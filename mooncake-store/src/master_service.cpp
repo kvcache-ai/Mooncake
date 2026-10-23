@@ -10247,6 +10247,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
         evict_ratio_lowerbound = evict_ratio_target;
     }
 
+    // Both timings are reported as histograms so an operator can tell a slow
+    // cycle apart from a slow scan without attaching a profiler.
+    const auto cycle_start = std::chrono::steady_clock::now();
+
     auto now = std::chrono::system_clock::now();
 
     auto is_evictable_memory_replica = [this](const Replica& replica) {
@@ -10595,6 +10599,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
     std::vector<std::vector<std::chrono::system_clock::time_point>>
         local_soft_pin(num_threads);
 
+    const auto scan_start = std::chrono::steady_clock::now();
+
     std::vector<std::thread> threads;
     for (int t = 0; t < num_threads; t++) {
         threads.emplace_back([&, t] {
@@ -10640,6 +10646,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
         });
     }
     for (auto& t : threads) t.join();
+    const int64_t scan_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - scan_start)
+            .count();
+    MasterMetricManager::instance().observe_evict_scan_duration_ms(scan_ms);
 
     // Merge per-thread results
     long total_eviction_base = 0;
@@ -10797,6 +10808,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
     }
     // ===== Phase 2: Serial eviction via key lookup =====
+    const auto reclaim_start = std::chrono::steady_clock::now();
     long evicted_count = 0;
     uint64_t total_freed_size = 0;
     bool stop_eviction_scan = false;
@@ -11011,6 +11023,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
     }
 
+    const int64_t reclaim_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - reclaim_start)
+            .count();
+    MasterMetricManager::instance().observe_evict_reclaim_duration_ms(
+        reclaim_ms);
+
     // erase() never returns bucket memory, so a shard that once held far
     // more keys than it does now would keep its high-water bucket array
     // forever. Shrink the metadata maps of the shards that evicted this
@@ -11063,13 +11082,20 @@ void MasterService::BatchEvict(double evict_ratio_target,
             << (long)std::ceil(object_count * evict_ratio_target)
             << " ideal_evict_num_correct="
             << (long)std::ceil(total_eviction_base * evict_ratio_target);
+    const int64_t cycle_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - cycle_start)
+            .count();
+    MasterMetricManager::instance().observe_evict_cycle_duration_ms(cycle_ms);
     LOG(INFO) << "[EVICT-RESULT] evicted_count=" << evicted_count
               << ", eviction_base=" << total_eviction_base
               << ", actual_evict_ratio="
               << (total_eviction_base > 0
                       ? (double)evicted_count / total_eviction_base
                       : 0.0)
-              << ", target_evict_ratio=" << evict_ratio_target;
+              << ", target_evict_ratio=" << evict_ratio_target
+              << ", cycle_ms=" << cycle_ms << ", scan_ms=" << scan_ms
+              << ", reclaim_ms=" << reclaim_ms;
     if (offload_on_evict_ && evicted_count == 0 && offload_deferred_count > 0) {
         LOG(WARNING) << "[EVICT] No memory freed this cycle; "
                      << offload_deferred_count

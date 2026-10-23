@@ -160,6 +160,23 @@ TEST_F(MasterMetricsTest, ClientOffboardingMetricsAreExported) {
               std::string::npos);
 }
 
+TEST_F(MasterMetricsTest, EvictionDurationsAreExported) {
+    auto& metrics = MasterMetricManager::instance();
+    // A cycle covers the Phase-1 scan and the Phase-2 reclaim it contains, so
+    // the three samples are distinct rather than a shared constant.
+    metrics.observe_evict_scan_duration_ms(17);
+    metrics.observe_evict_reclaim_duration_ms(23);
+    metrics.observe_evict_cycle_duration_ms(42);
+    const auto serialized = metrics.serialize_metrics();
+
+    EXPECT_NE(serialized.find("master_evict_scan_duration_ms"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_evict_reclaim_duration_ms"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_evict_cycle_duration_ms"),
+              std::string::npos);
+}
+
 TEST_F(MasterMetricsTest, BasicRequestTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();
