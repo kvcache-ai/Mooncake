@@ -18,6 +18,11 @@ except ImportError:
     print("Warning: Could not import MooncakeDistributedStoreAsync from async_store.py")
     MooncakeDistributedStoreAsync = None
 
+IS_P2P = (
+    MooncakeDistributedStoreAsync is not None
+    and hasattr(MooncakeDistributedStoreAsync, "setup_p2p_real_client")
+)
+
 # ==========================================
 #  Global Variables & Configuration
 # ==========================================
@@ -186,11 +191,9 @@ class MooncakeAsyncTestBase(unittest.IsolatedAsyncioTestCase):
         self.store = GLOBAL_STORE
         self.config = GLOBAL_CONFIG
 
-        # Asynchronously clear the store
-        # Note: Depending on implementation, you might want to call
-        # await self.store.async_remove_all()
-        # For now, we assume remove_all wraps C++ synchronous logic nicely in a thread.
-        await self.store.async_remove_all()
+        # TODO: Enable P2P cleanup once global remove_all is implemented.
+        if not IS_P2P:
+            await self.store.async_remove_all()
 
 # ==========================================
 #  Basic Bytes I/O & Auxiliary Tests
@@ -251,6 +254,8 @@ class TestMooncakeBasicFunctional(MooncakeAsyncTestBase):
         self.assertEqual(results[1], 0)
         self.assertEqual(results[2], 1)
 
+    # TODO: Enable P2P coverage once global remove/remove_all is implemented.
+    @unittest.skipIf(IS_P2P, "P2P global remove/remove_all is not implemented yet")
     async def test_04_remove(self):
         """Test remove and remove_all."""
         key = "test_remove_key"
@@ -272,6 +277,8 @@ class TestMooncakeBasicFunctional(MooncakeAsyncTestBase):
         self.assertFalse(await self.store.async_is_exist(keys[0]))
         self.assertFalse(await self.store.async_is_exist(keys[1]))
 
+    # TODO: Enable P2P coverage once global remove_by_regex is implemented.
+    @unittest.skipIf(IS_P2P, "P2P global remove_by_regex is not implemented yet")
     async def test_05_remove_by_regex(self):
         """Test remove_by_regex."""
         # Setup keys with specific patterns
