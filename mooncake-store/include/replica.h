@@ -349,6 +349,7 @@ class Replica {
         : id_(src.id_),
           data_(std::move(src.data_)),
           status_(src.status_),
+          status_before_remove_(src.status_before_remove_),
           refcnt_(src.refcnt_.exchange(0)) {
         // Mark the source as moved-from so its destructor doesn't
         // double-decrement metrics.
@@ -375,6 +376,7 @@ class Replica {
         id_ = src.id_;
         data_ = std::move(src.data_);
         status_ = src.status_;
+        status_before_remove_ = src.status_before_remove_;
         refcnt_.store(src.refcnt_.exchange(0));
         // Mark src as moved-from.
         src.status_ = ReplicaStatus::UNDEFINED;
@@ -629,6 +631,7 @@ class Replica {
     void mark_removed() {
         if (status_ == ReplicaStatus::COMPLETE ||
             status_ == ReplicaStatus::PROCESSING) {
+            status_before_remove_ = status_;
             status_ = ReplicaStatus::REMOVED;
         } else if (status_ == ReplicaStatus::REMOVED) {
             LOG(WARNING) << "Replica already marked as removed";
@@ -638,10 +641,14 @@ class Replica {
     }
 
     void cancel_remove() {
-        if (status_ == ReplicaStatus::REMOVED) {
-            status_ = ReplicaStatus::COMPLETE;
+        if (status_ == ReplicaStatus::REMOVED &&
+            (status_before_remove_ == ReplicaStatus::COMPLETE ||
+             status_before_remove_ == ReplicaStatus::PROCESSING)) {
+            status_ = status_before_remove_;
+            status_before_remove_ = ReplicaStatus::UNDEFINED;
         } else {
-            LOG(ERROR) << "Cannot cancel_remove from status: " << status_;
+            LOG(ERROR) << "Cannot cancel_remove without a local removal: "
+                       << status_;
         }
     }
 
@@ -860,6 +867,8 @@ class Replica {
                  LocalDiskReplicaData, DfsReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
+    // Local rollback history; descriptors and snapshots keep their wire format.
+    ReplicaStatus status_before_remove_{ReplicaStatus::UNDEFINED};
 
     friend class MasterService;  // Standby restore advances next_id_
     std::atomic<uint32_t> refcnt_{0};
