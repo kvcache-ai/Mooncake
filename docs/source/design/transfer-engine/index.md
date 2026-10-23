@@ -591,8 +591,6 @@ timeouts when computing the overall unsuccessful-task ratio.
 - Each shared object that embeds `libtransfer_engine` has its own registry. If
   a process loads both `mooncake.engine` and `mooncake.store`, only the first
   to start serves the port.
-- A histogram is missing from `/metrics` until its sum is nonzero.
-  `/metrics/json` always includes it.
 
 ### Example
 
