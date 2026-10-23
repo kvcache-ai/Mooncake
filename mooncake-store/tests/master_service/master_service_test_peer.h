@@ -28,26 +28,19 @@ class MasterServiceTestPeer {
             .has_value();
     }
 
-    using GroupDomainAccessorRO = MasterService::GroupDomainAccessorRO;
-    using GroupDomainAccessorRW = MasterService::GroupDomainAccessorRW;
     using MetadataAccessorRO = MasterService::MetadataAccessorRO;
     using MetadataAccessorRW = MasterService::MetadataAccessorRW;
-    using MetadataShard = MasterService::MetadataShard;
-    using MetadataShardAccessorRO = MasterService::MetadataShardAccessorRO;
-    using MetadataShardAccessorRW = MasterService::MetadataShardAccessorRW;
     using ObjectIdentity = MasterService::ObjectIdentity;
     using ObjectMetadata = mooncake::ObjectMetadata;
     using PromotionQueueResult = mooncake::PromotionQueueResult;
     using PromotionTask = mooncake::PromotionTask;
     using QuotaEraseMode = MasterService::QuotaEraseMode;
     using TenantQuotaEvictionResult = MasterService::TenantQuotaEvictionResult;
-    using TenantState = MasterService::TenantState;
 
     static constexpr auto kDynamicReplicationWindowEntryLimit =
         DynamicReplicationController::kWindowEntryLimit;
     static constexpr auto kMaxPromotionExecutionFailures =
         MasterService::kMaxPromotionExecutionFailures;
-    static constexpr auto kNumShards = MasterService::kNumShards;
     static constexpr auto kPromotionCandidateMaxRetries =
         PromotionCandidateTracker::kMaxRetries;
 
@@ -74,22 +67,11 @@ class MasterServiceTestPeer {
     // Drive one tenant watermark eviction pass without the periodic worker.
     void RunTenantEvictForTesting();
 
-    // The service's walks over tenants and over one tenant's objects.
-    auto ReadCursor(const TenantId& tenant_id) const {
-        return service_.ReadCursor(tenant_id);
-    }
-    using CursorSlice = MasterService::CursorSlice;
-    auto ReadCursor(const TenantId& tenant_id, CursorSlice slice) const {
-        return service_.ReadCursor(tenant_id, slice);
-    }
-    auto WriteCursor(const TenantId& tenant_id) {
-        return service_.WriteCursor(tenant_id);
-    }
-    void VisitTenants(const std::function<void(const TenantId&)>& visit) const {
-        service_.VisitTenants(visit);
-    }
-    std::vector<std::string> InFlightKeys(const TenantId& tenant_id) const {
-        return service_.InFlightKeys(tenant_id);
+    // The service's walk over the namespaces that hold objects.
+    void VisitNamespaces(
+        const std::function<void(const TenantId&, metadata::Namespace&)>& visit)
+        const {
+        service_.VisitNamespaces(visit);
     }
 
     // Enable epoch bookkeeping without starting a live KV event publisher.
@@ -210,11 +192,32 @@ class MasterServiceTestPeer {
         return service.local_ssd_manager_;
     }
 
-    static auto& MetadataShards(MasterService& service) {
-        return service.metadata_shards_;
+    // One namespace per tenant id written to, owning that tenant's object
+    // route and its group index.
+    static auto& Namespaces(MasterService& service) {
+        return service.namespaces_;
     }
-    static const auto& MetadataShards(const MasterService& service) {
-        return service.metadata_shards_;
+    static const auto& Namespaces(const MasterService& service) {
+        return service.namespaces_;
+    }
+
+    // The object under `object_id`, held shared or exclusively for the
+    // caller's scope the way a request path holds it; nullopt when that
+    // tenant is absent or the key holds no object. A test parks a path that
+    // must take the key by keeping the write guard.
+    static std::optional<route::ReadGuard> ReadObject(
+        const MasterService& service, const ObjectIdentity& object_id) {
+        const metadata::Namespace* ns =
+            service.namespaces_.Lookup(object_id.tenant_id);
+        return ns == nullptr ? std::nullopt
+                             : ns->objects.Read(object_id.user_key);
+    }
+    static std::optional<route::WriteGuard> WriteObject(
+        MasterService& service, const ObjectIdentity& object_id) {
+        metadata::Namespace* ns =
+            service.namespaces_.Lookup(object_id.tenant_id);
+        return ns == nullptr ? std::nullopt
+                             : ns->objects.Write(object_id.user_key);
     }
 
     static auto& NeedMemEviction(MasterService& service) {
@@ -378,9 +381,7 @@ class MasterServiceTestPeer {
         service_.CleanupExpiredSoftPins(now);
     }
 
-    void ClearCandidatesForReload() { service_.ClearCandidatesForReload(); }
-
-    // The caller holds the object's shard, as through MetadataAccessorRW.
+    // The caller holds the key exclusively, as through MetadataAccessorRW.
     void ClearDynamicReplicationStateForKey(const TenantId& tenant_id,
                                             const std::string& key,
                                             route::ObjectState& state) {
@@ -401,7 +402,10 @@ class MasterServiceTestPeer {
     void DiscardExpiredProcessingReplicas(
         const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) {
-        service_.DiscardExpiredProcessingReplicas(tenant_id, now);
+        if (const metadata::Namespace* ns =
+                service_.namespaces_.Lookup(tenant_id)) {
+            service_.DiscardExpiredProcessingReplicas(*ns, now);
+        }
     }
 
     uint32_t DynamicReplicationAdmissionMinHits() const {
@@ -456,14 +460,14 @@ class MasterServiceTestPeer {
         return service_.FindClientRecord(client_id);
     }
 
-    TenantQuotaHandle GetBoundTenantQuotaHandle(
-        const TenantState& tenant_state) const {
-        return service_.GetBoundTenantQuotaHandle(tenant_state);
+    // Resolves the namespace, creating it on first use.
+    metadata::Namespace& GetOrCreateNamespace(const TenantId& tenant_id) {
+        return service_.namespaces_.GetOrCreate(tenant_id);
     }
 
-    TenantState& GetOrCreateTenantState(MetadataShard& shard,
-                                        const TenantId& tenant_id) {
-        return service_.GetOrCreateTenantState(shard, tenant_id);
+    // The tenant's quota account, or null with multi-tenancy off.
+    TenantQuotaHandle QuotaAccountOf(const TenantId& tenant_id) {
+        return service_.QuotaAccountOf(tenant_id);
     }
 
     bool IsReplicaReadable(const Replica& replica) const {
@@ -527,15 +531,6 @@ class MasterServiceTestPeer {
     PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
                                                bool record_candidate = true) {
         return service_.TryPushPromotionQueue(object_id, record_candidate);
-    }
-
-    size_t getShardIndex(const TenantId& tenant_id,
-                         const std::string& user_key) const {
-        return service_.getShardIndex(tenant_id, user_key);
-    }
-
-    size_t getShardIndex(const std::string& key) const {
-        return service_.getShardIndex(key);
     }
 
    private:
