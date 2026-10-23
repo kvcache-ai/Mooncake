@@ -325,6 +325,8 @@ set_tests_properties(dfs_read_checksum_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 if(USE_3FS)
   add_store_test(dfs_hf3fs_test dfs_hf3fs_test.cpp)
+  # Unit test: the test's fake USRBIO definitions replace libhf3fs.
+  add_store_test(hf3fs_adapter_batch_test hf3fs_adapter_batch_test.cpp)
 endif()
 add_store_test(zstd_util_test zstd_util_test.cpp)
 add_store_test(local_file_snapshot_config_test
