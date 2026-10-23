@@ -478,7 +478,7 @@ TEST(BatchOpLogSnapshotCoordinatorTest,
     ASSERT_TRUE(wait_for_batch(2));
     objects.on_upload = [] { throw std::runtime_error("upload failed"); };
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, coordinator.RunOnce());
-    ASSERT_TRUE(standby.IsRunning());
+    ASSERT_EQ(StandbyState::WATCHING, standby.GetState());
     EXPECT_EQ(1u, coordinator.GetStatus().attempts);
 
     now += std::chrono::seconds(4);
