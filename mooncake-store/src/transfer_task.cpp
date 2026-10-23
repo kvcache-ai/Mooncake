@@ -151,6 +151,15 @@ static void nof_io_complete(void* ctx, const mooncake::NofIOCompletion& c) {
 }
 namespace {
 
+// openSegment fails when the owner's segment descriptor cannot be resolved:
+// the peer is down or unreachable, its metadata entry is stale or missing, or
+// the owner published to a different metadata service than this client reads
+// (e.g. HTTP metadata vs P2PHANDSHAKE). List the causes rather than pick one.
+constexpr const char* kOpenSegmentFailureHint =
+    "; the segment owner may be down or unreachable, or its metadata entry "
+    "stale or missing. If nodes and clients use different metadata_server "
+    "settings (e.g. P2PHANDSHAKE vs HTTP/etcd), that is a common cause";
+
 #ifdef USE_TENT
 int GetTentPositiveEnvOrDefault(const char* name, int default_value) {
     const char* raw_value = std::getenv(name);
@@ -1857,7 +1866,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
             tent_engine_->openSegment(seg_id, handle.transport_endpoint_);
         if (!status.ok()) {
             LOG(ERROR) << "Failed to open segment for endpoint='"
-                       << handle.transport_endpoint_ << "'";
+                       << handle.transport_endpoint_ << "'"
+                       << kOpenSegmentFailureHint;
             return std::nullopt;
         }
         seg = seg_id;
@@ -1867,7 +1877,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         seg = engine_.openSegment(handle.transport_endpoint_);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
             LOG(ERROR) << "Failed to open segment for endpoint='"
-                       << handle.transport_endpoint_ << "'";
+                       << handle.transport_endpoint_ << "'"
+                       << kOpenSegmentFailureHint;
             return std::nullopt;
         }
     }
