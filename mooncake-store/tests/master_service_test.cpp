@@ -3952,6 +3952,48 @@ TEST_F(MasterServiceTest,
     EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
 }
 
+TEST(ReplicaStateTest, CancelRemovalRestoresOriginalState) {
+    for (auto status : {ReplicaStatus::PROCESSING, ReplicaStatus::COMPLETE}) {
+        Replica replica("replica", 1024, status);
+        replica.mark_removed();
+        // Repeated removal must not overwrite the original state.
+        replica.mark_removed();
+        replica.cancel_remove();
+        EXPECT_EQ(status, replica.status());
+        replica.cancel_remove();
+        EXPECT_EQ(status, replica.status());
+
+        // A later removal remembers the new state rather than stale history.
+        if (status == ReplicaStatus::PROCESSING) {
+            replica.mark_complete();
+        } else {
+            replica.mark_processing();
+        }
+        const auto next_status = replica.status();
+        replica.mark_removed();
+        replica.cancel_remove();
+        EXPECT_EQ(next_status, replica.status());
+    }
+}
+
+TEST(ReplicaStateTest, MovePreservesRemovalHistory) {
+    for (auto status : {ReplicaStatus::PROCESSING, ReplicaStatus::COMPLETE}) {
+        Replica original("replica", 1024, status);
+        original.mark_removed();
+        Replica moved(std::move(original));
+        Replica assigned("old", 512, ReplicaStatus::COMPLETE);
+        assigned = std::move(moved);
+        assigned.cancel_remove();
+        EXPECT_EQ(status, assigned.status());
+    }
+}
+
+TEST(ReplicaStateTest, RemovedWithoutLocalHistoryCannotBecomeComplete) {
+    Replica replica("replica", 1024, ReplicaStatus::REMOVED);
+    replica.cancel_remove();
+    EXPECT_EQ(ReplicaStatus::REMOVED, replica.status());
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
