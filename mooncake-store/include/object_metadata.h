@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/heap_optional.h"
 #include "lease.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
@@ -111,7 +112,7 @@ struct ObjectMetadata {
         std::string session_id;
         std::unordered_set<ReplicaID> eligible_replica_ids;
     };
-    std::optional<PendingSessionTag> pending_session_tag;
+    HeapOptional<PendingSessionTag> pending_session_tag;
 
     void BeginSessionTag(std::string id,
                          const std::unordered_set<ReplicaID>& replicas) {
@@ -152,7 +153,7 @@ struct ObjectMetadata {
     // Replica IDs scope this action to the current write. PutEnd does not
     // carry a generation token, so a stale End from the same client cannot
     // otherwise be distinguished from the current write.
-    std::optional<PendingSoftPinAction> pending_soft_pin_action;
+    HeapOptional<PendingSoftPinAction> pending_soft_pin_action;
     const bool hard_pinned{false};  // immutable, set at creation
     bool memory_cache_total_accounted{false};
     bool disk_cache_total_accounted{false};
