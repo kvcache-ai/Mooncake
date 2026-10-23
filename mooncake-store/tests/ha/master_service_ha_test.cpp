@@ -2110,8 +2110,15 @@ TEST_F(MasterServiceHATest, PingStaysResponsiveDuringRemountMetadataWalk) {
         walk_reached &&
         PutStartHoldsSnapshotAfterClientReleaseForTesting(service);
 
+    // The remounting client's own heartbeat must also complete. Its
+    // retaining guard pins resources, but must not pin heartbeat observation.
+    auto remount_ping = std::async(
+        std::launch::async, [&] { return service.Ping(remount_client); });
+    const auto remount_ping_status =
+        remount_ping.wait_for(std::chrono::seconds(1));
     park_lock.unlock();
     const auto remount_result = remount.get();
+    const auto remount_ping_result = remount_ping.get();
 
     ASSERT_TRUE(walk_reached)
         << "remount never entered the metadata restore walk";
@@ -2125,6 +2132,60 @@ TEST_F(MasterServiceHATest, PingStaysResponsiveDuringRemountMetadataWalk) {
             << "ping " << i << " blocked behind the remount walk";
     }
     EXPECT_TRUE(still_in_walk);
+    EXPECT_EQ(remount_ping_status, std::future_status::ready);
+    ASSERT_TRUE(remount_ping_result.has_value());
+    if (remount_ping_status == std::future_status::ready) {
+        EXPECT_EQ(remount_ping_result->client_status,
+                  ClientStatus::NEED_REMOUNT);
+    }
+    ASSERT_TRUE(remount_result.has_value()) << toString(remount_result.error());
+    EXPECT_EQ(service.Ping(remount_client)->client_status, ClientStatus::OK);
+}
+
+TEST_F(MasterServiceHATest, PingStaysResponsiveWhileRemountWaitsForSnapshot) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const UUID pinger_client = generate_uuid();
+    const UUID remount_client = generate_uuid();
+    ASSERT_TRUE(service
+                    .ReMountSegment({MakeSegment("snapshot_wait_pinger")},
+                                    pinger_client)
+                    .has_value());
+    ASSERT_EQ(service.Ping(pinger_client)->client_status, ClientStatus::OK);
+
+    auto snapshot_lock = LockSnapshotForTesting(service);
+    auto remount = std::async(std::launch::async, [&] {
+        return service.ReMountSegment(
+            {MakeSegment("snapshot_wait_remount",
+                         kDefaultSegmentBase + kDefaultSegmentSize)},
+            remount_client);
+    });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool admission_reached = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::shared_lock<std::shared_mutex> client_lock(
+            MasterServiceTestPeer::ClientMutex(service), std::try_to_lock);
+        if (!client_lock.owns_lock()) {
+            admission_reached = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+
+    auto ping = std::async(std::launch::async,
+                           [&] { return service.Ping(pinger_client); });
+    const auto ping_status = ping.wait_for(std::chrono::seconds(1));
+    const auto remount_status = remount.wait_for(std::chrono::seconds(0));
+    snapshot_lock.unlock();
+    const auto ping_result = ping.get();
+    const auto remount_result = remount.get();
+
+    ASSERT_TRUE(admission_reached);
+    EXPECT_EQ(remount_status, std::future_status::timeout);
+    EXPECT_EQ(ping_status, std::future_status::ready);
+    ASSERT_TRUE(ping_result.has_value());
+    EXPECT_EQ(ping_result->client_status, ClientStatus::OK);
     ASSERT_TRUE(remount_result.has_value()) << toString(remount_result.error());
     EXPECT_EQ(service.Ping(remount_client)->client_status, ClientStatus::OK);
 }

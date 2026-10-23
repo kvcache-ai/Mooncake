@@ -613,7 +613,10 @@ MasterService::~MasterService() {
     for (const auto& [_, record] : client_liveness_records_) {
         metrics.on_client_liveness_record_removed(record->state());
     }
-    client_liveness_records_.clear();
+    {
+        std::unique_lock<std::shared_mutex> status_lock(client_status_mutex_);
+        client_liveness_records_.clear();
+    }
 }
 
 void MasterService::SetBatchOpLogTerminalCallback(
@@ -683,9 +686,13 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
-        auto [record_it, inserted] = client_liveness_records_.try_emplace(
-            client_id, std::make_shared<ClientLivenessRecord>(
-                           ClientLivenessRecord::Clock::now()));
+        auto [record_it, inserted] = [&] {
+            std::unique_lock<std::shared_mutex> status_lock(
+                client_status_mutex_);
+            return client_liveness_records_.try_emplace(
+                client_id, std::make_shared<ClientLivenessRecord>(
+                               ClientLivenessRecord::Clock::now()));
+        }();
         const auto record = record_it->second;
         if (inserted) {
             MasterMetricManager::instance().client_liveness_record_created();
@@ -711,7 +718,11 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         if (mount_result != ErrorCode::OK &&
             mount_result != ErrorCode::SEGMENT_ALREADY_EXISTS) {
             if (inserted) {
-                client_liveness_records_.erase(client_id);
+                {
+                    std::unique_lock<std::shared_mutex> status_lock(
+                        client_status_mutex_);
+                    client_liveness_records_.erase(client_id);
+                }
                 MasterMetricManager::instance()
                     .on_client_liveness_record_removed(
                         ClientLivenessState::ACTIVE);
@@ -806,10 +817,13 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     std::lock_guard<std::mutex> remount_serialization_guard(remount_mutex_);
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
-        auto [record_it, record_inserted] =
-            client_liveness_records_.try_emplace(
+        auto [record_it, record_inserted] = [&] {
+            std::unique_lock<std::shared_mutex> status_lock(
+                client_status_mutex_);
+            return client_liveness_records_.try_emplace(
                 client_id, std::make_shared<ClientLivenessRecord>(
                                ClientLivenessRecord::Clock::now()));
+        }();
         const auto record = record_it->second;
         if (record_inserted) {
             MasterMetricManager::instance().client_liveness_record_created();
@@ -823,7 +837,11 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             if (!record_inserted) {
                 return;
             }
-            client_liveness_records_.erase(client_id);
+            {
+                std::unique_lock<std::shared_mutex> status_lock(
+                    client_status_mutex_);
+                client_liveness_records_.erase(client_id);
+            }
             MasterMetricManager::instance().on_client_liveness_record_removed(
                 ClientLivenessState::ACTIVE);
         };
@@ -2758,7 +2776,11 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
     if (current != client_liveness_records_.end() &&
         current->second == job.liveness) {
         const auto state = current->second->state();
-        client_liveness_records_.erase(current);
+        {
+            std::unique_lock<std::shared_mutex> status_lock(
+                client_status_mutex_);
+            client_liveness_records_.erase(current);
+        }
         MasterMetricManager::instance().on_client_liveness_record_removed(
             state);
     }
@@ -4080,7 +4102,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         standby_allocator_keepalive_ = prev_standby_allocator_keepalive;
         invalid_replica_endpoints_ = prev_invalid_replica_endpoints;
         for (const auto& [client_id, record] : new_known_owner_records) {
-            client_liveness_records_.erase(client_id);
+            {
+                std::unique_lock<std::shared_mutex> status_lock(
+                    client_status_mutex_);
+                client_liveness_records_.erase(client_id);
+            }
             MasterMetricManager::instance().on_client_liveness_record_removed(
                 record->state());
         }
@@ -4098,7 +4124,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         // Copy, not move: rollback_restored_state() still needs a valid
         // record (state() for the removal metric) when a later durable
         // repair step fails the restore.
-        client_liveness_records_.emplace(client_id, record);
+        {
+            std::unique_lock<std::shared_mutex> status_lock(
+                client_status_mutex_);
+            client_liveness_records_.emplace(client_id, record);
+        }
         MasterMetricManager::instance().client_liveness_record_created();
     }
 
@@ -8142,33 +8172,29 @@ size_t MasterService::GetKeyCount() const {
 
 auto MasterService::Ping(const UUID& client_id)
     -> tl::expected<PingResponse, ErrorCode> {
-    bool observation_accepted = false;
-    {
-        std::shared_lock<std::shared_mutex> lock(client_mutex_);
-        const auto record_it = client_liveness_records_.find(client_id);
-        if (record_it != client_liveness_records_.end()) {
-            const auto observation =
-                record_it->second->Observe(ClientLivenessRecord::Clock::now());
-            observation_accepted =
-                observation != ClientLivenessObservation::REJECTED_OFFLINE;
-            if (observation == ClientLivenessObservation::RECOVERED_ACTIVE) {
-                MasterMetricManager::instance().client_liveness_recovered();
-                LOG(INFO) << "client_id=" << client_id
-                          << ", action=client_liveness_recovered, signal=ping";
-            }
-        }
-    }
-    // Read the mirror of ok_client_ instead of ok_client_ itself under
-    // client_mutex_: the mirror is only ever held exclusively for the
-    // microseconds of a client insert or erase, so heartbeat processing
-    // cannot stall behind a remount admission or a monitor expiry erasure
-    // the way a client_mutex_ shared read can. The status is advisory for
-    // the store either way -- a stale NEED_REMOUNT just triggers an
-    // idempotent remount.
+    std::shared_ptr<ClientLivenessRecord> record;
     bool client_ok = false;
     {
         std::shared_lock<std::shared_mutex> lock(client_status_mutex_);
+        const auto record_it = client_liveness_records_.find(client_id);
+        if (record_it != client_liveness_records_.end()) {
+            record = record_it->second;
+        }
         client_ok = client_status_view_.contains(client_id);
+    }
+    // Keep the record alive without pinning either registry lock while
+    // observing it. OFFLINE records still reject heartbeats after lookup.
+    bool observation_accepted = false;
+    if (record) {
+        const auto observation =
+            record->Observe(ClientLivenessRecord::Clock::now());
+        observation_accepted =
+            observation != ClientLivenessObservation::REJECTED_OFFLINE;
+        if (observation == ClientLivenessObservation::RECOVERED_ACTIVE) {
+            MasterMetricManager::instance().client_liveness_recovered();
+            LOG(INFO) << "client_id=" << client_id
+                      << ", action=client_liveness_recovered, signal=ping";
+        }
     }
     const ClientStatus client_status = observation_accepted && client_ok
                                            ? ClientStatus::OK
@@ -8207,9 +8233,12 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
     std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
-    auto [record_it, inserted] = client_liveness_records_.try_emplace(
-        client_id, std::make_shared<ClientLivenessRecord>(
-                       ClientLivenessRecord::Clock::now()));
+    auto [record_it, inserted] = [&] {
+        std::unique_lock<std::shared_mutex> status_lock(client_status_mutex_);
+        return client_liveness_records_.try_emplace(
+            client_id, std::make_shared<ClientLivenessRecord>(
+                           ClientLivenessRecord::Clock::now()));
+    }();
     const auto record = record_it->second;
     if (inserted) {
         MasterMetricManager::instance().client_liveness_record_created();
@@ -8229,7 +8258,11 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
     }
     if (err != ErrorCode::OK && err != ErrorCode::SEGMENT_ALREADY_EXISTS) {
         if (inserted) {
-            client_liveness_records_.erase(client_id);
+            {
+                std::unique_lock<std::shared_mutex> status_lock(
+                    client_status_mutex_);
+                client_liveness_records_.erase(client_id);
+            }
             MasterMetricManager::instance().on_client_liveness_record_removed(
                 ClientLivenessState::ACTIVE);
         }

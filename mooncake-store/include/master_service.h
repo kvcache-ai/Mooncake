@@ -121,7 +121,8 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  * Two dedicated guards sit outside this order: remount_mutex_ is only
  * acquired at the top of ReMountSegment, before client_mutex_, and nothing
  * acquires it while holding any lock above; client_status_mutex_ guards the
- * ok_client_ mirror and is never held while acquiring any other lock.
+ * ok_client_ mirror and liveness-record lookup for Ping. It is never held
+ * while acquiring any other lock.
  */
 
 class MasterService {
@@ -2266,6 +2267,9 @@ class MasterService {
 
     // Client related members
     mutable std::shared_mutex client_mutex_;
+    // Writers hold both client_mutex_ and client_status_mutex_. Readers may
+    // hold either: Ping copies a shared_ptr under client_status_mutex_ so it
+    // does not wait for admission or snapshot work under client_mutex_.
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
                        boost::hash<UUID>>
         client_liveness_records_;
