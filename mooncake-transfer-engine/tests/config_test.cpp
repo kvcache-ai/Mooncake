@@ -528,6 +528,33 @@ TEST_F(EfaNicSelectionEnvTest, EmptyStringKeepsDefault) {
     EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
 }
 
+class HipKfdPinFixEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_HIP_KFD_PIN_FIX"); }
+
+    static HipKfdPinFix load(const char* value) {
+        EXPECT_EQ(::setenv("MC_HIP_KFD_PIN_FIX", value, 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        return config.hip_kfd_pin_fix;
+    }
+};
+
+TEST_F(HipKfdPinFixEnvTest, DefaultsToProbe) {
+    ::unsetenv("MC_HIP_KFD_PIN_FIX");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.hip_kfd_pin_fix, HipKfdPinFix::PROBE);
+}
+
+TEST_F(HipKfdPinFixEnvTest, ParsesValues) {
+    EXPECT_EQ(load("0"), HipKfdPinFix::OFF);
+    EXPECT_EQ(load("1"), HipKfdPinFix::PROBE);
+    EXPECT_EQ(load("force"), HipKfdPinFix::FORCE);
+    EXPECT_EQ(load("FORCE"), HipKfdPinFix::FORCE);
+    EXPECT_EQ(load("always"), HipKfdPinFix::PROBE);  // invalid keeps default
+}
+
 // max_wr_from_env distinguishes "the operator asked for this depth" from "this
 // is the compiled-in default".  The EFA transport needs that distinction: with
 // no override it adopts the provider's per-device transmit queue depth, which
