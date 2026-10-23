@@ -29,6 +29,14 @@ std::string FormatBucketBoundary(double boundary) {
 
 }  // namespace
 
+const std::vector<double>& LatencyBuckets() {
+    static const std::vector<double> kBoundaries = {
+        125,   150,   200,   250,    300,    400,    500,
+        750,   1000,  1500,  2000,   3000,   5000,   7000,
+        15000, 20000, 50000, 100000, 200000, 500000, 1000000};
+    return kBoundaries;
+}
+
 // Shared histogram calculations and rendering do not own client metric state.
 const std::vector<double>& LifetimeBuckets() {
     static const std::vector<double> kBoundaries = {

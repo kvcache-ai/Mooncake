@@ -1227,7 +1227,7 @@ TEST_F(P2PClientIntegrationTest, UnregisterSwitchesToLocalOnly) {
 // ============================================================================
 
 static P2PClientMetric* GetP2PMetrics(P2PClientService* c) {
-    return dynamic_cast<P2PClientMetric*>(c->GetMetrics());
+    return c->GetMetrics();
 }
 
 TEST_F(P2PClientIntegrationTest, MetricLocalPutGet_TE) {

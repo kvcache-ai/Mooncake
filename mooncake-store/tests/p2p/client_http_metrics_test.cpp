@@ -1,7 +1,9 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <thread>
 #include <chrono>
@@ -20,9 +22,27 @@ class ClientHttpMetricsTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("ClientHttpMetricsTest");
         FLAGS_logtostderr = true;
+        for (size_t i = 0; i < env_names_.size(); ++i) {
+            if (const char* value = std::getenv(env_names_[i])) {
+                saved_env_[i] = value;
+            }
+        }
     }
 
-    void TearDown() override { google::ShutdownGoogleLogging(); }
+    void TearDown() override {
+        for (size_t i = 0; i < env_names_.size(); ++i) {
+            const int result =
+                saved_env_[i] ? setenv(env_names_[i], saved_env_[i]->c_str(), 1)
+                              : unsetenv(env_names_[i]);
+            EXPECT_EQ(result, 0);
+        }
+        google::ShutdownGoogleLogging();
+    }
+
+   private:
+    const std::array<const char*, 2> env_names_ = {
+        "MC_STORE_CLIENT_METRIC", "MC_STORE_CLIENT_METRIC_INTERVAL"};
+    std::array<std::optional<std::string>, 2> saved_env_;
 };
 
 // Test config builder with metrics settings
@@ -111,16 +131,16 @@ TEST_F(ClientHttpMetricsTest, ConfigWithLabels) {
 }
 
 // Test HTTP server endpoints directly
-// TODO(C1/C2): Separate these shared-metric fixture checks from the A00
-// centralized contract; do not expand or repair centralized baseline
-// assertions.
+// Serializer fixtures construct metrics directly; factory policy is covered
+// separately below. Runtime handler ownership is covered in C2.
 TEST_F(ClientHttpMetricsTest, HttpEndpointsTest) {
     // Create a simple HTTP server that mimics the metrics server behavior
     const uint16_t test_port =
         19003;  // Use a non-standard port to avoid conflicts
 
     // Create ClientMetric instance
-    auto metrics = ClientMetric::Create({{"test_label", "test_value"}});
+    auto metrics = std::make_unique<ClientMetric>(
+        0, std::map<std::string, std::string>{{"test_label", "test_value"}});
     ASSERT_NE(metrics, nullptr);
 
     // Add some test data to metrics
@@ -214,8 +234,8 @@ TEST_F(ClientHttpMetricsTest, HttpEndpointsTest) {
 }
 
 // Test P2P client metrics HTTP endpoints
-// TODO(C1/C2): Replace copied P2P handlers with production runtime endpoints
-// after metric/runtime ownership is split; retain P2P output coverage.
+// TODO(C2): Replace copied P2P handlers with production runtime endpoints
+// after runtime ownership is split; retain P2P output coverage.
 TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
     const uint16_t test_port = 19004;
 
@@ -379,106 +399,82 @@ TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
     server.stop();
 }
 
-// Test combined ClientMetric and P2PClientMetric HTTP endpoints
-TEST_F(ClientHttpMetricsTest, CombinedMetricsHttpEndpointsTest) {
-    const uint16_t test_port = 19005;
-
-    // Create both ClientMetric and P2PClientMetric instances
-    auto metrics = ClientMetric::Create({{"instance", "combined_test"}});
-    ASSERT_NE(metrics, nullptr);
-
-    auto p2p_metrics = P2PClientMetric::Create({{"instance", "combined_test"}});
+TEST_F(ClientHttpMetricsTest, MetricFactoryPoliciesRemainIndependent) {
+    ASSERT_EQ(setenv("MC_STORE_CLIENT_METRIC", "false", 1), 0);
+    ASSERT_EQ(setenv("MC_STORE_CLIENT_METRIC_INTERVAL", "7", 1), 0);
+    EXPECT_EQ(ClientMetric::Create(), nullptr);
+    auto p2p_metrics = P2PClientMetric::Create();
     ASSERT_NE(p2p_metrics, nullptr);
+    EXPECT_EQ(p2p_metrics->GetReportingInterval(), 0u);
 
-    // Add test data to both metrics
-    metrics->transfer_metric.total_read_bytes.inc(1024 * 1024);
-    metrics->transfer_metric.total_write_bytes.inc(2 * 1024 * 1024);
+    ASSERT_EQ(setenv("MC_STORE_CLIENT_METRIC", "true", 1), 0);
+    auto centralized_metrics = ClientMetric::Create();
+    ASSERT_NE(centralized_metrics, nullptr);
+    EXPECT_EQ(centralized_metrics->GetReportingInterval(), 7u);
+    EXPECT_EQ(p2p_metrics->GetReportingInterval(), 0u);
+}
 
+// Each architecture exposes its own output without concatenating metric sets.
+TEST_F(ClientHttpMetricsTest, IndependentMetricsHttpEndpointsTest) {
+    const uint16_t test_port = 19005;
+    ClientMetric centralized_metrics;
+    auto p2p_metrics = P2PClientMetric::Create();
+    ASSERT_NE(p2p_metrics, nullptr);
+    centralized_metrics.transfer_metric.total_read_bytes.inc(1024 * 1024);
+    p2p_metrics->transfer_metric.total_read_bytes.inc(4096);
     p2p_metrics->total_request.get_requests.inc(50);
-    p2p_metrics->total_request.get_hits.inc(40);
-    p2p_metrics->total_request.get_bytes.inc(10 * 1024 * 1024);
-    p2p_metrics->total_request.put_requests.inc(20);
-    p2p_metrics->total_request.put_bytes.inc(5 * 1024 * 1024);
-
-    // Create and start HTTP server
-    coro_http::coro_http_server server(1, test_port);
 
     using namespace coro_http;
-
-    // Register combined metrics handler
-    server.set_http_handler<GET>("/metrics", [&metrics, &p2p_metrics](
-                                                 coro_http_request& req,
-                                                 coro_http_response& resp) {
-        std::string metrics_str;
-        metrics->serialize(metrics_str);
-        p2p_metrics->serialize(metrics_str);
-        resp.add_header("Content-Type", "text/plain; version=0.0.4");
-        resp.set_status_and_content(status_type::ok, std::move(metrics_str));
-    });
-
-    server.set_http_handler<GET>(
-        "/metrics/summary", [&metrics, &p2p_metrics](coro_http_request& req,
-                                                     coro_http_response& resp) {
-            std::string summary;
-            summary += metrics->summary_metrics();
-            summary += "\n";
-            summary += p2p_metrics->summary_metrics();
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            resp.set_status_and_content(status_type::ok, std::move(summary));
-        });
-
+    coro_http_server server(1, test_port);
+    const auto register_metrics = [&server](const std::string& prefix,
+                                            auto* metrics) {
+        server.set_http_handler<GET>(
+            prefix + "/metrics",
+            [metrics](coro_http_request&, coro_http_response& resp) {
+                std::string output;
+                metrics->serialize(output);
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok, std::move(output));
+            });
+        server.set_http_handler<GET>(
+            prefix + "/metrics/summary",
+            [metrics](coro_http_request&, coro_http_response& resp) {
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok,
+                                            metrics->summary_metrics());
+            });
+    };
+    register_metrics("/centralized", &centralized_metrics);
+    register_metrics("/p2p", p2p_metrics.get());
     server.async_start();
-
-    // Wait for server to start
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    // Test combined /metrics endpoint
-    {
-        coro_http::coro_http_client client;
-        auto resp = client.get("http://127.0.0.1:" + std::to_string(test_port) +
-                               "/metrics");
-        EXPECT_EQ(resp.status, 200);
+    const std::string base = "http://127.0.0.1:" + std::to_string(test_port);
+    coro_http_client client;
+    auto resp = client.get(base + "/centralized/metrics");
+    EXPECT_EQ(resp.status, 200);
+    EXPECT_NE(resp.resp_body.find("mooncake_transfer_read_bytes 1048576"),
+              std::string::npos);
+    EXPECT_EQ(resp.resp_body.find("mooncake_p2p_"), std::string::npos);
+    resp = client.get(base + "/centralized/metrics/summary");
+    EXPECT_EQ(resp.status, 200);
+    EXPECT_NE(resp.resp_body.find("Total Read: 1.00 MB"), std::string::npos);
+    EXPECT_EQ(resp.resp_body.find("P2P Total"), std::string::npos);
 
-        // Check both transfer metrics and P2P metrics are present
-        EXPECT_TRUE(resp.resp_body.find("mooncake_transfer_read_bytes") !=
-                    std::string::npos)
-            << "Should contain transfer read bytes";
-        EXPECT_TRUE(
-            resp.resp_body.find("mooncake_p2p_total_get_requests_total") !=
-            std::string::npos)
-            << "Should contain P2P get requests";
-        EXPECT_TRUE(
-            resp.resp_body.find("mooncake_p2p_total_put_requests_total") !=
-            std::string::npos)
-            << "Should contain P2P put requests";
-    }
-
-    // Test combined /metrics/summary endpoint
-    {
-        coro_http::coro_http_client client;
-        auto resp = client.get("http://127.0.0.1:" + std::to_string(test_port) +
-                               "/metrics/summary");
-        EXPECT_EQ(resp.status, 200);
-
-        // Check both transfer and P2P summaries are present
-        EXPECT_TRUE(resp.resp_body.find("Transfer Metrics Summary") !=
-                    std::string::npos)
-            << "Should contain transfer metrics summary";
-        EXPECT_TRUE(resp.resp_body.find("P2P Total (per-request)") !=
-                    std::string::npos)
-            << "Should contain P2P metrics summary";
-        EXPECT_TRUE(resp.resp_body.find("Total Read") != std::string::npos)
-            << "Should contain transfer total read";
-        EXPECT_TRUE(resp.resp_body.find("Get:") != std::string::npos)
-            << "Should contain get section";
-        EXPECT_TRUE(resp.resp_body.find("Put:") != std::string::npos)
-            << "Should contain put section";
-    }
-
+    resp = client.get(base + "/p2p/metrics");
+    EXPECT_EQ(resp.status, 200);
+    EXPECT_NE(resp.resp_body.find("mooncake_p2p_total_get_requests_total"),
+              std::string::npos);
+    EXPECT_NE(resp.resp_body.find("mooncake_transfer_read_bytes 4096"),
+              std::string::npos);
+    resp = client.get(base + "/p2p/metrics/summary");
+    EXPECT_EQ(resp.status, 200);
+    EXPECT_NE(resp.resp_body.find("Get: 50 requests"), std::string::npos);
+    EXPECT_EQ(resp.resp_body.find("Transfer Metrics Summary"),
+              std::string::npos);
     server.stop();
 }
 
-// Test P2P client peer_request metrics HTTP endpoints
 TEST_F(ClientHttpMetricsTest, P2PClientPeerMetricsHttpEndpointsTest) {
     const uint16_t test_port = 19006;
 

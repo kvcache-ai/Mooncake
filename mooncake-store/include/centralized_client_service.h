@@ -1,6 +1,7 @@
 #pragma once
 
 #include "client_service.h"
+#include "client_metric.h"
 #include "ha_helper.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -304,11 +305,13 @@ class CentralizedClientService
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats() override;
 
+    tl::expected<std::string, ErrorCode> GetSummaryMetrics() override;
+
+    tl::expected<std::string, ErrorCode> SerializeMetrics() override;
+
    protected:
     void StartPing(const std::string& master_server_entry);
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
-
-    ClientMetric* GetMetrics() override { return metrics_.get(); }
 
    private:
     bool IsHAMode(const std::string& master_server_entry) const;
@@ -385,20 +388,14 @@ class CentralizedClientService
 
     // Global segment memory management
     struct SegmentDeleter {
-        void operator()(void* ptr) {
-            if (ptr) free(ptr);
-        }
+        void operator()(void* ptr) const;
     };
     struct AscendSegmentDeleter {
-        void operator()(void* ptr) {
-            if (ptr) free_memory("ascend", ptr);
-        }
+        void operator()(void* ptr) const;
     };
     struct HugepageSegmentDeleter {
         size_t size = 0;
-        void operator()(void* ptr) const {
-            if (ptr && size > 0) free_buffer_mmap_memory(ptr, size);
-        }
+        void operator()(void* ptr) const;
     };
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>

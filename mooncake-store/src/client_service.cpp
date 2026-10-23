@@ -14,6 +14,7 @@
 #include "p2p/client/runtime_config_store.h"
 #include "transfer_engine.h"
 #include "types.h"
+#include "utils.h"
 #include "p2p/client/p2p_client_service.h"
 #include "centralized_client_service.h"
 #include <ylt/coro_http/coro_http_client.hpp>
@@ -540,32 +541,30 @@ void ClientService::RegisterHttpMethods() {
     // Prometheus-style metrics endpoint
     http_server_->set_http_handler<GET>(
         "/metrics", [this](coro_http_request& req, coro_http_response& resp) {
-            ClientMetric* metrics = GetMetrics();
+            auto metrics = SerializeMetrics();
             if (!metrics) {
                 resp.set_status_and_content(status_type::service_unavailable,
                                             "Metrics not available");
                 return;
             }
-            std::string metrics_str;
-            metrics->serialize(metrics_str);
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok,
-                                        std::move(metrics_str));
+                                        std::move(metrics.value()));
         });
 
     // Human-readable summary endpoint
     http_server_->set_http_handler<GET>(
         "/metrics/summary",
         [this](coro_http_request& req, coro_http_response& resp) {
-            ClientMetric* metrics = GetMetrics();
+            auto metrics = GetSummaryMetrics();
             if (!metrics) {
                 resp.set_status_and_content(status_type::service_unavailable,
                                             "Metrics not available");
                 return;
             }
-            std::string summary = metrics->summary_metrics();
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            resp.set_status_and_content(status_type::ok, std::move(summary));
+            resp.set_status_and_content(status_type::ok,
+                                        std::move(metrics.value()));
         });
 
     // Health check endpoint
