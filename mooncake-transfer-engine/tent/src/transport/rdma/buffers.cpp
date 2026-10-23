@@ -108,6 +108,18 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
         if (context) ++context_count;
     }
 
+    if (!context_count)
+        return Status::RdmaError("No RDMA device available for registration");
+    // CNDRV creates a new fd on each export. Keep one export alive until all
+    // NICs have registered (or rolled back); each MR holds its own reference.
+    DmabufExport exported;
+    for (auto* context : context_list_) {
+        if (!context) continue;
+        CHECK_STATUS(
+            context->prepareMemReg((void*)desc.addr, desc.length, exported));
+        break;
+    }
+
     std::vector<RdmaContext::MemReg> mem_reg_list(context_list_.size(),
                                                   nullptr);
     bool use_parallel_reg = !force_sequential && context_count > 1;
@@ -123,10 +135,10 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
             int access = getAccessFlags(options.perm,
                                         context->isRelaxedOrderingEnabled());
             tasks.emplace_back(std::async(
-                std::launch::async,
-                [context, &mem_reg_list, id, addr, length, access]() {
-                    mem_reg_list[id] =
-                        context->registerMemReg(addr, length, access);
+                std::launch::async, [context, &mem_reg_list, &exported, id,
+                                     addr, length, access]() {
+                    mem_reg_list[id] = context->registerMemReg(
+                        addr, length, access, &exported);
                 }));
         }
         for (auto& task : tasks) task.get();
@@ -137,8 +149,8 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
             // Calculate access flags per context (for relaxed ordering support)
             int access = getAccessFlags(options.perm,
                                         context->isRelaxedOrderingEnabled());
-            mem_reg_list[id] =
-                context->registerMemReg((void*)desc.addr, desc.length, access);
+            mem_reg_list[id] = context->registerMemReg(
+                (void*)desc.addr, desc.length, access, &exported);
         }
     }
     // The buffer is usable only if every enabled NIC registered it: slice

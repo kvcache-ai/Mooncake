@@ -10,7 +10,8 @@ cmake -S . -B build-mlu -DUSE_TENT=ON -DUSE_CUDA=OFF -DUSE_MLU=ON \
   -DNEUWARE_ROOT=/usr/local/neuware -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF -DWITH_STORE_RS=OFF \
   -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DUSE_ETCD=OFF
 cmake --build build-mlu --target tent_mlu_platform_test tent_mlu_transport_test \
-  tent_mlu_engine_test tent_mlu_process_test -j8
+  tent_mlu_engine_test tent_mlu_process_test tent_mlu_rdma_test \
+  tent_mlu_topology_test -j8
 ctest --test-dir build-mlu --output-on-failure -R '^tent_mlu_.*_test$'
 ```
 
@@ -20,6 +21,15 @@ Pointer classification and allocation bounds come from Neuware, including
 interior pointers used by chunked transfers. Keep allocations
 alive until transfers finish, and synchronize producer work before submitting a
 transfer that reads its output.
+
+NIC affinity uses three ranks: prefer the NICs closest within the same PCIe
+root, then other NICs on the same NUMA node, then remaining NICs.
+All equally close NICs remain eligible. Missing sysfs paths and paths across
+different PCIe roots do not provide a comparable PCIe distance; if none of the
+NICs has a known distance within the device's root, discovery falls back to
+the existing NUMA-only preference. Device names use visible MLU ordinals, while
+affinity is resolved from each visible device's PCI bus ID. NIC whitelist and
+blacklist filtering still apply before ranking.
 
 For TCP-only testing, use this configuration:
 
@@ -85,9 +95,35 @@ its completion cannot be tracked, it remains pending until the queue drains.
 Drain failures are reported and resources are retained for retry. External pinned
 allocations remain owned by the caller.
 
-There is no MLU peer-to-peer, MLU IPC, or direct device RDMA. An invalid allocation
-range, missing local copy transport, or missing staging location fails instead
-of submitting device pointers to the host network path.
+## Direct RDMA
+
+With the RDMA transport enabled, TENT can transfer directly between registered
+MLU device buffers and peer MLU or host buffers. The allocation's device and
+Neuware runtime must support dma-buf export, and each enabled NIC must support
+`ibv_reg_dmabuf_mr`.
+
+TENT exports a page-aligned range within the allocation and shares that export
+across NIC registrations. It releases the exported FD after registration; each
+MR retains its own kernel reference until deregistration. Interior transfer
+addresses are supported when the aligned export fits within the allocation.
+
+Use `MemoryOptions::type = UNSPEC` for automatic registration. If device export
+or NIC registration fails, automatic registration retains the MLU copy path
+and uses host staging. Explicit `type = RDMA` reports registration failure.
+Partial NIC registration is rolled back across all NICs. MLU device memory is
+never passed to host `ibv_reg_mr` as a fallback.
+
+Direct selection requires RDMA registration of both endpoint buffers, the
+matching RDMA device capabilities, and a transport hint/policy that admits RDMA.
+MLU-only registration, a host-only transport policy, or
+`transports/rdma/disable_gpu_direct_rdma = true` selects staging. With
+`enable_progress_worker=true`, RDMA batches are polled for completion even
+when the runtime queue is disabled.
+
+Complete producer work before submission and wait for transfer completion
+before consuming the destination. Keep registered allocations alive until all
+transfers using them have drained, and drain batches before unregistering
+buffers or destroying the engine.
 
 The tests cover real SDK allocations, fresh worker threads, interior pointers,
 out-of-bounds rejection, transport routing, and READ/WRITE payload equality.
@@ -98,4 +134,9 @@ The process suite starts a second executable with independent allocations and
 passes payloads through loopback TCP/HP TCP; test pipes carry only commands
 and metadata.
 Run it on each supported SDK/device combination. Single-host success does not
-establish multi-host bandwidth or RDMA support.
+establish multi-host bandwidth. The RDMA suite checks direct/staged routes and
+payloads with both selector modes. Set `MC_TENT_MLU_REQUIRE_RDMA=1` to fail instead
+of skipping when direct RDMA is unavailable; optional `MC_TENT_TEST_NIC` and
+`MC_TENT_TEST_GID_INDEX` select the NIC and GID for this suite. Generic
+`tent_rdma_transport_test` cases cover owned/borrowed FD lifetimes and partial
+registration rollback without requiring an RDMA device.

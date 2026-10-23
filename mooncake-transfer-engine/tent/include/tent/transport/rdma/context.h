@@ -102,7 +102,11 @@ class RdmaContext {
     // everything else goes through ibv_reg_mr. Returns nullptr on failure
     // (including a failed dma-buf registration of an exportable buffer, which
     // makes the caller drop RDMA for that buffer and stage instead).
-    MemReg registerMemReg(void *addr, size_t length, int access);
+    // Prepare once per buffer and share across NICs. An empty successful
+    // export selects ordinary registration; device export failures never do.
+    Status prepareMemReg(void *addr, size_t length, DmabufExport &out);
+    MemReg registerMemReg(void *addr, size_t length, int access,
+                          const DmabufExport *prepared = nullptr);
 
     // True when this context can register dma-buf exported device memory.
     bool supportsDmabuf() const { return verbs_.ibv_reg_dmabuf_mr != nullptr; }

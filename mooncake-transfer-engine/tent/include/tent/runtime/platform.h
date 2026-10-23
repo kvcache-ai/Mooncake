@@ -41,18 +41,18 @@ inline bool isGpuMemoryType(MemoryType t) {
            t == MTYPE_XPU || t == MTYPE_MLU;
 }
 
-// A device allocation exported as a Linux dma-buf so a NIC can register it
-// with ibv_reg_dmabuf_mr. `fd` is owned by the exporting runtime and stays
-// valid for the lifetime of the allocation; callers must not close it. Level
-// Zero, for instance, caches one descriptor per allocation and returns that
-// same fd on every export, so a caller-side close would leave the driver
-// holding a stale number. The MR keeps its own reference to the dma-buf.
-// `offset` is the position of the requested address within the exported
-// buffer, which covers the whole underlying allocation, not just the
-// requested range.
+// A dma-buf covering the requested range. The MR keeps its own kernel
+// reference after registration. Level Zero returns a runtime-owned, borrowed
+// fd; CNDRV exports a new fd owned by the caller. Copies of an owned export
+// keep it open until all NIC registrations have finished.
 struct DmabufExport {
     int fd = -1;
     uint64_t offset = 0;
+
+    static DmabufExport owned(int fd, uint64_t offset);
+
+   private:
+    std::shared_ptr<int> owner_;
 };
 
 class Platform {
@@ -90,8 +90,8 @@ class Platform {
     // platform has no dma-buf export path (the default), InvalidArgument when
     // `addr` is not device memory owned by this platform (register it as host
     // memory instead), and InternalError when the export itself failed. Only
-    // an OK status populates `out`; per the DmabufExport contract the fd stays
-    // owned by the exporting runtime and the caller must not close it.
+    // an OK status populates `out`. Keep the export alive through NIC
+    // registration; its owner (if any) releases the fd automatically.
     virtual Status exportDmabuf(void *addr, size_t length, DmabufExport &out);
 
    protected:

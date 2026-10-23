@@ -28,6 +28,7 @@ class MluPlatform : public CpuPlatform {
     Status free(void* ptr, size_t size) override;
     Status copy(void* dst, void* src, size_t length) override;
     MemoryType getMemoryType(void* addr) override;
+    Status exportDmabuf(void* addr, size_t length, DmabufExport& out) override;
     const std::vector<RangeLocation> getLocation(
         void* start, size_t len, bool skip_prefault = false) override;
     Status synchronizeDevices(const Topology* topology) override;

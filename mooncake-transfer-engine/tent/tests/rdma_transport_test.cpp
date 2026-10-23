@@ -21,6 +21,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifdef USE_MLU
+#include <cnrt.h>
+#endif
+
 #ifdef USE_CUDA
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -2257,6 +2261,93 @@ TEST(RdmaContextDmabufSymbolTest, LoaderExposesOptionalDmabufVerb) {
     EXPECT_EQ(context.supportsDmabuf(),
               loader.sym().ibv_reg_dmabuf_mr != nullptr);
 }
+
+TEST_F(RdmaContextDmabufTest, OwnedExportClosesAfterSuccessfulRegistration) {
+    int fd = openFd();
+    context_->setDmabufExporter([&](void*, size_t, DmabufExport& out) {
+        out = DmabufExport::owned(fd, 0);
+        return Status::OK();
+    });
+    auto mr = context_->registerMemReg(host_buffer_.data(), 4096,
+                                       IBV_ACCESS_LOCAL_WRITE);
+    ASSERT_NE(mr, nullptr);
+    EXPECT_FALSE(fdOpen(fd));
+    EXPECT_EQ(context_->unregisterMemReg(mr), 0);
+}
+
+TEST_F(RdmaContextDmabufTest, OwnedExportClosesAfterRegistrationFailure) {
+    int fd = openFd();
+    context_->setDmabufExporter([&](void*, size_t, DmabufExport& out) {
+        out = DmabufExport::owned(fd, 0);
+        return Status::OK();
+    });
+    fake_mr.fail_dmabuf_reg = true;
+    EXPECT_EQ(context_->registerMemReg(host_buffer_.data(), 4096,
+                                       IBV_ACCESS_LOCAL_WRITE),
+              nullptr);
+    EXPECT_FALSE(fdOpen(fd));
+    EXPECT_EQ(fake_mr.reg_mr_calls, 0);
+}
+
+TEST_F(RdmaContextDmabufTest, ExportFailureReleasesAnOwnedHandle) {
+    int fd = openFd();
+    context_->setDmabufExporter([&](void*, size_t, DmabufExport& out) {
+        out = DmabufExport::owned(fd, 0);
+        return Status::InternalError("export validation failed");
+    });
+    EXPECT_EQ(context_->registerMemReg(host_buffer_.data(), 4096,
+                                       IBV_ACCESS_LOCAL_WRITE),
+              nullptr);
+    EXPECT_FALSE(fdOpen(fd));
+    EXPECT_EQ(fake_mr.reg_dmabuf_calls, 0);
+    EXPECT_EQ(fake_mr.reg_mr_calls, 0);
+}
+
+TEST_F(RdmaContextDmabufTest, PreparedDeviceExportNeverUsesMissingVerb) {
+    int fd = openFd();
+    auto exported = DmabufExport::owned(fd, 0);
+    RdmaContextTestPeer::verbs(*context_).ibv_reg_dmabuf_mr = nullptr;
+    EXPECT_EQ(context_->registerMemReg(host_buffer_.data(), 4096,
+                                       IBV_ACCESS_LOCAL_WRITE, &exported),
+              nullptr);
+    EXPECT_EQ(fake_mr.reg_mr_calls, 0);
+    EXPECT_TRUE(fdOpen(fd));
+}
+
+TEST_F(RdmaContextDmabufTest, SharedOwnedExportClosesOnlyAfterLastReference) {
+    int fd = openFd();
+    DmabufExport last;
+    {
+        auto first = DmabufExport::owned(fd, 123);
+        last = first;
+    }
+    EXPECT_TRUE(fdOpen(fd));
+    EXPECT_EQ(last.offset, 123u);
+    last = DmabufExport{};
+    EXPECT_FALSE(fdOpen(fd));
+}
+
+#ifdef USE_MLU
+TEST_F(RdmaContextDmabufTest, MluMemoryNeverFallsBackToPlainRegistration) {
+    ASSERT_EQ(cnrtSetDevice(0), cnrtSuccess);
+    void* ptr = nullptr;
+    ASSERT_EQ(cnrtMalloc(&ptr, 4096), cnrtSuccess);
+    for (auto error : {Status::NotImplemented("unsupported device"),
+                       Status::InvalidArgument("invalid device range"),
+                       Status::InternalError("export failed")}) {
+        context_->setDmabufExporter(
+            [&](void*, size_t, DmabufExport&) { return error; });
+        EXPECT_EQ(context_->registerMemReg(ptr, 4096, IBV_ACCESS_LOCAL_WRITE),
+                  nullptr);
+    }
+    RdmaContextTestPeer::verbs(*context_).ibv_reg_dmabuf_mr = nullptr;
+    EXPECT_EQ(context_->registerMemReg(ptr, 4096, IBV_ACCESS_LOCAL_WRITE),
+              nullptr);
+    EXPECT_EQ(fake_mr.reg_mr_calls, 0);
+    EXPECT_EQ(fake_mr.reg_dmabuf_calls, 0);
+    EXPECT_EQ(cnrtFree(ptr), cnrtSuccess);
+}
+#endif
 
 }  // namespace dmabuf_registration
 
@@ -4585,6 +4676,61 @@ class RdmaBufferRegistrationTest : public ::testing::Test {
     alignas(4096) char buffer_a_[4096];
     alignas(4096) char buffer_b_[4096];
 };
+
+// Both NICs must see the same live fd, even while registering concurrently.
+ibv_mr* fakeRegSharedDmabuf(ibv_pd* pd, uint64_t offset, size_t length,
+                            uint64_t iova, int fd, int access) {
+    EXPECT_NE(fcntl(fd, F_GETFD), -1);
+    EXPECT_EQ(offset, 123u);
+    return fakeRegMr(pd, reinterpret_cast<void*>(iova), length, access);
+}
+
+TEST_F(RdmaBufferRegistrationTest, SharedExportIsClosedAndPartialMrsRollBack) {
+    for (bool fail : {false, true}) {
+        int calls = 0, fd = -1;
+        for (auto& context : contexts_) {
+            RdmaContextTestPeer::verbs(*context).ibv_reg_dmabuf_mr =
+                fakeRegSharedDmabuf;
+            context->setDmabufExporter([&](void*, size_t, DmabufExport& out) {
+                ++calls;
+                fd = open("/dev/null", O_RDONLY);
+                out = DmabufExport::owned(fd, 123);
+                return Status::OK();
+            });
+        }
+        fake_mr.fail_nic = fail ? 1 : -1;
+        auto desc = describe(buffer_a_, sizeof(buffer_a_));
+        EXPECT_EQ(manager_.addBuffer(desc, options_).ok(), !fail);
+        EXPECT_EQ(calls, 1);
+        EXPECT_EQ(fcntl(fd, F_GETFD), -1);
+        if (fail) {
+            EXPECT_TRUE(desc.rkey.empty());
+            EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[0]), 0u);
+            EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[1]), 0u);
+        } else {
+            EXPECT_EQ(desc.rkey.size(), 2u);
+            ASSERT_TRUE(manager_.removeBuffer(desc).ok());
+        }
+    }
+}
+
+TEST_F(RdmaBufferRegistrationTest, MissingDmabufVerbOnOneNicRollsBackAll) {
+    int fd = -1;
+    auto& verbs = RdmaContextTestPeer::verbs(*contexts_[0]);
+    verbs.ibv_reg_dmabuf_mr = fakeRegSharedDmabuf;
+    contexts_[0]->setDmabufExporter([&](void*, size_t, DmabufExport& out) {
+        fd = open("/dev/null", O_RDONLY);
+        out = DmabufExport::owned(fd, 123);
+        return Status::OK();
+    });
+    RdmaContextTestPeer::verbs(*contexts_[1]).ibv_reg_dmabuf_mr = nullptr;
+    auto desc = describe(buffer_a_, sizeof(buffer_a_));
+    EXPECT_FALSE(manager_.addBuffer(desc, options_).ok());
+    EXPECT_EQ(fcntl(fd, F_GETFD), -1);
+    EXPECT_EQ(fake_mr.reg_calls[1].load(), 0);
+    EXPECT_EQ(fake_mr.dereg_calls[0].load(), 1);
+    EXPECT_TRUE(desc.rkey.empty());
+}
 
 TEST_F(RdmaBufferRegistrationTest, EveryNicRegistersAndKeysAreNicIndexed) {
     auto desc = describe(buffer_a_, sizeof(buffer_a_));
