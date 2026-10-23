@@ -2269,6 +2269,50 @@ auto MasterService::ResolveSoftPinRequest(const ReplicateConfig& config) const
     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 }
 
+auto MasterService::BatchUpdateSoftPin(const std::vector<std::string>& keys,
+                                       const TenantId& tenant_id,
+                                       uint64_t ttl_ms)
+    -> std::vector<tl::expected<void, ErrorCode>> {
+    ReplicateConfig config;
+    config.soft_pin_action = SoftPinAction::ENABLE;
+    config.soft_pin_ttl_ms = ttl_ms;
+    auto request = ResolveSoftPinRequest(config);
+    if (!tenant_id.IsValid() || !request) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+    const TenantId normalized_tenant = ResolveRequestTenantId(tenant_id);
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (const auto& key : keys) {
+        if (key.empty()) {
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        MetadataAccessorRW accessor(this,
+                                    ObjectIdentity{normalized_tenant, key});
+        if (!accessor.Exists()) {
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+            continue;
+        }
+        auto& metadata = accessor.Get();
+        if (accessor.InProcessing() || metadata.pending_soft_pin_action ||
+            !metadata.HasReplica(&Replica::fn_is_completed)) {
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY));
+            continue;
+        }
+        ApplySoftPinEvaluation(
+            metadata,
+            metadata.ApplySoftPin(*request, std::chrono::system_clock::now()));
+        results.emplace_back();
+    }
+    return results;
+}
+
 void MasterService::ApplySoftPinMetricDelta(int metric_delta) {
     if (metric_delta > 0) {
         MasterMetricManager::instance().inc_soft_pin_key_count(metric_delta);

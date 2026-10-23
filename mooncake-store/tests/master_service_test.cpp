@@ -265,6 +265,120 @@ TEST_F(MasterServiceTest, MountUnmountSegmentWithOffsetAllocator) {
     EXPECT_TRUE(unmount_result4.has_value());
 }
 
+TEST_F(MasterServiceTest, StandaloneSoftPinLifecycle) {
+    auto config = MasterServiceConfig::builder()
+                      .set_max_kv_soft_pin_ttl(60000)
+                      .set_default_kv_soft_pin_ttl(1000)
+                      .build();
+    MasterService service(config);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const auto client = generate_uuid();
+    ASSERT_TRUE(service.PutStart(client, "pin-key", TenantId::Default(), 1024,
+                                 ReplicateConfig{}));
+    ASSERT_TRUE(service.PutEnd(client, {"pin-key", std::nullopt},
+                               TenantId::Default(), ReplicaType::MEMORY));
+    const auto baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+    auto results = service.BatchUpdateSoftPin({"pin-key", "missing", ""},
+                                              TenantId::Default(), 30000);
+    ASSERT_EQ(results.size(), 3);
+    ASSERT_TRUE(results[0]);
+    EXPECT_EQ(results[1].error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(results[2].error(), ErrorCode::INVALID_PARAMS);
+    auto first = GetSoftPinDeadline(service, "pin-key");
+    ASSERT_TRUE(first);
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline + 1);
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(), 60000)[0]);
+    auto renewed = GetSoftPinDeadline(service, "pin-key");
+    ASSERT_GT(*renewed, *first);
+    CleanupExpiredSoftPinsAt(service, *first);
+    EXPECT_EQ(GetSoftPinDeadline(service, "pin-key"), renewed);
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(), 10000)[0]);
+    auto shortened = GetSoftPinDeadline(service, "pin-key");
+    ASSERT_LT(*shortened, *renewed);
+    CleanupExpiredSoftPinsAt(service, *shortened);
+    EXPECT_FALSE(GetSoftPinDeadline(service, "pin-key"));
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(), 60000)[0]);
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(), 0)[0]);
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(), 0)[0]);
+    EXPECT_FALSE(GetSoftPinDeadline(service, "pin-key"));
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+    EXPECT_TRUE(service.ExistKey("pin-key", TenantId::Default()).value());
+}
+
+TEST_F(MasterServiceTest, StandaloneSoftPinRejectsPendingWriteAndInvalidTtl) {
+    MasterService service(MasterServiceConfig::builder().build());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const auto client = generate_uuid();
+    ReplicateConfig config;
+    config.soft_pin_action = SoftPinAction::ENABLE;
+    config.soft_pin_ttl_ms = 30000;
+    ASSERT_TRUE(service.PutStart(client, "pending-pin", TenantId::Default(),
+                                 1024, config));
+    auto pending =
+        service.BatchUpdateSoftPin({"pending-pin"}, TenantId::Default(), 0);
+    EXPECT_EQ(pending[0].error(), ErrorCode::REPLICA_IS_NOT_READY);
+    ASSERT_TRUE(service.PutEnd(client, {"pending-pin", std::nullopt},
+                               TenantId::Default(), ReplicaType::MEMORY));
+    auto deadline = GetSoftPinDeadline(service, "pending-pin");
+    ASSERT_TRUE(deadline);
+    auto invalid =
+        service.BatchUpdateSoftPin({"pending-pin"}, TenantId::Default(),
+                                   std::numeric_limits<uint64_t>::max());
+    EXPECT_EQ(invalid[0].error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(GetSoftPinDeadline(service, "pending-pin"), deadline);
+    EXPECT_TRUE(service.BatchUpdateSoftPin({}, TenantId::Default(), 0).empty());
+}
+
+TEST_F(MasterServiceTest,
+       StandaloneSoftPinIsTenantScopedAndPreservesOtherMetadata) {
+    MasterService service(MakeStrictTenantConfig({"pin-a", "pin-b"}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const auto client = generate_uuid();
+    ReplicateConfig config;
+    config.with_hard_pin = true;
+    config.session_ids = std::vector<std::string>{"writing-session"};
+    for (const auto& tenant : {TenantId("pin-a"), TenantId("pin-b")}) {
+        ASSERT_TRUE(
+            service.PutStart(client, "shared-key", tenant, 1024, config));
+        ASSERT_TRUE(service.PutEnd(client, {"shared-key", std::nullopt}, tenant,
+                                   ReplicaType::MEMORY));
+    }
+    auto read_deadline = [&]() {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
+                "shared-key", TenantId("pin-a")));
+        EXPECT_TRUE(accessor.Get().IsHardPinned());
+        EXPECT_EQ(accessor.Get().session_id,
+                  std::optional<std::string>("writing-session"));
+        return accessor.Get().EvictionDeadline();
+    };
+    const auto lease = read_deadline();
+    ASSERT_TRUE(service.BatchUpdateSoftPin({"shared-key"}, TenantId("pin-a"),
+                                           30000)[0]);
+    EXPECT_FALSE(GetSoftPinDeadline(service, "shared-key", "pin-b"));
+    ASSERT_TRUE(service.BatchUpdateSoftPin({"shared-key"}, TenantId("pin-b"),
+                                           30000)[0]);
+    const auto other_deadline =
+        GetSoftPinDeadline(service, "shared-key", "pin-b");
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"shared-key"}, TenantId("pin-a"), 0)[0]);
+    EXPECT_FALSE(GetSoftPinDeadline(service, "shared-key", "pin-a"));
+    EXPECT_EQ(GetSoftPinDeadline(service, "shared-key", "pin-b"),
+              other_deadline);
+    EXPECT_EQ(read_deadline(), lease);
+}
+
 TEST_F(MasterServiceTest, SoftPinZeroTtlSkipsSoftPinRegistration) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_soft_pin_ttl(50)

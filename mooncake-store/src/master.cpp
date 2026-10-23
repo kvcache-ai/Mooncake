@@ -45,13 +45,14 @@ static_assert(mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 10000,
 static_assert(mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS == 30 * 60 * 1000,
               "Update kDefaultKvSoftPinTtlFlagValue when "
               "DEFAULT_KV_SOFT_PIN_TTL_MS changes");
-static_assert(mooncake::DEFAULT_MAX_KV_SOFT_PIN_TTL_MS == 24 * 60 * 60 * 1000,
+static_assert(mooncake::DEFAULT_MAX_KV_SOFT_PIN_TTL_MS ==
+                  7 * 24 * 60 * 60 * 1000,
               "Update kDefaultMaxKvSoftPinTtlFlagValue when "
               "DEFAULT_MAX_KV_SOFT_PIN_TTL_MS changes");
 
 constexpr char kDefaultKvLeaseTtlFlagValue[] = "10000";
 constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
-constexpr char kDefaultMaxKvSoftPinTtlFlagValue[] = "86400000";
+constexpr char kDefaultMaxKvSoftPinTtlFlagValue[] = "604800000";
 // Allowed range of --ha_leader_lease_ttl_sec.
 constexpr int64_t kMinHaLeaderLeaseTtlSec = 2;
 constexpr int64_t kMaxHaLeaderLeaseTtlSec = 60;
