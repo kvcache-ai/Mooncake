@@ -3,7 +3,11 @@
 // EvictionIndex: the order in which eviction visits one namespace's objects.
 // The namespace owns one and tells it about every key the route hands out: a
 // read as its read guard is released, a write as its write guard is. Eviction
-// reads it through a cursor, oldest-ranked key first.
+// reads it through a cursor, oldest-ranked entry first.
+//
+// An entry is what eviction takes together: one key, or the members of a
+// group, whose shared lease makes them due together. The index files a group
+// as one entry, so a walk meets each group once.
 //
 // An index may rank keys however it likes (by lease deadline, by access
 // frequency, by size) as long as it keeps one rule: the rank a key is filed at
@@ -14,9 +18,6 @@
 // can lower a rank, and says so at construction; the route skips the read hook
 // for every other index.
 //
-// Ranks are comparable across the namespaces of one service, which all use
-// the same kind of index, so eviction can merge their cursors.
-//
 // Lock order: whatever lock an index takes is a leaf under a key lock, and
 // nothing takes a key lock while holding it.
 
@@ -26,6 +27,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "metadata/object_route.h"
 
@@ -38,22 +40,27 @@ class EvictionIndex {
     // Lower ranks are evicted first.
     using Rank = int64_t;
 
-    // A key as the index filed it.
+    // What the index filed at one rank: one key, or a group's members.
     struct Entry {
-        std::string key;
+        std::vector<std::string> keys;
         Rank rank;
+        // Which incarnation of a group the keys were filed in, as the index
+        // numbers them; 0 for a key on its own.
+        uint64_t group = 0;
     };
 
-    // One walk over the filed keys, lowest rank first. What it hands out is a
-    // snapshot: a key may be refiled or gone by the time it is acted on.
+    // One walk over the filed entries, lowest rank first. What it hands out
+    // is a snapshot: a key may be refiled or gone by the time it is acted on.
     class Cursor {
        public:
         virtual ~Cursor() = default;
-        // The next filed key; nullopt once the walk is done.
+        // The next filed entry; nullopt once the walk is done.
         virtual std::optional<Entry> Next() = 0;
-        // Whether `entry`, which this cursor handed out, still stands at its
-        // rank. Asked under the key's write lock, so a key that moved on is
-        // refiled at its real rank as that lock is let go.
+        // Whether the key `guard` holds, one of `entry`'s, which this cursor
+        // handed out, still stands where the entry filed it: at its rank, in
+        // the same incarnation of its group. Asked under the key's write lock,
+        // so a key that moved on is refiled where it belongs as that lock is
+        // let go.
         [[nodiscard]] virtual bool StillAt(const route::WriteGuard& guard,
                                            const Entry& entry) const = 0;
         // How many keys were filed when the walk began.

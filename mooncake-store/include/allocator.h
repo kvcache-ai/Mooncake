@@ -173,7 +173,6 @@ class AllocatedBuffer {
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};
 
-    friend class Serializer<AllocatedBuffer>;
     friend class Replica;
     friend class SegmentAllocatorRegistration;
 };
@@ -374,26 +373,6 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     const std::vector<LiveAllocation>& allocations,
     ReplicaType replica_type = ReplicaType::MEMORY);
 
-// A detached capture of host-memory allocator metadata; owns no live allocator
-// and contributes neither usage nor capacity metrics.
-struct OffsetBufferAllocatorSnapshot {
-    std::string segment_name;
-    size_t base;
-    size_t capacity;
-    size_t used_bytes;
-    std::string transport_endpoint;
-    offset_allocator::OffsetAllocatorSnapshot allocation_state;
-
-    // Validate the detached snapshot without publishing resources or metrics.
-    [[nodiscard]] tl::expected<void, std::string> Validate() const;
-
-   private:
-    tl::expected<void, std::string> ValidateMetadata() const;
-    // Restore composes this cheap outer check with OffsetAllocator::Restore's
-    // mandatory layout validation, avoiding two graph scans in one factory.
-    friend class OffsetBufferAllocator;
-};
-
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
  * strategy, which provides efficient memory allocation with bin-based
@@ -408,18 +387,6 @@ class OffsetBufferAllocator
                           ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~OffsetBufferAllocator() override;
-
-    // Restore an unpublished allocator from decoded state. Installs the
-    // allocation layout and accounts usage before returning a runtime-ready
-    // object; capacity accounting remains the owning pool's responsibility.
-    // Consumes the snapshot and rejects inconsistent state with
-    // ErrorCode::INVALID_PARAMS.
-    static tl::expected<std::shared_ptr<OffsetBufferAllocator>, ErrorCode>
-    Restore(OffsetBufferAllocatorSnapshot snapshot);
-
-    // Requires a forked snapshot child or externally quiesced state. Does not
-    // acquire inherited runtime locks; copies all state needed by the codec.
-    OffsetBufferAllocatorSnapshot CaptureSnapshot() const;
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
 
@@ -445,10 +412,6 @@ class OffsetBufferAllocator
     }
 
    private:
-    OffsetBufferAllocator(
-        OffsetBufferAllocatorSnapshot snapshot,
-        std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator);
-
     // metadata
     const std::string segment_name_;
     const size_t base_;

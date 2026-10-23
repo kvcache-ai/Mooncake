@@ -24,6 +24,7 @@
 #include "mutex.h"
 #include "common/network.h"
 #include "pyclient.h"
+#include "nof/nof_runtime.h"
 #include "rpc_types.h"
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
@@ -360,6 +361,20 @@ class RealClient : public PyClient {
                                  bool force = false);
 
     int tearDownAll();
+
+    // Test-only seam: when set, setup_internal() builds the NoF runtime from
+    // this factory instead of CreateNofRuntime(). Not thread-safe; set before
+    // setup and reset (pass nullptr) after the test.
+    static void SetNofRuntimeFactoryForTesting(
+        std::function<NofRuntime()> factory);
+
+    // Test-only seam: when set, unregister_buffer_internal() calls this hook
+    // instead of Client::unregisterLocalMemory, so a test can replay a TE
+    // failure sequence (e.g. partial deregistration failure followed by
+    // NOT_REGISTERED) that TCP cannot produce. Not thread-safe; reset (pass
+    // nullptr) after the test.
+    static void SetTeUnregisterHookForTesting(
+        std::function<tl::expected<void, ErrorCode>(void *)> hook);
 
     int health_check() override;
 
@@ -794,6 +809,11 @@ class RealClient : public PyClient {
 
     tl::expected<void, ErrorCode> tearDownAll_internal();
 
+    // Idempotently releases this client's NoF registrations for all recorded
+    // user buffers; failures keep their records and latch
+    // nof_buffer_cleanup_failed_.
+    ErrorCode CleanupNofRegisteredBuffers();
+
     tl::expected<bool, ErrorCode> isExist_internal(const std::string &key);
 
     std::vector<tl::expected<bool, ErrorCode>> batchIsExist_internal(
@@ -1080,6 +1100,11 @@ class RealClient : public PyClient {
     std::unique_ptr<coro_rpc::coro_rpc_server> offload_rpc_server_;
     int offload_rpc_port_ = 0;
     bool use_hugepage_ = false;
+    // NoF runtime (initiator + DMA allocator) created during setup_internal.
+    // Both components are additionally owned by client_ /
+    // client_buffer_allocator_ (in the PyClient base), so member declaration
+    // order is not load-bearing.
+    NofRuntime nof_runtime_{};
 
     struct MappedShm {
         std::string shm_name;
@@ -1120,7 +1145,14 @@ class RealClient : public PyClient {
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
 
     mutable std::shared_mutex registered_buffer_mutex_;
-    std::unordered_map<void *, size_t> registered_buffer_sizes_;
+    struct BufferRegistrationRecord {
+        size_t size;
+    };
+    // A present record means "registered OR cleanup-pending": a record is
+    // retained when NoF/TE cleanup failed, in which case the buffer must
+    // stay mapped until the cleanup retry succeeds (or process exit).
+    std::unordered_map<void *, BufferRegistrationRecord>
+        registered_buffer_sizes_;
     std::optional<WritableBufferRegion> local_buffer_region_;
 
     // KV transfer sessions (process-local; not shared with DummyClient).
@@ -1189,6 +1221,10 @@ class RealClient : public PyClient {
 
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
+
+    // Latched when teardown's NoF buffer cleanup failed: repeat teardown
+    // calls retry the cleanup and keep reporting the failure until it heals.
+    std::atomic<bool> nof_buffer_cleanup_failed_{false};
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
@@ -1364,8 +1400,9 @@ class RealClient : public PyClient {
     std::vector<MappedShm> quarantine_shms_;
 
     // Re-attempt TE + SPDK unregister and munmap of quarantine_shms_. Caller
-    // must hold dummy_client_mutex_. Failures stay quarantined.
-    void RetryQuarantinedShmsLocked();
+    // must hold dummy_client_mutex_. Failures stay quarantined; returns OK
+    // only when nothing remains quarantined.
+    ErrorCode RetryQuarantinedShmsLocked();
 };
 
 }  // namespace mooncake

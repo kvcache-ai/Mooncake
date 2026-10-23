@@ -2534,6 +2534,25 @@ TEST(RoceModeDetectionTest, GlobalResourceConfig_ArrayRoceDesc) {
         R"({"comm_resource_config.protocol_desc":["hccs:device","roce:host"]})"));
 }
 
+TEST(RoceModeDetectionTest, GlobalResourceConfig_RoceHostString) {
+    EXPECT_TRUE(HasRoceHostProtocolDescInGlobalResourceConfig(
+        R"({"comm_resource_config.protocol_desc":"roce:host"})"));
+    EXPECT_TRUE(HasRoceHostProtocolDescInGlobalResourceConfig(
+        R"({"comm_resource_config":{"protocol_desc":"roce:host"}})"));
+}
+
+TEST(RoceModeDetectionTest, GlobalResourceConfig_RoceDeviceIsNotHost) {
+    EXPECT_FALSE(HasRoceHostProtocolDescInGlobalResourceConfig(
+        R"({"comm_resource_config.protocol_desc":"roce:device"})"));
+    EXPECT_FALSE(HasRoceHostProtocolDescInGlobalResourceConfig(
+        R"({"comm_resource_config.protocol_desc":["hccs:device","roce:device"]})"));
+}
+
+TEST(RoceModeDetectionTest, GlobalResourceConfig_ArrayContainsRoceHost) {
+    EXPECT_TRUE(HasRoceHostProtocolDescInGlobalResourceConfig(
+        R"({"comm_resource_config.protocol_desc":["hccs:device","roce:host"]})"));
+}
+
 TEST(RoceModeDetectionTest, GlobalResourceConfig_NonRoceDesc) {
     EXPECT_FALSE(HasRoceProtocolDescInGlobalResourceConfig(
         R"({"comm_resource_config.protocol_desc":"hccs:device"})"));
@@ -2637,6 +2656,19 @@ TEST(StoreResourceConfigSplitTest,
     EXPECT_EQ(ResolveAscendGlobalResourceConfig(cfg), std::string(cfg));
     EXPECT_FALSE(HasRoceProtocolDescInGlobalResourceConfig(
         ResolveAscendGlobalResourceConfig(cfg).c_str()));
+}
+
+TEST(StoreResourceConfigSplitTest, RoceHostInStoreSubtreeStillMatches) {
+    // Host memory is allocated after ascend_store_te_init is cleared, so the
+    // raw env has to match a roce:host entry in the store subtree.
+    constexpr const char* cfg =
+        R"({"comm_resource_config":{"protocol_desc":"hccs:device"},)"
+        R"("store":{"comm_resource_config":{"protocol_desc":"roce:host"}}})";
+    StoreTeInitScope store(false);
+    EXPECT_TRUE(HasRoceHostProtocolDescInGlobalResourceConfig(cfg));
+    const std::string resolved = ResolveAscendGlobalResourceConfig(cfg);
+    EXPECT_FALSE(
+        HasRoceHostProtocolDescInGlobalResourceConfig(resolved.c_str()));
 }
 
 // The headline case: one env var, Store TE -> RoCE, P2P TE -> HCCS.

@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
@@ -151,6 +152,80 @@ TEST(HcaAffinityTest, SessionAndAffinityExtensionsRemainWireCompatible) {
               current->preferred_hca_names);
     EXPECT_EQ(affinity_reader->per_key_preferred_hca_names,
               current->per_key_preferred_hca_names);
+}
+
+struct LegacyMemoryDescriptor {
+    AllocatedBuffer::Descriptor buffer_descriptor;
+};
+YLT_REFL(LegacyMemoryDescriptor, buffer_descriptor);
+
+struct LegacyReplicaDescriptor {
+    ReplicaID id{0};
+    std::variant<LegacyMemoryDescriptor, NoFDescriptor, DiskDescriptor,
+                 LocalDiskDescriptor, DistributedFSDescriptor>
+        descriptor_variant;
+    ReplicaStatus status;
+};
+YLT_REFL(LegacyReplicaDescriptor, id, descriptor_variant, status);
+
+TEST(HcaAffinityTest, ReadLocalityIsCompatibleInsideReplicaVariant) {
+    Replica::Descriptor replica;
+    replica.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor memory;
+    memory.buffer_descriptor = {1024, 0x300000000, "rdma", "receiver"};
+    memory.locality = SegmentLocality{7, {"mlx5_0"}};
+    replica.descriptor_variant = memory;
+    auto old_reader = struct_pack::deserialize<LegacyReplicaDescriptor>(
+        struct_pack::serialize(replica));
+    ASSERT_TRUE(old_reader);
+    EXPECT_EQ(std::get<LegacyMemoryDescriptor>(old_reader->descriptor_variant)
+                  .buffer_descriptor.transport_endpoint_,
+              "receiver");
+    auto current = struct_pack::deserialize<Replica::Descriptor>(
+        struct_pack::serialize(replica));
+    ASSERT_TRUE(current);
+    EXPECT_EQ(current->get_memory_descriptor().locality, memory.locality);
+    auto new_reader = struct_pack::deserialize<Replica::Descriptor>(
+        struct_pack::serialize(*old_reader));
+    ASSERT_TRUE(new_reader);
+    EXPECT_FALSE(new_reader->get_memory_descriptor().locality);
+}
+
+struct LegacySegment {
+    UUID id{0, 0};
+    std::string name;
+    uintptr_t base{0};
+    size_t size{0};
+    std::string te_endpoint;
+    std::string protocol;
+    std::string host_id;
+};
+YLT_REFL(LegacySegment, id, name, base, size, te_endpoint, protocol, host_id);
+
+TEST(HcaAffinityTest, SegmentLocalityHasCompatibleWireFields) {
+    LegacySegment old;
+    old.id = generate_uuid();
+    old.name = "receiver";
+    old.base = 0x300000000;
+    old.size = 1024 * 1024;
+    old.te_endpoint = "receiver:1234";
+    old.protocol = "rdma";
+    old.host_id = "receiver";
+    auto decoded =
+        struct_pack::deserialize<Segment>(struct_pack::serialize(old));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->name, old.name);
+    EXPECT_FALSE(decoded->locality);
+    decoded->locality = SegmentLocality{7, {"mlx5_0"}};
+    const auto encoded = struct_pack::serialize(*decoded);
+    auto legacy = struct_pack::deserialize<LegacySegment>(encoded);
+    ASSERT_TRUE(legacy);
+    EXPECT_EQ(legacy->base, old.base);
+    EXPECT_EQ(legacy->host_id, old.host_id);
+    auto current = struct_pack::deserialize<Segment>(encoded);
+    ASSERT_TRUE(current);
+    ASSERT_TRUE(current->locality);
+    EXPECT_EQ(*current->locality, *decoded->locality);
 }
 
 TEST(HcaAffinityTest, ReceiverTopologyDeterminesNuma) {
@@ -574,6 +649,55 @@ std::string ClientIntegrationTest::master_address_;
 std::string ClientIntegrationTest::metadata_url_;
 UUID ClientIntegrationTest::test_client_id_{0, 0};
 UUID ClientIntegrationTest::segment_provider_client_id_{0, 0};
+
+namespace {
+
+// Minimal initiator used to observe which initiator Client::Create wires up.
+class WiringProbeInitiator : public NVMeoFInitiator {
+   public:
+    NofSegmentHandle* OpenSegment(const std::string&) override {
+        return nullptr;
+    }
+    bool ProbeSegment(const std::string&, uint32_t, std::string*) override {
+        return false;
+    }
+    uint32_t GetBlockSize(const NofSegmentHandle*) override {
+        return kInvalidBlockSize;
+    }
+    int SubmitIO(NofSegmentHandle*, void*, uint64_t, uint64_t, NofIOOp,
+                 NofIOAdaptor*) override {
+        return -EINVAL;
+    }
+    int64_t PollCompletion(NofSegmentHandle*, uint32_t) override { return 0; }
+    ErrorCode RegisterMemory(void*, size_t) override { return ErrorCode::OK; }
+    ErrorCode UnregisterMemory(void*) override { return ErrorCode::OK; }
+    NofCapabilities GetCapabilities() const override { return {}; }
+};
+
+// Clears the Client default-initiator factory seam even when the test fails.
+struct DefaultInitiatorFactoryGuard {
+    ~DefaultInitiatorFactoryGuard() {
+        Client::SetDefaultNofInitiatorFactoryForTesting(nullptr);
+    }
+};
+
+}  // namespace
+
+// Regression test: callers that pass no initiator (the default argument)
+// must keep getting the process default NoF runtime, not nullptr.
+TEST_F(ClientIntegrationTest, CreateWithoutInitiatorKeepsDefaultNofRuntime) {
+    DefaultInitiatorFactoryGuard guard;
+    auto probe = std::make_shared<WiringProbeInitiator>();
+    Client::SetDefaultNofInitiatorFactoryForTesting([probe] { return probe; });
+
+    auto client_opt = Client::Create("localhost:17941",  // unique hostname
+                                     "P2PHANDSHAKE", FLAGS_protocol,
+                                     std::nullopt, master_address_);
+    ASSERT_TRUE(client_opt.has_value());
+    // The default argument must resolve to the process default runtime
+    // (here: the injected probe), not nullptr.
+    EXPECT_EQ((*client_opt)->GetNofInitiatorForTesting(), probe);
+}
 
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTest, BasicPutGetOperations) {

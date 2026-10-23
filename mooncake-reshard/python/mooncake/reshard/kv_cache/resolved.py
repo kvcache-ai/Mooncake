@@ -259,22 +259,39 @@ def _validated_spans(
             raise ValueError(f"resolved binding {name} differs")
     if snapshot.resource_id != placement.resource_id:
         raise ValueError("snapshot resource_id differs from placement")
-    if len(binding.ranges) > limits.max_ranges:
+    return _validated_range_spans(
+        placement,
+        binding.participant_id,
+        binding.regions,
+        binding.ranges,
+        token_start=snapshot.token_start,
+        token_end=snapshot.token_end,
+        limits=limits,
+    )
+
+
+def _validated_range_spans(
+    placement: KVCachePlacementManifest,
+    participant_id: str,
+    registered_regions: tuple[KVCacheRegisteredRegion, ...],
+    ranges: tuple[KVCacheResolvedRange, ...],
+    *,
+    token_start: int,
+    token_end: int,
+    limits: KVCacheTransferLimits,
+) -> list[tuple[int, int]]:
+    """Validate memory geometry after the caller checks its binding identity."""
+    if len(ranges) > limits.max_ranges:
         raise ValueError("resolved range count limit exceeded")
-    part = placement.part(ParticipantId(binding.participant_id))
-    regions = {r.region_id: r for r in binding.regions}
+    part = placement.part(ParticipantId(participant_id))
+    regions = {r.region_id: r for r in registered_regions}
     groups: dict[tuple[int, KVCacheComponent], list[KVCacheResolvedRange]] = {}
     spans: list[tuple[int, int]] = []
-    for item in binding.ranges:
+    for item in ranges:
         if item.global_layer_id not in part.layer_ids:
             raise ValueError("resolved range contains an unowned layer")
-        if (
-            not snapshot.token_start
-            <= item.token_start
-            < item.token_end
-            <= snapshot.token_end
-        ):
-            raise ValueError("resolved range is outside snapshot token interval")
+        if not token_start <= item.token_start < item.token_end <= token_end:
+            raise ValueError("resolved range is outside token interval")
         if (
             not part.head_start
             <= item.head_start
@@ -323,7 +340,7 @@ def _validated_spans(
     work = 0
     for items in groups.values():
         boundaries = sorted(
-            {snapshot.token_start, snapshot.token_end}
+            {token_start, token_end}
             | {t for r in items for t in (r.token_start, r.token_end)}
         )
         work += len(boundaries) * len(items)

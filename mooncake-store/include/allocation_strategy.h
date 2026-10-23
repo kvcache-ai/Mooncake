@@ -213,7 +213,6 @@ class AllocatorManager {
     std::unordered_map<std::string, UUID> owner_by_name_;
     std::vector<std::string> preferred_hcas_;
     friend class ScopedSegmentAccess;
-    friend class SegmentSerializer;
 };
 
 /**

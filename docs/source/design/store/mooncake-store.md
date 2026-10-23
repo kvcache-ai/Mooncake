@@ -190,7 +190,7 @@ Group metadata affects lifecycle behavior on a best-effort basis:
 - `ExistKey` and `GetReplicaList` refresh the group's shared read TTL. A read of any member extends the same group TTL, so the whole group is protected together; a grouped object's own per-member lease is not authoritative. Object soft-pin deadlines are independent and are not extended.
 - Memory eviction first consults the group's single shared TTL: if the group was read recently it is skipped as a whole; otherwise the group's current members are evicted all-or-none, applying the existing per-object safety checks (hard pins, soft pins when soft-pin eviction is disabled, incomplete writes, busy replicas, unavailable replica states) on a best-effort basis. The number of evicted objects is bounded by the requested eviction ratio.
 - Object removal APIs, copy/move tasks, and NoF eviction keep their existing object-level semantics. Group membership metadata is cleaned up when objects are removed.
-- On snapshot/standby restore, group state is rebuilt from object metadata, preserving the group's maximum restored lease deadline so grouped objects are not dropped as expired. Snapshots produced by a router that placed grouped objects on `hash(group_id)` shards are automatically re-routed to `hash(tenant, key)` on restore (`ReRouteRestoredObjectsByKey`), so they need not be regenerated; current-format snapshots restore correctly.
+- On standby restore, each grouped object rejoins its group from the group id in its metadata. The standby snapshot carries no leases, so, as for a newly created group, the shared TTL is unset until a member is read.
 
 This design is intentionally lightweight and backward compatible. Grouping should be treated as a lifecycle hint for related objects, not as a transactional guarantee that all members are created, made visible, or evicted atomically.
 
@@ -400,7 +400,7 @@ config.per_key_preferred_hca_names = [["mlx5_0"], ["mlx5_1"]]
 
 Put-session start receives sizes without source buffers, so use explicit hints
 when placement must follow the writer's topology. Hints are best effort and old
-clients/snapshots remain usable. Low-level mounts should register each bound
+clients remain usable. Low-level mounts should register each bound
 range separately with `cpu:N`; compound `segments:...` locations are unknown
 to master placement.
 
@@ -444,7 +444,7 @@ There are three startup parameters in `master_service` related to the soft pin m
 
 - `default_kv_soft_pin_ttl`: The fixed soft-pin lifetime (in milliseconds) used when an `ENABLE` request omits `soft_pin_ttl_ms`. The default value is `30 minutes`; reads do not extend it.
 
-- `max_kv_soft_pin_ttl`: The largest request-level soft-pin TTL accepted by the Master. The default value is `24 hours`.
+- `max_kv_soft_pin_ttl`: The largest request-level soft-pin TTL accepted by the Master. The default value is `7 days`.
 
 - `allow_evict_soft_pinned_objects`: Whether soft pinned objects are allowed to be evicted. The default value is `true`.
 
