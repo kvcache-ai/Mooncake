@@ -270,17 +270,6 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             bytes);
     }
 
-    TenantQuotaHandle GetOrCreateTenantStateHandleForTest(
-        MasterService& service, size_t shard_idx, const TenantId& tenant_id) {
-        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
-                                                             shard_idx);
-        auto& tenant_state =
-            MasterServiceTestPeer(service).GetOrCreateTenantState(shard.get(),
-                                                                  tenant_id);
-        return MasterServiceTestPeer(service).GetBoundTenantQuotaHandle(
-            tenant_state);
-    }
-
     tl::expected<void, ErrorCode> ChargeBoundTenantQuotaForTest(
         MasterService& service, TenantQuotaHandle account, uint64_t bytes) {
         return MasterServiceTestPeer(service).ChargeTenantQuota(account, bytes);
@@ -474,28 +463,6 @@ TEST_F(MasterServiceTenantQuotaTest,
                 10);
 
     PutComplete(service, client_id, "ok", TenantId("tenant-a"), 10);
-}
-
-TEST_F(MasterServiceTenantQuotaTest,
-       SameTenantStatesAcrossMetadataShardsShareBoundHandle) {
-    const TenantId tenant_id("tenant-a");
-    MasterService service(MakeConfig({{tenant_id, 1000}}));
-    MountSegment(service);
-
-    auto* first_handle =
-        GetOrCreateTenantStateHandleForTest(service, 0, tenant_id);
-    auto* second_handle =
-        GetOrCreateTenantStateHandleForTest(service, 1, tenant_id);
-
-    ASSERT_NE(first_handle, nullptr);
-    EXPECT_EQ(first_handle, second_handle);
-
-    auto charge = ChargeBoundTenantQuotaForTest(service, first_handle, 128);
-    ASSERT_TRUE(charge.has_value()) << toString(charge.error());
-    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
-
-    ReleaseBoundTenantQuotaForTest(service, second_handle, 128);
-    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
 }
 
 TEST_F(MasterServiceTenantQuotaTest,

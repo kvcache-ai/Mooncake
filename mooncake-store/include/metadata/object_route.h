@@ -59,6 +59,7 @@
 #include <boost/intrusive/list.hpp>
 #include <glog/logging.h>
 
+#include "common/shrink_buckets.h"
 #include "common/transparent_string_hash.h"
 #include "metadata/group_index.h"
 #include "metadata/object_state.h"
@@ -463,6 +464,13 @@ class ObjectRoute {
     // shared lease.
     void RebuildGroupState();
 
+    // Rehashes every stripe whose map has grown sparse, since erase() never
+    // gives bucket memory back (see ShrinkBucketsIfSparse): a route that once
+    // held millions of keys would keep its high-water bucket arrays for good.
+    // Takes each stripe lock exclusively in turn, so the caller holds no guard
+    // or cursor on the route.
+    void ShrinkSparseStripes();
+
    private:
     template <LockMode>
     friend class Guard;
@@ -832,6 +840,17 @@ inline ObjectRoute::Cursor<LockMode::kRead> ObjectRoute::ReadCursor() const {
 
 inline ObjectRoute::Cursor<LockMode::kWrite> ObjectRoute::WriteCursor() {
     return Cursor<LockMode::kWrite>(*this);
+}
+
+inline void ObjectRoute::ShrinkSparseStripes() {
+    AssertNotInCursor();
+    // Rehashing moves no node, so the slots and the keys guards point at stay
+    // put; only map iterators, which a cursor holds under the shared stripe
+    // lock, are invalidated.
+    for (Stripe& stripe : stripes_) {
+        std::unique_lock<std::shared_mutex> lock(stripe.lock);
+        ShrinkBucketsIfSparse(stripe.slots);
+    }
 }
 
 inline void ObjectRoute::RebuildGroupState() {

@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "common/shrink_buckets.h"
 #include "master_service/master_service_test_peer.h"
 #include "rpc_service.h"
 
@@ -1101,19 +1102,13 @@ TEST_F(MasterServiceTest,
         constexpr size_t kObjectSize = 4096;
         constexpr size_t kConcurrentWrites = 8;
         constexpr size_t kOldKeyCount = 32;
-        const size_t old_shard =
-            MetadataShardIndex(service, "single_flight_old_seed");
         std::vector<std::string> old_keys;
         std::vector<std::string> new_keys;
-        for (size_t i = 0; old_keys.size() < kOldKeyCount ||
-                           new_keys.size() < kConcurrentWrites;
-             ++i) {
-            const std::string key = "single_flight_key_" + std::to_string(i);
-            if (MetadataShardIndex(service, key) == old_shard) {
-                if (old_keys.size() < kOldKeyCount) old_keys.push_back(key);
-            } else if (new_keys.size() < kConcurrentWrites) {
-                new_keys.push_back(key);
-            }
+        for (size_t i = 0; i < kOldKeyCount; ++i) {
+            old_keys.push_back("single_flight_old_" + std::to_string(i));
+        }
+        for (size_t i = 0; i < kConcurrentWrites; ++i) {
+            new_keys.push_back("single_flight_new_" + std::to_string(i));
         }
 
         for (const auto& key : old_keys) {
@@ -1127,7 +1122,16 @@ TEST_F(MasterServiceTest,
                             .has_value());
         }
 
-        auto old_shard_lock = LockMetadataShardForTest(service, old_shard);
+        // Holding every old key blocks the eviction's validation of the
+        // bucket they share.
+        std::vector<route::WriteGuard> old_key_holds;
+        for (const auto& key : old_keys) {
+            auto hold = MasterServiceTestPeer::WriteObject(
+                service, MasterServiceTestPeer::ObjectIdentity{
+                             TenantId::Default(), key});
+            ASSERT_TRUE(hold.has_value()) << key;
+            old_key_holds.push_back(std::move(*hold));
+        }
         std::barrier start_barrier(kConcurrentWrites + 1);
         std::vector<int> errors(kConcurrentWrites,
                                 static_cast<int>(ErrorCode::INTERNAL_ERROR));
@@ -1162,9 +1166,9 @@ TEST_F(MasterServiceTest,
         start_barrier.arrive_and_wait();
         // Keep eviction validation blocked long enough for all writers to
         // encounter the full allocator. Without single-flight recovery they
-        // freeze different LRU buckets while waiting on this shard.
+        // freeze different LRU buckets while waiting on these keys.
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        old_shard_lock.reset();
+        old_key_holds.clear();
         for (auto& writer : writers) writer.join();
 
         for (size_t i = 0; i < kConcurrentWrites; ++i) {
@@ -2018,11 +2022,11 @@ TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
 
 // A mass client expiry marks handles stale all over the metadata table, so
 // the sweep cleans each object under its own write lock instead of holding a
-// shard exclusively for the whole walk. Dropping and retaking the lock
-// mid-shard must not cost coverage: every key of the departed segment is
+// stripe exclusively for the whole walk. Dropping and retaking the lock
+// mid-stripe must not cost coverage: every key of the departed segment is
 // erased, and every key of a live segment survives. The keys are forced onto
-// one shard so the sweep returns to it many times.
-TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsShardAcrossLockBatches) {
+// one stripe of the route so the sweep returns to it many times.
+TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsStripeAcrossLockBatches) {
     auto service = std::make_unique<MasterService>();
     PauseReplicaCleanup(*service);
 
@@ -2034,19 +2038,18 @@ TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsShardAcrossLockBatches) {
     const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
                                                    0x400000000, kSegmentSize);
 
-    // Enough keys per segment that draining the shard takes several batches.
+    // Enough keys per segment that draining the stripe takes several batches.
     constexpr size_t kKeysPerSegment = 100;
-    const size_t target_shard =
-        MetadataShardIndex(*service, "batch_sweep_seed");
+    const size_t target_stripe = RouteStripeIndex("batch_sweep_seed");
 
     std::vector<std::string> stale_keys;
     std::vector<std::string> live_keys;
     for (size_t i = 0;
          stale_keys.size() + live_keys.size() < 2 * kKeysPerSegment; ++i) {
         ASSERT_LT(i, 1000000u)
-            << "could not gather enough keys on shard " << target_shard;
+            << "could not gather enough keys on stripe " << target_stripe;
         const std::string key = "batch_sweep_key_" + std::to_string(i);
-        if (MetadataShardIndex(*service, key) != target_shard) {
+        if (RouteStripeIndex(key) != target_stripe) {
             continue;
         }
 
@@ -2403,14 +2406,14 @@ TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
     [[maybe_unused]] const auto context = PrepareSimpleSegment(
         *service_, "test_segment", buffer, object_size * object_count * 16);
 
-    // Pick keys that all hash to one shard so its metadata map grows past
-    // the shrink floor; random keys would spread these objects thinly
-    // across all 1024 shards.
-    const size_t target_shard = MetadataShardIndex(*service_, "shrink_key_0");
+    // Pick keys that all hash to one stripe of the route so its map grows
+    // past the shrink floor; random keys would spread these objects thinly
+    // across all 1024 stripes.
+    const size_t target_stripe = RouteStripeIndex("shrink_key_0");
     std::vector<std::string> keys;
     for (size_t i = 0; keys.size() < object_count; ++i) {
         std::string key = "shrink_key_" + std::to_string(i);
-        if (MetadataShardIndex(*service_, key) != target_shard) continue;
+        if (RouteStripeIndex(key) != target_stripe) continue;
         keys.push_back(std::move(key));
     }
 
@@ -2432,12 +2435,14 @@ TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
                         .has_value());
     }
 
-    const size_t buckets_before = MetadataBucketCount(*service_, target_shard);
+    const size_t buckets_before =
+        RouteStripeBucketCount(*service_, target_stripe);
     ASSERT_GT(buckets_before, kShrinkMinBucketCount);
 
     MasterServiceTestPeer(*service_).RunBatchEvictForTesting(1.0, 1.0);
 
-    const size_t buckets_after = MetadataBucketCount(*service_, target_shard);
+    const size_t buckets_after =
+        RouteStripeBucketCount(*service_, target_stripe);
     ASSERT_GT(buckets_after, 0u);
     // Without the post-eviction shrink the bucket array would still sit at
     // its high-water mark and this assertion would fail.
@@ -2462,10 +2467,9 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
                                                    0x400000000, kSegmentSize);
 
-    // Gather keys on one shard so its metadata map grows past the shrink
-    // floor; spreading them across all 1024 shards would leave each map tiny.
-    const size_t target_shard =
-        MetadataShardIndex(*service, "clear_shrink_key_0");
+    // Gather keys on one stripe of the route so its map grows past the shrink
+    // floor; spreading them across all 1024 stripes would leave each map tiny.
+    const size_t target_stripe = RouteStripeIndex("clear_shrink_key_0");
     // A few live keys keep the shared tenant alive after the sweep (partial
     // drain, not full erase); the rest are swept and must trigger a shrink.
     constexpr size_t kLiveKeys = 128;
@@ -2475,9 +2479,9 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     std::vector<std::string> live_keys;
     for (size_t i = 0; stale_keys.size() + live_keys.size() < kTotalKeys; ++i) {
         ASSERT_LT(i, 5000000u)
-            << "could not gather enough keys on shard " << target_shard;
+            << "could not gather enough keys on stripe " << target_stripe;
         const std::string key = "clear_shrink_key_" + std::to_string(i);
-        if (MetadataShardIndex(*service, key) != target_shard) {
+        if (RouteStripeIndex(key) != target_stripe) {
             continue;
         }
 
@@ -2503,7 +2507,8 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     }
     ASSERT_GT(stale_keys.size(), live_keys.size());
 
-    const size_t buckets_before = MetadataBucketCount(*service, target_shard);
+    const size_t buckets_before =
+        RouteStripeBucketCount(*service, target_stripe);
     ASSERT_GT(buckets_before, kShrinkMinBucketCount);
 
     // Unmount the stale segment, then sweep inline. The tenant survives
@@ -2520,7 +2525,8 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     // "merely hidden by the unmount".
     EXPECT_EQ(live_keys.size(), service->GetKeyCount());
 
-    const size_t buckets_after = MetadataBucketCount(*service, target_shard);
+    const size_t buckets_after =
+        RouteStripeBucketCount(*service, target_stripe);
     ASSERT_GT(buckets_after, 0u);
     // Without the post-sweep shrink the bucket array would stay at its
     // high-water mark and this assertion would fail.

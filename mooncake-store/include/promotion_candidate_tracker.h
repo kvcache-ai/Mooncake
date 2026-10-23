@@ -92,10 +92,6 @@ class PromotionCandidateTracker {
     // because its object went away without EraseLocked.
     void ForgetLocked(const TenantId& tenant_id, const std::string& key);
 
-    // Forgets every candidate, for a metadata reload that already dropped the
-    // objects carrying them.
-    void Reset();
-
    private:
     friend class test::MasterServiceTestPeer;
 
