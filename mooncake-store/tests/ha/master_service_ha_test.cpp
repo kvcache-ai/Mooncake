@@ -2958,12 +2958,17 @@ TEST_F(MasterServiceHATest, FailedRepairRestoreKeepsReplicaIdCounterAdvanced) {
 
     ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
                     .has_value());
-    PutObjectOnSegment(service, generate_uuid(),
-                       "standby_repair_id_counter_new", endpoint);
-    const auto fresh = ReplicaDescriptorsForTesting(
-        service, kDefaultTenant, "standby_repair_id_counter_new");
-    ASSERT_EQ(fresh.size(), 1);
-    EXPECT_GE(fresh.front().id, base_id + 2);
+    // Allocation assigns the replica ID; finishing the write would require
+    // the OpLog writer intentionally absent from this failed-restore setup.
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {endpoint};
+    auto fresh =
+        service.PutStart(generate_uuid(), "standby_repair_id_counter_new",
+                         kDefaultTenant, 1024, config);
+    ASSERT_TRUE(fresh.has_value());
+    ASSERT_EQ(fresh->size(), 1u);
+    EXPECT_GE(fresh->front().id, base_id + 2);
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,

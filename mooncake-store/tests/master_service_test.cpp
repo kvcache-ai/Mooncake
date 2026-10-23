@@ -1331,10 +1331,12 @@ TEST_F(MasterServiceTest, RemoveAllKeepsObjectWhenOpLogReservationFails) {
                     ->PutStart(context.client_id, "reservation_fail_key",
                                TenantId::Default(), 4096, replicate_config)
                     .has_value());
-    ASSERT_TRUE(service
-                    ->PutEnd(context.client_id, "reservation_fail_key",
-                             TenantId::Default(), ReplicaType::ALL)
-                    .has_value());
+    // PutEnd makes the replica visible before admission, but must report the
+    // missing writer instead of acknowledging an unlogged update.
+    auto end = service->PutEnd(context.client_id, "reservation_fail_key",
+                               TenantId::Default(), ReplicaType::ALL);
+    ASSERT_FALSE(end.has_value());
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, end.error());
 
     // force=true clears the lease gate, so the reservation is the only thing
     // left that can stop the removal.
