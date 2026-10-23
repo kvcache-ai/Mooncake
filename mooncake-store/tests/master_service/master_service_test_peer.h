@@ -132,6 +132,10 @@ class MasterServiceTestPeer {
         return service.client_liveness_records_;
     }
 
+    static auto& RemountMutex(MasterService& service) {
+        return service.remount_mutex_;
+    }
+
     static auto& ClientMutex(MasterService& service) {
         return service.client_mutex_;
     }

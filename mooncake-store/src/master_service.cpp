@@ -812,8 +812,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     // Single-flight for remounts. The locks below are acquired and released
     // in phases, so this dedicated mutex replaces the implicit serialization
     // the old whole-body client_mutex_ + master_state_mutex_ exclusive hold
-    // provided, without coupling Ping (client_mutex_ shared) to remount
-    // progress.
+    // provided, without coupling Ping to remount progress.
     std::lock_guard<std::mutex> remount_serialization_guard(remount_mutex_);
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
@@ -2469,7 +2468,8 @@ void MasterService::ClearInvalidHandles() {
     // and between object accessor acquisitions, so the documented
     // client-before-shard lock order is preserved and callers must not hold
     // master_state_mutex_.
-    constexpr auto kRetainingSetRefreshInterval = std::chrono::milliseconds(100);
+    constexpr auto kRetainingSetRefreshInterval =
+        std::chrono::milliseconds(100);
     auto capture = [this]() {
         std::unordered_set<UUID, boost::hash<UUID>> retained;
         std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
@@ -2493,7 +2493,8 @@ void MasterService::ClearInvalidHandles() {
             }
             retaining_clients = capture();
             last_refresh = now;
-        });
+        },
+        /*serialize_remount=*/true);
 }
 
 void MasterService::ClearInvalidHandles(
@@ -2515,7 +2516,7 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
 
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
     const std::function<bool(const Replica&)>& is_stale,
-    const std::function<void()>& refresh_retaining) {
+    const std::function<void()>& refresh_retaining, bool serialize_remount) {
     std::optional<ErrorCode> first_persist_error;
     VisitTenants([&](const TenantId& tenant_id) {
         if (refresh_retaining) {
@@ -2526,14 +2527,32 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
         // write lock below, since it may have changed, and one torn down or
         // published again meanwhile is left alone.
         std::vector<route::ObjectRef> to_sweep;
-        for (auto object : ReadCursor(tenant_id)) {
-            const auto& metadata = object.metadata();
-            if (metadata.HasReplica(is_stale) || !metadata.IsValid()) {
-                to_sweep.push_back(object.ref());
+        {
+            // Remount replaces buffers through saved Replica pointers after
+            // its cursor releases the object locks. Readers must also wait
+            // until that replacement finishes.
+            std::unique_lock<std::mutex> remount_lock(remount_mutex_,
+                                                      std::defer_lock);
+            if (serialize_remount) {
+                remount_lock.lock();
+            }
+            for (auto object : ReadCursor(tenant_id)) {
+                const auto& metadata = object.metadata();
+                if (metadata.HasReplica(is_stale) || !metadata.IsValid()) {
+                    to_sweep.push_back(object.ref());
+                }
             }
         }
         std::bitset<kNumShards> erased_shards;
         for (const auto& object : to_sweep) {
+            // The background sweep has no master-state guard. Serialize its
+            // writes with remount, which retains Replica pointers across the
+            // metadata walk. Take this before the client or metadata locks.
+            std::unique_lock<std::mutex> remount_lock(remount_mutex_,
+                                                      std::defer_lock);
+            if (serialize_remount) {
+                remount_lock.lock();
+            }
             if (refresh_retaining) {
                 refresh_retaining();
             }

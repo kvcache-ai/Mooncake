@@ -119,9 +119,9 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  * ShardedTenantQuotaTable, so these two locks are never nested.
  *
  * Two dedicated guards sit outside this order: remount_mutex_ is only
- * acquired at the top of ReMountSegment, before client_mutex_, and nothing
- * acquires it while holding any lock above; client_status_mutex_ guards the
- * ok_client_ mirror and liveness-record lookup for Ping. It is never held
+ * acquired by ReMountSegment and background cleanup before client_mutex_;
+ * neither holds any lock above when acquiring it. client_status_mutex_ guards
+ * the ok_client_ mirror and liveness-record lookup for Ping. It is never held
  * while acquiring any other lock.
  */
 
@@ -1116,9 +1116,13 @@ class MasterService {
     // refresh_retaining, when provided, runs at each tenant visit and before
     // each picked object's accessor, at points where no shard lock is held,
     // so the is_stale classification can use a fresher liveness view.
+    // serialize_remount protects replica access by the background sweep, which
+    // runs without master_state_mutex_. Callers holding that lock must leave
+    // this false to preserve the remount-before-master-state lock order.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale,
-        const std::function<void()>& refresh_retaining = nullptr);
+        const std::function<void()>& refresh_retaining = nullptr,
+        bool serialize_remount = false);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
@@ -2286,8 +2290,8 @@ class MasterService {
     std::unordered_set<UUID, boost::hash<UUID>> client_status_view_;
     // Serializes concurrent ReMountSegment calls, replacing the implicit
     // serialization the pre-fix whole-body client_mutex_/master_state_mutex_
-    // exclusive hold provided. Never acquired by any other path, so it
-    // cannot couple unrelated operations together.
+    // exclusive hold provided. Background cleanup takes it for each tenant
+    // read pass and each object mutation to protect the remount restore walk.
     std::mutex remount_mutex_;
     std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
     ClientOffboardingWorker client_offboarding_worker_{this};

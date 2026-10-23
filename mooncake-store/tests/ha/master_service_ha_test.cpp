@@ -2190,6 +2190,62 @@ TEST_F(MasterServiceHATest, PingStaysResponsiveWhileRemountWaitsForSnapshot) {
     EXPECT_EQ(service.Ping(remount_client)->client_status, ClientStatus::OK);
 }
 
+TEST_F(MasterServiceHATest, StaleHandleCleanupWaitsForRemountGuard) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "cleanup_remount_segment";
+    const std::string key = "cleanup_remount_key";
+    const UUID disk_owner = generate_uuid();
+    auto object = MakeStandbyObject(key, endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    object.metadata.replicas.push_back(
+        MakeStandbyLocalDiskReplica(disk_owner, endpoint));
+    object.metadata.replicas.back().id = 2;
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {object}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+    const auto record = ClientRecordForTesting(service, disk_owner);
+    ASSERT_TRUE(record);
+    const auto now = ClientLivenessRecord::Clock::now();
+    ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                               std::chrono::hours(1)),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    MasterMetricManager::instance().client_liveness_became_suspected();
+    ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                               std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    MasterMetricManager::instance().client_liveness_became_offline();
+
+    // Model the lifetime of Replica pointers retained by ReMountSegment.
+    // Cleanup must not access replicas until the remount critical section
+    // ends. Do not hold a metadata lock: the remount mutex alone must preserve
+    // the memory and disk elements.
+    std::unique_lock<std::mutex> remount_lock(
+        MasterServiceTestPeer::RemountMutex(service));
+    std::promise<void> started;
+    auto cleanup = std::async(std::launch::async, [&] {
+        started.set_value();
+        ClearInvalidHandlesForTesting(service);
+    });
+    started.get_future().wait();
+    const auto cleanup_status =
+        cleanup.wait_for(std::chrono::milliseconds(100));
+    const auto replicas_during_remount =
+        ReplicaCountForTesting(service, kDefaultTenant, key);
+    remount_lock.unlock();
+    cleanup.get();
+
+    EXPECT_EQ(cleanup_status, std::future_status::timeout);
+    EXPECT_EQ(replicas_during_remount, 2u);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1u);
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+    ASSERT_TRUE(service.GetReplicaList(key, kDefaultTenant).has_value());
+}
+
 TEST_F(MasterServiceHATest,
        ClearInvalidHandlesSeesOwnerThatBecameRetainingMidSweep) {
     MasterService service(
@@ -2282,8 +2338,7 @@ TEST_F(MasterServiceHATest,
     // The sweep must still be parked -- not already finished -- when the
     // owner registers, or the test would prove nothing. Release the park and
     // reap it first so a failure here cannot hang on the still-held lock.
-    if (sweep.wait_for(std::chrono::seconds(0)) ==
-        std::future_status::ready) {
+    if (sweep.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         park_lock.unlock();
         sweep.get();
         FAIL() << "sweep finished before the owner registered";
