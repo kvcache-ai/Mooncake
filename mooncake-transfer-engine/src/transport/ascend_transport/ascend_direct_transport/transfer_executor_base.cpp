@@ -216,7 +216,8 @@ int TransferExecutorBase::initEngines() {
     if (!local_copy_engine_) {
         return ERR_MEMORY;
     }
-    int ret = local_copy_engine_->Initialize(params_.transfer_timeout);
+    int ret = local_copy_engine_->Initialize(params_.transfer_timeout,
+                                             local_engine_contexts_.size());
     if (ret != 0) {
         LOG(ERROR) << "Failed to initialize LocalCopyEngine, ret: " << ret;
         return ret;
@@ -675,9 +676,9 @@ bool TransferExecutorBase::resolveLocalCopyDestinations(
 }
 
 void TransferExecutorBase::setLocalCopyTaskRunner(
-    std::function<void(std::function<void()>)> runner, size_t max_parallelism) {
+    std::function<void(std::function<void()>)> runner) {
     if (local_copy_engine_) {
-        local_copy_engine_->SetTaskRunner(std::move(runner), max_parallelism);
+        local_copy_engine_->SetTaskRunner(std::move(runner));
     }
 }
 

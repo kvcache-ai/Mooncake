@@ -1322,10 +1322,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 if (!split_limit.has_value() || cap < *split_limit) {
                     split_limit = cap;
                 }
-                LOG(INFO) << "Agent-mode store chunk cap: " << cap
-                          << " bytes across "
+                LOG(INFO) << "Agent mode splits the store segment of "
+                          << global_segment_size << " bytes across "
                           << ContextManager::getInstance().getDeviceCount()
-                          << " device(s)";
+                          << " devices, at most " << cap
+                          << " bytes on each device";
             }
         }
 #endif

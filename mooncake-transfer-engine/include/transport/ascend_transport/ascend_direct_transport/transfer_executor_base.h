@@ -82,8 +82,7 @@ class TransferExecutorBase {
 
     // Forwards to LocalCopyEngine::SetTaskRunner.
     void setLocalCopyTaskRunner(
-        std::function<void(std::function<void()>)> runner,
-        size_t max_parallelism);
+        std::function<void(std::function<void()>)> runner);
 
     int registerMem(void* addr, size_t length, adxl::MemType mem_type,
                     bool use_buffer_pool, bool remote_accessible);

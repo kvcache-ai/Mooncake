@@ -461,6 +461,8 @@ struct BoundRunner {
     std::mutex mu;
     const void* owner = nullptr;
     std::function<void(std::function<void()>)> run;
+    const void* device_owner = nullptr;
+    std::vector<std::function<void(std::function<void()>)>> device_runs;
 };
 
 BoundRunner& BoundAffinityRunner() {
@@ -469,6 +471,28 @@ BoundRunner& BoundAffinityRunner() {
 }
 
 thread_local bool on_bound_affinity_thread = false;
+
+void RunAndWait(const std::function<void(std::function<void()>)>& run,
+                std::function<void()> fn) {
+    if (!run) {
+        fn();
+        return;
+    }
+    std::promise<void> done;
+    auto wait = done.get_future();
+    run([&fn, &done] {
+        on_bound_affinity_thread = true;
+        try {
+            fn();
+            on_bound_affinity_thread = false;
+            done.set_value();
+        } catch (...) {
+            on_bound_affinity_thread = false;
+            done.set_exception(std::current_exception());
+        }
+    });
+    wait.get();
+}
 }  // namespace
 
 void SetBoundAffinityRunner(const void* owner,
@@ -489,6 +513,25 @@ void ClearBoundAffinityRunner(const void* owner) {
     state.run = nullptr;
 }
 
+void SetPerDeviceBoundAffinityRunners(
+    const void* owner,
+    std::vector<std::function<void(std::function<void()>)>> runners) {
+    auto& state = BoundAffinityRunner();
+    std::lock_guard<std::mutex> lock(state.mu);
+    state.device_owner = owner;
+    state.device_runs = std::move(runners);
+}
+
+void ClearPerDeviceBoundAffinityRunners(const void* owner) {
+    auto& state = BoundAffinityRunner();
+    std::lock_guard<std::mutex> lock(state.mu);
+    if (state.device_owner != owner) {
+        return;
+    }
+    state.device_owner = nullptr;
+    state.device_runs.clear();
+}
+
 void RunOnBoundAffinityThread(std::function<void()> fn) {
     if (!fn) {
         return;
@@ -503,24 +546,33 @@ void RunOnBoundAffinityThread(std::function<void()> fn) {
         std::lock_guard<std::mutex> lock(state.mu);
         run = state.run;
     }
-    if (!run) {
+    RunAndWait(run, std::move(fn));
+}
+
+void RunOnDeviceBoundAffinityThread(int32_t device_id,
+                                    std::function<void()> fn) {
+    if (!fn) {
+        return;
+    }
+    if (on_bound_affinity_thread) {
         fn();
         return;
     }
-    std::promise<void> done;
-    auto wait = done.get_future();
-    run([&fn, &done] {
-        on_bound_affinity_thread = true;
-        try {
-            fn();
-            on_bound_affinity_thread = false;
-            done.set_value();
-        } catch (...) {
-            on_bound_affinity_thread = false;
-            done.set_exception(std::current_exception());
+    std::function<void(std::function<void()>)> run;
+    {
+        auto& state = BoundAffinityRunner();
+        std::lock_guard<std::mutex> lock(state.mu);
+        if (device_id >= 0) {
+            const auto index = static_cast<size_t>(device_id);
+            if (index < state.device_runs.size() && state.device_runs[index]) {
+                run = state.device_runs[index];
+            }
         }
-    });
-    wait.get();
+        if (!run) {
+            run = state.run;
+        }
+    }
+    RunAndWait(run, std::move(fn));
 }
 
 bool TryBindCurrentThread(const std::vector<int>& cpus) {

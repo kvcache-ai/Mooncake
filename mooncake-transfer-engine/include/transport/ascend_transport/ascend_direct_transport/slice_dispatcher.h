@@ -45,12 +45,15 @@ class ISliceDispatcher {
 };
 
 /**
- * Default dispatcher: groups by target_id, enqueues to shared thread pool.
- * Sets ACL context before invoking executor. Thread pool size is parsed from
- * ASCEND_THREAD_POOL_SIZE and defaults to 16. Buffer-pool mode uses 1.
- * Device copies run on a separate pool of 6 threads.
- * Both pools pin to the shared NPU CPU affinity when every local NPU reports
- * the same set. Otherwise they stay on the default scheduler.
+ * Default dispatcher: groups by target_id, enqueues to a transfer thread pool.
+ * Sets ACL context before invoking executor. Each transfer pool's size is
+ * parsed from ASCEND_THREAD_POOL_SIZE and defaults to 16. Buffer-pool mode
+ * uses 1. Device copies run on a separate pool of 6 threads.
+ * One local device keeps one transfer pool and one memcpy pool. Both pin to
+ * the shared NPU CPU affinity when that device resolves a cpulist.
+ * Several local devices (standalone) keep one transfer pool and one memcpy
+ * pool per device. Each pool pins to that device's NUMA cpulist. Non-fabric
+ * host allocation for a device runs on that device's transfer pool.
  */
 class DefaultSliceDispatcher : public ISliceDispatcher {
    public:
@@ -63,10 +66,15 @@ class DefaultSliceDispatcher : public ISliceDispatcher {
 
    private:
     size_t resolveThreadPoolSize() const;
+    void enqueueShared(std::vector<Transport::Slice*> slice_list);
+    void enqueuePerDevice(std::vector<Transport::Slice*> slice_list);
 
     TransferExecutorBase* transfer_executor_;
     std::unique_ptr<AscendThreadPool> thread_pool_;
     std::unique_ptr<AscendThreadPool> memcpy_thread_pool_;
+    // Standalone, one entry per logic device. Empty means the shared pools.
+    std::vector<std::unique_ptr<AscendThreadPool>> device_thread_pools_;
+    std::vector<std::unique_ptr<AscendThreadPool>> device_memcpy_pools_;
     std::vector<aclrtContext> local_engine_contexts_;
 };
 

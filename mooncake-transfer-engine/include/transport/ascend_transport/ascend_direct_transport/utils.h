@@ -104,10 +104,11 @@ std::string ResolveAscendGlobalResourceConfig(const char* config_str);
 
 int SetDeviceAndGetContext(int32_t device_id, aclrtContext* out_context);
 
-// CPU sets for the memcpy pool and the transfer pool. Affinity is the NPU's
-// NUMA node; shared_cpus is that node's cpulist when every local NPU is on
-// the same node. Otherwise the shared pools stay on the default scheduler.
-// per_device_cpus is aligned with the logic-id list.
+// CPU sets for memcpy pools and transfer pools. Affinity is the NPU's NUMA
+// node. shared_cpus is that node's cpulist when every local NPU is on the
+// same node; a single shared pool uses it and otherwise stays unpinned.
+// per_device_cpus is aligned with the logic-id list. Standalone pools use
+// that list, one pool per device, including when the NUMA nodes differ.
 struct AscendAffinityPlan {
     std::vector<int> shared_cpus;
     std::vector<std::vector<int>> per_device_cpus;
@@ -128,9 +129,22 @@ void SetBoundAffinityRunner(const void* owner,
                             std::function<void(std::function<void()>)> runner);
 void ClearBoundAffinityRunner(const void* owner);
 
+// One runner per ACL logic device id. runners[i] runs work for device i.
+// owner identifies the publisher. A later clear from another owner is ignored.
+void SetPerDeviceBoundAffinityRunners(
+    const void* owner,
+    std::vector<std::function<void(std::function<void()>)>> runners);
+void ClearPerDeviceBoundAffinityRunners(const void* owner);
+
 // Run fn on the bound pool and wait. With no pool, or when already on that
 // pool, fn runs on the caller. A stopped pool also runs fn on the caller.
 void RunOnBoundAffinityThread(std::function<void()> fn);
+
+// Run fn on the pool published for device_id and wait. A missing per-device
+// runner uses the shared runner from SetBoundAffinityRunner. With neither,
+// or when already on a bound pool, fn runs on the caller.
+void RunOnDeviceBoundAffinityThread(int32_t device_id,
+                                    std::function<void()> fn);
 
 /**
  * @brief A simple thread pool for executing tasks asynchronously.

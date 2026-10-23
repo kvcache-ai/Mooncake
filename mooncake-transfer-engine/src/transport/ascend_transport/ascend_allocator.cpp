@@ -31,7 +31,12 @@ constexpr int kBestEffortPercentStep = 10;
 
 std::atomic<uint32_t> g_agent_alloc_next{0};
 
-bool BindNextAgentDevice() {
+// logic_device_id is the standalone round-robin slot, or -1 when this alloc
+// stays on the caller's device. The caller passes it to the matching pool.
+bool BindNextAgentDevice(int32_t* logic_device_id) {
+    if (logic_device_id != nullptr) {
+        *logic_device_id = -1;
+    }
     if (!globalConfig().ascend_agent_mode) {
         return true;
     }
@@ -44,6 +49,9 @@ bool BindNextAgentDevice() {
         return true;
     }
     const uint32_t idx = g_agent_alloc_next.load(std::memory_order_relaxed) % n;
+    if (logic_device_id != nullptr) {
+        *logic_device_id = static_cast<int32_t>(idx);
+    }
     if (!mgr.setCurrentContext(static_cast<int32_t>(idx))) {
         LOG(ERROR) << "Failed to set agent-mode alloc context for device "
                    << idx;
@@ -114,7 +122,7 @@ bool IsA5Soc() {
             return false;
         }
         const bool is_a5 = std::strstr(soc_name, "Ascend950") != nullptr;
-        LOG(INFO) << "Ascend SoC: " << soc_name << ", A5=" << is_a5;
+        LOG(INFO) << "Ascend SoC: " << soc_name;
         return is_a5;
     }();
     return kIsA5;
@@ -382,12 +390,13 @@ void* allocate_fabric_exact(size_t total_size, bool quiet = false) {
 }
 #endif
 
-void* RunNonFabricAlloc(const std::function<void*()>& alloc) {
+void* RunNonFabricAlloc(const std::function<void*()>& alloc,
+                        int32_t logic_device_id) {
     aclrtContext ctx = nullptr;
     const bool have_ctx =
         aclrtGetCurrentContext(&ctx) == ACL_ERROR_NONE && ctx != nullptr;
     void* ptr = nullptr;
-    RunOnBoundAffinityThread([&] {
+    auto run = [&] {
         if (have_ctx) {
             const auto ret = aclrtSetCurrentContext(ctx);
             if (ret != ACL_ERROR_NONE) {
@@ -398,7 +407,16 @@ void* RunNonFabricAlloc(const std::function<void*()>& alloc) {
             }
         }
         ptr = alloc();
-    });
+    };
+    // Standalone selected a device. Run the alloc on that device's transfer
+    // pool so the first touch follows that device's CPU affinity. No
+    // per-device pool (single device, or the dispatcher is not installed)
+    // keeps the shared runner.
+    if (logic_device_id >= 0) {
+        RunOnDeviceBoundAffinityThread(logic_device_id, run);
+    } else {
+        RunOnBoundAffinityThread(run);
+    }
     return ptr;
 }
 
@@ -521,7 +539,8 @@ aclrtDrvMemHandle ascend_get_physical_handle_from_va(void* va) {
 }
 
 void* ascend_allocate_memory(size_t total_size, const std::string& protocol) {
-    if (!BindNextAgentDevice()) {
+    int32_t logic_device_id = -1;
+    if (!BindNextAgentDevice(&logic_device_id)) {
         return nullptr;
     }
     void* ptr = nullptr;
@@ -529,7 +548,8 @@ void* ascend_allocate_memory(size_t total_size, const std::string& protocol) {
         ptr = AllocateStoreMemoryImpl(total_size, protocol);
     } else {
         ptr = RunNonFabricAlloc(
-            [&] { return AllocateStoreMemoryImpl(total_size, protocol); });
+            [&] { return AllocateStoreMemoryImpl(total_size, protocol); },
+            logic_device_id);
     }
     if (ptr) {
         CommitAgentDeviceSlot();
@@ -548,15 +568,18 @@ void* ascend_allocate_memory_best_effort(size_t target_size,
         return nullptr;
     }
     *actual_size = 0;
-    if (!BindNextAgentDevice()) {
+    int32_t logic_device_id = -1;
+    if (!BindNextAgentDevice(&logic_device_id)) {
         return nullptr;
     }
     if (!globalConfig().ascend_use_fabric_mem) {
-        return RunNonFabricAlloc([&] {
-            return AllocateExactOnBoundDevice(
-                target_size, protocol, actual_size, host_alloc, host_alignment,
-                defer_hugetlb_population);
-        });
+        return RunNonFabricAlloc(
+            [&] {
+                return AllocateExactOnBoundDevice(
+                    target_size, protocol, actual_size, host_alloc,
+                    host_alignment, defer_hugetlb_population);
+            },
+            logic_device_id);
     }
     (void)protocol;
     (void)host_alloc;
