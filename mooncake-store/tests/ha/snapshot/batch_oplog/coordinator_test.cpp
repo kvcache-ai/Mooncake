@@ -137,9 +137,12 @@ class RecordingBackend final : public HaKvBackend {
                                      &prefix)) {
                 return ErrorCode::INTERNAL_ERROR;
             }
-            // Append faster than this bounded reader applies. Every capture
-            // request must therefore observe a complete but backlogged cursor.
-            for (int i = 0; i < 2; ++i) {
+            // Preserve Range's requested page size. A short page before the
+            // durable prefix means missing history to the reader, not backlog.
+            // Appending two pages keeps later polls behind their observed
+            // durable prefix even after applying one complete page.
+            const size_t append_count = limit == 0 ? 2048 : 2 * limit;
+            for (size_t i = 0; i < append_count; ++i) {
                 auto batch = MakeBatch();
                 batch.batch_id = batch.first_seq = batch.last_seq =
                     ++prefix.batch_id;
@@ -150,7 +153,6 @@ class RecordingBackend final : public HaKvBackend {
             }
             values_[BuildDurablePrefixKey("cluster")] =
                 EncodeDurablePrefix(prefix);
-            limit = 1;
         }
         output.clear();
         for (const auto& [key, value] : values_) {
@@ -476,6 +478,7 @@ TEST(BatchOpLogSnapshotCoordinatorTest,
     ASSERT_TRUE(wait_for_batch(2));
     objects.on_upload = [] { throw std::runtime_error("upload failed"); };
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, coordinator.RunOnce());
+    ASSERT_TRUE(standby.IsRunning());
     EXPECT_EQ(1u, coordinator.GetStatus().attempts);
 
     now += std::chrono::seconds(4);
@@ -502,7 +505,7 @@ TEST(BatchOpLogSnapshotCoordinatorTest,
     EXPECT_LT(descriptor->last_included_seq, durable.last_seq);
 
     backend->grow_backlog = false;
-    // The final in-flight range may append two more batches before seeing
+    // The final in-flight range may append two more pages before seeing
     // grow_backlog=false. Waiting on the actual prefix also covers that race.
     ASSERT_EQ(ErrorCode::OK,
               backend->Get(BuildDurablePrefixKey("cluster"), raw));
