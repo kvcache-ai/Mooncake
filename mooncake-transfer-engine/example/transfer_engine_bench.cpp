@@ -492,6 +492,10 @@ Status initiatorWorker(TransferEngine* engine, SegmentID segment_id,
         }
 
         s = engine->freeBatchID(batch_id);
+        if (s.IsBatchCleanupDeferred()) {
+            s = Status::OK();
+        }
+
         LOG_ASSERT(s.ok());
         batch_count++;
     }
