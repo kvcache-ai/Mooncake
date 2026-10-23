@@ -3491,6 +3491,7 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
             standby_meta.hard_pinned.value_or(false), standby_meta.data_type,
             standby_meta.group_id, object.tenant_id, object.user_key);
         auto& metadata = accessor.Get();
+        metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         metadata.session_id = standby_meta.session_id.value_or("");
         if (!standby_meta.group_id.empty()) {
             metadata.lease_ = RegisterGroupMember(
@@ -12621,6 +12622,7 @@ std::string MasterService::SerializeMetadataForOpLog(
     payload.session_id = metadata.session_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
+    payload.object_checksum = metadata.GetPart(0).checksum();
 
     // Extract replica descriptors - get them all at once
     const auto& replicas = metadata.GetAllReplicas();
@@ -12648,6 +12650,7 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     payload.session_id = metadata.session_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
+    payload.object_checksum = metadata.GetPart(0).checksum();
 
     const auto& replicas = metadata.GetAllReplicas();
     payload.replicas.reserve(replicas.size());
@@ -12673,6 +12676,7 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.session_id = metadata.session_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
+    payload.object_checksum = metadata.GetPart(0).checksum();
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }

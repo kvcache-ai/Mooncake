@@ -1277,6 +1277,48 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     EXPECT_EQ(restored.transport_endpoint_, endpoint);
 }
 
+TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
+    const std::string endpoint = "checksum_restore_segment";
+    auto legacy_object = MakeStandbyObject("checksum_legacy_key", endpoint);
+    legacy_object.metadata.object_checksum = 0x1234;
+    auto batch_object = MakeStandbyObject("checksum_batch_key", endpoint);
+    batch_object.metadata.object_checksum = 0;
+
+    MasterService legacy_service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    ASSERT_TRUE(
+        legacy_service
+            .RestoreFromStandbySnapshot({legacy_object}, 7,
+                                        {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
+    MasterServiceTestPeer::MetadataAccessorRO legacy_accessor(
+        &legacy_service, MasterServiceTestPeer::ObjectIdentity{
+                             kDefaultTenant, legacy_object.key});
+    ASSERT_TRUE(legacy_accessor.Exists());
+    EXPECT_EQ(legacy_accessor.Get().GetPart(0).checksum(),
+              std::optional<uint64_t>(0x1234));
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(source->PutMetadata(batch_object.tenant_id, batch_object.key,
+                                    batch_object.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = batch_object.metadata.replicas.front().id;
+
+    MasterService batch_service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    ASSERT_TRUE(
+        batch_service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
+    MasterServiceTestPeer::MetadataAccessorRO batch_accessor(
+        &batch_service, MasterServiceTestPeer::ObjectIdentity{
+                            kDefaultTenant, batch_object.key});
+    ASSERT_TRUE(batch_accessor.Exists());
+    EXPECT_EQ(batch_accessor.Get().GetPart(0).checksum(),
+              std::optional<uint64_t>(0));
+}
+
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesReplicaIds) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
