@@ -57,11 +57,9 @@
 #include "device/cuda_ipc_buffer.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#include "nof/nof_runtime.h"
 #include "version.h"
 #include "transport/nvlink_transport/nvlink_host_numa_allocation.h"
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
-#endif
 #if defined(USE_ASCEND_DIRECT) || defined(USE_MEMFABRIC)
 #include "acl/acl_rt.h"
 #endif
@@ -296,6 +294,19 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
         };
     }
     return ((*client).*write)(keys, batched_slices.value(), config, stager);
+}
+
+// Backing slot for RealClient::SetNofRuntimeFactoryForTesting.
+std::function<NofRuntime()> &NofRuntimeFactoryForTestingSlot() {
+    static std::function<NofRuntime()> factory;
+    return factory;
+}
+
+// Backing slot for RealClient::SetTeUnregisterHookForTesting.
+std::function<tl::expected<void, ErrorCode>(void *)> &
+TeUnregisterHookForTestingSlot() {
+    static std::function<tl::expected<void, ErrorCode>(void *)> hook;
+    return hook;
 }
 
 #ifdef USE_ASCEND_DIRECT
@@ -919,7 +930,12 @@ RealClient::~RealClient() {
     }
     // Ensure resources are cleaned even if not explicitly closed
     stop_http_server();
-    tearDownAll_internal();
+    // A destructor cannot propagate errors, but a teardown failure (e.g.
+    // unconfirmed NoF cleanup) must still leave a trace.
+    if (!tearDownAll_internal()) {
+        LOG(ERROR) << "RealClient teardown completed with cleanup failures; "
+                      "some buffers must stay mapped until process exit";
+    }
 }
 
 std::shared_ptr<RealClient> RealClient::create() {
@@ -967,6 +983,16 @@ tl::expected<std::string, ErrorCode> RealClient::StartEmbeddedMaster(
     return embedded_master_->master_address();
 }
 
+void RealClient::SetNofRuntimeFactoryForTesting(
+    std::function<NofRuntime()> factory) {
+    NofRuntimeFactoryForTestingSlot() = std::move(factory);
+}
+
+void RealClient::SetTeUnregisterHookForTesting(
+    std::function<tl::expected<void, ErrorCode>(void *)> hook) {
+    TeUnregisterHookForTestingSlot() = std::move(hook);
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -998,6 +1024,43 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
     bool enable_embedded_master) {
+    // Re-entry guard (mirrors initAll_internal): a second setup would
+    // overwrite client_ and skip the first instance's ordered cleanup.
+    if (client_) {
+        LOG(ERROR) << "Client is already initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // A previous teardown that could not release NoF registrations leaves
+    // caller-owned buffers whose DMA translation may still be live under the
+    // OLD initiator's owner token. Re-init installs a fresh initiator whose
+    // UnregisterMemory no-ops on them, so a later teardown would erase the
+    // records and falsely report success. nof_buffer_cleanup_failed_ is the
+    // precise signal: it is set only when CleanupNofRegisteredBuffers fails
+    // to release a record, and stays false when NoF is unavailable — a clean
+    // non-NoF teardown that leaves register_buffer() records behind is NOT
+    // refused. Refuse to re-init this object; create a new client instead.
+    if (nof_buffer_cleanup_failed_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "Cannot re-initialize: a previous teardown left "
+                      "un-released NoF registrations; create a new client "
+                      "instead";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    // Likewise refuse when a previous teardown quarantined a mapping (a
+    // failed TE or NoF unregister): it stays pinned because its registration
+    // state is uncertain, and a re-initialized client's teardown could
+    // munmap it while an old registration is still live.
+    {
+        std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        if (!quarantine_shms_.empty()) {
+            LOG(ERROR) << "Cannot re-initialize: a previous teardown left "
+                          "quarantined shared mappings that must stay pinned; "
+                          "create a new client instead";
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+    // Reset the teardown latch so this instance can be torn down again.
+    closed_.store(false, std::memory_order_release);
+
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     if (!enable_embedded_master &&
@@ -1019,12 +1082,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 #endif
 
-#ifdef USE_NOF
-    if (!SpdkWrapper::GetInstance().InitializeEnv()) {
-        LOG(ERROR) << "spdk env init fail";
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-#endif
+    // The SPDK env initializes lazily on first use, so setup no longer
+    // fail-fasts.
+    auto &nof_factory = NofRuntimeFactoryForTestingSlot();
+    nof_runtime_ = nof_factory ? nof_factory() : CreateNofRuntime();
 
     std::optional<std::string> device_name =
         ((rdma_devices.empty() || rdma_devices == "auto-discovery")
@@ -1067,7 +1128,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, resolved_metadata_server, protocol,
             device_name, resolved_master_server_addr, transfer_engine,
-            {{"client_mode", "real"}}, tenant_id);
+            {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1098,7 +1159,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, resolved_metadata_server, protocol,
                 device_name, resolved_master_server_addr, transfer_engine,
-                {{"client_mode", "real"}}, tenant_id);
+                {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -1134,14 +1195,24 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
-    bool use_spdk_dma_for_client_buffer = false;
-#ifdef USE_NOF
-    use_spdk_dma_for_client_buffer = true;
-#endif
-    client_buffer_allocator_ = ClientBufferAllocator::create(
-        local_buffer_size, this->protocol,
-        use_hugepage_ && !globalConfig().ascend_use_fabric_mem,
-        use_spdk_dma_for_client_buffer);
+    // Inject the SPDK DMA allocator only when NoF is actually available;
+    // otherwise pass nullptr so allocate_buffer_allocator_memory falls
+    // through to exactly the same path as use_spdk_dma=false today
+    // (protocol-specific allocation -> VRAM -> aligned_alloc).
+    try {
+        client_buffer_allocator_ = ClientBufferAllocator::create(
+            local_buffer_size, this->protocol,
+            use_hugepage_ && !globalConfig().ascend_use_fabric_mem,
+            nof_runtime_.initiator ? nof_runtime_.dma_allocator : nullptr);
+    } catch (const std::bad_alloc &) {
+        // The NoF DMA allocator yields nullptr when the SPDK env is
+        // unavailable; report an error instead of a silent generic-allocation
+        // fallback that would surface later as NoF registration failures.
+        LOG(ERROR) << "Failed to allocate client buffer memory (NoF DMA "
+                      "allocator unavailable or out of memory; check the "
+                      "hugepage/SPDK environment)";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -1753,6 +1824,23 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
                                          std::memory_order_acq_rel)) {
+        // A previous teardown's cleanup failure must not decay into success
+        // on repeat calls: retry the idempotent cleanups and keep reporting
+        // failure until they heal.
+        if (nof_buffer_cleanup_failed_.load(std::memory_order_acquire)) {
+            const ErrorCode rc = CleanupNofRegisteredBuffers();
+            if (rc != ErrorCode::OK) {
+                return tl::unexpected(rc);
+            }
+        }
+        ErrorCode shm_rc;
+        {
+            std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+            shm_rc = RetryQuarantinedShmsLocked();
+        }
+        if (shm_rc != ErrorCode::OK) {
+            return tl::unexpected(shm_rc);
+        }
         return {};
     }
 
@@ -1813,6 +1901,15 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         embedded_master_->Stop();
         embedded_master_.reset();
     }
+    // NoF I/O is drained by now (client_.reset() joined the worker pool).
+    // Release this client's NoF registrations; on failure the caller-owned
+    // buffers may still be DMA-translated and must not be freed or remapped.
+    {
+        const ErrorCode nof_rc = CleanupNofRegisteredBuffers();
+        if (nof_rc != ErrorCode::OK && cleanup_error == ErrorCode::OK) {
+            cleanup_error = nof_rc;
+        }
+    }
     for (auto it = egm_segment_ptrs_.rbegin(); it != egm_segment_ptrs_.rend();
          ++it) {
         auto &owner = *it;
@@ -1868,16 +1965,16 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
                 continue;
             }
 #ifdef USE_NOF
-            // Unregister the SPDK registration before munmap (see
-            // unmap_shm_internal). munmap is only safe once the SPDK
-            // translation is gone; if unregister fails, retain the mapping
-            // (quarantine) so the VA cannot be reused while SPDK still holds a
-            // translation to it.
+            // Unregister the NoF registration before munmap (see
+            // unmap_shm_internal). munmap is only safe once the translation is
+            // gone; if unregister fails, retain the mapping (quarantine) so the
+            // VA cannot be reused while the translation to it is live.
             if (seg.spdk_registered) {
-                if (SpdkWrapper::GetInstance().UnregisterMemory(
-                        seg.shm_buffer, seg.shm_size) != 0) {
-                    LOG(ERROR) << "Failed to unregister received shm from SPDK "
-                                  "during teardown: "
+                if (!nof_runtime_.initiator ||
+                    nof_runtime_.initiator->UnregisterMemory(seg.shm_buffer) !=
+                        ErrorCode::OK) {
+                    LOG(ERROR) << "Failed to unregister received shm from the "
+                                  "NoF initiator during teardown: "
                                << seg.shm_buffer
                                << "; quarantining mapping (never munmap)";
                     quarantine_shms_.push_back(std::move(seg));
@@ -1900,15 +1997,46 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         shm_it = shm_contexts_.erase(shm_it);
     }
     // Re-attempt quarantined segments (unregister failed during this teardown
-    // or an earlier one). Any that still fail are retained until process exit,
-    // which is safe: they are never munmapped, so SPDK's translations never
-    // point at freed/reused virtual addresses.
-    RetryQuarantinedShmsLocked();
+    // or an earlier one). Failures stay pinned (never munmapped) until process
+    // exit, and are reported so teardown does not claim success while
+    // translations stay live.
+    if (RetryQuarantinedShmsLocked() != ErrorCode::OK &&
+        cleanup_error == ErrorCode::OK) {
+        cleanup_error = ErrorCode::INTERNAL_ERROR;
+    }
     if (cleanup_error != ErrorCode::OK) return tl::unexpected(cleanup_error);
     return {};
 }
 
-void RealClient::RetryQuarantinedShmsLocked() {
+ErrorCode RealClient::CleanupNofRegisteredBuffers() {
+    if (!nof_runtime_.initiator) {
+        nof_buffer_cleanup_failed_.store(false, std::memory_order_release);
+        return ErrorCode::OK;
+    }
+    bool failed = false;
+    std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+    for (auto it = registered_buffer_sizes_.begin();
+         it != registered_buffer_sizes_.end();) {
+        const ErrorCode rc =
+            nof_runtime_.initiator->UnregisterMemory(it->first);
+        if (rc != ErrorCode::OK) {
+            // Keep the record: the DMA translation state is unconfirmed,
+            // so the buffer must stay mapped.
+            LOG(ERROR) << "NoF registration for buffer " << it->first
+                       << " could not be released; its NoF pages stay "
+                          "quarantined — do NOT free or remap this buffer "
+                          "before process exit";
+            failed = true;
+            ++it;
+        } else {
+            it = registered_buffer_sizes_.erase(it);
+        }
+    }
+    nof_buffer_cleanup_failed_.store(failed, std::memory_order_release);
+    return failed ? ErrorCode::INTERNAL_ERROR : ErrorCode::OK;
+}
+
+ErrorCode RealClient::RetryQuarantinedShmsLocked() {
     auto it = quarantine_shms_.begin();
     while (it != quarantine_shms_.end()) {
         // The transfer engine may still hold this region (unregisterLocalMemory
@@ -1930,11 +2058,12 @@ void RealClient::RetryQuarantinedShmsLocked() {
             it->te_unregister_pending = false;
         }
 #ifdef USE_NOF
-        // A quarantined segment may still have a live SPDK registration: only
+        // A quarantined segment may still have a live NoF registration: only
         // munmap once the translation is actually released.
         if (it->spdk_registered) {
-            if (SpdkWrapper::GetInstance().UnregisterMemory(
-                    it->shm_buffer, it->shm_size) != 0) {
+            if (!nof_runtime_.initiator ||
+                nof_runtime_.initiator->UnregisterMemory(it->shm_buffer) !=
+                    ErrorCode::OK) {
                 ++it;
                 continue;
             }
@@ -1951,6 +2080,7 @@ void RealClient::RetryQuarantinedShmsLocked() {
                   << ", size: " << it->shm_size;
         it = quarantine_shms_.erase(it);
     }
+    return quarantine_shms_.empty() ? ErrorCode::OK : ErrorCode::INTERNAL_ERROR;
 }
 
 int RealClient::tearDownAll() { return to_py_ret(tearDownAll_internal()); }
@@ -3056,70 +3186,47 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     }
 
     // Ensure push_back below cannot reallocate and throw bad_alloc after the
-    // SPDK registration succeeded (which would leak the registration and the
+    // NoF registration succeeded (which would leak the registration and the
     // mapping). If reserve itself throws it happens before registration.
     context.mapped_shms.reserve(context.mapped_shms.size() + 1);
 
 #ifdef USE_NOF
-    // Register this mapping with SPDK for NoF zero-copy. Non-fatal on failure:
-    // the buffer stays usable for all non-NoF paths. Placed after the
-    // error-returning paths above so no failure path leaves a dangling SPDK
+    // Register this mapping with the NoF initiator for zero-copy. Non-fatal on
+    // failure: the buffer stays usable for all non-NoF paths. Placed after the
+    // error-returning paths above so no failure path leaves a dangling NoF
     // registration (the unregister below is symmetric on every teardown path).
-    if (register_spdk) {
-        if (!SpdkWrapper::IsRegistrableRange(shm.shm_buffer, shm.shm_size)) {
+    if (register_spdk && nof_runtime_.initiator) {
+        if (!NofRangeIsRegistrable(shm.shm_buffer, shm.shm_size)) {
             // Reached by the fallback mmap above when it cannot place the
-            // mapping at a 2MB-aligned base (e.g. a non-hugetlb fd). SPDK
-            // rejects such a range before marking anything (memory.c:344), so
-            // skipping the attempt keeps the teardown below able to munmap.
+            // mapping at a 2MB-aligned base (e.g. a non-hugetlb fd). A range
+            // rejected here is never touched by RegisterMemory, so the teardown
+            // below stays able to munmap without a pairing unregister.
             LOG(WARNING) << "Received shm is not 2MB-aligned; not registering "
-                            "with SPDK: "
-                         << shm.shm_buffer << ", size=" << shm.shm_size
-                         << "; NoF zero-copy transfers to this buffer will be "
-                            "unavailable";
+                            "for NoF zero-copy transfers: "
+                         << shm.shm_buffer << ", size=" << shm.shm_size;
         } else {
-            const int register_rc = SpdkWrapper::GetInstance().RegisterMemory(
-                shm.shm_buffer, shm.shm_size);
-            if (register_rc == 0) {
+            // Only NOF_REGISTRATION_STUCK (cleanup unconfirmed) must be
+            // treated as registered; a plain failure owns no registration.
+            const ErrorCode register_rc =
+                nof_runtime_.initiator->RegisterMemory(shm.shm_buffer,
+                                                       shm.shm_size);
+            if (register_rc == ErrorCode::OK) {
                 shm.spdk_registered = true;
-            } else if (register_rc == -EBUSY) {
-                // Already registered, so SPDK marked nothing new for us. Do NOT
-                // roll back: the unregister below would clear the existing
-                // registration (memory.c:358-366 detects it, 445-466 clears
-                // it). Retain the mapping and let teardown retry.
-                LOG(ERROR) << "Received shm is already registered with SPDK: "
+            } else if (register_rc == ErrorCode::NOF_REGISTRATION_STUCK) {
+                // Treat as registered so teardown retries the unregister and
+                // quarantines the mapping instead of munmapping.
+                LOG(ERROR) << "NoF registration of received shm left "
+                              "unconfirmed translation state: "
                            << shm.shm_buffer << ", size=" << shm.shm_size
-                           << "; retaining mapping";
+                           << "; treating as registered so teardown retries "
+                              "the unregister and quarantines the mapping";
                 shm.spdk_registered = true;
             } else {
-                LOG(WARNING) << "Failed to register received shm with SPDK: "
+                LOG(WARNING) << "Failed to register received shm with the NoF "
+                                "initiator: "
                              << shm.shm_buffer << ", size=" << shm.shm_size
                              << "; NoF zero-copy transfers to this buffer will "
                                 "be unavailable";
-                // spdk_mem_register() marks the range in g_mem_reg_map before
-                // running its notify callbacks and does NOT roll back on
-                // failure (SPDK v23.01.1, memory.c:370-384), and in iova=va it
-                // can already have installed the IOMMU mapping when a later
-                // step fails (memory.c:1092-1107). This unregister is the only
-                // chance to undo that, and only a 0 return proves it worked:
-                // -EINVAL is also returned for a half-marked range
-                // (memory.c:426) and, in iova=va, for an incomplete translation
-                // before the IOMMU is unmapped (memory.c:1216-1224); it covers
-                // a failure before anything was mapped as well, and the two
-                // cannot be told apart, so retaining a clean mapping is the
-                // accepted cost. Mirrors ShmHelper::allocate.
-                const int rollback_rc =
-                    SpdkWrapper::GetInstance().UnregisterMemory(shm.shm_buffer,
-                                                                shm.shm_size);
-                if (rollback_rc != 0) {
-                    LOG(ERROR)
-                        << "Failed to roll back incomplete SPDK registration: "
-                        << shm.shm_buffer << ", size: " << shm.shm_size
-                        << ", rc: " << rollback_rc
-                        << "; treating the range as registered so teardown "
-                           "retries the unregister and quarantines the mapping "
-                           "instead of munmapping";
-                    shm.spdk_registered = true;
-                }
             }
         }
     }
@@ -3145,8 +3252,8 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     context.client_buffer_allocator.reset();
 
     // Retry previously quarantined segments (unregister failed earlier) before
-    // tearing down this context.
-    RetryQuarantinedShmsLocked();
+    // tearing down this context. Failures stay quarantined for teardown.
+    (void)RetryQuarantinedShmsLocked();
 
     bool failed = false;
     // Keep the quarantine push_back below from reallocating (and throwing
@@ -3166,13 +3273,14 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
         const bool te_ok = static_cast<bool>(
             client_->unregisterLocalMemory(shm.shm_buffer, true));
 #ifdef USE_NOF
-        // Unregister the SPDK registration BEFORE munmap, mirroring
-        // ShmHelper::free()/cleanup(). munmap is only safe once the SPDK
+        // Unregister the NoF registration BEFORE munmap, mirroring
+        // ShmHelper::free()/cleanup(). munmap is only safe once the DMA
         // translation is gone.
         bool spdk_ok = true;
         if (shm.spdk_registered) {
-            spdk_ok = SpdkWrapper::GetInstance().UnregisterMemory(
-                          shm.shm_buffer, shm.shm_size) == 0;
+            spdk_ok = !nof_runtime_.initiator ||
+                      nof_runtime_.initiator->UnregisterMemory(
+                          shm.shm_buffer) == ErrorCode::OK;
         }
 #else
         const bool spdk_ok = true;
@@ -3182,22 +3290,24 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
             shm.spdk_registered = false;
 #endif
             // Both unregisters succeeded, so the VA is no longer referenced by
-            // TE or SPDK and can be released. Siblings that fail are handled by
-            // their own iterations, so a single failure does not leak the rest.
+            // TE or the NoF translation table and can be released. Siblings
+            // that fail are handled by their own iterations, so a single
+            // failure does not leak the rest.
             munmap(shm.shm_buffer, shm.shm_size);
             shm.shm_buffer = nullptr;
             continue;
         }
         // Unregister failed: retain the mapping (never munmap) so neither TE
-        // nor SPDK keeps a registration to a freed/reused VA, and quarantine it
-        // for a retry on a later teardown entry point.
+        // nor the NoF translation table keeps a registration to a freed/reused
+        // VA, and quarantine it for a retry on a later teardown entry point.
         if (!te_ok) {
             LOG(ERROR) << "Failed to unregister memory: " << shm.shm_name
                        << "; quarantining mapping (never munmap)";
         }
 #ifdef USE_NOF
         if (!spdk_ok) {
-            LOG(ERROR) << "Failed to unregister received shm from SPDK: "
+            LOG(ERROR) << "Failed to unregister received shm from the NoF "
+                          "initiator: "
                        << shm.shm_buffer
                        << "; quarantining mapping (never munmap)";
         }
@@ -3205,12 +3315,10 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
         shm.te_unregister_pending = !te_ok;
 #ifdef USE_NOF
         // Record only the side that is still registered. Clear spdk_registered
-        // when the SPDK unregister above succeeded even though the mapping
-        // stays quarantined: a later RetryQuarantinedShmsLocked() would
-        // otherwise call spdk_mem_unregister() a second time, get the benign
-        // -EINVAL no-op for an already released range (SPDK memory.c: no
-        // segment is marked REGISTERED), treat it as a failure, and keep the
-        // mapping quarantined (never munmapped) forever.
+        // when the NoF unregister above succeeded even though the mapping stays
+        // quarantined, so a later RetryQuarantinedShmsLocked() does not redo
+        // the unregister (idempotent under the interface contract, but pure
+        // noise).
         shm.spdk_registered = !spdk_ok;
 #endif
         quarantine_shms_.push_back(std::move(shm));
@@ -3435,8 +3543,8 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     context.client_buffer_allocator.reset();
 
     // Retry previously quarantined segments (unregister failed earlier) before
-    // tearing down this context.
-    RetryQuarantinedShmsLocked();
+    // tearing down this context. Failures stay quarantined for teardown.
+    (void)RetryQuarantinedShmsLocked();
 
     // Move regions out before cleanup so failure paths cannot erase the map
     // entry while iterating (undefined behavior) or double-erase at the end.
@@ -3479,33 +3587,35 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
                                    << "; quarantining mapping (never munmap)";
                     }
                 }
-            // Unregister the SPDK registration before munmap (see
-            // unmap_shm_internal). munmap is only safe once the SPDK
+            // Unregister the NoF registration before munmap (see
+            // unmap_shm_internal). munmap is only safe once the DMA
             // translation is gone.
             bool spdk_ok = true;
 #ifdef USE_NOF
             if (shm.spdk_registered) {
-                spdk_ok = SpdkWrapper::GetInstance().UnregisterMemory(
-                              shm.shm_buffer, shm.shm_size) == 0;
+                spdk_ok = !nof_runtime_.initiator ||
+                          nof_runtime_.initiator->UnregisterMemory(
+                              shm.shm_buffer) == ErrorCode::OK;
             }
 #endif
             if (!te_ok || !spdk_ok) {
                 // Unregister failed: retain the mapping (never munmap) so
-                // neither TE nor SPDK keeps a registration to a freed/reused
-                // VA, and quarantine it for a retry on a later teardown entry
-                // point.
+                // neither TE nor the NoF translation table keeps a registration
+                // to a freed/reused VA, and quarantine it for a retry on a
+                // later teardown entry point.
                 if (!spdk_ok) {
-                    LOG(ERROR) << "Failed to unregister received shm from SPDK "
-                                  "during unmap: "
+                    LOG(ERROR) << "Failed to unregister received shm from the "
+                                  "NoF initiator during unmap: "
                                << shm.shm_buffer
                                << "; quarantining mapping (never munmap)";
                 }
                 shm.te_unregister_pending = !te_ok;
 #ifdef USE_NOF
-                // Clear spdk_registered when the SPDK unregister above
+                // Clear spdk_registered when the NoF unregister above
                 // succeeded: see unmap_shm_internal (a stale flag makes the
-                // retry re-unregister an already released range, get -EINVAL,
-                // and keep the mapping quarantined forever).
+                // retry redo an already released unregister, which the
+                // interface defines as a benign no-op, but keeps the
+                // bookkeeping honest).
                 shm.spdk_registered = !spdk_ok;
 #endif
                 quarantine_shms_.push_back(std::move(shm));
@@ -3564,8 +3674,8 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     bool unregister_failed = false;
 
     // Retry previously quarantined segments (unregister failed earlier) before
-    // handling this buffer.
-    RetryQuarantinedShmsLocked();
+    // handling this buffer. Failures stay quarantined for teardown.
+    (void)RetryQuarantinedShmsLocked();
 
     // Find the shm corresponding to this dummy address
     auto shm_it = context.mapped_shms.end();
@@ -3621,33 +3731,35 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
                            << shm_it->shm_name
                            << "; quarantining mapping (never munmap)";
             }
-            // Unregister the SPDK registration before munmap (see
-            // unmap_shm_internal). munmap is only safe once the SPDK
+            // Unregister the NoF registration before munmap (see
+            // unmap_shm_internal). munmap is only safe once the DMA
             // translation is gone.
             bool spdk_ok = true;
 #ifdef USE_NOF
             if (shm_it->spdk_registered) {
-                spdk_ok = SpdkWrapper::GetInstance().UnregisterMemory(
-                              shm_it->shm_buffer, shm_it->shm_size) == 0;
+                spdk_ok = !nof_runtime_.initiator ||
+                          nof_runtime_.initiator->UnregisterMemory(
+                              shm_it->shm_buffer) == ErrorCode::OK;
             }
 #endif
             if (!te_ok || !spdk_ok) {
                 // Unregister failed: retain the mapping (never munmap) so
-                // neither TE nor SPDK keeps a registration to a freed/reused
-                // VA, and quarantine it for a retry on a later teardown entry
-                // point.
+                // neither TE nor the NoF translation table keeps a registration
+                // to a freed/reused VA, and quarantine it for a retry on a
+                // later teardown entry point.
                 if (!spdk_ok) {
-                    LOG(ERROR) << "Failed to unregister received shm from SPDK "
-                                  "during unregister: "
+                    LOG(ERROR) << "Failed to unregister received shm from the "
+                                  "NoF initiator during unregister: "
                                << shm_it->shm_buffer
                                << "; quarantining mapping (never munmap)";
                 }
                 shm_it->te_unregister_pending = !te_ok;
 #ifdef USE_NOF
-                // Clear spdk_registered when the SPDK unregister above
+                // Clear spdk_registered when the NoF unregister above
                 // succeeded: see unmap_shm_internal (a stale flag makes the
-                // retry re-unregister an already released range, get -EINVAL,
-                // and keep the mapping quarantined forever).
+                // retry redo an already released unregister, which the
+                // interface defines as a benign no-op, but keeps the
+                // bookkeeping honest).
                 shm_it->spdk_registered = !spdk_ok;
 #endif
                 quarantine_shms_.push_back(std::move(*shm_it));
@@ -4493,9 +4605,35 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     if (!result) {
         return result;
     }
+    // #3131: SPDK's RDMA transport keeps its own translation table, which TE
+    // registration does not cover. Register the same (possibly widened) range
+    // as TE; failure is non-fatal (same policy as the shm paths).
+    if (nof_runtime_.initiator) {
+        auto rc =
+            nof_runtime_.initiator->RegisterMemory(buffer, registration_size);
+        if (rc == ErrorCode::NOF_REGISTRATION_STUCK) {
+            // The failed page is terminally quarantined (never unregistered,
+            // never munmapped): the buffer must not be freed or remapped.
+            LOG(ERROR) << "NoF memory registration left unconfirmed "
+                          "translation state for buffer "
+                       << buffer << ", size " << registration_size
+                       << "; the affected NoF page is quarantined. Do not "
+                          "free or remap this buffer.";
+        } else if (rc != ErrorCode::OK) {
+            LOG(WARNING) << "NoF memory registration failed for buffer "
+                         << buffer << ", size " << registration_size << ": "
+                         << toString(rc)
+                         << "; buffer stays registered with the transfer "
+                            "engine, but NoF I/O to it will fail. Use "
+                            "hugepage-backed memory for NoF, or set "
+                            "MC_NOF_BACKEND=none if NoF is not intended.";
+        }
+    }
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        registered_buffer_sizes_[buffer] = size;
+        // The record keeps the logical size: writable-region resolution must
+        // not expose the physical segment beyond what the caller registered.
+        registered_buffer_sizes_[buffer] = {size};
     }
     return result;
 }
@@ -4510,15 +4648,47 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto unregister_result = client_->unregisterLocalMemory(buffer, true);
+    auto unregister_result = [&]() -> tl::expected<void, ErrorCode> {
+        auto &hook = TeUnregisterHookForTestingSlot();
+        if (hook) {
+            return hook(buffer);
+        }
+        return client_->unregisterLocalMemory(buffer, true);
+    }();
+
+    // Record check, NoF cleanup and record erase stay in one critical
+    // section (teardown's unregister walk takes the same lock).
+    std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+    auto rec_it = registered_buffer_sizes_.find(buffer);
     if (!unregister_result) {
-        LOG(ERROR) << "Unregister buffer failed with error: "
-                   << toString(unregister_result.error());
-        return tl::unexpected(unregister_result.error());
+        // Fall through to the NoF cleanup only when TE reports the buffer as
+        // not registered and the record is still present. NOT_REGISTERED is
+        // truthful: RdmaTransport retries any stuck MR deregistration before
+        // reporting it. Any other TE failure may leave the TE registration
+        // alive: keep the record and propagate.
+        if (unregister_result.error() != ErrorCode::NOT_REGISTERED ||
+            rec_it == registered_buffer_sizes_.end()) {
+            LOG(ERROR) << "Unregister buffer failed with error: "
+                       << toString(unregister_result.error());
+            return tl::unexpected(unregister_result.error());
+        }
+        LOG(WARNING) << "TE reports buffer " << buffer
+                     << " as already unregistered; retrying the NoF cleanup";
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        registered_buffer_sizes_.erase(buffer);
+    if (nof_runtime_.initiator) {
+        auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
+        if (rc != ErrorCode::OK) {
+            // The backend may still hold a translation for this buffer:
+            // propagate and keep the record so the NoF pages stay pinned.
+            LOG(ERROR) << "NoF memory unregistration failed for buffer "
+                       << buffer << ": " << toString(rc)
+                       << "; buffer stays recorded and the NoF pages stay "
+                          "quarantined. Do not free or remap this buffer.";
+            return tl::unexpected(rc);
+        }
+    }
+    if (rec_it != registered_buffer_sizes_.end()) {
+        registered_buffer_sizes_.erase(rec_it);
     }
     return {};
 }
@@ -4531,17 +4701,16 @@ std::optional<RealClient::WritableBufferRegion>
 RealClient::resolve_writable_buffer_region(void *buffer) const {
     std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     const auto target = reinterpret_cast<uintptr_t>(buffer);
-    for (const auto &[registered_buffer, registered_size] :
-         registered_buffer_sizes_) {
+    for (const auto &[registered_buffer, record] : registered_buffer_sizes_) {
         const auto base = reinterpret_cast<uintptr_t>(registered_buffer);
         if (target < base) {
             continue;
         }
         const auto offset = target - base;
-        if (offset < registered_size) {
+        if (offset < record.size) {
             return WritableBufferRegion{
                 .base = registered_buffer,
-                .size = registered_size,
+                .size = record.size,
                 .offset = static_cast<size_t>(offset),
             };
         }

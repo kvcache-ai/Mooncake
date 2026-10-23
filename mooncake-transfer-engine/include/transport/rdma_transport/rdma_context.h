@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 
@@ -265,16 +266,34 @@ class RdmaContext {
 
     bool autoGidSelectionEnabled() const { return auto_gid_selection_enabled_; }
 
-    bool reprobeAutoGid(
-        const GidSelectionSnapshot &expected_selection,
-        const std::vector<AutoGidSelectionIdentity> &tried_selections = {},
-        std::string *previous_gid = nullptr, std::string *next_gid = nullptr);
+    PeerAutoGidSelection preparePeerGidSelection(
+        const std::string &peer_nic_path,
+        std::string_view auto_gid_reprobe_from = {});
+
+    void requestPeerGidAdvance(const std::string &peer_nic_path);
+
+    AutoGidDataPathAction recordAutoGidCompletion(
+        const std::string &peer_nic_path, const AutoGidDataPathAttempt &attempt,
+        bool success);
+
+    void rememberPeerAdvertisedGid(const std::string &peer_nic_path,
+                                   std::string_view peer_gid);
+
+    uint64_t allocateEndpointId() {
+        return next_endpoint_id_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     // Refresh the runtime GID after IBV_EVENT_GID_CHANGE. Auto-GID mode uses
     // the same candidate filtering/ranking as initial device open; explicit
     // MC_GID_INDEX keeps the configured index and refreshes only its value.
     GidRefreshResult refreshCurrentGid(std::string *previous_gid = nullptr,
                                        std::string *next_gid = nullptr);
+
+    // Read the port's current state from the hardware. The monitor worker
+    // polls this for event-disabled contexts so a link that came back without
+    // a usable IBV_EVENT_PORT_ACTIVE is still noticed. Returns -1 and leaves
+    // *state untouched if no device is open or the query fails.
+    int queryPortState(ibv_port_state *state) const;
 
     ibv_context *context() const { return context_; }
 
@@ -333,6 +352,8 @@ class RdmaContext {
                                      ibv_port_attr &port_attr, uint8_t port,
                                      int &gid_index);
 
+    std::vector<AutoGidCandidate> queryAutoGidCandidates() const;
+
    public:
     int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
 
@@ -371,6 +392,8 @@ class RdmaContext {
     mutable std::mutex gid_lock_;
     mutable std::mutex gid_reprobe_lock_;
     bool auto_gid_selection_enabled_ = false;
+    PeerAutoGidStateTable peer_auto_gid_states_;
+    std::atomic<uint64_t> next_endpoint_id_{1};
 
     RWSpinlock memory_regions_lock_;
     MemoryRegionMap memory_region_map_;
