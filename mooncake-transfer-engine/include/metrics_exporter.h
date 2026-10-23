@@ -45,6 +45,9 @@ struct Histogram {
 
     int64_t count();
 
+    // Unlike ylt's serialize(), writes the series even while the sum is 0.
+    void serialize(std::string& out);
+
     const std::vector<double> boundaries;
     ylt::metric::histogram_t histogram;
     std::atomic<int64_t> sum{0};

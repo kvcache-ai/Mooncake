@@ -100,11 +100,6 @@ class BenchMetricsIntegrationTest : public ::testing::Test {
                   std::pair{"failures_total", uint64_t{0}},
                   std::pair{"latency_us_count", requests},
                   std::pair{"size_bytes_count", requests}}) {
-                // Histograms are exported only after their first observation.
-                if (requests == 0 &&
-                    (std::strcmp(suffix, "latency_us_count") == 0 ||
-                     std::strcmp(suffix, "size_bytes_count") == 0))
-                    continue;
                 const std::string metric =
                     std::string("mooncake_te_") + direction + "_" + suffix;
                 std::istringstream lines{std::string(response.resp_body)};
