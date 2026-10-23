@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -19,6 +20,42 @@
 namespace mooncake {
 
 namespace {
+
+void AppendFlightKeyUint64(std::string& destination, uint64_t value) {
+    for (size_t byte = 0; byte < sizeof(value); ++byte) {
+        destination.push_back(static_cast<char>((value >> (byte * 8)) & 0xff));
+    }
+}
+
+std::optional<std::string> BuildColdReadFlightKey(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+    if (keys.empty() || keys.size() != sizes.size()) return std::nullopt;
+
+    std::vector<size_t> order(keys.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(),
+              [&](size_t lhs, size_t rhs) { return keys[lhs] < keys[rhs]; });
+
+    size_t encoded_size = sizeof(uint64_t);
+    for (const auto& key : keys) {
+        encoded_size += 2 * sizeof(uint64_t) + key.size();
+    }
+    std::string flight_key;
+    flight_key.reserve(encoded_size);
+    AppendFlightKeyUint64(flight_key, keys.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        const size_t index = order[i];
+        if (i > 0 && keys[order[i - 1]] == keys[index]) {
+            // AllocateBatch's slice table is keyed by object key, so duplicate
+            // keys do not have an unambiguous one-to-one pointer mapping.
+            return std::nullopt;
+        }
+        AppendFlightKeyUint64(flight_key, keys[index].size());
+        flight_key.append(keys[index]);
+        AppendFlightKeyUint64(flight_key, static_cast<uint64_t>(sizes[index]));
+    }
+    return flight_key;
+}
 
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
@@ -348,12 +385,11 @@ void FileStorage::PartitionUnbucketedTasks(
 
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
-    if (keys.size() != 1) {
-        // Only a single-key read can be deduplicated: a multi-key batch is a
-        // distinct request even when it contains a key already in flight.
+    auto flight_key = BuildColdReadFlightKey(keys, sizes);
+    if (!flight_key) {
+        // Keep validation and duplicate-key behavior on the ordinary path.
         return BatchGetOnce(keys, sizes);
     }
-    const std::string& key = keys[0];
 
     std::shared_future<ColdReadOutcome> inflight;
     // Only the leader needs a promise, so allocate it on that branch instead
@@ -361,17 +397,18 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     std::shared_ptr<std::promise<ColdReadOutcome>> promise;
     {
         std::lock_guard<std::mutex> lock(singleflight_mutex_);
-        auto it = inflight_cold_reads_.find(key);
+        auto it = inflight_cold_reads_.find(*flight_key);
         if (it == inflight_cold_reads_.end()) {
             promise = std::make_shared<std::promise<ColdReadOutcome>>();
-            inflight_cold_reads_.emplace(key, promise->get_future().share());
+            inflight_cold_reads_.emplace(*flight_key,
+                                         promise->get_future().share());
         } else {
             inflight = it->second;
         }
     }
 
     if (inflight.valid()) {
-        // Waiter: another reader is already pulling this key off SSD.
+        // Waiter: another reader is already pulling this batch off SSD.
         // get() returns a reference into the shared state, which lives as long
         // as this future, so the waiter reads the leader's outcome in place
         // instead of copying it.
@@ -380,9 +417,10 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
             leader = &inflight.get();
         } catch (const std::future_error&) {
             // The leader unwound without publishing a result, so its promise
-            // is gone. Read the key ourselves rather than fail the caller for
-            // somebody else's error.
-            VLOG(1) << "Cold read flight abandoned for key: " << key;
+            // is gone. Read the batch ourselves rather than fail the caller
+            // for somebody else's error.
+            VLOG(1) << "Cold read flight abandoned for " << keys.size()
+                    << " key(s)";
             return BatchGetOnce(keys, sizes);
         }
         if (!leader->result) {
@@ -390,13 +428,26 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
             // SSD read for the same error.
             return leader->result;
         }
-        return ShareStagingBuffer(leader->staging);
+
+        std::vector<uint64_t> pointers;
+        pointers.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto slice = leader->staging->slices.find(keys[i]);
+            if (sizes[i] < 0 || slice == leader->staging->slices.end() ||
+                slice->second.size != static_cast<size_t>(sizes[i])) {
+                // The canonical key should make this impossible. Fall back
+                // defensively rather than return pointers in the wrong order.
+                return BatchGetOnce(keys, sizes);
+            }
+            pointers.push_back(reinterpret_cast<uintptr_t>(slice->second.ptr));
+        }
+        return ShareStagingBuffer(leader->staging, std::move(pointers));
     }
 
     // Leader: do the SSD IO, then publish it to the waiters.
-    auto forget_flight = [this, &key] {
+    auto forget_flight = [this, &flight_key] {
         std::lock_guard<std::mutex> lock(singleflight_mutex_);
-        inflight_cold_reads_.erase(key);
+        inflight_cold_reads_.erase(*flight_key);
     };
 
     ColdReadOutcome outcome;
@@ -415,7 +466,8 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
 }
 
 FileStorage::BatchGetResult FileStorage::ShareStagingBuffer(
-    const std::shared_ptr<AllocatedBatch>& staging) {
+    const std::shared_ptr<AllocatedBatch>& staging,
+    std::vector<uint64_t> pointers) {
     uint64_t alias_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
     auto lease_timeout =
         std::chrono::steady_clock::now() +
@@ -431,7 +483,7 @@ FileStorage::BatchGetResult FileStorage::ShareStagingBuffer(
     shard.batches.emplace(alias_id, ClientBufferEntry{staging, lease_timeout});
     VLOG(1) << "Sharing staging buffer of batch_id " << staging->batch_id
             << " as batch_id " << alias_id;
-    return BatchGetResult{alias_id, staging->pointers};
+    return BatchGetResult{alias_id, std::move(pointers)};
 }
 
 tl::expected<FileStorage::LocalBatchResult, ErrorCode>

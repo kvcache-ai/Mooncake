@@ -395,7 +395,7 @@ class FileStorageTest : public ::testing::Test {
     FileStorage::BatchGetResult FileStorageShareStagingBuffer(
         FileStorage& fileStorage,
         const std::shared_ptr<FileStorage::AllocatedBatch>& staging) {
-        return fileStorage.ShareStagingBuffer(staging);
+        return fileStorage.ShareStagingBuffer(staging, staging->pointers);
     }
 
     void SetPinnedRestoreArena(FileStorage& fileStorage, void* address,
@@ -1895,7 +1895,7 @@ TEST_F(FileStorageTest, BatchGetSingleflight_DifferentKeysRunConcurrently) {
         << "All different-key BatchGet calls should succeed";
 }
 
-TEST_F(FileStorageTest, BatchGetSingleflight_MultiKeyBypassesSingleflight) {
+TEST_F(FileStorageTest, BatchGetSingleflight_MultiKeyBatchSucceeds) {
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
     std::unordered_map<std::string, std::string> batch_data;
@@ -1911,6 +1911,78 @@ TEST_F(FileStorageTest, BatchGetSingleflight_MultiKeyBypassesSingleflight) {
     auto result = fileStorage.BatchGet(keys, sizes);
     ASSERT_TRUE(result) << "Multi-key BatchGet should succeed";
     fileStorage.ReleaseBuffer(result->batch_id);
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_SameMultiKeyBatchShared) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_GE(keys.size(), 3u);
+
+    keys.resize(3);
+    sizes.resize(3);
+    constexpr int kConcurrency = 16;
+    std::atomic<int> started{0};
+    std::atomic<int> success_count{0};
+    std::vector<uint64_t> first_key_pointers(kConcurrency, 0);
+    std::vector<std::thread> threads;
+    threads.reserve(kConcurrency);
+
+    for (int reader = 0; reader < kConcurrency; ++reader) {
+        threads.emplace_back([&, reader] {
+            std::vector<std::string> reader_keys;
+            std::vector<int64_t> reader_sizes;
+            for (size_t offset = 0; offset < keys.size(); ++offset) {
+                const size_t index = (reader + offset) % keys.size();
+                reader_keys.push_back(keys[index]);
+                reader_sizes.push_back(sizes[index]);
+            }
+
+            started.fetch_add(1);
+            while (started.load() < kConcurrency) {
+                std::this_thread::yield();
+            }
+            auto result = fileStorage.BatchGet(reader_keys, reader_sizes);
+            if (!result) return;
+            ASSERT_EQ(result->pointers.size(), reader_keys.size());
+            for (size_t i = 0; i < reader_keys.size(); ++i) {
+                const auto* data =
+                    reinterpret_cast<const char*>(result->pointers[i]);
+                EXPECT_EQ(std::string(data, reader_sizes[i]),
+                          batch_data.at(reader_keys[i]));
+                if (reader_keys[i] == keys.front()) {
+                    first_key_pointers[reader] = result->pointers[i];
+                }
+            }
+            fileStorage.ReleaseBuffer(result->batch_id);
+            success_count.fetch_add(1);
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    ASSERT_EQ(success_count.load(), kConcurrency);
+    size_t largest_shared_group = 0;
+    for (int i = 0; i < kConcurrency; ++i) {
+        size_t shared_group = 0;
+        for (int j = 0; j < kConcurrency; ++j) {
+            if (first_key_pointers[j] == first_key_pointers[i]) {
+                ++shared_group;
+            }
+        }
+        largest_shared_group = std::max(largest_shared_group, shared_group);
+    }
+    EXPECT_GT(largest_shared_group, 1u)
+        << "At least 2 reordered readers should share one staging batch";
 }
 
 TEST_F(FileStorageTest, BatchGetSingleflight_StagingSharingVerification) {
