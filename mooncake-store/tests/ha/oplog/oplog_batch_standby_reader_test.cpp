@@ -394,6 +394,11 @@ TEST(OpLogBatchStandbyReaderTest, FullPageContinuesOnNextPoll) {
     EXPECT_EQ(2u, first.applied_batches);
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
     EXPECT_FALSE(reader.GetLastAppliedDurablePrefix().has_value());
+    // Backlogged readers expose a snapshot boundary without claiming promotion
+    // readiness. This is the state that used to starve snapshot capture.
+    ASSERT_TRUE(reader.GetLastAppliedBatchPrefix().has_value());
+    EXPECT_EQ(2u, reader.GetLastAppliedBatchPrefix()->batch_id);
+    EXPECT_EQ(2u, reader.GetLastAppliedBatchPrefix()->last_seq);
 
     auto second = reader.PollOnce(/*max_batches=*/2);
     ASSERT_EQ(ErrorCode::OK, second.error);
@@ -404,6 +409,8 @@ TEST(OpLogBatchStandbyReaderTest, FullPageContinuesOnNextPoll) {
     ASSERT_TRUE(applied_prefix.has_value());
     EXPECT_EQ(3u, applied_prefix->batch_id);
     EXPECT_EQ(3u, applied_prefix->last_seq);
+    ASSERT_TRUE(reader.GetLastAppliedBatchPrefix().has_value());
+    EXPECT_EQ(3u, reader.GetLastAppliedBatchPrefix()->batch_id);
 }
 
 TEST(OpLogBatchStandbyReaderTest, ReportsValidZeroBoundaryAsComplete) {
@@ -420,6 +427,9 @@ TEST(OpLogBatchStandbyReaderTest, ReportsValidZeroBoundaryAsComplete) {
     ASSERT_TRUE(applied_prefix.has_value());
     EXPECT_EQ(0u, applied_prefix->batch_id);
     EXPECT_EQ(0u, applied_prefix->last_seq);
+    ASSERT_TRUE(reader.GetLastAppliedBatchPrefix().has_value());
+    EXPECT_EQ(0u, reader.GetLastAppliedBatchPrefix()->batch_id);
+    EXPECT_EQ(0u, reader.GetLastAppliedBatchPrefix()->last_seq);
 }
 
 TEST(OpLogBatchStandbyReaderTest, RejectsPrefixPointingIntoBatch) {
@@ -439,6 +449,7 @@ TEST(OpLogBatchStandbyReaderTest, RejectsPrefixPointingIntoBatch) {
     EXPECT_NE(ErrorCode::OK, result.error);
     EXPECT_EQ(0u, result.applied_entries);
     EXPECT_EQ(1u, applier.GetExpectedSequenceId());
+    EXPECT_FALSE(reader.GetLastAppliedBatchPrefix().has_value());
 }
 
 TEST(OpLogBatchStandbyReaderTest, AppliesExpandedEntriesInSequenceOrder) {

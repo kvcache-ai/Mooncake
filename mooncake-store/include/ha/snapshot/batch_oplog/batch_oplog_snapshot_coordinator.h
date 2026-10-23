@@ -95,7 +95,8 @@ class BatchOpLogSnapshotCoordinator final {
     ErrorCode RunAttempt();
     std::optional<uint64_t> ReadLatestBatchId(ErrorCode& error) const;
     bool CatchUpComplete(const DurablePrefix& target) const;
-    void FinishAttempt(ErrorCode error, bool count_attempt);
+    void FinishAttempt(ErrorCode error, bool count_attempt,
+                       bool published = false);
     Clock::time_point Now() const;
     void OnCaptureReleased();
     std::optional<DurablePrefix> ReadDurablePrefix() const;
@@ -118,7 +119,7 @@ class BatchOpLogSnapshotCoordinator final {
     bool promotion_requested_{false};
     uint64_t attempts_{0};
     ErrorCode last_error_{ErrorCode::OK};
-    std::optional<Clock::time_point> last_attempt_complete_;
+    std::optional<Clock::time_point> next_attempt_at_;
     std::optional<DurablePrefix> capture_cursor_;
     std::optional<DurablePrefix> catch_up_target_;
 };
