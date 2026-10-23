@@ -75,7 +75,7 @@ class Evictor::Pass {
             if (!entry) {
                 break;
             }
-            for (const std::string& key : entry->keys) {
+            for (const std::string_view key : entry->keys) {
                 if (report_.stopped) {
                     break;
                 }
