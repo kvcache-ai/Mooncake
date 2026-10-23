@@ -19,12 +19,9 @@ ARG TORCH_VERSION=2.14.1
 ARG TORCH_CUDA_ARCH_LIST="8.0;9.0;10.3"
 # CI can opt in to removing /workspace/build from the builder layer.
 ARG CLEAN_BUILD_ARTIFACTS=0
-# Bound both CMake/Ninja and the PyTorch JIT build on small CI runners.
-ARG BUILD_JOBS=2
 
 ENV PYTHON_VERSION=${PYTHON_VERSION} \
     TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
-    MAX_JOBS=${BUILD_JOBS} \
     PATH="/usr/local/go/bin:${PATH}"
 
 # Install base build utilities and the requested Python version via deadsnakes PPA
@@ -70,7 +67,7 @@ RUN mkdir -p build && \
         -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
     export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
-    cmake --build . --parallel "${BUILD_JOBS}" && \
+    cmake --build . && \
     cd /workspace && \
     export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH && \
     export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH && \

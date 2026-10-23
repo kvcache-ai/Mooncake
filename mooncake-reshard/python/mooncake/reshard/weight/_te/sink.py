@@ -8,11 +8,11 @@ from ...contracts import LeaseId, RuntimeFragmentId
 from ...transfer_engine import (
     MooncakeTransferEngineExecutor,
     TransferCompletionFailedError,
+    TransferBatch,
     TransferDirection,
     TransferEngineError,
     TransferSubmission,
 )
-from ...transfer_engine.lifetime import AllocationTokenSet, TerminalTransferState
 from ..manifest import (
     ParallelRank,
     RuntimeBindingFragment,
@@ -20,26 +20,21 @@ from ..manifest import (
     WeightRuntimeBindingManifest,
 )
 from ..planner import BoundWeightFragment, LiveTransferOperation, TransferPlan
+from .batching import iter_transfer_batches
 from .execution import (
-    endpoint_receipt_totals,
     executor_requirements_for_operation_indices,
     executors_for_operation_indices,
-    iter_endpoint_batches,
     operation_indices_for_executors,
     pair_manifests,
     planned_executors_for_binding,
+    select_worker_executors,
+    validate_scoped_executor_snapshot,
     require_live_transfer_operation,
     runtime_binding_fragment,
-    select_worker_executors,
     validate_execution_input_types,
     validate_lowering_budget,
     validate_lowering_limits,
     validate_manifest_pair,
-    validate_scoped_executor_snapshot,
-)
-from .lifetime import (
-    WeightAllocationGuardProviders,
-    acquire_weight_lifetime_tokens,
 )
 from .registration import (
     MemoryRegistrationLease,
@@ -48,6 +43,11 @@ from .registration import (
     same_runtime_snapshot,
     validate_registration,
 )
+from .lifetime import (
+    WeightAllocationGuardProviders,
+    acquire_weight_lifetime_tokens,
+)
+from ...transfer_engine.lifetime import AllocationTokenSet, TerminalTransferState
 
 
 @dataclass(frozen=True)
@@ -66,7 +66,6 @@ class MooncakeTransferEngineSink:
         max_batch_operations: int = 1024,
         max_region_segments: int = 1_000_000,
         max_total_lowered_segments: int = 10_000_000,
-        max_inflight_batches: int = 1,
         max_completion_drain_attempts: int = 3,
         completion_drain_timeout_ms: int = 1000,
     ) -> None:
@@ -74,7 +73,6 @@ class MooncakeTransferEngineSink:
             max_batch_operations=max_batch_operations,
             max_region_segments=max_region_segments,
             max_total_lowered_segments=max_total_lowered_segments,
-            max_inflight_batches=max_inflight_batches,
             max_completion_drain_attempts=max_completion_drain_attempts,
             completion_drain_timeout_ms=completion_drain_timeout_ms,
         )
@@ -87,7 +85,6 @@ class MooncakeTransferEngineSink:
         self.max_batch_operations = max_batch_operations
         self.max_region_segments = max_region_segments
         self.max_total_lowered_segments = max_total_lowered_segments
-        self.max_inflight_batches = max_inflight_batches
         self.max_completion_drain_attempts = max_completion_drain_attempts
         self.completion_drain_timeout_ms = completion_drain_timeout_ms
 
@@ -427,28 +424,42 @@ class MooncakeTransferEngineSink:
             ),
             lifetime_tokens=lifetime_tokens,
         ):
-            batch_receipts = submission.execute_batches(
-                iter_endpoint_batches(
-                    operations_by_endpoint,
+            receipts: list[DirectTransferReceipt] = []
+            for endpoint in sorted(operations_by_endpoint):
+                operations = sorted(
+                    operations_by_endpoint[endpoint],
+                    key=lambda item: (
+                        item[2].address + item[0].target_offset,
+                        item[1].address + item[0].source_offset,
+                    ),
+                )
+                operation_count = 0
+                total_bytes = 0
+                for batch in iter_transfer_batches(
+                    endpoint,
+                    operations,
                     max_batch_operations=self.max_batch_operations,
                     max_region_segments=self.max_region_segments,
-                ),
-                TransferDirection.WRITE,
-                max_inflight_batches=self.max_inflight_batches,
-            )
-            totals_by_endpoint = endpoint_receipt_totals(batch_receipts)
-            receipts = [
-                DirectTransferReceipt(
-                    source_worker_id=local_source_worker_id,
-                    target_endpoint=endpoint,
-                    operation_count=operation_count,
-                    nbytes=total_bytes,
+                ):
+                    self._transfer_batch(submission, batch)
+                    operation_count += batch.operation_count
+                    total_bytes += batch.nbytes
+                receipts.append(
+                    DirectTransferReceipt(
+                        source_worker_id=local_source_worker_id,
+                        target_endpoint=endpoint,
+                        operation_count=operation_count,
+                        nbytes=total_bytes,
+                    )
                 )
-                for endpoint, (operation_count, total_bytes) in sorted(
-                    totals_by_endpoint.items()
-                )
-            ]
         return tuple(receipts)
+
+    def _transfer_batch(
+        self,
+        submission: TransferSubmission,
+        batch: TransferBatch,
+    ) -> None:
+        submission.execute_batch(batch, TransferDirection.WRITE)
 
     def pending_transfer_ids(self) -> tuple[str, ...]:
         return self.transfer_executor.pending_transfer_ids()

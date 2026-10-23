@@ -132,11 +132,6 @@ class ScatterTransferTicket {
 
 namespace {
 
-struct ScatterTransferSubmission {
-    std::shared_ptr<ScatterTransferTicket> ticket;
-    uint64_t total_length;
-};
-
 uint64_t nanosToCeilingMillis(uint64_t timeout_ns) {
     constexpr uint64_t kNanosPerMillis = 1000 * 1000;
     if (timeout_ns >
@@ -144,83 +139,6 @@ uint64_t nanosToCeilingMillis(uint64_t timeout_ns) {
         return std::numeric_limits<uint64_t>::max() / kNanosPerMillis;
     }
     return (timeout_ns + kNanosPerMillis - 1) / kNanosPerMillis;
-}
-
-ScatterTransferSubmission submitScatterWithTicket(
-    const std::shared_ptr<TransferEngine>& engine, const std::string& endpoint,
-    const std::vector<uintptr_t>& local_base_addresses,
-    const std::vector<size_t>& local_capacities,
-    const std::vector<uint64_t>& remote_base_addresses,
-    const std::vector<size_t>& remote_capacities,
-    const std::vector<std::vector<size_t>>& local_offsets,
-    const std::vector<std::vector<size_t>>& remote_offsets,
-    const std::vector<std::vector<size_t>>& lengths,
-    TransferEnginePy::TransferOpcode opcode) {
-    const size_t range_count = local_base_addresses.size();
-    if (local_capacities.size() != range_count ||
-        remote_base_addresses.size() != range_count ||
-        remote_capacities.size() != range_count ||
-        local_offsets.size() != range_count ||
-        remote_offsets.size() != range_count || lengths.size() != range_count) {
-        LOG(ERROR) << "Scatter transfer range arrays have different sizes";
-        return {ScatterTransferTicket::terminal(
-                    ScatterTransferCompletionStatus::FAILED_DRAINED),
-                0};
-    }
-
-    std::vector<TransferEngine::ScatterTransferRange> ranges;
-    ranges.reserve(range_count);
-    uint64_t total_length = 0;
-    for (size_t i = 0; i < range_count; ++i) {
-        constexpr auto kMaxLocalAddress = std::numeric_limits<uintptr_t>::max();
-        if (local_capacities[i] > kMaxLocalAddress ||
-            local_base_addresses[i] >
-                kMaxLocalAddress -
-                    static_cast<uintptr_t>(local_capacities[i])) {
-            LOG(ERROR) << "Scatter transfer local allocation range overflows "
-                          "the address space at range "
-                       << i;
-            return {ScatterTransferTicket::terminal(
-                        ScatterTransferCompletionStatus::FAILED_DRAINED),
-                    0};
-        }
-        const size_t fragment_count = local_offsets[i].size();
-        if (remote_offsets[i].size() != fragment_count ||
-            lengths[i].size() != fragment_count) {
-            LOG(ERROR) << "Scatter transfer fragment arrays have different "
-                          "sizes at range "
-                       << i;
-            return {ScatterTransferTicket::terminal(
-                        ScatterTransferCompletionStatus::FAILED_DRAINED),
-                    0};
-        }
-
-        TransferEngine::ScatterTransferRange range;
-        range.opcode = opcode == TransferEnginePy::TransferOpcode::WRITE
-                           ? TransferRequest::WRITE
-                           : TransferRequest::READ;
-        range.remote_segment = endpoint;
-        range.remote_base_offset = remote_base_addresses[i];
-        range.remote_size = remote_capacities[i];
-        range.local_buffer = reinterpret_cast<void*>(local_base_addresses[i]);
-        range.local_capacity = local_capacities[i];
-        range.local_offsets = local_offsets[i];
-        range.remote_offsets = remote_offsets[i];
-        range.lengths = lengths[i];
-        ranges.push_back(std::move(range));
-
-        for (size_t length : lengths[i]) {
-            if (length > std::numeric_limits<uint64_t>::max() - total_length) {
-                total_length = std::numeric_limits<uint64_t>::max();
-                break;
-            }
-            total_length += length;
-        }
-    }
-
-    auto operation = std::make_shared<TransferEngine::ScatterTransferOperation>(
-        engine->submitScatter(ranges));
-    return {std::make_shared<ScatterTransferTicket>(operation), total_length};
 }
 
 }  // namespace
@@ -693,17 +611,74 @@ TransferEnginePy::scatterTransferSyncWithTicket(
     const std::vector<std::vector<size_t>>& remote_offsets,
     const std::vector<std::vector<size_t>>& lengths, TransferOpcode opcode) {
     pybind11::gil_scoped_release release;
-    auto submission = submitScatterWithTicket(
-        engine_, endpoint, local_base_addresses, local_capacities,
-        remote_base_addresses, remote_capacities, local_offsets, remote_offsets,
-        lengths, opcode);
+    const size_t range_count = local_base_addresses.size();
+    if (local_capacities.size() != range_count ||
+        remote_base_addresses.size() != range_count ||
+        remote_capacities.size() != range_count ||
+        local_offsets.size() != range_count ||
+        remote_offsets.size() != range_count || lengths.size() != range_count) {
+        LOG(ERROR) << "Scatter transfer range arrays have different sizes";
+        return ScatterTransferTicket::terminal(
+            ScatterTransferCompletionStatus::FAILED_DRAINED);
+    }
+
+    std::vector<TransferEngine::ScatterTransferRange> ranges;
+    ranges.reserve(range_count);
+    uint64_t total_length = 0;
+    for (size_t i = 0; i < range_count; ++i) {
+        constexpr auto kMaxLocalAddress = std::numeric_limits<uintptr_t>::max();
+        if (local_capacities[i] > kMaxLocalAddress ||
+            local_base_addresses[i] >
+                kMaxLocalAddress -
+                    static_cast<uintptr_t>(local_capacities[i])) {
+            LOG(ERROR) << "Scatter transfer local allocation range overflows "
+                          "the address space at range "
+                       << i;
+            return ScatterTransferTicket::terminal(
+                ScatterTransferCompletionStatus::FAILED_DRAINED);
+        }
+        const size_t fragment_count = local_offsets[i].size();
+        if (remote_offsets[i].size() != fragment_count ||
+            lengths[i].size() != fragment_count) {
+            LOG(ERROR) << "Scatter transfer fragment arrays have different "
+                          "sizes at range "
+                       << i;
+            return ScatterTransferTicket::terminal(
+                ScatterTransferCompletionStatus::FAILED_DRAINED);
+        }
+
+        TransferEngine::ScatterTransferRange range;
+        range.opcode = opcode == TransferOpcode::WRITE ? TransferRequest::WRITE
+                                                       : TransferRequest::READ;
+        range.remote_segment = endpoint;
+        range.remote_base_offset = remote_base_addresses[i];
+        range.remote_size = remote_capacities[i];
+        range.local_buffer = reinterpret_cast<void*>(local_base_addresses[i]);
+        range.local_capacity = local_capacities[i];
+        range.local_offsets = local_offsets[i];
+        range.remote_offsets = remote_offsets[i];
+        range.lengths = lengths[i];
+        ranges.push_back(std::move(range));
+
+        for (size_t length : lengths[i]) {
+            if (length > std::numeric_limits<uint64_t>::max() - total_length) {
+                total_length = std::numeric_limits<uint64_t>::max();
+                break;
+            }
+            total_length += length;
+        }
+    }
+
+    auto operation = std::make_shared<TransferEngine::ScatterTransferOperation>(
+        engine_->submitScatter(ranges));
+    auto ticket = std::make_shared<ScatterTransferTicket>(operation);
     const uint64_t timeout_ns =
-        submission.total_length >
+        total_length >
                 std::numeric_limits<uint64_t>::max() - transfer_timeout_nsec_
             ? std::numeric_limits<uint64_t>::max()
-            : transfer_timeout_nsec_ + submission.total_length;
-    submission.ticket->drain(nanosToCeilingMillis(timeout_ns));
-    return submission.ticket;
+            : transfer_timeout_nsec_ + total_length;
+    ticket->drain(nanosToCeilingMillis(timeout_ns));
+    return ticket;
 }
 
 batch_id_t TransferEnginePy::batchTransferAsyncWrite(
@@ -1822,25 +1797,6 @@ PYBIND11_MODULE(engine, m) {
         .def_readwrite("name", &TransferEnginePy::TransferNotify::name)
         .def_readwrite("msg", &TransferEnginePy::TransferNotify::msg);
 
-    auto submit_scatter = [](TransferEnginePy::TransferOpcode opcode) {
-        return [opcode](TransferEnginePy& adaptor, const std::string& endpoint,
-                        const std::vector<uintptr_t>& local_base_addresses,
-                        const std::vector<size_t>& local_capacities,
-                        const std::vector<uint64_t>& remote_base_addresses,
-                        const std::vector<size_t>& remote_capacities,
-                        const std::vector<std::vector<size_t>>& local_offsets,
-                        const std::vector<std::vector<size_t>>& remote_offsets,
-                        const std::vector<std::vector<size_t>>& lengths) {
-            py::gil_scoped_release release;
-            return submitScatterWithTicket(
-                       adaptor.getEngine(), endpoint, local_base_addresses,
-                       local_capacities, remote_base_addresses,
-                       remote_capacities, local_offsets, remote_offsets,
-                       lengths, opcode)
-                .ticket;
-        };
-    };
-
     auto adaptor_cls =
         py::class_<TransferEnginePy>(m, "TransferEngine")
             .def(py::init<>())
@@ -1868,20 +1824,6 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("transport_hint") = "", py::arg("nic_hint") = "")
-            .def("submit_scatter_write",
-                 submit_scatter(TransferEnginePy::TransferOpcode::WRITE),
-                 py::arg("endpoint"), py::arg("local_base_addresses"),
-                 py::arg("local_capacities"), py::arg("remote_base_addresses"),
-                 py::arg("remote_capacities"), py::arg("local_offsets"),
-                 py::arg("remote_offsets"), py::arg("lengths"),
-                 py::keep_alive<0, 1>())
-            .def("submit_scatter_read",
-                 submit_scatter(TransferEnginePy::TransferOpcode::READ),
-                 py::arg("endpoint"), py::arg("local_base_addresses"),
-                 py::arg("local_capacities"), py::arg("remote_base_addresses"),
-                 py::arg("remote_capacities"), py::arg("local_offsets"),
-                 py::arg("remote_offsets"), py::arg("lengths"),
-                 py::keep_alive<0, 1>())
             .def("scatter_transfer_sync_write_with_ticket",
                  &TransferEnginePy::scatterTransferSyncWriteWithTicket,
                  py::arg("endpoint"), py::arg("local_base_addresses"),

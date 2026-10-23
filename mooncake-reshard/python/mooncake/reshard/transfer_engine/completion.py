@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import time
-from collections.abc import Sequence
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, Protocol, Union, cast
+from typing import Any, Protocol, Sequence, Union, cast
 from uuid import uuid4
 
 from .lifetime import (
@@ -86,11 +84,6 @@ class _UndrainableCompletionUnknownTicket:
     status = "COMPLETION_UNKNOWN"
     restart_required = True
 
-    def __init__(self, owner: object | None = None) -> None:
-        # Keep the original ticket alive so its native destructor cannot run
-        # while quarantined. This placeholder never delegates drain to it.
-        self._owner = owner
-
     def drain(self, timeout_ms: int) -> str:
         return self.status
 
@@ -103,68 +96,6 @@ class _TerminalCleanupTicket:
 
     def drain(self, timeout_ms: int) -> str:
         return self.status
-
-
-class _CompositeCompletionTicket:
-    """Retain multiple native operations behind one pending-transfer handle."""
-
-    def __init__(
-        self,
-        tickets: Sequence[_CompletionTicket],
-        *,
-        terminal_failed: bool = False,
-    ) -> None:
-        self._tickets = tuple(tickets)
-        if not self._tickets:
-            raise ValueError("composite completion ticket requires child tickets")
-        self._terminal_failed = terminal_failed
-        self.restart_required = any(
-            getattr(ticket, "restart_required", False) for ticket in self._tickets
-        )
-
-    @property
-    def status(self) -> str:
-        return self._aggregate(tuple(ticket.status for ticket in self._tickets))
-
-    def drain(self, timeout_ms: int) -> str:
-        deadline_ns = time.monotonic_ns() + timeout_ms * 1_000_000
-        statuses: list[object] = []
-        interruption: BaseException | None = None
-        for ticket in self._tickets:
-            try:
-                status = ticket.status
-                if _completion_status_name(status) == "COMPLETION_UNKNOWN":
-                    remaining_ms = max(
-                        0, (deadline_ns - time.monotonic_ns()) // 1_000_000
-                    )
-                    status = ticket.drain(remaining_ms)
-                statuses.append(status)
-            except BaseException as error:
-                statuses.append("COMPLETION_UNKNOWN")
-                if interruption is None:
-                    interruption = error
-        if interruption is not None:
-            raise interruption
-        return self._aggregate(tuple(statuses))
-
-    def _aggregate(self, statuses: Sequence[object]) -> str:
-        names = tuple(_completion_status_name(status) for status in statuses)
-        if "COMPLETION_UNKNOWN" in names:
-            return "COMPLETION_UNKNOWN"
-        if self._terminal_failed or any(name != "COMPLETED" for name in names):
-            return "FAILED_DRAINED"
-        return "COMPLETED"
-
-
-def _composite_completion_ticket(
-    tickets: Sequence[_CompletionTicket],
-    *,
-    terminal_failed: bool = False,
-) -> _CompletionTicket:
-    return _CompositeCompletionTicket(
-        tickets,
-        terminal_failed=terminal_failed,
-    )
 
 
 def _canonical_engine_identity(engine: Any) -> tuple[str, int]:
@@ -272,19 +203,6 @@ def _batch_transfer_with_completion_fence(
             _UndrainableCompletionUnknownTicket(),
             error,
         ) from error
-    return _drain_completion_ticket(
-        ticket,
-        max_drain_attempts=max_drain_attempts,
-        drain_timeout_ms=drain_timeout_ms,
-    )
-
-
-def _drain_completion_ticket(
-    ticket: _CompletionTicket,
-    *,
-    max_drain_attempts: int,
-    drain_timeout_ms: int,
-) -> Union[int, str]:
     try:
         status_name = _completion_status_name(ticket.status)
     except Exception as error:
@@ -576,9 +494,7 @@ class PendingTransferManager:
                     with _pending_transfer_lock:
                         current = _pending_transfers.get(pending_transfer_id)
                         if current is not None:
-                            current.ticket = _UndrainableCompletionUnknownTicket(
-                                current.ticket
-                            )
+                            current.ticket = _UndrainableCompletionUnknownTicket()
                             current.restart_required = True
                     detail = (
                         "pending transfer unregister_memory outcome is unknown; "
@@ -631,9 +547,7 @@ class PendingTransferManager:
                     with _pending_transfer_lock:
                         current = _pending_transfers.get(pending_transfer_id)
                         if current is not None:
-                            current.ticket = _UndrainableCompletionUnknownTicket(
-                                current.ticket
-                            )
+                            current.ticket = _UndrainableCompletionUnknownTicket()
                             current.restart_required = True
                     detail = (
                         "pending transfer allocation lifetime release outcome is "

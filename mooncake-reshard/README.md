@@ -139,29 +139,9 @@ the compatibility entry point. `max_batch_operations`,
 `max_region_segments`, and `max_total_lowered_segments` bound physical
 expansion before native submission.
 
-Set `max_inflight_batches` on the reader or sink to overlap batches across
-selected endpoints. The default, `1`, drains each batch before submitting the
-next. Larger windows require the native `submit_scatter_read/write` methods,
-which return a completion ticket immediately after submission. The executor
-drains the oldest ticket when the window is full and returns receipts in
-submission order. Batch size limits still apply to each submitted batch.
-
-All published tickets are drained before returning a known failure. Unresolved
-tickets share one pending-transfer handle, which retains the active
-registrations and allocation tokens until every ticket reaches a terminal
-state. A native submit exception without a recoverable ticket requires engine
-restart. The resource-neutral API exposes the same window through
-`TransferSubmission.execute_batches(..., max_inflight_batches=N)`.
-
-Each composite pending-ticket drain shares one timeout budget across its
-children. Later children receive the remaining budget, including zero for a
-non-blocking completion check. Backend calls must honor that timeout; status
-queries and scheduling overhead are additional to the wait budget.
-
-`execute_batches` borrows its input iterable and does not call `close()` on
-caller-owned iterators. Keep a resource-owning generator alive on early exit,
-and explicitly close it after outstanding transfers reach a terminal state.
-Its `finally` block must not free buffers still retained by a pending transfer.
+This version drains each batch ticket to a known terminal state before it
+submits the next batch or endpoint. Native non-draining submission and a
+bounded multi-ticket window are the next performance phase.
 
 Live TE adapters accept runtime-bound source fragments. Store-backed restore
 continues through `WeightStore.load()`, which uses the same target placement and

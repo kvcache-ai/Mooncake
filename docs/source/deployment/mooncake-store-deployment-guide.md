@@ -1007,13 +1007,11 @@ Allocation first tries the key's hash-selected DFS shard, then tries other
 ready shards if that shard has no suitable extent. This lets new shards accept
 writes even when older shards are full. `NO_AVAILABLE_HANDLE` means no ready
 shard could satisfy the allocation. A DFS object is never striped across shards.
-The selected shard must have a contiguous free extent large enough for the
-object rounded up to `MOONCAKE_DFS_ALIGNMENT` (`aligned_size`) and then to the
-allocator's size class. No leading alignment padding is needed: each shard
-allocator starts at offset 0, and size-class rounding, splitting, and coalescing
-preserve alignment. Size-class rounding can still reserve more than
-`aligned_size`, so usable object capacity depends on object sizes and
-fragmentation.
+The selected shard must have room for the object rounded
+up to `MOONCAKE_DFS_ALIGNMENT`, plus up to one alignment unit of allocator
+padding (`MOONCAKE_DFS_ALIGNMENT - 1` bytes); usable object capacity is
+therefore lower than the shard file's
+logical size.
 
 For `Put`, `BatchPut`, `Upsert`, and `BatchUpsert`, the client writes requested
 memory and NoF replicas, stages device buffers to host memory when necessary,
@@ -1043,7 +1041,7 @@ reads for that descriptor.
   setup API cannot initialize the distributed `FileStorage` backend. Use the
   native C++ or Python/RealClient API.
 - A DFS object must fit in a single shard after alignment and allocator
-  size-class rounding; objects are not striped across shards.
+  padding; objects are not striped across shards.
 - DFS allocator state is currently in memory. A master restart or HA leader
   failover does not reconstruct existing DFS allocations, so DFS cannot provide
   continuity across those events.

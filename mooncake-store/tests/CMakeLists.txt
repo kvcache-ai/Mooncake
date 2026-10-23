@@ -228,9 +228,12 @@ add_store_test(promotion_candidate_tracker_test
 add_store_test(dynamic_replication_lease_table_test
                dynamic_replication_lease_table_test.cpp)
 add_store_test(group_index_test group_index_test.cpp)
-add_store_test(metadata_namespace_test metadata_namespace_test.cpp)
-add_store_test(metadata_namespace_table_test metadata_namespace_table_test.cpp)
-add_store_test(eviction_index_test eviction_index_test.cpp)
+add_store_test(metadata_tenant_test metadata_tenant_test.cpp)
+add_store_test(metadata_tenant_registry_test metadata_tenant_registry_test.cpp)
+add_store_test(client_readonly_query_test client_readonly_query_test.cpp)
+add_store_test(prefetch_throttle_test prefetch_throttle_test.cpp)
+add_store_test(prefetch_task_master_test prefetch_task_master_test.cpp)
+add_store_test(prefetch_teardown_test prefetch_teardown_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)
 target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -289,10 +292,6 @@ if(USE_NOF)
 endif()
 add_store_test(client_host_identity_config_test
                client_host_identity_config_test.cpp)
-add_store_test(client_readonly_query_test client_readonly_query_test.cpp)
-add_store_test(prefetch_throttle_test prefetch_throttle_test.cpp)
-add_store_test(prefetch_task_master_test prefetch_task_master_test.cpp)
-add_store_test(prefetch_teardown_test prefetch_teardown_test.cpp)
 add_store_test(client_metric_config_test client_metric_config_test.cpp)
 add_test(
   NAME client_metric_cluster_id_test

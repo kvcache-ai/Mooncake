@@ -3,21 +3,20 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+
 from mooncake.reshard.weight.te import (
-    MooncakeTransferEngineSink,
     TransferCompletionUnknownError,
+    MooncakeTransferEngineSink,
     TransferEngineError,
 )
 
 from .helpers import (
-    FakeAsyncScatterTransferEngine,
+    allocation_guards,
+    allocation_guards_for_bindings,
     FakeBatchTransferTicket,
     FakeScatterTransferEngine,
     FakeTransferEngine,
     RuntimeInputs,
-    allocation_guards,
-    allocation_guards_for_bindings,
-    execute_sink,
     manifests,
     multi_worker_participant_inputs,
     plan_transfer,
@@ -25,30 +24,6 @@ from .helpers import (
     with_revision,
     with_fragment_address,
 )
-
-
-def test_sink_bounds_inflight_batches_across_target_endpoints() -> None:
-    source = manifests(tp=1, prefix="source", address_base=0x10000)
-    target = manifests(tp=2, prefix="target", address_base=0x40000)
-    engine = FakeAsyncScatterTransferEngine()
-    sink = MooncakeTransferEngineSink(
-        engine,
-        max_batch_operations=1,
-        max_inflight_batches=2,
-    )
-
-    receipts = execute_sink(
-        sink,
-        plan_transfer(source, target),
-        source,
-        target,
-        target_registrations=registration_leases(target),
-    )
-
-    assert len(receipts) == 2
-    assert engine.peak_active_tickets == 2
-    assert engine.active_tickets == 0
-    assert [direction for direction, _ in engine.scatter_calls] == ["write", "write"]
 
 
 def test_te_sink_executes_local_source_ranges_without_staging_buffer() -> None:

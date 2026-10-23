@@ -72,5 +72,5 @@ MASTER_SERVER=127.0.0.1:50051 \
   MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=2 \
   MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT=10 \
   MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
-  python mooncake-wheel/tests/test_prefetch_on_exist.py
+  python python/tests/ssd/test_prefetch_on_exist.py
 ci_stop_service prefetch
