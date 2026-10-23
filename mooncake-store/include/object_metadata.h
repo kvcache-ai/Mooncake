@@ -328,7 +328,7 @@ struct ObjectMetadata {
         return lease_->IsExpired(now);
     }
 
-    // Lease deadline for the eviction census.
+    // Lease deadline eviction ranks the object by.
     std::chrono::system_clock::time_point EvictionDeadline() const {
         return lease_->ExpiresAt();
     }

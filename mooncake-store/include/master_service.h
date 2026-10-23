@@ -1024,14 +1024,14 @@ class MasterService {
         const std::vector<std::string>& keys, const TenantId& tenant_id,
         bool grant_lease);
 
-    // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
-    // object with smaller lease timeout. It has two passes. The first pass only
-    // evicts objects without soft pin. The second pass prioritizes objects
-    // without soft pin, but also allows to evict soft pinned objects if
-    // allow_evict_soft_pinned_objects_ is true. The first pass tries fulfill
-    // evict ratio target. If the actual evicted ratio is less than
-    // evict_ratio_lowerbound, the second pass will be triggered and try to
-    // fulfill evict ratio lowerbound.
+    // One pool-wide round of memory eviction (see eviction::Evictor), after
+    // the housekeeping that frees expired writes and deferred releases. Each
+    // namespace gives up `evict_ratio_target` of the objects its eviction
+    // index filed, oldest lease first, soft-pinned objects only when
+    // allow_evict_soft_pinned_objects_ is set and only up to
+    // `evict_ratio_lowerbound`. It consumes the allocation-pressure signal and
+    // raises it again when the round could free nothing that was there to
+    // free.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
@@ -1039,6 +1039,9 @@ class MasterService {
         uint64_t freed_bytes{0};
         uint64_t evicted_objects{0};
     };
+    // Evicts memory replicas of one tenant's objects, oldest lease first,
+    // until `target_bytes` are freed or nothing more qualifies (see
+    // eviction::Evictor).
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const TenantId& tenant_id, uint64_t target_bytes);
 
@@ -1178,42 +1181,6 @@ class MasterService {
     std::vector<std::string> GetGroupMemberKeys(
         const TenantId& tenant_id, const std::string& group_id) const;
 
-    // A single group member's eviction outcome, fed back by the
-    // EvictGroupOrObject callback.
-    struct EvictMemberOutcome {
-        uint64_t freed_bytes{0};
-        long evicted_objects{0};
-        bool stop_scan{false};
-        ErrorCode error{ErrorCode::OK};
-    };
-    // Aggregated outcome of a group eviction.
-    struct GroupEvictionResult {
-        uint64_t freed_bytes{0};
-        long evicted_objects{0};
-        bool stop_scan{false};
-        ErrorCode error{ErrorCode::OK};
-    };
-
-    class MetadataAccessorRW;
-    // Evicts every member of `group_id`, one key at a time. MUST be called
-    // WITHOUT holding any key: it holds each member itself, and never two at
-    // once, so concurrent group evictions cannot deadlock on each other.
-    //
-    // Each member is re-looked-up and re-validated under its own lock (lease,
-    // hard/soft pin, evictable replica — all against `now`) because state may
-    // have changed since the caller's snapshot; members that no longer qualify
-    // are skipped without invoking the callback. `evict_one_member` therefore
-    // performs only the path-specific member eviction (oplog persist, offload,
-    // quota charge, publish) on the member it is handed, and may erase it
-    // unless it is `key`, which is left to the caller. Each call returns that
-    // member's contribution. Returns the aggregated outcome.
-    GroupEvictionResult EvictGroupOrObject(
-        const TenantId& tenant_id, const std::string& key,
-        const std::string& group_id, bool allow_soft_pinned,
-        std::chrono::system_clock::time_point now,
-        const std::function<EvictMemberOutcome(MetadataAccessorRW& member)>&
-            evict_one_member);
-
     void ReleaseLocalDiskUsage(std::span<const Replica> replicas);
     enum class QuotaEraseMode {
         kFull,
@@ -1350,6 +1317,7 @@ class MasterService {
                           bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
+    class MetadataAccessorRW;
     // Publishes a new object under the key `accessor` holds, which must hold
     // none.
     auto InsertMetadata(MetadataAccessorRW& accessor, const UUID& client_id,
@@ -1538,6 +1506,13 @@ class MasterService {
     const double tenant_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
     const double nof_eviction_ratio_;                    // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;     // in range [0.0, 1.0]
+
+    // Memory eviction (see eviction::Evictor) and what it is built from: the
+    // policy, the reclaimer the HA and offload settings call for, and the
+    // observers. Built once the settings are read, before the eviction thread
+    // starts.
+    struct MemoryEviction;
+    std::unique_ptr<MemoryEviction> memory_eviction_;
 
     // Eviction thread related members
     std::thread eviction_thread_;
