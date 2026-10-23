@@ -891,6 +891,18 @@ class AscendDirectTransportTest : public ::testing::Test {
         return {true, false, status};
     }
 
+    struct FreeDeleter {
+        void operator()(void* ptr) const { free(ptr); }
+    };
+
+    // Returns a buffer starting on a 2 MiB boundary, as HCCS requires for
+    // remote-accessible device memory.
+    static std::unique_ptr<void, FreeDeleter> allocateDeviceAlignedBuffer() {
+        constexpr size_t kAlignment = 2 * 1024 * 1024;
+        return std::unique_ptr<void, FreeDeleter>(
+            aligned_alloc(kAlignment, 2 * kAlignment));
+    }
+
     size_t getLocalBufferCount(AscendDirectTransport* transport) {
         auto segment_desc =
             transport->meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
@@ -1364,13 +1376,80 @@ TEST_F(AscendDirectTransportTest, Memory_RegisterWithDeviceLocation) {
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);
 
-    mock_acl::set_pointer_location(test_buffer_src_,
-                                   ACL_MEM_LOCATION_TYPE_DEVICE, 0);
+    auto buffer = allocateDeviceAlignedBuffer();
+    ASSERT_NE(buffer, nullptr);
+    mock_acl::set_pointer_location(buffer.get(), ACL_MEM_LOCATION_TYPE_DEVICE,
+                                   0);
 
-    EXPECT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+    EXPECT_EQ(transport->registerLocalMemory(buffer.get(), kRegisterMemSize,
                                              "*", true, true),
               0);
-    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+    EXPECT_EQ(transport->unregisterLocalMemory(buffer.get(), true), 0);
+}
+
+TEST_F(AscendDirectTransportTest, Memory_RegisterRejectsUnalignedDeviceMem) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    // Mirrors a torch_npu caching-allocator sub-block 512 bytes past a 2 MiB
+    // boundary, which HCCS cannot export for remote access.
+    auto buffer = allocateDeviceAlignedBuffer();
+    ASSERT_NE(buffer, nullptr);
+    void* unaligned = static_cast<char*>(buffer.get()) + 512;
+
+    const size_t buffer_count_before = getLocalBufferCount(transport.get());
+    EXPECT_EQ(transport->registerLocalMemory(unaligned, kRegisterMemSize,
+                                             "npu:0", true, true),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 0);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), buffer_count_before);
+}
+
+TEST_F(AscendDirectTransportTest,
+       Memory_RegisterAllowsUnalignedLocalOnlyDeviceMem) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    auto buffer = allocateDeviceAlignedBuffer();
+    ASSERT_NE(buffer, nullptr);
+    void* unaligned = static_cast<char*>(buffer.get()) + 512;
+
+    // local_only memory is never exported over HCCS, so alignment is moot.
+    EXPECT_EQ(transport->registerLocalMemory(unaligned, kRegisterMemSize,
+                                             "npu:0", false, true),
+              0);
+    EXPECT_EQ(transport->unregisterLocalMemory(unaligned, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest,
+       Memory_RegisterAllowsUnalignedHostMemWithRemoteAccess) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    auto buffer = allocateDeviceAlignedBuffer();
+    ASSERT_NE(buffer, nullptr);
+    void* unaligned = static_cast<char*>(buffer.get()) + 512;
+
+    EXPECT_EQ(transport->registerLocalMemory(unaligned, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    EXPECT_EQ(transport->unregisterLocalMemory(unaligned, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest, Memory_RoceAllowsUnalignedDeviceMem) {
+    setenv("HCCL_INTRA_ROCE_ENABLE", "1", 1);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    auto buffer = allocateDeviceAlignedBuffer();
+    ASSERT_NE(buffer, nullptr);
+    void* unaligned = static_cast<char*>(buffer.get()) + 512;
+
+    EXPECT_EQ(transport->registerLocalMemory(unaligned, kRegisterMemSize,
+                                             "npu:0", true, true),
+              0);
+    EXPECT_EQ(transport->unregisterLocalMemory(unaligned, true), 0);
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
 }
 
 TEST_F(AscendDirectTransportTest, Memory_registerLocalMemoryBatch_Success) {

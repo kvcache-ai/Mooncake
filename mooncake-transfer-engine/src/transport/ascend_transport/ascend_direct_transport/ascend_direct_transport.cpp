@@ -35,6 +35,8 @@
 namespace mooncake {
 namespace {
 
+constexpr uintptr_t kHccsDeviceMemAlignment = 2 * 1024 * 1024;
+
 int32_t ResolveCurrentEngineId(bool agent_mode) {
     if (!agent_mode) {
         return 0;
@@ -391,6 +393,16 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
         // non-fabric TE has no fabric-enabled ADXL engine, so it must keep
         // treating that memory as host.
         mem_type = adxl::MEM_DEVICE;
+    }
+    // HCCS exports remote-accessible device memory as an IPC handle on 2 MiB
+    // pages. ADXL RegisterMem accepts an unaligned base, but the export then
+    // fails later at connect time, so reject it here with a clear error.
+    if (mem_type == adxl::MEM_DEVICE && remote_accessible && !roce_mode_ &&
+        reinterpret_cast<uintptr_t>(addr) % kHccsDeviceMemAlignment != 0) {
+        LOG(ERROR) << "Device mem addr:" << addr << ", length:" << length
+                   << " is not aligned to " << kHccsDeviceMemAlignment
+                   << " bytes, which HCCS requires for remote access.";
+        return ERR_INVALID_ARGUMENT;
     }
 
     int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
