@@ -106,7 +106,7 @@ TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
 
     const std::string key_a = "lease_group_key_a";
     const std::string key_b = "lease_group_key_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = key_a + "_group";
 
     ReplicateConfig config_a;
     config_a.replica_num = 1;
@@ -147,7 +147,7 @@ TEST_F(MasterServiceTest, GroupedEvictionSkipsUnsafeMembersAndEvictsSafePeers) {
 
     const std::string safe_key = "grouped_mixed_safe_key";
     const std::string hard_pinned_key = "grouped_mixed_hard_pinned_key";
-    const std::string group_id = FindGroupIdOnDifferentShard(safe_key);
+    const std::string group_id = safe_key + "_group";
 
     ReplicateConfig safe_config;
     safe_config.replica_num = 1;
@@ -307,8 +307,7 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.group_ids =
-        std::vector<std::string>{FindGroupIdOnDifferentShard(keys[0]), "",
-                                 FindGroupIdOnDifferentShard(keys[2])};
+        std::vector<std::string>{keys[0] + "_group", "", keys[2] + "_group"};
 
     auto results = service_.BatchPutStart(client_id, keys, sizes, config);
     ASSERT_EQ(results.size(), keys.size());
@@ -449,7 +448,7 @@ TEST_F(MasterServiceTest, GroupedReadRefreshesSharedGroupLease) {
 
     const std::string key_a = "lease_group_key_a";
     const std::string key_b = "lease_group_key_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = key_a + "_group";
 
     ReplicateConfig config_a;
     config_a.replica_num = 1;
@@ -498,7 +497,7 @@ TEST_F(MasterServiceTest, GroupedMembershipChangeStillSharesGroupLeaseOnRead) {
 
     const std::string key_a = "lease_group_dirty_key_a";
     const std::string key_b = "lease_group_dirty_key_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = key_a + "_group";
 
     ReplicateConfig config;
     config.replica_num = 1;
@@ -576,7 +575,7 @@ TEST_F(MasterServiceTest, GroupLeaseIsSharedAndExtendsOnMemberRead) {
 
     const std::string key_a = "group_lease_member_a";
     const std::string key_b = "group_lease_member_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = key_a + "_group";
 
     ReplicateConfig config;
     config.replica_num = 1;

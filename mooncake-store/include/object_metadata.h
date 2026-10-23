@@ -4,7 +4,7 @@
 //
 // Moved out of MasterService so the service and the per-object metadata
 // module share one definition. The envelope owns the object identity, the
-// authoritative read lease, the soft-pin state and the tenant quota ledger.
+// authoritative read lease and the soft-pin state.
 // The object's content and the replicas holding it live in the envelope's
 // single ObjectPart.
 //
@@ -106,7 +106,7 @@ struct ObjectMetadata {
     const TenantId tenant_id;
     const std::string user_key;
 
-    // Committed attribution only; protected by the owning metadata shard lock.
+    // Committed attribution only; protected by the key's lock.
     std::string session_id;
     struct PendingSessionTag {
         std::string session_id;

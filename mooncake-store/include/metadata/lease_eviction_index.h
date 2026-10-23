@@ -293,10 +293,8 @@ class LeaseEvictionIndex final : public EvictionIndex {
 
         std::optional<Entry> Next() override {
             if (pos_ == copy_.size()) {
-                copy_.Clear();
                 pos_ = 0;
                 next_ = index_.ReadBucket(next_, last_, copy_);
-                copy_.Seal();
             }
             if (pos_ == copy_.size()) {
                 return std::nullopt;
@@ -346,10 +344,17 @@ class LeaseEvictionIndex final : public EvictionIndex {
         return bucket;
     }
 
-    // Buckets::Read under the index lock.
+    // Buckets::Read under the index lock, into `out` in place of what it
+    // held, sealed once the lock is let go.
     Rank ReadBucket(Rank from, Rank last, Copy& out) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return buckets_.Read(from, last, out);
+        out.Clear();
+        Rank next;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            next = buckets_.Read(from, last, out);
+        }
+        out.Seal();
+        return next;
     }
 
     // The group `owner`'s key is filed in, if any.

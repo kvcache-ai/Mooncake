@@ -34,7 +34,6 @@ class MasterServiceTestPeer {
     using ObjectMetadata = mooncake::ObjectMetadata;
     using PromotionQueueResult = mooncake::PromotionQueueResult;
     using PromotionTask = mooncake::PromotionTask;
-    using EraseMode = MasterService::EraseMode;
     using NamespaceEvictionResult = MasterService::NamespaceEvictionResult;
 
     static constexpr auto kDynamicReplicationWindowEntryLimit =
@@ -438,16 +437,15 @@ class MasterServiceTestPeer {
 
     void FinalizeMetadataEraseAfterDurable(route::ObjectRef object,
                                            const TenantId& tenant_id) {
-        service_.FinalizeMetadataEraseAfterDurable(std::move(object), tenant_id,
-                                                   EraseMode::kFull);
+        service_.FinalizeMetadataEraseAfterDurable(std::move(object),
+                                                   tenant_id);
     }
 
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
-        const std::vector<ReplicaID>& replica_ids, EraseMode erase_mode,
-        const std::vector<std::string>& previous_media_hint = {}) {
-        service_.FinalizeRemovedReplicasAfterDurable(
-            durable_entry, replica_ids, erase_mode, previous_media_hint);
+        const std::vector<ReplicaID>& replica_ids) {
+        service_.FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                     replica_ids);
     }
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
@@ -504,14 +502,6 @@ class MasterServiceTestPeer {
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr) {
         return service_.PushOffloadingQueue(object_id, replica, mirror_clients);
-    }
-
-    void RebuildTenantQuotaUsageFromMetadata() {
-        service_.NotifyPolicyRestored();
-    }
-
-    void RecomputeTenantEffectiveQuotas() {
-        service_.NotifyPolicyCapacityChanged();
     }
 
     const TenantId& ResolveRequestTenantId(const TenantId& tenant_id) const {

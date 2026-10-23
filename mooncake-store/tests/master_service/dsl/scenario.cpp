@@ -244,21 +244,6 @@ MemoryNodeStatusSpec MemoryNodeStatus(std::string node) {
     return {.node = std::move(node)};
 }
 
-std::string GroupOnDifferentShard(std::string_view key) {
-    constexpr size_t kMetadataShardCount = 1024;
-    const size_t key_shard =
-        std::hash<std::string>{}(std::string(key)) % kMetadataShardCount;
-    for (size_t suffix = 0; suffix < 10000; ++suffix) {
-        std::string group =
-            std::string(key) + "_group_" + std::to_string(suffix);
-        if (std::hash<std::string>{}(group) % kMetadataShardCount !=
-            key_shard) {
-            return group;
-        }
-    }
-    return std::string(key) + "_fallback_group";
-}
-
 WaitAction WaitFor(std::chrono::milliseconds duration) { return {duration}; }
 
 WaitForOpLogFailureAction WaitForOpLogFailure() { return {}; }
