@@ -253,11 +253,16 @@ bool BatchOpLogSnapshotCoordinator::CatchUpComplete(
 }
 
 void BatchOpLogSnapshotCoordinator::FinishAttempt(ErrorCode error,
-                                                  bool count_attempt) {
+                                                  bool count_attempt,
+                                                  bool published) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (count_attempt) {
         ++attempts_;
-        last_attempt_complete_ = Now();
+        // Only a published snapshot earns the full interval. Retry a skipped
+        // or failed capture promptly while leaving the apply loop running.
+        next_attempt_at_ =
+            Now() + std::chrono::seconds(
+                        published ? config_.snapshot_interval_seconds : 5);
     }
     last_error_ = error;
     attempt_in_flight_ = false;
@@ -278,9 +283,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunOnce() {
                 HAMetricManager::instance().record_snapshot_skip(Skip::Stopped);
                 return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
             }
-            if (last_attempt_complete_ &&
-                Now() - *last_attempt_complete_ <
-                    std::chrono::seconds(config_.snapshot_interval_seconds)) {
+            if (next_attempt_at_ && Now() < *next_attempt_at_) {
                 HAMetricManager::instance().record_snapshot_skip(
                     Skip::Interval);
                 return ErrorCode::OK;
@@ -551,7 +554,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         }
     }
     lease_observer.reset();
-    FinishAttempt(publish_error, true);
+    FinishAttempt(publish_error, true, publish_error == ErrorCode::OK);
     return publish_error;
 }
 
@@ -559,10 +562,10 @@ void BatchOpLogSnapshotCoordinator::SchedulerLoop() {
     while (true) {
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            const auto delay =
-                std::chrono::seconds(config_.snapshot_interval_seconds == 0
-                                         ? 1
-                                         : config_.snapshot_interval_seconds);
+            const auto delay = std::chrono::seconds(
+                config_.snapshot_interval_seconds == 0
+                    ? 1
+                    : std::min<uint64_t>(config_.snapshot_interval_seconds, 5));
             if (cv_.wait_for(lock, delay, [this] { return stop_requested_; })) {
                 return;
             }

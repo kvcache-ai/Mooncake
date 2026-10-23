@@ -998,7 +998,7 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
 
     const auto pause_start = std::chrono::steady_clock::now();
     state->requested = false;
-    auto applied_prefix = batch_standby_reader_->GetLastAppliedDurablePrefix();
+    auto applied_prefix = batch_standby_reader_->GetLastAppliedBatchPrefix();
     ViewVersionId producer_view_version = 0;
     const ErrorCode producer_view_error =
         batch_standby_reader_->ReadProducerView(producer_view_version);
@@ -1007,7 +1007,9 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
         result.error == ErrorCode::OK && result.durable_prefix_present &&
         (producer_view_error == ErrorCode::OK ||
          producer_view_error == ErrorCode::ETCD_KEY_NOT_EXIST) &&
-        applied_prefix && *applied_prefix == result.durable_prefix &&
+        applied_prefix &&
+        applied_prefix->batch_id <= result.durable_prefix.batch_id &&
+        applied_prefix->last_seq <= result.durable_prefix.last_seq &&
         expected > 0 && expected - 1 == applied_prefix->last_seq;
     if (consistent && IsRunning() && metadata_store_) {
         BatchOpLogSnapshotCapture capture(
@@ -1237,8 +1239,10 @@ void HotStandbyService::ReplicationLoop() {
             {
                 std::lock_guard<std::mutex> cursor_lock(
                     batch_snapshot_cursor_mutex_);
+                // Snapshots may use a committed batch boundary with backlog.
+                // Promotion still requires the complete durable prefix.
                 last_applied_batch_snapshot_prefix_ =
-                    batch_standby_reader_->GetLastAppliedDurablePrefix();
+                    batch_standby_reader_->GetLastAppliedBatchPrefix();
             }
             HandleSnapshotCaptureRequest(result);
             if (result.durable_prefix_present) {
