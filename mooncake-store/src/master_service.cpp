@@ -8289,6 +8289,12 @@ auto MasterService::ReportSsdCapacity(const UUID& client_id,
     return {};
 }
 
+bool MasterService::IsOffloadTaskMirror(const OffloadingTask& task,
+                                        const UUID& client_id) {
+    return std::find(task.mirror_clients.begin(), task.mirror_clients.end(),
+                     client_id) != task.mirror_clients.end();
+}
+
 auto MasterService::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas)
@@ -8325,7 +8331,16 @@ auto MasterService::NotifyOffloadSuccess(
             MetadataAccessorRW accessor(this, request_object_id);
             if (accessor.Exists()) {
                 auto& offloading_task = accessor.GetState().offloading_task;
-                if (offloading_task) {
+                // Only a client the master enqueued the task to may cancel
+                // it. Anyone else would release the source pin and drop the
+                // task while the scheduled mirror is still writing.
+                if (offloading_task &&
+                    !IsOffloadTaskMirror(*offloading_task, client_id)) {
+                    LOG(WARNING) << "client_id=" << client_id
+                                 << ", key=" << request_object_id.user_key
+                                 << ", action=notify_offload_failure_refused"
+                                 << ", error=not_offload_task_mirror";
+                } else if (offloading_task) {
                     auto source = accessor.Get().GetReplicaByID(
                         offloading_task->source_id);
                     if (source != nullptr) {
@@ -8369,6 +8384,18 @@ auto MasterService::NotifyOffloadSuccess(
                 auto& obj_metadata = accessor.Get();
                 const auto previous_kv_media = KvMediaSnapshot(obj_metadata);
                 auto& offloading_task = accessor.GetState().offloading_task;
+                // An in-flight offload may only be settled by a client the
+                // master enqueued it to. Any other caller would otherwise
+                // clear the task, release its source pin and attach its own
+                // COMPLETE disk replica in place of the scheduled one.
+                if (offloading_task &&
+                    !IsOffloadTaskMirror(*offloading_task, client_id)) {
+                    LOG(WARNING) << "client_id=" << client_id
+                                 << ", key=" << request_object_id.user_key
+                                 << ", action=notify_offload_success_refused"
+                                 << ", error=not_offload_task_mirror";
+                    continue;
+                }
                 if (offloading_task &&
                     replica.type() != ReplicaType::LOCAL_DISK) {
                     LOG(ERROR) << "Invalid replica type: " << replica.type()
