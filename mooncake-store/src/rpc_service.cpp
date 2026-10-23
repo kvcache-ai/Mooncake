@@ -1610,23 +1610,24 @@ TieredStorageUsageSnapshot WrappedMasterService::GetStorageUsageSnapshot()
 
 tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
 WrappedMasterService::ListTenantQuotaSnapshots() {
-    if (!master_service_.IsTenantQuotaEnabled()) {
+    const TenantQuotaPolicy* quota = master_service_.tenant_quota_policy();
+    if (quota == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
-    return master_service_.ListTenantQuotaSnapshots();
+    return quota->ListSnapshots();
 }
 
 tl::expected<TenantQuotaSnapshot, ErrorCode>
 WrappedMasterService::GetTenantQuotaSnapshot(const std::string& tenant_id) {
-    if (!master_service_.IsTenantQuotaEnabled()) {
+    const TenantQuotaPolicy* quota = master_service_.tenant_quota_policy();
+    if (quota == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
     return WithRequestTenant(
         tenant_id,
         [&](const TenantId& resolved_tenant_id)
             -> tl::expected<TenantQuotaSnapshot, ErrorCode> {
-            auto snapshot =
-                master_service_.GetTenantQuotaSnapshot(resolved_tenant_id);
+            auto snapshot = quota->GetSnapshot(resolved_tenant_id);
             if (!snapshot.has_value()) {
                 return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
             }
@@ -1637,7 +1638,8 @@ WrappedMasterService::GetTenantQuotaSnapshot(const std::string& tenant_id) {
 tl::expected<TenantQuotaSnapshot, ErrorCode>
 WrappedMasterService::UpsertTenantQuotaPolicy(const std::string& tenant_id,
                                               uint64_t requested_quota_bytes) {
-    if (!master_service_.IsTenantQuotaEnabled()) {
+    TenantQuotaPolicy* quota = master_service_.tenant_quota_policy();
+    if (quota == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
     if (tenant_id.empty()) {
@@ -1647,13 +1649,13 @@ WrappedMasterService::UpsertTenantQuotaPolicy(const std::string& tenant_id,
     if (!resolved_tenant_id.IsValid()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return master_service_.UpsertTenantQuotaPolicy(resolved_tenant_id,
-                                                   requested_quota_bytes);
+    return quota->UpsertPolicy(resolved_tenant_id, requested_quota_bytes);
 }
 
 tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
 WrappedMasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
-    if (!master_service_.IsTenantQuotaEnabled()) {
+    TenantQuotaPolicy* quota = master_service_.tenant_quota_policy();
+    if (quota == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
     if (tenant_id.empty()) {
@@ -1663,15 +1665,16 @@ WrappedMasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
     if (!resolved_tenant_id.IsValid()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return master_service_.DeleteTenantQuotaPolicy(resolved_tenant_id);
+    return quota->DeletePolicy(resolved_tenant_id);
 }
 
 tl::expected<uint64_t, ErrorCode>
 WrappedMasterService::GetTenantQuotaAllocatableCapacityBytes() {
-    if (!master_service_.IsTenantQuotaEnabled()) {
+    const TenantQuotaPolicy* quota = master_service_.tenant_quota_policy();
+    if (quota == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
-    return master_service_.GetTenantQuotaAllocatableCapacityBytes();
+    return quota->AllocatableCapacityBytes();
 }
 
 tl::expected<std::vector<std::string>, ErrorCode>

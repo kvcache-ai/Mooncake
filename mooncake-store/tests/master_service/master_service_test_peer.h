@@ -34,8 +34,8 @@ class MasterServiceTestPeer {
     using ObjectMetadata = mooncake::ObjectMetadata;
     using PromotionQueueResult = mooncake::PromotionQueueResult;
     using PromotionTask = mooncake::PromotionTask;
-    using QuotaEraseMode = MasterService::QuotaEraseMode;
-    using TenantQuotaEvictionResult = MasterService::TenantQuotaEvictionResult;
+    using EraseMode = MasterService::EraseMode;
+    using NamespaceEvictionResult = MasterService::NamespaceEvictionResult;
 
     static constexpr auto kDynamicReplicationWindowEntryLimit =
         DynamicReplicationController::kWindowEntryLimit;
@@ -306,31 +306,31 @@ class MasterServiceTestPeer {
     }
 
     static auto& TenantQuotaPolicyMutex(MasterService& service) {
-        return service.tenant_quota_manager_.policy_mutex_;
+        return service.tenant_quota_policy_->manager_.policy_mutex_;
     }
     static const auto& TenantQuotaPolicyMutex(const MasterService& service) {
-        return service.tenant_quota_manager_.policy_mutex_;
+        return service.tenant_quota_policy_->manager_.policy_mutex_;
     }
 
     static auto& TenantQuotaPolicyStore(MasterService& service) {
-        return service.tenant_quota_manager_.policy_store_;
+        return service.tenant_quota_policy_->manager_.policy_store_;
     }
     static const auto& TenantQuotaPolicyStore(const MasterService& service) {
-        return service.tenant_quota_manager_.policy_store_;
+        return service.tenant_quota_policy_->manager_.policy_store_;
     }
 
     static auto& TenantQuotaRecomputeMutex(MasterService& service) {
-        return service.tenant_quota_manager_.recompute_mutex_;
+        return service.tenant_quota_policy_->manager_.recompute_mutex_;
     }
     static const auto& TenantQuotaRecomputeMutex(const MasterService& service) {
-        return service.tenant_quota_manager_.recompute_mutex_;
+        return service.tenant_quota_policy_->manager_.recompute_mutex_;
     }
 
     static auto& TenantQuotaTable(MasterService& service) {
-        return service.tenant_quota_manager_.table_;
+        return service.tenant_quota_policy_->manager_.table_;
     }
     static const auto& TenantQuotaTable(const MasterService& service) {
-        return service.tenant_quota_manager_.table_;
+        return service.tenant_quota_policy_->manager_.table_;
     }
 
     static auto& WeightMetadata(MasterService& service) {
@@ -365,11 +365,6 @@ class MasterServiceTestPeer {
         MasterService::DurableFinalizeCallback callback) {
         return service_.AppendOpLogWithDurableFinalize(
             type, tenant_id, key, payload, std::move(callback));
-    }
-
-    tl::expected<void, ErrorCode> ChargeTenantQuota(TenantQuotaHandle account,
-                                                    uint64_t bytes) {
-        return service_.ChargeTenantQuota(std::move(account), bytes);
     }
 
     void CleanupExpiredDynamicReplicationState() {
@@ -429,9 +424,9 @@ class MasterServiceTestPeer {
             metadata, pred_fn, erased_replica_ids);
     }
 
-    TenantQuotaEvictionResult EvictTenantMemoryForQuota(
-        const TenantId& tenant_id, uint64_t target_bytes) {
-        return service_.EvictTenantMemoryForQuota(tenant_id, target_bytes);
+    NamespaceEvictionResult EvictNamespaceMemory(const TenantId& tenant_id,
+                                                 uint64_t target_bytes) {
+        return service_.EvictNamespaceMemory(tenant_id, target_bytes);
     }
 
     void FinalizeExpiredProcessingReplicasAfterDurable(
@@ -444,15 +439,15 @@ class MasterServiceTestPeer {
     void FinalizeMetadataEraseAfterDurable(route::ObjectRef object,
                                            const TenantId& tenant_id) {
         service_.FinalizeMetadataEraseAfterDurable(std::move(object), tenant_id,
-                                                   QuotaEraseMode::kFull);
+                                                   EraseMode::kFull);
     }
 
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
-        const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
+        const std::vector<ReplicaID>& replica_ids, EraseMode erase_mode,
         const std::vector<std::string>& previous_media_hint = {}) {
         service_.FinalizeRemovedReplicasAfterDurable(
-            durable_entry, replica_ids, quota_mode, previous_media_hint);
+            durable_entry, replica_ids, erase_mode, previous_media_hint);
     }
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
@@ -460,14 +455,17 @@ class MasterServiceTestPeer {
         return service_.FindClientRecord(client_id);
     }
 
-    // Resolves the namespace, creating it on first use.
+    // Resolves the namespace, creating it through the table's factory on first
+    // use; the factory hangs the namespace policy's attachment (the tenant's
+    // quota account) on it.
     metadata::Namespace& GetOrCreateNamespace(const TenantId& tenant_id) {
         return service_.namespaces_.GetOrCreate(tenant_id);
     }
 
-    // The tenant's quota account, or null with multi-tenancy off.
-    TenantQuotaHandle QuotaAccountOf(const TenantId& tenant_id) {
-        return service_.QuotaAccountOf(tenant_id);
+    // The tenant's one stable quota account; multi-tenancy only.
+    mooncake::TenantQuotaAccount& TenantQuotaAccount(
+        const TenantId& tenant_id) {
+        return service_.tenant_quota_policy_->manager_.AccountFor(tenant_id);
     }
 
     bool IsReplicaReadable(const Replica& replica) const {
@@ -485,7 +483,7 @@ class MasterServiceTestPeer {
     }
 
     void LoadTenantQuotaPoliciesFromStoreOrThrow() {
-        service_.tenant_quota_manager_.LoadPoliciesOrThrow();
+        service_.tenant_quota_policy_->manager_.LoadPoliciesOrThrow();
     }
 
     ObjectIdentity MakeObjectIdentityForRequest(
@@ -509,15 +507,11 @@ class MasterServiceTestPeer {
     }
 
     void RebuildTenantQuotaUsageFromMetadata() {
-        service_.RebuildTenantQuotaUsageFromMetadata();
+        service_.NotifyPolicyRestored();
     }
 
     void RecomputeTenantEffectiveQuotas() {
-        service_.RecomputeTenantEffectiveQuotas();
-    }
-
-    void ReleaseTenantQuota(TenantQuotaHandle account, uint64_t bytes) {
-        service_.ReleaseTenantQuota(std::move(account), bytes);
+        service_.NotifyPolicyCapacityChanged();
     }
 
     const TenantId& ResolveRequestTenantId(const TenantId& tenant_id) const {

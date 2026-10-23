@@ -41,8 +41,7 @@
 #include "mutex.h"
 #include "segment.h"
 #include "local_ssd/manager.h"
-#include "tenant_quota_ledger.h"
-#include "tenant/quota_manager.h"
+#include "tenant/quota_policy.h"
 #include "types.h"
 #include "weight_store_manager.h"
 #include "master_config.h"
@@ -87,19 +86,20 @@ class PrefetchTaskMasterTest;
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
  * 1. client_mutex_
- * 2. tenant_quota_manager_'s policy mutex
+ * 2. the namespace policy's admission token (NamespacePolicy::AdmitWrite;
+ *    the tenant quota policy's policy lock)
  * 3. master_state_mutex_
  * 4. one key of a namespace (see metadata::Namespace)
- * 5. tenant_quota_manager_'s recompute mutex
- * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
+ * 5. the tenant quota policy's recompute lock
+ * 6. the quota table's shard locks or segment_mutex_
  * 7. soft_pin_deadline_index_ mutex
  *
- * Strict tenant admission and policy mutation paths that need both the tenant
- * policy mutex and master_state_mutex_ must acquire the tenant policy mutex
+ * Strict tenant admission and policy mutation paths that need both the
+ * quota policy lock and master_state_mutex_ must acquire the policy lock
  * first, then master_state_mutex_.
- * The recompute mutex serializes the capacity snapshot and the corresponding
- * quota-table update. The segment mutex is released before entering
- * ShardedTenantQuotaTable, so these two locks are never nested.
+ * The recompute lock serializes the capacity snapshot and the corresponding
+ * quota-table update. The segment mutex is released before entering the
+ * quota table, so these two locks are never nested.
  */
 
 class MasterService {
@@ -122,15 +122,14 @@ class MasterService {
     ~MasterService();
 
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
-    bool IsTenantQuotaEnabled() const;
-    std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
-    std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshot(
-        const TenantId& tenant_id) const;
-    tl::expected<TenantQuotaSnapshot, ErrorCode> UpsertTenantQuotaPolicy(
-        const TenantId& tenant_id, uint64_t requested_quota_bytes);
-    tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
-    DeleteTenantQuotaPolicy(const TenantId& tenant_id);
-    uint64_t GetTenantQuotaAllocatableCapacityBytes();
+    // Whether requests name their tenant, which multi-tenancy turns on.
+    bool IsTenantQuotaEnabled() const {
+        return tenant_quota_policy_ != nullptr;
+    }
+    // Multi-tenancy's control plane; null when multi-tenancy is off.
+    TenantQuotaPolicy* tenant_quota_policy() const {
+        return tenant_quota_policy_.get();
+    }
 
     WeightMetadataStore::Result<WeightRevisionLease> AcquireWeightRevisionLease(
         const AcquireWeightRevisionLeaseRequest& request);
@@ -1071,21 +1070,12 @@ class MasterService {
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
-    struct TenantQuotaEvictionResult {
-        uint64_t freed_bytes{0};
-        uint64_t evicted_objects{0};
-    };
-    // Evicts memory replicas of one tenant's objects, oldest lease first,
+    using NamespaceEvictionResult = StoreControl::EvictionResult;
+    // Evicts memory replicas of one namespace's objects, oldest lease first,
     // until `target_bytes` are freed or nothing more qualifies (see
-    // eviction::Evictor).
-    TenantQuotaEvictionResult EvictTenantMemoryForQuota(
-        const TenantId& tenant_id, uint64_t target_bytes);
-
-    // Background pass: evict any tenant that is over its own watermark down to
-    // (watermark - eviction_ratio) of its effective quota. Called from
-    // EvictionThreadFunc, and a no-op unless multi-tenancy and
-    // tenant_eviction_high_watermark_ratio are both enabled.
-    void EvictTenantsOverWatermark();
+    // eviction::Evictor); what a policy asks for through StoreControl.
+    NamespaceEvictionResult EvictNamespaceMemory(const TenantId& tenant_id,
+                                                 uint64_t target_bytes);
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const;
@@ -1136,8 +1126,11 @@ class MasterService {
 
     // One namespace per tenant id written to, each owning that tenant's object
     // route; a namespace stays put once created (see NamespaceTable).
-    metadata::NamespaceTable namespaces_{[](const TenantId& tenant_id) {
-        return std::make_unique<metadata::Namespace>(tenant_id);
+    metadata::NamespaceTable namespaces_{[this](const TenantId& tenant_id) {
+        return std::make_unique<metadata::Namespace>(
+            tenant_id, policy_,
+            policy_ == nullptr ? nullptr
+                               : policy_->OnNamespaceCreated(tenant_id));
     }};
     MasterStoreBackend weight_backend_{*this};
     tl::expected<void, ErrorCode> RemoveObject(const std::string& key,
@@ -1212,8 +1205,6 @@ class MasterService {
         const std::string& user_key, const TenantId& tenant_id) const;
     tl::expected<TenantId, ErrorCode> ResolveTenantIdForWrite(
         const TenantId& tenant_id) const;
-    tl::expected<TenantId, ErrorCode> ResolveTenantIdForWriteLocked(
-        const TenantId& tenant_id) const;
     bool IsTenantRegistered(const TenantId& tenant_id) const;
     bool TenantHasObjects(const TenantId& tenant_id) const;
 
@@ -1230,34 +1221,33 @@ class MasterService {
         const std::vector<std::string>& member_keys);
 
     void ReleaseLocalDiskUsage(std::span<const Replica> replicas);
-    enum class QuotaEraseMode {
+    // How an erase is published to KV-event subscribers: as the object's
+    // removal, or, when an upsert replaces it under the same lock, as the
+    // state the replacement starts from.
+    enum class EraseMode {
         kFull,
-        kPreserveOld,
-        kAbortOnly,
+        kReplace,
     };
-    tl::expected<void, ErrorCode> SettlePrimaryWriteQuotaIfReady(
-        TenantQuotaHandle quota_account, ObjectMetadata& metadata);
-    uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
-    uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
-                                        const ReplicateConfig& config) const;
-    // The tenant's quota account, or null with multi-tenancy off.
-    TenantQuotaHandle QuotaAccountOf(const TenantId& tenant_id);
-    tl::expected<void, ErrorCode> ChargeTenantQuota(TenantQuotaHandle account,
-                                                    uint64_t bytes);
-    void ReleaseTenantQuota(TenantQuotaHandle account, uint64_t bytes);
-    void RecomputeTenantEffectiveQuotas();
-    void RebuildTenantQuotaUsageFromMetadata();
-    // Erases the object `hold` holds in `tenant_id`'s namespace and every
-    // record that hangs off its key, under that key's lock: the tasks in
-    // flight on it, its replicas' resources, its quota charge, and its KV
-    // events. The key stays held, so the caller may publish a replacement.
+    // The memory every segment mounted on this service adds up to,
+    // saturating at the 64-bit range; what tenant quotas are carved from.
+    uint64_t AllocatableMemoryBytes();
+    // Restore: lets the namespace policy rebuild what it derives from the
+    // restored metadata.
+    void NotifyPolicyRestored();
+    // A segment came or went: lets the namespace policy re-derive what it
+    // carves from the allocatable memory.
+    void NotifyPolicyCapacityChanged();
+    // Erases the object `hold` holds in `ns` and every record that hangs off
+    // its key, under that key's lock: the tasks in flight on it, its replicas'
+    // resources and its KV events. The key stays held, so the caller may
+    // publish a replacement.
     void EraseMetadata(
-        const TenantId& tenant_id, const route::WriteGuard& hold,
-        QuotaEraseMode quota_mode,
+        metadata::Namespace& ns, const route::WriteGuard& hold,
+        EraseMode erase_mode,
         const std::vector<std::string>& previous_media_hint = {});
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
-        const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
+        const std::vector<ReplicaID>& replica_ids, EraseMode erase_mode,
         const std::vector<std::string>& previous_media_hint = {});
     // The durable finalizers of a decision taken under a key's lock that was
     // let go of before the OpLog entry became durable. Those that name the
@@ -1265,7 +1255,7 @@ class MasterService {
     // recreate that landed meanwhile is left alone.
     void FinalizeMetadataEraseAfterDurable(route::ObjectRef object,
                                            const TenantId& tenant_id,
-                                           QuotaEraseMode quota_mode);
+                                           EraseMode erase_mode);
     void FinalizeExpiredProcessingReplicasAfterDurable(
         route::ObjectRef object, const OpLogEntry& durable_entry,
         const std::chrono::system_clock::time_point& ttl);
@@ -1334,16 +1324,14 @@ class MasterService {
     // or local_disk replicas whose owner client no longer retains resources.
     bool CleanupStaleHandles(
         const std::string& key, const TenantId& tenant_id,
-        TenantQuotaHandle quota_account, ObjectMetadata& metadata,
-        route::ObjectState& state,
+        ObjectMetadata& metadata, route::ObjectState& state,
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
-    // accounting (quota release, promotion-task cancellation) instead of
+    // accounting (promotion-task cancellation) instead of
     // duplicating it.
     bool CleanupStaleHandles(
         const std::string& key, const TenantId& tenant_id,
-        TenantQuotaHandle quota_account, ObjectMetadata& metadata,
-        route::ObjectState& state,
+        ObjectMetadata& metadata, route::ObjectState& state,
         const std::function<bool(const Replica&)>& is_stale);
 
     // True when client_id currently has a LOCAL_DISK registration.
@@ -1373,7 +1361,6 @@ class MasterService {
                         const std::chrono::system_clock::time_point& now,
                         const ResolvedSoftPinRequest& soft_pin_request,
                         std::vector<Replica>&& replicas,
-                        uint64_t pending_quota_charge,
                         std::optional<std::chrono::system_clock::time_point>
                             committed_soft_pin_timeout = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
@@ -1511,17 +1498,11 @@ class MasterService {
                           PromotionQueueResult result);
     size_t RunPromotionCandidateRetry();
 
-    // Erase the object's in-flight PromotionTask, refund its pending charge,
-    // and decrement the cluster-wide in-flight counter. Safe no-op if no task
-    // exists.
-    void ErasePromotionTaskIfPresent(TenantQuotaHandle quota_account,
-                                     route::ObjectState& state)
+    // Erase the object's in-flight PromotionTask and decrement the
+    // cluster-wide in-flight counter. Safe no-op if no task exists.
+    void ErasePromotionTaskIfPresent(route::ObjectState& state)
         NO_THREAD_SAFETY_ANALYSIS {
         if (state.promotion_task) {
-            ReleaseTenantQuota(
-                quota_account,
-                std::exchange(state.promotion_task->pending_quota_charge_bytes,
-                              0));
             state.promotion_task.reset();
             promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
             MasterMetricManager::instance().dec_promotion_in_flight();
@@ -1529,8 +1510,7 @@ class MasterService {
         }
     }
     void CancelPromotionTaskForRemovedReplicas(
-        TenantQuotaHandle quota_account, ObjectMetadata& metadata,
-        route::ObjectState& state,
+        ObjectMetadata& metadata, route::ObjectState& state,
         const std::vector<ReplicaID>& removed_replica_ids)
         NO_THREAD_SAFETY_ANALYSIS;
 
@@ -1547,13 +1527,8 @@ class MasterService {
         false};  // Set to trigger NoF eviction when allocation fails
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
-    // Per-tenant watermark as a fraction of each tenant's OWN effective quota.
-    // Defaults to the same 0.90 as the pool-wide ratio above; 0.0 disables the
-    // pass. See EvictTenantsOverWatermark for why the pool-wide ratio is not
-    // sufficient once quotas partition the pool.
-    const double tenant_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
-    const double nof_eviction_ratio_;                    // in range [0.0, 1.0]
-    const double nof_eviction_high_watermark_ratio_;     // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;             // in range [0.0, 1.0]
+    const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
     // Memory eviction (see eviction::Evictor) and what it is built from: the
     // policy, the reclaimer the HA and offload settings call for, and the
@@ -1567,12 +1542,6 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
-    // The eviction thread wakes every 10 ms, but the tenant pass has to walk
-    // every registered tenant and lock every quota shard, so it is throttled
-    // rather than run on each tick. Quota pressure builds over seconds, not
-    // milliseconds, and admission still has its own synchronous fallback in
-    // between.
-    static constexpr uint64_t kTenantEvictionCheckIntervalMs = 1000;
 
     // Task cleanup thread related members
     std::thread task_cleanup_thread_;
@@ -1676,10 +1645,16 @@ class MasterService {
         // The held publication; like `Get()`, only while one is held.
         route::ObjectRef GetRef() const { return guard_->ref(); }
 
-        // The tenant's quota account, for the charges the held object makes.
-        TenantQuotaHandle QuotaAccount() const {
-            return service_->QuotaAccountOf(object_id_.tenant_id);
+        // The namespace policy's say on the held key taking `bytes` more
+        // memory, asked before it is allocated; zero bytes asks only whether
+        // the namespace admits writes. Only while a key is held.
+        [[nodiscard]] tl::expected<void, ErrorCode> Grow(uint64_t bytes) const {
+            return ns_->Grow(*guard_, bytes);
         }
+
+        // Tells the namespace policy the held object is about to be replaced
+        // under this same lock (see NamespacePolicy::OnReplace).
+        void BeforeReplace() const { ns_->BeforeReplace(*guard_); }
 
         // Get metadata (only call when IsPublished() is true)
         ObjectMetadata& Get() { return guard_->metadata(); }
@@ -1706,11 +1681,11 @@ class MasterService {
         // Erases the held object and everything keyed to it; the key stays
         // held, so the caller may publish a replacement under it.
         void Erase(const std::vector<std::string>& previous_media_hint = {}) {
-            Erase(QuotaEraseMode::kFull, previous_media_hint);
+            Erase(EraseMode::kFull, previous_media_hint);
         }
-        void Erase(QuotaEraseMode quota_mode,
+        void Erase(EraseMode erase_mode,
                    const std::vector<std::string>& previous_media_hint = {}) {
-            service_->EraseMetadata(object_id_.tenant_id, *guard_, quota_mode,
+            service_->EraseMetadata(*ns_, *guard_, erase_mode,
                                     previous_media_hint);
         }
 
@@ -1966,8 +1941,29 @@ class MasterService {
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
     const bool enable_multi_tenants_;
-    TenantQuotaManager tenant_quota_manager_{
-        [this] { return GetTenantQuotaAllocatableCapacityBytes(); }};
+
+    // What the namespace policy may see and ask of this service.
+    class PolicyStoreAccess final : public StoreControl {
+       public:
+        explicit PolicyStoreAccess(MasterService& service)
+            : service_(service) {}
+        void VisitNamespaces(
+            const std::function<void(const TenantId&, route::ObjectRoute&)>& fn)
+            override;
+        size_t ObjectCount(const TenantId& tenant_id) const override;
+        uint64_t AllocatableMemoryBytes() const override;
+        EvictionResult EvictNamespaceMemory(const TenantId& tenant_id,
+                                            uint64_t target_bytes) override;
+
+       private:
+        MasterService& service_;
+    };
+    PolicyStoreAccess policy_store_access_{*this};
+    // Multi-tenancy, when enabled; the namespace policy below points at it.
+    std::unique_ptr<TenantQuotaPolicy> tenant_quota_policy_;
+    // The policy every namespace is created under; null without one. Set in
+    // the constructor, before any namespace is created.
+    NamespacePolicy* policy_ = nullptr;
 
     // HTTP metadata server pointer for cleanup on client timeout
     // nullptr means cleanup is disabled

@@ -252,7 +252,7 @@ DEFINE_validator(offloading_queue_limit, [](const char* flagname,
     // bound (1e8) keeps `offloading_queue_limit_ *
     // offload_cap_ratio_` well within signed long range to
     // avoid overflow when computing offload_cap in
-    // BatchEvict / EvictTenantMemoryForQuota.
+    // BatchEvict / EvictNamespaceMemory.
     if (value == 0) {
         LOG(FATAL) << "offloading_queue_limit must be greater than 0";
         return false;
