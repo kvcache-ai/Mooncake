@@ -4,7 +4,7 @@ This script integrates P2P single-run performance testing and multi-dimensional 
 
 !!! IMPORTANT: DEPENDENCIES REQUIRED !!!
 This script is a WRAPPER that orchestrates the following C++ binaries:
-1. mooncake_master_p2p (The P2P master node service)
+1. mooncake_master (The P2P master node service)
 2. stress_workload_test_p2p (The P2P benchmark client)
 
 The locations of these two binaries MUST be correctly provided via the MASTER_BIN and TEST_BIN
@@ -42,6 +42,8 @@ Arguments:
 """
 
 import subprocess
+import logging
+import shlex
 import time
 import re
 import os
@@ -59,7 +61,7 @@ import urllib.error
 PROJECT_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
-MASTER_BIN = os.path.join(PROJECT_ROOT, "build/mooncake-store/src/mooncake_master_p2p")
+MASTER_BIN = os.path.join(PROJECT_ROOT, "build/mooncake-store/src/mooncake_master")
 TEST_BIN = os.path.join(
     PROJECT_ROOT, "build/mooncake-store/tests/p2p/stress_workload_test_p2p"
 )
@@ -70,17 +72,14 @@ METRICS_PORT = 9003
 def run_command(cmd):
     """Run a terminal command and return its output."""
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=600)
         return result.stdout + result.stderr
     except subprocess.TimeoutExpired:
+        logging.error("Benchmark command timed out: %s", cmd)
         return "ERROR: Command timed out"
     except Exception as e:
+        logging.exception("Benchmark command failed")
         return f"ERROR: {str(e)}"
-
-def kill_existing_processes():
-    """Clean up any existing master or test processes."""
-    subprocess.run("killall -9 mooncake_master_p2p stress_workload_test_p2p 2>/dev/null", shell=True)
-    time.sleep(1)
 
 def wait_master_ready(http_port, timeout_s=30):
     """Poll P2P master's metrics /health endpoint until it responds
@@ -165,8 +164,6 @@ def run_benchmark_config(rounds, threads, value_size, ops, rpc_threads, ram_buff
                          local_memcpy_async_worker_num=32,
                          route_cache_max_memory_mb=300, route_cache_ttl_ms=60000):
     """Run a specific P2P configuration."""
-    kill_existing_processes()
-
     master_cmd = (
         f"{MASTER_BIN} --rpc_port={RPC_PORT} --metrics_port={METRICS_PORT} "
         f"--rpc_thread_num={rpc_threads}"
@@ -174,42 +171,44 @@ def run_benchmark_config(rounds, threads, value_size, ops, rpc_threads, ram_buff
     master_proc = subprocess.Popen(master_cmd.split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         wait_master_ready(METRICS_PORT)
-    except RuntimeError as e:
-        master_proc.terminate()
-        print(f"    [!] Master startup failed: {e}")
-        return None
+        good_rounds = []
+        bad_rounds = []
+        for r in range(1, rounds + 1):
+            test_cmd = (f"{TEST_BIN} --num_threads={threads} --value_size={value_size} "
+                        f"--test_operation_nums={ops} --ram_buffer_size_gb={ram_buffer_size_gb} --batch_size={batch}")
 
-    good_rounds = []
-    bad_rounds = []
-    for r in range(1, rounds + 1):
-        test_cmd = (f"{TEST_BIN} --num_threads={threads} --value_size={value_size} "
-                    f"--test_operation_nums={ops} --ram_buffer_size_gb={ram_buffer_size_gb} --batch_size={batch}")
-
-        test_cmd += (
-            f" --p2p_local_transfer_mode={p2p_local_transfer_mode}"
-            f" --route_cache_max_memory_mb={route_cache_max_memory_mb}"
-            f" --route_cache_ttl_ms={route_cache_ttl_ms}"
-        )
-        if p2p_local_transfer_mode == "memcpy":
             test_cmd += (
-                f" --local_memcpy_async_worker_num={local_memcpy_async_worker_num}"
+                f" --p2p_local_transfer_mode={p2p_local_transfer_mode}"
+                f" --route_cache_max_memory_mb={route_cache_max_memory_mb}"
+                f" --route_cache_ttl_ms={route_cache_ttl_ms}"
             )
+            if p2p_local_transfer_mode == "memcpy":
+                test_cmd += (
+                    f" --local_memcpy_async_worker_num={local_memcpy_async_worker_num}"
+                )
 
-        output = run_command(test_cmd)
-        metrics, is_bad = parse_metrics(output)
-        if is_bad:
-            bad_rounds.append(metrics)
-            print(f"    [!] Mode P2P Round {r}/{rounds} BAD "
-                  f"(put_success={metrics['put_success_rate']:.1f}% "
-                  f"get_success={metrics['get_success_rate']:.1f}%) — excluded from average.")
-        else:
-            good_rounds.append(metrics)
+            output = run_command(test_cmd)
+            metrics, is_bad = parse_metrics(output)
+            if is_bad:
+                bad_rounds.append(metrics)
+                print(f"    [!] Mode P2P Round {r}/{rounds} BAD "
+                      f"(put_success={metrics['put_success_rate']:.1f}% "
+                      f"get_success={metrics['get_success_rate']:.1f}%) — excluded from average.")
+            else:
+                good_rounds.append(metrics)
 
-    master_proc.terminate()
-    try:
-        master_proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        master_proc.kill()
+    except Exception:
+        logging.exception("P2P benchmark failed")
+        raise
+    finally:
+        if master_proc.poll() is None:
+            master_proc.terminate()
+        try:
+            master_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logging.error("Master did not stop; killing PID %s", master_proc.pid)
+            master_proc.kill()
+            master_proc.wait()
 
     if not good_rounds:
         print(f"    [!] All {rounds} rounds bad for this config — no data recorded.")

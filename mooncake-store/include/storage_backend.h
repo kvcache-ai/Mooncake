@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <list>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -17,7 +18,7 @@
 #include "file_interface.h"
 #include "mutex.h"
 #include "offset_allocator/offset_allocator.hpp"
-#include "types.h"
+#include "common_types.h"
 
 namespace mooncake {
 struct FileRecord {
@@ -103,7 +104,7 @@ struct FileStorageConfig {
     uint32_t heartbeat_interval_seconds = 10;
 
     // Interval between client_buffer_gc (in seconds)
-    uint32_t client_buffer_gc_interval_seconds = 1;
+    uint32_t client_buffer_gc_interval_seconds = 10;
     uint64_t client_buffer_gc_ttl_ms = 5000;
 
     // Validates the configuration for correctness and consistency

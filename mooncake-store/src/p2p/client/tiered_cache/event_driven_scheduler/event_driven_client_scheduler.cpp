@@ -165,19 +165,8 @@ void EventDrivenClientScheduler::OnDelete(const DeleteContext& ctx) {
 
 bool EventDrivenClientScheduler::OnAllocationFailure(
     const AllocationFailureContext& ctx) {
-    // Unified synchronous-reclaim entry point for pressure on the FAST tier.
-    // Reached from any allocator path that runs out of fast-tier room:
-    //   1. external client writes (Put / PreWrite into DRAM),
-    //   2. promotion/onboard (migrating a hot key slow -> fast),
-    //   3. internal staging during data movement.
-    //
-    // Scope (D2-B): the event-driven scheduler force-reclaims ONLY the fast
-    // tier. Non-fast (slow) tiers are intentionally not reclaimed here — they
-    // own their own eviction inside CacheTier::Allocate (e.g. StorageTier
-    // triggers bucket eviction when capacity is exceeded), so a failed offload
-    // into a full slow tier has already attempted self-eviction by the time it
-    // surfaces. We therefore decline (return false) for non-fast tiers rather
-    // than double-managing their capacity.
+    // Reclaim only the fast tier; other tiers handle their own allocation
+    // pressure.
     if (!running_.load() || !roles_resolved_.load() ||
         ctx.tier_id != fast_tier_id_) {
         return false;
@@ -303,13 +292,7 @@ bool EventDrivenClientScheduler::ExecuteMovement(const MovementRequest& mv) {
             return true;
         }
         case MovementRequest::Kind::kMigrate: {
-            // Copy source -> dest, then delete source. CopyData is strict, so
-            // it must land on dest (sync-evicting it if full) and can never
-            // fall back to another tier — a successful copy means the new
-            // replica is genuinely on dest, so deleting the source cannot lose
-            // the only copy. (Strict also makes onboard actually evict-to-fit
-            // instead of silently re-landing the copy on the slow tier under
-            // fast-tier pressure.)
+            // Strict copy must reach dest before deleting the source replica.
             uint64_t version = 0;
             auto src = backend_->Get(mv.key, mv.source_tier,
                                      /*record_access=*/false, &version);

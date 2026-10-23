@@ -3,7 +3,8 @@
 #include <string>
 #include <string_view>
 
-#include "types.h"
+#include "p2p/common/p2p_types.h"
+#include "etcd_helper.h"
 #ifdef STORE_USE_REDIS
 #include "p2p/ha/redis_election_helper.h"
 #endif

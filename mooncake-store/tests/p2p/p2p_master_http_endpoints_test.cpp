@@ -5,7 +5,7 @@
  *         GET /batch_query_routes, GET /metrics).
  *
  * Brings up an in-process P2PMasterRpcService with the embedded HTTP
- * server bound to a free port (no RPC server)
+ * server bound to a kernel-assigned port (no RPC server)
  */
 
 #include <glog/logging.h>
@@ -43,21 +43,19 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
         google::InitGoogleLogging("P2PMasterHttpEndpointsTest");
         FLAGS_logtostderr = 1;
 
-        const uint16_t http_port = static_cast<uint16_t>(getFreeTcpPort());
-
         P2PMasterConfig wms_cfg;
         wms_cfg.metrics.enable_reporting = false;
         wms_cfg.routes.max_clients_per_key = 0;  // no limit for P2P
-        wms_cfg.metrics.http_port = http_port;
+        wms_cfg.metrics.http_port = 0;
 
         wrapped_ = std::make_unique<P2PMasterRpcService>(wms_cfg);
         wrapped_->init();
-        // Give the HTTP server a moment to come up (mirrors InProcP2PMaster).
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        ASSERT_EQ(wrapped_->GetHttpPort(), http_port);
+        const uint16_t http_port = wrapped_->GetHttpPort();
+        ASSERT_NE(http_port, 0);
 
         http_base_url_ = "http://127.0.0.1:" + std::to_string(http_port);
         LOG(INFO) << "P2P master HTTP server at " << http_base_url_;
+        ASSERT_EQ(HttpGet(http_base_url_ + "/health").status, 200);
 
         // Register one client owning two P2P segments so tests can also
         // exercise keys with replicas on multiple segments.
@@ -85,6 +83,11 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
         auto reg_res = wrapped_->RegisterClient(reg_req);
         ASSERT_TRUE(reg_res.has_value())
             << "RegisterClient failed: " << reg_res.error();
+        ASSERT_TRUE(
+            wrapped_
+                ->Heartbeat({.client_id = client_id_,
+                             .service_state = P2PClientServiceState::ONLINE})
+                .has_value());
 
         // Tests populate keys themselves; start from an empty keyspace.
         ASSERT_EQ(wrapped_->GetMasterService().GetKeyCount(), 0u);

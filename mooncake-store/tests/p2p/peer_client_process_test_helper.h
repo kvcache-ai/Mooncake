@@ -25,7 +25,7 @@
 #include "p2p/client/v1/data_manager_v1.h"
 #include "test_exit_codes.h"
 #include "transfer_engine.h"
-#include "types.h"
+#include "common_types.h"
 #include "utils.h"
 #include "../utils/common.h"
 
@@ -227,6 +227,7 @@ class PeerClientRpcServerStack {
             std::move(tiered_backend), transfer_engine_,
             /*lock_shard_count=*/1024, local_transfer_config);
         rpc_service_ = std::make_unique<ClientRpcService>(*data_manager_);
+        rpc_service_->SetReady();
         control_service_ =
             std::make_unique<PeerClientTestControlRpcService>(*data_manager_);
 
@@ -235,14 +236,11 @@ class PeerClientRpcServerStack {
         RegisterClientRpcService(*server_, *rpc_service_);
         RegisterPeerClientTestControlRpcService(*server_, *control_service_);
 
-        server_thread_ = std::thread([this]() {
-            auto ec = server_->start();
-            if (ec) {
-                LOG(ERROR) << "RPC server start failed: " << ec.message();
-            }
-        });
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        auto started = server_->async_start();
+        if (started.hasResult() || server_->port() == 0) {
+            LOG(ERROR) << "Peer RPC server failed to bind port " << port_;
+            return false;
+        }
         return true;
     }
 
@@ -287,9 +285,6 @@ class PeerClientRpcServerStack {
         if (server_) {
             server_->stop();
         }
-        if (server_thread_.joinable()) {
-            server_thread_.join();
-        }
         server_.reset();
         control_service_.reset();
         rpc_service_.reset();
@@ -304,7 +299,6 @@ class PeerClientRpcServerStack {
     std::unique_ptr<ClientRpcService> rpc_service_;
     std::unique_ptr<PeerClientTestControlRpcService> control_service_;
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;
-    std::thread server_thread_;
 };
 
 inline std::optional<UUID> ReadTierIdFromStateFile(const std::string& path) {

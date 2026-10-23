@@ -71,14 +71,12 @@ std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
 // Removed allocated_bytes parameter and member initialization
 CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
                                                  size_t base, size_t size,
-                                                 std::string transport_endpoint,
-                                                 const UUID& segment_id)
+                                                 std::string transport_endpoint)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       cur_size_(0),
-      transport_endpoint_(std::move(transport_endpoint)),
-      segment_id_(segment_id) {
+      transport_endpoint_(std::move(transport_endpoint)) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
             << " size=" << size;
@@ -137,8 +135,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
             << " segment=" << segment_name_ << " address=" << buffer;
     cur_size_.fetch_add(size);
     if (on_allocated_) on_allocated_(size);
-    return std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size,
-                                             segment_id_);
+    return std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size);
 }
 
 void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
@@ -164,14 +161,12 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
 // OffsetBufferAllocator implementation
 OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
                                              size_t base, size_t size,
-                                             std::string transport_endpoint,
-                                             const UUID& segment_id)
+                                             std::string transport_endpoint)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       cur_size_(0),
-      transport_endpoint_(std::move(transport_endpoint)),
-      segment_id_(segment_id) {
+      transport_endpoint_(std::move(transport_endpoint)) {
     VLOG(1) << "initializing_offset_buffer_allocator segment_name="
             << segment_name << " base_address=" << reinterpret_cast<void*>(base)
             << " size=" << size;
@@ -232,8 +227,7 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         // Create a custom AllocatedBuffer that manages the
         // OffsetAllocationHandle
         allocated_buffer = std::make_unique<AllocatedBuffer>(
-            shared_from_this(), buffer_ptr, size, segment_id_,
-            std::move(allocation_handle));
+            shared_from_this(), buffer_ptr, size, std::move(allocation_handle));
         VLOG(1) << "allocation_succeeded size=" << size
                 << " segment=" << segment_name_ << " address=" << buffer_ptr;
     } catch (const std::exception& e) {

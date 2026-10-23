@@ -229,7 +229,7 @@ TEST_F(EventDrivenSchedulerTest, EvictReclaimsFastTierAboveWatermark) {
 
 TEST_F(EventDrivenSchedulerTest,
        NonFastTierAllocationFailureDoesNotForceReclaim) {
-    // D2-B: the event-driven scheduler force-reclaims ONLY the fast tier. A
+    // The event-driven scheduler force-reclaims ONLY the fast tier. A
     // strict allocation on a full SLOW tier must fail without evicting any of
     // its residents (slow tiers own their eviction inside their own Allocate).
     TieredBackend backend;
@@ -258,10 +258,8 @@ TEST_F(EventDrivenSchedulerTest,
 }
 
 TEST_F(EventDrivenSchedulerTest, StrictDramPutEvictsInsteadOfSpilling) {
-    // P1-4: the local-Put path now allocates DRAM strictly. Writing far more
-    // data than the fast (DRAM) tier holds must keep succeeding by evicting
-    // cold fast-tier copies and retrying on DRAM — never spilling the local
-    // replica down to the slow tier.
+    // Local puts must reclaim DRAM when full instead of spilling to a slow
+    // tier.
     TieredBackend backend;
     ASSERT_TRUE(
         InitTieredBackendForTest(backend, MakeConfig(2 * kMB, 64 * kMB,
@@ -288,10 +286,7 @@ TEST_F(EventDrivenSchedulerTest, StrictDramPutEvictsInsteadOfSpilling) {
 }
 
 TEST_F(EventDrivenSchedulerTest, GetHotKeyStatsZeroReturnsAllBeyondDefaultCap) {
-    // P1-1: HA recovery passes hot_key_num=0 (== all) through DataManager ->
-    // TieredBackend so Phase 1 recovers the entire hot working set, not just
-    // the scheduler's default cap. This guards the TieredBackend layer that
-    // DataManager::GetHotKeyStats forwards verbatim.
+    // hot_key_num=0 must return the full working set for HA recovery.
     auto cfg = MakeConfig(16 * kMB, 64 * kMB);
     cfg["scheduler"]["hot_key_num"] = 64;  // explicit small cap for the test
     TieredBackend backend;
@@ -315,9 +310,7 @@ TEST_F(EventDrivenSchedulerTest, GetHotKeyStatsZeroReturnsAllBeyondDefaultCap) {
 }
 
 TEST_F(EventDrivenSchedulerTest, StrictCopyDataDoesNotFallBackToOtherTier) {
-    // P2-1: migrate copies strictly, so a copy that cannot land on dest fails
-    // outright instead of silently falling back to another tier (which made the
-    // "did it land on dest?" accounting unreliable).
+    // A strict copy must fail if it cannot reach the requested tier.
     TieredBackend backend;
     // Fast tier is too small to ever hold the item, even after eviction.
     ASSERT_TRUE(InitTieredBackendForTest(backend, MakeConfig(1 * kMB, 64 * kMB))

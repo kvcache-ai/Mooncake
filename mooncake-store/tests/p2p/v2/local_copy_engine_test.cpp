@@ -24,7 +24,7 @@
 #include "p2p/client/v2/copier.h"
 #include "p2p/client/v2/local_copy_engine.h"
 #include "p2p/client/v2/tiler_manager.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake::v2 {
 namespace {

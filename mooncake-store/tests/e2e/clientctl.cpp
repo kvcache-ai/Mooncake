@@ -14,8 +14,6 @@
 // Command line flags
 USE_engine_flags DEFINE_string(master_server_entry, "localhost:50051",
                                "Master server address");
-DEFINE_string(deployment_mode, "Centralization",
-              "Client deployment mode: Centralization or P2P");
 DEFINE_string(p2p_local_transfer_mode, "memcpy",
               "P2P local transfer mode: memcpy or te");
 DEFINE_string(redis_cluster_id, "",
@@ -87,8 +85,7 @@ class ClientCtl {
             hostname, FLAGS_engine_meta_url, FLAGS_protocol, FLAGS_device_name,
             FLAGS_master_server_entry,
             /*local_buffer_size=*/1024 * 1024 * 128, FLAGS_redis_cluster_id,
-            /*enable_http_server=*/false, FLAGS_deployment_mode,
-            FLAGS_p2p_local_transfer_mode,
+            /*enable_http_server=*/false, FLAGS_p2p_local_transfer_mode,
             static_cast<uint16_t>(std::stoi(port)), FLAGS_redis_username,
             FLAGS_redis_password);
 

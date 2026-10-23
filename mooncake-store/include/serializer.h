@@ -6,9 +6,13 @@
 #include <cstdint>
 #include <glog/logging.h>
 
-#include "types.h"
+#include "common_types.h"
 
 namespace mooncake {
+
+using SerializedByte = uint8_t;  // Used as basic unit of serialized data
+static_assert(sizeof(SerializedByte) == 1,
+              "SerializedByte must be exactly 1 byte in size");
 
 /**
  * @brief Serialization Framework Usage Guide

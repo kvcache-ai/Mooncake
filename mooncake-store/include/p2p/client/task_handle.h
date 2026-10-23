@@ -13,7 +13,7 @@
 #include <ylt/coro_io/coro_io.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 

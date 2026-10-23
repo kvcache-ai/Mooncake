@@ -2,9 +2,16 @@
 
 #include <glog/logging.h>
 
-#include "types.h"
+#include <mutex>
+
+#include "common_types.h"
 
 namespace mooncake {
+
+using EtcdRevisionId = ViewVersionId;
+using EtcdLeaseId = ViewVersionId;
+
+static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;  // in seconds
 
 /*
  * @brief A helper class for etcd operations.

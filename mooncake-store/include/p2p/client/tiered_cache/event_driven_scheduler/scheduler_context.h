@@ -5,7 +5,7 @@
 #include <optional>
 #include <string_view>
 
-#include "types.h"  // UUID
+#include "p2p/common/p2p_types.h"  // UUID
 
 namespace mooncake {
 

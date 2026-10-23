@@ -21,6 +21,7 @@
 #include <thread>
 #include <vector>
 
+#include "p2p/client/p2p_client_config_builder.h"
 #include "p2p/client/p2p_client_metric.h"
 #include "p2p/client/p2p_client_service.h"
 #include "p2p_client_process_test_helper.h"
@@ -44,11 +45,7 @@ class P2PClientIntegrationTest : public ::testing::Test {
         TransferDirectionMode transfer_direction_mode =
             TransferDirectionMode::REVERSE,
         size_t te_async_poll_worker_num = 32) {
-        if (rpc_port == 0) rpc_port = getFreeTcpPort();
-
-        // TODO(C2): Bind the client listener atomically and publish its actual
-        // port after runtime ownership is split; remove the port-probe race.
-        auto config = ClientConfigBuilder::build_p2p_real_client(
+        auto config = P2PClientConfigBuilder::build_p2p_real_client(
             host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
             R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
             /*local_buffer_size=*/0, nullptr, "", rpc_port);
@@ -75,6 +72,8 @@ class P2PClientIntegrationTest : public ::testing::Test {
             return nullptr;
         }
 
+        EXPECT_TRUE(WaitForRoutableClient(client->GetMasterClient(),
+                                          client->GetClientID()));
         return client;
     }
 
@@ -134,7 +133,7 @@ TEST_F(P2PClientIntegrationTest, PutAndGetLocal) {
     // Put
     std::vector<Slice> put_slices;
     put_slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
-    auto put_result = client_->Put(key, put_slices, WriteRouteRequestConfig{});
+    auto put_result = client_->Put(key, put_slices, P2PWriteRouteConfig{});
     ASSERT_TRUE(put_result.has_value())
         << "Put failed: " << static_cast<int>(put_result.error());
 
@@ -184,7 +183,7 @@ TEST_F(P2PClientIntegrationTest, ForceLocalWriteBypass) {
     // for a remote route.
     {
         const std::string key = "force_local_key";
-        WriteRouteRequestConfig cfg;
+        P2PWriteRouteConfig cfg;
         cfg.remote_weight = 0.0;
 
         std::vector<Slice> slices;
@@ -211,7 +210,7 @@ TEST_F(P2PClientIntegrationTest, ForceLocalWriteBypass) {
     // The replica should be on client2_ (remote), not on client_.
     {
         const std::string key = "force_remote_key";
-        WriteRouteRequestConfig cfg;
+        P2PWriteRouteConfig cfg;
         cfg.remote_weight = 1.0;
         cfg.local_write_waterline = 0.0;  // disable waterline for force-remote
 
@@ -245,7 +244,7 @@ TEST_F(P2PClientIntegrationTest, WaterlineBypassWritesLocal) {
     // With waterline=0.5 and remote_weight=0.5 (balanced), the waterline
     // triggers a local write: data stays on client_.
     const std::string key = "waterline_bypass_key";
-    WriteRouteRequestConfig cfg;
+    P2PWriteRouteConfig cfg;
     cfg.remote_weight = 0.5;          // balanced
     cfg.local_write_waterline = 0.5;  // local is < 50% full -> local write
 
@@ -273,7 +272,7 @@ TEST_F(P2PClientIntegrationTest, WaterlineBypassWritesLocal) {
 // is rejected by BatchPut at the client side.
 TEST_F(P2PClientIntegrationTest, ContradictoryConfigRejected) {
     const std::string data = "contradictory_payload";
-    WriteRouteRequestConfig cfg;
+    P2PWriteRouteConfig cfg;
     cfg.remote_weight = 0.0;
     cfg.local_write_waterline =
         0.0;  // dead end: forbid local write + forbid remote route
@@ -301,7 +300,7 @@ TEST_F(P2PClientIntegrationTest, IsExist) {
     // Put data
     std::vector<Slice> slices;
     slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
-    auto put_result = client_->Put(key, slices, WriteRouteRequestConfig{});
+    auto put_result = client_->Put(key, slices, P2PWriteRouteConfig{});
     ASSERT_TRUE(put_result.has_value());
 
     // After put: should exist (via master, since AddReplica callback fired)
@@ -340,13 +339,130 @@ TEST_F(P2PClientIntegrationTest, GetMissMetrics) {
 // Query returns replica descriptors
 // ============================================================================
 
+TEST_F(P2PClientIntegrationTest, MissingTransferEngineFailsBeforePublication) {
+    P2PClientService pending("P2PHANDSHAKE", 0, false, {}, false);
+    EXPECT_EQ(pending.GetHealthStatus(), "INITIALIZING");
+    EXPECT_EQ(pending.GetRpcPort(), 0);
+    P2PClientConfig config;
+    config.local_hostname = "localhost";
+    config.protocol = "rpc_only";
+    EXPECT_EQ(pending.Init(config), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(pending.GetRpcPort(), 0);
+    EXPECT_EQ(pending.GetBufferAllocator(), nullptr);
+    // The caller must stop the client after a failed direct Init.
+    pending.Stop();
+    EXPECT_EQ(pending.GetHealthStatus(), "STOPPED");
+    pending.Destroy();
+}
+
+TEST_F(P2PClientIntegrationTest, NativeQueriesPreserveRoutesAndBatchOrder) {
+    const std::string key = "native_query_route_fields";
+    const std::string missing = "native_query_missing_key";
+    const std::string data = "native_route_payload";
+    P2PWriteRouteConfig config;
+    config.remote_weight = 0.0;
+    std::vector<Slice> slices{{const_cast<char*>(data.data()), data.size()}};
+    auto put = client_->Put(key, slices, config);
+    ASSERT_TRUE(put.has_value()) << put.error();
+
+    auto local = client_->Query(key);
+    ASSERT_TRUE(local.has_value()) << local.error();
+    ASSERT_EQ(local->size(), 1u);
+    const auto& route = local->front();
+    EXPECT_EQ(route.client_id, client_->GetClientID());
+    EXPECT_NE(route.segment_id, (UUID{0, 0}));
+    EXPECT_FALSE(route.ip_address.empty());
+    EXPECT_NE(route.rpc_port, 0);
+    EXPECT_EQ(route.rpc_port, client_->GetRpcPort());
+    EXPECT_EQ(route.object_size, data.size());
+
+    const auto expect_same_route = [&](const P2PRouteDescriptor& actual) {
+        EXPECT_EQ(actual.client_id, route.client_id);
+        EXPECT_EQ(actual.segment_id, route.segment_id);
+        EXPECT_EQ(actual.ip_address, route.ip_address);
+        EXPECT_EQ(actual.rpc_port, route.rpc_port);
+        EXPECT_EQ(actual.object_size, route.object_size);
+    };
+    auto remote = client2_->Query(key);
+    ASSERT_TRUE(remote.has_value()) << remote.error();
+    ASSERT_EQ(remote->size(), 1u);
+    expect_same_route(remote->front());
+
+    auto batch = client2_->BatchQuery({key, missing, key});
+    ASSERT_EQ(batch.size(), 3u);
+    for (size_t index : {0u, 2u}) {
+        ASSERT_TRUE(batch[index].has_value()) << batch[index].error();
+        ASSERT_EQ(batch[index]->size(), 1u);
+        expect_same_route(batch[index]->front());
+    }
+    ASSERT_FALSE(batch[1].has_value());
+    EXPECT_EQ(batch[1].error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_TRUE(client2_->BatchQuery({}).empty());
+
+    auto regex = client2_->QueryByRegex("^native_query_route_fields$");
+    ASSERT_TRUE(regex.has_value()) << regex.error();
+    ASSERT_EQ(regex->count(key), 1u);
+    ASSERT_EQ(regex->at(key).size(), 1u);
+    expect_same_route(regex->at(key).front());
+}
+
+TEST_F(P2PClientIntegrationTest, BatchQueryKeepsLocalHitsAfterUnregister) {
+    auto isolated = CreateP2PClient("localhost", 0, "memcpy");
+    ASSERT_NE(isolated, nullptr);
+    const std::string key = "local-only-batch-query";
+    std::string value = "retained";
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    P2PWriteRouteConfig config;
+    config.remote_weight = 0.0;
+    ASSERT_TRUE(isolated->Put(key, slices, config).has_value());
+    P2PReadRouteConfig filtered;
+    filtered.priority_limit = 1000;
+    auto master_result =
+        isolated->GetMasterClient().GetReadRoute(key, filtered);
+    ASSERT_FALSE(master_result.has_value());
+    auto healthy = isolated->BatchQuery({key}, filtered);
+    ASSERT_EQ(healthy.size(), 1u);
+    ASSERT_FALSE(healthy[0].has_value());
+    EXPECT_EQ(healthy[0].error(), master_result.error());
+    ASSERT_TRUE(isolated->UnregisterClient().has_value());
+    EXPECT_EQ(isolated->GetHealthStatus(), "LOCAL_ONLY");
+    auto single = isolated->Query(key);
+    ASSERT_TRUE(single.has_value());
+    auto batch = isolated->BatchQuery({key, "missing-local-only-key", key});
+    ASSERT_EQ(batch.size(), 3u);
+    for (size_t i : {0u, 2u}) {
+        ASSERT_TRUE(batch[i].has_value());
+        ASSERT_EQ(batch[i]->size(), 1u);
+        EXPECT_EQ(batch[i]->front().client_id, isolated->GetClientID());
+        EXPECT_EQ(batch[i]->front().segment_id, single->front().segment_id);
+        EXPECT_EQ(batch[i]->front().object_size, value.size());
+    }
+    ASSERT_FALSE(batch[1].has_value());
+    EXPECT_EQ(batch[1].error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_TRUE(isolated->BatchQuery({}).empty());
+}
+
+TEST_F(P2PClientIntegrationTest, BatchQueryIpUsesNativeMaster) {
+    const auto first = client_->GetClientID();
+    const auto second = client2_->GetClientID();
+    const auto missing = generate_uuid();
+    auto result = client_->BatchQueryIp({first, second, missing, first});
+    ASSERT_TRUE(result.has_value()) << result.error();
+    ASSERT_EQ(result->size(), 2u);
+    ASSERT_EQ(result->count(first), 1u);
+    ASSERT_EQ(result->count(second), 1u);
+    EXPECT_FALSE(result->at(first).empty());
+    EXPECT_FALSE(result->at(second).empty());
+    EXPECT_EQ(result->count(missing), 0u);
+}
+
 TEST_F(P2PClientIntegrationTest, QueryReturnsReplicas) {
     const std::string key = "p2p_query_replica";
     const std::string data = "replica_data";
 
     std::vector<Slice> slices;
     slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
-    auto put = client_->Put(key, slices, WriteRouteRequestConfig{});
+    auto put = client_->Put(key, slices, P2PWriteRouteConfig{});
     ASSERT_TRUE(put.has_value());
 
     auto query = client_->Query(key);
@@ -354,7 +470,7 @@ TEST_F(P2PClientIntegrationTest, QueryReturnsReplicas) {
         << "Query failed: " << static_cast<int>(query.error());
 
     // P2P mode: replicas come from master's AddReplica record
-    auto& replicas = query.value()->replicas;
+    auto& replicas = query.value();
     EXPECT_GE(replicas.size(), 1u)
         << "Expected at least one replica descriptor";
 }
@@ -372,7 +488,7 @@ TEST_F(P2PClientIntegrationTest, BatchIsExist) {
         std::string data = "data_" + std::to_string(i);
         std::vector<Slice> slices;
         slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
-        auto put = client_->Put(key, slices, WriteRouteRequestConfig{});
+        auto put = client_->Put(key, slices, P2PWriteRouteConfig{});
         ASSERT_TRUE(put.has_value());
     }
 
@@ -419,7 +535,7 @@ TEST_F(P2PClientIntegrationTest, BatchPutAndBatchQuery) {
 
     // BatchPut
     auto put_results =
-        client_->BatchPut(keys, batched_slices, WriteRouteRequestConfig{});
+        client_->BatchPut(keys, batched_slices, P2PWriteRouteConfig{});
     ASSERT_EQ(put_results.size(), static_cast<size_t>(batch_size));
     for (auto& r : put_results) {
         EXPECT_TRUE(r.has_value())
@@ -469,11 +585,11 @@ TEST_F(P2PClientIntegrationTest, RemoteBatchPutAndBatchGet) {
 
         // Force write route to exclude local candidate so the writer must
         // execute remote Put RPCs.
-        WriteRouteRequestConfig remote_put_config;
+        P2PWriteRouteConfig remote_put_config;
         remote_put_config.remote_weight = 1.0;  // force remote
         remote_put_config.local_write_waterline = 0.0;
         remote_put_config.max_candidates =
-            WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+            P2PWriteRouteConfig::RETURN_ALL_CANDIDATES;
         auto put_results =
             remote_writer->BatchPut(keys, batched_slices, remote_put_config);
         ASSERT_EQ(put_results.size(), static_cast<size_t>(batch_size));
@@ -493,7 +609,7 @@ TEST_F(P2PClientIntegrationTest, RemoteBatchPutAndBatchGet) {
         }
 
         auto batch_get_results = remote_writer->BatchGet(
-            keys, all_buffers, all_sizes, ReadRouteConfig{});
+            keys, all_buffers, all_sizes, P2PReadRouteConfig{});
         ASSERT_EQ(batch_get_results.size(), static_cast<size_t>(batch_size));
         for (int i = 0; i < batch_size; ++i) {
             ASSERT_TRUE(batch_get_results[i].has_value())
@@ -511,7 +627,7 @@ TEST_F(P2PClientIntegrationTest, RemoteBatchPutAndBatchGet) {
         auto allocator = ClientBufferAllocator::create(8 * 1024 * 1024);
         ASSERT_NE(allocator, nullptr);
         auto batch_get_handles =
-            remote_writer->BatchGet(keys, allocator, ReadRouteConfig{});
+            remote_writer->BatchGet(keys, allocator, P2PReadRouteConfig{});
         ASSERT_EQ(batch_get_handles.size(), static_cast<size_t>(batch_size));
         for (int i = 0; i < batch_size; ++i) {
             ASSERT_TRUE(batch_get_handles[i].has_value())
@@ -544,7 +660,7 @@ TEST_F(P2PClientIntegrationTest, PutOverwrite) {
     {
         std::vector<Slice> s;
         s.emplace_back(Slice{const_cast<char*>(data1.data()), data1.size()});
-        auto r = client_->Put(key, s, WriteRouteRequestConfig{});
+        auto r = client_->Put(key, s, P2PWriteRouteConfig{});
         ASSERT_TRUE(r.has_value());
 
         // Verify the master-side metadata over RPC (the master runs in a
@@ -562,7 +678,7 @@ TEST_F(P2PClientIntegrationTest, PutOverwrite) {
         // Overwriting is not allowed, but the error should be ignored
         std::vector<Slice> s;
         s.emplace_back(Slice{const_cast<char*>(data2.data()), data2.size()});
-        auto r = client_->Put(key, s, WriteRouteRequestConfig{});
+        auto r = client_->Put(key, s, P2PWriteRouteConfig{});
         ASSERT_TRUE(r.has_value());
 
         // due to the write operation is canceled,
@@ -624,7 +740,7 @@ TEST_F(P2PClientIntegrationTest, RemoveAllLocalRemovesPutKeys) {
         std::vector<Slice> slices;
         slices.emplace_back(
             Slice{const_cast<char*>(payloads[i].data()), payloads[i].size()});
-        auto put = client_->Put(keys[i], slices, WriteRouteRequestConfig{});
+        auto put = client_->Put(keys[i], slices, P2PWriteRouteConfig{});
         ASSERT_TRUE(put.has_value()) << "Put failed for " << keys[i] << ": "
                                      << static_cast<int>(put.error());
     }
@@ -659,7 +775,7 @@ TEST_F(P2PClientIntegrationTest, RemoveAllLocalIdempotent) {
         std::string data = "idem_payload_" + std::to_string(i);
         std::vector<Slice> slices;
         slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
-        auto put = client_->Put(key, slices, WriteRouteRequestConfig{});
+        auto put = client_->Put(key, slices, P2PWriteRouteConfig{});
         ASSERT_TRUE(put.has_value()) << "Put failed for " << key << ": "
                                      << static_cast<int>(put.error());
     }
@@ -688,7 +804,7 @@ TEST_F(P2PClientIntegrationTest, RemoveLocalAfterPut) {
 
     std::vector<Slice> slices;
     slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
-    auto put = client_->Put(key, slices, WriteRouteRequestConfig{});
+    auto put = client_->Put(key, slices, P2PWriteRouteConfig{});
     ASSERT_TRUE(put.has_value())
         << "Put failed: " << static_cast<int>(put.error());
 
@@ -734,24 +850,6 @@ TEST_F(P2PClientIntegrationTest, RemoveLocalNonExistent) {
 // }
 
 // ============================================================================
-// MountSegment / UnmountSegment should return NOT_IMPLEMENTED
-// ============================================================================
-
-// TEST_F(P2PClientIntegrationTest, MountSegmentNotImplemented) {
-//     char dummy[64] = {0};
-//     auto r = client_->MountSegment(dummy, sizeof(dummy));
-//     ASSERT_FALSE(r.has_value());
-//     EXPECT_EQ(r.error(), ErrorCode::NOT_IMPLEMENTED);
-// }
-
-// TEST_F(P2PClientIntegrationTest, UnmountSegmentNotImplemented) {
-//     char dummy[64] = {0};
-//     auto r = client_->UnmountSegment(dummy, sizeof(dummy));
-//     ASSERT_FALSE(r.has_value());
-//     EXPECT_EQ(r.error(), ErrorCode::NOT_IMPLEMENTED);
-// }
-
-// ============================================================================
 // Query non-existent key should fail
 // ============================================================================
 
@@ -773,7 +871,7 @@ TEST_F(P2PClientIntegrationTest, LargePutGet) {
     // Put
     std::vector<Slice> put_slices;
     put_slices.emplace_back(Slice{payload.data(), payload.size()});
-    auto put = client_->Put(key, put_slices, WriteRouteRequestConfig{});
+    auto put = client_->Put(key, put_slices, P2PWriteRouteConfig{});
     ASSERT_TRUE(put.has_value())
         << "Large Put failed: " << static_cast<int>(put.error());
 
@@ -816,8 +914,7 @@ TEST_F(P2PClientIntegrationTest, LocalPutGetWithTeTransferMode) {
 
     std::vector<Slice> put_slices = {Slice{part1.data(), part1.size()},
                                      Slice{part2.data(), part2.size()}};
-    auto put_result =
-        te_client->Put(key, put_slices, WriteRouteRequestConfig{});
+    auto put_result = te_client->Put(key, put_slices, P2PWriteRouteConfig{});
     ASSERT_TRUE(put_result.has_value())
         << "Put failed: " << static_cast<int>(put_result.error());
 
@@ -852,8 +949,7 @@ TEST_F(P2PClientIntegrationTest, LocalGetBufferHandleWithTeTransferMode) {
     ASSERT_TRUE(reg_src.has_value());
 
     std::vector<Slice> put_slices = {{payload.data(), payload.size()}};
-    auto put_result =
-        te_client->Put(key, put_slices, WriteRouteRequestConfig{});
+    auto put_result = te_client->Put(key, put_slices, P2PWriteRouteConfig{});
     ASSERT_TRUE(put_result.has_value())
         << "Put failed: " << static_cast<int>(put_result.error());
 
@@ -863,7 +959,7 @@ TEST_F(P2PClientIntegrationTest, LocalGetBufferHandleWithTeTransferMode) {
         allocator->getBase(), allocator->size(), "*", false, false);
     ASSERT_TRUE(reg_dst.has_value());
 
-    auto get_result = te_client->Get(key, allocator, ReadRouteConfig{});
+    auto get_result = te_client->Get(key, allocator, P2PReadRouteConfig{});
     ASSERT_TRUE(get_result.has_value())
         << "Get(buffer) failed: " << static_cast<int>(get_result.error());
 
@@ -893,10 +989,10 @@ TEST_F(P2PClientIntegrationTest, ForwardRemotePutAndGet) {
         const std::string key = "p2p_fwd_put_get_" + mode + "_" + host;
         const std::string payload = "forward_payload_" + mode + "_data";
 
-        WriteRouteRequestConfig route;
+        P2PWriteRouteConfig route;
         route.remote_weight = 1.0;  // force remote
         route.local_write_waterline = 0.0;
-        route.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+        route.max_candidates = P2PWriteRouteConfig::RETURN_ALL_CANDIDATES;
 
         std::vector<Slice> slices;
         slices.emplace_back(
@@ -914,8 +1010,8 @@ TEST_F(P2PClientIntegrationTest, ForwardRemotePutAndGet) {
         EXPECT_TRUE(exist_on_owner.value())
             << "Forward Put should leave key on owner peer, mode=" << mode;
 
-        ReadRouteConfig rcfg;
-        rcfg.max_candidates = ReadRouteConfig::RETURN_ALL_CANDIDATES;
+        P2PReadRouteConfig rcfg;
+        rcfg.max_candidates = P2PReadRouteConfig::RETURN_ALL_CANDIDATES;
 
         std::vector<char> buf(payload.size(), 0);
         auto get_res =
@@ -959,11 +1055,11 @@ TEST_F(P2PClientIntegrationTest, ForwardRemoteBatchPutAndBatchGet) {
             batched_slices.push_back(std::move(slices));
         }
 
-        WriteRouteRequestConfig remote_put_config;
+        P2PWriteRouteConfig remote_put_config;
         remote_put_config.remote_weight = 1.0;  // force remote
         remote_put_config.local_write_waterline = 0.0;
         remote_put_config.max_candidates =
-            WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+            P2PWriteRouteConfig::RETURN_ALL_CANDIDATES;
 
         auto put_results =
             remote_writer->BatchPut(keys, batched_slices, remote_put_config);
@@ -984,8 +1080,8 @@ TEST_F(P2PClientIntegrationTest, ForwardRemoteBatchPutAndBatchGet) {
                 << key << " mode=" << mode;
         }
 
-        ReadRouteConfig read_config;
-        read_config.max_candidates = ReadRouteConfig::RETURN_ALL_CANDIDATES;
+        P2PReadRouteConfig read_config;
+        read_config.max_candidates = P2PReadRouteConfig::RETURN_ALL_CANDIDATES;
 
         std::vector<std::vector<char>> read_payloads(batch_size);
         std::vector<std::vector<void*>> all_buffers(batch_size);
@@ -1069,11 +1165,11 @@ TEST_F(P2PClientIntegrationTest, TeAsyncPollForwardRemoteBatchPutAndGet) {
             batched_slices.push_back(std::move(slices));
         }
 
-        WriteRouteRequestConfig remote_put_config;
+        P2PWriteRouteConfig remote_put_config;
         remote_put_config.remote_weight = 1.0;
         remote_put_config.local_write_waterline = 0.0;
         remote_put_config.max_candidates =
-            WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+            P2PWriteRouteConfig::RETURN_ALL_CANDIDATES;
         auto put_results =
             remote_writer->BatchPut(keys, batched_slices, remote_put_config);
         ASSERT_EQ(put_results.size(), static_cast<size_t>(batch_size));
@@ -1084,8 +1180,8 @@ TEST_F(P2PClientIntegrationTest, TeAsyncPollForwardRemoteBatchPutAndGet) {
                 << " err=" << static_cast<int>(put_results[i].error());
         }
 
-        ReadRouteConfig read_config;
-        read_config.max_candidates = ReadRouteConfig::RETURN_ALL_CANDIDATES;
+        P2PReadRouteConfig read_config;
+        read_config.max_candidates = P2PReadRouteConfig::RETURN_ALL_CANDIDATES;
         std::vector<std::vector<char>> read_payloads(batch_size);
         std::vector<std::vector<void*>> all_buffers(batch_size);
         std::vector<std::vector<size_t>> all_sizes(batch_size);
@@ -1144,11 +1240,11 @@ TEST_F(P2PClientIntegrationTest, TeAsyncPollReverseRemoteBatchPutAndGet) {
             batched_slices.push_back(std::move(slices));
         }
 
-        WriteRouteRequestConfig remote_put_config;
+        P2PWriteRouteConfig remote_put_config;
         remote_put_config.remote_weight = 1.0;
         remote_put_config.local_write_waterline = 0.0;
         remote_put_config.max_candidates =
-            WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+            P2PWriteRouteConfig::RETURN_ALL_CANDIDATES;
         auto put_results =
             remote_writer->BatchPut(keys, batched_slices, remote_put_config);
         ASSERT_EQ(put_results.size(), static_cast<size_t>(batch_size));
@@ -1159,8 +1255,8 @@ TEST_F(P2PClientIntegrationTest, TeAsyncPollReverseRemoteBatchPutAndGet) {
                 << " err=" << static_cast<int>(put_results[i].error());
         }
 
-        ReadRouteConfig read_config;
-        read_config.max_candidates = ReadRouteConfig::RETURN_ALL_CANDIDATES;
+        P2PReadRouteConfig read_config;
+        read_config.max_candidates = P2PReadRouteConfig::RETURN_ALL_CANDIDATES;
         std::vector<std::vector<char>> read_payloads(batch_size);
         std::vector<std::vector<void*>> all_buffers(batch_size);
         std::vector<std::vector<size_t>> all_sizes(batch_size);
@@ -1194,7 +1290,7 @@ TEST_F(P2PClientIntegrationTest, TeAsyncPollReverseRemoteBatchPutAndGet) {
 TEST_F(P2PClientIntegrationTest, UnregisterSwitchesToLocalOnly) {
     auto c = CreateP2PClient("localhost:18821");
     ASSERT_NE(c, nullptr);
-    EXPECT_EQ(c->GetHealthStatus(), "FULL");
+    EXPECT_EQ(c->GetHealthStatus(), "ONLINE");
 
     // Unregister -> stable LOCAL_ONLY (heartbeat stopped, no auto re-register).
     auto un = c->UnregisterClient();
@@ -1206,7 +1302,7 @@ TEST_F(P2PClientIntegrationTest, UnregisterSwitchesToLocalOnly) {
     const std::string data = "local-only-data";
     std::vector<Slice> put_slices;
     put_slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
-    ASSERT_TRUE(c->Put(key, put_slices, WriteRouteRequestConfig{}).has_value());
+    ASSERT_TRUE(c->Put(key, put_slices, P2PWriteRouteConfig{}).has_value());
 
     std::vector<char> buf(data.size(), 0);
     auto get_res = c->Get(key, {(void*)buf.data()}, {buf.size()});
@@ -1219,7 +1315,7 @@ TEST_F(P2PClientIntegrationTest, UnregisterSwitchesToLocalOnly) {
     // P2PClientHttpEndpointsTest.HttpUnregisterThenRegister.)
 
     c->Stop();
-    c->Destroy();
+    c.reset();
 }
 
 // ============================================================================
@@ -1247,7 +1343,7 @@ TEST_F(P2PClientIntegrationTest, MetricLocalPutGet_TE) {
     // Put (default config -> local write)
     std::vector<Slice> put_slices;
     put_slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
-    auto put_result = client_->Put(key, put_slices, WriteRouteRequestConfig{});
+    auto put_result = client_->Put(key, put_slices, P2PWriteRouteConfig{});
     ASSERT_TRUE(put_result.has_value())
         << "Put failed: " << static_cast<int>(put_result.error());
 
@@ -1298,7 +1394,7 @@ TEST_F(P2PClientIntegrationTest, MetricLocalPutGet_Memcpy) {
     // Put
     std::vector<Slice> put_slices;
     put_slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
-    auto put_result = c->Put(key, put_slices, WriteRouteRequestConfig{});
+    auto put_result = c->Put(key, put_slices, P2PWriteRouteConfig{});
     ASSERT_TRUE(put_result.has_value())
         << "Memcpy Put failed: " << static_cast<int>(put_result.error());
 
@@ -1326,7 +1422,7 @@ TEST_F(P2PClientIntegrationTest, MetricLocalPutGet_Memcpy) {
     EXPECT_EQ(m->remote_request.get_requests.value(), 0);
 
     c->Stop();
-    c->Destroy();
+    c.reset();
 }
 
 TEST_F(P2PClientIntegrationTest, MetricRemotePut) {
@@ -1348,10 +1444,10 @@ TEST_F(P2PClientIntegrationTest, MetricRemotePut) {
         m_owner->peer_request_metrics.write_remote_data.requests.value();
 
     // Force remote write
-    WriteRouteRequestConfig cfg;
+    P2PWriteRouteConfig cfg;
     cfg.remote_weight = 1.0;
     cfg.local_write_waterline = 0.0;
-    cfg.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+    cfg.max_candidates = P2PWriteRouteConfig::RETURN_ALL_CANDIDATES;
 
     std::vector<Slice> slices;
     slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
@@ -1385,7 +1481,7 @@ TEST_F(P2PClientIntegrationTest, MetricRemoteGet) {
     // First: client_ puts locally
     std::vector<Slice> put_slices;
     put_slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
-    auto put_result = client_->Put(key, put_slices, WriteRouteRequestConfig{});
+    auto put_result = client_->Put(key, put_slices, P2PWriteRouteConfig{});
     ASSERT_TRUE(put_result.has_value());
 
     // Snapshot reader (client2_) metrics
@@ -1488,7 +1584,7 @@ TEST_F(P2PClientIntegrationTest, MetricBatchPutGet) {
     auto before_local_put_req = m->local_request.put_requests.value();
 
     auto put_results =
-        client_->BatchPut(keys, batched_slices, WriteRouteRequestConfig{});
+        client_->BatchPut(keys, batched_slices, P2PWriteRouteConfig{});
     ASSERT_EQ(put_results.size(), static_cast<size_t>(batch_size));
     for (auto& r : put_results) {
         ASSERT_TRUE(r.has_value())
@@ -1518,7 +1614,7 @@ TEST_F(P2PClientIntegrationTest, MetricBatchPutGet) {
     }
 
     auto get_results =
-        client_->BatchGet(keys, all_buffers, all_sizes, ReadRouteConfig{});
+        client_->BatchGet(keys, all_buffers, all_sizes, P2PReadRouteConfig{});
     ASSERT_EQ(get_results.size(), static_cast<size_t>(batch_size));
     for (int i = 0; i < batch_size; ++i) {
         ASSERT_TRUE(get_results[i].has_value())
@@ -1544,7 +1640,7 @@ TEST_F(P2PClientIntegrationTest, MetricPutAlreadyExists) {
 
     std::vector<Slice> slices;
     slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
-    auto first_put = client_->Put(key, slices, WriteRouteRequestConfig{});
+    auto first_put = client_->Put(key, slices, P2PWriteRouteConfig{});
     ASSERT_TRUE(first_put.has_value());
 
     // Snapshot before the duplicate put
@@ -1555,7 +1651,7 @@ TEST_F(P2PClientIntegrationTest, MetricPutAlreadyExists) {
     auto before_remote_put_req = m->remote_request.put_requests.value();
 
     // Duplicate put is surfaced as success (idempotent rewrite).
-    auto second_put = client_->Put(key, slices, WriteRouteRequestConfig{});
+    auto second_put = client_->Put(key, slices, P2PWriteRouteConfig{});
     ASSERT_TRUE(second_put.has_value());
 
     // The already-exists write is ignored in every metric layer.
@@ -1583,7 +1679,7 @@ TEST_F(P2PClientIntegrationTest, MetricPutFailure) {
     slices.emplace_back(std::vector<Slice>{
         Slice{const_cast<char*>(payload.data()), payload.size()}});
 
-    auto results = client_->BatchPut(keys, slices, WriteRouteRequestConfig{});
+    auto results = client_->BatchPut(keys, slices, P2PWriteRouteConfig{});
     ASSERT_EQ(results.size(), keys.size());
     for (auto& r : results) {
         EXPECT_FALSE(r.has_value());
@@ -1610,7 +1706,7 @@ TEST_F(P2PClientIntegrationTest, KeyRetentionMetricsLifecycle) {
     std::vector<Slice> put_slices;
     put_slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
     ASSERT_TRUE(
-        client_->Put(key, put_slices, WriteRouteRequestConfig{}).has_value());
+        client_->Put(key, put_slices, P2PWriteRouteConfig{}).has_value());
 
     // Let the key age into a non-zero bucket.
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
@@ -1638,8 +1734,7 @@ TEST_F(P2PClientIntegrationTest, KeyRetentionMetricsLifecycle) {
     EXPECT_NE(text.find("mooncake_p2p_key_retention_removed_age_"
                         "seconds_bucket"),
               std::string::npos);
-    // The quantile gauges were replaced by scrape-time histograms; the
-    // live-age histogram is present only while keys are alive.
+    // Export scrape-time histograms; live-age samples require live keys.
     EXPECT_EQ(text.find("mooncake_p2p_key_retention_live_age_p"),
               std::string::npos);
     EXPECT_EQ(text.find("mooncake_p2p_key_retention_removed_age_p"),

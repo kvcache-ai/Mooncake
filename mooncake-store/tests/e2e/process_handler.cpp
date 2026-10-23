@@ -122,9 +122,14 @@ bool MasterProcessHandler::start() {
         // Execute the master
         std::string rpc_address_arg = "--rpc-address=" + config_.rpc_address;
         std::string rpc_port_arg = "--rpc-port=" + std::to_string(port_);
-        std::vector<std::string> args = {master_path_, "--enable-ha=true",
-                                         rpc_address_arg, rpc_port_arg};
+        std::vector<std::string> args = {master_path_,
+                                         "--enable-ha=true",
+                                         rpc_address_arg,
+                                         rpc_port_arg,
+                                         "--enable_metric_reporting=false",
+                                         "--metrics_port=0"};
 
+#if defined(MOONCAKE_STORE_CLIENT_P2P)
         if (config_.max_client_per_key.has_value()) {
             args.emplace_back("--max-client-per-key=" +
                               std::to_string(*config_.max_client_per_key));
@@ -147,10 +152,6 @@ bool MasterProcessHandler::start() {
             }
         }
 
-        if (!config_.cluster_id.empty()) {
-            args.emplace_back("--cluster-id=" + config_.cluster_id);
-        }
-
         if (config_.election_backend == "redis") {
             args.emplace_back("--election-backend=redis");
             args.emplace_back("--redis-endpoint=" + config_.redis_endpoint);
@@ -170,6 +171,18 @@ bool MasterProcessHandler::start() {
             }
         } else {
             args.emplace_back("--etcd-endpoints=" + config_.etcd_endpoints);
+        }
+
+#else
+        if (config_.election_backend != "etcd") {
+            LOG(ERROR) << "Centralized master tests require etcd election";
+            exit(1);
+        }
+        args.emplace_back("--etcd-endpoints=" + config_.etcd_endpoints);
+#endif
+
+        if (!config_.cluster_id.empty()) {
+            args.emplace_back("--cluster-id=" + config_.cluster_id);
         }
 
         LOG(INFO) << "[m" << index_ << "] Exec master " << rpc_address_arg

@@ -16,7 +16,7 @@
 #include "p2p/client/tiered_cache/event_driven_scheduler/event_driven_policy.h"
 #include "p2p/client/tiered_cache/event_driven_scheduler/tier_roles.h"
 #include "p2p/client/tiered_cache/scheduler/client_scheduler_interface.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 

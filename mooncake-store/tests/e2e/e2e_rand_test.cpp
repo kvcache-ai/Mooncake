@@ -10,6 +10,7 @@
 #include "e2e_utils.h"
 #include "process_handler.h"
 #include "types.h"
+#include "etcd_helper.h"
 #include "utils.h"
 
 USE_engine_flags;

@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 
-#define protected public
+#define private public
 #include "p2p/client/p2p_client_service.h"
-#undef protected
+#undef private
 
 #ifdef STORE_USE_REDIS
 #include "p2p/ha/redis_election_helper.h"

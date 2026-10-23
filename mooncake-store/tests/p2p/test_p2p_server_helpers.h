@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdlib>
+#include <exception>
+#include <glog/logging.h>
 #include <memory>
 #include <optional>
 #include <string>
@@ -10,11 +12,27 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "p2p/master/p2p_rpc_service.h"
+#include "p2p/master/p2p_master_client.h"
 #include "types.h"
 #include "utils.h"
 
 namespace mooncake {
 namespace testing {
+
+// Init publishes the local state; Master sees it on the next heartbeat.
+// Data-path fixtures wait for that advertisement instead of assuming Init's
+// return synchronously changes the Master's route visibility.
+inline bool WaitForRoutableClient(P2PMasterClient& master,
+                                  const UUID& client_id) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+        auto ips = master.BatchQueryIp({client_id});
+        if (ips && ips->contains(client_id)) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
 
 struct InProcP2PMasterConfig {
     std::optional<int> rpc_port;
@@ -71,8 +89,7 @@ class InProcP2PMaster {
 
     bool Start(InProcP2PMasterConfig config = {}) {
         try {
-            rpc_port_ = config.rpc_port.has_value() ? config.rpc_port.value()
-                                                    : getFreeTcpPort();
+            rpc_port_ = config.rpc_port.value_or(0);
 
             server_ = std::make_unique<coro_rpc::coro_rpc_server>(
                 /*thread_num=*/4, /*port=*/rpc_port_, /*address=*/"0.0.0.0",
@@ -80,6 +97,7 @@ class InProcP2PMaster {
 
             P2PMasterConfig wms_cfg;
             wms_cfg.metrics.enable_reporting = false;
+            wms_cfg.metrics.http_port = 0;
             wms_cfg.rpc.heartbeat_port = config.heartbeat_rpc_port.value_or(0);
             wms_cfg.routes.max_clients_per_key = 0;  // no limit for P2P
 
@@ -114,7 +132,9 @@ class InProcP2PMaster {
                     config.heartbeat_rpc_thread_num.has_value()
                         ? config.heartbeat_rpc_thread_num.value()
                         : 1u;
-                if (hb_threads == 0) hb_threads = 1;
+                if (hb_threads == 0) {
+                    hb_threads = 1;
+                }
                 heartbeat_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
                     /*thread_num=*/hb_threads, /*port=*/heartbeat_rpc_port_,
                     /*address=*/"0.0.0.0", std::chrono::seconds(0),
@@ -124,17 +144,29 @@ class InProcP2PMaster {
 
             auto ec = server_->async_start();
             if (ec.hasResult()) {
+                LOG(ERROR) << "Failed to start test P2P master on port "
+                           << rpc_port_ << ": "
+                           << ec.result().value().message();
                 return false;
             }
+            rpc_port_ = server_->port();
             if (heartbeat_server_) {
                 auto hb_ec = heartbeat_server_->async_start();
                 if (hb_ec.hasResult()) {
+                    LOG(ERROR)
+                        << "Failed to start test heartbeat server on port "
+                        << heartbeat_rpc_port_ << ": "
+                        << hb_ec.result().value().message();
                     return false;
                 }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             return true;
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to start test P2P master: " << e.what();
+            return false;
         } catch (...) {
+            LOG(ERROR) << "Failed to start test P2P master: unknown exception";
             return false;
         }
     }

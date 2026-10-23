@@ -1,3 +1,4 @@
+#include "version.h"
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
@@ -214,6 +215,7 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              &master_config.processing_task_timeout_sec,
                              FLAGS_processing_task_timeout_sec);
 }
+
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
                            bool conf_set) {
     if (FLAGS_max_threads != 4) {  // 4 is the default value
@@ -466,9 +468,10 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
 }
 
 int main(int argc, char* argv[]) {
-    mooncake::init_ylt_log_level();
     // Initialize gflags
+    gflags::SetVersionString(mooncake::GetMooncakeStoreBuildInfo());
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+    mooncake::init_ylt_log_level();
 
     if (!FLAGS_log_dir.empty()) {
         google::InitGoogleLogging(argv[0]);

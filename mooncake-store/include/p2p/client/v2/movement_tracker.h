@@ -51,7 +51,7 @@
 
 #include "p2p/client/v2/block.h"
 #include "p2p/client/v2/v2_common.h"
-#include "types.h"
+#include "common_types.h"
 #include "utils.h"
 
 namespace mooncake::v2 {

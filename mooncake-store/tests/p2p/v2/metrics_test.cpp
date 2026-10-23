@@ -22,7 +22,7 @@
 #include "p2p/client/p2p_client_metric.h"
 #include "p2p/client/v2/data_manager_v2.h"
 #include "transfer_engine.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake::v2 {
 namespace {

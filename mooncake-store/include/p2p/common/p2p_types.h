@@ -1,17 +1,87 @@
 #pragma once
 
-#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include <boost/functional/hash.hpp>
 
-#include "types.h"
+#include "common_types.h"
+#include <ylt/reflection/user_reflect_macro.hpp>
 
 namespace mooncake {
 
+// Error codes that mean "the object/replica already exists", i.e. an
+// idempotent rewrite whose failure is surfaced as success end-to-end.
+inline bool IsAlreadyExistsError(ErrorCode err) {
+    return err == ErrorCode::REPLICA_NUM_EXCEEDED ||
+           err == ErrorCode::REPLICA_ALREADY_EXISTS ||
+           err == ErrorCode::OBJECT_ALREADY_EXISTS;
+}
+
+/**
+ * @enum MemoryType
+ * @brief Defines the physical storage medium type for a cache tier.
+ */
+enum class MemoryType { DRAM, NVME, ASCEND_NPU, UNKNOWN };
+
+static inline std::string MemoryTypeToString(MemoryType type) {
+    switch (type) {
+        case MemoryType::DRAM:
+            return "DRAM";
+        case MemoryType::NVME:
+            return "NVME";
+        case MemoryType::ASCEND_NPU:
+            return "ASCEND_NPU";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+/**
+ * @struct ReplicaLocation
+ * @brief Describes a single replica's key, tier and size.
+ */
+struct ReplicaLocation {
+    std::string key;
+    UUID tier_id;
+    size_t size;
+};
+
+/**
+ * @brief Election backend type for leader election in HA mode.
+ */
+enum class ElectionBackend { ETCD, REDIS };
+
 static constexpr int64_t DEFAULT_CLIENT_CRASHED_TTL_SEC = 30;
+
+enum class P2PClientServiceState {
+    INITIALIZING = 0,
+    ONLINE = 1,
+    DEGRADED = 2,
+    LOCAL_ONLY = 3,
+    STOPPING = 4,
+    STOPPED = 5,
+};
+
+inline const char* toString(P2PClientServiceState state) {
+    switch (state) {
+        case P2PClientServiceState::INITIALIZING:
+            return "INITIALIZING";
+        case P2PClientServiceState::ONLINE:
+            return "ONLINE";
+        case P2PClientServiceState::DEGRADED:
+            return "DEGRADED";
+        case P2PClientServiceState::LOCAL_ONLY:
+            return "LOCAL_ONLY";
+        case P2PClientServiceState::STOPPING:
+            return "STOPPING";
+        case P2PClientServiceState::STOPPED:
+            return "STOPPED";
+        default:
+            return "UNKNOWN";
+    }
+}
 
 /**
  * @brief Client health state owned by the P2P master.
@@ -37,45 +107,31 @@ inline std::ostream& operator<<(std::ostream& os,
     }
 }
 
-struct P2PReadRouteConfigExtra {
-    std::vector<std::string> tag_filters;
-    int priority_limit = 0;
+enum class P2PClientSelectionStrategy {
+    ORDERED = 0,
+    RANDOM = 1,
+    CAPACITY_PRIORITY = 2,
 };
-YLT_REFL(P2PReadRouteConfigExtra, tag_filters, priority_limit);
 
-/**
- * @brief Temporary unified-facade read selection config.
- *
- * This is not a master RPC DTO. The centralized baseline API has no
- * read-route config parameter.
- *
- * TODO(C4 / external interface; see p2p-split-plan-v2.md): Rename this to
- * P2PReadRouteConfig and remove it from centralized Query/Get/Batch methods
- * once the public client facade has architecture-specific business APIs.
- */
-struct ReadRouteConfig {
+inline std::ostream& operator<<(std::ostream& output,
+                                P2PClientSelectionStrategy strategy) {
+    switch (strategy) {
+        case P2PClientSelectionStrategy::ORDERED:
+            return output << "ORDERED";
+        case P2PClientSelectionStrategy::RANDOM:
+            return output << "RANDOM";
+        case P2PClientSelectionStrategy::CAPACITY_PRIORITY:
+            return output << "CAPACITY_PRIORITY";
+    }
+    return output << "UNKNOWN";
+}
+
+struct P2PWriteRouteConfig {
     static constexpr size_t RETURN_ALL_CANDIDATES = 0;
 
-    ReadRouteConfig() = default;
-    explicit ReadRouteConfig(size_t max_c) : max_candidates(max_c) {}
-
-    size_t max_candidates = RETURN_ALL_CANDIDATES;
-    std::optional<P2PReadRouteConfigExtra> p2p_config;
-};
-YLT_REFL(ReadRouteConfig, max_candidates, p2p_config);
-
-/**
- * @brief Temporary unified-facade P2P write selection config.
- *
- * This is converted to P2PWriteRouteConfig at the master RPC boundary.
- * TODO(C4 / external interface; see p2p-split-plan-v2.md): Move this type out
- * of the shared ClientService WriteConfig after the public client facade has
- * architecture-specific business APIs.
- */
-struct WriteRouteRequestConfig {
-    static constexpr size_t RETURN_ALL_CANDIDATES = 0;
     size_t max_candidates = 2;
-    ObjectIterateStrategy strategy = ObjectIterateStrategy::CAPACITY_PRIORITY;
+    P2PClientSelectionStrategy strategy =
+        P2PClientSelectionStrategy::CAPACITY_PRIORITY;
     // Remote-write weight in [0, 1]. Controls local-vs-remote routing via
     // multiplicative scoring on the master side:
     //   score = free_ratio * (is_local ? (1 - remote_weight) : remote_weight)
@@ -93,14 +149,24 @@ struct WriteRouteRequestConfig {
     //   false = sum free/total over all tiers;
     //   true  = only account the highest-priority eligible tier's free/total
     bool top_tier_only = true;
-    bool early_return = true;
+    bool early_return = true;  // whether to return immediately once candidates
+                               // meet conditions of config
 
-    // Exclude segments carrying any configured tag.
+    // filter the segment with tag
     std::vector<std::string> tag_filters;
-    // Exclude segments whose priority is lower than this value.
+    // filter the segments whose priority is lower than priority_limit
     int priority_limit = 0;
 
     bool IsValid() const {
+        // waterline extremes:
+        //   <= 0  -> local-write bypass disabled (forbid local write)
+        //   >= 1  -> always bypass to local when free (forbid remote write)
+        // remote_weight extremes:
+        //   <= 0  -> master only returns local routes (forbid remote routing)
+        //   >= 1  -> master only returns remote routes (forbid local routing)
+        // Two combinations are contradictory (dead end):
+        //   forbid local write  + forbid remote routing
+        //   forbid remote write + forbid local routing (defensive)
         const bool no_local_write = local_write_waterline <= 0.0;
         const bool no_remote_write = local_write_waterline >= 1.0;
         const bool no_remote_route = remote_weight <= 0.0;
@@ -109,19 +175,44 @@ struct WriteRouteRequestConfig {
                !(no_remote_write && no_local_route);
     }
 };
-YLT_REFL(WriteRouteRequestConfig, max_candidates, strategy, remote_weight,
+YLT_REFL(P2PWriteRouteConfig, max_candidates, strategy, remote_weight,
          local_write_waterline, top_tier_only, early_return, tag_filters,
          priority_limit);
 
 inline std::ostream& operator<<(std::ostream& os,
-                                const WriteRouteRequestConfig& config) {
-    os << "WriteRouteRequestConfig: { max_candidates: " << config.max_candidates
+                                const P2PWriteRouteConfig& config) {
+    os << "P2PWriteRouteConfig: { max_candidates: " << config.max_candidates
        << ", strategy: " << config.strategy
        << ", remote_weight: " << config.remote_weight
        << ", local_write_waterline: " << config.local_write_waterline
-       << ", top_tier_only: " << (config.top_tier_only ? "true" : "false")
-       << ", early_return: " << (config.early_return ? "true" : "false")
+       << ", top_tier_only: " << config.top_tier_only
+       << ", early_return: " << config.early_return
        << ", priority_limit: " << config.priority_limit << " }";
+    return os;
+}
+
+// Who initiates the cross-node transfer for the data plane: REVERSE matches the
+// historical target-initiated path and is the conventional default when unset
+// optional or client-level config omits an explicit override.
+enum class TransferDirectionMode : uint8_t {
+    REVERSE = 0,
+    FORWARD = 1,
+};
+
+// Logging only: prints REVERSE / FORWARD / UNKNOWN for invalid numeric values.
+inline std::ostream& operator<<(std::ostream& os,
+                                const TransferDirectionMode& mode) noexcept {
+    switch (mode) {
+        case TransferDirectionMode::REVERSE:
+            os << "REVERSE";
+            break;
+        case TransferDirectionMode::FORWARD:
+            os << "FORWARD";
+            break;
+        default:
+            os << "UNKNOWN";
+            break;
+    }
     return os;
 }
 
@@ -181,25 +272,6 @@ struct P2PWithdrawRouteOperation {
 };
 YLT_REFL(P2PWithdrawRouteOperation, key, segment_id);
 
-enum class P2PClientSelectionStrategy {
-    ORDERED = 0,
-    RANDOM = 1,
-    CAPACITY_PRIORITY = 2,
-};
-
-inline std::ostream& operator<<(std::ostream& output,
-                                P2PClientSelectionStrategy strategy) {
-    switch (strategy) {
-        case P2PClientSelectionStrategy::ORDERED:
-            return output << "ORDERED";
-        case P2PClientSelectionStrategy::RANDOM:
-            return output << "RANDOM";
-        case P2PClientSelectionStrategy::CAPACITY_PRIORITY:
-            return output << "CAPACITY_PRIORITY";
-    }
-    return output << "UNKNOWN";
-}
-
 struct P2PRouteDescriptor {
     UUID client_id{0, 0};
     UUID segment_id{0, 0};
@@ -218,5 +290,47 @@ struct P2PReadRouteConfig {
     int priority_limit{0};
 };
 YLT_REFL(P2PReadRouteConfig, max_candidates, tag_filters, priority_limit);
+
+inline bool IsValidClusterIdComponent(const std::string& cluster_id) {
+    if (cluster_id.empty()) {
+        return false;
+    }
+    if (cluster_id.size() > 128) {
+        return false;
+    }
+    for (unsigned char c : cluster_id) {
+        const bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                        (c >= 'a' && c <= 'z') || c == '_' || c == '-' ||
+                        c == '.';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Sequence ID comparison utilities for OpLog and HA components.
+// These use signed difference to handle uint64_t wrap-around correctly:
+//   IsSequenceNewer(0, UINT64_MAX) = true  (0 is newer after wrap)
+//   IsSequenceNewer(UINT64_MAX, 0) = false (UINT64_MAX is older before wrap)
+//
+// Assumes gap < 2^63, which is always true for sequence IDs in practice.
+inline bool IsSequenceNewer(uint64_t a, uint64_t b) {
+    return static_cast<int64_t>(a - b) > 0;
+}
+
+inline bool IsSequenceOlder(uint64_t a, uint64_t b) {
+    return static_cast<int64_t>(a - b) < 0;
+}
+
+inline bool IsSequenceEqual(uint64_t a, uint64_t b) { return a == b; }
+
+inline bool IsSequenceNewerOrEqual(uint64_t a, uint64_t b) {
+    return a == b || static_cast<int64_t>(a - b) > 0;
+}
+
+inline bool IsSequenceOlderOrEqual(uint64_t a, uint64_t b) {
+    return a == b || static_cast<int64_t>(a - b) < 0;
+}
 
 }  // namespace mooncake

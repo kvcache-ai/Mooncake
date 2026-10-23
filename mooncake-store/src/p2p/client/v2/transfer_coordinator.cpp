@@ -265,6 +265,9 @@ bool TransferCoordinator::IsDrained(Transport::BatchID batch_id,
 
 void TransferCoordinator::CancelBatch(Transport::BatchID batch_id,
                                       size_t num_tasks) {
+    // TODO(V2-TE-DRAIN): Match V1's backend-aware drain semantics. A timeout
+    // must only report stalled cleanup, not return while TE may still access
+    // caller-owned buffers; leaking BatchDesc does not retain those buffers.
     // There is no cancel primitive, and freeBatchID only releases the
     // descriptor once every task is finished. So "cancel" is: poll until the
     // batch is terminal, then free. The timeout bounds shutdown at the cost of
@@ -290,6 +293,8 @@ void TransferCoordinator::CancelBatch(Transport::BatchID batch_id,
 
 async_simple::coro::Lazy<void> TransferCoordinator::CancelBatchCoro(
     Transport::BatchID batch_id, size_t num_tasks) {
+    // TODO(V2-TE-DRAIN): Apply the same buffer-safe drain as CancelBatch;
+    // completing this coroutine currently lets its caller release buffers.
     const auto start = std::chrono::steady_clock::now();
     while (!IsDrained(batch_id, num_tasks)) {
         const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(

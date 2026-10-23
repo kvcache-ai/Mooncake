@@ -43,7 +43,7 @@ namespace mooncake {
 namespace benchmark {
 
 // Global client and allocator instances
-std::shared_ptr<ClientService> g_client = nullptr;
+std::shared_ptr<Client> g_client = nullptr;
 std::unique_ptr<SimpleAllocator> g_client_buffer_allocator = nullptr;
 void* g_segment_ptr = nullptr;
 size_t g_ram_buffer_size = 0;
@@ -101,12 +101,9 @@ bool initialize_client() {
     if (!FLAGS_device_name.empty()) {
         rdma_devices = FLAGS_device_name;
     }
-    // TODO(C4/public API): Replace this shared-facade factory adaptation with
-    // the concrete centralized API; preserve a00f757 scenarios and assertions.
-    auto config = ClientConfigBuilder::build_centralized_real_client(
-        FLAGS_local_hostname, FLAGS_metadata_connection_string, FLAGS_protocol,
-        rdma_devices, FLAGS_master_address);
-    auto client_opt = ClientService::Create(config);
+    auto client_opt =
+        Client::Create(FLAGS_local_hostname, FLAGS_metadata_connection_string,
+                       FLAGS_protocol, rdma_devices, FLAGS_master_address);
 
     if (!client_opt.has_value()) {
         LOG(ERROR) << "Failed to create client";
@@ -176,8 +173,6 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
     std::vector<Slice> slices;
     slices.emplace_back(
         Slice{write_buffer, static_cast<size_t>(FLAGS_value_size)});
-    const std::vector<void*> read_buffers{write_buffer};
-    const std::vector<size_t> read_sizes{static_cast<size_t>(FLAGS_value_size)};
 
     ReplicateConfig config;
     config.replica_num = 1;
@@ -218,7 +213,8 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
         std::string key = stored_keys[key_index];
 
         auto start_time = std::chrono::high_resolution_clock::now();
-        auto result = g_client->Get(key, read_buffers, read_sizes);
+        auto result = g_client->Get(key, write_buffer,
+                                    static_cast<size_t>(FLAGS_value_size));
         auto end_time = std::chrono::high_resolution_clock::now();
 
         auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(

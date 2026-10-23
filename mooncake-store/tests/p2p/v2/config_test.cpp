@@ -23,7 +23,7 @@
 #include "p2p/client/v2/block_index.h"
 #include "p2p/client/v2/data_manager_v2.h"
 #include "p2p/client/v2/v2_common.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake::v2 {
 namespace {

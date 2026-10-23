@@ -91,7 +91,7 @@ LegacyClientScheduler::LegacyClientScheduler(TieredBackend* backend,
         // Simple Policy Configuration
         SimplePolicy::Config simple_config;
         simple_config.promotion_threshold =
-            5.0;  // Default to 5.0 for tests (matches previous hardcoded value)
+            5.0;
         if (config.isMember("scheduler")) {
             const auto& sched_conf = config["scheduler"];
             if (sched_conf.isMember("promotion_threshold"))
@@ -162,10 +162,7 @@ void LegacyClientScheduler::OnCommit(const CommitContext& ctx) {
         MutexLocker lock(&shard.mutex);
         TrackReplicaLocked(shard, ctx.key, ctx.tier_id, ctx.size_bytes);
     }
-    // When this commit counts as an access, record it too. This reproduces the
-    // old TieredBackend::Commit behavior, which issued a separate,
-    // record_access-guarded OnAccess(key) right after the commit. (Internal
-    // data movement passes record_access=false and is not counted.)
+    // Record user access when requested; internal data movement does not count.
     if (ctx.record_access && stats_collector_) {
         stats_collector_->RecordAccess(ctx.key);
     }

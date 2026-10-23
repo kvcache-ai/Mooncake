@@ -13,8 +13,7 @@ namespace mooncake::test {
 // ============================================================================
 
 TEST(P2POpLogTypesTest, OpTypeValuesDoNotConflictWithMain) {
-    // Main branch uses OpType 1-4 (PUT_END, PUT_REVOKE, REMOVE, LEASE_RENEW).
-    // P2P OpTypes start from 10.
+    // P2P OpTypes start at 10, after the reserved common operation range.
     EXPECT_EQ(static_cast<int>(OpType_PUBLISH_ROUTE), 10);
     EXPECT_EQ(static_cast<int>(OpType_WITHDRAW_ROUTE), 11);
     EXPECT_EQ(static_cast<int>(OpType_MOUNT_SEGMENT), 12);

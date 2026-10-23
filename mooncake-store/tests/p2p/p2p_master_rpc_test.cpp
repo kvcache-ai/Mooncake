@@ -70,7 +70,11 @@ class P2PMasterRpcTest : public ::testing::Test {
                                      .rpc_port = kClientPort});
         ASSERT_TRUE(registered.has_value()) << registered.error();
         EXPECT_EQ(*registered, kViewVersion);
-        ASSERT_TRUE(client_->CompleteRouteSync(client_id_).has_value());
+        ASSERT_TRUE(
+            client_
+                ->Heartbeat({.client_id = client_id_,
+                             .service_state = P2PClientServiceState::ONLINE})
+                .has_value());
     }
 
     void TearDown() override {
@@ -109,6 +113,44 @@ class P2PMasterRpcTest : public ::testing::Test {
     P2PSegment first_;
     P2PSegment second_;
 };
+
+TEST_F(P2PMasterRpcTest, BatchQueryIpPreservesPartialResultsAndItemMetrics) {
+    auto& metrics = P2PMasterMetricManager::instance();
+    const auto requests = metrics.get_batch_query_ip_requests();
+    const auto failures = metrics.get_batch_query_ip_failures();
+    const auto partial = metrics.get_batch_query_ip_partial_successes();
+    const auto items = metrics.get_batch_query_ip_items();
+    const auto failed_items = metrics.get_batch_query_ip_failed_items();
+    const UUID missing = generate_uuid();
+
+    auto result = client_->BatchQueryIp({client_id_, missing, client_id_});
+    ASSERT_TRUE(result.has_value()) << result.error();
+    ASSERT_EQ(result->size(), 1u);
+    ASSERT_EQ(result->count(client_id_), 1u);
+    EXPECT_EQ(result->at(client_id_), (std::vector<std::string>{"127.0.0.1"}));
+    EXPECT_EQ(result->count(missing), 0u);
+    EXPECT_EQ(metrics.get_batch_query_ip_requests(), requests + 1);
+    EXPECT_EQ(metrics.get_batch_query_ip_items(), items + 3);
+    EXPECT_EQ(metrics.get_batch_query_ip_partial_successes(), partial + 1);
+    EXPECT_EQ(metrics.get_batch_query_ip_failed_items(), failed_items + 1);
+    EXPECT_EQ(metrics.get_batch_query_ip_failures(), failures);
+
+    auto empty = client_->BatchQueryIp({});
+    ASSERT_TRUE(empty.has_value()) << empty.error();
+    EXPECT_TRUE(empty->empty());
+    EXPECT_EQ(metrics.get_batch_query_ip_requests(), requests + 2);
+    EXPECT_EQ(metrics.get_batch_query_ip_items(), items + 3);
+    EXPECT_EQ(metrics.get_batch_query_ip_failures(), failures);
+
+    auto absent = client_->BatchQueryIp({missing, missing});
+    ASSERT_TRUE(absent.has_value()) << absent.error();
+    EXPECT_TRUE(absent->empty());
+    EXPECT_EQ(metrics.get_batch_query_ip_requests(), requests + 3);
+    EXPECT_EQ(metrics.get_batch_query_ip_items(), items + 5);
+    EXPECT_EQ(metrics.get_batch_query_ip_failures(), failures + 1);
+    EXPECT_EQ(metrics.get_batch_query_ip_partial_successes(), partial + 1);
+    EXPECT_EQ(metrics.get_batch_query_ip_failed_items(), failed_items + 3);
+}
 
 TEST_F(P2PMasterRpcTest, MixedSyncPreservesItemErrorsAndReadOrder) {
     ASSERT_TRUE(Publish("existing", first_.id).has_value());
@@ -214,6 +256,48 @@ TEST_F(P2PMasterRpcTest, BatchWithdrawMissingAndRepeatedLocationsIsIdempotent) {
     EXPECT_EQ(metrics.get_batch_withdraw_route_partial_successes(), partial);
 }
 
+TEST_F(P2PMasterRpcTest, BatchReadRoutesWaitForReadyAndPreserveOrder) {
+    const auto cold = generate_uuid();
+    const auto segment = MakeSegment("not-ready");
+    P2PRegisterClientRequest registration;
+    registration.client_id = cold;
+    registration.segments = {segment};
+    registration.ip_address = "127.0.0.1";
+    registration.rpc_port = 50099;
+    ASSERT_TRUE(client_->RegisterClient(registration).has_value());
+    P2PPublishRouteRequest publish;
+    publish.key = "ready-barrier";
+    publish.client_id = cold;
+    publish.segment_id = segment.id;
+    publish.object_size = 64;
+    ASSERT_TRUE(client_->PublishRoute(publish).has_value());
+    auto heartbeat = client_->Heartbeat({.client_id = cold});
+    ASSERT_TRUE(heartbeat.has_value());
+    auto routes = client_->BatchGetReadRoute({"ready-barrier", "missing"}, {});
+    ASSERT_EQ(routes.size(), 2);
+    ASSERT_FALSE(routes[0].has_value());
+    ASSERT_FALSE(routes[1].has_value());
+    EXPECT_EQ(routes[0].error(), ErrorCode::REPLICA_IS_NOT_READY);
+    EXPECT_EQ(routes[1].error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    ASSERT_TRUE(
+        client_
+            ->Heartbeat({.client_id = cold,
+                         .service_state = P2PClientServiceState::ONLINE})
+            .has_value());
+    routes = client_->BatchGetReadRoute({"ready-barrier", "missing"}, {});
+    ASSERT_EQ(routes.size(), 2);
+    ASSERT_TRUE(routes[0].has_value());
+    ASSERT_FALSE(routes[1].has_value());
+    EXPECT_EQ(routes[1].error(), ErrorCode::OBJECT_NOT_FOUND);
+    ASSERT_EQ(routes[0]->size(), 1);
+    EXPECT_EQ(routes[0]->front().client_id, cold);
+    heartbeat = client_->Heartbeat(
+        {.client_id = cold, .service_state = P2PClientServiceState::ONLINE});
+    ASSERT_TRUE(heartbeat.has_value());
+    EXPECT_TRUE(client_->UnregisterClient(cold).has_value());
+}
+
 TEST_F(P2PMasterRpcTest, LifecycleRemovesRoutesAndUpdatesClientStatus) {
     const auto extra = MakeSegment("extra");
     ASSERT_TRUE(client_->MountSegment(extra).has_value());
@@ -228,7 +312,9 @@ TEST_F(P2PMasterRpcTest, LifecycleRemovesRoutesAndUpdatesClientStatus) {
     EXPECT_FALSE(*exists[0]);
     EXPECT_TRUE(*exists[1]);
 
-    auto heartbeat = client_->Heartbeat({.client_id = client_id_});
+    auto heartbeat =
+        client_->Heartbeat({.client_id = client_id_,
+                            .service_state = P2PClientServiceState::ONLINE});
     ASSERT_TRUE(heartbeat.has_value()) << heartbeat.error();
     EXPECT_EQ(heartbeat->view_version, kViewVersion);
     EXPECT_EQ(heartbeat->status, P2PClientStatus::HEALTH);

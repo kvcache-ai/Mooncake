@@ -239,19 +239,10 @@ std::vector<MovementRequest> MultiLRUPolicy::DecideEvict(
         return out;
     }
 
-    // Walk coldest-first victims, dropping the fast-tier copy until the target
-    // is met. Eviction NEVER migrates a sole copy down to the slow tier: a
-    // synchronous copy would slow the evict loop. Demotion to the slow tier is
-    // the (asynchronous) offload path's job — eviction only reaps fast-tier
-    // copies. Keys with a pre-demoted slow replica survive there; cold sole
-    // copies are simply dropped (a future cache miss). This also avoids a
-    // per-victim GetReplicaTierIds lookup, keeping the pass fast.
-    //
-    // Design assumption: fast-tier data is reconstructible cache (KVCache), so
-    // dropping a cold sole copy costs at most a recompute/refetch. Unlike the
-    // legacy path (which MIGRATEs a sole copy down before EVICTing), this
-    // trades that guarantee for evict-loop speed. Do NOT route non-cache,
-    // single-copy- of-record data through this policy expecting durability.
+    // Drop cold fast-tier copies until the target is met; offload runs
+    // separately.
+    // Sole copies may be evicted: this policy requires reconstructible cache
+    // data.
     const auto candidates =
         collector_.CollectEvictionCandidates(config_.candidate_scan_limit);
     size_t planned = 0;

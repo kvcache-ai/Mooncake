@@ -294,9 +294,8 @@ TEST(MultiLRUPolicyTest, SustainedWriteLoadDrivesTriggerAcrossFullRange) {
     EXPECT_NEAR(policy.evict_wm(), cfg.evict_watermark_high, 1e-3);
 }
 
-// P2-2: the allocation-failure path (min_reclaim_bytes > 0) must NOT consume
-// the write-load accumulator, so a concurrent periodic pass still observes the
-// load and floats the trigger watermark down to the low bound.
+// Synchronous reclaim must preserve write-load accounting for periodic
+// eviction.
 TEST(MultiLRUPolicyTest, AllocFailurePathDoesNotConsumeWriteLoad) {
     TieredBackend backend;
     ASSERT_TRUE(
@@ -320,8 +319,7 @@ TEST(MultiLRUPolicyTest, AllocFailurePathDoesNotConsumeWriteLoad) {
     EXPECT_NEAR(policy.evict_wm(), cfg.evict_watermark_low, 1e-6);
 }
 
-// P2-3: a zero-size commit must never enter the MultiLRU, so it cannot become a
-// victim that the eviction loop emits without advancing reclaim.
+// Zero-size commits must not enter MultiLRU and stall eviction progress.
 TEST(MultiLRUPolicyTest, ZeroSizeCommitProducesNoVictim) {
     TieredBackend backend;
     ASSERT_TRUE(
@@ -340,7 +338,7 @@ TEST(MultiLRUPolicyTest, ZeroSizeCommitProducesNoVictim) {
     EXPECT_TRUE(movements.empty());
 }
 
-// --- Factory config wiring (P0-1: candidate_scan_limit key) -----------------
+// Factory configuration for candidate_scan_limit.
 
 TEST(SchedulerFactoryConfigTest, CandidateScanLimitUsesOwnKey) {
     Json::Value cfg;

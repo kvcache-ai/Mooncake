@@ -20,7 +20,7 @@
 #include "p2p/ha/oplog/p2p_standby_metadata_store.h"
 #include "p2p/ha/oplog/p2p_standby_snapshot_service.h"
 #include "p2p/ha/standby_state_machine.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 

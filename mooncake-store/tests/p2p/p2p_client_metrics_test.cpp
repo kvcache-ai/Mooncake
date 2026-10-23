@@ -204,7 +204,7 @@ TEST_F(P2PClientMetricsTest, P2PReportingCanRestartAndStop) {
     EXPECT_EQ(reporting_metrics.GetReportingInterval(), 1u);
 }
 
-// Test the standalone metric preserves all previously exported series.
+// Verify the metric exports all supported series.
 TEST_F(P2PClientMetricsTest, P2PClientMetricStandaloneContractTest) {
     auto p2p_metrics = P2PClientMetric::Create({});
     ASSERT_NE(p2p_metrics, nullptr);

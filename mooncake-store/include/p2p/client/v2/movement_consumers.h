@@ -33,7 +33,7 @@
 #include "p2p/client/v2/movement_tracker.h"
 #include "p2p/client/v2/tier_graph.h"
 #include "p2p/client/v2/tiler_manager.h"
-#include "types.h"
+#include "common_types.h"
 
 namespace mooncake::v2 {
 

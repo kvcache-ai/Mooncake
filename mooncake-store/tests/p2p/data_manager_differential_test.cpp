@@ -30,7 +30,7 @@
 #include "p2p/client/data_manager_factory.h"
 #include "p2p/client/data_manager_test_hook.h"
 #include "transfer_engine.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 #include "utils.h"
 
 namespace mooncake {

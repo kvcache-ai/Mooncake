@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <exception>
 #include <vector>
 #include <sys/mman.h>  // For shm_open, mmap, munmap
 #include <sys/stat.h>  // For S_IRUSR, S_IWUSR
@@ -18,10 +19,16 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
         new ClientBufferAllocator(size, protocol, use_hugepage));
 }
 
-std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
-    void* addr, size_t size, const std::string& protocol) {
-    return std::shared_ptr<ClientBufferAllocator>(
-        new ClientBufferAllocator(addr, size, protocol));
+tl::expected<std::shared_ptr<ClientBufferAllocator>, ErrorCode>
+ClientBufferAllocator::create(void* addr, size_t size,
+                             const std::string& protocol) {
+    try {
+        return std::shared_ptr<ClientBufferAllocator>(
+            new ClientBufferAllocator(addr, size, protocol));
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to create external buffer allocator: " << e.what();
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
 }
 
 ClientBufferAllocator::ClientBufferAllocator(size_t size,
@@ -96,6 +103,14 @@ void* BufferHandle::ptr() const { return handle_.ptr(); }
 size_t BufferHandle::size() const { return handle_.size(); }
 
 // Utility functions for buffer and slice management
+size_t CalculateSliceSize(std::span<const Slice> slices) {
+    size_t slice_size = 0;
+    for (const auto& slice : slices) {
+        slice_size += slice.size;
+    }
+    return slice_size;
+}
+
 std::vector<Slice> split_into_slices(BufferHandle& handle) {
     std::vector<Slice> slices;
     auto base = static_cast<uint8_t*>(handle.ptr());
@@ -105,62 +120,6 @@ std::vector<Slice> split_into_slices(BufferHandle& handle) {
         size_t chunk_size = std::min(handle.size() - offset, kMaxSliceSize);
         slices.push_back({base + offset, chunk_size});
         offset += chunk_size;
-    }
-    return slices;
-}
-
-uint64_t calculate_total_size(const Replica::Descriptor& replica) {
-    uint64_t total_length = 0;
-    if (replica.is_p2p_proxy_replica()) {
-        total_length = replica.get_p2p_proxy_descriptor().object_size;
-    } else if (replica.is_disk_replica()) {
-        auto& disk_descriptor = replica.get_disk_descriptor();
-        total_length = disk_descriptor.object_size;
-    } else if (replica.is_local_disk_replica()) {
-        total_length = replica.get_local_disk_descriptor().object_size;
-    } else {
-        total_length = replica.get_memory_descriptor().buffer_descriptor.size_;
-    }
-    return total_length;
-}
-
-int allocateSlices(std::vector<Slice>& slices,
-                   const Replica::Descriptor& replica, void* buffer_ptr) {
-    if (replica.is_disk_replica()) {
-        // For disk-based replica, split into slices based on file size
-        uint64_t offset = 0;
-        uint64_t total_length = replica.get_disk_descriptor().object_size;
-        while (offset < total_length) {
-            auto chunk_size = std::min(total_length - offset, kMaxSliceSize);
-            void* chunk_ptr = static_cast<char*>(buffer_ptr) + offset;
-            slices.emplace_back(Slice{chunk_ptr, chunk_size});
-            offset += chunk_size;
-        }
-    } else if (replica.is_local_disk_replica()) {
-        slices.emplace_back(
-            Slice{buffer_ptr, replica.get_local_disk_descriptor().object_size});
-    } else if (replica.is_memory_replica()) {
-        // For memory-based replica, split into slices based on buffer
-        // descriptors
-        auto& handle = replica.get_memory_descriptor().buffer_descriptor;
-        void* chunk_ptr = buffer_ptr;
-        slices.emplace_back(Slice{chunk_ptr, handle.size_});
-    } else if (replica.is_p2p_proxy_replica()) {
-        slices.emplace_back(
-            Slice{buffer_ptr, replica.get_p2p_proxy_descriptor().object_size});
-    }
-    return 0;
-}
-
-std::vector<Slice> BuildSlicesFromBuffers(const std::vector<void*>& buffers,
-                                          const std::vector<size_t>& sizes,
-                                          uint64_t total_size) {
-    std::vector<Slice> slices;
-    uint64_t remaining = total_size;
-    for (size_t i = 0; i < buffers.size() && remaining > 0; ++i) {
-        size_t chunk = std::min(static_cast<uint64_t>(sizes[i]), remaining);
-        slices.emplace_back(Slice{buffers[i], chunk});
-        remaining -= chunk;
     }
     return slices;
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <memory>
@@ -7,9 +8,9 @@
 #include <ylt/util/tl/expected.hpp>
 #include "p2p/client/client_rpc_types.h"
 #include "p2p/client/data_manager.h"
-#include "p2p/client/inflight_tracker.h"
+#include "inflight_tracker.h"
 #include "p2p/client/p2p_client_metric.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 namespace mooncake {
@@ -36,11 +37,18 @@ class ClientRpcService {
         DataManager& data_manager,
         std::shared_ptr<P2PClientMetric> metrics = nullptr);
 
-    /**
-     * @brief Stop serving peer RPCs: reject new incoming handlers and block
-     * until in-flight ones finish
-     */
+    // After local callers have drained, wait for peer handlers and leases,
+    // then close and drain the completion handlers. The listener stays alive
+    // throughout this call so peers can return their operation tokens.
     void Stop();
+
+    // Enable peer requests after local resources and runtime config are ready.
+    void SetReady() { ready_.store(true, std::memory_order_release); }
+
+    bool IsReady() const {
+        return ready_.load(std::memory_order_acquire) &&
+               normal_op_tracker_.is_running();
+    }
 
     /**
      * @brief Read remote data: Client A requests Client B to read data and
@@ -88,7 +96,14 @@ class ClientRpcService {
     std::shared_ptr<P2PClientMetric>
         metrics_;  // Optional: shared from P2PClientService
 
-    InflightTracker peer_tracker_;
+    std::atomic<bool> ready_{false};
+    // Normal operation RPCs: ReadRemoteData, WriteRemoteData, PreWrite and
+    // PinKey.
+    InflightTracker normal_op_tracker_;
+    // RPCs that complete or release existing leases: WriteCommit, WriteRevoke
+    // and UnPinKey. Keep accepting them while new operations are draining,
+    // then wait for their handlers after the lease records have drained.
+    InflightTracker finish_op_tracker_;
 };
 
 /**

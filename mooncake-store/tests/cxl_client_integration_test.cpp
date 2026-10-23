@@ -17,7 +17,6 @@
 #include <sys/mman.h>
 
 #include "allocator.h"
-#include "centralized_client_service.h"
 #include "client_service.h"
 #include "client_config_builder.h"
 #include "types.h"
@@ -33,8 +32,9 @@ DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
 DEFINE_string(cxl_device_name, "tmp_dax_sim", "Device name for cxl");
 DEFINE_uint64(cxl_device_size, 1073741824, "Device Size for cxl");
 DEFINE_bool(auto_disc, false, "Auto discover tcp devices");
-DEFINE_string(transfer_engine_metadata_url, "127.0.0.1:2379",
-              "Metadata connection string for transfer engine");
+DEFINE_string(transfer_engine_metadata_url, "",
+              "Transfer engine metadata URL; empty uses the in-process HTTP "
+              "metadata server");
 
 namespace mooncake {
 namespace testing {
@@ -93,23 +93,20 @@ class ClientIdCaptureSink : public google::LogSink {
 
 class ClientIntegrationTestCxl : public ::testing::Test {
    protected:
-    static std::shared_ptr<CentralizedClientService> CreateClient(
-        const std::string& host_name) {
-        // TODO(C4/public API): Replace this shared-facade factory adaptation
-        // with the concrete centralized API; preserve a00f757 scenarios and
-        // assertions.
-        auto config = ClientConfigBuilder::build_centralized_real_client(
-            host_name, FLAGS_transfer_engine_metadata_url, FLAGS_protocol,
-            std::nullopt, master_address_);
-        auto client_opt = ClientService::Create(config);
+    static std::shared_ptr<Client> CreateClient(const std::string& host_name) {
+        auto client_opt =
+            Client::Create(host_name,
+                           FLAGS_transfer_engine_metadata_url.empty()
+                               ? master_.metadata_url()
+                               : FLAGS_transfer_engine_metadata_url,
+                           FLAGS_protocol, std::nullopt, master_address_);
 
         EXPECT_TRUE(client_opt.has_value())
             << "Failed to create client with host_name: " << host_name;
         if (!client_opt.has_value()) {
             return nullptr;
         }
-        return std::static_pointer_cast<CentralizedClientService>(
-            client_opt.value());
+        return client_opt.value();
     }
 
     static void SetUpTestSuite() {
@@ -239,7 +236,7 @@ class ClientIntegrationTestCxl : public ::testing::Test {
         }
     }
 
-    static std::shared_ptr<CentralizedClientService> test_client_;
+    static std::shared_ptr<Client> test_client_;
     // Here we use a simple allocator for the client buffer. In a real
     // application, user should manage the memory allocation and deallocation
     // themselves.
@@ -258,8 +255,7 @@ class ClientIntegrationTestCxl : public ::testing::Test {
 };
 
 // Static members initialization
-std::shared_ptr<CentralizedClientService>
-    ClientIntegrationTestCxl::test_client_ = nullptr;
+std::shared_ptr<Client> ClientIntegrationTestCxl::test_client_ = nullptr;
 void* ClientIntegrationTestCxl::segment_ptr_ = nullptr;
 void* ClientIntegrationTestCxl::test_client_segment_ptr_ = nullptr;
 std::unique_ptr<SimpleAllocator>
@@ -294,9 +290,7 @@ TEST_F(ClientIntegrationTestCxl, BasicPutGetOperations) {
 
     buffer = client_buffer_allocator_->allocate(1 * 1024 * 1024);
     // Verify data through Get operation
-    std::vector<void*> get_buffers = {buffer};
-    std::vector<size_t> get_sizes = {test_data.size()};
-    auto get_result = test_client_->Get(key, get_buffers, get_sizes);
+    auto get_result = test_client_->Get(key, buffer, test_data.size());
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
     ASSERT_EQ(get_result.value(), test_data.size());
@@ -360,9 +354,8 @@ TEST_F(ClientIntegrationTestCxl, BatchPutGetOperations) {
     for (int i = 0; i < batch_sz; i++) {
         target_buffer =
             client_buffer_allocator_->allocate(test_data_list[i].size());
-        std::vector<void*> bufs = {target_buffer};
-        std::vector<size_t> szs = {test_data_list[i].size()};
-        auto get_result = test_client_->Get(keys[i], bufs, szs);
+        auto get_result =
+            test_client_->Get(keys[i], target_buffer, test_data_list[i].size());
         ASSERT_TRUE(get_result.has_value())
             << "Get operation failed: " << toString(get_result.error());
         client_buffer_allocator_->deallocate(target_buffer,

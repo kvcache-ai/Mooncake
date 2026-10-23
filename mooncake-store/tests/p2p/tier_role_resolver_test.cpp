@@ -85,8 +85,8 @@ TEST(TierRoleResolverTest, ManualMissFallsBackToAuto) {
 TEST(TierRoleResolverTest, ManualInversionFallsBackToAuto) {
     // fast_tier_tag lands on the LOWEST-priority tier; with no slow tag the
     // auto-fallback would pick the highest-priority tier as 'slow', inverting
-    // the roles (hot data would be demoted to the higher-priority tier). D1-B
-    // detects the inversion and reverts to priority-based auto roles.
+    // the roles (hot data would be demoted to the higher-priority tier). The
+    // resolver detects the inversion and reverts to priority-based auto roles.
     UUID a{1, 1}, b{2, 2}, c{3, 3};
     std::vector<TierView> views = {
         MakeView(a, 100, MemoryType::NVME, {}),

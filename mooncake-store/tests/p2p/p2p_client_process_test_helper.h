@@ -14,11 +14,11 @@
 
 #include <glog/logging.h>
 
-#include "client_config_builder.h"
+#include "p2p/client/p2p_client_config_builder.h"
 #include "p2p/client/p2p_client_service.h"
 #include "test_exit_codes.h"
 #include "test_p2p_server_helpers.h"
-#include "types.h"
+#include "common_types.h"
 #include "utils.h"
 
 #ifdef _WIN32
@@ -251,7 +251,7 @@ class P2PPeerProcessStack {
     bool Start(const std::string& master_address, const std::string& host_name,
                uint16_t rpc_port, const std::string& local_transfer_mode,
                TransferDirectionMode transfer_direction_mode) {
-        auto config = ClientConfigBuilder::build_p2p_real_client(
+        auto config = P2PClientConfigBuilder::build_p2p_real_client(
             host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address,
             R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
             /*local_buffer_size=*/0, nullptr, "", rpc_port);
@@ -266,7 +266,17 @@ class P2PPeerProcessStack {
         client_ = std::make_shared<P2PClientService>(
             config.metadata_connstring, config.http_port,
             config.enable_http_server, config.labels);
-        return client_->Init(config) == ErrorCode::OK;
+        auto error = client_->Init(config);
+        if (error != ErrorCode::OK) {
+            LOG(ERROR) << "Peer process initialization failed: " << error;
+            return false;
+        }
+        if (!WaitForRoutableClient(client_->GetMasterClient(),
+                                  client_->GetClientID())) {
+            LOG(ERROR) << "Peer process did not become routable";
+            return false;
+        }
+        return true;
     }
 
     void Stop() { client_.reset(); }

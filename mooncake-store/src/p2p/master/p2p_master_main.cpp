@@ -1,8 +1,9 @@
+#include "version.h"
 #include <glog/logging.h>
 
 #include "p2p/common/p2p_master_config.h"
 #include "p2p/master/p2p_master.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 #include <gflags/gflags.h>
 
@@ -306,8 +307,9 @@ static tl::expected<P2PMasterConfig, std::string> LoadP2PMasterConfig() {
 }  // namespace mooncake
 
 int main(int argc, char* argv[]) {
-    mooncake::init_ylt_log_level();
+    gflags::SetVersionString(mooncake::GetMooncakeStoreBuildInfo());
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+    mooncake::init_ylt_log_level();
     if (!FLAGS_log_dir.empty()) {
         google::InitGoogleLogging(argv[0]);
     }

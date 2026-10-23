@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <string>
@@ -30,12 +31,9 @@ class InProcMaster {
 
     bool Start(InProcMasterConfig config) {
         try {
-            // Choose ports if not provided
-            rpc_port_ = config.rpc_port.has_value() ? config.rpc_port.value()
-                                                    : getFreeTcpPort();
-            http_metrics_port_ = config.http_metrics_port.has_value()
-                                     ? config.http_metrics_port.value()
-                                     : getFreeTcpPort();
+            // Bind the default RPC listener to a kernel-assigned port instead
+            // of selecting and releasing a port before the server owns it.
+            rpc_port_ = config.rpc_port.value_or(0);
             http_metadata_port_ = config.http_metadata_port.has_value()
                                       ? config.http_metadata_port.value()
                                       : getFreeTcpPort();
@@ -45,9 +43,17 @@ class InProcMaster {
                 meta_server_ = std::make_unique<HttpMetadataServer>(
                     static_cast<uint16_t>(http_metadata_port_), "127.0.0.1");
                 if (!meta_server_->start()) {
+                    LOG(ERROR)
+                        << "Failed to start test HTTP metadata server on "
+                        << http_metadata_port_;
                     return false;
                 }
             }
+
+            // Select the metrics port after the metadata listener is bound.
+            http_metrics_port_ = config.http_metrics_port.has_value()
+                                     ? config.http_metrics_port.value()
+                                     : getFreeTcpPort();
 
             // RPC server + master service
             server_ = std::make_unique<coro_rpc::coro_rpc_server>(
@@ -110,12 +116,25 @@ class InProcMaster {
 
             auto ec = server_->async_start();
             if (ec.hasResult()) {
+                LOG(ERROR) << "Failed to start test Master RPC server on "
+                           << rpc_port_;
                 return false;
             }
             // Allow server to bind
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            rpc_port_ = server_->port();
+            if (rpc_port_ == 0) {
+                LOG(ERROR) << "Test Master RPC server did not publish its port";
+                return false;
+            }
             return true;
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to start in-process test Master: "
+                       << e.what();
+            return false;
         } catch (...) {
+            LOG(ERROR)
+                << "Failed to start in-process test Master: unknown exception";
             return false;
         }
     }

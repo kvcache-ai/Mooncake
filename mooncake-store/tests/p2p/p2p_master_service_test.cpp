@@ -65,7 +65,7 @@ class P2PMasterServiceTest : public ::testing::Test {
     UUID RegisterP2PClient(P2PMasterService& service, const UUID& client_id,
                            const std::vector<P2PSegment>& segments,
                            const std::string& ip = "127.0.0.1",
-                           uint16_t port = 50051) {
+                           uint16_t port = 50051, bool ready = true) {
         P2PRegisterClientRequest req;
         req.client_id = client_id;
         req.ip_address = ip;
@@ -74,6 +74,12 @@ class P2PMasterServiceTest : public ::testing::Test {
         auto res = service.RegisterClient(req);
         EXPECT_TRUE(res.has_value())
             << "Failed to register client: " << res.error();
+        if (ready)
+            EXPECT_TRUE(
+                service
+                    .Heartbeat({.client_id = client_id,
+                                .service_state = P2PClientServiceState::ONLINE})
+                    .has_value());
         return req.client_id;
     }
 
@@ -976,7 +982,7 @@ TEST_F(P2PMasterServiceTest, BatchWriteRouteUsesCurrentCapacityTiersAndHealth) {
     ASSERT_NE(second, nullptr);
     second->health_state_.last_heartbeat =
         std::chrono::steady_clock::now() -
-        std::chrono::seconds(P2PClientMeta::disconnect_timeout_sec_ + 1);
+        std::chrono::seconds(second->disconnect_timeout_sec_ + 1);
     ASSERT_EQ(second->CheckHealth().second, P2PClientStatus::DISCONNECTION);
 
     P2PBatchGetWriteRouteRequest request;
@@ -1816,7 +1822,7 @@ TEST_F(P2PMasterServiceTest, ReadRouteChoosesEligibleTierAndRechecksHealth) {
     ASSERT_NE(client, nullptr);
     client->health_state_.last_heartbeat =
         std::chrono::steady_clock::now() -
-        std::chrono::seconds(P2PClientMeta::disconnect_timeout_sec_ + 1);
+        std::chrono::seconds(client->disconnect_timeout_sec_ + 1);
     ASSERT_EQ(client->CheckHealth().second, P2PClientStatus::DISCONNECTION);
     route = service->GetReadRoute("key", config);
     ASSERT_FALSE(route.has_value());
@@ -2046,45 +2052,198 @@ TEST_F(P2PMasterServiceTest, FullWriteReadCycle) {
 }
 
 // ============================================================
-// CompleteRouteSync Tests
+// Heartbeat service-state tests
 // ============================================================
 
-TEST_F(P2PMasterServiceTest, SetSyncCompletedSuccess) {
+TEST_F(P2PMasterServiceTest, HeartbeatPublishesServiceReadiness) {
     auto service = CreateService();
-    auto seg = MakeP2PSegment();
     auto client_id = generate_uuid();
-    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+    RegisterP2PClient(*service, client_id, {MakeP2PSegment()}, "127.0.0.1",
+                      50051, false);
+    auto client = service->GetClientManager().GetClient(client_id);
+    ASSERT_NE(client, nullptr);
+    EXPECT_EQ(client->GetServiceState(), P2PClientServiceState::INITIALIZING);
+    for (auto state :
+         {P2PClientServiceState::ONLINE, P2PClientServiceState::DEGRADED,
+          P2PClientServiceState::LOCAL_ONLY, P2PClientServiceState::STOPPING,
+          P2PClientServiceState::STOPPED, P2PClientServiceState::INITIALIZING,
+          P2PClientServiceState::ONLINE}) {
+        auto heartbeat = service->Heartbeat(
+            {.client_id = client_id, .service_state = state});
+        ASSERT_TRUE(heartbeat.has_value());
+        EXPECT_EQ(heartbeat->status, P2PClientStatus::HEALTH);
+        EXPECT_EQ(client->GetServiceState(), state);
+        EXPECT_EQ(client->IsReady(), state == P2PClientServiceState::ONLINE);
+    }
+    auto invalid = service->Heartbeat(
+        {.client_id = client_id,
+         .service_state = static_cast<P2PClientServiceState>(99)});
+    ASSERT_TRUE(invalid.has_value());
+    // Preserve the current raw-state storage policy: an unknown report must
+    // never be interpreted as ONLINE or make the client routable.
+    EXPECT_EQ(client->GetServiceState(),
+              static_cast<P2PClientServiceState>(99));
+    EXPECT_FALSE(client->IsReady());
+}
 
-    // Registration marks the client as syncing.
-    auto p2p_client = service->client_manager_->GetClient(client_id);
-    ASSERT_NE(p2p_client, nullptr);
-    EXPECT_TRUE(p2p_client->IsSyncing());
+TEST_F(P2PMasterServiceTest, ServiceStateIsPreservedWhenLivenessExpires) {
+    auto service = CreateService();
+    service->GetClientManager().Stop();
+    const auto client_id = generate_uuid();
+    const auto segment = MakeP2PSegment();
+    RegisterP2PClient(*service, client_id, {segment});
+    AddReplicaHelper(*service, "expired-service", 64, client_id, segment.id);
+    auto client = service->GetClientManager().GetClient(client_id);
+    ASSERT_NE(client, nullptr);
+    client->health_state_.last_heartbeat =
+        std::chrono::steady_clock::now() -
+        std::chrono::seconds(client->crash_timeout_sec_ + 1);
+    ASSERT_EQ(client->CheckHealth().second, P2PClientStatus::CRASHED);
+    EXPECT_EQ(client->GetServiceState(), P2PClientServiceState::ONLINE);
 
-    // CompleteRouteSync should clear is_syncing
-    auto result = service->CompleteRouteSync(client_id);
+    // Even a valid ONLINE report must not overwrite Master's CRASHED judgement.
+    auto heartbeat =
+        service->Heartbeat({.client_id = client_id,
+                            .service_state = P2PClientServiceState::ONLINE});
+    ASSERT_TRUE(heartbeat.has_value());
+    EXPECT_EQ(heartbeat->status, P2PClientStatus::CRASHED);
+    EXPECT_EQ(client->GetServiceState(), P2PClientServiceState::ONLINE);
+    EXPECT_TRUE(client->IsReady());
+    EXPECT_FALSE(client->is_health());
+    EXPECT_FALSE(service->GetReadRoute("expired-service").has_value());
+    auto regex = service->GetReadRouteByRegex("^expired-service$");
+    ASSERT_TRUE(regex.has_value());
+    EXPECT_TRUE(regex->empty());
+    EXPECT_FALSE(service->QueryIp(client_id).has_value());
+    P2PGetWriteRouteRequest request;
+    request.client_id = generate_uuid();
+    request.key = "new-key";
+    request.object_size = 64;
+    EXPECT_FALSE(service->GetWriteRoute(request).has_value());
+}
+
+TEST_F(P2PMasterServiceTest, UnreadyClientIsHiddenFromAllRouteQueries) {
+    auto service = CreateService();
+    auto segment = MakeP2PSegment();
+    const auto cold = generate_uuid();
+    RegisterP2PClient(*service, cold, {segment}, "127.0.0.1", 50051, false);
+    // Metadata may be restored or arrive before the readiness confirmation.
+    AddReplicaHelper(*service, "ready-gate", 64, cold, segment.id);
+
+    P2PHeartbeatRequest heartbeat{.client_id = cold};
+    auto hb = service->Heartbeat(heartbeat);
+    ASSERT_TRUE(hb.has_value());
+    EXPECT_EQ(hb->status, P2PClientStatus::HEALTH);
+    auto read = service->GetReadRoute("ready-gate");
+    ASSERT_FALSE(read.has_value());
+    EXPECT_EQ(read.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    auto regex = service->GetReadRouteByRegex("^ready-gate$");
+    ASSERT_TRUE(regex.has_value());
+    EXPECT_TRUE(regex->empty());
+    auto ip = service->QueryIp(cold);
+    ASSERT_FALSE(ip.has_value());
+    EXPECT_EQ(ip.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    auto ips = service->BatchQueryIp({cold});
+    ASSERT_TRUE(ips.has_value());
+    EXPECT_TRUE(ips->empty());
+
+    P2PGetWriteRouteRequest request;
+    request.client_id = generate_uuid();
+    request.key = "new-ready-gate";
+    request.object_size = 64;
+    auto write = service->GetWriteRoute(request);
+    ASSERT_FALSE(write.has_value());
+    EXPECT_EQ(write.error(), ErrorCode::NO_AVAILABLE_CANDIDATE);
+    P2PBatchGetWriteRouteRequest batch;
+    batch.client_id = request.client_id;
+    batch.keys = {"new-ready-gate", "another-key"};
+    batch.object_sizes = {64, 64};
+    auto writes = service->BatchGetWriteRoute(batch);
+    ASSERT_EQ(writes.responses.size(), 2);
+    EXPECT_TRUE(writes.responses[0].empty());
+    EXPECT_TRUE(writes.responses[1].empty());
+    EXPECT_EQ(writes.error_codes[0], ErrorCode::NO_AVAILABLE_CANDIDATE);
+    EXPECT_EQ(writes.error_codes[1], ErrorCode::NO_AVAILABLE_CANDIDATE);
+
+    const auto warm = generate_uuid();
+    auto warm_segment = MakeP2PSegment();
+    RegisterP2PClient(*service, warm, {warm_segment});
+    AddReplicaHelper(*service, "ready-gate", 64, warm, warm_segment.id);
+    read = service->GetReadRoute("ready-gate");
+    ASSERT_TRUE(read.has_value());
+    ASSERT_EQ(read->size(), 1);
+    EXPECT_EQ(read->front().client_id, warm);
+    write = service->GetWriteRoute(request);
+    ASSERT_TRUE(write.has_value());
+    ASSERT_EQ(write->size(), 1);
+    EXPECT_EQ(write->front().client_id, warm);
+    ips = service->BatchQueryIp({cold, warm});
+    ASSERT_TRUE(ips.has_value());
+    ASSERT_EQ(ips->size(), 1);
+    EXPECT_TRUE(ips->contains(warm));
+
+    ASSERT_TRUE(
+        service
+            ->Heartbeat({.client_id = cold,
+                         .service_state = P2PClientServiceState::ONLINE})
+            .has_value());
+    // Filtering must not erase the stored location while it is unready.
+    read = service->GetReadRoute("ready-gate");
+    ASSERT_TRUE(read.has_value());
+    EXPECT_EQ(read->size(), 2);
+    write = service->GetWriteRoute(request);
+    ASSERT_TRUE(write.has_value());
+    EXPECT_EQ(write->size(), 2);
+    regex = service->GetReadRouteByRegex("^ready-gate$");
+    ASSERT_TRUE(regex.has_value());
+    ASSERT_TRUE(regex->contains("ready-gate"));
+    EXPECT_EQ(regex->at("ready-gate").size(), 2);
+    EXPECT_TRUE(service->QueryIp(cold).has_value());
+    heartbeat.service_state = P2PClientServiceState::ONLINE;
+    hb = service->Heartbeat(heartbeat);
+    ASSERT_TRUE(hb.has_value());
+
+    P2PRegisterClientRequest duplicate{.client_id = cold,
+                                       .segments = {segment},
+                                       .ip_address = "127.0.0.1",
+                                       .rpc_port = 50051};
+    ASSERT_TRUE(service->RegisterClient(duplicate).has_value());
+    EXPECT_TRUE(service->GetClientManager().GetClient(cold)->IsReady());
+    ASSERT_TRUE(service->UnregisterClient(cold).has_value());
+    ASSERT_TRUE(service->RegisterClient(duplicate).has_value());
+    EXPECT_FALSE(service->GetClientManager().GetClient(cold)->IsReady());
+}
+
+TEST_F(P2PMasterServiceTest, HeartbeatDoesNotRegisterUnknownClient) {
+    auto service = CreateService();
+    auto result =
+        service->Heartbeat({.client_id = generate_uuid(),
+                            .service_state = P2PClientServiceState::ONLINE});
     ASSERT_TRUE(result.has_value());
-    EXPECT_FALSE(p2p_client->IsSyncing());
+    EXPECT_EQ(result->status, P2PClientStatus::UNDEFINED);
+    EXPECT_TRUE(service->GetClientManager().GetAllClients().empty());
 }
 
-TEST_F(P2PMasterServiceTest, SetSyncCompletedClientNotFound) {
-    auto service = CreateService();
-    auto result = service->CompleteRouteSync(generate_uuid());
-    EXPECT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::CLIENT_NOT_FOUND);
-}
-
-TEST_F(P2PMasterServiceTest, SetSyncCompletedIdempotent) {
+TEST_F(P2PMasterServiceTest, ReadyHeartbeatsAreIdempotent) {
     auto service = CreateService();
     auto seg = MakeP2PSegment();
     auto client_id = generate_uuid();
-    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051, false);
 
     // Call twice — should succeed both times
-    EXPECT_TRUE(service->CompleteRouteSync(client_id).has_value());
-    EXPECT_TRUE(service->CompleteRouteSync(client_id).has_value());
+    EXPECT_TRUE(
+        service
+            ->Heartbeat({.client_id = client_id,
+                         .service_state = P2PClientServiceState::ONLINE})
+            .has_value());
+    EXPECT_TRUE(
+        service
+            ->Heartbeat({.client_id = client_id,
+                         .service_state = P2PClientServiceState::ONLINE})
+            .has_value());
 
     auto p2p_client = service->client_manager_->GetClient(client_id);
-    EXPECT_FALSE(p2p_client->IsSyncing());
+    EXPECT_TRUE(p2p_client->IsReady());
 }
 
 }  // namespace mooncake::test

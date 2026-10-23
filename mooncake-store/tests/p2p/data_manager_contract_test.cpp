@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -31,7 +32,7 @@
 #include "p2p/client/data_manager_test_hook.h"
 #include "p2p/client/data_manager_types.h"
 #include "transfer_engine.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -1367,6 +1368,39 @@ TEST_P(DataManagerContractTest, SetRectifyCallbackReplacesAndDisables) {
 // ===========================================================================
 // Lifecycle
 // ===========================================================================
+
+TEST_P(DataManagerContractTest, LeaseDrainKeepsCompletionOperationsAvailable) {
+    SKIP_UNLESS_FORWARD_PROTOCOL();
+    const std::string read_key = "contract_drain_read";
+    const std::string write_key = "contract_drain_write";
+    ASSERT_TRUE(Put(read_key, MakePayload(64)).has_value());
+    auto pin = dm().PinKey(read_key);
+    ASSERT_TRUE(pin.has_value());
+    auto pre = dm().PreWrite(write_key, 64);
+    ASSERT_TRUE(pre.has_value());
+
+    std::promise<void> started;
+    auto drained = std::async(std::launch::async, [&] {
+        started.set_value();
+        dm().WaitForLeaseDrain();
+    });
+    started.get_future().wait();
+    EXPECT_EQ(drained.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+
+    EXPECT_TRUE(dm().WriteCommit(write_key, pre->write_operation_id).has_value());
+    // Also release the lease if a broken drain closed commit admission.
+    EXPECT_TRUE(dm().WriteRevoke(write_key, pre->write_operation_id).has_value());
+    EXPECT_EQ(drained.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    EXPECT_TRUE(dm().UnPinKey(read_key, pin->read_operation_id).has_value());
+    EXPECT_EQ(drained.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    drained.get();
+
+    EXPECT_TRUE(dm().Exist(write_key));
+    dm().WaitForLeaseDrain();
+}
 
 TEST_P(DataManagerContractTest, StopAndDestroyAreIdempotent) {
     ASSERT_TRUE(Put("contract_stop", MakePayload(64)).has_value());

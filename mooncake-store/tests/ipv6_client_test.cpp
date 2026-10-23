@@ -21,6 +21,7 @@
 #include <memory>
 #include <string>
 
+#include "centralized_client_config_builder.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
 #include "common.h"
@@ -32,145 +33,6 @@ DEFINE_string(server_address, "[::1]:17813",
 
 namespace mooncake {
 namespace testing {
-
-//=============================================================================
-// Unit tests for IPv6 address parsing functions
-//=============================================================================
-
-class IPv6ParsingTest : public ::testing::Test {
-   protected:
-    static void SetUpTestSuite() {
-        google::InitGoogleLogging("IPv6ParsingTest");
-        FLAGS_logtostderr = 1;
-    }
-
-    static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
-};
-
-// Test isValidIpV6 function with various IPv6 address formats
-TEST_F(IPv6ParsingTest, IsValidIpV6) {
-    // Valid IPv6 addresses
-    EXPECT_TRUE(isValidIpV6("::1")) << "Loopback address should be valid";
-    EXPECT_TRUE(isValidIpV6("::")) << "Any address should be valid";
-    EXPECT_TRUE(isValidIpV6("2001:db8::1")) << "Global unicast should be valid";
-    EXPECT_TRUE(isValidIpV6("fe80::1"))
-        << "Link-local without scope should be valid";
-    EXPECT_TRUE(isValidIpV6("fe80::a236:bcff:fecb:a1be"))
-        << "Full link-local should be valid";
-
-    // Valid IPv6 addresses with scope ID
-    EXPECT_TRUE(isValidIpV6("fe80::1%eth0"))
-        << "Link-local with scope ID should be valid";
-    EXPECT_TRUE(isValidIpV6("fe80::a236:bcff:fecb:a1be%eno2"))
-        << "Full link-local with scope ID should be valid";
-
-    // Invalid: IPv6 with port (should not be considered valid pure IPv6)
-    EXPECT_FALSE(isValidIpV6("fe80::1%eth0:12345"))
-        << "IPv6 with scope ID and port should be invalid";
-    EXPECT_FALSE(isValidIpV6("fe80::a236:bcff:fecb:a1be%eno2:17813"))
-        << "Full address with scope and port should be invalid";
-
-    // Invalid addresses
-    EXPECT_FALSE(isValidIpV6("192.168.1.1")) << "IPv4 should be invalid";
-    EXPECT_FALSE(isValidIpV6("localhost")) << "Hostname should be invalid";
-    EXPECT_FALSE(isValidIpV6("")) << "Empty string should be invalid";
-    EXPECT_FALSE(isValidIpV6("not-an-ip")) << "Random string should be invalid";
-}
-
-// Test parseHostNameWithPort function with IPv6 addresses
-TEST_F(IPv6ParsingTest, ParseHostNameWithPort) {
-    // Test bracketed IPv6 with port
-    {
-        auto [host, port] = parseHostNameWithPort("[::1]:17813");
-        EXPECT_EQ(host, "::1") << "Should extract loopback address";
-        EXPECT_EQ(port, 17813) << "Should extract port 17813";
-    }
-
-    // Test bracketed link-local with scope ID and port
-    {
-        auto [host, port] =
-            parseHostNameWithPort("[fe80::a236:bcff:fecb:a1be%eno2]:17813");
-        EXPECT_EQ(host, "fe80::a236:bcff:fecb:a1be%eno2")
-            << "Should preserve scope ID";
-        EXPECT_EQ(port, 17813) << "Should extract port 17813";
-    }
-
-    // Test unbracketed IPv6 with scope ID and port (common in internal usage)
-    {
-        auto [host, port] =
-            parseHostNameWithPort("fe80::a236:bcff:fecb:a1be%eno2:15773");
-        EXPECT_EQ(host, "fe80::a236:bcff:fecb:a1be%eno2")
-            << "Should correctly parse host with scope ID";
-        EXPECT_EQ(port, 15773) << "Should extract correct port";
-    }
-
-    // Test pure IPv6 without port (should use default handshake port)
-    {
-        auto [host, port] = parseHostNameWithPort("::1");
-        EXPECT_EQ(host, "::1") << "Should return loopback address";
-        EXPECT_EQ(port, getDefaultHandshakePort())
-            << "Should use default handshake port";
-    }
-
-    // Test link-local with scope ID but no port
-    {
-        auto [host, port] =
-            parseHostNameWithPort("fe80::a236:bcff:fecb:a1be%eno2");
-        EXPECT_EQ(host, "fe80::a236:bcff:fecb:a1be%eno2")
-            << "Should preserve full address with scope";
-        EXPECT_EQ(port, getDefaultHandshakePort())
-            << "Should use default handshake port";
-    }
-
-    // Test IPv4 address (should still work)
-    {
-        auto [host, port] = parseHostNameWithPort("192.168.1.1:8080");
-        EXPECT_EQ(host, "192.168.1.1") << "Should extract IPv4 address";
-        EXPECT_EQ(port, 8080) << "Should extract port";
-    }
-
-    // Test hostname with port
-    {
-        auto [host, port] = parseHostNameWithPort("localhost:17813");
-        EXPECT_EQ(host, "localhost") << "Should extract hostname";
-        EXPECT_EQ(port, 17813) << "Should extract port";
-    }
-}
-
-// Test maybeWrapIpV6 function
-TEST_F(IPv6ParsingTest, MaybeWrapIpV6) {
-    // IPv6 addresses should be wrapped
-    EXPECT_EQ(maybeWrapIpV6("::1"), "[::1]") << "Loopback should be wrapped";
-    EXPECT_EQ(maybeWrapIpV6("fe80::1%eth0"), "[fe80::1%eth0]")
-        << "Link-local with scope should be wrapped";
-    EXPECT_EQ(maybeWrapIpV6("fe80::a236:bcff:fecb:a1be%eno2"),
-              "[fe80::a236:bcff:fecb:a1be%eno2]")
-        << "Full link-local should be wrapped";
-
-    // Non-IPv6 should not be wrapped
-    EXPECT_EQ(maybeWrapIpV6("192.168.1.1"), "192.168.1.1")
-        << "IPv4 should not be wrapped";
-    EXPECT_EQ(maybeWrapIpV6("localhost"), "localhost")
-        << "Hostname should not be wrapped";
-}
-
-// Test that IPv6 address with different formats are handled correctly
-TEST_F(IPv6ParsingTest, IPv6AddressFormatVariations) {
-    // Test different IPv6 address formats that should be parsed correctly
-    std::vector<std::pair<std::string, std::pair<std::string, uint16_t>>>
-        test_cases = {
-            {"[::1]:8080", {"::1", 8080}},
-            {"[2001:db8::1]:9000", {"2001:db8::1", 9000}},
-            {"[fe80::1%lo]:7000", {"fe80::1%lo", 7000}},
-        };
-
-    for (const auto& [input, expected] : test_cases) {
-        auto [host, port] = parseHostNameWithPort(input);
-        EXPECT_EQ(host, expected.first) << "Host mismatch for input: " << input;
-        EXPECT_EQ(port, expected.second)
-            << "Port mismatch for input: " << input;
-    }
-}
 
 //=============================================================================
 // Integration tests for IPv6 client operations
@@ -204,10 +66,35 @@ class IPv6ClientTest : public ::testing::Test {
         if (client_) {
             client_->tearDownAll();
         }
+        if (storage_provider_) {
+            storage_provider_->tearDownAll();
+        }
         master_.Stop();
     }
 
+    bool StartStorageProvider(const std::string& server_address) {
+        // The tested client has no storage; provide a separate IPv6 segment.
+        const auto host = parseHostNameWithPort(server_address).first;
+        const std::string rdma_devices =
+            FLAGS_protocol == "rdma" ? FLAGS_device_name : std::string("");
+        storage_provider_ = RealClient::create();
+        auto config =
+            CentralizedClientConfigBuilder::build_centralized_real_client(
+                maybeWrapIpV6(host) + ":0", "P2PHANDSHAKE", FLAGS_protocol,
+                rdma_devices.empty() ? std::nullopt
+                                     : std::optional<std::string>(rdma_devices),
+                master_address_, 16 * 1024 * 1024, 0);
+        const int result = storage_provider_->setup(config);
+        if (result != 0) {
+            LOG(ERROR) << "Failed to start IPv6 storage provider at " << host
+                       << ": " << result;
+            return false;
+        }
+        return true;
+    }
+
     std::shared_ptr<RealClient> client_;
+    std::shared_ptr<RealClient> storage_provider_;
     mooncake::testing::InProcMaster master_;
     std::string master_address_;
 };
@@ -225,6 +112,8 @@ TEST_F(IPv6ClientTest, BasicPutGetOverIPv6Loopback) {
         << "Failed to start in-proc master";
     master_address_ = master_.master_address();
     LOG(INFO) << "Started in-proc master at " << master_address_;
+    ASSERT_TRUE(StartStorageProvider(FLAGS_server_address))
+        << "Failed to start IPv6 storage provider";
 
     // Setup the client with IPv6 address
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
@@ -234,9 +123,7 @@ TEST_F(IPv6ClientTest, BasicPutGetOverIPv6Loopback) {
     LOG(INFO) << "Setting up client with server address: "
               << FLAGS_server_address;
 
-    // TODO(C4/public API): Replace this shared-facade factory adaptation with
-    // the concrete centralized API; preserve a00f757 scenarios and assertions.
-    auto config = ClientConfigBuilder::build_centralized_real_client(
+    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
         FLAGS_server_address, "P2PHANDSHAKE", FLAGS_protocol,
         rdma_devices.empty() ? std::nullopt
                              : std::optional<std::string>(rdma_devices),
@@ -297,13 +184,15 @@ TEST_F(IPv6ClientTest, BasicPutGetOverLinkLocalIPv6) {
         << "Failed to start in-proc master";
     master_address_ = master_.master_address();
     LOG(INFO) << "Started in-proc master at " << master_address_;
+    ASSERT_TRUE(StartStorageProvider(server_address))
+        << "Failed to start link-local IPv6 storage provider";
 
     // Setup client with link-local address
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
 
-    auto config = ClientConfigBuilder::build_centralized_real_client(
+    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
         server_address, "P2PHANDSHAKE", FLAGS_protocol,
         rdma_devices.empty() ? std::nullopt
                              : std::optional<std::string>(rdma_devices),
@@ -351,13 +240,15 @@ TEST_F(IPv6ClientTest, BatchOperationsOverIPv6) {
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start in-proc master";
     master_address_ = master_.master_address();
+    ASSERT_TRUE(StartStorageProvider(FLAGS_server_address))
+        << "Failed to start IPv6 storage provider";
 
     // Setup the client
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
 
-    auto config = ClientConfigBuilder::build_centralized_real_client(
+    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
         FLAGS_server_address, "P2PHANDSHAKE", FLAGS_protocol,
         rdma_devices.empty() ? std::nullopt
                              : std::optional<std::string>(rdma_devices),

@@ -16,7 +16,7 @@
 
 #include "p2p/client/heartbeat_type.h"
 #include "hybrid_metric.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 

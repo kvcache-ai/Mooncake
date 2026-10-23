@@ -16,7 +16,7 @@
 #include "p2p/client/heartbeat_type.h"
 #include "p2p/common/p2p_rpc_types.h"
 #include "p2p/master/p2p_segment_manager.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 
@@ -31,7 +31,8 @@ struct P2PClientHealthState {
 class P2PClientMeta final {
    public:
     P2PClientMeta(const UUID& client_id, const std::string& ip_address,
-                  uint16_t rpc_port);
+                  uint16_t rpc_port, int64_t disconnect_timeout_sec,
+                  int64_t crash_timeout_sec);
     ~P2PClientMeta();
 
     auto MountSegment(const P2PSegment& segment)
@@ -49,8 +50,6 @@ class P2PClientMeta final {
 
     using SegmentRemovalCallback = std::function<void(const UUID& segment_id)>;
     void SetSegmentRemovalCallback(SegmentRemovalCallback cb);
-
-    static void SetTimeouts(int64_t disconnect_sec, int64_t crash_sec);
 
     /**
      * @brief Update heartbeat timestamp and health status.
@@ -94,11 +93,15 @@ class P2PClientMeta final {
     std::optional<P2PWriteCandidate> GetWriteRouteCandidate(
         const P2PWriteRouteConfig& config) const;
 
-    void SetSyncing(bool syncing) {
-        is_syncing_.store(syncing, std::memory_order_release);
+    // Last valid client report; liveness remains in health_state_.
+    void SetServiceState(P2PClientServiceState state) {
+        service_state_.store(state, std::memory_order_release);
     }
-    bool IsSyncing() const {
-        return is_syncing_.load(std::memory_order_acquire);
+    P2PClientServiceState GetServiceState() const {
+        return service_state_.load(std::memory_order_acquire);
+    }
+    bool IsReady() const {
+        return GetServiceState() == P2PClientServiceState::ONLINE;
     }
 
    private:
@@ -119,8 +122,8 @@ class P2PClientMeta final {
         bool top_tier_only) const;
 
    private:
-    static int64_t disconnect_timeout_sec_;
-    static int64_t crash_timeout_sec_;
+    const int64_t disconnect_timeout_sec_;
+    const int64_t crash_timeout_sec_;
 
     mutable SharedMutex client_mutex_;
     UUID client_id_;
@@ -134,7 +137,8 @@ class P2PClientMeta final {
     uint16_t rpc_port_ = 0;
     P2PSegmentManager segment_manager_;
     SegmentRemovalCallback segment_removal_cb_;
-    std::atomic<bool> is_syncing_{false};
+    std::atomic<P2PClientServiceState> service_state_{
+        P2PClientServiceState::INITIALIZING};
 };
 
 }  // namespace mooncake

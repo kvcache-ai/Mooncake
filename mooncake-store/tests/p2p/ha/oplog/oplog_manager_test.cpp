@@ -1,4 +1,5 @@
 #include "p2p/ha/oplog/oplog_manager.h"
+#include "p2p/common/p2p_types.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -27,7 +28,7 @@ class OpLogManagerTest : public ::testing::Test {
     std::unique_ptr<OpLogManager> manager_;
 };
 
-// ========== 2.1.1 Basic functionality tests ==========
+// ========== Basic functionality tests ==========
 
 TEST_F(OpLogManagerTest, TestAppendEntry) {
     uint64_t id = M().Append(OpType::PUT_END, "key1", "value1");
@@ -108,7 +109,7 @@ TEST_F(OpLogManagerTest, SetInitialSequenceIdIgnoredWhenNotEmpty) {
     EXPECT_EQ(id1, M().GetLastSequenceId());
 }
 
-// ========== 2.1.2 Checksum tests ==========
+// ========== Checksum tests ==========
 
 TEST_F(OpLogManagerTest, TestChecksumComputation) {
     // Same payload => same checksum; different payload => different checksum
@@ -141,7 +142,7 @@ TEST_F(OpLogManagerTest, TestVerifyChecksum) {
     EXPECT_FALSE(OpLogManager::VerifyChecksum(entry));
 }
 
-// ========== 2.1.3 Size validation tests ==========
+// ========== Size validation tests ==========
 
 TEST_F(OpLogManagerTest, TestValidateEntrySize_Valid) {
     OpLogEntry entry;
@@ -184,7 +185,7 @@ TEST_F(OpLogManagerTest, TestValidateEntrySize_EmptyKey) {
     EXPECT_TRUE(OpLogManager::ValidateEntrySize(entry, &reason));
 }
 
-// ========== 2.1.4 Etcd integration tests (placeholder) ==========
+// ========== Etcd integration tests (placeholder) ==========
 
 TEST_F(OpLogManagerTest, TestWriteToEtcd_Success) {
 #if defined(STORE_USE_ETCD)
@@ -212,7 +213,7 @@ TEST_F(OpLogManagerTest, TestIdempotentWrite) {
                     "EtcdOpLogStore::WriteOpLog tests.";
 }
 
-// ========== 2.1.5 Boundary condition tests ==========
+// ========== Boundary condition tests ==========
 
 TEST_F(OpLogManagerTest, TestSequenceIdWrapAround) {
     // Theoretical wrap-around test: set initial value near UINT64_MAX and

@@ -5,7 +5,7 @@
 #include <vector>
 #include <optional>
 #include <cstdint>
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
 

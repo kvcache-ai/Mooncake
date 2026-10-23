@@ -1,4 +1,6 @@
-#include "types.h"
+#include "common_types.h"
+
+#include <cstring>
 
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/uuid_generators.hpp>
@@ -22,8 +24,6 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::WRITE_FAIL, "WRITE_FAIL"},
         {ErrorCode::INVALID_PARAMS, "INVALID_PARAMS"},
         {ErrorCode::ILLEGAL_CLIENT, "ILLEGAL_CLIENT"},
-        {ErrorCode::NON_CONTIGUOUS_BUFFER_NOT_SUPPORTED,
-         "NON_CONTIGUOUS_BUFFER_NOT_SUPPORTED"},
         {ErrorCode::INVALID_WRITE, "INVALID_WRITE"},
         {ErrorCode::INVALID_READ, "INVALID_READ"},
         {ErrorCode::INVALID_REPLICA, "INVALID_REPLICA"},
@@ -37,8 +37,6 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::REPLICA_NOT_FOUND, "REPLICA_NOT_FOUND"},
         {ErrorCode::REPLICA_ALREADY_EXISTS, "REPLICA_ALREADY_EXISTS"},
         {ErrorCode::REPLICA_IS_GONE, "REPLICA_IS_GONE"},
-        {ErrorCode::REPLICA_ALREADY_EXISTS, "REPLICA_ALREADY_EXISTS"},
-        {ErrorCode::REPLICA_NOT_FOUND, "REPLICA_NOT_FOUND"},
         {ErrorCode::REPLICA_NUM_EXCEEDED, "REPLICA_NUM_EXCEEDED"},
         {ErrorCode::REPLICA_IS_PROCESSING, "REPLICA_IS_PROCESSING"},
         {ErrorCode::TRANSFER_FAIL, "TRANSFER_FAIL"},

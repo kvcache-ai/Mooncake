@@ -204,6 +204,46 @@ std::vector<tl::expected<bool, ErrorCode>> P2PMasterRpcService::BatchExistKey(
     return result;
 }
 
+tl::expected<
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+    ErrorCode>
+P2PMasterRpcService::BatchQueryIp(const std::vector<UUID>& client_ids) {
+    ScopedVLogTimer timer(1, "BatchQueryIp");
+    const size_t total_client_ids = client_ids.size();
+    timer.LogRequest("client_ids_count=", total_client_ids);
+    P2PMasterMetricManager::instance().inc_batch_query_ip_requests(
+        total_client_ids);
+
+    auto result = master_service_.BatchQueryIp(client_ids);
+
+    size_t failure_count = 0;
+    if (!result.has_value()) {
+        failure_count = total_client_ids;
+    } else {
+        for (size_t i = 0; i < client_ids.size(); ++i) {
+            const auto& client_id = client_ids[i];
+            if (result.value().find(client_id) == result.value().end()) {
+                failure_count++;
+                VLOG(1) << "BatchQueryIp failed for client_id[" << i << "] '"
+                        << client_id << "': not found in results";
+            }
+        }
+    }
+
+    if (failure_count != 0 && failure_count == total_client_ids) {
+        P2PMasterMetricManager::instance().inc_batch_query_ip_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        P2PMasterMetricManager::instance().inc_batch_query_ip_partial_success(
+            failure_count);
+    }
+
+    timer.LogResponse("total=", total_client_ids,
+                      ", success=", total_client_ids - failure_count,
+                      ", failures=", failure_count);
+    return result;
+}
+
 tl::expected<std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
              ErrorCode>
 P2PMasterRpcService::GetReadRouteByRegex(std::string_view regex) {
@@ -511,18 +551,6 @@ P2PBatchSyncRoutesResponse P2PMasterRpcService::BatchSyncRoutes(
     return response;
 }
 
-tl::expected<void, ErrorCode> P2PMasterRpcService::CompleteRouteSync(
-    const UUID& client_id) {
-    ScopedVLogTimer timer(1, "CompleteRouteSync");
-    timer.LogRequest("client_id=", client_id);
-
-    auto result = master_service_.CompleteRouteSync(client_id);
-    if (!result) {
-        LOG(ERROR) << "CompleteRouteSync failed: " << toString(result.error());
-    }
-    return result;
-}
-
 void RegisterP2PRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::P2PMasterRpcService& wrapped_master_service,
@@ -530,6 +558,8 @@ void RegisterP2PRpcService(
     server.register_handler<&P2PMasterRpcService::ExistKey>(
         &wrapped_master_service);
     server.register_handler<&P2PMasterRpcService::BatchExistKey>(
+        &wrapped_master_service);
+    server.register_handler<&P2PMasterRpcService::BatchQueryIp>(
         &wrapped_master_service);
     server.register_handler<&P2PMasterRpcService::GetReadRouteByRegex>(
         &wrapped_master_service);
@@ -567,8 +597,6 @@ void RegisterP2PRpcService(
     server.register_handler<&P2PMasterRpcService::BatchWithdrawRoute>(
         &wrapped_master_service);
     server.register_handler<&P2PMasterRpcService::BatchSyncRoutes>(
-        &wrapped_master_service);
-    server.register_handler<&P2PMasterRpcService::CompleteRouteSync>(
         &wrapped_master_service);
 }
 

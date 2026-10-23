@@ -77,7 +77,7 @@ OpLogEntry MakeUnregisterClientEntry(uint64_t seq,
     return MakeEntry(seq, OpType_UNREGISTER_CLIENT, "", data);
 }
 
-// Helper to create REMOVE entry (main branch OpType).
+// Create a common REMOVE OpLog entry.
 OpLogEntry MakeRemoveEntry(uint64_t seq, const std::string& key) {
     return MakeEntry(seq, OpType::REMOVE, key, "");
 }

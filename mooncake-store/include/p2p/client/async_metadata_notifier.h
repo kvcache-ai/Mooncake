@@ -14,7 +14,7 @@
 #include <boost/functional/hash.hpp>
 
 #include "p2p/master/p2p_master_client.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 
@@ -39,7 +39,7 @@ class AsyncMetadataNotifier {
     // drop_pending=false (default): sender drains remaining ops before exiting.
     // drop_pending=true: queued ops are discarded immediately without invoking
     // failure_cb.
-    void Start();
+    ErrorCode Start();
     void Stop(bool drop_pending = false);
 
     // --- Normal priority ---
@@ -215,6 +215,8 @@ class AsyncMetadataNotifier {
    private:
     tl::expected<void, ErrorCode> DoEnqueue(PendingOp&& op, bool is_recovery);
 
+    ErrorCode StartSenderThread(size_t shard_idx);
+    void SenderThreadMain(size_t shard_idx);
     void SenderLoop(size_t shard_idx);
     // Returns (total_collected, recovery_collected)
     std::pair<size_t, size_t> CollectBatch(SenderShard& shard,

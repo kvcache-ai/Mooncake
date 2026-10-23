@@ -631,12 +631,8 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
     }
 
     if (scheduler_) {
-        // Single Context-carrying hook. EventDriven uses the tier
-        // id + size to place the key in the fast-tier MultiLRU and to track
-        // write load, and deliberately does NOT count the commit as a frequency
-        // hit. Legacy's OnCommit(CommitContext) reproduces the old
-        // behavior (track replica + a record_access-guarded RecordAccess),
-        // which is why the previously separate OnAccess(key) call here is gone.
+        // Pass tier and size to OnCommit; the scheduler controls access
+        // accounting.
         scheduler_->OnCommit(CommitContext{key, current_tier_id, handle_size,
                                            committed_version, record_access});
     }
@@ -678,16 +674,8 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
         entry = it->second;
     }
 
-    // Select the served replica under the entry read lock, copy out what the
-    // scheduler needs, then RELEASE the lock before notifying it. The OnAccess
-    // hook may re-enter the backend (e.g. GetReplicaTierIds), which would
-    // deadlock on a recursive shared_mutex if we still held entry->mutex here.
-    // Moving OnAccess after selection also gives it the served tier id, which
-    // the event-driven scheduler needs to route offload/onboard.
-    //
-    // Note: every early return below is a miss (empty replicas / tier not
-    // found) and intentionally skips OnAccess — a miss is not an access and
-    // must not bump a key's heat.
+    // Release the entry lock before OnAccess, which may re-enter the backend.
+    // Notify only for a served replica; misses do not increase key frequency.
     AllocationHandle served_handle;
     UUID served_tier{};
     size_t served_size = 0;

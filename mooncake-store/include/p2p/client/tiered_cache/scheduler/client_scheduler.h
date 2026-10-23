@@ -16,7 +16,7 @@
 #include "p2p/client/tiered_cache/scheduler/client_scheduler_interface.h"
 #include "p2p/client/tiered_cache/scheduler/scheduler_policy.h"
 #include "p2p/client/tiered_cache/scheduler/stats_collector.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 #include "utils.h"
 
 #include <json/value.h>

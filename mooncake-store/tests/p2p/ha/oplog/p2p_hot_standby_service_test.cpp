@@ -177,6 +177,11 @@ class P2PHotStandbyServiceTest : public ::testing::Test {
         req.segments = {segment};
         auto result = service.RegisterClient(req);
         ASSERT_TRUE(result.has_value()) << toString(result.error());
+        ASSERT_TRUE(
+            service
+                .Heartbeat({.client_id = client_id,
+                            .service_state = P2PClientServiceState::ONLINE})
+                .has_value());
     }
 
     void PublishRoute(P2PMasterService& service, const std::string& key,
@@ -712,6 +717,18 @@ TEST_F(P2PHotStandbyServiceTest, RestoreExportedMetadataIntoP2PMasterService) {
                   standby.ExportMetadata(), promoted_sequence_id),
               ErrorCode::OK);
 
+    // Promotion restores metadata, but does not infer a live client's
+    // readiness.
+    auto blocked = restored_master.GetReadRoute("key-restore");
+    ASSERT_FALSE(blocked.has_value());
+    EXPECT_EQ(blocked.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    auto heartbeat = restored_master.Heartbeat({.client_id = client_id});
+    ASSERT_TRUE(heartbeat.has_value());
+    ASSERT_TRUE(restored_master
+                    .Heartbeat({.client_id = client_id,
+                                .service_state = P2PClientServiceState::ONLINE})
+                    .has_value());
+
     auto ip_result = restored_master.QueryIp(client_id);
     ASSERT_TRUE(ip_result.has_value()) << toString(ip_result.error());
     ASSERT_EQ(ip_result.value().size(), 1);
@@ -782,6 +799,10 @@ TEST_F(P2PHotStandbyServiceTest, RestorePromotedMetadataIntoWrappedRuntime) {
                   standby.ExportMetadata(), promoted_sequence_id),
               ErrorCode::OK);
 
+    ASSERT_TRUE(promoted_runtime
+                    .Heartbeat({.client_id = client_id,
+                                .service_state = P2PClientServiceState::ONLINE})
+                    .has_value());
     auto replica_result = promoted_runtime.GetReadRoute(
         P2PGetReadRouteRequest{.key = "runtime-key"});
     ASSERT_TRUE(replica_result.has_value()) << toString(replica_result.error());
@@ -832,6 +853,10 @@ TEST_F(P2PHotStandbyServiceTest, PromotedRuntimeContinuesP2PMasterFlow) {
                   standby.ExportMetadata(), promoted_sequence_id),
               ErrorCode::OK);
 
+    ASSERT_TRUE(promoted_runtime
+                    .Heartbeat({.client_id = original_client_id,
+                                .service_state = P2PClientServiceState::ONLINE})
+                    .has_value());
     auto restored_replica = promoted_runtime.GetReadRoute(
         P2PGetReadRouteRequest{.key = "flow-key-before-promotion"});
     ASSERT_TRUE(restored_replica.has_value())

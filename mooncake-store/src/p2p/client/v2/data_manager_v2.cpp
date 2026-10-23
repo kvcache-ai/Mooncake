@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 
 #include <glog/logging.h>
 
@@ -19,6 +20,8 @@ namespace mooncake::v2 {
 namespace {
 
 constexpr size_t kForEachKeyBatchSize = 512;
+constexpr auto kLeaseDrainReportInterval = std::chrono::seconds(10);
+constexpr auto kLeaseDrainPollInterval = std::chrono::milliseconds(100);
 
 size_t ParseByteSize(const Json::Value& value) {
     if (value.isString()) {
@@ -1665,6 +1668,11 @@ DataManagerV2::WriteRemoteDataAsync(
     // Reuses the forward protocol: PreWrite claims the key and allocates,
     // WriteCommit publishes, WriteRevoke rolls back. That keeps one
     // implementation of the claim ordering instead of two.
+    // TODO(V2-REVERSE-WRITE-LIFETIME): Move the pending-write transaction into
+    // this coroutine before submitting TE and retain its MutableBlock across
+    // the await. Lease expiry can currently free the target behind this raw
+    // address. Reattach only after TE drains and the token/deadline still match;
+    // this also requires fixing V2-TE-DRAIN in TransferCoordinator.
     auto reserved = PreWrite(key, total, target_id);
     if (!reserved) {
         co_return tl::make_unexpected(reserved.error());
@@ -1778,6 +1786,31 @@ void DataManagerV2::SetRectifyCallback(RectifyRouteCallback fn) {
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
+
+void DataManagerV2::WaitForLeaseDrain() {
+    if (!leases_) return;
+
+    // New operations have drained at the service boundary. Keep the scanner
+    // and lifecycle gate active so completion RPCs can still settle leases.
+    // As in V1, peers must stop accessing buffers once their leases expire.
+    auto next_report =
+        std::chrono::steady_clock::now() + kLeaseDrainReportInterval;
+    while (true) {
+        const size_t pending_writes = leases_->PendingWriteCount();
+        const size_t pinned_keys = leases_->PinnedLeaseCount();
+        if (pending_writes == 0 && pinned_keys == 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_report) {
+            LOG(ERROR) << "DataManagerV2: waiting for peer leases to drain: "
+                       << "pending_writes=" << pending_writes
+                       << ", pinned_keys=" << pinned_keys;
+            next_report = now + kLeaseDrainReportInterval;
+        }
+        std::this_thread::sleep_for(kLeaseDrainPollInterval);
+    }
+}
 
 void DataManagerV2::Stop() {
     if (!lifecycle_->BeginStop()) {

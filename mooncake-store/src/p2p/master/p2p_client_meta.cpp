@@ -7,12 +7,15 @@
 
 namespace mooncake {
 
-int64_t P2PClientMeta::disconnect_timeout_sec_ = 0;
-int64_t P2PClientMeta::crash_timeout_sec_ = 0;
-
 P2PClientMeta::P2PClientMeta(const UUID& client_id,
-                             const std::string& ip_address, uint16_t rpc_port)
-    : client_id_(client_id), ip_address_(ip_address), rpc_port_(rpc_port) {
+                             const std::string& ip_address, uint16_t rpc_port,
+                             int64_t disconnect_timeout_sec,
+                             int64_t crash_timeout_sec)
+    : disconnect_timeout_sec_(disconnect_timeout_sec),
+      crash_timeout_sec_(crash_timeout_sec),
+      client_id_(client_id),
+      ip_address_(ip_address),
+      rpc_port_(rpc_port) {
     health_state_.status = P2PClientStatus::HEALTH;
     health_state_.last_heartbeat = std::chrono::steady_clock::now();
 }
@@ -147,11 +150,6 @@ tl::expected<void, ErrorCode> P2PClientMeta::CheckSegmentAvailable(
 
 void P2PClientMeta::SetSegmentRemovalCallback(SegmentRemovalCallback cb) {
     segment_removal_cb_ = std::move(cb);
-}
-
-void P2PClientMeta::SetTimeouts(int64_t disconnect_sec, int64_t crash_sec) {
-    disconnect_timeout_sec_ = disconnect_sec;
-    crash_timeout_sec_ = crash_sec;
 }
 
 P2PClientHealthState P2PClientMeta::get_health_state() const {

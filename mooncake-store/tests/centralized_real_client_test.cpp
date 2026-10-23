@@ -2,12 +2,17 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <cstdio>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <memory>
 #include <string>
 #include <random>
 #include <barrier>
 
-#include "real_client.h"
+#include "centralized_client_config_builder.h"
+#include "config.h"
+#include "real_client_test_helper.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
@@ -15,6 +20,22 @@ DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 
 namespace mooncake {
 namespace testing {
+
+namespace {
+
+class ScopedMaxMrSize {
+   public:
+    explicit ScopedMaxMrSize(size_t value)
+        : original_(globalConfig().max_mr_size) {
+        globalConfig().max_mr_size = value;
+    }
+    ~ScopedMaxMrSize() { globalConfig().max_mr_size = original_; }
+
+   private:
+    size_t original_;
+};
+
+}  // namespace
 
 // Helper class to temporarily mute glog output by setting log level to FATAL
 class GLogMuter {
@@ -31,6 +52,11 @@ class GLogMuter {
 
 class RealClientTest : public ::testing::Test {
    protected:
+    CentralizedClientConfig DeploymentConfig() {
+        return CentralizedClientConfigBuilder::build_centralized_real_client(
+            "127.0.0.1:0", "P2PHANDSHAKE", "tcp", std::nullopt,
+            master_.master_address(), 16 * 1024 * 1024, 4 * 1024 * 1024);
+    }
     static void SetUpTestSuite() {
         google::InitGoogleLogging("RealClientTest");
         FLAGS_logtostderr = 1;
@@ -65,6 +91,53 @@ class RealClientTest : public ::testing::Test {
     std::string master_address_;
 };
 
+TEST_F(RealClientTest, InvalidShmRegistrationClosesFdAndLeavesNoContext) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    auto client = RealClient::create();
+    auto config = DeploymentConfig();
+    ASSERT_EQ(client->setup(config), 0);
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> file(std::tmpfile(),
+                                                            std::fclose);
+    ASSERT_NE(file, nullptr);
+    const int fd = fileno(file.get());
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, 4096), 0);
+    struct stat original{};
+    ASSERT_EQ(fstat(fd, &original), 0);
+    const int passed_fd = dup(fd);
+    ASSERT_GE(passed_fd, 0);
+    {
+        ScopedMaxMrSize limit(1);
+        auto result =
+            RealClientTestHelper::MapShm(*client, passed_fd, 0x100000, 4096,
+                                         false, {1, 2});
+        EXPECT_FALSE(result);
+    }
+    struct stat after{};
+    const bool duplicate_still_open = fstat(passed_fd, &after) == 0 &&
+                                      after.st_dev == original.st_dev &&
+                                      after.st_ino == original.st_ino;
+    EXPECT_FALSE(duplicate_still_open);
+    if (duplicate_still_open) close(passed_fd);
+    EXPECT_EQ(RealClientTestHelper::FindShmContext(*client, {1, 2}), nullptr);
+    EXPECT_EQ(client->tearDownAll(), 0);
+}
+
+TEST_F(RealClientTest, FailedLocalPoolRegistrationRejectsSetup) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    auto config = DeploymentConfig();
+    auto client = RealClient::create();
+    {
+        ScopedMaxMrSize limit(1);
+        EXPECT_NE(client->setup(config), 0);
+        EXPECT_FALSE(client->is_initialized());
+    }
+    EXPECT_EQ(client->tearDownAll(), 0);
+    client = RealClient::create();
+    ASSERT_EQ(client->setup(config), 0);
+    EXPECT_EQ(client->tearDownAll(), 0);
+}
+
 // Test basic Put and Get operations
 TEST_F(RealClientTest, BasicPutGetOperations) {
     // Start in-proc master
@@ -77,9 +150,7 @@ TEST_F(RealClientTest, BasicPutGetOperations) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    // TODO(C4/public API): Replace this shared-facade factory adaptation with
-    // the concrete centralized API; preserve a00f757 scenarios and assertions.
-    auto config = ClientConfigBuilder::build_centralized_real_client(
+    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
         "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
         rdma_devices.empty() ? std::nullopt
                              : std::optional<std::string>(rdma_devices),
@@ -130,7 +201,7 @@ TEST_F(RealClientTest, GetWithLeaseTimeOut) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    auto config = ClientConfigBuilder::build_centralized_real_client(
+    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
         "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
         rdma_devices.empty() ? std::nullopt
                              : std::optional<std::string>(rdma_devices),
@@ -263,7 +334,7 @@ TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    auto config = ClientConfigBuilder::build_centralized_real_client(
+    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
         "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
         rdma_devices.empty() ? std::nullopt
                              : std::optional<std::string>(rdma_devices),
@@ -524,7 +595,7 @@ TEST_F(RealClientTest, TestSetupExistTransferEngine) {
     } else {
         ASSERT_TRUE(false) << "Unsupported protocol: " << FLAGS_protocol;
     }
-    auto config = ClientConfigBuilder::build_centralized_real_client(
+    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
         "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
         rdma_devices.empty() ? std::nullopt
                              : std::optional<std::string>(rdma_devices),
@@ -554,7 +625,7 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    auto config = ClientConfigBuilder::build_centralized_real_client(
+    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
         "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
         rdma_devices.empty() ? std::nullopt
                              : std::optional<std::string>(rdma_devices),
@@ -631,7 +702,7 @@ TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    auto config = ClientConfigBuilder::build_centralized_real_client(
+    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
         "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
         rdma_devices.empty() ? std::nullopt
                              : std::optional<std::string>(rdma_devices),
@@ -682,19 +753,21 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
 
     // Setup client 1
     const std::string client1_addr = "localhost:17813";
-    auto setup_config = ClientConfigBuilder::build_centralized_real_client(
-        client1_addr, "P2PHANDSHAKE", FLAGS_protocol,
-        std::optional<std::string>(rdma_devices), master_address_,
-        16 * 1024 * 1024, 16 * 1024 * 1024);
+    auto setup_config =
+        CentralizedClientConfigBuilder::build_centralized_real_client(
+            client1_addr, "P2PHANDSHAKE", FLAGS_protocol,
+            std::optional<std::string>(rdma_devices), master_address_,
+            16 * 1024 * 1024, 16 * 1024 * 1024);
     ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     // Setup client 2
     auto py_client2 = RealClient::create();
     const std::string client2_addr = "localhost:17814";
-    auto setup_config2 = ClientConfigBuilder::build_centralized_real_client(
-        client2_addr, "P2PHANDSHAKE", FLAGS_protocol,
-        std::optional<std::string>(rdma_devices), master_address_,
-        16 * 1024 * 1024, 16 * 1024 * 1024);
+    auto setup_config2 =
+        CentralizedClientConfigBuilder::build_centralized_real_client(
+            client2_addr, "P2PHANDSHAKE", FLAGS_protocol,
+            std::optional<std::string>(rdma_devices), master_address_,
+            16 * 1024 * 1024, 16 * 1024 * 1024);
     ASSERT_EQ(py_client2->setup(setup_config2), 0);
 
     const std::string test_data = "Hello, CopyMoveQueryTask!";

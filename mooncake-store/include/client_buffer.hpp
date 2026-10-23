@@ -1,12 +1,14 @@
 #pragma once
 
 #include <optional>
+#include <memory>
+#include <span>
 #include <vector>
 #include <string>
+#include <ylt/util/tl/expected.hpp>
 
 #include "offset_allocator/offset_allocator.hpp"
-#include "types.h"
-#include "replica.h"
+#include "common_types.h"
 
 namespace mooncake {
 
@@ -31,8 +33,8 @@ class ClientBufferAllocator
         size_t size, const std::string& protocol = "",
         bool use_hugepage = false);
 
-    // Create for shared memory
-    static std::shared_ptr<ClientBufferAllocator> create(
+    // Create for caller-owned memory; report allocation failures as errors.
+    static tl::expected<std::shared_ptr<ClientBufferAllocator>, ErrorCode> create(
         void* addr, size_t size, const std::string& protocol = "");
 
     ~ClientBufferAllocator();
@@ -96,39 +98,13 @@ class BufferHandle {
 };
 
 // Utility functions for buffer and slice management
+[[nodiscard]] size_t CalculateSliceSize(std::span<const Slice> slices);
+
 /**
  * @brief Split a BufferHandle into slices of maximum size kMaxSliceSize
  * @param handle The buffer handle to split
  * @return Vector of slices covering the entire buffer
  */
 std::vector<Slice> split_into_slices(BufferHandle& handle);
-
-/**
- * @brief Calculate the total size of a replica descriptor
- * @param replica The replica descriptor to calculate size for
- * @return Total size in bytes
- */
-uint64_t calculate_total_size(const Replica::Descriptor& replica);
-
-/**
- * @brief Allocate slices from a buffer handle based on replica descriptor
- * @param slices Output vector to store the allocated slices
- * @param replica The replica descriptor defining the slice structure
- * @param buffer_ptr The buffer pointer to allocate slices from
- * @return 0 on success, non-zero on error
- */
-int allocateSlices(std::vector<Slice>& slices,
-                   const Replica::Descriptor& replica, void* buffer_ptr);
-
-/**
- * @brief Build slices from user-provided buffers, trimmed to total_size.
- * @param buffers Vector of buffer pointers.
- * @param sizes Vector of buffer sizes (must match buffers.size()).
- * @param total_size Maximum total bytes across all slices.
- * @return Vector of slices whose combined size equals total_size.
- */
-std::vector<Slice> BuildSlicesFromBuffers(const std::vector<void*>& buffers,
-                                          const std::vector<size_t>& sizes,
-                                          uint64_t total_size);
 
 }  // namespace mooncake

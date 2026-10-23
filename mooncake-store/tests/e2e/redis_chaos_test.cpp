@@ -32,7 +32,7 @@
 
 #include <hiredis/hiredis.h>
 
-DEFINE_string(master_path, "./mooncake-store/src/mooncake_master_p2p",
+DEFINE_string(master_path, "./mooncake-store/src/mooncake_master",
               "Path to the P2P master executable");
 FLAG_out_dir;
 DEFINE_string(clientctl_path, "./mooncake-store/tests/e2e/clientctl",
@@ -243,7 +243,6 @@ class ClientCtlProcess {
                 "--redis_cluster_id=" + FLAGS_redis_cluster_id,
                 "--redis_username=" + FLAGS_redis_username,
                 "--redis_password=" + FLAGS_redis_password,
-                "--deployment_mode=P2P",
                 "--p2p_local_transfer_mode=memcpy",
                 "--engine_meta_url=P2PHANDSHAKE",
                 "--protocol=tcp",
@@ -476,12 +475,8 @@ class RedisChaosTest : public ::testing::Test {
     }
 
     void WaitForLeaderServiceReady() {
-        // The leader master only starts serving RPCs after the election lease
-        // elapses, and a fixed TTL+1s sleep is too tight on slow CI runners:
-        // clients that start before the RPC server is up fall back to
-        // DEGRADED mode and write locally without notifying the master, so no
-        // ADD_REPLICA OpLog entry is produced. Poll the leader's RPC port so
-        // the test controls the deployment order deterministically.
+        // Wait for leader RPC readiness so writes publish replicas to the
+        // master.
         auto deadline =
             std::chrono::steady_clock::now() +
             std::chrono::seconds(FLAGS_redis_master_view_ttl_sec * 4);
@@ -496,7 +491,7 @@ class RedisChaosTest : public ::testing::Test {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
-        // Fallback to the original heuristic if the probe cannot complete.
+        // Fall back to a TTL-based wait if the probe times out.
         std::this_thread::sleep_for(
             std::chrono::seconds(FLAGS_redis_master_view_ttl_sec + 1));
     }

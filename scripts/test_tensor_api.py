@@ -9,11 +9,15 @@ import torch
 import numpy as np
 from dataclasses import dataclass
 from mooncake.store import MooncakeDistributedStore
-from mooncake.store import ReplicateConfig
-
 from mooncake.mooncake_config import MooncakeConfig
 
 import concurrent.futures
+
+IS_P2P = hasattr(MooncakeDistributedStore, "setup_p2p_real_client")
+if IS_P2P:
+    from mooncake.store import P2PWriteRouteConfig
+else:
+    from mooncake.store import ReplicateConfig
 
 # ==========================================
 #  Global Variables & Configuration
@@ -94,18 +98,44 @@ def create_store_connection():
     store = MooncakeDistributedStore()
     config = MooncakeConfig.load_from_env()
     print(f"[{os.getpid()}] Connecting to Mooncake Master at {config.master_server_address} using {config.protocol}...")
-    rc = store.setup(
-        config.local_hostname,
-        config.metadata_server,
-        config.global_segment_size,
-        config.local_buffer_size,
-        config.protocol,
-        config.device_name,
-        config.master_server_address,
-    )
+    if IS_P2P:
+        # Run the same workload against the installed P2P Store and its master.
+        rc = store.setup_p2p_real_client(
+            local_hostname=config.local_hostname,
+            metadata_server=config.metadata_server,
+            tiered_backend_config_json=os.environ["MOONCAKE_TIERED_BACKEND_CONFIG"],
+            local_buffer_size=config.local_buffer_size,
+            protocol=config.protocol,
+            rdma_devices=config.device_name,
+            master_server_addr=config.master_server_address,
+            client_rpc_port=0,
+            enable_http_server=False,
+            enable_metric_collection=False,
+            runtime_config='{"write":{"remote_weight":0.0}}',
+        )
+    else:
+        rc = store.setup(
+            config.local_hostname,
+            config.metadata_server,
+            config.global_segment_size,
+            config.local_buffer_size,
+            config.protocol,
+            config.device_name,
+            config.master_server_address,
+        )
     if rc != 0:
         raise RuntimeError(f"Failed to setup mooncake store, error code: {rc}")
     return store, config
+
+def create_write_config():
+    """Select the write policy for this single-client test deployment."""
+    if IS_P2P:
+        config = P2PWriteRouteConfig()
+        config.remote_weight = 0.0
+    else:
+        config = ReplicateConfig()
+        config.replica_num = 1
+    return config
 
 def generate_tensors(num_tensors, size_mb):
     """Generate random Tensors suitable for TP testing."""
@@ -496,8 +526,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
         key = "func_pub_test"
         tensor = torch.randn(1024, 1024, dtype=torch.float32)
 
-        repconfig = ReplicateConfig()
-        repconfig.replica_num = 1
+        repconfig = create_write_config()
 
         # Perform Put
         rc = self.store.pub_tensor(key, tensor, repconfig)
@@ -519,8 +548,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
         _, tensors = generate_tensors(1, 16)
         target_tensor = tensors[0]
 
-        repconfig = ReplicateConfig()
-        repconfig.replica_num = 1
+        repconfig = create_write_config()
 
         # 1. Pub with TP
         rc = self.store.pub_tensor_with_tp(key, target_tensor, config=repconfig, tp_size=tp_size, split_dim=split_dim)
@@ -550,8 +578,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
         num_tensors = 4
         keys, tensors = generate_tensors(num_tensors, 8) # Small size for functional testing
 
-        repconfig = ReplicateConfig()
-        repconfig.replica_num = 1
+        repconfig = create_write_config()
 
         # 1. Batch Pub with TP
         results = self.store.batch_pub_tensor_with_tp(keys, tensors, config=repconfig, tp_size=tp_size, split_dim=split_dim)
@@ -810,8 +837,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         """Benchmark: Standard Batch Pub/Get."""
         put_times = []
         get_times = []
-        repconfig = ReplicateConfig()
-        repconfig.replica_num = 1
+        repconfig = create_write_config()
 
         print(f"--- Running Standard Batch Benchmark ({self.BENCH_ITERATIONS} iters) ---")
         for i in range(self.BENCH_ITERATIONS):
@@ -838,8 +864,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         split_dim = 0
         put_times = []
         get_times = []
-        repconfig = ReplicateConfig()
-        repconfig.replica_num = 1
+        repconfig = create_write_config()
 
         print(f"--- Running TP Batch Benchmark (TP={tp_size}) ---")
         for i in range(self.BENCH_ITERATIONS):

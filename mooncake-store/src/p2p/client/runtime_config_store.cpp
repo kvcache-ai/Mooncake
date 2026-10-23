@@ -1,40 +1,22 @@
 #include "p2p/client/runtime_config_store.h"
 
 #include <glog/logging.h>
-#include <type_traits>
 
 namespace mooncake {
 
-RuntimeConfigStore::RuntimeConfigStore(DeploymentMode mode)
-    : write_(mode == DeploymentMode::P2P
-                 ? WriteConfig{WriteRouteRequestConfig{}}
-                 : WriteConfig{ReplicateConfig{}}) {}
-
-RuntimeConfigStore::WriteConfig RuntimeConfigStore::getDefaultWriteConfig()
-    const {
+P2PWriteRouteConfig RuntimeConfigStore::getDefaultWriteConfig() const {
     std::shared_lock lock(mu_);
     return write_;
 }
 
-ReadRouteConfig RuntimeConfigStore::getDefaultReadConfig() const {
+P2PReadRouteConfig RuntimeConfigStore::getDefaultReadConfig() const {
     std::shared_lock lock(mu_);
     return read_;
 }
 
 bool RuntimeConfigStore::updateWriteConfig(const Json::Value& json) {
     std::unique_lock lock(mu_);
-    bool ok = true;
-    std::visit(
-        [&](auto& cfg) {
-            if constexpr (std::is_same_v<std::decay_t<decltype(cfg)>,
-                                         WriteRouteRequestConfig>) {
-                ok = applyPatch(cfg, json);
-            } else {
-                applyPatch(cfg, json);
-            }
-        },
-        write_);
-    return ok;
+    return applyPatch(write_, json);
 }
 
 void RuntimeConfigStore::updateReadConfig(const Json::Value& json) {
@@ -45,8 +27,7 @@ void RuntimeConfigStore::updateReadConfig(const Json::Value& json) {
 Json::Value RuntimeConfigStore::exportConfig() const {
     std::shared_lock lock(mu_);
     Json::Value root;
-    root["write"] =
-        std::visit([](const auto& cfg) { return toJson(cfg); }, write_);
+    root["write"] = toJson(write_);
     root["read"] = toJson(read_);
     return root;
 }
@@ -57,16 +38,7 @@ bool RuntimeConfigStore::loadFromJson(const Json::Value& root) {
     std::unique_lock lock(mu_);
     bool ok = true;
     if (root.isMember("write")) {
-        std::visit(
-            [&](auto& cfg) {
-                if constexpr (std::is_same_v<std::decay_t<decltype(cfg)>,
-                                             WriteRouteRequestConfig>) {
-                    ok = applyPatch(cfg, root["write"]);
-                } else {
-                    applyPatch(cfg, root["write"]);
-                }
-            },
-            write_);
+        ok = applyPatch(write_, root["write"]);
     }
     if (root.isMember("read")) {
         applyPatch(read_, root["read"]);
@@ -79,41 +51,7 @@ bool RuntimeConfigStore::loadFromJson(const Json::Value& root) {
 
 // --- Patch helpers ---
 
-void RuntimeConfigStore::applyPatch(ReplicateConfig& config,
-                                    const Json::Value& json) {
-    if (!json.isObject()) return;
-    if (json.isMember("replica_num") && json["replica_num"].isUInt64()) {
-        uint64_t val = json["replica_num"].asUInt64();
-        if (val > 0) {
-            config.replica_num = val;
-        } else {
-            LOG(WARNING) << "Invalid replica_num: " << val;
-        }
-    }
-    if (json.isMember("with_soft_pin") && json["with_soft_pin"].isBool()) {
-        config.with_soft_pin = json["with_soft_pin"].asBool();
-    }
-    if (json.isMember("preferred_segments") &&
-        json["preferred_segments"].isArray()) {
-        config.preferred_segments.clear();
-        for (const auto& seg : json["preferred_segments"]) {
-            if (seg.isString()) {
-                config.preferred_segments.push_back(seg.asString());
-            }
-        }
-    }
-    if (json.isMember("preferred_segment") &&
-        json["preferred_segment"].isString()) {
-        config.preferred_segment = json["preferred_segment"].asString();
-    }
-    if (json.isMember("prefer_alloc_in_same_node") &&
-        json["prefer_alloc_in_same_node"].isBool()) {
-        config.prefer_alloc_in_same_node =
-            json["prefer_alloc_in_same_node"].asBool();
-    }
-}
-
-bool RuntimeConfigStore::applyPatch(WriteRouteRequestConfig& config,
+bool RuntimeConfigStore::applyPatch(P2PWriteRouteConfig& config,
                                     const Json::Value& json) {
     if (!json.isObject()) return false;
 
@@ -126,7 +64,7 @@ bool RuntimeConfigStore::applyPatch(WriteRouteRequestConfig& config,
     }
     if (json.isMember("strategy") && json["strategy"].isInt()) {
         patched.strategy =
-            static_cast<ObjectIterateStrategy>(json["strategy"].asInt());
+            static_cast<P2PClientSelectionStrategy>(json["strategy"].asInt());
     }
     if (json.isMember("remote_weight") && json["remote_weight"].isNumeric()) {
         double w = json["remote_weight"].asDouble();
@@ -165,17 +103,14 @@ bool RuntimeConfigStore::applyPatch(WriteRouteRequestConfig& config,
     return true;
 }
 
-void RuntimeConfigStore::applyPatch(ReadRouteConfig& config,
+void RuntimeConfigStore::applyPatch(P2PReadRouteConfig& config,
                                     const Json::Value& json) {
     if (!json.isObject()) return;
     if (json.isMember("max_candidates") && json["max_candidates"].isUInt64()) {
         config.max_candidates = json["max_candidates"].asUInt64();
     }
     if (json.isMember("p2p_config") && json["p2p_config"].isObject()) {
-        if (!config.p2p_config.has_value()) {
-            config.p2p_config = P2PReadRouteConfigExtra{};
-        }
-        auto& p2p = config.p2p_config.value();
+        auto& p2p = config;
         const auto& p2p_json = json["p2p_config"];
         if (p2p_json.isMember("tag_filters") &&
             p2p_json["tag_filters"].isArray()) {
@@ -195,21 +130,7 @@ void RuntimeConfigStore::applyPatch(ReadRouteConfig& config,
 
 // --- toJson helpers ---
 
-Json::Value RuntimeConfigStore::toJson(const ReplicateConfig& config) {
-    Json::Value json;
-    json["replica_num"] = Json::Value::UInt64(config.replica_num);
-    json["with_soft_pin"] = config.with_soft_pin;
-    Json::Value segs(Json::arrayValue);
-    for (const auto& seg : config.preferred_segments) {
-        segs.append(seg);
-    }
-    json["preferred_segments"] = segs;
-    json["preferred_segment"] = config.preferred_segment;
-    json["prefer_alloc_in_same_node"] = config.prefer_alloc_in_same_node;
-    return json;
-}
-
-Json::Value RuntimeConfigStore::toJson(const WriteRouteRequestConfig& config) {
+Json::Value RuntimeConfigStore::toJson(const P2PWriteRouteConfig& config) {
     Json::Value json;
     json["max_candidates"] = Json::Value::UInt64(config.max_candidates);
     json["strategy"] = static_cast<int>(config.strategy);
@@ -226,19 +147,17 @@ Json::Value RuntimeConfigStore::toJson(const WriteRouteRequestConfig& config) {
     return json;
 }
 
-Json::Value RuntimeConfigStore::toJson(const ReadRouteConfig& config) {
+Json::Value RuntimeConfigStore::toJson(const P2PReadRouteConfig& config) {
     Json::Value json;
     json["max_candidates"] = Json::Value::UInt64(config.max_candidates);
-    if (config.p2p_config.has_value()) {
-        Json::Value p2p;
-        Json::Value tags(Json::arrayValue);
-        for (const auto& tag : config.p2p_config->tag_filters) {
-            tags.append(tag);
-        }
-        p2p["tag_filters"] = tags;
-        p2p["priority_limit"] = config.p2p_config->priority_limit;
-        json["p2p_config"] = p2p;
+    Json::Value p2p;
+    Json::Value tags(Json::arrayValue);
+    for (const auto& tag : config.tag_filters) {
+        tags.append(tag);
     }
+    p2p["tag_filters"] = tags;
+    p2p["priority_limit"] = config.priority_limit;
+    json["p2p_config"] = p2p;
     return json;
 }
 

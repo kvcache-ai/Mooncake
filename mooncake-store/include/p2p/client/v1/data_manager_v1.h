@@ -38,7 +38,7 @@
 #include "p2p/client/task_handle.h"
 #include "p2p/client/tiered_cache/tiered_backend.h"
 #include "transfer_engine.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 #include "utils.h"
 #include "p2p/client/client_rpc_types.h"
 
@@ -87,6 +87,8 @@ class DataManagerV1 final : public DataManager, public DataManagerTestHook {
     ~DataManagerV1() override;
 
     void Stop() override;
+
+    void WaitForLeaseDrain() override;
 
     /**
      * @brief Cleanup: delegates to TieredBackend::Destroy().
@@ -525,7 +527,8 @@ class DataManagerV1 final : public DataManager, public DataManagerTestHook {
             batches);
 
     void ReleaseTeWaitInflight();
-    bool IsTeBatchFullyDrained(Transport::BatchID batch_id, size_t num_tasks);
+    bool IsTeBatchFullyDrained(Transport::BatchID batch_id, size_t num_tasks,
+                               bool uses_tent);
     async_simple::coro::Lazy<void> CancelBatchTETaskCoro(
         Transport::BatchID batch_id, size_t num_tasks);
     async_simple::coro::Lazy<void> CancelTeWaitBatchesCoro(
@@ -596,7 +599,9 @@ class DataManagerV1 final : public DataManager, public DataManagerTestHook {
      * @brief Wait for multiple transfer batches to complete
      * @param batches Vector of (batch_id, num_tasks, segment_endpoint) tuples
      * @return ErrorCode indicating success or failure. If any batch fails,
-     *         remaining batch IDs are freed and error is returned immediately.
+     *         all submitted batches are drained before returning the error so
+     *         the caller can release its buffers. Cleanup may wait
+     * indefinitely.
      */
     tl::expected<void, ErrorCode> WaitAllTransferBatches(
         const std::vector<std::tuple<Transport::BatchID, size_t, std::string>>&

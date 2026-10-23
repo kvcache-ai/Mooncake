@@ -1,5 +1,7 @@
 import sys
 import platform
+from pathlib import Path
+import subprocess
 from setuptools import setup, Distribution
 from wheel.bdist_wheel import bdist_wheel
 
@@ -165,6 +167,26 @@ class CustomBdistWheel(bdist_wheel):
 # ---------------------------------------------------------------------------
 # setup()
 # ---------------------------------------------------------------------------
+package_dir = Path(__file__).resolve().parent / "mooncake"
+store_binaries = [package_dir / name for name in ("mooncake_master", "mooncake_client")]
+if any(binary.exists() for binary in store_binaries):
+    architectures = {}
+    for binary in store_binaries:
+        output = subprocess.check_output(
+            [str(binary), "--version"], text=True, timeout=10
+        )
+        values = [line.partition("=")[2] for line in output.splitlines()
+                  if line.startswith("architecture=")]
+        if len(values) != 1 or values[0] not in ("centralized", "p2p"):
+            sys.exit(f"Error: invalid Store architecture in {binary} --version")
+        architectures[binary.name] = values[0]
+    if architectures["mooncake_master"] != architectures["mooncake_client"]:
+        sys.exit(
+            "Error: Store architecture mismatch: "
+            f"mooncake_master={architectures['mooncake_master']}, "
+            f"mooncake_client={architectures['mooncake_client']}"
+        )
+
 setup(
     distclass=BinaryDistribution,
     cmdclass={"bdist_wheel": CustomBdistWheel},

@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <exception>
 #include <utility>
 
 namespace mooncake {
@@ -40,10 +41,11 @@ AsyncMetadataNotifier::AsyncMetadataNotifier(P2PMasterClient& master_client,
 
 AsyncMetadataNotifier::~AsyncMetadataNotifier() { Stop(); }
 
-void AsyncMetadataNotifier::Start() {
+ErrorCode AsyncMetadataNotifier::Start() {
     bool expected = false;
     if (!running_.compare_exchange_strong(expected, true)) {
-        return;  // already running
+        VLOG(1) << "AsyncMetadataNotifier already running, skip starting";
+        return ErrorCode::OK;
     }
 
     for (auto& shard : shards_) {
@@ -54,7 +56,42 @@ void AsyncMetadataNotifier::Start() {
               << " sender shards, max_batch_size=" << max_batch_size_;
 
     for (size_t i = 0; i < sender_thread_count_; ++i) {
-        shards_[i]->sender_thread = std::thread([this, i]() { SenderLoop(i); });
+        auto error = StartSenderThread(i);
+        if (error != ErrorCode::OK) {
+            LOG(ERROR) << "AsyncMetadataNotifier startup failed, shard=" << i
+                       << ", error=" << error << "; stopping started senders";
+            Stop(/*drop_pending=*/true);
+            return error;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode AsyncMetadataNotifier::StartSenderThread(size_t shard_idx) {
+    try {
+        shards_[shard_idx]->sender_thread = std::thread(
+            &AsyncMetadataNotifier::SenderThreadMain, this, shard_idx);
+        return ErrorCode::OK;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to start metadata sender, shard=" << shard_idx
+                   << ", what=" << e.what();
+    } catch (...) {
+        LOG(ERROR)
+            << "Failed to start metadata sender: unknown exception, shard="
+            << shard_idx;
+    }
+    return ErrorCode::INTERNAL_ERROR;
+}
+
+void AsyncMetadataNotifier::SenderThreadMain(size_t shard_idx) {
+    try {
+        SenderLoop(shard_idx);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Metadata sender failed, shard=" << shard_idx
+                   << ", what=" << e.what();
+    } catch (...) {
+        LOG(ERROR) << "Metadata sender failed with unknown exception, shard="
+                   << shard_idx;
     }
 }
 

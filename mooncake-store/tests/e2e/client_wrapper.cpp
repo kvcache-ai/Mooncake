@@ -1,20 +1,23 @@
 #include "client_wrapper.h"
 
+#include <cstdlib>
 #include <cstring>
-#include <stdexcept>
+#include <utility>
 
-#include "p2p/client/p2p_client_service.h"
+#include "client_service.h"
+#include "replica.h"
 #include "utils.h"
 
 namespace mooncake {
 namespace testing {
 
-ClientTestWrapper::ClientTestWrapper(std::shared_ptr<ClientService> client,
-                                     std::shared_ptr<SimpleAllocator> allocator,
-                                     bool is_p2p)
-    : client_(client), is_p2p_(is_p2p), allocator_(allocator) {}
+ClientTestWrapper::ClientTestWrapper(std::shared_ptr<Client> client,
+                                     std::shared_ptr<SimpleAllocator> allocator)
+    : client_(std::move(client)), allocator_(std::move(allocator)) {}
 
 ClientTestWrapper::~ClientTestWrapper() {
+    // Finish native teardown before releasing externally registered memory.
+    client_.reset();
     for (auto& [base, segment] : segments_) {
         free(segment.base);
     }
@@ -26,51 +29,31 @@ ClientTestWrapper::CreateClientWrapper(
     const std::string& protocol, const std::string& device_name,
     const std::string& master_server_entry, size_t local_buffer_size,
     const std::string& redis_cluster_id, bool enable_http_server,
-    const std::string& deployment_mode,
     const std::string& p2p_local_transfer_mode, uint16_t p2p_client_rpc_port,
     const std::string& redis_username, const std::string& redis_password) {
-    std::shared_ptr<ClientService> client;
-    if (deployment_mode == "P2P") {
-        static constexpr const char* kP2PTierConfig =
-            R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})";
-        auto config = ClientConfigBuilder::build_p2p_real_client(
-            hostname, metadata_connstring, protocol, device_name,
-            master_server_entry, kP2PTierConfig, local_buffer_size, nullptr, "",
-            p2p_client_rpc_port, /*rpc_thread_num=*/2,
-            /*lock_shard_count=*/1024,
-            /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
-            /*route_cache_ttl_ms=*/60 * 1000, p2p_local_transfer_mode,
-            /*local_memcpy_async_worker_num=*/32, /*http_port=*/9003,
-            enable_http_server);
-        if (!redis_cluster_id.empty()) {
-            config.redis_cluster_id = redis_cluster_id;
-        }
-        config.redis_username = redis_username;
-        config.redis_password = redis_password;
-        auto p2p_client = std::make_shared<P2PClientService>(
-            config.metadata_connstring, config.http_port,
-            config.enable_http_server, config.labels);
-        auto err = p2p_client->Init(config);
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "failed to init P2P client, error=" << err;
-            return std::nullopt;
-        }
-        client = std::move(p2p_client);
-    } else {
-        auto config = ClientConfigBuilder::build_centralized_real_client(
-            hostname, metadata_connstring, protocol, device_name,
-            master_server_entry, 0, local_buffer_size, nullptr, "", false, 9003,
-            enable_http_server);
-        if (!redis_cluster_id.empty()) {
-            config.redis_cluster_id = redis_cluster_id;
-        }
-        config.redis_username = redis_username;
-        config.redis_password = redis_password;
-        auto client_opt = ClientService::Create(config);
-        if (!client_opt.has_value()) {
-            return std::nullopt;
-        }
-        client = client_opt.value();
+    std::shared_ptr<Client> client;
+    if (!redis_cluster_id.empty() || !redis_username.empty() ||
+        !redis_password.empty() ||
+        master_server_entry.rfind("redis://", 0) == 0) {
+        LOG(ERROR) << "Centralized clients do not support Redis discovery";
+        return std::nullopt;
+    }
+    if (enable_http_server) {
+        LOG(WARNING) << "Centralized clients use native metric environment "
+                        "controls, not the P2P HTTP server option";
+    }
+    auto client_opt = Client::Create(hostname, metadata_connstring, protocol,
+                                     device_name, master_server_entry);
+    if (!client_opt.has_value()) {
+        LOG(ERROR) << "Failed to create centralized client";
+        return std::nullopt;
+    }
+    client = client_opt.value();
+    auto err = client->InitStorage(0, local_buffer_size, false);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to initialize centralized client storage: "
+                   << err;
+        return std::nullopt;
     }
 
     std::shared_ptr<SimpleAllocator> allocator =
@@ -90,8 +73,7 @@ ClientTestWrapper::CreateClientWrapper(
                    << ", error=" << error_code;
         return std::nullopt;
     }
-    return std::make_shared<ClientTestWrapper>(client, allocator,
-                                               deployment_mode == "P2P");
+    return std::make_shared<ClientTestWrapper>(client, allocator);
 }
 
 ErrorCode ClientTestWrapper::Mount(const size_t size, void*& buffer) {
@@ -135,34 +117,31 @@ ErrorCode ClientTestWrapper::Unmount(const void* buffer) {
 }
 
 ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
+    uint64_t total_size;
     auto query_result = client_->Query(key);
     if (!query_result.has_value()) {
         return query_result.error();
     }
-    if (query_result.value()->replicas.empty()) {
+    if (query_result->replicas.empty()) {
         return ErrorCode::INVALID_REPLICA;
     }
-    uint64_t total_size =
-        calculate_total_size(query_result.value()->replicas[0]);
+    total_size = calculate_total_size(query_result->replicas[0]);
     if (total_size == 0) {
         value.clear();
         return ErrorCode::OK;
     }
 
-    void* buffer = allocator_->allocate(total_size);
-    if (!buffer) {
-        LOG(ERROR) << "Failed to allocate memory for Get";
-        throw std::runtime_error("Failed to allocate memory for Get");
-    }
-
-    auto get_result = client_->Get(key, {buffer}, {(size_t)total_size});
+    SliceGuard buffer(total_size, allocator_);
+    auto get_result = client_->Get(key, *query_result, buffer.slices_);
     if (!get_result.has_value()) {
-        allocator_->deallocate(buffer, total_size);
         return get_result.error();
     }
 
-    value.assign(static_cast<const char*>(buffer), total_size);
-    allocator_->deallocate(buffer, total_size);
+    value.clear();
+    value.reserve(total_size);
+    for (const auto& slice : buffer.slices_) {
+        value.append(static_cast<const char*>(slice.ptr), slice.size);
+    }
     return ErrorCode::OK;
 }
 
@@ -179,51 +158,13 @@ ErrorCode ClientTestWrapper::Put(const std::string& key,
     // Perform put operation
     ReplicateConfig replicate_config;
     replicate_config.replica_num = 1;
-    WriteConfig config = is_p2p_ ? WriteConfig{WriteRouteRequestConfig{}}
-                                 : WriteConfig{replicate_config};
-    auto put_result = client_->Put(key, slice_guard.slices_, config);
+    auto put_result = client_->Put(key, slice_guard.slices_, replicate_config);
     return put_result.has_value() ? ErrorCode::OK : put_result.error();
 }
 
 ErrorCode ClientTestWrapper::Delete(const std::string& key) {
     auto remove_result = client_->Remove(key);
     return remove_result.has_value() ? ErrorCode::OK : remove_result.error();
-}
-
-ClientTestWrapper::SliceGuard::SliceGuard(
-    const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-    std::shared_ptr<SimpleAllocator> allocator)
-    : allocator_(allocator) {
-    slices_.resize(descriptors.size());
-    for (size_t i = 0; i < descriptors.size(); i++) {
-        void* buffer = allocator_->allocate(descriptors[i].size_);
-        if (!buffer) {
-            LOG(ERROR) << "Failed to allocate memory for slice";
-            throw std::runtime_error("Failed to allocate memory for slice");
-        }
-        slices_[i] = Slice{buffer, descriptors[i].size_};
-    }
-}
-
-ClientTestWrapper::SliceGuard::SliceGuard(
-    size_t size, std::shared_ptr<SimpleAllocator> allocator)
-    : allocator_(allocator) {
-    while (size != 0) {
-        auto chunk_size = std::min(size, kMaxSliceSize);
-        auto ptr = allocator_->allocate(chunk_size);
-        if (!ptr) {
-            LOG(ERROR) << "Failed to allocate memory for slice";
-            throw std::runtime_error("Failed to allocate memory for slice");
-        }
-        slices_.emplace_back(Slice{ptr, chunk_size});
-        size -= chunk_size;
-    }
-}
-
-ClientTestWrapper::SliceGuard::~SliceGuard() {
-    for (auto& slice : slices_) {
-        allocator_->deallocate(slice.ptr, slice.size);
-    }
 }
 
 }  // namespace testing

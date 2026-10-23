@@ -10,7 +10,7 @@
 #include <chrono>
 
 #include "allocator.h"
-#include "types.h"
+#include "common_types.h"
 
 namespace mooncake {
 
@@ -59,6 +59,64 @@ class BufferAllocatorTest : public ::testing::Test {
     std::vector<BufferAllocatorType> allocator_types_ = {
         BufferAllocatorType::CACHELIB, BufferAllocatorType::OFFSET};
 };
+
+TEST_F(BufferAllocatorTest, UsageObserversTrackSuccessfulAllocationsOnly) {
+    for (auto type : allocator_types_) {
+        SCOPED_TRACE(static_cast<int>(type));
+        int64_t allocated = 0;
+        int64_t deallocated = 0;
+        // The two allocation classes each need a separate slab.
+        auto allocator = CreateTestAllocator(
+            "accounting", 0, 2 * facebook::cachelib::Slab::kSize, type);
+        allocator->set_usage_observers(
+            [&](int64_t bytes) { allocated += bytes; },
+            [&](int64_t bytes) { deallocated += bytes; });
+
+        auto first = allocator->allocate(477);
+        auto second = allocator->allocate(2048);
+        ASSERT_NE(first, nullptr);
+        ASSERT_NE(second, nullptr);
+        EXPECT_EQ(allocated, 477 + 2048);
+        EXPECT_EQ(deallocated, 0);
+        EXPECT_EQ(allocator->size(), allocated);
+
+        EXPECT_EQ(allocator->allocate(allocator->capacity() + 1), nullptr);
+        EXPECT_EQ(allocated, 477 + 2048);
+        EXPECT_EQ(deallocated, 0);
+        first.reset();
+        EXPECT_EQ(deallocated, 477);
+        EXPECT_EQ(allocator->size(), 2048);
+        second.reset();
+        EXPECT_EQ(deallocated, allocated);
+        EXPECT_EQ(allocator->size(), 0);
+        allocator.reset();
+        EXPECT_EQ(deallocated, allocated);
+    }
+}
+
+TEST_F(BufferAllocatorTest, UsageObserversRetireOutstandingHandlesOnce) {
+    for (auto type : allocator_types_) {
+        SCOPED_TRACE(static_cast<int>(type));
+        int64_t allocated = 0;
+        int64_t deallocated = 0;
+        auto allocator = CreateTestAllocator(
+            "retired", 0, 2 * facebook::cachelib::Slab::kSize, type);
+        allocator->set_usage_observers(
+            [&](int64_t bytes) { allocated += bytes; },
+            [&](int64_t bytes) { deallocated += bytes; });
+        auto first = allocator->allocate(1024);
+        auto live = allocator->allocate(2048);
+        ASSERT_NE(first, nullptr);
+        ASSERT_NE(live, nullptr);
+        first.reset();
+        EXPECT_EQ(deallocated, 1024);
+        allocator.reset();
+        EXPECT_FALSE(live->isAllocatorValid());
+        EXPECT_EQ(deallocated, allocated);
+        live.reset();
+        EXPECT_EQ(deallocated, allocated);
+    }
+}
 
 // Test basic allocation and deallocation functionality
 TEST_F(BufferAllocatorTest, AllocateAndDeallocate) {

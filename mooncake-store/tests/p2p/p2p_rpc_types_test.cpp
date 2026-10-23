@@ -43,8 +43,6 @@ static_assert(coro_rpc::func_id<&P2PMasterRpcService::BatchWithdrawRoute>() ==
               1805314735u);
 static_assert(coro_rpc::func_id<&P2PMasterRpcService::BatchSyncRoutes>() ==
               3376879306u);
-static_assert(coro_rpc::func_id<&P2PMasterRpcService::CompleteRouteSync>() ==
-              1587901567u);
 static_assert(coro_rpc::func_id<&P2PMasterRpcService::ServiceReady>() ==
               1460324940u);
 static_assert(
@@ -69,6 +67,23 @@ static_assert(
     std::is_same_v<decltype(P2PPublishRouteOperation::key), std::string_view>);
 static_assert(
     std::is_same_v<decltype(P2PWithdrawRouteOperation::key), std::string_view>);
+
+TEST(P2PRpcTypesTest, HeartbeatCarriesClientServiceState) {
+    P2PHeartbeatRequest request;
+    EXPECT_EQ(request.service_state, P2PClientServiceState::INITIALIZING);
+    request.client_id = {1, 2};
+    for (auto state :
+         {P2PClientServiceState::INITIALIZING, P2PClientServiceState::DEGRADED,
+          P2PClientServiceState::LOCAL_ONLY, P2PClientServiceState::STOPPING,
+          P2PClientServiceState::STOPPED, P2PClientServiceState::ONLINE}) {
+        request.service_state = state;
+        auto bytes = struct_pack::serialize(request);
+        auto decoded = struct_pack::deserialize<P2PHeartbeatRequest>(bytes);
+        ASSERT_TRUE(decoded.has_value());
+        EXPECT_EQ(decoded->client_id, request.client_id);
+        EXPECT_EQ(decoded->service_state, state);
+    }
+}
 
 TEST(P2PRpcTypesTest, BatchRouteKeysDeserializeAsBufferViews) {
     const std::string publish_key = "publish-key";

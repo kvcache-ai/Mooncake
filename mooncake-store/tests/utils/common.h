@@ -2,7 +2,7 @@
 
 #include <utility>
 
-#include "file_storage.h"
+#include "allocator.h"
 #include "storage_backend.h"
 #include "p2p/client/tiered_cache/tiered_backend.h"
 

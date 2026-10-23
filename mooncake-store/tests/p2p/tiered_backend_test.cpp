@@ -210,9 +210,7 @@ class TieredBackendTest : public ::testing::Test {
     }
 };
 
-// P0-3: a transient usage > capacity (concurrent accounting can briefly
-// over-report) must not wrap free_space around to ~SIZE_MAX, which would make
-// HasAvailableBytes (free_space >= required) accept any allocation.
+// Usage above capacity must yield zero free space without unsigned underflow.
 TEST_F(TieredBackendTest, GetTierViewsClampsFreeSpaceWhenUsageExceedsCapacity) {
     TieredBackend backend;
     InjectTier(
@@ -225,8 +223,7 @@ TEST_F(TieredBackendTest, GetTierViewsClampsFreeSpaceWhenUsageExceedsCapacity) {
     ASSERT_EQ(views.size(), 1u);
     EXPECT_EQ(views[0].capacity, 1000u);
     EXPECT_EQ(views[0].usage, 1500u);
-    // The bug: 1000 - 1500 underflows to a huge value. The fix saturates to 0,
-    // so the scheduler's free_space >= required_bytes check correctly rejects.
+    // Saturating free space to zero must reject the allocation.
     EXPECT_EQ(views[0].free_space, 0u);
     EXPECT_NE(views[0].free_space, std::numeric_limits<size_t>::max());
 }
@@ -245,8 +242,7 @@ TEST_F(TieredBackendTest, GetTierViewsReportsExactFreeSpaceBelowCapacity) {
     EXPECT_EQ(views[0].free_space, 600u);
 }
 
-// P1-4: GetDramTierId underpins the DRAM-only local Put path. It must pick the
-// highest-priority DRAM tier and ignore non-DRAM tiers regardless of priority.
+// Select the highest-priority DRAM tier, ignoring other storage media.
 TEST_F(TieredBackendTest, GetDramTierIdPicksHighestPriorityDram) {
     TieredBackend backend;
     InjectTier(
@@ -1384,13 +1380,10 @@ TEST_F(TieredBackendTest, MultiTierInteraction) {
     ASSERT_TRUE(get_cold.has_value());
     EXPECT_EQ(get_cold.value()->loc.tier->GetTierId(), storage_id);
 
-    // 4. Demote "hot_key" to Storage (Create Replica)
-    // We simulate migration by reading and copying (TieredBackend::CopyData
-    // expects DataSource) We need a wrapper to read. For this test, we just
-    // reuse the buffer we have logic for `DataSource`.
+    // Create a storage replica of hot_key.
     DataSource demote_source;
     demote_source.buffer = std::make_unique<TempDRAMBuffer>(
-        std::move(buf1), data_size);  // reuse buf1 logic, but buf1 ptr moved?
+        std::move(buf1), data_size);
     // Create new buffer
     auto buf_copy = CreateTestBuffer(data_size);
     demote_source.buffer =
@@ -1565,6 +1558,50 @@ TEST_F(TieredBackendTest, CapacityAsPlainInteger) {
 // ============================================================================
 // TierMetric Integration Tests
 // ============================================================================
+
+TEST_F(TieredBackendTest, DramOffsetAllocationAccounting) {
+    constexpr size_t capacity = 16 * 1024 * 1024;
+    Json::Value config;
+    Json::Value tier_config;
+    tier_config["type"] = "DRAM";
+    tier_config["capacity"] = Json::UInt64(capacity);
+    tier_config["priority"] = 10;
+    tier_config["allocator_type"] = "OFFSET";
+    config["tiers"].append(tier_config);
+    auto metrics = std::make_shared<TierMetric>();
+    TieredBackend backend;
+    ASSERT_TRUE(
+        backend.Init(config, nullptr, nullptr, nullptr, nullptr, metrics)
+            .has_value());
+    const auto views = backend.GetTierViews();
+    ASSERT_EQ(views.size(), 1);
+    const std::array<std::string, 1> label{
+        "tier_" + std::to_string(views[0].id.first) + "_" +
+        std::to_string(views[0].id.second)};
+    const auto expect_usage = [&](int64_t used) {
+        std::string serialized;
+        metrics->serialize(serialized);
+        EXPECT_EQ(metrics->capacity_bytes.value(label), capacity);
+        EXPECT_EQ(metrics->used_bytes.value(label), used);
+        EXPECT_EQ(metrics->key_count.value(label), 0);
+        EXPECT_EQ(backend.GetTierViews().front().usage, used);
+    };
+    expect_usage(0);
+    auto first = backend.Allocate(477);
+    auto second = backend.Allocate(2048);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+    expect_usage(477 + 2048);
+
+    const auto failed = backend.Allocate(capacity + 1);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    expect_usage(477 + 2048);
+    first = nullptr;
+    expect_usage(2048);
+    second = nullptr;
+    expect_usage(0);
+}
 
 // Init registers every created tier into the TierMetric, and Commit/Delete
 // maintain the per-tier key count; usage is refreshed on metrics reads.

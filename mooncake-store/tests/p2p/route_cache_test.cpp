@@ -10,11 +10,11 @@
 namespace mooncake {
 namespace {
 
-// Helper to create a P2PProxyDescriptor
-P2PProxyDescriptor MakeP2PProxy(uint64_t client_id_hi, uint64_t segment_id_hi,
+// Helper to create a P2PRouteDescriptor
+P2PRouteDescriptor MakeP2PProxy(uint64_t client_id_hi, uint64_t segment_id_hi,
                                 const std::string& ip = "127.0.0.1",
                                 uint16_t port = 12345, uint64_t size = 1024) {
-    P2PProxyDescriptor proxy;
+    P2PRouteDescriptor proxy;
     proxy.client_id = {client_id_hi, 0};
     proxy.segment_id = {segment_id_hi, 0};
     proxy.ip_address = ip;
@@ -528,7 +528,7 @@ TEST_F(RouteCacheTest, TryLockYieldBehavior) {
     // Hold up the shard by doing huge merges constantly
     std::thread blocker([&]() {
         for (int i = 0; i < 2000 && !stop; ++i) {
-            std::vector<P2PProxyDescriptor> huge_list(10, proxy);
+            std::vector<P2PRouteDescriptor> huge_list(10, proxy);
             cache_.Replace(key, huge_list);
         }
     });
@@ -556,7 +556,7 @@ TEST_F(RouteCacheTest, RemoveReplicaLockFreeFallback) {
     // Hold up the shard
     std::thread blocker([&]() {
         for (int i = 0; i < 2000 && !stop; ++i) {
-            std::vector<P2PProxyDescriptor> huge_list(10, proxy1);
+            std::vector<P2PRouteDescriptor> huge_list(10, proxy1);
             cache_.Replace(key, huge_list);
         }
     });

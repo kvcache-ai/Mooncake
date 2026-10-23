@@ -33,6 +33,8 @@ namespace {
 
 constexpr uint32_t kDefaultLeaseDurationMs = 5000;
 constexpr uint32_t kDefaultLeaseScanIntervalMs = 1000;
+constexpr auto kLeaseDrainReportInterval = std::chrono::seconds(10);
+constexpr auto kLeaseDrainPollInterval = std::chrono::milliseconds(100);
 
 async_simple::Future<tl::expected<void, ErrorCode>> MakeReadyExpectedFuture(
     tl::expected<void, ErrorCode> value) {
@@ -257,7 +259,6 @@ DataManagerV1::~DataManagerV1() { Stop(); }
 
 void DataManagerV1::Stop() {
     ShutdownLeaseScanner();
-    ClearLeaseRecords();
     if (async_memcpy_executor_) {
         async_memcpy_executor_->Shutdown();
     }
@@ -269,6 +270,7 @@ void DataManagerV1::Stop() {
         // coro_executor_pool_, can hang forever.
         te_wait_cv_.wait(lock, [this] { return te_wait_inflight_ == 0; });
     }
+    ClearLeaseRecords();
     if (te_wait_pool_) {
         te_wait_pool_->stop();
     }
@@ -277,6 +279,37 @@ void DataManagerV1::Stop() {
     }
     if (tiered_backend_) {
         tiered_backend_->Stop();
+    }
+}
+
+void DataManagerV1::WaitForLeaseDrain() {
+    // New-operation handlers and local callers have already drained. Only
+    // completion RPCs and the lease scanner can now remove these records.
+    // Protocol assumption: peers never access a buffer after lease expiry.
+    auto next_report =
+        std::chrono::steady_clock::now() + kLeaseDrainReportInterval;
+    while (true) {
+        size_t pending_writes = 0;
+        size_t pinned_keys = 0;
+        for (const auto& shard : pending_write_shards_) {
+            std::shared_lock lock(shard.mutex);
+            pending_writes += shard.existed_operation_key_map.size();
+        }
+        for (const auto& shard : pinned_key_shards_) {
+            std::shared_lock lock(shard.mutex);
+            pinned_keys += shard.existed_operation_key_map.size();
+        }
+        if (pending_writes == 0 && pinned_keys == 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_report) {
+            LOG(ERROR) << "Waiting for peer leases to drain: pending_writes="
+                       << pending_writes << ", pinned_keys=" << pinned_keys;
+            next_report = now + kLeaseDrainReportInterval;
+        }
+        // Never hold shard locks while waiting for completion or expiry.
+        std::this_thread::sleep_for(kLeaseDrainPollInterval);
     }
 }
 
@@ -574,15 +607,8 @@ void DataManagerV1::LeaseScannerMain() {
 // Put
 // ================================================================
 
-// TODO: wanyue-wy
-// Currently, for performance optimization,
-// we only take the shared key lock during the allocation and commit phases.
-// This leads to a concurrent race issue. If multiple threads write to the same
-// key simultaneously, each thread will be allocated storage and computing
-// resources, but ultimately only one thread will succeed in writing, resulting
-// in a waste of resources.
-// In future, we will add a pre-occupation mechanism in the Allocation stage
-// to optimize this issue.
+// Both Put paths reserve a pending-write slot before allocation via
+// PreWriteInternal; an active write lease rejects competing writes on that key.
 tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> DataManagerV1::Put(
     std::string_view key, std::vector<Slice>& slices) {
     switch (local_transfer_config_.mode) {
@@ -842,7 +868,6 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManagerV1::BuildDataCopier(
         LOG(ERROR) << "Failed to get data for key: " << key;
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
-
     switch (local_transfer_config_.mode) {
         case LocalTransferMode::TE:
             return BuildDataCopierViaTe(handle, slices);
@@ -856,7 +881,23 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManagerV1::BuildDataCopierViaTe(
     const AllocationHandle& handle, const std::vector<Slice>& slices) {
     // using Te, treat local memory as remote memory
     const size_t source_size = handle->loc.data.buffer->size();
-    auto dest_buffers = SlicesToRemoteBufferDescs(slices);
+    std::vector<RemoteBufferDesc> dest_buffers;
+    dest_buffers.reserve(slices.size());
+    size_t offset = 0;
+    for (const auto& slice : slices) {
+        if (offset >= source_size) break;
+        const size_t length = std::min(slice.size, source_size - offset);
+        if (length == 0) continue;
+        dest_buffers.push_back({local_transfer_config_.te_endpoint,
+                                reinterpret_cast<uintptr_t>(slice.ptr),
+                                length});
+        offset += length;
+    }
+    if (offset != source_size) {
+        LOG(ERROR) << "Local TE read destination is too small: required="
+                   << source_size << ", provided=" << offset;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     auto validate_result = ValidateRemoteBuffers(dest_buffers);
     if (!validate_result) {
         LOG(ERROR) << "BuildDataCopierViaTe: Buffer validation failed"
@@ -1325,8 +1366,8 @@ DataManagerV1::PinKeyInternal(const KeyCtx& ctx, std::optional<UUID> tier_id) {
     // Active pin: bump ref_count / renew lease; no tiered_backend::Get.
     const auto bump_existing_pin =
         [&](auto it) -> tl::expected<PinKeyResult, ErrorCode> {
+        // TODO:
         // PinKey forward path: DRAM-only for now; non-DRAM replica handling
-        // TODO.
         if (it->second.handle->loc.data.type != MemoryType::DRAM) {
             LOG(ERROR) << "PinKey: DRAM-only forward path, non-DRAM replica"
                        << ", key=" << ctx.key << ", error="
@@ -1961,14 +2002,24 @@ void DataManagerV1::ReleaseTeWaitInflight() {
 }
 
 bool DataManagerV1::IsTeBatchFullyDrained(Transport::BatchID batch_id,
-                                          size_t num_tasks) {
+                                          size_t num_tasks, bool uses_tent) {
     for (size_t i = 0; i < num_tasks; ++i) {
         TransferStatus status;
         Status s = transfer_engine_->getTransferStatus(batch_id, i, status);
-        if (!s.ok() || (status.s != TransferStatusEnum::COMPLETED &&
-                        status.s != TransferStatusEnum::FAILED)) {
-            return false;
+        if (!s.ok()) return false;
+        if (status.s == TransferStatusEnum::COMPLETED ||
+            status.s == TransferStatusEnum::FAILED) {
+            continue;
         }
+        // TENT can retain CANCELED/TIMEOUT after all slices have resolved.
+        // Classic MultiTransport::getTransferStatus reports TIMEOUT from an
+        // overdue slice timestamp before success+failed reaches slice_count.
+        // That timeout does not establish that buffers can be released.
+        if (uses_tent && (status.s == TransferStatusEnum::CANCELED ||
+                          status.s == TransferStatusEnum::TIMEOUT)) {
+            continue;
+        }
+        return false;
     }
     return true;
 }
@@ -2091,25 +2142,27 @@ DataManagerV1::WaitAllTransferBatchesCoro(
     co_return tl::expected<void, ErrorCode>{};
 }
 
-// freeBatchID() only releases BatchDesc when is_finished=true on every task.
-// Then, only COMPLETED and FAILED status of task will trigger to set
-// is_finished=true. And there is no cancel API in TransferEngine. Thus, we must
-// poll until all tasks reach a terminal state before calling freeBatchID.
+// Classic TE requires is_finished=true on every task (COMPLETED/FAILED).
+// TENT additionally reports resolved tasks as CANCELED/TIMEOUT. There is no
+// cancel API here, so use the backend-specific drain check before freeBatchID
+// or returning to a caller that may release the associated buffers. A timeout
+// reports stalled cleanup; it cannot establish that memory is safe to free.
 void DataManagerV1::CancelBatchTETask(Transport::BatchID batch_id,
                                       size_t num_tasks) {
-    auto start = std::chrono::steady_clock::now();
+    // Submitted batches belong to an initialized engine. Classic TE retains
+    // metadata; TENT returns nullptr. Query once, outside the polling loop.
+    const bool uses_tent = transfer_engine_->getMetadata() == nullptr;
+    auto next_report = std::chrono::steady_clock::now() +
+                       std::chrono::seconds(kTeDrainTimeoutSeconds);
     while (true) {
-        if (IsTeBatchFullyDrained(batch_id, num_tasks)) {
+        if (IsTeBatchFullyDrained(batch_id, num_tasks, uses_tent)) {
             break;
         }
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                           std::chrono::steady_clock::now() - start)
-                           .count();
-        if (elapsed >= kTeDrainTimeoutSeconds) {
-            LOG(WARNING) << "CancelBatchTETask: timed out after " << elapsed
-                         << "s for batch " << batch_id
-                         << " — BatchDesc may leak";
-            return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_report) {
+            LOG(ERROR) << "CancelBatchTETask: still waiting for batch "
+                       << batch_id << " — retaining buffers until tasks finish";
+            next_report = now + std::chrono::seconds(kTeDrainTimeoutSeconds);
         }
         std::this_thread::sleep_for(kTeWaitPollInterval);
     }
@@ -2118,19 +2171,19 @@ void DataManagerV1::CancelBatchTETask(Transport::BatchID batch_id,
 
 async_simple::coro::Lazy<void> DataManagerV1::CancelBatchTETaskCoro(
     Transport::BatchID batch_id, size_t num_tasks) {
-    auto start = std::chrono::steady_clock::now();
+    // The same initialized-engine check also covers externally supplied TE.
+    const bool uses_tent = transfer_engine_->getMetadata() == nullptr;
+    auto next_report = std::chrono::steady_clock::now() +
+                       std::chrono::seconds(kTeDrainTimeoutSeconds);
     while (true) {
-        if (IsTeBatchFullyDrained(batch_id, num_tasks)) {
+        if (IsTeBatchFullyDrained(batch_id, num_tasks, uses_tent)) {
             break;
         }
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                           std::chrono::steady_clock::now() - start)
-                           .count();
-        if (elapsed >= kTeDrainTimeoutSeconds) {
-            LOG(WARNING) << "CancelBatchTETask: timed out after " << elapsed
-                         << "s for batch " << batch_id
-                         << " — BatchDesc may leak";
-            co_return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_report) {
+            LOG(ERROR) << "CancelBatchTETaskCoro: still waiting for batch "
+                       << batch_id << " — retaining buffers until tasks finish";
+            next_report = now + std::chrono::seconds(kTeDrainTimeoutSeconds);
         }
         (void)co_await coro_io::sleep_for(kTeWaitPollInterval);
     }

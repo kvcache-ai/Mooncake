@@ -17,7 +17,6 @@
 #include "p2p/client/tiered_cache/data_copier.h"
 #include "p2p/client/tiered_cache/scheduler/stats_collector.h"
 #include "p2p/common/p2p_types.h"
-#include "rpc_types.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -37,7 +36,6 @@ struct TieredLocation {
     struct DataSource data;
 };
 
-// TierView now lives in p2p/client/data_manager_types.h.
 
 /**
  * @struct AllocationEntry
@@ -65,8 +63,6 @@ struct AllocationEntry {
  */
 using AllocationHandle = std::shared_ptr<AllocationEntry>;
 
-// AddReplicaCallback / RemoveReplicaCallback now live in
-// p2p/client/data_manager_types.h.
 
 /**
  * @brief Result of TieredBackend::conditionalExecute.
@@ -82,7 +78,6 @@ struct ConditionalExecuteResult<void> {
     bool key_exists = false;
 };
 
-// SegmentSyncCallback now lives in p2p/client/data_manager_types.h.
 
 /**
  * @class TieredBackend
@@ -126,15 +121,11 @@ class TieredBackend {
     // needed.
 
     /**
-     * @brief Allocation
-     * reserves storage space. Returns a handle.
-     * If the handle goes out of scope without being committed, the space is
-     * auto-freed.
-     * @param size: Size in bytes to allocate
-     * @param preferred_tier: Preferred tier ID (optional)
-     * @param strict: If true, allocation MUST succeed on preferred_tier.
-     *                Will trigger sync eviction if needed, no fallback.
-     *                If false (default), will fallback to other tiers.
+     * @brief Reserve storage; an uncommitted handle releases it on destruction.
+     * @param size Bytes to allocate.
+     * @param preferred_tier Preferred tier ID.
+     * @param strict Evict if needed and allocate only on preferred_tier;
+     * false allows fallback to other tiers.
      */
     tl::expected<AllocationHandle, ErrorCode> Allocate(
         size_t size, std::optional<UUID> preferred_tier = std::nullopt,
@@ -204,26 +195,12 @@ class TieredBackend {
         bool notify_master = true);
 
     /**
-     * @brief Reverse-notification hook for bottom-up (tier-initiated) eviction.
-     *
-     * When a tier autonomously evicts a bucket to reclaim space, it physically
-     * removes the underlying files for a batch of keys, bypassing the normal
-     * top-down Delete path. This method re-synchronizes the high-level state
-     * with that fact. For each evicted key whose replica lives on @p tier_id:
-     *   - removes that replica from the metadata index, releasing the owning
-     *     AllocationHandle OUTSIDE all locks so the tier's RAII Free path runs
-     *     exactly once (the single, symmetric per-key byte decrement);
-     *   - notifies the scheduler via OnDelete so LRU / fast-reclaim no longer
-     *     believe a backup exists on the evicted tier;
-     *   - best-effort notifies Master via the remove-replica callback.
-     *
-     * The physical eviction is irreversible, so this cleanup always runs to
-     * completion (it is never gated on shutdown or Master reachability).
-     *
-     * @param keys    Keys that lived in the evicted bucket (snapshot taken
-     *                before the physical eviction).
-     * @param tier_id The tier that performed the eviction.
-     * @return Number of replicas actually removed from the metadata index.
+     * @brief Remove metadata after a tier physically evicts keys.
+     * Release handles outside locks, then notify the scheduler and Master.
+     * Cleanup proceeds even during shutdown or Master failure.
+     * @param keys Keys from the evicted bucket.
+     * @param tier_id Tier that performed the eviction.
+     * @return Number of replicas removed from the metadata index.
      */
     size_t NotifyBucketEviction(const std::vector<std::string>& keys,
                                 const UUID& tier_id);
@@ -277,12 +254,8 @@ class TieredBackend {
         const;
 
     /**
-     * @brief Get hot key statistics from the scheduler (e.g. for HA recovery
-     *        prioritization).
-     * @param hot_key_num see IClientScheduler::GetHotKeyStats. Defaults to
-     *        nullopt, which resolves to the startup config
-     * scheduler.hot_key_num (default 64); set scheduler.hot_key_num=0 to return
-     * all tracked keys (the historical no-arg behavior).
+     * @brief Return scheduler hot-key statistics.
+     * @param hot_key_num See IClientScheduler::GetHotKeyStats.
      */
     AccessStats GetHotKeyStats(
         std::optional<size_t> hot_key_num = std::nullopt) const;

@@ -37,7 +37,7 @@
 #include "p2p/client/v2/block_registry.h"
 #include "p2p/client/v2/movement.h"
 #include "p2p/client/v2/movement_tracker.h"
-#include "types.h"
+#include "common_types.h"
 
 namespace mooncake::v2 {
 

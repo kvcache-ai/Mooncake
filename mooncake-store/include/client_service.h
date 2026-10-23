@@ -1,97 +1,134 @@
 #pragma once
 
-#include <csignal>
 #include <boost/functional/hash.hpp>
-#include <condition_variable>
-#include <functional>
+#include <csignal>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
-#include "mutex.h"
+#include <chrono>
+#include <unordered_set>
+#include <glog/logging.h>
 
-#include "p2p/client/inflight_tracker.h"
+#include "client_metric.h"
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include "client_buffer.hpp"
+#include "client_resources.h"
+#include "inflight_tracker.h"
+#include "ha_helper.h"
+#include "master_client.h"
+#include "storage_backend.h"
+#include "thread_pool.h"
 #include "transfer_engine.h"
+#include "transfer_task.h"
 #include "types.h"
-#include "p2p/common/p2p_rpc_types.h"
-#include "p2p/common/p2p_types.h"
-#include "rpc_types.h"
 #include "replica.h"
 #include "master_metric_manager.h"
-#include <ylt/coro_rpc/coro_rpc_server.hpp>
-#include <ylt/coro_http/coro_http_server.hpp>
-#include "client_config_builder.h"
-#include "client_buffer.hpp"
-#include "p2p/client/runtime_config_store.h"
 
 namespace mooncake {
 
-class AutoPortBinder;
+// Buffer conversion helpers for centralized replica descriptors.
+uint64_t calculate_total_size(const Replica::Descriptor& replica);
+int allocateSlices(std::vector<Slice>& slices,
+                   const Replica::Descriptor& replica, void* buffer_ptr);
 
-using WriteConfig = std::variant<ReplicateConfig, WriteRouteRequestConfig>;
+struct BatchGetOffloadObjectResponse {
+    std::vector<uint64_t> pointers;
+    std::string transfer_engine_addr;
+    uint64_t gc_ttl_ms;
+
+    BatchGetOffloadObjectResponse() = default;
+    BatchGetOffloadObjectResponse(std::vector<uint64_t>&& pointers_param,
+                                  std::string transfer_engine_addr_param,
+                                  uint64_t gc_ttl_ms_param)
+        : pointers(std::move(pointers_param)),
+          transfer_engine_addr(std::move(transfer_engine_addr_param)),
+          gc_ttl_ms(gc_ttl_ms_param) {}
+};
+YLT_REFL(BatchGetOffloadObjectResponse, pointers, transfer_engine_addr,
+         gc_ttl_ms);
+
+class PutOperation;
+class FileStorage;
+class ClientRequester;
 
 /**
- * @brief Result of a query operation containing replica information
+ * @brief Result of a query operation containing replica information and lease
+ * timeout
  */
 class QueryResult {
    public:
     /** @brief List of available replicas for the queried key */
     const std::vector<Replica::Descriptor> replicas;
+    /** @brief Time point when the lease for this key expires */
+    const std::chrono::steady_clock::time_point lease_timeout;
 
-    explicit QueryResult(std::vector<Replica::Descriptor>&& replicas_param)
-        : replicas(std::move(replicas_param)) {}
+    QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
+                std::chrono::steady_clock::time_point lease_timeout_param)
+        : replicas(std::move(replicas_param)),
+          lease_timeout(lease_timeout_param) {}
 
-    virtual ~QueryResult() = default;
+    bool IsLeaseExpired() const {
+        return std::chrono::steady_clock::now() >= lease_timeout;
+    }
 
-    // Disable copy to prevent slicing; allow move
-    QueryResult(const QueryResult&) = delete;
-    QueryResult& operator=(const QueryResult&) = delete;
-    QueryResult(QueryResult&&) = default;
-    QueryResult& operator=(QueryResult&&) = default;
+    bool IsLeaseExpired(std::chrono::steady_clock::time_point& now) const {
+        return now >= lease_timeout;
+    }
 };
 
 /**
  * @brief Client for interacting with the mooncake distributed object store
  */
-class ClientService {
+class Client {
    public:
-    virtual ~ClientService();
+    ~Client();
+
+    // Reject new core business calls and drain admitted calls/background work.
+    void Stop();
 
     /**
-     * @brief stops background threads
+     * @brief Creates and initializes a new Client instance
+     * @param local_hostname Original TE server name
+     * @param metadata_connstring Connection string for metadata service
+     * @param protocol Transfer protocol ("rdma" or "tcp")
+     * @param device_names Comma-separated RDMA device names.
+     *        Optional with default auto-discovery. Only required when
+     *        auto-discovery is disabled (set env `MC_MS_AUTO_DISC=0`).
+     * @param master_server_entry The entry of master server (IP:Port of master
+     *        address for non-HA mode, etcd://IP:Port;IP:Port;...;IP:Port for
+     *        HA mode)
+     * @return std::optional containing a shared_ptr to Client if successful,
+     * std::nullopt otherwise
      */
-    virtual void Stop();
+    static std::optional<std::shared_ptr<Client>> Create(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
+        const std::optional<std::string>& device_names = std::nullopt,
+        const std::string& master_server_entry = kDefaultMasterAddress,
+        const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
+        std::map<std::string, std::string> labels = {});
 
     /**
-     * @brief Stops the heartbeat thread
+     * @brief Retrieves data for a given key
+     * @param object_key Key to retrieve
+     * @param slices Vector of slices to store the retrieved data
+     * @return ErrorCode indicating success/failure
      */
-    virtual void StopHeartbeat() EXCLUDES(registration_mutex_);
+    tl::expected<void, ErrorCode> Get(const std::string& object_key,
+                                      std::vector<Slice>& slices);
 
     /**
-     * @brief Release internal resources. Should be called after Stop()
+     * @brief Batch retrieve data for multiple keys
+     * @param object_keys Keys to query
+     * @param slices Map of object keys to their data slices
      */
-    virtual void Destroy();
-
-    /**
-     * @brief Creates and initializes a new ClientService instance
-     * @param config The start up configuration for the client service.
-     * @return std::optional containing a shared_ptr to ClientService if
-     * successful, std::nullopt otherwise
-     */
-    static std::optional<std::shared_ptr<ClientService>> Create(
-        const CentralizedClientConfig& config);
-    static std::optional<std::shared_ptr<ClientService>> Create(
-        const P2PClientConfig& config);
-
-    /**
-     * @brief Returns the deployment mode of the client service.
-     * @return DeploymentMode (CENTRALIZATION or P2P).
-     */
-    virtual DeploymentMode deployment_mode() const = 0;
+    std::vector<tl::expected<void, ErrorCode>> BatchGet(
+        const std::vector<std::string>& object_keys,
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
 
     /**
      * @brief Batch query IP addresses for multiple client IDs.
@@ -99,10 +136,18 @@ class ClientService {
      * @return An expected object containing a map from client_id to their IP
      * address lists on success, or an ErrorCode on failure.
      */
-    virtual tl::expected<
+    tl::expected<
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode>
-    BatchQueryIp(const std::vector<UUID>& client_ids) = 0;
+    BatchQueryIp(const std::vector<UUID>& client_ids);
+
+    /**
+     * @brief Gets object metadata without transferring data
+     * @param object_key Key to query
+     * @return QueryResult containing replicas and lease timeout, or ErrorCode
+     * indicating failure
+     */
+    tl::expected<QueryResult, ErrorCode> Query(const std::string& object_key);
 
     /**
      * @brief Queries replica lists for object keys that match a regex pattern.
@@ -110,78 +155,57 @@ class ClientService {
      * @return An expected object containing a map from object keys to their
      * replica descriptors on success, or an ErrorCode on failure.
      */
-    virtual tl::expected<
+    tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode>
-    QueryByRegex(const std::string& str) = 0;
-
-    /**
-     * @brief Gets object metadata without transferring data
-     * @param object_key Key to query
-     * @return QueryResult (or its subclass) containing replicas, or ErrorCode
-     * indicating failure
-     */
-    virtual tl::expected<std::unique_ptr<QueryResult>, ErrorCode> Query(
-        const std::string& object_key, const ReadRouteConfig& config = {}) = 0;
+    QueryByRegex(const std::string& str);
 
     /**
      * @brief Batch query object metadata without transferring data
      * @param object_keys Keys to query
-     * @return Vector of QueryResult (or its subclass) containing replicas
+     * @return Vector of QueryResult objects containing replicas and lease
+     * timeouts
      */
-    virtual std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>>
-    BatchQuery(const std::vector<std::string>& object_keys,
-               const ReadRouteConfig& config = {}) = 0;
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
+        const std::vector<std::string>& object_keys);
 
     /**
-     * @brief Gets data with memory allocation
-     * @param key Object key
-     * @param allocator Read buffer allocator
-     * @param config Read route config
-     * @return BufferHandle allocated by `allocator` on success.
-     *         ErrorCode on failure.
+     * @brief Batch clear KV cache for specified object keys on a specific
+     * segment for a given client.
+     * @param object_keys Vector of object key strings to clear.
+     * @param client_id The UUID of the client that owns the object keys.
+     * @param segment_name The name of the segment (storage device) to clear
+     * from.
+     * @return An expected object containing a vector of successfully cleared
+     * object keys on success, or an ErrorCode on failure.
      */
-    virtual tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> Get(
-        const std::string& key,
-        std::shared_ptr<ClientBufferAllocator> allocator,
-        const ReadRouteConfig& config = {}) = 0;
-
-    virtual std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
-    BatchGet(const std::vector<std::string>& keys,
-             std::shared_ptr<ClientBufferAllocator> allocator,
-             const ReadRouteConfig& config = {}) = 0;
+    tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
+        const std::vector<std::string>& object_keys, const UUID& client_id,
+        const std::string& segment_name);
 
     /**
-     * @brief Gets data into user-provided buffers without memory allocation
-     * @param key Object key
-     * @param buffers Vector of destination buffer pointers
-     * @param sizes Vector of buffer sizes (must match buffers.size())
-     * @param config Read route config
-     * @return Number of bytes read on success. ErrorCode on failure.
+     * @brief Transfers data using pre-queried object information
+     * @param object_key Key of the object
+     * @param query_result Previously queried object metadata containing
+     * replicas and lease timeout
+     * @param slices Vector of slices to store the data
+     * @return ErrorCode indicating success/failure
      */
-    virtual tl::expected<int64_t, ErrorCode> Get(
-        const std::string& key, const std::vector<void*>& buffers,
-        const std::vector<size_t>& sizes,
-        const ReadRouteConfig& config = {}) = 0;
-
+    tl::expected<void, ErrorCode> Get(const std::string& object_key,
+                                      const QueryResult& query_result,
+                                      std::vector<Slice>& slices);
     /**
-     * @brief Batch get data into user-provided buffers
-     * @param keys Object keys
-     * @param all_buffers Vector of buffer pointer vectors (one per key)
-     * @param all_sizes Vector of buffer size vectors (one per key)
-     * @param config Read route config
-     * @param aggregate_same_segment_task
-     * Whether to aggregate read tasks on the same segment.
-     * If false, each key will be generated as a independent task.
-     * Otherwise, the tasks will be aggregated on the same segment.
-     * @return Vector of bytes read on success. ErrorCode on failure.
+     * @brief Transfers data using pre-queried object information
+     * @param object_keys Keys of the objects
+     * @param query_results Previously queried object metadata for each key
+     * @param slices Map of object keys to their data slices
+     * @return Vector of ErrorCode results for each object
      */
-    virtual std::vector<tl::expected<int64_t, ErrorCode>> BatchGet(
-        const std::vector<std::string>& keys,
-        const std::vector<std::vector<void*>>& all_buffers,
-        const std::vector<std::vector<size_t>>& all_sizes,
-        const ReadRouteConfig& config = {},
-        bool aggregate_same_segment_task = false) = 0;
+    std::vector<tl::expected<void, ErrorCode>> BatchGet(
+        const std::vector<std::string>& object_keys,
+        const std::vector<QueryResult>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices,
+        bool prefer_same_node = false);
 
     /**
      * @brief Stores data with replication
@@ -190,9 +214,9 @@ class ClientService {
      * @param config Replication configuration
      * @return ErrorCode indicating success/failure
      */
-    virtual tl::expected<void, ErrorCode> Put(const ObjectKey& key,
-                                              std::vector<Slice>& slices,
-                                              const WriteConfig& config) = 0;
+    tl::expected<void, ErrorCode> Put(
+        const ObjectKey& key, std::vector<Slice>& slices,
+        const std::optional<ReplicateConfig>& config = std::nullopt);
 
     /**
      * @brief Batch put data with replication
@@ -201,10 +225,10 @@ class ClientService {
      * to match keys)
      * @param config Replication configuration
      */
-    virtual std::vector<tl::expected<void, ErrorCode>> BatchPut(
+    std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
-        const WriteConfig& config) = 0;
+        const std::optional<ReplicateConfig>& config = std::nullopt);
 
     /**
      * @brief Removes an object and all its replicas
@@ -212,8 +236,8 @@ class ClientService {
      * @param force If true, skip lease and replication task checks
      * @return ErrorCode indicating success/failure
      */
-    virtual tl::expected<void, ErrorCode> Remove(const ObjectKey& key,
-                                                 bool force = false) = 0;
+    tl::expected<void, ErrorCode> Remove(const ObjectKey& key,
+                                         bool force = false);
 
     /**
      * @brief Removes objects from the store whose keys match a regex pattern.
@@ -222,33 +246,15 @@ class ClientService {
      * @return An expected object containing the number of removed objects on
      * success, or an ErrorCode on failure.
      */
-    virtual tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str,
-                                                        bool force = false) = 0;
+    tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str,
+                                                bool force = false);
 
     /**
      * @brief Removes all objects and all its replicas
      * @param force If true, skip lease and replication task checks
      * @return tl::expected<long, ErrorCode> number of removed objects or error
      */
-    virtual tl::expected<long, ErrorCode> RemoveAll(bool force = false) = 0;
-
-    /**
-     * @brief Removes all objects from this Client's LOCAL tiered storage.
-     * @return Number of removed objects, or ErrorCode on failure.
-     */
-    virtual tl::expected<long, ErrorCode> RemoveAllLocal() {
-        return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
-    }
-
-    /**
-     * @brief Removes a single object from this Client's LOCAL tiered storage.
-     * @param key Key to remove
-     * @return ErrorCode indicating success/failure.
-     */
-    virtual tl::expected<void, ErrorCode> RemoveLocal(const ObjectKey& key) {
-        (void)key;
-        return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
-    }
+    tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
     /**
      * @brief Registers a memory segment to master for allocation
@@ -256,9 +262,8 @@ class ClientService {
      * @param size Size of the buffer in bytes
      * @return ErrorCode indicating success/failure
      */
-    virtual tl::expected<void, ErrorCode> MountSegment(
-        const void* buffer, size_t size,
-        const std::string& protocol = "tcp") = 0;
+    tl::expected<void, ErrorCode> MountSegment(
+        const void* buffer, size_t size, const std::string& protocol = "tcp");
 
     /**
      * @brief Unregisters a memory segment from master
@@ -266,8 +271,8 @@ class ClientService {
      * @param size Size of the buffer in bytes
      * @return ErrorCode indicating success/failure
      */
-    virtual tl::expected<void, ErrorCode> UnmountSegment(const void* buffer,
-                                                         size_t size) = 0;
+    tl::expected<void, ErrorCode> UnmountSegment(const void* buffer,
+                                                 size_t size);
 
     /**
      * @brief Registers memory buffer with TransferEngine for data transfer
@@ -294,17 +299,18 @@ class ClientService {
     /**
      * @brief Checks if an object exists
      * @param key Key to check
-     * @return True if exists, false if not, or ErrorCode for unexpected errors.
+     * @return ErrorCode::OK if exists, ErrorCode::OBJECT_NOT_FOUND if not
+     * exists, other ErrorCode for errors
      */
-    virtual tl::expected<bool, ErrorCode> IsExist(const std::string& key) = 0;
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key);
 
     /**
      * @brief Checks if multiple objects exist
      * @param keys Vector of keys to check
      * @return Vector of existence results for each key
      */
-    virtual std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
-        const std::vector<std::string>& keys) = 0;
+    std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
+        const std::vector<std::string>& keys);
 
     /**
      * @brief Create a copy task to copy an object's replicas to target segments
@@ -313,7 +319,7 @@ class ClientService {
      * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
      * failure
      */
-    virtual tl::expected<UUID, ErrorCode> CreateCopyTask(
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
 
     /**
@@ -325,9 +331,9 @@ class ClientService {
      * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
      * failure
      */
-    virtual tl::expected<UUID, ErrorCode> CreateMoveTask(
-        const std::string& key, const std::string& source,
-        const std::string& target);
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& source,
+                                                 const std::string& target);
 
     /**
      * @brief Query a task by task id
@@ -335,8 +341,60 @@ class ClientService {
      * @return tl::expected<QueryTaskResponse, ErrorCode> Task basic info
      * on success, ErrorCode on failure
      */
-    virtual tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
-        const UUID& task_id);
+    tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    /**
+     * @brief Get global segment base address for cxl protocol
+     * @return Global segment base address
+     */
+    void* GetBaseAddr();
+
+    /**
+     * @brief Mounts a local disk segment into the master.
+     * @param enable_offloading If true, enables offloading (write-to-file).
+     */
+    tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
+
+    /**
+     * @brief Heartbeat call to collect object-level statistics and retrieve the
+     * set of non-offloaded objects.
+     * @param enable_offloading Indicates whether offloading is enabled for this
+     * segment.
+     * @param offloading_objects On return, contains a map from object key to
+     * size (in bytes) for all objects that require offload.
+     */
+    tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
+        bool enable_offloading,
+        std::unordered_map<std::string, int64_t>& offloading_objects);
+
+    /**
+     * @brief Performs a batched read of multiple objects using a
+     * high-throughput Transfer Engine.
+     * @param transfer_engine_addr Address of the Transfer Engine service (e.g.,
+     * "ip:port").
+     * @param keys List of keys identifying the data objects to be transferred
+     * @param pointers Array of destination memory addresses on the remote node
+     *                         where data will be written (one per key)
+     * @param batch_slices Map from object key to its data slice
+     * (`mooncake::Slice`), containing raw bytes to be written.
+     */
+    tl::expected<void, ErrorCode> BatchGetOffloadObject(
+        const std::string& transfer_engine_addr,
+        const std::vector<std::string>& keys,
+        const std::vector<uintptr_t>& pointers,
+        const std::unordered_map<std::string, Slice>& batch_slices);
+
+    /**
+     * @brief Notifies the master that offloading of specified objects has
+     * succeeded.
+     * @param keys         A list of object keys (names) that were successfully
+     * offloaded.
+     * @param metadatas    The corresponding metadata for each offloaded object,
+     * including size, storage location, etc.
+     */
+    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas);
 
     /**
      * @brief Fetch tasks assigned to a client
@@ -344,7 +402,7 @@ class ClientService {
      * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of
      * tasks on success, ErrorCode on failure
      */
-    virtual tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+    tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
         size_t batch_size);
 
     /**
@@ -352,246 +410,232 @@ class ClientService {
      * @param task_complete Task complete request
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    virtual tl::expected<void, ErrorCode> MarkTaskToComplete(
+    tl::expected<void, ErrorCode> MarkTaskToComplete(
         const TaskCompleteRequest& task_complete);
 
     // For human-readable metrics
-    virtual tl::expected<std::string, ErrorCode> GetSummaryMetrics() = 0;
+    tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
+        if (metrics_ == nullptr) {
+            LOG(ERROR) << "Centralized client metrics are disabled";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return metrics_->summary_metrics();
+    }
 
-    virtual tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
-    CalcCacheStats() = 0;
+    tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+    CalcCacheStats() {
+        return master_client_.CalcCacheStats();
+    }
 
     // For Prometheus-style metrics
-    virtual tl::expected<std::string, ErrorCode> SerializeMetrics() = 0;
-
-    /**
-     * @brief Gets the HTTP server port.
-     * @return The port number, or 0 if HTTP server is disabled.
-     */
-    uint16_t GetHttpPort() const { return http_port_; }
-
-    /**
-     * @brief Checks if HTTP server is enabled.
-     * @return True if enabled, false otherwise.
-     */
-    bool IsHttpServerEnabled() const { return http_server_ != nullptr; }
-
-    /**
-     * @brief Returns the shared buffer allocator (TE-registered pool).
-     *        May be nullptr if local_buffer_size was 0.
-     */
-    std::shared_ptr<ClientBufferAllocator> GetBufferAllocator() const {
-        return local_buffer_allocator_;
+    tl::expected<std::string, ErrorCode> SerializeMetrics() {
+        if (metrics_ == nullptr) {
+            LOG(ERROR) << "Centralized client metrics are disabled";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        std::string str;
+        metrics_->serialize(str);
+        return str;
     }
 
-    /**
-     * @brief Gets the health status for the /health endpoint.
-     * @return A string representing the health status.
-     */
-    virtual std::string GetHealthStatus() const { return "OK"; }
-
-    RuntimeConfigStore& getRuntimeConfigStore() {
-        return *runtime_config_store_;
-    }
-    const RuntimeConfigStore& getRuntimeConfigStore() const {
-        return *runtime_config_store_;
-    }
-
-    RuntimeConfigStore::WriteConfig getDefaultWriteConfig() const {
-        return runtime_config_store_->getDefaultWriteConfig();
-    }
-    ReadRouteConfig getDefaultReadConfig() const {
-        return runtime_config_store_->getDefaultReadConfig();
-    }
-
-   public:
-    std::string local_endpoint() const {
-        return local_ip_ + ":" + std::to_string(te_port_);
-    }
-    /**
-     * @brief Gets the local transport endpoint (IP and port).
-     * @return The transport endpoint string.
-     */
     [[nodiscard]] std::string GetTransportEndpoint() {
-        return transfer_engine_->getLocalIpAndPort();
+        return resources_.GetTransferEngine()->getLocalIpAndPort();
     }
-    UUID GetClientID() const { return client_id_; }
-    ViewVersionId GetViewVersion() const { return view_version_.load(); }
 
-   public:
-    /**
-     * @brief Checks if memory registration parameters are valid
-     * @param addr Memory address to check
-     * @param length Size of the memory region
-     * @return ErrorCode indicating success or failure
-     */
-    static tl::expected<void, ErrorCode> CheckRegisterMemoryParams(
-        const void* addr, size_t length);
+    tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
+        const std::vector<Replica::Descriptor>& replica_list);
 
-    /**
-     * @brief Calculate the total size of a list of slices.
-     * @param slices Vector of slices.
-     * @return Total size in bytes.
-     */
-    [[nodiscard]] static size_t CalculateSliceSize(
-        const std::vector<Slice>& slices);
+    // Initialize storage and the client RPC server before exposing the Client.
+    // Discard the Client on failure; its members release the allocated
+    // resources.
+    ErrorCode InitStorage(uint64_t global_segment_size,
+                          uint64_t local_buffer_size, bool enable_offload,
+                          uint16_t client_rpc_port = 0);
+    std::shared_ptr<ClientBufferAllocator> GetBufferAllocator() const {
+        return resources_.GetBufferAllocator();
+    }
+    const std::string& GetLocalHostname() const { return local_hostname_; }
+    tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> Get(
+        const std::string& key,
+        std::shared_ptr<ClientBufferAllocator> allocator);
+    std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
+    BatchGet(const std::vector<std::string>& keys,
+             std::shared_ptr<ClientBufferAllocator> allocator);
+    tl::expected<int64_t, ErrorCode> Get(const std::string& key, void* buffer,
+                                         size_t size);
+    std::vector<tl::expected<int64_t, ErrorCode>> BatchGet(
+        const std::vector<std::string>& keys, const std::vector<void*>& buffers,
+        const std::vector<size_t>& sizes);
+    std::vector<tl::expected<int64_t, ErrorCode>> BatchGet(
+        const std::vector<std::string>& keys,
+        const std::vector<std::vector<void*>>& all_buffers,
+        const std::vector<std::vector<size_t>>& all_sizes,
+        bool aggregate_same_segment_task = false);
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    BatchGetOffloadObjectFromStorage(const std::vector<std::string>& keys,
+                                     const std::vector<int64_t>& sizes);
 
-    /**
-     * @brief Calculate the total size of a list of slices.
-     * @param slices Span of slices.
-     * @return Total size in bytes.
-     */
-    [[nodiscard]] static size_t CalculateSliceSize(
-        std::span<const Slice> slices);
+   private:
+    friend struct ClientLifecycleTestHelper;
 
-   protected:
+    // Internal read composition runs under the outer public call's guard.
+    tl::expected<QueryResult, ErrorCode> QueryImpl(const std::string& key);
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQueryImpl(
+        const std::vector<std::string>& keys);
+    tl::expected<void, ErrorCode> GetImpl(const std::string& key,
+                                          const QueryResult& query_result,
+                                          std::vector<Slice>& slices);
+    std::vector<tl::expected<void, ErrorCode>> BatchGetImpl(
+        const std::vector<std::string>& keys,
+        const std::vector<QueryResult>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices,
+        bool prefer_same_node = false);
+
     /**
      * @brief Private constructor to enforce creation through Create() method
      */
-    ClientService(const std::string& metadata_connstring,
-                  uint16_t http_port = 9003, bool enable_http_server = true,
-                  const std::map<std::string, std::string>& labels = {});
+    Client(const std::string& local_hostname,
+           const std::string& metadata_connstring, const std::string& protocol,
+           const std::map<std::string, std::string>& labels = {});
 
     /**
-     * @brief Initializes the Transfer Engine.
-     * @param te_port Transfer engine port (0 means auto-bind).
-     * @param metadata_connstring Connection string for metadata service.
-     * @param protocol Transport protocol (e.g., "tcp", "rdma").
-     * @param device_names Optional RDMA device names.
-     * @return ErrorCode indicating success or failure.
+     * @brief Internal helper functions for initialization and data transfer
      */
+    ErrorCode ConnectToMaster(const std::string& master_server_entry);
     ErrorCode InitTransferEngine(
-        uint16_t te_port, const std::string& metadata_connstring,
-        const std::string& protocol,
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
-
-   protected:
-    ErrorCode InnerInitTransferEngine(
-        bool auto_discover, const std::string& protocol,
-        const std::optional<std::string>& device_names);
-    /**
-     * @brief Waits for the next heartbeat interval using condition variable.
-     * @param interval_ms Milliseconds to wait.
-     */
-    void WaitForNextHeartbeat(int interval_ms);
-
-    void HeartbeatTryRegister();
+    void InitTransferSubmitter();
+    ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
+                           std::vector<Slice>& slices,
+                           TransferRequest::OpCode op_code);
+    ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
+                            std::vector<Slice>& slices);
+    ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
+                           std::vector<Slice>& slices);
 
     /**
-     * @brief Stops the heartbeat with registration_mutex_ held.
+     * @brief Prepare and use the storage backend for persisting data
      */
-    void InnerStopHeartbeat() REQUIRES(registration_mutex_);
+    void PrepareStorageBackend(const std::string& storage_root_dir,
+                               const std::string& fsdir,
+                               bool enable_eviction = true,
+                               uint64_t quota_bytes = 0);
+
+    void PutToLocalFile(const std::string& object_key,
+                        const std::vector<Slice>& slices,
+                        const DiskDescriptor& disk_descriptor);
 
     /**
-     * @brief Registers HTTP handlers on the http_server_ instance.
-     * No-op when the HTTP server is disabled.
+     * @brief Find the first complete replica from a replica list
+     * @param replica_list List of replicas to search through
+     * @param replica the first complete replica (file or memory)
+     * @return ErrorCode::OK if found, ErrorCode::INVALID_REPLICA if no complete
+     * replica
      */
-    virtual void RegisterHttpMethods();
-
-    void RegisterRuntimeConfigHttpMethods();
+    ErrorCode FindFirstCompleteReplica(
+        const std::vector<Replica::Descriptor>& replica_list,
+        Replica::Descriptor& replica);
 
     /**
-     * @brief Starts the HTTP server.
+     * @brief Batch put helper methods for structured approach
      */
-    void StartHttpServer();
+    std::vector<PutOperation> CreatePutOperations(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices);
+    void StartBatchPut(std::vector<PutOperation>& ops,
+                       const ReplicateConfig& config);
+    void SubmitTransfers(std::vector<PutOperation>& ops);
+    void WaitForTransfers(std::vector<PutOperation>& ops);
+    void FinalizeBatchPut(std::vector<PutOperation>& ops);
+    std::vector<tl::expected<void, ErrorCode>> CollectResults(
+        const std::vector<PutOperation>& ops);
 
-    /**
-     * @brief Stops the HTTP server.
-     */
-    void StopHttpServer();
+    std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
+        std::vector<PutOperation>& ops);
+    std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
+        const std::vector<std::string>& object_keys,
+        const std::vector<QueryResult>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
 
-    /**
-     * @brief Creates and TE-registers a shared buffer pool.
-     * @param pool_size Size in bytes (0 = skip, local_buffer_allocator_ stays
-     * null).
-     * @param protocol Transport protocol for memory allocation.
-     * @param use_hugepage Whether to allocate with huge pages.
-     */
-    void InitLocalBufferAllocator(size_t pool_size, const std::string& protocol,
-                                  bool use_hugepage = false);
+   private:
+    InflightTracker local_inflight_tracker_{"centralized client requests"};
 
-    /**
-     * @brief Register (or re-register) this client with the master
-     */
-    tl::expected<ViewVersionId, ErrorCode> RegisterClient()
-        EXCLUDES(registration_mutex_);
-
-    virtual tl::expected<ViewVersionId, ErrorCode> InnerRegisterClient()
-        REQUIRES(registration_mutex_) = 0;
-
-    /**
-     * @brief Hook invoked when a local (client-initiated) request enters
-     * (entering=true) or leaves (entering=false) the in-flight set. Subclasses
-     * override to update an in-flight gauge. Base default is a no-op.
-     */
-    virtual void RecordLocalInflight(bool entering) { (void)entering; }
-
-   protected:
-    /**
-     * @brief Acquires an in-flight request guard. If the service has not been
-     * started yet or is shutting down, the returned guard's is_valid() is false
-     * and the caller must reject the request.
-     */
-    InflightTracker::Guard AcquireInflightGuard() {
-        return local_inflight_tracker_.Enter();
-    }
-
-    /**
-     * @brief Marks the service as shutting down: rejects new local requests and
-     * waits (unbounded) for all in-flight ones to finish before the DataManager
-     * is torn down.
-     * @return true if successfully marked, false if already shutting down.
-     */
-    bool MarkShuttingDown() {
-        bool initiated = local_inflight_tracker_.Close();
-        local_inflight_tracker_.Wait();
-        return initiated;
-    }
-
-   protected:
     // Client identification
     const UUID client_id_;
 
+    // Client-side metrics
+    std::unique_ptr<ClientMetric> metrics_;
+
     // Core components
-    std::shared_ptr<TransferEngine> transfer_engine_;
+    ClientResources resources_;
+    MasterClient master_client_;
+    std::unique_ptr<TransferSubmitter> transfer_submitter_;
+
+    // Mutex to protect mounted_segments_
+    std::mutex mounted_segments_mutex_;
+    std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
 
     // Configuration
-    std::string local_ip_;
-    uint16_t te_port_ = 0;
-    std::unique_ptr<RuntimeConfigStore> runtime_config_store_;
-
-    // The segment endpoint that the transfer engine registered with the
-    // metadata backend.
-    std::string te_endpoint_;
-    std::unique_ptr<AutoPortBinder> port_binder_;
-    void initTeEndpoint();
-    const std::string& get_te_endpoint() const { return te_endpoint_; }
-
+    std::string local_hostname_;
     const std::string metadata_connstring_;
-    std::thread heartbeat_thread_;
-    std::atomic<bool> heartbeat_running_{false};
-    std::condition_variable heartbeat_cv_;
-    std::mutex heartbeat_mtx_;
-    /// View version from master. Updated by async registration thread,
-    /// read by heartbeat thread.
-    std::atomic<ViewVersionId> view_version_{0};
-    /// Master server entry saved at Init() (e.g. "etcd://..." or a direct
-    /// address), so a re-registration can restart the heartbeat.
-    std::string master_server_entry_;
-    // Serializes register / unregister / stop-heartbeat.
-    // Lock order: registration_mutex_ before draining local_inflight_tracker_
-    // (and registration_mutex_ -> heartbeat_mtx_). Stop() holds
-    // registration_mutex_ before Wait() so this order is never inverted.
-    Mutex registration_mutex_;
+    const std::string protocol_;
 
-    InflightTracker local_inflight_tracker_{
-        "local requests", [this] { RecordLocalInflight(true); },
-        [this] { RecordLocalInflight(false); }};
+    // Client persistent thread pool for async operations
+    ThreadPool write_thread_pool_;
+    std::shared_ptr<StorageBackend> storage_backend_;
 
-    std::unique_ptr<coro_http::coro_http_server> http_server_;
-    uint16_t http_port_ = 0;  // 0 means disabled
+    // These resources belong to Client, not to Backend or RealClient.
+    struct SegmentDeleter {
+        void operator()(void* ptr) const;
+    };
+    struct AscendSegmentDeleter {
+        void operator()(void* ptr) const;
+    };
+    struct HugepageSegmentDeleter {
+        size_t size = 0;
+        void operator()(void* ptr) const;
+    };
+    std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
+    std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
+        ascend_segment_ptrs_;
+    std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
+        hugepage_segment_ptrs_;
+    // The native client-to-client RPC server is independent of file offload.
+    ErrorCode StartClientRpcServer(uint16_t port);
+    void StopClientRpcServer();
+    std::unique_ptr<coro_rpc::coro_rpc_server> client_rpc_server_;
+    std::atomic<bool> client_rpc_ready_{false};
+    std::string client_rpc_addr_;
+    std::unique_ptr<FileStorage> file_storage_;
+    std::unique_ptr<ClientRequester> client_requester_;
+    tl::expected<void, ErrorCode> BatchGetIntoOffloadObjectInternal(
+        const std::string& target_rpc_service_addr,
+        std::unordered_map<std::string, Slice>& objects);
 
-    std::shared_ptr<ClientBufferAllocator> local_buffer_allocator_;
+    // For high availability
+    MasterViewHelper master_view_helper_;
+    std::thread ping_thread_;
+    std::atomic<bool> ping_running_{false};
+    void PingThreadMain(bool is_ha_mode, std::string current_master_address);
+};
+
+// Native client-to-client RPC requester.
+class ClientRequester {
+   public:
+    ClientRequester();
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    batch_get_offload_object(const std::string& client_addr,
+                             const std::vector<std::string>& keys,
+                             const std::vector<int64_t> sizes);
+
+   private:
+    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
+        client_pools_;
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
+        const std::string& client_addr, Args&&... args);
 };
 
 }  // namespace mooncake

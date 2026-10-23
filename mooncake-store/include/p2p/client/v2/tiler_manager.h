@@ -33,7 +33,7 @@
 #include "p2p/client/v2/event_center.h"
 #include "p2p/client/v2/eviction_index.h"
 #include "p2p/client/v2/v2_common.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake::v2 {
 

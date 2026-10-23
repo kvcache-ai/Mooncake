@@ -4,7 +4,10 @@
 #include <unordered_map>
 #include <sys/uio.h>
 #include <cstdio>
-#include "types.h"
+#include <span>
+#include <ylt/util/tl/expected.hpp>
+
+#include "common_types.h"
 #include <atomic>
 #include <thread>
 #include <sys/file.h>
@@ -28,10 +31,10 @@ class FileLockRAII {
         }
     }
 
-    FileLockRAII(const FileLockRAII &) = delete;
-    FileLockRAII &operator=(const FileLockRAII &) = delete;
+    FileLockRAII(const FileLockRAII&) = delete;
+    FileLockRAII& operator=(const FileLockRAII&) = delete;
 
-    FileLockRAII(FileLockRAII &&other) noexcept
+    FileLockRAII(FileLockRAII&& other) noexcept
         : fd_(other.fd_), locked_(other.locked_) {
         other.locked_ = false;
     }
@@ -52,7 +55,7 @@ class FileLockRAII {
  */
 class StorageFile {
    public:
-    StorageFile(const std::string &filename, int fd)
+    StorageFile(const std::string& filename, int fd)
         : filename_(filename),
           fd_(fd),
           error_code_(ErrorCode::OK),
@@ -71,7 +74,7 @@ class StorageFile {
      * written on success, or ErrorCode on failure
      * @note Thread-safe operation with write locking
      */
-    virtual tl::expected<size_t, ErrorCode> write(const std::string &buffer,
+    virtual tl::expected<size_t, ErrorCode> write(const std::string& buffer,
                                                   size_t length) = 0;
 
     /**
@@ -93,7 +96,7 @@ class StorageFile {
      * on success, or ErrorCode on failure
      * @note Thread-safe operation with read locking
      */
-    virtual tl::expected<size_t, ErrorCode> read(std::string &buffer,
+    virtual tl::expected<size_t, ErrorCode> read(std::string& buffer,
                                                  size_t length) = 0;
 
     /**
@@ -105,7 +108,7 @@ class StorageFile {
      * success, or ErrorCode on failure
      * @note Thread-safe operation with write locking
      */
-    virtual tl::expected<size_t, ErrorCode> vector_write(const iovec *iov,
+    virtual tl::expected<size_t, ErrorCode> vector_write(const iovec* iov,
                                                          int iovcnt,
                                                          off_t offset) = 0;
 
@@ -118,7 +121,7 @@ class StorageFile {
      * success, or ErrorCode on failure
      * @note Thread-safe operation with read locking
      */
-    virtual tl::expected<size_t, ErrorCode> vector_read(const iovec *iov,
+    virtual tl::expected<size_t, ErrorCode> vector_read(const iovec* iov,
                                                         int iovcnt,
                                                         off_t offset) = 0;
 
@@ -154,18 +157,18 @@ class StorageFile {
 
 class PosixFile : public StorageFile {
    public:
-    PosixFile(const std::string &filename, int fd);
+    PosixFile(const std::string& filename, int fd);
     ~PosixFile() override;
 
-    tl::expected<size_t, ErrorCode> write(const std::string &buffer,
+    tl::expected<size_t, ErrorCode> write(const std::string& buffer,
                                           size_t length) override;
     tl::expected<size_t, ErrorCode> write(std::span<const char> data,
                                           size_t length) override;
-    tl::expected<size_t, ErrorCode> read(std::string &buffer,
+    tl::expected<size_t, ErrorCode> read(std::string& buffer,
                                          size_t length) override;
-    tl::expected<size_t, ErrorCode> vector_write(const iovec *iov, int iovcnt,
+    tl::expected<size_t, ErrorCode> vector_write(const iovec* iov, int iovcnt,
                                                  off_t offset) override;
-    tl::expected<size_t, ErrorCode> vector_read(const iovec *iov, int iovcnt,
+    tl::expected<size_t, ErrorCode> vector_read(const iovec* iov, int iovcnt,
                                                 off_t offset) override;
 };
 
