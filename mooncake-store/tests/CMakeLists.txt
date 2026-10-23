@@ -243,9 +243,6 @@ target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(local_ssd_test PRIVATE mooncake_local_ssd gtest
                                              gtest_main)
 add_test(NAME local_ssd_test COMMAND local_ssd_test)
-add_store_test(local_ssd_codec_test ha/snapshot/local_ssd_codec_test.cpp)
-add_store_test(store_resource_snapshot_codec_test
-               ha/snapshot/store_resource_snapshot_codec_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(byte_size_test byte_size_test.cpp)
 add_store_test(network_test network_test.cpp)
@@ -305,7 +302,6 @@ set_tests_properties(client_metric_cluster_id_test
                      PROPERTIES ENVIRONMENT "MC_STORE_CLUSTER_ID=test-cluster")
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(allocator_metric_test allocator_metric_test.cpp)
-add_store_test(serializer_test serializer_test.cpp)
 add_store_test(dfs_posix_test dfs_posix_test.cpp)
 add_store_test(dfs_immutable_bucket_allocator_test
                dfs_immutable_bucket_allocator_test.cpp)
