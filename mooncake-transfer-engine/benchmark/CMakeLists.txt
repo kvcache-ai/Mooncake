@@ -93,6 +93,16 @@ if(BUILD_UNIT_TESTS)
     add_test(NAME tebench_mlu_data_test COMMAND tebench_mlu_data_test)
   endif()
 
+  if(USE_XPU)
+    add_executable(tebench_xpu_data_test tests/xpu_data_test.cpp utils.cpp)
+    target_link_libraries(tebench_xpu_data_test PRIVATE transfer_engine
+                                                        tent_link_group gtest
+                                                        gtest_main)
+    target_include_directories(tebench_xpu_data_test
+                               PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tebench_xpu_data_test COMMAND tebench_xpu_data_test)
+  endif()
+
   add_test(NAME tebench_build_tree_help
            COMMAND ${CMAKE_COMMAND} -E env --unset=LD_LIBRARY_PATH
                    $<TARGET_FILE:tebench> --help)

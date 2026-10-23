@@ -120,6 +120,32 @@ also enables the MLU local-copy transport in the benchmark configuration.
 result back to host memory for comparison. For throughput measurements without
 payload checks, use `--check_consistency=false --op_type=read` or `write`.
 
+### 3.5 Intel XPU Device Memory and File Targets
+
+Build with `USE_TENT=ON`, `USE_XPU=ON` and `BUILD_BENCHMARK=ON`, using the
+Intel DPC++ compiler (`CXX=icpx`). In this build,
+`--backend=tent --seg_type=VRAM` allocates XPU device memory. `--local_gpu_id`
+works as in Section 3.4.
+
+A `file://<path>` target segment name makes the initiator transfer to and from
+a local file, so no target process is needed. Create the file first; it must
+cover `--target_offset` plus `max_num_threads * max_block_size *
+max_batch_size` bytes. Select the file transport with `--xport_type`:
+
+```bash
+fallocate -l 1G /mnt/nvme/tebench.dat
+./tebench --backend=tent --metadata_type=p2p --seg_type=VRAM \
+  --local_gpu_id=0 --xport_type=iouring --total_buffer_size=268435456 \
+  --target_seg_name=file:///mnt/nvme/tebench.dat \
+  --start_block_size=1048576 --max_block_size=1048576 \
+  --start_batch_size=1 --max_batch_size=1 \
+  --start_num_threads=1 --max_num_threads=8 \
+  --op_type=write --duration=10
+```
+
+To check the data, run once with `--op_type=write_seed` and then with
+`--op_type=read_verify` (Section 5.4).
+
 ## 4. Output Metrics
 
 Each output row corresponds to one benchmark configuration.
