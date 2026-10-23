@@ -1309,6 +1309,7 @@ The following `MC_*` variables are read directly by the engine/client at runtime
 | `MC_STORE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Store/Master client RPC I/O pool size. This pool is isolated from Transfer Engine traffic. Invalid values and `0` use the fallback |
 | `MC_TE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Transfer Engine and TENT client RPC I/O pool size. This pool is isolated from Store/Master traffic. Invalid values and `0` use the fallback |
 | `MC_USE_TENT` / `MC_USE_TEV1` | unset | Set to any value to enable the TENT (next-gen) transfer engine. Required for Intel XPU deployments (`USE_XPU=ON`): the classic engine has no XPU support |
+| `MC_STORE_TRANSFER_TIMEOUT_MS` | `60000` | How long (ms) a Store client waits for a Transfer Engine read or write before failing it with `TRANSFER_FAIL` (logged as `Failed to complete transfers after ... milliseconds`). Integer in `[1, 86400000]`; invalid values log a warning and keep the default. Read once when the client is created. Covers per-object reads and writes with or without TENT; scatter transfers keep their own deadline (`MC_TENT_TRANSFER_TIMEOUT_S` under TENT). A failed put is revoked while slices that were still queued can be sent later, so a value well below the transport's own deadlines makes that window more frequent ([#4491](https://github.com/kvcache-ai/Mooncake/issues/4491)) |
 | `MC_STORE_CLUSTER_ID` | unset | Cluster ID label attached to client metrics |
 
 RPC client I/O pool settings are read and resolved once when the process-wide

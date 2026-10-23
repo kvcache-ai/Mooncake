@@ -1,8 +1,12 @@
 // transfer_task_test.cpp
 #include "transfer_task.h"
 
+#include <arpa/inet.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -662,6 +666,92 @@ TEST_F(TransferTaskTest, RemoteTransferWaitCompletesCorrectly) {
     }
     EXPECT_EQ(client.unregisterLocalMemory(local.data()), 0);
     EXPECT_EQ(server.unregisterLocalMemory(remote.data()), 0);
+}
+
+// MC_STORE_TRANSFER_TIMEOUT_MS bounds how long a Transfer Engine operation is
+// waited on. The peer accepts the TCP connection but never answers, so only
+// the configured timeout can end the wait: the transport's own status and
+// progress deadlines default to 30 s and the built-in timeout is 60 s.
+TEST_F(TransferTaskTest, TransferEngineWaitHonorsConfiguredTimeout) {
+    ScopedEnvVar memcpy_disabled("MC_STORE_MEMCPY", "0");
+    ScopedEnvVar tent_config("MC_TENT_CONF", nullptr);
+    ScopedEnvVar timeout("MC_STORE_TRANSFER_TIMEOUT_MS", "500");
+
+    // Connections complete from the listen backlog; nothing is ever read.
+    const int silent_peer = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(silent_peer, 0);
+    struct SocketCloser {
+        int fd;
+        ~SocketCloser() { close(fd); }
+    } silent_peer_closer{silent_peer};
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    ASSERT_EQ(bind(silent_peer, reinterpret_cast<sockaddr*>(&address),
+                   sizeof(address)),
+              0);
+    ASSERT_EQ(listen(silent_peer, 16), 0);
+    socklen_t address_length = sizeof(address);
+    ASSERT_EQ(getsockname(silent_peer, reinterpret_cast<sockaddr*>(&address),
+                          &address_length),
+              0);
+    const uint16_t silent_port = ntohs(address.sin_port);
+
+    // Declared before the engines: the abandoned slice may still reference
+    // these buffers until engine shutdown fails it.
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> local(kSize, 'B'), remote(kSize, 'A');
+    {
+        TransferEngine client(false), server(false);
+        ASSERT_EQ(client.init("P2PHANDSHAKE", "127.0.0.1:0", "", 0, "tcp"), 0);
+        ASSERT_EQ(server.init("P2PHANDSHAKE", "127.0.0.1:0", "", 0, "tcp"), 0);
+        if (client.isUsingTent()) {
+            GTEST_SKIP() << "the silent peer is wired through the classic "
+                            "TCP segment cache";
+        }
+        ASSERT_NE(client.installTransport("tcp", nullptr), nullptr);
+        ASSERT_NE(server.installTransport("tcp", nullptr), nullptr);
+        ASSERT_EQ(
+            client.registerLocalMemory(local.data(), local.size(), "cpu:0"), 0);
+        ASSERT_EQ(
+            server.registerLocalMemory(remote.data(), remote.size(), "cpu:0"),
+            0);
+
+        // Resolve the server segment, then point its cached TCP data
+        // endpoint at the silent peer.
+        const auto segment = client.openSegment(server.getLocalIpAndPort());
+        auto segment_desc = client.getMetadata()->getSegmentDescByID(segment);
+        ASSERT_NE(segment_desc, nullptr);
+        segment_desc->tcp_data_host = "127.0.0.1";
+        segment_desc->tcp_data_port = silent_port;
+
+        MemoryDescriptor memory;
+        memory.buffer_descriptor.buffer_address_ =
+            reinterpret_cast<uintptr_t>(remote.data());
+        memory.buffer_descriptor.size_ = remote.size();
+        memory.buffer_descriptor.transport_endpoint_ =
+            server.getLocalIpAndPort();
+        memory.buffer_descriptor.protocol_ = "tcp";
+        Replica::Descriptor replica;
+        replica.descriptor_variant = memory;
+        replica.status = ReplicaStatus::COMPLETE;
+        std::shared_ptr<StorageBackend> backend;
+        TransferSubmitter submitter(client, backend,
+                                    client.getLocalIpAndPort());
+        std::vector<Slice> slices{{local.data(), local.size()}};
+
+        const auto start = std::chrono::steady_clock::now();
+        auto future = submitter.submit(replica, slices, TransferRequest::WRITE);
+        ASSERT_TRUE(future);
+        ASSERT_EQ(future->strategy(), TransferStrategy::TRANSFER_ENGINE);
+        EXPECT_EQ(future->get(), ErrorCode::TRANSFER_FAIL);
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+
+        EXPECT_GE(elapsed, std::chrono::milliseconds(500));
+        EXPECT_LT(elapsed, std::chrono::seconds(10))
+            << "the wait was not bounded by MC_STORE_TRANSFER_TIMEOUT_MS";
+    }
 }
 
 // Test TransferStrategy enum and stream operator
