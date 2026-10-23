@@ -8,14 +8,15 @@
 
 namespace mooncake {
 
-// Opaque segment handle. Its definition lives inside the initiator
-// implementation (e.g. spdk_initiator.cpp); callers only ever hold pointers.
-//
-// Identity contract: repeated OpenSegment() with the same transport string
-// returns handles bound to the same underlying queue pair, and the returned
-// pointer is stable for the lifetime of the initiator. The pointer value is
-// used as the worker-affinity / QoS map key.
-class NofSegmentHandle;
+// Segment handle owned by the initiator; callers must not delete it.
+// Within an initiator, repeated OpenSegment() calls with the same transport
+// string return the same cached handle. The handle is released when the
+// initiator is destroyed.
+class NofSegmentHandle {
+   protected:
+    NofSegmentHandle() = default;
+    ~NofSegmentHandle() = default;
+};
 
 enum class NofIOOp : int {
     kRead = 0,
@@ -26,10 +27,12 @@ enum class NofIOOp : int {
 constexpr uint32_t kInvalidBlockSize = 0xFFFFFFFF;
 
 // Neutral completion result: no spdk_nvme_cpl outside the implementation.
+// On failure, SPDK sets sc, sct and error_string; Linux sets error_string
+// and leaves sc and sct at zero. Both backends report success via success.
 struct NofIOCompletion {
     bool success = false;
-    int sc = 0;                // NVMe status code; valid when !success
-    int sct = 0;               // NVMe status code type; valid when !success
+    int sc = 0;                // NVMe status code
+    int sct = 0;               // NVMe status code type
     std::string error_string;  // empty on success
 };
 
@@ -79,13 +82,16 @@ class NVMeoFInitiator {
     //
     // @pre buffer/byte_offset/byte_length are block-size aligned (interface
     //      precondition; implementations reject violations with -EINVAL).
-    // @pre Must be called from the thread that polls this handle
-    //      (qpair single-thread constraint).
+    // @pre SubmitIO and PollCompletion for the same handle must be called
+    //      from the same thread.
     // @pre adaptor must remain valid until its callback runs.
     // Callback contract: invoked synchronously on the polling thread inside
     // PollCompletion, never from a background thread. Any scratch DMA
     // buffers the implementation needs are released before the callback
     // returns.
+    // Returns 0: request queued; the callback reports whether the I/O succeeds.
+    // Returns -EAGAIN: request not queued and no callback will run.
+    // Call PollCompletion to make room, then retry SubmitIO.
     virtual int SubmitIO(NofSegmentHandle* handle, void* buffer,
                          uint64_t byte_offset, uint64_t byte_length, NofIOOp op,
                          NofIOAdaptor* adaptor) = 0;

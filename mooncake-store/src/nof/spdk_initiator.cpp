@@ -254,7 +254,7 @@ NofRegistryBundle& GetNofRegistryBundle() {
 // Opaque handle definition — visible only inside this file.
 // ---------------------------------------------------------------------------
 
-class NofSegmentHandle {
+class SpdkSegmentHandle : public NofSegmentHandle {
    public:
     struct spdk_nvme_qpair* qpair;
     struct spdk_nvme_ns* ns;
@@ -270,7 +270,7 @@ struct tr_info {
 
 struct ctrlr_info {
     struct spdk_nvme_ctrlr* ctrlr;
-    std::map<uint32_t, std::unique_ptr<NofSegmentHandle>> ns_seg;
+    std::map<uint32_t, std::unique_ptr<SpdkSegmentHandle>> ns_seg;
     std::mutex ns_mutex;
 };
 
@@ -341,7 +341,7 @@ class SpdkInitiator::Impl {
         // whole process, so spdk_env_fini (in ~SpdkEnvGuard) never runs here.
     }
 
-    NofSegmentHandle* OpenSegment(const std::string& tr_str) {
+    SpdkSegmentHandle* OpenSegment(const std::string& tr_str) {
         if (!EnsureEnv()) {
             return nullptr;
         }
@@ -385,7 +385,7 @@ class SpdkInitiator::Impl {
             }
         }
 
-        NofSegmentHandle* seg_handle = nullptr;
+        SpdkSegmentHandle* seg_handle = nullptr;
         {
             auto& ns_seg = info->ns_seg;
             std::lock_guard<std::mutex> lock(info->ns_mutex);
@@ -409,7 +409,7 @@ class SpdkInitiator::Impl {
                 return nullptr;
             }
 
-            auto new_seg = std::make_unique<NofSegmentHandle>();
+            auto new_seg = std::make_unique<SpdkSegmentHandle>();
             new_seg->qpair = qpair;
             new_seg->ns = ns;
             seg_handle = new_seg.get();
@@ -418,14 +418,14 @@ class SpdkInitiator::Impl {
         return seg_handle;
     }
 
-    uint32_t GetBlockSize(const NofSegmentHandle* handle) {
+    uint32_t GetBlockSize(const SpdkSegmentHandle* handle) {
         if (!handle || !handle->ns) {
             return kInvalidBlockSize;
         }
         return spdk_nvme_ns_get_sector_size(handle->ns);
     }
 
-    int SubmitIO(NofSegmentHandle* handle, void* buffer, uint64_t byte_offset,
+    int SubmitIO(SpdkSegmentHandle* handle, void* buffer, uint64_t byte_offset,
                  uint64_t byte_length, NofIOOp op, NofIOAdaptor* adaptor) {
         if (!handle || !buffer || byte_length == 0 || !handle->qpair ||
             !handle->ns || !adaptor || !adaptor->cb) {
@@ -457,7 +457,8 @@ class SpdkInitiator::Impl {
         return -EINVAL;
     }
 
-    int64_t PollCompletion(NofSegmentHandle* handle, uint32_t max_completions) {
+    int64_t PollCompletion(SpdkSegmentHandle* handle,
+                           uint32_t max_completions) {
         if (!handle || !handle->qpair) {
             return -EINVAL;
         }
@@ -512,7 +513,7 @@ class SpdkInitiator::Impl {
             return false;
         }
 
-        NofSegmentHandle* seg_handle = OpenSegment(tr_str);
+        SpdkSegmentHandle* seg_handle = OpenSegment(tr_str);
         if (!seg_handle) {
             if (error_reason) {
                 *error_reason = "open_fail";
@@ -761,7 +762,7 @@ class SpdkInitiator::Impl {
                 if (ctx->done.load(std::memory_order_acquire) || !ctx->seg) {
                     continue;
                 }
-                PollCompletion(ctx->seg, 0);
+                PollCompletion(static_cast<SpdkSegmentHandle*>(ctx->seg), 0);
                 pending = pending || !ctx->done.load(std::memory_order_acquire);
             }
             if (pending) {
@@ -805,19 +806,20 @@ bool SpdkInitiator::ProbeSegment(const std::string& tr_str, uint32_t timeout_ms,
 }
 
 uint32_t SpdkInitiator::GetBlockSize(const NofSegmentHandle* handle) {
-    return impl_->GetBlockSize(handle);
+    return impl_->GetBlockSize(static_cast<const SpdkSegmentHandle*>(handle));
 }
 
 int SpdkInitiator::SubmitIO(NofSegmentHandle* handle, void* buffer,
                             uint64_t byte_offset, uint64_t byte_length,
                             NofIOOp op, NofIOAdaptor* adaptor) {
-    return impl_->SubmitIO(handle, buffer, byte_offset, byte_length, op,
-                           adaptor);
+    return impl_->SubmitIO(static_cast<SpdkSegmentHandle*>(handle), buffer,
+                           byte_offset, byte_length, op, adaptor);
 }
 
 int64_t SpdkInitiator::PollCompletion(NofSegmentHandle* handle,
                                       uint32_t max_completions) {
-    return impl_->PollCompletion(handle, max_completions);
+    return impl_->PollCompletion(static_cast<SpdkSegmentHandle*>(handle),
+                                 max_completions);
 }
 
 ErrorCode SpdkInitiator::RegisterMemory(void* ptr, size_t size) {

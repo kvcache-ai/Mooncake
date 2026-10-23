@@ -45,6 +45,7 @@ class MockInitiator : public NVMeoFInitiator {
 
     int SubmitIO(NofSegmentHandle*, void*, uint64_t, uint64_t, NofIOOp,
                  NofIOAdaptor* adaptor) override {
+        if (pending_.size() >= queue_limit_) return -EAGAIN;
         if (fail_submit_) {
             return -1;
         }
@@ -76,6 +77,7 @@ class MockInitiator : public NVMeoFInitiator {
     ErrorCode UnregisterMemory(void*) override { return ErrorCode::OK; }
     NofCapabilities GetCapabilities() const override { return {}; }
 
+    size_t queue_limit_ = 4096;
     uint32_t block_size_ = 4096;
     bool fail_submit_ = false;
     bool fail_io_ = false;
@@ -126,6 +128,19 @@ TEST(NofWorkerPoolTest, SubmitFailureFailsTask) {
     state->wait_for_completion();
     EXPECT_TRUE(state->is_completed());
     EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
+}
+
+TEST(NofWorkerPoolTest, CompletesTaskWithSingleEntryQueue) {
+    auto mock = std::make_shared<MockInitiator>();
+    mock->queue_limit_ = 1;
+    NofWorkerPool pool(mock, 0);
+    auto* seg = mock->OpenSegment("backpressure");
+    auto state = std::make_shared<NofOperationState>();
+    std::vector<uint8_t> buf(4 * 1024 * 1024);
+    pool.submitTask(
+        NofTask(seg, buf.data(), 0, buf.size(), NofIOOp::kWrite, state));
+    state->wait_for_completion();
+    EXPECT_EQ(state->get_result(), ErrorCode::OK);
 }
 
 TEST(NofRuntimeTest, NonNofBuildReturnsNullInitiator) {
