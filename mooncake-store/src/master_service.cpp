@@ -56,6 +56,9 @@
 #include "kv_event/kv_event_config.h"
 #include "ha_metric_manager.h"
 #include "metadata_store.h"
+#include "eviction/evictor.h"
+#include "eviction/offloading_reclaimer.h"
+#include "eviction/report_observers.h"
 
 namespace mooncake {
 
@@ -158,6 +161,265 @@ bool MasterService::DefaultProbeNofSegment(const std::string& te_endpoint,
     }
     return initiator->ProbeSegment(te_endpoint, timeout_ms, error_reason);
 }
+
+// Memory eviction's ties to this service: memory replicas are what it takes,
+// and the reclaimer that takes them follows the HA and offload settings.
+struct MasterService::MemoryEviction {
+    // A completed memory replica nobody holds may go, except a managed
+    // weight's. A soft-pinned object gives its memory only to make up a
+    // round's minimum, and only when soft pins may be evicted at all.
+    class Policy final : public eviction::EvictionPolicy {
+       public:
+        Policy(const MasterService& service, bool allow_soft_pinned)
+            : service_(service), allow_soft_pinned_(allow_soft_pinned) {}
+
+        tl::expected<eviction::Plan, eviction::SkipReason> Decide(
+            const eviction::Candidate& candidate) const override {
+            // A managed weight leaves memory only through its manager.
+            if (candidate.metadata.IsGrouped() &&
+                service_.weight_manager_.IsManagedGroup(
+                    candidate.metadata.group_id)) {
+                return tl::make_unexpected(
+                    eviction::SkipReason::kExternalEvict);
+            }
+            if (service_.IsSoftPinActive(candidate.metadata, candidate.now)) {
+                if (!allow_soft_pinned_) {
+                    return tl::make_unexpected(
+                        eviction::SkipReason::kSoftPinned);
+                }
+                if (!candidate.fallback) {
+                    return tl::make_unexpected(eviction::SkipReason::kDeferred);
+                }
+            }
+            eviction::Plan plan;
+            for (const Replica& replica : candidate.metadata.GetAllReplicas()) {
+                if (service_.IsEvictableMemoryReplica(replica)) {
+                    plan.release.push_back(replica.id());
+                }
+            }
+            if (plan.release.empty()) {
+                return tl::make_unexpected(
+                    eviction::SkipReason::kNothingToRelease);
+            }
+            return plan;
+        }
+
+       private:
+        const MasterService& service_;
+        const bool allow_soft_pinned_;
+    };
+
+    // Takes the replicas off the object on the spot, with the cache, quota
+    // and dynamic-replication bookkeeping that goes with them.
+    class ImmediateReclaimer final : public eviction::Reclaimer {
+       public:
+        explicit ImmediateReclaimer(MasterService& service)
+            : service_(service) {}
+
+        tl::expected<eviction::Effect, ErrorCode> Apply(
+            metadata::Namespace& ns, const route::WriteGuard& hold,
+            const eviction::Plan& plan, const eviction::Report&) override {
+            ObjectMetadata& metadata = hold.metadata();
+            const uint64_t before_charge =
+                service_.CompletedMemoryQuotaCharge(metadata);
+            eviction::Effect effect;
+            effect.detached = service_.PopReplicasWithCacheTotalAccounting(
+                metadata, [&plan](const Replica& replica) {
+                    return InPlan(plan, replica);
+                });
+            std::vector<ReplicaID> released_ids;
+            released_ids.reserve(effect.detached.size());
+            for (const auto& replica : effect.detached) {
+                released_ids.push_back(replica.id());
+            }
+            service_.dynamic_replication_.RecordReplicaRemoval(metadata,
+                                                               released_ids);
+            const uint64_t after_charge =
+                service_.CompletedMemoryQuotaCharge(metadata);
+            if (service_.enable_multi_tenants_ &&
+                before_charge > after_charge) {
+                auto release_result = metadata.quota_ledger.ReleaseCommitted(
+                    service_.QuotaAccountOf(ns.id()),
+                    before_charge - after_charge);
+                LogTenantQuotaLedgerError(release_result, "release_committed",
+                                          metadata.tenant_id,
+                                          metadata.user_key);
+            }
+            effect.released_bytes =
+                metadata.TotalLength() * effect.detached.size();
+            effect.needs_teardown = !metadata.IsValid();
+            effect.outcome = effect.needs_teardown
+                                 ? eviction::Outcome::kDropped
+                                 : eviction::Outcome::kDemoted;
+            return effect;
+        }
+
+        void TearDown(metadata::Namespace& ns,
+                      const route::WriteGuard& hold) override {
+            service_.EraseMetadata(ns.id(), hold, QuotaEraseMode::kFull);
+        }
+
+       private:
+        MasterService& service_;
+    };
+
+    // HA strong consistency: records the object as it will be once the
+    // replicas are gone and marks them removed; they are freed once the
+    // record is durable, which also tears down an object left with nothing.
+    class OpLogReclaimer final : public eviction::Reclaimer {
+       public:
+        explicit OpLogReclaimer(MasterService& service) : service_(service) {}
+
+        tl::expected<eviction::Effect, ErrorCode> Apply(
+            metadata::Namespace& ns, const route::WriteGuard& hold,
+            const eviction::Plan& plan, const eviction::Report&) override {
+            ObjectMetadata& metadata = hold.metadata();
+            const std::string& key = hold.key();
+            const auto in_plan = [&plan](const Replica& replica) {
+                return InPlan(plan, replica);
+            };
+            auto remaining =
+                service_.BuildRemainingReplicaDescriptors(metadata, in_plan);
+
+            // Keep the removed IDs local until submission succeeds so a
+            // consumed reservation cannot strand REMOVED replicas.
+            auto reservation = service_.ReserveBatchOpLogSlot();
+            if (!reservation) {
+                LOG(WARNING)
+                    << "BatchEvict: OpLog reservation failed for key=" << key
+                    << ", err=" << static_cast<int>(reservation.error())
+                    << ", stopping eviction scan";
+                return tl::make_unexpected(reservation.error());
+            }
+            std::vector<ReplicaID> removed_ids;
+            metadata.VisitReplicas(in_plan, [&removed_ids](Replica& replica) {
+                removed_ids.push_back(replica.id());
+                replica.mark_removed();
+            });
+            auto persisted = service_.AppendReservedOpLogWithDurableFinalize(
+                std::move(reservation.value()),
+                remaining.empty() ? OpType::REMOVE : OpType::PUT_END,
+                ns.id().value(), key,
+                remaining.empty()
+                    ? std::string{}
+                    : service_.SerializeMetadataForOpLogFromReplicaDescriptors(
+                          metadata, remaining),
+                [this, removed_ids](const OpLogEntry& durable_entry) {
+                    service_.FinalizeRemovedReplicasAfterDurable(
+                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                });
+            if (!persisted) {
+                for (const auto& id : removed_ids) {
+                    if (auto* replica = metadata.GetReplicaByID(id);
+                        replica != nullptr) {
+                        replica->cancel_remove();
+                    }
+                }
+                LOG(WARNING)
+                    << "BatchEvict: OpLog persist failed for key=" << key
+                    << ", err=" << static_cast<int>(persisted.error())
+                    << ", stopping eviction scan";
+                return tl::make_unexpected(persisted.error());
+            }
+            eviction::Effect effect;
+            effect.released_bytes = metadata.TotalLength() * removed_ids.size();
+            effect.outcome = remaining.empty() ? eviction::Outcome::kDropped
+                                               : eviction::Outcome::kDemoted;
+            return effect;
+        }
+
+        // The durable finalize tears the object down, so Apply never asks.
+        void TearDown(metadata::Namespace& ns,
+                      const route::WriteGuard& hold) override {
+            service_.EraseMetadata(ns.id(), hold, QuotaEraseMode::kFull);
+        }
+
+       private:
+        MasterService& service_;
+    };
+
+    class OffloadQueue final : public eviction::OffloadQueue {
+       public:
+        explicit OffloadQueue(MasterService& service) : service_(service) {}
+
+        bool Push(const TenantId& tenant_id, const std::string& key,
+                  Replica& source, std::vector<UUID>* mirror_clients) override {
+            return service_
+                .PushOffloadingQueue(ObjectIdentity{tenant_id, key}, source,
+                                     mirror_clients)
+                .has_value();
+        }
+
+       private:
+        MasterService& service_;
+    };
+
+    // Announces that an object lost memory. With the OpLog on, the durable
+    // finalize announces it instead.
+    class KvEventObserver final : public eviction::EvictionObserver {
+       public:
+        explicit KvEventObserver(MasterService& service) : service_(service) {}
+
+        void OnApplied(const eviction::ObjectView& view,
+                       const eviction::Effect& effect) override {
+            if (effect.released_bytes > 0) {
+                service_.PublishKvRemovedAfterEvict(
+                    view.key, 1, "cpu", view.metadata, view.tenant_id);
+            }
+        }
+
+       private:
+        MasterService& service_;
+    };
+
+    struct Settings {
+        bool through_oplog = false;
+        bool allow_evict_soft_pinned = false;
+        bool offload_on_evict = false;
+        eviction::OffloadingReclaimer::Options offload;
+    };
+
+    MemoryEviction(MasterService& service, const Settings& settings)
+        : policy(service, settings.allow_evict_soft_pinned),
+          immediate(service),
+          oplog(service),
+          offload_queue(service),
+          offloading(immediate, offload_queue, settings.offload),
+          kv_events(service),
+          log(settings.offload.cap),
+          evictor(service.namespaces_, policy,
+                  settings.through_oplog
+                      ? static_cast<eviction::Reclaimer&>(oplog)
+                  : settings.offload_on_evict
+                      ? static_cast<eviction::Reclaimer&>(offloading)
+                      : static_cast<eviction::Reclaimer&>(immediate),
+                  Observers(settings)) {}
+
+    static bool InPlan(const eviction::Plan& plan, const Replica& replica) {
+        return std::find(plan.release.begin(), plan.release.end(),
+                         replica.id()) != plan.release.end();
+    }
+
+    std::vector<eviction::EvictionObserver*> Observers(
+        const Settings& settings) {
+        std::vector<eviction::EvictionObserver*> observers{&metrics, &log};
+        if (!settings.through_oplog) {
+            observers.push_back(&kv_events);
+        }
+        return observers;
+    }
+
+    Policy policy;
+    ImmediateReclaimer immediate;
+    OpLogReclaimer oplog;
+    OffloadQueue offload_queue;
+    eviction::OffloadingReclaimer offloading;
+    KvEventObserver kv_events;
+    eviction::MetricsObserver metrics;
+    eviction::LogObserver log;
+    // Last, so everything it refers to is built first.
+    eviction::Evictor evictor;
+};
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
@@ -346,6 +608,17 @@ MasterService::MasterService(const MasterServiceConfig& config)
                          "cap will be evicted without disk offload";
         }
     }
+    memory_eviction_ = std::make_unique<MemoryEviction>(
+        *this,
+        MemoryEviction::Settings{
+            .through_oplog = enable_oplog_,
+            .allow_evict_soft_pinned = allow_evict_soft_pinned_objects_,
+            .offload_on_evict = offload_on_evict_,
+            .offload = {.cap = offload_on_evict_
+                                   ? static_cast<long>(offloading_queue_limit_ *
+                                                       offload_cap_ratio_)
+                                   : 0,
+                        .force_evict = offload_force_evict_}});
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY. Only meaningful when offload is enabled
@@ -1490,170 +1763,70 @@ std::vector<std::string> MasterService::GetGroupMemberKeys(
     return ns->objects.GroupMembers(group_id);
 }
 
-MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
-    const TenantId& tenant_id, const std::string& key,
-    const std::string& group_id, bool allow_soft_pinned,
-    bool allow_managed_weight, bool allow_hard_pinned,
-    std::chrono::system_clock::time_point now,
-    const std::function<EvictMemberOutcome(MetadataAccessorRW& member)>&
-        evict_one_member) {
-    GroupEvictionResult result;
-
-    if (!allow_managed_weight && !group_id.empty() &&
-        weight_manager_.IsManagedGroup(group_id)) {
-        return result;
-    }
-
-    // Group membership lives in the tenant's route and is read WITHOUT
-    // holding any key.
-    std::vector<std::string> member_keys =
-        GetGroupMemberKeys(tenant_id, group_id);
-    if (member_keys.empty()) {
-        member_keys.push_back(key);
-    }
-
-    // Each member is held on its own, one at a time, and re-looked-up and
-    // re-validated under its own lock, so no two evictions wait on each
-    // other's keys.
-    auto is_evictable_memory_replica = [this](const Replica& replica) {
-        return IsEvictableMemoryReplica(replica);
-    };
-    for (const auto& member_key : member_keys) {
-        MetadataAccessorRW member(this, ObjectIdentity{tenant_id, member_key});
-        if (!member.IsPublished()) {
-            continue;
-        }
-        auto& member_metadata = member.Get();
-        if (!allow_managed_weight &&
-            weight_manager_.IsManagedGroup(member_metadata.group_id)) {
-            continue;
-        }
-        // Re-validate under the member's own lock: the group/member lease
-        // and pin state may have changed since the caller's snapshot. A
-        // surviving shared group lease makes every member's lease not
-        // expired, so the whole group is skipped here.
-        if ((!allow_hard_pinned && member_metadata.IsHardPinned()) ||
-            !member_metadata.IsLeaseExpired(now) ||
-            (!allow_soft_pinned && IsSoftPinActive(member_metadata, now)) ||
-            !member_metadata.HasReplica(is_evictable_memory_replica)) {
-            continue;
-        }
-        // The callback performs only the path-specific eviction (oplog
-        // persist, offload, publish) and may erase the member it holds.
-        EvictMemberOutcome member_outcome = evict_one_member(member);
-        result.freed_bytes += member_outcome.freed_bytes;
-        result.evicted_objects += member_outcome.evicted_objects;
-        if (member_outcome.stop_scan) {
-            result.stop_scan = true;
-            result.error = member_outcome.error;
-            break;
-        }
-    }
-    return result;
-}
-
-MasterService::GroupEvictionResult
-MasterService::EvictManagedWeightMembersToCold(
+void MasterService::EvictManagedWeightMembersToCold(
     const WeightRevisionMetadata& revision,
     const std::vector<std::string>& member_keys) {
     const TenantId tenant_id(revision.identity.tenant_id);
-    if (member_keys.empty()) {
-        return {};
+    metadata::Namespace* ns = namespaces_.Lookup(tenant_id);
+    if (ns == nullptr || member_keys.empty()) {
+        return;
     }
     const std::unordered_set<std::string> selected_members(member_keys.begin(),
                                                            member_keys.end());
-
-    const auto now = std::chrono::system_clock::now();
-    std::vector<std::vector<Replica>> deferred_replicas;
+    // Not const: ObjectMetadata::IsLeaseExpired takes it by reference.
+    auto now = std::chrono::system_clock::now();
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    auto is_evictable_memory = [this](const Replica& replica) {
-        return IsEvictableMemoryReplica(replica);
-    };
-    auto evict_one = [&,
-                      this](MetadataAccessorRW& member) -> EvictMemberOutcome {
-        const auto& member_key = member.GetKey();
-        auto& metadata = member.Get();
+    // Memory eviction's own reclaimer, without the offload: a member goes cold
+    // only when it holds a readable cold replica already.
+    eviction::Reclaimer& reclaimer =
+        enable_oplog_
+            ? static_cast<eviction::Reclaimer&>(memory_eviction_->oplog)
+            : memory_eviction_->immediate;
+    for (const std::string& member_key :
+         ns->objects.GroupMembers(revision.manifest.payload_group_id)) {
         if (!selected_members.contains(member_key)) {
-            return {};
+            continue;
         }
+        // Freed once the member's lock is let go.
+        std::vector<Replica> detached;
+        const std::optional<route::WriteGuard> hold =
+            ns->objects.Write(member_key);
+        if (!hold) {
+            continue;
+        }
+        ObjectMetadata& metadata = hold->metadata();
         const bool has_cold =
             metadata.HasReplica([this](const Replica& replica) {
                 return !replica.is_memory_replica() &&
                        IsReplicaReadable(replica);
             });
-        if (!has_cold) {
-            return {};
+        if (!has_cold || !metadata.IsLeaseExpired(now) ||
+            IsSoftPinActive(metadata, now)) {
+            continue;
         }
-
-        if (enable_oplog_) {
-            auto reservation = ReserveBatchOpLogSlot();
-            if (!reservation) {
-                return {.stop_scan = true, .error = reservation.error()};
+        eviction::Plan plan;
+        for (const Replica& replica : metadata.GetAllReplicas()) {
+            if (IsEvictableMemoryReplica(replica)) {
+                plan.release.push_back(replica.id());
             }
-            auto remaining =
-                BuildRemainingReplicaDescriptors(metadata, is_evictable_memory);
-            std::vector<ReplicaID> removed_ids;
-            metadata.VisitReplicas(is_evictable_memory,
-                                   [&removed_ids](Replica& replica) {
-                                       removed_ids.push_back(replica.id());
-                                       replica.mark_removed();
-                                   });
-            if (removed_ids.empty()) {
-                return {};
-            }
-            auto persisted = AppendReservedOpLogWithDurableFinalize(
-                std::move(reservation.value()), OpType::PUT_END,
-                tenant_id.value(), member_key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
-                                                                remaining),
-                [this, removed_ids](const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, QuotaEraseMode::kFull);
-                });
-            if (!persisted) {
-                for (const auto& id : removed_ids) {
-                    if (auto* replica = metadata.GetReplicaByID(id)) {
-                        replica->cancel_remove();
-                    }
-                }
-                return {.stop_scan = true, .error = persisted.error()};
-            }
-            PublishKvRemovedAfterEvict(member_key, removed_ids.size(), "cpu",
-                                       metadata, tenant_id);
-            return {.freed_bytes = metadata.TotalLength() * removed_ids.size(),
-                    .evicted_objects = 1};
         }
-
-        const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
-        auto removed =
-            PopReplicasWithCacheTotalAccounting(metadata, is_evictable_memory);
-        const uint64_t removed_count = removed.size();
-        if (removed_count == 0) {
-            return {};
+        if (plan.release.empty()) {
+            continue;
         }
-        std::vector<ReplicaID> removed_ids;
-        removed_ids.reserve(removed.size());
-        for (const auto& replica : removed) {
-            removed_ids.push_back(replica.id());
+        auto effect = reclaimer.Apply(*ns, *hold, plan, eviction::Report{});
+        if (!effect) {
+            break;
         }
-        dynamic_replication_.RecordReplicaRemoval(metadata, removed_ids);
-        deferred_replicas.emplace_back(std::move(removed));
-        const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
-        if (enable_multi_tenants_ && before_charge > after_charge) {
-            auto released = metadata.quota_ledger.ReleaseCommitted(
-                member.QuotaAccount(), before_charge - after_charge);
-            LogTenantQuotaLedgerError(released, "release_committed", tenant_id,
-                                      member_key);
+        // With the OpLog on, the durable finalize announces it instead.
+        if (!enable_oplog_) {
+            PublishKvRemovedAfterEvict(member_key, effect->detached.size(),
+                                       "cpu", metadata, tenant_id);
         }
-        PublishKvRemovedAfterEvict(member_key, removed_count, "cpu", metadata,
-                                   tenant_id);
-        return {.freed_bytes = metadata.TotalLength() * removed_count,
-                .evicted_objects = 1};
-    };
-
-    return EvictGroupOrObject(tenant_id, member_keys.front(),
-                              revision.manifest.payload_group_id, false, true,
-                              true, now, evict_one);
+        if (effect->needs_teardown) {
+            reclaimer.TearDown(*ns, *hold);
+        }
+        detached = std::move(effect->detached);
+    }
 }
 
 bool MasterService::HasCompletedMemoryCacheReplica(
@@ -10062,1078 +10235,52 @@ uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
 MasterService::TenantQuotaEvictionResult
 MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                                          uint64_t target_bytes) {
-    TenantQuotaEvictionResult total;
     if (!enable_multi_tenants_ || target_bytes == 0) {
-        return total;
+        return {};
     }
-
-    const TenantId normalized_tenant(tenant_id);
-    auto now = std::chrono::system_clock::now();
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    const metadata::Namespace* ns = namespaces_.Lookup(normalized_tenant);
-    if (ns == nullptr) {
-        return total;
+    const eviction::Report report = memory_eviction_->evictor.Run(
+        tenant_id, eviction::ByteGoal{.target_bytes = target_bytes});
+    if (report.evicted_objects > 0) {
+        if (metadata::Namespace* ns = namespaces_.Lookup(tenant_id)) {
+            ns->objects.ShrinkSparseStripes();
+        }
     }
-
-    auto is_evictable_memory_replica = [this](const Replica& replica) {
-        return IsEvictableMemoryReplica(replica);
-    };
-    auto can_evict_replicas = [&](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(is_evictable_memory_replica);
-    };
-    auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
-    };
-    auto evict_replicas =
-        [&, this](TenantQuotaHandle quota_account, ObjectMetadata& metadata,
-                  std::vector<std::vector<Replica>>& deferred_replicas) {
-            const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
-            auto replicas = PopReplicasWithCacheTotalAccounting(
-                metadata, is_evictable_memory_replica);
-            std::vector<ReplicaID> erased_ids;
-            erased_ids.reserve(replicas.size());
-            for (const auto& replica : replicas) {
-                erased_ids.push_back(replica.id());
-            }
-            dynamic_replication_.RecordReplicaRemoval(metadata, erased_ids);
-            const uint64_t replica_count = replicas.size();
-            if (!replicas.empty()) {
-                deferred_replicas.emplace_back(std::move(replicas));
-            }
-            const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
-            if (before_charge > after_charge) {
-                auto release_result = metadata.quota_ledger.ReleaseCommitted(
-                    quota_account, before_charge - after_charge);
-                LogTenantQuotaLedgerError(release_result, "release_committed",
-                                          metadata.tenant_id,
-                                          metadata.user_key);
-            }
-            return metadata.TotalLength() * replica_count;
-        };
-    long offload_queued_this_call = 0;
-    long offload_deferred_count = 0;
-    long offload_cap_forced_count = 0;
-    long offload_push_failed_forced = 0;
-    const long offload_cap =
-        offload_on_evict_
-            ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
-            : 0;
-
-    auto try_evict_or_offload = [&, this](const std::string& key,
-                                          ObjectMetadata& metadata,
-                                          TenantQuotaHandle quota_account,
-                                          route::ObjectState& state,
-                                          std::vector<std::vector<Replica>>&
-                                              deferred_replicas) {
-        if (!offload_on_evict_) {
-            return evict_replicas(quota_account, metadata, deferred_replicas);
-        }
-
-        if (has_local_disk_replica(metadata)) {
-            return evict_replicas(quota_account, metadata, deferred_replicas);
-        }
-
-        if (offload_force_evict_ && offload_queued_this_call >= offload_cap) {
-            ++offload_cap_forced_count;
-            return evict_replicas(quota_account, metadata, deferred_replicas);
-        }
-
-        bool queued = false;
-        metadata.VisitReplicas(
-            is_evictable_memory_replica,
-            [this, &key, &normalized_tenant, &state, &queued,
-             &now](Replica& replica) {
-                if (queued) {
-                    return;
-                }
-                std::vector<UUID> mirror_clients;
-                auto result = PushOffloadingQueue(
-                    MakeObjectIdentity(key, normalized_tenant), replica,
-                    &mirror_clients);
-                if (result) {
-                    replica.inc_refcnt();
-                    auto& task = state.offloading_task;
-                    if (!task) {
-                        task = OffloadingTask{replica.id(), now,
-                                              std::move(mirror_clients)};
-                    }
-                    queued = true;
-                }
-            });
-
-        if (queued) {
-            ++offload_queued_this_call;
-            ++offload_deferred_count;
-            return evict_replicas(quota_account, metadata, deferred_replicas);
-        }
-
-        if (offload_force_evict_) {
-            ++offload_push_failed_forced;
-            return evict_replicas(quota_account, metadata, deferred_replicas);
-        }
-        return uint64_t{0};
-    };
-
-    auto try_evict_group_or_object =
-        [&, this](const std::string& key, bool allow_soft_pinned,
-                  std::vector<std::vector<Replica>>& deferred_replicas)
-        -> TenantQuotaEvictionResult {
-        // Snapshot grouped-ness under the trigger's lock; it is let go of
-        // before any member is held (see EvictGroupOrObject).
-        std::string group_id;
-        {
-            MetadataAccessorRW trigger(this,
-                                       ObjectIdentity{normalized_tenant, key});
-            if (!trigger.IsPublished()) {
-                return {};
-            }
-            auto& metadata = trigger.Get();
-            // Re-validate: state may have changed since the collection phase.
-            // Soft pins are only a blocker when this pass is not allowed to
-            // evict them.
-            if (now < metadata.EvictionDeadline() ||
-                (!allow_soft_pinned && IsSoftPinActive(metadata, now)) ||
-                !can_evict_replicas(metadata)) {
-                return {};
-            }
-            if (!metadata.IsGrouped()) {
-                uint64_t freed =
-                    try_evict_or_offload(key, metadata, trigger.QuotaAccount(),
-                                         trigger.GetState(), deferred_replicas);
-                TenantQuotaEvictionResult result{
-                    .freed_bytes = freed,
-                    .evicted_objects = freed > 0 ? 1U : 0U};
-                if (freed > 0) {
-                    PublishKvRemovedAfterEvict(key, 1, "cpu", metadata,
-                                               normalized_tenant);
-                }
-                if (!metadata.IsValid()) {
-                    trigger.Erase();
-                }
-                return result;
-            }
-            group_id = metadata.group_id;
-        }
-
-        // Grouped object: the group is evicted all-or-none at the group level
-        // (either the whole group is protected or it is a candidate), based on
-        // the shared group TTL. Within an evicted group, member-level
-        // best-effort safety still applies (hard pins, soft pins, active
-        // writes, busy replicas are skipped). Re-validation of each member
-        // (lease/pin/evictable replica) happens inside EvictGroupOrObject under
-        // the member's own lock, so this callback only performs the
-        // path-specific eviction. Membership is read from group_domain_
-        // (keyed by scoped(tenant, group_id)).
-        auto evict_one_member =
-            [&, this](MetadataAccessorRW& member) -> EvictMemberOutcome {
-            const std::string& member_key = member.GetKey();
-            auto& member_metadata = member.Get();
-            const uint64_t freed = try_evict_or_offload(
-                member_key, member_metadata, member.QuotaAccount(),
-                member.GetState(), deferred_replicas);
-            EvictMemberOutcome outcome{.freed_bytes = freed,
-                                       .evicted_objects = freed > 0 ? 1 : 0};
-            if (freed > 0) {
-                PublishKvRemovedAfterEvict(member_key, 1, "cpu",
-                                           member_metadata, normalized_tenant);
-            }
-            if (member_key != key && !member_metadata.IsValid()) {
-                member.Erase();
-            }
-            return outcome;
-        };
-
-        GroupEvictionResult group_result = EvictGroupOrObject(
-            normalized_tenant, key, group_id, allow_soft_pinned, false, false,
-            now, evict_one_member);
-        TenantQuotaEvictionResult result{
-            .freed_bytes = group_result.freed_bytes,
-            .evicted_objects =
-                static_cast<uint64_t>(group_result.evicted_objects)};
-
-        // The callback erased every member except the trigger; re-look-up the
-        // trigger to erase it if it is now invalid.
-        {
-            MetadataAccessorRW trigger(this,
-                                       ObjectIdentity{normalized_tenant, key});
-            if (trigger.IsPublished() && !trigger.Get().IsValid()) {
-                trigger.Erase();
-            }
-        }
-        return result;
-    };
-
-    auto pass = [&](bool allow_soft_pinned) {
-        // Take the candidate keys through the tenant's cursor, then evict each
-        // after it: EvictGroupOrObject holds each member's key on its own, one
-        // at a time, and must not be entered holding any. The list is rotated
-        // to a random start, so that the objects a walk reaches first are not
-        // the ones every pass prefers.
-        std::vector<std::string> candidate_keys;
-        for (auto object : ns->objects.ReadCursor()) {
-            const auto& metadata = object.metadata();
-            if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
-                (!allow_soft_pinned && IsSoftPinActive(metadata, now)) ||
-                !can_evict_replicas(metadata)) {
-                continue;
-            }
-            candidate_keys.push_back(object.key());
-        }
-        if (candidate_keys.empty()) {
-            return;
-        }
-        std::rotate(candidate_keys.begin(),
-                    candidate_keys.begin() + randomIndex(candidate_keys.size()),
-                    candidate_keys.end());
-        std::vector<std::vector<Replica>> deferred_replicas;
-        for (const auto& key : candidate_keys) {
-            if (total.freed_bytes >= target_bytes) {
-                break;
-            }
-            auto evict_result = try_evict_group_or_object(
-                key, allow_soft_pinned, deferred_replicas);
-            total.freed_bytes += evict_result.freed_bytes;
-            total.evicted_objects += evict_result.evicted_objects;
-            deferred_replicas.clear();
-        }
-    };
-
-    pass(/*allow_soft_pinned=*/false);
-    if (allow_evict_soft_pinned_objects_ && total.freed_bytes < target_bytes) {
-        pass(/*allow_soft_pinned=*/true);
-    }
-
-    if (total.freed_bytes > 0) {
-        MasterMetricManager::instance().inc_tenant_evict_bytes(
-            normalized_tenant.value(),
-            static_cast<int64_t>(std::min<uint64_t>(
-                total.freed_bytes,
-                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))));
-    }
-    if (offload_on_evict_ && total.freed_bytes == 0 &&
-        offload_deferred_count > 0) {
-        LOG(WARNING) << "[TENANT-EVICT] No memory freed for tenant "
-                     << normalized_tenant << "; " << offload_deferred_count
-                     << " object(s) deferred for disk offload.";
-    }
-    if (offload_cap_forced_count > 0) {
-        LOG(WARNING) << "[TENANT-EVICT] Offload cap (" << offload_cap
-                     << ") reached for tenant " << normalized_tenant
-                     << "; force-evicted " << offload_cap_forced_count
-                     << " object(s) without disk offload.";
-    }
-    if (offload_push_failed_forced > 0) {
-        LOG(WARNING) << "[TENANT-EVICT] PushOffloadingQueue failed for tenant "
-                     << normalized_tenant << " on "
-                     << offload_push_failed_forced
-                     << " object(s); force-evicted without disk offload "
-                        "(offload_force_evict=true).";
-    }
-    return total;
+    return {.freed_bytes = report.released_bytes,
+            .evicted_objects = report.evicted_objects};
 }
 
 void MasterService::BatchEvict(double evict_ratio_target,
                                double evict_ratio_lowerbound) {
-    // Consume the allocation-pressure signal before this pass. A new failure
-    // during the pass remains visible to the next iteration.
+    // Consume the allocation-pressure signal before this round. A new failure
+    // during the round remains visible to the next iteration.
     const bool allocation_pressure =
         need_mem_eviction_.exchange(false, std::memory_order_relaxed);
 
-    if (evict_ratio_target < evict_ratio_lowerbound) {
-        LOG(ERROR) << "evict_ratio_target=" << evict_ratio_target
-                   << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound
-                   << ", error=invalid_params";
-        evict_ratio_lowerbound = evict_ratio_target;
-    }
-
-    auto now = std::chrono::system_clock::now();
-
-    auto is_evictable_memory_replica = [this](const Replica& replica) {
-        return IsEvictableMemoryReplica(replica);
-    };
-
-    auto can_evict_replicas = [&](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(is_evictable_memory_replica);
-    };
-
-    auto evict_replicas =
-        [&, this](TenantQuotaHandle quota_account, ObjectMetadata& metadata,
-                  std::vector<std::vector<Replica>>& deferred_replicas) {
-            if (enable_oplog_) {
-                return metadata.TotalLength() *
-                       metadata.CountReplicas([](const Replica& replica) {
-                           return replica.is_memory_replica() &&
-                                  replica.status() == ReplicaStatus::REMOVED;
-                       });
-            }
-            const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
-            auto replicas = PopReplicasWithCacheTotalAccounting(
-                metadata, is_evictable_memory_replica);
-            std::vector<ReplicaID> erased_ids;
-            erased_ids.reserve(replicas.size());
-            for (const auto& replica : replicas) {
-                erased_ids.push_back(replica.id());
-            }
-            dynamic_replication_.RecordReplicaRemoval(metadata, erased_ids);
-            const size_t replica_count = replicas.size();
-            if (!replicas.empty()) {
-                deferred_replicas.emplace_back(std::move(replicas));
-            }
-            const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
-            if (enable_multi_tenants_ && before_charge > after_charge) {
-                auto release_result = metadata.quota_ledger.ReleaseCommitted(
-                    quota_account, before_charge - after_charge);
-                LogTenantQuotaLedgerError(release_result, "release_committed",
-                                          metadata.tenant_id,
-                                          metadata.user_key);
-            }
-            return metadata.TotalLength() * replica_count;
-        };
-
-    // --- Offload-on-evict support ---
-    long offload_queued_this_cycle = 0;
-    long offload_deferred_count = 0;
-    long offload_cap_forced_count = 0;    // #keys force-evicted due to cap
-    long offload_push_failed_forced = 0;  // #keys force-evicted on push fail
-    const long offload_cap =
-        offload_on_evict_
-            ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
-            : 0;
-
-    auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
-    };
-
-    // Returns freed bytes. Returns 0 if offload-queued and no additional
-    // replicas were evicted (all MEMORY replicas of the key are now pinned).
-    auto try_evict_or_offload =
-        [&, this](
-            const TenantId& tenant_id, const std::string& key,
-            ObjectMetadata& metadata, TenantQuotaHandle quota_account,
-            route::ObjectState& state,
-            std::vector<std::vector<Replica>>& deferred_replicas) -> uint64_t {
-        if (enable_oplog_) {
-            return evict_replicas(quota_account, metadata, deferred_replicas);
-        }
-        if (!offload_on_evict_) {
-            // Original behavior
-            return evict_replicas(quota_account, metadata, deferred_replicas);
-        }
-
-        // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
-        if (has_local_disk_replica(metadata)) {
-            return evict_replicas(quota_account, metadata, deferred_replicas);
-        }
-
-        // Force-evict cap: if force_evict enabled and cap reached, force
-        // delete. Warning is aggregated at the end of the cycle to avoid log
-        // flooding.
-        if (offload_force_evict_ && offload_queued_this_cycle >= offload_cap) {
-            offload_cap_forced_count++;
-            return evict_replicas(quota_account, metadata, deferred_replicas);
-        }
-
-        // Queue one MEMORY replica for offload; others will be evicted below.
-        bool queued = false;
-        metadata.VisitReplicas(
-            is_evictable_memory_replica,
-            [this, &tenant_id, &key, &state, &queued, &now](Replica& replica) {
-                if (queued) return;  // only need to pin one replica for offload
-                std::vector<UUID> mirror_clients;
-                auto result =
-                    PushOffloadingQueue(MakeObjectIdentity(key, tenant_id),
-                                        replica, &mirror_clients);
-                if (result) {
-                    replica.inc_refcnt();
-                    auto& task = state.offloading_task;
-                    if (!task) {
-                        task = OffloadingTask{replica.id(), now,
-                                              std::move(mirror_clients)};
-                    }
-                    queued = true;
-                }
-            });
-
-        if (queued) {
-            offload_queued_this_cycle++;
-            offload_deferred_count++;
-            // Any remaining MEMORY replicas with refcnt==0 are redundant copies
-            // (data survives via the pinned replica → disk). Evict them now to
-            // reclaim memory immediately rather than waiting another cycle.
-            return evict_replicas(quota_account, metadata, deferred_replicas);
-        }
-
-        // PushOffloadingQueue failed. Default (data-preserving) behavior is to
-        // skip this cycle — the outer eviction loop will retry after the
-        // offload queue drains. Only force-evict when explicitly opted in, to
-        // prevent silent data loss when the queue is unavailable.
-        if (offload_force_evict_) {
-            offload_push_failed_forced++;
-            return evict_replicas(quota_account, metadata, deferred_replicas);
-        }
-        return 0;
-    };
-
-    // HA strong-consistency: persist the post-eviction state before the
-    // helper mutates metadata. Keep the removed IDs local until submission
-    // succeeds so a consumed reservation cannot strand REMOVED replicas.
-    auto persist_evict_oplog_or_skip =
-        [&, this](const TenantId& tenant_id, const std::string& key,
-                  ObjectMetadata& metadata) -> tl::expected<void, ErrorCode> {
-        if (!enable_oplog_) {
-            return {};
-        }
-
-        // Predict the descriptor list after evict_replicas() runs:
-        // drop COMPLETE memory replicas with refcnt==0; keep everything else
-        // that is COMPLETE.
-        auto remaining = BuildRemainingReplicaDescriptors(
-            metadata, is_evictable_memory_replica);
-
-        auto reservation = ReserveBatchOpLogSlot();
-        if (!reservation) {
-            LOG(WARNING) << "BatchEvict: OpLog reservation failed for key="
-                         << key
-                         << ", err=" << static_cast<int>(reservation.error())
-                         << ", stopping eviction scan";
-            return tl::make_unexpected(reservation.error());
-        }
-        std::vector<ReplicaID> removed_ids;
-        metadata.VisitReplicas(is_evictable_memory_replica,
-                               [&removed_ids](Replica& replica) {
-                                   removed_ids.push_back(replica.id());
-                                   replica.mark_removed();
-                               });
-        tl::expected<OpLogEntry, ErrorCode> persist_result;
-        if (remaining.empty()) {
-            persist_result = AppendReservedOpLogWithDurableFinalize(
-                std::move(reservation.value()), OpType::REMOVE,
-                tenant_id.value(), key, {},
-                [this, removed_ids](const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, QuotaEraseMode::kFull);
-                });
-        } else {
-            persist_result = AppendReservedOpLogWithDurableFinalize(
-                std::move(reservation.value()), OpType::PUT_END,
-                tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
-                                                                remaining),
-                [this, removed_ids](const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, QuotaEraseMode::kFull);
-                });
-        }
-        if (!persist_result) {
-            const ErrorCode error = persist_result.error();
-            for (const auto& id : removed_ids) {
-                if (auto* replica = metadata.GetReplicaByID(id);
-                    replica != nullptr) {
-                    replica->cancel_remove();
-                }
-            }
-            LOG(WARNING) << "BatchEvict: OpLog persist failed for key=" << key
-                         << ", err=" << static_cast<int>(error)
-                         << ", stopping eviction scan";
-            return tl::make_unexpected(error);
-        }
-        return {};
-    };
-
-    struct EvictionResult {
-        uint64_t freed_bytes{0};
-        long evicted_objects{0};
-        bool stop_scan{false};
-        // Set when the candidate was present but its re-validation failed
-        // (lease still live, soft-pinned, or no evictable replica), so the
-        // first pass can keep its lease timeout for the second-pass census.
-        bool revalidation_skipped{false};
-    };
-
-    // Evicts a single object or a whole group. MUST be called WITHOUT holding
-    // any key: EvictGroupOrObject holds one member at a time and never two,
-    // re-looking-up and re-validating each under its own key, so no two
-    // evictions wait on each other's keys.
-    auto try_evict_group_or_object =
-        [&, this](const TenantId& tenant_id, const std::string& key,
-                  bool allow_soft_pinned,
-                  std::vector<std::vector<Replica>>& deferred_replicas)
-        -> EvictionResult {
-        // Snapshot grouped-ness/membership under the trigger's lock; it is let
-        // go of before any member is held.
-        std::string group_id;
-        {
-            MetadataAccessorRW trigger(this, ObjectIdentity{tenant_id, key});
-            if (!trigger.IsPublished()) {
-                return {};
-            }
-            auto& metadata = trigger.Get();
-            // Re-validate: state may have changed since the census. Soft pins
-            // are only a blocker when this pass is not allowed to evict them.
-            if (now < metadata.EvictionDeadline() ||
-                (!allow_soft_pinned && IsSoftPinActive(metadata, now)) ||
-                !can_evict_replicas(metadata)) {
-                return {.revalidation_skipped = true};
-            }
-
-            if (!metadata.IsGrouped()) {
-                auto submission =
-                    persist_evict_oplog_or_skip(tenant_id, key, metadata);
-                if (!submission) {
-                    return {.stop_scan = true};
-                }
-                uint64_t freed = try_evict_or_offload(
-                    tenant_id, key, metadata, trigger.QuotaAccount(),
-                    trigger.GetState(), deferred_replicas);
-                EvictionResult result{.freed_bytes = freed,
-                                      .evicted_objects = freed > 0 ? 1 : 0};
-                if (!enable_oplog_ && freed > 0) {
-                    PublishKvRemovedAfterEvict(key, 1, "cpu", metadata,
-                                               tenant_id);
-                }
-                if (!enable_oplog_ && !metadata.IsValid()) {
-                    trigger.Erase();
-                }
-                return result;
-            }
-            group_id = metadata.group_id;
-        }
-
-        // Grouped object: the group is evicted all-or-none at the group level
-        // (either the whole group is protected or it is a candidate), based on
-        // the shared group TTL. Within an evicted group, member-level
-        // best-effort safety still applies below (hard pins, soft pins, active
-        // writes, busy replicas are skipped). Re-validation of each member
-        // (lease/pin/evictable replica) happens inside EvictGroupOrObject under
-        // the member's own lock, so this callback only performs the
-        // path-specific eviction. Membership is read from group_domain_
-        // (keyed by scoped(tenant, group_id)) without holding any key.
-        auto evict_one_member =
-            [&, this](MetadataAccessorRW& member) -> EvictMemberOutcome {
-            const std::string& member_key = member.GetKey();
-            auto& member_metadata = member.Get();
-            auto submission = persist_evict_oplog_or_skip(tenant_id, member_key,
-                                                          member_metadata);
-            if (!submission) {
-                return {.stop_scan = true};
-            }
-            const uint64_t freed = try_evict_or_offload(
-                tenant_id, member_key, member_metadata, member.QuotaAccount(),
-                member.GetState(), deferred_replicas);
-            EvictMemberOutcome outcome{.freed_bytes = freed,
-                                       .evicted_objects = freed > 0 ? 1 : 0};
-            if (freed > 0 && !enable_oplog_) {
-                PublishKvRemovedAfterEvict(member_key, 1, "cpu",
-                                           member_metadata, tenant_id);
-            }
-            if (member_key != key && !enable_oplog_ &&
-                !member_metadata.IsValid()) {
-                member.Erase();
-            }
-            return outcome;
-        };
-
-        GroupEvictionResult group_result =
-            EvictGroupOrObject(tenant_id, key, group_id, allow_soft_pinned,
-                               false, false, now, evict_one_member);
-        EvictionResult result{.freed_bytes = group_result.freed_bytes,
-                              .evicted_objects = group_result.evicted_objects,
-                              .stop_scan = group_result.stop_scan};
-
-        // The callback erased every member except the trigger; re-look-up the
-        // trigger to erase it if it is now invalid.
-        if (!enable_oplog_) {
-            MetadataAccessorRW trigger(this, ObjectIdentity{tenant_id, key});
-            if (trigger.IsPublished() && !trigger.Get().IsValid()) {
-                trigger.Erase();
-            }
-        }
-        return result;
-    };
-
-    // A candidate names the object by key; every eviction looks the key up
-    // again and re-validates it under its own lock.
-    struct Candidate {
-        TenantId tenant_id;
-        std::string key;
-        std::chrono::system_clock::time_point lease_timeout;
-    };
-
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-
-    // The census partitions over the namespaces that hold objects right now;
-    // one that gains its first object meanwhile joins the next round.
-    std::vector<metadata::Namespace*> namespaces;
+    // Writes that expired before they finished, and replicas whose release
+    // was deferred, go first, so the round judges what is left.
+    const auto now = std::chrono::system_clock::now();
     VisitNamespaces(
         [&](const TenantId& /*tenant_id*/, metadata::Namespace& ns) {
-            namespaces.push_back(&ns);
+            DiscardExpiredProcessingReplicas(ns, now);
         });
-
-    // ===== Phase 1: Parallel candidate census =====
-    // N threads share the census, each walking one namespace at a time. For
-    // selective ratios
-    // only the lease timestamps are collected here; full tenant/key
-    // identities are materialized afterwards for a bounded frontier around
-    // the eviction cutoff. High ratios collect full Candidates directly,
-    // because a census followed by a second scan would cost more than the
-    // identities it saves.
-    constexpr size_t kCensusThreads = 16;
-    const int num_threads =
-        static_cast<int>(std::min(kCensusThreads, namespaces.size()));
-    // Calls `walk(t, ns)` for every namespace, spread over the threads; `t` is
-    // the calling thread's index.
-    auto parallel_walk = [&](const auto& walk) {
-        std::atomic<size_t> next_unit{0};
-        std::vector<std::thread> workers;
-        workers.reserve(num_threads);
-        for (int t = 0; t < num_threads; t++) {
-            workers.emplace_back([&, t] {
-                for (size_t unit = next_unit.fetch_add(1);
-                     unit < namespaces.size(); unit = next_unit.fetch_add(1)) {
-                    walk(t, *namespaces[unit]);
-                }
-            });
-        }
-        for (auto& worker : workers) worker.join();
-    };
-
-    // Writes that expired before they finished go first, so the census below
-    // counts what is left.
-    parallel_walk([&](int, const metadata::Namespace& ns) {
-        DiscardExpiredProcessingReplicas(ns, now);
-    });
-
-    constexpr size_t kMinReserveSlack = 1024;
-    constexpr size_t kMinFrontierLimit = 64 * 1024;
-    constexpr size_t kReserveSlackDivisor = 10;
-    constexpr size_t kFrontierDivisor = 4;
-    // Above this target ratio the reserve frontier would already cover a
-    // large share of the population, so selective materialization stops
-    // paying for the extra scan it costs.
-    constexpr double kCompactPrebypassTargetRatio =
-        static_cast<double>(kReserveSlackDivisor) /
-        static_cast<double>(kFrontierDivisor * (kReserveSlackDivisor + 1));
-    const bool compact_frontier_prebypass =
-        evict_ratio_target >= kCompactPrebypassTargetRatio;
-
-    std::vector<std::vector<Candidate>> local_candidates(num_threads);
-    std::vector<std::vector<std::chrono::system_clock::time_point>>
-        local_no_pin(num_threads);
-    std::vector<long> local_eviction_base(num_threads, 0);
-    std::vector<long> local_object_count(num_threads, 0);
-    std::vector<std::vector<std::chrono::system_clock::time_point>>
-        local_soft_pin(num_threads);
-
-    parallel_walk([&](int t, const metadata::Namespace& ns) {
-        for (auto object : ns.objects.ReadCursor()) {
-            const auto& metadata = object.metadata();
-            local_object_count[t]++;
-            if (metadata.IsHardPinned()) continue;
-            bool has_evictable = can_evict_replicas(metadata);
-            if (has_evictable) local_eviction_base[t]++;
-            // Grouped objects are evicted all-or-none, so rank them by the
-            // shared group TTL (consistent across members) instead of each
-            // member's own lease; this keeps the candidate cutoff aligned
-            // with group boundaries and prevents over-eviction.
-            const auto deadline = metadata.EvictionDeadline();
-            if (now < deadline || !has_evictable) continue;
-            if (!IsSoftPinActive(metadata, now)) {
-                if (compact_frontier_prebypass) {
-                    local_candidates[t].push_back(
-                        {ns.id(), object.key(), deadline});
-                } else {
-                    local_no_pin[t].push_back(deadline);
-                }
-            } else if (allow_evict_soft_pinned_objects_) {
-                local_soft_pin[t].push_back(deadline);
-            }
-        }
-    });
-
-    // Merge per-thread results
-    long total_eviction_base = 0;
-    for (auto v : local_eviction_base) total_eviction_base += v;
-
-    long object_count = 0;
-    for (auto v : local_object_count) object_count += v;
-
-    std::vector<Candidate> candidates;
-    if (compact_frontier_prebypass) {
-        size_t total = 0;
-        for (auto& v : local_candidates) total += v.size();
-        candidates.reserve(total);
-        for (auto& v : local_candidates) {
-            candidates.insert(candidates.end(),
-                              std::make_move_iterator(v.begin()),
-                              std::make_move_iterator(v.end()));
-        }
-    }
-
-    std::vector<std::chrono::system_clock::time_point> no_pin_timeouts;
-    {
-        size_t total = 0;
-        for (auto& v : local_no_pin) total += v.size();
-        no_pin_timeouts.reserve(total);
-    }
-    for (auto& v : local_no_pin) {
-        no_pin_timeouts.insert(no_pin_timeouts.end(),
-                               std::make_move_iterator(v.begin()),
-                               std::make_move_iterator(v.end()));
-    }
-
-    std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
-    {
-        size_t total = 0;
-        for (auto& v : local_soft_pin) total += v.size();
-        soft_pin_objects.reserve(total);
-    }
-    for (auto& v : local_soft_pin) {
-        soft_pin_objects.insert(soft_pin_objects.end(),
-                                std::make_move_iterator(v.begin()),
-                                std::make_move_iterator(v.end()));
-    }
-
-    if (total_eviction_base == 0) {
-        VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
-                << " eviction_base=0 (no evictable memory objects)";
-        return;
-    }
-
-    const long ideal_evict_num =
-        std::ceil(total_eviction_base * evict_ratio_target);
-    const size_t no_pin_count =
-        compact_frontier_prebypass ? candidates.size() : no_pin_timeouts.size();
-    const long primary_no_pin_num =
-        std::min(ideal_evict_num, static_cast<long>(no_pin_count));
-
-    // Re-scan metadata and copy full identities only for objects inside the
-    // requested timestamp range. The eligibility conditions are identical to
-    // the census above, so the selected set matches what the census counted.
-    auto collect_candidates = [&](bool use_cutoff,
-                                  std::chrono::system_clock::time_point cutoff,
-                                  bool collect_older_or_equal) {
-        std::vector<std::vector<Candidate>> local_frontier(num_threads);
-        parallel_walk([&](int t, const metadata::Namespace& ns) {
-            for (auto object : ns.objects.ReadCursor()) {
-                const auto& metadata = object.metadata();
-                if (metadata.IsHardPinned() || IsSoftPinActive(metadata, now) ||
-                    !can_evict_replicas(metadata)) {
-                    continue;
-                }
-                // Group-aware eviction deadline (shared group TTL for grouped
-                // objects) so the cutoff matches eviction.
-                const auto deadline = metadata.EvictionDeadline();
-                if (now < deadline) continue;
-                if (use_cutoff) {
-                    const bool in_range = collect_older_or_equal
-                                              ? deadline <= cutoff
-                                              : deadline > cutoff;
-                    if (!in_range) continue;
-                }
-                local_frontier[t].push_back({ns.id(), object.key(), deadline});
-            }
-        });
-
-        size_t total = 0;
-        for (const auto& v : local_frontier) total += v.size();
-        std::vector<Candidate> merged;
-        merged.reserve(total);
-        for (auto& v : local_frontier) {
-            merged.insert(merged.end(), std::make_move_iterator(v.begin()),
-                          std::make_move_iterator(v.end()));
-        }
-        return merged;
-    };
-
-    bool compact_frontier_used = false;
-    std::chrono::system_clock::time_point reserve_cutoff{};
-
-    if (primary_no_pin_num > 0 && !compact_frontier_prebypass) {
-        const size_t primary_count = static_cast<size_t>(primary_no_pin_num);
-        // The reserve absorbs objects that stop being evictable between the
-        // census and the eviction pass, so ordinary churn does not require a
-        // second materialization pass.
-        const size_t reserve_slack = std::max(
-            kMinReserveSlack,
-            (primary_count + kReserveSlackDivisor - 1) / kReserveSlackDivisor);
-        const size_t reserve_count =
-            std::min(no_pin_count, primary_count + reserve_slack);
-        const size_t frontier_limit =
-            std::max(kMinFrontierLimit,
-                     (no_pin_count + kFrontierDivisor - 1) / kFrontierDivisor);
-
-        if (reserve_count <= frontier_limit) {
-            std::nth_element(no_pin_timeouts.begin(),
-                             no_pin_timeouts.begin() + (reserve_count - 1),
-                             no_pin_timeouts.end());
-            reserve_cutoff = no_pin_timeouts[reserve_count - 1];
-            candidates = collect_candidates(/*use_cutoff=*/true, reserve_cutoff,
-                                            /*collect_older_or_equal=*/true);
-
-            // Shortfall guard: if churn left the frontier holding fewer
-            // objects than the target needs, fall back to the full candidate
-            // set so evict_num below still derives from the requested target
-            // rather than from a shrunken frontier.
-            if (candidates.size() >= primary_count) {
-                compact_frontier_used = true;
-            } else {
-                candidates =
-                    collect_candidates(/*use_cutoff=*/false, {},
-                                       /*collect_older_or_equal=*/true);
-            }
-        } else {
-            candidates = collect_candidates(/*use_cutoff=*/false, {},
-                                            /*collect_older_or_equal=*/true);
-        }
-    }
-    // ===== Phase 2: Serial eviction via key lookup =====
-    long evicted_count = 0;
-    uint64_t total_freed_size = 0;
-    bool stop_eviction_scan = false;
-    std::vector<std::chrono::system_clock::time_point> no_pin_objects;
-    std::vector<std::vector<Replica>> deferred_replicas;
-    // Tenants that actually evicted this cycle; their routes are shrink
-    // candidates once eviction finishes.
-    std::unordered_set<TenantId, TenantIdHash> evicted_tenants;
-
-    // First pass: evict candidates with no soft pin
-    if (!candidates.empty()) {
-        long evict_num = std::min(ideal_evict_num, (long)candidates.size());
-
-        std::nth_element(candidates.begin(),
-                         candidates.begin() + (evict_num - 1), candidates.end(),
-                         [](const Candidate& a, const Candidate& b) {
-                             return a.lease_timeout < b.lease_timeout;
-                         });
-
-        // Treat evict_num as a minimum: if re-validation skips a candidate,
-        // continue trying the next one so actual evicted count reaches
-        // evict_num. This matches the old per-shard over-eviction behavior.
-        long evicted_this_pass = 0;
-        auto evict_candidate_batch = [&](std::vector<Candidate>& batch) {
-            for (auto& c : batch) {
-                if (stop_eviction_scan) break;
-                // Stop once the target object count is reached. Grouped
-                // eviction is all-or-none, so evicting a group can overshoot
-                // evict_num by at most one group; using evict_num (rather than
-                // the per-object lease cutoff) bounds that overshoot and keeps
-                // the eviction ratio close to the target.
-                if (evicted_this_pass >= evict_num) {
-                    no_pin_objects.push_back(c.lease_timeout);
-                    continue;
-                }
-                auto evict_result = try_evict_group_or_object(
-                    c.tenant_id, c.key,
-                    /*allow_soft_pinned=*/false, deferred_replicas);
-
-                total_freed_size += evict_result.freed_bytes;
-
-                if (evict_result.revalidation_skipped) {
-                    no_pin_objects.push_back(c.lease_timeout);
-                }
-
-                evicted_count += evict_result.evicted_objects;
-                evicted_this_pass += evict_result.evicted_objects;
-                if (evict_result.evicted_objects > 0) {
-                    evicted_tenants.insert(c.tenant_id);
-                }
-                if (evict_result.stop_scan) {
-                    stop_eviction_scan = true;
-                }
-                deferred_replicas.clear();
-            }
-        };
-
-        evict_candidate_batch(candidates);
-
-        // Metadata may change after the frontier is materialized. If the
-        // reserve is exhausted before the target is met, refill from the
-        // remainder of the current no-soft-pin population. This recovery
-        // scan is paid only on churn and preserves the behavior of
-        // continuing past the cutoff until evict_num is reached.
-        if (!stop_eviction_scan && compact_frontier_used &&
-            evicted_this_pass < evict_num) {
-            auto refill_candidates = collect_candidates(
-                /*use_cutoff=*/true, reserve_cutoff,
-                /*collect_older_or_equal=*/false);
-            evict_candidate_batch(refill_candidates);
-        }
-    }
-
-    // Try releasing discarded replicas before we decide whether to do the
-    // second pass.
-    uint64_t released_discarded_cnt = ReleaseExpiredDiscardedReplicas(now);
-
-    // The ideal number of objects to evict in the second pass
-    long target_evict_num =
-        std::ceil(total_eviction_base * evict_ratio_lowerbound) -
-        evicted_count - released_discarded_cnt;
-    // The actual number of objects we can evict in the second pass
-    target_evict_num =
-        std::min(target_evict_num,
-                 (long)no_pin_objects.size() + (long)soft_pin_objects.size());
-
-    // Do second pass eviction only if 1). there are candidates that can be
-    // evicted AND 2). The evicted number in the first pass is less than
-    // evict_ratio_lowerbound.
-    if (!stop_eviction_scan && target_evict_num > 0) {
-        // The second pass judges every tenant afresh: it takes the objects
-        // `selected` admits and evicts them until the target is met. The
-        // list is rotated to a random start, so that the objects a walk
-        // reaches first are not the ones every round prefers.
-        auto evict_selected = [&](const auto& selected,
-                                  bool allow_soft_pinned) {
-            std::vector<std::pair<TenantId, std::string>> to_evict;
-            for (const metadata::Namespace* ns : namespaces) {
-                for (auto object : ns->objects.ReadCursor()) {
-                    if (selected(object.metadata())) {
-                        to_evict.emplace_back(ns->id(), object.key());
-                    }
-                }
-            }
-            if (to_evict.empty()) return;
-            std::rotate(to_evict.begin(),
-                        to_evict.begin() + randomIndex(to_evict.size()),
-                        to_evict.end());
-            for (auto& c : to_evict) {
-                if (target_evict_num <= 0 || stop_eviction_scan) break;
-                auto evict_result = try_evict_group_or_object(
-                    c.first, c.second, allow_soft_pinned, deferred_replicas);
-                total_freed_size += evict_result.freed_bytes;
-                evicted_count += evict_result.evicted_objects;
-                target_evict_num -= evict_result.evicted_objects;
-                if (evict_result.evicted_objects > 0) {
-                    evicted_tenants.insert(c.first);
-                }
-                if (evict_result.stop_scan) {
-                    stop_eviction_scan = true;
-                }
-                deferred_replicas.clear();
-            }
-        };
-
-        if (target_evict_num <= static_cast<long>(no_pin_objects.size())) {
-            // Second pass A: only evict objects without soft pin.
-            std::nth_element(no_pin_objects.begin(),
-                             no_pin_objects.begin() + (target_evict_num - 1),
-                             no_pin_objects.end());
-            auto target_timeout = no_pin_objects[target_evict_num - 1];
-
-            evict_selected(
-                [&](const ObjectMetadata& metadata) {
-                    return !metadata.IsHardPinned() &&
-                           now >= metadata.EvictionDeadline() &&
-                           metadata.EvictionDeadline() <= target_timeout &&
-                           !IsSoftPinActive(metadata, now) &&
-                           can_evict_replicas(metadata);
-                },
-                /*allow_soft_pinned=*/false);
-        } else if (!soft_pin_objects.empty()) {
-            // Second pass B: Prioritize evicting objects without soft pin,
-            // but also allow evicting soft pinned objects.
-            const long soft_pin_evict_num =
-                target_evict_num - static_cast<long>(no_pin_objects.size());
-            std::nth_element(
-                soft_pin_objects.begin(),
-                soft_pin_objects.begin() + (soft_pin_evict_num - 1),
-                soft_pin_objects.end());
-            auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
-
-            evict_selected(
-                [&](const ObjectMetadata& metadata) {
-                    if (metadata.IsHardPinned() ||
-                        now < metadata.EvictionDeadline() ||
-                        !can_evict_replicas(metadata)) {
-                        return false;
-                    }
-                    return !IsSoftPinActive(metadata, now) ||
-                           metadata.EvictionDeadline() <= soft_target_timeout;
-                },
-                /*allow_soft_pinned=*/true);
-        } else {
-            LOG(ERROR) << "Error in second pass eviction: target_evict_num="
-                       << target_evict_num
-                       << ", no_pin_objects.size()=" << no_pin_objects.size()
-                       << ", soft_pin_objects.size()="
-                       << soft_pin_objects.size()
-                       << ", evicted_count=" << evicted_count
-                       << ", eviction_base=" << total_eviction_base
-                       << ", evict_ratio_target=" << evict_ratio_target
-                       << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound;
-        }
-    }
-
+    const uint64_t released_discarded = ReleaseExpiredDiscardedReplicas(now);
+    const eviction::Report report = memory_eviction_->evictor.Run(
+        eviction::Scope::All(),
+        eviction::ObjectGoal{.target_ratio = evict_ratio_target,
+                             .min_ratio = evict_ratio_lowerbound});
     // erase() never returns bucket memory, so a route that once held far
-    // more keys than it does now would keep its high-water bucket arrays
-    // forever. Shrink the routes that evicted this cycle.
-    for (metadata::Namespace* ns : namespaces) {
-        if (evicted_tenants.contains(ns->id())) {
-            ns->objects.ShrinkSparseStripes();
-        }
+    // more keys than it does now would keep its high-water buckets forever.
+    if (report.evicted_objects > 0) {
+        VisitNamespaces(
+            [](const TenantId& /*tenant_id*/, metadata::Namespace& ns) {
+                ns.objects.ShrinkSparseStripes();
+            });
     }
-
-    const bool made_progress = evicted_count > 0 || released_discarded_cnt > 0;
-    const bool success = made_progress || offload_deferred_count > 0;
-    if (allocation_pressure && !stop_eviction_scan && !success &&
-        total_eviction_base > 0) {
+    if (allocation_pressure && !report.stopped && !report.MadeProgress() &&
+        released_discarded == 0 && report.filed > 0) {
         need_mem_eviction_.store(true, std::memory_order_relaxed);
-    }
-
-    if (success) {
-        MasterMetricManager::instance().inc_eviction_success(evicted_count,
-                                                             total_freed_size);
-        MasterMetricManager::instance().inc_mem_eviction_success(
-            evicted_count, total_freed_size);
-    } else {
-        MasterMetricManager::instance().inc_eviction_fail();
-        MasterMetricManager::instance().inc_mem_eviction_fail();
-    }
-    VLOG(1) << "action=evict_objects"
-            << ", evicted_count=" << evicted_count
-            << ", offload_deferred=" << offload_deferred_count
-            << ", offload_cap_forced=" << offload_cap_forced_count
-            << ", offload_push_failed_forced=" << offload_push_failed_forced
-            << ", total_freed_size=" << total_freed_size
-            << ", eviction_base=" << total_eviction_base
-            << ", actual_evict_ratio="
-            << (total_eviction_base > 0
-                    ? (double)evicted_count / total_eviction_base
-                    : 0.0)
-            << ", target_evict_ratio=" << evict_ratio_target;
-    VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
-            << " disk_object_count=" << (object_count - total_eviction_base)
-            << " eviction_base=" << total_eviction_base << " disk_ratio="
-            << (object_count > 0
-                    ? (double)(object_count - total_eviction_base) /
-                          object_count
-                    : 0.0)
-            << " ideal_evict_num_inflated="
-            << (long)std::ceil(object_count * evict_ratio_target)
-            << " ideal_evict_num_correct="
-            << (long)std::ceil(total_eviction_base * evict_ratio_target);
-    LOG(INFO) << "[EVICT-RESULT] evicted_count=" << evicted_count
-              << ", eviction_base=" << total_eviction_base
-              << ", actual_evict_ratio="
-              << (total_eviction_base > 0
-                      ? (double)evicted_count / total_eviction_base
-                      : 0.0)
-              << ", target_evict_ratio=" << evict_ratio_target;
-    if (offload_on_evict_ && evicted_count == 0 && offload_deferred_count > 0) {
-        LOG(WARNING) << "[EVICT] No memory freed this cycle; "
-                     << offload_deferred_count
-                     << " objects deferred for disk offload. "
-                        "Consider lowering eviction_high_watermark_ratio.";
-    }
-    if (offload_cap_forced_count > 0) {
-        LOG(WARNING) << "[EVICT] Offload cap (" << offload_cap
-                     << ") reached; force-evicted " << offload_cap_forced_count
-                     << " object(s) without disk offload this cycle.";
-    }
-    if (offload_push_failed_forced > 0) {
-        LOG(WARNING) << "[EVICT] PushOffloadingQueue failed for "
-                     << offload_push_failed_forced
-                     << " object(s); force-evicted without disk offload "
-                        "(offload_force_evict=true).";
     }
 }
 

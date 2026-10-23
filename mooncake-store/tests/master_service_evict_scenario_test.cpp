@@ -20,6 +20,7 @@
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/oplog_batch_types.h"
+#include "metadata/lease_eviction_index.h"
 #include "tenant/quota_policy_store.h"
 #include "types.h"
 
@@ -336,10 +337,13 @@ TEST_F(MasterServiceEvictScenarioTest, EvictsWholeGroupTogether) {
                    .CompleteOn("memory")
                    .InGroup("group")
                    .ExpiredFrom(base))
-        .Given(IndexedObjects(kGroupSize, kObjectCount)
-                   .Size(kObjectSize)
-                   .CompleteOn("memory")
-                   .ExpiredFrom(base + std::chrono::nanoseconds(kGroupSize)))
+        // A bucket of the eviction index later: leases within one bucket
+        // are not ranked against each other.
+        .Given(
+            IndexedObjects(kGroupSize, kObjectCount)
+                .Size(kObjectSize)
+                .CompleteOn("memory")
+                .ExpiredFrom(base + metadata::LeaseEvictionIndex::kBucketWidth))
         .When(EvictMemory(0.10))
         .Then(ReadableCount(IndexedObjects(0, kObjectCount),
                             kObjectCount - kGroupSize))

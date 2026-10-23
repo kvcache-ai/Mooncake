@@ -231,7 +231,7 @@ TEST_F(TenantIterationTest, InFlightKeysNameOnlyKeysWithWorkInFlight) {
               std::vector<std::string>{"pending_b"});
 }
 
-TEST_F(TenantIterationTest, MemoryEvictionCensusCoversEveryTenant) {
+TEST_F(TenantIterationTest, MemoryEvictionCoversEveryTenant) {
     auto config = MultiTenantConfig();
     config.default_kv_lease_ttl = 1;
     MasterService service(config);
