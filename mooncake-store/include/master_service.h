@@ -117,6 +117,11 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  * The recompute mutex serializes the capacity snapshot and the corresponding
  * quota-table update. The segment mutex is released before entering
  * ShardedTenantQuotaTable, so these two locks are never nested.
+ *
+ * Two dedicated guards sit outside this order: remount_mutex_ is only
+ * acquired at the top of ReMountSegment, before client_mutex_, and nothing
+ * acquires it while holding any lock above; client_status_mutex_ guards the
+ * ok_client_ mirror and is never held while acquiring any other lock.
  */
 
 class MasterService {
@@ -1080,8 +1085,18 @@ class MasterService {
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
+    // Liveness-complement sweep that re-captures the retaining-client set
+    // periodically during the walk: a client that mounts or remounts while
+    // the sweep is in progress is seen alive before its remaining replicas
+    // are classified, so they cannot be misclassified as stale (a
+    // point-in-time capture taken before an O(total keys) walk could erase a
+    // concurrently mounting client's fresh replicas). The set is re-captured
+    // under client_mutex_ shared only and between object accessor
+    // acquisitions, so callers must not hold master_state_mutex_.
     void ClearInvalidHandles();
-    // Caller owns master_state_mutex_ (shared) while metadata is swept.
+    // Same sweep, but classification uses the caller-provided retaining set
+    // for every shard (point-in-time liveness). Kept for tests that
+    // construct explicit liveness sets.
     void ClearInvalidHandles(
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
     // Clear completed LOCAL_DISK replicas owned by exactly this client, in
@@ -1097,8 +1112,12 @@ class MasterService {
     // cleaned, each under its own write lock: a mass client expiry marks
     // handles stale table-wide, and walking a whole shard while holding it
     // exclusively blocked every RPC for that shard until the sweep moved on.
+    // refresh_retaining, when provided, runs at each tenant visit and before
+    // each picked object's accessor, at points where no shard lock is held,
+    // so the is_stale classification can use a fresher liveness view.
     tl::expected<void, ErrorCode> ClearStaleHandles(
-        const std::function<bool(const Replica&)>& is_stale);
+        const std::function<bool(const Replica&)>& is_stale,
+        const std::function<void()>& refresh_retaining = nullptr);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
@@ -2252,6 +2271,20 @@ class MasterService {
         client_liveness_records_;
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
+    // Mirror of ok_client_ maintained at every mutation, all of which run
+    // under client_mutex_ exclusive, so the mirror never diverges for more
+    // than the duration of one mutation. Ping answers OK/NEED_REMOUNT from
+    // this copy under a mutex whose exclusive holds are only the
+    // microseconds of an insert or erase, so heartbeat processing never
+    // waits behind long client_mutex_ exclusive sections (remount admission,
+    // monitor expiry erasure).
+    mutable std::shared_mutex client_status_mutex_;
+    std::unordered_set<UUID, boost::hash<UUID>> client_status_view_;
+    // Serializes concurrent ReMountSegment calls, replacing the implicit
+    // serialization the pre-fix whole-body client_mutex_/master_state_mutex_
+    // exclusive hold provided. Never acquired by any other path, so it
+    // cannot couple unrelated operations together.
+    std::mutex remount_mutex_;
     std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
     ClientOffboardingWorker client_offboarding_worker_{this};
     void ClientMonitorFunc();
