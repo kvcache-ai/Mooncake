@@ -286,6 +286,17 @@ TEST_F(MetricsTestBase, PrometheusTextCarriesPrefixedSeries) {
               std::string::npos);
 }
 
+// ylt's own serializer drops a histogram whose sum is 0.
+TEST_F(MetricsTestBase, ZeroLatencyHistogramIsExported) {
+    metrics().recordCompleted(Direction::Read, 64, 0);
+
+    const std::string text = metrics().prometheusText();
+    EXPECT_NE(text.find("mooncake_te_read_latency_us_sum 0\n"),
+              std::string::npos);
+    EXPECT_NE(text.find("mooncake_te_read_latency_us_count 1\n"),
+              std::string::npos);
+}
+
 TEST_F(MetricsTestBase, JsonTextCarriesHistogramSums) {
     auto& m = metrics();
     m.recordCompleted(Direction::Read, 1048576, 2000000);

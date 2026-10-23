@@ -78,6 +78,26 @@ int64_t Histogram::count() {
     return total;
 }
 
+void Histogram::serialize(std::string& out) {
+    const std::string& name = histogram.str_name();
+    out.append("# HELP ").append(name).append(" ");
+    out.append(histogram.help()).append("\n");
+    out.append("# TYPE ").append(name).append(" histogram\n");
+    int64_t cumulative = 0;
+    auto bucket_counts = histogram.get_bucket_counts();
+    for (size_t i = 0; i < bucket_counts.size(); ++i) {
+        cumulative += bucket_counts[i]->value();
+        out.append(name).append("_bucket{le=\"");
+        out.append(i < boundaries.size() ? std::to_string(boundaries[i])
+                                         : std::string("+Inf"));
+        out.append("\"} ").append(std::to_string(cumulative)).append("\n");
+    }
+    out.append(name).append("_sum ");
+    out.append(std::to_string(sum.load(std::memory_order_relaxed)));
+    out.append("\n").append(name).append("_count ");
+    out.append(std::to_string(cumulative)).append("\n");
+}
+
 MetricsExporter::MetricsExporter(std::string name) : name_(std::move(name)) {}
 
 MetricsExporter::~MetricsExporter() { stop(); }
@@ -159,7 +179,7 @@ std::string MetricsExporter::prometheusText() {
     try {
         std::string result;
         for (auto* counter : counters_) counter->serialize(result);
-        for (auto* entry : histograms_) entry->histogram.serialize(result);
+        for (auto* entry : histograms_) entry->serialize(result);
         return result;
     } catch (const std::exception& e) {
         LOG(ERROR) << "Failed to serialize " << name_

@@ -120,6 +120,37 @@ class MetricsExporterTest : public ::testing::Test {
     metrics::MetricsExporter exporter_{"Exporter Test"};
 };
 
+TEST(HistogramSerializeTest, WritesCumulativeBuckets) {
+    metrics::Histogram h{"h", "help", std::vector<double>{100, 1000, 10000}};
+    for (int64_t v : {50, 100, 250, 20000}) h.observe(v);
+
+    std::string out;
+    h.serialize(out);
+    EXPECT_EQ(out,
+              "# HELP h help\n"
+              "# TYPE h histogram\n"
+              "h_bucket{le=\"100.000000\"} 2\n"
+              "h_bucket{le=\"1000.000000\"} 3\n"
+              "h_bucket{le=\"10000.000000\"} 3\n"
+              "h_bucket{le=\"+Inf\"} 4\n"
+              "h_sum 20400\n"
+              "h_count 4\n");
+}
+
+TEST(HistogramSerializeTest, WritesUnobservedHistogram) {
+    metrics::Histogram h{"h", "help", std::vector<double>{100}};
+
+    std::string out;
+    h.serialize(out);
+    EXPECT_EQ(out,
+              "# HELP h help\n"
+              "# TYPE h histogram\n"
+              "h_bucket{le=\"100.000000\"} 0\n"
+              "h_bucket{le=\"+Inf\"} 0\n"
+              "h_sum 0\n"
+              "h_count 0\n");
+}
+
 TEST_F(MetricsExporterTest, FromEnvReadsHttpVariables) {
     setenv("MC_TE_METRIC_TEST_HTTP_HOST", "127.0.0.1", 1);
     setenv("MC_TE_METRIC_TEST_HTTP_PORT", "19321", 1);
