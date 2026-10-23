@@ -11,6 +11,11 @@ thread_local bool track_allocations = false;
 thread_local size_t tracked_allocation_bytes = 0;
 }  // namespace
 
+// Replace the whole set of replaceable allocation functions, not only
+// operator new(size_t): everything must allocate with malloc, because every
+// delete below frees with free. Under ASan, a form left unreplaced (e.g. the
+// nothrow new behind std::stable_sort's temporary buffer in gtest) comes from
+// ASan's operator new, and freeing it here is an alloc-dealloc-mismatch.
 void* operator new(size_t size) {
     if (void* ptr = std::malloc(size ? size : 1)) {
         if (track_allocations) tracked_allocation_bytes += size;
@@ -18,9 +23,26 @@ void* operator new(size_t size) {
     }
     throw std::bad_alloc();
 }
+void* operator new(size_t size, const std::nothrow_t&) noexcept {
+    void* ptr = std::malloc(size ? size : 1);
+    if (ptr != nullptr && track_allocations) tracked_allocation_bytes += size;
+    return ptr;
+}
+void* operator new[](size_t size) { return operator new(size); }
+void* operator new[](size_t size, const std::nothrow_t& tag) noexcept {
+    return operator new(size, tag);
+}
 
 void operator delete(void* ptr) noexcept { std::free(ptr); }
 void operator delete(void* ptr, size_t) noexcept { std::free(ptr); }
+void operator delete(void* ptr, const std::nothrow_t&) noexcept {
+    std::free(ptr);
+}
+void operator delete[](void* ptr) noexcept { std::free(ptr); }
+void operator delete[](void* ptr, size_t) noexcept { std::free(ptr); }
+void operator delete[](void* ptr, const std::nothrow_t&) noexcept {
+    std::free(ptr);
+}
 
 namespace mooncake::test {
 namespace {
