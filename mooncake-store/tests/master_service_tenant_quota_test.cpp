@@ -434,6 +434,14 @@ TEST_F(MasterServiceTenantQuotaTest,
                                     10, MemoryConfig());
     ASSERT_FALSE(missing.has_value());
     EXPECT_EQ(missing.error(), ErrorCode::TENANT_NOT_REGISTERED);
+    auto missing_upsert = service.UpsertStart(
+        client_id, "missing", TenantId("tenant-b"), 10, MemoryConfig());
+    ASSERT_FALSE(missing_upsert.has_value());
+    EXPECT_EQ(missing_upsert.error(), ErrorCode::TENANT_NOT_REGISTERED);
+    // A refused write leaves no namespace behind, which would stay for good.
+    EXPECT_EQ(
+        MasterServiceTestPeer::Namespaces(service).Lookup(TenantId("tenant-b")),
+        nullptr);
 
     auto implicit_default = service.PutStart(
         client_id, "default-key", TenantId::Default(), 10, MemoryConfig());

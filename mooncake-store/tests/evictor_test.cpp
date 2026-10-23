@@ -678,31 +678,18 @@ TEST_F(OffloadingReclaimerTest, PastTheCapAForcedRunDropsWithoutOffload) {
 
 // --- Report observers --------------------------------------------------------
 
-TEST_F(EvictorTest, MetricsCountAPoolRunThatReleasedMemory) {
+TEST_F(EvictorTest, MetricsLeaveAPoolRunToItsCaller) {
     Publish("a", "k1", seconds(10));
     Publish("b", "k2", seconds(8));
-    auto& metrics = MasterMetricManager::instance();
-    const int64_t successes = metrics.get_mem_eviction_success();
-    const int64_t evicted_keys = metrics.get_evicted_key_count();
-
-    eviction::MetricsObserver observer;
-    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&observer});
-    evictor.Run(Scope::All(),
-                ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
-
-    EXPECT_EQ(metrics.get_mem_eviction_success(), successes + 1);
-    EXPECT_EQ(metrics.get_evicted_key_count(), evicted_keys + 2);
-}
-
-TEST_F(EvictorTest, MetricsIgnoreAPoolRunWithNothingFiled) {
     auto& metrics = MasterMetricManager::instance();
     const int64_t attempts = metrics.get_mem_eviction_attempts();
 
     eviction::MetricsObserver observer;
     eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&observer});
-    evictor.Run(Scope::All(),
-                ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+    const auto report = evictor.Run(
+        Scope::All(), ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
 
+    EXPECT_EQ(report.evicted_objects, 2u);
     EXPECT_EQ(metrics.get_mem_eviction_attempts(), attempts);
 }
 

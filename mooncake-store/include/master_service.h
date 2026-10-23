@@ -1084,6 +1084,30 @@ class MasterService {
         std::string user_key;
     };
 
+    // What the namespace policy may see and ask of this service.
+    class PolicyStoreAccess final : public StoreControl {
+       public:
+        explicit PolicyStoreAccess(MasterService& service)
+            : service_(service) {}
+        void VisitNamespaces(
+            const std::function<void(const TenantId&, route::ObjectRoute&)>& fn)
+            override;
+        size_t ObjectCount(const TenantId& tenant_id) const override;
+        uint64_t AllocatableMemoryBytes() const override;
+        EvictionResult EvictNamespaceMemory(const TenantId& tenant_id,
+                                            uint64_t target_bytes) override;
+
+       private:
+        MasterService& service_;
+    };
+    PolicyStoreAccess policy_store_access_{*this};
+    // Multi-tenancy, when enabled; the namespace policy below points at it.
+    std::unique_ptr<TenantQuotaPolicy> tenant_quota_policy_;
+    // The policy every namespace is created under; null without one. Set in
+    // the constructor, before any namespace is created, and declared before
+    // the namespaces so that it outlives them.
+    NamespacePolicy* policy_ = nullptr;
+
     // One namespace per tenant id written to, each owning that tenant's object
     // route; a namespace stays put once created (see NamespaceTable).
     metadata::NamespaceTable namespaces_{[this](const TenantId& tenant_id) {
@@ -1335,8 +1359,9 @@ class MasterService {
     };
     // The checks and setup PutStart and UpsertStart share before they take the
     // key: validates `config` for a write of `slice_length` bytes, records the
-    // client's host, and resolves the soft pin, the writer's host and the
-    // group. `action` names the caller in the log.
+    // client's host, resolves the soft pin, the writer's host and the group,
+    // and refuses a tenant that is not registered. `action` names the caller
+    // in the log.
     auto PrepareWriteStart(const UUID& client_id, const std::string& key,
                            const TenantId& tenant_id, uint64_t slice_length,
                            const ReplicateConfig& config,
@@ -1872,29 +1897,6 @@ class MasterService {
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
     const bool enable_multi_tenants_;
-
-    // What the namespace policy may see and ask of this service.
-    class PolicyStoreAccess final : public StoreControl {
-       public:
-        explicit PolicyStoreAccess(MasterService& service)
-            : service_(service) {}
-        void VisitNamespaces(
-            const std::function<void(const TenantId&, route::ObjectRoute&)>& fn)
-            override;
-        size_t ObjectCount(const TenantId& tenant_id) const override;
-        uint64_t AllocatableMemoryBytes() const override;
-        EvictionResult EvictNamespaceMemory(const TenantId& tenant_id,
-                                            uint64_t target_bytes) override;
-
-       private:
-        MasterService& service_;
-    };
-    PolicyStoreAccess policy_store_access_{*this};
-    // Multi-tenancy, when enabled; the namespace policy below points at it.
-    std::unique_ptr<TenantQuotaPolicy> tenant_quota_policy_;
-    // The policy every namespace is created under; null without one. Set in
-    // the constructor, before any namespace is created.
-    NamespacePolicy* policy_ = nullptr;
 
     // HTTP metadata server pointer for cleanup on client timeout
     // nullptr means cleanup is disabled

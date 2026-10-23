@@ -4861,6 +4861,12 @@ auto MasterService::PrepareWriteStart(
     if (!group_id) {
         return tl::make_unexpected(group_id.error());
     }
+    // Refused before the key is taken: taking it creates the tenant's
+    // namespace, which stays once created. Grow(0) under the key still has
+    // the last word.
+    if (!IsTenantRegistered(tenant_id)) {
+        return tl::make_unexpected(ErrorCode::TENANT_NOT_REGISTERED);
+    }
     return WriteStartPlan{.soft_pin_request = std::move(*soft_pin_request),
                           .writer_host_id = std::move(writer_host_id),
                           .group_id = std::move(*group_id)};
@@ -9284,11 +9290,6 @@ MasterService::NamespaceEvictionResult MasterService::EvictNamespaceMemory(
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const eviction::Report report = memory_eviction_->evictor.Run(
         tenant_id, eviction::ByteGoal{.target_bytes = target_bytes});
-    if (report.evicted_objects > 0) {
-        if (metadata::Namespace* ns = namespaces_.Lookup(tenant_id)) {
-            ns->objects.ShrinkSparseStripes();
-        }
-    }
     return {.freed_bytes = report.released_bytes,
             .evicted_objects = report.evicted_objects};
 }
@@ -9313,19 +9314,24 @@ void MasterService::BatchEvict(double evict_ratio_target,
         eviction::Scope::All(),
         eviction::ObjectGoal{.target_ratio = evict_ratio_target,
                              .min_ratio = evict_ratio_lowerbound});
-    // erase() never returns bucket memory, so a route that once held far
-    // more keys than it does now would keep its high-water buckets forever.
-    // Every namespace, including one the round left empty: VisitNamespaces
-    // would skip it, and it has the most buckets to give back.
-    if (report.evicted_objects > 0) {
-        namespaces_.Visit(
-            [](const TenantId& /*tenant_id*/, metadata::Namespace& ns) {
-                ns.objects.ShrinkSparseStripes();
-            });
-    }
-    if (allocation_pressure && !report.stopped && !report.MadeProgress() &&
-        released_discarded == 0 && report.filed > 0) {
+    const bool made_progress = report.MadeProgress() || released_discarded > 0;
+    if (allocation_pressure && !report.stopped && !made_progress &&
+        report.filed > 0) {
         need_mem_eviction_.store(true, std::memory_order_relaxed);
+    }
+
+    // Counted here, not by the evictor's observers: releasing discarded
+    // replicas is progress too, and only the round sees it. A round with
+    // nothing filed and nothing released had nothing to succeed or fail at.
+    auto& metrics = MasterMetricManager::instance();
+    if (made_progress) {
+        const auto objects = static_cast<int64_t>(report.evicted_objects);
+        const auto bytes = static_cast<int64_t>(report.released_bytes);
+        metrics.inc_eviction_success(objects, bytes);
+        metrics.inc_mem_eviction_success(objects, bytes);
+    } else if (report.filed > 0) {
+        metrics.inc_eviction_fail();
+        metrics.inc_mem_eviction_fail();
     }
 }
 

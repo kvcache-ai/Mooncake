@@ -68,7 +68,8 @@ class Evictor::Pass {
     // Walks the cursor until the namespace's share of the target is met, then
     // the objects the policy deferred until its share of the minimum is; each
     // also ends when an OpLog write fails or nothing is left. A group's
-    // members come in one entry and go together, one key lock at a time.
+    // members come in one entry and go together, one key lock at a time. A
+    // namespace that dropped objects then shrinks its route's sparse stripes.
     void Run() {
         while (!report_.stopped && !Met(/*fallback=*/false)) {
             std::optional<Entry> entry = cursor_->Next();
@@ -89,6 +90,13 @@ class Evictor::Pass {
             // Only the publication the policy deferred: a replacement was
             // never judged.
             Evict(ns_.objects.Write(ref), /*entry=*/nullptr);
+        }
+        // erase() never returns bucket memory, so a route that once held far
+        // more keys than it does now would keep its high-water buckets
+        // forever. An object dropped through the OpLog goes once its record
+        // is durable, so its key is given back by a later run's shrink.
+        if (dropped_) {
+            ns_.objects.ShrinkSparseStripes();
         }
     }
 
@@ -132,6 +140,7 @@ class Evictor::Pass {
             return {};
         }
         report_.Add(*effect);
+        dropped_ = dropped_ || effect->outcome == Outcome::kDropped;
         const ObjectView view{ns_.id(), hold.key(), hold.metadata()};
         for (EvictionObserver* observer : evictor_.observers_) {
             observer->OnApplied(view, *effect);
@@ -189,6 +198,7 @@ class Evictor::Pass {
     const Clock::time_point now_;
     // In the order the walk met them.
     std::vector<route::ObjectRef> deferred_;
+    bool dropped_ = false;
 };
 
 Evictor::Evictor(metadata::NamespaceTable& namespaces,
