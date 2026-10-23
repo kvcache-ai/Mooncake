@@ -332,6 +332,8 @@ threshold, `MC_MUSA_COPY_API=transfer_batch` to force the API, or
 **Requirements:**
 - NVIDIA NVLink hardware
 - Compiled with `USE_INTRA_NVLINK=ON` (enabled in the prebuilt `x86_64` CUDA wheels; other variants must be built from source)
+- Registered buffers must be legacy device allocations (`cudaMalloc` / `cuMemAlloc`), because the transport shares them with `cudaIpcGetMemHandle`. Virtual-memory allocations (`cuMemCreate`) have no such handle. In particular, PyTorch tensors allocated with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` cannot be registered: allocate the transfer buffers separately, or disable `expandable_segments` for them.
+- Peers in containers must share the IPC **and** PID namespaces, e.g. `docker run --ipc=host --pid=host` (Kubernetes: `hostIPC` plus `hostPID` or `shareProcessNamespace`). A CUDA IPC handle carries the exporting process's PID. Two containers with separate PID namespaces can hand out the same PID, and the importer then rejects the peer's handle as its own: `cudaIpcOpenMemHandle failed: invalid device context`. A typical symptom is that only the peer pairs with the same worker index fail.
 
 **Configuration:**
 ```bash
