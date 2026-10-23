@@ -489,8 +489,10 @@ planned as a follow-up.
 ### Intel XPU Transport (xpu)
 
 **Description:** Intel GPU support in TENT through oneAPI SYCL. On the same
-node, the XPU transport copies VRAM directly between XPUs: over PCIe peer
-access within a process, and through Level Zero IPC handles between processes.
+node, the XPU transport copies between XPUs. Within a process, the copy runs
+directly over PCIe (or Xe Link) when the two devices have peer access, and is
+bounced through host memory otherwise. Between processes, it maps the peer's
+buffer through a Level Zero IPC handle when the IPC requirements below are met.
 With `rdma`, registered XPU memory is accessed directly through dma-buf when
 available. Otherwise, the XPU transport performs the local device-to-host and
 host-to-device copies, and an existing TCP/RDMA transport carries the staged
@@ -534,9 +536,13 @@ export MC_USE_TENT=1
 - No XPU support in the classic Transfer Engine
 - Transfers involving XPU memory require an XPU-platform initiator (see the
   RDMA section above)
-- Same-node IPC needs ptrace permission over the exporting process (Yama
-  `ptrace_scope` 0 or 1, or `CAP_SYS_PTRACE`); otherwise transfers fall back
-  to the network transport
+- Same-node IPC between processes requires both processes in the same PID
+  namespace, peer access from the copying device to the device that holds the
+  buffer, and ptrace permission over the exporting process: Yama
+  `ptrace_scope` 0 or 1, or `CAP_SYS_PTRACE` for scope 2; scope 3 rejects the
+  import even with that capability. Otherwise the transfer takes the network
+  path (RDMA dma-buf or host staging); see the GPU-Direct note in the
+  [build guide](build.md).
 
 **Build instructions:** See {ref}`build-with-intel-xpu`.
 
