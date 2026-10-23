@@ -30,6 +30,8 @@
 
 namespace mooncake {
 
+class AutoPortBinder;
+
 using WriteConfig = std::variant<ReplicateConfig, WriteRouteRequestConfig>;
 
 /**
