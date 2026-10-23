@@ -272,6 +272,86 @@ jobs:
         failed-tests-log: build/Testing/Temporary/LastTestsFailed.log
         last-test-log: build/Testing/Temporary/LastTest.log
 
+  metadata-removal-tests:
+    name: Metadata removal (MP=${{ matrix.mp }}, CXL=${{ matrix.cxl }})
+    needs: [check-paths]
+    if: *run-ci-for-source-changes
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mp: ['ON', 'OFF']
+        cxl: ['ON', 'OFF']
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+        submodules: recursive
+    - name: Install CPU build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build g++ pkg-config python3-dev \
+          libibverbs-dev libnuma-dev libgoogle-glog-dev libgflags-dev \
+          libjsoncpp-dev libyaml-cpp-dev libgtest-dev libssl-dev libasio-dev \
+          libboost-dev libunwind-dev
+    - name: Configure focused Transfer Engine build
+      run: |
+        cmake -S . -B build-metadata -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DENABLE_MULTI_PROTOCOL=${{ matrix.mp }} -DUSE_CXL=${{ matrix.cxl }} \
+          -DUSE_TCP=ON -DUSE_CUDA=OFF -DUSE_TENT=OFF \
+          -DUSE_HTTP=OFF -DUSE_ETCD=OFF -DUSE_REDIS=OFF \
+          -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+          -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF
+    - name: Build and run removal tests
+      env:
+        MP: ${{ matrix.mp }}
+        MC_METADATA_SERVER: P2PHANDSHAKE
+      run: |
+        cmake --build build-metadata --target transfer_metadata_test local_buffer_registrations_test --parallel 2
+        if [ "$MP" = ON ]; then
+          cmake --build build-metadata --target transport_metadata_removal_test --parallel 2
+        fi
+        mkdir -p "$PWD/build-metadata/results"
+        export GTEST_OUTPUT="xml:$PWD/build-metadata/results/"
+        ctest --test-dir build-metadata --verbose --no-tests=error \
+          -R '^(transfer_metadata_removal_test|transport_metadata_removal_test|local_buffer_registrations_test)$'
+    - name: Check executed test counts
+      env:
+        MP: ${{ matrix.mp }}
+        CXL: ${{ matrix.cxl }}
+      run: |
+        python3 - <<'PY'
+        import os
+        import pathlib
+        import xml.etree.ElementTree as ET
+        directory = pathlib.Path('build-metadata/results')
+        expected = {'transfer_metadata_test.xml': 1,
+                    'local_buffer_registrations_test.xml': 8}
+        if os.environ['MP'] == 'ON':
+            cxl = os.environ['CXL'] == 'ON'
+            expected = {
+                'transfer_metadata_test.xml': 6 if cxl else 4,
+                'transport_metadata_removal_test.xml': 5 if cxl else 2,
+                'local_buffer_registrations_test.xml': 8,
+            }
+        for filename, minimum in expected.items():
+            cases = ET.parse(directory / filename).getroot().findall('.//testcase')
+            assert len(cases) >= minimum, (filename, len(cases), minimum)
+            assert all(c.get('status') == 'run' and
+                       not any(c.find(t) is not None for t in
+                               ('failure', 'error', 'skipped')) for c in cases), filename
+            print(f'{filename}: {len(cases)} tests executed and passed')
+        PY
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: metadata-removal-mp-${{ matrix.mp }}-cxl-${{ matrix.cxl }}
+        path: |
+          build-metadata/results/
+          build-metadata/Testing/Temporary/
+          build-metadata/CMakeCache.txt
+
   build-flags:
     needs: [check-paths]
     if: *run-ci-for-source-changes

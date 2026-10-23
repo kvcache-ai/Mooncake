@@ -26,6 +26,9 @@
 #include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
+#ifdef ENABLE_MULTI_PROTOCOL
+#include "transport/local_buffer_registrations.h"
+#endif
 
 namespace mooncake {
 
@@ -110,6 +113,9 @@ class HylinkTransport : public Transport {
     RelocateMap remap_;
 
     std::mutex register_mutex_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    LocalBufferRegistrations published_buffers_;
+#endif
     std::unordered_map<uint64_t, std::string> registered_exports_;
 
     static constexpr int kStreamsPerDevice = 8;
