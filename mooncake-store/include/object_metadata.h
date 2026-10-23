@@ -33,7 +33,6 @@
 #include "object_part.h"
 #include "replica.h"
 #include "tenant_id.h"
-#include "tenant_quota_ledger.h"
 #include "types.h"
 
 namespace mooncake {
@@ -157,7 +156,6 @@ struct ObjectMetadata {
     const bool hard_pinned{false};  // immutable, set at creation
     bool memory_cache_total_accounted{false};
     bool disk_cache_total_accounted{false};
-    TenantQuotaLedger quota_ledger;
 
     struct DynamicReplicaRecord {
         std::chrono::system_clock::time_point created_at;

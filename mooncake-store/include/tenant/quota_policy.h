@@ -40,6 +40,10 @@
 
 namespace mooncake {
 
+namespace test {
+class MasterServiceTestPeer;
+}  // namespace test
+
 class TenantQuotaPolicy final : public NamespacePolicy {
    public:
     // Internal settings the master passes after validating its config; both
@@ -99,6 +103,8 @@ class TenantQuotaPolicy final : public NamespacePolicy {
     void OnMaintenance() override;
 
    private:
+    friend class test::MasterServiceTestPeer;
+
     static TenantQuotaAccount& AccountOf(const PolicyContext& ctx);
 
     StoreControl& store_;

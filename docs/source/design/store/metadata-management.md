@@ -62,7 +62,6 @@ Each key maps to one `ObjectMetadata` record:
 | `size`, `object_checksum`, `data_type` | Object length, optional checksum, data-type classification |
 | `tenant_id`, `user_key`, `group_id` | Identity (the key is stored again inside the record) and optional group for shared-TTL lifecycle |
 | `lease`, `soft_pin_timeout`, `hard_pinned` | Read lease and pin state that control eviction eligibility |
-| `quota_ledger` | Per-tenant quota accounting for this object |
 | `replicas_` | `std::vector<Replica>` — the location descriptors |
 
 A `Replica` is a `std::variant` over the storage media, with a serializable
@@ -89,7 +88,8 @@ visible to readers:
    duplicates — a completed object or a fresh in-progress write returns
    `OBJECT_ALREADY_EXISTS`, while an expired in-progress write has its stale
    `PROCESSING` replicas moved to a deferred-release list. The Master then
-   charges tenant quota, allocates buffers on segments via the
+   asks the namespace policy (the tenant quota, with multi-tenancy on) for the
+   memory the write takes, allocates buffers on segments via the
    `AllocationStrategy` over the `SegmentManager`'s per-segment allocators,
    and **inserts the `ObjectMetadata` with replicas in `PROCESSING` state**,
    returning the replica descriptors to the client.

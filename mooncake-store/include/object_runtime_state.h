@@ -34,7 +34,6 @@ struct ReplicationTask {
     } type;
     ReplicaID source_id;
     std::vector<ReplicaID> replica_ids;
-    uint64_t pending_quota_charge_bytes{0};
     UUID dynamic_replication_lease_id{};
     uint64_t dynamic_replication_version_epoch{0};
     bool durable_cleanup_pending{false};
@@ -112,7 +111,6 @@ struct PromotionTask {
     ReplicaID source_id;    // the LOCAL_DISK replica being promoted
     ReplicaID alloc_id{0};  // the new MEMORY replica staged by AllocStart
     uint64_t object_size;
-    uint64_t pending_quota_charge_bytes{0};
     std::chrono::system_clock::time_point start_time;
     UUID holder_id;  // owner of source LOCAL_DISK; only Notifier allowed
     // Execution failures so far in this admission chain. Read by
