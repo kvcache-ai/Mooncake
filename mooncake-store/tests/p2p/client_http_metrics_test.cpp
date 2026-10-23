@@ -421,6 +421,7 @@ TEST_F(ClientHttpMetricsTest, IndependentMetricsHttpEndpointsTest) {
     auto p2p_metrics = P2PClientMetric::Create();
     ASSERT_NE(p2p_metrics, nullptr);
     centralized_metrics.transfer_metric.total_read_bytes.inc(1024 * 1024);
+    p2p_metrics->transfer_metric.total_read_bytes.inc(4096);
     p2p_metrics->total_request.get_requests.inc(50);
 
     using namespace coro_http;
@@ -464,7 +465,7 @@ TEST_F(ClientHttpMetricsTest, IndependentMetricsHttpEndpointsTest) {
     EXPECT_EQ(resp.status, 200);
     EXPECT_NE(resp.resp_body.find("mooncake_p2p_total_get_requests_total"),
               std::string::npos);
-    EXPECT_NE(resp.resp_body.find("mooncake_transfer_read_bytes"),
+    EXPECT_NE(resp.resp_body.find("mooncake_transfer_read_bytes 4096"),
               std::string::npos);
     resp = client.get(base + "/p2p/metrics/summary");
     EXPECT_EQ(resp.status, 200);
