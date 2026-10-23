@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -61,17 +62,22 @@ class TransferEngineImplTestPeer {
     static Status freeBatch(TransferEngineImpl& engine, BatchID batch_id) {
         return engine.multi_transports_->freeBatchID(batch_id);
     }
+
+    static Status tryFreeBatch(TransferEngineImpl& engine, BatchID batch_id) {
+        return engine.multi_transports_->tryFreeBatchID(batch_id, {});
+    }
 };
 
 namespace {
 
-// Reports `status` for every task; COMPLETED unless a test changes it.
+// Reports `task_status[task_id]` if set, else `status` (COMPLETED by default).
 class FakeTransport : public Transport {
    public:
     explicit FakeTransport(size_t transferred_bytes)
         : transferred_bytes_(transferred_bytes) {}
 
     TransferStatusEnum status = TransferStatusEnum::COMPLETED;
+    std::map<size_t, TransferStatusEnum> task_status;
 
     Status submitTransfer(BatchID,
                           const std::vector<TransferRequest>&) override {
@@ -86,7 +92,8 @@ class FakeTransport : public Transport {
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status) override {
-        status.s = this->status;
+        auto it = task_status.find(task_id);
+        status.s = it == task_status.end() ? this->status : it->second;
         status.transferred_bytes = transferred_bytes_;
         __atomic_store_n(&toBatchDesc(batch_id).task_list[task_id].is_finished,
                          true, __ATOMIC_RELEASE);
@@ -349,6 +356,38 @@ TEST_F(EngineMetricsTest, ConcurrentPollsRecordOnce) {
     EXPECT_EQ(requestsTotal(Direction::Read), kTasks);
     EXPECT_EQ(bytesTotal(Direction::Read), kTasks * 4096);
     EXPECT_EQ(latencyCount(Direction::Read), kTasks);
+}
+
+// A batch poll alone records every task, including those after a failure.
+TEST_F(EngineMetricsTest, BatchPollRecordsTasksAfterFailure) {
+    auto transport = std::make_shared<FakeTransport>(4096);
+    buildBatch("127.0.0.1:0", transport, Transport::TransferRequest::WRITE, 3);
+    transport->task_status[0] = TransferStatusEnum::FAILED;
+    transport->task_status[1] = TransferStatusEnum::TIMEOUT;
+
+    TransferStatus status;
+    engine_->getBatchTransferStatus(batch_, status);
+
+    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(requestsTotal(Direction::Write), 3);
+    EXPECT_EQ(failuresTotal(Direction::Write), 1);
+    EXPECT_EQ(timeoutsTotal(Direction::Write), 1);
+    EXPECT_EQ(bytesTotal(Direction::Write), 4096);
+}
+
+// Freeing a batch records every task, including those after a timeout.
+TEST_F(EngineMetricsTest, FreeBatchRecordsTasksAfterTimeout) {
+    auto transport = std::make_shared<FakeTransport>(4096);
+    buildBatch("127.0.0.1:0", transport, Transport::TransferRequest::WRITE, 3);
+    transport->task_status[0] = TransferStatusEnum::TIMEOUT;
+    transport->task_status[1] = TransferStatusEnum::FAILED;
+
+    EXPECT_TRUE(TransferEngineImplTestPeer::tryFreeBatch(*engine_, batch_)
+                    .IsBatchBusy());
+    EXPECT_EQ(requestsTotal(Direction::Write), 3);
+    EXPECT_EQ(timeoutsTotal(Direction::Write), 1);
+    EXPECT_EQ(failuresTotal(Direction::Write), 1);
+    EXPECT_EQ(bytesTotal(Direction::Write), 4096);
 }
 
 class EngineMetricsOutcomeTest

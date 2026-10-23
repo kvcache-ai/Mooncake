@@ -158,6 +158,7 @@ Status MultiTransport::tryFreeBatchID(
     BatchID batch_id, const std::function<void()>& before_delete) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
+    bool busy = false;
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         auto& task = batch_desc.task_list[task_id];
         if (task.is_finished) {
@@ -176,12 +177,15 @@ Status MultiTransport::tryFreeBatchID(
         // A terminal transfer status only means the task published completion;
         // the completion callback may still be unwinding while holding raw
         // BatchDesc access. Keep the batch alive until the explicit quiescence
-        // counter reaches zero below.
+        // counter reaches zero below. Keep walking so every task is recorded.
         if (status.s != Transport::TransferStatusEnum::COMPLETED &&
             status.s != Transport::TransferStatusEnum::FAILED) {
-            return Status::BatchBusy(
-                "BatchID cannot be freed until all tasks are done");
+            busy = true;
         }
+    }
+    if (busy) {
+        return Status::BatchBusy(
+            "BatchID cannot be freed until all tasks are done");
     }
     // A terminal status only means the task published completion; the
     // completion callback may still be unwinding while holding a pin on
@@ -597,6 +601,7 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     // set is_finished. The WAITING fast path does not write is_finished.
 
     size_t success_count = 0;
+    bool any_failed = false;
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         TransferStatus task_status;
         auto ret = getTransferStatus(batch_id, task_id, task_status);
@@ -606,14 +611,18 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
             return Status::OK();
         }
 
+        // Keep walking after a failure so every task is recorded.
         if (task_status.s == Transport::TransferStatusEnum::COMPLETED) {
             status.transferred_bytes += task_status.transferred_bytes;
             success_count++;
         } else if (task_status.s == Transport::TransferStatusEnum::FAILED ||
                    task_status.s == Transport::TransferStatusEnum::TIMEOUT) {
-            status.s = Transport::TransferStatusEnum::FAILED;
-            return Status::OK();
+            any_failed = true;
         }
+    }
+    if (any_failed) {
+        status.s = Transport::TransferStatusEnum::FAILED;
+        return Status::OK();
     }
 
     status.s = (success_count == task_count)
