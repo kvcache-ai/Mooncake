@@ -199,4 +199,12 @@ Hardware data-path tests (`tent_rdma_transport_test` roundtrip,
 `tent_nvlink_transport_test`, Sunrise, MPComm) skip or are omitted from
 ctest when the device is missing. That skip is expected; a green
 `cuda-off` run does not mean those paths were exercised. `tent_nvlink_transport_test`
-is built when CUDA is on but is not registered with ctest.
+is built when CUDA is on but is not registered with ctest. The `tent_xpu_*`
+tests are built only with `USE_XPU=ON`; they skip without a SYCL device and
+some can fall back to an OpenCL CPU device, so check the GoogleTest skip
+counts before treating a run as Intel GPU coverage. On hardware expected to
+support dma-buf RDMA, set `MC_TENT_XPU_REQUIRE_DMABUF_RDMA=1` so missing
+dma-buf support fails instead of skipping. `tent_xpu_ipc_process_test` skips
+its IPC cases when ptrace forbids the cross-process import (Yama
+`ptrace_scope` 2 or 3 without `CAP_SYS_PTRACE`), and its fallback cases when
+the process has `CAP_SYS_PTRACE`.
