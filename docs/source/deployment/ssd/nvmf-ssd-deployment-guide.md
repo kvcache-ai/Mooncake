@@ -19,6 +19,96 @@ Follow the "Build with NVMe-oF SSD Pool" section in the
 [Build Guide](../../getting_started/build.md) to install SPDK dependencies and
 build Mooncake with `-DUSE_NOF=ON`.
 
+### Linux kernel initiator
+
+The Linux initiator uses NVMe-oF namespaces already connected by the Linux
+kernel and supports TCP and RDMA. This backend does not require SPDK/DPDK or
+hugepages.
+
+Mooncake automatically finds the device from the connection information and
+NSID; no device-path configuration is needed. The operating system manages
+connections and reconnections.
+
+**Build and enable.** Install the liburing development package and enable
+these CMake options:
+
+```text
+-DUSE_NOF=ON
+-DUSE_NOF_LINUX=ON
+```
+
+Set the following environment variable for the master and every client process
+that uses NoF:
+
+```bash
+export MC_NOF_BACKEND=linux
+```
+
+`MC_NOF_LINUX_QUEUE_DEPTH` optionally sets the maximum outstanding requests per
+Linux data queue (default `256`, range `1`–`32768`). It is read at first use;
+invalid values fall back to the default. Probe queues are unaffected.
+
+**Connect storage devices.** Connect the required subsystems on the master
+host and every client host that performs NoF I/O. For TCP:
+
+```bash
+sudo modprobe nvme-tcp
+
+sudo nvme connect \
+  -t tcp \
+  -a 192.168.65.56 \
+  -s 4420 \
+  -n nqn.2026-10.io.example:cache \
+  --keep-alive-tmo=10 \
+  --reconnect-delay=1 \
+  --ctrl-loss-tmo=-1 \
+  --fast_io_fail_tmo=30
+```
+
+Recommended settings are listed below. All time values are in seconds.
+
+| Parameter | Recommended value | Purpose |
+|-----------|-------------------|---------|
+| `keep-alive-tmo` | `10` | Set KATO for connection keep-alive and failure detection. |
+| `reconnect-delay` | `1` | Set the interval between reconnect attempts. |
+| `ctrl-loss-tmo` | `-1` | Keep reconnecting instead of deleting the controller after a reconnect timeout. |
+| `fast_io_fail_tmo` | `30` | Limit how long I/O waits during reconnection. |
+
+For RDMA, load `nvme-rdma` and use `-t rdma`.
+
+Clients and the master on the same host can share a kernel connection; do not
+connect separately for each process. The current implementation requires one
+connected controller per subsystem on each host. Multiple namespaces in that
+subsystem share the connection.
+
+**Start services and register segments.** The recommended deployment order is:
+
+1. Start the target and prepare its namespaces.
+2. Establish NVMe-oF connections on the master and client hosts.
+3. Confirm that the controllers are `live` and the namespaces are visible.
+4. Start the Mooncake master and clients.
+5. Register the NoF segments and verify reads and writes before serving traffic.
+
+Use these commands to inspect connections and devices:
+
+```bash
+sudo nvme list
+sudo nvme list-subsys
+```
+
+The current implementation allows processes to start before devices are
+connected, but successful startup or registration does not mean storage is
+ready. Complete device connections before registering segments and enabling
+NoF traffic.
+
+Use the existing segment registration workflow. The registered connection
+information and NSID must match the kernel connection.
+
+**Failure recovery.** The kernel handles reconnection after temporary
+disconnections. If a device has been deleted or recreated, restore the
+connection and restart the affected Mooncake processes. If the master has
+unmounted a segment, register it again after recovery.
+
 ## 2. Deploy Mooncake Services
 
 ### 2.1 Node Topology
@@ -308,7 +398,7 @@ extra_config:
 | `MC_NOF_WORKERS` | Number of worker threads used to process SPDK NoF I/O operations. | 4 |
 | `MC_NOF_SUBMIT_CHUNK_BYTES` | Size of each I/O operation submitted to SPDK. | 128KB |
 | `MC_NOF_INFLIGHT_BYTES_LIMIT` | Maximum number of in-flight I/O bytes allowed in the system. | 32MB |
-| `MC_NOF_BACKEND` | NoF backend pair: `spdk` or `none`. `none` disables NoF at runtime in a `USE_NOF` build — one binary can be deployed on nodes without a working SPDK/hugepage environment. Case-insensitive; unrecognized values fall back to `spdk` with a warning. | `spdk` |
+| `MC_NOF_BACKEND` | NoF backend pair: `spdk`, `linux`, or `none`. `none` disables NoF at runtime. Case-insensitive; unknown values warn and fall back to the default. Selecting an unbuilt backend logs an error and leaves NoF unavailable. | `spdk` if built, otherwise `linux` |
 | `MC_NOF_IOVA_MODE` | SPDK IOVA mode passed to `spdk_env_init`: `pa` or `va`. Set `va` inside containers without physical-address access (restricted `/proc/self/pagemap`), where the default PA mode fails with `Cannot use IOVA as 'PA'`. | unset (SPDK default, PA-preferred) |
 
 The `MC_NOF_WORKERS`, `MC_NOF_SUBMIT_CHUNK_BYTES` and

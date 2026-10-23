@@ -7,78 +7,97 @@
 
 #ifdef USE_NOF
 #include <glog/logging.h>
-
+#endif
+#ifdef USE_NOF_SPDK
 #include "nof/spdk_initiator.h"
+#endif
+#ifdef USE_NOF_LINUX
+#include "nof/linux_initiator.h"
 #endif
 
 namespace mooncake {
-
-#ifdef USE_NOF
 namespace {
-
-// Backend selector (MC_NOF_BACKEND, case-insensitive). One knob selects a
-// *paired* Initiator+Allocator — a mismatched pair would silently violate
-// the SPDK initiator's alignment/registration assumptions.
-//   spdk (default; unset/empty) -> SpdkInitiator + SpdkDmaAllocator
-//   none                        -> runtime-disable NoF: {nullptr, System}
-// Unrecognized values fall back to spdk with a warning: a typo that silently
-// disables NoF turns into write failures, which is worse.
-enum class NofBackend { kSpdk, kNone };
+#ifdef USE_NOF
+// MC_NOF_BACKEND selects both the initiator and its matching allocator
+// to satisfy the backend's buffer alignment and registration requirements.
+enum class NofBackend { kSpdk, kLinux, kNone };
 
 NofBackend ResolveNofBackend() {
+#ifdef USE_NOF_SPDK
+    constexpr auto default_backend = NofBackend::kSpdk;
+    constexpr const char* default_name = "spdk";
+#else
+    constexpr auto default_backend = NofBackend::kLinux;
+    constexpr const char* default_name = "linux";
+#endif
     const char* raw = std::getenv("MC_NOF_BACKEND");
     if (!raw || *raw == '\0') {
-        return NofBackend::kSpdk;  // unset/empty -> default
+        return default_backend;
     }
     std::string v(raw);
     std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });
     if (v == "none") {
-        // INFO, not WARNING: an explicit operator choice, but logged so a
-        // forgotten inherited env var does not silently disable NoF.
         LOG(INFO) << "MC_NOF_BACKEND=none: NoF disabled at runtime";
         return NofBackend::kNone;
     }
-    if (v != "spdk") {
-        LOG(WARNING) << "Unrecognized MC_NOF_BACKEND=\"" << raw
-                     << "\"; falling back to \"spdk\"";
-    }
-    return NofBackend::kSpdk;
+    if (v == "spdk") return NofBackend::kSpdk;
+    if (v == "linux") return NofBackend::kLinux;
+    LOG(WARNING) << "Unrecognized MC_NOF_BACKEND=\"" << raw
+                 << "\"; falling back to \"" << default_name << "\"";
+    return default_backend;
 }
+#endif
 
+#ifdef USE_NOF_LINUX
+// Use at least 4 KiB alignment for 512/4096-byte logical blocks,
+// including older kernels that require block-aligned buffers.
+class LinuxBufferAllocator final : public DmaBufferAllocator {
+   public:
+    void* Alloc(size_t size, size_t align, int) override {
+        void* buffer = nullptr;
+        return posix_memalign(&buffer, std::max<size_t>(4096, align), size) == 0
+                   ? buffer
+                   : nullptr;
+    }
+    void Free(void* buffer) override { free(buffer); }
+};
+#endif
 }  // namespace
-#endif  // USE_NOF
 
 NofRuntime CreateNofRuntime() {
 #ifdef USE_NOF
-    if (ResolveNofBackend() == NofBackend::kNone) {
-        // Runtime-disable: nullptr initiator is the uniform "NoF unavailable"
-        // signal. dma_allocator stays non-null (SystemDmaAllocator) to honor
-        // the NofRuntime invariant; callers gate on initiator, so the system
-        // allocator never actually reaches ClientBufferAllocator.
-        return NofRuntime{nullptr, std::make_shared<SystemDmaAllocator>()};
-    }
-    return NofRuntime{std::make_shared<SpdkInitiator>(),
-                      std::make_shared<SpdkDmaAllocator>()};
-#else
-    // Non-USE_NOF builds ignore MC_NOF_BACKEND (a backend that isn't compiled
-    // in cannot be selected).
-    return NofRuntime{nullptr, std::make_shared<SystemDmaAllocator>()};
+    const auto backend = ResolveNofBackend();
+#ifdef USE_NOF_SPDK
+    if (backend == NofBackend::kSpdk)
+        return {std::make_shared<SpdkInitiator>(),
+                std::make_shared<SpdkDmaAllocator>()};
 #endif
+#ifdef USE_NOF_LINUX
+    if (backend == NofBackend::kLinux)
+        return {std::make_shared<LinuxNvmeInitiator>(),
+                std::make_shared<LinuxBufferAllocator>()};
+#endif
+    if (backend != NofBackend::kNone) {
+        LOG(ERROR) << "Selected NoF backend is not built; NoF is unavailable";
+    }
+#endif
+    return {nullptr, std::make_shared<SystemDmaAllocator>()};
 }
 
 std::shared_ptr<DmaBufferAllocator> CreateDefaultDmaAllocator() {
 #ifdef USE_NOF
-    if (ResolveNofBackend() == NofBackend::kNone) {
-        // Honor "none": return nullptr, matching the historical
-        // "NoF unavailable" signal.
-        return nullptr;
-    }
-    return std::make_shared<SpdkDmaAllocator>();
-#else
-    return nullptr;  // preserve hugepage_memory_alloc's historical behavior
+    const auto backend = ResolveNofBackend();
+#ifdef USE_NOF_SPDK
+    if (backend == NofBackend::kSpdk)
+        return std::make_shared<SpdkDmaAllocator>();
 #endif
+#ifdef USE_NOF_LINUX
+    if (backend == NofBackend::kLinux)
+        return std::make_shared<LinuxBufferAllocator>();
+#endif
+#endif
+    return nullptr;
 }
-
 }  // namespace mooncake
