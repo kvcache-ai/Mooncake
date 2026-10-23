@@ -487,6 +487,30 @@ TEST_F(EvictorTest, AGroupMemberIsDeferredOnce) {
         1);
 }
 
+// The fallback asks whether the minimum is met only between entries, so a
+// group's deferred members go together even past the minimum.
+TEST_F(EvictorTest, AGroupsDeferredMembersGoTogetherInTheFallback) {
+    Publish("a", "g1", seconds(10), "g");
+    Publish("a", "g2", seconds(10), "g");
+    Publish("a", "g3", seconds(10), "g");
+    Publish("a", "x", seconds(5));
+    Publish("a", "y", seconds(3));
+    policy_.soft_pinned = {"g1", "g2", "g3"};
+    policy_.defer_soft_pinned = true;
+
+    // The walk frees x and y, one short of the minimum of 3 (2.5 rounded up).
+    const auto report = Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 0.5});
+
+    ASSERT_EQ(reclaimer_.applied.size(), 5u);
+    EXPECT_EQ(std::vector<std::string>(reclaimer_.applied.begin(),
+                                       reclaimer_.applied.begin() + 2),
+              (std::vector<std::string>{"x", "y"}));
+    EXPECT_EQ(std::set<std::string>(reclaimer_.applied.begin() + 2,
+                                    reclaimer_.applied.end()),
+              (std::set<std::string>{"g1", "g2", "g3"}));
+    EXPECT_EQ(report.evicted_objects, 5u);
+}
+
 // A read that extends a lease leaves the key filed where it was. The run meets
 // it there, leaves it alone, and refiles it at its real deadline.
 TEST_F(EvictorTest, AKeyWhoseLeaseWasExtendedIsRefiledNotEvicted) {
