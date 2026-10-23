@@ -223,6 +223,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
               "transports/rdma/endpoint/qp_mul_factor");
     setConfig(config, "MC_MAX_SGE", "transports/rdma/endpoint/max_sge");
     setConfig(config, "MC_MAX_WR", "transports/rdma/endpoint/max_qp_wr");
+    setConfig(config, "MC_TENT_RDMA_SIGNAL_INTERVAL",
+              "transports/rdma/endpoint/signal_interval");
     setConfig(config, "MC_MAX_INLINE",
               "transports/rdma/endpoint/max_inline_bytes");
     setConfig(config, "MC_PKEY_INDEX", "transports/rdma/endpoint/pkey_index");

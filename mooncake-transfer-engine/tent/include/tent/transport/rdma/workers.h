@@ -105,7 +105,9 @@ class Workers {
     // partway through a group of completions that share one timestamp.
     void handleCompletion(WorkerContext& worker, RdmaContext& context,
                           const ibv_wc& wc, uint64_t poll_ts,
-                          bool last_in_pass = true);
+                          bool last_in_pass = true,
+                          bool queue_already_drained = false,
+                          bool completion_owed = true);
 
     // The lane whose inflight_slice_set holds `slice`'s entry, or nullptr
     // when it cannot be resolved (no lane recorded, or the worker array is
