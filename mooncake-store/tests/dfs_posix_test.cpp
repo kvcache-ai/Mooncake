@@ -2301,7 +2301,7 @@ TEST_F(DfsBackendTest, FailurePaths) {
     ASSERT_FALSE(write.has_value());
     EXPECT_EQ(write.error(), ErrorCode::INVALID_PARAMS);
 
-    auto open = adapter.OpenExistingFile(tmp_->file("does_not_exist"));
+    auto open = adapter.OpenExistingFile(tmp_->file("does_not_exist"), false);
     ASSERT_FALSE(open.has_value());
     EXPECT_EQ(open.error(), ErrorCode::FILE_NOT_FOUND);
 }
