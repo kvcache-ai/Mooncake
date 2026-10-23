@@ -11,6 +11,8 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::OK, "OK"},
         {ErrorCode::INTERNAL_ERROR, "INTERNAL_ERROR"},
         {ErrorCode::BUFFER_OVERFLOW, "BUFFER_OVERFLOW"},
+        {ErrorCode::NOF_REGISTRATION_STUCK, "NOF_REGISTRATION_STUCK"},
+        {ErrorCode::NOT_REGISTERED, "NOT_REGISTERED"},
         {ErrorCode::SHARD_INDEX_OUT_OF_RANGE, "SHARD_INDEX_OUT_OF_RANGE"},
         {ErrorCode::SEGMENT_NOT_FOUND, "SEGMENT_NOT_FOUND"},
         {ErrorCode::SEGMENT_ALREADY_EXISTS, "SEGMENT_ALREADY_EXISTS"},

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <fcntl.h>
 #include <cerrno>
 #include <dlfcn.h>
 #include <gtest/gtest.h>
@@ -31,6 +32,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -54,6 +56,7 @@
 #include "tent/transport/rdma/rdma_transport.h"
 #include "tent/transport/rdma/slice.h"
 #include "tent/transport/rdma/workers.h"
+#include "../src/platform/xpu/xpu_dmabuf_utils.h"
 
 namespace mooncake {
 namespace tent {
@@ -405,6 +408,14 @@ class RdmaEndPointTestPeer {
     static TicketLock& qpLock(const std::shared_ptr<RdmaEndPoint>& endpoint,
                               int qp_index) {
         return endpoint->queue_lock_list_[qp_index];
+    }
+    static void markNotifyConnected(
+        const std::shared_ptr<RdmaEndPoint>& endpoint) {
+        endpoint->notify_connected_.store(true);
+    }
+    static uint64_t notifySendWrId(
+        const std::shared_ptr<RdmaEndPoint>& endpoint) {
+        return endpoint->notify_send_wr_id_;
     }
 };
 
@@ -1976,6 +1987,278 @@ TEST_F(RdmaContextEnableTest, OpenDeviceFallsBackToTheEncodedRate) {
     EXPECT_EQ(fake_rnic.query_speed_calls, 1);
     EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);  // NDR 4x encoded
 }
+
+// Keep these stand-ins separate from the multi-NIC registration test helpers.
+namespace dmabuf_registration {
+
+TEST(XpuDmabufRangeTest, ChecksBoundsBeforeSubtracting) {
+    constexpr uint64_t size = 1 << 20;
+    constexpr uint64_t interior = 4096;
+    constexpr uint64_t max = std::numeric_limits<uint64_t>::max();
+    EXPECT_TRUE(xpu_detail::validateDmabufRange(0, size, size).ok());
+    EXPECT_TRUE(
+        xpu_detail::validateDmabufRange(interior, size - interior, size).ok());
+    EXPECT_TRUE(xpu_detail::validateDmabufRange(size, 0, size).ok());
+    EXPECT_TRUE(
+        xpu_detail::validateDmabufRange(interior, size - interior + 1, size)
+            .IsInternalError());
+    EXPECT_TRUE(
+        xpu_detail::validateDmabufRange(size + 1, 1, size).IsInternalError());
+    EXPECT_TRUE(
+        xpu_detail::validateDmabufRange(max, 1, size).IsInternalError());
+    EXPECT_TRUE(xpu_detail::validateDmabufRange(1, max, max).IsInternalError());
+}
+
+TEST(XpuDmabufBackingTest, RoundedForeignBackingIsNotProofOfNoPooling) {
+    constexpr uint64_t page = 64 << 10;
+    EXPECT_FALSE(xpu_detail::hasDedicatedDmabuf(page / 2, page, false));
+    EXPECT_FALSE(xpu_detail::hasDedicatedDmabuf(1 << 20, 2 << 20, false));
+    EXPECT_FALSE(xpu_detail::hasDedicatedDmabuf(2 << 20, 16 << 20, false));
+    EXPECT_TRUE(xpu_detail::hasDedicatedDmabuf(page, page, false));
+    EXPECT_TRUE(xpu_detail::hasDedicatedDmabuf(page / 2, page, true));
+    EXPECT_FALSE(xpu_detail::hasDedicatedDmabuf(page, page / 2, true));
+    EXPECT_FALSE(xpu_detail::hasDedicatedDmabuf(0, page, true));
+}
+
+// Memory-registration verbs stand-ins. registerMemReg() picks between
+// ibv_reg_mr and ibv_reg_dmabuf_mr from what the platform's dma-buf exporter
+// says about the address; the fake records which one it was handed and the
+// dma-buf arguments, so a test can check both the choice and the plumbing
+// (offset, iova, fd) without a device or an RNIC.
+struct FakeMrVerbs {
+    ibv_pd pd{};
+    ibv_mr host_mr{};
+    ibv_mr dmabuf_mr{};
+    int reg_mr_calls = 0;
+    int reg_dmabuf_calls = 0;
+    int dereg_calls = 0;
+    bool fail_dmabuf_reg = false;
+    uint64_t last_offset = 0;
+    size_t last_length = 0;
+    uint64_t last_iova = 0;
+    int last_fd = -1;
+    int last_access = 0;
+};
+FakeMrVerbs fake_mr;
+
+ibv_mr* fakeRegMr(ibv_pd*, void* addr, size_t length, int) {
+    ++fake_mr.reg_mr_calls;
+    fake_mr.host_mr.addr = addr;
+    fake_mr.host_mr.length = length;
+    return &fake_mr.host_mr;
+}
+
+ibv_mr* fakeRegDmabufMr(ibv_pd*, uint64_t offset, size_t length, uint64_t iova,
+                        int fd, int access) {
+    ++fake_mr.reg_dmabuf_calls;
+    fake_mr.last_offset = offset;
+    fake_mr.last_length = length;
+    fake_mr.last_iova = iova;
+    fake_mr.last_fd = fd;
+    fake_mr.last_access = access;
+    if (fake_mr.fail_dmabuf_reg) {
+        errno = EINVAL;
+        return nullptr;
+    }
+    // rdma-core stores the dma-buf offset, not a host VA or the supplied iova.
+    fake_mr.dmabuf_mr.addr = reinterpret_cast<void*>(offset);
+    fake_mr.dmabuf_mr.length = length;
+    return &fake_mr.dmabuf_mr;
+}
+
+int fakeDeregMr(ibv_mr*) {
+    ++fake_mr.dereg_calls;
+    return 0;
+}
+
+// A context enabled on a placeholder device with the fake MR verbs and an
+// injected dma-buf exporter. Exercises registerMemReg()/unregisterMemReg()
+// exactly as LocalBufferManager does when a buffer is added.
+class RdmaContextDmabufTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        fake_mr = FakeMrVerbs{};
+        context_ = std::make_unique<RdmaContext>(transport_);
+        auto& verbs = RdmaContextTestPeer::verbs(*context_);
+        verbs.ibv_reg_mr_default = fakeRegMr;
+        verbs.ibv_reg_dmabuf_mr = fakeRegDmabufMr;
+        verbs.ibv_dereg_mr = fakeDeregMr;
+        params_ = std::make_shared<RdmaParams>();
+        RdmaContextTestPeer::bindDevice(*context_, &fake_port.native, params_);
+        RdmaContextTestPeer::bindResources(*context_, &fake_mr.pd, {}, nullptr);
+        RdmaContextTestPeer::seedAddress(*context_, "mc-fake-rnic", /*lid=*/1,
+                                         /*gid_index=*/0, ibv_gid{},
+                                         RdmaContext::DEVICE_ENABLED);
+    }
+
+    void TearDown() override {
+        RdmaContextTestPeer::unbindResources(*context_);
+        RdmaContextTestPeer::unbindDevice(*context_);
+    }
+
+    // A real fd standing in for the dma-buf, so the test can observe that
+    // registerMemReg() leaves it open: the exporting runtime owns it.
+    static int openFd() {
+        int fd = open("/dev/null", O_RDONLY);
+        EXPECT_GE(fd, 0);
+        return fd;
+    }
+    static bool fdOpen(int fd) { return fcntl(fd, F_GETFD) != -1; }
+
+    RdmaTransport transport_;
+    std::unique_ptr<RdmaContext> context_;
+    std::shared_ptr<RdmaParams> params_;
+    std::vector<char> host_buffer_ = std::vector<char>(4096);
+};
+
+TEST_F(RdmaContextDmabufTest, ExportableMemoryUsesDmabufRegistration) {
+    int fd = openFd();
+    context_->setDmabufExporter([&](void*, size_t, DmabufExport& out) {
+        out.fd = fd;
+        out.offset = 512;
+        return Status::OK();
+    });
+    void* addr = host_buffer_.data() + 512;
+    auto mr = context_->registerMemReg(addr, 1024, IBV_ACCESS_LOCAL_WRITE);
+    ASSERT_EQ(mr, &fake_mr.dmabuf_mr);
+    EXPECT_EQ(fake_mr.reg_dmabuf_calls, 1);
+    EXPECT_EQ(fake_mr.reg_mr_calls, 0);
+    EXPECT_EQ(fake_mr.last_offset, 512u);
+    EXPECT_EQ(fake_mr.last_length, 1024u);
+    EXPECT_EQ(fake_mr.last_iova, reinterpret_cast<uint64_t>(addr));
+    EXPECT_EQ(static_cast<ibv_mr*>(mr)->addr, reinterpret_cast<void*>(512));
+    EXPECT_EQ(fake_mr.last_fd, fd);
+    EXPECT_EQ(fake_mr.last_access, IBV_ACCESS_LOCAL_WRITE);
+    // The MR owns its dma-buf reference; the exporter's fd is left to the
+    // runtime that handed it out (Level Zero caches it per allocation).
+    EXPECT_TRUE(fdOpen(fd));
+
+    // The unaligned offset is not a host VMA. Any accidental MADV_DOFORK on
+    // it would fail and log a warning, even though unregister returns success.
+    testing::internal::CaptureStderr();
+    const int unregister_result = context_->unregisterMemReg(mr);
+    const std::string unregister_log = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(unregister_result, 0);
+    EXPECT_EQ(unregister_log.find("Failed to restore fork state"),
+              std::string::npos);
+    EXPECT_EQ(fake_mr.dereg_calls, 1);
+    close(fd);
+}
+
+TEST_F(RdmaContextDmabufTest, HostMemoryTakesThePlainPath) {
+    int exporter_calls = 0;
+    context_->setDmabufExporter([&](void*, size_t, DmabufExport&) {
+        ++exporter_calls;
+        return Status::InvalidArgument("not device memory");
+    });
+    auto mr = context_->registerMemReg(host_buffer_.data(), 4096,
+                                       IBV_ACCESS_LOCAL_WRITE);
+    ASSERT_EQ(mr, &fake_mr.host_mr);
+    EXPECT_EQ(exporter_calls, 1);
+    EXPECT_EQ(fake_mr.reg_dmabuf_calls, 0);
+    EXPECT_EQ(fake_mr.reg_mr_calls, 1);
+    EXPECT_EQ(context_->unregisterMemReg(mr), 0);
+}
+
+TEST_F(RdmaContextDmabufTest, PlatformWithoutExportTakesThePlainPath) {
+    context_->setDmabufExporter([](void*, size_t, DmabufExport&) {
+        return Status::NotImplemented("no dma-buf on this platform");
+    });
+    auto mr = context_->registerMemReg(host_buffer_.data(), 4096,
+                                       IBV_ACCESS_LOCAL_WRITE);
+    ASSERT_EQ(mr, &fake_mr.host_mr);
+    EXPECT_EQ(fake_mr.reg_dmabuf_calls, 0);
+    EXPECT_EQ(fake_mr.reg_mr_calls, 1);
+    EXPECT_EQ(context_->unregisterMemReg(mr), 0);
+}
+
+TEST_F(RdmaContextDmabufTest, DefaultExporterIsThePlatform) {
+    // No exporter injected: the CPU platform in this test process has no
+    // dma-buf export, so registration must land on ibv_reg_mr.
+    auto mr = context_->registerMemReg(host_buffer_.data(), 4096,
+                                       IBV_ACCESS_LOCAL_WRITE);
+    ASSERT_EQ(mr, &fake_mr.host_mr);
+    EXPECT_EQ(fake_mr.reg_dmabuf_calls, 0);
+    EXPECT_EQ(context_->unregisterMemReg(mr), 0);
+}
+
+TEST_F(RdmaContextDmabufTest, ExportFailureIsARegistrationFailure) {
+    // Device memory the driver refused to export must not be handed to
+    // ibv_reg_mr as if it were host memory.
+    context_->setDmabufExporter([](void*, size_t, DmabufExport&) {
+        return Status::InternalError("zeMemGetAllocProperties failed");
+    });
+    auto mr = context_->registerMemReg(host_buffer_.data(), 4096,
+                                       IBV_ACCESS_LOCAL_WRITE);
+    EXPECT_EQ(mr, nullptr);
+    EXPECT_EQ(fake_mr.reg_dmabuf_calls, 0);
+    EXPECT_EQ(fake_mr.reg_mr_calls, 0);
+}
+
+TEST_F(RdmaContextDmabufTest,
+       OutOfBoundsDeviceRangeNeverUsesPlainRegistration) {
+    int exporter_calls = 0;
+    context_->setDmabufExporter([&](void*, size_t length, DmabufExport&) {
+        ++exporter_calls;
+        // Use the platform's validator for a device allocation of 4096 bytes
+        // with an interior start. The requested length must not be clipped.
+        EXPECT_EQ(length, 4096u);
+        return xpu_detail::validateDmabufRange(512, length, 4096);
+    });
+    auto mr = context_->registerMemReg(host_buffer_.data(), 4096,
+                                       IBV_ACCESS_LOCAL_WRITE);
+    EXPECT_EQ(mr, nullptr);
+    EXPECT_EQ(exporter_calls, 1);
+    EXPECT_EQ(fake_mr.reg_dmabuf_calls, 0);
+    EXPECT_EQ(fake_mr.reg_mr_calls, 0);
+}
+
+TEST_F(RdmaContextDmabufTest, DmabufRegistrationFailureFailsWithoutClosingFd) {
+    int fd = openFd();
+    context_->setDmabufExporter([&](void*, size_t, DmabufExport& out) {
+        out.fd = fd;
+        return Status::OK();
+    });
+    fake_mr.fail_dmabuf_reg = true;
+    auto mr = context_->registerMemReg(host_buffer_.data(), 4096,
+                                       IBV_ACCESS_LOCAL_WRITE);
+    EXPECT_EQ(mr, nullptr);
+    EXPECT_EQ(fake_mr.reg_dmabuf_calls, 1);
+    EXPECT_EQ(fake_mr.reg_mr_calls, 0);
+    EXPECT_TRUE(fdOpen(fd));
+    close(fd);
+}
+
+TEST_F(RdmaContextDmabufTest, VerbsWithoutDmabufNeverConsultTheExporter) {
+    RdmaContextTestPeer::verbs(*context_).ibv_reg_dmabuf_mr = nullptr;
+    EXPECT_FALSE(context_->supportsDmabuf());
+    int exporter_calls = 0;
+    context_->setDmabufExporter([&](void*, size_t, DmabufExport& out) {
+        ++exporter_calls;
+        out.fd = openFd();
+        return Status::OK();
+    });
+    auto mr = context_->registerMemReg(host_buffer_.data(), 4096,
+                                       IBV_ACCESS_LOCAL_WRITE);
+    ASSERT_EQ(mr, &fake_mr.host_mr);
+    EXPECT_EQ(exporter_calls, 0);
+    EXPECT_EQ(fake_mr.reg_mr_calls, 1);
+    EXPECT_EQ(context_->unregisterMemReg(mr), 0);
+}
+
+TEST(RdmaContextDmabufSymbolTest, LoaderExposesOptionalDmabufVerb) {
+    // ibv_reg_dmabuf_mr is optional: the loader must come up either way, and
+    // supportsDmabuf() must mirror what it found.
+    auto& loader = IbvLoader::Instance();
+    if (!loader.available()) GTEST_SKIP() << "libibverbs not loadable";
+    RdmaTransport transport;
+    RdmaContext context(transport);
+    RdmaContextTestPeer::verbs(context) = loader.sym();
+    EXPECT_EQ(context.supportsDmabuf(),
+              loader.sym().ibv_reg_dmabuf_mr != nullptr);
+}
+
+}  // namespace dmabuf_registration
 
 // The whole runtime chain: an async event reaches Workers::applyContextEvent,
 // the context re-reads its (fake) port, and the selector is re-seeded only
@@ -3673,6 +3956,41 @@ TEST_F(RdmaSliceOrphanTest, ALingeringOrphanIsReportedOnceAndStillHeld) {
     completeWith(slice, IBV_WC_SUCCESS);
     RdmaTransportTestPeer::reapOrphanSlices(transport_);
     EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// A notification picks its send slot from its wr_id, and the slot is only
+// free while every lower wr_id was posted. The fixture is borrowed for its
+// fake verbs; its post_send is swapped for one that can refuse a post.
+class RdmaNotifySendSlotTest : public RdmaWorkersSharedQpTest {
+   protected:
+    static std::vector<uint64_t> posted;
+    static bool refuse;
+    static int postNotify(ibv_qp*, ibv_send_wr* wr, ibv_send_wr** bad_wr) {
+        posted.push_back(wr->wr_id);
+        *bad_wr = refuse ? wr : nullptr;
+        return refuse ? EINVAL : 0;
+    }
+    void SetUp() override {
+        RdmaWorkersSharedQpTest::SetUp();
+        posted.clear();
+        refuse = false;
+        fake.native.ops.post_send = postNotify;
+    }
+};
+std::vector<uint64_t> RdmaNotifySendSlotTest::posted;
+bool RdmaNotifySendSlotTest::refuse = false;
+
+TEST_F(RdmaNotifySendSlotTest, AFailedPostDoesNotTakeASendSlot) {
+    RdmaEndPointTestPeer::markNotifyConnected(endpoint_);
+    for (int i = 0; i < 255; ++i)  // wr_id 0..254, none completed
+        ASSERT_TRUE(endpoint_->sendNotification("n", "m"));
+    refuse = true;
+    EXPECT_FALSE(endpoint_->sendNotification("n", "m"));
+    EXPECT_EQ(RdmaEndPointTestPeer::notifySendWrId(endpoint_), 255u);
+    refuse = false;
+    ASSERT_TRUE(endpoint_->sendNotification("n", "m"));
+    // 256 would reuse slot 0, whose wr_id 0 is still in flight.
+    EXPECT_EQ(posted.back(), 255u);
 }
 
 // The handler reads the slice well past acknowledge(), which is what

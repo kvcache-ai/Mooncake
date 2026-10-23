@@ -51,24 +51,38 @@ class LocalCopyEngine {
     // based on memory types and transfer size.
     // opcode: WRITE for local->remote, READ for remote->local
     // slice_list: list of slices to copy
+    // dest_addrs: either empty, meaning each slice's own dest_addr is already
+    //   a valid local address, or exactly one entry per slice holding that
+    //   slice's destination rebased onto this process's mapping. The latter is
+    //   needed for a segment owned by another process on this machine, whose
+    //   virtual addresses mean nothing here.
     void Copy(TransferRequest::OpCode opcode,
-              const std::vector<Slice *> &slice_list);
+              const std::vector<Slice *> &slice_list,
+              const std::vector<void *> &dest_addrs = {});
 
    private:
+    // Destination for slice_list[index], honouring the rebased addresses when
+    // the caller supplied them.
+    static void *DestAddr(const std::vector<Slice *> &slice_list,
+                          const std::vector<void *> &dest_addrs, size_t index);
+
     // Perform synchronous memory copy for each slice individually
     void CopyWithSync(TransferRequest::OpCode opcode,
                       const std::vector<Slice *> &slice_list,
+                      const std::vector<void *> &dest_addrs,
                       aclrtMemcpyKind kind);
 
     // Perform asynchronous memory copy with stream synchronization
     void CopyWithAsync(TransferRequest::OpCode opcode,
                        const std::vector<Slice *> &slice_list,
+                       const std::vector<void *> &dest_addrs,
                        aclrtMemcpyKind kind);
 
     // Perform batched memory copy using aclrtMemcpyBatch
     // Returns ACL_ERROR_RT_FEATURE_NOT_SUPPORT if batch copy is not supported
     aclError CopyWithBatch(TransferRequest::OpCode opcode,
                            const std::vector<Slice *> &slice_list,
+                           const std::vector<void *> &dest_addrs,
                            aclrtMemcpyKind kind, size_t batch_num,
                            size_t slice_index) const;
 

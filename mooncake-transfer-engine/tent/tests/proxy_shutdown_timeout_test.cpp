@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <thread>
@@ -51,6 +52,7 @@ class NeverCompletingSubBatch : public Transport::SubBatch {
    public:
     size_t size() const override { return task_count; }
     size_t task_count = 0;
+    int submission = 0;
     std::vector<Request> requests;
 };
 
@@ -59,6 +61,9 @@ class NeverCompletingTransport : public Transport {
     NeverCompletingTransport() { caps.dram_to_dram = true; }
 
     std::atomic<int> submit_calls{0};
+    bool fail_second = false;
+    std::atomic<bool> complete_first{false};
+    std::atomic<int> failed_polls{0};
     std::atomic<int> free_local_memory_calls{0};
 
     Status install(std::string& /*local_segment_name*/,
@@ -81,8 +86,8 @@ class NeverCompletingTransport : public Transport {
 
     Status submitTransferTasks(
         SubBatchRef batch, const std::vector<Request>& request_list) override {
-        ++submit_calls;
         auto* fb = static_cast<NeverCompletingSubBatch*>(batch);
+        fb->submission = ++submit_calls;
         for (const auto& req : request_list) {
             fb->requests.push_back(req);
             fb->task_count++;
@@ -98,6 +103,15 @@ class NeverCompletingTransport : public Transport {
         }
         status.s = TransferStatusEnum::PENDING;
         status.transferred_bytes = 0;
+        if (fail_second && fb->submission == 2) {
+            ++failed_polls;
+            status.s = FAILED;
+        } else if (complete_first.load()) {
+            const auto& request = fb->requests[task_id];
+            std::memcpy(reinterpret_cast<void*>(request.target_offset),
+                        request.source, request.length);
+            status = {COMPLETED, request.length};
+        }
         return Status::OK();
     }
 
@@ -154,6 +168,7 @@ std::shared_ptr<Config> makeMinimalP2PConfig() {
     cfg->set("transports/rdma/enable", false);
     cfg->set("transports/io_uring/enable", false);
     cfg->set("transports/nvlink/enable", false);
+    cfg->set("transports/mlu/enable", false);
     cfg->set("transports/mnnvl/enable", false);
     cfg->set("transports/gds/enable", false);
     cfg->set("transports/ascend_direct/enable", false);
@@ -237,6 +252,49 @@ TEST(ProxyShutdownTimeout, TimedOutDrainHandsResourcesToDeferredTeardown) {
     engine.reset();
     EXPECT_EQ(fake_tcp->free_local_memory_calls.load(std::memory_order_acquire),
               0);
+}
+
+TEST(ProxyShutdownTimeout, FailedSiblingDoesNotPublishParentBeforeCopyDrains) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("max_failover_attempts", 0);
+    cfg->set("staging/shutdown_drain_timeout_ms", 20L);
+    auto engine = std::make_unique<TransferEngineImpl>(cfg);
+    ASSERT_TRUE(engine->available());
+    auto transport = std::make_shared<NeverCompletingTransport>();
+    transport->fail_second = true;
+    engine->swapTransportForTest(TCP, transport);
+    std::vector<uint8_t> source(128, 0x91), target(128, 0);
+    ASSERT_TRUE(engine->registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(engine->registerLocalMemory(target.data(), target.size()).ok());
+    TaskInfo task;
+    task.request.opcode = Request::WRITE;
+    task.request.source = source.data();
+    task.request.target_id = LOCAL_SEGMENT_ID;
+    task.request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    task.request.length = source.size();
+    task.staging = true;
+    auto manager = std::make_unique<ProxyManager>(engine.get(), 64, 2);
+    ASSERT_TRUE(manager->submit(&task, 0, {"", kWildcardLocation, ""}).ok());
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (transport->failed_polls.load() == 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    EXPECT_GT(transport->failed_polls.load(), 0);
+    // Give the cleanup path time to run while the first copy is held.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    TransferStatus status{};
+    EXPECT_TRUE(manager->getStatus(&task, status).ok());
+    EXPECT_EQ(status.s, PENDING);
+    transport->complete_first = true;
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (task.staging_status.load() == PENDING &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    EXPECT_EQ(task.staging_status.load(), FAILED);
+    manager.reset();
+    EXPECT_EQ(engine->aliveBatchCountForTest(), 0u);
+    EXPECT_TRUE(engine->unregisterLocalMemory(source.data()).ok());
+    EXPECT_TRUE(engine->unregisterLocalMemory(target.data()).ok());
 }
 
 }  // namespace

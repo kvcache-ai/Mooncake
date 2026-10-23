@@ -17,7 +17,7 @@ on:
         default: x86_64
       python-versions:
         type: string
-        default: '["3.10", "3.11", "3.12", "3.13"]'
+        default: '["3.10", "3.11", "3.12", "3.13", "3.14"]'
       artifact-prefix:
         type: string
         required: true

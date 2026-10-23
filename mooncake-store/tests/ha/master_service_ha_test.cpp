@@ -824,6 +824,16 @@ class MasterServiceHATest : public ::testing::Test {
         return accessor.Exists() ? accessor.Get().CountReplicas() : 0;
     }
 
+    // Objects holding a completed LOCAL_DISK replica, summed over the shards.
+    static long DiskObjectCountForTesting(MasterService& service) {
+        long count = 0;
+        for (size_t i = 0; i < MasterServiceTestPeer::kNumShards; ++i) {
+            MasterServiceTestPeer::MetadataShardAccessorRO shard(&service, i);
+            count += shard->disk_object_count;
+        }
+        return count;
+    }
+
     static bool IsHardPinnedForTesting(MasterService& service,
                                        const TenantId& tenant_id,
                                        const std::string& key) {
@@ -1037,19 +1047,12 @@ class MasterServiceHATest : public ::testing::Test {
         return task.get().has_value() && reached_discovery && metadata_released;
     }
 
+    // PutStart is the only caller in these tests that holds the snapshot
+    // barrier shared, so a barrier that cannot be taken exclusively while the
+    // client lock is free means PutStart reached it and let the client lock
+    // go.
     static bool PutStartHoldsSnapshotAfterClientReleaseForTesting(
-        MasterService& service, const TenantId& tenant_id,
-        const std::string& key) {
-        const auto scoped_key = tenant_id.MakeScopedKey(key);
-        const size_t stripe_idx =
-            std::hash<std::string>{}(scoped_key) %
-            MasterServiceTestPeer::kObjectOperationLockStripes;
-        std::unique_lock<std::mutex> object_lock(
-            MasterServiceTestPeer::ObjectOperationLocks(service)[stripe_idx],
-            std::try_to_lock);
-        if (object_lock.owns_lock()) {
-            return false;
-        }
+        MasterService& service) {
         std::unique_lock<std::shared_mutex> client_lock(
             MasterServiceTestPeer::ClientMutex(service), std::try_to_lock);
         if (!client_lock.owns_lock()) {
@@ -2034,8 +2037,7 @@ TEST_F(MasterServiceHATest,
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
     bool reached_snapshot = false;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(
-                service, kDefaultTenant, key)) {
+        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(service)) {
             reached_snapshot = true;
             break;
         }
@@ -2779,6 +2781,7 @@ TEST_F(MasterServiceHATest,
                                      "standby_repair_reject_ld_lost"),
               0);
     EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+    EXPECT_EQ(DiskObjectCountForTesting(service), 0);
 
     // Retry with the writer accepting: the restore lands, and the disk
     // owner's record is installed for real this time.
@@ -2793,6 +2796,9 @@ TEST_F(MasterServiceHATest,
               0);
     EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).contains(
         disk_owner));
+    // The restored survivor counts as a disk object, like one whose
+    // LOCAL_DISK replica was added through AddReplica.
+    EXPECT_EQ(DiskObjectCountForTesting(service), 1);
 }
 
 TEST_F(MasterServiceHATest, RestoreDiscardRepairTimeoutThenRetrySucceeds) {

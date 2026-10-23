@@ -442,8 +442,18 @@ impl StoreClientBuilder {
             && self.initial_state == ClientLifecycleState::Active
             && published_initial_state != self.initial_state;
 
+        if let Some(bound_tenant) = self.metadata.bound_tenant() {
+            if bound_tenant != self.default_tenant {
+                return Err(StoreError::InvalidState(format!(
+                    "metadata backend is bound to tenant {bound_tenant}, but StoreClient is configured for tenant {}",
+                    self.default_tenant
+                )));
+            }
+        }
         let default_scope = NamespaceScope::with_defaults(Some(&self.default_tenant), None, None);
-        let runtime_metadata = if self.metadata_is_tenant_scoped {
+        let runtime_metadata = if self.metadata_is_tenant_scoped
+            || self.metadata.bound_tenant() == Some(self.default_tenant.as_str())
+        {
             self.metadata.clone()
         } else {
             self.metadata

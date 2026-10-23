@@ -95,7 +95,7 @@ static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
 static constexpr uint64_t DEFAULT_MAX_KV_SOFT_PIN_TTL_MS =
-    24 * 60 * 60 * 1000;  // 24 hours
+    7 * 24 * 60 * 60 * 1000;  // 7 days
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
@@ -307,6 +307,14 @@ enum class ErrorCode : int32_t {
     // Buffer allocation errors (Range: -20 to -99)
     BUFFER_OVERFLOW = -10,  ///< Insufficient buffer space.
 
+    // Memory registration errors
+    NOF_REGISTRATION_STUCK =
+        -11,  ///< NoF DMA registration failed after partially changing backend
+              ///< state; cleanup could not be confirmed. The range stays
+              ///< quarantined (never munmap without a successful unregister).
+    NOT_REGISTERED = -12,  ///< The address is not registered with the transfer
+                           ///< engine.
+
     // Segment selection errors (Range: -100 to -199)
     SHARD_INDEX_OUT_OF_RANGE = -100,  ///< Shard index is out of bounds.
     SEGMENT_NOT_FOUND = -101,         ///< No available segments found.
@@ -427,17 +435,6 @@ inline std::ostream& operator<<(std::ostream& os,
                                 const ErrorCode& errorCode) noexcept {
     return os << toString(errorCode);
 }
-
-struct SerializationError {
-    ErrorCode code;
-    std::string message;
-
-    SerializationError(ErrorCode c, const std::string& msg)
-        : code(c), message(msg) {}
-
-    // Construct from ErrorCode
-    explicit SerializationError(ErrorCode c) : code(c), message(toString(c)) {}
-};
 
 /**
  * @brief Represents a contiguous memory region

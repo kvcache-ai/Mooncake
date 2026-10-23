@@ -10,6 +10,7 @@
 
 #include "master_metric_manager.h"
 #include "master_service.h"
+#include "ha/oplog/oplog_test_failpoint.h"
 #include "rpc_worker_pool.h"
 #include "rpc_helper.h"
 #include "types.h"
@@ -969,6 +970,19 @@ long WrappedMasterService::RemoveAll(bool force, const std::string& tenant_id) {
     return result;
 }
 
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchUpdateSoftPin(const std::vector<std::string>& keys,
+                                         uint64_t ttl_ms,
+                                         const std::string& tenant_id) {
+    return WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        keys.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchUpdateSoftPin(keys, resolved_tenant_id,
+                                                      ttl_ms);
+        });
+}
+
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
     const std::vector<std::string>& keys, bool force,
     const std::string& tenant_id) {
@@ -1000,6 +1014,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
     const Segment& segment, const UUID& client_id) {
+    TestFailPoint::Wait("rpc_mount_segment_before_service");
     return execute_rpc(
         "MountSegment",
         [&] { return master_service_.MountSegment(segment, client_id); },

@@ -211,6 +211,8 @@ class TransferMetadata {
         // Capability marker. Encoded only by transports that opt into
         // ready_ack; decoded from field presence to detect peer support.
         bool ready_ack_supported = false;
+        // Optional classic-RDMA advisory. Older peers omit this field.
+        std::string auto_gid_reprobe_from;
         // Per-peer RDMA CtrlChannel (notify QP). 0 = not supported / unused.
         // When ctrl_channel is true, this handshake only sets up the control
         // path (qp_num may be empty).
