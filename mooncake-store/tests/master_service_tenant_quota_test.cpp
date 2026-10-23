@@ -1093,7 +1093,7 @@ TEST_F(MasterServiceTenantQuotaTest,
 
 #ifdef USE_NOF
 TEST_F(MasterServiceTenantQuotaTest,
-       DeletePolicySeesZeroChargePutStartMetadataCreateWithoutPolicyLock) {
+       DeletePolicyRefusesWhileZeroChargePutStartAllocates) {
     MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
     UUID client_id = MountNoFSegment(service);
 
@@ -1123,29 +1123,20 @@ TEST_F(MasterServiceTenantQuotaTest,
     }
     policy_lock.unlock();
 
-    using DeleteResult =
-        tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>;
-    std::promise<DeleteResult> delete_promise;
-    auto delete_future = delete_promise.get_future();
-    std::thread delete_thread([&] {
-        delete_promise.set_value(
-            service.tenant_quota_policy()->DeletePolicy(TenantId("tenant-a")));
-    });
-
-    EXPECT_EQ(delete_future.wait_for(std::chrono::milliseconds(200)),
-              std::future_status::timeout)
-        << "tenant deletion passed the metadata scan while zero-charge "
-           "PutStart still held the target key";
+    // The write charges nothing and has not published its object, yet it
+    // keeps the tenant from being deleted.
+    auto delete_result =
+        service.tenant_quota_policy()->DeletePolicy(TenantId("tenant-a"));
 
     blocking_strategy_ptr->AllowAllocation();
     put_thread.join();
-    delete_thread.join();
 
-    ASSERT_TRUE(put_result.has_value());
-    ASSERT_TRUE(put_result->has_value()) << toString(put_result->error());
-    auto delete_result = delete_future.get();
     ASSERT_FALSE(delete_result.has_value());
     EXPECT_EQ(delete_result.error(), ErrorCode::TENANT_NOT_EMPTY);
+    ASSERT_TRUE(put_result.has_value());
+    ASSERT_TRUE(put_result->has_value()) << toString(put_result->error());
+    EXPECT_TRUE(service.tenant_quota_policy()->IsTenantRegistered(
+        TenantId("tenant-a")));
 
     auto snapshot = Snapshot(service, TenantId("tenant-a"));
     EXPECT_EQ(snapshot.charged_bytes, 0);
