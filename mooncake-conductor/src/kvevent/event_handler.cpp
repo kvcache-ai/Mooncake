@@ -349,6 +349,25 @@ void KVEventHandler::OnSourceStale(const std::string& cache_pool_key,
     }
 }
 
+void KVEventHandler::OnSourceReset(const std::string& cache_pool_key,
+                                   const zmq::MessageMetadata& metadata,
+                                   const std::string& reason) {
+    // Like OnSourceStale this runs on the source's own event loop between
+    // dispatches, so no batch of ours is in flight while the index is mutated.
+    // Unlike it, the handler stays available: the client resubscribes from the
+    // new epoch and the restarted engine's cache is tracked again.
+    if (std::string error = RetractIndexEntries(); !error.empty()) {
+        LOG(ERROR) << "Failed to retract restarted source service_key="
+                   << cache_pool_key << " endpoint=" << service_.endpoint
+                   << " error=" << error;
+    } else {
+        LOG(WARNING) << "Retracted restarted source service_key="
+                     << cache_pool_key << " endpoint=" << service_.endpoint
+                     << " last_sequence=" << metadata.sequence
+                     << " reason=" << reason;
+    }
+}
+
 std::string KVEventHandler::HandleVllmBatch(
     const zmq::VllmEventBatch& batch, const zmq::MessageMetadata& metadata) {
     if (batch.data_parallel_rank.has_value() &&
@@ -1115,6 +1134,10 @@ std::string KVEventHandler::ClearMooncakeBindings(
 
 std::string KVEventHandler::InvalidateEndpoint() {
     MarkUnavailable();
+    return RetractIndexEntries();
+}
+
+std::string KVEventHandler::RetractIndexEntries() {
     if (service_.publisher_kind == common::PublisherKind::kVllm ||
         service_.publisher_kind == common::PublisherKind::kSglang) {
         return manager_->GetIndexer()->ClearEngine({
