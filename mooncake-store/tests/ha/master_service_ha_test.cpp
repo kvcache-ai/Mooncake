@@ -824,6 +824,16 @@ class MasterServiceHATest : public ::testing::Test {
         return accessor.Exists() ? accessor.Get().CountReplicas() : 0;
     }
 
+    // Objects holding a completed LOCAL_DISK replica, summed over the shards.
+    static long DiskObjectCountForTesting(MasterService& service) {
+        long count = 0;
+        for (size_t i = 0; i < MasterServiceTestPeer::kNumShards; ++i) {
+            MasterServiceTestPeer::MetadataShardAccessorRO shard(&service, i);
+            count += shard->disk_object_count;
+        }
+        return count;
+    }
+
     static bool IsHardPinnedForTesting(MasterService& service,
                                        const TenantId& tenant_id,
                                        const std::string& key) {
@@ -2771,6 +2781,7 @@ TEST_F(MasterServiceHATest,
                                      "standby_repair_reject_ld_lost"),
               0);
     EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+    EXPECT_EQ(DiskObjectCountForTesting(service), 0);
 
     // Retry with the writer accepting: the restore lands, and the disk
     // owner's record is installed for real this time.
@@ -2785,6 +2796,9 @@ TEST_F(MasterServiceHATest,
               0);
     EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).contains(
         disk_owner));
+    // The restored survivor counts as a disk object, like one whose
+    // LOCAL_DISK replica was added through AddReplica.
+    EXPECT_EQ(DiskObjectCountForTesting(service), 1);
 }
 
 TEST_F(MasterServiceHATest, RestoreDiscardRepairTimeoutThenRetrySucceeds) {

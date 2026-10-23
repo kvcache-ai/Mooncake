@@ -35,6 +35,7 @@ Prerequisites:
 """
 
 import os
+import socket
 import time
 import unittest
 
@@ -132,6 +133,18 @@ class TestPrefetchOnExist(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # Integration test: it needs the live master that the smoke script
+        # starts. The wheel CI runs this file with pytest and no services —
+        # skip there instead of erroring at store setup.
+        master = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
+        host, _, port = master.rpartition(":")
+        try:
+            with socket.create_connection((host or "127.0.0.1", int(port)), timeout=2):
+                pass
+        except OSError:
+            raise unittest.SkipTest(
+                f"needs the smoke-script master at {master} (run via run_ssd_offload_smoke.sh)"
+            )
         cls.store = MooncakeDistributedStore()
         setup_store(cls.store)
 

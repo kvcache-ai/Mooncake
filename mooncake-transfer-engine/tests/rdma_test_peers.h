@@ -66,6 +66,15 @@ class RdmaContextTestPeer {
         return context.endpoint_store_ != nullptr;
     }
 
+    static void bindEndpointStore(RdmaContext &context,
+                                  std::shared_ptr<EndpointStore> store) {
+        context.endpoint_store_ = std::move(store);
+    }
+
+    static void enablePeerGidRecovery(RdmaContext &context) {
+        context.peer_auto_gid_states_.configure(2, true);
+    }
+
     static void seedAutoGidState(RdmaContext &context, ibv_context *verbs_ctx,
                                  uint8_t port, uint32_t lid, const ibv_gid &gid,
                                  int gid_index) {
@@ -79,6 +88,21 @@ class RdmaContextTestPeer {
 
     static void disableContextForTeardown(RdmaContext &context) {
         context.context_ = nullptr;
+    }
+
+    // Inserts a synthetic memory region (typically backed by a fake ibv_mr)
+    // so deregistration paths can be exercised without RDMA hardware.
+    static void seedMemoryRegion(RdmaContext &context, void *addr,
+                                 size_t length, ibv_mr *mr) {
+        RWSpinlock::WriteGuard guard(context.memory_regions_lock_);
+        context.memory_region_map_[reinterpret_cast<uintptr_t>(addr)] =
+            MemoryRegionMeta{addr, length, mr};
+    }
+
+    static bool hasMemoryRegion(RdmaContext &context, void *addr) {
+        RWSpinlock::ReadGuard guard(context.memory_regions_lock_);
+        return context.findMemoryRegionContaining(reinterpret_cast<uintptr_t>(
+                   addr)) != context.memory_region_map_.end();
     }
 };
 

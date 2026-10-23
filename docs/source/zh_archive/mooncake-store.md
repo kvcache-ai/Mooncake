@@ -637,7 +637,7 @@ soft pin 是仅在运行时生效的淘汰优先级状态，不会持久化到�
 
 * `default_kv_soft_pin_ttl`：未显式传入 TTL 时使用的固定软固定生命周期。默认值为 `30 分钟`，访问不会续期。
 
-* `max_kv_soft_pin_ttl`：Master 接受的请求级 soft pin TTL 上限。默认值为 `24 小时`。
+* `max_kv_soft_pin_ttl`：Master 接受的请求级 soft pin TTL 上限。默认值为 `7 天`。
 
 * `allow_evict_soft_pinned_objects`：是否允许替换已被软固定的对象。默认值为 `true`。
 

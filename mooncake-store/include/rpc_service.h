@@ -161,6 +161,10 @@ class WrappedMasterService {
     long RemoveAll(bool force = false,
                    const std::string& tenant_id = "default");
 
+    std::vector<tl::expected<void, ErrorCode>> BatchUpdateSoftPin(
+        const std::vector<std::string>& keys, uint64_t ttl_ms,
+        const std::string& tenant_id = "default");
+
     std::vector<tl::expected<void, ErrorCode>> BatchRemove(
         const std::vector<std::string>& keys, bool force = false,
         const std::string& tenant_id = "default");

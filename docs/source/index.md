@@ -239,4 +239,5 @@ troubleshooting/store-rs-key-access
 :hidden:
 
 community/governance
+community/ecosystem-prs
 :::
