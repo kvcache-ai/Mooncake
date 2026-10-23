@@ -65,10 +65,14 @@ docker_launch(){
     # Check if sglang-router is needed and missing
     if [[ "$registry_addr" == *"sglang"* ]]; then
         echo "=== Detected sglang image, checking sglang-router ==="
+        # Tone hosts often cannot reach pypi.org. Set the Aliyun mirror before
+        # any extra pip installs: sglang-router may already be in the image, but
+        # sgl-eval==0.1.0 still needs pillow<12, and the remote node typically
+        # has no warm pip cache.
+        pip_cmd=$(append_str "${pip_cmd}" \
+            "pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/")
         if ! ${docker_exec} "python -c 'import sglang_router' 2>/dev/null"; then
             echo "sglang-router not found, will install it"
-            pip_cmd=$(append_str "${pip_cmd}" \
-                "pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/")
             pip_cmd=$(append_str "${pip_cmd}" \
                 "pip install sglang-router")
         else
