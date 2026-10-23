@@ -4565,7 +4565,7 @@ std::vector<std::shared_ptr<BufferHandle>> RealClient::batch_get_buffer(
     const std::vector<std::string> &keys) {
     return execute_timed_operation<std::vector<std::shared_ptr<BufferHandle>>>(
         [&]() { return batch_get_buffer_internal(keys); },
-        [](const auto &) { return true; },
+        [this](const auto &) { return client_ != nullptr; },
         [&](uint64_t latency_us, const auto &buffers) {
             client_->ObserveTransferOperation(
                 TransferOperationKind::kRead, "batch_get_buffer",
@@ -5386,7 +5386,7 @@ std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
                     buffers, all_keys, all_dst_offsets, all_src_offsets,
                     all_sizes, nullptr, query_result_cache));
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 client_->ObserveTransferOperation(
                     TransferOperationKind::kRead, "get_into_ranges",
@@ -5448,7 +5448,7 @@ std::vector<int> RealClient::batch_put_from(
             [&]() {
                 return batch_put_from_internal(keys, buffers, sizes, config);
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int> py_results;
                 py_results.reserve(ret.size());
@@ -5739,7 +5739,7 @@ std::vector<int> RealClient::batch_upsert_from(
             [&]() {
                 return batch_upsert_from_internal(keys, buffers, sizes, config);
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int> py_results;
                 py_results.reserve(ret.size());
@@ -6018,7 +6018,7 @@ std::vector<int64_t> RealClient::batch_get_into(
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
             [&]() { return batch_get_into_internal(keys, buffers, sizes); },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int64_t> py_results;
                 py_results.reserve(ret.size());
@@ -6969,7 +6969,7 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
                 return batch_put_from_multi_buffers_internal(
                     keys, all_buffers, sizes, config, stage_nonlocal);
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int> py_results;
                 py_results.reserve(ret.size());
@@ -8054,7 +8054,7 @@ std::vector<int> RealClient::batch_upsert_from_multi_buffers(
                 return batch_upsert_from_multi_buffers_internal(
                     keys, all_buffers, sizes, config, stage_nonlocal);
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 auto py_results = ToPyResults(ret);
                 client_->ObserveTransferOperation(
@@ -8098,7 +8098,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
                 return batch_get_into_multi_buffers_internal(
                     keys, all_buffers, all_sizes, prefer_alloc_in_same_node);
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int> py_results;
                 py_results.reserve(ret.size());
