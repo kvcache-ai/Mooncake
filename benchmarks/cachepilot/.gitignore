@@ -1,0 +1,29 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Results: keep demo CSVs/figures trackable; ignore bulky logs & caches
+results/logs/*.log
+results/logs/*.csv
+!results/csv/.gitkeep
+!results/logs/.gitkeep
+!results/figures/.gitkeep
+benchmark/__pycache__/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Large / local
+*.bin
+*.pt
+*.onnx
+*.so
+*.dll
