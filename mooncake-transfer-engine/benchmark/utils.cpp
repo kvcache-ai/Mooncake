@@ -21,6 +21,10 @@
 #include <optional>
 #include <string_view>
 
+#ifdef USE_XPU
+#include "tent/runtime/platform.h"
+#endif
+
 DEFINE_string(seg_name, "", "Memory segment name for the local side");
 DEFINE_string(seg_type, "DRAM",
               "Memory segment type for the target side: DRAM|VRAM");
@@ -140,6 +144,18 @@ DEFINE_string(tent_intent_type, "unspec",
 
 namespace mooncake {
 namespace tent {
+
+#ifdef USE_XPU
+bool isXpuMemory(void* ptr) {
+    return Platform::getLoader().getMemoryType(ptr) == MTYPE_XPU;
+}
+
+void copyXpuData(void* dst, void* src, size_t length) {
+    auto status = Platform::getLoader().copy(dst, src, length);
+    LOG_ASSERT(status.ok()) << "XPU copy failed: " << status.ToString();
+}
+#endif
+
 std::string XferBenchConfig::seg_name;
 std::string XferBenchConfig::seg_type;
 std::string XferBenchConfig::seg_type_mix;

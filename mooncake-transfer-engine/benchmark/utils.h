@@ -237,6 +237,13 @@ static inline bool isHipMemory(void* ptr) {
 }
 #endif
 
+#ifdef USE_XPU
+// Defined in utils.cpp: tent/runtime/platform.h cannot be included here
+// because te_backend.cpp also includes the classic Transfer Engine headers.
+bool isXpuMemory(void* ptr);
+void copyXpuData(void* dst, void* src, size_t length);
+#endif
+
 #ifdef USE_MLU
 static inline bool isMluMemory(void* ptr) {
     cnrtPointerAttributes_t attr{};
@@ -301,6 +308,14 @@ static inline void fillData(void* addr, size_t length, uint8_t seed) {
         return;
     }
 #endif
+#ifdef USE_XPU
+    if (isXpuMemory(addr)) {
+        std::vector<uint8_t> data(length);
+        fillData(data.data(), length, seed);
+        copyXpuData(addr, data.data(), length);
+        return;
+    }
+#endif
     if (XferBenchConfig::xport_type != "hp_tcp" ||
         !XferBenchConfig::check_consistency) {
         memset(addr, seed, length);
@@ -359,6 +374,17 @@ static inline void verifyData(void* addr, size_t length, uint8_t seed) {
     if (isHipMemory(addr)) {
         std::vector<uint8_t> act_data(length);
         hipMemcpy(act_data.data(), addr, length, hipMemcpyDefault);
+        if (memcmp(act_data.data(), ref_data.data(), length)) {
+            LOG(FATAL) << "Inconsistent data detected";
+        }
+        return;
+    }
+#endif
+#ifdef USE_XPU
+    if (isXpuMemory(addr)) {
+        fillData(ref_data.data(), length, seed);
+        std::vector<uint8_t> act_data(length);
+        copyXpuData(act_data.data(), addr, length);
         if (memcmp(act_data.data(), ref_data.data(), length)) {
             LOG(FATAL) << "Inconsistent data detected";
         }

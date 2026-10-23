@@ -120,6 +120,35 @@ also enables the MLU local-copy transport in the benchmark configuration.
 result back to host memory for comparison. For throughput measurements without
 payload checks, use `--check_consistency=false --op_type=read` or `write`.
 
+### 3.5 Intel XPU Device Memory
+
+Build with `USE_TENT=ON`, `USE_XPU=ON` and `BUILD_BENCHMARK=ON` using `icpx`
+after sourcing `/opt/intel/oneapi/setvars.sh` (see the
+[build guide](../../getting_started/build.md)). In this build,
+`--backend=tent --seg_type=VRAM` allocates Intel GPU memory and registers it
+as `xpu:<N>`. `--local_gpu_id=N` selects a visible device; `-1` allocates a
+buffer on each visible device. `--check_consistency`, `write_seed` and
+`read_verify` fill and verify XPU buffers through the TENT platform copy.
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+
+# Target on GPU 1
+./tebench --backend=tent --seg_type=VRAM --local_gpu_id=1
+
+# Initiator on GPU 0, using the printed segment name
+./tebench --backend=tent --seg_type=VRAM --local_gpu_id=0 \
+  --target_seg_name=<SEG_NAME_FROM_TARGET> --op_type=read --duration=5
+```
+
+Leave `--xport_type` empty so the engine chooses the path per request.
+tebench then registers XPU buffers with every enabled transport: XPU IPC
+between processes on one node, dma-buf RDMA when the NIC accepts XPU memory,
+or host staging otherwise (see the XPU notes in the build guide). An explicit
+`--xport_type` registers the buffer with that transport only and fails when
+it cannot register XPU memory. `--seg_type_mix=dram,vram` also works with XPU
+memory; the NVLink example in Section 5.8 requires CUDA.
+
 ## 4. Output Metrics
 
 Each output row corresponds to one benchmark configuration.

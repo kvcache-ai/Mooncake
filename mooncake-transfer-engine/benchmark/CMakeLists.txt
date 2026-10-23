@@ -93,8 +93,15 @@ if(BUILD_UNIT_TESTS)
     add_test(NAME tebench_mlu_data_test COMMAND tebench_mlu_data_test)
   endif()
 
+  set(TEBENCH_HELP_ENV --unset=LD_LIBRARY_PATH)
+  if(USE_XPU)
+    # Remove build-tree overrides so this still checks project-library RPATHs,
+    # but retain the oneAPI runtime needed by tebench and its shared libraries.
+    list(JOIN CMAKE_CXX_IMPLICIT_LINK_DIRECTORIES ":" TEBENCH_COMPILER_PATH)
+    list(APPEND TEBENCH_HELP_ENV "LD_LIBRARY_PATH=${TEBENCH_COMPILER_PATH}")
+  endif()
   add_test(NAME tebench_build_tree_help
-           COMMAND ${CMAKE_COMMAND} -E env --unset=LD_LIBRARY_PATH
+           COMMAND ${CMAKE_COMMAND} -E env ${TEBENCH_HELP_ENV}
                    $<TARGET_FILE:tebench> --help)
   set_tests_properties(
     tebench_build_tree_help

@@ -158,6 +158,7 @@ static IntentType getIntentType(const std::string& intent_type) {
 // Resolve device prefix, start index, and buffer count for a single seg_type.
 // Returns 0 on success, -1 on failure.
 static int resolveSegTypeParams(const std::string& seg_type,
+                                [[maybe_unused]] const Topology* topology,
                                 std::string& device_prefix, int& start_idx,
                                 int& num_buffers) {
     if (seg_type == "DRAM" || seg_type == "dram") {
@@ -211,6 +212,28 @@ static int resolveSegTypeParams(const std::string& seg_type,
                 << "local_gpu_id " << start_idx << " out of range [0, "
                 << device_count << ")";
         }
+#elif defined(USE_XPU)
+    } else if (seg_type == "VRAM" || seg_type == "vram") {
+        // XpuPlatform::probe publishes one "xpu:N" memory entry per visible
+        // device, so the engine topology is the device list; no SYCL call
+        // is needed here.
+        device_prefix = "xpu";
+        int gpu_count = 0;
+        LOG_ASSERT(topology) << "engine topology unavailable";
+        for (size_t i = 0; i < topology->getMemCount(); ++i) {
+            const auto* mem = topology->getMemEntry(i);
+            if (mem && mem->name.rfind("xpu:", 0) == 0) ++gpu_count;
+        }
+        LOG_ASSERT(gpu_count > 0) << "no XPU device found in topology";
+        start_idx = 0;
+        num_buffers = gpu_count;
+        if (XferBenchConfig::local_gpu_id != -1) {
+            start_idx = XferBenchConfig::local_gpu_id;
+            num_buffers = 1;
+            LOG_ASSERT(start_idx >= 0 && start_idx < gpu_count)
+                << "local_gpu_id " << start_idx << " out of range [0, "
+                << gpu_count << ")";
+        }
 #endif
     } else {
         LOG(ERROR) << "Unknown seg_type: " << seg_type;
@@ -243,8 +266,8 @@ int TENTBenchRunner::allocateBuffers() {
     for (const auto& seg_type : seg_types) {
         std::string device_prefix;
         int start_idx = 0, num_buffers = 0;
-        if (resolveSegTypeParams(seg_type, device_prefix, start_idx,
-                                 num_buffers) != 0) {
+        if (resolveSegTypeParams(seg_type, engine_->getLocalTopology().get(),
+                                 device_prefix, start_idx, num_buffers) != 0) {
             return -1;
         }
 
@@ -263,9 +286,12 @@ int TENTBenchRunner::allocateBuffers() {
                 // handle). registerLocalMemory below then resets options.type
                 // to UNSPEC so the buffer registers to ALL enabled transports,
                 // not just this one.
-                options.type = (seg_type == "vram")
-                                   ? (device_prefix == "mlu" ? UNSPEC : NVLINK)
-                                   : SHM;
+                options.type =
+                    (seg_type == "vram")
+                        ? (device_prefix == "mlu" || device_prefix == "xpu"
+                               ? UNSPEC
+                               : NVLINK)
+                        : SHM;
             }
             // else: single-seg_type fallback (--seg_type without
             // --seg_type_mix, no --xport_type). Leave options.type as UNSPEC
@@ -297,6 +323,13 @@ int TENTBenchRunner::allocateBuffers() {
             // A network-selected MLU allocation also needs its local-copy
             // transport registered for host staging.
             if (device_prefix == "mlu") options.type = UNSPEC;
+            // A default XPU allocation resolves to RDMA, which registers XPU
+            // memory only when the NIC accepts its dma-buf. Register it with
+            // every enabled transport so XPU IPC, host staging, and TCP stay
+            // available. An explicit --xport_type remains strict.
+            if (xport_type.empty() && device_prefix == "xpu") {
+                options.type = UNSPEC;
+            }
             CHECK_FAIL(
                 engine_->registerLocalMemory(buf, total_buffer_size, options));
             auto t2 = getCurrentTimeInNano();
