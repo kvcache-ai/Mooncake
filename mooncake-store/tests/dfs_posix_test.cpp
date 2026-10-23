@@ -726,7 +726,7 @@ TEST(ShardAllocatorTest, LruIndexOutlivesCallerKeys) {
     };
     std::vector<DistributedFSDescriptor> descs;
     for (int i = 0; i < 4; ++i) {
-        auto desc = alloc.Allocate(long_key(i), 100);
+        auto desc = alloc.Allocate(long_key(i), 8192);
         ASSERT_TRUE(desc.has_value()) << "allocation " << i;
         alloc.UpdateAccess(long_key(i), desc->shard_idx, desc->offset);
         descs.push_back(*desc);
@@ -734,7 +734,9 @@ TEST(ShardAllocatorTest, LruIndexOutlivesCallerKeys) {
 
     // Restore explicitly, by PendingEviction destruction, and by rejecting
     // every candidate; each path re-inserts the keys into the index.
-    alloc.RestorePreparedEviction(alloc.PrepareEviction());
+    auto initial = alloc.PrepareEviction();
+    ASSERT_EQ(initial.Candidates().size(), 2u);
+    alloc.RestorePreparedEviction(std::move(initial));
     {
         auto dropped = alloc.PrepareEviction();
     }
