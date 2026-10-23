@@ -5342,6 +5342,64 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     EXPECT_EQ(2u, prefix.last_seq);
 }
 
+TEST_F(MasterServiceHATest, RejectedPutEndRetriesTheMissingRecord) {
+    for (bool upsert : {false, true}) {
+        SCOPED_TRACE(upsert ? "UpsertStart" : "PutStart");
+        const std::string cluster_id = "test_put_end_admission_retry";
+        auto backend = std::make_shared<FakeBatchHaKvBackend>();
+        auto service_config = MakeStrictHAConfig();
+        service_config.cluster_id = cluster_id;
+        service_config.oplog_batch_max_entries = 1;
+        MasterService service(service_config);
+        auto* writer = InstallRejectingWriter(service, backend);
+        auto mounted = PrepareSimpleSegment(service);
+        OpLogBatchStorage storage(cluster_id, *backend);
+        OpLogBatchRecord batch;
+        ReadBatchEventually(storage, 1, batch);
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        const std::string key = "rejected_end";
+        auto start = upsert ? service.UpsertStart(mounted.client_id, key,
+                                                  kDefaultTenant, 1024, config)
+                            : service.PutStart(mounted.client_id, key,
+                                               kDefaultTenant, 1024, config);
+        ASSERT_TRUE(start.has_value());
+        auto finish = [&] {
+            return upsert
+                       ? service.UpsertEnd(mounted.client_id, key,
+                                           kDefaultTenant, ReplicaType::MEMORY)
+                       : service.PutEnd(mounted.client_id, key, kDefaultTenant,
+                                        ReplicaType::MEMORY);
+        };
+        writer->RejectCommitsWith(ErrorCode::PERSISTENT_FAIL);
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            auto end = finish();
+            ASSERT_FALSE(end.has_value());
+            EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, end.error());
+            EXPECT_EQ(1024u, TenantUsedBytes(service));
+        }
+        EXPECT_EQ(2u, writer->rejected_commits());
+
+        writer->RejectCommitsWith(ErrorCode::OK);
+        ASSERT_TRUE(finish().has_value());
+        EXPECT_EQ(1024u, TenantUsedBytes(service));
+        ASSERT_TRUE(finish().has_value());
+        EXPECT_EQ(1024u, TenantUsedBytes(service));
+        writer->Stop();
+
+        ASSERT_EQ(ErrorCode::OK, storage.ReadBatch(2, batch));
+        ASSERT_EQ(1u, batch.entries.size());
+        EXPECT_EQ(OpType::PUT_END, batch.entries.front().op_type);
+        EXPECT_EQ(key, batch.entries.front().object_key);
+        EXPECT_EQ(2u, batch.entries.front().sequence_id);
+        EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(3, batch));
+        auto replicas = service.GetReplicaList(key, kDefaultTenant);
+        ASSERT_TRUE(replicas.has_value());
+        EXPECT_EQ(1u, replicas->replicas.size());
+    }
+}
+
 TEST_F(MasterServiceHATest, PutEndVisibleBeforeBatchRecordDurable) {
     const std::string cluster_id = "test_batch_record_put_end_visible";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
