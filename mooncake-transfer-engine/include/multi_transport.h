@@ -120,6 +120,9 @@ class MultiTransport {
     static void recordTaskEnd(Transport::TransferTask &task,
                               const TransferStatus &status);
 
+    // True while the metrics record tasks.
+    static bool metricsEnabled();
+
     // If `allows_reuse` is non-null it is written on every return. True means
     // this segment's transport is a function of `target_id` only, so the
     // caller may reuse the returned pointer for later requests with the same

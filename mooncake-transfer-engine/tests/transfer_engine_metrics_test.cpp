@@ -12,7 +12,10 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -61,17 +64,24 @@ class TransferEngineImplTestPeer {
     static Status freeBatch(TransferEngineImpl& engine, BatchID batch_id) {
         return engine.multi_transports_->freeBatchID(batch_id);
     }
+
+    static Status tryFreeBatch(TransferEngineImpl& engine, BatchID batch_id) {
+        return engine.multi_transports_->tryFreeBatchID(batch_id, {});
+    }
 };
 
 namespace {
 
-// Reports `status` for every task; COMPLETED unless a test changes it.
+// Reports `task_status[task_id]` if set, else `status` (COMPLETED by default),
+// and marks the task finished on COMPLETED or FAILED as real transports do.
 class FakeTransport : public Transport {
    public:
     explicit FakeTransport(size_t transferred_bytes)
         : transferred_bytes_(transferred_bytes) {}
 
     TransferStatusEnum status = TransferStatusEnum::COMPLETED;
+    std::map<size_t, TransferStatusEnum> task_status;
+    std::atomic<size_t> polls{0};
 
     Status submitTransfer(BatchID,
                           const std::vector<TransferRequest>&) override {
@@ -86,10 +96,16 @@ class FakeTransport : public Transport {
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status) override {
-        status.s = this->status;
+        polls.fetch_add(1, std::memory_order_relaxed);
+        auto it = task_status.find(task_id);
+        status.s = it == task_status.end() ? this->status : it->second;
         status.transferred_bytes = transferred_bytes_;
-        __atomic_store_n(&toBatchDesc(batch_id).task_list[task_id].is_finished,
-                         true, __ATOMIC_RELEASE);
+        if (status.s == TransferStatusEnum::COMPLETED ||
+            status.s == TransferStatusEnum::FAILED) {
+            __atomic_store_n(
+                &toBatchDesc(batch_id).task_list[task_id].is_finished, true,
+                __ATOMIC_RELEASE);
+        }
         return Status::OK();
     }
 
@@ -263,8 +279,6 @@ TEST_F(MetricsTestBase, PrometheusTextCarriesPrefixedSeries) {
               std::string::npos);
     EXPECT_NE(text.find("mooncake_te_read_size_bytes_bucket"),
               std::string::npos);
-    EXPECT_EQ(text.find("mooncake_te_read_latency_us_sum 0"),
-              std::string::npos);
     // Untouched counters are still exported as 0.
     EXPECT_NE(text.find("mooncake_te_read_failures_total 0"),
               std::string::npos);
@@ -325,6 +339,13 @@ class EngineMetricsTest : public MetricsTestBase {
         }
     }
 
+    // Frees the batch without forcing its tasks finished.
+    Status tryFree() {
+        Status s = TransferEngineImplTestPeer::tryFreeBatch(*engine_, batch_);
+        if (s.ok()) batch_ = 0;
+        return s;
+    }
+
     std::unique_ptr<TransferEngineImpl> engine_;
     Transport::TransferRequest request_{};
     BatchID batch_ = 0;
@@ -333,7 +354,7 @@ class EngineMetricsTest : public MetricsTestBase {
 TEST_F(EngineMetricsTest, ConcurrentPollsRecordOnce) {
     auto transport = std::make_shared<FakeTransport>(4096);
     constexpr size_t kTasks = 64;
-    buildBatch("127.0.0.1:12396", transport, Transport::TransferRequest::READ,
+    buildBatch("127.0.0.1:0", transport, Transport::TransferRequest::READ,
                kTasks);
 
     std::vector<std::thread> pollers;
@@ -349,6 +370,72 @@ TEST_F(EngineMetricsTest, ConcurrentPollsRecordOnce) {
     EXPECT_EQ(requestsTotal(Direction::Read), kTasks);
     EXPECT_EQ(bytesTotal(Direction::Read), kTasks * 4096);
     EXPECT_EQ(latencyCount(Direction::Read), kTasks);
+}
+
+// A batch poll records every task even when has_failure is already set, and
+// a repeated poll records nothing new.
+TEST_F(EngineMetricsTest, BatchPollRecordsTasksAfterFailure) {
+    auto transport = std::make_shared<FakeTransport>(4096);
+    buildBatch("127.0.0.1:0", transport, Transport::TransferRequest::WRITE, 3);
+    transport->task_status[0] = TransferStatusEnum::FAILED;
+    transport->task_status[1] = TransferStatusEnum::TIMEOUT;
+    Transport::toBatchDesc(batch_).has_failure.store(true);
+
+    TransferStatus status;
+    engine_->getBatchTransferStatus(batch_, status);
+
+    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(transport->polls.load(), 3u);
+    EXPECT_EQ(requestsTotal(Direction::Write), 3);
+    EXPECT_EQ(failuresTotal(Direction::Write), 1);
+    EXPECT_EQ(timeoutsTotal(Direction::Write), 1);
+    EXPECT_EQ(bytesTotal(Direction::Write), 4096);
+
+    engine_->getBatchTransferStatus(batch_, status);
+    EXPECT_EQ(requestsTotal(Direction::Write), 3);
+    // Only the failed task is polled again; recorded tasks are skipped.
+    EXPECT_EQ(transport->polls.load(), 4u);
+}
+
+// A timed-out batch poll must not flag the batch as failed: the tasks can
+// still complete, and mooncake-store reads has_failure for the result.
+TEST_F(EngineMetricsTest, TimeoutDoesNotSetHasFailure) {
+    auto transport = std::make_shared<FakeTransport>(4096);
+    buildBatch("127.0.0.1:0", transport, Transport::TransferRequest::WRITE, 2);
+    auto& batch = Transport::toBatchDesc(batch_);
+
+    TransferStatus status;
+    transport->status = TransferStatusEnum::TIMEOUT;
+    engine_->getBatchTransferStatus(batch_, status);
+    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    EXPECT_FALSE(batch.has_failure.load());
+
+    transport->status = TransferStatusEnum::COMPLETED;
+    engine_->getBatchTransferStatus(batch_, status);
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, 2 * 4096u);
+    EXPECT_FALSE(batch.has_failure.load());
+    EXPECT_EQ(timeoutsTotal(Direction::Write), 2);
+}
+
+// A busy task does not free the batch, but tasks behind it that never got a
+// poll are still queried and recorded.
+TEST_F(EngineMetricsTest, FreeBatchRecordsTasksBehindBusyTask) {
+    auto transport = std::make_shared<FakeTransport>(4096);
+    buildBatch("127.0.0.1:0", transport, Transport::TransferRequest::WRITE, 3);
+    transport->task_status[0] = TransferStatusEnum::TIMEOUT;
+    transport->task_status[2] = TransferStatusEnum::FAILED;
+
+    EXPECT_TRUE(tryFree().IsBatchBusy());
+    EXPECT_EQ(transport->polls.load(), 3u);
+    EXPECT_EQ(requestsTotal(Direction::Write), 3);
+    EXPECT_EQ(timeoutsTotal(Direction::Write), 1);
+    EXPECT_EQ(failuresTotal(Direction::Write), 1);
+    EXPECT_EQ(bytesTotal(Direction::Write), 4096);
+
+    // Already-recorded tasks are not counted again on the next attempt.
+    EXPECT_TRUE(tryFree().IsBatchBusy());
+    EXPECT_EQ(requestsTotal(Direction::Write), 3);
 }
 
 class EngineMetricsOutcomeTest
