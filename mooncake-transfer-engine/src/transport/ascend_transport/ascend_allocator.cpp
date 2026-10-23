@@ -1,15 +1,24 @@
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <string>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
 #include <glog/logging.h>
 #include "ascend_allocator.h"
+#include "bool_parser.h"
 #include "config.h"
+#include "shared_segment/host_memfd.h"
 #include "acl/acl.h"
 #include "transport/ascend_transport/ascend_direct_transport/adxl_compat.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
+#include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
 namespace mooncake {
 namespace {
@@ -69,6 +78,136 @@ void remove_store_memory_range(void *ptr) {
         g_store_mem_ranges.begin(), g_store_mem_ranges.end(),
         [ptr](const StoreMemRange &range) { return range.base == ptr; });
     g_store_mem_ranges.erase(it, g_store_mem_ranges.end());
+}
+
+void add_store_memory_range(void *ptr, size_t size) {
+    std::lock_guard<std::mutex> store_lock(g_store_mem_mutex);
+    g_store_mem_ranges.push_back({ptr, size});
+}
+
+// ASCEND_USE_SHMEM. Opt-in: allocate a memfd a peer on this machine can map.
+// Parsed here so the store and GlobalConfig do not have to carry the switch.
+bool SharedHostMemRequested() {
+    const char *value = std::getenv("ASCEND_USE_SHMEM");
+    if (value == nullptr) {
+        return false;
+    }
+    const auto parsed = TryParseBool(value);
+    if (!parsed.has_value()) {
+        LOG(WARNING) << "Invalid value '" << value
+                     << "' for ASCEND_USE_SHMEM, treating it as disabled";
+        return false;
+    }
+    return *parsed;
+}
+
+// Mirrors hixl GetSocTypeByName(), which classifies any SoC whose name
+// contains "Ascend950" as V5 (A5). Queried once: the SoC cannot change under a
+// running process.
+bool IsA5Soc() {
+    static const bool kIsA5 = []() -> bool {
+        const char *soc_name = aclrtGetSocName();
+        if (soc_name == nullptr || soc_name[0] == '\0') {
+            LOG(WARNING) << "aclrtGetSocName returned no name; assuming the "
+                            "SoC is not A5";
+            return false;
+        }
+        const bool is_a5 = std::strstr(soc_name, "Ascend950") != nullptr;
+        LOG(INFO) << "Ascend SoC: " << soc_name << ", A5=" << is_a5;
+        return is_a5;
+    }();
+    return kIsA5;
+}
+
+// MC_CUSTOM_TOPO_JSON is the classic-TE switch for a user-supplied host
+// topology. A set path means this process will drive host memory from a NIC,
+// which is the same reason A5 cannot use aclrtMallocHost.
+bool CustomTopologyConfigured() {
+    const char *path = std::getenv("MC_CUSTOM_TOPO_JSON");
+    return path != nullptr && path[0] != '\0';
+}
+
+// Private mmap on A5 only. Device RoCE and HCCS keep aclrtMallocHost.
+bool HostMmapRequested() {
+    if (!IsA5Soc()) {
+        return false;
+    }
+    if (CustomTopologyConfigured()) {
+        return true;
+    }
+    const char *config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+    return HasRoceHostProtocolDescInGlobalResourceConfig(config);
+}
+
+// Host segments backed by an mmap rather than aclrtMallocHost. The mapped
+// length is rounded up to the THP granularity, so the fd and the length that
+// munmap needs are kept here rather than re-derived at free time. `fd` is -1
+// for a private mapping, which has nothing to close and nothing to share.
+struct HostMappingRecord {
+    int fd;
+    size_t mapped_size;
+};
+std::mutex g_host_mapping_mutex;
+std::unordered_map<void *, HostMappingRecord> g_host_mappings;
+
+size_t align_up_to_thp(size_t total_size) {
+    const uint64_t granularity = host_memfd::Granularity();
+    return ((total_size + granularity - 1) / granularity) * granularity;
+}
+
+// Returns the exact requested size to the caller; the padding up to the THP
+// granularity is left unused but stays mapped until the segment is freed.
+void *allocate_host_mapping(size_t total_size, bool shared) {
+    const size_t mapped_size = align_up_to_thp(total_size);
+    int fd = -1;
+    void *addr = nullptr;
+    std::string error;
+    const bool ok = shared
+                        ? host_memfd::Create(mapped_size, fd, addr, error)
+                        : host_memfd::CreatePrivate(mapped_size, addr, error);
+    if (!ok) {
+        LOG(ERROR) << "Failed to allocate " << (shared ? "shared" : "private")
+                   << " host memory, size: " << mapped_size << ", " << error;
+        return nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_host_mapping_mutex);
+        g_host_mappings.emplace(addr, HostMappingRecord{fd, mapped_size});
+    }
+    add_store_memory_range(addr, mapped_size);
+    LOG(INFO) << (shared ? "Shared" : "Private")
+              << " host memory allocated, addr: " << addr
+              << ", requested: " << total_size << ", mapped: " << mapped_size;
+    if (shared && !host_memfd::ShmemThpEnabled()) {
+        LOG(WARNING) << "shmem transparent huge pages are disabled, so this "
+                        "segment is backed by 4KiB pages";
+    }
+    return addr;
+}
+
+// Returns true when `ptr` was an mmap-backed host allocation and has been
+// released.
+bool free_host_mapping(void *ptr) {
+    HostMappingRecord record{};
+    {
+        std::lock_guard<std::mutex> lock(g_host_mapping_mutex);
+        auto it = g_host_mappings.find(ptr);
+        if (it == g_host_mappings.end()) {
+            return false;
+        }
+        record = it->second;
+        g_host_mappings.erase(it);
+    }
+    remove_store_memory_range(ptr);
+    if (munmap(ptr, record.mapped_size) != 0) {
+        LOG(ERROR) << "Failed to unmap host memory: " << ptr
+                   << ", size: " << record.mapped_size << ", "
+                   << std::strerror(errno);
+    }
+    if (record.fd >= 0) {
+        close(record.fd);
+    }
+    return true;
 }
 
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
@@ -236,8 +375,7 @@ void *allocate_fabric_exact(size_t total_size, bool quiet = false) {
     }
     va = allocate_vmm_memory_direct_impl(total_size, quiet);
     if (va) {
-        std::lock_guard<std::mutex> store_lock(g_store_mem_mutex);
-        g_store_mem_ranges.push_back({va, total_size});
+        add_store_memory_range(va, total_size);
     }
     return va;
 }
@@ -260,6 +398,17 @@ void *AllocateStoreMemoryImpl(size_t total_size, const std::string &protocol) {
         return nullptr;
     }
 
+    // A5 host RoCE cannot drive aclrtMallocHost memory. That only applies when
+    // protocol_desc contains roce:host, or the user set MC_CUSTOM_TOPO_JSON.
+    // Sharing is a separate opt-in: ASCEND_USE_SHMEM asks for a memfd that a
+    // peer process on this machine can map too.
+    if (SharedHostMemRequested()) {
+        return allocate_host_mapping(total_size, /*shared=*/true);
+    }
+    if (HostMmapRequested()) {
+        return allocate_host_mapping(total_size, /*shared=*/false);
+    }
+
     void *buffer = nullptr;
     auto ret = aclrtMallocHost(&buffer, total_size);
     if (ret != ACL_ERROR_NONE) {
@@ -268,8 +417,7 @@ void *AllocateStoreMemoryImpl(size_t total_size, const std::string &protocol) {
     }
     LOG(INFO) << "aclrtMallocHost suc, addr: " << buffer;
     if (buffer) {
-        std::lock_guard<std::mutex> store_lock(g_store_mem_mutex);
-        g_store_mem_ranges.push_back({buffer, total_size});
+        add_store_memory_range(buffer, total_size);
     }
     return buffer;
 }
@@ -394,6 +542,22 @@ void *ascend_allocate_memory_best_effort(size_t target_size,
 #endif
 }
 
+bool ascend_get_shared_host_handle(void *addr, std::string *handle) {
+    if (addr == nullptr || handle == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_host_mapping_mutex);
+    auto it = g_host_mappings.find(addr);
+    // Only the allocation base is advertised. A caller registering a sub-range
+    // would make peers compute offsets against the wrong origin, so such a
+    // buffer simply does not advertise sharing and keeps using ADXL.
+    if (it == g_host_mappings.end() || it->second.fd < 0) {
+        return false;
+    }
+    *handle = host_memfd::ExportHandle(it->second.fd);
+    return true;
+}
+
 bool ascend_is_store_memory(void *addr, size_t length) {
     if (!addr || length == 0) return false;
     auto addr_start = reinterpret_cast<uintptr_t>(addr);
@@ -435,11 +599,15 @@ bool ascend_is_direct_vmm_memory(void *addr, size_t length) {
 }
 
 void ascend_free_memory(const std::string &protocol, void *ptr) {
-    // Route by the per-allocation record, not the process-global fabric flag:
-    // ascend_use_fabric_mem can differ between alloc time and free time (it is
-    // a process-global toggled during TE init), so it cannot be trusted here.
-    // Only fabric/VMM allocations are recorded in g_vmm_alloc_records;
-    // everything else is a plain aclrtMallocHost buffer.
+    // Route by the per-allocation record. Fabric mode is a process-global
+    // toggled during TE init, and the shared-memfd choice is an environment
+    // read at alloc time; neither can be trusted at free time.
+    // Fabric/VMM allocations are recorded in g_vmm_alloc_records and
+    // mmap-backed host allocations in g_host_mappings; everything else is a
+    // plain aclrtMallocHost buffer.
+    if (free_host_mapping(ptr)) {
+        return;
+    }
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
     std::unique_lock<std::mutex> lock(g_vmm_alloc_mutex);
     auto it = g_vmm_alloc_records.find(ptr);

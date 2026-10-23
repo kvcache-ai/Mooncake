@@ -265,6 +265,120 @@ TEST_F(MasterServiceTest, MountUnmountSegmentWithOffsetAllocator) {
     EXPECT_TRUE(unmount_result4.has_value());
 }
 
+TEST_F(MasterServiceTest, StandaloneSoftPinLifecycle) {
+    auto config = MasterServiceConfig::builder()
+                      .set_max_kv_soft_pin_ttl(60000)
+                      .set_default_kv_soft_pin_ttl(1000)
+                      .build();
+    MasterService service(config);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const auto client = generate_uuid();
+    ASSERT_TRUE(service.PutStart(client, "pin-key", TenantId::Default(), 1024,
+                                 ReplicateConfig{}));
+    ASSERT_TRUE(service.PutEnd(client, {"pin-key", std::nullopt},
+                               TenantId::Default(), ReplicaType::MEMORY));
+    const auto baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+    auto results = service.BatchUpdateSoftPin({"pin-key", "missing", ""},
+                                              TenantId::Default(), 30000);
+    ASSERT_EQ(results.size(), 3);
+    ASSERT_TRUE(results[0]);
+    EXPECT_EQ(results[1].error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(results[2].error(), ErrorCode::INVALID_PARAMS);
+    auto first = GetSoftPinDeadline(service, "pin-key");
+    ASSERT_TRUE(first);
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline + 1);
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(), 60000)[0]);
+    auto renewed = GetSoftPinDeadline(service, "pin-key");
+    ASSERT_GT(*renewed, *first);
+    CleanupExpiredSoftPinsAt(service, *first);
+    EXPECT_EQ(GetSoftPinDeadline(service, "pin-key"), renewed);
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(), 10000)[0]);
+    auto shortened = GetSoftPinDeadline(service, "pin-key");
+    ASSERT_LT(*shortened, *renewed);
+    CleanupExpiredSoftPinsAt(service, *shortened);
+    EXPECT_FALSE(GetSoftPinDeadline(service, "pin-key"));
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(), 60000)[0]);
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(), 0)[0]);
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(), 0)[0]);
+    EXPECT_FALSE(GetSoftPinDeadline(service, "pin-key"));
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+    EXPECT_TRUE(service.ExistKey("pin-key", TenantId::Default()).value());
+}
+
+TEST_F(MasterServiceTest, StandaloneSoftPinRejectsPendingWriteAndInvalidTtl) {
+    MasterService service(MasterServiceConfig::builder().build());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const auto client = generate_uuid();
+    ReplicateConfig config;
+    config.soft_pin_action = SoftPinAction::ENABLE;
+    config.soft_pin_ttl_ms = 30000;
+    ASSERT_TRUE(service.PutStart(client, "pending-pin", TenantId::Default(),
+                                 1024, config));
+    auto pending =
+        service.BatchUpdateSoftPin({"pending-pin"}, TenantId::Default(), 0);
+    EXPECT_EQ(pending[0].error(), ErrorCode::REPLICA_IS_NOT_READY);
+    ASSERT_TRUE(service.PutEnd(client, {"pending-pin", std::nullopt},
+                               TenantId::Default(), ReplicaType::MEMORY));
+    auto deadline = GetSoftPinDeadline(service, "pending-pin");
+    ASSERT_TRUE(deadline);
+    auto invalid =
+        service.BatchUpdateSoftPin({"pending-pin"}, TenantId::Default(),
+                                   std::numeric_limits<uint64_t>::max());
+    EXPECT_EQ(invalid[0].error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(GetSoftPinDeadline(service, "pending-pin"), deadline);
+    EXPECT_TRUE(service.BatchUpdateSoftPin({}, TenantId::Default(), 0).empty());
+}
+
+TEST_F(MasterServiceTest,
+       StandaloneSoftPinIsTenantScopedAndPreservesOtherMetadata) {
+    MasterService service(MakeStrictTenantConfig({"pin-a", "pin-b"}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const auto client = generate_uuid();
+    ReplicateConfig config;
+    config.with_hard_pin = true;
+    config.session_ids = std::vector<std::string>{"writing-session"};
+    for (const auto& tenant : {TenantId("pin-a"), TenantId("pin-b")}) {
+        ASSERT_TRUE(
+            service.PutStart(client, "shared-key", tenant, 1024, config));
+        ASSERT_TRUE(service.PutEnd(client, {"shared-key", std::nullopt}, tenant,
+                                   ReplicaType::MEMORY));
+    }
+    auto read_deadline = [&]() {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
+                "shared-key", TenantId("pin-a")));
+        EXPECT_TRUE(accessor.Get().IsHardPinned());
+        EXPECT_EQ(accessor.Get().session_id,
+                  std::optional<std::string>("writing-session"));
+        return accessor.Get().EvictionDeadline();
+    };
+    const auto lease = read_deadline();
+    ASSERT_TRUE(service.BatchUpdateSoftPin({"shared-key"}, TenantId("pin-a"),
+                                           30000)[0]);
+    EXPECT_FALSE(GetSoftPinDeadline(service, "shared-key", "pin-b"));
+    ASSERT_TRUE(service.BatchUpdateSoftPin({"shared-key"}, TenantId("pin-b"),
+                                           30000)[0]);
+    const auto other_deadline =
+        GetSoftPinDeadline(service, "shared-key", "pin-b");
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"shared-key"}, TenantId("pin-a"), 0)[0]);
+    EXPECT_FALSE(GetSoftPinDeadline(service, "shared-key", "pin-a"));
+    EXPECT_EQ(GetSoftPinDeadline(service, "shared-key", "pin-b"),
+              other_deadline);
+    EXPECT_EQ(read_deadline(), lease);
+}
+
 TEST_F(MasterServiceTest, SoftPinZeroTtlSkipsSoftPinRegistration) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_soft_pin_ttl(50)
@@ -891,6 +1005,70 @@ TEST_F(MasterServiceTest, DfsBucketUpsertRestoresEvictedReplica) {
     std::filesystem::remove_all(dfs_root, ec);
 }
 
+// A bucket goes as a whole: one member under a live lease keeps every
+// member's replica in it.
+TEST_F(MasterServiceTest, DfsBucketEvictionKeepsBucketWithLeasedMember) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_bucket_leased_member_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "8192");
+    ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "2");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "1");
+    ScopedEnvVar high_watermark("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.7");
+    ScopedEnvVar low_watermark("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.5");
+    ScopedEnvVar eviction_interval("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL",
+                                   "60");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        // The first two keys fill the first bucket, the third starts another.
+        for (const std::string key :
+             {"leased_member", "bucket_0_peer", "bucket_1_peer"}) {
+            auto start = service.PutStart(context.client_id, key,
+                                          TenantId::Default(), 4096, config);
+            ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, key, TenantId::Default(),
+                                    ReplicaType::ALL)
+                            .has_value());
+        }
+        // A read leases the member.
+        ASSERT_TRUE(service.GetReplicaList("leased_member", TenantId::Default())
+                        .has_value());
+
+        MasterServiceTestPeer(service).RunDfsEvictionForTesting();
+
+        for (const std::string key : {"leased_member", "bucket_0_peer"}) {
+            auto replicas = service.GetReplicaList(key, TenantId::Default());
+            ASSERT_TRUE(replicas.has_value()) << key;
+            EXPECT_EQ(std::count_if(replicas->replicas.begin(),
+                                    replicas->replicas.end(),
+                                    [](const Replica::Descriptor& descriptor) {
+                                        return descriptor.is_dfs_replica();
+                                    }),
+                      1)
+                << key;
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
 TEST_F(MasterServiceTest,
        DfsBucketConcurrentPutAndUpsertShareSingleRecoveryBucket) {
     const auto dfs_root =
@@ -1169,10 +1347,10 @@ TEST_F(MasterServiceTest, RemoveAllKeepsObjectWhenOpLogReservationFails) {
         << "the object survived, so the tenant was never emptied";
 }
 
-// RemoveAll holds one shard lock at a time, so a commit can land in a shard the
-// scan already passed. The scan's own bookkeeping cannot see it, and publishing
+// RemoveAll holds no lock across its walk, so a commit can land in a tenant the
+// walk already passed. The walk's own bookkeeping cannot see it, and publishing
 // `cleared` would order it after that commit's `stored` — telling subscribers
-// to drop an object that is live. Pause the scan right after the shard the new
+// to drop an object that is live. Pause the walk right after the tenant the new
 // key belongs to, commit there, and the clear must be withheld.
 TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
     MasterService service;
@@ -1190,13 +1368,12 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
                             TenantId::Default(), ReplicaType::ALL)
                     .has_value());
 
-    const size_t racer_shard = ShardIndexForKey(service, "racer_key");
     bool committed = false;
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
-        [&](size_t shard) {
-            // Commit exactly once, immediately after the scan releases the
-            // shard the new key hashes to, so the scan can never observe it.
-            if (shard != racer_shard || committed) {
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(
+        [&](const TenantId& tenant_id) {
+            // Commit exactly once, immediately after the walk finishes the
+            // tenant the new key belongs to, so the walk can never observe it.
+            if (!tenant_id.IsDefault() || committed) {
                 return;
             }
             committed = true;
@@ -1211,7 +1388,7 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
         });
 
     service.RemoveAll(true);
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
     auto exists = service.ExistKey("racer_key", TenantId::Default());
@@ -1270,11 +1447,10 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
                             TenantId::Default(), ReplicaType::ALL)
                     .has_value());
 
-    const size_t racer_shard = ShardIndexForKey(service, "scoped_racer");
     bool committed = false;
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
-        [&](size_t shard) {
-            if (shard != racer_shard || committed) {
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(
+        [&](const TenantId& tenant_id) {
+            if (!tenant_id.IsDefault() || committed) {
                 return;
             }
             committed = true;
@@ -1289,7 +1465,7 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
         });
 
     service.RemoveAll(TenantId::Default(), true);
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
     EXPECT_EQ(0u,
@@ -1841,11 +2017,11 @@ TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
 }
 
 // A mass client expiry marks handles stale all over the metadata table, so
-// the sweep cleans a shard in bounded write-lock batches instead of holding
-// it exclusively for the whole walk. Dropping and retaking the lock mid-shard
-// must not cost coverage: every key of the departed segment is erased, and
-// every key of a live segment survives. The keys are forced onto one shard
-// because the batch bound is per shard.
+// the sweep cleans each object under its own write lock instead of holding a
+// shard exclusively for the whole walk. Dropping and retaking the lock
+// mid-shard must not cost coverage: every key of the departed segment is
+// erased, and every key of a live segment survives. The keys are forced onto
+// one shard so the sweep returns to it many times.
 TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsShardAcrossLockBatches) {
     auto service = std::make_unique<MasterService>();
     PauseReplicaCleanup(*service);
@@ -1919,6 +2095,60 @@ TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsShardAcrossLockBatches) {
         EXPECT_TRUE(get_result->replicas[0].is_memory_replica())
             << "key=" << key;
     }
+}
+
+// The sweep walks one tenant at a time, so a departed segment's replicas must
+// be cleared from every tenant, and one tenant's sweep must leave another's
+// object under the same user key alone.
+TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsEveryTenant) {
+    const TenantId tenant_a("sweep_tenant_a");
+    const TenantId tenant_b("sweep_tenant_b");
+    auto service = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()}));
+    PauseReplicaCleanup(*service);
+
+    const std::string stale_segment_name = "tenant_sweep_stale_segment";
+    const std::string live_segment_name = "tenant_sweep_live_segment";
+    const auto stale_segment =
+        PrepareSimpleSegment(*service, stale_segment_name, 0x300000000);
+    const auto live_segment =
+        PrepareSimpleSegment(*service, live_segment_name, 0x400000000);
+
+    ReplicateConfig stale_config;
+    stale_config.replica_num = 1;
+    stale_config.preferred_segments = {stale_segment_name};
+    ReplicateConfig live_config;
+    live_config.replica_num = 1;
+    live_config.preferred_segments = {live_segment_name};
+    for (const auto& tenant_id : {tenant_a, tenant_b}) {
+        PutCompletedObject(*service, stale_segment.client_id, "stale_key",
+                           tenant_id, stale_config);
+        PutCompletedObject(*service, live_segment.client_id, "live_key",
+                           tenant_id, live_config);
+    }
+    // tenant_b also holds the user key tenant_a loses, on the live segment.
+    PutCompletedObject(*service, live_segment.client_id, "mixed_key", tenant_b,
+                       live_config);
+    PutCompletedObject(*service, stale_segment.client_id, "mixed_key", tenant_a,
+                       stale_config);
+
+    ASSERT_TRUE(
+        service
+            ->UnmountSegment(stale_segment.segment_id, stale_segment.client_id)
+            .has_value());
+    ClearInvalidHandlesForTest(*service);
+
+    EXPECT_EQ(3u, service->GetKeyCount());
+    for (const auto& tenant_id : {tenant_a, tenant_b}) {
+        auto stale = service->GetReplicaList("stale_key", tenant_id);
+        ASSERT_FALSE(stale.has_value()) << "tenant=" << tenant_id;
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, stale.error())
+            << "tenant=" << tenant_id;
+        EXPECT_TRUE(service->GetReplicaList("live_key", tenant_id).has_value())
+            << "tenant=" << tenant_id;
+    }
+    EXPECT_FALSE(service->GetReplicaList("mixed_key", tenant_a).has_value());
+    EXPECT_TRUE(service->GetReplicaList("mixed_key", tenant_b).has_value());
 }
 
 TEST_F(MasterServiceTest, UnmountSegmentKeepsSynchronousCleanupInHaMode) {
@@ -2578,8 +2808,7 @@ TEST_F(MasterServiceTest, SoftPinDeadlineHeapCompactsRepeatedUpdates) {
     constexpr size_t kUpdates = 5000;
     for (size_t i = 0; i < kUpdates; ++i) {
         UpsertSoftPinDeadlineIndexForTest(
-            service, "compaction_key", 0,
-            base + std::chrono::milliseconds(i + 1));
+            service, "compaction_key", base + std::chrono::milliseconds(i + 1));
     }
 
     EXPECT_EQ(SoftPinRegistrationCount(service), 1u);
@@ -3294,6 +3523,65 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
     }
     EXPECT_TRUE(segment_names.contains("segment_1"));
     EXPECT_FALSE(segment_names.contains("segment_0"));
+}
+
+// Drain plans and completes one tenant at a time: the segment counts as
+// drained only once every tenant's object under the same user key has left
+// it.
+TEST_F(MasterServiceTest, DrainJobMovesObjectsOfEveryTenant) {
+    const TenantId tenant_a("drain_tenant_a");
+    const TenantId tenant_b("drain_tenant_b");
+    auto service_config =
+        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()});
+    service_config.default_kv_lease_ttl = 0;
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"segment_0"};
+    const std::string key = "drain_shared_key";
+    for (const auto& tenant_id : {tenant_a, tenant_b}) {
+        PutCompletedObject(*service_, generate_uuid(), key, tenant_id, config);
+    }
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 2;
+
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    WaitUntil(
+        [&] {
+            (void)ExecutePendingMoveTasks(*service_, ctx0.client_id);
+            auto query = service_->QueryDrainJob(job_id.value());
+            return query.has_value() && query->status == JobStatus::SUCCEEDED;
+        },
+        std::chrono::seconds(10));
+
+    auto query = service_->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->succeeded_units, 2u);
+
+    auto segment_status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(segment_status.has_value());
+    EXPECT_EQ(segment_status.value(), SegmentStatus::DRAINED);
+
+    for (const auto& tenant_id : {tenant_a, tenant_b}) {
+        auto replicas = service_->GetReplicaList(key, tenant_id);
+        ASSERT_TRUE(replicas.has_value()) << "tenant=" << tenant_id;
+        ASSERT_EQ(1u, replicas->replicas.size()) << "tenant=" << tenant_id;
+        EXPECT_EQ("segment_1", replicas->replicas[0]
+                                   .get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_)
+            << "tenant=" << tenant_id;
+    }
 }
 
 TEST_F(MasterServiceTest, CancelDrainJobRestoresSegmentStatus) {

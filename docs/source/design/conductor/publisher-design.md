@@ -83,7 +83,10 @@ empty:
 - `seq_hashes` and the legacy `block_hashes` are emitted as empty arrays;
 - `token_ids` and `parent_hash` are nil on `stored`; `base_block_idx` is nil on
   both `stored` and `removed`;
-- `group_id` carries the Store group identity, not a connector group field.
+- `group_id` carries the Store group identity, not a connector group field;
+- `session_id` on `stored` carries the object's committed write attribution, or
+  nil when untagged. Availability changes after the write reuse the committed
+  tag; `removed` and `cleared` carry none.
 
 A `cleared` event is envelope-only. It omits `object_key`, `group_id`,
 `seq_hashes`, `block_hashes`, and `base_block_idx` entirely rather than

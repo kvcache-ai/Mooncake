@@ -220,6 +220,22 @@ In addition, if the error `Failed to get description of XXX` is displayed, it in
    * **Reused sockets are not probed before a transfer.** A connection that a middlebox silently dropped while idle surfaces as a stall on the next transfer (TCP retransmission timeout) rather than a fast reconnect. Same-datacenter peers are unaffected in practice; if your initiators reach peers across a NAT or firewall with aggressive idle expiry, keep the pool opted out or shorten the idle gap below the middlebox timeout.
    * A connection whose protocol stream went dirty is closed instead of reused, and a failed lane is retried on a cooldown, so a restarted peer costs at most the transfer that was in flight.
 
+## Intel XPU Transfers
+
+- **No Intel GPU is visible:** In the same shell or container as the client,
+  run `source /opt/intel/oneapi/setvars.sh`, then check that `sycl-ls` lists a
+  Level Zero GPU. An OpenCL CPU device alone does not provide GPU support.
+- **XPU buffers are not handled:** Use an {ref}`XPU-enabled build
+  <build-with-intel-xpu>`; the default wheels do not include XPU support. Set
+  `MC_USE_TENT=1` before constructing the engine or store.
+- **Choosing a protocol:** `xpu` is a local transport (host staging and
+  same-node XPU copies), not a network protocol. Pass `tcp` or `rdma` to Store
+  setup; see {ref}`Intel XPU Transport <intel-xpu-transport>`.
+- **Same-node transfers still use the network:** Check that
+  `/proc/sys/kernel/yama/ptrace_scope` is 0 or 1 (or grant `CAP_SYS_PTRACE`),
+  that `transports/xpu/disable_ipc` is not `true`, and that any selector policy
+  with a `transports` list includes `"xpu"` ahead of `"rdma"`.
+
 ## Memory Allocator
 
 Mooncake Store's mmap arena is opt-in for mmap buffer allocations. Setting `MC_MMAP_ARENA_POOL_SIZE` explicitly enables it and pre-allocates a hugepage-backed pool; if it is enabled via gflag instead, the default pool size is `8gb`. If the arena cannot allocate hugepages, it falls back to regular pages automatically.
