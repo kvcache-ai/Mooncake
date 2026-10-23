@@ -189,7 +189,7 @@ class MasterServiceTest : public ::testing::Test {
             metadata.soft_pin_timeout = deadline;
         }
         MasterServiceTestPeer::SoftPinDeadlineIndex(service).Upsert(
-            normalized_tenant.MakeScopedKey(key), shard_idx, deadline);
+            normalized_tenant.MakeScopedKey(key), deadline);
     }
 
     size_t SoftPinDeadlineHeapSize(MasterService& service) {
@@ -249,11 +249,11 @@ class MasterServiceTest : public ::testing::Test {
     }
 
     void UpsertSoftPinDeadlineIndexForTest(
-        MasterService& service, const std::string& key, size_t shard_idx,
+        MasterService& service, const std::string& key,
         const std::chrono::system_clock::time_point& deadline,
         const std::string& tenant_id = "default") {
         MasterServiceTestPeer::SoftPinDeadlineIndex(service).Upsert(
-            TenantId(tenant_id).MakeScopedKey(key), shard_idx, deadline);
+            TenantId(tenant_id).MakeScopedKey(key), deadline);
     }
 
     size_t PopExpiredSoftPinDeadlinesForTest(

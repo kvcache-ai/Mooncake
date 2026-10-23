@@ -1111,6 +1111,14 @@ class MasterService {
         std::string user_key;
     };
 
+    // One of `count` disjoint slices of a tenant's objects: the read cursors
+    // of slices 0 to count - 1 together visit what one ReadCursor() would, so
+    // that many threads can walk one tenant at once.
+    struct CursorSlice {
+        size_t index;
+        size_t count;
+    };
+
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
     // One publication of an object: its metadata and the tasks in flight for
@@ -1178,14 +1186,12 @@ class MasterService {
 
         struct Entry {
             TimePoint deadline;
-            size_t shard_idx;
             std::string scoped_key;
         };
 
-        void Upsert(std::string scoped_key, size_t shard_idx,
-                    const TimePoint& deadline);
+        void Upsert(std::string scoped_key, const TimePoint& deadline);
         void Remove(const std::string& scoped_key);
-        void RemoveIfMatches(const std::string& scoped_key, size_t shard_idx,
+        void RemoveIfMatches(const std::string& scoped_key,
                              const TimePoint& deadline);
         std::vector<Entry> PopExpired(const TimePoint& now);
         void Clear();
@@ -1193,7 +1199,6 @@ class MasterService {
        private:
         struct Registration {
             TimePoint deadline;
-            size_t shard_idx;
         };
 
         struct EarlierDeadline {
@@ -1513,7 +1518,6 @@ class MasterService {
         const std::function<bool(const std::string& key)>& matches_key,
         const std::function<void(const ObjectMetadata&)>& on_remove);
     static void ApplySoftPinMetricDelta(int metric_delta);
-    size_t GetMetadataShardIndex(const ObjectMetadata& metadata) const;
     void ApplySoftPinEvaluation(
         const ObjectMetadata& metadata,
         const ObjectMetadata::SoftPinEvaluation& result) const;
@@ -1627,12 +1631,12 @@ class MasterService {
     // when none is left valid.
     void CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor);
 
-    /**
-     * @brief Helper to discard expired processing keys.
-     */
+    // Discards the tenant's expired processing replicas and expired tasks;
+    // with `slice`, only those of that slice of its objects.
     void DiscardExpiredProcessingReplicas(
-        MetadataShardAccessorRW& shard,
-        const std::chrono::system_clock::time_point& now);
+        const TenantId& tenant_id,
+        const std::chrono::system_clock::time_point& now,
+        CursorSlice slice = {0, 1});
     void FreeDfsReplicas(const std::string& key,
                          std::span<const Replica> replicas);
     void RunDfsEviction();
@@ -1780,14 +1784,23 @@ class MasterService {
     // accessor's scope may reach another key through another accessor.
     class MetadataAccessorRW {
        public:
-        // Holds the key only while it holds an object.
-        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
+        struct AsIs {};
+        // Holds the key only while it holds an object, and leaves that object
+        // as it is, without the invalid-replica cleanup: for a pass that acts
+        // on what the object's own state says, such as an expiry sweep.
+        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id,
+                           AsIs)
             : service_(service),
               object_id_(std::move(object_id)),
               shard_guard_(service_,
                            service_->getShardIndex(object_id_.tenant_id,
                                                    object_id_.user_key)) {
             Locate();
+        }
+
+        // Holds the key only while it holds an object.
+        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
+            : MetadataAccessorRW(service, std::move(object_id), AsIs{}) {
             // Invalid memory replicas go first, which may tear the object down.
             if (IsPublished()) {
                 service_->CleanupInvalidMemoryReplicas(*this);
@@ -1811,12 +1824,8 @@ class MasterService {
         // its `cleared` against.
         MetadataAccessorRW(MasterService* service, const TenantId& tenant_id,
                            const route::ObjectRef& ref)
-            : service_(service),
-              object_id_{tenant_id, ref.key},
-              shard_guard_(service_,
-                           service_->getShardIndex(object_id_.tenant_id,
-                                                   object_id_.user_key)) {
-            Locate();
+            : MetadataAccessorRW(service, ObjectIdentity{tenant_id, ref.key},
+                                 AsIs{}) {
             if (IsPublished() && it_->second.generation != ref.generation) {
                 it_ = tenant_state_->metadata.end();
             }
@@ -2066,6 +2075,18 @@ class MasterService {
     [[nodiscard]] TenantCursor<LockMode::kWrite> WriteCursor(
         const TenantId& tenant_id);
 
+    // Walks only `slice` of the tenant's objects; see CursorSlice.
+    [[nodiscard]] TenantCursor<LockMode::kRead> ReadCursor(
+        const TenantId& tenant_id, CursorSlice slice) const;
+
+    // The tenant's keys whose object carries work in flight (see
+    // route::ObjectState::HasWorkInFlight), as a snapshot to resolve again: the
+    // work can finish, or the object be torn down or replaced, once the walk
+    // has moved on; with `slice`, only those of that slice. Until the store
+    // moves to per-tenant routes this walks every object of the slice.
+    [[nodiscard]] std::vector<std::string> InFlightKeys(
+        const TenantId& tenant_id, CursorSlice slice = {0, 1}) const;
+
     // Calls `visit` with each tenant that holds an object when the walk
     // starts, holding no lock, so `visit` may reach any key. A tenant that
     // gains its first object meanwhile may or may not be visited.
@@ -2173,8 +2194,12 @@ class MasterService {
        private:
         friend class MasterService;
 
-        TenantCursor(Access<MasterService>& service, TenantId tenant_id)
-            : service_(service), tenant_id_(std::move(tenant_id)) {
+        TenantCursor(Access<MasterService>& service, TenantId tenant_id,
+                     CursorSlice slice = {0, 1})
+            : service_(service),
+              tenant_id_(std::move(tenant_id)),
+              next_shard_(kNumShards * slice.index / slice.count),
+              end_shard_(kNumShards * (slice.index + 1) / slice.count) {
             Settle();
         }
 
@@ -2192,7 +2217,7 @@ class MasterService {
                 // a map whose lock is gone.
                 it_ = end_ = RecordIterator{};
                 lock_.reset();
-                if (next_shard_ == kNumShards) {
+                if (next_shard_ == end_shard_) {
                     return;
                 }
                 auto& shard = service_.metadata_shards_[next_shard_++];
@@ -2211,7 +2236,8 @@ class MasterService {
 
         Access<MasterService>& service_;
         const TenantId tenant_id_;
-        size_t next_shard_{0};
+        size_t next_shard_;
+        const size_t end_shard_;
         std::optional<SharedMutexLocker> lock_;
         RecordIterator it_{};
         RecordIterator end_{};
