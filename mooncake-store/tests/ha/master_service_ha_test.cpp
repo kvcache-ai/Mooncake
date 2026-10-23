@@ -824,6 +824,16 @@ class MasterServiceHATest : public ::testing::Test {
         return accessor.Exists() ? accessor.Get().CountReplicas() : 0;
     }
 
+    // Objects holding a completed LOCAL_DISK replica, summed over the shards.
+    static long DiskObjectCountForTesting(MasterService& service) {
+        long count = 0;
+        for (size_t i = 0; i < MasterServiceTestPeer::kNumShards; ++i) {
+            MasterServiceTestPeer::MetadataShardAccessorRO shard(&service, i);
+            count += shard->disk_object_count;
+        }
+        return count;
+    }
+
     static bool IsHardPinnedForTesting(MasterService& service,
                                        const TenantId& tenant_id,
                                        const std::string& key) {
@@ -2123,20 +2133,21 @@ TEST_F(MasterServiceHATest,
        ClearInvalidHandlesSeesOwnerThatBecameRetainingMidSweep) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
-    const std::string endpoint = "sweep_mid_mount_segment";
+    const std::string endpoint = "sweep_discovery_mount_segment";
     const auto shard_of = [&](const std::string& key) {
         return MasterServiceTestPeer(service).getShardIndex(kDefaultTenant,
                                                             key);
     };
-    // Three keys on shards in walk order: the sweep erases the progress
-    // marker first, parks on the middle shard, and only reaches the third
-    // shard after the park is released.
+    // The sweep discovers tenants by walking every shard, so a lock on the
+    // middle shard parks it before any tenant is visited. The live key's
+    // object is only restored while the sweep is parked there, and lands on a
+    // shard the discovery walk has not passed yet.
     std::string progress_key;
     std::string park_key;
     std::string live_key;
     for (int i = 0; i < 1000000; ++i) {
         const std::string candidate =
-            "sweep_mid_mount_key_" + std::to_string(i);
+            "sweep_discovery_mount_key_" + std::to_string(i);
         const size_t shard = shard_of(candidate);
         if (progress_key.empty() && shard <= 300) {
             progress_key = candidate;
@@ -2151,8 +2162,6 @@ TEST_F(MasterServiceHATest,
     ASSERT_FALSE(progress_key.empty());
     ASSERT_FALSE(park_key.empty());
     ASSERT_FALSE(live_key.empty());
-    ASSERT_LT(shard_of(progress_key), shard_of(park_key));
-    ASSERT_LT(shard_of(park_key), shard_of(live_key));
 
     const auto make_local_disk_object = [&](const std::string& key,
                                             const UUID& owner) {
@@ -2164,7 +2173,6 @@ TEST_F(MasterServiceHATest,
         return StandbyObjectEntry{"default", key, std::move(metadata)};
     };
 
-    // Two objects whose owners have gone offline before the sweep starts.
     const UUID offline_progress_owner = generate_uuid();
     const UUID offline_park_owner = generate_uuid();
     const UUID recovering_owner = generate_uuid();
@@ -2187,62 +2195,60 @@ TEST_F(MasterServiceHATest,
                   ClientLivenessTransition::BECAME_OFFLINE);
     }
 
-    // Park the sweep on the middle shard: it cannot walk past it while the
-    // lock is held.
+    // Park the sweep during the tenant discovery walk, before the first
+    // tenant is visited and picked through. It cannot finish while the lock
+    // is held, and its one-time initial capture has run once it is parked.
     auto park_lock =
         LockMetadataShardForTesting(service, kDefaultTenant, park_key);
     auto sweep = std::async(std::launch::async,
                             [&] { ClearInvalidHandlesForTesting(service); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    // The progress marker's erasure proves the sweep is past the first
-    // shard, so a point-in-time capture -- if the sweep took one -- is
-    // already done.
-    const auto marker_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    bool marker_erased = false;
-    while (std::chrono::steady_clock::now() < marker_deadline) {
-        if (ReplicaCountForTesting(service, kDefaultTenant, progress_key) ==
-            0) {
-            marker_erased = true;
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    // While the sweep is parked between shards it must hold no global lock:
-    // the fixed sweep captures liveness per shard and takes only the current
-    // shard's mutex. The old sweep kept master_state_mutex_ shared for the
-    // whole table walk, which would deadlock the restore below (it needs
-    // master_state exclusively). Fail instead of hanging on that code.
-    bool parked_without_global_locks = false;
-    if (marker_erased) {
+    // While parked the sweep must hold no global lock: the restore below
+    // needs master_state exclusively. Fail instead of hanging on that code.
+    {
         std::unique_lock<std::shared_mutex> probe(
             MasterServiceTestPeer::MasterStateMutex(service), std::try_to_lock);
-        parked_without_global_locks = probe.owns_lock();
+        if (!probe.owns_lock()) {
+            park_lock.unlock();
+            sweep.get();
+            FAIL() << "sweep held master_state_mutex_ while parked during "
+                      "tenant discovery";
+            return;
+        }
     }
-    if (!parked_without_global_locks) {
+
+    // The sweep must still be parked -- not already finished -- when the
+    // owner registers, or the test would prove nothing. Release the park and
+    // reap it first so a failure here cannot hang on the still-held lock.
+    if (sweep.wait_for(std::chrono::seconds(0)) ==
+        std::future_status::ready) {
         park_lock.unlock();
         sweep.get();
-        FAIL() << "sweep held master_state_mutex_ while parked between shards";
+        FAIL() << "sweep finished before the owner registered";
         return;
     }
 
-    // The owner registers while the sweep is parked between shards: the
-    // restore installs an ACTIVE liveness record for it and places its
-    // object on a shard the sweep has not reached yet.
+    // The owner registers while the sweep is parked: the restore installs an
+    // ACTIVE liveness record for it and places its object on a shard the
+    // discovery walk has not reached yet. Its record is fresh -- an OFFLINE
+    // record cannot come back -- so an owner that was already swept away
+    // stays swept; this is the mounting owner the refresh must learn about.
     const auto recovering_restore = service.RestoreFromStandbySnapshot(
         {make_local_disk_object(live_key, recovering_owner)}, 7,
         {MakeStandbyMemorySegment(endpoint)});
 
+    // Hold the park past the retaining-set refresh interval, so the refresh
+    // at the tenant visit re-captures liveness before the read pass.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
     park_lock.unlock();
     sweep.get();
 
-    ASSERT_TRUE(marker_erased) << "sweep never reached the progress marker";
     ASSERT_TRUE(recovering_restore.has_value())
         << toString(recovering_restore.error());
-    // The owner became retaining before the sweep reached its shard, so the
-    // liveness-complement re-capture keeps its replica. A point-in-time
-    // capture taken before the restore would have swept it.
+    // The owner became retaining before the sweep's read pass reached its
+    // shard, so the re-capture keeps its replica. A sweep with only the
+    // initial point-in-time capture would have swept it.
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, live_key), 1u);
     // Owners that stayed offline are still swept, on both sides of the park.
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, progress_key),
@@ -2496,11 +2502,11 @@ TEST_F(MasterServiceHATest, NoFBatchEvictWaitsForSnapshotBarrier) {
 TEST_F(MasterServiceHATest, InvalidHandleCleanupDoesNotWaitForSnapshotBarrier) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
-    // The sweep takes only per-shard locks plus a short client_mutex_ shared
-    // capture per shard, so it must complete while the global snapshot
-    // barrier is held exclusively. The old sweep kept master_state_mutex_
-    // shared across the whole table walk, which is what the barrier-pinned
-    // predecessor of this test asserted.
+    // The sweep takes only per-object accessor locks plus a short
+    // client_mutex_ shared capture refreshed periodically, so it must
+    // complete while the global snapshot barrier is held exclusively. The
+    // old sweep kept master_state_mutex_ shared across the whole table walk,
+    // which is what the barrier-pinned predecessor of this test asserted.
     auto snapshot_lock = LockSnapshotForTesting(service);
     auto cleanup = std::async(std::launch::async,
                               [&] { ClearInvalidHandlesForTesting(service); });
@@ -3015,6 +3021,7 @@ TEST_F(MasterServiceHATest,
                                      "standby_repair_reject_ld_lost"),
               0);
     EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+    EXPECT_EQ(DiskObjectCountForTesting(service), 0);
 
     // Retry with the writer accepting: the restore lands, and the disk
     // owner's record is installed for real this time.
@@ -3029,6 +3036,9 @@ TEST_F(MasterServiceHATest,
               0);
     EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).contains(
         disk_owner));
+    // The restored survivor counts as a disk object, like one whose
+    // LOCAL_DISK replica was added through AddReplica.
+    EXPECT_EQ(DiskObjectCountForTesting(service), 1);
 }
 
 TEST_F(MasterServiceHATest, RestoreDiscardRepairTimeoutThenRetrySucceeds) {

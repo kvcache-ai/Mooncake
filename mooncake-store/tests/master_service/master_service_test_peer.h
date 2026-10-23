@@ -61,12 +61,24 @@ class MasterServiceTestPeer {
     // Drive one tenant watermark eviction pass without the periodic worker.
     void RunTenantEvictForTesting();
 
+    // The service's walks over tenants and over one tenant's objects.
+    auto ReadCursor(const TenantId& tenant_id) const {
+        return service_.ReadCursor(tenant_id);
+    }
+    auto WriteCursor(const TenantId& tenant_id) {
+        return service_.WriteCursor(tenant_id);
+    }
+    void VisitTenants(const std::function<void(const TenantId&)>& visit) const {
+        service_.VisitTenants(visit);
+    }
+
     // Enable epoch bookkeeping without starting a live KV event publisher.
     void SetKvTenantEpochTrackingForTesting(bool enabled);
 
-    // Called after each shard lock is released during RemoveAll. Tests can
-    // commit into an already-scanned shard to pin the interleaving.
-    void SetRemoveAllShardHookForTesting(std::function<void(size_t)> hook);
+    // Called once per tenant RemoveAll has finished removing. Tests can commit
+    // into a tenant the walk already passed to pin the interleaving.
+    void SetRemoveAllTenantHookForTesting(
+        std::function<void(const TenantId&)> hook);
 
     // Counts of published clears and clears suppressed by a concurrent commit.
     uint64_t GetKvClearedPublishedForTesting() const;
@@ -468,12 +480,6 @@ class MasterServiceTestPeer {
         std::vector<UUID>* mirror_clients = nullptr) {
         return service_.PushOffloadingQueue(object_id, replica, mirror_clients);
     }
-
-    void ReRouteRestoredObjectsByKey() {
-        service_.ReRouteRestoredObjectsByKey();
-    }
-
-    void RebuildGroupState() { service_.RebuildGroupState(); }
 
     void RebuildTenantQuotaUsageFromMetadata() {
         service_.RebuildTenantQuotaUsageFromMetadata();

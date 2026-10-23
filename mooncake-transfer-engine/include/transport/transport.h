@@ -168,6 +168,13 @@ class Transport {
     struct Slice {
         enum SliceStatus { PENDING, POSTED, SUCCESS, TIMEOUT, FAILED };
 
+        struct RdmaCompletionToken {
+            uint64_t endpoint_id;
+            uint64_t selection_epoch;
+            bool valid;
+            bool observe_success;
+        };
+
         void *source_addr;
         size_t length;
         TransferRequest::OpCode opcode;
@@ -211,6 +218,7 @@ class Transport {
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
                 RdmaEndPoint *endpoint;  // Endpoint used for this transfer
+                RdmaCompletionToken auto_gid_token;
                 int qp_index;
             } rdma;
             struct {

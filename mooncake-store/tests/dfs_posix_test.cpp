@@ -12,6 +12,7 @@
 #include <functional>
 #include <future>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -126,6 +127,10 @@ void ConfigurePosixDfs(EnvGuard& env) {
     env.Set("MOONCAKE_DFS_EVICTION_ENABLED", "0");
     env.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
 }
+
+// Small-shard tests use objects that reserve two 4 KiB pages, so a few of
+// them fill a shard and cross the eviction watermarks.
+constexpr uint64_t kTwoPageObject = 8 * 1024;
 
 DistributedStorageConfig MakeAllocatorConfig(const std::string& mount_path,
                                              int shard_count,
@@ -359,26 +364,181 @@ TEST(ShardAllocatorTest, InitReturnsSpecificErrors) {
     EXPECT_EQ(file_error_result.error(), ErrorCode::FILE_WRITE_FAIL);
 }
 
-TEST(ShardAllocatorTest, AllocateReservesAlignmentPadding) {
+TEST(ShardAllocatorTest, AllocateReservesOnlyAlignedSize) {
     EnvGuard env;
     ConfigurePosixDfs(env);
-    TempDir tmp("dfs_alloc_padding");
+    TempDir tmp("dfs_alloc_exact_fit");
 
     ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096)));
 
-    auto desc = alloc.Allocate("key1", 100);
-    ASSERT_TRUE(desc.has_value());
-    EXPECT_EQ(desc->aligned_size, 4096);
-    EXPECT_EQ(desc->offset % 4096, 0);
+    auto first = alloc.Allocate("key1", 100);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->aligned_size, 4096);
+    EXPECT_EQ(first->offset, 0);
+    auto second = alloc.Allocate("key2", 100);
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->offset, 4096);
+    EXPECT_EQ(alloc.GetUsedBytes(), 8 * 1024);
 
-    auto exhausted = alloc.Allocate("key2", 100);
+    auto exhausted = alloc.Allocate("key3", 100);
     EXPECT_FALSE(exhausted.has_value());
     EXPECT_EQ(exhausted.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
-    alloc.Free(desc->offset, desc->aligned_size, desc->shard_idx, "key1");
-    auto after_free = alloc.Allocate("key3", 100);
-    EXPECT_TRUE(after_free.has_value());
+    alloc.Free(first->offset, first->aligned_size, first->shard_idx, "key1");
+    auto after_free = alloc.Allocate("key4", 100);
+    ASSERT_TRUE(after_free.has_value());
+    EXPECT_EQ(after_free->offset, 0);
+
+    // A payload whose aligned size equals the whole shard fits exactly.
+    TempDir whole_tmp("dfs_alloc_whole_shard");
+    ShardAllocator whole;
+    ASSERT_TRUE(
+        whole.Init(MakeAllocatorConfig(whole_tmp.path(), 1, 8 * 1024, 4096)));
+    auto full = whole.Allocate("full", 8 * 1024 - 1);
+    ASSERT_TRUE(full.has_value());
+    EXPECT_EQ(full->offset, 0);
+    EXPECT_EQ(full->aligned_size, 8 * 1024);
+    auto too_large = whole.Allocate("too_large", 8 * 1024 + 1);
+    EXPECT_FALSE(too_large.has_value());
+}
+
+TEST(ShardAllocatorTest, MegabytePayloadsPackWithoutAlignmentHeadroom) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    constexpr uint64_t kMiB = 1024 * 1024;
+    constexpr uint64_t kShardCapacity = 32 * kMiB;
+
+    struct Case {
+        uint64_t size;
+        uint64_t reserved;
+        size_t count;
+    };
+    // Reservations follow the allocator's size classes (eight per power of
+    // two), so only payloads off a class boundary reserve extra bytes.
+    const std::vector<Case> cases{
+        {kMiB, kMiB, 32},
+        {kMiB + 1, kMiB + kMiB / 8, 28},
+        {kMiB + kMiB / 2, kMiB + kMiB / 2, 21},
+        {2 * kMiB, 2 * kMiB, 16},
+        {3 * kMiB - 123, 3 * kMiB, 10},
+        {4 * kMiB, 4 * kMiB, 8},
+        {8 * kMiB, 8 * kMiB, 4},
+    };
+
+    for (const auto& c : cases) {
+        SCOPED_TRACE("size=" + std::to_string(c.size));
+        TempDir tmp("dfs_alloc_mib");
+        ShardAllocator alloc;
+        ASSERT_TRUE(alloc.Init(
+            MakeAllocatorConfig(tmp.path(), 1, kShardCapacity, 4096)));
+        FileStorageConfig file_config;
+        file_config.storage_backend_type = StorageBackendType::kDistributed;
+        file_config.storage_filepath = tmp.path();
+        DistributedStorageBackend client(
+            file_config,
+            MakeAllocatorConfig(tmp.path(), 1, kShardCapacity, 4096),
+            std::make_unique<PosixFsAdapter>());
+        ASSERT_TRUE(client.Init());
+
+        std::vector<DistributedFSDescriptor> descs;
+        while (true) {
+            auto desc =
+                alloc.Allocate("k" + std::to_string(descs.size()), c.size);
+            if (!desc) {
+                EXPECT_EQ(desc.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+                break;
+            }
+            EXPECT_EQ(desc->offset % 4096, 0);
+            EXPECT_EQ(desc->offset, descs.size() * c.reserved);
+            descs.push_back(*desc);
+        }
+        ASSERT_EQ(descs.size(), c.count);
+        EXPECT_EQ(alloc.GetUsedBytes(), c.count * c.reserved);
+
+        // Write a distinct pattern into every object, then read all of them
+        // back: overlapping extents would clobber a neighbour's bytes.
+        std::vector<std::string> values;
+        for (size_t i = 0; i < descs.size(); ++i) {
+            values.emplace_back(c.size, static_cast<char>('a' + i % 26));
+            values.back().back() = static_cast<char>('A' + i % 26);
+            auto writes =
+                client.BatchWrite({{"k" + std::to_string(i),
+                                    descs[i],
+                                    {{values[i].data(), values[i].size()}}}});
+            ASSERT_EQ(writes.size(), 1);
+            ASSERT_TRUE(writes[0]) << "write " << i;
+        }
+        for (size_t i = 0; i < descs.size(); ++i) {
+            std::string output(c.size, '\0');
+            auto reads = client.BatchRead({{"k" + std::to_string(i),
+                                            descs[i],
+                                            {{output.data(), output.size()}}}});
+            ASSERT_EQ(reads.size(), 1);
+            ASSERT_TRUE(reads[0]) << "read " << i;
+            EXPECT_TRUE(output == values[i]) << "readback mismatch " << i;
+        }
+    }
+}
+
+TEST(ShardAllocatorTest, MixedMegabytePayloadsStayAlignedAcrossReuse) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    constexpr uint64_t kMiB = 1024 * 1024;
+    const std::vector<uint64_t> sizes{kMiB,         kMiB + 1, kMiB + kMiB / 3,
+                                      2 * kMiB - 7, 3 * kMiB, 5 * kMiB + 4097,
+                                      7 * kMiB / 2};
+
+    for (uint64_t alignment : {uint64_t{4096}, uint64_t{64 * 1024}, kMiB}) {
+        SCOPED_TRACE("alignment=" + std::to_string(alignment));
+        TempDir tmp("dfs_alloc_mixed_mib");
+        ShardAllocator alloc;
+        ASSERT_TRUE(alloc.Init(
+            MakeAllocatorConfig(tmp.path(), 1, 256 * kMiB, alignment)));
+
+        std::map<uint64_t, std::pair<std::string, DistributedFSDescriptor>>
+            live;
+        auto check_live = [&]() {
+            uint64_t previous_end = 0;
+            for (const auto& [offset, entry] : live) {
+                const auto& desc = entry.second;
+                EXPECT_EQ(offset % alignment, 0);
+                EXPECT_GE(offset, previous_end);
+                previous_end = offset + desc.aligned_size;
+                EXPECT_LE(previous_end, 256 * kMiB);
+            }
+        };
+
+        for (int round = 0; round < 4; ++round) {
+            size_t allocated = 0;
+            for (size_t i = 0;; ++i) {
+                const std::string key =
+                    "r" + std::to_string(round) + "_" + std::to_string(i);
+                auto desc = alloc.Allocate(key, sizes[i % sizes.size()]);
+                if (!desc) break;
+                ASSERT_TRUE(
+                    live.emplace(desc->offset, std::make_pair(key, *desc))
+                        .second);
+                ++allocated;
+            }
+            EXPECT_GT(allocated, round == 0 ? 50u : 10u);
+            check_live();
+            // Free every other live object to create aligned holes of mixed
+            // sizes, which the next round refills.
+            bool drop = true;
+            for (auto it = live.begin(); it != live.end();) {
+                if (drop) {
+                    const auto& [key, desc] = it->second;
+                    alloc.Free(key, desc);
+                    it = live.erase(it);
+                } else {
+                    ++it;
+                }
+                drop = !drop;
+            }
+        }
+        check_live();
+    }
 }
 
 TEST(ShardAllocatorTest, ExhaustionAndEviction) {
@@ -394,14 +554,14 @@ TEST(ShardAllocatorTest, ExhaustionAndEviction) {
 
     std::vector<DistributedFSDescriptor> descs;
     for (int i = 0; i < 4; ++i) {
-        auto desc = alloc.Allocate("k" + std::to_string(i), 100);
+        auto desc = alloc.Allocate("k" + std::to_string(i), kTwoPageObject);
         ASSERT_TRUE(desc.has_value()) << "allocation " << i;
         alloc.UpdateAccess("k" + std::to_string(i), desc->shard_idx,
                            desc->offset);
         descs.push_back(*desc);
     }
 
-    auto exhausted = alloc.Allocate("k_exhausted", 100);
+    auto exhausted = alloc.Allocate("k_exhausted", kTwoPageObject);
     EXPECT_FALSE(exhausted.has_value());
     EXPECT_EQ(exhausted.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
@@ -412,12 +572,12 @@ TEST(ShardAllocatorTest, ExhaustionAndEviction) {
 
     // Prepare only reserves candidates; their extents are not reusable until
     // the master accepts and commits the transaction.
-    auto before_commit = alloc.Allocate("k_before_commit", 100);
+    auto before_commit = alloc.Allocate("k_before_commit", kTwoPageObject);
     EXPECT_FALSE(before_commit.has_value());
 
     alloc.CommitPreparedEviction(std::move(pending));
 
-    auto after_evict = alloc.Allocate("k_after_evict", 100);
+    auto after_evict = alloc.Allocate("k_after_evict", kTwoPageObject);
     EXPECT_TRUE(after_evict.has_value());
 }
 
@@ -434,7 +594,7 @@ TEST(ShardAllocatorTest, RestorePreparedEvictionPreservesCandidateOrder) {
 
     for (int i = 0; i < 4; ++i) {
         const std::string key = "k" + std::to_string(i);
-        auto desc = alloc.Allocate(key, 100);
+        auto desc = alloc.Allocate(key, kTwoPageObject);
         ASSERT_TRUE(desc.has_value()) << "allocation " << i;
         alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
     }
@@ -466,7 +626,7 @@ TEST(ShardAllocatorTest, PartialResolutionContinuesToLowWatermark) {
     std::vector<DistributedFSDescriptor> descs;
     for (int i = 0; i < 4; ++i) {
         const std::string key = "k" + std::to_string(i);
-        auto desc = alloc.Allocate(key, 100);
+        auto desc = alloc.Allocate(key, kTwoPageObject);
         ASSERT_TRUE(desc.has_value()) << "allocation " << i;
         alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
         descs.push_back(*desc);
@@ -506,7 +666,7 @@ TEST(ShardAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
 
     for (int i = 0; i < 4; ++i) {
         const std::string key = "k" + std::to_string(i);
-        auto desc = alloc.Allocate(key, 100);
+        auto desc = alloc.Allocate(key, kTwoPageObject);
         ASSERT_TRUE(desc.has_value()) << "allocation " << i;
         alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
     }
@@ -519,7 +679,7 @@ TEST(ShardAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
     auto repeated = PrepareAndCommitPreparedEviction(alloc);
     EXPECT_TRUE(repeated.empty());
 
-    auto before_release = alloc.Allocate("k_before_release", 100);
+    auto before_release = alloc.Allocate("k_before_release", kTwoPageObject);
     EXPECT_FALSE(before_release.has_value());
     EXPECT_EQ(before_release.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
@@ -532,13 +692,13 @@ TEST(ShardAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
     ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096)));
 
-    auto desc_a = alloc.Allocate("A", 100);
+    auto desc_a = alloc.Allocate("A", kTwoPageObject);
     ASSERT_TRUE(desc_a.has_value());
     alloc.UpdateAccess("A", desc_a->shard_idx, desc_a->offset);
 
     alloc.Free(desc_a->offset, desc_a->aligned_size, desc_a->shard_idx, "A");
 
-    auto desc_b = alloc.Allocate("B", 100);
+    auto desc_b = alloc.Allocate("B", kTwoPageObject);
     ASSERT_TRUE(desc_b.has_value());
     ASSERT_EQ(desc_b->offset, desc_a->offset);
     alloc.UpdateAccess("B", desc_b->shard_idx, desc_b->offset);
@@ -556,13 +716,13 @@ TEST(ShardAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
     ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096)));
 
-    auto desc_a = alloc.Allocate("A", 100);
+    auto desc_a = alloc.Allocate("A", kTwoPageObject);
     ASSERT_TRUE(desc_a.has_value());
     alloc.UpdateAccess("A", desc_a->shard_idx, desc_a->offset);
 
     alloc.Free(desc_a->offset, desc_a->aligned_size, desc_a->shard_idx, "A");
 
-    auto desc_b = alloc.Allocate("B", 100);
+    auto desc_b = alloc.Allocate("B", kTwoPageObject);
     ASSERT_TRUE(desc_b.has_value());
     ASSERT_EQ(desc_b->offset, desc_a->offset);
     alloc.UpdateAccess("B", desc_b->shard_idx, desc_b->offset);
@@ -613,9 +773,9 @@ TEST(ShardAllocatorTest, ExpansionValidatesCountAndUsesEmptyShards) {
     TempDir tmp("dfs_expand_capacity");
     ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
-    auto old = alloc.Allocate("old", 100);
+    auto old = alloc.Allocate("old", kTwoPageObject);
     ASSERT_TRUE(old);
-    ASSERT_FALSE(alloc.Allocate("full", 100));
+    ASSERT_FALSE(alloc.Allocate("full", kTwoPageObject));
 
     for (int count : {-1, 0}) {
         auto result = alloc.ExpandShards(count);
@@ -644,7 +804,7 @@ TEST(ShardAllocatorTest, ExpansionValidatesCountAndUsesEmptyShards) {
         if (std::hash<std::string>{}(key) % 2 == 0) break;
     }
     ASSERT_EQ(std::hash<std::string>{}(key) % 2, 0);
-    auto added = alloc.Allocate(key, 100);
+    auto added = alloc.Allocate(key, kTwoPageObject);
     ASSERT_TRUE(added);
     EXPECT_EQ(added->shard_idx, 1);
     alloc.Free(old->offset, old->aligned_size, old->shard_idx, "old");
@@ -821,10 +981,10 @@ TEST(ShardAllocatorTest, FailedExpansionDoesNotPublishPartialCapacity) {
     ASSERT_FALSE(result);
     EXPECT_EQ(alloc.GetShardCount(), 1);
     EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
-    auto old = alloc.Allocate("still_usable", 100);
+    auto old = alloc.Allocate("still_usable", kTwoPageObject);
     ASSERT_TRUE(old);
     EXPECT_EQ(old->shard_idx, 0);
-    EXPECT_FALSE(alloc.Allocate("not_published", 100));
+    EXPECT_FALSE(alloc.Allocate("not_published", kTwoPageObject));
     ASSERT_TRUE(std::filesystem::remove(blocked));
     ASSERT_TRUE(alloc.ExpandShards(3));
     EXPECT_EQ(alloc.GetShardCount(), 3);
@@ -836,14 +996,14 @@ TEST(ShardAllocatorTest, PreparedEvictionRemainsValidAcrossExpansion) {
     TempDir tmp("dfs_expand_eviction");
     ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
-    auto old = alloc.Allocate("old", 100);
+    auto old = alloc.Allocate("old", kTwoPageObject);
     ASSERT_TRUE(old);
     alloc.UpdateAccess("old", old->shard_idx, old->offset);
     auto pending = alloc.PrepareEviction();
     ASSERT_EQ(pending.Candidates().size(), 1);
     ASSERT_TRUE(alloc.ExpandShards(2));
     alloc.CommitPreparedEviction(std::move(pending));
-    auto after = alloc.Allocate("after", 100);
+    auto after = alloc.Allocate("after", kTwoPageObject);
     ASSERT_TRUE(after);
     alloc.Free(after->offset, after->aligned_size, after->shard_idx, "after");
     EXPECT_TRUE(alloc.PrepareEviction().Empty());

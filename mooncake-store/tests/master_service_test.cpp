@@ -1169,10 +1169,10 @@ TEST_F(MasterServiceTest, RemoveAllKeepsObjectWhenOpLogReservationFails) {
         << "the object survived, so the tenant was never emptied";
 }
 
-// RemoveAll holds one shard lock at a time, so a commit can land in a shard the
-// scan already passed. The scan's own bookkeeping cannot see it, and publishing
+// RemoveAll holds no lock across its walk, so a commit can land in a tenant the
+// walk already passed. The walk's own bookkeeping cannot see it, and publishing
 // `cleared` would order it after that commit's `stored` — telling subscribers
-// to drop an object that is live. Pause the scan right after the shard the new
+// to drop an object that is live. Pause the walk right after the tenant the new
 // key belongs to, commit there, and the clear must be withheld.
 TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
     MasterService service;
@@ -1190,13 +1190,12 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
                             TenantId::Default(), ReplicaType::ALL)
                     .has_value());
 
-    const size_t racer_shard = ShardIndexForKey(service, "racer_key");
     bool committed = false;
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
-        [&](size_t shard) {
-            // Commit exactly once, immediately after the scan releases the
-            // shard the new key hashes to, so the scan can never observe it.
-            if (shard != racer_shard || committed) {
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(
+        [&](const TenantId& tenant_id) {
+            // Commit exactly once, immediately after the walk finishes the
+            // tenant the new key belongs to, so the walk can never observe it.
+            if (!tenant_id.IsDefault() || committed) {
                 return;
             }
             committed = true;
@@ -1211,7 +1210,7 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
         });
 
     service.RemoveAll(true);
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
     auto exists = service.ExistKey("racer_key", TenantId::Default());
@@ -1270,11 +1269,10 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
                             TenantId::Default(), ReplicaType::ALL)
                     .has_value());
 
-    const size_t racer_shard = ShardIndexForKey(service, "scoped_racer");
     bool committed = false;
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
-        [&](size_t shard) {
-            if (shard != racer_shard || committed) {
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(
+        [&](const TenantId& tenant_id) {
+            if (!tenant_id.IsDefault() || committed) {
                 return;
             }
             committed = true;
@@ -1289,7 +1287,7 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
         });
 
     service.RemoveAll(TenantId::Default(), true);
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
     EXPECT_EQ(0u,
@@ -1841,11 +1839,11 @@ TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
 }
 
 // A mass client expiry marks handles stale all over the metadata table, so
-// the sweep cleans a shard in bounded write-lock batches instead of holding
-// it exclusively for the whole walk. Dropping and retaking the lock mid-shard
-// must not cost coverage: every key of the departed segment is erased, and
-// every key of a live segment survives. The keys are forced onto one shard
-// because the batch bound is per shard.
+// the sweep cleans each object under its own write lock instead of holding a
+// shard exclusively for the whole walk. Dropping and retaking the lock
+// mid-shard must not cost coverage: every key of the departed segment is
+// erased, and every key of a live segment survives. The keys are forced onto
+// one shard so the sweep returns to it many times.
 TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsShardAcrossLockBatches) {
     auto service = std::make_unique<MasterService>();
     PauseReplicaCleanup(*service);
@@ -1919,6 +1917,60 @@ TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsShardAcrossLockBatches) {
         EXPECT_TRUE(get_result->replicas[0].is_memory_replica())
             << "key=" << key;
     }
+}
+
+// The sweep walks one tenant at a time, so a departed segment's replicas must
+// be cleared from every tenant, and one tenant's sweep must leave another's
+// object under the same user key alone.
+TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsEveryTenant) {
+    const TenantId tenant_a("sweep_tenant_a");
+    const TenantId tenant_b("sweep_tenant_b");
+    auto service = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()}));
+    PauseReplicaCleanup(*service);
+
+    const std::string stale_segment_name = "tenant_sweep_stale_segment";
+    const std::string live_segment_name = "tenant_sweep_live_segment";
+    const auto stale_segment =
+        PrepareSimpleSegment(*service, stale_segment_name, 0x300000000);
+    const auto live_segment =
+        PrepareSimpleSegment(*service, live_segment_name, 0x400000000);
+
+    ReplicateConfig stale_config;
+    stale_config.replica_num = 1;
+    stale_config.preferred_segments = {stale_segment_name};
+    ReplicateConfig live_config;
+    live_config.replica_num = 1;
+    live_config.preferred_segments = {live_segment_name};
+    for (const auto& tenant_id : {tenant_a, tenant_b}) {
+        PutCompletedObject(*service, stale_segment.client_id, "stale_key",
+                           tenant_id, stale_config);
+        PutCompletedObject(*service, live_segment.client_id, "live_key",
+                           tenant_id, live_config);
+    }
+    // tenant_b also holds the user key tenant_a loses, on the live segment.
+    PutCompletedObject(*service, live_segment.client_id, "mixed_key", tenant_b,
+                       live_config);
+    PutCompletedObject(*service, stale_segment.client_id, "mixed_key", tenant_a,
+                       stale_config);
+
+    ASSERT_TRUE(
+        service
+            ->UnmountSegment(stale_segment.segment_id, stale_segment.client_id)
+            .has_value());
+    ClearInvalidHandlesForTest(*service);
+
+    EXPECT_EQ(3u, service->GetKeyCount());
+    for (const auto& tenant_id : {tenant_a, tenant_b}) {
+        auto stale = service->GetReplicaList("stale_key", tenant_id);
+        ASSERT_FALSE(stale.has_value()) << "tenant=" << tenant_id;
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, stale.error())
+            << "tenant=" << tenant_id;
+        EXPECT_TRUE(service->GetReplicaList("live_key", tenant_id).has_value())
+            << "tenant=" << tenant_id;
+    }
+    EXPECT_FALSE(service->GetReplicaList("mixed_key", tenant_a).has_value());
+    EXPECT_TRUE(service->GetReplicaList("mixed_key", tenant_b).has_value());
 }
 
 TEST_F(MasterServiceTest, UnmountSegmentKeepsSynchronousCleanupInHaMode) {
@@ -3294,6 +3346,65 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
     }
     EXPECT_TRUE(segment_names.contains("segment_1"));
     EXPECT_FALSE(segment_names.contains("segment_0"));
+}
+
+// Drain plans and completes one tenant at a time: the segment counts as
+// drained only once every tenant's object under the same user key has left
+// it.
+TEST_F(MasterServiceTest, DrainJobMovesObjectsOfEveryTenant) {
+    const TenantId tenant_a("drain_tenant_a");
+    const TenantId tenant_b("drain_tenant_b");
+    auto service_config =
+        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()});
+    service_config.default_kv_lease_ttl = 0;
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"segment_0"};
+    const std::string key = "drain_shared_key";
+    for (const auto& tenant_id : {tenant_a, tenant_b}) {
+        PutCompletedObject(*service_, generate_uuid(), key, tenant_id, config);
+    }
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 2;
+
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    WaitUntil(
+        [&] {
+            (void)ExecutePendingMoveTasks(*service_, ctx0.client_id);
+            auto query = service_->QueryDrainJob(job_id.value());
+            return query.has_value() && query->status == JobStatus::SUCCEEDED;
+        },
+        std::chrono::seconds(10));
+
+    auto query = service_->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->succeeded_units, 2u);
+
+    auto segment_status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(segment_status.has_value());
+    EXPECT_EQ(segment_status.value(), SegmentStatus::DRAINED);
+
+    for (const auto& tenant_id : {tenant_a, tenant_b}) {
+        auto replicas = service_->GetReplicaList(key, tenant_id);
+        ASSERT_TRUE(replicas.has_value()) << "tenant=" << tenant_id;
+        ASSERT_EQ(1u, replicas->replicas.size()) << "tenant=" << tenant_id;
+        EXPECT_EQ("segment_1", replicas->replicas[0]
+                                   .get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_)
+            << "tenant=" << tenant_id;
+    }
 }
 
 TEST_F(MasterServiceTest, CancelDrainJobRestoresSegmentStatus) {
