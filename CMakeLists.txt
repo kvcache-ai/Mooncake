@@ -177,7 +177,13 @@ if (WITH_STORE_RS)
 endif()
 
 option(EP_USE_IDE "Enable intelligent indexing for IDEs" OFF)
-if(WITH_EP)
+if(WITH_EP AND USE_XPU)
+  # Mooncake PG is CUDA/MUSA/MACA-only; the XPU EP bootstraps over any
+  # torch.distributed group, so only the EP module is built.
+  message(
+    STATUS "WITH_EP enabled on Intel XPU: building the SYCL Mooncake EP module")
+  add_subdirectory(mooncake-ep)
+elseif(WITH_EP)
   add_subdirectory(mooncake-pg)
   include_directories(mooncake-pg/include)
 

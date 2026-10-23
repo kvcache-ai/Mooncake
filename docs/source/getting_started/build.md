@@ -61,8 +61,11 @@ sudo make install
 ### Build with Intel XPU
 
 Intel XPU support requires TENT and a native oneAPI SYCL build with the Intel
-DPC++ compiler (`icpx`), not GCC. Install the common dependencies above and
-the Intel GPU driver, Level Zero runtime, and oneAPI compiler separately.
+DPC++ compiler (`icpx`), not GCC. Mooncake EP on XPU needs `-DWITH_EP=ON`
+instead of TENT; see the EP build notes in
+[Mooncake EP & Mooncake PG](../api-reference/python/ep-backend.md). Install the
+common dependencies above and the Intel GPU driver, Level Zero runtime, and
+oneAPI compiler separately.
 From the repository root, use a fresh build directory:
 
 ```bash

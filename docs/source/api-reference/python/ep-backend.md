@@ -34,6 +34,16 @@ result locally. The wheel provides the native PG core/device libraries and the
 adapter source bundle; the runtime environment provides PyTorch, a CUDA toolkit
 with `nvcc`, and Ninja.
 
+On Intel XPU, Mooncake EP is built natively with the oneAPI DPC++ compiler
+(TENT and Mooncake PG are not needed). It supports ranks on one node; see
+{ref}`Intel XPU <mooncake-ep-intel-xpu>` in the EP design notes:
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+cmake -S . -B build-xpu -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+  -DUSE_XPU=ON -DWITH_EP=ON -DUSE_CUDA=OFF -DWITH_STORE_RUST=OFF
+```
+
 PG symbols are exposed through `mooncake.pg`; `mooncake.ep` is the EP entry point
 and no longer re-exports PG symbols. Existing callers should move imports such
 as `MooncakeBackendOptions` and `set_host_ip` from `mooncake.ep` to
