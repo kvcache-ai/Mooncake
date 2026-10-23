@@ -42,7 +42,10 @@ constexpr int32_t kProbeMagic = 0x4d435850;  // "MCXP"
 // that differs from the fd marks the handle as user-modified, so the runtime
 // imports the fd we supply instead of translating (and caching) it itself.
 // Its cache is keyed by (exporter pid, exporter fd) and outlives the mapping,
-// so a recycled fd number would silently map a freed buffer.
+// so a recycled fd number would silently map a freed buffer. This layout is
+// the runtime's, not the Level Zero spec's (checked with compute-runtime
+// 26.22); if it changes, the import or the probe read fails and the
+// fallback runs.
 constexpr size_t kIpcHandleFdOffset = 0;
 constexpr size_t kIpcHandleMirrorOffset = 22;
 // pid, size_lo, size_hi, namespace_lo, namespace_hi
@@ -209,6 +212,13 @@ void XpuIpcBuffer::importPeers(const std::vector<std::vector<int32_t>>& handles,
         const size_t size =
             static_cast<uint32_t>(h[1]) |
             (static_cast<size_t>(static_cast<uint32_t>(h[2])) << 32);
+        // Peers are addressed, and probed, at this rank's offsets.
+        if (size != alloc_bytes_) {
+            LOG(WARNING) << "[EP XPU] rank " << r << " has a " << size
+                         << "-byte EP buffer, this rank " << alloc_bytes_
+                         << "; every rank must use the same size";
+            continue;
+        }
         ze_ipc_mem_handle_t ipc{};
         std::memcpy(ipc.data, h.data() + kHeaderWords, sizeof(ipc.data));
         int64_t exporter_fd = 0;

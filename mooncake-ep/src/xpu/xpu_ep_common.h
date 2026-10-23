@@ -110,14 +110,14 @@ inline size_t get_ep_buffer_size_hint(int num_max_dispatch_tokens_per_rank,
         .total_bytes;
 }
 
-// Dispatch message: [int4 header (source token index + 3 reserved)]
-// [payload: hidden BF16 or FP8 values][FP8 only: hidden / 128 float scales],
-// padded to whole cache lines.
+// Dispatch message: [hidden BF16 or FP8 values][FP8 only: hidden / 128
+// float scales], padded to whole cache lines. Message t is source token t, so
+// it needs no header.
 inline size_t dispatch_msg_bytes(int hidden, bool use_fp8) {
-    return round_up(
-        16 + (use_fp8 ? hidden + (hidden / kNumPerChannels) * sizeof(float)
-                      : static_cast<size_t>(hidden) * kBf16Size),
-        kLineBytes);
+    return round_up(use_fp8
+                        ? hidden + (hidden / kNumPerChannels) * sizeof(float)
+                        : static_cast<size_t>(hidden) * kBf16Size,
+                    kLineBytes);
 }
 
 // Matches CUDA pack2<int, int64_t>: count in the low word, offset high.

@@ -292,6 +292,142 @@ def check_duplicate_experts(buffer, group, rank, world, args):
     assert bool(torch.isfinite(combined.float()).all())
 
 
+def _identity_round(buffer, world, args, n, timeout_us=None):
+    """Inputs for a round whose experts return their input unchanged."""
+    device = torch.device("xpu", torch.xpu.current_device())
+    x = torch.randn((n, args.hidden), device=device).to(torch.bfloat16)
+    idx = _route(n, args.num_experts, args.num_topk, 0, device)
+    w = torch.rand((n, args.num_topk), device=device)
+    active = torch.ones((world,), dtype=torch.int32, device=device)
+    return x, idx, w, active, timeout_us or args.timeout_us
+
+
+def _dispatch(buffer, args, rnd):
+    x, idx, _, active, timeout_us = rnd
+    recv, _, handle, _, _ = buffer.dispatch(
+        x, idx, active, args.max_tokens, args.num_experts, timeout_us, use_fp8=False
+    )
+    return recv, handle
+
+
+def _check_identity_combine(rnd, combined, what):
+    x, _, w, active, _ = rnd
+    torch.xpu.synchronize()
+    assert bool(active.all()), f"{what}: active_ranks={active.tolist()}"
+    ref = x.float() * w.sum(-1, keepdim=True)
+    torch.testing.assert_close(
+        combined.float(), ref, rtol=2e-2, atol=2e-2, msg=lambda m: f"{what}: {m}"
+    )
+
+
+def check_reused_src_info(buffer, group, rank, world, args):
+    """The caching allocator can give a dispatch the src_info block of an
+    earlier, finished one. That dispatch must still get a top-k snapshot of
+    its own, which a second dispatch held at the same time must not take."""
+    n = args.max_tokens
+    # Go once around the ring of snapshots, each dispatch with a src_info of
+    # its own (kept alive, so the allocator cannot hand it out again).
+    handles = []
+    for i in range(8):
+        rnd = _identity_round(buffer, world, args, n)
+        recv, handle = _dispatch(buffer, args, rnd)
+        combined, _, _ = buffer.combine(recv, rnd[1], rnd[2], rnd[3], rnd[4], handle)
+        _check_identity_combine(rnd, combined, f"ring round {i}")
+        handles.append(handle)
+    first = handles[0][0]
+    assert len({h[0].data_ptr() for h in handles}) == len(handles)
+    real_empty = torch.empty
+
+    def empty_reusing_first(*size, **kw):
+        shape = size[0] if len(size) == 1 and not isinstance(size[0], int) else size
+        if kw.get("dtype") == torch.int32 and tuple(shape) == tuple(first.shape):
+            return first
+        return real_empty(*size, **kw)
+
+    a = _identity_round(buffer, world, args, n)
+    torch.empty = empty_reusing_first
+    try:
+        recv_a, handle_a = _dispatch(buffer, args, a)
+    finally:
+        torch.empty = real_empty
+    assert handle_a[0].data_ptr() == first.data_ptr(), "src_info was not reused"
+    b = _identity_round(buffer, world, args, n)
+    recv_b, handle_b = _dispatch(buffer, args, b)
+    out_a, _, _ = buffer.combine(recv_a, a[1], a[2], a[3], a[4], handle_a)
+    out_b, _, _ = buffer.combine(recv_b, b[1], b[2], b[3], b[4], handle_b)
+    _check_identity_combine(a, out_a, "dispatch with a reused src_info")
+    _check_identity_combine(b, out_b, "dispatch held alongside it")
+
+
+def check_unknown_handle(buffer, group, rank, world, args):
+    """Combine finds its dispatch by the handle's src_info tensor; a handle
+    with a copy of it must be rejected, not reduced with another's routing."""
+    rnd = _identity_round(buffer, world, args, args.max_tokens)
+    recv, handle = _dispatch(buffer, args, rnd)
+    copied = (handle[0].clone(),) + tuple(handle[1:])
+    try:
+        buffer.combine(recv, rnd[1], rnd[2], rnd[3], rnd[4], copied)
+    except RuntimeError as e:
+        assert "src_info" in str(e), e
+    else:
+        raise AssertionError("combine accepted a handle from no dispatch")
+    combined, _, _ = buffer.combine(recv, rnd[1], rnd[2], rnd[3], rnd[4], handle)
+    _check_identity_combine(rnd, combined, "combine after a rejected handle")
+
+
+def check_cross_stream(buffer, group, rank, world, args):
+    """Rounds issued back to back on two streams, with nothing ordering the
+    streams, must run in issue order as on one stream (CUDA runs them all on
+    its comm stream)."""
+    streams = [torch.xpu.Stream(), torch.xpu.Stream()]
+    rounds = [
+        _identity_round(buffer, world, args, args.max_tokens, 5_000_000)
+        for _ in range(6)
+    ]
+    for s in streams:
+        s.wait_stream(torch.xpu.current_stream())
+    outs = []
+    for i, rnd in enumerate(rounds):
+        with torch.xpu.stream(streams[i % 2]):
+            recv, handle = _dispatch(buffer, args, rnd)
+            out, _, _ = buffer.combine(recv, rnd[1], rnd[2], rnd[3], rnd[4], handle)
+            outs.append(out)
+    for s in streams:
+        torch.xpu.current_stream().wait_stream(s)
+    for i, (rnd, out) in enumerate(zip(rounds, outs)):
+        _check_identity_combine(rnd, out, f"cross-stream round {i}")
+
+
+class _NoPeers:
+    """A runtime that could not map its peers."""
+
+    def __init__(self, runtime):
+        self._runtime = runtime
+
+    def use_fast_path(self):
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._runtime, name)
+
+
+def check_fast_path_agreement(buffer, group, rank, world, args):
+    """If one rank cannot reach its peers, every rank must fall back: a rank
+    in the native kernels would wait forever on one in the fallback."""
+    runtime = buffer.runtime
+    if rank == world - 1:
+        buffer.runtime = _NoPeers(runtime)
+    try:
+        buffer.connect()
+    finally:
+        buffer.runtime = runtime
+    flags = [None] * world
+    dist.all_gather_object(flags, buffer._use_fallback, group=_CPU_GROUP)
+    assert all(flags), f"_use_fallback per rank: {flags}"
+    buffer.connect()
+    assert not buffer._use_fallback, "the fast path did not come back"
+
+
 def check_dead_rank(buffer, group, rank, world, args):
     """The last rank skips a dispatch/combine. The others must time out on it,
     drop it from active_ranks, and finish from the remaining ranks, as the
@@ -370,6 +506,10 @@ def _worker(local_rank, world, args, port):
     for _ in range(4):
         check_two_batch_overlap(buffer, group, local_rank, world, args)
     check_duplicate_experts(buffer, group, local_rank, world, args)
+    check_reused_src_info(buffer, group, local_rank, world, args)
+    check_unknown_handle(buffer, group, local_rank, world, args)
+    check_cross_stream(buffer, group, local_rank, world, args)
+    check_fast_path_agreement(buffer, group, local_rank, world, args)
     check_round(buffer, group, local_rank, world, args, args.max_tokens, False, False)
     if world > 2:
         check_dead_rank(buffer, group, local_rank, world, args)
@@ -382,6 +522,7 @@ def _worker(local_rank, world, args, port):
     if local_rank == 0:
         print(
             f"PASSED: {len(token_counts)} rounds + 4 two-batch rounds + duplicate experts"
+            " + reused src_info + rejected handle + cross-stream + fallback agreement"
             f"{' + dead-rank timeout' if world > 2 else ''} on {world} ranks "
             f"(hidden={args.hidden}, experts={args.num_experts}, topk={args.num_topk})",
             flush=True,

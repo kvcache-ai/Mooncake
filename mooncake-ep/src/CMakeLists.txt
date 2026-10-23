@@ -8,7 +8,11 @@ if(USE_XPU)
         STRING
         "Intel GPUs to compile the XPU EP kernels ahead of time for (ocloc -device list, e.g. bmg,pvc); others JIT-compile on first use. Empty: JIT only"
   )
-  find_library(MOONCAKE_EP_ZE_LOADER ze_loader REQUIRED)
+  find_library(MOONCAKE_EP_ZE_LOADER ze_loader)
+  if(NOT MOONCAKE_EP_ZE_LOADER)
+    message(FATAL_ERROR "Mooncake EP on XPU needs the Level Zero loader "
+                        "(libze_loader)")
+  endif()
   pybind11_add_module(
     _ep MODULE xpu/ep_py_xpu.cpp xpu/mooncake_ep_xpu_buffer.cpp xpu/xpu_ipc.cpp
     xpu/xpu_ep_kernels.cpp)

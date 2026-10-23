@@ -224,7 +224,6 @@ sycl::event dispatch_send_impl(sycl::queue& q, const DispatchArgs a) {
                     }
 
                     uint8_t* msg = a.staging + t * msg_bytes;
-                    if (tid == 0) *reinterpret_cast<int*>(msg) = t;
                     const auto* xv = reinterpret_cast<const vec4*>(
                         static_cast<const uint8_t*>(a.x) +
                         static_cast<size_t>(t) * hidden * kBf16Size);
@@ -236,7 +235,7 @@ sycl::event dispatch_send_impl(sycl::queue& q, const DispatchArgs a) {
                         const bool live = i < n_vec;
                         const vec4 v = live ? xv[i] : vec4(0);
                         if constexpr (!kUseFP8) {
-                            if (live) reinterpret_cast<vec4*>(msg + 16)[i] = v;
+                            if (live) reinterpret_cast<vec4*>(msg)[i] = v;
                         } else {
                             float f[8];
                             float amax = kFP8Margin;
@@ -258,10 +257,9 @@ sycl::event dispatch_send_impl(sycl::queue& q, const DispatchArgs a) {
                                     packed |= static_cast<uint64_t>(
                                                   float_to_e4m3(f[j] * scale))
                                               << (8 * j);
-                                reinterpret_cast<uint64_t*>(msg + 16)[i] =
-                                    packed;
+                                reinterpret_cast<uint64_t*>(msg)[i] = packed;
                                 if ((i & 15) == 0)
-                                    reinterpret_cast<float*>(msg + 16 +
+                                    reinterpret_cast<float*>(msg +
                                                              hidden)[i / 16] =
                                         amax * kFP8AmaxInv;
                             }
@@ -364,10 +362,10 @@ sycl::event dispatch_recv_impl(sycl::queue& q, const DispatchArgs a) {
                     if (lane == 0) a.packed_recv_src_info[row] = t;
                     coop_pull(static_cast<uint8_t*>(a.packed_recv_x) +
                                   row * hidden_bytes,
-                              msg + 16, hidden_bytes, lane, kWarpSize);
+                              msg, hidden_bytes, lane, kWarpSize);
                     if constexpr (kUseFP8) {
                         const auto* src_scales =
-                            reinterpret_cast<const float*>(msg + 16 + a.hidden);
+                            reinterpret_cast<const float*>(msg + a.hidden);
                         float* dst_scales =
                             a.packed_recv_x_scales +
                             static_cast<size_t>(le) * slots * num_scales +

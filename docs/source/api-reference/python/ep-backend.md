@@ -44,6 +44,11 @@ cmake -S . -B build-xpu -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
   -DUSE_XPU=ON -DWITH_EP=ON -DUSE_CUDA=OFF -DWITH_STORE_RUST=OFF
 ```
 
+The module runs on PyTorch's SYCL queues and uses the SYCL runtime that
+PyTorch XPU installs, so build it with a oneAPI release that ships the same
+runtime major version (`libsycl.so.N`). For example, PyTorch 2.14+xpu ships
+`libsycl.so.9`, from oneAPI 2026.
+
 PG symbols are exposed through `mooncake.pg`; `mooncake.ep` is the EP entry point
 and no longer re-exports PG symbols. Existing callers should move imports such
 as `MooncakeBackendOptions` and `set_host_ip` from `mooncake.ep` to

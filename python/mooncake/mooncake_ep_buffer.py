@@ -347,6 +347,16 @@ class Buffer:
             ibgda_disabled = bool(self.runtime.ibgda_disabled())
             use_fast_path = not ibgda_disabled
 
+        if self.device_type == "xpu":
+            # Each rank maps its peers on its own, so one may reach them all
+            # while another cannot. Take the fast path only if every rank can;
+            # a rank in native kernels would wait forever on one that runs the
+            # fallback's collectives, and the other way round.
+            agreed = torch.tensor(
+                [int(use_fast_path)], dtype=torch.int32, device=device
+            )
+            dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=self.group)
+            use_fast_path = bool(agreed.item())
         self._use_fallback = not use_fast_path
 
     def update_ep_member(self):

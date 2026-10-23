@@ -10,7 +10,10 @@ the next peer-to-peer send several-fold, which a busy MoE layer never sees.
     python mooncake-ep/benchmarks/xpu_buffer_perf.py --num-ranks 4 \\
         --hidden 7168 --experts 256 --topk 8 --tokens 1,16,64,128
 
---impl fallback times the torch.distributed fallback of the same Buffer.
+--impl fallback times the torch.distributed fallback of the same Buffer;
+--impl alltoall times two XCCL all_to_all_single calls that move the bytes a
+dispatch and a combine move, with no routing work: a lower bound for an EP
+built on torch.distributed collectives.
 """
 
 import argparse
@@ -29,7 +32,37 @@ def _device_for(local_rank: int) -> int:
     return int(devices.split(",")[local_rank]) if devices else local_rank
 
 
+class AllToAllBaseline:
+    """Dispatch and combine as one even all_to_all_single each, carrying one
+    row per (token, top-k) pick."""
+
+    def __init__(self, group, world):
+        self.group, self.world = group, world
+
+    def _exchange(self, rows):
+        # Even splits need a row count divisible by the world size.
+        pad = -rows.size(0) % self.world
+        if pad:
+            rows = torch.cat([rows, rows.new_zeros((pad, rows.size(1)))])
+        out = torch.empty_like(rows)
+        dist.all_to_all_single(out, rows, group=self.group)
+        return out
+
+    def dispatch(self, x, topk_idx, active, T, E, timeout_us, use_fp8=False):
+        assert not use_fp8, "--impl alltoall is BF16 only"
+        rows = x.repeat_interleave(topk_idx.size(1), dim=0)
+        return self._exchange(rows), None, x.size(0), None, None
+
+    def combine(self, x, topk_idx, w, active, timeout_us, handle, out=None):
+        rows = self._exchange(x)[: handle * topk_idx.size(1)]
+        rows = rows.view(handle, topk_idx.size(1), -1).float()
+        out.copy_((rows * w.unsqueeze(-1)).sum(1))
+        return out, None, None
+
+
 def make_buffer(impl, group, max_tokens, hidden, world, experts):
+    if impl == "alltoall":
+        return AllToAllBaseline(group, world)
     from mooncake.mooncake_ep_buffer import Buffer
 
     size = Buffer.get_ep_buffer_size_hint(max_tokens, hidden, world, experts)
@@ -129,7 +162,9 @@ def worker(local_rank, world, args, port):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--num-ranks", type=int, default=2)
-    p.add_argument("--impl", choices=["native", "fallback"], default="native")
+    p.add_argument(
+        "--impl", choices=["native", "fallback", "alltoall"], default="native"
+    )
     p.add_argument("--hidden", type=int, default=7168)
     p.add_argument("--experts", type=int, default=256)
     p.add_argument("--topk", type=int, default=8)

@@ -90,6 +90,9 @@ class MooncakeEpXpuBuffer {
 
    private:
     sycl::queue& queueFor(uint64_t stream_ptr);
+    // Both need mu_ held.
+    void orderAfterLast(sycl::queue& q);
+    int takeShadowSlot(uint64_t src_info_ptr);
     int64_t timeoutTicks(int timeout_us) const;
     int64_t* topkShadow(int slot) const;
     int32_t* slotShadow(int slot) const;
@@ -108,6 +111,10 @@ class MooncakeEpXpuBuffer {
 
     std::mutex mu_;
     int buffer_idx_ = 0;
+    // The last kernel launched and its queue: every launch is ordered after
+    // it, so calls run in issue order whichever streams they come from.
+    sycl::event last_event_;
+    std::optional<sycl::queue> last_queue_;
     // Two-batch overlap runs two dispatchers on one buffer; each dispatch
     // keeps its own top-k snapshot, keyed by its src_info tensor, for combine.
     std::unordered_map<uint64_t, int> shadow_slots_;

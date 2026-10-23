@@ -16,6 +16,8 @@
 
 #include <glog/logging.h>
 
+#include <string>
+
 #include "xpu_ep_common.h"
 #include "xpu_ep_kernels.h"
 
@@ -78,7 +80,10 @@ MooncakeEpXpuBuffer::MooncakeEpXpuBuffer(int rank, int num_ranks,
 }
 
 MooncakeEpXpuBuffer::~MooncakeEpXpuBuffer() {
+    // Calls may have run on other streams than queue_; the last one launched
+    // completes after all of them.
     try {
+        last_event_.wait();
         queue_.wait();
     } catch (...) {
     }
@@ -113,6 +118,30 @@ sycl::queue& MooncakeEpXpuBuffer::queueFor(uint64_t stream_ptr) {
                  "the stream belongs to a different device than the buffer");
     XPU_EP_CHECK(q.is_in_order(), "the torch.xpu stream must be in-order");
     return q;
+}
+
+void MooncakeEpXpuBuffer::orderAfterLast(sycl::queue& q) {
+    // Calls share the slot and arrival counters and the buffer halves, so
+    // they must run in issue order, as on CUDA's single comm stream. On one
+    // in-order stream that holds already; across streams, wait for the last
+    // launch.
+    if (last_queue_ && *last_queue_ != q)
+        q.ext_oneapi_submit_barrier({last_event_});
+    last_queue_ = q;
+}
+
+int MooncakeEpXpuBuffer::takeShadowSlot(uint64_t src_info_ptr) {
+    // Every dispatch takes the next slot, even when the caching allocator
+    // hands it the src_info block of an earlier dispatch: otherwise a later
+    // dispatch could take the slot of one that is still held.
+    const int slot = next_shadow_slot_;
+    next_shadow_slot_ = (next_shadow_slot_ + 1) % kTopkShadowSlots;
+    auto prev = shadow_slots_.find(slot_owner_[slot]);
+    if (prev != shadow_slots_.end() && prev->second == slot)
+        shadow_slots_.erase(prev);
+    slot_owner_[slot] = src_info_ptr;
+    shadow_slots_[src_info_ptr] = slot;
+    return slot;
 }
 
 int64_t MooncakeEpXpuBuffer::timeoutTicks(int timeout_us) const {
@@ -170,23 +199,11 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::dispatch(
 
     BufferPair layout(ipc_->base(), num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks_, num_experts);
-    int cur, shadow_slot;
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        cur = buffer_idx_;
-        buffer_idx_ ^= 1;
-        auto [it, inserted] =
-            shadow_slots_.emplace(packed_recv_src_info_ptr, next_shadow_slot_);
-        if (inserted) {
-            // The slot's previous dispatch is overwritten, so forget it; this
-            // also keeps the map at kTopkShadowSlots entries.
-            if (slot_owner_[next_shadow_slot_] != 0)
-                shadow_slots_.erase(slot_owner_[next_shadow_slot_]);
-            slot_owner_[next_shadow_slot_] = packed_recv_src_info_ptr;
-            next_shadow_slot_ = (next_shadow_slot_ + 1) % kTopkShadowSlots;
-        }
-        shadow_slot = it->second;
-    }
+    std::lock_guard<std::mutex> lock(mu_);
+    const int cur = buffer_idx_;
+    buffer_idx_ ^= 1;
+    const int shadow_slot = takeShadowSlot(packed_recv_src_info_ptr);
+    orderAfterLast(q);
     if (num_tokens > 0)
         q.memcpy(topkShadow(shadow_slot), reinterpret_cast<void*>(topk_idx_ptr),
                  static_cast<size_t>(num_tokens) * num_topk * sizeof(int64_t));
@@ -219,13 +236,17 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::dispatch(
     a.timeout_ticks = timeoutTicks(timeout_us);
     a.max_wgs = max_wgs_;
 
-    dispatch_send(q, a);
+    last_event_ = dispatch_send(q, a);
     Hook hook;
     if (return_recv_hook) {
         sycl::queue hook_queue = q;
-        hook = [hook_queue, a]() mutable { dispatch_recv(hook_queue, a); };
+        hook = [this, hook_queue, a]() mutable {
+            std::lock_guard<std::mutex> lock(mu_);
+            orderAfterLast(hook_queue);
+            last_event_ = dispatch_recv(hook_queue, a);
+        };
     } else {
-        dispatch_recv(q, a);
+        last_event_ = dispatch_recv(q, a);
     }
     std::optional<XpuEventHandle> event;
     if (async) event.emplace(q.ext_oneapi_submit_barrier());
@@ -257,14 +278,17 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::combine(
 
     BufferPair layout(ipc_->base(), num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks_, num_experts);
-    int cur, shadow_slot = 0;
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        auto it = shadow_slots_.find(src_info_ptr);
-        if (it != shadow_slots_.end()) shadow_slot = it->second;
-        cur = buffer_idx_;
-        buffer_idx_ ^= 1;
-    }
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = shadow_slots_.find(src_info_ptr);
+    XPU_EP_CHECK(it != shadow_slots_.end(),
+                 "the combine handle must come from one of the last " +
+                     std::to_string(kTopkShadowSlots) +
+                     " dispatches on this buffer (it is found by its "
+                     "src_info tensor)");
+    const int shadow_slot = it->second;
+    const int cur = buffer_idx_;
+    buffer_idx_ ^= 1;
+    orderAfterLast(q);
 
     CombineArgs a{};
     a.x = reinterpret_cast<const void*>(x_ptr);
@@ -289,13 +313,17 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::combine(
     a.timeout_ticks = timeoutTicks(timeout_us);
     a.max_wgs = max_wgs_;
 
-    combine_send(q, a);
+    last_event_ = combine_send(q, a);
     Hook hook;
     if (return_recv_hook) {
         sycl::queue hook_queue = q;
-        hook = [hook_queue, a]() mutable { combine_recv(hook_queue, a); };
+        hook = [this, hook_queue, a]() mutable {
+            std::lock_guard<std::mutex> lock(mu_);
+            orderAfterLast(hook_queue);
+            last_event_ = combine_recv(hook_queue, a);
+        };
     } else {
-        combine_recv(q, a);
+        last_event_ = combine_recv(q, a);
     }
     std::optional<XpuEventHandle> event;
     if (async) event.emplace(q.ext_oneapi_submit_barrier());

@@ -30,7 +30,6 @@ namespace xpu_ep {
 PYBIND11_MODULE(_ep, m) {
     m.def("get_ep_buffer_size_hint", &get_ep_buffer_size_hint);
     m.def("has_nccl_device_support", []() { return false; });
-    m.attr("MAX_QP_COUNT") = py::int_(0);
     m.attr("DEVICE_TYPE") = py::str("xpu");
 
     py::class_<XpuEventHandle>(m, "EventHandle")
@@ -48,11 +47,6 @@ PYBIND11_MODULE(_ep, m) {
         .def("p2p_enabled", &B::p2p_enabled)
         .def("use_fast_path", &B::use_fast_path)
         .def("is_roce", &B::is_roce)
-        // RDMA bootstrap is never reached (ibgda_disabled() is true); these
-        // keep the CUDA method set for callers that probe it.
-        .def("get_mr_info",
-             [](B&) { return std::tuple<int64_t, int32_t>{0, 0}; })
-        .def("update_local_qpns", [](B&) {})
         .def("get_ipc_handle", &B::get_ipc_handle)
         .def("sync_nvlink_ipc_handles", &B::sync_nvlink_ipc_handles)
         .def("dispatch", &B::dispatch)

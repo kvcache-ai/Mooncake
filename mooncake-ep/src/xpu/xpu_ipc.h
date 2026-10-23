@@ -25,8 +25,8 @@ namespace mooncake {
 namespace xpu_ep {
 
 // A device buffer shared with every peer on the node through Level Zero IPC,
-// the XPU counterpart of the CUDA P2pTransport. Peers write into each other's
-// buffers directly over PCIe P2P (or Xe Link).
+// the XPU counterpart of the CUDA P2pTransport. Peers read each other's
+// buffers directly over PCIe P2P (or Xe Link) and write only ready flags.
 class XpuIpcBuffer {
    public:
     XpuIpcBuffer(sycl::queue& queue, size_t bytes, int rank, int num_ranks);
