@@ -28,8 +28,10 @@
 // on its own.
 //
 // Locks: the evictor holds at most one key lock at a time and no lock of its
-// own, and frees the replicas it took only once that key lock is let go. What
-// the caller holds across Run, it holds for the whole run.
+// own, and frees the replicas it took only once that key lock is let go. A
+// namespace that dropped objects has its route's sparse stripes shrunk once
+// its part of the run is over, one stripe lock at a time. What the caller
+// holds across Run, it holds for the whole run.
 
 #include <atomic>
 #include <cstddef>

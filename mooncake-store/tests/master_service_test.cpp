@@ -2636,6 +2636,36 @@ TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
     EXPECT_LT(buckets_after, buckets_before / 2);
 }
 
+TEST_F(MasterServiceTest, BatchEvictCountsARoundOnlyWhenItHadSomethingToDo) {
+    // Zero lease TTL so the committed object is immediately evictable.
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service = std::make_unique<MasterService>(service_config);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(
+        service->PutStart(client_id, "key", TenantId::Default(), 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service
+            ->PutEnd(client_id, "key", TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t successes = metrics.get_mem_eviction_success();
+    const int64_t attempts = metrics.get_mem_eviction_attempts();
+
+    MasterServiceTestPeer(*service).RunBatchEvictForTesting(1.0, 1.0);
+    EXPECT_EQ(metrics.get_mem_eviction_success(), successes + 1);
+    EXPECT_EQ(metrics.get_mem_eviction_attempts(), attempts + 1);
+
+    // Nothing left filed and nothing discarded: neither a success nor a
+    // failure.
+    MasterServiceTestPeer(*service).RunBatchEvictForTesting(1.0, 1.0);
+    EXPECT_EQ(metrics.get_mem_eviction_attempts(), attempts + 1);
+}
+
 TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     // Regression for the lease-expire / client-offboarding delete path.
     // ClearInvalidHandles -> ClearStaleHandles can erase tens of millions of
