@@ -32,7 +32,6 @@
 
 #include "common.h"
 #include "config.h"
-#include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
@@ -48,6 +47,8 @@ namespace mooncake {
 static constexpr size_t kDefaultMaxPteEntries = 22ULL * 1024 * 1024;  // 22M
 
 static size_t getMaxPteEntries() { return kDefaultMaxPteEntries; }
+
+static constexpr size_t kThpPageSize = 2ULL * 1024 * 1024;
 
 EfaTransport::EfaTransport() {
     LOG(INFO) << "[EFA] AWS Elastic Fabric Adapter transport initialized";
@@ -66,7 +67,7 @@ void EfaTransport::startWorkerThreads() {
     worker_running_ = true;
     // MC_EFA_CQ_THREADS caps CQ poller count (default 1). Set 0 to disable cap.
     size_t num_threads = context_list_.size();
-    int cq_cap = Environ::Get().GetEfaCqThreads();
+    const int cq_cap = globalConfig().efa_cq_threads;
     if (cq_cap > 0 && static_cast<size_t>(cq_cap) < num_threads) {
         num_threads = static_cast<size_t>(cq_cap);
     }
@@ -134,6 +135,12 @@ int EfaTransport::install(std::string& local_server_name,
     local_server_name_ = local_server_name;
     local_topology_ = topo;
 
+    std::string fabric_error;
+    if (!loadLibfabric(&fabric_error)) {
+        LOG(ERROR) << "EfaTransport: " << fabric_error;
+        return ERR_CONTEXT;
+    }
+
     auto ret = initializeEfaResources();
     if (ret) {
         LOG(ERROR) << "EfaTransport: cannot initialize EFA resources";
@@ -183,9 +190,13 @@ int EfaTransport::preTouchMemory(void* addr, size_t length) {
 
     for (size_t thread_i = 0; thread_i < num_threads; ++thread_i) {
         void* block_addr = static_cast<char*>(addr) + thread_i * block_size;
-        threads.emplace_back([this, thread_i, block_addr, block_size,
+        // The last thread also takes the remainder.
+        size_t block_len = thread_i + 1 == num_threads
+                               ? length - thread_i * block_size
+                               : block_size;
+        threads.emplace_back([this, thread_i, block_addr, block_len,
                               &thread_results]() {
-            int ret = context_list_[0]->preTouchMemory(block_addr, block_size);
+            int ret = context_list_[0]->preTouchMemory(block_addr, block_len);
             thread_results[thread_i] = ret;
         });
     }
@@ -211,11 +222,9 @@ int EfaTransport::registerLocalMemory(void* addr, size_t length,
                                        update_metadata, false);
 }
 
-int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
-                                              const std::string& name,
-                                              bool remote_accessible,
-                                              bool update_metadata,
-                                              bool force_sequential) {
+int EfaTransport::registerLocalMemoryInternal(
+    void* addr, size_t length, const std::string& name, bool remote_accessible,
+    bool update_metadata, bool force_sequential, ThpPlan thp_plan) {
     (void)remote_accessible;
     const int kBaseAccessRights = IBV_ACCESS_LOCAL_WRITE |
                                   IBV_ACCESS_REMOTE_WRITE |
@@ -232,10 +241,41 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
     // We detect the actual page size of the buffer and compute accordingly,
     // so hugepage-backed memory avoids unnecessary splitting.
     size_t page_size = detectBufferPageSize(addr);
+    // KernelPageSize reads 4KB for transparent huge pages, yet the NIC maps a
+    // THP-backed range with 2MB pages. For MADV_HUGEPAGE memory (e.g. Store
+    // segments), fault the buffer in now and, if THP backs all of it, budget
+    // PTEs at 2MB. Otherwise a large segment is partitioned so that each chunk
+    // is reachable through only one or two NICs -- and on a single-NIC host a
+    // segment above ~88GB cannot be registered at all.
+    bool pre_touched = thp_plan != ThpPlan::kAuto;
+    bool thp_budget = thp_plan == ThpPlan::kThpPartitioned;
+    if (thp_budget) {
+        page_size = kThpPageSize;  // checked THP-backed by the kAuto attempt
+    } else if (thp_plan == ThpPlan::kAuto && page_size < kThpPageSize &&
+               length >= kThpPageSize && hasHugepageAdvice(addr)) {
+        int ret = preTouchMemory(addr, length);
+        if (ret != 0) return ret;
+        pre_touched = true;
+        if (isThpBacked(addr, length)) {
+            page_size = kThpPageSize;
+            thp_budget = true;
+        } else {
+            LOG(INFO) << "EFA: " << addr << " (" << length
+                      << " bytes) is not fully THP-backed, budgeting PTEs at "
+                      << page_size << " bytes";
+        }
+    }
     size_t pte_limit = getMaxPteEntries() * page_size;
     // When max_mr_size is not configured, fall back to pte_limit so that
     // PTE-aware splitting still kicks in for large buffers on 4KB pages.
     size_t chunk_limit = (max_mr > 0) ? std::min(max_mr, pte_limit) : pte_limit;
+    const size_t num_nics = context_list_.size();
+    if (thp_plan == ThpPlan::kThpPartitioned && num_nics > 1) {
+        // One 2MB-aligned share per NIC, so each NIC maps ~length / num_nics.
+        size_t share = (length + num_nics - 1) / num_nics;
+        share = (share + kThpPageSize - 1) / kThpPageSize * kThpPageSize;
+        chunk_limit = std::min(chunk_limit, share);
+    }
     LOG(INFO) << "Auto-split params: page_size=" << page_size
               << ", max_pte_entries=" << getMaxPteEntries()
               << ", pte_limit=" << pte_limit << ", max_mr_size=" << max_mr
@@ -273,10 +313,10 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
     // Strategy: if total PTE usage per NIC fits within the PTE budget,
     // register ALL chunks on ALL NICs (full coverage → max throughput).
     // Otherwise fall back to disjoint per-NIC partition.
-    size_t num_nics = context_list_.size();
     size_t num_chunks = chunks.size();
     size_t total_pages_per_nic = length / page_size;
-    bool use_full_coverage = (total_pages_per_nic <= getMaxPteEntries());
+    bool use_full_coverage = (total_pages_per_nic <= getMaxPteEntries()) &&
+                             thp_plan != ThpPlan::kThpPartitioned;
 
     // Optionally narrow a single-chunk DEVICE buffer to the NICs the topology
     // reports as closest to its GPU. See buildLocalNicMap() for where the set
@@ -335,9 +375,14 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
                 nic_assignments[ci].push_back(n);
             }
         }
-        LOG(WARNING) << "Disjoint NIC partition: PTE/NIC="
-                     << total_pages_per_nic
-                     << " exceeds budget=" << getMaxPteEntries();
+        if (thp_plan == ThpPlan::kThpPartitioned) {
+            LOG(WARNING) << "Disjoint NIC partition: full-coverage "
+                            "registration failed";
+        } else {
+            LOG(WARNING) << "Disjoint NIC partition: PTE/NIC="
+                         << total_pages_per_nic
+                         << " exceeds budget=" << getMaxPteEntries();
+        }
         for (size_t ci = 0; ci < num_chunks; ++ci) {
             std::string nic_list;
             for (size_t j = 0; j < nic_assignments[ci].size(); ++j) {
@@ -390,6 +435,24 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
         }
     };
 
+    // The 2MB budget registers every NIC on the whole buffer, which can fail
+    // with ENOMEM on a NIC that would still take its share of the buffer. If
+    // the first chunk fails, nothing has been published to metadata yet, so
+    // retry: first at 2MB with the buffer partitioned across NICs (a single
+    // NIC has nothing to partition), then with the 4KB partitioned plan.
+    auto nextThpPlan = [&](size_t ci) {
+        if (!thp_budget || ci != 0) return thp_plan;
+        ThpPlan next = thp_plan == ThpPlan::kAuto && num_nics > 1
+                           ? ThpPlan::kThpPartitioned
+                           : ThpPlan::kBasePages;
+        LOG(WARNING) << "EFA: registering " << addr << " (" << length
+                     << " bytes) with the 2MB THP PTE budget failed, retrying "
+                     << (next == ThpPlan::kThpPartitioned
+                             ? "with the buffer partitioned across NICs"
+                             : "with the 4KB budget");
+        return next;
+    };
+
     // Register each chunk on its assigned NICs
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
         void* chunk_addr = chunks[ci].first;
@@ -402,7 +465,7 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
         bool do_pre_touch = is_host_mem && context_list_.size() > 0 &&
                             std::thread::hardware_concurrency() >= 4 &&
                             chunk_len >= (size_t)4 * 1024 * 1024 * 1024;
-        if (do_pre_touch) {
+        if (do_pre_touch && !pre_touched) {
             int ret = preTouchMemory(chunk_addr, chunk_len);
             if (ret != 0) {
                 if (ci > 0) rollbackChunks(ci - 1);
@@ -445,6 +508,11 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
                         << "Failed to register memory region chunk " << ci
                         << " with EFA context " << assigned_nics[j];
                     rollbackChunks(ci);
+                    ThpPlan next = nextThpPlan(ci);
+                    if (next != thp_plan)
+                        return registerLocalMemoryInternal(
+                            addr, length, name, remote_accessible,
+                            update_metadata, force_sequential, next);
                     return ret_codes[j];
                 }
             }
@@ -456,6 +524,11 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
                     LOG(ERROR) << "Failed to register memory region chunk "
                                << ci << " with EFA context " << nic_idx;
                     rollbackChunks(ci);
+                    ThpPlan next = nextThpPlan(ci);
+                    if (next != thp_plan)
+                        return registerLocalMemoryInternal(
+                            addr, length, name, remote_accessible,
+                            update_metadata, force_sequential, next);
                     return ret;
                 }
             }
@@ -1286,8 +1359,12 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
         // Try multiple attempts to find a device with valid MR registration.
         // With per-NIC partition, not all devices have all buffers registered,
         // so rkey[device_id] may be 0 for unassigned NICs.
+        // Topology::selectDevice() draws a random preferred HCA for try 0 and
+        // returns entry (try - 1) of preferred + available for try > 0, so
+        // num_devices + 1 attempts are needed for the deterministic part of the
+        // walk to visit every entry, whatever retry_count it starts from.
         int num_devices = static_cast<int>(desc->devices.size());
-        for (int attempt = 0; attempt < num_devices; ++attempt) {
+        for (int attempt = 0; attempt <= num_devices; ++attempt) {
             int try_count = retry_count + attempt;
             device_id =
                 hint.empty()
@@ -1305,6 +1382,28 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
             if (device_id >= 0 &&
                 static_cast<size_t>(device_id) < buffer.rkey.size() &&
                 buffer.rkey[device_id] != 0) {
+                return 0;
+            }
+        }
+
+        // The walk can still miss a keyed NIC: a hint that resolves to an HCA
+        // pins every attempt to that HCA, and a topology that lists fewer HCAs
+        // than the buffer has keys (or none for this location) never reaches
+        // the rest. Under the disjoint per-NIC partition a chunk is registered
+        // on a single NIC, so a miss fails a transfer that a registered NIC
+        // could serve. Fall back to any NIC that holds a key for this buffer.
+        const size_t num_keys = buffer.rkey.size();
+        for (size_t i = 0; i < num_keys; ++i) {
+            const size_t candidate =
+                (static_cast<size_t>(retry_count) + i) % num_keys;
+            if (buffer.rkey[candidate] != 0) {
+                device_id = static_cast<int>(candidate);
+                LOG_EVERY_N(WARNING, 1000)
+                    << "selectDevice: topology walk found no keyed NIC for "
+                       "buffer "
+                    << buffer.name << " (hint '" << hint << "', retry_count "
+                    << retry_count << "), falling back to device_id "
+                    << device_id;
                 return 0;
             }
         }

@@ -19,12 +19,15 @@
 #include "config/rpc_protocol_config.h"
 #include "default_config.h"
 #include "duration_utils.h"
+#include "ha/ha_types.h"
 #include "ha/leadership/master_service_supervisor.h"
 #include "ha/snapshot/batch_oplog/config.h"
 
 #include "http_metadata_server.h"
 #include "master_admin_service.h"
+#include "rpc_worker_pool.h"
 #include "rpc_service.h"
+#include "shutdown_request.h"
 #include "types.h"
 #include "common/network.h"
 #include "glog_compat.h"
@@ -42,13 +45,17 @@ static_assert(mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 10000,
 static_assert(mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS == 30 * 60 * 1000,
               "Update kDefaultKvSoftPinTtlFlagValue when "
               "DEFAULT_KV_SOFT_PIN_TTL_MS changes");
-static_assert(mooncake::DEFAULT_MAX_KV_SOFT_PIN_TTL_MS == 24 * 60 * 60 * 1000,
+static_assert(mooncake::DEFAULT_MAX_KV_SOFT_PIN_TTL_MS ==
+                  7 * 24 * 60 * 60 * 1000,
               "Update kDefaultMaxKvSoftPinTtlFlagValue when "
               "DEFAULT_MAX_KV_SOFT_PIN_TTL_MS changes");
 
 constexpr char kDefaultKvLeaseTtlFlagValue[] = "10000";
 constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
-constexpr char kDefaultMaxKvSoftPinTtlFlagValue[] = "86400000";
+constexpr char kDefaultMaxKvSoftPinTtlFlagValue[] = "604800000";
+// Allowed range of --ha_leader_lease_ttl_sec.
+constexpr int64_t kMinHaLeaderLeaseTtlSec = 2;
+constexpr int64_t kMaxHaLeaderLeaseTtlSec = 60;
 
 namespace {
 
@@ -176,8 +183,22 @@ DEFINE_double(nof_eviction_high_watermark_ratio,
 // RPC server configuration parameters (new, preferred)
 // TODO: deprecate port and max_threads in the future
 DEFINE_int32(rpc_thread_num, 0,
-             "Number of threads for RPC server (0 = use max_threads, preferred "
-             "over max_threads)");
+             "Number of io threads for RPC server (0 = use max_threads, "
+             "preferred over max_threads)");
+DEFINE_int32(handler_worker_thread_num, 0,
+             "Number of worker threads that run RPC handlers apart from the "
+             "io threads, so a slow handler cannot delay a Ping (0 = as "
+             "many as rpc_thread_num)");
+DEFINE_validator(handler_worker_thread_num,
+                 [](const char* flagname, int32_t value) {
+                     // The config stores it unsigned, so a negative value
+                     // would become a thread count asio refuses to start.
+                     if (value < 0) {
+                         LOG(ERROR) << flagname << " must not be negative";
+                         return false;
+                     }
+                     return true;
+                 });
 DEFINE_int32(
     rpc_port, 0,
     "Port for RPC server to listen on (0 = use port, preferred over port)");
@@ -306,6 +327,20 @@ DEFINE_uint32(kv_events_queue_capacity, 65536,
               "the queue is full (0 = unbounded)");
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
+DEFINE_int64(ha_leader_lease_ttl_sec,
+             mooncake::DEFAULT_MASTER_VIEW_LEASE_TTL_SEC,
+             "Leadership lease TTL in seconds for the etcd HA backend. A "
+             "longer TTL tolerates longer etcd apply stalls but delays "
+             "failover after a leader crash (range 2..60)");
+DEFINE_validator(ha_leader_lease_ttl_sec, [](const char* flagname,
+                                             int64_t value) {
+    if (value < kMinHaLeaderLeaseTtlSec || value > kMaxHaLeaderLeaseTtlSec) {
+        LOG(ERROR) << flagname << " must be in [" << kMinHaLeaderLeaseTtlSec
+                   << ", " << kMaxHaLeaderLeaseTtlSec << "], got " << value;
+        return false;
+    }
+    return true;
+});
 DEFINE_string(ha_backend_connstring, "",
               "HA backend connection string. If unset, only backend_type=etcd "
               "falls back to etcd_endpoints for backward compatibility");
@@ -353,6 +388,10 @@ DEFINE_bool(enable_oplog_snapshot, false,
             "Enable standby batch OpLog snapshot production");
 DEFINE_uint64(snapshot_chunk_object_count, 1000000,
               "Maximum objects per standby batch OpLog snapshot chunk");
+DEFINE_uint64(snapshot_interval_seconds, 600,
+              "Interval between standby batch OpLog snapshots in seconds");
+DEFINE_string(snapshot_object_store_type, "",
+              "Batch OpLog snapshot object store type: local or s3");
 DEFINE_int32(oplog_poll_interval_ms, 1000,
              "Batch-record standby poll interval.");
 DEFINE_uint32(oplog_batch_max_entries, 1024,
@@ -405,38 +444,6 @@ DEFINE_string(tenant_quota_connector_type, "file",
 DEFINE_string(tenant_quota_connector_uri, "",
               "Tenant quota policy connector URI");
 
-// Snapshot related configuration flags (migrated from global_flags)
-DEFINE_string(snapshot_backup_dir, "",
-              "Optional local directory for snapshot and restore backup. "
-              "If empty, local backup is disabled");
-DEFINE_bool(enable_snapshot_restore, false, "enable restore from snapshot");
-DEFINE_bool(enable_snapshot, false, "Enable periodic snapshot of master data");
-DEFINE_uint64(snapshot_interval_seconds,
-              mooncake::DEFAULT_SNAPSHOT_INTERVAL_SEC,
-              "Interval in second between periodic snapshots of master data");
-DEFINE_uint64(snapshot_child_timeout_seconds,
-              mooncake::DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC,
-              "Timeout for snapshot child process in seconds");
-DEFINE_uint32(snapshot_retention_count,
-              mooncake::DEFAULT_SNAPSHOT_RETENTION_COUNT,
-              "Number of recent snapshots to keep (older snapshots will be "
-              "automatically deleted)");
-DEFINE_string(snapshot_object_store_type, "",
-              "Snapshot object store type: 'local' for local filesystem, "
-              "'s3' for S3 storage");
-DEFINE_string(snapshot_payload_store_type, "",
-              "Deprecated alias of --snapshot_object_store_type");
-DEFINE_string(snapshot_payload_backend_type, "",
-              "Deprecated alias of --snapshot_object_store_type");
-DEFINE_string(snapshot_catalog_store_type, "",
-              "Snapshot catalog store type: ''/'embedded' or 'redis' "
-              "('payload' is kept as a deprecated alias)");
-DEFINE_string(snapshot_catalog_backend_type, "",
-              "Deprecated alias of --snapshot_catalog_store_type");
-DEFINE_string(snapshot_catalog_store_connstring, "",
-              "Optional connection string for snapshot catalog store");
-DEFINE_string(snapshot_catalog_backend_connstring, "",
-              "Deprecated alias of --snapshot_catalog_store_connstring");
 // Task manager configuration
 DEFINE_uint32(max_total_finished_tasks, 10000,
               "Maximum number of finished tasks to keep in memory");
@@ -526,6 +533,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_rpc_port);
     default_config.GetUInt32("rpc_thread_num", &master_config.rpc_thread_num,
                              FLAGS_rpc_thread_num);
+    default_config.GetUInt32("handler_worker_thread_num",
+                             &master_config.handler_worker_thread_num,
+                             FLAGS_handler_worker_thread_num);
     default_config.GetString("rpc_address", &master_config.rpc_address,
                              FLAGS_rpc_address);
     default_config.GetString("rpc_interface", &master_config.rpc_interface,
@@ -664,6 +674,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("ha_backend_connstring",
                              &master_config.ha_backend_connstring,
                              FLAGS_ha_backend_connstring);
+    default_config.GetInt64("ha_leader_lease_ttl_sec",
+                            &master_config.ha_leader_lease_ttl_sec,
+                            FLAGS_ha_leader_lease_ttl_sec);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
                              FLAGS_etcd_endpoints);
     default_config.GetString("cluster_id", &master_config.cluster_id,
@@ -680,6 +693,10 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("snapshot_chunk_object_count",
                              &master_config.snapshot_chunk_object_count,
                              FLAGS_snapshot_chunk_object_count);
+    default_config.GetUInt64("snapshot_interval_seconds",
+                             &master_config.snapshot_interval_seconds, 600);
+    default_config.GetString("snapshot_object_store_type",
+                             &master_config.snapshot_object_store_type, "");
     default_config.GetInt32("oplog_poll_interval_ms",
                             &master_config.oplog_poll_interval_ms,
                             FLAGS_oplog_poll_interval_ms);
@@ -737,53 +754,6 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              &master_config.tenant_quota_connector_uri,
                              FLAGS_tenant_quota_connector_uri);
 
-    default_config.GetString("snapshot_backup_dir",
-                             &master_config.snapshot_backup_dir,
-                             FLAGS_snapshot_backup_dir);
-    default_config.GetBool("enable_snapshot_restore",
-                           &master_config.enable_snapshot_restore,
-                           FLAGS_enable_snapshot_restore);
-    default_config.GetBool("enable_snapshot", &master_config.enable_snapshot,
-                           FLAGS_enable_snapshot);
-    default_config.GetUInt64("snapshot_interval_seconds",
-                             &master_config.snapshot_interval_seconds,
-                             FLAGS_snapshot_interval_seconds);
-    default_config.GetUInt64("snapshot_child_timeout_seconds",
-                             &master_config.snapshot_child_timeout_seconds,
-                             FLAGS_snapshot_child_timeout_seconds);
-    default_config.GetUInt32("snapshot_retention_count",
-                             &master_config.snapshot_retention_count,
-                             FLAGS_snapshot_retention_count);
-    default_config.GetString("snapshot_object_store_type",
-                             &master_config.snapshot_object_store_type,
-                             FLAGS_snapshot_object_store_type);
-    if (master_config.snapshot_object_store_type.empty()) {
-        default_config.GetString("snapshot_payload_store_type",
-                                 &master_config.snapshot_object_store_type,
-                                 master_config.snapshot_object_store_type);
-    }
-    if (master_config.snapshot_object_store_type.empty()) {
-        default_config.GetString("snapshot_payload_backend_type",
-                                 &master_config.snapshot_object_store_type,
-                                 master_config.snapshot_object_store_type);
-    }
-    default_config.GetString("snapshot_catalog_store_type",
-                             &master_config.snapshot_catalog_store_type,
-                             FLAGS_snapshot_catalog_store_type);
-    if (master_config.snapshot_catalog_store_type.empty()) {
-        default_config.GetString("snapshot_catalog_backend_type",
-                                 &master_config.snapshot_catalog_store_type,
-                                 master_config.snapshot_catalog_store_type);
-    }
-    default_config.GetString("snapshot_catalog_store_connstring",
-                             &master_config.snapshot_catalog_store_connstring,
-                             FLAGS_snapshot_catalog_store_connstring);
-    if (master_config.snapshot_catalog_store_connstring.empty()) {
-        default_config.GetString(
-            "snapshot_catalog_backend_connstring",
-            &master_config.snapshot_catalog_store_connstring,
-            master_config.snapshot_catalog_store_connstring);
-    }
     default_config.GetUInt32("max_total_finished_tasks",
                              &master_config.max_total_finished_tasks,
                              FLAGS_max_total_finished_tasks);
@@ -885,6 +855,15 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.rpc_enable_tcp_no_delay = FLAGS_rpc_enable_tcp_no_delay;
+    }
+    if ((google::GetCommandLineFlagInfo("handler_worker_thread_num", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.handler_worker_thread_num =
+            FLAGS_handler_worker_thread_num;
+    }
+    if (master_config.handler_worker_thread_num == 0) {
+        master_config.handler_worker_thread_num = master_config.rpc_thread_num;
     }
     if ((google::GetCommandLineFlagInfo("default_kv_lease_ttl", &info) &&
          !info.is_default) ||
@@ -1128,6 +1107,17 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.ha_backend_connstring = FLAGS_ha_backend_connstring;
     }
+    if ((google::GetCommandLineFlagInfo("ha_leader_lease_ttl_sec", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_leader_lease_ttl_sec = FLAGS_ha_leader_lease_ttl_sec;
+    }
+    if (master_config.ha_leader_lease_ttl_sec < kMinHaLeaderLeaseTtlSec ||
+        master_config.ha_leader_lease_ttl_sec > kMaxHaLeaderLeaseTtlSec) {
+        LOG(FATAL) << "ha_leader_lease_ttl_sec must be in ["
+                   << kMinHaLeaderLeaseTtlSec << ", " << kMaxHaLeaderLeaseTtlSec
+                   << "], got " << master_config.ha_leader_lease_ttl_sec;
+    }
     if ((google::GetCommandLineFlagInfo("etcd_endpoints", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1180,6 +1170,18 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.snapshot_chunk_object_count =
             FLAGS_snapshot_chunk_object_count;
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_interval_seconds", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_interval_seconds =
+            FLAGS_snapshot_interval_seconds;
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_object_store_type", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_object_store_type =
+            FLAGS_snapshot_object_store_type;
     }
     if ((google::GetCommandLineFlagInfo("oplog_poll_interval_ms", &info) &&
          !info.is_default) ||
@@ -1325,120 +1327,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.max_retry_attempts = FLAGS_max_retry_attempts;
-    }
-    if ((google::GetCommandLineFlagInfo("enable_snapshot", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.enable_snapshot = FLAGS_enable_snapshot;
-    }
-    if ((google::GetCommandLineFlagInfo("enable_snapshot_restore", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.enable_snapshot_restore = FLAGS_enable_snapshot_restore;
-    }
-    if ((google::GetCommandLineFlagInfo("snapshot_interval_seconds", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.snapshot_interval_seconds =
-            FLAGS_snapshot_interval_seconds;
-    }
-    if ((google::GetCommandLineFlagInfo("snapshot_child_timeout_seconds",
-                                        &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.snapshot_child_timeout_seconds =
-            FLAGS_snapshot_child_timeout_seconds;
-    }
-    if ((google::GetCommandLineFlagInfo("snapshot_retention_count", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.snapshot_retention_count = FLAGS_snapshot_retention_count;
-    }
-    if ((google::GetCommandLineFlagInfo("snapshot_backup_dir", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.snapshot_backup_dir = FLAGS_snapshot_backup_dir;
-    }
-    bool use_snapshot_object_store_flag = false;
-    bool use_snapshot_payload_store_flag = false;
-    bool use_snapshot_payload_backend_flag = false;
-    if (google::GetCommandLineFlagInfo("snapshot_object_store_type", &info) &&
-        !info.is_default) {
-        use_snapshot_object_store_flag = true;
-    }
-    if (google::GetCommandLineFlagInfo("snapshot_payload_store_type", &info) &&
-        !info.is_default) {
-        use_snapshot_payload_store_flag = true;
-    }
-    if (google::GetCommandLineFlagInfo("snapshot_payload_backend_type",
-                                       &info) &&
-        !info.is_default) {
-        use_snapshot_payload_backend_flag = true;
-    }
-    if (use_snapshot_object_store_flag) {
-        master_config.snapshot_object_store_type =
-            FLAGS_snapshot_object_store_type;
-    } else if (use_snapshot_payload_store_flag) {
-        LOG(WARNING) << "--snapshot_payload_store_type is deprecated; use "
-                     << "--snapshot_object_store_type instead";
-        master_config.snapshot_object_store_type =
-            FLAGS_snapshot_payload_store_type;
-    } else if (use_snapshot_payload_backend_flag) {
-        LOG(WARNING) << "--snapshot_payload_backend_type is deprecated; use "
-                     << "--snapshot_object_store_type instead";
-        master_config.snapshot_object_store_type =
-            FLAGS_snapshot_payload_backend_type;
-    } else if (!conf_set) {
-        master_config.snapshot_object_store_type =
-            FLAGS_snapshot_object_store_type;
-    }
-    bool use_snapshot_catalog_store_flag = false;
-    bool use_snapshot_catalog_backend_flag = false;
-    if (google::GetCommandLineFlagInfo("snapshot_catalog_store_type", &info) &&
-        !info.is_default) {
-        use_snapshot_catalog_store_flag = true;
-    }
-    if (google::GetCommandLineFlagInfo("snapshot_catalog_backend_type",
-                                       &info) &&
-        !info.is_default) {
-        use_snapshot_catalog_backend_flag = true;
-    }
-    if (use_snapshot_catalog_store_flag) {
-        master_config.snapshot_catalog_store_type =
-            FLAGS_snapshot_catalog_store_type;
-    } else if (use_snapshot_catalog_backend_flag) {
-        LOG(WARNING) << "--snapshot_catalog_backend_type is deprecated; use "
-                     << "--snapshot_catalog_store_type instead";
-        master_config.snapshot_catalog_store_type =
-            FLAGS_snapshot_catalog_backend_type;
-    } else if (!conf_set) {
-        master_config.snapshot_catalog_store_type =
-            FLAGS_snapshot_catalog_store_type;
-    }
-    bool use_snapshot_catalog_store_connstring_flag = false;
-    bool use_snapshot_catalog_backend_connstring_flag = false;
-    if (google::GetCommandLineFlagInfo("snapshot_catalog_store_connstring",
-                                       &info) &&
-        !info.is_default) {
-        use_snapshot_catalog_store_connstring_flag = true;
-    }
-    if (google::GetCommandLineFlagInfo("snapshot_catalog_backend_connstring",
-                                       &info) &&
-        !info.is_default) {
-        use_snapshot_catalog_backend_connstring_flag = true;
-    }
-    if (use_snapshot_catalog_store_connstring_flag) {
-        master_config.snapshot_catalog_store_connstring =
-            FLAGS_snapshot_catalog_store_connstring;
-    } else if (use_snapshot_catalog_backend_connstring_flag) {
-        LOG(WARNING)
-            << "--snapshot_catalog_backend_connstring is deprecated; use "
-            << "--snapshot_catalog_store_connstring instead";
-        master_config.snapshot_catalog_store_connstring =
-            FLAGS_snapshot_catalog_backend_connstring;
-    } else if (!conf_set) {
-        master_config.snapshot_catalog_store_connstring =
-            FLAGS_snapshot_catalog_store_connstring;
     }
 }
 
@@ -1605,8 +1493,9 @@ int main(int argc, char* argv[]) {
         LOG(FATAL) << "enable_oplog requires enable_ha=true";
         return 1;
     }
-    if (master_config.enable_oplog && master_config.ha_backend_type != "etcd") {
-        LOG(FATAL) << "enable_oplog currently requires ha_backend_type=etcd";
+    if (master_config.enable_oplog &&
+        !mooncake::ha::HaBackendSupportsOpLog(master_config.ha_backend_type)) {
+        LOG(FATAL) << "enable_oplog requires ha_backend_type=etcd or redis";
         return 1;
     }
     if (auto error = ValidateBatchOpLogSnapshotConfig(master_config)) {
@@ -1713,11 +1602,14 @@ int main(int argc, char* argv[]) {
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type
         << ", ha_backend_connstring=" << ha_backend_connstring
+        << ", ha_leader_lease_ttl_sec=" << master_config.ha_leader_lease_ttl_sec
         << ", etcd_endpoints=" << master_config.etcd_endpoints
         << ", client_active_ttl_sec=" << master_config.client_active_ttl_sec
         << ", client_suspicion_ttl_sec="
         << master_config.client_suspicion_ttl_sec
         << ", rpc_thread_num=" << master_config.rpc_thread_num
+        << ", handler_worker_thread_num="
+        << master_config.handler_worker_thread_num
         << ", rpc_port=" << master_config.rpc_port
         << ", rpc_address=" << master_config.rpc_address
         << ", rpc_interface=" << master_config.rpc_interface
@@ -1751,17 +1643,6 @@ int main(int argc, char* argv[]) {
         << master_config.pending_task_timeout_sec
         << ", processing_task_timeout_sec="
         << master_config.processing_task_timeout_sec
-        << ", enable_snapshot=" << master_config.enable_snapshot
-        << ", enable_snapshot_restore=" << master_config.enable_snapshot_restore
-        << ", snapshot_interval_seconds="
-        << master_config.snapshot_interval_seconds
-        << ", snapshot_backup_dir=" << master_config.snapshot_backup_dir
-        << ", snapshot_object_store_type="
-        << master_config.snapshot_object_store_type
-        << ", snapshot_catalog_store_type="
-        << master_config.snapshot_catalog_store_type
-        << ", snapshot_retention_count="
-        << master_config.snapshot_retention_count
         << ", max_retry_attempts=" << master_config.max_retry_attempts
         << ", enable_cxl=" << master_config.enable_cxl
         << ", cxl_path=" << master_config.cxl_path
@@ -1792,12 +1673,34 @@ int main(int argc, char* argv[]) {
     }
 
     if (master_config.enable_ha) {
+        // Arm the shutdown bound and the handlers before any lease can be
+        // acquired; without them a SIGTERM kills a leader mid-term. This
+        // call is serial and one-shot from main(): the check-then-store in
+        // StartShutdownWatchdog assumes no concurrent caller.
+        if (!mooncake::StartShutdownWatchdog(
+                mooncake::ha::kHaShutdownDeadline)) {
+            LOG(ERROR) << "Failed to start the shutdown watchdog, "
+                          "refusing to start";
+            return 1;
+        }
+        if (!mooncake::InstallShutdownSignalHandlers()) {
+            PLOG(ERROR) << "Failed to install SIGINT/SIGTERM handlers, "
+                           "refusing to start";
+            return 1;
+        }
         mooncake::MasterServiceSupervisorConfig supervisor_config{
             master_config};
         supervisor_config.http_metadata_server = metadata_server_ptr;
         supervisor_config.http_metadata_remote_url = http_metadata_remote_url;
         mooncake::ha::MasterServiceSupervisor supervisor(supervisor_config);
-        return supervisor.Start();
+        const int result = supervisor.Start();
+        // Finish a requested process exit without further main/static
+        // teardown; supervisor-owned cleanup may already have run on this
+        // error path.
+        if (mooncake::ShutdownRequested() || mooncake::ShutdownLatched()) {
+            mooncake::ExitAfterShutdown(result);
+        }
+        return result;
     } else {
         // version is not used in non-HA mode, just pass a dummy value
         mooncake::ViewVersionId version = 0;
@@ -1830,7 +1733,12 @@ int main(int argc, char* argv[]) {
         admin_server.SetServiceDelegate(wrapped_master_service);
         admin_server.SetServiceAvailable(true);
 
-        mooncake::RegisterRpcService(server, *wrapped_master_service);
+        // Declared after the service so that it drains before the service
+        // is destroyed.
+        mooncake::RpcWorkerPool worker_pool(
+            master_config.handler_worker_thread_num);
+        mooncake::RegisterRpcService(server, *wrapped_master_service,
+                                     &worker_pool);
 
         static std::atomic<bool> shutdown_requested{false};
         auto signal_handler = [](int /* signum */) {

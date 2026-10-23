@@ -17,7 +17,7 @@ on:
         default: x86_64
       python-versions:
         type: string
-        default: '["3.10", "3.11", "3.12", "3.13"]'
+        default: '["3.10", "3.11", "3.12", "3.13", "3.14"]'
       artifact-prefix:
         type: string
         required: true
@@ -63,49 +63,37 @@ jobs:
           case "$BUILD_VARIANT:$BUILD_ARCHITECTURE" in
             cuda:x86_64)
               variant_flag=''
-              generator=''
               arch_list='8.0;9.0'
-              ep_versions='2.11.0;2.12.0;2.12.1;2.13.0;2.14.0'
               build_nvlink=true
               cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_INTRA_NVLINK=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
               ;;
             cuda13:x86_64)
               variant_flag=CU13_BUILD
-              generator=''
               arch_list='8.0;9.0;10.3'
-              ep_versions='2.11.0;2.12.0;2.12.1;2.13.0;2.14.0'
               build_nvlink=true
               cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_INTRA_NVLINK=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
               ;;
             non-cuda:x86_64)
               variant_flag=NON_CUDA_BUILD
-              generator=''
               arch_list=''
-              ep_versions=''
               build_nvlink=false
               cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
               ;;
             cuda:arm64)
               variant_flag=''
-              generator=Ninja
               arch_list='9.0'
-              ep_versions='2.11.0;2.12.0;2.12.1;2.13.0;2.14.0'
               build_nvlink=false
               cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
               ;;
             cuda13:arm64)
               variant_flag=CU13_BUILD
-              generator=Ninja
               arch_list='9.0;10.3'
-              ep_versions='2.11.0;2.12.0;2.12.1;2.13.0;2.14.0'
               build_nvlink=false
               cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
               ;;
             non-cuda:arm64)
               variant_flag=NON_CUDA_BUILD
-              generator=Ninja
               arch_list=''
-              ep_versions=''
               build_nvlink=false
               cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
               ;;
@@ -115,12 +103,14 @@ jobs:
               ;;
           esac
           cmake_args="$cmake_args -DENABLE_KV_EVENTS=ON"
+          # AWS EFA transport. It dlopens libfabric when protocol=efa is used,
+          # so the wheel only needs the headers (fetched below) and still
+          # imports on hosts without libfabric.
+          cmake_args="$cmake_args -DUSE_EFA=ON -DLIBFABRIC_INCLUDE_DIR=$RUNNER_TEMP/libfabric-headers/include"
 
           {
             echo "VARIANT_FLAG=$variant_flag"
-            echo "CMAKE_GEN=$generator"
             echo "TORCH_CUDA_ARCH_LIST=$arch_list"
-            echo "EP_TORCH_VERSIONS_INPUT=$ep_versions"
             echo "BUILD_NVLINK_ALLOCATOR=$build_nvlink"
             echo "CMAKE_ARGS=$cmake_args"
           } >> "$GITHUB_ENV"
@@ -156,6 +146,19 @@ jobs:
             core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
+      - name: Fetch libfabric headers
+        # Pin the oldest libfabric API the EFA transport accepts, so the wheel
+        # works with any runtime libfabric >= 1.18 (e.g. the AWS EFA installer's).
+        env:
+          LIBFABRIC_HEADERS_VERSION: "1.18.3"
+        run: |
+          dest="$RUNNER_TEMP/libfabric-headers"
+          mkdir -p "$dest"
+          curl --retry 3 --retry-delay 2 -fsSL \
+            "https://github.com/ofiwg/libfabric/archive/refs/tags/v${LIBFABRIC_HEADERS_VERSION}.tar.gz" |
+            tar xz -C "$dest" --strip-components=1 "libfabric-${LIBFABRIC_HEADERS_VERSION}/include/rdma"
+          test -f "$dest/include/rdma/fabric.h"
+
       - name: Configure project
         run: |
           SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
@@ -164,11 +167,11 @@ jobs:
           fi
           $SUDO bash -x dependencies.sh -y
           echo "/usr/local/go/bin" >> "$GITHUB_PATH"
-          gen=(); [ -n "$CMAKE_GEN" ] && gen=(-G "$CMAKE_GEN")
-          ep=(); [ -n "$EP_TORCH_VERSIONS_INPUT" ] && ep=(-DEP_TORCH_VERSIONS="$EP_TORCH_VERSIONS_INPUT")
           mkdir -p build && cd build
+          # Ninja is required: limit_jobs.cmake caps parallelism through Ninja
+          # job pools, which Make ignores (exit 137 on GitHub-hosted runners).
           # shellcheck disable=SC2086
-          cmake "${gen[@]}" .. $CMAKE_ARGS "${ep[@]}" -DPython3_EXECUTABLE="$(which python3)"
+          cmake -G Ninja .. $CMAKE_ARGS -DPython3_EXECUTABLE="$(which python3)"
 
       - name: Build project
         env:
@@ -273,6 +276,19 @@ jobs:
           fi
 
           "$smoke_venv/bin/mooncake_master" --version
+
+          # EFA support must not add a link-time libfabric dependency: the
+          # builder image has no libfabric, so importing the engine here also
+          # proves the wheel works on hosts without it.
+          site_packages=$("$smoke_venv/bin/python" -c \
+            'import sysconfig; print(sysconfig.get_paths()["platlib"])')
+          if find "$site_packages"/mooncake* -name '*.so*' -type f -print0 |
+              xargs -0 -r readelf -d 2>/dev/null | grep -F 'Shared library: [libfabric.so'; then
+            echo "::error::The wheel links libfabric; the EFA transport must dlopen it"
+            exit 1
+          fi
+          "$smoke_venv/bin/python" -c \
+            'from mooncake import engine; assert engine.SUPPORT_EFA, "EFA support missing"'
 
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4

@@ -19,7 +19,6 @@ class MasterServiceTestPeer {
     using GroupDomainAccessorRW = MasterService::GroupDomainAccessorRW;
     using MetadataAccessorRO = MasterService::MetadataAccessorRO;
     using MetadataAccessorRW = MasterService::MetadataAccessorRW;
-    using MetadataSerializer = MasterService::MetadataSerializer;
     using MetadataShard = MasterService::MetadataShard;
     using MetadataShardAccessorRO = MasterService::MetadataShardAccessorRO;
     using MetadataShardAccessorRW = MasterService::MetadataShardAccessorRW;
@@ -32,20 +31,23 @@ class MasterServiceTestPeer {
     using TenantState = MasterService::TenantState;
 
     static constexpr auto kDynamicReplicationWindowEntryLimit =
-        MasterService::kDynamicReplicationWindowEntryLimit;
+        DynamicReplicationController::kWindowEntryLimit;
     static constexpr auto kMaxPromotionExecutionFailures =
         MasterService::kMaxPromotionExecutionFailures;
     static constexpr auto kNumShards = MasterService::kNumShards;
-    static constexpr auto kObjectOperationLockStripes =
-        MasterService::kObjectOperationLockStripes;
     static constexpr auto kPromotionCandidateMaxRetries =
-        MasterService::kPromotionCandidateMaxRetries;
+        PromotionCandidateTracker::kMaxRetries;
 
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
 
     void SetBatchOpLogWriterFactoryForTesting(
         MasterService::BatchOpLogWriterFactory factory);
+
+    // The OpLog payload built from one object's metadata, so a suite can name
+    // the fields that payload carries.
+    static std::string SerializeMetadataForOpLogForTesting(
+        MasterService& service, const ObjectMetadata& metadata);
 
     // Drive one eviction cycle synchronously, without the periodic worker.
     void RunBatchEvictForTesting(double evict_ratio_target,
@@ -59,12 +61,31 @@ class MasterServiceTestPeer {
     // Drive one tenant watermark eviction pass without the periodic worker.
     void RunTenantEvictForTesting();
 
+    // The service's walks over tenants and over one tenant's objects.
+    auto ReadCursor(const TenantId& tenant_id) const {
+        return service_.ReadCursor(tenant_id);
+    }
+    using CursorSlice = MasterService::CursorSlice;
+    auto ReadCursor(const TenantId& tenant_id, CursorSlice slice) const {
+        return service_.ReadCursor(tenant_id, slice);
+    }
+    auto WriteCursor(const TenantId& tenant_id) {
+        return service_.WriteCursor(tenant_id);
+    }
+    void VisitTenants(const std::function<void(const TenantId&)>& visit) const {
+        service_.VisitTenants(visit);
+    }
+    std::vector<std::string> InFlightKeys(const TenantId& tenant_id) const {
+        return service_.InFlightKeys(tenant_id);
+    }
+
     // Enable epoch bookkeeping without starting a live KV event publisher.
     void SetKvTenantEpochTrackingForTesting(bool enabled);
 
-    // Called after each shard lock is released during RemoveAll. Tests can
-    // commit into an already-scanned shard to pin the interleaving.
-    void SetRemoveAllShardHookForTesting(std::function<void(size_t)> hook);
+    // Called once per tenant RemoveAll has finished removing. Tests can commit
+    // into a tenant the walk already passed to pin the interleaving.
+    void SetRemoveAllTenantHookForTesting(
+        std::function<void(const TenantId&)> hook);
 
     // Counts of published clears and clears suppressed by a concurrent commit.
     uint64_t GetKvClearedPublishedForTesting() const;
@@ -119,10 +140,26 @@ class MasterServiceTestPeer {
     }
 
     static auto& DynamicReplicationWindows(MasterService& service) {
-        return service.dynamic_replication_windows_;
+        return service.dynamic_replication_.windows_;
     }
     static const auto& DynamicReplicationWindows(const MasterService& service) {
-        return service.dynamic_replication_windows_;
+        return service.dynamic_replication_.windows_;
+    }
+
+    // A replica-action lease is recorded per tenant and keyed by proposal id,
+    // so a caller names both.
+    static std::optional<ReplicaActionLease> FindDynamicReplicationLease(
+        MasterService& service, const TenantId& tenant_id,
+        const UUID& proposal_id) {
+        return service.dynamic_replication_.FindLease(tenant_id, proposal_id);
+    }
+
+    // A tenant keeps a lease table only while one of its leases is in flight.
+    static bool HasDynamicReplicationLeaseTable(
+        const DynamicReplicationController& controller,
+        const TenantId& tenant_id) {
+        std::lock_guard<std::mutex> lock(controller.lease_mutex_);
+        return controller.leases_.contains(tenant_id);
     }
 
     static auto& EnableDfs(MasterService& service) {
@@ -181,13 +218,6 @@ class MasterServiceTestPeer {
         return service.nof_segment_manager_;
     }
 
-    static auto& ObjectOperationLocks(MasterService& service) {
-        return service.object_operation_locks_;
-    }
-    static const auto& ObjectOperationLocks(const MasterService& service) {
-        return service.object_operation_locks_;
-    }
-
     static auto& OrderedOplogWriter(MasterService& service) {
         return service.ordered_oplog_writer_;
     }
@@ -204,10 +234,10 @@ class MasterServiceTestPeer {
     }
 
     static auto& PromotionCandidateCount(MasterService& service) {
-        return service.promotion_candidate_count_;
+        return service.promotion_candidates_.count_;
     }
     static const auto& PromotionCandidateCount(const MasterService& service) {
-        return service.promotion_candidate_count_;
+        return service.promotion_candidates_.count_;
     }
 
     static auto& PromotionInFlight(MasterService& service) {
@@ -238,32 +268,11 @@ class MasterServiceTestPeer {
         return service.segment_manager_;
     }
 
-    static auto& SnapshotCatalogStore(MasterService& service) {
-        return service.snapshot_catalog_store_;
+    static auto& MasterStateMutex(MasterService& service) {
+        return service.master_state_mutex_;
     }
-    static const auto& SnapshotCatalogStore(const MasterService& service) {
-        return service.snapshot_catalog_store_;
-    }
-
-    static auto& SnapshotManager(MasterService& service) {
-        return service.snapshot_manager_;
-    }
-    static const auto& SnapshotManager(const MasterService& service) {
-        return service.snapshot_manager_;
-    }
-
-    static auto& SnapshotMutex(MasterService& service) {
-        return service.snapshot_mutex_;
-    }
-    static const auto& SnapshotMutex(const MasterService& service) {
-        return service.snapshot_mutex_;
-    }
-
-    static auto& SnapshotObjectStore(MasterService& service) {
-        return service.snapshot_object_store_;
-    }
-    static const auto& SnapshotObjectStore(const MasterService& service) {
-        return service.snapshot_object_store_;
+    static const auto& MasterStateMutex(const MasterService& service) {
+        return service.master_state_mutex_;
     }
 
     static auto& SoftPinDeadlineIndex(MasterService& service) {
@@ -281,31 +290,31 @@ class MasterServiceTestPeer {
     }
 
     static auto& TenantQuotaPolicyMutex(MasterService& service) {
-        return service.tenant_quota_policy_mutex_;
+        return service.tenant_quota_manager_.policy_mutex_;
     }
     static const auto& TenantQuotaPolicyMutex(const MasterService& service) {
-        return service.tenant_quota_policy_mutex_;
+        return service.tenant_quota_manager_.policy_mutex_;
     }
 
     static auto& TenantQuotaPolicyStore(MasterService& service) {
-        return service.tenant_quota_policy_store_;
+        return service.tenant_quota_manager_.policy_store_;
     }
     static const auto& TenantQuotaPolicyStore(const MasterService& service) {
-        return service.tenant_quota_policy_store_;
+        return service.tenant_quota_manager_.policy_store_;
     }
 
     static auto& TenantQuotaRecomputeMutex(MasterService& service) {
-        return service.tenant_quota_recompute_mutex_;
+        return service.tenant_quota_manager_.recompute_mutex_;
     }
     static const auto& TenantQuotaRecomputeMutex(const MasterService& service) {
-        return service.tenant_quota_recompute_mutex_;
+        return service.tenant_quota_manager_.recompute_mutex_;
     }
 
     static auto& TenantQuotaTable(MasterService& service) {
-        return service.tenant_quota_table_;
+        return service.tenant_quota_manager_.table_;
     }
     static const auto& TenantQuotaTable(const MasterService& service) {
-        return service.tenant_quota_table_;
+        return service.tenant_quota_manager_.table_;
     }
 
     static auto& WeightMetadata(MasterService& service) {
@@ -344,6 +353,10 @@ class MasterServiceTestPeer {
         return service_.ChargeTenantQuota(std::move(account), bytes);
     }
 
+    void CleanupExpiredDynamicReplicationState() {
+        service_.CleanupExpiredDynamicReplicationState();
+    }
+
     void CleanupExpiredSoftPins(
         const std::chrono::system_clock::time_point& now) {
         service_.CleanupExpiredSoftPins(now);
@@ -351,9 +364,11 @@ class MasterServiceTestPeer {
 
     void ClearCandidatesForReload() { service_.ClearCandidatesForReload(); }
 
-    void ClearDynamicReplicationStateForKey(TenantState& tenant_state,
-                                            const std::string& key) {
-        service_.ClearDynamicReplicationStateForKey(tenant_state, key);
+    // The caller holds the object's shard, as through MetadataAccessorRW.
+    void ClearDynamicReplicationStateForKey(const TenantId& tenant_id,
+                                            const std::string& key,
+                                            route::ObjectState& state) {
+        service_.dynamic_replication_.ClearPendingLocked(tenant_id, key, state);
     }
 
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
@@ -367,26 +382,23 @@ class MasterServiceTestPeer {
         service_.ClearInvalidHandles(retaining_clients);
     }
 
-    std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
-        const MasterServiceConfig& config);
-
     void DiscardExpiredProcessingReplicas(
-        MetadataShardAccessorRW& shard,
+        const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) {
-        service_.DiscardExpiredProcessingReplicas(shard, now);
+        service_.DiscardExpiredProcessingReplicas(tenant_id, now);
     }
 
     uint32_t DynamicReplicationAdmissionMinHits() const {
-        return service_.DynamicReplicationAdmissionMinHits();
+        return service_.dynamic_replication_.AdmissionMinHits();
     }
 
     static int64_t DynamicReplicationNowMs() {
-        return MasterService::DynamicReplicationNowMs();
+        return DynamicReplicationController::NowMs();
     }
 
     uint64_t DynamicReplicationVersionEpoch(
         const ObjectMetadata& metadata) const {
-        return service_.DynamicReplicationVersionEpoch(metadata);
+        return DynamicReplicationController::VersionEpoch(metadata);
     }
 
     size_t EraseReplicasWithCacheTotalAccounting(
@@ -403,10 +415,16 @@ class MasterServiceTestPeer {
     }
 
     void FinalizeExpiredProcessingReplicasAfterDurable(
-        const OpLogEntry& durable_entry,
+        route::ObjectRef object, const OpLogEntry& durable_entry,
         const std::chrono::system_clock::time_point& ttl) {
-        service_.FinalizeExpiredProcessingReplicasAfterDurable(durable_entry,
-                                                               ttl);
+        service_.FinalizeExpiredProcessingReplicasAfterDurable(
+            std::move(object), durable_entry, ttl);
+    }
+
+    void FinalizeMetadataEraseAfterDurable(route::ObjectRef object,
+                                           const TenantId& tenant_id) {
+        service_.FinalizeMetadataEraseAfterDurable(std::move(object), tenant_id,
+                                                   QuotaEraseMode::kFull);
     }
 
     void FinalizeRemovedReplicasAfterDurable(
@@ -447,7 +465,7 @@ class MasterServiceTestPeer {
     }
 
     void LoadTenantQuotaPoliciesFromStoreOrThrow() {
-        service_.LoadTenantQuotaPoliciesFromStoreOrThrow();
+        service_.tenant_quota_manager_.LoadPoliciesOrThrow();
     }
 
     ObjectIdentity MakeObjectIdentityForRequest(
@@ -456,7 +474,8 @@ class MasterServiceTestPeer {
     }
 
     bool ObserveDynamicReplicationAccess(const ObjectIdentity& object_id) {
-        return service_.ObserveDynamicReplicationAccess(object_id);
+        return service_.dynamic_replication_.ObserveAccess(object_id.tenant_id,
+                                                           object_id.user_key);
     }
 
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job) {
@@ -468,12 +487,6 @@ class MasterServiceTestPeer {
         std::vector<UUID>* mirror_clients = nullptr) {
         return service_.PushOffloadingQueue(object_id, replica, mirror_clients);
     }
-
-    void ReRouteRestoredObjectsByKey() {
-        service_.ReRouteRestoredObjectsByKey();
-    }
-
-    void RebuildGroupState() { service_.RebuildGroupState(); }
 
     void RebuildTenantQuotaUsageFromMetadata() {
         service_.RebuildTenantQuotaUsageFromMetadata();
@@ -489,10 +502,6 @@ class MasterServiceTestPeer {
 
     const TenantId& ResolveRequestTenantId(const TenantId& tenant_id) const {
         return service_.ResolveRequestTenantId(tenant_id);
-    }
-
-    size_t RunPromotionCandidateRetry(size_t max_shards_to_scan) {
-        return service_.RunPromotionCandidateRetry(max_shards_to_scan);
     }
 
     size_t RunPromotionCandidateRetry() {

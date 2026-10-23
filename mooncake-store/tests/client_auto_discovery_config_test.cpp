@@ -46,6 +46,10 @@ class ClientAutoDiscoveryConfigTest : public ::testing::Test {
 TEST_F(ClientAutoDiscoveryConfigTest, UsesProtocolAndDeviceDefaults) {
     EXPECT_FALSE(
         ClientAutoDiscoveryConfig::FromEnvironment("tcp", false).enabled);
+    EXPECT_FALSE(
+        ClientAutoDiscoveryConfig::FromEnvironment("nvlink", false).enabled);
+    EXPECT_FALSE(
+        ClientAutoDiscoveryConfig::FromEnvironment("nvlink", true).enabled);
     EXPECT_TRUE(
         ClientAutoDiscoveryConfig::FromEnvironment("rdma", false).enabled);
     EXPECT_TRUE(
@@ -60,10 +64,18 @@ TEST_F(ClientAutoDiscoveryConfigTest, ExplicitZeroAndOneOverrideDefaults) {
     auto_discover.Set("0");
     EXPECT_FALSE(
         ClientAutoDiscoveryConfig::FromEnvironment("rdma", false).enabled);
+    EXPECT_FALSE(
+        ClientAutoDiscoveryConfig::FromEnvironment("nvlink", false).enabled);
+    EXPECT_FALSE(
+        ClientAutoDiscoveryConfig::FromEnvironment("nvlink", true).enabled);
 
     auto_discover.Set("1");
     EXPECT_TRUE(
         ClientAutoDiscoveryConfig::FromEnvironment("tcp", true).enabled);
+    EXPECT_TRUE(
+        ClientAutoDiscoveryConfig::FromEnvironment("nvlink", false).enabled);
+    EXPECT_TRUE(
+        ClientAutoDiscoveryConfig::FromEnvironment("nvlink", true).enabled);
 }
 
 TEST_F(ClientAutoDiscoveryConfigTest, PreservesStoiAcceptedSyntax) {

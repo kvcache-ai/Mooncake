@@ -10,6 +10,8 @@
 
 #include "master_metric_manager.h"
 #include "master_service.h"
+#include "ha/oplog/oplog_test_failpoint.h"
+#include "rpc_worker_pool.h"
 #include "rpc_helper.h"
 #include "types.h"
 #include "common/scoped_vlog_timer.h"
@@ -180,7 +182,8 @@ tl::expected<bool, ErrorCode> WrappedMasterService::ProbeKey(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchProbeKey(
-    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
+    const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "BatchProbeKey");
     timer.LogRequest("keys_count=", keys.size());
 
@@ -188,7 +191,8 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchProbeKey(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
         keys.size(), [&](const TenantId& resolved_tenant_id) {
-            return master_service_.BatchProbeKey(keys, resolved_tenant_id);
+            return master_service_.BatchProbeKey(policy, keys,
+                                                 resolved_tenant_id);
         });
 }
 
@@ -310,13 +314,22 @@ WrappedMasterService::GetReplicaList(const std::string& key,
     return execute_rpc(
         "GetReplicaList",
         [&] {
-            return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
-                                         ? std::string_view(tenant_id)
-                                         : TenantId::kDefaultValue,
-                                     [&](const TenantId& resolved_tenant_id) {
-                                         return master_service_.GetReplicaList(
-                                             key, resolved_tenant_id);
-                                     });
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    auto result =
+                        master_service_.GetReplicaList(key, resolved_tenant_id);
+                    // Tell the reader which scope the
+                    // object actually lives in, so its
+                    // disk-replica verify requests can
+                    // name the write scope exactly.
+                    if (result) {
+                        result->resolved_tenant_id = resolved_tenant_id.value();
+                    }
+                    return result;
+                });
         },
         [&](auto& timer) { timer.LogRequest("key=", key); },
         [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
@@ -341,8 +354,14 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
         keys.size(), [&](const TenantId& resolved_tenant_id) {
-            return master_service_.BatchGetReplicaList(keys,
-                                                       resolved_tenant_id);
+            auto batch =
+                master_service_.BatchGetReplicaList(keys, resolved_tenant_id);
+            for (auto& result : batch) {
+                if (result) {
+                    result->resolved_tenant_id = resolved_tenant_id.value();
+                }
+            }
+            return batch;
         });
 
     size_t failure_count = 0;
@@ -501,6 +520,9 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                    << " != slice_lengths.size()=" << slice_lengths.size();
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (!config.ValidSessionIds(keys.size())) {
+        results.assign(keys.size(),
+                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     } else if (config.group_ids.has_value() &&
                config.group_ids->size() != keys.size()) {
         LOG(ERROR) << "BatchPutStart: group_ids.size()="
@@ -514,10 +536,10 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     } else if (config.prefer_alloc_in_same_node) {
         ReplicateConfig new_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
-            auto key_config = new_config.ForSingleKey(i);
+            new_config.SetKeyIds(config, i);
             auto result = master_service_.PutStart(
                 client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config);
+                slice_lengths[i], new_config);
             results.emplace_back(result);
             if ((i == 0) && result.has_value()) {
                 std::string preferred_segment;
@@ -536,8 +558,9 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
             }
         }
     } else {
+        ReplicateConfig key_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
-            auto key_config = config.ForSingleKey(i);
+            key_config.SetKeyIds(config, i);
             results.emplace_back(master_service_.PutStart(
                 client_id, keys[i], resolved_tenant_id.value(),
                 slice_lengths[i], key_config));
@@ -756,6 +779,9 @@ WrappedMasterService::BatchUpsertStart(
                    << " != slice_lengths.size()=" << slice_lengths.size();
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (!config.ValidSessionIds(keys.size())) {
+        results.assign(keys.size(),
+                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     } else if (config.group_ids.has_value() &&
                config.group_ids->size() != keys.size()) {
         LOG(ERROR) << "BatchUpsertStart: group_ids.size()="
@@ -944,6 +970,19 @@ long WrappedMasterService::RemoveAll(bool force, const std::string& tenant_id) {
     return result;
 }
 
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchUpdateSoftPin(const std::vector<std::string>& keys,
+                                         uint64_t ttl_ms,
+                                         const std::string& tenant_id) {
+    return WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        keys.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchUpdateSoftPin(keys, resolved_tenant_id,
+                                                      ttl_ms);
+        });
+}
+
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
     const std::vector<std::string>& keys, bool force,
     const std::string& tenant_id) {
@@ -975,6 +1014,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
     const Segment& segment, const UUID& client_id) {
+    TestFailPoint::Wait("rpc_mount_segment_before_service");
     return execute_rpc(
         "MountSegment",
         [&] { return master_service_.MountSegment(segment, client_id); },
@@ -1348,6 +1388,36 @@ tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
             timer.LogRequest("client_id=", client_id, ", key=", key,
                              ", tenant_id=", tenant_id,
                              ", replica_type=", replica_type);
+        },
+        [] {
+            MasterMetricManager::instance().inc_evict_disk_replica_requests();
+        },
+        [] {
+            MasterMetricManager::instance().inc_evict_disk_replica_failures();
+        });
+}
+
+tl::expected<bool, ErrorCode> WrappedMasterService::EvictDiskReplicaIfCurrent(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    ReplicaType replica_type, ReplicaID expected_replica_id) {
+    return execute_rpc(
+        "EvictDiskReplicaIfCurrent",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    return master_service_.EvictDiskReplicaIfCurrent(
+                        client_id, key, resolved_tenant_id, replica_type,
+                        expected_replica_id);
+                });
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", tenant_id=", tenant_id,
+                             ", replica_type=", replica_type,
+                             ", expected_replica_id=", expected_replica_id);
         },
         [] {
             MasterMetricManager::instance().inc_evict_disk_replica_requests();
@@ -1797,165 +1867,100 @@ tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
 
 tl::expected<void, ErrorCode>
 WrappedMasterService::RestoreFromBatchOpLogPromotion(
-    BatchOpLogPromotionHandoff handoff, size_t chunk_object_count) {
-    return master_service_.RestoreFromBatchOpLogPromotion(std::move(handoff),
+    const BatchOpLogPromotionHandoff& handoff, size_t chunk_object_count) {
+    return master_service_.RestoreFromBatchOpLogPromotion(handoff,
                                                           chunk_object_count);
 }
 
-void RegisterRpcService(
-    coro_rpc::coro_rpc_server& server,
-    mooncake::WrappedMasterService& wrapped_master_service) {
-    server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
+tl::expected<void, ErrorCode>
+WrappedMasterService::RestoreFromBatchOpLogPromotion(
+    const StandbyMetadataStore& metadata_store, DurablePrefix applied_cursor,
+    const std::vector<StandbySegmentInfo>& segments, ReplicaID max_replica_id,
+    size_t chunk_object_count) {
+    return master_service_.RestoreFromBatchOpLogPromotion(
+        metadata_store, applied_cursor, segments, max_replica_id,
+        chunk_object_count);
+}
+
+namespace {
+
+template <auto... Methods>
+void RegisterPooledHandlers(coro_rpc::coro_rpc_server& server,
+                            WrappedMasterService& service,
+                            RpcWorkerPool* worker_pool) {
+    if (worker_pool == nullptr) {
+        server.register_handler<Methods...>(&service);
+        return;
+    }
+    (worker_pool->Register<Methods>(server, service), ...);
+}
+
+}  // namespace
+
+void RegisterRpcService(coro_rpc::coro_rpc_server& server,
+                        WrappedMasterService& wrapped_master_service,
+                        RpcWorkerPool* worker_pool) {
+    server.register_handler<&WrappedMasterService::Ping,
+                            &WrappedMasterService::ServiceReady>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::ProbeKey>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchReplicaClear>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::GetReplicaListByRegex>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
-        &wrapped_master_service);
-    server
-        .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
-            &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::PutStart>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::PutEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::PutRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchPutStart>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchPutEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchPutRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::UpsertStart>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::UpsertEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::UpsertRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchUpsertStart>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchUpsertEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchUpsertRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::Remove>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::RemoveByRegex>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::RemoveAll>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchRemove>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::MountNoFSegment>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::ReMountSegment>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::ReMountNoFSegment>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::GracefulUnmountSegment>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::UnmountNoFSegment>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetAllNoFSegments>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::GetNoFSegmentsByName>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::Ping>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetFsdir>(
-        &wrapped_master_service);
-    server
-        .register_handler<&mooncake::WrappedMasterService::QuerySegmentStatus>(
-            &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::QuerySegmentStatusById>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetStorageConfig>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchProbeKey>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::MountLocalDiskSegment>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::UnmountLocalDiskSegment>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::OffloadObjectHeartbeat>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::ReportSsdCapacity>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::NotifyOffloadSuccess>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::PromotionObjectHeartbeat>(
-        &wrapped_master_service);
-    server
-        .register_handler<&mooncake::WrappedMasterService::PromotionAllocStart>(
-            &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::NotifyPromotionSuccess>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::NotifyPromotionFailure>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::CopyStart>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::DynamicReplicaCopyStart>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::CopyEnd>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::DynamicReplicaCopyEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::CopyRevoke>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::DynamicReplicaCopyRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::MoveStart>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::MoveEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::MoveRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::EvictDiskReplica>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::BatchEvictDiskReplica>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::PollRemoveAll>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::CreateCopyTask>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::CreateMoveTask>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::QueryTask>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::FetchTasks>(
-        &wrapped_master_service);
-    server
-        .register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(
-            &wrapped_master_service);
+    RegisterPooledHandlers<
+        &WrappedMasterService::ExistKey, &WrappedMasterService::ProbeKey,
+        &WrappedMasterService::BatchQueryIp,
+        &WrappedMasterService::BatchReplicaClear,
+        &WrappedMasterService::GetReplicaListByRegex,
+        &WrappedMasterService::GetReplicaList,
+        &WrappedMasterService::BatchGetReplicaList,
+        &WrappedMasterService::PutStart, &WrappedMasterService::PutEnd,
+        &WrappedMasterService::PutRevoke, &WrappedMasterService::BatchPutStart,
+        &WrappedMasterService::BatchPutEnd,
+        &WrappedMasterService::BatchPutRevoke,
+        &WrappedMasterService::UpsertStart, &WrappedMasterService::UpsertEnd,
+        &WrappedMasterService::UpsertRevoke,
+        &WrappedMasterService::BatchUpsertStart,
+        &WrappedMasterService::BatchUpsertEnd,
+        &WrappedMasterService::BatchUpsertRevoke, &WrappedMasterService::Remove,
+        &WrappedMasterService::RemoveByRegex, &WrappedMasterService::RemoveAll,
+        &WrappedMasterService::BatchRemove, &WrappedMasterService::MountSegment,
+        &WrappedMasterService::MountNoFSegment,
+        &WrappedMasterService::ReMountSegment,
+        &WrappedMasterService::ReMountNoFSegment,
+        &WrappedMasterService::UnmountSegment,
+        &WrappedMasterService::GracefulUnmountSegment,
+        &WrappedMasterService::UnmountNoFSegment,
+        &WrappedMasterService::GetAllNoFSegments,
+        &WrappedMasterService::GetNoFSegmentsByName,
+        &WrappedMasterService::GetFsdir,
+        &WrappedMasterService::QuerySegmentStatus,
+        &WrappedMasterService::QuerySegmentStatusById,
+        &WrappedMasterService::GetStorageConfig,
+        &WrappedMasterService::BatchExistKey,
+        &WrappedMasterService::BatchProbeKey,
+        &WrappedMasterService::MountLocalDiskSegment,
+        &WrappedMasterService::UnmountLocalDiskSegment,
+        &WrappedMasterService::OffloadObjectHeartbeat,
+        &WrappedMasterService::ReportSsdCapacity,
+        &WrappedMasterService::NotifyOffloadSuccess,
+        &WrappedMasterService::PromotionObjectHeartbeat,
+        &WrappedMasterService::PromotionAllocStart,
+        &WrappedMasterService::NotifyPromotionSuccess,
+        &WrappedMasterService::NotifyPromotionFailure,
+        &WrappedMasterService::CopyStart,
+        &WrappedMasterService::DynamicReplicaCopyStart,
+        &WrappedMasterService::CopyEnd,
+        &WrappedMasterService::DynamicReplicaCopyEnd,
+        &WrappedMasterService::CopyRevoke,
+        &WrappedMasterService::DynamicReplicaCopyRevoke,
+        &WrappedMasterService::MoveStart, &WrappedMasterService::MoveEnd,
+        &WrappedMasterService::MoveRevoke,
+        &WrappedMasterService::EvictDiskReplica,
+        &WrappedMasterService::EvictDiskReplicaIfCurrent,
+        &WrappedMasterService::BatchEvictDiskReplica,
+        &WrappedMasterService::PollRemoveAll,
+        &WrappedMasterService::CreateCopyTask,
+        &WrappedMasterService::CreateMoveTask, &WrappedMasterService::QueryTask,
+        &WrappedMasterService::FetchTasks,
+        &WrappedMasterService::MarkTaskToComplete>(
+        server, wrapped_master_service, worker_pool);
 }
 
 }  // namespace mooncake

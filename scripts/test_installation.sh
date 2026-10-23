@@ -43,6 +43,7 @@ cp -r mooncake-wheel/tests test_env/
 cp -r python/tests/services test_env/service_tests
 cp -r python/tests/unit test_env/unit_tests
 cp -r mooncake-reshard/tests test_env/reshard_tests
+cp python/tests/store/test_fast_copy.py test_env/tests/
 cp -r python/tests/ssd test_env/ssd_tests
 cd test_env
 torch_requirement=$(python "$script_dir/ci/select_pg_torch_version.py" \
@@ -50,6 +51,7 @@ torch_requirement=$(python "$script_dir/ci/select_pg_torch_version.py" \
 echo "Installing $torch_requirement for the bundled PG extensions"
 pip install "$torch_requirement" numpy
 python -c "import mooncake._fast_copy"
+python -c "import mooncake.structured_object_store"
 python tests/test_fast_copy.py
 python tests/test_import_structure.py
 

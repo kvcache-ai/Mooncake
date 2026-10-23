@@ -22,10 +22,13 @@
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "real_client.h"
 #include "embedded_master.h"
+#include "environ.h"
+#include "environment_variables.h"
 #include "common/client_buffer_allocation.h"
 #include "common/mmap_aligned.h"
 #include "registered_pinned_memory.h"
@@ -39,6 +42,7 @@
 #include "bool_parser.h"
 #include "client_auto_port_config.h"
 #include "config/cxl_segment_config.h"
+#include "config/egm_store_pool_config.h"
 #include "config/hugepage_config.h"
 #include "integer_parser.h"
 #include "mutex.h"
@@ -53,12 +57,13 @@
 #include "device/cuda_ipc_buffer.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#include "nof/nof_runtime.h"
 #include "version.h"
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
+#include "transport/nvlink_transport/nvlink_host_numa_allocation.h"
+#if defined(USE_ASCEND_DIRECT) || defined(USE_MEMFABRIC)
+#include "acl/acl_rt.h"
 #endif
 #ifdef USE_ASCEND_DIRECT
-#include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
 #endif
 #ifdef USE_CUDA
@@ -69,6 +74,9 @@
 #endif
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include "ascend_allocator.h"
+#endif
+#ifdef USE_MEMFABRIC
+#include "memfabric_allocator.h"
 #endif
 
 DEFINE_bool(enable_http_server, false,
@@ -288,6 +296,19 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     return ((*client).*write)(keys, batched_slices.value(), config, stager);
 }
 
+// Backing slot for RealClient::SetNofRuntimeFactoryForTesting.
+std::function<NofRuntime()> &NofRuntimeFactoryForTestingSlot() {
+    static std::function<NofRuntime()> factory;
+    return factory;
+}
+
+// Backing slot for RealClient::SetTeUnregisterHookForTesting.
+std::function<tl::expected<void, ErrorCode>(void *)> &
+TeUnregisterHookForTestingSlot() {
+    static std::function<tl::expected<void, ErrorCode>(void *)> hook;
+    return hook;
+}
+
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
     if (result != ACL_ERROR_NONE) {
@@ -333,6 +354,31 @@ tl::expected<void, ErrorCode> set_context_from_dummy_shms(
         }
     }
     return set_context_if_needed(protocol, device_id, action);
+}
+#endif
+
+#ifdef USE_MEMFABRIC
+void *AllocateMemFabricStoreSegment(size_t segment_size,
+                                    const std::string &protocol,
+                                    bool use_hugepage, bool defer_hugetlb,
+                                    size_t *mapped_size) {
+    size_t actual_size = 0;
+    MemFabricHostAllocFn host_alloc = nullptr;
+    size_t host_align = 0;
+    size_t alloc_size = segment_size;
+    if (use_hugepage) {
+        host_align = get_hugepage_size_from_env();
+        alloc_size = align_up(segment_size, host_align);
+        host_alloc =
+            static_cast<MemFabricHostAllocFn>(allocate_buffer_mmap_memory);
+    }
+    void *ptr = memfabric_allocate_memory_best_effort(
+        alloc_size, protocol, &actual_size, host_alloc, host_align,
+        defer_hugetlb);
+    if (ptr != nullptr) {
+        *mapped_size = actual_size;
+    }
+    return ptr;
 }
 #endif
 
@@ -460,7 +506,8 @@ inline QueryResult FilterQueryResult(const QueryResult &qr,
                                      bool include_object_checksum = true) {
     return QueryResult(
         {replica}, qr.lease_timeout,
-        include_object_checksum ? qr.object_checksum : std::nullopt);
+        include_object_checksum ? qr.object_checksum : std::nullopt,
+        qr.resolved_tenant_id);
 }
 
 // Shared object-byte range overflow check (same semantics as
@@ -883,7 +930,12 @@ RealClient::~RealClient() {
     }
     // Ensure resources are cleaned even if not explicitly closed
     stop_http_server();
-    tearDownAll_internal();
+    // A destructor cannot propagate errors, but a teardown failure (e.g.
+    // unconfirmed NoF cleanup) must still leave a trace.
+    if (!tearDownAll_internal()) {
+        LOG(ERROR) << "RealClient teardown completed with cleanup failures; "
+                      "some buffers must stay mapped until process exit";
+    }
 }
 
 std::shared_ptr<RealClient> RealClient::create() {
@@ -931,6 +983,16 @@ tl::expected<std::string, ErrorCode> RealClient::StartEmbeddedMaster(
     return embedded_master_->master_address();
 }
 
+void RealClient::SetNofRuntimeFactoryForTesting(
+    std::function<NofRuntime()> factory) {
+    NofRuntimeFactoryForTestingSlot() = std::move(factory);
+}
+
+void RealClient::SetTeUnregisterHookForTesting(
+    std::function<tl::expected<void, ErrorCode>(void *)> hook) {
+    TeUnregisterHookForTestingSlot() = std::move(hook);
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -942,10 +1004,69 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
     bool enable_embedded_master) {
+    return setup_internal(EgmStorePoolConfig{}, local_hostname, metadata_server,
+                          global_segment_size, local_buffer_size, protocol,
+                          rdma_devices, master_server_addr, transfer_engine,
+                          ipc_socket_path, local_rpc_port, enable_ssd_offload,
+                          start_offload_rpc_server, ssd_offload_path, tenant_id,
+                          enable_client_http_server, client_http_port,
+                          enable_embedded_master);
+}
+
+tl::expected<void, ErrorCode> RealClient::setup_internal(
+    const EgmStorePoolConfig &egm_config, const std::string &local_hostname,
+    const std::string &metadata_server, size_t global_segment_size,
+    size_t local_buffer_size, const std::string &protocol,
+    const std::string &rdma_devices, const std::string &master_server_addr,
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path, int local_rpc_port,
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port,
+    bool enable_embedded_master) {
+    // Re-entry guard (mirrors initAll_internal): a second setup would
+    // overwrite client_ and skip the first instance's ordered cleanup.
+    if (client_) {
+        LOG(ERROR) << "Client is already initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // A previous teardown that could not release NoF registrations leaves
+    // caller-owned buffers whose DMA translation may still be live under the
+    // OLD initiator's owner token. Re-init installs a fresh initiator whose
+    // UnregisterMemory no-ops on them, so a later teardown would erase the
+    // records and falsely report success. nof_buffer_cleanup_failed_ is the
+    // precise signal: it is set only when CleanupNofRegisteredBuffers fails
+    // to release a record, and stays false when NoF is unavailable — a clean
+    // non-NoF teardown that leaves register_buffer() records behind is NOT
+    // refused. Refuse to re-init this object; create a new client instead.
+    if (nof_buffer_cleanup_failed_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "Cannot re-initialize: a previous teardown left "
+                      "un-released NoF registrations; create a new client "
+                      "instead";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    // Likewise refuse when a previous teardown quarantined a mapping (a
+    // failed TE or NoF unregister): it stays pinned because its registration
+    // state is uncertain, and a re-initialized client's teardown could
+    // munmap it while an old registration is still live.
+    {
+        std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        if (!quarantine_shms_.empty()) {
+            LOG(ERROR) << "Cannot re-initialize: a previous teardown left "
+                          "quarantined shared mappings that must stay pinned; "
+                          "create a new client instead";
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+    // Reset the teardown latch so this instance can be torn down again.
+    closed_.store(false, std::memory_order_release);
+
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     if (!enable_embedded_master &&
-        Environ::GetBool("MOONCAKE_ENABLE_EMBEDDED_MASTER", false)) {
+        Environ::Process().GetTypedOr(
+            EmbeddedMasterEnvironmentVariables::MOONCAKE_ENABLE_EMBEDDED_MASTER,
+            false)) {
         LOG(INFO) << "enable_embedded_master inferred from "
                      "MOONCAKE_ENABLE_EMBEDDED_MASTER";
         enable_embedded_master = true;
@@ -961,12 +1082,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 #endif
 
-#ifdef USE_NOF
-    if (!SpdkWrapper::GetInstance().InitializeEnv()) {
-        LOG(ERROR) << "spdk env init fail";
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-#endif
+    // The SPDK env initializes lazily on first use, so setup no longer
+    // fail-fasts.
+    auto &nof_factory = NofRuntimeFactoryForTestingSlot();
+    nof_runtime_ = nof_factory ? nof_factory() : CreateNofRuntime();
 
     std::optional<std::string> device_name =
         ((rdma_devices.empty() || rdma_devices == "auto-discovery")
@@ -1009,7 +1128,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, resolved_metadata_server, protocol,
             device_name, resolved_master_server_addr, transfer_engine,
-            {{"client_mode", "real"}}, tenant_id);
+            {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1040,7 +1159,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, resolved_metadata_server, protocol,
                 device_name, resolved_master_server_addr, transfer_engine,
-                {{"client_mode", "real"}}, tenant_id);
+                {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -1065,19 +1184,35 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
+    if (egm_config.enabled && !client_->HasClassicTransport("nvlink")) {
+        LOG(ERROR) << "EGM Store requires the classic NVLink transport; "
+                      "check MC_MS_AUTO_DISC and MC_FORCE_MNNVL";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     // Local_buffer_size is allowed to be 0, but we only register memory when
     // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
-    bool use_spdk_dma_for_client_buffer = false;
-#ifdef USE_NOF
-    use_spdk_dma_for_client_buffer = true;
-#endif
-    client_buffer_allocator_ = ClientBufferAllocator::create(
-        local_buffer_size, this->protocol,
-        use_hugepage_ && !globalConfig().ascend_use_fabric_mem,
-        use_spdk_dma_for_client_buffer);
+    // Inject the SPDK DMA allocator only when NoF is actually available;
+    // otherwise pass nullptr so allocate_buffer_allocator_memory falls
+    // through to exactly the same path as use_spdk_dma=false today
+    // (protocol-specific allocation -> VRAM -> aligned_alloc).
+    try {
+        client_buffer_allocator_ = ClientBufferAllocator::create(
+            local_buffer_size, this->protocol,
+            use_hugepage_ && !globalConfig().ascend_use_fabric_mem,
+            nof_runtime_.initiator ? nof_runtime_.dma_allocator : nullptr);
+    } catch (const std::bad_alloc &) {
+        // The NoF DMA allocator yields nullptr when the SPDK env is
+        // unavailable; report an error instead of a silent generic-allocation
+        // fallback that would surface later as NoF registration failures.
+        LOG(ERROR) << "Failed to allocate client buffer memory (NoF DMA "
+                      "allocator unavailable or out of memory; check the "
+                      "hugepage/SPDK environment)";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -1127,7 +1262,47 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         uint64_t current_glbseg_size = 0;                  // For logging
 
         auto split_limit = GetTransportRegistrationLimit(protocol);
-        const size_t alignment = facebook::cachelib::Slab::kSize;
+        size_t alignment = facebook::cachelib::Slab::kSize;
+        std::vector<int> egm_numa_nodes;
+        std::vector<size_t> egm_node_sizes;
+        size_t egm_node_index = 0;
+        if (egm_config.enabled) {
+            if (egm_config.auto_numa_nodes) {
+                auto status = NvlinkHostNumaAllocation::DiscoverHostNumaNodes(
+                    egm_numa_nodes);
+                if (!status.ok()) {
+                    LOG(ERROR) << "EGM NUMA discovery failed: " << status;
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+            } else {
+                egm_numa_nodes = egm_config.numa_nodes;
+            }
+            std::vector<size_t> granularities;
+            for (int node : egm_numa_nodes) {
+                size_t granularity = 0;
+                auto status =
+                    NvlinkHostNumaAllocation::GetAllocationGranularity(
+                        node, granularity);
+                if (!status.ok()) {
+                    LOG(ERROR) << "EGM granularity query failed for NUMA node "
+                               << node << ": " << status;
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                granularities.push_back(granularity);
+            }
+            auto capacity = CalculateEgmStorePoolCapacity(
+                global_segment_size, granularities, alignment,
+                static_cast<size_t>(globalConfig().max_mr_size));
+            if (!capacity) return tl::unexpected(capacity.error());
+            alignment = capacity->alignment;
+            split_limit = capacity->max_chunk_size;
+            egm_node_sizes = std::move(capacity->node_sizes);
+            global_segment_size = (global_segment_size / alignment) * alignment;
+            LOG(INFO) << "EGM Store capacity: requested=" << total_glbseg_size
+                      << " effective=" << global_segment_size
+                      << " alignment=" << alignment;
+            total_glbseg_size = global_segment_size;
+        }
 #ifdef USE_ASCEND_DIRECT
         if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
             const size_t cap = AgentModeStoreChunkCap(global_segment_size);
@@ -1165,8 +1340,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             protocol == "rdma" && use_hugepage_;
 
         while (global_segment_size > 0) {
-            size_t segment_size =
-                GetNextSegmentSize(global_segment_size, split_limit, alignment);
+            size_t segment_size = GetNextSegmentSize(
+                egm_config.enabled ? egm_node_sizes[egm_node_index]
+                                   : global_segment_size,
+                split_limit, alignment);
             if (segment_size == 0) {
                 LOG(ERROR) << "Registration limit is smaller than segment "
                               "alignment";
@@ -1176,10 +1353,30 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
+            std::unique_ptr<NvlinkHostNumaAllocation> egm_owner;
             std::string seg_location = kWildcardLocation;
             bool use_mmap_segment = !seg_numa_nodes.empty() || use_hugepage_;
 
-            if (!seg_numa_nodes.empty()) {
+            if (egm_config.enabled) {
+                auto status = NvlinkHostNumaAllocation::Create(
+                    egm_numa_nodes[egm_node_index], segment_size, alignment,
+                    egm_owner);
+                if (!status.ok()) {
+                    LOG(ERROR) << "EGM allocation failed: " << status;
+                    if (egm_owner) {
+                        auto cleanup = egm_owner->Release();
+                        if (!cleanup.ok()) {
+                            LOG(ERROR)
+                                << "EGM partial allocation cleanup failed: "
+                                << cleanup << "; retaining until process exit";
+                            (void)egm_owner.release();
+                        }
+                    }
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                ptr = egm_owner->base();
+                mapped_size = egm_owner->length();
+            } else if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
                 size_t page_sz = use_hugepage_
                                      ? get_hugepage_size_from_env()
@@ -1192,6 +1389,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #ifdef USE_ASCEND_DIRECT
             } else if (protocol == "ascend" || protocol == "ubshmem") {
                 ptr = AllocateAscendStoreSegment(
+                    segment_size, this->protocol, use_hugepage_,
+                    parallel_hugetlb_population, &mapped_size);
+#elif defined(USE_MEMFABRIC)
+            } else if (protocol == "ascend") {
+                ptr = AllocateMemFabricStoreSegment(
                     segment_size, this->protocol, use_hugepage_,
                     parallel_hugetlb_population, &mapped_size);
 #endif
@@ -1219,12 +1421,25 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
             const size_t mount_size =
-                split_limit.has_value() ? segment_size : mapped_size;
+                egm_config.enabled || !split_limit.has_value() ? mapped_size
+                                                               : segment_size;
             current_glbseg_size += mount_size;
             LOG(INFO) << "Mounting segment: " << mount_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
 
-            if (this->protocol == "ascend" || this->protocol == "ubshmem") {
+            if (egm_config.enabled) {
+                egm_segment_ptrs_.emplace_back(std::move(egm_owner));
+            } else if (this->protocol == "ascend" ||
+                       this->protocol == "ubshmem") {
+#ifdef USE_MEMFABRIC
+                if (use_hugepage_) {
+                    hugepage_segment_ptrs_.emplace_back(
+                        ptr, HugepageSegmentDeleter{mapped_size});
+                } else {
+                    memfabric_segment_ptrs_.emplace_back(
+                        ptr, MemFabricSegmentDeleter{this->protocol});
+                }
+#else
                 if (use_hugepage_ && !globalConfig().ascend_use_fabric_mem) {
                     hugepage_segment_ptrs_.emplace_back(
                         ptr, HugepageSegmentDeleter{mapped_size});
@@ -1232,6 +1447,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     ascend_segment_ptrs_.emplace_back(
                         ptr, AscendSegmentDeleter{this->protocol});
                 }
+#endif
             } else if (this->protocol == "sunrise_link") {
 #if defined(USE_SUNRISE)
                 sunrise_segment_ptrs_.emplace_back(ptr,
@@ -1286,6 +1502,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 setup_segment_pinned_regions_.push_back(
                     std::move(pinned_region));
             }
+            if (egm_config.enabled) {
+                egm_node_sizes[egm_node_index] -= segment_size;
+                if (egm_node_sizes[egm_node_index] == 0) ++egm_node_index;
+            }
         }
         if (total_glbseg_size == 0) {
             LOG(INFO) << "Global segment size is 0, skip mounting segment";
@@ -1315,6 +1535,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
             ->register_handler<&RealClient::release_offload_buffer>(this);
+        offload_rpc_server_->register_handler<&RealClient::verify_disk_replica>(
+            this);
         offload_rpc_server_->async_start();
         auto err = offload_rpc_server_->get_errc();
         if (err) {
@@ -1347,14 +1569,19 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         // The dangling-replica heal in Client::Put needs an existence check
         // against this process's offload files, which only the FileStorage
         // owns. true: backing file is gone, false: present, nullopt: unknown.
+        // Offload storage keys are tenant-scoped (the default tenant
+        // included), so probe with the scoped key: a raw object key never
+        // hits the scoped index and would report every healthy file gone.
         std::weak_ptr<FileStorage> weak_storage = file_storage_;
         client_->SetLocalDiskProbe(
-            [weak_storage](const std::string &key) -> std::optional<bool> {
+            [weak_storage,
+             tenant_id](const std::string &key) -> std::optional<bool> {
                 auto storage = weak_storage.lock();
                 if (!storage) {
                     return std::nullopt;
                 }
-                auto exists = storage->Exists(key);
+                auto exists =
+                    storage->Exists(TenantId(tenant_id).MakeScopedKey(key));
                 if (!exists) {
                     return std::nullopt;
                 }
@@ -1468,8 +1695,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_embedded_master =
         get_config_bool(config, CONFIG_KEY_ENABLE_EMBEDDED_MASTER, false);
     if (!enable_embedded_master) {
-        enable_embedded_master =
-            Environ::GetBool("MOONCAKE_ENABLE_EMBEDDED_MASTER", false);
+        enable_embedded_master = Environ::Process().GetTypedOr(
+            EmbeddedMasterEnvironmentVariables::MOONCAKE_ENABLE_EMBEDDED_MASTER,
+            false);
     }
 
     // Validate required parameters
@@ -1550,11 +1778,25 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
-    return setup_internal(
-        local_hostname, metadata_server, global_segment_size, local_buffer_size,
-        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
-        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
-        enable_client_http_server, client_http_port, enable_embedded_master);
+    auto egm_config = ParseEgmStorePoolConfig(
+        config, protocol, global_segment_size, local_buffer_size);
+    if (!egm_config) return tl::unexpected(egm_config.error());
+    try {
+        auto result = setup_internal(
+            *egm_config, local_hostname, metadata_server, global_segment_size,
+            local_buffer_size, protocol, rdma_devices, master_server_addr,
+            nullptr, ipc_socket_path, 50052, enable_ssd_offload, true,
+            ssd_offload_path, tenant_id, enable_client_http_server,
+            client_http_port, enable_embedded_master);
+        if (!result && egm_config->enabled) {
+            (void)tearDownAll_internal();
+        }
+        return result;
+    } catch (...) {
+        // The Python wrapper still owns this client when setup throws.
+        if (egm_config->enabled) (void)tearDownAll_internal();
+        throw;
+    }
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1582,6 +1824,23 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
                                          std::memory_order_acq_rel)) {
+        // A previous teardown's cleanup failure must not decay into success
+        // on repeat calls: retry the idempotent cleanups and keep reporting
+        // failure until they heal.
+        if (nof_buffer_cleanup_failed_.load(std::memory_order_acquire)) {
+            const ErrorCode rc = CleanupNofRegisteredBuffers();
+            if (rc != ErrorCode::OK) {
+                return tl::unexpected(rc);
+            }
+        }
+        ErrorCode shm_rc;
+        {
+            std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+            shm_rc = RetryQuarantinedShmsLocked();
+        }
+        if (shm_rc != ErrorCode::OK) {
+            return tl::unexpected(shm_rc);
+        }
         return {};
     }
 
@@ -1589,7 +1848,35 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_dummy_client_monitor();
     stop_http_server();
 
+    ErrorCode cleanup_error = ErrorCode::OK;
     if (client_) {
+        if (!egm_segment_ptrs_.empty()) {
+            // Callers must quiesce in-flight requests before close. FileStorage
+            // owns a Client reference and workers that access segments.
+            if (offload_rpc_server_) {
+                offload_rpc_server_->stop();
+                offload_rpc_server_.reset();
+            }
+            file_storage_.reset();
+            for (auto it = egm_segment_ptrs_.rbegin();
+                 it != egm_segment_ptrs_.rend(); ++it) {
+                auto &owner = *it;
+                if (!owner) continue;
+                auto result =
+                    client_->UnmountSegment(owner->base(), owner->length());
+                if (!result) {
+                    // Failed mounts may have no Client record even if
+                    // publication is uncertain. Retain memory unless unmount
+                    // confirms cleanup.
+                    LOG(ERROR)
+                        << "EGM unmount failed: " << toString(result.error())
+                        << "; retaining allocation until process exit";
+                    if (cleanup_error == ErrorCode::OK)
+                        cleanup_error = result.error();
+                    (void)owner.release();
+                }
+            }
+        }
         if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
             protocol != "cxl") {
             auto unregister_result = client_->unregisterLocalMemory(
@@ -1602,12 +1889,41 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
             std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
             local_buffer_region_.reset();
         }
+        // Keep EGM Release separate from UnmountSegment above. Unmount only
+        // removes Master metadata and TE registration; replica copy/move
+        // workers may still hold local source slices. If reset drops the last
+        // Client reference, its destructor stops and joins those workers before
+        // we release backing memory. This is not a GPU completion barrier:
+        // transfers that timed out may still require deferred cleanup.
         client_.reset();
     }
     if (embedded_master_) {
         embedded_master_->Stop();
         embedded_master_.reset();
     }
+    // NoF I/O is drained by now (client_.reset() joined the worker pool).
+    // Release this client's NoF registrations; on failure the caller-owned
+    // buffers may still be DMA-translated and must not be freed or remapped.
+    {
+        const ErrorCode nof_rc = CleanupNofRegisteredBuffers();
+        if (nof_rc != ErrorCode::OK && cleanup_error == ErrorCode::OK) {
+            cleanup_error = nof_rc;
+        }
+    }
+    for (auto it = egm_segment_ptrs_.rbegin(); it != egm_segment_ptrs_.rend();
+         ++it) {
+        auto &owner = *it;
+        if (!owner) continue;
+        auto status = owner->Release();
+        if (!status.ok()) {
+            LOG(ERROR) << "EGM release failed: " << status
+                       << "; retaining allocation until process exit";
+            if (cleanup_error == ErrorCode::OK)
+                cleanup_error = ErrorCode::INTERNAL_ERROR;
+            (void)owner.release();
+        }
+    }
+    egm_segment_ptrs_.clear();
     ReleaseAllMountedSegmentRecords();
     ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
@@ -1617,10 +1933,16 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     if (!setup_segments_safe_to_free || setup_segment_memory_must_leak_) {
         for (auto &ptr : hugepage_segment_ptrs_) ptr.release();
         for (auto &ptr : segment_ptrs_) ptr.release();
+#ifdef USE_MEMFABRIC
+        for (auto &ptr : memfabric_segment_ptrs_) ptr.release();
+#endif
         setup_segment_memory_must_leak_ = false;
     }
     hugepage_segment_ptrs_.clear();
     segment_ptrs_.clear();
+#ifdef USE_MEMFABRIC
+    memfabric_segment_ptrs_.clear();
+#endif
     ub_segment_ptrs_.clear();
 #ifdef USE_VRAM_SEGMENT
     vram_segment_ptrs_.clear();
@@ -1643,16 +1965,16 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
                 continue;
             }
 #ifdef USE_NOF
-            // Unregister the SPDK registration before munmap (see
-            // unmap_shm_internal). munmap is only safe once the SPDK
-            // translation is gone; if unregister fails, retain the mapping
-            // (quarantine) so the VA cannot be reused while SPDK still holds a
-            // translation to it.
+            // Unregister the NoF registration before munmap (see
+            // unmap_shm_internal). munmap is only safe once the translation is
+            // gone; if unregister fails, retain the mapping (quarantine) so the
+            // VA cannot be reused while the translation to it is live.
             if (seg.spdk_registered) {
-                if (SpdkWrapper::GetInstance().UnregisterMemory(
-                        seg.shm_buffer, seg.shm_size) != 0) {
-                    LOG(ERROR) << "Failed to unregister received shm from SPDK "
-                                  "during teardown: "
+                if (!nof_runtime_.initiator ||
+                    nof_runtime_.initiator->UnregisterMemory(seg.shm_buffer) !=
+                        ErrorCode::OK) {
+                    LOG(ERROR) << "Failed to unregister received shm from the "
+                                  "NoF initiator during teardown: "
                                << seg.shm_buffer
                                << "; quarantining mapping (never munmap)";
                     quarantine_shms_.push_back(std::move(seg));
@@ -1675,14 +1997,46 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         shm_it = shm_contexts_.erase(shm_it);
     }
     // Re-attempt quarantined segments (unregister failed during this teardown
-    // or an earlier one). Any that still fail are retained until process exit,
-    // which is safe: they are never munmapped, so SPDK's translations never
-    // point at freed/reused virtual addresses.
-    RetryQuarantinedShmsLocked();
+    // or an earlier one). Failures stay pinned (never munmapped) until process
+    // exit, and are reported so teardown does not claim success while
+    // translations stay live.
+    if (RetryQuarantinedShmsLocked() != ErrorCode::OK &&
+        cleanup_error == ErrorCode::OK) {
+        cleanup_error = ErrorCode::INTERNAL_ERROR;
+    }
+    if (cleanup_error != ErrorCode::OK) return tl::unexpected(cleanup_error);
     return {};
 }
 
-void RealClient::RetryQuarantinedShmsLocked() {
+ErrorCode RealClient::CleanupNofRegisteredBuffers() {
+    if (!nof_runtime_.initiator) {
+        nof_buffer_cleanup_failed_.store(false, std::memory_order_release);
+        return ErrorCode::OK;
+    }
+    bool failed = false;
+    std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+    for (auto it = registered_buffer_sizes_.begin();
+         it != registered_buffer_sizes_.end();) {
+        const ErrorCode rc =
+            nof_runtime_.initiator->UnregisterMemory(it->first);
+        if (rc != ErrorCode::OK) {
+            // Keep the record: the DMA translation state is unconfirmed,
+            // so the buffer must stay mapped.
+            LOG(ERROR) << "NoF registration for buffer " << it->first
+                       << " could not be released; its NoF pages stay "
+                          "quarantined — do NOT free or remap this buffer "
+                          "before process exit";
+            failed = true;
+            ++it;
+        } else {
+            it = registered_buffer_sizes_.erase(it);
+        }
+    }
+    nof_buffer_cleanup_failed_.store(failed, std::memory_order_release);
+    return failed ? ErrorCode::INTERNAL_ERROR : ErrorCode::OK;
+}
+
+ErrorCode RealClient::RetryQuarantinedShmsLocked() {
     auto it = quarantine_shms_.begin();
     while (it != quarantine_shms_.end()) {
         // The transfer engine may still hold this region (unregisterLocalMemory
@@ -1704,11 +2058,12 @@ void RealClient::RetryQuarantinedShmsLocked() {
             it->te_unregister_pending = false;
         }
 #ifdef USE_NOF
-        // A quarantined segment may still have a live SPDK registration: only
+        // A quarantined segment may still have a live NoF registration: only
         // munmap once the translation is actually released.
         if (it->spdk_registered) {
-            if (SpdkWrapper::GetInstance().UnregisterMemory(
-                    it->shm_buffer, it->shm_size) != 0) {
+            if (!nof_runtime_.initiator ||
+                nof_runtime_.initiator->UnregisterMemory(it->shm_buffer) !=
+                    ErrorCode::OK) {
                 ++it;
                 continue;
             }
@@ -1725,6 +2080,7 @@ void RealClient::RetryQuarantinedShmsLocked() {
                   << ", size: " << it->shm_size;
         it = quarantine_shms_.erase(it);
     }
+    return quarantine_shms_.empty() ? ErrorCode::OK : ErrorCode::INTERNAL_ERROR;
 }
 
 int RealClient::tearDownAll() { return to_py_ret(tearDownAll_internal()); }
@@ -2658,9 +3014,9 @@ int RealClient::probeKey(const std::string &key) {
     }
 }
 
-std::vector<int> RealClient::batchProbeKey(
-    const std::vector<std::string> &keys) {
-    auto internal_results = batchProbeKey_internal(keys);
+std::vector<int> RealClient::batchProbeKey(const std::vector<std::string> &keys,
+                                           const GrantLeasePolicy &policy) {
+    auto internal_results = batchProbeKey_internal(keys, policy);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -2830,70 +3186,47 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     }
 
     // Ensure push_back below cannot reallocate and throw bad_alloc after the
-    // SPDK registration succeeded (which would leak the registration and the
+    // NoF registration succeeded (which would leak the registration and the
     // mapping). If reserve itself throws it happens before registration.
     context.mapped_shms.reserve(context.mapped_shms.size() + 1);
 
 #ifdef USE_NOF
-    // Register this mapping with SPDK for NoF zero-copy. Non-fatal on failure:
-    // the buffer stays usable for all non-NoF paths. Placed after the
-    // error-returning paths above so no failure path leaves a dangling SPDK
+    // Register this mapping with the NoF initiator for zero-copy. Non-fatal on
+    // failure: the buffer stays usable for all non-NoF paths. Placed after the
+    // error-returning paths above so no failure path leaves a dangling NoF
     // registration (the unregister below is symmetric on every teardown path).
-    if (register_spdk) {
-        if (!SpdkWrapper::IsRegistrableRange(shm.shm_buffer, shm.shm_size)) {
+    if (register_spdk && nof_runtime_.initiator) {
+        if (!NofRangeIsRegistrable(shm.shm_buffer, shm.shm_size)) {
             // Reached by the fallback mmap above when it cannot place the
-            // mapping at a 2MB-aligned base (e.g. a non-hugetlb fd). SPDK
-            // rejects such a range before marking anything (memory.c:344), so
-            // skipping the attempt keeps the teardown below able to munmap.
+            // mapping at a 2MB-aligned base (e.g. a non-hugetlb fd). A range
+            // rejected here is never touched by RegisterMemory, so the teardown
+            // below stays able to munmap without a pairing unregister.
             LOG(WARNING) << "Received shm is not 2MB-aligned; not registering "
-                            "with SPDK: "
-                         << shm.shm_buffer << ", size=" << shm.shm_size
-                         << "; NoF zero-copy transfers to this buffer will be "
-                            "unavailable";
+                            "for NoF zero-copy transfers: "
+                         << shm.shm_buffer << ", size=" << shm.shm_size;
         } else {
-            const int register_rc = SpdkWrapper::GetInstance().RegisterMemory(
-                shm.shm_buffer, shm.shm_size);
-            if (register_rc == 0) {
+            // Only NOF_REGISTRATION_STUCK (cleanup unconfirmed) must be
+            // treated as registered; a plain failure owns no registration.
+            const ErrorCode register_rc =
+                nof_runtime_.initiator->RegisterMemory(shm.shm_buffer,
+                                                       shm.shm_size);
+            if (register_rc == ErrorCode::OK) {
                 shm.spdk_registered = true;
-            } else if (register_rc == -EBUSY) {
-                // Already registered, so SPDK marked nothing new for us. Do NOT
-                // roll back: the unregister below would clear the existing
-                // registration (memory.c:358-366 detects it, 445-466 clears
-                // it). Retain the mapping and let teardown retry.
-                LOG(ERROR) << "Received shm is already registered with SPDK: "
+            } else if (register_rc == ErrorCode::NOF_REGISTRATION_STUCK) {
+                // Treat as registered so teardown retries the unregister and
+                // quarantines the mapping instead of munmapping.
+                LOG(ERROR) << "NoF registration of received shm left "
+                              "unconfirmed translation state: "
                            << shm.shm_buffer << ", size=" << shm.shm_size
-                           << "; retaining mapping";
+                           << "; treating as registered so teardown retries "
+                              "the unregister and quarantines the mapping";
                 shm.spdk_registered = true;
             } else {
-                LOG(WARNING) << "Failed to register received shm with SPDK: "
+                LOG(WARNING) << "Failed to register received shm with the NoF "
+                                "initiator: "
                              << shm.shm_buffer << ", size=" << shm.shm_size
                              << "; NoF zero-copy transfers to this buffer will "
                                 "be unavailable";
-                // spdk_mem_register() marks the range in g_mem_reg_map before
-                // running its notify callbacks and does NOT roll back on
-                // failure (SPDK v23.01.1, memory.c:370-384), and in iova=va it
-                // can already have installed the IOMMU mapping when a later
-                // step fails (memory.c:1092-1107). This unregister is the only
-                // chance to undo that, and only a 0 return proves it worked:
-                // -EINVAL is also returned for a half-marked range
-                // (memory.c:426) and, in iova=va, for an incomplete translation
-                // before the IOMMU is unmapped (memory.c:1216-1224); it covers
-                // a failure before anything was mapped as well, and the two
-                // cannot be told apart, so retaining a clean mapping is the
-                // accepted cost. Mirrors ShmHelper::allocate.
-                const int rollback_rc =
-                    SpdkWrapper::GetInstance().UnregisterMemory(shm.shm_buffer,
-                                                                shm.shm_size);
-                if (rollback_rc != 0) {
-                    LOG(ERROR)
-                        << "Failed to roll back incomplete SPDK registration: "
-                        << shm.shm_buffer << ", size: " << shm.shm_size
-                        << ", rc: " << rollback_rc
-                        << "; treating the range as registered so teardown "
-                           "retries the unregister and quarantines the mapping "
-                           "instead of munmapping";
-                    shm.spdk_registered = true;
-                }
             }
         }
     }
@@ -2919,8 +3252,8 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     context.client_buffer_allocator.reset();
 
     // Retry previously quarantined segments (unregister failed earlier) before
-    // tearing down this context.
-    RetryQuarantinedShmsLocked();
+    // tearing down this context. Failures stay quarantined for teardown.
+    (void)RetryQuarantinedShmsLocked();
 
     bool failed = false;
     // Keep the quarantine push_back below from reallocating (and throwing
@@ -2940,13 +3273,14 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
         const bool te_ok = static_cast<bool>(
             client_->unregisterLocalMemory(shm.shm_buffer, true));
 #ifdef USE_NOF
-        // Unregister the SPDK registration BEFORE munmap, mirroring
-        // ShmHelper::free()/cleanup(). munmap is only safe once the SPDK
+        // Unregister the NoF registration BEFORE munmap, mirroring
+        // ShmHelper::free()/cleanup(). munmap is only safe once the DMA
         // translation is gone.
         bool spdk_ok = true;
         if (shm.spdk_registered) {
-            spdk_ok = SpdkWrapper::GetInstance().UnregisterMemory(
-                          shm.shm_buffer, shm.shm_size) == 0;
+            spdk_ok = !nof_runtime_.initiator ||
+                      nof_runtime_.initiator->UnregisterMemory(
+                          shm.shm_buffer) == ErrorCode::OK;
         }
 #else
         const bool spdk_ok = true;
@@ -2956,22 +3290,24 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
             shm.spdk_registered = false;
 #endif
             // Both unregisters succeeded, so the VA is no longer referenced by
-            // TE or SPDK and can be released. Siblings that fail are handled by
-            // their own iterations, so a single failure does not leak the rest.
+            // TE or the NoF translation table and can be released. Siblings
+            // that fail are handled by their own iterations, so a single
+            // failure does not leak the rest.
             munmap(shm.shm_buffer, shm.shm_size);
             shm.shm_buffer = nullptr;
             continue;
         }
         // Unregister failed: retain the mapping (never munmap) so neither TE
-        // nor SPDK keeps a registration to a freed/reused VA, and quarantine it
-        // for a retry on a later teardown entry point.
+        // nor the NoF translation table keeps a registration to a freed/reused
+        // VA, and quarantine it for a retry on a later teardown entry point.
         if (!te_ok) {
             LOG(ERROR) << "Failed to unregister memory: " << shm.shm_name
                        << "; quarantining mapping (never munmap)";
         }
 #ifdef USE_NOF
         if (!spdk_ok) {
-            LOG(ERROR) << "Failed to unregister received shm from SPDK: "
+            LOG(ERROR) << "Failed to unregister received shm from the NoF "
+                          "initiator: "
                        << shm.shm_buffer
                        << "; quarantining mapping (never munmap)";
         }
@@ -2979,12 +3315,10 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
         shm.te_unregister_pending = !te_ok;
 #ifdef USE_NOF
         // Record only the side that is still registered. Clear spdk_registered
-        // when the SPDK unregister above succeeded even though the mapping
-        // stays quarantined: a later RetryQuarantinedShmsLocked() would
-        // otherwise call spdk_mem_unregister() a second time, get the benign
-        // -EINVAL no-op for an already released range (SPDK memory.c: no
-        // segment is marked REGISTERED), treat it as a failure, and keep the
-        // mapping quarantined (never munmapped) forever.
+        // when the NoF unregister above succeeded even though the mapping stays
+        // quarantined, so a later RetryQuarantinedShmsLocked() does not redo
+        // the unregister (idempotent under the interface contract, but pure
+        // noise).
         shm.spdk_registered = !spdk_ok;
 #endif
         quarantine_shms_.push_back(std::move(shm));
@@ -3209,8 +3543,8 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     context.client_buffer_allocator.reset();
 
     // Retry previously quarantined segments (unregister failed earlier) before
-    // tearing down this context.
-    RetryQuarantinedShmsLocked();
+    // tearing down this context. Failures stay quarantined for teardown.
+    (void)RetryQuarantinedShmsLocked();
 
     // Move regions out before cleanup so failure paths cannot erase the map
     // entry while iterating (undefined behavior) or double-erase at the end.
@@ -3253,33 +3587,35 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
                                    << "; quarantining mapping (never munmap)";
                     }
                 }
-            // Unregister the SPDK registration before munmap (see
-            // unmap_shm_internal). munmap is only safe once the SPDK
+            // Unregister the NoF registration before munmap (see
+            // unmap_shm_internal). munmap is only safe once the DMA
             // translation is gone.
             bool spdk_ok = true;
 #ifdef USE_NOF
             if (shm.spdk_registered) {
-                spdk_ok = SpdkWrapper::GetInstance().UnregisterMemory(
-                              shm.shm_buffer, shm.shm_size) == 0;
+                spdk_ok = !nof_runtime_.initiator ||
+                          nof_runtime_.initiator->UnregisterMemory(
+                              shm.shm_buffer) == ErrorCode::OK;
             }
 #endif
             if (!te_ok || !spdk_ok) {
                 // Unregister failed: retain the mapping (never munmap) so
-                // neither TE nor SPDK keeps a registration to a freed/reused
-                // VA, and quarantine it for a retry on a later teardown entry
-                // point.
+                // neither TE nor the NoF translation table keeps a registration
+                // to a freed/reused VA, and quarantine it for a retry on a
+                // later teardown entry point.
                 if (!spdk_ok) {
-                    LOG(ERROR) << "Failed to unregister received shm from SPDK "
-                                  "during unmap: "
+                    LOG(ERROR) << "Failed to unregister received shm from the "
+                                  "NoF initiator during unmap: "
                                << shm.shm_buffer
                                << "; quarantining mapping (never munmap)";
                 }
                 shm.te_unregister_pending = !te_ok;
 #ifdef USE_NOF
-                // Clear spdk_registered when the SPDK unregister above
+                // Clear spdk_registered when the NoF unregister above
                 // succeeded: see unmap_shm_internal (a stale flag makes the
-                // retry re-unregister an already released range, get -EINVAL,
-                // and keep the mapping quarantined forever).
+                // retry redo an already released unregister, which the
+                // interface defines as a benign no-op, but keeps the
+                // bookkeeping honest).
                 shm.spdk_registered = !spdk_ok;
 #endif
                 quarantine_shms_.push_back(std::move(shm));
@@ -3338,8 +3674,8 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     bool unregister_failed = false;
 
     // Retry previously quarantined segments (unregister failed earlier) before
-    // handling this buffer.
-    RetryQuarantinedShmsLocked();
+    // handling this buffer. Failures stay quarantined for teardown.
+    (void)RetryQuarantinedShmsLocked();
 
     // Find the shm corresponding to this dummy address
     auto shm_it = context.mapped_shms.end();
@@ -3395,33 +3731,35 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
                            << shm_it->shm_name
                            << "; quarantining mapping (never munmap)";
             }
-            // Unregister the SPDK registration before munmap (see
-            // unmap_shm_internal). munmap is only safe once the SPDK
+            // Unregister the NoF registration before munmap (see
+            // unmap_shm_internal). munmap is only safe once the DMA
             // translation is gone.
             bool spdk_ok = true;
 #ifdef USE_NOF
             if (shm_it->spdk_registered) {
-                spdk_ok = SpdkWrapper::GetInstance().UnregisterMemory(
-                              shm_it->shm_buffer, shm_it->shm_size) == 0;
+                spdk_ok = !nof_runtime_.initiator ||
+                          nof_runtime_.initiator->UnregisterMemory(
+                              shm_it->shm_buffer) == ErrorCode::OK;
             }
 #endif
             if (!te_ok || !spdk_ok) {
                 // Unregister failed: retain the mapping (never munmap) so
-                // neither TE nor SPDK keeps a registration to a freed/reused
-                // VA, and quarantine it for a retry on a later teardown entry
-                // point.
+                // neither TE nor the NoF translation table keeps a registration
+                // to a freed/reused VA, and quarantine it for a retry on a
+                // later teardown entry point.
                 if (!spdk_ok) {
-                    LOG(ERROR) << "Failed to unregister received shm from SPDK "
-                                  "during unregister: "
+                    LOG(ERROR) << "Failed to unregister received shm from the "
+                                  "NoF initiator during unregister: "
                                << shm_it->shm_buffer
                                << "; quarantining mapping (never munmap)";
                 }
                 shm_it->te_unregister_pending = !te_ok;
 #ifdef USE_NOF
-                // Clear spdk_registered when the SPDK unregister above
+                // Clear spdk_registered when the NoF unregister above
                 // succeeded: see unmap_shm_internal (a stale flag makes the
-                // retry re-unregister an already released range, get -EINVAL,
-                // and keep the mapping quarantined forever).
+                // retry redo an already released unregister, which the
+                // interface defines as a benign no-op, but keeps the
+                // bookkeeping honest).
                 shm_it->spdk_registered = !spdk_ok;
 #endif
                 quarantine_shms_.push_back(std::move(*shm_it));
@@ -3456,10 +3794,55 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     return {};
 }
 
+RealClient::DiskReadHealResult RealClient::heal_disk_replica_for_read(
+    const std::string &key, const Replica::Descriptor &local_disk_replica,
+    const std::optional<std::string> &resolved_tenant_id) {
+    // The failed replica lives on a possibly remote owner: ask the owner over
+    // the offload RPC to verify the backing file and, when it is proven gone,
+    // evict its own replica (the master scopes LOCAL_DISK eviction to the
+    // owning client, so the reader cannot evict it directly). Unlike the
+    // Put-path guard, no "all replicas are this client's local disk"
+    // restriction: a remote reader heals the owner's dangling replica, and a
+    // key with a healthy DFS/DISK fallback still gets evicted so the fallback
+    // can serve.
+    if (!client_) {
+        return DiskReadHealResult::kUnknown;
+    }
+    const auto &endpoint =
+        local_disk_replica.get_local_disk_descriptor().transport_endpoint;
+    // Ship this reader's tenant plus the tenant scope the master resolved for
+    // the query that produced this replica. The resolved scope is the one the
+    // write path used, so an owner that understands the field probes and
+    // evicts under it exactly; older owners fall back to the reader's tenant.
+    VerifyDiskReplicaRequest request{std::string(client_->tenant_id()), {key}};
+    if (resolved_tenant_id && !resolved_tenant_id->empty()) {
+        request.resolved_tenant_id = *resolved_tenant_id;
+    }
+    // Ship the id of the replica this read failed on: the owner forwards it
+    // as the eviction precondition, so a replica replaced between our query
+    // and the verify survives and the re-query discovers it.
+    request.replica_ids = std::vector<uint64_t>{local_disk_replica.id};
+    auto verify = client_requester_->verify_disk_replica(endpoint, request);
+    if (!verify) {
+        return DiskReadHealResult::kUnknown;
+    }
+    // Tri-state per key: 1 = backing file present (transient failure, the
+    // caller retries the same replica), 0 = proven gone and evicted by the
+    // owner, anything else or a missing slot = the owner could not determine.
+    if (verify->states.empty() || verify->states[0] > 1) {
+        return DiskReadHealResult::kUnknown;
+    }
+    if (verify->states[0] == 1) {
+        return DiskReadHealResult::kPresent;
+    }
+    return DiskReadHealResult::kEvicted;
+}
+
 // Implementation of get_buffer_internal method
 std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const std::string &key,
-    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator,
+    bool heal_dangling_disk_replica) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return nullptr;
@@ -3528,6 +3911,19 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         if (!read_result) {
             LOG(ERROR) << "SSD read failed for key '" << key
                        << "': " << toString(read_result.error());
+            // Same heal as the batch path: the owner proves the backing file
+            // gone (evict + re-query) or present (retry the same replica
+            // once). kUnknown surfaces the plain miss.
+            if (heal_dangling_disk_replica) {
+                const auto heal = heal_disk_replica_for_read(
+                    key, *best_replica,
+                    query_result.value().resolved_tenant_id);
+                if (heal != DiskReadHealResult::kUnknown) {
+                    return get_buffer_internal(key, client_buffer_allocator,
+                                               /*heal_dangling_disk_replica=*/
+                                               false);
+                }
+            }
             return nullptr;
         }
         auto checksum_result =
@@ -3808,7 +4204,8 @@ RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
 std::vector<std::shared_ptr<BufferHandle>>
 RealClient::batch_get_buffer_internal(
     const std::vector<std::string> &keys,
-    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator,
+    bool heal_dangling_disk_replica) {
     std::vector<std::shared_ptr<BufferHandle>> final_results(keys.size(),
                                                              nullptr);
 
@@ -4066,6 +4463,65 @@ RealClient::batch_get_buffer_internal(
                                << "': " << toString(read_result.error());
                     op_status[idx_it->second] =
                         tl::make_unexpected(read_result.error());
+                    // A dead LOCAL_DISK replica must not stay failed forever:
+                    // the owner is asked over the offload RPC whether the
+                    // backing file is gone, a proven-gone answer evicts the
+                    // dangling replica, and the key is retried once so a
+                    // surviving replica can serve the read; when nothing
+                    // survives, the retry surfaces a real miss. The failed
+                    // replica is matched by the endpoint this batch read
+                    // from, so a sibling replica on another owner is never
+                    // blamed. A batch read also dies wholesale, so a key whose
+                    // file provably exists is retried as-is: its failure came
+                    // from a sibling's wiped bucket file, not from its own
+                    // data. The retry runs with healing off so a replica whose
+                    // file exists but keeps failing (e.g. a truncated bucket)
+                    // surfaces its error instead of recursing until the stack
+                    // or the allocator gives out. On success the bytes land in
+                    // this op's own buffer and op_status flips to success, so
+                    // the duplicate fan-out and handle assembly below treat
+                    // the healed key like any other successful read.
+                    if (client_ && heal_dangling_disk_replica) {
+                        const Replica::Descriptor *failed_replica = nullptr;
+                        for (const auto &r : op.query_result.replicas) {
+                            if (r.is_local_disk_replica() &&
+                                r.get_local_disk_descriptor()
+                                        .transport_endpoint == endpoint) {
+                                failed_replica = &r;
+                                break;
+                            }
+                        }
+                        if (failed_replica == nullptr) {
+                            for (const auto &r : op.query_result.replicas) {
+                                if (r.is_local_disk_replica()) {
+                                    failed_replica = &r;
+                                    break;
+                                }
+                            }
+                        }
+                        const auto heal =
+                            failed_replica
+                                ? heal_disk_replica_for_read(
+                                      key, *failed_replica,
+                                      op.query_result.resolved_tenant_id)
+                                : DiskReadHealResult::kUnknown;
+                        if (heal == DiskReadHealResult::kEvicted ||
+                            heal == DiskReadHealResult::kPresent) {
+                            auto healed = batch_get_buffer_internal(
+                                {key}, client_buffer_allocator,
+                                /*heal_dangling_disk_replica=*/false);
+                            if (!healed.empty() && healed[0] &&
+                                healed[0]->size() == op.total_size) {
+                                if (CopyMaybeDevice(
+                                        op.buffer_handle->ptr(),
+                                        healed[0]->ptr(), op.total_size,
+                                        "healed SSD read retry, key: " + key)) {
+                                    op_status[idx_it->second] =
+                                        static_cast<int64_t>(op.total_size);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -4149,9 +4605,35 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     if (!result) {
         return result;
     }
+    // #3131: SPDK's RDMA transport keeps its own translation table, which TE
+    // registration does not cover. Register the same (possibly widened) range
+    // as TE; failure is non-fatal (same policy as the shm paths).
+    if (nof_runtime_.initiator) {
+        auto rc =
+            nof_runtime_.initiator->RegisterMemory(buffer, registration_size);
+        if (rc == ErrorCode::NOF_REGISTRATION_STUCK) {
+            // The failed page is terminally quarantined (never unregistered,
+            // never munmapped): the buffer must not be freed or remapped.
+            LOG(ERROR) << "NoF memory registration left unconfirmed "
+                          "translation state for buffer "
+                       << buffer << ", size " << registration_size
+                       << "; the affected NoF page is quarantined. Do not "
+                          "free or remap this buffer.";
+        } else if (rc != ErrorCode::OK) {
+            LOG(WARNING) << "NoF memory registration failed for buffer "
+                         << buffer << ", size " << registration_size << ": "
+                         << toString(rc)
+                         << "; buffer stays registered with the transfer "
+                            "engine, but NoF I/O to it will fail. Use "
+                            "hugepage-backed memory for NoF, or set "
+                            "MC_NOF_BACKEND=none if NoF is not intended.";
+        }
+    }
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        registered_buffer_sizes_[buffer] = size;
+        // The record keeps the logical size: writable-region resolution must
+        // not expose the physical segment beyond what the caller registered.
+        registered_buffer_sizes_[buffer] = {size};
     }
     return result;
 }
@@ -4166,15 +4648,47 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto unregister_result = client_->unregisterLocalMemory(buffer, true);
+    auto unregister_result = [&]() -> tl::expected<void, ErrorCode> {
+        auto &hook = TeUnregisterHookForTestingSlot();
+        if (hook) {
+            return hook(buffer);
+        }
+        return client_->unregisterLocalMemory(buffer, true);
+    }();
+
+    // Record check, NoF cleanup and record erase stay in one critical
+    // section (teardown's unregister walk takes the same lock).
+    std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+    auto rec_it = registered_buffer_sizes_.find(buffer);
     if (!unregister_result) {
-        LOG(ERROR) << "Unregister buffer failed with error: "
-                   << toString(unregister_result.error());
-        return tl::unexpected(unregister_result.error());
+        // Fall through to the NoF cleanup only when TE reports the buffer as
+        // not registered and the record is still present. NOT_REGISTERED is
+        // truthful: RdmaTransport retries any stuck MR deregistration before
+        // reporting it. Any other TE failure may leave the TE registration
+        // alive: keep the record and propagate.
+        if (unregister_result.error() != ErrorCode::NOT_REGISTERED ||
+            rec_it == registered_buffer_sizes_.end()) {
+            LOG(ERROR) << "Unregister buffer failed with error: "
+                       << toString(unregister_result.error());
+            return tl::unexpected(unregister_result.error());
+        }
+        LOG(WARNING) << "TE reports buffer " << buffer
+                     << " as already unregistered; retrying the NoF cleanup";
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        registered_buffer_sizes_.erase(buffer);
+    if (nof_runtime_.initiator) {
+        auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
+        if (rc != ErrorCode::OK) {
+            // The backend may still hold a translation for this buffer:
+            // propagate and keep the record so the NoF pages stay pinned.
+            LOG(ERROR) << "NoF memory unregistration failed for buffer "
+                       << buffer << ": " << toString(rc)
+                       << "; buffer stays recorded and the NoF pages stay "
+                          "quarantined. Do not free or remap this buffer.";
+            return tl::unexpected(rc);
+        }
+    }
+    if (rec_it != registered_buffer_sizes_.end()) {
+        registered_buffer_sizes_.erase(rec_it);
     }
     return {};
 }
@@ -4187,17 +4701,16 @@ std::optional<RealClient::WritableBufferRegion>
 RealClient::resolve_writable_buffer_region(void *buffer) const {
     std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     const auto target = reinterpret_cast<uintptr_t>(buffer);
-    for (const auto &[registered_buffer, registered_size] :
-         registered_buffer_sizes_) {
+    for (const auto &[registered_buffer, record] : registered_buffer_sizes_) {
         const auto base = reinterpret_cast<uintptr_t>(registered_buffer);
         if (target < base) {
             continue;
         }
         const auto offset = target - base;
-        if (offset < registered_size) {
+        if (offset < record.size) {
             return WritableBufferRegion{
                 .base = registered_buffer,
-                .size = registered_size,
+                .size = record.size,
                 .offset = static_cast<size_t>(offset),
             };
         }
@@ -4221,6 +4734,24 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
         }
     }
     return std::nullopt;
+}
+
+bool RealClient::can_use_direct_memory_read(const Replica::Descriptor &replica,
+                                            void *buffer, size_t size) const {
+    if (!replica.is_memory_replica()) return false;
+    // The selected replica's descriptor controls Transfer Engine routing.
+    // NVLink accepts ordinary CUDA allocations as local endpoints, while RDMA
+    // requires the destination range to have a local memory registration.
+    const std::string &replica_protocol =
+        replica.get_memory_descriptor().buffer_descriptor.protocol_;
+    if (replica_protocol == "nvlink") {
+        return true;
+    }
+    if (replica_protocol != "rdma") {
+        return false;
+    }
+    auto region = resolve_writable_buffer_region(buffer);
+    return region.has_value() && size <= region->size - region->offset;
 }
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
@@ -4337,7 +4868,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             device::GetAcceleratorRegistry().RuntimeAccelerators();
         void *dst = static_cast<char *>(buffer) + dst_offset;
         if (runtime_accelerator.FindDeviceForPointer(dst) &&
-            (!client_->CanUseLocalMemcpy(replica) ||
+            ((!client_->CanUseLocalMemcpy(replica) &&
+              !can_use_direct_memory_read(replica, dst, total_size)) ||
              client_->IsHotCacheEnabled())) {
             if (!client_buffer_allocator_) {
                 LOG(ERROR) << "Client buffer allocator is not provided";
@@ -4479,7 +5011,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     void *dst = static_cast<char *>(buffer) + dst_offset;
     auto filtered_qr = FilterQueryResult(query_result, replica, false);
     if (runtime_accelerator.FindDeviceForPointer(dst) &&
-        !client_->CanUseLocalMemcpy(replica)) {
+        !client_->CanUseLocalMemcpy(replica) &&
+        !can_use_direct_memory_read(replica, dst, size)) {
         if (!client_buffer_allocator_) {
             LOG(ERROR) << "Client buffer allocator is not provided";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -6361,7 +6894,7 @@ tl::expected<bool, ErrorCode> RealClient::probeKey_internal(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> RealClient::batchProbeKey_internal(
-    const std::vector<std::string> &keys) {
+    const std::vector<std::string> &keys, const GrantLeasePolicy &policy) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<bool, ErrorCode>>(
@@ -6374,7 +6907,7 @@ std::vector<tl::expected<bool, ErrorCode>> RealClient::batchProbeKey_internal(
     }
 
     // Call client BatchProbeKey and return the vector<expected> directly
-    return client_->BatchProbeKey(keys);
+    return client_->BatchProbeKey(keys, policy);
 }
 
 int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
@@ -7126,6 +7659,9 @@ std::vector<int> RealClient::batch_put_session_start(
         return std::vector<int>(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
+    if (!config.ValidSessionIds(keys.size())) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
     if (config.group_ids.has_value() &&
         config.group_ids->size() != keys.size()) {
         LOG(ERROR) << "batch_put_session_start: group_ids.size()="
@@ -7175,6 +7711,15 @@ std::vector<int> RealClient::batch_put_session_start(
             filtered_group_ids.push_back(start_config.group_ids->at(idx));
         }
         start_config.group_ids = std::move(filtered_group_ids);
+    }
+
+    if (start_config.session_ids) {
+        std::vector<std::string> ids;
+        ids.reserve(start_indices.size());
+        for (size_t idx : start_indices) {
+            ids.push_back(start_config.session_ids->at(idx));
+        }
+        start_config.session_ids = std::move(ids);
     }
 
     auto start_responses =
@@ -8354,6 +8899,146 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
     return file_storage_->ReleaseBuffer(batch_id);
 }
 
+async_simple::coro::Lazy<tl::expected<VerifyDiskReplicaResponse, ErrorCode>>
+RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
+    if (!file_storage_) {
+        LOG(ERROR) << "verify_disk_replica called but file_storage_ is null";
+        co_return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    // The write path scopes offload files by the object's recorded tenant,
+    // which is the tenant the master resolved for it. When the request carries
+    // that resolved tenant, it IS the write scope: probe it alone, and a miss
+    // there proves the backing file gone no matter what other scopes hold.
+    // Older readers only ship their own configured tenant, which matches the
+    // write scope when tenant isolation is on. With isolation off the master
+    // resolves every request to "default", and the write scope is always
+    // "default" regardless of the reader's configured tenant: a scoped probe
+    // would report a healthy default-scoped file missing, and the master would
+    // then normalize the follow-up eviction to "default" and delete that
+    // healthy replica. So without a resolved tenant we probe the default scope
+    // on a scoped miss and refuse to evict on the ambiguity.
+    struct CallState {
+        std::string tenant_id;  // scope probed and evicted under
+        bool exact_scope;       // resolved tenant known: skip the default probe
+        std::vector<std::string> raw_keys;
+        std::vector<std::string> scoped_keys;
+        std::vector<std::string> default_scoped_keys;
+        // Parallel to raw_keys; empty when the reader predates the field.
+        std::vector<uint64_t> replica_ids;
+        std::shared_ptr<FileStorage> file_storage;
+        std::shared_ptr<Client> client;
+    };
+    auto state = std::make_unique<CallState>();
+    if (request.resolved_tenant_id && !request.resolved_tenant_id->empty()) {
+        state->tenant_id = *request.resolved_tenant_id;
+        state->exact_scope = true;
+    } else {
+        state->tenant_id = request.tenant_id;
+        state->exact_scope = false;
+    }
+    const TenantId scoped_tenant(state->tenant_id);
+    state->raw_keys = request.keys;
+    state->scoped_keys.reserve(request.keys.size());
+    state->default_scoped_keys.reserve(request.keys.size());
+    for (const auto &key : request.keys) {
+        state->scoped_keys.emplace_back(scoped_tenant.MakeScopedKey(key));
+        state->default_scoped_keys.emplace_back(
+            TenantId::Default().MakeScopedKey(key));
+    }
+    state->file_storage = file_storage_;
+    state->client = client_;
+    if (request.replica_ids) {
+        state->replica_ids = *request.replica_ids;
+    }
+    auto *s = state.get();
+    auto try_result = co_await coro_io::post([s]() {
+        // 1 = present, 0 = the replica the reader failed on is no longer in
+        // the master's metadata (evicted here, or superseded by a
+        // replacement), 2 = the storage layer could not answer, the reader
+        // shipped no replica id to enforce, or the eviction did not go
+        // through.
+        std::vector<uint8_t> states;
+        states.reserve(s->raw_keys.size());
+        for (size_t i = 0; i < s->raw_keys.size(); ++i) {
+            auto exists = s->file_storage->Exists(s->scoped_keys[i]);
+            if (!exists) {
+                states.push_back(2);
+                continue;
+            }
+            if (*exists) {
+                states.push_back(1);
+                continue;
+            }
+            // A scoped miss is not proof of absence unless the probed scope
+            // is known to be the write scope (exact_scope). Otherwise, when
+            // the probe tenant is not "default", the file may sit under the
+            // default scope instead: with tenant isolation off every write
+            // lands there no matter what tenant the reader configured, and
+            // under isolation a different tenant's object can share the raw
+            // key. Either way the object the reader meant is indistinguishable
+            // from the one we would find, so report undetermined rather than
+            // evict a possibly healthy replica.
+            if (!s->exact_scope &&
+                s->tenant_id != TenantId::Default().value()) {
+                auto default_exists =
+                    s->file_storage->Exists(s->default_scoped_keys[i]);
+                if (!default_exists || *default_exists) {
+                    states.push_back(2);
+                    continue;
+                }
+            }
+            // The backing file is gone for good. The master scopes LOCAL_DISK
+            // eviction to the owning client, so the eviction has to happen on
+            // this side of the RPC, and it goes out under the probed tenant
+            // scope to hit the same master record the reader saw. The reader's
+            // replica id rides along as the precondition: the master evicts
+            // only if its current record is still that replica, so a
+            // replacement registered between the reader's query and this
+            // verify is left untouched (the reader re-queries and finds it).
+            // A reader that predates the id field gives us nothing to enforce,
+            // and a master that predates the conditional RPC answers with an
+            // unknown-handler error: both report undetermined rather than
+            // evict unconditionally. OBJECT_NOT_FOUND is the goal state too:
+            // the metadata is already gone.
+            if (s->replica_ids.size() <= i) {
+                states.push_back(2);
+                continue;
+            }
+            auto evicted = s->client->EvictDiskReplicaIfCurrent(
+                s->raw_keys[i], s->tenant_id, ReplicaType::LOCAL_DISK,
+                s->replica_ids[i]);
+            if (!evicted) {
+                if (evicted.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                    states.push_back(0);
+                    continue;
+                }
+                LOG(WARNING)
+                    << "Owner-side conditional eviction of dangling "
+                       "LOCAL_DISK replica failed for key="
+                    << s->raw_keys[i] << ": " << toString(evicted.error());
+                states.push_back(2);
+                continue;
+            }
+            if (*evicted) {
+                LOG(WARNING) << "Owner evicted its dangling LOCAL_DISK replica "
+                                "for key="
+                             << s->raw_keys[i]
+                             << " after a reader's verify request found the "
+                                "backing file gone";
+            } else {
+                LOG(INFO) << "Owner skipped the eviction of its LOCAL_DISK "
+                             "replica for key="
+                          << s->raw_keys[i]
+                          << ": the master's current record is a different "
+                             "replica, left untouched";
+            }
+            states.push_back(0);
+        }
+        return states;
+    });
+    co_return VerifyDiskReplicaResponse(std::move(try_result.value()));
+}
+
 bool RealClient::can_use_pinned_restore_arena(
     const std::string &target_rpc_service_addr,
     const std::unordered_map<std::string, std::vector<Slice>> &objects) const {
@@ -8559,6 +9244,19 @@ ClientRequester::batch_get_offload_object(const std::string &client_addr,
         LOG(ERROR)
             << "Failed to invoke batch_get_offload_object, client_addr = "
             << client_addr << ", error is: " << result.error();
+    }
+    return result;
+}
+
+tl::expected<VerifyDiskReplicaResponse, ErrorCode>
+ClientRequester::verify_disk_replica(const std::string &client_addr,
+                                     const VerifyDiskReplicaRequest &request) {
+    auto result =
+        invoke_rpc<&RealClient::verify_disk_replica, VerifyDiskReplicaResponse>(
+            client_addr, request);
+    if (!result) {
+        LOG(ERROR) << "Failed to invoke verify_disk_replica, client_addr = "
+                   << client_addr << ", error is: " << result.error();
     }
     return result;
 }

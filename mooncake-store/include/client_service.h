@@ -32,7 +32,6 @@ namespace mooncake {
 
 class PutOperation;
 class DistributedStorageBackend;
-class RealClient;
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol);
@@ -49,13 +48,19 @@ class QueryResult {
     const std::chrono::steady_clock::time_point lease_timeout;
     /** @brief Optional full-object checksum */
     const std::optional<uint64_t> object_checksum;
+    /** @brief Tenant scope the master resolved the query to, when the master
+     * reports it; readers forward it to disk-replica verify requests */
+    const std::optional<std::string> resolved_tenant_id;
 
-    QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
-                std::chrono::steady_clock::time_point lease_timeout_param,
-                std::optional<uint64_t> object_checksum_param = std::nullopt)
+    QueryResult(
+        std::vector<Replica::Descriptor>&& replicas_param,
+        std::chrono::steady_clock::time_point lease_timeout_param,
+        std::optional<uint64_t> object_checksum_param = std::nullopt,
+        std::optional<std::string> resolved_tenant_id_param = std::nullopt)
         : replicas(std::move(replicas_param)),
           lease_timeout(lease_timeout_param),
-          object_checksum(object_checksum_param) {}
+          object_checksum(object_checksum_param),
+          resolved_tenant_id(std::move(resolved_tenant_id_param)) {}
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
@@ -101,7 +106,19 @@ class Client {
         const std::string& master_server_entry = kDefaultMasterAddress,
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
         std::map<std::string, std::string> labels = {},
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        std::shared_ptr<NVMeoFInitiator> nof_initiator = nullptr);
+
+    // Test-only seam: when set, Client::Create builds the default NoF
+    // initiator from this factory instead of CreateNofRuntime() whenever the
+    // caller passes no initiator (nullptr). Not thread-safe; set before
+    // Create and reset (pass nullptr) after the test.
+    static void SetDefaultNofInitiatorFactoryForTesting(
+        std::function<std::shared_ptr<NVMeoFInitiator>()> factory);
+
+    // Test-only accessor for the wiring above: the initiator this client
+    // ended up with (nullptr = NoF unavailable in this process).
+    std::shared_ptr<NVMeoFInitiator> GetNofInitiatorForTesting() const;
 
     /**
      * @brief Retrieves data for a given key
@@ -366,6 +383,13 @@ class Client {
                                                    const std::string& tenant_id,
                                                    ReplicaType replica_type);
 
+    // Conditional variant: the master evicts only when its current record is
+    // still the replica the caller failed on. See MasterClient for the
+    // mixed-version behavior.
+    tl::expected<bool, ErrorCode> EvictDiskReplicaIfCurrent(
+        const std::string& key, const std::string& tenant_id,
+        ReplicaType replica_type, ReplicaID expected_replica_id);
+
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const std::vector<std::string>& keys, ReplicaType replica_type);
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
@@ -456,13 +480,14 @@ class Client {
         const std::vector<std::string>& keys);
 
     /**
-     * @brief Point-in-time existence check for multiple objects, granting no
-     *        read leases
+     * @brief Probe multiple objects, optionally leasing the last complete
+     *        candidate. LastHitOnly leases the last all-true candidate.
      * @param keys Vector of keys to check
-     * @return Vector of existence results for each key
+     * @return Per-key existence results in input order
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys,
+        const GrantLeasePolicy& policy = {});
 
     /**
      * @brief Create a copy task to copy an object's replicas to target segments
@@ -700,6 +725,11 @@ class Client {
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
+    [[nodiscard]] bool HasClassicTransport(const std::string& protocol) const {
+        return transfer_engine_ && !transfer_engine_->isUsingTent() &&
+               transfer_engine_->getTransport(protocol) != nullptr;
+    }
+
     [[nodiscard]] bool CanUseLocalMemcpy(const std::string& endpoint) const {
         return transfer_submitter_ != nullptr &&
                transfer_submitter_->canUseLocalMemcpy(endpoint);
@@ -806,6 +836,32 @@ class Client {
         const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL);
 
+    // What the dangling-replica probe established for one key. The Put path
+    // retries only on kEvicted; the batch-get path also retries on kPresent,
+    // because a batch read dies wholesale and a healthy key swept in by a
+    // sibling's wiped file must be re-read, not just left unevicted.
+    enum class DiskReplicaHealResult {
+        // Not a lone client-owned LOCAL_DISK replica; nothing to heal.
+        kNotDangling,
+        // The probe could not answer (transport/config trouble); leave
+        // everything as it was.
+        kUnknown,
+        // The backing file provably exists; nothing was evicted.
+        kPresent,
+        // The backing file is proven gone and the dangling replica was
+        // evicted, so the operation can be retried.
+        kEvicted,
+    };
+
+    // When PutStart reports OBJECT_ALREADY_EXISTS, check whether every
+    // completed replica is a LOCAL_DISK replica owned by this client, and ask
+    // the installed probe (FileStorage::Exists over the offload files) whether
+    // the backing file is gone (issue #3709). Only then evict the dangling
+    // replica so the Put can be retried; any other outcome keeps the old
+    // idempotent path. The batch-get path uses the same heal after a failed
+    // SSD read (#3884).
+    DiskReplicaHealResult healDanglingLocalDiskReplica(const ObjectKey& key);
+
    protected:
     /**
      * @brief Constructor exposed to subclasses for testing only; production
@@ -832,13 +888,6 @@ class Client {
      * @brief Internal helper functions for initialization and data transfer
      */
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
-    // When PutStart reports OBJECT_ALREADY_EXISTS, check whether every
-    // completed replica is a LOCAL_DISK replica owned by this client, and ask
-    // the installed probe (FileStorage::Exists over the offload files) whether
-    // the backing file is gone (issue #3709). Only then evict the dangling
-    // replica so the Put can be retried; any other outcome keeps the old
-    // idempotent path. Returns true only when a replica was actually evicted.
-    bool healDanglingLocalDiskReplica(const ObjectKey& key);
     // The BatchPutStart counterpart: heals the OBJECT_ALREADY_EXISTS subset
     // with one batched replica-list query and one batched evict, then retries
     // PutStart for just the evicted keys and splices the responses back, so a
@@ -982,6 +1031,8 @@ class Client {
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
+    // NoF initiator injected by RealClient; nullptr when NoF is unavailable.
+    std::shared_ptr<NVMeoFInitiator> nof_initiator_;
 
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;

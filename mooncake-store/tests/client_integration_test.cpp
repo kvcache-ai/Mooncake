@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
@@ -349,6 +350,55 @@ std::string ClientIntegrationTest::metadata_url_;
 UUID ClientIntegrationTest::test_client_id_{0, 0};
 UUID ClientIntegrationTest::segment_provider_client_id_{0, 0};
 
+namespace {
+
+// Minimal initiator used to observe which initiator Client::Create wires up.
+class WiringProbeInitiator : public NVMeoFInitiator {
+   public:
+    NofSegmentHandle* OpenSegment(const std::string&) override {
+        return nullptr;
+    }
+    bool ProbeSegment(const std::string&, uint32_t, std::string*) override {
+        return false;
+    }
+    uint32_t GetBlockSize(const NofSegmentHandle*) override {
+        return kInvalidBlockSize;
+    }
+    int SubmitIO(NofSegmentHandle*, void*, uint64_t, uint64_t, NofIOOp,
+                 NofIOAdaptor*) override {
+        return -EINVAL;
+    }
+    int64_t PollCompletion(NofSegmentHandle*, uint32_t) override { return 0; }
+    ErrorCode RegisterMemory(void*, size_t) override { return ErrorCode::OK; }
+    ErrorCode UnregisterMemory(void*) override { return ErrorCode::OK; }
+    NofCapabilities GetCapabilities() const override { return {}; }
+};
+
+// Clears the Client default-initiator factory seam even when the test fails.
+struct DefaultInitiatorFactoryGuard {
+    ~DefaultInitiatorFactoryGuard() {
+        Client::SetDefaultNofInitiatorFactoryForTesting(nullptr);
+    }
+};
+
+}  // namespace
+
+// Regression test: callers that pass no initiator (the default argument)
+// must keep getting the process default NoF runtime, not nullptr.
+TEST_F(ClientIntegrationTest, CreateWithoutInitiatorKeepsDefaultNofRuntime) {
+    DefaultInitiatorFactoryGuard guard;
+    auto probe = std::make_shared<WiringProbeInitiator>();
+    Client::SetDefaultNofInitiatorFactoryForTesting([probe] { return probe; });
+
+    auto client_opt = Client::Create("localhost:17941",  // unique hostname
+                                     "P2PHANDSHAKE", FLAGS_protocol,
+                                     std::nullopt, master_address_);
+    ASSERT_TRUE(client_opt.has_value());
+    // The default argument must resolve to the process default runtime
+    // (here: the injected probe), not nullptr.
+    EXPECT_EQ((*client_opt)->GetNofInitiatorForTesting(), probe);
+}
+
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
     const std::string test_data = "Hello, World!";
@@ -471,6 +521,42 @@ TEST_F(ClientIntegrationTest, BatchPutPreservesObjectChecksumPairing) {
                   ComputeCrcChecksum(values[i].data(), values[i].size()));
         client_buffer_allocator_->deallocate(buffers[i], values[i].size());
     }
+}
+
+TEST_F(ClientIntegrationTest, TaggedBatchWritesSkipChecksumFailures) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+    void* buffer = client_buffer_allocator_->allocate(4);
+    ASSERT_NE(buffer, nullptr);
+    std::memcpy(buffer, "data", 4);
+    for (bool upsert : {false, true}) {
+        const std::vector<ObjectKey> keys = {
+            "invalid-slice", upsert ? "tagged-upsert" : "tagged-put"};
+        std::vector<std::vector<Slice>> slices{{Slice{nullptr, 1}},
+                                               {Slice{buffer, 4}}};
+        ReplicateConfig config;
+        config.session_ids = std::vector<std::string>{"invalid", "valid"};
+        auto results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                              : test_client_->BatchPut(keys, slices, config);
+        ASSERT_EQ(results.size(), 2);
+        ASSERT_FALSE(results[0]);
+        EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+        ASSERT_TRUE(results[1]) << toString(results[1].error());
+        auto query = test_client_->Query(keys[1]);
+        ASSERT_TRUE(query);
+        EXPECT_EQ(query->object_checksum, ComputeCrcChecksum("data", 4));
+
+        // A short tag vector must not become valid after filtering a key.
+        config.session_ids = std::vector<std::string>{"wrong"};
+        results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                         : test_client_->BatchPut(keys, slices, config);
+        for (const auto& result : results) {
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        }
+    }
+    client_buffer_allocator_->deallocate(buffer, 4);
 }
 
 // Test Remove operation

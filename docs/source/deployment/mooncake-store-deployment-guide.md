@@ -153,9 +153,13 @@ Each instance must specify its own reachable `--rpc_address`. `--etcd_endpoints`
 
 ---
 
-### High-Availability (Redis) — Alternative HA Backend
+### High-Availability (Redis) — Experimental Alternative HA Backend
 
-Same HA semantics but using Redis instead of etcd for leader election:
+```{caution}
+Redis-backed HA is experimental. It still needs further verification and hardening. It is not a Primary-Standby deployment and it is not a strict-durability failover path.
+```
+
+Redis is an ephemeral coordination store. A successful Redis write means Redis accepted the record. It does not mean the record is durably committed, and failover does not recover cluster metadata from Redis. `appendfsync everysec` can remain the default operational setting because correctness does not depend on replaying acknowledged Redis records after a restart. If the Redis namespace is missing, empty, or fails validation, treat that state as lost and rebuild by starting a new empty cluster so applications can repopulate metadata from the authoritative source. See **Recovery from Unusable HA State**. Primary-Standby OpLog replication, promotion, and batch OpLog snapshots require `ha_backend_type=etcd`.
 
 ```bash
 mooncake_master \
@@ -165,29 +169,15 @@ mooncake_master \
   --rpc_address=10.0.0.1
 ```
 
-**Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`. Redis is used only for leader election here. OpLog replication currently requires `ha_backend_type=etcd`.
+**Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`. The build must include `STORE_USE_REDIS`.
 
 
 ---
 
-### Snapshot & Restore — Backup / Disaster Recovery
+### Snapshot & Restore
 
-```{caution}
-Metadata Snapshot And Restore is experimental feature.
-```
-
-Periodically persist master metadata to local disk or S3, enabling recovery from a recent snapshot after a crash.
-
-```bash
-export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots
-
-mooncake_master \
-  --enable_snapshot=true \
-  --snapshot_interval_seconds=300 \
-  --snapshot_retention_count=5 \
-  --snapshot_object_store_type=local \
-  --enable_snapshot_restore=true
-```
+The legacy Master-generated snapshot and restore path has been removed. HA
+recovery uses the standby-generated batch OpLog snapshot path described below.
 
 ---
 
@@ -351,7 +341,7 @@ The master resolves the current IPv4 address of `eth0` at startup and uses it as
 
 ## High Availability (HA)
 
-Mooncake Store supports a Primary-Standby HA model with batch-record OpLog replication. The active Primary serves traffic and writes ordered batches to etcd. Standby nodes poll the durable batch prefix and apply each entry in strict sequence order.
+With `ha_backend_type=etcd`, Mooncake Store supports a Primary-Standby HA model with batch-record OpLog replication. The active Primary serves traffic and writes ordered batches to etcd. Standby nodes poll the durable batch prefix and apply each entry in strict sequence order. `ha_backend_type=redis` is experimental: it coordinates and stores state for simple testing, and is not suitable for production deployments.
 
 ### HA Architecture
 
@@ -371,7 +361,7 @@ Mooncake Store supports a Primary-Standby HA model with batch-record OpLog repli
 HA leadership and metadata replication are configured separately:
 
 - The HA coordinator elects the active master. Configure it with `--enable_ha`, `--ha_backend_type`, `--ha_backend_connstring`, and `--cluster_id`. For `ha_backend_type=etcd`, legacy `--etcd_endpoints` is used only when `--ha_backend_connstring` is empty.
-- The optional batch-record OpLog persists metadata mutations so standby masters can catch up and later be promoted. Enable it explicitly with `--enable_oplog=true`; it is disabled by default and requires `ha_backend_type=etcd` and a build with `STORE_USE_ETCD`.
+- The optional batch-record OpLog records metadata mutations so standby masters can catch up and later be promoted. It is the etcd Primary-Standby path. Enable it explicitly with `--enable_oplog=true`; it is disabled by default. `ha_backend_type=etcd` requires a build with `STORE_USE_ETCD`. On etcd, acknowledged batches form the durable prefix used for promotion. `ha_backend_type=redis` requires a build with `STORE_USE_REDIS` and is an experimental HA log storage method. A successful Redis write only means Redis accepted the record. Do not treat Redis persistence, including AOF `appendfsync everysec`, as a strict durability guarantee.
 - The optional standby-generated batch OpLog snapshot path is enabled with `--enable_oplog_snapshot=true` together with `--enable_oplog=true`. It uses the batch snapshot provider/coordinator and does not use the legacy catalog snapshot manager. Startup fails when the required etcd, cluster ID, object-store, or chunk configuration is invalid; a temporary upload failure leaves OpLog apply running for a later attempt.
 
 
@@ -383,12 +373,6 @@ HA leadership and metadata replication are configured separately:
 - `--oplog_poll_interval_ms`: Base polling and retry delay for the batch standby, in milliseconds.
 - `--oplog_batch_max_entries`: Maximum number of entries admitted to an ordered batch. Defaults to `1024`.
 - `--batch_oplog_retry_timeout_sec`: Maximum consecutive retryable batch-standby failure window in seconds (default `180`).
-
-For legacy catalog snapshot-based standby bootstrap, configure:
-
-- `--enable_snapshot_restore` (bool, default `false`): Enable standby to bootstrap from the latest snapshot at startup.
-- `--snapshot_object_store_type` (str): Snapshot object store type: `local` or `s3`.
-- `--snapshot_catalog_store_type` (str): Snapshot catalog store type: `embedded` (default) or `redis`.
 
 For the new batch OpLog snapshot path, configure:
 
@@ -411,8 +395,8 @@ non-serving if recovery cannot prove a complete state.
 
 When a Standby starts, it follows this sequence:
 
-1. **Snapshot Bootstrap** (if `enable_snapshot_restore=true` for legacy catalog snapshots, or `enable_oplog_snapshot=true` for batch OpLog snapshots):
-   - Legacy mode loads the latest snapshot from the configured catalog and object store. Batch OpLog mode loads the latest/fallback descriptor and manifest directly from the batch snapshot control keys.
+1. **Snapshot Bootstrap** (if `enable_oplog_snapshot=true`):
+   - Batch OpLog mode loads the latest/fallback descriptor and manifest directly from the batch snapshot control keys.
    - Rebuild object metadata and segment state from the snapshot baseline.
 2. **OpLog Catch-up**:
    - Start from the snapshot's `last_included_seq` (or from 1 if no snapshot).
@@ -563,7 +547,7 @@ Multi-Tenant Deployment <multi-tenancy>
 - Start with default eviction settings; adjust `--eviction_high_watermark_ratio` and `--eviction_ratio` based on memory pressure and object churn.
 - Use `/metrics/summary` during bring-up; integrate `/metrics` with Prometheus/Grafana for production.
 - For detailed SSD offload configuration (storage backends, eviction policies, io_uring), see the [SSD Offload guide](ssd/ssd-offload).
-- For OSS offload configuration, see the [OSS Offload guide](oss-offload).
+- For object storage offload configuration (OSS and S3-compatible services), see the [Object Storage Offload guide](object-storage-offload).
 - For NVMe-oF SSD pool configuration see the [NVMe-oF SSD Pool Deployment Guide](ssd/nvmf-ssd-deployment-guide)
 - For the experimental HF3FS USRBIO adapter used by descriptor-based DFS replicas, see the [HF3FS USRBIO adapter guide](../getting_started/plugin-usage/3FS-USRBIO-Plugin).
 - For detailed monitoring and observation see [Observability](../getting_started/observability)
@@ -574,7 +558,7 @@ Multi-Tenant Deployment <multi-tenancy>
 
 KV Cache Sharing and Isolation<kv-cache-sharing-and-isolation>
 SSD Storage<ssd/index>
-OSS Offload<oss-offload>
+Object Storage Offload<object-storage-offload>
 HF3FS USRBIO Adapter (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
 ../getting_started/observability
 :::
@@ -588,7 +572,8 @@ HF3FS USRBIO Adapter (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-P
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--rpc_port` | `0` → effective `50051` | RPC listen port. The literal default is `0`, which falls back to the deprecated `--port` (default `50051`) |
-| `--rpc_thread_num` | `0` → effective `min(4, CPU cores)` | RPC worker threads. The literal default is `0`, which falls back to the deprecated `--max_threads` → `min(4, CPU cores)` |
+| `--rpc_thread_num` | `0` → effective `min(4, CPU cores)` | RPC io threads, which read and write the connections. The literal default is `0`, which falls back to the deprecated `--max_threads` → `min(4, CPU cores)` |
+| `--handler_worker_thread_num` | `0` → effective `--rpc_thread_num` | RPC worker threads. Every handler except `Ping` and `ServiceReady` runs on these threads instead of the io threads, so a slow request cannot delay the heartbeats sharing its io thread. The literal default is `0`, which starts as many worker threads as io threads |
 | `--rpc_address` | `0.0.0.0` | RPC bind address |
 | `--rpc_interface` | empty | Network interface to resolve RPC address at startup (overrides `--rpc_address`) |
 | `--rpc_conn_timeout_seconds` | `0` | Idle connection timeout; `0` disables |
@@ -735,7 +720,7 @@ mooncake_master \
 |------|---------|-------------|
 | `--default_kv_lease_ttl` | `10000` ms | Lease TTL for KV objects. Supports `5000ms`, `5s`, `30m`, `1h` |
 | `--default_kv_soft_pin_ttl` | `1800000` ms | Soft pin TTL (30 min) |
-| `--max_kv_soft_pin_ttl` | `86400000` ms | Maximum request-level soft pin TTL (24 h) |
+| `--max_kv_soft_pin_ttl` | `604800000` ms | Maximum request-level soft pin TTL (7 days) |
 | `--allow_evict_soft_pinned_objects` | `true` | Allow evicting soft-pinned objects |
 | `--eviction_ratio` | `0.05` | Fraction evicted at high watermark |
 | `--eviction_high_watermark_ratio` | `0.90` | Usage ratio triggering eviction |
@@ -760,35 +745,28 @@ mooncake_master \
 | `--ha_backend_connstring` | empty | HA backend connection string |
 | `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
-| `--enable_oplog` | `false` | Enable the primary OpLog writer and standby reader; currently requires `enable_ha=true` and `ha_backend_type=etcd` |
+| `--ha_leader_lease_ttl_sec` | `5` | Leadership lease TTL in seconds for `ha_backend_type=etcd` (range `2`-`60`; the JSON config key `ha_leader_lease_ttl_sec` is also accepted). Raise it to ride out etcd apply stalls longer than the default. A longer TTL delays failover: a new leader waits one full TTL before serving, and a standby waits for a crashed leader's lease to expire. Ignored by the Redis and k8s backends |
+| `--enable_oplog` | `false` | Enable the batch OpLog writer and reader; requires `enable_ha=true` and `ha_backend_type=etcd` or `redis`. etcd uses it for Primary-Standby promotion. Redis uses it as an experimental HA log store: a successful write only means Redis accepted the record |
 | `--enable_oplog_snapshot` | `false` | Enable standby-generated batch OpLog snapshots; requires batch OpLog, HA/etcd, valid object-store configuration, and persistent local snapshot storage when applicable |
 | `--snapshot_chunk_object_count` | `1000000` | Maximum objects per batch OpLog snapshot chunk; must be positive when the new snapshot path is enabled |
 | `--oplog_poll_interval_ms` | `1000` | Base polling and retry delay for the batch standby, in milliseconds |
 | `--oplog_batch_max_entries` | `1024` | Maximum number of entries admitted to an ordered batch |
 | `--batch_oplog_retry_timeout_sec` | `180` | Maximum consecutive retryable batch-standby failure window in seconds |
 
-```{caution}
-Metadata Snapshot And Restore is experimental feature.
-```
-
-**Metadata Snapshot And Restore**
+**Batch OpLog Snapshot**
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--enable_snapshot` | `false` | Enable periodic metadata snapshot |
-| `--snapshot_interval_seconds` | `600` (10 min) | Interval between snapshots |
-| `--snapshot_child_timeout_seconds` | `300` (5 min) | Timeout per snapshot child process |
-| `--snapshot_retention_count` | `2` | Number of recent snapshots retained |
+| `--enable_oplog` | `false` | Enable the primary batch OpLog writer and standby reader |
+| `--enable_oplog_snapshot` | `false` | Enable standby-generated batch OpLog snapshots |
+| `--snapshot_chunk_object_count` | `1000000` | Maximum objects per batch snapshot chunk |
+| `--snapshot_interval_seconds` | `600` (10 min) | Interval between standby batch snapshots |
 | `--snapshot_object_store_type` | required | Object store: `local` or `s3` |
-| `--snapshot_catalog_store_type` | empty | Catalog store: `embedded` or `redis` |
-| `--snapshot_catalog_store_connstring` | empty | Catalog store connection string (required for `redis`) |
-| `--snapshot_backup_dir` | empty | Optional local backup directory |
-| `--enable_snapshot_restore` | `false` | Restore from latest snapshot at startup |
 
-**Environment variable:** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (required when `--snapshot_object_store_type=local`) — persistent directory for local snapshots.
+**Environment variable:** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (required when `--snapshot_object_store_type=local`) — persistent directory for batch snapshots.
 
 ```{warning}
-The snapshot storage path is a **managed directory** exclusively controlled by Mooncake. Old snapshots exceeding `--snapshot_retention_count` are automatically deleted. Use a dedicated directory to avoid data loss.
+The snapshot storage path is a **managed directory** exclusively controlled by Mooncake. Use a dedicated directory to avoid data loss.
 ```
 
 ### Task Manager
@@ -1021,19 +999,21 @@ config.dfs_replica_num = 1
 store.put("key", b"value", config)
 ```
 
-`dfs_replica_num` may currently be `0` or `1`. A DFS replica must be requested
-with at least one memory replica (`replica_num >= 1`), so DFS-only placement is
-not supported.
+`dfs_replica_num` may currently be `0` or `1`. DFS-only placement is supported
+by setting `replica_num = 0` and `nof_replica_num = 0`; the object then has no
+memory replica, and DFS eviction or removal deletes it.
 
 Allocation first tries the key's hash-selected DFS shard, then tries other
 ready shards if that shard has no suitable extent. This lets new shards accept
 writes even when older shards are full. `NO_AVAILABLE_HANDLE` means no ready
 shard could satisfy the allocation. A DFS object is never striped across shards.
-The selected shard must have room for the object rounded
-up to `MOONCAKE_DFS_ALIGNMENT`, plus up to one alignment unit of allocator
-padding (`MOONCAKE_DFS_ALIGNMENT - 1` bytes); usable object capacity is
-therefore lower than the shard file's
-logical size.
+The selected shard must have a contiguous free extent large enough for the
+object rounded up to `MOONCAKE_DFS_ALIGNMENT` (`aligned_size`) and then to the
+allocator's size class. No leading alignment padding is needed: each shard
+allocator starts at offset 0, and size-class rounding, splitting, and coalescing
+preserve alignment. Size-class rounding can still reserve more than
+`aligned_size`, so usable object capacity depends on object sizes and
+fragmentation.
 
 For `Put`, `BatchPut`, `Upsert`, and `BatchUpsert`, the client writes requested
 memory and NoF replicas, stages device buffers to host memory when necessary,
@@ -1045,7 +1025,9 @@ failed key is revoked without downgrading successful keys.
 For a same-size `Upsert`, if either the existing object or the new request has
 a DFS replica, the requested memory, NoF, and DFS replica counts must match the
 existing topology. A different-size update releases the old placement and
-allocates a new topology.
+allocates a new topology. For example, after the memory replica of a
+memory-plus-DFS object is evicted, a same-size `Upsert` must request the
+DFS-only topology.
 
 On reads, the master returns the readable replica list through the normal query
 path, and the client selects the first complete replica. If it selects DFS, any
@@ -1055,19 +1037,18 @@ reads for that descriptor.
 #### Current limitations
 
 - Only the `default` tenant is supported.
-- `dfs_replica_num` must be `0` or `1`, and `replica_num >= 1` is required when
-  it is enabled.
+- `dfs_replica_num` must be `0` or `1`.
 - C and Rust clients cannot currently request or access descriptor-based DFS:
   their replication configuration does not expose `dfs_replica_num`, and their
   setup API cannot initialize the distributed `FileStorage` backend. Use the
   native C++ or Python/RealClient API.
 - A DFS object must fit in a single shard after alignment and allocator
-  padding; objects are not striped across shards.
+  size-class rounding; objects are not striped across shards.
 - DFS allocator state is currently in memory. A master restart or HA leader
   failover does not reconstruct existing DFS allocations, so DFS cannot provide
   continuity across those events.
-- DFS cannot be enabled with snapshot generation, snapshot restore, oplog
-  recovery, or standby restore until DFS allocator state restoration is
+- DFS cannot be enabled with batch snapshot or OpLog recovery, or standby
+  restore until DFS allocator state restoration is
   implemented.
 - There is currently no background DFS retry queue or configurable
   asynchronous acknowledgement policy.
@@ -1327,7 +1308,7 @@ The following `MC_*` variables are read directly by the engine/client at runtime
 | `MC_RPC_CLIENT_IO_THREADS` | `min(16, online CPU count)`, minimum `1` | Fallback number of threads and `io_context` instances for each component's RPC client I/O pool. A positive integer overrides the default; invalid values and `0` use the default |
 | `MC_STORE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Store/Master client RPC I/O pool size. This pool is isolated from Transfer Engine traffic. Invalid values and `0` use the fallback |
 | `MC_TE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Transfer Engine and TENT client RPC I/O pool size. This pool is isolated from Store/Master traffic. Invalid values and `0` use the fallback |
-| `MC_USE_TENT` / `MC_USE_TEV1` | unset | Set to any value to enable the TENT (next-gen) transfer engine |
+| `MC_USE_TENT` / `MC_USE_TEV1` | unset | Set to any value to enable the TENT (next-gen) transfer engine. Required for Intel XPU deployments (`USE_XPU=ON`): the classic engine has no XPU support |
 | `MC_STORE_CLUSTER_ID` | unset | Cluster ID label attached to client metrics |
 
 RPC client I/O pool settings are read and resolved once when the process-wide

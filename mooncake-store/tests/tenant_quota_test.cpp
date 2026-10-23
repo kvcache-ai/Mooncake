@@ -1,5 +1,5 @@
-#include "tenant_quota_sharded.h"
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_sharded.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 
 #ifdef STORE_USE_ETCD
@@ -328,6 +328,45 @@ TEST(TenantQuotaTableTest, AccountingMismatchDoesNotMutateState) {
     ASSERT_FALSE(release.has_value());
     EXPECT_EQ(release.error(), TenantQuotaError::kAccountingMismatch);
     EXPECT_EQ(Snapshot(table, "tenant-a").charged_bytes, 10);
+}
+
+TEST(TenantQuotaTableTest, UncheckedChargeIgnoresQuotaAndAdmission) {
+    TenantQuotaTable table;
+    const TenantId tenant_id("tenant-a");
+    ASSERT_TRUE(table.UpsertTenantPolicy(tenant_id, 100).has_value());
+    table.RecomputeEffectiveQuotas(100);
+    auto* account = table.GetOrCreateTenantHandle(tenant_id);
+
+    account->ChargeUnchecked(150);
+    auto snapshot = Snapshot(table, "tenant-a");
+    EXPECT_EQ(snapshot.charged_bytes, 150);
+    EXPECT_TRUE(snapshot.over_quota);
+    EXPECT_FALSE(snapshot.admission_closed);
+    EXPECT_FALSE(account->TryCharge(1).has_value());
+
+    // An account closed to admission still takes memory already in use, and
+    // stays closed.
+    auto* closed = table.GetOrCreateTenantHandle(TenantId("missing"));
+    ASSERT_TRUE(closed->AdmissionClosed());
+    closed->ChargeUnchecked(10);
+    EXPECT_EQ(closed->ChargedBytes(), 10);
+    EXPECT_TRUE(closed->AdmissionClosed());
+    ASSERT_TRUE(closed->Release(10).has_value());
+}
+
+TEST(TenantQuotaTableTest, UncheckedChargeSaturates) {
+    TenantQuotaTable table;
+    const TenantId tenant_id("tenant-a");
+    const uint64_t max = TenantQuotaAccount::kMaxChargedBytes;
+    ASSERT_TRUE(table.UpsertTenantPolicy(tenant_id, max).has_value());
+    ASSERT_TRUE(table.RebuildUsage({{tenant_id, max - 5}}));
+    table.RecomputeEffectiveQuotas(max);
+    auto* account = table.GetOrCreateTenantHandle(tenant_id);
+
+    account->ChargeUnchecked(10);
+    EXPECT_EQ(account->ChargedBytes(), max);
+    // The saturated charge does not spill into the admission bit.
+    EXPECT_FALSE(account->AdmissionClosed());
 }
 
 TEST(TenantQuotaTableTest, DisablePolicyRejectsNonEmptyTenant) {

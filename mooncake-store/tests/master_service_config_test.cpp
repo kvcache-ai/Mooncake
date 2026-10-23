@@ -196,6 +196,10 @@ TEST(MasterServiceConfigTest, ValidatesOplogSnapshotConfiguration) {
     config.snapshot_object_store_type = "local";
     EXPECT_FALSE(ValidateBatchOpLogSnapshotConfig(config).has_value());
 
+    config.ha_backend_type = "redis";
+    EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
+    config.ha_backend_type = "etcd";
+
     config.snapshot_chunk_object_count = 0;
     EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
     config.snapshot_chunk_object_count = 1;
@@ -242,6 +246,18 @@ TEST(MasterServiceConfigTest, OplogBatchMaxEntriesBuilderOverrideRespected) {
     EXPECT_EQ(17u, config.oplog_batch_max_entries);
 }
 
+TEST(MasterServiceConfigTest,
+     RestoreRepairDurableTimeoutBuilderOverrideRespected) {
+    MasterServiceConfig defaults;
+    EXPECT_EQ(DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS,
+              defaults.restore_repair_durable_timeout_ms);
+
+    auto config = MasterServiceConfig::builder()
+                      .set_restore_repair_durable_timeout_ms(50)
+                      .build();
+    EXPECT_EQ(50u, config.restore_repair_durable_timeout_ms);
+}
+
 TEST(MasterServiceConfigTest, MetricsBootstrapConfigPropagatesToSupervisor) {
     MasterConfig master_config{};
     master_config.metrics = {
@@ -256,6 +272,16 @@ TEST(MasterServiceConfigTest, MetricsBootstrapConfigPropagatesToSupervisor) {
     EXPECT_FALSE(metrics.enabled);
     EXPECT_EQ(metrics.port, 65535u);
     EXPECT_EQ(metrics.host, "127.0.0.7");
+}
+
+TEST(MasterServiceConfigTest, HandlerWorkerThreadNumPropagatesToSupervisor) {
+    EXPECT_EQ(0u, MasterServiceSupervisorConfig{}.handler_worker_thread_num);
+
+    MasterConfig master_config{};
+    master_config.handler_worker_thread_num = 7;
+    const MasterServiceSupervisorConfig supervisor_config(master_config);
+
+    EXPECT_EQ(7u, supervisor_config.handler_worker_thread_num);
 }
 
 TEST(MasterServiceConfigTest,

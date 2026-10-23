@@ -24,8 +24,9 @@
 #include "ha/ha_types.h"
 #include "master_admin_service.h"
 #include "master_config.h"
+#include "master_metric_manager.h"
 #include "rpc_service.h"
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 #include "version.h"
 
@@ -1019,6 +1020,63 @@ Segment MasterAdminServerWithServiceTest::segment_;
 // -----------------------------------------------------------------------
 // GET /get_all_keys
 // -----------------------------------------------------------------------
+
+TEST_F(MasterAdminServerWithServiceTest, StandaloneSoftPinHttp) {
+    auto pin = HttpPostJson("/api/v1/soft_pin",
+                            std::string("{\"keys\":[\"") + kDefaultKey +
+                                "\",\"absent-pin-key\"],\"ttl_ms\":60000}");
+    ASSERT_EQ(pin.http_status, 200);
+    EXPECT_NE(pin.body.find("\"error_code\":0"), std::string::npos);
+    EXPECT_NE(pin.body.find("-704"), std::string::npos);
+    auto unpin =
+        HttpPostJson("/api/v1/soft_unpin",
+                     std::string("{\"keys\":[\"") + kDefaultKey + "\"]}");
+    ASSERT_EQ(unpin.http_status, 200);
+    EXPECT_NE(unpin.body.find("\"error_code\":0"), std::string::npos);
+    EXPECT_TRUE(service_->ExistKey(kDefaultKey).value());
+    for (const auto& body :
+         {"not-json", "{}", "{\"keys\":[\"a\"]}", "{\"keys\":[],\"ttl_ms\":1}",
+          "{\"keys\":[\"a\"],\"ttl_ms\":-1}"}) {
+        EXPECT_EQ(HttpPostJson("/api/v1/soft_pin", body).http_status, 400);
+    }
+    EXPECT_EQ(
+        HttpPostJson("/api/v1/soft_unpin", "{\"keys\":[\"a\"],\"ttl_ms\":1}")
+            .http_status,
+        400);
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       SoftPinRejectsTrailingContentWithoutChangingState) {
+    const auto pin =
+        std::string("{\"keys\":[\"") + kDefaultKey + "\"],\"ttl_ms\":60000}";
+    const auto unpin = std::string("{\"keys\":[\"") + kDefaultKey + "\"]}";
+    ASSERT_EQ(HttpPostJson("/api/v1/soft_unpin", unpin).http_status, 200);
+    const auto baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+    const std::vector<std::string> suffixes = {
+        " trailing-garbage", " {}", "\n[]", std::string(1, '\0'), "\v"};
+    for (const auto& suffix : suffixes) {
+        EXPECT_EQ(HttpPostJson("/api/v1/soft_pin", pin + suffix).http_status,
+                  400);
+        EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+                  baseline);
+    }
+    ASSERT_EQ(HttpPostJson("/api/v1/soft_pin", pin + " \t\r\n").http_status,
+              200);
+    ASSERT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline + 1);
+    for (const auto& suffix : suffixes) {
+        EXPECT_EQ(
+            HttpPostJson("/api/v1/soft_unpin", unpin + suffix).http_status,
+            400);
+        EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+                  baseline + 1);
+    }
+    ASSERT_EQ(HttpPostJson("/api/v1/soft_unpin", unpin + " \t\r\n").http_status,
+              200);
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+}
 
 TEST_F(MasterAdminServerWithServiceTest, GetAllKeysReturnsKeys) {
     auto resp = HttpGet("/get_all_keys");

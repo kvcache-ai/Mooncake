@@ -204,7 +204,6 @@ class AllocatorManager {
         allocators_;
     std::unordered_map<std::string, UUID> owner_by_name_;
     friend class ScopedSegmentAccess;
-    friend class SegmentSerializer;
 };
 
 /**

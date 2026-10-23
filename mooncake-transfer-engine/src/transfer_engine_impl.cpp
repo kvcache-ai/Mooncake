@@ -128,7 +128,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #endif
 
-#ifdef USE_ASCEND
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     // The only difference in initializing the Ascend Transport is that the
     // `local_server_name` must include the physical NPU card ID. The format
     // changes from `ip:port` to `ip:port:npu_x`, e.g., `"0.0.0.0:12345:npu_2"`.
@@ -274,13 +274,22 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
 
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
-    Transport* ascend_transport =
-        multi_transports_->installTransport("ascend", local_topology_);
-    if (!ascend_transport) {
-        LOG(ERROR) << "Failed to install Ascend transport";
-        return -1;
+    if (shouldInstallAscendTransport(auto_discover_config_.protocol)) {
+        Transport* ascend_transport =
+            multi_transports_->installTransport("ascend", local_topology_);
+        if (!ascend_transport) {
+            LOG(ERROR) << "Failed to install Ascend transport";
+            return -1;
+        }
+        maybeInstallShmTransport(multi_transports_.get(), local_topology_);
+        return 0;
     }
-#else
+    // The hint asked for a host transport. Discovery installs it below when
+    // enabled; with discovery off the caller installs it explicitly, the way
+    // Store and the Python binding do.
+    LOG(INFO) << "protocol=" << auto_discover_config_.protocol
+              << ", skipping Ascend Direct for the host transports";
+#endif
 
 #ifdef USE_UBSHMEM
     Transport* ubshmem_transport =
@@ -306,6 +315,9 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
     if (auto_discover_config_.enabled) {
         LOG(INFO) << "Auto-discovering topology...";
+        // RDMA discovery drops EFA NICs (they expose SRD only, not the RC QPs
+        // the RDMA transport needs), but EFA discovery must keep them.
+        const bool use_efa = autoDiscoverUsesEfa();
         if (getenv("MC_CUSTOM_TOPO_JSON")) {
             auto path = getenv("MC_CUSTOM_TOPO_JSON");
             LOG(INFO) << "Using custom topology from: " << path;
@@ -315,13 +327,31 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             } else {
                 LOG(WARNING) << "Failed to load custom topology from " << path
                              << ", falling back to auto-detect.";
-                local_topology_->discover(filter_);
+                local_topology_->discover(filter_, /*exclude_efa=*/!use_efa);
             }
         } else {
-            local_topology_->discover(filter_);
+            local_topology_->discover(filter_, /*exclude_efa=*/!use_efa);
         }
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
+
+#ifdef USE_EFA
+        // Install EFA before the per-build transport selection below. The
+        // NVLink/MNNVL branch never installs EFA, so builds that combine
+        // USE_EFA with it (the default CUDA wheels) would otherwise fall back
+        // to TCP, or to RDMA on the host's non-EFA NICs.
+        if (use_efa) {
+            Transport* efa_transport =
+                multi_transports_->installTransport("efa", local_topology_);
+            if (!efa_transport) {
+                LOG(ERROR) << "Failed to install EFA transport";
+                return -1;
+            }
+            LOG(INFO) << "installTransport, type=efa";
+            maybeInstallShmTransport(multi_transports_.get(), local_topology_);
+            return 0;
+        }
+#endif
 
 #ifdef USE_UB
         Transport* ub_transport =
@@ -507,7 +537,6 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 #endif
     }
-#endif
 
     maybeInstallShmTransport(multi_transports_.get(), local_topology_);
     return 0;

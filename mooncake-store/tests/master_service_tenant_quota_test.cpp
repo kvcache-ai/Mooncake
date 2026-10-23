@@ -19,7 +19,7 @@
 #include <unistd.h>
 
 #include "allocation_strategy.h"
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -293,25 +293,28 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     }
 
     void DiscardExpiredProcessingForTest(MasterService& service,
-                                         const TenantId& tenant_id,
-                                         const std::string& key) {
-        const size_t shard_idx =
-            MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
-        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
-                                                             shard_idx);
+                                         const TenantId& tenant_id) {
         MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
-            shard, std::chrono::system_clock::time_point::max());
+            tenant_id, std::chrono::system_clock::time_point::max());
     }
 
     void FinalizeExpiredProcessingForTest(MasterService& service,
                                           const TenantId& tenant_id,
                                           const std::string& key) {
+        route::ObjectRef object;
+        {
+            MasterServiceTestPeer::MetadataAccessorRW accessor(
+                &service,
+                MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+            ASSERT_TRUE(accessor.IsPublished());
+            object = accessor.GetRef();
+        }
         OpLogEntry entry;
         entry.tenant_id = tenant_id.value();
         entry.object_key = key;
         MasterServiceTestPeer(service)
             .FinalizeExpiredProcessingReplicasAfterDurable(
-                entry, std::chrono::system_clock::now());
+                object, entry, std::chrono::system_clock::now());
     }
 
     void FinalizeRemovedMemoryReplicasForTest(MasterService& service,
@@ -363,7 +366,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     std::unique_lock<std::shared_mutex> LockSnapshotForTest(
         MasterService& service) {
         return std::unique_lock<std::shared_mutex>(
-            MasterServiceTestPeer::SnapshotMutex(service));
+            MasterServiceTestPeer::MasterStateMutex(service));
     }
 
     std::unique_lock<std::mutex> LockTenantQuotaRecomputeForTest(
@@ -820,7 +823,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     AddCompletedDiskReplica(service, client_id, "key", tenant_id, 100);
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 100);
 
-    DiscardExpiredProcessingForTest(service, tenant_id, "key");
+    DiscardExpiredProcessingForTest(service, tenant_id);
 
     ExpectDiskOnlyObjectAndChargedBytes(service, tenant_id, "key", 0);
 }
