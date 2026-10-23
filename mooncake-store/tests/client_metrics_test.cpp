@@ -335,6 +335,8 @@ TEST_F(ClientMetricFactoryTest, DefaultsToCollectionWithoutReporting) {
     auto metrics = ClientMetric::Create({{"instance", "centralized"}});
     ASSERT_NE(metrics, nullptr);
     EXPECT_EQ(metrics->GetReportingInterval(), 0u);
+    // Untouched zero-valued counters are omitted from serialized output.
+    metrics->transfer_metric.total_read_bytes.inc(1);
     std::string serialized;
     metrics->serialize(serialized);
     EXPECT_NE(serialized.find("instance=\"centralized\""), std::string::npos);

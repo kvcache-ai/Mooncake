@@ -319,6 +319,9 @@ TEST_F(P2PClientHttpEndpointsTest, HttpGetAllKeysInvalidLimit) {
 // ============================================================================
 
 TEST_F(P2PClientHttpEndpointsTest, MetricsUseConcreteClientOutput) {
+    ASSERT_EQ(HttpPost(Url("/put", "key=http_metrics_probe"), "metrics").status,
+              200);
+    ASSERT_EQ(HttpGet(Url("/get", "key=http_metrics_probe")).status, 200);
     ClientService& facade = *client_;
     ASSERT_TRUE(facade.SerializeMetrics().has_value());
     ASSERT_TRUE(facade.GetSummaryMetrics().has_value());
@@ -327,7 +330,7 @@ TEST_F(P2PClientHttpEndpointsTest, MetricsUseConcreteClientOutput) {
     ASSERT_EQ(metrics.status, 200);
     EXPECT_NE(metrics.resp_body.find("mooncake_p2p_total_get_requests_total"),
               std::string::npos);
-    EXPECT_NE(metrics.resp_body.find("mooncake_transfer_read_bytes"),
+    EXPECT_NE(metrics.resp_body.find("mooncake_p2p_local_get_bytes_total"),
               std::string::npos);
 
     const auto summary = HttpGet(Url("/metrics/summary"));

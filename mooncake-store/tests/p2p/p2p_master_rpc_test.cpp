@@ -398,7 +398,12 @@ class P2PMasterRpcShutdownTest : public ::testing::TestWithParam<bool> {
             if (error == asio::error::connection_refused) {
                 return true;
             }
-            if (error) {
+            if (error == asio::error::connection_reset) {
+                // A probe can race with stop() closing an accepted socket.
+                // Keep waiting for connection_refused to prove closure.
+                LOG(WARNING)
+                    << "Listener probe reset during shutdown: " << error;
+            } else if (error) {
                 LOG(ERROR) << "Unexpected listener probe failure: " << error;
                 return false;
             }
@@ -406,6 +411,8 @@ class P2PMasterRpcShutdownTest : public ::testing::TestWithParam<bool> {
             // gates.
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
+        LOG(ERROR) << "Timed out waiting for listener to close on port "
+                   << port;
         return false;
     }
 
