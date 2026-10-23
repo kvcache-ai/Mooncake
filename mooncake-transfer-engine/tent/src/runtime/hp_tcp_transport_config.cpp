@@ -1,7 +1,7 @@
 // Copyright 2026 KVCache.AI
 #include "tent/runtime/hp_tcp_transport_config.h"
+#include "tent/common/config_parser.h"
 
-#include <limits>
 #include <string_view>
 
 namespace mooncake::tent {
@@ -15,26 +15,8 @@ template <typename T>
 Status ReadUnsigned(const json& object, std::string_view key, T* output) {
     auto it = object.find(std::string(key));
     if (it == object.end()) return Status::OK();
-    uint64_t value = 0;
-    if (it->is_number_unsigned()) {
-        value = it->get<uint64_t>();
-    } else if (it->is_number_integer()) {
-        const auto signed_value = it->get<int64_t>();
-        if (signed_value < 0) {
-            return Invalid("transports/hp_tcp/" + std::string(key),
-                           "must be non-negative");
-        }
-        value = static_cast<uint64_t>(signed_value);
-    } else {
-        return Invalid("transports/hp_tcp/" + std::string(key),
-                       "must be an integer");
-    }
-    if (value > std::numeric_limits<T>::max()) {
-        return Invalid("transports/hp_tcp/" + std::string(key),
-                       "is out of range");
-    }
-    *output = static_cast<T>(value);
-    return Status::OK();
+    return parseUnsignedConfigValue(
+        *it, "transports/hp_tcp/" + std::string(key), output);
 }
 
 Status ReadString(const json& object, std::string_view key,
@@ -96,9 +78,8 @@ Status ParseHpTcpTransportConfig(const Config& config,
     }
 
     if (auto it = hp_tcp.find("enable"); it != hp_tcp.end()) {
-        if (!it->is_boolean())
-            return Invalid("transports/hp_tcp/enable", "must be a boolean");
-        parsed.enabled = it->get<bool>();
+        CHECK_STATUS(parseBoolConfigValue(*it, "transports/hp_tcp/enable",
+                                          &parsed.enabled));
     }
     CHECK_STATUS(
         ReadString(hp_tcp, "bind_address", &parsed.params.bind_address));
@@ -133,10 +114,8 @@ Status ParseHpTcpTransportConfig(const Config& config,
         return Invalid("transports/hp_tcp",
                        "contains zero or inconsistent limits");
     }
-    if (parsed.enabled && config.get("transports/tcp/enable", true)) {
-        return Invalid("transports",
-                       "tcp and hp_tcp cannot be enabled together");
-    }
+    CHECK_STATUS(validateTcpTransportSelection(
+        config.get("transports/tcp/enable", true), parsed.enabled));
 
     *out = std::move(parsed);
     return Status::OK();
