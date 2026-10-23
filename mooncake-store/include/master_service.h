@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <boost/functional/hash.hpp>
 #include <chrono>
 #include <condition_variable>
@@ -687,6 +688,12 @@ class MasterService {
      */
     long RemoveAll(const TenantId& tenant_id, bool force = false);
 
+    // Update existing objects without transferring data. Results follow input
+    // order; batches are not atomic. A zero TTL clears the soft pin.
+    auto BatchUpdateSoftPin(const std::vector<std::string>& keys,
+                            const TenantId& tenant_id, uint64_t ttl_ms)
+        -> std::vector<tl::expected<void, ErrorCode>>;
+
     /**
      * @brief Batch remove objects and their replicas
      * @param keys The list of keys to remove.
@@ -1000,6 +1007,15 @@ class MasterService {
     tl::expected<size_t, ErrorCode> InstallLegacyStandbyObjects(
         LegacyRestoreContext& ctx);
 
+    // A standby object whose replicas are built and that waits to be
+    // published under its own tenant and key.
+    struct PreparedObject;
+    // Publishes each of `objects` and records the publication in `installed`.
+    // Publishes nothing if a key already holds an object when it starts.
+    tl::expected<void, ErrorCode> PublishRestoredObjects(
+        std::vector<PreparedObject>& objects,
+        std::vector<std::pair<TenantId, route::ObjectRef>>& installed);
+
     // A restored local-disk replica reads only while its owner has a liveness
     // record; share the existing one or stage a fresh record for install.
     std::shared_ptr<ClientLivenessRecord> RecordRestoreKnownOwner(
@@ -1069,19 +1085,18 @@ class MasterService {
     void ClearInvalidHandles(
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
     // Clear completed LOCAL_DISK replicas owned by exactly this client, in
-    // all shards. Owner-targeted on purpose: a liveness-complement sweep
+    // every tenant. Owner-targeted on purpose: a liveness-complement sweep
     // classifies by absence from a point-in-time set, so an owner that
     // mounts and registers between taking that set and the sweep reaching
-    // its shard would be swept as stale. A predicate on the owner id cannot
+    // its object would be swept as stale. A predicate on the owner id cannot
     // misclassify a concurrent mount, whatever the interleaving.
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
-    // Shard walk shared by the two sweeps above; removes completed replicas
+    // Walk shared by the two sweeps above; removes completed replicas
     // matching is_stale, erasing a key when no valid replica remains. Each
-    // shard is first scanned under its shared lock to pick the keys that
-    // match, and only those are cleaned, in bounded batches under the write
-    // lock: a mass client expiry marks handles stale table-wide, and walking
-    // a whole shard while holding it exclusively blocked every RPC for that
-    // shard until the sweep moved on.
+    // tenant is first read to pick the objects that match, and only those are
+    // cleaned, each under its own write lock: a mass client expiry marks
+    // handles stale table-wide, and walking a whole shard while holding it
+    // exclusively blocked every RPC for that shard until the sweep moved on.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
@@ -1094,6 +1109,14 @@ class MasterService {
     struct ObjectIdentity {
         TenantId tenant_id;
         std::string user_key;
+    };
+
+    // One of `count` disjoint slices of a tenant's objects: the read cursors
+    // of slices 0 to count - 1 together visit what one ReadCursor() would, so
+    // that many threads can walk one tenant at once.
+    struct CursorSlice {
+        size_t index;
+        size_t count;
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
@@ -1163,14 +1186,12 @@ class MasterService {
 
         struct Entry {
             TimePoint deadline;
-            size_t shard_idx;
             std::string scoped_key;
         };
 
-        void Upsert(std::string scoped_key, size_t shard_idx,
-                    const TimePoint& deadline);
+        void Upsert(std::string scoped_key, const TimePoint& deadline);
         void Remove(const std::string& scoped_key);
-        void RemoveIfMatches(const std::string& scoped_key, size_t shard_idx,
+        void RemoveIfMatches(const std::string& scoped_key,
                              const TimePoint& deadline);
         std::vector<Entry> PopExpired(const TimePoint& now);
         void Clear();
@@ -1178,7 +1199,6 @@ class MasterService {
        private:
         struct Registration {
             TimePoint deadline;
-            size_t shard_idx;
         };
 
         struct EarlierDeadline {
@@ -1497,13 +1517,7 @@ class MasterService {
         std::chrono::system_clock::time_point now,
         const std::function<bool(const std::string& key)>& matches_key,
         const std::function<void(const ObjectMetadata&)>& on_remove);
-    void RebuildGroupState();
-    // Post-restore migration: re-route every object to its hash(tenant, key)
-    // shard, fixing snapshots that placed grouped objects on hash(group_id)
-    // shards. No-op for correctly-routed snapshots.
-    void ReRouteRestoredObjectsByKey();
     static void ApplySoftPinMetricDelta(int metric_delta);
-    size_t GetMetadataShardIndex(const ObjectMetadata& metadata) const;
     void ApplySoftPinEvaluation(
         const ObjectMetadata& metadata,
         const ObjectMetadata::SoftPinEvaluation& result) const;
@@ -1617,12 +1631,12 @@ class MasterService {
     // when none is left valid.
     void CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor);
 
-    /**
-     * @brief Helper to discard expired processing keys.
-     */
+    // Discards the tenant's expired processing replicas and expired tasks;
+    // with `slice`, only those of that slice of its objects.
     void DiscardExpiredProcessingReplicas(
-        MetadataShardAccessorRW& shard,
-        const std::chrono::system_clock::time_point& now);
+        const TenantId& tenant_id,
+        const std::chrono::system_clock::time_point& now,
+        CursorSlice slice = {0, 1});
     void FreeDfsReplicas(const std::string& key,
                          std::span<const Replica> replicas);
     void RunDfsEviction();
@@ -1770,14 +1784,23 @@ class MasterService {
     // accessor's scope may reach another key through another accessor.
     class MetadataAccessorRW {
        public:
-        // Holds the key only while it holds an object.
-        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
+        struct AsIs {};
+        // Holds the key only while it holds an object, and leaves that object
+        // as it is, without the invalid-replica cleanup: for a pass that acts
+        // on what the object's own state says, such as an expiry sweep.
+        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id,
+                           AsIs)
             : service_(service),
               object_id_(std::move(object_id)),
               shard_guard_(service_,
                            service_->getShardIndex(object_id_.tenant_id,
                                                    object_id_.user_key)) {
             Locate();
+        }
+
+        // Holds the key only while it holds an object.
+        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
+            : MetadataAccessorRW(service, std::move(object_id), AsIs{}) {
             // Invalid memory replicas go first, which may tear the object down.
             if (IsPublished()) {
                 service_->CleanupInvalidMemoryReplicas(*this);
@@ -1801,12 +1824,8 @@ class MasterService {
         // its `cleared` against.
         MetadataAccessorRW(MasterService* service, const TenantId& tenant_id,
                            const route::ObjectRef& ref)
-            : service_(service),
-              object_id_{tenant_id, ref.key},
-              shard_guard_(service_,
-                           service_->getShardIndex(object_id_.tenant_id,
-                                                   object_id_.user_key)) {
-            Locate();
+            : MetadataAccessorRW(service, ObjectIdentity{tenant_id, ref.key},
+                                 AsIs{}) {
             if (IsPublished() && it_->second.generation != ref.generation) {
                 it_ = tenant_state_->metadata.end();
             }
@@ -1970,20 +1989,25 @@ class MasterService {
     friend class MetadataAccessor;
     class MetadataAccessorRO {
        public:
+        // Reads the object without copying its identity, which a batch read
+        // would otherwise pay for once per key.
         MetadataAccessorRO(const MasterService* service,
-                           ObjectIdentity object_id)
+                           const TenantId& tenant_id,
+                           const std::string& user_key)
             : service_(service),
-              object_id_(std::move(object_id)),
-              shard_idx_(service_->getShardIndex(object_id_.tenant_id,
-                                                 object_id_.user_key)),
+              shard_idx_(service_->getShardIndex(tenant_id, user_key)),
               shard_guard_(service_, shard_idx_),
-              tenant_it_(shard_guard_->tenants.find(object_id_.tenant_id)),
+              tenant_it_(shard_guard_->tenants.find(tenant_id)),
               tenant_state_(tenant_it_ == shard_guard_->tenants.end()
                                 ? nullptr
                                 : &tenant_it_->second),
               it_(tenant_state_ == nullptr
                       ? ObjectMetadataConstIterator{}
-                      : tenant_state_->metadata.find(object_id_.user_key)) {}
+                      : tenant_state_->metadata.find(user_key)) {}
+        MetadataAccessorRO(const MasterService* service,
+                           const ObjectIdentity& object_id)
+            : MetadataAccessorRO(service, object_id.tenant_id,
+                                 object_id.user_key) {}
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
@@ -2017,7 +2041,6 @@ class MasterService {
         using ObjectMetadataConstIterator = ObjectMap::const_iterator;
 
         const MasterService* service_;
-        const ObjectIdentity object_id_;
         const size_t shard_idx_;
         MetadataShardAccessorRO shard_guard_;
         std::unordered_map<TenantId, TenantState, TenantIdHash>::const_iterator
@@ -2052,10 +2075,64 @@ class MasterService {
     [[nodiscard]] TenantCursor<LockMode::kWrite> WriteCursor(
         const TenantId& tenant_id);
 
+    // Walks only `slice` of the tenant's objects; see CursorSlice.
+    [[nodiscard]] TenantCursor<LockMode::kRead> ReadCursor(
+        const TenantId& tenant_id, CursorSlice slice) const;
+
+    // The tenant's keys whose object carries work in flight (see
+    // route::ObjectState::HasWorkInFlight), as a snapshot to resolve again: the
+    // work can finish, or the object be torn down or replaced, once the walk
+    // has moved on; with `slice`, only those of that slice. Until the store
+    // moves to per-tenant routes this walks every object of the slice.
+    [[nodiscard]] std::vector<std::string> InFlightKeys(
+        const TenantId& tenant_id, CursorSlice slice = {0, 1}) const;
+
     // Calls `visit` with each tenant that holds an object when the walk
     // starts, holding no lock, so `visit` may reach any key. A tenant that
     // gains its first object meanwhile may or may not be visited.
     void VisitTenants(const std::function<void(const TenantId&)>& visit) const;
+
+    // Rehashes the tenant's object map in each of `shards` that has grown
+    // sparse, since erase() never returns bucket memory. Interim: it goes
+    // with the shards.
+    void ShrinkSparseTenantMaps(const TenantId& tenant_id,
+                                const std::bitset<kNumShards>& shards);
+
+    // The work client reads leave for when they hold no lock on any key:
+    // queueing a promotion for each read served only from LOCAL_DISK, and
+    // counting each object's access towards another memory replica once.
+    class ReadFollowUps {
+       public:
+        void Promote(const TenantId& tenant_id, const std::string& key) {
+            promotions_.push_back({tenant_id, key});
+        }
+        void RecordAccess(const TenantId& tenant_id, const std::string& key) {
+            if (accessed_.insert(tenant_id.MakeScopedKey(key)).second) {
+                accesses_.push_back({tenant_id, key});
+            }
+        }
+        // The caller holds master_state_mutex_ (shared) and no key.
+        void Run(MasterService& service) const;
+
+       private:
+        std::vector<ObjectIdentity> promotions_;
+        std::vector<ObjectIdentity> accesses_;
+        std::unordered_set<std::string> accessed_;
+    };
+
+    // What ExistKey answers for an object: whether it has a replica to read,
+    // granting it a read lease if it does and `grant_lease` is set.
+    bool ReadExistence(const ObjectMetadata& metadata, bool grant_lease) const;
+    // A client read of an object: its readable replicas, after the read's
+    // effects on it (the read lease, the DFS LRU, hit metrics). What is left
+    // for when no key is held goes to `follow_ups`.
+    auto ReadReplicaList(const TenantId& tenant_id, const std::string& key,
+                         const ObjectMetadata& metadata,
+                         ReadFollowUps& follow_ups)
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
+    // An admin read of an object, which leaves it as it is.
+    auto ReadReplicaListForAdmin(const ObjectMetadata& metadata) const
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     // The single-pass cursor behind ReadCursor() and WriteCursor(). It owns
     // the lock of the shard it stands in, so it neither copies nor moves, and
@@ -2117,8 +2194,12 @@ class MasterService {
        private:
         friend class MasterService;
 
-        TenantCursor(Access<MasterService>& service, TenantId tenant_id)
-            : service_(service), tenant_id_(std::move(tenant_id)) {
+        TenantCursor(Access<MasterService>& service, TenantId tenant_id,
+                     CursorSlice slice = {0, 1})
+            : service_(service),
+              tenant_id_(std::move(tenant_id)),
+              next_shard_(kNumShards * slice.index / slice.count),
+              end_shard_(kNumShards * (slice.index + 1) / slice.count) {
             Settle();
         }
 
@@ -2136,7 +2217,7 @@ class MasterService {
                 // a map whose lock is gone.
                 it_ = end_ = RecordIterator{};
                 lock_.reset();
-                if (next_shard_ == kNumShards) {
+                if (next_shard_ == end_shard_) {
                     return;
                 }
                 auto& shard = service_.metadata_shards_[next_shard_++];
@@ -2155,7 +2236,8 @@ class MasterService {
 
         Access<MasterService>& service_;
         const TenantId tenant_id_;
-        size_t next_shard_{0};
+        size_t next_shard_;
+        const size_t end_shard_;
         std::optional<SharedMutexLocker> lock_;
         RecordIterator it_{};
         RecordIterator end_{};
@@ -2200,6 +2282,15 @@ class MasterService {
     static constexpr uint64_t kNoFHeartbeatThreadSleepMs = 100;
     mutable std::mutex nof_probe_fn_mutex_;
     NoFProbeFn nof_probe_fn_;
+
+    // Shared NoF probe default, used by both the constructor and the
+    // test-seam reset. A single function-static initiator keeps the probe
+    // path aligned with the process-global NofPageRegistry and avoids
+    // duplicating the lambda body in two places. Private but reachable from
+    // the friend test peer, which resets nof_probe_fn_ to this default.
+    static bool DefaultProbeNofSegment(const std::string& te_endpoint,
+                                       uint32_t timeout_ms,
+                                       std::string* error_reason);
 
     // if high availability features enabled
     const bool enable_ha_;

@@ -109,11 +109,13 @@ add_executable(worker_pool_rail_state_test
 target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
                                                          gtest_main)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  # Control GID I/O to exercise recovery while completion failures arrive.
+  # Control GID I/O and port-state queries so event recovery can be exercised
+  # without an RDMA device.
   target_link_options(
     worker_pool_rail_state_test
     PRIVATE
     "-Wl,--wrap=_ZN8mooncake11RdmaContext17refreshCurrentGidEPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_"
+    "-Wl,--wrap=_ZNK8mooncake11RdmaContext14queryPortStateEP14ibv_port_state"
   )
 endif()
 add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)
@@ -535,6 +537,12 @@ add_executable(rdma_context_reprobe_test
 target_link_libraries(rdma_context_reprobe_test PUBLIC transfer_engine gtest
                                                        gtest_main)
 add_test(NAME rdma_context_reprobe_test COMMAND rdma_context_reprobe_test)
+
+add_executable(rdma_unregister_retry_test
+               ${WORKSPACE}/rdma_unregister_retry_test.cpp)
+target_link_libraries(rdma_unregister_retry_test PUBLIC transfer_engine gtest
+                                                        gtest_main)
+add_test(NAME rdma_unregister_retry_test COMMAND rdma_unregister_retry_test)
 
 add_executable(rdma_memory_location_test
                ${WORKSPACE}/rdma_memory_location_test.cpp)

@@ -573,6 +573,7 @@ bool WorkerPool::tryReactivateContext(uint64_t now_ns) {
     }
     breaker_reactivate_after_ns_ = 0;
     context_failure_count_.store(0, std::memory_order_relaxed);
+    context_disabling_event_.store(-1, std::memory_order_relaxed);
     context_.set_active(true);
     return true;
 }
@@ -590,6 +591,8 @@ void WorkerPool::resetContextBreaker(bool context_active) {
     std::lock_guard<std::mutex> lock(context_state_lock_);
     breaker_reactivate_after_ns_ = 0;
     context_failure_count_.store(0, std::memory_order_relaxed);
+    if (context_active)
+        context_disabling_event_.store(-1, std::memory_order_relaxed);
     context_.set_active(context_active);
 }
 
@@ -1398,8 +1401,11 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
         recovery_activate_after_ns_.store(0, std::memory_order_relaxed);
         // The async event now owns this context's inactive state. Clear the
         // local-WC breaker deadline so its TTL cannot resurrect a context that
-        // a DEVICE_FATAL/PORT_ERR took down.
+        // a DEVICE_FATAL/PORT_ERR took down. Remember which event it was: the
+        // 1 Hz port poll may resume only PORT_ERR.
         resetContextBreaker(false);
+        context_disabling_event_.store(static_cast<int>(event_type),
+                                       std::memory_order_relaxed);
         refreshPublishedLocalTopology();
 
         /**
@@ -1451,12 +1457,16 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
     return true;
 }
 
-void WorkerPool::scheduleContextRecovery(uint64_t delay_ns) {
+void WorkerPool::scheduleContextRecovery(uint64_t delay_ns,
+                                         bool override_breaker) {
     std::lock_guard<std::mutex> lock(context_state_lock_);
     // A redundant PORT_ACTIVE on an in-service context is not recovery
     // evidence: preserve its local-WC streak and do not arm a probe that
     // could later override a new local-WC trip.
     if (context_.active()) return;
+    // The 1 Hz port poll must not steal a breaker-owned pause: the port is
+    // expected to still be ACTIVE while local-WC TTL recovery runs.
+    if (!override_breaker && breaker_reactivate_after_ns_ != 0) return;
 
     // Event recovery owns this inactive period. Cancel only the breaker
     // deadline; a successful GID probe below resets the failure count.
@@ -1501,6 +1511,36 @@ void WorkerPool::maybeActivateRecoveredContext() {
     refreshPublishedLocalTopology();
     LOG(INFO) << "Worker: Context " << context_.deviceName()
               << " is now active after recovery delay";
+}
+
+void WorkerPool::resumePausedContext() {
+    if (context_.active()) return;
+    if (recovery_activate_after_ns_.load(std::memory_order_relaxed) != 0)
+        return;
+    {
+        std::lock_guard<std::mutex> lock(context_state_lock_);
+        if (breaker_reactivate_after_ns_ != 0) return;
+    }
+    // CQ_ERR / DEVICE_FATAL / WQ_FATAL / LID_CHANGE leave the same inactive
+    // state, but the port is often still ACTIVE. Republishing that RNIC does
+    // not rebuild the failed CQ or device, so only a missed PORT_ACTIVE is
+    // eligible for this poll.
+    if (context_disabling_event_.load(std::memory_order_relaxed) !=
+        static_cast<int>(IBV_EVENT_PORT_ERR))
+        return;
+
+    ibv_port_state state;
+    if (context_.queryPortState(&state) != 0) return;
+    // Only a fully active port carries traffic. Intermediate states
+    // (INIT/ARMED/ACTIVE_DEFER) mean the link is still settling, so leave
+    // the context inactive and re-check on the next tick.
+    if (state != IBV_PORT_ACTIVE) return;
+
+    LOG(WARNING) << "Worker: Context " << context_.deviceName()
+                 << " port reports ACTIVE without an IBV_EVENT_PORT_ACTIVE "
+                    "event";
+    scheduleContextRecovery(kContextRecoveryDelayNs,
+                            /*override_breaker=*/false);
 }
 
 bool WorkerPool::hasAvailablePeerRailAlternative(
@@ -1598,6 +1638,9 @@ void WorkerPool::monitorWorker() {
             // Drop expired active-connect pause entries so the map doesn't grow
             // for peers that are never re-attempted after their pause lapses.
             context_.pruneConnectPause();
+            // Safety net for a recovery event that never reached us. See
+            // issue #4694; TENT's equivalent is Workers::resumePausedContexts.
+            resumePausedContext();
             last_reset_ts = current_ts;
         }
 

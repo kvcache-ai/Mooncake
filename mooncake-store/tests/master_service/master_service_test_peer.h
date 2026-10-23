@@ -65,11 +65,18 @@ class MasterServiceTestPeer {
     auto ReadCursor(const TenantId& tenant_id) const {
         return service_.ReadCursor(tenant_id);
     }
+    using CursorSlice = MasterService::CursorSlice;
+    auto ReadCursor(const TenantId& tenant_id, CursorSlice slice) const {
+        return service_.ReadCursor(tenant_id, slice);
+    }
     auto WriteCursor(const TenantId& tenant_id) {
         return service_.WriteCursor(tenant_id);
     }
     void VisitTenants(const std::function<void(const TenantId&)>& visit) const {
         service_.VisitTenants(visit);
+    }
+    std::vector<std::string> InFlightKeys(const TenantId& tenant_id) const {
+        return service_.InFlightKeys(tenant_id);
     }
 
     // Enable epoch bookkeeping without starting a live KV event publisher.
@@ -376,9 +383,9 @@ class MasterServiceTestPeer {
     }
 
     void DiscardExpiredProcessingReplicas(
-        MetadataShardAccessorRW& shard,
+        const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) {
-        service_.DiscardExpiredProcessingReplicas(shard, now);
+        service_.DiscardExpiredProcessingReplicas(tenant_id, now);
     }
 
     uint32_t DynamicReplicationAdmissionMinHits() const {
@@ -480,12 +487,6 @@ class MasterServiceTestPeer {
         std::vector<UUID>* mirror_clients = nullptr) {
         return service_.PushOffloadingQueue(object_id, replica, mirror_clients);
     }
-
-    void ReRouteRestoredObjectsByKey() {
-        service_.ReRouteRestoredObjectsByKey();
-    }
-
-    void RebuildGroupState() { service_.RebuildGroupState(); }
 
     void RebuildTenantQuotaUsageFromMetadata() {
         service_.RebuildTenantQuotaUsageFromMetadata();
