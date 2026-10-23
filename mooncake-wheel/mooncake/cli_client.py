@@ -5,7 +5,6 @@ Minimal CLI module for mooncake_client.
 
 import os
 import sys
-import subprocess
 
 
 def main():
@@ -20,8 +19,8 @@ def main():
     # Make sure the binary is executable
     os.chmod(bin_path, 0o755)
 
-    # Run the binary with all arguments passed through
-    return subprocess.call([bin_path] + sys.argv[1:])
+    # Preserve the service PID so signals and wait() track native shutdown.
+    os.execv(bin_path, [bin_path] + sys.argv[1:])
 
 
 if __name__ == "__main__":
