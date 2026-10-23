@@ -1,4 +1,5 @@
 #include <cerrno>
+#include <fcntl.h>
 #include <string>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -17,6 +18,16 @@ PosixFile::PosixFile(const std::string &filename, int fd)
 tl::expected<void, ErrorCode> PosixFile::datasync() {
     if (fdatasync(fd_) != 0) {
         LOG(ERROR) << "fdatasync failed: " << strerror(errno);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> PosixFile::start_writeback(off_t offset,
+                                                         size_t length) {
+    if (::sync_file_range(fd_, offset, static_cast<off_t>(length),
+                          SYNC_FILE_RANGE_WRITE) != 0) {
+        LOG(ERROR) << "sync_file_range failed: " << strerror(errno);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};

@@ -171,6 +171,33 @@ TEST_F(PosixFileTest, VectorizedWrite) {
     EXPECT_EQ(posix_file.get_error_code(), ErrorCode::OK);
 }
 
+// start_writeback, like datasync(), reports a failure to the caller and
+// leaves the file's state alone; the caller decides what to remove
+// (BucketStorageBackend drops the whole bucket).
+TEST_F(PosixFileTest, StartWritebackLeavesFileState) {
+    const std::string filename =
+        "start_writeback_" + std::to_string(getpid()) + ".tmp";
+    int fd = open(filename.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    {
+        PosixFile posix_file(filename, fd);
+        std::string data(64 * 1024, 'w');
+        iovec iov{data.data(), data.size()};
+        ASSERT_TRUE(posix_file.vector_write(&iov, 1, 0));
+
+        EXPECT_TRUE(posix_file.start_writeback(0, data.size()).has_value());
+        EXPECT_EQ(posix_file.get_error_code(), ErrorCode::OK);
+
+        // A negative offset makes sync_file_range fail with EINVAL.
+        auto failed = posix_file.start_writeback(-1, data.size());
+        ASSERT_FALSE(failed.has_value());
+        EXPECT_EQ(failed.error(), ErrorCode::FILE_WRITE_FAIL);
+        EXPECT_EQ(posix_file.get_error_code(), ErrorCode::OK);
+    }
+    EXPECT_EQ(access(filename.c_str(), F_OK), 0) << "written file was deleted";
+    unlink(filename.c_str());
+}
+
 // A short pwritev must be treated as a failed write. Otherwise the PosixFile
 // destructor has no failure state and leaves a truncated object on disk.
 TEST_F(PosixFileTest, ShortVectorizedWriteRemovesPartialFile) {

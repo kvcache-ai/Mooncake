@@ -2838,6 +2838,138 @@ TEST_F(StorageBackendTest,
 
 //-----------------------------------------------------------------------------
 
+namespace {
+
+// Offloads one bucket of `objects` values, object i holding
+// value_bytes + i bytes of a pattern unique to i, then reads every object
+// back and compares it byte for byte.
+void OffloadAndReadBackBucket(const std::string& dir, size_t objects,
+                              size_t value_bytes) {
+    FileStorageConfig config;
+    config.storage_filepath = dir;
+    fs::create_directories(dir);
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = static_cast<int64_t>(objects);
+    bucket_config.bucket_size_limit = 1LL << 30;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    std::vector<std::string> values(objects);
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    for (size_t i = 0; i < objects; ++i) {
+        values[i].resize(value_bytes + i);
+        for (size_t j = 0; j < values[i].size(); ++j) {
+            values[i][j] = static_cast<char>((i * 131 + j * 7) & 0xFF);
+        }
+        batch.emplace(
+            "key_" + std::to_string(i),
+            std::vector<Slice>{Slice{values[i].data(), values[i].size()}});
+    }
+    auto offload = backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload.has_value()) << toString(offload.error());
+
+    std::vector<std::string> read(objects);
+    std::unordered_map<std::string, Slice> load;
+    for (size_t i = 0; i < objects; ++i) {
+        read[i].resize(values[i].size());
+        load.emplace("key_" + std::to_string(i),
+                     Slice{read[i].data(), read[i].size()});
+    }
+    ASSERT_TRUE(backend.BatchLoad(load).has_value());
+    for (size_t i = 0; i < objects; ++i) {
+        EXPECT_TRUE(read[i] == values[i]) << "key_" << i;
+    }
+}
+
+}  // namespace
+
+// WriteBucket writes a bucket through the page cache in chunks that end at
+// multiples of kBucketWriteChunkBytes in the file, splitting objects across
+// them, with at most IOV_MAX iovecs each. Every object must read back
+// intact wherever the chunk boundaries fall.
+
+// 1,200 iovecs in well under one chunk: split by IOV_MAX alone. One
+// pwritev used to fail this bucket with EINVAL.
+TEST_F(StorageBackendTest, BucketWriteSplitsAtIovMax) {
+    OffloadAndReadBackBucket(data_path + "/iov_max", 600, 1024);
+}
+
+// About 26 MiB of ~300 KiB objects: objects straddle chunk boundaries.
+TEST_F(StorageBackendTest, BucketWriteSplitsObjectsAtChunkBoundaries) {
+    OffloadAndReadBackBucket(data_path + "/boundaries", 90, 300 * 1024);
+}
+
+// Objects larger than a chunk are split into several chunks.
+TEST_F(StorageBackendTest, BucketWriteSplitsObjectsLargerThanAChunk) {
+    OffloadAndReadBackBucket(
+        data_path + "/large", 3,
+        2 * BucketStorageBackend::kBucketWriteChunkBytes + 12345);
+}
+
+// The first chunk stops at IOV_MAX iovecs about 3 MiB in, and the next one
+// continues to the 4 MiB boundary inside an object.
+TEST_F(StorageBackendTest, BucketWriteContinuesFromIovMaxToChunkBoundary) {
+    OffloadAndReadBackBucket(data_path + "/iov_max_then_boundary", 1100,
+                             6 * 1024);
+}
+
+// A failed start_writeback can be the only report of lost data (ext4 drops
+// the pages of a failed delayed allocation, and a later fdatasync then
+// succeeds), so WriteBucket must fail the bucket as it does when datasync
+// fails: no .bucket or .meta left, and the keys not stored.
+TEST_F(StorageBackendTest, WritebackFailureRemovesOrphanBucketFile) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+    storage_backend.SetWritebackFailureForTest(true);
+
+    // Two objects of 3 MiB cross the first chunk boundary, so writeback is
+    // started once.
+    std::vector<std::string> values(2, std::string(3 * 1024 * 1024, 'w'));
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    for (size_t i = 0; i < values.size(); ++i) {
+        batch.emplace(
+            "writeback_fail_key_" + std::to_string(i),
+            std::vector<Slice>{Slice{values[i].data(), values[i].size()}});
+    }
+    auto offload_result = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_FALSE(offload_result.has_value());
+    EXPECT_EQ(offload_result.error(), ErrorCode::FILE_WRITE_FAIL);
+
+    for (const auto& entry : fs::directory_iterator(data_path)) {
+        EXPECT_NE(entry.path().extension(), ".bucket") << entry.path();
+        EXPECT_NE(entry.path().extension(), ".meta") << entry.path();
+    }
+    for (size_t i = 0; i < values.size(); ++i) {
+        auto exists =
+            storage_backend.IsExist("writeback_fail_key_" + std::to_string(i));
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_FALSE(exists.value());
+    }
+
+    // Nothing is left behind that stops a retry.
+    storage_backend.SetWritebackFailureForTest(false);
+    auto retry = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(retry.has_value()) << toString(retry.error());
+    for (size_t i = 0; i < values.size(); ++i) {
+        auto exists =
+            storage_backend.IsExist("writeback_fail_key_" + std::to_string(i));
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_TRUE(exists.value());
+    }
+}
+
 TEST_F(StorageBackendTest, BucketStorageBackend_DeleteBucketNotFound) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
