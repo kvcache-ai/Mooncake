@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -914,10 +915,21 @@ class RouterEventPublisher {
         msgpack::sbuffer buffer;
         msgpack::packer<msgpack::sbuffer> packer(&buffer);
         packer.pack_array(3);
-        packer.pack(batch.get().via.array.ptr[0]);
+        // msgpack-c 6 re-packs an integral double as an integer, which the
+        // decoder rejects as a timestamp, so write the float64 encoding.
+        PackFloat64(buffer, batch.get().via.array.ptr[0].as<double>());
         packer.pack(batch.get().via.array.ptr[1]);
         packer.pack(rank);
         Publish(std::string(buffer.data(), buffer.size()));
+    }
+
+    static void PackFloat64(msgpack::sbuffer& buffer, double value) {
+        const auto bits = std::bit_cast<uint64_t>(value);
+        char encoded[9] = {static_cast<char>(0xcb)};
+        for (int index = 0; index < 8; ++index) {
+            encoded[1 + index] = static_cast<char>(bits >> (56 - 8 * index));
+        }
+        buffer.write(encoded, sizeof(encoded));
     }
 
    private:
