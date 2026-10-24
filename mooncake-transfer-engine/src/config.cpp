@@ -540,6 +540,38 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.use_ipv6 = true;
     }
 
+#ifdef MOONCAKE_ENABLE_PXN
+    // pxn slot size per slot pool, unit KB
+    const char* pxn_slot_size_kb_env = std::getenv("MC_PXN_SLOT_SIZE_KB");
+    if (pxn_slot_size_kb_env) {
+        long kb = atol(pxn_slot_size_kb_env);
+        if (kb > 0) {
+            config.pxn_slot_size = static_cast<size_t>(kb) * 1024;
+            config.pxn_slot_size = std::max(config.pxn_slot_size, config.slice_size);
+        } else {
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_PXN_SLOT_SIZE_KB";
+        }
+    }
+    // pxn slot count per slot pool
+    const char* pxn_slot_count_env =
+        std::getenv("MC_PXN_SLOT_COUNT_PER_WORKER");
+    if (pxn_slot_count_env) {
+        int cnt = atoi(pxn_slot_count_env);
+        if (cnt > 0) {
+            config.pxn_slot_count_per_worker = cnt;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_PXN_SLOT_COUNT_PER_WORKER";
+        }
+    }
+    const char* without_pxn_env = std::getenv("MC_WITHOUT_PXN");
+    if (without_pxn_env && std::string(without_pxn_env) == "1") {
+        config.without_pxn = true;
+        LOG(INFO) << "MC_WITHOUT_PXN=1, PXN bypass enabled";
+    }
+#endif
+
     const char* fragment_ratio = std::getenv("MC_FRAGMENT_RATIO");
     if (fragment_ratio) {
         size_t val = atoi(fragment_ratio);
