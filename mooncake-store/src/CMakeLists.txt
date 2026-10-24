@@ -22,7 +22,6 @@ set(MOONCAKE_CENTRALIZED_MASTER_SOURCES
 set(MOONCAKE_STORE_SOURCES
     ${MOONCAKE_MASTER_SUPPORT_SOURCES}
     client_resources.cpp
-    storage_backend.cpp
     thread_pool.cpp
     posix_file.cpp
     client_buffer.cpp
@@ -159,6 +158,7 @@ else()
         master_client.cpp
         transfer_task.cpp
         file_storage.cpp
+        storage_backend.cpp
     )
     target_sources(mooncake_master_core PRIVATE ${MOONCAKE_CENTRALIZED_MASTER_SOURCES})
     target_sources(mooncake_master PRIVATE master.cpp)

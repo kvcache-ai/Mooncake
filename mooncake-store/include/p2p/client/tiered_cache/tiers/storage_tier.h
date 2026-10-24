@@ -14,9 +14,15 @@
 #include <json/json.h>
 
 #include "p2p/client/tiered_cache/tiers/cache_tier.h"
-#include "storage_backend.h"
+#include "p2p/client/tiered_cache/tiers/bucket_storage_backend.h"
 
 namespace mooncake {
+
+namespace v1 {
+// V1 policy: prefer fragmented buckets, then the oldest bucket.
+tl::expected<int64_t, ErrorCode> SelectBucketForEviction(
+    const BucketStorageBackend& backend);
+}  // namespace v1
 
 /**
  * @class StorageBuffer
@@ -26,7 +32,7 @@ namespace mooncake {
 class StorageBuffer : public BufferBase {
    public:
     explicit StorageBuffer(std::unique_ptr<AllocatedBuffer> staging_buffer,
-                           StorageBackendInterface* backend)
+                           v1::BucketStorageBackend* backend)
         : staging_buffer_(std::move(staging_buffer)),
           backend_(backend),
           size_(staging_buffer_ ? staging_buffer_->size() : 0) {}
@@ -120,7 +126,7 @@ class StorageBuffer : public BufferBase {
    private:
     mutable std::mutex data_mutex_;
     std::unique_ptr<AllocatedBuffer> staging_buffer_;
-    StorageBackendInterface* backend_ = nullptr;
+    v1::BucketStorageBackend* backend_ = nullptr;
     std::string key_;
     std::atomic<bool> is_on_disk_{false};
     std::atomic<bool> is_flushing_{false};
@@ -182,10 +188,13 @@ class StorageTier : public CacheTier {
     // Background flush thread worker
     void FlushWorker();
 
+    void CleanStoragePath();
+
     UUID tier_id_;
     std::vector<std::string> tags_;
 
-    std::shared_ptr<StorageBackendInterface> storage_backend_;
+    v1::BucketStorageConfig storage_config_;
+    std::shared_ptr<v1::BucketStorageBackend> storage_backend_;
 
     // Pending Write Buffer for aggregation
     std::mutex batch_mutex_;

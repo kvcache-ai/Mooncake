@@ -15,7 +15,6 @@
 #include "p2p/client/tiered_cache/tiers/storage_tier.h"
 #include "p2p/client/tiered_cache/tiered_backend.h"
 #include "../utils/common.h"
-#include "storage_backend.h"
 #include "allocator.h"
 #include "utils.h"
 
@@ -615,18 +614,15 @@ TEST_F(StorageTierTest, BucketBackendRejectsOffloadWhenPhysicalSpaceTooLow) {
                         "stable int64_t overflow-safe test";
     }
 
-    FileStorageConfig config;
+    v1::BucketStorageConfig config;
     config.storage_filepath = test_dir.string();
-    config.storage_backend_type = StorageBackendType::kBucket;
     config.total_size_limit = std::numeric_limits<int64_t>::max();
 
-    BucketBackendConfig bucket_config;
-    bucket_config.bucket_keys_limit = 10;
-    bucket_config.bucket_size_limit =
-        static_cast<int64_t>(space_info.capacity + 1);
+    config.bucket_keys_limit = 10;
+    config.bucket_size_limit = static_cast<int64_t>(space_info.capacity + 1);
 
     {
-        BucketStorageBackend backend(config, bucket_config);
+        v1::BucketStorageBackend backend(config);
         ASSERT_TRUE(backend.Init());
 
         auto enable_res = backend.IsEnableOffloading();
@@ -653,16 +649,14 @@ TEST_F(StorageTierTest, BucketEviction) {
     fs::create_directories("/tmp/mooncake_test_bucket_eviction");
 
     // Create backend directly
-    FileStorageConfig config;
+    v1::BucketStorageConfig config;
     config.storage_filepath = "/tmp/mooncake_test_bucket_eviction";
-    config.storage_backend_type = StorageBackendType::kBucket;
 
-    BucketBackendConfig bucket_config;
-    bucket_config.bucket_size_limit = 1024 * 1024;
-    bucket_config.bucket_keys_limit = 10;
+    config.bucket_size_limit = 1024 * 1024;
+    config.bucket_keys_limit = 10;
 
     {
-        BucketStorageBackend backend(config, bucket_config);
+        v1::BucketStorageBackend backend(config);
         ASSERT_TRUE(backend.Init());
 
         // Create test data
@@ -672,7 +666,7 @@ TEST_F(StorageTierTest, BucketEviction) {
         batch["key2"] = {Slice{data.data(), data.size()}};
         batch["key3"] = {Slice{data.data(), data.size()}};
 
-        auto offload_res = backend.BatchOffload(batch, nullptr);
+        auto offload_res = backend.BatchOffload(batch);
         ASSERT_TRUE(offload_res.has_value());
         int64_t bucket_id = offload_res.value();
 
@@ -692,7 +686,7 @@ TEST_F(StorageTierTest, BucketEviction) {
         LOG(INFO) << "Marked key1 and key2 as deleted";
 
         // Select bucket for eviction (should select the fragmented bucket)
-        auto select_res = backend.SelectBucketForEviction();
+        auto select_res = v1::SelectBucketForEviction(backend);
         ASSERT_TRUE(select_res.has_value());
         EXPECT_EQ(select_res.value(), bucket_id)
             << "Should select the fragmented bucket";

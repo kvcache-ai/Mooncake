@@ -84,6 +84,7 @@ set(MOONCAKE_STORE_P2P_SOURCES
     client/tiered_cache/tiered_backend.cpp
     client/tiered_cache/tiers/dram_tier.cpp
     client/tiered_cache/tiers/storage_tier.cpp
+    client/tiered_cache/tiers/bucket_storage_backend.cpp
     client/tiered_cache/scheduler/simple_policy.cpp
     client/tiered_cache/scheduler/lru_policy.cpp
     client/tiered_cache/scheduler/client_scheduler.cpp

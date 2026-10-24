@@ -3,8 +3,6 @@
 #include <glog/logging.h>
 
 #include <atomic>
-#include <condition_variable>
-#include <deque>
 #include <filesystem>
 #include <list>
 #include <mutex>
@@ -12,8 +10,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <json/json.h>
 
 #include "file_interface.h"
 #include "mutex.h"
@@ -42,8 +38,6 @@ struct BucketMetadata {
 YLT_REFL(BucketMetadata, data_size, keys, metadatas);
 
 struct OffloadMetadata {
-    // `total_keys` tracks live keys reachable through the backend.
-    // `total_size` tracks backend-accounted used bytes.
     int64_t total_keys;
     int64_t total_size;
     OffloadMetadata(std::size_t keys, int64_t size)
@@ -77,8 +71,6 @@ struct BucketBackendConfig {
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();
-
-    void MergeFromJson(const Json::Value& v);
 };
 
 struct FileStorageConfig {
@@ -104,7 +96,7 @@ struct FileStorageConfig {
     uint32_t heartbeat_interval_seconds = 10;
 
     // Interval between client_buffer_gc (in seconds)
-    uint32_t client_buffer_gc_interval_seconds = 10;
+    uint32_t client_buffer_gc_interval_seconds = 1;
     uint64_t client_buffer_gc_ttl_ms = 5000;
 
     // Validates the configuration for correctness and consistency
@@ -122,8 +114,6 @@ struct FileStorageConfig {
      * @return FileStorageConfig with values from env or defaults
      */
     static FileStorageConfig FromEnvironment();
-
-    void MergeFromJson(const Json::Value& v);
 };
 
 class StorageBackendInterface {
@@ -150,20 +140,6 @@ class StorageBackendInterface {
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) = 0;
 
-    /**
-     * @brief Mark a key as deleted.
-     * @param key The object key that was deleted
-     * @return tl::expected<void, ErrorCode> indicating operation status
-     * @note FilePerKey physically removes the file and updates physical
-     * accounting. Bucket backend removes the live mapping but defers physical
-     * reclaim to bucket eviction.
-     */
-    virtual tl::expected<void, ErrorCode> MarkKeyDeleted(
-        const std::string& key) {
-        // Default implementation: no-op
-        return {};
-    }
-
     // Test-only: Set predicate to force failures for specific keys in
     // BatchOffload. Default implementation does nothing (no failures injected).
     // Concrete backends can override to provide test failure injection.
@@ -173,54 +149,7 @@ class StorageBackendInterface {
         // Default: no-op (no test failures injected)
     }
 
-    // Removes every file and subdirectory under
-    // file_storage_config_.storage_filepath, keeping the directory itself.
-    // This is a no-op when the path is missing or empty. It is intentionally
-    // NOT invoked by the backends themselves; only the P2P tiered-cache path
-    // (StorageTier) calls it, so the centralized FileStorage path keeps its
-    // persist/recover-across-restart behavior unchanged.
-    void CleanStoragePath();
-
     FileStorageConfig file_storage_config_;
-};
-
-class LocalStorageSpaceManager {
-   public:
-    explicit LocalStorageSpaceManager(
-        std::filesystem::path storage_root = std::filesystem::path());
-
-    void SetStorageRoot(std::filesystem::path storage_root);
-
-    tl::expected<void, ErrorCode> Init(uint64_t used_space_bytes,
-                                       uint64_t quota_bytes = 0);
-
-    tl::expected<bool, ErrorCode> HasPhysicalSpace(
-        uint64_t required_size) const;
-
-    bool IsInitialized() const;
-
-    bool TryReserve(uint64_t required_size);
-
-    void Release(uint64_t size_to_release);
-
-    uint64_t TotalSpace() const;
-
-    uint64_t UsedSpace() const;
-
-    uint64_t AvailableSpace() const;
-
-    bool IsOverQuota() const;
-
-   private:
-    void RecalculateAvailableSpaceLocked();
-
-   private:
-    std::filesystem::path storage_root_;
-    mutable std::shared_mutex mutex_;
-    uint64_t total_space_ = 0;
-    uint64_t used_space_ = 0;
-    uint64_t available_space_ = 0;
-    std::atomic<bool> initialized_{false};
 };
 
 /**
@@ -384,7 +313,7 @@ class StorageBackend {
      * @brief Deletes the physical file associated with the given object key
      * @param path Path to the file to remove
      */
-    tl::expected<void, ErrorCode> RemoveFile(const std::string& path);
+    void RemoveFile(const std::string& path);
 
     /**
      * @brief Removes objects from the storage backend whose keys match a regex
@@ -423,8 +352,14 @@ class StorageBackend {
     mutable std::shared_mutex
         file_queue_mutex_;  // Mutex to protect file queue operations
 
+    // Storage space tracking variables
+    mutable std::shared_mutex
+        space_mutex_;               // Mutex to protect space tracking variables
+    uint64_t total_space_ = 0;      // Total storage space in bytes
+    uint64_t used_space_ = 0;       // Used storage space in bytes
+    uint64_t available_space_ = 0;  // Available storage space in bytes
+
     std::atomic<bool> initialized_{false};
-    LocalStorageSpaceManager space_manager_;
 
     /**
      * @brief Make sure the path is valid and create necessary directories
@@ -491,6 +426,12 @@ class StorageBackend {
      * @param size_to_release The amount of space, in bytes, to be released.
      */
     void ReleaseSpace(uint64_t size_to_release);
+
+    /**
+     * @brief Recalculates available_space_ based on total_space_ and
+     * used_space_. Must be called with space_mutex_ locked.
+     */
+    void RecalculateAvailableSpace();
 
     /**
      * @brief Gets the actual filesystem directory name by removing "moon_"
@@ -583,9 +524,6 @@ class StorageBackendAdaptor : public StorageBackendInterface {
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
 
-    tl::expected<void, ErrorCode> MarkKeyDeleted(
-        const std::string& key) override;
-
     // Test-only: Set predicate to force failures for specific keys in
     // BatchOffload. Returns true if the key should fail, false otherwise. This
     // allows deterministic testing of partial success behavior.
@@ -611,7 +549,6 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 
     static std::string ConcatSlicesToString(const std::vector<Slice>& slices);
 
-    mutable Mutex scan_mutex_;
     mutable Mutex mutex_;
 
     int64_t total_keys GUARDED_BY(mutex_);
@@ -635,7 +572,6 @@ class BucketStorageBackend : public StorageBackendInterface {
    public:
     BucketStorageBackend(const FileStorageConfig& file_storage_config_,
                          const BucketBackendConfig& bucket_backend_config_);
-    ~BucketStorageBackend();
 
     /**
      * @brief Offload objects in batches
@@ -752,35 +688,10 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     /**
      * @brief Retrieves the global metadata of the store.
-     * @return On success: `tl::expected` containing live key count and
-     * backend-accounted used bytes. On failure: an error code.
+     * @return On success: `tl::expected` containing a `StoreMetadata`
+     * object. On failure: an error code.
      */
     tl::expected<OffloadMetadata, ErrorCode> GetStoreMetadata();
-
-    /**
-     * @brief Select a bucket for eviction based on fragmentation and age.
-     * @return tl::expected<int64_t, ErrorCode>
-     * - On success: the bucket ID to evict
-     * - On failure: error code (e.g., OBJECT_NOT_FOUND if no buckets exist)
-     */
-    tl::expected<int64_t, ErrorCode> SelectBucketForEviction() const;
-
-    /**
-     * @brief Evict an entire bucket by removing its data and metadata files.
-     * @param bucket_id The ID of the bucket to evict
-     * @return tl::expected<size_t, ErrorCode>
-     * - On success: the amount of space freed (in bytes)
-     * - On failure: error code
-     */
-    tl::expected<size_t, ErrorCode> EvictBucket(int64_t bucket_id);
-
-    /**
-     * @brief Mark a key as deleted (for fragmentation tracking).
-     * @param key The object key that was deleted
-     * @return tl::expected<void, ErrorCode> indicating operation status
-     */
-    tl::expected<void, ErrorCode> MarkKeyDeleted(
-        const std::string& key) override;
 
    private:
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
@@ -794,11 +705,7 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<iovec>& iovs);
 
     tl::expected<void, ErrorCode> StoreBucketMetadata(
-        const std::string& metadata_path,
-        const std::string& serialized_metadata);
-
-    tl::expected<std::string, ErrorCode> SerializeBucketMetadata(
-        const std::shared_ptr<BucketMetadata>& bucket_metadata);
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
 
     tl::expected<void, ErrorCode> LoadBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
@@ -829,27 +736,6 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<bool, ErrorCode> HasNext();
 
-    struct PendingBucketDeletion {
-        int64_t bucket_id;
-        uint64_t data_bytes;
-        uint64_t meta_bytes;
-        uint64_t queued_bytes;
-        std::string data_path;
-        std::string meta_path;
-    };
-
-    tl::expected<bool, ErrorCode> CanAcceptAnotherBucket() const;
-
-    uint64_t MaxPendingDeletionBytes() const;
-
-    void StartDeletionWorker();
-
-    void StopDeletionWorker();
-
-    void EnqueueBucketDeletion(PendingBucketDeletion task);
-
-    void BucketDeletionWorker();
-
    private:
     std::atomic<bool> initialized_{false};
     std::optional<BucketIdGenerator> bucket_id_generator_;
@@ -862,34 +748,22 @@ class BucketStorageBackend : public StorageBackendInterface {
      * metadata members:
      * - object_bucket_map_: maps object keys to bucket IDs
      * - buckets_: ordered map of bucket ID to bucket metadata
-     * - physical_used_bytes_: physical bytes still present on local storage
+     * - total_size_: cumulative data size of all stored objects
      */
     mutable SharedMutex mutex_;
     mutable Mutex iterator_mutex_;
     std::string storage_path_;
-    int64_t physical_used_bytes_ GUARDED_BY(mutex_) = 0;
+    int64_t total_size_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
-    LocalStorageSpaceManager space_manager_;
 
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
         ungrouped_offloading_objects_;
-
-    // Track valid key count per bucket for fragmentation calculation
-    std::unordered_map<int64_t, int> GUARDED_BY(mutex_) bucket_valid_keys_;
-
-    std::mutex deletion_mutex_;
-    std::condition_variable deletion_cv_;
-    std::deque<PendingBucketDeletion> pending_bucket_deletions_;
-    std::thread deletion_thread_;
-    bool stop_deletion_worker_ = false;
-    std::atomic<uint64_t> pending_deletion_bytes_{0};
-    std::atomic<uint64_t> pending_deletion_count_{0};
 };
 
 class OffsetAllocatorStorageBackend : public StorageBackendInterface {
@@ -1108,10 +982,6 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
-CreateStorageBackend(const FileStorageConfig& config,
-                     const Json::Value& tier_config = Json::Value{});
-
-tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
-CreateStorageBackend(const Json::Value& tier_config);
+CreateStorageBackend(const FileStorageConfig& config);
 
 }  // namespace mooncake

@@ -136,6 +136,7 @@ add_p2p_store_test(client_http_metrics_test client_http_metrics_test.cpp)
 # tiered cache
 add_p2p_store_test(tiered_backend_test tiered_backend_test.cpp)
 add_p2p_store_test(storage_tier_test storage_tier_test.cpp)
+add_p2p_store_test(v1_bucket_storage_backend_test bucket_storage_backend_test.cpp)
 add_p2p_store_test(scheduler_integration_test scheduler_integration_test.cpp)
 add_p2p_store_test(multi_lru_test multi_lru_test.cpp)
 add_p2p_store_test(event_driven_policy_test event_driven_policy_test.cpp)

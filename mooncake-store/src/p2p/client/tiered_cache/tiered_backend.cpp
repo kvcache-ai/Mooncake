@@ -893,6 +893,10 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
 // TODO: move the logic into the storage_tier
 size_t TieredBackend::NotifyBucketEviction(const std::vector<std::string>& keys,
                                            const UUID& tier_id) {
+    // Known V1 limitation: an old bucket's key list can name a newer replica
+    // on this tier. There is no bucket identity check before removing it and
+    // notifying Master. Fixing only the backend mapping erase is insufficient.
+    // Intentionally deferred: retire V1 after V2 is validated and deployed.
     // Capture handle references locally so the actual resource release (and the
     // owning tier's per-key Free accounting) happens OUTSIDE all metadata
     // locks, mirroring Delete(). The physical bucket has already been removed
