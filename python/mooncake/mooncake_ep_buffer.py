@@ -372,7 +372,11 @@ class Buffer:
         self, device: torch.device, dtype: torch.dtype = torch.int32
     ) -> torch.Tensor:
         if not self._is_mooncake_backend():
-            if not self._warned_active_ranks_without_mooncake_backend:
+            # XPU builds have no Mooncake PG, so there is nothing to switch to.
+            if (
+                self.device_type != "xpu"
+                and not self._warned_active_ranks_without_mooncake_backend
+            ):
                 import warnings
 
                 try:
@@ -560,8 +564,11 @@ class Buffer:
             )
             native_weights = ()
             if self.device_type == "xpu":
+                # The mode is passed apart from the pointer: an empty tensor's
+                # data_ptr() is 0, and a rank without tokens still reduces.
                 native_weights = (
                     0 if topk_weights is None else topk_weights.data_ptr(),
+                    topk_weights is not None,
                 )
             event, hook = self.runtime.dispatch(
                 x.data_ptr(),

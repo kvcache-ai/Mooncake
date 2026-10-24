@@ -329,7 +329,9 @@ endif()
 if(USE_XPU)
   # XPU sources live under mooncake-transfer-engine/tent and mooncake-ep, which
   # are only added when USE_TENT or WITH_EP is ON. Without this guard
-  # -DUSE_XPU=ON configures and builds cleanly while compiling no XPU code.
+  # -DUSE_XPU=ON configures and builds cleanly while compiling no XPU code. An
+  # EP build without TENT must also leave out the Store; the top-level
+  # CMakeLists.txt checks that once WITH_STORE is defined.
   if(NOT USE_TENT AND NOT WITH_EP)
     message(
       FATAL_ERROR

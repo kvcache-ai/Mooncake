@@ -213,7 +213,7 @@ XPU_EP_INLINE void list_picks(const DispatchArgs& a, sycl::sub_group sg,
     if (dst < 0) return;
     const size_t entry = static_cast<size_t>(dst) * T + pos;
     if (first == lane) rank_lists[entry] = t | (count << 16);
-    if (a.topk_weights && slot >= 0) {
+    if (a.recv.count && slot >= 0) {
         int32_t* pick = rank_picks + (entry * kTopkShadowMaxTopk + index) * 2;
         pick[0] = (e % num_local) | (slot << 16);
         pick[1] = sycl::bit_cast<int32_t>(a.topk_weights[k]);

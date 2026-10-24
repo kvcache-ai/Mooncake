@@ -41,7 +41,8 @@ On Intel XPU, Mooncake EP is built natively with the oneAPI DPC++ compiler
 ```bash
 source /opt/intel/oneapi/setvars.sh
 cmake -S . -B build-xpu -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
-  -DUSE_XPU=ON -DWITH_EP=ON -DUSE_CUDA=OFF -DWITH_STORE_RUST=OFF
+  -DUSE_XPU=ON -DWITH_EP=ON -DUSE_CUDA=OFF -DWITH_STORE=OFF \
+  -DWITH_STORE_RUST=OFF
 ```
 
 The module runs on PyTorch's SYCL queues and uses the SYCL runtime that

@@ -39,7 +39,7 @@ struct RecvTable {
 struct DispatchArgs {
     const void* x;
     const int64_t* topk_idx;
-    const float* topk_weights;  // null: combine does not pre-reduce
+    const float* topk_weights;  // read when recv.count is set
     int32_t* active_ranks;
     void* packed_recv_x;
     float* packed_recv_x_scales;

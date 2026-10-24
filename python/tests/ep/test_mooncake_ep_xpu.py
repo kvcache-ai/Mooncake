@@ -49,13 +49,13 @@ def _fp8_reference(x: torch.Tensor):
     a true division, 448 / amax, as in the kernel. (`448.0 / t` in torch is
     t.reciprocal() * 448, which rounds differently.)
     """
-    xf = x.float().cpu().view(x.size(0), -1, 128)
+    xf = x.float().cpu().view(x.size(0), x.size(1) // 128, 128)
     amax = xf.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
     scale = torch.full_like(amax, 448.0) / amax
     codes = (xf * scale).to(torch.float8_e4m3fn)
     scale_inv = amax * (1.0 / 448.0)
-    deq = (codes.float() * scale_inv).view(x.size(0), -1)
-    return codes.view(x.size(0), -1), scale_inv.squeeze(-1), deq.to(x.device)
+    deq = (codes.float() * scale_inv).view(x.shape)
+    return codes.view(x.shape), scale_inv.squeeze(-1), deq.to(x.device)
 
 
 def _expert_scale(expert: torch.Tensor) -> torch.Tensor:
@@ -536,6 +536,12 @@ def _worker(local_rank, world, args, port):
                 f"weights_at_dispatch={with_weights} ok",
                 flush=True,
             )
+    # A rank with no tokens passes an empty weights tensor; it must still take
+    # part in the pre-reduced combine like its peers. A few tokens elsewhere
+    # suffice and keep the CPU reference check fast at 8 ranks.
+    for empty_rank, use_fp8, hook_mode in ((0, False, False), (world - 1, True, True)):
+        n = 0 if local_rank == empty_rank else max(1, args.max_tokens // 8)
+        check_round(buffer, group, local_rank, world, args, n, use_fp8, hook_mode, True)
     for _ in range(4):
         check_two_batch_overlap(buffer, group, local_rank, world, args)
     check_duplicate_experts(buffer, group, local_rank, world, args, False)
@@ -557,7 +563,8 @@ def _worker(local_rank, world, args, port):
     dist.barrier(_CPU_GROUP)
     if local_rank == 0:
         print(
-            f"PASSED: {len(token_counts)} rounds + 4 two-batch rounds + duplicate experts"
+            f"PASSED: {len(token_counts)} rounds + 2 empty-rank rounds"
+            " + 4 two-batch rounds + duplicate experts"
             " + reused src_info + rejected handle + cross-stream + fallback agreement"
             f"{' + dead-rank timeout' if world > 2 else ''} on {world} ranks "
             f"(hidden={args.hidden}, experts={args.num_experts}, topk={args.num_topk})",

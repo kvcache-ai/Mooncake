@@ -113,6 +113,13 @@ std::vector<int32_t> MooncakeEpXpuBuffer::get_ipc_handle() {
 void MooncakeEpXpuBuffer::sync_nvlink_ipc_handles(
     const std::vector<std::vector<int32_t>>& remote_handles,
     const std::vector<int>& active_ranks_mask) {
+    // Remapping peers closes the old mappings, which launched kernels may
+    // still be reading.
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        last_event_.wait();
+    }
+    queue_.wait();
     ipc_->importPeers(remote_handles, active_ranks_mask);
 }
 
@@ -203,7 +210,8 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::dispatch(
     bool use_fp8, uint64_t packed_recv_x_ptr, uint64_t packed_recv_x_scales_ptr,
     uint64_t packed_recv_count_ptr, uint64_t packed_recv_src_info_ptr,
     uint64_t packed_recv_layout_range_ptr, bool async, bool return_recv_hook,
-    uint64_t compute_stream_ptr, uint64_t topk_weights_ptr) {
+    uint64_t compute_stream_ptr, uint64_t topk_weights_ptr,
+    bool with_topk_weights) {
     XPU_EP_CHECK(!(async && return_recv_hook),
                  "async and return_recv_hook are mutually exclusive");
     checkShape(hidden, num_topk, num_max_dispatch_tokens_per_rank, num_experts);
@@ -213,6 +221,10 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::dispatch(
     XPU_EP_CHECK(active_ranks_ptr != 0, "active_ranks is required");
     XPU_EP_CHECK(!use_fp8 || packed_recv_x_scales_ptr != 0,
                  "FP8 dispatch requires packed_recv_x_scales");
+    // The mode is a flag of its own: a rank with no tokens passes an empty
+    // weights tensor, whose pointer is null, yet must reduce like its peers.
+    XPU_EP_CHECK(!with_topk_weights || num_tokens == 0 || topk_weights_ptr != 0,
+                 "topk_weights is required for its tokens");
     sycl::queue& q = queueFor(compute_stream_ptr);
 
     BufferPair layout(ipc_->base(), num_max_dispatch_tokens_per_rank, hidden,
@@ -221,7 +233,7 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::dispatch(
     const int cur = buffer_idx_;
     buffer_idx_ ^= 1;
     const int shadow_slot = takeShadowSlot(packed_recv_src_info_ptr);
-    slot_reduced_[shadow_slot] = topk_weights_ptr != 0;
+    slot_reduced_[shadow_slot] = with_topk_weights;
     orderAfterLast(q);
     if (num_tokens > 0)
         q.memcpy(topkShadow(shadow_slot), reinterpret_cast<void*>(topk_idx_ptr),
@@ -246,7 +258,7 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::dispatch(
     a.counter_per_rank =
         reinterpret_cast<int*>(workspace_ + kRankCounterOffset);
     a.done_counter = reinterpret_cast<int*>(workspace_ + kDoneOffset);
-    if (topk_weights_ptr) a.recv = recvTable(shadow_slot);
+    if (with_topk_weights) a.recv = recvTable(shadow_slot);
     a.peers = PeerView{ipc_->base(), ipc_->peerBases()};
     a.num_tokens = num_tokens;
     a.hidden = hidden;

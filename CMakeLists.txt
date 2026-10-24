@@ -44,6 +44,18 @@ endif()
 option(MOONCAKE_ENABLE_OPLOG_PERF_METRICS
        "Enable detailed batch OpLog performance metrics" OFF)
 
+# Without TENT only Mooncake EP builds for XPU: the Store's XPU device gets its
+# SYCL flags from TENT's platform library. Checked before the Store's
+# dependencies are looked up, which would fail first and less clearly.
+if(USE_XPU
+   AND NOT USE_TENT
+   AND WITH_STORE)
+  message(
+    FATAL_ERROR
+      "USE_XPU=ON without USE_TENT=ON builds Mooncake EP only. Re-run cmake with -DWITH_EP=ON -DWITH_STORE=OFF, or with -DUSE_TENT=ON."
+  )
+endif()
+
 include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
 if(SKBUILD)
   set(PYBIND11_FINDPYTHON ON)

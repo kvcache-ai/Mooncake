@@ -79,7 +79,7 @@ class MooncakeEpXpuBuffer {
                     uint64_t packed_recv_src_info_ptr,
                     uint64_t packed_recv_layout_range_ptr, bool async,
                     bool return_recv_hook, uint64_t compute_stream_ptr,
-                    uint64_t topk_weights_ptr);
+                    uint64_t topk_weights_ptr, bool with_topk_weights);
 
     Result combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
                    uint64_t topk_weights_ptr, uint64_t src_info_ptr,
