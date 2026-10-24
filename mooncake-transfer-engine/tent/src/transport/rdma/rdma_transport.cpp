@@ -182,6 +182,8 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_DEVICE(max_cqe, params->device.max_cqe);
 
     SET_ENDPOINT(endpoint_store_cap, params->endpoint.endpoint_store_cap);
+    SET_ENDPOINT(endpoint_idle_timeout_secs,
+                 params->endpoint.endpoint_idle_timeout_secs);
     SET_ENDPOINT(max_sge, params->endpoint.max_sge);
     SET_ENDPOINT(max_qp_wr, params->endpoint.max_qp_wr);
     SET_ENDPOINT(max_inline_bytes, params->endpoint.max_inline_bytes);

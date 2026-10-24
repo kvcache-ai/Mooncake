@@ -84,7 +84,8 @@ RdmaEndPoint::RdmaEndPoint()
       queue_lock_list_(nullptr),
       wr_depth_list_(nullptr),
       inflight_slices_(0),
-      destroy_start_time_(0) {}
+      destroy_start_time_(0),
+      last_used_ts_(0) {}
 
 RdmaEndPoint::~RdmaEndPoint() { deconstruct(); }
 
@@ -97,6 +98,10 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
                    << statusToString(expected);
         return -1;
     }
+    // An endpoint under construction has not been looked up yet, so stamp it
+    // here: otherwise idle eviction could retire it before its handshake
+    // finishes.
+    noteUsed();
 
     context_ = context;
     params_ = params;
@@ -1307,6 +1312,10 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
 }
 
 bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
+    // The passive side of a transfer never looks its own endpoint up, so an
+    // inbound notification is the one place it can record that the peer is
+    // still there.
+    noteUsed();
     std::lock_guard<std::mutex> resource_guard(notify_resource_mutex_);
     if (!notify_recv_mr_) {
         // The endpoint was deconstructed while this completion was in the
