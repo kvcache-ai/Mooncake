@@ -98,6 +98,10 @@ PGResult<DeviceRouteConfig> loadDeviceRouteConfigFromEnvironment() {
 //   "allreduce:ring":
 //     Use Ring for AllReduce across all sizes. AllGather keeps its automatic
 //     policy.
+//   "alltoall:pairwise;gather:star;scatter:star":
+//     Use Pairwise for AllToAll and Star for Gather/Scatter.
+//   "broadcast:star;reduce:star":
+//     Use Star instead of Ring for the two rooted operations.
 //   "allreduce:oneshot@512KiB":
 //     Use OneShot for AllReduce inputs <= 512 KiB. Larger inputs and AllGather
 //     keep their automatic policy.
@@ -127,11 +131,20 @@ loadCollectiveAlgorithmChoicesFromEnvironment() {
     static const std::unordered_map<std::string_view, OpType> kOperationByName{
         {"allreduce", OpType::AllReduce},
         {"allgather", OpType::AllGather},
+        {"reducescatter", OpType::ReduceScatter},
+        {"broadcast", OpType::Broadcast},
+        {"reduce", OpType::Reduce},
+        {"alltoall", OpType::AllToAll},
+        {"gather", OpType::Gather},
+        {"scatter", OpType::Scatter},
+        {"barrier", OpType::Barrier},
     };
     static const std::unordered_map<std::string_view, DeviceCollectiveAlgorithm>
         kAlgorithmByName{
             {"ring", DeviceCollectiveAlgorithm::Ring},
             {"oneshot", DeviceCollectiveAlgorithm::OneShot},
+            {"pairwise", DeviceCollectiveAlgorithm::Pairwise},
+            {"star", DeviceCollectiveAlgorithm::Star},
         };
 
     std::vector<DeviceCollectiveAlgorithmChoice> choices;
@@ -1089,6 +1102,20 @@ PGResult<void> MooncakeCommunicator::broadcastGpu(
     PG_TRY(checkBuffer(recv_buffer, bytes, "receive buffer"));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    if (gpu_collective_backend_ == GpuCollectiveBackend::New) {
+        PG_ASSERT(device_collective_,
+                  "new GPU collective backend is selected without a local "
+                  "runtime");
+        return device_collective_->enqueue(
+            BroadcastRequest{send_buffer, recv_buffer, count, datatype, root,
+                             failed_ranks_hint},
+            stream);
+    }
+#else
+    PG_ASSERT(gpu_collective_backend_ != GpuCollectiveBackend::New,
+              "new GPU collective backend is unavailable in this build");
+#endif
     worker_->putTaskCuda(
         OpType::Broadcast, bytes, root, meta_, stream, failed_ranks_hint,
         [=](void* dst, size_t pos, size_t size, cudaStream_t enqueue_stream) {
@@ -1289,9 +1316,23 @@ PGResult<void> MooncakeCommunicator::reduceScatterGpu(
     PG_TRY(auto recv_bytes, getByteCount(count, datatype));
     PG_TRY(checkBuffer(send_buffer, recv_bytes, "send buffer"));
     PG_TRY(checkBuffer(recv_buffer, recv_bytes, "receive buffer"));
-    PG_TRY(checkReduction(datatype, op, false));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    if (gpu_collective_backend_ == GpuCollectiveBackend::New) {
+        PG_ASSERT(device_collective_,
+                  "new GPU collective backend is selected without a local "
+                  "runtime");
+        return device_collective_->enqueue(
+            ReduceScatterRequest{send_buffer, recv_buffer, count, datatype, op,
+                                 failed_ranks_hint},
+            stream);
+    }
+#else
+    PG_ASSERT(gpu_collective_backend_ != GpuCollectiveBackend::New,
+              "new GPU collective backend is unavailable in this build");
+#endif
+    PG_TRY(checkReduction(datatype, op, false));
     const int active_size = getSize();
     worker_->putTaskCuda(
         OpType::ReduceScatter, recv_bytes, 0, meta_, stream, failed_ranks_hint,
@@ -1358,6 +1399,20 @@ PGResult<void> MooncakeCommunicator::allToAllGpu(
     PG_TRY(checkBuffer(recv_buffer, peer_bytes, "receive buffer"));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    if (gpu_collective_backend_ == GpuCollectiveBackend::New) {
+        PG_ASSERT(device_collective_,
+                  "new GPU collective backend is selected without a local "
+                  "runtime");
+        return device_collective_->enqueue(
+            AllToAllRequest{send_buffer, recv_buffer, count, datatype,
+                            failed_ranks_hint},
+            stream);
+    }
+#else
+    PG_ASSERT(gpu_collective_backend_ != GpuCollectiveBackend::New,
+              "new GPU collective backend is unavailable in this build");
+#endif
     const int active_size = getSize();
     worker_->putTaskCuda(
         OpType::AllToAll, peer_bytes, 0, meta_, stream, failed_ranks_hint,
@@ -1400,6 +1455,18 @@ PGResult<void> MooncakeCommunicator::barrierGpu(
     PG_TRY(checkOpState(OpType::Barrier));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    if (gpu_collective_backend_ == GpuCollectiveBackend::New) {
+        PG_ASSERT(device_collective_,
+                  "new GPU collective backend is selected without a local "
+                  "runtime");
+        return device_collective_->enqueue(
+            BarrierRequest{.failed_ranks_hint = failed_ranks_hint}, stream);
+    }
+#else
+    PG_ASSERT(gpu_collective_backend_ != GpuCollectiveBackend::New,
+              "new GPU collective backend is unavailable in this build");
+#endif
     worker_->putTaskCuda(
         OpType::Barrier, kBarrierDummySize, 0, meta_, stream, failed_ranks_hint,
         [](void*, size_t, size_t, cudaStream_t) {},
@@ -1452,9 +1519,23 @@ PGResult<void> MooncakeCommunicator::reduceGpu(const void* send_buffer,
     if (is_root) {
         PG_TRY(checkBuffer(recv_buffer, bytes, "receive buffer"));
     }
-    PG_TRY(checkReduction(datatype, op, false));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    if (gpu_collective_backend_ == GpuCollectiveBackend::New) {
+        PG_ASSERT(device_collective_,
+                  "new GPU collective backend is selected without a local "
+                  "runtime");
+        return device_collective_->enqueue(
+            ReduceRequest{send_buffer, recv_buffer, count, datatype, op, root,
+                          failed_ranks_hint},
+            stream);
+    }
+#else
+    PG_ASSERT(gpu_collective_backend_ != GpuCollectiveBackend::New,
+              "new GPU collective backend is unavailable in this build");
+#endif
+    PG_TRY(checkReduction(datatype, op, false));
     const int active_size = getSize();
     worker_->putTaskCuda(
         OpType::Reduce, bytes, root, meta_, stream, failed_ranks_hint,
@@ -1522,6 +1603,20 @@ PGResult<void> MooncakeCommunicator::gatherGpu(const void* send_buffer,
     }
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    if (gpu_collective_backend_ == GpuCollectiveBackend::New) {
+        PG_ASSERT(device_collective_,
+                  "new GPU collective backend is selected without a local "
+                  "runtime");
+        return device_collective_->enqueue(
+            GatherRequest{send_buffer, recv_buffer, count, datatype, root,
+                          failed_ranks_hint},
+            stream);
+    }
+#else
+    PG_ASSERT(gpu_collective_backend_ != GpuCollectiveBackend::New,
+              "new GPU collective backend is unavailable in this build");
+#endif
     const int active_size = getSize();
     worker_->putTaskCuda(
         OpType::Gather, send_bytes, root, meta_, stream, failed_ranks_hint,
@@ -1588,6 +1683,20 @@ PGResult<void> MooncakeCommunicator::scatterGpu(
     }
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    if (gpu_collective_backend_ == GpuCollectiveBackend::New) {
+        PG_ASSERT(device_collective_,
+                  "new GPU collective backend is selected without a local "
+                  "runtime");
+        return device_collective_->enqueue(
+            ScatterRequest{send_buffer, recv_buffer, count, datatype, root,
+                           failed_ranks_hint},
+            stream);
+    }
+#else
+    PG_ASSERT(gpu_collective_backend_ != GpuCollectiveBackend::New,
+              "new GPU collective backend is unavailable in this build");
+#endif
     const int active_size = getSize();
     worker_->putTaskCuda(
         OpType::Scatter, recv_bytes, root, meta_, stream, failed_ranks_hint,

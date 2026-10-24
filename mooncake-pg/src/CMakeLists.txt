@@ -15,8 +15,18 @@ if(USE_CUDA)
       "${_pg_device_source}"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/ring/ring_all_reduce.cu"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/ring/ring_all_gather.cu"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/ring/ring_reduce_scatter.cu"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/ring/ring_broadcast.cu"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/ring/ring_reduce.cu"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/ring/ring_barrier.cu"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/one_shot/one_shot_all_reduce.cu"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/one_shot/one_shot_all_gather.cu"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/one_shot/one_shot_reduce_scatter.cu"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/pairwise/pairwise_all_to_all.cu"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/star/star_gather.cu"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/star/star_scatter.cu"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/star/star_broadcast.cu"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/star/star_reduce.cu"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_transfer/routes/nccl_device_route/nccl_device_route.cu"
   )
 elseif(USE_MUSA OR USE_MACA)
@@ -176,6 +186,8 @@ if(USE_CUDA)
       device_comm/device_collective/protocols/ll/ll_protocol.cpp
       device_comm/device_collective/algorithms/ring/ring_algorithm.cpp
       device_comm/device_collective/algorithms/one_shot/one_shot_algorithm.cpp
+      device_comm/device_collective/algorithms/pairwise/pairwise_algorithm.cpp
+      device_comm/device_collective/algorithms/star/star_algorithm.cpp
       device_comm/device_collective/strong_stream.cpp)
 endif()
 
