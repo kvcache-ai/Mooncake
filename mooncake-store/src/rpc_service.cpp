@@ -1953,6 +1953,9 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::PollRemoveAll,
         &WrappedMasterService::CreateCopyTask,
         &WrappedMasterService::CreateMoveTask, &WrappedMasterService::QueryTask,
+        &WrappedMasterService::CreateDrainJob,
+        &WrappedMasterService::QueryDrainJob,
+        &WrappedMasterService::CancelDrainJob,
         &WrappedMasterService::FetchTasks,
         &WrappedMasterService::MarkTaskToComplete>(
         server, wrapped_master_service, worker_pool);
