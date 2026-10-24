@@ -40,29 +40,31 @@
 namespace mooncake {
 namespace tent {
 
-Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
-    static std::shared_ptr<Platform> g_instance;
-    static std::once_flag flag;
-    std::call_once(flag, [&]() {
+std::unique_ptr<Platform> Platform::create(std::shared_ptr<Config> conf) {
 #ifdef USE_CUDA
-        g_instance = std::make_shared<CudaPlatform>(conf);
+    return std::make_unique<CudaPlatform>(conf);
 #elif defined(USE_HIP)
-        g_instance = std::make_shared<RocmPlatform>(conf);
+    return std::make_unique<RocmPlatform>(conf);
 #elif defined(USE_SUNRISE)
-        g_instance = std::make_shared<SunrisePlatform>(conf);
+    return std::make_unique<SunrisePlatform>(conf);
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
     defined(USE_MEMFABRIC)
-        g_instance = std::make_shared<AscendPlatform>(conf);
+    return std::make_unique<AscendPlatform>(conf);
 #elif defined(USE_TPU)
-        g_instance = std::make_shared<TpuPlatform>(conf);
+    return std::make_unique<TpuPlatform>(conf);
 #elif defined(USE_MLU)
-            g_instance = std::make_shared<MluPlatform>(conf);
+    return std::make_unique<MluPlatform>(conf);
 #elif defined(USE_XPU)
-            g_instance = std::make_shared<XpuPlatform>(conf);
+    return std::make_unique<XpuPlatform>(conf);
 #else
-        g_instance = std::make_shared<CpuPlatform>(conf);
+    return std::make_unique<CpuPlatform>(conf);
 #endif
-    });
+}
+
+Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
+    static std::unique_ptr<Platform> g_instance;
+    static std::once_flag flag;
+    std::call_once(flag, [&]() { g_instance = create(conf); });
     return *g_instance;
 }
 
