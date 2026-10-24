@@ -80,6 +80,28 @@ turn a compact N-D plan into an unbounded number of operations.
 The logical planner is copy-only. It does not infer model semantics from tensor
 names or transform dtype, quantization, packing, swizzle, or checkpoint format.
 
+### Stored-source geometry
+
+For an already published source, use `StoredWeightManifest` and
+`plan_stored_transfer_to_target_placement(source_manifest, target_placement)`.
+Each `StoredFragmentSnapshot` identifies a logical box by `global_offset` and
+`local_shape`, and its bytes by `object_key`, `object_offset`, and `nbytes`.
+There is no source rank, training mesh, or framework runtime object in this
+fragment contract. Source fragment count, boundaries, and dimensions can differ
+from the target placement.
+
+The framework adapter determines the logical boxes and which consistent source
+copy to publish. It must decompose any nonrectangular local allocation into
+valid boxes. Mooncake validates the declared snapshot and geometry, computes
+source/target intersections, and lowers them to byte ranges; it does not infer
+training sharding or select a training replica from runtime state.
+
+The stored-source planner tests reconstruct exact bytes for nonuniform 4-to-8
+and 8-to-4 layouts, both tensor dimensions, shuffled fragments, and padded
+object offsets. These are CPU planning regressions, not transport or throughput
+measurements. This path does not replace sparse coordinate planning or change
+its wire format.
+
 ## Runtime Binding
 
 `bind_logical_transfer_plan` attaches selected typed
