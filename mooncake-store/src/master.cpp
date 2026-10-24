@@ -1733,6 +1733,12 @@ int main(int argc, char* argv[]) {
         admin_server.SetServiceDelegate(wrapped_master_service);
         admin_server.SetServiceAvailable(true);
 
+        // Open the restore lifecycle (RFC #4700, slice 1): the non-HA path
+        // has no promotion restore, so it moves Constructed -> Ready ->
+        // Serving explicitly, before the RPC service is registered.
+        wrapped_master_service->MarkReadyForServing();
+        wrapped_master_service->ActivateServing();
+
         // Declared after the service so that it drains before the service
         // is destroyed.
         mooncake::RpcWorkerPool worker_pool(
