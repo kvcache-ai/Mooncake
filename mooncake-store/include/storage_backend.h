@@ -551,6 +551,7 @@ class StorageBackend {
     FileRecord PopFileToEvictByFIFO();
 
     void RestoreFileToWriteQueueFront(const FileRecord& record);
+    void RestoreFileToWriteQueue(const FileRecord& record, bool to_front);
 
     tl::expected<void, ErrorCode> DeleteEvictedFile(const FileRecord& record);
 
