@@ -393,8 +393,9 @@ void ShardAllocator::Free(uint64_t offset, uint64_t /*aligned_size*/,
 
     auto lru_it = shard.lru_index.find(key);
     if (lru_it != shard.lru_index.end() && lru_it->second->second == offset) {
-        shard.lru_list.erase(lru_it->second);
+        const auto list_it = lru_it->second;
         shard.lru_index.erase(lru_it);
+        shard.lru_list.erase(list_it);
     }
 
     auto it = shard.offset_to_handle.find(offset);
@@ -432,7 +433,8 @@ void ShardAllocator::UpdateAccess(const std::string& key, int shard_idx,
                               lru_it->second);
     } else {
         shard.lru_list.push_front({key, offset});
-        shard.lru_index[key] = shard.lru_list.begin();
+        shard.lru_index.emplace(shard.lru_list.front().first,
+                                shard.lru_list.begin());
     }
 }
 
@@ -507,8 +509,8 @@ void ShardAllocator::RestorePreparedEviction(PendingEviction&& pending) {
             shard.lru_index.end()) {
             shard.lru_list.push_back(
                 {prepared.candidate.key, prepared.candidate.offset});
-            shard.lru_index[prepared.candidate.key] =
-                std::prev(shard.lru_list.end());
+            shard.lru_index.emplace(shard.lru_list.back().first,
+                                    std::prev(shard.lru_list.end()));
         }
     }
 
@@ -572,8 +574,8 @@ void ShardAllocator::ResolvePreparedEviction(
             shard.lru_index.end()) {
             shard.lru_list.push_back(
                 {prepared.candidate.key, prepared.candidate.offset});
-            shard.lru_index[prepared.candidate.key] =
-                std::prev(shard.lru_list.end());
+            shard.lru_index.emplace(shard.lru_list.back().first,
+                                    std::prev(shard.lru_list.end()));
         }
     }
 
@@ -666,8 +668,8 @@ void ShardAllocator::PrepareEvictionFromShard(ShardState& shard, int shard_idx,
         if (handle_it == shard.offset_to_handle.end() ||
             handle_it->second.key != evict_key ||
             handle_it->second.eviction_prepared) {
-            shard.lru_list.erase(lru_it);
             shard.lru_index.erase(evict_key);
+            shard.lru_list.erase(lru_it);
             continue;
         }
 
@@ -684,8 +686,8 @@ void ShardAllocator::PrepareEvictionFromShard(ShardState& shard, int shard_idx,
 
         handle_it->second.eviction_prepared = true;
         prepared_bytes += handle_it->second.bytes;
-        shard.lru_list.erase(lru_it);
         shard.lru_index.erase(evict_key);
+        shard.lru_list.erase(lru_it);
 
         const double projected_usage =
             usage - static_cast<double>(prepared_bytes) /
