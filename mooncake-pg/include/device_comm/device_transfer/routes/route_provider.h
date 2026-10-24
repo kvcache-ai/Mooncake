@@ -4,7 +4,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -31,8 +30,22 @@ class RouteProvider {
    public:
     virtual ~RouteProvider() = default;
 
-    [[nodiscard]] virtual std::string_view routeKey() const noexcept = 0;
-    [[nodiscard]] virtual uint32_t routeVersion() const noexcept = 0;
+    [[nodiscard]] DeviceRouteType routeType() const noexcept {
+        return route_type_;
+    }
+    [[nodiscard]] std::string_view routeKey() const noexcept {
+        return route_key_;
+    }
+    [[nodiscard]] uint32_t routeVersion() const noexcept {
+        return endpoint_version_;
+    }
+
+    // Whether all backing regions must be supplied through registerRegion()
+    // before installEndpoints(), including regions not used by local transfers.
+    [[nodiscard]] virtual bool requiresAllRegionsForInstallation()
+        const noexcept {
+        return false;
+    }
 
     // Prepare one complete DTS backing region for this route. Providers only
     // borrow the allocation and must undo the same preparation in
@@ -46,17 +59,32 @@ class RouteProvider {
     // unusable endpoint.
     [[nodiscard]] virtual std::optional<RouteEndpoint> localEndpoint() = 0;
 
+    // Prepare resources for the snapshot while current routes remain usable.
+    // Reclaim generations with versions below reclaim_before_version.
+    virtual PGResult<void> installEndpoints(
+        const DeviceTransferSnapshot& snapshot,
+        uint64_t reclaim_before_version) = 0;
+
+    // Switch resources after local DTS users stop.
     // Resolve the service-owned endpoint snapshot as one batch.
     // A missing peer or a missing matching route means that the provider
     // must clear any state previously associated with that slot and return
     // an Unreachable entry for it.
     [[nodiscard]] virtual PGResult<std::vector<DeviceTransferRoute>>
-    resolveRoutes(
-        std::span<const std::optional<DeviceTransferEndpoint>> endpoints) = 0;
+    updateRoutes() = 0;
 
-    virtual PGResult<void> shutdown() { return {}; }
+    // Fill this provider's fields, preserving other providers' fields.
+    virtual void fillDeviceContext(DeviceRouteContext&) const noexcept {}
+
+    virtual PGResult<void> shutdown() = 0;
 
    protected:
+    RouteProvider(DeviceRouteType route_type, std::string_view route_key,
+                  uint32_t endpoint_version) noexcept
+        : route_type_(route_type),
+          route_key_(route_key),
+          endpoint_version_(endpoint_version) {}
+
     [[nodiscard]] PGResult<const RouteEndpoint*> findEndpoint(
         const std::optional<DeviceTransferEndpoint>& endpoint) const {
         if (!endpoint) return nullptr;
@@ -96,6 +124,11 @@ class RouteProvider {
                         "serialized data contains trailing bytes");
         return metadata;
     }
+
+   private:
+    DeviceRouteType route_type_;
+    std::string_view route_key_;
+    uint32_t endpoint_version_;
 };
 
 }  // namespace mooncake

@@ -9,78 +9,67 @@
 
 namespace mooncake {
 
-P2pRoute::P2pRoute(device::P2pTransport& transport, void* local_region,
-                   int device_index, GlobalRank self_rank,
+P2pRoute::P2pRoute(int device_index, GlobalRank self_rank,
                    uint32_t max_world_size)
-    : transport_(transport),
-      local_region_(local_region),
+    : RouteProvider(DeviceRouteType::P2p, kRouteKey, kEndpointVersion),
       device_index_(device_index),
       self_rank_(self_rank),
       max_world_size_(max_world_size) {}
 
-PGResult<void> P2pRoute::initialize() {
-    PG_VALIDATE_STATE(!snapshot_stream_, "P2P route is already initialized");
-    PG_TRY(auto snapshot_stream, GpuStream::createNonBlocking(device_index_));
+PGResult<std::unique_ptr<P2pRoute>> P2pRoute::create(int device_index,
+                                                     GlobalRank self_rank,
+                                                     uint32_t max_world_size) {
+    PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
+    auto route = std::unique_ptr<P2pRoute>(
+        new P2pRoute(device_index, self_rank, max_world_size));
 
     // Scan visible hardware once; peer mappings are resolved separately.
     cudaDeviceProp properties{};
-    PG_TRY_CUDA(cudaGetDeviceProperties(&properties, device_index_));
+    PG_TRY_CUDA(cudaGetDeviceProperties(&properties, device_index));
     static_assert(sizeof(properties.uuid.bytes) == sizeof(DeviceUUID));
-    std::memcpy(device_uuid_.data(), properties.uuid.bytes,
-                device_uuid_.size());
+    std::memcpy(route->device_uuid_.data(), properties.uuid.bytes,
+                route->device_uuid_.size());
     int device_count = 0;
     PG_TRY_CUDA(cudaGetDeviceCount(&device_count));
     for (int peer = 0; peer < device_count; ++peer) {
-        if (peer == device_index_) continue;
+        if (peer == device_index) continue;
         int accessible = 0;
-        PG_TRY_CUDA(cudaDeviceCanAccessPeer(&accessible, device_index_, peer));
+        PG_TRY_CUDA(cudaDeviceCanAccessPeer(&accessible, device_index, peer));
         if (!accessible) continue;
         int native_atomics = 0;
         PG_TRY_CUDA(cudaDeviceGetP2PAttribute(
-            &native_atomics, cudaDevP2PAttrNativeAtomicSupported, device_index_,
+            &native_atomics, cudaDevP2PAttrNativeAtomicSupported, device_index,
             peer));
         if (!native_atomics) continue;
         PG_TRY_CUDA(cudaGetDeviceProperties(&properties, peer));
         DeviceUUID uuid;
         std::memcpy(uuid.data(), properties.uuid.bytes, uuid.size());
-        native_atomic_peer_uuids_.push_back(uuid);
+        route->native_atomic_peer_uuids_.push_back(uuid);
     }
 
-    snapshot_stream_.emplace(std::move(snapshot_stream));
-    return {};
+    return route;
 }
 
-std::string_view P2pRoute::routeKey() const noexcept { return kRouteKey; }
-
-uint32_t P2pRoute::routeVersion() const noexcept { return kEndpointVersion; }
-
 std::optional<RouteEndpoint> P2pRoute::localEndpoint() {
-    if (!local_region_) return std::nullopt;
-    const auto handle = localHandle();
-    if (handle.empty()) return std::nullopt;
+    if (local_handle_.empty()) return std::nullopt;
     return RouteEndpoint{
         .route_key = std::string(kRouteKey),
         .version = routeVersion(),
-        .metadata = encodeEndpointMetadata(handle),
+        .metadata = encodeEndpointMetadata(local_handle_),
     };
 }
 
-std::vector<int32_t> P2pRoute::localHandle() const {
-    return transport_.exportIpcHandle(local_region_);
-}
-
-PGResult<std::vector<DeviceTransferRoute>> P2pRoute::resolveRoutes(
-    std::span<const std::optional<DeviceTransferEndpoint>> endpoints) {
-    PG_VALIDATE_STATE(snapshot_stream_, "P2P route is not initialized");
-    PG_VALIDATE_STATE(local_region_,
-                      "P2P peer-accessible region is not configured");
-    PG_VALIDATE_ARG(endpoints.size() == max_world_size_,
+PGResult<void> P2pRoute::installEndpoints(
+    const DeviceTransferSnapshot& snapshot, uint64_t reclaim_before_version) {
+    PG_VALIDATE_STATE(local_ptr_, "P2P region is not registered");
+    PG_VALIDATE_ARG(snapshot.endpoints.size() == max_world_size_,
                     "P2P route endpoint snapshot size does not match max world "
                     "size");
+    const auto& endpoints = snapshot.endpoints;
+    PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index_));
 
     // Decode the complete snapshot before changing the imported mappings.
     std::vector<std::vector<int32_t>> handles(max_world_size_);
-    std::vector<int> active(max_world_size_, 0);
     for (GlobalRank rank = 0; rank < static_cast<GlobalRank>(max_world_size_);
          ++rank) {
         PG_TRY(auto endpoint, findEndpoint(endpoints[rank]));
@@ -89,75 +78,91 @@ PGResult<std::vector<DeviceTransferRoute>> P2pRoute::resolveRoutes(
                decodeEndpointMetadata<std::vector<int32_t>>(*endpoint));
         PG_VALIDATE_ARG(!handles[rank].empty(),
                         "P2P route endpoint handle is empty");
-        active[rank] = 1;
     }
 
-    PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index_));
-    transport_.importPeerHandles(local_region_, self_rank_, max_world_size_,
-                                 handles, active);
+    if (standby_) {
+        PG_VALIDATE_STATE(
+            standby_->installation_version < reclaim_before_version,
+            "previous P2P generation is not reclaimable");
+        standby_.reset();
+    }
 
-    std::vector<int32_t> available(max_world_size_, 0);
-    std::vector<void*> region_bases(max_world_size_, nullptr);
-    PG_TRY_CUDA(
-        cudaMemcpyAsync(available.data(), transport_.availableTablePtr(),
-                        available.size() * sizeof(int32_t),
-                        cudaMemcpyDeviceToHost, snapshot_stream_->get()));
-    PG_TRY_CUDA(
-        cudaMemcpyAsync(region_bases.data(), transport_.peerPtrsTablePtr(),
-                        region_bases.size() * sizeof(void*),
-                        cudaMemcpyDeviceToHost, snapshot_stream_->get()));
-    PG_TRY(snapshot_stream_->synchronize());
-
-    std::vector<DeviceTransferRoute> routes(max_world_size_);
+    auto next = std::make_unique<State>();
+    next->installation_version = snapshot.version;
+    next->peers.resize(max_world_size_);
+    next->routes.resize(max_world_size_);
     for (GlobalRank rank = 0; rank < static_cast<GlobalRank>(max_world_size_);
          ++rank) {
-        if (!active[rank]) continue;
-
-        uint64_t mapped_region_address = 0;
+        if (handles[rank].empty()) continue;
+        void* address = nullptr;
         if (rank == self_rank_) {
-            mapped_region_address = reinterpret_cast<uint64_t>(local_region_);
-        } else if (available[rank] && region_bases[rank]) {
-            mapped_region_address =
-                reinterpret_cast<uint64_t>(region_bases[rank]);
+            address = local_ptr_;
+        } else {
+            auto& peer = next->peers[rank];
+            const auto* previous = current_ ? &current_->peers[rank] : nullptr;
+            peer.handle = std::move(handles[rank]);
+            if (previous && previous->mapping &&
+                previous->handle == peer.handle)
+                peer.mapping = previous->mapping;
+            else
+                peer.mapping = device::importP2pMemory(peer.handle);
+            if (!peer.mapping) continue;
+            address = peer.mapping->address();
         }
-        if (mapped_region_address == 0) continue;
 
-        routes[rank] = DeviceTransferRoute{
+        next->routes[rank] = DeviceTransferRoute{
             .type = DeviceRouteType::P2p,
             .region_size = endpoints[rank]->region_size,
-            .p2p = {.mapped_region_address = mapped_region_address},
+            .p2p = {.mapped_region_address =
+                        reinterpret_cast<uint64_t>(address)},
         };
     }
-    return routes;
+    standby_ = std::move(next);
+    return {};
+}
+
+PGResult<std::vector<DeviceTransferRoute>> P2pRoute::updateRoutes() {
+    PG_VALIDATE_STATE(standby_, "P2P route update requires prepared endpoints");
+    current_.swap(standby_);
+    return current_->routes;
 }
 
 PGResult<void> P2pRoute::registerRegion(DeviceRegionKind kind, void* addr,
                                         size_t size) {
-    PG_VALIDATE_STATE(snapshot_stream_, "P2P route is not initialized");
     PG_VALIDATE_ARG(addr && size != 0, "P2P region is empty");
     PG_ASSERT(kind == DeviceRegionKind::PeerAccessible ||
                   kind == DeviceRegionKind::LocalStaging,
               "P2P route received an unknown device region kind");
 
-    // P2P preparation is tied to allocation rather than registration in the
-    // current TE device API:
-    //
-    // - PeerAccessible is allocated through P2pTransport, which retains the
-    //   Fabric/MACA metadata needed when P2pRoute exports its base address.
-    // - LocalStaging is not exported; a P2P put reads it as ordinary local
-    //   device memory.
-    //
-    // Neither region requires additional work here.
+    if (kind == DeviceRegionKind::LocalStaging) return {};
+    PG_VALIDATE_STATE(!local_ptr_, "P2P region is already registered");
+    PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index_));
+    auto handle = device::exportP2pMemory(addr, size);
+    if (handle.empty()) {
+        return makePGError(PGErrorCode::NotSupported,
+                           "P2P region cannot be exported");
+    }
+    local_ptr_ = addr;
+    local_size_ = size;
+    local_handle_ = std::move(handle);
     return {};
 }
 
 PGResult<void> P2pRoute::unregisterRegion(DeviceRegionKind kind, void* addr,
                                           size_t size) {
-    PG_VALIDATE_STATE(snapshot_stream_, "P2P route is not initialized");
     PG_VALIDATE_ARG(addr && size != 0, "P2P region is empty");
-    PG_ASSERT(kind == DeviceRegionKind::PeerAccessible ||
-                  kind == DeviceRegionKind::LocalStaging,
-              "P2P route received an unknown device region kind");
+    if (kind == DeviceRegionKind::LocalStaging) return {};
+    PG_VALIDATE_STATE(local_ptr_ == addr && local_size_ == size,
+                      "P2P region does not match the exported allocation");
+    local_handle_.clear();
+    local_ptr_ = nullptr;
+    local_size_ = 0;
+    return {};
+}
+
+PGResult<void> P2pRoute::shutdown() {
+    standby_.reset();
+    current_.reset();
     return {};
 }
 

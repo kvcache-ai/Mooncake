@@ -59,6 +59,8 @@ PGResult<DeviceRouteConfig> loadDeviceRouteConfigFromEnvironment() {
                                         config.p2p.enabled));
     PG_TRY(applyRouteDisableEnvironment("MOONCAKE_PG_DISABLE_RDMA_ROUTE",
                                         config.rdma.enabled));
+    PG_TRY(applyRouteDisableEnvironment("MOONCAKE_PG_DISABLE_NCCL_DEVICE_ROUTE",
+                                        config.nccl_device.enabled));
     PG_TRY(applyRouteDisableEnvironment("MOONCAKE_PG_DISABLE_HOST_PROXY_ROUTE",
                                         config.host_proxy.enabled));
     return config;
@@ -249,11 +251,12 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
     // initialized only when CUDA is available. GPU communicator creation
     // checks that these resources exist.
     if (get_device_result == cudaSuccess) {
+        PG_TRY(auto strong_stream, StrongStream::create(device_index));
         auto transfer_service = std::make_unique<DeviceTransferService>();
         PG_TRY(transfer_service->initialize(
             static_cast<GlobalRank>(rank), static_cast<uint32_t>(world_size),
             device_index, *engine, link_manager, kDefaultPeerAccessibleCapacity,
-            kDefaultLocalStagingCapacity, route_config));
+            kDefaultLocalStagingCapacity, *strong_stream, route_config));
 
         PG_TRY(auto workspace,
                DeviceCollectiveWorkspace::create(
@@ -261,15 +264,13 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
                    static_cast<uint32_t>(world_size),
                    kDefaultDeviceCollectiveBufferSize));
 
-        PG_TRY(auto strong_stream, StrongStream::create(device_index));
-
         auto recovery_worker =
             std::make_unique<DeviceCollectiveRecoveryWorker>();
         PG_TRY(recovery_worker->start());
 
+        device_collective_strong_stream = std::move(strong_stream);
         device_transfer_service = std::move(transfer_service);
         device_collective_workspace = std::move(workspace);
-        device_collective_strong_stream = std::move(strong_stream);
         device_collective_recovery_worker = std::move(recovery_worker);
     }
 #endif
@@ -463,12 +464,12 @@ PGResult<void> MooncakePGContext::shutdown() {
         device_collective_recovery_worker->shutdown();
         device_collective_recovery_worker.reset();
     }
-    device_collective_strong_stream.reset();
     device_collective_workspace.reset();
     if (device_transfer_service) {
         PG_TRY(device_transfer_service->shutdown());
         device_transfer_service.reset();
     }
+    device_collective_strong_stream.reset();
 #endif
     link_manager.shutdown();
     engine = nullptr;
