@@ -536,7 +536,7 @@ void MooncakeEpBuffer::sync_ibgda_peers(
     const std::vector<int64_t>& subnet_prefixes,
     const std::vector<int64_t>& interface_ids,
     const std::vector<int>& active_ranks_mask) {
-    if (!rdma_transport_) return;
+    if (!rdma_transport_ || ibgda_disabled_) return;
 
     // Flatten per-rank QPN/LID vectors into per-QP arrays expected by
     // connectPeers.  Each rank owns USE_QP_COUNT/num_ranks QPs.
