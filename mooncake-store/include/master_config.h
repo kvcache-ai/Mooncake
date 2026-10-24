@@ -123,6 +123,10 @@ struct MasterConfig {
     std::string ha_backend_connstring;
     int64_t ha_leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     std::string etcd_endpoints;
+    bool etcd_tls_enabled;
+    std::string etcd_ca_file;
+    std::string etcd_cert_file;
+    std::string etcd_key_file;
 
     // OpLog store configuration
     bool enable_oplog = false;
@@ -260,6 +264,10 @@ class MasterServiceSupervisorConfig {
     std::string ha_backend_connstring;
     int64_t ha_leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     std::string etcd_endpoints = "0.0.0.0:2379";
+    bool etcd_tls_enabled = false;
+    std::string etcd_ca_file;
+    std::string etcd_cert_file;
+    std::string etcd_key_file;
     // OpLog store configuration
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
@@ -397,6 +405,10 @@ class MasterServiceSupervisorConfig {
         ha_backend_type = config.ha_backend_type;
         ha_leader_lease_ttl_sec = config.ha_leader_lease_ttl_sec;
         etcd_endpoints = config.etcd_endpoints;
+        etcd_tls_enabled = config.etcd_tls_enabled;
+        etcd_ca_file = config.etcd_ca_file;
+        etcd_cert_file = config.etcd_cert_file;
+        etcd_key_file = config.etcd_key_file;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
         enable_oplog = config.enable_oplog;
