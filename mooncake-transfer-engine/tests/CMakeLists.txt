@@ -28,6 +28,23 @@ if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
                  ${WORKSPACE}/adaptive_congestion_control_benchmark.cpp)
   target_link_libraries(adaptive_congestion_control_benchmark
                         PRIVATE adaptive_congestion_control_core)
+
+  add_executable(classic_rdma_congestion_control_test
+                 ${WORKSPACE}/classic_rdma_congestion_control_test.cpp)
+  target_link_libraries(classic_rdma_congestion_control_test
+                        PRIVATE transfer_engine gtest gtest_main)
+  add_test(NAME classic_rdma_congestion_control_test
+           COMMAND classic_rdma_congestion_control_test)
+
+  configure_file(installed_congestion_control_header_test.cmake.in
+                 installed_congestion_control_header_test.cmake @ONLY)
+  add_test(
+    NAME installed_congestion_control_header_test
+    COMMAND
+      ${CMAKE_COMMAND} -DTRANSFER_ENGINE_LIBRARY=$<TARGET_FILE:transfer_engine>
+      -P
+      ${CMAKE_CURRENT_BINARY_DIR}/installed_congestion_control_header_test.cmake
+  )
 endif()
 
 if(USE_HIP)
