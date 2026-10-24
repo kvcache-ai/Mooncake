@@ -88,6 +88,7 @@ SegmentPool::WriteAccess::PrepareWithLiveAllocations(
     if (!resource) {
         return tl::make_unexpected(resource.error());
     }
+    resource->resource().allocator()->SetLocality(segment.locality);
     resource->resource().allocator()->AttachUsageTracker(
         segment_pool_.usage_tracker_);
     MountedRegion mounted{segment, client_id, SegmentStatus::OK, kind};

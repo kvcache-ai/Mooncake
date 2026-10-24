@@ -675,7 +675,7 @@ class FileStorageTest : public ::testing::Test {
         std::free(seg_ptr);
     }
     void RunBatchPutHealWipeScenario(const std::string& data_path,
-                                     bool with_session_ids = false) {
+                                     bool with_key_metadata = false) {
         std::filesystem::path master_root =
             std::filesystem::path(data_path) / "heal_master_batch";
         std::filesystem::create_directories(master_root);
@@ -771,9 +771,14 @@ class FileStorageTest : public ::testing::Test {
         }
         ReplicateConfig cfg;
         cfg.replica_num = 1;
-        if (with_session_ids) {
+        if (with_key_metadata) {
             cfg.session_ids =
                 std::vector<std::string>{"fresh", "wiped-a", "wiped-b"};
+            cfg.group_ids =
+                std::vector<std::string>{"fresh-group", "a-group", "b-group"};
+            cfg.per_key_preferred_hca_names =
+                std::vector<std::vector<std::string>>{
+                    {"mlx5_0"}, {}, {"mlx5_1"}};
         }
         auto results = client.value()->BatchPut(keys, batched_slices, cfg);
         ASSERT_EQ(results.size(), keys.size());
@@ -1773,7 +1778,7 @@ TEST_F(FileStorageTest,
 }
 
 TEST_F(FileStorageTest,
-       TaggedBatchPutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
+       SessionAndHcaBatchPutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
     RunBatchPutHealWipeScenario(data_path, true);
 }
 

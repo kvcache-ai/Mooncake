@@ -2375,6 +2375,48 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
               3072);
 }
 
+TEST_F(MasterServiceHATest, RemountMatchesSharedEndpointRangesByAddress) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "shared_endpoint_numa_ranges";
+    const size_t range_size = 4096;
+    const size_t second_range_base = kDefaultSegmentBase + range_size;
+    auto first_object = MakeStandbyObject("shared_range_first", endpoint);
+    first_object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 128;
+    auto second_object = MakeStandbyObject("shared_range_second", endpoint);
+    second_object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = second_range_base + 128;
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {first_object, second_object}, 7,
+                        {MakeStandbyMemorySegment(endpoint, range_size)})
+                    .has_value());
+
+    Segment first_segment =
+        MakeSegment(endpoint, kDefaultSegmentBase, range_size);
+    Segment second_segment =
+        MakeSegment(endpoint, second_range_base, range_size);
+    ASSERT_TRUE(
+        service.ReMountSegment({first_segment, second_segment}, generate_uuid())
+            .has_value());
+
+    for (const auto& [key, expected_address] :
+         std::vector<std::pair<std::string, uintptr_t>>{
+             {"shared_range_first", kDefaultSegmentBase + 128},
+             {"shared_range_second", second_range_base + 128}}) {
+        auto replicas = service.GetReplicaList(key, kDefaultTenant);
+        ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+        ASSERT_EQ(replicas->replicas.size(), 1);
+        EXPECT_EQ(replicas->replicas.front()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.buffer_address_,
+                  expected_address);
+    }
+}
+
 TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
     MasterService service(
         MasterServiceConfig::builder()

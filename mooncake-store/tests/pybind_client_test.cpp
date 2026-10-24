@@ -1033,7 +1033,14 @@ TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
     ASSERT_EQ(queries.size(), 1);
     ASSERT_TRUE(queries[0].has_value());
     PyClient::QueryResultCache snapshot;
-    snapshot.emplace(key, std::move(queries[0]));
+    // Two candidates exercise fragment splitting when affinity is enabled.
+    auto replicas = queries[0]->replicas;
+    auto alias = replicas.front();
+    ++alias.id;
+    replicas.push_back(std::move(alias));
+    snapshot.emplace(key,
+                     QueryResult(std::move(replicas), queries[0]->lease_timeout,
+                                 queries[0]->object_checksum));
     auto destination = py_client_->allocate_client_buffer(original.size());
     ASSERT_TRUE(destination.has_value());
     auto read = [&](size_t offset, size_t size) {
@@ -1046,8 +1053,10 @@ TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
     EXPECT_EQ(read(0, 4),
               (std::vector<std::vector<std::vector<int64_t>>>{{{4}}}));
     ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
-    EXPECT_EQ(read(4, 28),
-              (std::vector<std::vector<std::vector<int64_t>>>{{{28}}}));
+    EXPECT_EQ(py_client_->get_into_ranges_from_snapshot(
+                  {destination->ptr()}, {{key}}, {{{4, 12}}}, {{{4, 12}}},
+                  {{{8, 20}}}, snapshot),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{8, 20}}}));
     EXPECT_EQ(std::string(static_cast<char*>(destination->ptr()), 32),
               original);
     auto current = py_client_->get_buffer(key);
@@ -2093,8 +2102,8 @@ TEST_F(RealClientTest, TestPutSessionStartRejectsReliableNofConfig) {
     EXPECT_EQ(rcs[0], kInvalidParams);
 }
 
-// Filtered start_keys must keep group_ids aligned (skip existing sessions).
-TEST_F(RealClientTest, TestPutSessionStartFiltersGroupIds) {
+// Skip existing sessions while keeping every per-key field aligned.
+TEST_F(RealClientTest, TestPutSessionStartFiltersSessionGroupAndHcaHints) {
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start in-proc master";
     master_address_ = master_.master_address();
@@ -2114,17 +2123,24 @@ TEST_F(RealClientTest, TestPutSessionStartFiltersGroupIds) {
 
     ReplicateConfig first_config;
     first_config.group_ids = std::vector<std::string>{"group_a"};
+    first_config.session_ids = std::vector<std::string>{"session_a"};
+    first_config.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_0"}};
     ASSERT_EQ(py_client_->batch_put_session_start({"group_key_a"}, {kSize},
                                                   first_config)[0],
               0);
 
     ReplicateConfig batch_config;
     batch_config.group_ids = std::vector<std::string>{"group_a", "group_b"};
+    batch_config.session_ids =
+        std::vector<std::string>{"session_a", "session_b"};
+    batch_config.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_0"}, {"mlx5_1"}};
     auto rcs = py_client_->batch_put_session_start(
         {"group_key_a", "group_key_b"}, {kSize, kSize}, batch_config);
     ASSERT_EQ(rcs.size(), 2u);
     EXPECT_EQ(rcs[0], kInvalidParams) << "existing session should be skipped";
-    EXPECT_EQ(rcs[1], 0) << "filtered group_ids must match remaining keys";
+    EXPECT_EQ(rcs[1], 0) << "filtered metadata must match remaining keys";
 
     auto revoke_rcs =
         py_client_->batch_put_session_revoke({"group_key_a", "group_key_b"});

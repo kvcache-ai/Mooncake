@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -77,6 +78,35 @@ class QueryResult {
 class Client {
    public:
     virtual ~Client();
+
+    // One topology/registration snapshot serves every key or fragment in a
+    // batch. Returned names remain owned by that snapshot.
+    using HcaAffinity =
+        std::function<const std::vector<std::string>&(std::span<const Slice>)>;
+    static HcaAffinity MakeHcaAffinity(const Topology& topology,
+                                       std::vector<SegmentBufferInfo> buffers);
+    static std::optional<SegmentLocality> DiscoverSegmentLocality(
+        const Topology& topology, const std::string& location);
+    class ReadReplicaSelector {
+       public:
+        ErrorCode operator()(const std::vector<Replica::Descriptor>& replicas,
+                             std::span<const Slice> destinations,
+                             Replica::Descriptor& result);
+
+       private:
+        friend class Client;
+        explicit ReadReplicaSelector(const Client* client) : client_(client) {}
+        struct Context {
+            HcaAffinity infer;
+            std::unordered_set<std::string> endpoints;
+        };
+        const Client* client_;
+        std::unique_ptr<Context> context_;
+        bool initialized_{false};
+    };
+    ReadReplicaSelector MakeReadReplicaSelector() const {
+        return ReadReplicaSelector(this);
+    }
 
     using WriteBufferStager =
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(
@@ -279,7 +309,8 @@ class Client {
         const std::vector<Replica::Descriptor>& replicas,
         const std::vector<std::vector<Slice>>& slices,
         const std::vector<std::vector<uint64_t>>& src_offsets,
-        TransferIntent intent = TransferIntent::kUnspecified);
+        TransferIntent intent = TransferIntent::kUnspecified,
+        std::span<const QueryResult* const> query_results = {});
 
     /**
      * @brief Batch ranged read from restored LOCAL_DISK arenas.
@@ -985,7 +1016,7 @@ class Client {
      */
     ErrorCode FindFirstCompleteReplica(
         const std::vector<Replica::Descriptor>& replica_list,
-        Replica::Descriptor& replica);
+        Replica::Descriptor& replica) const;
 
     /**
      * @brief Batch put helper methods for structured approach
@@ -1020,6 +1051,12 @@ class Client {
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
+    HcaAffinity MakeHcaAffinity() const;
+    void AttachHcaAffinity(ReplicateConfig& config,
+                           const std::vector<Slice>& slices) const;
+    ReplicateConfig AttachBatchHcaAffinity(
+        const ReplicateConfig& config, const std::vector<PutOperation>& ops,
+        const std::vector<size_t>& indices) const;
 
     // Client identification
     const UUID client_id_;
