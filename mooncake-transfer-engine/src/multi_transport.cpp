@@ -21,6 +21,9 @@
 
 #include "config.h"
 #include "multi_transport_locality.h"
+#ifdef WITH_METRICS
+#include "transfer_engine_metrics.h"
+#endif
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/rdma_twosided/rdma_twosided_transport.h"
 #ifdef USE_BAREX
@@ -155,6 +158,7 @@ Status MultiTransport::tryFreeBatchID(
     BatchID batch_id, const std::function<void()>& before_delete) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
+    bool busy = false;
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         auto& task = batch_desc.task_list[task_id];
         if (task.is_finished) {
@@ -173,12 +177,15 @@ Status MultiTransport::tryFreeBatchID(
         // A terminal transfer status only means the task published completion;
         // the completion callback may still be unwinding while holding raw
         // BatchDesc access. Keep the batch alive until the explicit quiescence
-        // counter reaches zero below.
+        // counter reaches zero below. Keep walking so every task is recorded.
         if (status.s != Transport::TransferStatusEnum::COMPLETED &&
             status.s != Transport::TransferStatusEnum::FAILED) {
-            return Status::BatchBusy(
-                "BatchID cannot be freed until all tasks are done");
+            busy = true;
         }
+    }
+    if (busy) {
+        return Status::BatchBusy(
+            "BatchID cannot be freed until all tasks are done");
     }
     // A terminal status only means the task published completion; the
     // completion callback may still be unwinding while holding a pin on
@@ -246,6 +253,64 @@ void MultiTransport::deferredCleanupLoop() {
     }
 }
 
+#ifdef WITH_METRICS
+
+void MultiTransport::recordTaskStart(Transport::TransferTask& task,
+                                     const TransferRequest& request) {
+    if (!TransferEngineMetrics::isEnabled()) return;
+    if (task.start_time.time_since_epoch().count() != 0) return;
+    // Scatter grouping keeps every request in a task on the same opcode.
+    task.metrics_opcode = request.opcode;
+    task.start_time = std::chrono::steady_clock::now();
+}
+
+void MultiTransport::recordTaskEnd(Transport::TransferTask& task,
+                                   const TransferStatus& status) {
+    const auto start = task.start_time;
+    if (start.time_since_epoch().count() == 0) return;
+
+    // Record the first terminal status once; completion after TIMEOUT
+    // does not change the metrics outcome.
+    if (status.s != Transport::TransferStatusEnum::COMPLETED &&
+        status.s != Transport::TransferStatusEnum::FAILED &&
+        status.s != Transport::TransferStatusEnum::CANCELED &&
+        status.s != Transport::TransferStatusEnum::TIMEOUT) {
+        return;
+    }
+    // A task refused before any slice was created reads as COMPLETED with 0
+    // bytes but no transfer happened.
+    if (__atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE) == 0) return;
+    if (__atomic_exchange_n(&task.export_metrics_recorded, true,
+                            __ATOMIC_ACQ_REL)) {
+        return;
+    }
+
+    auto& metrics = TransferEngineMetrics::instance();
+    auto direction = task.metrics_opcode == Transport::TransferRequest::READ
+                         ? TransferEngineMetrics::Direction::Read
+                         : TransferEngineMetrics::Direction::Write;
+    if (status.s == Transport::TransferStatusEnum::COMPLETED) {
+        auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start);
+        metrics.recordCompleted(direction, status.transferred_bytes,
+                                static_cast<uint64_t>(latency.count()));
+    } else if (status.s == Transport::TransferStatusEnum::TIMEOUT) {
+        metrics.recordTimeout(direction);
+    } else {
+        metrics.recordFailed(direction);
+    }
+}
+
+#else
+
+void MultiTransport::recordTaskStart(Transport::TransferTask&,
+                                     const TransferRequest&) {}
+
+void MultiTransport::recordTaskEnd(Transport::TransferTask&,
+                                   const TransferStatus&) {}
+
+#endif  // WITH_METRICS
+
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
     return submitTransfer(batch_id, entries, nullptr);
@@ -287,6 +352,7 @@ Status MultiTransport::submitTransfer(
             transports[i]->supportsGroupedScatter()) {
             while (i + count < entries.size() &&
                    entries[i + count].task_group_id == group_id &&
+                   entries[i + count].opcode == entries[i].opcode &&
                    transports[i + count] == transports[i])
                 ++count;
         }
@@ -304,6 +370,7 @@ Status MultiTransport::submitTransfer(
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         if (count > 1) Transport::Slice::unsealTaskSubmission(&task);
 #endif
+        recordTaskStart(task, entries[i]);
         submit_tasks[transports[i]].push_back(&task);
         if (task_sizes) task_sizes->push_back(count);
         i += count;
@@ -374,6 +441,7 @@ Status MultiTransport::mp_submitTransfer(
 #else
         task.request = &request;
 #endif
+        recordTaskStart(task, request);
         ++task_id;
         submit_tasks[transport].push_back(&task);
     }
@@ -433,6 +501,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             checkSliceTimeout(task)) {
             status.s = Transport::TransferStatusEnum::TIMEOUT;
         }
+        recordTaskEnd(task, status);
         return Status::OK();
     }
 
@@ -460,6 +529,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             status.s = Transport::TransferStatusEnum::WAITING;
         }
     }
+    recordTaskEnd(task, status);
     return Status::OK();
 }
 
@@ -531,6 +601,7 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     // set is_finished. The WAITING fast path does not write is_finished.
 
     size_t success_count = 0;
+    bool any_failed = false;
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         TransferStatus task_status;
         auto ret = getTransferStatus(batch_id, task_id, task_status);
@@ -540,14 +611,18 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
             return Status::OK();
         }
 
+        // Keep walking after a failure so every task is recorded.
         if (task_status.s == Transport::TransferStatusEnum::COMPLETED) {
             status.transferred_bytes += task_status.transferred_bytes;
             success_count++;
         } else if (task_status.s == Transport::TransferStatusEnum::FAILED ||
                    task_status.s == Transport::TransferStatusEnum::TIMEOUT) {
-            status.s = Transport::TransferStatusEnum::FAILED;
-            return Status::OK();
+            any_failed = true;
         }
+    }
+    if (any_failed) {
+        status.s = Transport::TransferStatusEnum::FAILED;
+        return Status::OK();
     }
 
     status.s = (success_count == task_count)
