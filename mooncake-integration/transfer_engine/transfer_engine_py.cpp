@@ -1374,7 +1374,8 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
 int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     pybind11::gil_scoped_release release;
     TransferStatus status;
-    Status s = engine_->getTransferStatus(batch_id, 0, status);
+    // Batches from batch_transfer_async_* carry one task per buffer.
+    Status s = engine_->getBatchTransferStatus(batch_id, status);
     LOG_ASSERT(s.ok());
     if (status.s == TransferStatusEnum::COMPLETED) {
         engine_->freeBatchID(batch_id);
