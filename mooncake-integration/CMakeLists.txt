@@ -105,6 +105,15 @@ if(WITH_TE)
         ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_first_buffer.py)
     set_tests_properties(tent_python_first_buffer_test PROPERTIES TIMEOUT 60)
+    add_test(
+      NAME tent_python_sync_no_replay_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env MC_USE_TENT=1 MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
+        PYTHONPATH=$<TARGET_FILE_DIR:engine>
+        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_sync_no_replay.py)
+    set_tests_properties(tent_python_sync_no_replay_test PROPERTIES TIMEOUT 60)
   endif()
 endif()
 
