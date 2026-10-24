@@ -30,6 +30,7 @@
 #include "allocator.h"
 #include "common/timestamp.h"
 #include "common/file_util.h"
+#include "dax_file.h"
 #include "utils/common.h"
 
 namespace fs = std::filesystem;
@@ -1268,6 +1269,253 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_BasicPutGet) {
         std::string loaded(static_cast<char*>(it->second.ptr), it->second.size);
         EXPECT_EQ(loaded, expected_value);
     }
+}
+
+//-----------------------------------------------------------------------------
+// Device-DAX arena. A sparse regular file stands in for /dev/daxX.Y: the
+// backend takes the same open + mmap(MAP_SHARED) path either way, and a
+// regular file additionally lets the test read the bytes back through the
+// fd to prove write-through.
+
+namespace {
+
+std::string MakeFakeDaxDevice(const std::string& dir, size_t size) {
+    const std::string path = dir + "/fake_dax.dev";
+    std::ofstream(path, std::ios::binary).close();
+    fs::resize_file(path, size);
+    return path;
+}
+
+void OffloadOne(StorageBackendInterface& backend, const std::string& key,
+                const std::string& value) {
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(key, std::vector<Slice>{Slice{const_cast<char*>(value.data()),
+                                                value.size()}});
+    auto res = backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(res.value(), 1);
+}
+
+std::string LoadOne(StorageBackendInterface& backend, const std::string& key,
+                    size_t size) {
+    std::string out(size, '\0');
+    std::unordered_map<std::string, Slice> slices;
+    slices.emplace(key, Slice{out.data(), out.size()});
+    EXPECT_TRUE(backend.BatchLoad(slices).has_value());
+    return out;
+}
+
+}  // namespace
+
+TEST_F(StorageBackendTest, DaxFile_RoundTripWriteThroughAndBounds) {
+    const size_t size = 64 * 1024;
+    const auto path = MakeFakeDaxDevice(data_path, size);
+    auto opened = DaxFile::Open(path, size);
+    ASSERT_TRUE(opened.has_value());
+    auto& file = *opened;
+
+    std::string payload = "dax-payload";
+    iovec wiov{payload.data(), payload.size()};
+    auto wr = file->vector_write(&wiov, 1, 4096);
+    ASSERT_TRUE(wr.has_value());
+    EXPECT_EQ(wr.value(), payload.size());
+
+    std::string out(payload.size(), '\0');
+    iovec riov{out.data(), out.size()};
+    ASSERT_TRUE(file->vector_read(&riov, 1, 4096).has_value());
+    EXPECT_EQ(out, payload);
+
+    // MAP_SHARED write-through: the bytes are visible via the fd path.
+    std::ifstream in(path, std::ios::binary);
+    in.seekg(4096);
+    std::string on_disk(payload.size(), '\0');
+    in.read(on_disk.data(), on_disk.size());
+    EXPECT_EQ(on_disk, payload);
+
+    // Out-of-range I/O is rejected rather than silently truncated.
+    EXPECT_FALSE(file->vector_write(&wiov, 1, size - 1).has_value());
+    EXPECT_FALSE(file->vector_read(&riov, 1, size).has_value());
+    EXPECT_FALSE(file->vector_write(&wiov, 1, -1).has_value());
+
+    // A zero-length mapping request is invalid; a missing path fails open.
+    EXPECT_FALSE(DaxFile::Open(path, 0).has_value());
+    EXPECT_FALSE(DaxFile::Open(data_path + "/missing.dev", size).has_value());
+}
+
+TEST_F(StorageBackendTest, DaxFile_FlushCpuCache) {
+    const size_t size = 64 * 1024;
+    const auto path = MakeFakeDaxDevice(data_path, size);
+    auto opened = DaxFile::Open(path, size, /*flush_cpu_cache=*/true);
+#if defined(__x86_64__)
+    ASSERT_TRUE(opened.has_value());
+    auto& file = *opened;
+
+    // Unaligned start and a length spanning several cache lines, split over
+    // two iovecs, so the flush covers partial first and last lines.
+    std::string a(100, 'a'), b(150, 'b');
+    iovec wiov[2] = {{a.data(), a.size()}, {b.data(), b.size()}};
+    const off_t offset = 4096 + 37;
+    auto wr = file->vector_write(wiov, 2, offset);
+    ASSERT_TRUE(wr.has_value());
+    EXPECT_EQ(wr.value(), a.size() + b.size());
+    EXPECT_TRUE(file->datasync().has_value());
+
+    std::string out(a.size() + b.size(), '\0');
+    iovec riov{out.data(), out.size()};
+    ASSERT_TRUE(file->vector_read(&riov, 1, offset).has_value());
+    EXPECT_EQ(out, a + b);
+#else
+    // Only x86-64 has a flush implementation; refuse rather than silently
+    // run without the durability the caller asked for.
+    EXPECT_FALSE(opened.has_value());
+#endif
+}
+
+TEST_F(StorageBackendTest, DaxFile_ExclusiveOwner) {
+    const size_t size = 64 * 1024;
+    const auto path = MakeFakeDaxDevice(data_path, size);
+    const auto alias = data_path + "/dax_alias.dev";
+    fs::remove(alias);
+    fs::create_symlink(path, alias);
+
+    auto first = DaxFile::Open(path, size);
+    ASSERT_TRUE(first.has_value());
+    // The lock is on the device, not the path string.
+    EXPECT_FALSE(DaxFile::Open(path, size).has_value());
+    EXPECT_FALSE(DaxFile::Open(alias, size).has_value());
+
+    first->reset();
+    EXPECT_TRUE(DaxFile::Open(alias, size).has_value());
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_DaxRejectsSharedDevice) {
+    const auto path = MakeFakeDaxDevice(data_path, 8 * 1024 * 1024);
+    const auto alias = data_path + "/dax_alias.dev";
+    fs::remove(alias);
+    fs::create_symlink(path, alias);
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = 4 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+    OffsetAllocatorBackendConfig dax_cfg;
+    dax_cfg.dax_device_path = path;
+
+    // A second client with its own storage_path but the same device is
+    // refused while the first one is live.
+    auto owner =
+        std::make_unique<OffsetAllocatorStorageBackend>(config, dax_cfg);
+    ASSERT_TRUE(owner->Init());
+    FileStorageConfig other = config;
+    other.storage_filepath = data_path + "/other_client";
+    OffsetAllocatorStorageBackend intruder(other, dax_cfg);
+    EXPECT_FALSE(intruder.Init());
+    owner.reset();
+
+    // The transfer engine's CXL segment device may not be the arena.
+    ::setenv("MC_CXL_DEV_PATH", alias.c_str(), 1);
+    OffsetAllocatorStorageBackend shared(config, dax_cfg);
+    auto res = shared.Init();
+    ::unsetenv("MC_CXL_DEV_PATH");
+    ASSERT_FALSE(res.has_value());
+    EXPECT_EQ(res.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_DaxArenaPutGetRemoveAll) {
+    const auto path = MakeFakeDaxDevice(data_path, 8 * 1024 * 1024);
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = 4 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+    OffsetAllocatorBackendConfig dax_cfg;
+    dax_cfg.dax_device_path = path;
+    ASSERT_TRUE(dax_cfg.Validate());
+
+    OffsetAllocatorStorageBackend backend(config, dax_cfg);
+    ASSERT_TRUE(backend.Init());
+    // The arena is the mapped device: no kv_cache.data is created.
+    EXPECT_FALSE(fs::exists(data_path + "/kv_cache.data"));
+
+    const std::string key = "dax_key";
+    const std::string value(64 * 1024, 'x');
+    OffloadOne(backend, key, value);
+    EXPECT_TRUE(backend.IsExist(key).value());
+    EXPECT_EQ(LoadOne(backend, key, value.size()), value);
+
+    backend.RemoveAll();
+    EXPECT_FALSE(backend.IsExist(key).value());
+
+    // Still writable after RemoveAll on the same mapping.
+    const std::string value2(32 * 1024, 'y');
+    OffloadOne(backend, key, value2);
+    EXPECT_EQ(LoadOne(backend, key, value2.size()), value2);
+}
+
+TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_DaxCapacityAlignment) {
+    const auto path = MakeFakeDaxDevice(data_path, 8 * 1024 * 1024);
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_keys_limit = 10000;
+    OffsetAllocatorBackendConfig dax_cfg;
+    dax_cfg.dax_device_path = path;
+
+    // 5 MiB rounds down to the 2 MiB device alignment.
+    config.total_size_limit = 5 * 1024 * 1024;
+    {
+        OffsetAllocatorStorageBackend backend(config, dax_cfg);
+        EXPECT_EQ(backend.GetCapacityForTest(), 4u * 1024 * 1024);
+        ASSERT_TRUE(backend.Init());
+    }
+
+    // Below one alignment unit there is no arena at all.
+    config.total_size_limit = 1024 * 1024;
+    {
+        OffsetAllocatorStorageBackend backend(config, dax_cfg);
+        EXPECT_EQ(backend.GetCapacityForTest(), 0u);
+        EXPECT_FALSE(backend.Init().has_value());
+    }
+
+    // The alignment knob must be a power of two.
+    dax_cfg.dax_alignment_bytes = 3 * 1024 * 1024;
+    EXPECT_FALSE(dax_cfg.Validate());
+    dax_cfg.dax_alignment_bytes = 0;
+    EXPECT_FALSE(dax_cfg.Validate());
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_DaxArenaRecoversAfterRestart) {
+    const auto path = MakeFakeDaxDevice(data_path, 8 * 1024 * 1024);
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = 4 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+    OffsetAllocatorBackendConfig dax_cfg;
+    dax_cfg.dax_device_path = path;
+    dax_cfg.persist_mode = OffsetPersistMode::kStrict;
+    ASSERT_TRUE(dax_cfg.Validate());
+
+    const std::string key = "survivor";
+    const std::string value(16 * 1024, 'z');
+    {
+        OffsetAllocatorStorageBackend backend(config, dax_cfg);
+        ASSERT_TRUE(backend.Init());
+        OffloadOne(backend, key, value);
+    }  // destructor writes the final checkpoint
+
+    OffsetAllocatorStorageBackend restarted(config, dax_cfg);
+    ASSERT_TRUE(restarted.Init());
+    ASSERT_TRUE(restarted.IsExist(key).value());
+    EXPECT_EQ(LoadOne(restarted, key, value.size()), value);
 }
 
 //-----------------------------------------------------------------------------
