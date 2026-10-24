@@ -390,6 +390,8 @@ void SIEVEEndpointStore::testOnlyInsertWaiting(
 void SIEVEEndpointStore::testOnlyInsertEndpoint(
     const std::string &peer_nic_path, std::shared_ptr<RdmaEndPoint> ep) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    while (!endpoint_map_.empty() && endpoint_map_.size() >= max_size_)
+        evictEndpoint();
     endpoint_map_[peer_nic_path] = std::make_pair(ep, true);
     fifo_list_.push_front(peer_nic_path);
     fifo_map_[peer_nic_path] = fifo_list_.begin();
