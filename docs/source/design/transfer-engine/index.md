@@ -29,6 +29,13 @@ In addition, Transfer Engine also supports registering some **local DRAM areas**
 #### 2. NVMeof Segment
 Transfer Engine also leverages the NVMeof protocol to support direct data transfer from files on NVMe to DRAM/VRAM via PCIe, without going through the CPU and achieving zero-copy. Users need to follow the instructions to mount remote storage nodes locally and use the `openSegment` interface for reference to complete data read/write operations.
 
+For direct `NVMeoFTransport::submitTransfer` calls, each request must have a
+nonzero length and fit entirely within the concatenated NVMe-oF buffers. Requests
+may span adjacent buffers. A missing or incompatible segment, an overflowing
+segment length, or an invalid request range returns `InvalidArgument` before any
+request in that call is prepared or submitted; existing batch tasks are unchanged.
+This validation does not make subsequent I/O execution atomic.
+
 (batchtransfer)=
 ### BatchTransfer
 
