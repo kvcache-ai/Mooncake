@@ -1,294 +1,119 @@
 #!/usr/bin/env python3
-"""
-EngramStore backend benchmark.
+"""Benchmark named byte tables locally or against an existing Mooncake Store.
 
-Scenario:
-  - 1 token per request (L=1)
-  - Batch sizes: 1, 4, 16, 64, 128, 256
-  - Benchmarks Mooncake's row-id lookup backend only
-
-Usage:
-  # Start master first:
-  # mooncake_master --default_kv_lease_ttl=500 --enable_http_metadata_server=true
-
-  export MOONCAKE_MASTER=127.0.0.1:50051
-  export MOONCAKE_TE_META_DATA_SERVER=http://127.0.0.1:8080/metadata
-  python scripts/bench_engram_store_27b.py
-
-Optional:
-  export ENGRAM_STORE_ALLOW_POPULATE_FALLBACK=1
+Local:  python scripts/bench_engram_store_27b.py --local-dir /dev/shm/engram-bench
+Remote: configure MooncakeConfig environment variables, then run without flags.
 """
 
-import ctypes
-import os
+import argparse
 import time
 import uuid
 from contextlib import contextmanager
 
 import numpy as np
 
-os.environ["MOONCAKE_STORE_BACKEND"] = "cpp"
-from mooncake import _store as store
-from mooncake.mooncake_config import MooncakeConfig
+from mooncake.engram import EngramStore
 
 BATCH_SIZES = [1, 4, 16, 64, 128, 256]
 NUM_WARMUP = 10
 NUM_ITER = 50
 TABLE_VOCAB_SIZES = [50000] * 8
 ROW_BYTES = 64
-ALLOW_POPULATE_FALLBACK = (
-    os.environ.get("ENGRAM_STORE_ALLOW_POPULATE_FALLBACK", "0") == "1"
-)
-
-
-def create_engram_store_config():
-    cfg = store.EngramStoreConfig()
-    cfg.table_vocab_sizes = TABLE_VOCAB_SIZES
-    cfg.row_bytes = ROW_BYTES
-    return cfg
-
-
-def rollback_keys(store_obj, keys):
-    for key in keys:
-        rc = store_obj.remove(key, True)
-        if rc not in (0, -704):
-            print(f"Warning: failed to remove benchmark key {key}, rc={rc}")
-
-
-def populate_store_via_cxl_segment(store_obj, keys, embedding_buffers):
-    cxl_path = os.environ.get("MC_CXL_DEV_PATH")
-    if not cxl_path:
-        raise RuntimeError("MC_CXL_DEV_PATH is required for CXL fallback")
-
-    real_cxl_path = os.path.realpath(cxl_path)
-    base_addr = None
-    limit_addr = None
-    with open("/proc/self/maps", "r", encoding="utf-8") as fin:
-        for line in fin:
-            if real_cxl_path not in line:
-                continue
-            addr_range = line.split()[0]
-            start_hex, end_hex = addr_range.split("-")
-            base_addr = int(start_hex, 16)
-            limit_addr = int(end_hex, 16)
-            break
-
-    if base_addr is None or limit_addr is None:
-        raise RuntimeError(f"failed to find CXL mapping for {real_cxl_path}")
-
-    page_size = 4096
-    aligned_sizes = []
-    total_aligned_bytes = 0
-    for emb in embedding_buffers:
-        nbytes = emb.nbytes
-        aligned = (nbytes + page_size - 1) // page_size * page_size
-        aligned_sizes.append(aligned)
-        total_aligned_bytes += aligned
-
-    cursor = limit_addr - total_aligned_bytes
-    if cursor < base_addr:
-        raise RuntimeError("CXL mapping is too small for staging region")
-
-    published_keys = []
-    try:
-        for head_idx, emb in enumerate(embedding_buffers):
-            nbytes = emb.nbytes
-            aligned = aligned_sizes[head_idx]
-            if cursor + aligned > limit_addr:
-                raise RuntimeError("CXL mapping is too small for benchmark tables")
-            ctypes.memmove(cursor, emb.ctypes.data, nbytes)
-            key = keys[head_idx]
-            rc = store_obj.put_from(key, cursor, nbytes)
-            if rc != 0:
-                raise RuntimeError(f"CXL put_from fallback failed for {key}, rc={rc}")
-            published_keys.append(key)
-            cursor += aligned
-    except Exception:
-        rollback_keys(store_obj, published_keys)
-        raise
-
-
-def populate_store(engram_store, layer_id, store_obj):
-    keys = engram_store.get_store_keys(layer_id)
-    embedding_buffers = []
-    for vocab_size in engram_store.get_table_vocab_sizes(layer_id):
-        emb = np.random.randint(
-            0,
-            256,
-            size=(vocab_size, engram_store.get_row_bytes(layer_id)),
-            dtype=np.uint8,
-        )
-        embedding_buffers.append(emb)
-
-    t0 = time.perf_counter()
-    mode = "engram_store.populate"
-    try:
-        engram_store.populate(layer_id, embedding_buffers)
-    except RuntimeError:
-        if not ALLOW_POPULATE_FALLBACK:
-            raise
-        protocol = os.environ.get("MOONCAKE_PROTOCOL", "")
-        if protocol == "cxl":
-            mode = "cxl put_from fallback"
-            populate_store_via_cxl_segment(store_obj, keys, embedding_buffers)
-        else:
-            mode = "store.put fallback"
-            published_keys = []
-            try:
-                for head_idx, emb in enumerate(embedding_buffers):
-                    key = keys[head_idx]
-                    rc = store_obj.put(key, emb)
-                    if rc != 0:
-                        raise RuntimeError(
-                            f"fallback populate failed for {key}, rc={rc}"
-                        )
-                    published_keys.append(key)
-            except Exception:
-                rollback_keys(store_obj, published_keys)
-                raise
-    populate_ms = (time.perf_counter() - t0) * 1000
-    return embedding_buffers, populate_ms, mode
-
-
-def make_row_ids(engram_store, layer_id, batch_size, seq_len):
-    row_ids = []
-    for b in range(batch_size):
-        batch = []
-        for pos in range(seq_len):
-            token_rows = []
-            for head, vocab_size in enumerate(
-                engram_store.get_table_vocab_sizes(layer_id)
-            ):
-                token_rows.append((b * seq_len + pos + head) % vocab_size)
-            batch.append(token_rows)
-        row_ids.append(batch)
-    return np.asarray(row_ids, dtype=np.int64)
 
 
 @contextmanager
-def registered_output(store_obj, engram_store, layer_id, row_ids):
-    output = np.empty(
-        (*row_ids.shape, engram_store.get_row_bytes(layer_id)), dtype=np.uint8
-    )
-    if store_obj.register_buffer(output.ctypes.data, output.nbytes) != 0:
+def registered_output(client, shape):
+    output = np.empty(shape, np.uint8)
+    if client is not None and client.register_buffer(output.ctypes.data, output.nbytes):
         raise RuntimeError("Could not register benchmark output")
     try:
         yield output
     finally:
-        if store_obj.unregister_buffer(output.ctypes.data) != 0:
+        if client is not None and client.unregister_buffer(output.ctypes.data):
             raise RuntimeError("Could not unregister benchmark output")
 
 
-def run_benchmark(engram_store, layer_id, store_obj, batch_size, num_warmup, num_iter):
-    seq_len = 1
-    row_ids = make_row_ids(engram_store, layer_id, batch_size, seq_len)
-
-    with registered_output(store_obj, engram_store, layer_id, row_ids) as output:
-        for _ in range(num_warmup):
-            engram_store.lookup_into(layer_id, row_ids, output)
-
-        total_ms_list = []
-        for _ in range(num_iter):
-            t0 = time.perf_counter()
-            engram_store.lookup_into(layer_id, row_ids, output)
-            t1 = time.perf_counter()
-            total_ms_list.append((t1 - t0) * 1000)
-
-    total_ms = np.array(total_ms_list)
-    mean_total = np.mean(total_ms)
-    p50_total = np.percentile(total_ms, 50)
-    p99_total = np.percentile(total_ms, 99)
-
-    tokens_per_sec = batch_size / (mean_total / 1000)
-    bytes_per_request = (
-        batch_size
-        * seq_len
-        * engram_store.get_num_heads(layer_id)
-        * engram_store.get_row_bytes(layer_id)
-    )
-    gbps = (bytes_per_request / 1e9) / (mean_total / 1000)
-
-    return {
-        "batch_size": batch_size,
-        "mean_total_ms": mean_total,
-        "p50_ms": p50_total,
-        "p99_ms": p99_total,
-        "tokens_per_sec": tokens_per_sec,
-        "gbps": gbps,
-    }
-
-
-def validate_lookup_correctness(engram_store, layer_id, store_obj, embedding_buffers):
-    row_ids = make_row_ids(engram_store, layer_id, batch_size=1, seq_len=1)
-    with registered_output(store_obj, engram_store, layer_id, row_ids) as output:
-        engram_store.lookup_into(layer_id, row_ids, output)
-
-    max_abs_err = 0.0
-    for head_idx in range(output.shape[2]):
-        row_idx = row_ids[0][0][head_idx]
-        expected = embedding_buffers[head_idx][row_idx]
-        actual = output[0, 0, head_idx]
-        max_abs_err = max(max_abs_err, float(np.max(np.abs(actual - expected))))
-    return max_abs_err
-
-
 def main():
-    print("=" * 60)
-    print("EngramStore Backend Benchmark")
-    print("  Config: 1 token, Mooncake row-id lookup only")
-    print("  Batch sizes: 1, 4, 16, 64, 128, 256")
-    print(f"  Protocol: {os.environ.get('MOONCAKE_PROTOCOL', '<unset>')}")
-    print(f"  Allow populate fallback: {ALLOW_POPULATE_FALLBACK}")
-    print("=" * 60)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--local-dir")
+    args = parser.parse_args()
+    client = None
+    if args.local_dir is None:
+        from mooncake.mooncake_config import MooncakeConfig
+        from mooncake.store import MooncakeDistributedStore
 
-    config = MooncakeConfig.load_from_env()
-    store_obj = store.MooncakeDistributedStore()
-    rc = store_obj.setup(
-        config.local_hostname,
-        config.metadata_server,
-        config.global_segment_size,
-        config.local_buffer_size,
-        config.protocol,
-        config.device_name,
-        config.master_server_address,
-    )
-    if rc != 0:
-        raise RuntimeError(f"Failed to setup Mooncake store, rc={rc}")
+        config = MooncakeConfig.load_from_env()
+        client = MooncakeDistributedStore()
+        rc = client.setup(
+            config.local_hostname,
+            config.metadata_server,
+            config.global_segment_size,
+            config.local_buffer_size,
+            config.protocol,
+            config.device_name,
+            config.master_server_address,
+        )
+        if rc:
+            client.close()
+            raise RuntimeError(f"Failed to setup Mooncake Store: {rc}")
 
-    engram_store = None
+    specs = {
+        f"head/{head}": {"num_rows": count, "row_bytes": ROW_BYTES}
+        for head, count in enumerate(TABLE_VOCAB_SIZES)
+    }
+    names = list(specs)
+    published = []
     try:
-        cfg = create_engram_store_config()
-        layer_id = uuid.uuid4().int & 0x7FFFFFFF
-        engram_store = store.EngramStore({layer_id: cfg}, store_obj)
-        embedding_buffers, populate_ms, mode = populate_store(
-            engram_store, layer_id, store_obj
-        )
-        print(f"Populate mode: {mode}, took {populate_ms:.2f} ms")
-
-        max_abs_err = validate_lookup_correctness(
-            engram_store, layer_id, store_obj, embedding_buffers
-        )
-        print(f"Max abs error: {max_abs_err:.6f}")
-
-        print("\nResults:")
-        print(
-            f"{'Batch':>8} {'Mean(ms)':>10} {'P50(ms)':>10} {'P99(ms)':>10} {'Tok/s':>12} {'GB/s':>10}"
-        )
-        for batch_size in BATCH_SIZES:
-            result = run_benchmark(
-                engram_store, layer_id, store_obj, batch_size, NUM_WARMUP, NUM_ITER
-            )
-            print(
-                f"{result['batch_size']:>8} {result['mean_total_ms']:>10.3f} {result['p50_ms']:>10.3f} "
-                f"{result['p99_ms']:>10.3f} {result['tokens_per_sec']:>12.1f} {result['gbps']:>10.3f}"
-            )
-    finally:
-        if engram_store is not None:
+        with EngramStore(
+            tables=specs,
+            namespace=f"benchmark/{uuid.uuid4().hex}",
+            local_dir=args.local_dir,
+            store_client=client,
+            persistent=client is not None,
+        ) as store:
             try:
-                engram_store.remove_from_store(layer_id, force=True)
-            except Exception as exc:
-                print(f"Warning: failed to clean up benchmark layer: {exc}")
-        store_obj.close()
+                rng = np.random.default_rng(42)
+                rows = [
+                    rng.integers(0, 256, (count, ROW_BYTES), dtype=np.uint8)
+                    for count in TABLE_VOCAB_SIZES
+                ]
+                for name, table in zip(names, rows):
+                    store.populate(name, table)
+                    published.append(name)
+                print("Batch   Mean(ms)    P50(ms)    P99(ms)       Tok/s       GB/s")
+                for batch in BATCH_SIZES:
+                    ids = np.column_stack(
+                        [rng.integers(count, size=batch) for count in TABLE_VOCAB_SIZES]
+                    )
+                    with registered_output(
+                        client, (batch, len(names), ROW_BYTES)
+                    ) as out:
+                        store.lookup(names, ids, out)
+                        for head, table in enumerate(rows):
+                            np.testing.assert_array_equal(
+                                out[:, head], table[ids[:, head]]
+                            )
+                        for _ in range(NUM_WARMUP):
+                            store.lookup(names, ids, out)
+                        times = []
+                        for _ in range(NUM_ITER):
+                            start = time.perf_counter()
+                            store.lookup(names, ids, out)
+                            times.append(time.perf_counter() - start)
+                        mean = np.mean(times)
+                        p50, p99 = np.percentile(times, [50, 99])
+                        print(
+                            f"{batch:5d} {mean * 1e3:10.3f} {p50 * 1e3:10.3f} "
+                            f"{p99 * 1e3:10.3f} {batch / mean:11.1f} "
+                            f"{out.nbytes / mean / 1e9:10.3f}"
+                        )
+            finally:
+                if client is not None:
+                    for name in published:
+                        store.remove(name)
+    finally:
+        if client is not None:
+            client.close()
 
 
 if __name__ == "__main__":

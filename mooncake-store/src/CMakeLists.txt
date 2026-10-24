@@ -163,8 +163,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     local_hot_cache.cpp
     store_c.cpp
     memory_alloc.cpp
-    ssd_register_client.cpp
-    engram/engram_store.cpp)
+    ssd_register_client.cpp)
 
 if(BUILD_UNIT_TESTS)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv/executor_stub.cpp)
