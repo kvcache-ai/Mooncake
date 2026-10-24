@@ -492,7 +492,8 @@ Status initiatorWorker(TransferEngine* engine, SegmentID segment_id,
         }
 
         s = engine->freeBatchID(batch_id);
-        LOG_ASSERT(s.ok());
+        // A deferred cleanup also invalidates the batch ID; the engine owns it.
+        LOG_ASSERT(s.ok() || s.IsBatchCleanupDeferred()) << s.ToString();
         batch_count++;
     }
     LOG(INFO) << "Worker " << thread_id << " stopped!";
