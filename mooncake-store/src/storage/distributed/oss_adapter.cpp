@@ -24,6 +24,7 @@
 #include <glog/logging.h>
 
 #include "config/oss_adapter_config.h"
+#include "storage/distributed/object_storage_http.h"
 
 namespace mooncake {
 namespace {
@@ -289,6 +290,7 @@ struct OssObjectStorageAdapter::RequestContext {
     CURLM* multi = nullptr;
     curl_slist* headers = nullptr;
     std::string error_body;
+    std::map<std::string, std::string> response_headers;
     IovecUploadContext upload_context;
     DownloadContext download_context;
 };
@@ -492,6 +494,8 @@ tl::expected<void, ErrorCode> OssObjectStorageAdapter::PrepareRequest(
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, context.headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, DownloadCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context.download_context);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &context.response_headers);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 120000L);
@@ -685,7 +689,10 @@ OssObjectStorageAdapter::RequestBatch(
                 results[context->index] = context->expected_size;
             } else if (!context->upload && status == 206 &&
                        context->download_context.transferred ==
-                           context->expected_size) {
+                           context->expected_size &&
+                       object_storage_http::MatchesContentRange(
+                           context->response_headers, 0,
+                           context->expected_size)) {
                 results[context->index] = context->download_context.transferred;
             } else {
                 LOG(ERROR) << "OSS batch " << (context->upload ? "PUT" : "GET")
@@ -801,7 +808,9 @@ tl::expected<size_t, ErrorCode> OssObjectStorageAdapter::GetRange(
     if (!response) return tl::make_unexpected(response.error());
     if (response->status == 404)
         return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
-    if (response->status != 206 || response->transferred != len)
+    if (response->status != 206 || response->transferred != len ||
+        !object_storage_http::MatchesContentRange(response->headers, first,
+                                                  len))
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     return len;
 }

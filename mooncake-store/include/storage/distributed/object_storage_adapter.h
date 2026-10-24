@@ -1,5 +1,6 @@
 #pragma once
 
+#include <sys/types.h>
 #include <sys/uio.h>
 
 #include <span>
@@ -53,6 +54,14 @@ class ObjectStorageAdapter {
     virtual tl::expected<size_t, ErrorCode> Get(const std::string& logical_key,
                                                 void* buf, size_t len) = 0;
 
+    // Read exactly len bytes starting at offset. Implementations must reject
+    // short or mismatched ranges. An error may leave buf partially written.
+    // Optional so existing whole-object adapters remain source compatible.
+    virtual tl::expected<size_t, ErrorCode> GetRange(
+        const std::string& logical_key, void* buf, size_t len, off_t offset) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     // Batch methods may be overridden by concurrent adapters. The default
     // implementation preserves compatibility by executing requests serially.
     // Return exactly one result per request, in the same order. Referenced
@@ -101,6 +110,12 @@ class ObjectStorageAdapter {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
     virtual const char* GetName() const = 0;
+
+    // True only when Put never retries an ambiguous physical upload. A fresh
+    // retry could materialize after DELETE even if a later PUT succeeds.
+    // Required by the immutable-attempt backend/catalog protocol. Existing
+    // whole-object offload and batch operations keep their own retry policy.
+    virtual bool SupportsSinglePutAttempt() const { return false; }
 };
 
 }  // namespace mooncake
