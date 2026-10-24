@@ -28,7 +28,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "p2p/client/v2/block.h"
-#include "types.h"
+#include "common_types.h"
 
 namespace mooncake {
 class TransferEngine;

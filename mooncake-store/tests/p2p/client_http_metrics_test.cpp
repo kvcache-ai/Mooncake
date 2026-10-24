@@ -9,9 +9,10 @@
 #include <chrono>
 
 #include <csignal>
-#include "client_config_builder.h"
-#include "client_metric.h"
+#include "p2p/client/p2p_client_config_builder.h"
 #include "p2p/client/p2p_client_metric.h"
+#include "p2p/client/p2p_client_service.h"
+#include "test_p2p_server_helpers.h"
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_http/coro_http_client.hpp>
 
@@ -30,6 +31,8 @@ class ClientHttpMetricsTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        p2p_service_.reset();
+        p2p_master_.reset();
         for (size_t i = 0; i < env_names_.size(); ++i) {
             const int result =
                 saved_env_[i] ? setenv(env_names_[i], saved_env_[i]->c_str(), 1)
@@ -38,6 +41,39 @@ class ClientHttpMetricsTest : public ::testing::Test {
         }
         google::ShutdownGoogleLogging();
     }
+
+    bool StartP2PService(const std::map<std::string, std::string>& labels) {
+        p2p_master_ = std::make_unique<testing::InProcP2PMaster>();
+        if (!p2p_master_->Start()) {
+            LOG(ERROR) << "Failed to start metrics-test P2P master";
+            return false;
+        }
+        auto config = P2PClientConfigBuilder::build_p2p_real_client(
+            "127.0.0.1", "P2PHANDSHAKE", "tcp", std::nullopt,
+            p2p_master_->master_address(),
+            R"({"tiers":[{"type":"DRAM","capacity":1048576,"priority":100}]})",
+            1048576, nullptr, "", /*client_rpc_port=*/0);
+        config.http_port = 0;
+        config.labels = labels;
+        config.metric_report_interval_seconds = 0;
+        config.async_sender_thread_count = 0;
+        config.route_cache_max_memory_bytes = 0;
+        config.local_transfer_mode = LocalTransferMode::MEMCPY;
+        config.local_memcpy_async_worker_num = 1;
+        config.te_async_poll_worker_num = 1;
+        auto created = P2PClientService::Create(config);
+        if (!created) return false;
+        p2p_service_ = *created;
+        if (!p2p_service_->IsHttpServerEnabled() ||
+            p2p_service_->GetHttpPort() == 0) {
+            LOG(ERROR) << "Metrics-test P2P HTTP listener did not start";
+            return false;
+        }
+        return true;
+    }
+
+    std::unique_ptr<testing::InProcP2PMaster> p2p_master_;
+    std::shared_ptr<P2PClientService> p2p_service_;
 
    private:
     const std::array<const char*, 2> env_names_ = {
@@ -48,7 +84,7 @@ class ClientHttpMetricsTest : public ::testing::Test {
 // Test config builder with metrics settings
 TEST_F(ClientHttpMetricsTest, ConfigBuilderMetricsSettings) {
     // Test P2P config with default metrics settings
-    auto p2p_config = ClientConfigBuilder::build_p2p_real_client(
+    auto p2p_config = P2PClientConfigBuilder::build_p2p_real_client(
         "127.0.0.1", "http://127.0.0.1:8080/metadata", "tcp", std::nullopt,
         "127.0.0.1:50051",
         R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})");
@@ -57,7 +93,7 @@ TEST_F(ClientHttpMetricsTest, ConfigBuilderMetricsSettings) {
     EXPECT_TRUE(p2p_config.enable_http_server);
 
     // Test P2P config with custom metrics settings
-    auto p2p_config_custom = ClientConfigBuilder::build_p2p_real_client(
+    auto p2p_config_custom = P2PClientConfigBuilder::build_p2p_real_client(
         "127.0.0.1", "http://127.0.0.1:8080/metadata", "tcp", std::nullopt,
         "127.0.0.1:50051",
         R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})", 0,
@@ -69,33 +105,11 @@ TEST_F(ClientHttpMetricsTest, ConfigBuilderMetricsSettings) {
 
     EXPECT_EQ(p2p_config_custom.http_port, 9005);
     EXPECT_FALSE(p2p_config_custom.enable_http_server);
-
-    // Test Centralized config with default metrics settings
-    auto centralized_config =
-        ClientConfigBuilder::build_centralized_real_client(
-            "127.0.0.1", "http://127.0.0.1:8080/metadata");
-
-    EXPECT_EQ(centralized_config.http_port, 9003);
-    EXPECT_TRUE(centralized_config.enable_http_server);
-
-    // Test Centralized config with custom metrics settings
-    auto centralized_config_custom =
-        ClientConfigBuilder::build_centralized_real_client(
-            "127.0.0.1", "http://127.0.0.1:8080/metadata", "tcp", std::nullopt,
-            "127.0.0.1:50051", 0, 0, nullptr, "",
-            false,  // enable_offload
-            9006,   // http_port
-            false,  // enable_http_server
-            {}      // labels
-        );
-
-    EXPECT_EQ(centralized_config_custom.http_port, 9006);
-    EXPECT_FALSE(centralized_config_custom.enable_http_server);
 }
 
 // Test metrics disabled scenario
 TEST_F(ClientHttpMetricsTest, MetricsDisabled) {
-    auto config = ClientConfigBuilder::build_p2p_real_client(
+    auto config = P2PClientConfigBuilder::build_p2p_real_client(
         "127.0.0.1", "http://127.0.0.1:8080/metadata", "tcp", std::nullopt,
         "127.0.0.1:50051",
         R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})", 0,
@@ -113,7 +127,7 @@ TEST_F(ClientHttpMetricsTest, ConfigWithLabels) {
     std::map<std::string, std::string> labels = {
         {"instance_id", "test_instance"}, {"cluster_id", "test_cluster"}};
 
-    auto config = ClientConfigBuilder::build_p2p_real_client(
+    auto config = P2PClientConfigBuilder::build_p2p_real_client(
         "127.0.0.1", "http://127.0.0.1:8080/metadata", "tcp", std::nullopt,
         "127.0.0.1:50051",
         R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})", 0,
@@ -132,115 +146,11 @@ TEST_F(ClientHttpMetricsTest, ConfigWithLabels) {
 
 // Test HTTP server endpoints directly
 // Serializer fixtures construct metrics directly; factory policy is covered
-// separately below. Runtime handler ownership is covered in C2.
-TEST_F(ClientHttpMetricsTest, HttpEndpointsTest) {
-    // Create a simple HTTP server that mimics the metrics server behavior
-    const uint16_t test_port =
-        19003;  // Use a non-standard port to avoid conflicts
-
-    // Create ClientMetric instance
-    auto metrics = std::make_unique<ClientMetric>(
-        0, std::map<std::string, std::string>{{"test_label", "test_value"}});
-    ASSERT_NE(metrics, nullptr);
-
-    // Add some test data to metrics
-    metrics->transfer_metric.total_read_bytes.inc(1024);
-    metrics->transfer_metric.total_write_bytes.inc(2048);
-    metrics->transfer_metric.get_latency_us.observe(100);
-    metrics->transfer_metric.get_latency_us.observe(200);
-
-    // Create and start HTTP server
-    coro_http::coro_http_server server(1, test_port);
-
-    using namespace coro_http;
-
-    // Register handlers similar to ClientService
-    server.set_http_handler<GET>("/metrics", [&metrics](
-                                                 coro_http_request& req,
-                                                 coro_http_response& resp) {
-        std::string metrics_str;
-        metrics->serialize(metrics_str);
-        resp.add_header("Content-Type", "text/plain; version=0.0.4");
-        resp.set_status_and_content(status_type::ok, std::move(metrics_str));
-    });
-
-    server.set_http_handler<GET>(
-        "/metrics/summary",
-        [&metrics](coro_http_request& req, coro_http_response& resp) {
-            std::string summary = metrics->summary_metrics();
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            resp.set_status_and_content(status_type::ok, std::move(summary));
-        });
-
-    server.set_http_handler<GET>(
-        "/health", [](coro_http_request& req, coro_http_response& resp) {
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            resp.set_status_and_content(status_type::ok, "OK");
-        });
-
-    server.async_start();
-
-    // Wait for server to start
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    // Test /health endpoint
-    {
-        coro_http::coro_http_client client;
-        auto resp = client.get("http://127.0.0.1:" + std::to_string(test_port) +
-                               "/health");
-        EXPECT_EQ(resp.status, 200) << "Health endpoint returned wrong status";
-        EXPECT_EQ(resp.resp_body, "OK")
-            << "Health endpoint returned wrong body";
-    }
-
-    // Test /metrics endpoint
-    {
-        coro_http::coro_http_client client;
-        auto resp = client.get("http://127.0.0.1:" + std::to_string(test_port) +
-                               "/metrics");
-        EXPECT_EQ(resp.status, 200) << "Metrics endpoint returned wrong status";
-        // Check that metrics contain expected data
-        EXPECT_TRUE(resp.resp_body.find("mooncake_transfer_read_bytes") !=
-                    std::string::npos)
-            << "Metrics should contain read bytes metric";
-        EXPECT_TRUE(resp.resp_body.find("mooncake_transfer_write_bytes") !=
-                    std::string::npos)
-            << "Metrics should contain write bytes metric";
-        EXPECT_TRUE(resp.resp_body.find("test_label") != std::string::npos)
-            << "Metrics should contain label";
-        EXPECT_TRUE(resp.resp_body.find("test_value") != std::string::npos)
-            << "Metrics should contain label value";
-    }
-
-    // Test /metrics/summary endpoint
-    {
-        coro_http::coro_http_client client;
-        auto resp = client.get("http://127.0.0.1:" + std::to_string(test_port) +
-                               "/metrics/summary");
-        EXPECT_EQ(resp.status, 200)
-            << "Metrics summary endpoint returned wrong status";
-        // Check that summary contains expected data
-        EXPECT_TRUE(resp.resp_body.find("Transfer Metrics Summary") !=
-                    std::string::npos)
-            << "Summary should contain transfer metrics header";
-        EXPECT_TRUE(resp.resp_body.find("Total Read") != std::string::npos)
-            << "Summary should contain total read";
-        EXPECT_TRUE(resp.resp_body.find("Total Write") != std::string::npos)
-            << "Summary should contain total write";
-    }
-
-    // Stop server
-    server.stop();
-}
-
-// Test P2P client metrics HTTP endpoints
-// TODO(C2): Replace copied P2P handlers with production runtime endpoints
-// after runtime ownership is split; retain P2P output coverage.
+// separately below. Runtime metrics handlers belong to P2PClientService.
 TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
-    const uint16_t test_port = 19004;
-
-    // Create P2PClientMetric instance
-    auto p2p_metrics = P2PClientMetric::Create({{"p2p_label", "p2p_value"}});
+    ASSERT_TRUE(StartP2PService({{"p2p_label", "p2p_value"}}));
+    const uint16_t test_port = p2p_service_->GetHttpPort();
+    auto* p2p_metrics = p2p_service_->GetMetrics();
     ASSERT_NE(p2p_metrics, nullptr);
 
     // Add test data to P2P metrics
@@ -260,34 +170,6 @@ TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
     p2p_metrics->total_request.get_latency_success.observe(100);
     p2p_metrics->total_request.get_latency_success.observe(150);
     p2p_metrics->total_request.get_latency_failure.observe(400);
-
-    // Create and start HTTP server
-    coro_http::coro_http_server server(1, test_port);
-
-    using namespace coro_http;
-
-    // Register handlers for P2P metrics
-    server.set_http_handler<GET>("/metrics", [&p2p_metrics](
-                                                 coro_http_request& req,
-                                                 coro_http_response& resp) {
-        std::string metrics_str;
-        p2p_metrics->serialize(metrics_str);
-        resp.add_header("Content-Type", "text/plain; version=0.0.4");
-        resp.set_status_and_content(status_type::ok, std::move(metrics_str));
-    });
-
-    server.set_http_handler<GET>(
-        "/metrics/summary",
-        [&p2p_metrics](coro_http_request& req, coro_http_response& resp) {
-            std::string summary = p2p_metrics->summary_metrics();
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            resp.set_status_and_content(status_type::ok, std::move(summary));
-        });
-
-    server.async_start();
-
-    // Wait for server to start
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // Test /metrics endpoint for P2P metrics
     {
@@ -396,36 +278,29 @@ TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
             << "Summary should show 20.00 MB read";
     }
 
-    server.stop();
+    p2p_service_->Stop();
 }
 
 TEST_F(ClientHttpMetricsTest, MetricFactoryPoliciesRemainIndependent) {
     ASSERT_EQ(setenv("MC_STORE_CLIENT_METRIC", "false", 1), 0);
     ASSERT_EQ(setenv("MC_STORE_CLIENT_METRIC_INTERVAL", "7", 1), 0);
-    EXPECT_EQ(ClientMetric::Create(), nullptr);
     auto p2p_metrics = P2PClientMetric::Create();
     ASSERT_NE(p2p_metrics, nullptr);
     EXPECT_EQ(p2p_metrics->GetReportingInterval(), 0u);
 
     ASSERT_EQ(setenv("MC_STORE_CLIENT_METRIC", "true", 1), 0);
-    auto centralized_metrics = ClientMetric::Create();
-    ASSERT_NE(centralized_metrics, nullptr);
-    EXPECT_EQ(centralized_metrics->GetReportingInterval(), 7u);
     EXPECT_EQ(p2p_metrics->GetReportingInterval(), 0u);
 }
 
 // Each architecture exposes its own output without concatenating metric sets.
 TEST_F(ClientHttpMetricsTest, IndependentMetricsHttpEndpointsTest) {
-    const uint16_t test_port = 19005;
-    ClientMetric centralized_metrics;
     auto p2p_metrics = P2PClientMetric::Create();
     ASSERT_NE(p2p_metrics, nullptr);
-    centralized_metrics.transfer_metric.total_read_bytes.inc(1024 * 1024);
     p2p_metrics->transfer_metric.total_read_bytes.inc(4096);
     p2p_metrics->total_request.get_requests.inc(50);
 
     using namespace coro_http;
-    coro_http_server server(1, test_port);
+    coro_http_server server(1, 0);
     const auto register_metrics = [&server](const std::string& prefix,
                                             auto* metrics) {
         server.set_http_handler<GET>(
@@ -444,24 +319,20 @@ TEST_F(ClientHttpMetricsTest, IndependentMetricsHttpEndpointsTest) {
                                             metrics->summary_metrics());
             });
     };
-    register_metrics("/centralized", &centralized_metrics);
     register_metrics("/p2p", p2p_metrics.get());
-    server.async_start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    auto started = server.async_start();
+    if (started.hasResult()) {
+        const auto error = started.value();
+        LOG(ERROR) << "HTTP metrics test server stopped during startup: "
+                   << error.message();
+        FAIL() << "HTTP server startup failed: " << error.message();
+    }
+    const uint16_t test_port = server.port();
+    ASSERT_NE(test_port, 0);
 
     const std::string base = "http://127.0.0.1:" + std::to_string(test_port);
     coro_http_client client;
-    auto resp = client.get(base + "/centralized/metrics");
-    EXPECT_EQ(resp.status, 200);
-    EXPECT_NE(resp.resp_body.find("mooncake_transfer_read_bytes 1048576"),
-              std::string::npos);
-    EXPECT_EQ(resp.resp_body.find("mooncake_p2p_"), std::string::npos);
-    resp = client.get(base + "/centralized/metrics/summary");
-    EXPECT_EQ(resp.status, 200);
-    EXPECT_NE(resp.resp_body.find("Total Read: 1.00 MB"), std::string::npos);
-    EXPECT_EQ(resp.resp_body.find("P2P Total"), std::string::npos);
-
-    resp = client.get(base + "/p2p/metrics");
+    auto resp = client.get(base + "/p2p/metrics");
     EXPECT_EQ(resp.status, 200);
     EXPECT_NE(resp.resp_body.find("mooncake_p2p_total_get_requests_total"),
               std::string::npos);
@@ -476,10 +347,9 @@ TEST_F(ClientHttpMetricsTest, IndependentMetricsHttpEndpointsTest) {
 }
 
 TEST_F(ClientHttpMetricsTest, P2PClientPeerMetricsHttpEndpointsTest) {
-    const uint16_t test_port = 19006;
-
-    // Create P2PClientMetric instance
-    auto p2p_metrics = P2PClientMetric::Create({{"p2p_label", "peer_test"}});
+    ASSERT_TRUE(StartP2PService({{"p2p_label", "peer_test"}}));
+    const uint16_t test_port = p2p_service_->GetHttpPort();
+    auto* p2p_metrics = p2p_service_->GetMetrics();
     ASSERT_NE(p2p_metrics, nullptr);
 
     // Add test data to both total_request and peer_request
@@ -520,34 +390,6 @@ TEST_F(ClientHttpMetricsTest, P2PClientPeerMetricsHttpEndpointsTest) {
         120);
     p2p_metrics->peer_request_metrics.read_remote_data.latency_failure.observe(
         180);
-
-    // Create and start HTTP server
-    coro_http::coro_http_server server(1, test_port);
-
-    using namespace coro_http;
-
-    // Register handlers for P2P metrics
-    server.set_http_handler<GET>("/metrics", [&p2p_metrics](
-                                                 coro_http_request& req,
-                                                 coro_http_response& resp) {
-        std::string metrics_str;
-        p2p_metrics->serialize(metrics_str);
-        resp.add_header("Content-Type", "text/plain; version=0.0.4");
-        resp.set_status_and_content(status_type::ok, std::move(metrics_str));
-    });
-
-    server.set_http_handler<GET>(
-        "/metrics/summary",
-        [&p2p_metrics](coro_http_request& req, coro_http_response& resp) {
-            std::string summary = p2p_metrics->summary_metrics();
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            resp.set_status_and_content(status_type::ok, std::move(summary));
-        });
-
-    server.async_start();
-
-    // Wait for server to start
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // Test /metrics endpoint for P2P peer metrics
     {
@@ -679,7 +521,7 @@ TEST_F(ClientHttpMetricsTest, P2PClientPeerMetricsHttpEndpointsTest) {
             << "Summary should show local UnPinKey rollback requests";
     }
 
-    server.stop();
+    p2p_service_->Stop();
 }
 
 }  // namespace mooncake::test

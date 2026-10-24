@@ -11,6 +11,7 @@
 #include <mutex>
 #include <condition_variable>
 
+#include "p2p/client/p2p_client_config_builder.h"
 #include "p2p/client/p2p_client_service.h"
 #include "types.h"
 #include "utils.h"
@@ -52,7 +53,7 @@ namespace mooncake {
 namespace benchmark {
 
 // Global client and allocator instances
-std::shared_ptr<ClientService> g_client = nullptr;
+std::shared_ptr<P2PClientService> g_client = nullptr;
 void* g_worker_buffer_base = nullptr;
 size_t g_per_thread_buffer_stride =
     0;  // (1 + batch_size) * value_size per thread
@@ -107,7 +108,7 @@ bool initialize_client() {
                         std::to_string(capacity_bytes) +
                         ", \"priority\": 10, \"allocator_type\": \"OFFSET\"}]}";
     }
-    auto config = ClientConfigBuilder::build_p2p_real_client(
+    auto config = P2PClientConfigBuilder::build_p2p_real_client(
         FLAGS_local_hostname, FLAGS_metadata_connection_string, FLAGS_protocol,
         device_names, FLAGS_master_address, tiered_config, 0, nullptr, "",
         12345,
@@ -116,7 +117,7 @@ bool initialize_client() {
             1024 * 1024,
         /*route_cache_ttl_ms=*/FLAGS_route_cache_ttl_ms,
         FLAGS_p2p_local_transfer_mode, FLAGS_local_memcpy_async_worker_num);
-    auto client_opt = ClientService::Create(config);
+    auto client_opt = P2PClientService::Create(config);
 
     if (!client_opt.has_value()) {
         LOG(ERROR) << "Failed to create client";
@@ -233,9 +234,9 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
     slices.emplace_back(
         Slice{write_buffer, static_cast<size_t>(FLAGS_value_size)});
 
-    WriteRouteRequestConfig p2p_config;
+    P2PWriteRouteConfig p2p_config;
     p2p_config.max_candidates = 1;
-    WriteConfig config = p2p_config;
+    P2PWriteRouteConfig config = p2p_config;
 
     std::vector<std::string> stored_keys;  // Track keys for GET operations
     stored_keys.reserve(total_keys);
@@ -461,8 +462,7 @@ void print_results(const std::vector<ThreadStats>& thread_stats,
                                  (get_duration_s * 1024.0 * 1024.0)
                            : 0.0;
 
-    // Report PUT and GET success rates separately. A single combined rate
-    // hid cases where one phase was healthy and the other was failing.
+    // Report PUT and GET success rates separately.
     uint64_t put_attempts = total_put_ops + total_put_failures;
     uint64_t get_attempts = total_get_ops + total_get_failures;
     double put_success_rate =

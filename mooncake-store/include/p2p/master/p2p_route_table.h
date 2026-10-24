@@ -13,7 +13,6 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "p2p/common/p2p_types.h"
-#include "types.h"
 #include "utils.h"
 
 namespace mooncake {

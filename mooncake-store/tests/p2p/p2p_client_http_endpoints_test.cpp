@@ -23,7 +23,7 @@
 
 #include <ylt/coro_http/coro_http_client.hpp>
 
-#include "client_config_builder.h"
+#include "p2p/client/p2p_client_config_builder.h"
 #include "p2p/client/p2p_client_service.h"
 #include "test_p2p_server_helpers.h"
 #include "types.h"
@@ -35,9 +35,7 @@ class P2PClientHttpEndpointsTest : public ::testing::Test {
    protected:
     static std::shared_ptr<P2PClientService> CreateP2PClient(
         const std::string& host_name, uint32_t rpc_port, uint16_t http_port) {
-        // TODO(C2): Bind the client listener atomically and publish its actual
-        // port after runtime ownership is split; remove the port-probe race.
-        auto config = ClientConfigBuilder::build_p2p_real_client(
+        auto config = P2PClientConfigBuilder::build_p2p_real_client(
             host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
             R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
             /*local_buffer_size=*/0, nullptr, "", rpc_port,
@@ -58,6 +56,8 @@ class P2PClientHttpEndpointsTest : public ::testing::Test {
             ADD_FAILURE() << "Init failed: " << static_cast<int>(err);
             return nullptr;
         }
+        EXPECT_TRUE(WaitForRoutableClient(client->GetMasterClient(),
+                                          client->GetClientID()));
         return client;
     }
 
@@ -71,7 +71,7 @@ class P2PClientHttpEndpointsTest : public ::testing::Test {
 
         // Take a free HTTP port to avoid colliding with the default 9003.
         const uint16_t http_port = static_cast<uint16_t>(getFreeTcpPort());
-        const uint32_t rpc_port = static_cast<uint32_t>(getFreeTcpPort());
+        const uint32_t rpc_port = 0;
         client_ = CreateP2PClient("localhost:18901", rpc_port, http_port);
         ASSERT_NE(client_, nullptr);
         ASSERT_TRUE(client_->IsHttpServerEnabled());
@@ -322,9 +322,8 @@ TEST_F(P2PClientHttpEndpointsTest, MetricsUseConcreteClientOutput) {
     ASSERT_EQ(HttpPost(Url("/put", "key=http_metrics_probe"), "metrics").status,
               200);
     ASSERT_EQ(HttpGet(Url("/get", "key=http_metrics_probe")).status, 200);
-    ClientService& facade = *client_;
-    ASSERT_TRUE(facade.SerializeMetrics().has_value());
-    ASSERT_TRUE(facade.GetSummaryMetrics().has_value());
+    ASSERT_TRUE(client_->SerializeMetrics().has_value());
+    ASSERT_TRUE(client_->GetSummaryMetrics().has_value());
 
     const auto metrics = HttpGet(Url("/metrics"));
     ASSERT_EQ(metrics.status, 200);
@@ -341,13 +340,12 @@ TEST_F(P2PClientHttpEndpointsTest, MetricsUseConcreteClientOutput) {
               std::string::npos);
 }
 
-TEST_F(P2PClientHttpEndpointsTest, DisabledMetricsPreserveFacadeErrors) {
+TEST_F(P2PClientHttpEndpointsTest, DisabledMetricsPreserveErrors) {
     P2PClientService disabled_client("P2PHANDSHAKE", 0, false, {}, false);
-    ClientService& facade = disabled_client;
-    const auto metrics = facade.SerializeMetrics();
+    const auto metrics = disabled_client.SerializeMetrics();
     ASSERT_FALSE(metrics.has_value());
     EXPECT_EQ(metrics.error(), ErrorCode::INVALID_PARAMS);
-    const auto summary = facade.GetSummaryMetrics();
+    const auto summary = disabled_client.GetSummaryMetrics();
     ASSERT_FALSE(summary.has_value());
     EXPECT_EQ(summary.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -355,6 +353,55 @@ TEST_F(P2PClientHttpEndpointsTest, DisabledMetricsPreserveFacadeErrors) {
 // ============================================================================
 // /unregister + /register
 // ============================================================================
+
+TEST_F(P2PClientHttpEndpointsTest, LocalStartupCanJoinThroughHttp) {
+    for (size_t senders : {0u, 1u}) {
+        auto config = P2PClientConfigBuilder::build_p2p_real_client(
+            "localhost:" + std::to_string(getFreeTcpPort()), "P2PHANDSHAKE",
+            "tcp", std::nullopt, master_address_,
+            R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})");
+        config.start_local_only = true;
+        config.client_rpc_port = 0;
+        config.http_port = 0;
+        config.local_transfer_mode = LocalTransferMode::MEMCPY;
+        config.async_sender_thread_count = senders;
+        auto created = P2PClientService::Create(config);
+        ASSERT_TRUE(created.has_value());
+        auto local = *created;
+        ASSERT_TRUE(local->IsHttpServerEnabled());
+        ASSERT_NE(local->GetHttpPort(), 0);
+        const auto base =
+            "http://127.0.0.1:" + std::to_string(local->GetHttpPort());
+        const auto key = "http-local-join-" + std::to_string(senders);
+        EXPECT_EQ(local->GetHealthStatus(), "LOCAL_ONLY");
+        EXPECT_EQ(master_.GetWrapped()
+                      .GetMasterService()
+                      .GetClientManager()
+                      .GetClient(local->GetClientID()),
+                  nullptr);
+        ASSERT_EQ(HttpPost(base + "/put?key=" + key, "local-value").status,
+                  200);
+        EXPECT_EQ(HttpGet(base + "/get?key=" + key).resp_body, "local-value");
+        ASSERT_EQ(HttpPost(base + "/register").status, 200);
+        EXPECT_EQ(local->GetHealthStatus(), "ONLINE");
+        ASSERT_TRUE(WaitForRoutableClient(local->GetMasterClient(),
+                                          local->GetClientID()));
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        auto remote = HttpGet(Url("/get", "key=" + key));
+        while (remote.status != 200 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            remote = HttpGet(Url("/get", "key=" + key));
+        }
+        EXPECT_EQ(remote.status, 200);
+        EXPECT_EQ(remote.resp_body, "local-value");
+        ASSERT_EQ(HttpPost(base + "/register").status, 200);
+        ASSERT_EQ(HttpPost(base + "/unregister").status, 200);
+        EXPECT_EQ(local->GetHealthStatus(), "LOCAL_ONLY");
+        EXPECT_EQ(HttpGet(base + "/get?key=" + key).resp_body, "local-value");
+    }
+}
 
 TEST_F(P2PClientHttpEndpointsTest, HttpUnregisterThenRegister) {
     // Unregister via HTTP -> 200, client switches to LOCAL_ONLY.
@@ -375,16 +422,18 @@ TEST_F(P2PClientHttpEndpointsTest, HttpUnregisterThenRegister) {
         << "status=" << re.status << " body=" << re.resp_body;
     EXPECT_EQ(re.resp_body, "OK");
 
-    // Recovery back to FULL is asynchronous.
+    // Service readiness does not wait for historical metadata recovery.
     bool full = false;
     for (int i = 0; i < 50; ++i) {
-        if (client_->GetHealthStatus() == "FULL") {
+        if (client_->GetHealthStatus() == "ONLINE") {
             full = true;
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     EXPECT_TRUE(full) << "health=" << client_->GetHealthStatus();
+    EXPECT_TRUE(WaitForRoutableClient(client_->GetMasterClient(),
+                                      client_->GetClientID()));
 }
 
 }  // namespace testing

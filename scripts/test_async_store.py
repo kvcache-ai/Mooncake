@@ -18,6 +18,11 @@ except ImportError:
     print("Warning: Could not import MooncakeDistributedStoreAsync from async_store.py")
     MooncakeDistributedStoreAsync = None
 
+IS_P2P = (
+    MooncakeDistributedStoreAsync is not None
+    and hasattr(MooncakeDistributedStoreAsync, "setup_p2p_real_client")
+)
+
 # ==========================================
 #  Global Variables & Configuration
 # ==========================================
@@ -125,6 +130,21 @@ def setUpModule():
         print(f"[{os.getpid()}] (Async) Connecting to Mooncake Master at {GLOBAL_CONFIG.master_server_address}...")
 
         def _do_setup():
+            if hasattr(GLOBAL_STORE, "setup_p2p_real_client"):
+                # Match the single-client P2P deployment used by the sync suite.
+                return GLOBAL_STORE.setup_p2p_real_client(
+                    local_hostname=GLOBAL_CONFIG.local_hostname,
+                    metadata_server=GLOBAL_CONFIG.metadata_server,
+                    tiered_backend_config_json=os.environ["MOONCAKE_TIERED_BACKEND_CONFIG"],
+                    local_buffer_size=GLOBAL_CONFIG.local_buffer_size,
+                    protocol=GLOBAL_CONFIG.protocol,
+                    rdma_devices=GLOBAL_CONFIG.device_name,
+                    master_server_addr=GLOBAL_CONFIG.master_server_address,
+                    client_rpc_port=0,
+                    enable_http_server=False,
+                    enable_metric_collection=False,
+                    runtime_config='{"write":{"remote_weight":0.0}}',
+                )
             return GLOBAL_STORE.setup(
                 GLOBAL_CONFIG.local_hostname,
                 GLOBAL_CONFIG.metadata_server,
@@ -171,11 +191,9 @@ class MooncakeAsyncTestBase(unittest.IsolatedAsyncioTestCase):
         self.store = GLOBAL_STORE
         self.config = GLOBAL_CONFIG
 
-        # Asynchronously clear the store
-        # Note: Depending on implementation, you might want to call
-        # await self.store.async_remove_all()
-        # For now, we assume remove_all wraps C++ synchronous logic nicely in a thread.
-        await self.store.async_remove_all()
+        # TODO: Enable P2P cleanup once global remove_all is implemented.
+        if not IS_P2P:
+            await self.store.async_remove_all()
 
 # ==========================================
 #  Basic Bytes I/O & Auxiliary Tests
@@ -236,6 +254,8 @@ class TestMooncakeBasicFunctional(MooncakeAsyncTestBase):
         self.assertEqual(results[1], 0)
         self.assertEqual(results[2], 1)
 
+    # TODO: Enable P2P coverage once global remove/remove_all is implemented.
+    @unittest.skipIf(IS_P2P, "P2P global remove/remove_all is not implemented yet")
     async def test_04_remove(self):
         """Test remove and remove_all."""
         key = "test_remove_key"
@@ -257,6 +277,8 @@ class TestMooncakeBasicFunctional(MooncakeAsyncTestBase):
         self.assertFalse(await self.store.async_is_exist(keys[0]))
         self.assertFalse(await self.store.async_is_exist(keys[1]))
 
+    # TODO: Enable P2P coverage once global remove_by_regex is implemented.
+    @unittest.skipIf(IS_P2P, "P2P global remove_by_regex is not implemented yet")
     async def test_05_remove_by_regex(self):
         """Test remove_by_regex."""
         # Setup keys with specific patterns

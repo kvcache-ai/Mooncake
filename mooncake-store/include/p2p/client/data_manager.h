@@ -1,7 +1,7 @@
 #pragma once
 
 // The stable DataManager abstraction used by every P2P caller
-// (P2PClientService, ClientRpcService, HARecoveryManager). It carries only
+// (P2PClientService, ClientRpcService, MetadataRecoveryWorker). It carries only
 // methods that have a real production caller, so that an alternative local
 // data plane can be dropped in without touching any of those callers.
 //
@@ -33,7 +33,7 @@
 #include "p2p/client/data_manager_types.h"
 #include "p2p/client/task_handle.h"
 #include "transfer_engine.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 
@@ -56,8 +56,10 @@ class DataManager {
     // Lifecycle
     // ================================================================
 
-    /** Reject new requests, drain in-flight work, stop background threads. */
+    /** After callers and peer leases drain, stop internal background work. */
     virtual void Stop() = 0;
+
+    virtual void WaitForLeaseDrain() = 0;
 
     /** Release tiers and notify the external metadata system. After Stop(). */
     virtual void Destroy() = 0;
@@ -122,9 +124,10 @@ class DataManager {
      * @brief Iterate all local replicas in batches.
      *
      * Granularity is per-replica, not per-key: a key with replicas on N tiers
-     * produces N ReplicaLocation entries. HARecoveryManager resyncs metadata
-     * per (key, tier_id) and GetLocalKeyCount sums batch sizes, so changing
-     * this to per-key would change both. Returning false stops the walk.
+     * produces N ReplicaLocation entries. MetadataRecoveryWorker resyncs
+     * metadata per (key, tier_id) and GetLocalKeyCount sums batch sizes, so
+     * changing this to per-key would change both. Returning false stops the
+     * walk.
      */
     virtual void ForEachKeyBatch(
         const std::function<bool(std::vector<ReplicaLocation>&&)>& callback)

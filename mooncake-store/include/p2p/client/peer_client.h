@@ -1,7 +1,7 @@
 #pragma once
 
 #include "p2p/client/client_rpc_types.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 #include <csignal>
 #include <vector>
 #include <string>

@@ -6,7 +6,7 @@
 #include <glog/logging.h>
 
 #include "etcd_helper.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 

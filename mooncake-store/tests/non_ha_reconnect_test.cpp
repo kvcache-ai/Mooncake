@@ -29,11 +29,8 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
     // Create client (non-HA), mount a segment
     std::string local_hostname = "127.0.0.1:18001";
     std::string master_addr = master.master_address();
-    // TODO(C4/public API): Restore the A00 client factory once the concrete
-    // centralized API is split; retain the original reconnect assertions.
-    auto config = ClientConfigBuilder::build_centralized_real_client(
-        local_hostname, "P2PHANDSHAKE", "tcp", std::nullopt, master_addr);
-    auto client_opt = ClientService::Create(config);
+    auto client_opt = Client::Create(local_hostname, "P2PHANDSHAKE", "tcp",
+                                     std::nullopt, master_addr);
     ASSERT_TRUE(client_opt.has_value());
     auto client = client_opt.value();
 

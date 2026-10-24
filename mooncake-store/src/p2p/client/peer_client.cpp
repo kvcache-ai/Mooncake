@@ -4,7 +4,7 @@
 #include <glog/logging.h>
 
 #include "p2p/client/client_rpc_service.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 

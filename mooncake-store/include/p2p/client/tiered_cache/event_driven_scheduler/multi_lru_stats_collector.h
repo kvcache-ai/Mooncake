@@ -9,7 +9,7 @@
 #include "p2p/client/tiered_cache/event_driven_scheduler/event_driven_stats_collector.h"
 #include "p2p/client/tiered_cache/event_driven_scheduler/frequency_sketch.h"
 #include "p2p/client/tiered_cache/event_driven_scheduler/multi_lru.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 

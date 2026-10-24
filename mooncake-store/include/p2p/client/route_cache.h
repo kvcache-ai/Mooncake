@@ -13,7 +13,7 @@
 #include <memory>
 #include <optional>
 #include <utility>
-#include "replica.h"
+#include "p2p/common/p2p_types.h"
 #include "offset_allocator/offset_allocator.hpp"
 #include "mutex.h"
 
@@ -53,7 +53,7 @@ struct P2PRouteData {
      * @return Total bytes written.
      */
     static size_t Serialize(void* dest, std::string_view key,
-                            const std::vector<P2PProxyDescriptor>& replicas);
+                            const std::vector<P2PRouteDescriptor>& replicas);
 };
 
 /**
@@ -112,16 +112,16 @@ class RouteCache {
      * @brief overwrite
      */
     void Replace(std::string_view key,
-                 const std::vector<P2PProxyDescriptor>& replicas);
+                 const std::vector<P2PRouteDescriptor>& replicas);
 
     /**
      * @brief update if key exists, otherwise insert
      */
     void Upsert(std::string_view key,
-                const std::vector<P2PProxyDescriptor>& replicas);
+                const std::vector<P2PRouteDescriptor>& replicas);
 
     void RemoveReplica(std::string_view key,
-                       const std::vector<P2PProxyDescriptor>& remove_replicas);
+                       const std::vector<P2PRouteDescriptor>& remove_replicas);
 
     struct Metrics {
         size_t free_node_count;
@@ -310,13 +310,13 @@ class RouteCache {
    private:
     void InnerPut(Shard& shard, size_t bucket_idx, size_t hash_val,
                   std::string_view key,
-                  const std::vector<P2PProxyDescriptor>& replicas, bool merge);
+                  const std::vector<P2PRouteDescriptor>& replicas, bool merge);
 
     void BuildReplicaList(
         Node* old_node,
-        const std::vector<P2PProxyDescriptor>& increment_replicas,
-        const std::vector<P2PProxyDescriptor>& remove_replicas,
-        std::vector<P2PProxyDescriptor>& out);
+        const std::vector<P2PRouteDescriptor>& increment_replicas,
+        const std::vector<P2PRouteDescriptor>& remove_replicas,
+        std::vector<P2PRouteDescriptor>& out);
 
     size_t Evict(Shard& shard, size_t goal_free_count) REQUIRES(shard.mtx_);
     void GCLoop();

@@ -80,7 +80,7 @@ class OpLogApplierTest : public ::testing::Test {
     std::string cluster_id_;
 };
 
-// ========== 4.1.1 Basic apply tests ==========
+// ========== Basic apply tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyPublishRoute) {
     OpLogEntry entry =
@@ -117,7 +117,7 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidOpType) {
     EXPECT_FALSE(metadata_store_->RouteExists("key1"));
 }
 
-// ========== 4.1.2 Sequence ordering tests ==========
+// ========== Sequence ordering tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyInOrder) {
     OpLogEntry entry1 =
@@ -213,7 +213,7 @@ TEST_F(OpLogApplierTest, TestApplyDuplicateSequenceId) {
     EXPECT_FALSE(metadata_store_->RouteExists("key1_dup"));
 }
 
-// ========== 4.1.3 Gap resolution tests ==========
+// ========== Gap resolution tests ==========
 
 class OpLogApplierGapTest : public ::testing::Test {
    protected:
@@ -297,7 +297,7 @@ TEST_F(OpLogApplierGapTest, RequestMissingOpLog_NotFound) {
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
 }
 
-// ========== 4.1.4 Checksum tests ==========
+// ========== Checksum tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_ValidChecksum) {
     OpLogEntry entry =
@@ -331,7 +331,7 @@ TEST_F(OpLogApplierTest, TestChecksumFailureMetric) {
     // Metric increment is tested implicitly by the failure
 }
 
-// ========== 4.1.5 Size validation tests ==========
+// ========== Size validation tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_ValidSize) {
     OpLogEntry entry =
@@ -366,7 +366,7 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntry_PayloadTooLarge) {
     EXPECT_EQ(1u, applier_->GetExpectedSequenceId());  // Should not advance
 }
 
-// ========== 4.1.6 Recovery tests ==========
+// ========== Recovery tests ==========
 
 TEST_F(OpLogApplierTest, TestRecover) {
     // Set initial state: last applied sequence_id = 10
@@ -415,7 +415,7 @@ TEST_F(OpLogApplierTest, TestRecover_AfterGap) {
     // processed This tests that recovery resets the expected sequence
 }
 
-// ========== 4.1.7 Pending entries tests ==========
+// ========== Pending entries tests ==========
 
 TEST_F(OpLogApplierTest, TestProcessPendingEntries) {
     OpLogEntry entry1 =
@@ -514,7 +514,7 @@ TEST_F(OpLogApplierTest, TestPendingEntriesSkip) {
     EXPECT_FALSE(metadata_store_->RouteExists("key4"));
 }
 
-// ========== 4.1.8 Payload deserialization tests ==========
+// ========== Payload deserialization tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyPublishRoute_ValidPayload) {
     OpLogEntry entry = MakeEntry(1, OpType_PUBLISH_ROUTE, "key1",

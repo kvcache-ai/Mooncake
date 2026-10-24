@@ -8,7 +8,7 @@
 
 #include "p2p/ha/oplog/oplog_change_notifier.h"
 #include "p2p/ha/oplog/oplog_manager.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 

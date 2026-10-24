@@ -2,11 +2,18 @@
 
 #ifdef STORE_USE_ETCD
 #include "libetcd_wrapper.h"
+#include <type_traits>
 #endif
 
 #include <glog/logging.h>
 
 namespace mooncake {
+
+#ifdef STORE_USE_ETCD
+static_assert(std::is_same_v<EtcdRevisionId, GoInt64>);
+static_assert(std::is_same_v<EtcdLeaseId, GoInt64>);
+static_assert(std::is_same_v<ViewVersionId, GoInt64>);
+#endif
 
 std::string EtcdHelper::connected_endpoints_ = "";
 std::mutex EtcdHelper::etcd_mutex_;

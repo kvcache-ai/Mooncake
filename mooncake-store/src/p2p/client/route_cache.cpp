@@ -7,7 +7,7 @@ namespace mooncake {
 
 size_t P2PRouteData::Serialize(
     void* dest, std::string_view key,
-    const std::vector<P2PProxyDescriptor>& replicas) {
+    const std::vector<P2PRouteDescriptor>& replicas) {
     size_t record_size = P2PRouteData::CalculateSize(replicas.size());
     char* base_ptr = reinterpret_cast<char*>(dest);
     auto* record = reinterpret_cast<P2PRouteData*>(base_ptr);
@@ -185,7 +185,7 @@ P2PRouteHandle RouteCache::Get(std::string_view key) NO_THREAD_SAFETY_ANALYSIS {
 }
 
 void RouteCache::Replace(std::string_view key,
-                         const std::vector<P2PProxyDescriptor>& replicas)
+                         const std::vector<P2PRouteDescriptor>& replicas)
     NO_THREAD_SAFETY_ANALYSIS {
     size_t hash_val = std::hash<std::string_view>{}(key);
     auto& shard = *shards_[hash_val % shard_count_];
@@ -204,7 +204,7 @@ void RouteCache::Replace(std::string_view key,
 }
 
 void RouteCache::Upsert(std::string_view key,
-                        const std::vector<P2PProxyDescriptor>& replicas)
+                        const std::vector<P2PRouteDescriptor>& replicas)
     NO_THREAD_SAFETY_ANALYSIS {
     size_t hash_val = std::hash<std::string_view>{}(key);
     auto& shard = *shards_[hash_val % shard_count_];
@@ -224,7 +224,7 @@ void RouteCache::Upsert(std::string_view key,
 
 void RouteCache::InnerPut(Shard& shard, size_t bucket_idx, size_t hash_val,
                           std::string_view key,
-                          const std::vector<P2PProxyDescriptor>& replicas,
+                          const std::vector<P2PRouteDescriptor>& replicas,
                           bool merge) REQUIRES(shard.mtx_) {
     // 1. Identify target node
     auto result =
@@ -239,7 +239,7 @@ void RouteCache::InnerPut(Shard& shard, size_t bucket_idx, size_t hash_val,
     }
 
     // 2. Prepare final replica list
-    std::vector<P2PProxyDescriptor> final_replicas;
+    std::vector<P2PRouteDescriptor> final_replicas;
     if (merge && target_old_node) {
         BuildReplicaList(target_old_node, replicas, {}, final_replicas);
     } else {
@@ -282,7 +282,7 @@ void RouteCache::InnerPut(Shard& shard, size_t bucket_idx, size_t hash_val,
 }
 
 void RouteCache::RemoveReplica(std::string_view key,
-                               const std::vector<P2PProxyDescriptor>&
+                               const std::vector<P2PRouteDescriptor>&
                                    remove_replicas) NO_THREAD_SAFETY_ANALYSIS {
     size_t hash_val = std::hash<std::string_view>{}(key);
     auto& shard = *shards_[hash_val % shard_count_];
@@ -315,7 +315,7 @@ void RouteCache::RemoveReplica(std::string_view key,
         return;
     }
 
-    std::vector<P2PProxyDescriptor> remaining;
+    std::vector<P2PRouteDescriptor> remaining;
     BuildReplicaList(curr, {}, remove_replicas, remaining);
 
     if (auto handle = curr->GetHandle()) {
@@ -333,9 +333,9 @@ void RouteCache::RemoveReplica(std::string_view key,
 }
 
 void RouteCache::BuildReplicaList(
-    Node* old_node, const std::vector<P2PProxyDescriptor>& increment_replicas,
-    const std::vector<P2PProxyDescriptor>& remove_replicas,
-    std::vector<P2PProxyDescriptor>& out) {
+    Node* old_node, const std::vector<P2PRouteDescriptor>& increment_replicas,
+    const std::vector<P2PRouteDescriptor>& remove_replicas,
+    std::vector<P2PRouteDescriptor>& out) {
     // Note: old_node might be marked as deleted soon after this method.
     // Ensure the data copy from old record is performed efficiently.
     out = increment_replicas;
@@ -367,7 +367,7 @@ void RouteCache::BuildReplicaList(
             }
         }
         if (!exist) {
-            P2PProxyDescriptor p;
+            P2PRouteDescriptor p;
             p.client_id = old_item.client_id;
             p.segment_id = old_item.segment_id;
             p.ip_address = old_item.ip_address;

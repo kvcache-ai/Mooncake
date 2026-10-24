@@ -30,8 +30,8 @@ P2PSegment Segment(UUID id = {1, 1}, std::string name = "segment",
 std::shared_ptr<P2PClientMeta> Client(UUID id = {10, 10},
                                       int64_t disconnect_timeout_sec = 2,
                                       int64_t crash_timeout_sec = 5) {
-    P2PClientMeta::SetTimeouts(disconnect_timeout_sec, crash_timeout_sec);
-    return std::make_shared<P2PClientMeta>(id, "127.0.0.1", 50051);
+    return std::make_shared<P2PClientMeta>(
+        id, "127.0.0.1", 50051, disconnect_timeout_sec, crash_timeout_sec);
 }
 
 TEST(P2PClientMetaTest, OwnsSegmentSnapshots) {

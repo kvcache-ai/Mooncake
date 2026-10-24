@@ -21,7 +21,7 @@
 #include "p2p/ha/oplog/p2p_standby_metadata_store.h"
 #include "p2p/master/p2p_client_manager.h"
 #include "p2p/master/p2p_route_table.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 
@@ -128,17 +128,13 @@ class P2PMasterService final {
         -> P2PBatchSyncRoutesResponse;
 
     /**
-     * @brief Client notifies Master that metadata sync is complete
-     */
-    auto CompleteRouteSync(UUID client_id) -> tl::expected<void, ErrorCode>;
-
-    /**
      * @brief Restore P2P metadata exported by P2PHotStandbyService promotion.
      *
      * The target service must be empty. Restore registers clients/segments and
      * rebuilds route metadata plus location reverse indexes without recording
      * new OpLog entries. If last_applied_sequence_id is provided, the target
      * OpLogManager starts future writes after that sequence.
+     * Subsequent client heartbeats restore service readiness before routing.
      */
     ErrorCode RestoreFromStandbyMetadata(
         const P2PStandbyMetadataStore::ExportedMetadata& metadata,

@@ -18,7 +18,7 @@
 #include "p2p/common/p2p_rpc_types.h"
 #include "p2p/master/p2p_master_metric_manager.h"
 #include "p2p/master/p2p_master_service.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 
@@ -49,6 +49,11 @@ class P2PMasterRpcService final {
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string_view>& keys);
+
+    tl::expected<
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+        ErrorCode>
+    BatchQueryIp(const std::vector<UUID>& client_ids);
 
     tl::expected<
         std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
@@ -90,7 +95,6 @@ class P2PMasterRpcService final {
         const P2PBatchWithdrawRouteRequest& req);
     P2PBatchSyncRoutesResponse BatchSyncRoutes(
         const P2PBatchSyncRoutesRequest& req);
-    tl::expected<void, ErrorCode> CompleteRouteSync(const UUID& client_id);
 
    private:
     void init_http_server();

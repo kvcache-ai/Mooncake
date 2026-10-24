@@ -9,6 +9,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "types.h"
+#include "etcd_helper.h"
 #include "master_config.h"
 
 namespace mooncake {

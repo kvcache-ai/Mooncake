@@ -7,10 +7,21 @@ namespace mooncake {
 // Version information for the Mooncake system
 constexpr const char* MOONCAKE_STORE_VERSION = "@MOONCAKE_STORE_VERSION@";
 
+// Selected Store architecture
+constexpr const char* MOONCAKE_STORE_ARCHITECTURE = "@MOONCAKE_STORE_CLIENT_ARCH@";
+
 // Function to get the version string
 inline const std::string& GetMooncakeStoreVersion() {
     static const std::string version(MOONCAKE_STORE_VERSION);
     return version;
+}
+
+// Human-readable build identity
+inline const std::string& GetMooncakeStoreBuildInfo() {
+    static const std::string info =
+        std::string("store_version=") + MOONCAKE_STORE_VERSION +
+        "\narchitecture=" + MOONCAKE_STORE_ARCHITECTURE;
+    return info;
 }
 
 }  // namespace mooncake

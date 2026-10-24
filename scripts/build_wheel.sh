@@ -2,10 +2,13 @@
 # Script to build the mooncake wheel package
 # Usage: ./scripts/build_wheel.sh [python_version] [output_dir]
 # Example: ./scripts/build_wheel.sh 3.10 dist-3.10
+# Select an independent CMake build with BUILD_DIR (default: build).
+# Example: BUILD_DIR=build-p2p ./scripts/build_wheel.sh 3.10 dist-p2p
 
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
 
+BUILD_DIR=${BUILD_DIR:-build}
 # Get Python version from environment variable or argument
 PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
@@ -26,21 +29,23 @@ echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
+# Remove binaries from the previous architecture before selecting this pair.
+rm -f mooncake-wheel/mooncake/mooncake_master mooncake-wheel/mooncake/mooncake_client
 
 echo "Creating directory structure..."
 
 # Copy engine.so to mooncake directory (will be imported by transfer module)
-cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
+cp "${BUILD_DIR}"/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
 # Copy store.so to mooncake directory
-if [ -f build/mooncake-integration/store.*.so ]; then
+if [ -f "${BUILD_DIR}"/mooncake-integration/store.*.so ]; then
     echo "Copying store.so..."
-    cp build/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
+    cp "${BUILD_DIR}"/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
     echo "Copying master binary..."
     # Copy master binary
-    cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
+    cp "${BUILD_DIR}/mooncake-store/src/mooncake_master" mooncake-wheel/mooncake/
     # Copy client binary
-    cp build/mooncake-store/src/mooncake_client mooncake-wheel/mooncake/
+    cp "${BUILD_DIR}/mooncake-store/src/mooncake_client" mooncake-wheel/mooncake/
     # Copy async_store.py
     cp mooncake-integration/store/async_store.py mooncake-wheel/mooncake/async_store.py
 else
@@ -48,36 +53,36 @@ else
 fi
 
 # Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
-if [ -f build/mooncake-store/src/libmooncake_store.so ]; then
+if [ -f "${BUILD_DIR}/mooncake-store/src/libmooncake_store.so" ]; then
     echo "Copying libmooncake_store.so..."
-    cp build/mooncake-store/src/libmooncake_store.so mooncake-wheel/mooncake/libmooncake_store.so
+    cp "${BUILD_DIR}/mooncake-store/src/libmooncake_store.so" mooncake-wheel/mooncake/libmooncake_store.so
 fi
 
 # Copy libtransfer_engine.so to mooncake directory (only when USE_ETCD is set)
-if [ -f build/mooncake-common/etcd/libetcd_wrapper.so ]; then
+if [ -f "${BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so" ]; then
     echo "Copying libetcd_wrapper.so..."
-    cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/libetcd_wrapper.so
+    cp "${BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so" mooncake-wheel/mooncake/libetcd_wrapper.so
 fi
 
 # Copy libtransfer_engine.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
-if [ -f build/mooncake-transfer-engine/src/libtransfer_engine.so ]; then
+if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so" ]; then
     echo "Copying libtransfer_engine.so..."
-    cp build/mooncake-transfer-engine/src/libtransfer_engine.so mooncake-wheel/mooncake/libtransfer_engine.so
+    cp "${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so" mooncake-wheel/mooncake/libtransfer_engine.so
 fi
 
 # Copy ascend_transport.so to mooncake directory (only when USE_ASCEND_DIRECT is set)
-if [ -f build/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so ]; then
+if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so" ]; then
     echo "Copying ascend_transport.so..."
-    cp build/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so mooncake-wheel/mooncake/ascend_transport.so
+    cp "${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so" mooncake-wheel/mooncake/ascend_transport.so
 fi
 
 # Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
-if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ] \
+if [ -f "${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so" ] \
    || [ -f /usr/lib/libaccl_barex.so ] \
    || [ -f /usr/lib64/libaccl_barex.so ]; then
-    if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
+    if [ -f "${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so" ]; then
      echo "Copying CUDA nvlink_allocator.so..."
-     cp build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
+     cp "${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so" mooncake-wheel/mooncake/nvlink_allocator.so
     fi
     echo "Copying allocator libraries..."
     # Copy allocator.py
@@ -88,10 +93,10 @@ fi
 
 echo "Copying transfer_engine_bench..."
 # Copy transfer_engine_bench
-cp build/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
+cp "${BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench" mooncake-wheel/mooncake/
 
-if [ -f "build/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so" ]; then
-    cp build/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so mooncake-wheel/mooncake/
+if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so" ]; then
+    cp "${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so" mooncake-wheel/mooncake/
     echo "Copying ascend_transport_mem libraries..."
 else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"

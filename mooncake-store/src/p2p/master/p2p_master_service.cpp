@@ -59,7 +59,7 @@ P2PMasterService::P2PMasterService(const P2PMasterConfig& config,
         config.client_lifecycle.live_ttl_seconds,
         config.client_lifecycle.crashed_ttl_seconds, view_version);
     InitializeClientManager();
-    // TODO(P2P heartbeat/HA redesign): The monitor starts before promotion
+    // TODO: The monitor starts before promotion
     // restore and RPC readiness, so a slow restore can expire restored clients.
     // Coordinate heartbeat monitoring and timeout baselines with HA readiness.
     client_manager_->Start();
@@ -154,7 +154,16 @@ auto P2PMasterService::QuerySegments(const std::string& segment)
 
 auto P2PMasterService::QueryIp(const UUID& client_id)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
-    auto result = client_manager_->QueryIp(client_id);
+    auto client = client_manager_->GetClient(client_id);
+    if (!client) {
+        LOG(WARNING) << "QueryIp: client not found, client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
+    }
+    if (!client->IsReady()) {
+        LOG(WARNING) << "QueryIp: client is not ready, client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    auto result = client->QueryIp();
     if (!result.has_value()) {
         LOG(ERROR) << "fail to query ip"
                    << ", client_id=" << client_id << ", ret=" << result.error();
@@ -382,7 +391,7 @@ auto P2PMasterService::RegisterClient(const P2PRegisterClientRequest& req)
         return view_version_;
     };
 
-    // TODO(P2P heartbeat/HA redesign): Registration mutates memory before
+    // TODO: Registration mutates memory before
     // recording OpLog. If persistence fails, this retry path reports success
     // without retrying the missing registration log. Coordinate registration
     // completion and retry semantics in the heartbeat/HA redesign.
@@ -528,6 +537,11 @@ auto P2PMasterService::BuildRouteDescriptor(const P2PRouteLocation& location,
                      << ", segment_id=" << location.segment_id;
         return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
     }
+    if (!client->IsReady()) {
+        VLOG(1) << "Route references a client that is not ready"
+                << ", client_id=" << location.client_id;
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
     auto segment = client->CheckSegmentAvailable(location.segment_id);
     if (!segment.has_value()) {
         LOG(WARNING) << "Route references an unavailable segment"
@@ -555,8 +569,8 @@ std::vector<P2PRouteDescriptor> P2PMasterService::FilterRoutes(
     // 1. Filter qualified routes.
     for (const auto& location : route.locations) {
         auto client = client_manager_->GetClient(location.client_id);
-        if (!client || !client->is_health()) {
-            // A disconnected client cannot serve the read RPC, so skip it.
+        if (!client || !client->is_health() || !client->IsReady()) {
+            // Keep stored metadata, but do not expose unavailable endpoints.
             continue;
         }
         auto segment_result = client->QuerySegment(location.segment_id);
@@ -714,6 +728,9 @@ P2PBatchGetWriteRouteResponse P2PMasterService::SelectWriteRoutes(
             break;
         }
         const UUID client_id = client->get_client_id();
+        if (!client->IsReady()) {
+            continue;
+        }
         const double weight =
             client_id == requester_id ? 1.0 - remote_weight : remote_weight;
         if (weight <= 0.0) {
@@ -998,19 +1015,6 @@ auto P2PMasterService::BatchSyncRoutes(const P2PBatchSyncRoutesRequest& request)
     return response;
 }
 
-auto P2PMasterService::CompleteRouteSync(UUID client_id)
-    -> tl::expected<void, ErrorCode> {
-    auto client = client_manager_->GetClient(client_id);
-    if (!client) {
-        LOG(WARNING) << "CompleteRouteSync: client not found"
-                     << ", client_id=" << client_id;
-        return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
-    }
-    client->SetSyncing(false);
-    LOG(INFO) << "CompleteRouteSync: client_id=" << client_id;
-    return {};
-}
-
 ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
     const P2PStandbyMetadataStore::ExportedMetadata& metadata,
     uint64_t last_applied_sequence_id) {
@@ -1054,9 +1058,6 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
                        << ", client_id=" << client_id
                        << ", error=" << toString(result.error());
             return result.error();
-        }
-        if (auto p2p_client = client_manager_->GetClient(client_id)) {
-            p2p_client->SetSyncing(false);
         }
         ++restored_clients;
     }

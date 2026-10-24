@@ -14,7 +14,6 @@
 
 #include "allocator.h"
 #include "client_service.h"
-#include "centralized_client_service.h"
 #include "types.h"
 #include "utils.h"
 #include "test_server_helpers.h"
@@ -83,15 +82,10 @@ class ClientIdCaptureSink : public google::LogSink {
 
 class ClientIntegrationTest : public ::testing::Test {
    protected:
-    static std::shared_ptr<CentralizedClientService> CreateClient(
-        const std::string& host_name) {
-        // TODO(C4/public API): Replace this shared-facade factory adaptation
-        // with the concrete centralized API; preserve a00f757 scenarios and
-        // assertions.
-        auto config = ClientConfigBuilder::build_centralized_real_client(
-            host_name, "P2PHANDSHAKE", FLAGS_protocol, std::nullopt,
-            master_address_);
-        auto client_opt = ClientService::Create(config);
+    static std::shared_ptr<Client> CreateClient(const std::string& host_name) {
+        auto client_opt =
+            Client::Create(host_name, "P2PHANDSHAKE", FLAGS_protocol,
+                           std::nullopt, master_address_);
 
         EXPECT_TRUE(client_opt.has_value())
             << "Failed to create client with host_name: " << host_name;
@@ -99,12 +93,7 @@ class ClientIntegrationTest : public ::testing::Test {
             return nullptr;
         }
 
-        // Cast to CentralizedClientService for BatchReplicaClear access
-        auto client = std::static_pointer_cast<CentralizedClientService>(
-            client_opt.value());
-        EXPECT_TRUE(client != nullptr)
-            << "Failed to cast to CentralizedClientService";
-        return client;
+        return client_opt.value();
     }
 
     static void SetUpTestSuite() {
@@ -265,8 +254,8 @@ class ClientIntegrationTest : public ::testing::Test {
         }
     }
 
-    static std::shared_ptr<CentralizedClientService> test_client_;
-    static std::shared_ptr<ClientService> segment_provider_client_;
+    static std::shared_ptr<Client> test_client_;
+    static std::shared_ptr<Client> segment_provider_client_;
     // Here we use a simple allocator for the client buffer. In a real
     // application, user should manage the memory allocation and deallocation
     // themselves.
@@ -284,9 +273,8 @@ class ClientIntegrationTest : public ::testing::Test {
 };
 
 // Static members initialization
-std::shared_ptr<CentralizedClientService> ClientIntegrationTest::test_client_ =
-    nullptr;
-std::shared_ptr<ClientService> ClientIntegrationTest::segment_provider_client_ =
+std::shared_ptr<Client> ClientIntegrationTest::test_client_ = nullptr;
+std::shared_ptr<Client> ClientIntegrationTest::segment_provider_client_ =
     nullptr;
 void* ClientIntegrationTest::segment_ptr_ = nullptr;
 void* ClientIntegrationTest::test_client_segment_ptr_ = nullptr;
@@ -322,7 +310,7 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
 
     buffer = client_buffer_allocator_->allocate(1 * 1024 * 1024);
     // Verify data through Get operation
-    auto get_result = test_client_->Get(key, {buffer}, {test_data.size()});
+    auto get_result = test_client_->Get(key, buffer, test_data.size());
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
     ASSERT_EQ(get_result.value(), static_cast<int64_t>(test_data.size()));
@@ -380,7 +368,7 @@ TEST_F(ClientIntegrationTest, RemoveOperation) {
 
     // Try to get the removed data - should fail
     buffer = client_buffer_allocator_->allocate(test_data.size());
-    auto get_result = test_client_->Get(key, {buffer}, {test_data.size()});
+    auto get_result = test_client_->Get(key, buffer, test_data.size());
     ASSERT_FALSE(get_result.has_value()) << "Get should fail for removed key";
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 }
@@ -414,19 +402,17 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
     auto query_result = test_client_->Query(key);
     ASSERT_TRUE(query_result.has_value())
         << "Query operation failed: " << toString(query_result.error());
-    auto replica_list = query_result.value()->replicas;
+    auto replica_list = query_result.value().replicas;
     ASSERT_EQ(replica_list.size(), 1);
     ASSERT_EQ(replica_list[0]
                   .get_memory_descriptor()
                   .buffer_descriptor.transport_endpoint_,
               segment_provider_client_->GetTransportEndpoint());
 
-    // TODO(C4): Restore the a00f757 Query-result reuse path in Get after
-    // concrete client APIs are split; preserve the original assertions.
-    auto get_result = test_client_->Get(key, {buffer}, {test_data.size()});
+    std::vector<Slice> read_slices{{buffer, test_data.size()}};
+    auto get_result = test_client_->Get(key, query_result.value(), read_slices);
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
-    ASSERT_EQ(get_result.value(), static_cast<int64_t>(test_data.size()));
     ASSERT_EQ(memcmp(buffer, test_data.data(), test_data.size()), 0);
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
@@ -463,7 +449,7 @@ TEST_F(ClientIntegrationTest, DISABLED_AllocateTest) {
         client_buffer_allocator_->deallocate(buffer, data_size);
         // Get and verify data
         buffer = client_buffer_allocator_->allocate(data_size);
-        auto get_result = test_client_->Get(key, {buffer}, {data_size});
+        auto get_result = test_client_->Get(key, buffer, data_size);
         ASSERT_TRUE(get_result.has_value())
             << "Get operation failed: " << toString(get_result.error());
         ASSERT_EQ(get_result.value(), static_cast<int64_t>(data_size));
@@ -538,10 +524,8 @@ TEST_F(ClientIntegrationTest, LargeAllocateTest) {
         memset(buffers[i], 0, data_size);
     }
 
-    // Get operation with multiple buffers
-    std::vector<void*> get_buffers(buffers.begin(), buffers.end());
-    std::vector<size_t> get_sizes(kNumBuffers, data_size);
-    auto get_result = test_client_->Get(key, get_buffers, get_sizes);
+    // Read into the original slices to preserve multi-buffer coverage.
+    auto get_result = test_client_->Get(key, slices);
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
 
@@ -604,8 +588,8 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
     for (int i = 0; i < batch_sz; i++) {
         target_buffer =
             client_buffer_allocator_->allocate(test_data_list[i].size());
-        auto get_result = test_client_->Get(keys[i], {target_buffer},
-                                            {test_data_list[i].size()});
+        auto get_result =
+            test_client_->Get(keys[i], target_buffer, test_data_list[i].size());
         ASSERT_TRUE(get_result.has_value())
             << "Get operation failed: " << toString(get_result.error());
         client_buffer_allocator_->deallocate(target_buffer,
@@ -997,6 +981,168 @@ TEST_F(ClientIntegrationTest, BatchReplicaClearOperations) {
     // Non-existent keys should not be in results (silently skipped)
     EXPECT_TRUE(non_existent_result.value().empty())
         << "Non-existent keys should return empty results";
+}
+
+// Centralized client helpers consume Replica descriptors; buffer allocation
+// itself remains covered by the architecture-neutral client_buffer_test.
+class ClientReplicaBufferTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        google::InitGoogleLogging("ClientReplicaBufferTest");
+        FLAGS_logtostderr = 1;
+    }
+    void TearDown() override { google::ShutdownGoogleLogging(); }
+};
+
+// Test calculate_total_size function with memory replica
+TEST_F(ClientReplicaBufferTest, CalculateTotalSizeMemoryReplica) {
+    // Create a memory replica descriptor
+    Replica::Descriptor replica;
+    MemoryDescriptor mem_desc;
+
+    // Set buffer descriptor with proper initialization
+    mem_desc.buffer_descriptor.size_ = 4096;
+    mem_desc.buffer_descriptor.buffer_address_ = 0x1000;
+
+    replica.descriptor_variant = mem_desc;
+    replica.status = ReplicaStatus::COMPLETE;
+
+    uint64_t total_size = calculate_total_size(replica);
+    EXPECT_EQ(total_size, 4096);
+}
+
+// Test calculate_total_size function with disk replica
+TEST_F(ClientReplicaBufferTest, CalculateTotalSizeDiskReplica) {
+    // Create a disk replica descriptor
+    Replica::Descriptor replica;
+    DiskDescriptor disk_desc;
+    disk_desc.object_size = 4096;
+
+    replica.descriptor_variant = disk_desc;
+    replica.status = ReplicaStatus::COMPLETE;
+
+    uint64_t total_size = calculate_total_size(replica);
+    EXPECT_EQ(total_size, 4096);
+}
+
+// Test calculate_total_size function with zero-size memory replica
+TEST_F(ClientReplicaBufferTest, CalculateTotalSizeZeroSizeMemoryReplica) {
+    // Create a memory replica descriptor with zero size
+    Replica::Descriptor replica;
+    MemoryDescriptor mem_desc;
+    mem_desc.buffer_descriptor.size_ = 0;
+    mem_desc.buffer_descriptor.buffer_address_ = 0x1000;
+
+    replica.descriptor_variant = mem_desc;
+    replica.status = ReplicaStatus::COMPLETE;
+
+    uint64_t total_size = calculate_total_size(replica);
+    EXPECT_EQ(total_size, 0);
+}
+
+// Test allocateSlices function with memory replica
+TEST_F(ClientReplicaBufferTest, AllocateSlicesMemoryReplica) {
+    const size_t buffer_size = 1024 * 1024;  // 1MB
+    const size_t alloc_size = 4096;          // 4KB
+
+    auto allocator = ClientBufferAllocator::create(buffer_size);
+    ASSERT_NE(allocator, nullptr);
+
+    auto handle_opt = allocator->allocate(alloc_size);
+    ASSERT_TRUE(handle_opt.has_value());
+
+    BufferHandle handle = std::move(handle_opt.value());
+
+    // Create a memory replica descriptor
+    Replica::Descriptor replica;
+    MemoryDescriptor mem_desc;
+    mem_desc.buffer_descriptor.size_ = 4096;
+    mem_desc.buffer_descriptor.buffer_address_ = 0x1000;
+
+    replica.descriptor_variant = mem_desc;
+    replica.status = ReplicaStatus::COMPLETE;
+
+    std::vector<Slice> slices;
+    int result = allocateSlices(slices, replica, handle.ptr());
+
+    EXPECT_EQ(result, 0);
+    EXPECT_EQ(slices.size(), 1);
+
+    // Verify slice size matches buffer descriptor
+    EXPECT_EQ(slices[0].size, 4096);
+
+    // Verify slice pointer matches buffer pointer
+    EXPECT_EQ(slices[0].ptr, handle.ptr());
+}
+
+// Test allocateSlices function with disk replica
+TEST_F(ClientReplicaBufferTest, AllocateSlicesDiskReplica) {
+    const size_t buffer_size = 1024 * 1024;  // 1MB
+    const size_t alloc_size = 8192;          // 8KB
+
+    auto allocator = ClientBufferAllocator::create(buffer_size);
+    ASSERT_NE(allocator, nullptr);
+
+    auto handle_opt = allocator->allocate(alloc_size);
+    ASSERT_TRUE(handle_opt.has_value());
+
+    BufferHandle handle = std::move(handle_opt.value());
+
+    // Create a disk replica descriptor
+    Replica::Descriptor replica;
+    DiskDescriptor disk_desc;
+    disk_desc.object_size = 8192;
+
+    replica.descriptor_variant = disk_desc;
+    replica.status = ReplicaStatus::COMPLETE;
+
+    std::vector<Slice> slices;
+    int result = allocateSlices(slices, replica, handle.ptr());
+
+    EXPECT_EQ(result, 0);
+    EXPECT_GE(slices.size(), 1);
+
+    // Verify total size matches file size
+    size_t total_slice_size = 0;
+    for (const auto& slice : slices) {
+        EXPECT_NE(slice.ptr, nullptr);
+        EXPECT_GT(slice.size, 0);
+        EXPECT_LE(slice.size, kMaxSliceSize);
+        total_slice_size += slice.size;
+    }
+
+    EXPECT_EQ(total_slice_size, 8192);
+}
+
+// Test allocateSlices function with zero-size memory replica
+TEST_F(ClientReplicaBufferTest, AllocateSlicesZeroSizeMemoryReplica) {
+    const size_t buffer_size = 1024 * 1024;  // 1MB
+    const size_t alloc_size = 1024;          // 1KB
+
+    auto allocator = ClientBufferAllocator::create(buffer_size);
+    ASSERT_NE(allocator, nullptr);
+
+    auto handle_opt = allocator->allocate(alloc_size);
+    ASSERT_TRUE(handle_opt.has_value());
+
+    BufferHandle handle = std::move(handle_opt.value());
+
+    // Create a memory replica descriptor with zero size
+    Replica::Descriptor replica;
+    MemoryDescriptor mem_desc;
+    mem_desc.buffer_descriptor.size_ = 0;
+    mem_desc.buffer_descriptor.buffer_address_ = 0x1000;
+
+    replica.descriptor_variant = mem_desc;
+    replica.status = ReplicaStatus::COMPLETE;
+
+    std::vector<Slice> slices;
+    int result = allocateSlices(slices, replica, handle.ptr());
+
+    EXPECT_EQ(result, 0);
+    EXPECT_EQ(slices.size(), 1);
+    EXPECT_EQ(slices[0].size, 0);
+    EXPECT_EQ(slices[0].ptr, handle.ptr());
 }
 
 }  // namespace testing

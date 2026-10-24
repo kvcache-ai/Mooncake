@@ -26,7 +26,7 @@
 #include "p2p/client/data_manager_types.h"
 #include "p2p/client/v2/block.h"
 #include "p2p/client/v2/copier.h"
-#include "types.h"
+#include "common_types.h"
 
 namespace mooncake::v2 {
 

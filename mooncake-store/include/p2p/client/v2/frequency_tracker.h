@@ -44,7 +44,7 @@
 #include "p2p/client/data_manager_types.h"
 #include "p2p/client/v2/block_registry.h"
 #include "p2p/client/v2/v2_common.h"
-#include "types.h"
+#include "common_types.h"
 #include "utils.h"
 
 namespace mooncake::v2 {

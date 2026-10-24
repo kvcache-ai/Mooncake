@@ -6,7 +6,6 @@
 
 #include "p2p/client/heartbeat_type.h"
 #include "p2p/common/p2p_types.h"
-#include "types.h"
 #include <ylt/reflection/user_reflect_macro.hpp>
 
 namespace mooncake {
@@ -28,8 +27,9 @@ YLT_REFL(P2PRegisterClientRequest, client_id, segments, ip_address, rpc_port);
 struct P2PHeartbeatRequest {
     UUID client_id;
     std::vector<HeartbeatTask> tasks;
+    P2PClientServiceState service_state = P2PClientServiceState::INITIALIZING;
 };
-YLT_REFL(P2PHeartbeatRequest, client_id, tasks);
+YLT_REFL(P2PHeartbeatRequest, client_id, tasks, service_state);
 
 struct P2PHeartbeatResponse {
     P2PClientStatus status = P2PClientStatus::UNDEFINED;
@@ -67,70 +67,6 @@ struct P2PBatchGetReadRouteResponse {
     std::vector<ErrorCode> error_codes;
 };
 YLT_REFL(P2PBatchGetReadRouteResponse, responses, error_codes);
-
-struct P2PWriteRouteConfig {
-    static constexpr size_t RETURN_ALL_CANDIDATES = 0;
-
-    size_t max_candidates{2};
-    P2PClientSelectionStrategy strategy{
-        P2PClientSelectionStrategy::CAPACITY_PRIORITY};
-    // Remote-write weight in [0, 1]. Controls local-vs-remote routing via
-    // multiplicative scoring on the master side:
-    //   score = free_ratio * (is_local ? (1 - remote_weight) : remote_weight)
-    //   0   -> local only  (client writes locally);
-    //   0.5 -> pure capacity order (local and remote weighted equally);
-    //   1   -> remote only (master never returns the local client).
-    double remote_weight{0.5};
-
-    // Local-write waterline in [0, 1]. When the client's local utilization
-    // (1 - free/total over eligible tiers) is below this threshold, the client
-    // writes locally without asking the master. 0 = disabled.
-    double local_write_waterline{0.5};
-
-    // Capacity metric used when scoring a client:
-    //   false = sum free/total over all tiers;
-    //   true  = only account the highest-priority eligible tier's free/total
-    bool top_tier_only{true};
-    bool early_return{true};  // whether to return immediately once candidates
-                              // meet conditions of config
-
-    // filter the segment with tag
-    std::vector<std::string> tag_filters;
-    // filter the segments whose priority is lower than priority_limit
-    int priority_limit{0};
-
-    bool IsValid() const {
-        // waterline extremes:
-        //   <= 0  -> local-write bypass disabled (forbid local write)
-        //   >= 1  -> always bypass to local when free (forbid remote write)
-        // remote_weight extremes:
-        //   <= 0  -> master only returns local routes (forbid remote routing)
-        //   >= 1  -> master only returns remote routes (forbid local routing)
-        // Two combinations are contradictory (dead end):
-        //   forbid local write  + forbid remote routing
-        //   forbid remote write + forbid local routing (defensive)
-        const bool no_local_write = local_write_waterline <= 0.0;
-        const bool no_remote_write = local_write_waterline >= 1.0;
-        const bool no_remote_route = remote_weight <= 0.0;
-        const bool no_local_route = remote_weight >= 1.0;
-        return !(no_local_write && no_remote_route) &&
-               !(no_remote_write && no_local_route);
-    }
-};
-YLT_REFL(P2PWriteRouteConfig, max_candidates, strategy, remote_weight,
-         local_write_waterline, top_tier_only, early_return, tag_filters,
-         priority_limit);
-
-inline std::ostream& operator<<(std::ostream& output,
-                                const P2PWriteRouteConfig& config) {
-    return output << "P2PWriteRouteConfig: { max_candidates: "
-                  << config.max_candidates << ", strategy: " << config.strategy
-                  << ", remote_weight: " << config.remote_weight
-                  << ", local_write_waterline: " << config.local_write_waterline
-                  << ", top_tier_only: " << config.top_tier_only
-                  << ", early_return: " << config.early_return
-                  << ", priority_limit: " << config.priority_limit << " }";
-}
 
 struct P2PGetWriteRouteRequest {
     std::string_view key;

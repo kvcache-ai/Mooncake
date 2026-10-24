@@ -16,7 +16,7 @@
 #include "p2p/client/heartbeat_type.h"
 #include "p2p/common/p2p_rpc_types.h"
 #include "p2p/master/p2p_client_meta.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 
@@ -87,6 +87,8 @@ class P2PClientManager final {
     std::unordered_map<UUID, std::shared_ptr<P2PClientMeta>, boost::hash<UUID>>
         client_metas_ GUARDED_BY(clients_mutex_);
     std::jthread client_monitor_thread_;
+    const int64_t disconnect_timeout_sec_;
+    const int64_t crash_timeout_sec_;
     const ViewVersionId view_version_;
     SegmentRemovalCallback segment_removal_cb_;
 };

@@ -5,7 +5,9 @@
 #include <mutex>
 #include <thread>
 #include <hf3fs_usrbio.h>
-#include "types.h"
+#include <span>
+#include <ylt/util/tl/expected.hpp>
+#include "common_types.h"
 
 namespace mooncake {
 
@@ -33,28 +35,28 @@ class USRBIOResourceManager {
    public:
     USRBIOResourceManager() {}
 
-    void setDefaultParams(const Hf3fsConfig &config) {
+    void setDefaultParams(const Hf3fsConfig& config) {
         default_config_ = config;
     }
 
-    struct ThreadUSRBIOResource *getThreadResource(const Hf3fsConfig &config);
+    struct ThreadUSRBIOResource* getThreadResource(const Hf3fsConfig& config);
 
-    struct ThreadUSRBIOResource *getThreadResource() {
+    struct ThreadUSRBIOResource* getThreadResource() {
         return getThreadResource(default_config_);
     }
 
     ~USRBIOResourceManager();
 
    private:
-    USRBIOResourceManager(const USRBIOResourceManager &) = delete;
-    USRBIOResourceManager &operator=(const USRBIOResourceManager &) = delete;
+    USRBIOResourceManager(const USRBIOResourceManager&) = delete;
+    USRBIOResourceManager& operator=(const USRBIOResourceManager&) = delete;
     Hf3fsConfig default_config_;
 
     // Thread resources map protection lock
     std::mutex resource_map_mutex;
 
     // ThreadID to resource mapping
-    std::unordered_map<std::thread::id, struct ThreadUSRBIOResource *>
+    std::unordered_map<std::thread::id, struct ThreadUSRBIOResource*>
         thread_resources;
 };
 
@@ -74,7 +76,7 @@ struct ThreadUSRBIOResource {
     ThreadUSRBIOResource() : initialized(false) {}
 
     // Initialize resource
-    bool Initialize(const Hf3fsConfig &config);
+    bool Initialize(const Hf3fsConfig& config);
 
     // Cleanup resource
     void Cleanup();
@@ -84,23 +86,23 @@ struct ThreadUSRBIOResource {
 
 class ThreeFSFile : public StorageFile {
    public:
-    ThreeFSFile(const std::string &filename, int fd,
-                USRBIOResourceManager *resource_manager);
+    ThreeFSFile(const std::string& filename, int fd,
+                USRBIOResourceManager* resource_manager);
     ~ThreeFSFile() override;
 
-    tl::expected<size_t, ErrorCode> write(const std::string &buffer,
+    tl::expected<size_t, ErrorCode> write(const std::string& buffer,
                                           size_t length) override;
     tl::expected<size_t, ErrorCode> write(std::span<const char> data,
                                           size_t length) override;
-    tl::expected<size_t, ErrorCode> read(std::string &buffer,
+    tl::expected<size_t, ErrorCode> read(std::string& buffer,
                                          size_t length) override;
-    tl::expected<size_t, ErrorCode> vector_write(const iovec *iov, int iovcnt,
+    tl::expected<size_t, ErrorCode> vector_write(const iovec* iov, int iovcnt,
                                                  off_t offset) override;
-    tl::expected<size_t, ErrorCode> vector_read(const iovec *iov, int iovcnt,
+    tl::expected<size_t, ErrorCode> vector_read(const iovec* iov, int iovcnt,
                                                 off_t offset) override;
 
    private:
-    USRBIOResourceManager *resource_manager_;
+    USRBIOResourceManager* resource_manager_;
 };
 
 }  // namespace mooncake

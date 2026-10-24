@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <unordered_map>

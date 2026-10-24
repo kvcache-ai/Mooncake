@@ -291,8 +291,7 @@ TEST_F(SchedulerIntegrationTest, TestPromotion) {
 
     // 5. Verify Promotion
     replicas = backend.GetReplicaTierIds(key);
-    // Should now have 1 replica (DRAM) because we implemented Move (Transfer +
-    // Delete)
+    // Move leaves only the destination DRAM replica.
     ASSERT_EQ(replicas.size(), 1);
 
     bool has_dram = false;
@@ -971,7 +970,7 @@ TEST_F(ConcurrencyTest, CASFailureNoCallbackInvoked) {
         << "Stale CAS must not invoke metadata sync callback";
 }
 
-// Concurrent flush + delete stress test (validates UAF fix)
+// Concurrent flush/delete must keep data handles valid.
 TEST_F(SchedulerIntegrationTest, ConcurrentFlushDeleteStress) {
     TieredBackend backend;
     auto res = InitTieredBackendForTest(backend, config_);
@@ -1298,8 +1297,7 @@ TEST_F(SchedulerIntegrationTest, SingleTierEviction) {
     LOG(INFO) << "Single-tier eviction test completed";
 }
 
-// P0-2: an unrecognized scheduler.type must WARN and fall back to legacy
-// rather than silently ignoring the misconfiguration.
+// Unknown scheduler types must warn and fall back to the legacy scheduler.
 TEST_F(SchedulerIntegrationTest,
        UnknownSchedulerTypeWarnsAndFallsBackToLegacy) {
     config_["scheduler"]["type"] = "definitely_not_a_real_type";

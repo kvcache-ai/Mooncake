@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import time
 
 from aiohttp import web
@@ -51,19 +52,35 @@ class MooncakeStoreService:
     def __init__(self, config_path: str = None, cli_config: dict = None):
         self.store = None
         self.config = None
+        self.is_p2p = hasattr(MooncakeDistributedStore, "setup_p2p_real_client")
         self._setup_logging()
 
         try:
-            if config_path:
-                self.config = MooncakeConfig.from_file(config_path)
+            if self.is_p2p:
+                config_path = config_path or os.getenv("MOONCAKE_CONFIG_PATH")
+                self.config = {}
+                if config_path:
+                    with open(config_path) as source:
+                        self.config = json.load(source)
+                    if not isinstance(self.config, dict):
+                        raise ValueError("P2P configuration must be a JSON object")
+                self.config.update(cli_config or {})
+                # Native dict setup accepts JSON text for nested configuration.
+                self.config = {
+                    key: json.dumps(value) if isinstance(value, (dict, list)) else value
+                    for key, value in self.config.items()
+                }
             else:
-                self.config = MooncakeConfig.load_from_env()
+                if config_path:
+                    self.config = MooncakeConfig.from_file(config_path)
+                else:
+                    self.config = MooncakeConfig.load_from_env()
 
-            # Override with CLI config if provided
-            if cli_config:
-                for key, value in cli_config.items():
-                    if hasattr(self.config, key):
-                        setattr(self.config, key, value)
+                # Override with CLI config if provided
+                if cli_config:
+                    for key, value in cli_config.items():
+                        if hasattr(self.config, key):
+                            setattr(self.config, key, value)
 
             logging.info("Mooncake configuration loaded")
         except Exception as e:
@@ -106,21 +123,26 @@ class MooncakeStoreService:
                 )
 
                 self.store = MooncakeDistributedStore()
-                ret = self.store.setup(
-                    self.config.local_hostname,
-                    self.config.metadata_server,
-                    self.config.global_segment_size,
-                    self.config.local_buffer_size,
-                    self.config.protocol,
-                    self.config.device_name,
-                    self.config.master_server_address,
-                    heartbeat_rpc_port=self.config.heartbeat_rpc_port,
-                )
+                if self.is_p2p:
+                    ret = self.store.setup_p2p_real_client(self.config)
+                else:
+                    ret = self.store.setup(
+                        self.config.local_hostname,
+                        self.config.metadata_server,
+                        self.config.global_segment_size,
+                        self.config.local_buffer_size,
+                        self.config.protocol,
+                        self.config.device_name,
+                        self.config.master_server_address
+                    )
 
                 if ret != 0:
                     raise RuntimeError("Store initialization failed")
 
-                logging.info(f"Store service started successfully on {self.config.local_hostname}")
+                if self.is_p2p:
+                    logging.info("Store service started successfully")
+                else:
+                    logging.info(f"Store service started successfully on {self.config.local_hostname}")
                 return True
 
             except Exception as e:

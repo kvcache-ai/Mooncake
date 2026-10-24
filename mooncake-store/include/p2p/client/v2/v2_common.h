@@ -22,7 +22,7 @@
 #include <boost/functional/hash.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "types.h"
+#include "common_types.h"
 
 namespace mooncake::v2 {
 

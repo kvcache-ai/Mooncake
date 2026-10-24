@@ -1,17 +1,17 @@
 #pragma once
 
-#include "centralized_client_service.h"
+#include "client_service.h"
+#include "mutex.h"
 #include "client_buffer.hpp"
 #include "storage_backend.h"
 
 namespace mooncake {
 
-class CentralizedClientService;
+class Client;
 
 class FileStorage {
    public:
-    FileStorage(const FileStorageConfig& config,
-                std::shared_ptr<CentralizedClientService> client,
+    FileStorage(const FileStorageConfig& config, Client* client,
                 const std::string& local_rpc_addr);
     ~FileStorage();
 
@@ -84,7 +84,8 @@ class FileStorage {
 
     void ClientBufferGCThreadFunc();
 
-    std::shared_ptr<CentralizedClientService> client_;
+    // Borrowed from the owning Client, which destroys FileStorage first.
+    Client* client_;
     std::string local_rpc_addr_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;

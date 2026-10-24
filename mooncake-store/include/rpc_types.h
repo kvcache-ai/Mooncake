@@ -29,15 +29,6 @@ struct PingResponse {
 YLT_REFL(PingResponse, view_version_id, client_status);
 
 /**
- * @brief Response structure for the DummyClient ping RPC (RealClient::ping).
- */
-struct DummyHeartbeatResponse {
-    DummyClientStatus status = DummyClientStatus::HEALTH;
-    uint64_t mapped_shm_count = 0;
-};
-YLT_REFL(DummyHeartbeatResponse, status, mapped_shm_count);
-
-/**
  * @brief Response structure for GetReplicaList operation
  */
 struct GetReplicaListResponse {
@@ -150,21 +141,5 @@ struct TaskCompleteRequest {
     TaskCompleteRequest() = default;
 };
 YLT_REFL(TaskCompleteRequest, id, status, message);
-
-struct BatchGetOffloadObjectResponse {
-    std::vector<uint64_t> pointers;
-    std::string transfer_engine_addr;
-    uint64_t gc_ttl_ms;
-
-    BatchGetOffloadObjectResponse() = default;
-    BatchGetOffloadObjectResponse(std::vector<uint64_t>&& pointers_param,
-                                  std::string transfer_engine_addr_param,
-                                  uint64_t gc_ttl_ms_param)
-        : pointers(std::move(pointers_param)),
-          transfer_engine_addr(std::move(transfer_engine_addr_param)),
-          gc_ttl_ms(gc_ttl_ms_param) {}
-};
-YLT_REFL(BatchGetOffloadObjectResponse, pointers, transfer_engine_addr,
-         gc_ttl_ms);
 
 }  // namespace mooncake

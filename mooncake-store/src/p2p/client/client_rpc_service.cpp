@@ -58,13 +58,22 @@ ClientRpcService::ClientRpcService(DataManager& data_manager,
                                    std::shared_ptr<P2PClientMetric> metrics)
     : data_manager_(data_manager),
       metrics_(metrics),
-      peer_tracker_(
-          "peer RPCs", [this] { RecordPeerInflight(true); },
+      normal_op_tracker_(
+          "new peer operations", [this] { RecordPeerInflight(true); },
+          [this] { RecordPeerInflight(false); }),
+      finish_op_tracker_(
+          "peer lease completion RPCs", [this] { RecordPeerInflight(true); },
           [this] { RecordPeerInflight(false); }) {}
 
 void ClientRpcService::Stop() {
-    peer_tracker_.Close();
-    peer_tracker_.Wait();
+    normal_op_tracker_.Close();
+    normal_op_tracker_.Wait();
+    // Forward transfers outlive PreWrite/PinKey handlers. Keep their tokens
+    // and buffers until completion or lease expiry, with the scanner running.
+    data_manager_.WaitForLeaseDrain();
+    finish_op_tracker_.Close();
+    finish_op_tracker_.Wait();
+    ready_.store(false, std::memory_order_release);
 }
 
 void ClientRpcService::RecordPeerInflight(bool entering) {
@@ -82,10 +91,11 @@ ClientRpcService::ReadRemoteData(const RemoteReadRequest& request) {
     timer.LogRequest("key=", request.key,
                      "buffer_count=", request.dest_buffers.size());
 
-    auto inflight_handle = peer_tracker_.Enter();
-    if (!inflight_handle.is_valid()) {
+    auto inflight_handle = normal_op_tracker_.Enter();
+    if (!inflight_handle.is_valid() ||
+        !ready_.load(std::memory_order_acquire)) {
         LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
-                     << ": client is draining/shutting down";
+                     << ": client is not ready or is shutting down";
         co_return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
@@ -166,10 +176,11 @@ ClientRpcService::WriteRemoteData(const RemoteWriteRequest& request) {
     timer.LogRequest("key=", request.key,
                      "buffer_count=", request.src_buffers.size());
 
-    auto inflight_handle = peer_tracker_.Enter();
-    if (!inflight_handle.is_valid()) {
+    auto inflight_handle = normal_op_tracker_.Enter();
+    if (!inflight_handle.is_valid() ||
+        !ready_.load(std::memory_order_acquire)) {
         LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
-                     << ": client is draining/shutting down";
+                     << ": client is not ready or is shutting down";
         co_return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
@@ -239,10 +250,11 @@ tl::expected<PreWriteResponse, ErrorCode> ClientRpcService::PreWrite(
     ScopedVLogTimer timer(1, "ClientRpcService::PreWrite");
     timer.LogRequest("key=", request.key, "size_bytes=", request.size_bytes);
 
-    auto inflight_handle = peer_tracker_.Enter();
-    if (!inflight_handle.is_valid()) {
+    auto inflight_handle = normal_op_tracker_.Enter();
+    if (!inflight_handle.is_valid() ||
+        !ready_.load(std::memory_order_acquire)) {
         LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
-                     << ": client is draining/shutting down";
+                     << ": client is not ready or is shutting down";
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
@@ -290,10 +302,11 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteCommit(
     ScopedVLogTimer timer(1, "ClientRpcService::WriteCommit");
     timer.LogRequest("key=", request.key);
 
-    auto inflight_handle = peer_tracker_.Enter();
-    if (!inflight_handle.is_valid()) {
+    auto inflight_handle = finish_op_tracker_.Enter();
+    if (!inflight_handle.is_valid() ||
+        !ready_.load(std::memory_order_acquire)) {
         LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
-                     << ": client is draining/shutting down";
+                     << ": client is not ready or is shutting down";
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
@@ -341,10 +354,11 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteRevoke(
     ScopedVLogTimer timer(1, "ClientRpcService::WriteRevoke");
     timer.LogRequest("key=", request.key);
 
-    auto inflight_handle = peer_tracker_.Enter();
-    if (!inflight_handle.is_valid()) {
+    auto inflight_handle = finish_op_tracker_.Enter();
+    if (!inflight_handle.is_valid() ||
+        !ready_.load(std::memory_order_acquire)) {
         LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
-                     << ": client is draining/shutting down";
+                     << ": client is not ready or is shutting down";
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
@@ -392,10 +406,11 @@ tl::expected<PinKeyResponse, ErrorCode> ClientRpcService::PinKey(
     ScopedVLogTimer timer(1, "ClientRpcService::PinKey");
     timer.LogRequest("key=", request.key);
 
-    auto inflight_handle = peer_tracker_.Enter();
-    if (!inflight_handle.is_valid()) {
+    auto inflight_handle = normal_op_tracker_.Enter();
+    if (!inflight_handle.is_valid() ||
+        !ready_.load(std::memory_order_acquire)) {
         LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
-                     << ": client is draining/shutting down";
+                     << ": client is not ready or is shutting down";
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
@@ -447,10 +462,11 @@ tl::expected<void, ErrorCode> ClientRpcService::UnPinKey(
     ScopedVLogTimer timer(1, "ClientRpcService::UnPinKey");
     timer.LogRequest("key=", request.key);
 
-    auto inflight_handle = peer_tracker_.Enter();
-    if (!inflight_handle.is_valid()) {
+    auto inflight_handle = finish_op_tracker_.Enter();
+    if (!inflight_handle.is_valid() ||
+        !ready_.load(std::memory_order_acquire)) {
         LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
-                     << ": client is draining/shutting down";
+                     << ": client is not ready or is shutting down";
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 

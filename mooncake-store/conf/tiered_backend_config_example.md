@@ -15,7 +15,7 @@ the client scheduler when initialising a P2P real client.
 > [Scheduler Fields](#scheduler-fields-scheduler-object).
 
 The configuration is passed via `tiered_backend_config_json` in
-`ClientConfigBuilder::build_p2p_real_client()`. It accepts either:
+`P2PClientConfigBuilder::build_p2p_real_client()`. It accepts either:
 - An **inline JSON string** (the string must start with `{`)
 - A **file path** to a JSON file (default: `conf/tiered_backend.json`)
 

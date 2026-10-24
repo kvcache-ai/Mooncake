@@ -7,7 +7,6 @@
 #include <stdexcept>
 #include <vector>
 
-#include "rpc_types.h"
 #include "p2p/client/tiered_cache/tiers/cache_tier.h"
 
 namespace mooncake {

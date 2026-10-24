@@ -9,7 +9,7 @@ if (USE_HIP)
 endif()
 
 add_executable(rdma_transport_test ${WORKSPACE}/rdma_transport_test.cpp)
-target_link_libraries(rdma_transport_test PUBLIC transfer_engine)
+target_link_libraries(rdma_transport_test PUBLIC transfer_engine gflags::gflags glog::glog)
 # add_test(NAME rdma_transport_test COMMAND rdma_transport_test)
 
 add_executable(transport_uint_test ${WORKSPACE}/transport_uint_test.cpp)
@@ -36,11 +36,22 @@ if (USE_NVMEOF)
     # add_test(NAME nvmeof_transport_test COMMAND nvmeof_transport_test)
 endif()
 
-if (USE_TCP)
-add_executable(tcp_transport_test ${WORKSPACE}/tcp_transport_test.cpp)
-target_link_libraries(tcp_transport_test PUBLIC transfer_engine gtest gtest_main )
-add_test(NAME tcp_transport_test COMMAND tcp_transport_test)
+if(USE_TCP)
+  add_executable(tcp_transport_test ${WORKSPACE}/tcp_transport_test.cpp)
+  target_link_libraries(tcp_transport_test PUBLIC transfer_engine gtest
+                                                  gtest_main)
+  add_test(NAME tcp_transport_test COMMAND tcp_transport_test)
+
+  add_executable(tcp_write_visibility_test
+                 ${WORKSPACE}/tcp_write_visibility_test.cpp)
+  target_link_libraries(tcp_write_visibility_test PUBLIC transfer_engine gtest
+                                                         gtest_main)
+  add_test(NAME tcp_write_visibility_test COMMAND tcp_write_visibility_test)
 endif()
+
+add_executable(tcp_address_validation_test ${WORKSPACE}/tcp_address_validation_test.cpp)
+target_link_libraries(tcp_address_validation_test PUBLIC gtest gtest_main)
+add_test(NAME tcp_address_validation_test COMMAND tcp_address_validation_test)
 
 if (USE_MNNVL)
     add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
@@ -69,3 +80,10 @@ add_test(NAME memory_location_test COMMAND memory_location_test)
 add_executable(common_test ${WORKSPACE}/common_test.cpp)
 target_link_libraries(common_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME common_test COMMAND common_test)
+
+# Multi-protocol transport test (only when ENABLE_MULTI_PROTOCOL is ON)
+if (ENABLE_MULTI_PROTOCOL)
+    add_executable(mp_transport_test ${WORKSPACE}/mp_transport_test.cpp)
+    target_link_libraries(mp_transport_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME mp_transport_test COMMAND mp_transport_test)
+endif()

@@ -75,6 +75,32 @@ TEST_F(P2PClientManagerTest, RegisterClientSuccess) {
     EXPECT_EQ(res.value(), 1);
 }
 
+TEST_F(P2PClientManagerTest, TimeoutPolicyIsIsolatedBetweenManagers) {
+    auto long_lived = CreateManager(100, 200);
+    const UUID first_id{101, 201};
+    const UUID short_id{102, 202};
+    const UUID later_id{103, 203};
+    ASSERT_TRUE(long_lived->RegisterClient(MakeP2PRegisterRequest(first_id))
+                    .has_value());
+    auto short_lived = CreateManager(1, 2);
+    ASSERT_TRUE(short_lived->RegisterClient(MakeP2PRegisterRequest(short_id))
+                    .has_value());
+    ASSERT_TRUE(long_lived->RegisterClient(MakeP2PRegisterRequest(later_id))
+                    .has_value());
+    const auto previous =
+        std::chrono::steady_clock::now() - std::chrono::seconds(3);
+    for (auto id : {first_id, later_id}) {
+        auto client = long_lived->GetClient(id);
+        ASSERT_NE(client, nullptr);
+        client->health_state_.last_heartbeat = previous;
+        EXPECT_EQ(client->CheckHealth().second, P2PClientStatus::HEALTH);
+    }
+    auto client = short_lived->GetClient(short_id);
+    ASSERT_NE(client, nullptr);
+    client->health_state_.last_heartbeat = previous;
+    EXPECT_EQ(client->CheckHealth().second, P2PClientStatus::CRASHED);
+}
+
 TEST_F(P2PClientManagerTest, RegisterClientDuplicate) {
     auto mgr = CreateManager();
     mgr->Start();

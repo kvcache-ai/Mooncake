@@ -50,7 +50,7 @@
 #include "p2p/client/v2/transfer_coordinator.h"
 #include "p2p/client/v2/v2_common.h"
 #include "transfer_engine.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 struct TierMetric;
@@ -187,6 +187,7 @@ class DataManagerV2 final : public DataManager, public DataManagerTestHook {
 
     // --- DataManager ---
     void Stop() override;
+    void WaitForLeaseDrain() override;
     void Destroy() override;
 
     tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> Put(

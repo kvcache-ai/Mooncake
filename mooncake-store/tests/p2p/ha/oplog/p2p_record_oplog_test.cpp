@@ -115,6 +115,10 @@ class P2PRecordOplogTest : public ::testing::Test {
         req.segments = {segment};
         auto result = service.RegisterClient(req);
         ASSERT_TRUE(result.has_value()) << toString(result.error());
+        P2PHeartbeatRequest heartbeat;
+        heartbeat.client_id = client_id;
+        heartbeat.service_state = P2PClientServiceState::ONLINE;
+        ASSERT_TRUE(service.Heartbeat(heartbeat).has_value());
     }
 
     void UnregisterClient(P2PMasterService& service,

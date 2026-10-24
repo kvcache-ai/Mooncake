@@ -27,7 +27,7 @@
 #include <utility>
 #include <vector>
 
-#include "types.h"
+#include "common_types.h"
 
 namespace mooncake::v2 {
 

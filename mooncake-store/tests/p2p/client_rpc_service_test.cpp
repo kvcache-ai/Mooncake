@@ -2,8 +2,12 @@
 #include <gtest/gtest.h>
 #include <async_simple/coro/SyncAwait.h>
 #include <json/json.h>
+#include <chrono>
+#include <cstring>
+#include <future>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "p2p/client/client_rpc_service.h"
@@ -79,6 +83,7 @@ class ClientRpcServiceTest : public ::testing::Test {
 
         // Create ClientRpcService
         rpc_service_ = std::make_unique<ClientRpcService>(*data_manager_);
+        rpc_service_->SetReady();
     }
 
     void TearDown() override {
@@ -124,6 +129,35 @@ class ClientRpcServiceTest : public ::testing::Test {
 // ============================================================================
 // ReadRemoteData Tests
 // ============================================================================
+
+TEST_F(ClientRpcServiceTest, RejectsPeerRequestsUntilReadyAndAfterStop) {
+    ClientRpcService pending(*data_manager_);
+    const auto unavailable = [](const auto& result) {
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    };
+    unavailable(async_simple::coro::syncAwait(
+        pending.ReadRemoteData(RemoteReadRequest{})));
+    unavailable(async_simple::coro::syncAwait(
+        pending.WriteRemoteData(RemoteWriteRequest{})));
+    unavailable(pending.PreWrite(PreWriteRequest{}));
+    unavailable(pending.WriteCommit(WriteCommitRequest{}));
+    unavailable(pending.WriteRevoke(WriteRevokeRequest{}));
+    unavailable(pending.PinKey(PinKeyRequest{}));
+    unavailable(pending.UnPinKey(UnPinKeyRequest{}));
+
+    pending.SetReady();
+    auto invalid = pending.PreWrite(PreWriteRequest{});
+    ASSERT_FALSE(invalid.has_value());
+    EXPECT_EQ(invalid.error(), ErrorCode::INVALID_PARAMS);
+    pending.Stop();
+    pending.SetReady();
+    unavailable(pending.PreWrite(PreWriteRequest{}));
+    unavailable(pending.WriteCommit(WriteCommitRequest{}));
+    unavailable(pending.WriteRevoke(WriteRevokeRequest{}));
+    unavailable(pending.UnPinKey(UnPinKeyRequest{}));
+    EXPECT_FALSE(pending.IsReady());
+}
 
 // Test ReadRemoteData - success case (without initialized TransferEngine)
 TEST_F(ClientRpcServiceTest, ReadRemoteDataSuccess) {
@@ -580,6 +614,81 @@ TEST_F(ClientRpcServiceTest, WriteRevokeTokenMismatch) {
 // Graceful stop (drain / reject new peer RPCs)
 // ============================================================================
 
+TEST_F(ClientRpcServiceTest, DrainKeepsCompletionRpcsUntilAllTokensReturn) {
+    const std::string commit_key = "drain_commit";
+    const std::string revoke_key = "drain_revoke";
+    const std::string pin_key = "drain_pin";
+    auto commit = rpc_service_->PreWrite({commit_key, 64, GetTierId()});
+    auto revoke = rpc_service_->PreWrite({revoke_key, 64, GetTierId()});
+    ASSERT_TRUE(commit.has_value());
+    ASSERT_TRUE(revoke.has_value());
+    // No TE operation is submitted by this test: initialize the exported
+    // memory directly before completing the write protocol.
+    std::memset(reinterpret_cast<void*>(commit->remote_buffer.addr), 1, 64);
+    const std::string data = "pinned data";
+    auto buffer = StringToBuffer(data);
+    std::vector<Slice> slices{{buffer.get(), data.size()}};
+    auto put = data_manager_->Put(pin_key, slices);
+    ASSERT_TRUE(put.has_value());
+    ASSERT_TRUE(put.value()->Wait().has_value());
+    auto pin = rpc_service_->PinKey({pin_key, GetTierId()});
+    auto second_pin = rpc_service_->PinKey({pin_key, GetTierId()});
+    ASSERT_TRUE(pin.has_value());
+    ASSERT_TRUE(second_pin.has_value());
+
+    auto stopped =
+        std::async(std::launch::async, [this] { rpc_service_->Stop(); });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (rpc_service_->IsReady() &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_FALSE(rpc_service_->IsReady());
+    const auto unavailable = [](const auto& result) {
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    };
+    unavailable(rpc_service_->PreWrite({"new_write", 64, GetTierId()}));
+    unavailable(rpc_service_->PinKey({pin_key, GetTierId()}));
+    unavailable(async_simple::coro::syncAwait(
+        rpc_service_->ReadRemoteData(RemoteReadRequest{})));
+    unavailable(async_simple::coro::syncAwait(
+        rpc_service_->WriteRemoteData(RemoteWriteRequest{})));
+
+    EXPECT_EQ(stopped.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    auto wrong_revoke =
+        rpc_service_->WriteRevoke({revoke_key, generate_uuid()});
+    EXPECT_FALSE(wrong_revoke.has_value());
+    if (!wrong_revoke)
+        EXPECT_EQ(wrong_revoke.error(), ErrorCode::INVALID_WRITE);
+    auto wrong_unpin = rpc_service_->UnPinKey({pin_key, generate_uuid()});
+    EXPECT_FALSE(wrong_unpin.has_value());
+    if (!wrong_unpin) EXPECT_EQ(wrong_unpin.error(), ErrorCode::INVALID_READ);
+    EXPECT_TRUE(
+        rpc_service_->WriteCommit({commit_key, commit->write_operation_id})
+            .has_value());
+    EXPECT_TRUE(
+        rpc_service_->WriteRevoke({revoke_key, revoke->write_operation_id})
+            .has_value());
+    EXPECT_TRUE(
+        rpc_service_->UnPinKey({pin_key, pin->read_operation_id}).has_value());
+    EXPECT_EQ(stopped.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    EXPECT_TRUE(rpc_service_->UnPinKey({pin_key, second_pin->read_operation_id})
+                    .has_value());
+    EXPECT_EQ(stopped.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    stopped.get();
+    EXPECT_TRUE(data_manager_->Exist(commit_key));
+    rpc_service_->SetReady();
+    unavailable(
+        rpc_service_->WriteCommit({commit_key, commit->write_operation_id}));
+    unavailable(rpc_service_->UnPinKey({pin_key, pin->read_operation_id}));
+    rpc_service_->Stop();
+}
+
 TEST_F(ClientRpcServiceTest, StopRejectsNewPeerRpcs) {
     auto tier_id = GetTierId();
     ASSERT_TRUE(tier_id.has_value()) << "No tier available";
@@ -589,9 +698,13 @@ TEST_F(ClientRpcServiceTest, StopRejectsNewPeerRpcs) {
     pre.key = "drain_prewrite_admitted";
     pre.size_bytes = 64;
     pre.target_tier_id = tier_id;
-    ASSERT_TRUE(rpc_service_->PreWrite(pre).has_value());
+    auto admitted = rpc_service_->PreWrite(pre);
+    ASSERT_TRUE(admitted.has_value());
+    ASSERT_TRUE(
+        rpc_service_->WriteRevoke({pre.key, admitted->write_operation_id})
+            .has_value());
 
-    // Stop (no in-flight -> returns immediately).
+    // No handlers or forward leases remain, so Stop can finish immediately.
     rpc_service_->Stop();
 
     // After draining: every handler rejects new requests with a retryable code

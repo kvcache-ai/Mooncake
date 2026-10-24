@@ -4,7 +4,7 @@
 #include <variant>
 #include <vector>
 
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 

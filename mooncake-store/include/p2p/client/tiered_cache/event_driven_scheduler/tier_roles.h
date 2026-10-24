@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "p2p/client/tiered_cache/tiered_backend.h"  // TierView
-#include "types.h"                                   // UUID
+#include "p2p/common/p2p_types.h"                    // UUID
 
 namespace mooncake {
 

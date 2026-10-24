@@ -6,7 +6,7 @@
 #include <string_view>
 
 #include "p2p/client/tiered_cache/scheduler/stats_collector.h"  // AccessStats
-#include "types.h"                                              // UUID
+#include "p2p/common/p2p_types.h"                               // UUID
 
 namespace mooncake {
 

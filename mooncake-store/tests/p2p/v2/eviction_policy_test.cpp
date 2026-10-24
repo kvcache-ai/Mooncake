@@ -18,7 +18,7 @@
 #include <vector>
 
 #include "p2p/client/v2/v2_common.h"
-#include "types.h"
+#include "common_types.h"
 
 namespace mooncake::v2 {
 namespace {

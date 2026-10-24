@@ -9,15 +9,12 @@
 #include <ylt/metric/gauge.hpp>
 
 #include "p2p/client/heartbeat_type.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 
-// Aggregates per-client cumulative metric snapshots into cluster-wide
-// master_cluster_* gauges
-// TODO: Extend ClientMetricSnapshot and this aggregator with per-medium hit
-// dimensions when clients can attribute hits to a concrete storage tier. The
-// master must not infer DRAM/NVMe hits from replica metadata.
+// Aggregate client metric snapshots into master_cluster_* gauges.
+// TODO: Report per-medium hits from client observations, not replica metadata.
 class ClientMetricsAggregator {
    public:
     ClientMetricsAggregator();

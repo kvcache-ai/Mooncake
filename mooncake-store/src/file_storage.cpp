@@ -7,136 +7,7 @@
 #include "utils.h"
 namespace mooncake {
 
-FileStorageConfig FileStorageConfig::FromEnvironment() {
-    FileStorageConfig config;
-
-    auto storage_backend_descriptor =
-        GetEnvStringOr("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-                       "bucket_storage_backend");
-
-    if (storage_backend_descriptor == "bucket_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kBucket;
-    } else if (storage_backend_descriptor == "file_per_key_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kFilePerKey;
-    } else if (storage_backend_descriptor ==
-               "offset_allocator_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kOffsetAllocator;
-    } else {
-        LOG(ERROR) << "Unknown storage backend.";
-    }
-
-    config.storage_filepath = GetEnvStringOr(
-        "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
-
-    config.local_buffer_size = GetEnvOr<int64_t>(
-        "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
-
-    config.scanmeta_iterator_keys_limit =
-        GetEnvOr<int64_t>("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
-                          config.scanmeta_iterator_keys_limit);
-
-    config.total_keys_limit = GetEnvOr<int64_t>(
-        "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", config.total_keys_limit);
-
-    config.total_size_limit = GetEnvOr<int64_t>(
-        "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", config.total_size_limit);
-
-    config.heartbeat_interval_seconds =
-        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
-                           config.heartbeat_interval_seconds);
-    config.client_buffer_gc_interval_seconds =
-        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
-                           config.heartbeat_interval_seconds);
-
-    config.client_buffer_gc_ttl_ms =
-        GetEnvOr<uint64_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
-                           config.client_buffer_gc_ttl_ms);
-
-    return config;
-}
-
-bool FileStorageConfig::ValidatePath(std::string path) const {
-    if (path.empty()) {
-        LOG(ERROR) << "FileStorageConfig: storage_filepath is invalid";
-        return false;
-    }
-    namespace fs = std::filesystem;
-    // 1. Must be an absolute path
-    if (!fs::path(path).is_absolute()) {
-        LOG(ERROR)
-            << "FileStorageConfig: storage_filepath must be an absolute path: "
-            << path;
-        return false;
-    }
-
-    // 2. Check if the path contains ".." components that could lead to path
-    // traversal (static check)
-    fs::path p(path);
-    for (const auto& component : p) {
-        if (component == "..") {
-            LOG(ERROR) << "FileStorageConfig: path traversal is not allowed: "
-                       << path;
-            return false;
-        }
-    }
-
-    struct stat stat_buf;
-
-    // 3. Use stat() to check if the path exists
-    if (::stat(path.c_str(), &stat_buf) != 0) {
-        LOG(ERROR) << "FileStorageConfig: storage_filepath does not exist: "
-                   << path;
-        return false;
-    }
-    // Path exists — check if it is a directory
-    if (!S_ISDIR(stat_buf.st_mode)) {
-        LOG(ERROR) << "FileStorageConfig: storage_filepath is not a directory: "
-                   << path;
-        return false;
-    }
-
-    // (Optional) Check write permission
-    if (::access(path.c_str(), W_OK) != 0) {
-        LOG(ERROR) << "FileStorageConfig: no write permission on directory: "
-                   << path;
-        return false;
-    }
-
-    // 4. Additional security: prevent symlink bypass (optional)
-    // Use lstat to avoid automatic dereferencing of symbolic links
-    struct stat lstat_buf;
-    if (::lstat(path.c_str(), &lstat_buf) == 0) {
-        if (S_ISLNK(lstat_buf.st_mode)) {
-            LOG(ERROR) << "FileStorageConfig: symbolic link is not allowed: "
-                       << path;
-            return false;
-        }
-    }
-
-    return true;
-}
-
-bool FileStorageConfig::Validate() const {
-    if (!ValidatePath(storage_filepath)) {
-        return false;
-    }
-    if (total_keys_limit <= 0) {
-        LOG(ERROR) << "FileStorageConfig: total_keys_limit must > 0";
-        return false;
-    }
-    if (total_size_limit == 0) {
-        LOG(ERROR) << "FileStorageConfig: total_size_limit should not be zero";
-        return false;
-    }
-    if (heartbeat_interval_seconds <= 0) {
-        LOG(ERROR) << "FileStorageConfig: heartbeat_interval_seconds must > 0";
-        return false;
-    }
-    return true;
-}
-
-FileStorage::FileStorage(const FileStorageConfig& config,
-                         std::shared_ptr<CentralizedClientService> client,
+FileStorage::FileStorage(const FileStorageConfig& config, Client* client,
                          const std::string& local_rpc_addr)
     : config_(config),
       client_(client),
@@ -397,7 +268,7 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
     for (size_t i = 0; i < batched_query_results.size(); ++i) {
         if (batched_query_results[i]) {
             for (const auto& descriptor :
-                 batched_query_results[i].value()->replicas) {
+                 batched_query_results[i].value().replicas) {
                 if (descriptor.is_memory_replica()) {
                     const auto& memory_descriptor =
                         descriptor.get_memory_descriptor();

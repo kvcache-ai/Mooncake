@@ -1,12 +1,18 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <array>
+#include <csignal>
+#include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <optional>
 #include <string>
 
 #include "client_metric.h"
 #include "utils.h"
+#include <ylt/coro_http/coro_http_server.hpp>
+#include <ylt/coro_http/coro_http_client.hpp>
 
 namespace mooncake::test {
 
@@ -370,6 +376,169 @@ TEST_F(ClientMetricFactoryTest, UsesEnvironmentReportingInterval) {
         ASSERT_NE(metrics, nullptr);
         EXPECT_EQ(metrics->GetReportingInterval(), 0u);
     }
+}
+
+TEST_F(ClientMetricsTest, HttpEndpointsTest) {
+    // Create ClientMetric instance
+    auto metrics = std::make_unique<ClientMetric>(
+        0, std::map<std::string, std::string>{{"test_label", "test_value"}});
+    ASSERT_NE(metrics, nullptr);
+
+    // Add some test data to metrics
+    metrics->transfer_metric.total_read_bytes.inc(1024);
+    metrics->transfer_metric.total_write_bytes.inc(2048);
+    metrics->transfer_metric.get_latency_us.observe(100);
+    metrics->transfer_metric.get_latency_us.observe(200);
+
+    // Create and start HTTP server
+    coro_http::coro_http_server server(1, 0);
+
+    using namespace coro_http;
+
+    // Serialize centralized metrics through HTTP handlers
+    server.set_http_handler<GET>("/metrics", [&metrics](
+                                                 coro_http_request& req,
+                                                 coro_http_response& resp) {
+        std::string metrics_str;
+        metrics->serialize(metrics_str);
+        resp.add_header("Content-Type", "text/plain; version=0.0.4");
+        resp.set_status_and_content(status_type::ok, std::move(metrics_str));
+    });
+
+    server.set_http_handler<GET>(
+        "/metrics/summary",
+        [&metrics](coro_http_request& req, coro_http_response& resp) {
+            std::string summary = metrics->summary_metrics();
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(status_type::ok, std::move(summary));
+        });
+
+    server.set_http_handler<GET>(
+        "/health", [](coro_http_request& req, coro_http_response& resp) {
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(status_type::ok, "OK");
+        });
+
+    auto started = server.async_start();
+    if (started.hasResult()) {
+        const auto error = started.value();
+        LOG(ERROR) << "HTTP metrics test server stopped during startup: "
+                   << error.message();
+        FAIL() << "HTTP server startup failed: " << error.message();
+    }
+    const uint16_t test_port = server.port();
+    ASSERT_NE(test_port, 0);
+
+    // Test /health endpoint
+    {
+        coro_http::coro_http_client client;
+        auto resp = client.get("http://127.0.0.1:" + std::to_string(test_port) +
+                               "/health");
+        EXPECT_EQ(resp.status, 200) << "Health endpoint returned wrong status";
+        EXPECT_EQ(resp.resp_body, "OK")
+            << "Health endpoint returned wrong body";
+    }
+
+    // Test /metrics endpoint
+    {
+        coro_http::coro_http_client client;
+        auto resp = client.get("http://127.0.0.1:" + std::to_string(test_port) +
+                               "/metrics");
+        EXPECT_EQ(resp.status, 200) << "Metrics endpoint returned wrong status";
+        // Check that metrics contain expected data
+        EXPECT_TRUE(resp.resp_body.find("mooncake_transfer_read_bytes") !=
+                    std::string::npos)
+            << "Metrics should contain read bytes metric";
+        EXPECT_TRUE(resp.resp_body.find("mooncake_transfer_write_bytes") !=
+                    std::string::npos)
+            << "Metrics should contain write bytes metric";
+        EXPECT_TRUE(resp.resp_body.find("test_label") != std::string::npos)
+            << "Metrics should contain label";
+        EXPECT_TRUE(resp.resp_body.find("test_value") != std::string::npos)
+            << "Metrics should contain label value";
+    }
+
+    // Test /metrics/summary endpoint
+    {
+        coro_http::coro_http_client client;
+        auto resp = client.get("http://127.0.0.1:" + std::to_string(test_port) +
+                               "/metrics/summary");
+        EXPECT_EQ(resp.status, 200)
+            << "Metrics summary endpoint returned wrong status";
+        // Check that summary contains expected data
+        EXPECT_TRUE(resp.resp_body.find("Transfer Metrics Summary") !=
+                    std::string::npos)
+            << "Summary should contain transfer metrics header";
+        EXPECT_TRUE(resp.resp_body.find("Total Read") != std::string::npos)
+            << "Summary should contain total read";
+        EXPECT_TRUE(resp.resp_body.find("Total Write") != std::string::npos)
+            << "Summary should contain total write";
+    }
+
+    // Stop server
+    server.stop();
+}
+
+TEST_F(ClientMetricFactoryTest, MetricFactoryPoliciesRemainIndependent) {
+    ASSERT_EQ(setenv("MC_STORE_CLIENT_METRIC", "false", 1), 0);
+    ASSERT_EQ(setenv("MC_STORE_CLIENT_METRIC_INTERVAL", "7", 1), 0);
+    EXPECT_EQ(ClientMetric::Create(), nullptr);
+
+    ASSERT_EQ(setenv("MC_STORE_CLIENT_METRIC", "true", 1), 0);
+    auto centralized_metrics = ClientMetric::Create();
+    ASSERT_NE(centralized_metrics, nullptr);
+    EXPECT_EQ(centralized_metrics->GetReportingInterval(), 7u);
+}
+
+// Each architecture exposes its own output without concatenating metric sets.
+TEST_F(ClientMetricsTest, IndependentMetricsHttpEndpointsTest) {
+    ClientMetric centralized_metrics;
+    centralized_metrics.transfer_metric.total_read_bytes.inc(1024 * 1024);
+
+    using namespace coro_http;
+    coro_http_server server(1, 0);
+    const auto register_metrics = [&server](const std::string& prefix,
+                                            auto* metrics) {
+        server.set_http_handler<GET>(
+            prefix + "/metrics",
+            [metrics](coro_http_request&, coro_http_response& resp) {
+                std::string output;
+                metrics->serialize(output);
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok, std::move(output));
+            });
+        server.set_http_handler<GET>(
+            prefix + "/metrics/summary",
+            [metrics](coro_http_request&, coro_http_response& resp) {
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok,
+                                            metrics->summary_metrics());
+            });
+    };
+    register_metrics("/centralized", &centralized_metrics);
+    auto started = server.async_start();
+    if (started.hasResult()) {
+        const auto error = started.value();
+        LOG(ERROR) << "HTTP metrics test server stopped during startup: "
+                   << error.message();
+        FAIL() << "HTTP server startup failed: " << error.message();
+    }
+    const uint16_t test_port = server.port();
+    ASSERT_NE(test_port, 0);
+
+    const std::string base = "http://127.0.0.1:" + std::to_string(test_port);
+    coro_http_client client;
+    auto resp = client.get(base + "/centralized/metrics");
+    EXPECT_EQ(resp.status, 200);
+    EXPECT_NE(resp.resp_body.find("mooncake_transfer_read_bytes 1048576"),
+              std::string::npos);
+    EXPECT_EQ(resp.resp_body.find("mooncake_p2p_"), std::string::npos);
+    resp = client.get(base + "/centralized/metrics/summary");
+    EXPECT_EQ(resp.status, 200);
+    EXPECT_NE(resp.resp_body.find("Total Read: 1.00 MB"), std::string::npos);
+    EXPECT_EQ(resp.resp_body.find("P2P Total"), std::string::npos);
+
+    server.stop();
 }
 
 }  // namespace mooncake::test

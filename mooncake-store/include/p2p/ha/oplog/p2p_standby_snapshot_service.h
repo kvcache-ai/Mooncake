@@ -15,7 +15,7 @@
 #include <ylt/reflection/user_reflect_macro.hpp>
 
 #include "p2p/ha/oplog/p2p_standby_metadata_store.h"
-#include "types.h"
+#include "p2p/common/p2p_types.h"
 
 namespace mooncake {
 

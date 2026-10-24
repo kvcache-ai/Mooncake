@@ -17,6 +17,11 @@ struct RpcNameTraits<&P2PMasterRpcService::BatchExistKey> {
 };
 
 template <>
+struct RpcNameTraits<&P2PMasterRpcService::BatchQueryIp> {
+    static constexpr const char* value = "BatchQueryIp";
+};
+
+template <>
 struct RpcNameTraits<&P2PMasterRpcService::GetReadRouteByRegex> {
     static constexpr const char* value = "GetReadRouteByRegex";
 };
@@ -101,95 +106,105 @@ struct RpcNameTraits<&P2PMasterRpcService::BatchSyncRoutes> {
     static constexpr const char* value = "BatchSyncRoutes";
 };
 
-template <>
-struct RpcNameTraits<&P2PMasterRpcService::CompleteRouteSync> {
-    static constexpr const char* value = "CompleteRouteSync";
-};
-
 ErrorCode P2PMasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "P2PMasterClient::Connect");
     timer.LogRequest("master_addr=", master_addr);
 
     MutexLocker lock(&connect_mutex_);
-    bool is_same_addr = (client_addr_param_ == master_addr);
-    if (!is_same_addr) {
-        auto client_pool = client_pools_->at(master_addr);
-        client_accessor_.SetClientPool(client_pool);
-        client_addr_param_ = master_addr;
-        if (heartbeat_rpc_port_ > 0) {
-            auto colon = master_addr.rfind(':');
-            std::string host = (colon == std::string::npos)
-                                   ? master_addr
-                                   : master_addr.substr(0, colon);
-            heartbeat_accessor_.SetClientPool(client_pools_->at(
-                host + ":" + std::to_string(heartbeat_rpc_port_)));
-        } else {
-            heartbeat_accessor_.SetClientPool(client_pool);
+    try {
+        bool is_same_addr = (client_addr_param_ == master_addr);
+        if (!is_same_addr) {
+            auto client_pool = client_pools_->at(master_addr);
+            client_accessor_.SetClientPool(client_pool);
+            client_addr_param_ = master_addr;
+            if (heartbeat_rpc_port_ > 0) {
+                auto colon = master_addr.rfind(':');
+                std::string host = (colon == std::string::npos)
+                                       ? master_addr
+                                       : master_addr.substr(0, colon);
+                heartbeat_accessor_.SetClientPool(client_pools_->at(
+                    host + ":" + std::to_string(heartbeat_rpc_port_)));
+            } else {
+                heartbeat_accessor_.SetClientPool(client_pool);
+            }
         }
-    }
 
-    auto result = invoke_rpc<&P2PMasterRpcService::ServiceReady, std::string>();
-    if (!result.has_value() && is_same_addr) {
-        timer.LogResponse("error_code=", result.error());
-        result = invoke_rpc<&P2PMasterRpcService::ServiceReady, std::string>();
-    }
-    if (!result.has_value()) {
-        timer.LogResponse("error_code=", result.error());
-        client_addr_param_.clear();
-        return result.error();
-    }
+        auto result =
+            invoke_rpc<&P2PMasterRpcService::ServiceReady, std::string>();
+        if (!result.has_value() && is_same_addr) {
+            timer.LogResponse("error_code=", result.error());
+            result =
+                invoke_rpc<&P2PMasterRpcService::ServiceReady, std::string>();
+        }
+        if (!result.has_value()) {
+            LOG(ERROR) << "ServiceReady probe failed, address=" << master_addr
+                       << ", error=" << result.error();
+            timer.LogResponse("error_code=", result.error());
+            client_addr_param_.clear();
+            return result.error();
+        }
 
-    std::string client_version = GetMooncakeStoreVersion();
-    if (result.value() != client_version) {
-        LOG(ERROR) << "Version mismatch: server=" << result.value()
-                   << " client=" << client_version;
-        timer.LogResponse("error_code=", ErrorCode::INVALID_VERSION);
-        return ErrorCode::INVALID_VERSION;
-    }
+        std::string client_version = GetMooncakeStoreVersion();
+        if (result.value() != client_version) {
+            LOG(ERROR) << "Version mismatch: server=" << result.value()
+                       << " client=" << client_version;
+            timer.LogResponse("error_code=", ErrorCode::INVALID_VERSION);
+            return ErrorCode::INVALID_VERSION;
+        }
 
-    auto hb_ready =
-        invoke_rpc<&P2PMasterRpcService::HeartbeatServiceReady, uint32_t>();
-    if (!hb_ready.has_value()) {
-        LOG(ERROR) << "HeartbeatServiceReady probe failed: error_code="
-                   << hb_ready.error()
-                   << " (master may predate this RPC; upgrade master first)";
-        timer.LogResponse("error_code=", hb_ready.error());
-        client_addr_param_.clear();
-        return hb_ready.error();
-    }
-    const bool client_dedicated = heartbeat_rpc_port_ > 0;
-    const bool master_dedicated = *hb_ready > 0;
-    if (client_dedicated != master_dedicated) {
-        LOG(ERROR) << "Heartbeat routing mismatch: client_hb_port="
-                   << heartbeat_rpc_port_ << " master_hb_port=" << *hb_ready
-                   << " (one side is dedicated, the other is legacy)";
-        timer.LogResponse("error_code=", ErrorCode::HEARTBEAT_ROUTING_MISMATCH);
-        client_addr_param_.clear();
-        return ErrorCode::HEARTBEAT_ROUTING_MISMATCH;
-    }
+        auto hb_ready =
+            invoke_rpc<&P2PMasterRpcService::HeartbeatServiceReady, uint32_t>();
+        if (!hb_ready.has_value()) {
+            LOG(ERROR)
+                << "HeartbeatServiceReady probe failed: error_code="
+                << hb_ready.error()
+                << " (master may predate this RPC; upgrade master first)";
+            timer.LogResponse("error_code=", hb_ready.error());
+            client_addr_param_.clear();
+            return hb_ready.error();
+        }
+        const bool client_dedicated = heartbeat_rpc_port_ > 0;
+        const bool master_dedicated = *hb_ready > 0;
+        if (client_dedicated != master_dedicated) {
+            LOG(ERROR) << "Heartbeat routing mismatch: client_hb_port="
+                       << heartbeat_rpc_port_ << " master_hb_port=" << *hb_ready
+                       << " (one side is dedicated, the other is legacy)";
+            timer.LogResponse("error_code=",
+                              ErrorCode::HEARTBEAT_ROUTING_MISMATCH);
+            client_addr_param_.clear();
+            return ErrorCode::HEARTBEAT_ROUTING_MISMATCH;
+        }
 
-    if (client_dedicated) {
-        auto hb_result =
-            invoke_rpc_via<&P2PMasterRpcService::ServiceReady, std::string>(
-                heartbeat_accessor_);
-        if (!hb_result.has_value() && is_same_addr) {
-            hb_result =
+        if (client_dedicated) {
+            auto hb_result =
                 invoke_rpc_via<&P2PMasterRpcService::ServiceReady, std::string>(
                     heartbeat_accessor_);
+            if (!hb_result.has_value() && is_same_addr) {
+                hb_result = invoke_rpc_via<&P2PMasterRpcService::ServiceReady,
+                                           std::string>(heartbeat_accessor_);
+            }
+            if (!hb_result.has_value()) {
+                LOG(ERROR) << "Dedicated heartbeat RPC server unreachable at"
+                           << " heartbeat_rpc_port=" << heartbeat_rpc_port_
+                           << ": error_code=" << hb_result.error();
+                timer.LogResponse("error_code=",
+                                  ErrorCode::HEARTBEAT_RPC_UNREACHABLE);
+                client_addr_param_.clear();
+                return ErrorCode::HEARTBEAT_RPC_UNREACHABLE;
+            }
         }
-        if (!hb_result.has_value()) {
-            LOG(ERROR) << "Dedicated heartbeat RPC server unreachable at"
-                       << " heartbeat_rpc_port=" << heartbeat_rpc_port_
-                       << ": error_code=" << hb_result.error();
-            timer.LogResponse("error_code=",
-                              ErrorCode::HEARTBEAT_RPC_UNREACHABLE);
-            client_addr_param_.clear();
-            return ErrorCode::HEARTBEAT_RPC_UNREACHABLE;
-        }
-    }
 
-    timer.LogResponse("error_code=", ErrorCode::OK);
-    return ErrorCode::OK;
+        timer.LogResponse("error_code=", ErrorCode::OK);
+        return ErrorCode::OK;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "P2P master connection setup threw, address="
+                   << master_addr << ", what=" << e.what();
+    } catch (...) {
+        LOG(ERROR) << "P2P master connection setup threw unknown, address="
+                   << master_addr;
+    }
+    client_addr_param_.clear();
+    return ErrorCode::INTERNAL_ERROR;
 }
 
 tl::expected<bool, ErrorCode> P2PMasterClient::ExistKey(
@@ -208,6 +223,22 @@ std::vector<tl::expected<bool, ErrorCode>> P2PMasterClient::BatchExistKey(
     auto result = invoke_batch_rpc<&P2PMasterRpcService::BatchExistKey, bool>(
         object_keys.size(), object_keys);
     timer.LogResponse("result=", result.size(), " keys");
+    return result;
+}
+
+tl::expected<
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+    ErrorCode>
+P2PMasterClient::BatchQueryIp(const std::vector<UUID>& client_ids) {
+    ScopedVLogTimer timer(1, "P2PMasterClient::BatchQueryIp");
+    timer.LogRequest("client_ids_count=", client_ids.size());
+
+    auto result = invoke_rpc<
+        &P2PMasterRpcService::BatchQueryIp,
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>>(
+        client_ids);
+
+    timer.LogResponseExpected(result);
     return result;
 }
 
@@ -415,17 +446,6 @@ P2PMasterClient::BatchSyncRoutes(const P2PBatchSyncRoutesRequest& req) {
 
     auto result = invoke_rpc<&P2PMasterRpcService::BatchSyncRoutes,
                              P2PBatchSyncRoutesResponse>(req);
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-tl::expected<void, ErrorCode> P2PMasterClient::CompleteRouteSync(
-    const UUID& client_id) {
-    ScopedVLogTimer timer(1, "P2PMasterClient::CompleteRouteSync");
-    timer.LogRequest("client_id=", client_id);
-
-    auto result =
-        invoke_rpc<&P2PMasterRpcService::CompleteRouteSync, void>(client_id);
     timer.LogResponseExpected(result);
     return result;
 }

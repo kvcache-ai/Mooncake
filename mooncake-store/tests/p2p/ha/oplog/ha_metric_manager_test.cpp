@@ -22,7 +22,7 @@ class HAMetricManagerTest : public ::testing::Test {
     HAMetricManager& M() { return HAMetricManager::instance(); }
 };
 
-// ========== 7.1.1 Metric update tests ==========
+// ========== Metric update tests ==========
 
 TEST_F(HAMetricManagerTest, TestSetOpLogLastSequenceId) {
     M().set_oplog_last_sequence_id(123);
@@ -107,7 +107,7 @@ TEST_F(HAMetricManagerTest, TestRecordOpLogApplyLatency) {
     SUCCEED();
 }
 
-// ========== 7.1.2 Metric serialization tests ==========
+// ========== Metric serialization tests ==========
 
 TEST_F(HAMetricManagerTest, TestSerializeMetrics) {
     M().set_oplog_last_sequence_id(1);
@@ -225,7 +225,7 @@ TEST_F(HAMetricManagerTest, TestGetSummaryString) {
     EXPECT_NE(std::string::npos, summary.find("applied_seq"));
 }
 
-// ========== 7.1.3 Singleton tests ==========
+// ========== Singleton tests ==========
 
 TEST_F(HAMetricManagerTest, TestSingletonInstance) {
     HAMetricManager& a = HAMetricManager::instance();

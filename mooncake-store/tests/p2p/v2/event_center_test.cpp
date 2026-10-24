@@ -27,7 +27,7 @@
 #include "p2p/client/v2/block.h"
 #include "p2p/client/v2/block_registry.h"
 #include "p2p/client/v2/movement.h"
-#include "types.h"
+#include "common_types.h"
 
 namespace mooncake::v2 {
 namespace {
