@@ -11,14 +11,14 @@ namespace mooncake {
 // and one send connection. send() and Reduce operations read chunk.source;
 // Copy operations write chunk.destination. Call begin() once before data
 // operations and finish() once after them.
-template <typename T, ReduceOp Op>
+template <typename T>
 class SimplePrimitives {
    public:
     [[nodiscard]] __device__ __forceinline__ static SimplePrimitives bind(
-        const SimpleBindings& state, const SimpleWorkspace& workspace,
-        const CollectivePeer& recv_peer, const CollectivePeer& send_peer,
-        uint32_t channel, uint32_t channel_count, uint64_t max_chunk_bytes,
-        uint64_t timeout_ticks) {
+        const SimpleState& state, const SimpleWorkspace& workspace,
+        const DeviceGroupView& view, uint32_t recv_active_index,
+        uint32_t send_active_index, uint32_t channel, uint32_t channel_count,
+        uint64_t max_chunk_bytes, uint64_t timeout_ticks) {
         PG_ASSERT(state.transfer_handle && channel_count > 0 &&
                   channel_count <= kMaxDeviceCollectiveChannels &&
                   channel < channel_count);
@@ -29,10 +29,8 @@ class SimplePrimitives {
             PG_ASSERT(handle.local_staging_region.contains(workspace.staging,
                                                            workspace.bytes));
         }
-        PG_ASSERT(peerAt(state, recv_peer.in_group_rank).global_rank ==
-                  recv_peer.global_rank);
-        PG_ASSERT(peerAt(state, send_peer.in_group_rank).global_rank ==
-                  send_peer.global_rank);
+        PG_ASSERT(recv_active_index < view.participant_count &&
+                  send_active_index < view.participant_count);
         const auto buffers = SimpleBufferLayout::make(
             workspace.bytes / channel_count, max_chunk_bytes);
         PG_ASSERT(buffers.chunk_bytes >= sizeof(T));
@@ -42,10 +40,10 @@ class SimplePrimitives {
             workspace.staging
                 ? StagingRegion{workspace.staging + offset, channel_bytes}
                 : StagingRegion{};
-        return SimplePrimitives(state, buffers, workspace.buffer + offset,
-                                recv_peer.in_group_rank,
-                                send_peer.in_group_rank, channel, timeout_ticks,
-                                staging, send_peer.workspace_offset + offset);
+        return SimplePrimitives(
+            state, view, buffers, workspace.buffer + offset, recv_active_index,
+            send_active_index, channel, timeout_ticks, staging,
+            view.participants[send_active_index].workspace_offset + offset);
     }
 
     [[nodiscard]] __device__ __forceinline__ uint64_t chunkElements() const {
@@ -55,27 +53,26 @@ class SimplePrimitives {
     // StrongStream ordering makes our shared workspace available at this point.
     // Notify the sender, then wait for the receiver to make its workspace
     // available.
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult
     begin(cooperative_groups::thread_block block) const {
         const uint64_t ready_offset =
             state_.signal_layout.recvBufferReadyOffset(
-                recv_peer_.signal_offset, channel_, state_.self_rank);
+                recv_signal_offset_, channel_, view_.self().in_group_rank);
         signalPeer(recv_peer_, ready_offset, block);
 
         const auto* ready_signal = state_.signal_layout.recvBufferReadyPtr(
-            state_.signals, channel_, send_rank_);
+            state_.signals, channel_, send_peer_.in_group_rank);
         return waitForSignal(ready_signal, buffer_ready_sequence_ + 1,
-                             send_rank_, block);
+                             send_peer_.in_group_rank, block);
     }
 
     // Send source[0:count] to the bound outgoing connection.
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult
     send(const CollectiveChunk<T>& chunk,
          cooperative_groups::thread_block block) {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto send = slotFor(send_cursor_);
-        const auto available = waitPrevSendConsumed(send, block);
-        if (!available.succeeded()) return available;
+        PG_COLL_TRY(waitPrevSendConsumed(send, block));
         const auto payload = outgoingPayload(send);
         copyValuesTo(chunk.source, chunk.count, block,
                      payload.template dataAs<T>());
@@ -83,17 +80,31 @@ class SimplePrimitives {
         return {};
     }
 
+    // Store source to destination and send the same values.
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult
+    copySend(const CollectiveChunk<T>& chunk,
+             cooperative_groups::thread_block block) {
+        PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
+        const auto send = slotFor(send_cursor_);
+        PG_COLL_TRY(waitPrevSendConsumed(send, block));
+
+        const auto payload = outgoingPayload(send);
+        copyValuesTo(chunk.source, chunk.count, block, chunk.destination,
+                     payload.template dataAs<T>());
+        publishSend(send, payload, chunk.count, block);
+        return {};
+    }
+
     // Receive the next message and send Op(source, received). No local copy.
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+    template <ReduceOp Op>
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult
     recvReduceSend(const CollectiveChunk<T>& chunk,
                    cooperative_groups::thread_block block) {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto recv = slotFor(recv_cursor_);
         const auto send = slotFor(send_cursor_);
-        const auto arrived = waitRecvReady(recv, block);
-        if (!arrived.succeeded()) return arrived;
-        const auto available = waitPrevSendConsumed(send, block);
-        if (!available.succeeded()) return available;
+        PG_COLL_TRY(waitRecvReady(recv, block));
+        PG_COLL_TRY(waitPrevSendConsumed(send, block));
 
         const auto payload = outgoingPayload(send);
         reduceValuesTo<T, Op>(chunk.source, receivedPayload(recv), chunk.count,
@@ -104,13 +115,13 @@ class SimplePrimitives {
     }
 
     // Receive the next message and store Op(source, received) to destination.
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+    template <ReduceOp Op>
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult
     recvReduceCopy(const CollectiveChunk<T>& chunk,
                    cooperative_groups::thread_block block) {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto recv = slotFor(recv_cursor_);
-        const auto arrived = waitRecvReady(recv, block);
-        if (!arrived.succeeded()) return arrived;
+        PG_COLL_TRY(waitRecvReady(recv, block));
 
         reduceValuesTo<T, Op>(chunk.source, receivedPayload(recv), chunk.count,
                               block, chunk.destination);
@@ -119,16 +130,15 @@ class SimplePrimitives {
     }
 
     // Store Op(source, received) to destination and send the same result.
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+    template <ReduceOp Op>
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult
     recvReduceCopySend(const CollectiveChunk<T>& chunk,
                        cooperative_groups::thread_block block) {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto recv = slotFor(recv_cursor_);
         const auto send = slotFor(send_cursor_);
-        const auto arrived = waitRecvReady(recv, block);
-        if (!arrived.succeeded()) return arrived;
-        const auto available = waitPrevSendConsumed(send, block);
-        if (!available.succeeded()) return available;
+        PG_COLL_TRY(waitRecvReady(recv, block));
+        PG_COLL_TRY(waitPrevSendConsumed(send, block));
 
         const auto payload = outgoingPayload(send);
         reduceValuesTo<T, Op>(chunk.source, receivedPayload(recv), chunk.count,
@@ -140,13 +150,12 @@ class SimplePrimitives {
     }
 
     // Copy the next received message to destination; source is unused.
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult
     recvCopy(const CollectiveChunk<T>& chunk,
              cooperative_groups::thread_block block) {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto recv = slotFor(recv_cursor_);
-        const auto arrived = waitRecvReady(recv, block);
-        if (!arrived.succeeded()) return arrived;
+        PG_COLL_TRY(waitRecvReady(recv, block));
 
         copyValuesTo(receivedPayload(recv), chunk.count, block,
                      chunk.destination);
@@ -155,16 +164,14 @@ class SimplePrimitives {
     }
 
     // Copy the next received message to destination and forward it.
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult
     recvCopySend(const CollectiveChunk<T>& chunk,
                  cooperative_groups::thread_block block) {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto recv = slotFor(recv_cursor_);
         const auto send = slotFor(send_cursor_);
-        const auto arrived = waitRecvReady(recv, block);
-        if (!arrived.succeeded()) return arrived;
-        const auto available = waitPrevSendConsumed(send, block);
-        if (!available.succeeded()) return available;
+        PG_COLL_TRY(waitRecvReady(recv, block));
+        PG_COLL_TRY(waitPrevSendConsumed(send, block));
 
         const auto payload = outgoingPayload(send);
         copyValuesTo(receivedPayload(recv), chunk.count, block,
@@ -175,7 +182,7 @@ class SimplePrimitives {
     }
 
     // Wait until the last published send has been consumed.
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult
     waitSendsConsumed(cooperative_groups::thread_block block) {
         if (!send_pending_) return {};
         // Receives release slots in order. The last ACK proves all previous
@@ -185,10 +192,9 @@ class SimplePrimitives {
         return result;
     }
 
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult
     finish(cooperative_groups::thread_block block) {
-        const auto result = waitSendsConsumed(block);
-        if (!result.succeeded()) return result;
+        PG_COLL_TRY(waitSendsConsumed(block));
         if (block.thread_rank() == 0) {
             device::mc_st_release_u64(&send_progress_->send_cursor,
                                       send_cursor_);
@@ -201,21 +207,23 @@ class SimplePrimitives {
     }
 
    private:
-    __device__ __forceinline__ SimplePrimitives(
-        const SimpleBindings& state, SimpleBufferLayout buffers,
-        const char* recv_buffer, InGroupRank recv_rank, InGroupRank send_rank,
-        uint32_t channel, uint64_t timeout_ticks, StagingRegion staging,
-        uint64_t send_buffer_offset)
+    __device__ __forceinline__
+    SimplePrimitives(const SimpleState& state, const DeviceGroupView& view,
+                     SimpleBufferLayout buffers, const char* recv_buffer,
+                     uint32_t recv_active_index, uint32_t send_active_index,
+                     uint32_t channel, uint64_t timeout_ticks,
+                     StagingRegion staging, uint64_t send_buffer_offset)
         : state_(state),
+          view_(view),
           lane_(state.transfer_handle->lane(channel)),
           timeout_ticks_(timeout_ticks),
           recv_buffer_(recv_buffer),
           buffers_(buffers),
-          recv_rank_(recv_rank),
-          send_rank_(send_rank),
           channel_(channel),
-          recv_peer_(peerAt(state, recv_rank)),
-          send_peer_(peerAt(state, send_rank)),
+          recv_peer_(view.participants[recv_active_index]),
+          send_peer_(view.participants[send_active_index]),
+          recv_signal_offset_(state.signal_offsets[recv_active_index]),
+          send_signal_offset_(state.signal_offsets[send_active_index]),
           send_writer_(
               *state.transfer_handle, lane_, send_peer_.global_rank, staging,
               RemotePayloadRegion{send_buffer_offset, buffers.bufferBytes()}) {
@@ -228,22 +236,12 @@ class SimplePrimitives {
         PG_ASSERT(state.transfer_handle->peer_accessible_region.contains(
             state.signals, uint64_t{state.signal_layout.total_signal_count} *
                                sizeof(uint64_t)));
-        send_progress_ = channel_peer_progress + send_rank;
-        recv_progress_ = channel_peer_progress + recv_rank;
+        send_progress_ = channel_peer_progress + send_peer_.in_group_rank;
+        recv_progress_ = channel_peer_progress + recv_peer_.in_group_rank;
         send_cursor_ = device::mc_ld_acquire_u64(&send_progress_->send_cursor);
         recv_cursor_ = device::mc_ld_acquire_u64(&recv_progress_->recv_cursor);
         buffer_ready_sequence_ =
             device::mc_ld_acquire_u64(&send_progress_->buffer_ready_sequence);
-    }
-
-    [[nodiscard]] __device__ __forceinline__ static const SimplePeer& peerAt(
-        const SimpleBindings& state, InGroupRank rank) {
-        PG_ASSERT(state.transfer_handle);
-        PG_ASSERT(rank >= 0 && static_cast<uint32_t>(rank) <
-                                   state.signal_layout.max_group_size);
-        const auto& peer = state.peer_bindings[rank];
-        PG_ASSERT(peer.global_rank != kInvalidGlobalRank);
-        return peer;
     }
 
     struct SlotPosition {
@@ -258,7 +256,7 @@ class SimplePrimitives {
     }
 
     __device__ __forceinline__ void signalPeer(
-        SimplePeer peer, uint64_t offset,
+        const CollectivePeer& peer, uint64_t offset,
         cooperative_groups::thread_block block) const {
         SignalRequest request;
         request.signal.kind = SignalAction::Kind::Add;
@@ -268,7 +266,7 @@ class SimplePrimitives {
         (void)lane_.signal(peer.global_rank, request, block);
     }
 
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult
     waitForSignal(const uint64_t* signal, uint64_t expected, InGroupRank peer,
                   cooperative_groups::thread_block block) const {
         const auto result = lane_.waitSignal(
@@ -280,32 +278,33 @@ class SimplePrimitives {
         return {};
     }
 
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult waitRecvReady(
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult waitRecvReady(
         SlotPosition slot, cooperative_groups::thread_block block) const {
         const auto* ready_signal = state_.signal_layout.payloadReadyPtr(
-            state_.signals, channel_, recv_rank_, slot.index);
-        return waitForSignal(ready_signal, slot.generation, recv_rank_, block);
+            state_.signals, channel_, recv_peer_.in_group_rank, slot.index);
+        return waitForSignal(ready_signal, slot.generation,
+                             recv_peer_.in_group_rank, block);
     }
 
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult
     waitPrevSendConsumed(SlotPosition slot,
                          cooperative_groups::thread_block block) const {
         // The ACK permits both remote slot overwrite and local staging reuse.
         return waitConsumedSequence(slot.index, slot.generation - 1, block);
     }
 
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
-    waitSendConsumed(SlotPosition slot,
-                     cooperative_groups::thread_block block) const {
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult waitSendConsumed(
+        SlotPosition slot, cooperative_groups::thread_block block) const {
         return waitConsumedSequence(slot.index, slot.generation, block);
     }
 
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+    [[nodiscard]] __device__ __forceinline__ CollectiveResult
     waitConsumedSequence(uint32_t slot_index, uint64_t sequence,
                          cooperative_groups::thread_block block) const {
         const auto* consumed_signal = state_.signal_layout.payloadConsumedPtr(
-            state_.signals, channel_, send_rank_, slot_index);
-        return waitForSignal(consumed_signal, sequence, send_rank_, block);
+            state_.signals, channel_, send_peer_.in_group_rank, slot_index);
+        return waitForSignal(consumed_signal, sequence,
+                             send_peer_.in_group_rank, block);
     }
 
     [[nodiscard]] __device__ __forceinline__ const T* receivedPayload(
@@ -327,7 +326,8 @@ class SimplePrimitives {
         request.size = count * sizeof(T);
         request.signal.kind = SignalAction::Kind::Add;
         request.signal.remote_offset = state_.signal_layout.payloadReadyOffset(
-            send_peer_.signal_offset, channel_, state_.self_rank, slot.index);
+            send_signal_offset_, channel_, view_.self().in_group_rank,
+            slot.index);
         request.signal.add.delta = 1;
         request.timeout_ticks = timeout_ticks_;
         // Submission stays asynchronous; consumed ACKs gate storage reuse.
@@ -340,22 +340,23 @@ class SimplePrimitives {
         SlotPosition slot, cooperative_groups::thread_block block) {
         const uint64_t consumed_offset =
             state_.signal_layout.payloadConsumedOffset(
-                recv_peer_.signal_offset, channel_, state_.self_rank,
+                recv_signal_offset_, channel_, view_.self().in_group_rank,
                 slot.index);
         signalPeer(recv_peer_, consumed_offset, block);
         ++recv_cursor_;
     }
 
-    const SimpleBindings& state_;
+    const SimpleState& state_;
+    const DeviceGroupView& view_;
     TransferLane lane_;
     uint64_t timeout_ticks_;
     const char* recv_buffer_;
     SimpleBufferLayout buffers_;
-    InGroupRank recv_rank_;
-    InGroupRank send_rank_;
     uint32_t channel_;
-    SimplePeer recv_peer_;
-    SimplePeer send_peer_;
+    const CollectivePeer& recv_peer_;
+    const CollectivePeer& send_peer_;
+    uint64_t recv_signal_offset_;
+    uint64_t send_signal_offset_;
     PayloadWriter send_writer_;
     SimplePeerProgress* send_progress_;
     SimplePeerProgress* recv_progress_;

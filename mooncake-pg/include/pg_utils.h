@@ -30,6 +30,16 @@ inline constexpr uint64_t alignmentPadding(uint64_t value,
     return remainder == 0 ? 0 : alignment - remainder;
 }
 
+// Returns whether [left, left + left_size) and [right, right + right_size)
+// overlap. Empty ranges never overlap. The caller must ensure that both
+// endpoint sums fit in uint64_t.
+inline constexpr bool rangesOverlap(uint64_t left, uint64_t left_size,
+                                    uint64_t right,
+                                    uint64_t right_size) noexcept {
+    if (left_size == 0 || right_size == 0) return false;
+    return left < right + right_size && right < left + left_size;
+}
+
 /**
  * @brief Configuration parameters for the BackoffWaiter.
  *

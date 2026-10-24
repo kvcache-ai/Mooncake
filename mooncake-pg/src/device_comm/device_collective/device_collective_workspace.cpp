@@ -9,14 +9,12 @@ namespace mooncake {
 
 DeviceCollectiveWorkspace::DeviceCollectiveWorkspace(
     DeviceTransferService& transfer_service, RegionSlice buffer,
-    GlobalRank self_rank, uint32_t max_world_size,
-    DeviceCollectiveWorkspaceEndpoint local_endpoint)
+    GlobalRank self_rank, uint32_t max_world_size)
     : transfer_service_(transfer_service),
       buffer_(std::move(buffer)),
       self_rank_(self_rank),
-      local_endpoint_(local_endpoint),
       endpoints_(max_world_size) {
-    endpoints_[self_rank_] = local_endpoint_;
+    endpoints_[self_rank_] = localEndpoint();
 }
 
 PGResult<std::unique_ptr<DeviceCollectiveWorkspace>>
@@ -30,14 +28,9 @@ DeviceCollectiveWorkspace::create(DeviceTransferService& transfer_service,
         "device collective self rank is outside the world");
     PG_TRY(auto buffer, transfer_service.allocatePeerAccessible(
                             buffer_size, alignof(uint64_t)));
-    const DeviceCollectiveWorkspaceEndpoint local_endpoint{
-        .buffer_offset = buffer.offset(),
-        .buffer_size = buffer.size(),
-    };
     return std::unique_ptr<DeviceCollectiveWorkspace>(
         new DeviceCollectiveWorkspace(transfer_service, std::move(buffer),
-                                      self_rank, max_world_size,
-                                      local_endpoint));
+                                      self_rank, max_world_size));
 }
 
 const RegionSlice& DeviceCollectiveWorkspace::buffer() const noexcept {
@@ -54,9 +47,12 @@ PGResult<const RegionSlice*> DeviceCollectiveWorkspace::staging() {
     return &*staging_;
 }
 
-const DeviceCollectiveWorkspaceEndpoint&
-DeviceCollectiveWorkspace::localEndpoint() const noexcept {
-    return local_endpoint_;
+DeviceCollectiveWorkspaceEndpoint DeviceCollectiveWorkspace::localEndpoint()
+    const noexcept {
+    return {
+        .buffer_offset = buffer_.offset(),
+        .buffer_size = buffer_.size(),
+    };
 }
 
 PGResult<void> DeviceCollectiveWorkspace::installPeerEndpoint(

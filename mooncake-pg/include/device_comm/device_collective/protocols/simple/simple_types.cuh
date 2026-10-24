@@ -144,22 +144,15 @@ struct SimplePipelineSignalLayout {
     }
 };
 
-// Protocol-owned bindings, indexed by stable InGroupRank.
-struct SimplePeer {
-    GlobalRank global_rank = kInvalidGlobalRank;
-    uint64_t signal_offset = 0;
-};
-
-// Host-published Simple bindings for the current View. Progress lives in a
-// separate [channel][peer] array, reset when the View changes.
-struct SimpleBindings {
+// Host-installed Simple addresses and layout for one communicator.
+struct SimpleState {
     const DeviceTransferHandle* transfer_handle = nullptr;
-    InGroupRank self_rank = kInvalidInGroupRank;
     const uint64_t* signals = nullptr;
     SimplePipelineSignalLayout signal_layout;
+    // Local progress, indexed by [channel][in_group_rank].
     SimplePeerProgress* peer_progress = nullptr;
-    // Indexed by InGroupRank.
-    SimplePeer peer_bindings[kMaxNumRanks] = {};
+    // Remote signal offsets, indexed by DeviceGroupView active index.
+    uint64_t signal_offsets[kMaxNumRanks] = {};
 };
 
 }  // namespace mooncake

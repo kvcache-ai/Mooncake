@@ -36,10 +36,10 @@ class HostProxyRoute : public RouteProvider {
     PGResult<void> unregisterRegion(DeviceRegionKind kind, void* addr,
                                     size_t size) override;
     [[nodiscard]] std::optional<RouteEndpoint> localEndpoint() override;
-    PGResult<void> installEndpoints(const DeviceTransferSnapshot& snapshot,
-                                    uint64_t reclaim_before_version) override;
-    [[nodiscard]] PGResult<std::vector<DeviceTransferRoute>> updateRoutes()
-        override;
+    [[nodiscard]] PGResult<std::vector<DeviceTransferRoute>> installEndpoints(
+        const DeviceTransferSnapshot& snapshot,
+        uint64_t reclaim_before_version) override;
+    PGResult<void> updateRoutes() override;
     void fillDeviceContext(DeviceRouteContext& context) const noexcept override;
 
     PGResult<void> shutdown() override;
@@ -56,7 +56,6 @@ class HostProxyRoute : public RouteProvider {
     uint32_t max_world_size_ = 0;
     HostProxyCommandSlot* device_slots_ = nullptr;
     bool shutdown_requested_ = false;
-    std::vector<DeviceTransferRoute> pending_routes_;
 };
 
 }  // namespace mooncake
