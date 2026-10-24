@@ -10,12 +10,31 @@
 #include <optional>
 #include <utility>
 
+#include "memfabric_allocator.h"
 #include "tent/common/utils/ip.h"
 
 namespace mooncake {
 namespace tent {
 
 namespace {
+
+// Must match SMEM Trans's NPU page alignment. All native registration
+// boundaries are multiples of this size, including ranges on remote peers.
+constexpr uint64_t kRegistrationAlignment = 2ULL * 1024 * 1024;
+
+Status alignedBufferRange(const BufferDesc& desc, uint64_t& begin,
+                          uint64_t& end) {
+    constexpr auto mask = kRegistrationAlignment - 1;
+    constexpr auto max = std::numeric_limits<uint64_t>::max();
+    if (desc.addr == 0 || desc.length == 0 || desc.length > max - desc.addr)
+        return Status::InvalidArgument("invalid MemFabric buffer range" LOC_MARK);
+    end = desc.addr + desc.length;
+    if (end > max - mask)
+        return Status::InvalidArgument("MemFabric alignment overflows" LOC_MARK);
+    begin = desc.addr & ~mask;
+    end = (end + mask) & ~mask;
+    return Status::OK();
+}
 
 std::optional<smem_bm_data_op_type> parseDataOpType(const std::string& str) {
     if (str == "device_sdma") return SMEMB_DATA_OP_SDMA;
@@ -56,13 +75,14 @@ MemFabricSubBatch::~MemFabricSubBatch() {
 MemFabricTransport::MemFabricTransport() = default;
 MemFabricTransport::~MemFabricTransport() { (void)uninstall(); }
 
-Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>&) {
-    const char* protocol_env = std::getenv("MF_PROTOCOL");
-    config_.data_op_type_str = protocol_env ? protocol_env : "";
+Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>& conf) {
+    const bool store =
+        conf && conf->get("transports/memfabric/store_te_init", false);
+    config_.data_op_type_str = memfabric_get_protocol(store);
     if (config_.data_op_type_str.empty()) {
-        LOG(ERROR) << "MF_PROTOCOL env var not set";
         return Status::InvalidArgument(
-            "MF_PROTOCOL must be set (device_sdma/device_rdma/...)" LOC_MARK);
+            store ? "MF_STORE_PROTOCOL or MF_PROTOCOL must be set" LOC_MARK
+                  : "MF_PROTOCOL must be set" LOC_MARK);
     }
     config_.data_op_type = parseDataOpType(config_.data_op_type_str);
     if (!config_.data_op_type.has_value()) {
@@ -70,7 +90,8 @@ Status MemFabricTransport::loadConfig(const std::shared_ptr<Config>&) {
         return Status::InvalidArgument(
             "Invalid data_op_type: " + config_.data_op_type_str + LOC_MARK);
     }
-    LOG(INFO) << "data_op_type=" << config_.data_op_type_str;
+    LOG(INFO) << "data_op_type=" << config_.data_op_type_str
+              << ", store_te_init=" << store;
 
     transfer_timeout_ms_ = 10000;
     const char* timeout_env = std::getenv("MF_TRANSFER_TIMEOUT");
@@ -92,6 +113,9 @@ Status MemFabricTransport::install(std::string& local_segment_name,
                                    std::shared_ptr<ControlService> metadata,
                                    std::shared_ptr<Topology> local_topology,
                                    std::shared_ptr<Config> conf) {
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    if (installed_)
+        return Status::InvalidArgument("MemFabric already installed" LOC_MARK);
     LOG(INFO) << "install: segment_name=" << local_segment_name;
 
     local_segment_name_ = local_segment_name;
@@ -129,8 +153,43 @@ Status MemFabricTransport::install(std::string& local_segment_name,
             "Local RPC address exceeds MemFabric endpoint capacity" LOC_MARK);
     }
 
-    int32_t device_id = 0;
-    if (aclrtGetDevice(&device_id) != ACL_ERROR_NONE) {
+    config_.bind_url = bind_url;
+    config_.nic_url = device_rdma ? nic_url : "";
+    config_.store_url.clear();
+    config_.device_id = -1;
+    const auto log_level = conf ? conf->get("log_level", "info") : "info";
+    config_.log_level = log_level == "error"     ? 3
+                        : log_level == "warning" ? 2
+                                                 : 1;
+    caps = Capabilities{};
+    caps.dram_to_dram = true;
+    caps.dram_to_gpu = true;
+    caps.gpu_to_dram = true;
+    caps.gpu_to_gpu = true;
+    stopping_ = false;
+    installed_ = true;
+    LOG(INFO) << "MemFabricTransport installed; native initialization is "
+                 "deferred until the first memory registration";
+    return Status::OK();
+}
+
+Status MemFabricTransport::bindDevice() const {
+    if (config_.device_id < 0 ||
+        aclrtSetDevice(config_.device_id) != ACL_ERROR_NONE)
+        return Status::InternalError(
+            "Unable to bind MemFabric device" LOC_MARK);
+    return Status::OK();
+}
+
+Status MemFabricTransport::initializeLocked() {
+    if (!installed_ || stopping_)
+        return Status::InternalError("MemFabric is not available" LOC_MARK);
+    if (handle_) return bindDevice();
+
+    // Registration runs on the caller's device-bound thread, unlike the
+    // framework's initialization timeout thread. Do not guess a device here.
+    int32_t device_id = -1;
+    if (aclrtGetDevice(&device_id) != ACL_ERROR_NONE || device_id < 0) {
         LOG(ERROR) << "aclrtGetDevice failed, device may be not set";
         return Status::InternalError(
             "aclrtGetDevice failed, device may be not set" LOC_MARK);
@@ -149,13 +208,7 @@ Status MemFabricTransport::install(std::string& local_segment_name,
         }
         LOG(INFO) << "LoadLibrary: ok";
 
-        auto log_level_str = conf->get("log_level", "info");
-        int mf_log_level = 1;
-        if (log_level_str == "warning")
-            mf_log_level = 2;
-        else if (log_level_str == "error")
-            mf_log_level = 3;
-        MemFabricUnderApi::SmemSetLogLevel(mf_log_level);
+        MemFabricUnderApi::SmemSetLogLevel(config_.log_level);
 
         if (g_init_ref_.load() == 0) {
             auto ret = MemFabricUnderApi::SmemTransInit(device_id, 0);
@@ -170,6 +223,7 @@ Status MemFabricTransport::install(std::string& local_segment_name,
         g_init_ref_.fetch_add(1);
     }
 
+    smem_trans_config_t cfg;
     if (MemFabricUnderApi::SmemTransConfigInit(&cfg) != 0) {
         LOG(ERROR) << "smem_trans_config_init failed";
         std::lock_guard<std::mutex> lock(g_init_mutex_);
@@ -183,9 +237,10 @@ Status MemFabricTransport::install(std::string& local_segment_name,
     cfg.deviceId = device_id;
     cfg.dataOpType = config_.data_op_type.value();
 
-    std::memcpy(cfg.url, bind_url.c_str(), bind_url.size() + 1);
-    if (device_rdma) {
-        std::memcpy(cfg.nic, nic_url.c_str(), nic_url.size() + 1);
+    std::memcpy(cfg.url, config_.bind_url.c_str(), config_.bind_url.size() + 1);
+    if (!config_.nic_url.empty()) {
+        std::memcpy(cfg.nic, config_.nic_url.c_str(),
+                    config_.nic_url.size() + 1);
         LOG(INFO) << "RDMA mode: nic=" << cfg.nic;
     }
     LOG(INFO) << "trans config: url=" << cfg.url << ", nic=" << cfg.nic
@@ -207,7 +262,9 @@ Status MemFabricTransport::install(std::string& local_segment_name,
     uint16_t actual_port = 0;
     if (MemFabricUnderApi::SmemTransGetRpcPort(handle_, &actual_port) == 0 &&
         actual_port != 0) {
-        config_.store_url = buildIpAddrWithPort(host, actual_port, ipv6);
+        const auto host = parseHostNameWithPort(config_.bind_url, 0).first;
+        config_.store_url = buildIpAddrWithPort(
+            host, actual_port, host.find(':') != std::string::npos);
         LOG(INFO) << "smem_trans_get_rpc_port: port=" << actual_port
                   << ", store_url=" << config_.store_url;
     } else {
@@ -234,18 +291,9 @@ Status MemFabricTransport::install(std::string& local_segment_name,
         return s;
     }
 
-    caps = Capabilities{};
-    caps.dram_to_dram = true;
-    caps.dram_to_gpu = true;
-    caps.gpu_to_dram = true;
-    caps.gpu_to_gpu = true;
-
-    {
-        std::lock_guard<std::mutex> lock(inflight_mu_);
-        stopping_ = false;
-    }
-    installed_ = true;
-    LOG(INFO) << "MemFabricTransport installed: url=" << config_.store_url
+    config_.device_id = device_id;
+    LOG(INFO) << "MemFabricTransport initialized: device_id=" << device_id
+              << ", url=" << config_.store_url
               << ", dataOpType=" << config_.data_op_type_str;
     return Status::OK();
 }
@@ -301,7 +349,6 @@ Status MemFabricTransport::allocateSubBatch(SubBatchRef& batch,
         return Status::InternalError(
             "MemFabric transport is stopping" LOC_MARK);
     auto mf_batch = std::make_unique<MemFabricSubBatch>();
-    mf_batch->handle = handle_;
     mf_batch->task_list.reserve(max_size);
     batches_.insert(mf_batch.get());
     batch = mf_batch.release();
@@ -333,6 +380,40 @@ Status MemFabricTransport::submitTransferTasks(
         return Status::InvalidArgument("invalid sub-batch" LOC_MARK);
     }
 
+    if (!handle_)
+        return Status::InternalError(
+            "Register memory before transfer" LOC_MARK);
+    CHECK_STATUS(bindDevice());
+
+    uint64_t total_slice_count = 0;
+    std::vector<size_t> slice_counts;
+    slice_counts.reserve(request_list.size());
+    for (const auto& request : request_list) {
+        const auto source = reinterpret_cast<uint64_t>(request.source);
+        const auto max = std::numeric_limits<uint64_t>::max();
+        if (source == 0 || request.target_offset == 0 || request.length == 0 ||
+            request.length > max - source ||
+            request.length > max - request.target_offset)
+            return Status::InvalidArgument("invalid MemFabric transfer range" LOC_MARK);
+        // Count internal boundaries at both endpoints. Equal page offsets
+        // share every boundary and must only be counted once.
+        const auto local_boundaries =
+            (source + request.length - 1) / kRegistrationAlignment -
+            source / kRegistrationAlignment;
+        const auto remote_boundaries =
+            (request.target_offset + request.length - 1) /
+                kRegistrationAlignment -
+            request.target_offset / kRegistrationAlignment;
+        const auto slices = 1 + local_boundaries +
+            (source % kRegistrationAlignment ==
+                     request.target_offset % kRegistrationAlignment
+                 ? 0 : remote_boundaries);
+        if (slices > std::numeric_limits<uint32_t>::max() - total_slice_count)
+            return Status::InvalidArgument("too many native transfer slices" LOC_MARK);
+        total_slice_count += slices;
+        slice_counts.push_back(static_cast<size_t>(slices));
+    }
+
     // Resolve every destination before changing the sub-batch so an error
     // leaves existing tasks untouched and dispatches no new work.
     std::vector<std::string> dest_urls(request_list.size());
@@ -353,18 +434,36 @@ Status MemFabricTransport::submitTransferTasks(
     for (auto& [key, indices] : groups) {
         const auto& dest_url = key.first;
         bool is_write = key.second;
-        const uint32_t batch_size = static_cast<uint32_t>(indices.size());
-        std::vector<void*> src_list(batch_size);
-        std::vector<void*> dest_list(batch_size);
-        std::vector<size_t> size_list(batch_size);
-
-        for (uint32_t j = 0; j < batch_size; ++j) {
-            const auto& req = request_list[indices[j]];
-            src_list[j] =
-                const_cast<void*>(static_cast<const void*>(req.source));
-            dest_list[j] = reinterpret_cast<void*>(req.target_offset);
-            size_list[j] = req.length;
+        std::vector<void*> src_list;
+        std::vector<void*> dest_list;
+        std::vector<size_t> size_list;
+        size_t group_slice_count = 0;
+        for (size_t index : indices) group_slice_count += slice_counts[index];
+        src_list.reserve(group_slice_count);
+        dest_list.reserve(group_slice_count);
+        size_list.reserve(group_slice_count);
+        for (size_t index : indices) {
+            const auto& req = request_list[index];
+            auto source = reinterpret_cast<uint64_t>(req.source);
+            auto target = req.target_offset;
+            auto remaining = req.length;
+            while (remaining != 0) {
+                // A logical buffer can span several gap registrations. Split
+                // at both endpoints' aligned boundaries so each native copy
+                // is wholly inside one local and one remote registration.
+                const auto length = std::min<uint64_t>(
+                    remaining,
+                    std::min(kRegistrationAlignment - source % kRegistrationAlignment,
+                             kRegistrationAlignment - target % kRegistrationAlignment));
+                src_list.push_back(reinterpret_cast<void*>(source));
+                dest_list.push_back(reinterpret_cast<void*>(target));
+                size_list.push_back(length);
+                source += length;
+                target += length;
+                remaining -= length;
+            }
         }
+        const auto batch_size = static_cast<uint32_t>(src_list.size());
 
         smem_trans_batch_params_t params = {};
         params.destUrl = dest_url.c_str();
@@ -436,6 +535,7 @@ Status MemFabricTransport::getTransferStatusLocked(SubBatchRef batch,
         return Status::OK();
     }
 
+    CHECK_STATUS(bindDevice());
     int32_t batch_result = 0;
     auto query_ret = MemFabricUnderApi::SmemTransBatchStatusQuery(
         handle_, task.batch_id, &batch_result, 0);
@@ -478,65 +578,102 @@ Status MemFabricTransport::getTransferStatusLocked(SubBatchRef batch,
 
 Status MemFabricTransport::addMemoryBuffer(BufferDesc& desc,
                                            const MemoryOptions& options) {
-    (void)options;
-    LOG(INFO) << "addMemoryBuffer: addr=" << desc.addr
-              << ", length=" << desc.length;
-    if (!handle_) {
-        LOG(ERROR) << "addMemoryBuffer called before install";
-        return Status::InternalError("not installed" LOC_MARK);
-    }
-    auto ret = MemFabricUnderApi::SmemTransRegisterMem(
-        handle_, reinterpret_cast<void*>(desc.addr), desc.length, 0);
-    if (ret != 0) {
-        LOG(ERROR) << "smem_trans_register_mem failed, ret=" << ret
-                   << ", addr=" << desc.addr << ", length=" << desc.length;
-        return Status::InternalError("register_mem failed" LOC_MARK);
-    }
-    desc.transports.push_back(MEMFABRIC);
-    desc.transport_attrs[MEMFABRIC] = "";
-    LOG(INFO) << "register_mem: ok, addr=" << desc.addr;
+    std::vector<BufferDesc> buffers{desc};
+    CHECK_STATUS(addMemoryBuffer(buffers, options));
+    desc = std::move(buffers.front());
     return Status::OK();
 }
 
 Status MemFabricTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
                                            const MemoryOptions& options) {
-    (void)options;
     if (desc_list.empty()) return Status::OK();
-    if (!handle_) {
-        LOG(ERROR) << "addMemoryBuffer called before install";
-        return Status::InternalError("not installed" LOC_MARK);
-    }
-    if (desc_list.size() > std::numeric_limits<uint32_t>::max()) {
-        return Status::InvalidArgument("too many buffers" LOC_MARK);
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    CHECK_STATUS(initializeLocked());
+
+    const bool local_sdma = config_.data_op_type == SMEMB_DATA_OP_SDMA &&
+                            options.perm == kLocalReadWrite;
+    if (local_sdma) {
+        for (auto& desc : desc_list) {
+            if (std::find(desc.transports.begin(), desc.transports.end(), MEMFABRIC)
+                == desc.transports.end())
+                desc.transports.push_back(MEMFABRIC);
+            desc.transport_attrs[MEMFABRIC] = "";
+        }
+        return Status::OK();
     }
 
-    // Let MemFabric align and merge the whole batch so adjacent buffers do not
-    // produce overlapping registrations after alignment to NPU pages.
-    std::vector<void*> addrs;
-    std::vector<size_t> caps;
-    addrs.reserve(desc_list.size());
-    caps.reserve(desc_list.size());
-    for (const auto& desc : desc_list) {
-        addrs.push_back(reinterpret_cast<void*>(desc.addr));
-        caps.push_back(desc.length);
+    std::vector<std::pair<uint64_t, uint64_t>> ranges(desc_list.size());
+    for (size_t i = 0; i < desc_list.size(); ++i)
+        CHECK_STATUS(alignedBufferRange(desc_list[i], ranges[i].first,
+                                       ranges[i].second));
+
+    // Restore native batch coalescing before subtracting existing MRs.
+    // Do not merge merely adjacent ranges: they may be separate allocations.
+    std::sort(ranges.begin(), ranges.end());
+    size_t merged_count = 0;
+    for (const auto& range : ranges) {
+        if (merged_count > 0 && range.first < ranges[merged_count - 1].second) {
+            ranges[merged_count - 1].second =
+                std::max(ranges[merged_count - 1].second, range.second);
+        } else {
+            ranges[merged_count++] = range;
+        }
     }
-    auto ret = MemFabricUnderApi::SmemTransBatchRegisterMem(
-        handle_, addrs.data(), caps.data(), static_cast<uint32_t>(addrs.size()),
-        0);
-    if (ret != 0) {
-        LOG(ERROR) << "smem_trans_batch_register_mem failed, ret=" << ret
-                   << ", count=" << addrs.size();
-        return Status::InternalError("batch register_mem failed" LOC_MARK);
+    ranges.resize(merged_count);
+
+    size_t registered_gaps = 0;
+    for (size_t range_index = 0; range_index < ranges.size(); ++range_index) {
+        const auto [begin, end] = ranges[range_index];
+        auto cursor = begin;
+        auto it = registered_ranges_.upper_bound(cursor);
+        if (it != registered_ranges_.begin()) --it;
+        while (cursor < end) {
+            while (it != registered_ranges_.end() && it->second <= cursor) ++it;
+            if (it != registered_ranges_.end() && it->first <= cursor) {
+                cursor = std::min(end, it->second);
+                ++it;
+                continue;
+            }
+            const auto gap_end = it == registered_ranges_.end()
+                                     ? end : std::min(end, it->first);
+            const auto ret = MemFabricUnderApi::SmemTransRegisterMem(
+                handle_, reinterpret_cast<void*>(cursor), gap_end - cursor, 0);
+            if (ret != 0) {
+                LOG(ERROR) << "SmemTransRegisterMem failed, ret=" << ret
+                           << ", protocol=" << config_.data_op_type_str
+                           << ", merged_range_index=" << range_index
+                           << ", range_begin=" << begin << ", range_end=" << end
+                           << ", gap_begin=" << cursor << ", gap_end=" << gap_end
+                           << ", registered_gaps=" << registered_gaps
+                           << "; successful MRs retained until destruction";
+                return Status::InternalError("register_mem failed" LOC_MARK);
+            }
+            // Commit each successful native range immediately: if a later
+            // gap fails, retrying must not register this prefix a second time.
+            registered_ranges_.emplace(cursor, gap_end);
+            ++registered_gaps;
+            cursor = gap_end;
+        }
     }
     for (auto& desc : desc_list) {
-        desc.transports.push_back(MEMFABRIC);
+        if (std::find(desc.transports.begin(), desc.transports.end(), MEMFABRIC)
+            == desc.transports.end())
+            desc.transports.push_back(MEMFABRIC);
         desc.transport_attrs[MEMFABRIC] = "";
     }
     return Status::OK();
 }
 
 Status MemFabricTransport::removeMemoryBuffer(BufferDesc& desc) {
+    std::lock_guard<std::mutex> lock(inflight_mu_);
     if (!handle_) return Status::OK();
+    if (config_.data_op_type == SMEMB_DATA_OP_SDMA &&
+        desc.permission == kLocalReadWrite)
+        return Status::OK();
+    CHECK_STATUS(bindDevice());
+
+    // SMEM's deregistration currently retains the native MR until destruction;
+    // preserve registered_ranges_ so overlapping logical buffers remain valid.
     LOG(INFO) << "removeMemoryBuffer: addr=" << desc.addr;
     auto ret = MemFabricUnderApi::SmemTransDeregisterMem(
         handle_, reinterpret_cast<void*>(desc.addr));
@@ -586,16 +723,17 @@ Status MemFabricTransport::quiesce() {
 }
 
 Status MemFabricTransport::uninstall() {
-    if (!installed_) return Status::OK();
     (void)quiesce();
+    std::lock_guard<std::mutex> lock(inflight_mu_);
+    if (!installed_) return Status::OK();
     LOG(INFO) << "uninstall: handle=" << handle_;
     if (handle_) {
+        CHECK_STATUS(bindDevice());
         MemFabricUnderApi::SmemTransDestroy(handle_, 0);
         handle_ = nullptr;
+        registered_ranges_.clear();
         LOG(INFO) << "smem_trans_destroy: done";
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_init_mutex_);
+        std::lock_guard<std::mutex> init_lock(g_init_mutex_);
         if (g_init_ref_.fetch_sub(1) == 1) {
             MemFabricUnderApi::SmemTransUninit(0);
             MemFabricUnderApi::CleanupLibrary();
@@ -603,6 +741,7 @@ Status MemFabricTransport::uninstall() {
         }
     }
     installed_ = false;
+    config_.device_id = -1;
     metadata_.reset();
     return Status::OK();
 }

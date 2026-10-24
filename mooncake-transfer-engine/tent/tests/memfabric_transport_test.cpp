@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "memfabric_allocator.h"
 #include "tent/common/config.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/transport/memfabric/memfabric_transport.h"
@@ -148,6 +149,9 @@ struct MockMemFabricState {
     std::unordered_set<uint64_t> pending;
     std::unordered_map<uint64_t, std::pair<int32_t, int32_t>> results;
     int init_calls = 0;
+    int init_device = -1;
+    int create_device = -1;
+    int mem_free_calls = 0;
     int32_t init_ret = 0;
     int uninit_calls = 0;
     int config_init_calls = 0;
@@ -159,6 +163,9 @@ struct MockMemFabricState {
     std::vector<smem_trans_opcode_t> batch_opcodes;
     int status_query_calls = 0;
     int register_mem_calls = 0;
+    int32_t register_mem_ret = 0;
+    int fail_register_call = 0;
+    std::vector<Copy> submitted_copies;
     int batch_register_mem_calls = 0;
     int32_t batch_register_ret = 0;
     std::vector<void*> registered_addrs;
@@ -181,9 +188,21 @@ struct MockMemFabricState {
 
 static std::shared_ptr<MockMemFabricState> g_state;
 
-int32_t mockSmemTransInit(uint32_t, uint32_t) {
+int32_t mockSmemMemAlloc(uint16_t, uint64_t size, uint32_t, void** address) {
+    *address = std::malloc(size);
+    return *address ? 0 : -1;
+}
+
+int32_t mockSmemMemFree(void* address) {
+    ++g_state->mem_free_calls;
+    std::free(address);
+    return 0;
+}
+
+int32_t mockSmemTransInit(uint32_t device, uint32_t) {
     std::lock_guard<std::mutex> lock(g_state->mu);
     g_state->init_calls++;
+    g_state->init_device = device;
     return g_state->init_ret;
 }
 
@@ -202,6 +221,7 @@ int32_t mockSmemTransConfigInit(smem_trans_config_t* config) {
 smem_trans_t mockSmemTransCreate(const smem_trans_config_t* config, uint32_t) {
     std::lock_guard<std::mutex> lock(g_state->mu);
     g_state->create_calls++;
+    g_state->create_device = config->deviceId;
     g_state->create_url = config->url;
     g_state->create_nic = config->nic;
     if (g_state->create_fail) return nullptr;
@@ -221,9 +241,20 @@ int32_t mockSmemTransGetRpcPort(smem_trans_t, uint16_t* port) {
     return g_state->get_rpc_port_ret;
 }
 
-int32_t mockSmemTransRegisterMem(smem_trans_t, void*, size_t, uint32_t) {
+int32_t mockSmemTransRegisterMem(smem_trans_t, void* addr, size_t size, uint32_t) {
     std::lock_guard<std::mutex> lock(g_state->mu);
-    g_state->register_mem_calls++;
+    ++g_state->register_mem_calls;
+    if (g_state->register_mem_ret != 0 ||
+        g_state->register_mem_calls == g_state->fail_register_call)
+        return -9;
+    const auto begin = reinterpret_cast<uint64_t>(addr);
+    for (size_t i = 0; i < g_state->registered_addrs.size(); ++i) {
+        const auto old = reinterpret_cast<uint64_t>(g_state->registered_addrs[i]);
+        if (begin < old + g_state->registered_sizes[i] && old < begin + size)
+            return -9;  // Native partial overlap must never be submitted.
+    }
+    g_state->registered_addrs.push_back(addr);
+    g_state->registered_sizes.push_back(size);
     return 0;
 }
 
@@ -259,6 +290,11 @@ int32_t mockSmemTransBatchCopy(smem_trans_t, smem_trans_batch_params_t* params,
     g_state->cv.notify_all();
     g_state->cv.wait(lock, [] { return !g_state->block_submit; });
     if (params) g_state->batch_opcodes.push_back(params->opcode);
+    g_state->submitted_copies.push_back({
+        params->opcode,
+        std::vector<void*>(params->srcList, params->srcList + params->batchSize),
+        std::vector<void*>(params->destList, params->destList + params->batchSize),
+        std::vector<size_t>(params->sizeList, params->sizeList + params->batchSize)});
     if (g_state->batch_copy_ret != 0) return g_state->batch_copy_ret;
     *batchId = g_state->next_batch_id.fetch_add(1, std::memory_order_relaxed);
     g_state->pending.insert(*batchId);
@@ -339,6 +375,7 @@ Request MakeRead(void* src, uint64_t dest, size_t len) {
 class MemFabricTransportTest : public ::testing::Test {
    protected:
     void SetUp() override {
+        unsetenv("MF_STORE_PROTOCOL");
         ResetAcl();
         g_state = std::make_shared<MockMemFabricState>();
         state_ = g_state;
@@ -362,12 +399,35 @@ class MemFabricTransportTest : public ::testing::Test {
         ResetMockApi();
         g_state.reset();
         unsetenv("MF_PROTOCOL");
+        unsetenv("MF_STORE_PROTOCOL");
     }
 
-    Status Install() {
-        setenv("MF_PROTOCOL", "device_rdma", 1);
+    Status Initialize(MemFabricTransport& transport) {
+        std::lock_guard<std::mutex> lock(transport.inflight_mu_);
+        return transport.initializeLocked();
+    }
+
+    // Complete both phases for tests that exercise the native transport.
+    Status Install(const char* protocol = "device_rdma", bool store = false) {
+        if (!transport_->installed_) {
+            CHECK_STATUS(Configure(protocol, store));
+        }
+        return Initialize(*transport_);
+    }
+
+    Status Configure(const char* protocol = "device_rdma", bool store = false) {
+        if (protocol) {
+            setenv("MF_PROTOCOL", protocol, 1);
+        } else {
+            unsetenv("MF_PROTOCOL");
+        }
         auto conf = std::make_shared<Config>();
+        conf->set("transports/memfabric/store_te_init", store);
         return transport_->install(name_, metadata_, nullptr, conf);
+    }
+
+    std::string Protocol() const {
+        return transport_->config_.data_op_type_str;
     }
 
     int InflightCount() const { return transport_->inflight_.load(); }
@@ -409,6 +469,16 @@ class MemFabricTransportTest : public ::testing::Test {
 
     void InstallMockApi();
     void ResetMockApi();
+    std::weak_ptr<const MemFabricUnderApi::MemoryApi> InstallMemoryApi(
+        std::shared_ptr<void> library = nullptr) {
+        auto api = std::make_shared<MemFabricUnderApi::MemoryApi>();
+        api->library = std::move(library);
+        api->allocate = mockSmemMemAlloc;
+        api->free = mockSmemMemFree;
+        MemFabricUnderApi::gMemoryApi = api;
+        MemFabricUnderApi::gMemoryApiWeak = api;
+        return api;
+    }
 
     std::shared_ptr<MockMemFabricState> state_;
     std::shared_ptr<ControlService> metadata_;
@@ -418,6 +488,7 @@ class MemFabricTransportTest : public ::testing::Test {
 };
 
 void MemFabricTransportTest::InstallMockApi() {
+    InstallMemoryApi();
     MemFabricUnderApi::gLoaded = true;
     MemFabricUnderApi::gLibHandle = nullptr;
     MemFabricUnderApi::pSmemTransInit = &mockSmemTransInit;
@@ -437,20 +508,179 @@ void MemFabricTransportTest::InstallMockApi() {
 }
 
 void MemFabricTransportTest::ResetMockApi() {
-    MemFabricUnderApi::gLoaded = false;
-    MemFabricUnderApi::gLibHandle = nullptr;
-    MemFabricUnderApi::pSmemTransInit = nullptr;
-    MemFabricUnderApi::pSmemTransUninit = nullptr;
-    MemFabricUnderApi::pSmemTransConfigInit = nullptr;
-    MemFabricUnderApi::pSmemTransCreate = nullptr;
-    MemFabricUnderApi::pSmemTransDestroy = nullptr;
-    MemFabricUnderApi::pSmemTransGetRpcPort = nullptr;
-    MemFabricUnderApi::pSmemTransRegisterMem = nullptr;
-    MemFabricUnderApi::pSmemTransBatchRegisterMem = nullptr;
-    MemFabricUnderApi::pSmemTransDeregisterMem = nullptr;
-    MemFabricUnderApi::pSmemTransBatchCopy = nullptr;
-    MemFabricUnderApi::pSmemTransBatchStatusQuery = nullptr;
-    MemFabricUnderApi::pSmemSetLogLevel = nullptr;
+    MemFabricUnderApi::CleanupLibrary();
+    MemFabricUnderApi::gMemoryApiWeak.reset();
+}
+
+TEST_F(MemFabricTransportTest, SharedAllocationsRetainLibraryAfterUninstall) {
+    auto closed = std::make_shared<int>(0);
+    auto api = InstallMemoryApi(std::shared_ptr<void>(
+        reinterpret_cast<void*>(1), [closed](void*) { ++*closed; }));
+    ASSERT_TRUE(Install("device_sdma").ok());
+    auto release = [](void* ptr) { memfabric_free_memory("ascend", ptr); };
+    std::unique_ptr<void, decltype(release)> first(
+        memfabric_allocate_memory(64, "ascend"), release);
+    std::unique_ptr<void, decltype(release)> second(
+        memfabric_allocate_memory(64, "ascend"), release);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    ASSERT_TRUE(transport_->uninstall().ok());
+    EXPECT_FALSE(MemFabricUnderApi::IsLoaded());
+    EXPECT_EQ(*closed, 0);
+    first.reset();
+    EXPECT_FALSE(api.expired());
+    EXPECT_EQ(*closed, 0);
+    second.reset();
+    EXPECT_TRUE(api.expired());
+    EXPECT_EQ(*closed, 1);
+}
+
+TEST_F(MemFabricTransportTest, NativeHostMemoryIgnoresMmapHints) {
+    InstallMemoryApi();
+    setenv("MF_STORE_PROTOCOL", "device_sdma", 1);
+    ASSERT_TRUE(Install("device_rdma").ok());
+    EXPECT_TRUE(memfabric_use_fabric_mem("ascend"));
+    EXPECT_FALSE(memfabric_use_fabric_mem("tcp"));
+    size_t actual_size = 0;
+    auto release = [](void* ptr) { memfabric_free_memory("ascend", ptr); };
+    std::unique_ptr<void, decltype(release)> buffer(
+        memfabric_allocate_memory_best_effort(
+            64, "ascend", &actual_size,
+            [](size_t, size_t, bool) -> void* {
+                ADD_FAILURE() << "Native Host memory must not use mmap";
+                return nullptr;
+            },
+            2 * 1024 * 1024, true),
+        release);
+    ASSERT_NE(buffer, nullptr);
+    EXPECT_EQ(actual_size, 64u);
+    setenv("MF_STORE_PROTOCOL", "device_rdma", 1);
+    EXPECT_FALSE(memfabric_use_fabric_mem("ascend"));
+    buffer.reset();
+    EXPECT_EQ(state_->mem_free_calls, 1);
+}
+
+TEST_F(MemFabricTransportTest, RdmaMemoryHonorsHostAllocationCallback) {
+    setenv("MF_STORE_PROTOCOL", "device_rdma", 1);
+    ASSERT_TRUE(Install("device_sdma").ok());
+    size_t actual_size = 0;
+    void* buffer = memfabric_allocate_memory_best_effort(
+        64, "ascend", &actual_size,
+        [](size_t size, size_t alignment, bool defer_population) -> void* {
+            EXPECT_EQ(alignment, 4096u);
+            EXPECT_TRUE(defer_population);
+            return std::malloc(size);
+        },
+        4096, true);
+    EXPECT_NE(buffer, nullptr);
+    EXPECT_EQ(actual_size, 64u);
+    std::free(buffer);
+    EXPECT_EQ(state_->mem_free_calls, 0);
+}
+
+TEST_F(MemFabricTransportTest, InstallDefersNativeInitialization) {
+    g_device_id = -1;
+    ASSERT_TRUE(Configure("device_sdma").ok());
+    EXPECT_EQ(state_->init_calls, 0);
+    EXPECT_EQ(state_->create_calls, 0);
+    EXPECT_TRUE(PublishedEndpoint().empty());
+    EXPECT_TRUE(transport_->uninstall().ok());
+    EXPECT_EQ(state_->destroy_calls, 0);
+    EXPECT_EQ(state_->uninit_calls, 0);
+    EXPECT_EQ(InitRefCount(), 0);
+}
+
+TEST_F(MemFabricTransportTest, ConcurrentRegistrationUsesRegistrationDevice) {
+    g_device_count = 2;
+    ASSERT_TRUE(Configure("device_sdma").ok());
+    auto registration = [this](uint64_t addr) {
+        g_device_id = 1;
+        BufferDesc desc;
+        desc.addr = addr;
+        desc.length = 4096;
+        MemoryOptions options;
+        options.perm = kLocalReadWrite;
+        return transport_->addMemoryBuffer(desc, options);
+    };
+    auto first = std::async(std::launch::async, registration, 0x10000);
+    auto second = std::async(std::launch::async, registration, 0x20000);
+    EXPECT_TRUE(first.get().ok());
+    EXPECT_TRUE(second.get().ok());
+    EXPECT_EQ(state_->init_calls, 1);
+    EXPECT_EQ(state_->create_calls, 1);
+    EXPECT_EQ(state_->init_device, 1);
+    EXPECT_EQ(state_->create_device, 1);
+    EXPECT_EQ(state_->register_mem_calls, 0);
+    EXPECT_FALSE(PublishedEndpoint().empty());
+    // Later callers start on another device and are rebound to the owner.
+    BufferDesc desc;
+    desc.addr = 0x30000;
+    desc.length = 4096;
+    g_device_id = 0;
+    ASSERT_TRUE(transport_->addMemoryBuffer(desc, MemoryOptions()).ok());
+    EXPECT_EQ(g_device_id, 1);
+    EXPECT_EQ(state_->register_mem_calls, 1);
+}
+
+TEST_F(MemFabricTransportTest, FirstBatchRegistrationInitializesAndSharesCoverage) {
+    g_device_count = 2;
+    ASSERT_TRUE(Configure("device_urma").ok());
+    EXPECT_EQ(state_->init_calls, 0);
+    g_device_id = 1;
+    std::vector<BufferDesc> buffers(2);
+    buffers[0].addr = 0x201000;
+    buffers[0].length = 4096;
+    buffers[1].addr = 0x202000;
+    buffers[1].length = 8192;
+    ASSERT_TRUE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    EXPECT_EQ(state_->init_calls, 1);
+    EXPECT_EQ(state_->init_device, 1);
+    EXPECT_EQ(state_->create_device, 1);
+    EXPECT_EQ(state_->register_mem_calls, 1);
+    EXPECT_FALSE(PublishedEndpoint().empty());
+    for (const auto& buffer : buffers)
+        EXPECT_EQ(buffer.transports, (std::vector<TransportType>{MEMFABRIC}));
+}
+
+TEST_F(MemFabricTransportTest, FirstLocalSdmaBatchSkipsNativeRegistration) {
+    ASSERT_TRUE(Configure("device_sdma").ok());
+    g_device_id = 0;
+    std::vector<BufferDesc> buffers(2);
+    buffers[0].addr = 0x201000;
+    buffers[0].length = 4096;
+    buffers[1].addr = 0x202000;
+    buffers[1].length = 8192;
+    MemoryOptions options;
+    options.perm = kLocalReadWrite;
+    ASSERT_TRUE(transport_->addMemoryBuffer(buffers, options).ok());
+    EXPECT_EQ(state_->init_calls, 1);
+    EXPECT_EQ(state_->register_mem_calls, 0);
+    EXPECT_EQ(state_->batch_register_mem_calls, 0);
+    for (const auto& buffer : buffers)
+        EXPECT_EQ(buffer.transports, (std::vector<TransportType>{MEMFABRIC}));
+}
+
+TEST_F(MemFabricTransportTest, FirstRegistrationCanRetryInitialization) {
+    ASSERT_TRUE(Configure().ok());
+    BufferDesc desc;
+    desc.addr = 0x10000;
+    desc.length = 4096;
+    g_device_id = -1;
+    EXPECT_FALSE(transport_->addMemoryBuffer(desc, MemoryOptions()).ok());
+    EXPECT_EQ(state_->init_calls, 0);
+    g_device_id = 0;
+    state_->create_fail = true;
+    EXPECT_FALSE(transport_->addMemoryBuffer(desc, MemoryOptions()).ok());
+    EXPECT_EQ(InitRefCount(), 0);
+    EXPECT_TRUE(PublishedEndpoint().empty());
+    EXPECT_TRUE(desc.transports.empty());
+    InstallMockApi();
+    state_->create_fail = false;
+    ASSERT_TRUE(transport_->addMemoryBuffer(desc, MemoryOptions()).ok());
+    EXPECT_EQ(state_->init_calls, 2);
+    EXPECT_EQ(state_->register_mem_calls, 1);
+    EXPECT_EQ(InitRefCount(), 1);
+    EXPECT_FALSE(PublishedEndpoint().empty());
 }
 
 TEST_F(MemFabricTransportTest, InstallSucceeds) {
@@ -458,6 +688,50 @@ TEST_F(MemFabricTransportTest, InstallSucceeds) {
     EXPECT_EQ(state_->init_calls, 1);
     EXPECT_EQ(state_->create_calls, 1);
     EXPECT_EQ(state_->get_rpc_port_calls, 1);
+}
+
+TEST_F(MemFabricTransportTest, StoreProtocolOverridesTransportAndAllocator) {
+    for (const auto* store_protocol : {"device_rdma", "device_sdma"}) {
+        SCOPED_TRACE(store_protocol);
+        InstallMockApi();
+        setenv("MF_STORE_PROTOCOL", store_protocol, 1);
+        ASSERT_TRUE(Install("device_urma").ok());
+        EXPECT_EQ(Protocol(), "device_urma");
+        ASSERT_TRUE(transport_->uninstall().ok());
+        InstallMockApi();
+        ASSERT_TRUE(Install("device_urma", true).ok());
+        EXPECT_EQ(Protocol(), store_protocol);
+        EXPECT_EQ(memfabric_use_fabric_mem("ascend"),
+                  std::string(store_protocol) == "device_sdma");
+        EXPECT_STREQ(std::getenv("MF_PROTOCOL"), "device_urma");
+        EXPECT_STREQ(std::getenv("MF_STORE_PROTOCOL"), store_protocol);
+        ASSERT_TRUE(transport_->uninstall().ok());
+    }
+}
+
+TEST_F(MemFabricTransportTest, StoreProtocolFallbackAndValidation) {
+    ASSERT_TRUE(Install("device_sdma", true).ok());
+    EXPECT_EQ(Protocol(), "device_sdma");
+    ASSERT_TRUE(transport_->uninstall().ok());
+    InstallMockApi();
+    setenv("MF_STORE_PROTOCOL", "", 1);
+    ASSERT_TRUE(Install("device_rdma", true).ok());
+    EXPECT_EQ(Protocol(), "device_rdma");
+    ASSERT_TRUE(transport_->uninstall().ok());
+    InstallMockApi();
+    setenv("MF_STORE_PROTOCOL", "device_sdma", 1);
+    EXPECT_FALSE(Install(nullptr).ok());
+    ASSERT_TRUE(Install(nullptr, true).ok());
+    EXPECT_EQ(Protocol(), "device_sdma");
+    EXPECT_TRUE(memfabric_use_fabric_mem("ascend"));
+    EXPECT_EQ(std::getenv("MF_PROTOCOL"), nullptr);
+    ASSERT_TRUE(transport_->uninstall().ok());
+    InstallMockApi();
+    setenv("MF_STORE_PROTOCOL", "invalid", 1);
+    ASSERT_TRUE(Install("device_rdma").ok());
+    ASSERT_TRUE(transport_->uninstall().ok());
+    EXPECT_FALSE(Install("device_rdma", true).ok());
+    EXPECT_STREQ(std::getenv("MF_PROTOCOL"), "device_rdma");
 }
 
 TEST_F(MemFabricTransportTest, InstallFailsWhenCreateReturnsNull) {
@@ -503,9 +777,10 @@ TEST_F(MemFabricTransportTest, FailedInstallKeepsOtherInstanceInitialized) {
     ASSERT_TRUE(Install().ok());
     state_->create_fail = true;
     MemFabricTransport other;
-    EXPECT_FALSE(
+    ASSERT_TRUE(
         other.install(name_, metadata_, nullptr, std::make_shared<Config>())
             .ok());
+    EXPECT_FALSE(Initialize(other).ok());
     EXPECT_EQ(state_->init_calls, 1);
     EXPECT_EQ(state_->uninit_calls, 0);
     EXPECT_EQ(InitRefCount(), 1);
@@ -522,8 +797,9 @@ TEST_F(MemFabricTransportTest, InstallKeepsLibraryWhileLastInstanceUninstalls) {
     state_->block_log_level = true;
     MemFabricTransport other;
     auto installing = std::async(std::launch::async, [&] {
-        return other.install(name_, metadata_, nullptr,
-                             std::make_shared<Config>());
+        auto status = other.install(name_, metadata_, nullptr,
+                                    std::make_shared<Config>());
+        return status.ok() ? Initialize(other) : status;
     });
     bool reached_log_level;
     {
@@ -1227,7 +1503,7 @@ TEST_F(MemFabricTransportTest, AddRemoveMemoryBuffer) {
     EXPECT_EQ(state_->deregister_mem_calls, 1);
 }
 
-TEST_F(MemFabricTransportTest, BatchRegisterBuffersPreservesRanges) {
+TEST_F(MemFabricTransportTest, BatchRegisterBuffersSharesAlignedCoverage) {
     ASSERT_TRUE(Install().ok());
     std::vector<BufferDesc> buffers(2);
     buffers[0].addr = 0x201000;
@@ -1235,12 +1511,11 @@ TEST_F(MemFabricTransportTest, BatchRegisterBuffersPreservesRanges) {
     buffers[1].addr = 0x202000;
     buffers[1].length = 8192;
     ASSERT_TRUE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
-    EXPECT_EQ(state_->register_mem_calls, 0);
-    EXPECT_EQ(state_->batch_register_mem_calls, 1);
+    EXPECT_EQ(state_->register_mem_calls, 1);
+    EXPECT_EQ(state_->batch_register_mem_calls, 0);
     EXPECT_EQ(state_->registered_addrs,
-              (std::vector<void*>{reinterpret_cast<void*>(0x201000),
-                                  reinterpret_cast<void*>(0x202000)}));
-    EXPECT_EQ(state_->registered_sizes, (std::vector<size_t>{4096, 8192}));
+              (std::vector<void*>{reinterpret_cast<void*>(0x200000)}));
+    EXPECT_EQ(state_->registered_sizes, (std::vector<size_t>{0x200000}));
     for (const auto& desc : buffers) {
         EXPECT_EQ(desc.transports, (std::vector<TransportType>{MEMFABRIC}));
         ASSERT_EQ(desc.transport_attrs.count(MEMFABRIC), 1u);
@@ -1259,10 +1534,10 @@ TEST_F(MemFabricTransportTest, BatchRegisterFailureDoesNotPublishBuffers) {
     EXPECT_FALSE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
     EXPECT_EQ(state_->batch_register_mem_calls, 0);
     ASSERT_TRUE(Install().ok());
-    state_->batch_register_ret = -9;
+    state_->register_mem_ret = -9;
     EXPECT_FALSE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
-    EXPECT_EQ(state_->register_mem_calls, 0);
-    EXPECT_EQ(state_->batch_register_mem_calls, 1);
+    EXPECT_EQ(state_->register_mem_calls, 1);
+    EXPECT_EQ(state_->batch_register_mem_calls, 0);
     for (const auto& desc : buffers) {
         EXPECT_TRUE(desc.transports.empty());
         EXPECT_TRUE(desc.transport_attrs.empty());
@@ -1312,6 +1587,212 @@ TEST_F(MemFabricTransportTest, SubmitFailsWhenBatchCopyFails) {
     ASSERT_EQ(mf_batch->task_list.size(), 1u);
     EXPECT_EQ(mf_batch->task_list[0].status_word, TransferStatusEnum::FAILED);
     EXPECT_EQ(mf_batch->pending_batch_count, 0u);
+}
+
+TEST_F(MemFabricTransportTest, SequentialThreeMiBBuffersRegisterOnlyUncoveredTail) {
+    ASSERT_TRUE(Install().ok());
+    BufferDesc left{}, right{};
+    left.addr = 0x200000;
+    left.length = 0x300000;
+    right.addr = 0x500000;
+    right.length = 0x300000;
+    ASSERT_TRUE(transport_->addMemoryBuffer(left, MemoryOptions{}).ok());
+    ASSERT_TRUE(transport_->addMemoryBuffer(right, MemoryOptions{}).ok());
+    EXPECT_EQ(state_->registered_addrs,
+              (std::vector<void*>{reinterpret_cast<void*>(0x200000),
+                                  reinterpret_cast<void*>(0x600000)}));
+    EXPECT_EQ(state_->registered_sizes, (std::vector<size_t>{0x400000, 0x200000}));
+    ASSERT_TRUE(transport_->removeMemoryBuffer(left).ok());
+    ASSERT_TRUE(transport_->addMemoryBuffer(right, MemoryOptions{}).ok());
+    EXPECT_EQ(state_->register_mem_calls, 2);
+}
+
+TEST_F(MemFabricTransportTest, RegistersInteriorAndLeadingGapsWithoutReplacingMRs) {
+    ASSERT_TRUE(Install().ok());
+    std::vector<BufferDesc> buffers(2);
+    buffers[0].addr = 0x400000;
+    buffers[0].length = 0x200000;
+    buffers[1].addr = 0x800000;
+    buffers[1].length = 0x200000;
+    ASSERT_TRUE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    BufferDesc bridge{};
+    bridge.addr = 0x200000;
+    bridge.length = 0xa00000;
+    ASSERT_TRUE(transport_->addMemoryBuffer(bridge, MemoryOptions{}).ok());
+    EXPECT_EQ(state_->registered_addrs,
+              (std::vector<void*>{reinterpret_cast<void*>(0x400000),
+                                  reinterpret_cast<void*>(0x800000),
+                                  reinterpret_cast<void*>(0x200000),
+                                  reinterpret_cast<void*>(0x600000),
+                                  reinterpret_cast<void*>(0xa00000)}));
+}
+
+TEST_F(MemFabricTransportTest, RetryKeepsSuccessfullyRegisteredPrefix) {
+    ASSERT_TRUE(Install().ok());
+    std::vector<BufferDesc> buffers(2);
+    buffers[0].addr = 0x200000;
+    buffers[0].length = 0x200000;
+    buffers[1].addr = 0x600000;
+    buffers[1].length = 0x200000;
+    state_->fail_register_call = 2;
+    EXPECT_FALSE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    EXPECT_TRUE(buffers[0].transports.empty());
+    state_->fail_register_call = 0;
+    ASSERT_TRUE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    EXPECT_EQ(state_->register_mem_calls, 3);
+    EXPECT_EQ(state_->registered_addrs.size(), 2U);
+}
+
+TEST_F(MemFabricTransportTest, InvalidRegistrationDoesNotReachNativeApi) {
+    ASSERT_TRUE(Install().ok());
+    for (const auto& range : std::vector<std::pair<uint64_t, uint64_t>>{
+             {0, 1}, {0x200000, 0}, {UINT64_MAX - 1, 4},
+             {UINT64_MAX - 0x100000, 1}}) {
+        BufferDesc desc{};
+        desc.addr = range.first;
+        desc.length = range.second;
+        EXPECT_FALSE(transport_->addMemoryBuffer(desc, MemoryOptions{}).ok());
+    }
+    EXPECT_EQ(state_->register_mem_calls, 0);
+}
+
+TEST_F(MemFabricTransportTest, ConcurrentOverlappingRegistrationsShareNativeMR) {
+    ASSERT_TRUE(Install().ok());
+    auto add = [&](uint64_t addr) {
+        BufferDesc desc{};
+        desc.addr = addr;
+        desc.length = 4096;
+        return transport_->addMemoryBuffer(desc, MemoryOptions{});
+    };
+    auto left = std::async(std::launch::async, [&] { return add(0x201000); });
+    auto right = std::async(std::launch::async, [&] { return add(0x202000); });
+    EXPECT_TRUE(left.get().ok());
+    EXPECT_TRUE(right.get().ok());
+    EXPECT_EQ(state_->register_mem_calls, 1);
+}
+
+TEST_F(MemFabricTransportTest, ReadAndWriteSplitAtBothEndpointsAndPreserveTaskStatus) {
+    ASSERT_TRUE(Install().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 4).ok());
+    constexpr size_t length = 5 * 1024 * 1024 + 17;
+    constexpr uint64_t page = 2 * 1024 * 1024;
+    std::vector<char> source(length, 37), target(length, 0);
+    state_->copy_data = true;
+    for (bool write : {true, false}) {
+        const auto request = write
+            ? MakeWrite(source.data(), reinterpret_cast<uint64_t>(target.data()), length)
+            : MakeRead(target.data(), reinterpret_cast<uint64_t>(source.data()), length);
+        const auto task = batch_->size();
+        ASSERT_TRUE(transport_->submitTransferTasks(batch_, {request}).ok());
+        const auto& copy = state_->submitted_copies.back();
+        size_t copied = 0;
+        ASSERT_GT(copy.sizes.size(), 1U);
+        for (size_t i = 0; i < copy.sizes.size(); ++i) {
+            EXPECT_LE(reinterpret_cast<uint64_t>(copy.sources[i]) % page + copy.sizes[i], page);
+            EXPECT_LE(reinterpret_cast<uint64_t>(copy.destinations[i]) % page + copy.sizes[i], page);
+            copied += copy.sizes[i];
+        }
+        EXPECT_EQ(copied, length);
+        EXPECT_EQ(target, source);
+        TransferStatus status{};
+        ASSERT_TRUE(transport_->getTransferStatus(batch_, task, status).ok());
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, length);
+        std::fill(target.begin(), target.end(), 0);
+    }
+}
+
+TEST_F(MemFabricTransportTest, ShuffledOverlappingAlignedRangesMergeOnce) {
+    ASSERT_TRUE(Install().ok());
+    std::vector<BufferDesc> buffers(3);
+    // Disjoint logical slices of one allocation overlap after 2 MiB rounding.
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        buffers[i].addr = std::vector<uint64_t>{0x700000, 0x300000, 0x500000}[i];
+        buffers[i].length = 0x200000;
+    }
+    ASSERT_TRUE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    EXPECT_EQ(state_->register_mem_calls, 1);
+    EXPECT_EQ(state_->registered_addrs,
+              (std::vector<void*>{reinterpret_cast<void*>(0x200000)}));
+    EXPECT_EQ(state_->registered_sizes, (std::vector<size_t>{0x800000}));
+    EXPECT_EQ(buffers[0].addr, 0x700000u);
+    for (const auto& buffer : buffers)
+        EXPECT_EQ(buffer.transports, (std::vector<TransportType>{MEMFABRIC}));
+}
+
+TEST_F(MemFabricTransportTest, AdjacentAlignedAllocationsStaySeparate) {
+    ASSERT_TRUE(Install().ok());
+    std::vector<BufferDesc> buffers(2);
+    buffers[0].addr = 0x400000;
+    buffers[1].addr = 0x200000;
+    for (auto& buffer : buffers) buffer.length = 0x200000;
+    ASSERT_TRUE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    EXPECT_EQ(state_->register_mem_calls, 2);
+    EXPECT_EQ(state_->registered_sizes,
+              (std::vector<size_t>{0x200000, 0x200000}));
+}
+
+TEST_F(MemFabricTransportTest, MergedGapFailureCleanupRetryRetainsCoverage) {
+    ASSERT_TRUE(Install().ok());
+    BufferDesc existing{};
+    existing.addr = 0x400000;
+    existing.length = 0x200000;
+    ASSERT_TRUE(transport_->addMemoryBuffer(existing, MemoryOptions{}).ok());
+    std::vector<BufferDesc> buffers(2);
+    buffers[0].addr = 0x300000;
+    buffers[0].length = 0x400000;
+    buffers[1].addr = 0x700000;
+    buffers[1].length = 0x200000;
+    state_->fail_register_call = 3;
+    EXPECT_FALSE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    for (auto& buffer : buffers) {
+        EXPECT_TRUE(buffer.transports.empty());
+        // Match the engine's defensive cleanup after a failed registration.
+        ASSERT_TRUE(transport_->removeMemoryBuffer(buffer).ok());
+    }
+    state_->fail_register_call = 0;
+    ASSERT_TRUE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    EXPECT_EQ(state_->register_mem_calls, 4);
+    EXPECT_EQ(state_->registered_sizes,
+              (std::vector<size_t>{0x200000, 0x200000, 0x400000}));
+    ASSERT_TRUE(transport_->uninstall().ok());
+    EXPECT_EQ(state_->destroy_calls, 1);
+}
+
+TEST_F(MemFabricTransportTest, SliceCountsHandleCoincidentAndDistinctBoundaries) {
+    ASSERT_TRUE(Install().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 8).ok());
+    struct Case { uint64_t source, target; size_t length, slices; };
+    for (const auto& c : std::vector<Case>{
+             {0x200000, 0x800000, 0x400000, 2},
+             {0x200001, 0x800001, 0x400000, 3},
+             {0x200001, 0x800002, 0x400000, 5},
+             {0x3fffff, 0x9fffff, 1, 1},
+             {0x3fffff, 0x9ffffe, 3, 3}}) {
+        const auto task = batch_->size();
+        ASSERT_TRUE(transport_->submitTransferTasks(
+            batch_, {MakeWrite(reinterpret_cast<void*>(c.source),
+                               c.target, c.length)}).ok());
+        const auto& copy = state_->submitted_copies.back();
+        EXPECT_EQ(copy.sizes.size(), c.slices);
+        size_t total = 0;
+        for (auto size : copy.sizes) total += size;
+        EXPECT_EQ(total, c.length);
+        TransferStatus status{};
+        ASSERT_TRUE(transport_->getTransferStatus(batch_, task, status).ok());
+        EXPECT_EQ(status.transferred_bytes, c.length);
+    }
+}
+
+TEST_F(MemFabricTransportTest, ExcessiveSliceCountDispatchesNoWork) {
+    ASSERT_TRUE(Install().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 1).ok());
+    const uint64_t length = uint64_t{UINT32_MAX} * 0x200000 + 1;
+    EXPECT_FALSE(transport_->submitTransferTasks(
+        batch_, {MakeWrite(reinterpret_cast<void*>(0x200000),
+                           0x200000, length)}).ok());
+    EXPECT_EQ(batch_->size(), 0u);
+    EXPECT_EQ(state_->batch_copy_calls, 0);
 }
 
 }  // namespace tent

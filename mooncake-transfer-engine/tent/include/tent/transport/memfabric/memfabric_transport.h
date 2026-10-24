@@ -4,6 +4,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -21,7 +22,10 @@ namespace tent {
 
 struct MemFabricConfig {
     std::string store_url;
-    uint32_t device_id = 0;
+    std::string bind_url;
+    std::string nic_url;
+    int log_level = 1;
+    int32_t device_id = -1;
     std::optional<smem_bm_data_op_type> data_op_type;
     std::string data_op_type_str;
 };
@@ -36,7 +40,6 @@ struct MemFabricTask {
 
 struct MemFabricSubBatch : public Transport::SubBatch {
     std::vector<MemFabricTask> task_list;
-    smem_trans_t handle = nullptr;
     std::unordered_map<uint64_t, TransferStatusEnum> batch_status_cache;
     size_t pending_batch_count = 0;
     size_t size() const override { return task_list.size(); }
@@ -77,11 +80,18 @@ class MemFabricTransport : public Transport {
 
    private:
     Status loadConfig(const std::shared_ptr<Config>& conf);
+    // Called with inflight_mu_ held; also serializes registration and teardown.
+    Status initializeLocked();
+    Status bindDevice() const;
     Status publishLocalDevices();
     Status resolveDestUrl(const Request& request, std::string& dest_url) const;
     // Caller holds inflight_mu_; shared by public polling and quiesce().
     Status getTransferStatusLocked(SubBatchRef batch, int task_id,
                                    TransferStatus& status);
+
+    // SMEM retains native registrations until handle destruction. Keep their
+    // aligned coverage across logical remove/re-add calls as well.
+    std::map<uint64_t, uint64_t> registered_ranges_;  // [begin, end), guarded by inflight_mu_
 
     bool installed_{false};
     smem_trans_t handle_{nullptr};
