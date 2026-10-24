@@ -104,6 +104,10 @@ void WrappedMasterService::StopBatchOpLogWriter() {
     master_service_.StopBatchOpLogWriter();
 }
 
+void WrappedMasterService::StopHttpMetadataCleanup() {
+    master_service_.StopHttpMetadataCleanup();
+}
+
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();
