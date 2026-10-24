@@ -75,7 +75,7 @@ The following environment variables can be configured to control Ascend Direct T
 
 2. **TCP Connection**: Transport internally establishes a host-side TCP connection and automatically searches for available ports. An error will be reported if no ports are available.
 
-3. **Memory Alignment for HCCS**: When using the `HCCS` communication protocol, registered memory addresses must be aligned with page tables (device memory: 2MB alignment).
+3. **Memory Alignment for HCCS**: When using the `HCCS` communication protocol, registered memory addresses must be aligned with page tables (device memory: 2MB alignment). Registering a remote-accessible device buffer whose base address is not 2MB-aligned (for example, a sub-block from the torch_npu caching allocator) fails immediately with `ERR_INVALID_ARGUMENT` instead of failing later at connection time.
 
 4. **Configuration File**: Ensure `/etc/hccn.conf` exists, especially in containers. Mount `/etc/hccn.conf` or copy the host file to the container's `/etc` path.
 
