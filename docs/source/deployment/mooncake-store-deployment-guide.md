@@ -98,6 +98,51 @@ MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 mooncake-store/tests/str
 
 The absence of errors indicates successful data transfer.
 
+### MLU Tensor Offload and Reload
+
+Build Mooncake with `-DWITH_STORE=ON -DUSE_MLU=ON -DUSE_CUDA=OFF`
+and a compatible Neuware SDK (see [build configuration](../getting_started/build.md)).
+Install matching `torch` and `torch_mlu` packages for the Python Tensor API.
+Store uses CNRT for MLU pointer detection, device selection, synchronous copies,
+and pinned host buffers. Both Classic TE and TENT can use this Store backend.
+
+After setting up a Store client as above, a Tensor can be offloaded to Store and
+reloaded into a new MLU allocation:
+
+```python
+import torch
+import torch_mlu
+
+source = torch.arange(4096, dtype=torch.float32).to("mlu")
+torch.mlu.synchronize()  # Finish the producer before Store reads the pointer.
+assert store.put_tensor("mlu-example", source) == 0
+del source
+
+destination = torch.empty(4096, dtype=torch.float32, device="mlu")
+size = destination.numel() * destination.element_size()
+assert store.register_buffer(destination.data_ptr(), size) == 0
+try:
+    # This existing API name also accepts contiguous MLU tensors.
+    assert store.get_tensor_into_cuda("mlu-example", destination) == size
+    assert torch.equal(destination.cpu(), torch.arange(4096, dtype=torch.float32))
+finally:
+    assert store.unregister_buffer(destination.data_ptr()) == 0
+store.remove("mlu-example", force=True)
+```
+
+Keep registered Tensor owners alive until transfers finish and buffers are
+unregistered. For a producer on a nondefault stream, synchronize its event or
+stream before calling Store. Tensor writes currently gather metadata and payload
+into host staging; registered-pointer writes use the Transfer Engine path.
+
+With a master running, the real-device regression suite can be run as follows:
+
+```bash
+MC_STORE_TEST_REQUIRE_MLU=1 MASTER_SERVER=127.0.0.1:50051 \
+  PROTOCOL=tcp python3 -m unittest discover -s mooncake-wheel/tests \
+  -p test_mlu_tensor.py
+```
+
 ### Verify Installed Examples
 
 For a Python integration check, run `mooncake-store/tests/distributed_object_store_provider.py` after starting the metadata service and `mooncake_master`.
