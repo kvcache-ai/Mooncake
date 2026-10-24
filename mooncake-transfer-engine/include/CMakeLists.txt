@@ -33,6 +33,8 @@ install(FILES transport/device/musa/musa_ops.cuh
         DESTINATION include/transport/device/musa)
 install(FILES transport/device/maca/maca_ops.cuh
         DESTINATION include/transport/device/maca)
+install(FILES transport/device/hygon/hygon_ops.cuh
+        DESTINATION include/transport/device/hygon)
 
 # IBGDA library headers
 install(

@@ -34,6 +34,18 @@ __device__ __forceinline__ dtype_t __ldg(const dtype_t* ptr) {
 
 #if defined(__CUDACC__) || defined(__MCC__) || defined(__MUSACC__)
 __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
+
+template <typename T>
+__forceinline__ __device__ T ep_shfl(T value, int src_lane) {
+    return __shfl_sync(0xffffffff, value, src_lane);
+}
+
+template <typename T>
+__forceinline__ __device__ T ep_shfl_xor(T value, int lane_mask) {
+    return __shfl_xor_sync(0xffffffff, value, lane_mask);
+}
+
+__forceinline__ __device__ void ep_syncwarp() { __syncwarp(); }
 #endif
 
 // -- Kernel launch (MUSA: no __launch_bounds__, no cooperative launch) --------
@@ -72,6 +84,18 @@ __device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2 x) {
 
 #if defined(__CUDACC__) || defined(__MCC__) || defined(__MUSACC__)
 __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
+
+template <typename T>
+__forceinline__ __device__ T ep_shfl(T value, int src_lane) {
+    return __shfl_sync(0xffffffff, value, src_lane);
+}
+
+template <typename T>
+__forceinline__ __device__ T ep_shfl_xor(T value, int lane_mask) {
+    return __shfl_xor_sync(0xffffffff, value, lane_mask);
+}
+
+__forceinline__ __device__ void ep_syncwarp() { __syncwarp(); }
 #endif
 
 // -- Kernel launch (MACA: no cooperative launch) -----------------------------
@@ -88,25 +112,64 @@ __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
         CUDA_CHECK(cudaGetLastError());                     \
     } while (false)
 
-#else  // !MOONCAKE_EP_USE_MUSA && !MOONCAKE_EP_USE_MACA
+#else  // CUDA-compatible platforms
 
 // -- FP8 types (CUDA native names) -------------------------------------------
 #include <cuda_fp8.h>
 using ep_fp8_storage_t = __nv_fp8_storage_t;
 using ep_fp8x2_storage_t = __nv_fp8x2_storage_t;
-#if defined(__CUDACC__) || defined(__MCC__)
+#if defined(__CUDACC__) || defined(__MCC__) || defined(__HIPCC__)
 __device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2 x) {
     return __nv_cvt_float2_to_fp8x2(x, __NV_SATFINITE, __NV_E4M3);
 }
 #endif
 
 // -- Device intrinsics -------------------------------------------------------
-#if defined(__CUDACC__) || defined(__MCC__)
+#if defined(MOONCAKE_EP_USE_HYGON) && \
+    (defined(__CUDACC__) || defined(__HIPCC__) || defined(__HIP_DEVICE_COMPILE__))
+__forceinline__ __device__ int get_lane_id() {
+    // EP is written around 32-thread logical warps.  DTK reports a hardware
+    // warpSize of 64, so split each wavefront into two logical warps.
+    return static_cast<int>(threadIdx.x) & 31;
+}
+
+// DTK executes 64 lanes in one hardware wavefront, while the low-latency EP
+// kernels assign work in CUDA-compatible 32-lane logical warps.  HIP's
+// *_sync compatibility intrinsics operate on the whole 64-lane wavefront and
+// may broadcast from the wrong half (or wait for lanes in a divergent half).
+// Keep all shuffle traffic inside the caller's 32-lane logical warp.  Lanes in
+// a hardware wavefront execute in lockstep, so a block-scoped memory fence is
+// sufficient for the logical-warp synchronization points used by these
+// kernels.
+template <typename T>
+__forceinline__ __device__ T ep_shfl(T value, int src_lane) {
+    return __shfl(value, src_lane, 32);
+}
+
+template <typename T>
+__forceinline__ __device__ T ep_shfl_xor(T value, int lane_mask) {
+    return __shfl_xor(value, lane_mask, 32);
+}
+
+__forceinline__ __device__ void ep_syncwarp() { __threadfence_block(); }
+#elif defined(__CUDACC__) || defined(__MCC__)
 __forceinline__ __device__ int get_lane_id() {
     int lane_id;
     asm("mov.s32 %0, %laneid;" : "=r"(lane_id));
     return lane_id;
 }
+
+template <typename T>
+__forceinline__ __device__ T ep_shfl(T value, int src_lane) {
+    return __shfl_sync(0xffffffff, value, src_lane);
+}
+
+template <typename T>
+__forceinline__ __device__ T ep_shfl_xor(T value, int lane_mask) {
+    return __shfl_xor_sync(0xffffffff, value, lane_mask);
+}
+
+__forceinline__ __device__ void ep_syncwarp() { __syncwarp(); }
 #endif
 
 // -- Kernel launch (CUDA: cooperative launch) --------------------------------

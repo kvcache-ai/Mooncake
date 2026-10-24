@@ -454,16 +454,67 @@ if(USE_HYGON)
     endif()
   endif()
 
+  # DTK ships a CUDA-compatible frontend/runtime below cuda/cuda-<version>.
+  # Prefer the unversioned SDK link, then the newest installed version.  Keep
+  # all paths overridable for installations with a vendor-specific layout.
+  if(NOT DEFINED DTK_CUDA_ROOT OR DTK_CUDA_ROOT STREQUAL "")
+    if(EXISTS "${DTK_ROOT}/cuda/cuda")
+      set(DTK_CUDA_ROOT "${DTK_ROOT}/cuda/cuda")
+    else()
+      file(GLOB _dtk_cuda_roots LIST_DIRECTORIES TRUE
+           "${DTK_ROOT}/cuda/cuda-*")
+      if(_dtk_cuda_roots)
+        list(SORT _dtk_cuda_roots COMPARE NATURAL ORDER DESCENDING)
+        list(GET _dtk_cuda_roots 0 DTK_CUDA_ROOT)
+      endif()
+    endif()
+    set(DTK_CUDA_ROOT "${DTK_CUDA_ROOT}" CACHE PATH
+        "Path to the CUDA-compatible part of Hygon DTK" FORCE)
+  endif()
+
+  if(NOT DTK_CUDA_ROOT OR NOT EXISTS "${DTK_CUDA_ROOT}")
+    message(FATAL_ERROR
+      "USE_HYGON=ON requires a DTK CUDA compatibility toolkit below "
+      "${DTK_ROOT}/cuda (or set DTK_CUDA_ROOT explicitly)")
+  endif()
+
   if(NOT DEFINED DTK_INCLUDE_DIR OR DTK_INCLUDE_DIR STREQUAL "")
-    set(DTK_INCLUDE_DIR "${DTK_ROOT}/cuda/cuda-11/include")
+    set(DTK_INCLUDE_DIR "${DTK_CUDA_ROOT}/include")
   endif()
 
   if(NOT DEFINED DTK_LIB_DIR OR DTK_LIB_DIR STREQUAL "")
-    set(DTK_LIB_DIR "${DTK_ROOT}/cuda/cuda-11/lib64")
+    if(EXISTS "${DTK_CUDA_ROOT}/lib64")
+      set(DTK_LIB_DIR "${DTK_CUDA_ROOT}/lib64")
+    else()
+      set(DTK_LIB_DIR "${DTK_CUDA_ROOT}/lib")
+    endif()
+  endif()
+
+  if(NOT DEFINED DTK_NVCC_EXECUTABLE OR DTK_NVCC_EXECUTABLE STREQUAL "")
+    find_program(DTK_NVCC_EXECUTABLE NAMES nvcc
+                 HINTS "${DTK_CUDA_ROOT}/bin" NO_DEFAULT_PATH)
+  endif()
+
+  file(STRINGS "${DTK_INCLUDE_DIR}/cuda_runtime_api.h" _dtk_cudart_line
+       REGEX "^#define CUDART_VERSION[ \\t]+[0-9]+" LIMIT_COUNT 1)
+  if(_dtk_cudart_line MATCHES "([0-9]+)$")
+    set(DTK_CUDART_VERSION "${CMAKE_MATCH_1}")
+    math(EXPR DTK_CUDA_VERSION_MAJOR "${DTK_CUDART_VERSION} / 1000")
+    math(EXPR DTK_CUDA_VERSION_MINOR "(${DTK_CUDART_VERSION} % 1000) / 10")
+  else()
+    message(FATAL_ERROR
+      "Unable to determine the DTK CUDA compatibility version from "
+      "${DTK_INCLUDE_DIR}/cuda_runtime_api.h")
+  endif()
+  if(NOT DTK_NVCC_EXECUTABLE)
+    message(FATAL_ERROR
+      "USE_HYGON=ON requires DTK's nvcc compatibility driver; set "
+      "DTK_NVCC_EXECUTABLE explicitly")
   endif()
 
   add_compile_definitions(USE_HYGON)
-  message(STATUS "Hygon DCU/DTK support is enabled")
+  message(STATUS "Hygon DCU/DTK support is enabled: ${DTK_CUDA_ROOT}")
+  message(STATUS "Hygon device compiler: ${DTK_NVCC_EXECUTABLE}")
   include_directories(${DTK_INCLUDE_DIR})
   if(EXISTS "${DTK_LIB_DIR}")
     link_directories(${DTK_LIB_DIR})

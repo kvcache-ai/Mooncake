@@ -28,7 +28,6 @@ cmake ..
 make -j
 sudo make install
 ```
-
 ### Build with VRAM Segment
 
 To enable VRAM Segment, install CUDA toolkit and build Mooncake with
@@ -236,8 +235,8 @@ environment setup must be prepared separately.
 | Huawei Ascend Direct | `-DUSE_ASCEND_DIRECT=ON` | Install Ascend CANN Toolkit and ADXL dependencies. | Source `/usr/local/Ascend/cann/set_env.sh` before configuring CMake. This is the recommended Ascend path. |
 | Huawei Ascend UBSHMEM | `-DUSE_UBSHMEM=ON` | Install Ascend CANN Toolkit. Requires CANN >= 9.0.0, driver >= 26.0.0, Lingqu >= 1.5. | Source the CANN `set_env.sh` before configuring CMake. |
 | AMD HIP / ROCm | `-DUSE_HIP=ON` | Install ROCm/HIP SDK. | Ensure HIP compiler, headers, and runtime libraries are visible to CMake. |
-| Hygon DCU | `-DUSE_HYGON=ON` | Install DTK SDK. | Set `DTK_HOME`, or pass `-DDTK_ROOT=/path/to/dtk`. Use `-DDTK_INCLUDE_DIR` and `-DDTK_LIB_DIR` for custom layouts. |
 | ScaleFabric SHCA | `-DUSE_SHCA=ON` | Install `shca-tools`. | Supports Transfer Engine/TENT RDMA paths only; Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
+| Hygon DCU | `-DUSE_HYGON=ON` | Install DTK SDK. | Set `DTK_HOME`, or pass `-DDTK_ROOT=/path/to/dtk`. Mooncake EP uses DTK's CUDA-compatible `nvcc`; do not invoke `hipcc` for its `.cu` sources. |
 | Iluvatar CoreX | `-DUSE_COREX=ON` | Install CoreX SDK. | Set `COREX_HOME`, or pass `-DCOREX_ROOT=/path/to/corex`. Use `-DCOREX_INCLUDE_DIR` and `-DCOREX_LIB_DIR` for custom layouts. |
 | Biren GPU | `-DUSE_SUPA=ON` | Install Biren SUPA SDK. | Set `BIREN_HOME` to the SDK root containing `supa/include` and `supa/lib`, or pass `-DBIREN_HOME=/path/to/biren-sdk`. Uses a CUDA-compatible runtime. |
 
@@ -421,6 +420,8 @@ The following options can be passed to `cmake ..`.
 | `-DMACA_LIB_DIR=/path/to/lib64` | `-DUSE_MACA=ON` | Override the MACA library directory. |
 | `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"` | `-DUSE_MACA=ON` | Override MACA runtime libraries linked by `transfer_engine`. |
 | `-DDTK_ROOT=/path/to/dtk` | `-DUSE_HYGON=ON` | Override the DTK SDK root. `DTK_HOME` is also honored; default is `/opt/dtk`. |
+| `-DDTK_CUDA_ROOT=/path/to/cuda-12` | `-DUSE_HYGON=ON` | Override DTK's CUDA-compatible toolkit. The default is `${DTK_ROOT}/cuda/cuda`, falling back to the newest `${DTK_ROOT}/cuda/cuda-*`. |
+| `-DDTK_NVCC_EXECUTABLE=/path/to/nvcc` | `-DUSE_HYGON=ON` | Override DTK's CUDA-compatible compiler used for Mooncake EP/PG device sources. |
 | `-DDTK_INCLUDE_DIR=/path/to/include` | `-DUSE_HYGON=ON` | Override the DTK include directory. |
 | `-DDTK_LIB_DIR=/path/to/lib64` | `-DUSE_HYGON=ON` | Override the DTK library directory. |
 | `-DCOREX_ROOT=/path/to/corex` | `-DUSE_COREX=ON` | Override the CoreX SDK root. `COREX_HOME` is also honored; default is `/usr/local/corex`. |
