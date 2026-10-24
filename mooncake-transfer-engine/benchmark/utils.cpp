@@ -96,6 +96,17 @@ DEFINE_int32(deadline_tight_threads, 0,
              "--workload_classes_json.");
 DEFINE_bool(deadline_bw_arbitration, false,
             "tent only: enable deadline-aware RDMA bandwidth arbitration.");
+DEFINE_bool(deadline_aware, false,
+            "tent only: route transfers through the admission queue "
+            "(enable_runtime_queue) ordered by deadline; required by "
+            "--mlu_local_threshold.");
+DEFINE_double(mlu_local_threshold, 0.0,
+              "tent only: drop a queued transfer whose predicted completion "
+              "time divided by its remaining deadline window (MLU) is at or "
+              "above this value; 0 disables the drop. Values below 1.0 also "
+              "drop transfers predicted to meet their deadline (the engine "
+              "warns); 1.2-1.5 is recommended. Acts only on RDMA- or "
+              "UB-routed transfers; requires --deadline_aware.");
 DEFINE_int32(local_gpu_id, 0,
              "Local device ordinal for VRAM, -1 for all visible devices. "
              "Selects an MLU device with --backend=tent in USE_MLU builds.");
@@ -168,6 +179,8 @@ uint64_t XferBenchConfig::request_interval_us = 0;
 uint64_t XferBenchConfig::deadline_us = 0;
 int XferBenchConfig::deadline_tight_threads = 0;
 bool XferBenchConfig::deadline_bw_arbitration = false;
+bool XferBenchConfig::deadline_aware = false;
+double XferBenchConfig::mlu_local_threshold = 0.0;
 
 std::string XferBenchConfig::metadata_type;
 std::string XferBenchConfig::metadata_url_list;
@@ -257,6 +270,8 @@ void XferBenchConfig::loadFromFlags() {
     deadline_us = FLAGS_deadline_us;
     deadline_tight_threads = FLAGS_deadline_tight_threads;
     deadline_bw_arbitration = FLAGS_deadline_bw_arbitration;
+    deadline_aware = FLAGS_deadline_aware;
+    mlu_local_threshold = FLAGS_mlu_local_threshold;
     duration = FLAGS_duration;
 
     metadata_type = FLAGS_metadata_type;
@@ -340,15 +355,19 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
 void printDeadlineGroupStats(const char* group, size_t block_size,
                              size_t batch_size, XferBenchStats& stats,
                              int num_threads, uint64_t deadline_us) {
-    if (num_threads <= 0 || stats.transfer_duration.count() == 0) return;
+    if (num_threads <= 0 ||
+        (stats.transfer_duration.count() == 0 && stats.dropped == 0))
+        return;
     const double duration_s = stats.total_duration.avg() / 1e6;
     const double bytes = static_cast<double>(block_size) * batch_size *
                          stats.transfer_duration.count();
     const double throughput_gbs = bytes / 1e9 / duration_s;
     std::cout << "  [deadline-" << group << "] threads=" << num_threads;
     if (deadline_us != 0) std::cout << " deadline_us=" << deadline_us;
-    std::cout << " operations=" << stats.transfer_duration.count()
-              << " throughput=" << std::fixed << std::setprecision(6)
+    std::cout << " operations=" << stats.transfer_duration.count();
+    if (XferBenchConfig::mlu_local_threshold > 0.0)
+        std::cout << " dropped=" << stats.dropped;
+    std::cout << " throughput=" << std::fixed << std::setprecision(6)
               << throughput_gbs << " GB/s" << std::endl;
 }
 

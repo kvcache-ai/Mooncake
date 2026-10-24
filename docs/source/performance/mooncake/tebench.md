@@ -446,6 +446,37 @@ gpu_id + thread_id
   such as `foreground_get`, `background_prefetch`, or `checkpoint`. This is
   useful for validating intent-specific transport and QoS policy selection.
 
+**Deadline scheduling (TENT only)**
+
+* `--deadline_us` / `--deadline_tight_threads` : tag the transfers of workers
+  `[0, N)` with a relative deadline (Section 4.2 does the same per class).
+* `--deadline_aware` : route transfers through the admission queue
+  (`enable_runtime_queue` + `runtime_queue/deadline_aware`), ordered by
+  deadline.
+* `--mlu_local_threshold` : drop a queued transfer whose predicted completion
+  time divided by its remaining window (MLU) reaches this value
+  (`runtime_queue/mlu_local_threshold`); `0` disables the drop. MLU `1.0` is
+  the predicted met/missed boundary, so a value below `1.0` also drops
+  transfers the predictor expects to make their deadline; the engine accepts
+  it with a warning, which is useful to force drops in a measurement. `1.2`
+  to `1.5` is the recommended range ("Choosing θ_local" in the
+  [deadline scheduling design](../../design/tent/deadline-scheduling.md)).
+  Requires `--deadline_aware`. The drop reads the bandwidth estimate of the
+  RDMA or UB transport that carries the transfer and only acts on transfers
+  routed over those two; on a TCP-only host it does nothing.
+  A dropped transfer is counted, not treated as a failure: it is left out of
+  the latency and bandwidth columns, the case ends with a
+  `[deadline-drop] ... completed=<N> dropped=<M>` line, and the
+  `[deadline-tight]` / `[deadline-loose]` lines gain a `dropped=` field.
+  `Avg Lat` divides wall time by completed operations, so it also absorbs the
+  time spent on dropped attempts; read transfer latency from `Avg Tx`.
+* `--deadline_bw_arbitration` : order slices most-urgent-first before posting
+  on a NIC (`transports/rdma/deadline_bw_arbitration`).
+
+These flags only add keys to the engine config; a `MC_TENT_CONF` file keeps
+its own `runtime_queue` settings when they are left at their defaults. See the
+[deadline scheduling design](../../design/tent/deadline-scheduling.md).
+
 **Metadata service**
 
 * `--metadata_type` : `p2p | etcd | redis | http` (default: `p2p`)

@@ -152,11 +152,10 @@ int processBatchSizes(
 
         XferBenchTimer timer;
         while (timer.lap_us(false) < 1000000ull) {
-            if (runner.runSingleTransfer(
-                    local_addr, target_id, target_addr, thread_block_size,
-                    thread_batch_size, opcode, deadlineNs(), intent_type) < 0) {
-                return failTask();
-            }
+            const double val = runner.runSingleTransfer(
+                local_addr, target_id, target_addr, thread_block_size,
+                thread_batch_size, opcode, deadlineNs(), intent_type);
+            if (val < 0 && val != kTransferDropped) return failTask();
         }
         if (measurement_ready.fetch_add(1, std::memory_order_acq_rel) + 1 ==
             num_threads) {
@@ -169,6 +168,7 @@ int processBatchSizes(
         timer.reset();
         std::vector<double> transfer_duration;
         std::vector<double> thread_instant_bandwidth;
+        uint64_t thread_dropped = 0;
         if (mixed_opcode) {
             while (timer.lap_us(false) <
                    XferBenchConfig::duration * 1000000ull) {
@@ -183,6 +183,10 @@ int processBatchSizes(
                 auto val = runner.runSingleTransfer(
                     local_addr, target_id, target_addr, thread_block_size,
                     thread_batch_size, WRITE, deadlineNs(), intent_type);
+                if (val == kTransferDropped) {
+                    ++thread_dropped;
+                    continue;
+                }
                 if (val < 0) return failTask();
                 thread_instant_bandwidth.push_back(
                     gbPerSecond(batch_bytes, val));
@@ -192,6 +196,10 @@ int processBatchSizes(
                 val = runner.runSingleTransfer(
                     local_addr, target_id, target_addr, thread_block_size,
                     thread_batch_size, READ, deadlineNs(), intent_type);
+                if (val == kTransferDropped) {
+                    ++thread_dropped;
+                    continue;
+                }
                 if (val < 0) return failTask();
                 thread_instant_bandwidth.push_back(
                     gbPerSecond(batch_bytes, val));
@@ -217,6 +225,10 @@ int processBatchSizes(
                 auto val = runner.runSingleTransfer(
                     local_addr, target_id, target_addr, thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type);
+                if (val == kTransferDropped) {
+                    ++thread_dropped;
+                    continue;
+                }
                 if (val < 0) return failTask();
                 thread_instant_bandwidth.push_back(
                     gbPerSecond(batch_bytes, val));
@@ -237,6 +249,7 @@ int processBatchSizes(
         stats.total_duration.add(total_duration);
         stats.transfer_duration.add(transfer_duration);
         stats.instant_bandwidth.add(thread_instant_bandwidth);
+        stats.dropped += thread_dropped;
         auto& target = target_stats[target_index];
         ++target.threads;
         target.transferred_bytes =
@@ -254,6 +267,7 @@ int processBatchSizes(
         auto& group_stats = tight ? tight_stats : loose_stats;
         group_stats.total_duration.add(total_duration);
         group_stats.transfer_duration.add(transfer_duration);
+        group_stats.dropped += thread_dropped;
         return 0;
     });
 
@@ -290,6 +304,12 @@ int processBatchSizes(
                 return -1;
             }
         }
+    }
+    if (XferBenchConfig::mlu_local_threshold > 0.0) {
+        std::cout << "  [deadline-drop] mlu_local_threshold="
+                  << XferBenchConfig::mlu_local_threshold
+                  << " completed=" << stats.transfer_duration.count()
+                  << " dropped=" << stats.dropped << std::endl;
     }
     if (XferBenchConfig::deadline_us > 0 && workload_classes.empty()) {
         const int tight_threads =
@@ -414,6 +434,23 @@ int main(int argc, char* argv[]) {
     if (XferBenchConfig::deadline_us > 0 &&
         XferBenchConfig::backend != "tent") {
         LOG(ERROR) << "deadline tagging is supported only by the tent backend";
+        return EXIT_FAILURE;
+    }
+    if ((XferBenchConfig::deadline_aware ||
+         XferBenchConfig::mlu_local_threshold != 0.0) &&
+        XferBenchConfig::backend != "tent") {
+        LOG(ERROR) << "--deadline_aware and --mlu_local_threshold are "
+                      "supported only by the tent backend";
+        return EXIT_FAILURE;
+    }
+    if (!std::isfinite(XferBenchConfig::mlu_local_threshold) ||
+        XferBenchConfig::mlu_local_threshold < 0.0) {
+        LOG(ERROR) << "mlu_local_threshold must be finite and non-negative";
+        return EXIT_FAILURE;
+    }
+    if (XferBenchConfig::mlu_local_threshold > 0.0 &&
+        !XferBenchConfig::deadline_aware) {
+        LOG(ERROR) << "--mlu_local_threshold requires --deadline_aware";
         return EXIT_FAILURE;
     }
     if (!workload_classes.empty() &&
