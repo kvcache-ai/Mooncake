@@ -211,6 +211,28 @@ static int resolveSegTypeParams(const std::string& seg_type,
                 << "local_gpu_id " << start_idx << " out of range [0, "
                 << device_count << ")";
         }
+#elif defined(USE_XPU)
+    } else if (seg_type == "VRAM" || seg_type == "vram") {
+        // XpuPlatform::probe lists one "xpu:N" memory node per device, in the
+        // same order XpuPlatform::allocate resolves "xpu:N".
+        device_prefix = "xpu";
+        std::vector<Topology::NicEntry> nics;
+        std::vector<Topology::MemEntry> mems;
+        CHECK_FAIL(Platform::getLoader().probe(nics, mems));
+        int gpu_count = 0;
+        for (const auto& mem : mems) {
+            if (LocationParser(mem.name).type() == "xpu") ++gpu_count;
+        }
+        LOG_ASSERT(gpu_count > 0) << "No XPU devices are visible";
+        start_idx = 0;
+        num_buffers = gpu_count;
+        if (XferBenchConfig::local_gpu_id != -1) {
+            start_idx = XferBenchConfig::local_gpu_id;
+            num_buffers = 1;
+            LOG_ASSERT(start_idx >= 0 && start_idx < gpu_count)
+                << "local_gpu_id " << start_idx << " out of range [0, "
+                << gpu_count << ")";
+        }
 #endif
     } else {
         LOG(ERROR) << "Unknown seg_type: " << seg_type;
