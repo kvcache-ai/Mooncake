@@ -76,7 +76,7 @@ T applyReduceOp(const T& a, const T& b, ReduceOp op) {
         case ReduceOp::Max:
             return std::max(a, b);
         default:
-            PG_ASSERT(false, "Unsupported reduce op: ", (int)op);
+            detail::throwPGAssertFailure("Unsupported reduce op: ", (int)op);
     }
 }
 

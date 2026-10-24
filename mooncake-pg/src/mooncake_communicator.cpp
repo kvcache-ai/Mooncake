@@ -31,13 +31,13 @@ constexpr size_t kBarrierDummySize = 1;
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
 constexpr size_t kDefaultDeviceCollectiveBufferSize =
     32ull * 1024 * 1024;  // 32 MiB
-constexpr size_t kDefaultDeviceCollectiveControlReserve =
-    8ull * 1024 * 1024;  // 8 MiB
+constexpr size_t kDefaultCommunicatorResourceReserve =
+    64ull * 1024 * 1024;  // 64 MiB
 
 // Only remotely published resources occupy the eager peer-accessible region.
 // DTS allocates the local staging region lazily if a selected route needs one.
 constexpr size_t kDefaultPeerAccessibleCapacity =
-    kDefaultDeviceCollectiveBufferSize + kDefaultDeviceCollectiveControlReserve;
+    kDefaultDeviceCollectiveBufferSize + kDefaultCommunicatorResourceReserve;
 constexpr size_t kDefaultLocalStagingCapacity =
     kDefaultDeviceCollectiveBufferSize;
 
@@ -64,6 +64,24 @@ PGResult<DeviceRouteConfig> loadDeviceRouteConfigFromEnvironment() {
     return config;
 }
 #endif
+
+PGResult<std::optional<DeviceAllReduceAlgorithm>>
+loadCollectiveAlgorithmFromEnvironment() {
+    const char* raw_value = std::getenv("MOONCAKE_PG_COLLECTIVE_ALGORITHM");
+    if (!raw_value || std::string_view(raw_value) == "auto") {
+        return std::optional<DeviceAllReduceAlgorithm>{};
+    }
+    const std::string_view value(raw_value);
+    if (value == "ring") {
+        return std::optional{DeviceAllReduceAlgorithm::Ring};
+    }
+    if (value == "oneshot") {
+        return std::optional{DeviceAllReduceAlgorithm::OneShot};
+    }
+    return makePGError(PGErrorCode::InvalidArgument,
+                       "MOONCAKE_PG_COLLECTIVE_ALGORITHM must be 'auto', "
+                       "'ring', or 'oneshot'");
+}
 
 void copyDeviceToDevice(void* dst, const void* src, size_t bytes,
                         cudaStream_t stream) {
@@ -272,8 +290,12 @@ PGResult<std::string> MooncakePGContext::launchCoordinator() {
     PG_VALIDATE_STATE(global_rank == 0,
                       "only global rank 0 may start the coordinator");
     if (!coordinator_host) {
+        // The coordinator publishes one algorithm policy for every rank.
+        PG_TRY(auto all_reduce_algorithm,
+               loadCollectiveAlgorithmFromEnvironment());
         auto candidate = std::make_unique<CoordinatorHost>(
-            host_ip, max_world_size, fault_reconciliation_window_us);
+            host_ip, max_world_size, fault_reconciliation_window_us,
+            all_reduce_algorithm);
         PG_TRY(candidate->start());
         coordinator_host = std::move(candidate);
     }
