@@ -397,6 +397,35 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Then(Objects({"leased_a", "leased_b"}).DoNotExist());
 }
 
+TEST_F(MasterServiceEvictScenarioTest,
+       LastHitOnlyLeasesOnlyTheSelectedCandidate) {
+    auto config = EvictConfig();
+    config.default_kv_lease_ttl = 60 * 60 * 1000;
+    MasterScenario scenario("last hit only leases one candidate", config);
+    scenario.Given(MemoryNode("memory"))
+        .Given(Objects({"p0_state", "p0_conv", "p1_state", "p2_state",
+                        "p2_conv", "p3_conv"})
+                   .Size(kObjectSize)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase()))
+        // Candidates are pairs in caller order and every result still reports
+        // existence. p1 and p3 are incomplete, so the last all-true pair is
+        // p2: only its two keys are leased, and the complete p0 pair is not.
+        .Then(BatchProbe({"p0_state", "p0_conv", "p1_state", "p1_conv",
+                          "p2_state", "p2_conv", "p3_state", "p3_conv"})
+                  .LastHitOnly(2)
+                  .Returns({true, true, true, false, true, true, false, true}))
+        .When(EvictMemory(1.0))
+        .Then(Objects({"p2_state", "p2_conv"}).AreReadable())
+        .Then(Objects({"p0_state", "p0_conv", "p1_state", "p3_conv"})
+                  .DoNotExist())
+        // Once that lease expires, the same pass reclaims the candidate.
+        .When(ExpireAt("p2_state", ExpiredBase()))
+        .When(ExpireAt("p2_conv", ExpiredBase()))
+        .When(EvictMemory(1.0))
+        .Then(Objects({"p2_state", "p2_conv"}).DoNotExist());
+}
+
 TEST_F(MasterServiceEvictScenarioTest, EvictsExactOldestObjectsAtHighRatio) {
     constexpr size_t kObjectCount = 200;
     constexpr size_t kExpectedEvicted = 160;
