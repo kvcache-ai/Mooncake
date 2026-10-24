@@ -4919,8 +4919,16 @@ auto MasterService::AllocateReplicas(const std::string& key,
         }
         auto alloc = dfs_allocator_->Allocate(key, value_length);
         if (!alloc) {
-            LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
-                       << ", error=" << alloc.error();
+            // NO_AVAILABLE_HANDLE is a capacity failure that can repeat for
+            // every PutStart and is returned to the caller, so log it like
+            // memory exhaustion above.
+            if (alloc.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
+                VLOG(1) << "Failed to allocate DFS replica for key=" << key
+                        << ", error=" << alloc.error();
+            } else {
+                LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
+                           << ", error=" << alloc.error();
+            }
             if (dfs_allocation_failed != nullptr) {
                 *dfs_allocation_failed =
                     alloc.error() == ErrorCode::NO_AVAILABLE_HANDLE;
