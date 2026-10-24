@@ -684,6 +684,8 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         self._print_perf(f"TP Batch Put (TP={tp_size})", put_times)
         self._print_perf(f"TP Batch Get (TP={tp_size})", get_times)
 
+    # TODO(#4849): Re-enable P2P coverage once global remove/remove_all is implemented.
+    @unittest.skipIf(IS_P2P, "P2P global remove/remove_all is not implemented yet")
     def test_benchmark_03_batch_put_get_into(self):
         """Benchmark: Zero copy Batch Get."""
         self.store.remove_all()
@@ -744,6 +746,8 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         for r in res:
             self.assertEqual(r, 0, f"Buffer unregistration failed for buffer at {large_buffer_ptr}")
 
+    # TODO(#4849): Re-enable P2P coverage once global remove/remove_all is implemented.
+    @unittest.skipIf(IS_P2P, "P2P global remove/remove_all is not implemented yet")
     def test_benchmark_04_batch_put_get_into_with_tp(self):
         """Benchmark: Zero copy Batch Get with tp."""
         tp_size = 4
