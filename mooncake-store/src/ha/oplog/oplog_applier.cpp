@@ -431,6 +431,9 @@ void OpLogApplier::ApplySegmentMount(const OpLogEntry& entry) {
     info.capacity = op.capacity;
     info.is_memory_segment = op.is_memory_segment;
     info.file_path = op.file_path;
+    info.segment_id = op.segment_id;
+    info.base = op.base;
+    info.owner_client_id = op.owner_client_id;
     segment_registry_.OnSegmentMount(info);
 }
 
