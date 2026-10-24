@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "environment_value_parser.h"
 #include "hf3fs/hf3fs.h"
 #include "storage/distributed/shard_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
@@ -40,6 +41,23 @@ std::string DfsRootFromEnv() {
     const char* root = std::getenv("MOONCAKE_DFS_ROOT_DIR");
     return root && root[0] != '\0' ? std::string(root)
                                    : std::string(kDefaultRoot);
+}
+
+// Mirrors the sizes Hf3fsAdapter::Init reads, so tests stay above capacity
+// under any valid MOONCAKE_HF3FS_* override.
+Hf3fsConfig ConfigFromEnv() {
+    Hf3fsConfig config;
+    if (const char* raw = std::getenv("MOONCAKE_HF3FS_IOV_SIZE")) {
+        if (auto value = TryParseEnvironmentValue<size_t>(raw)) {
+            config.iov_size = *value;
+        }
+    }
+    if (const char* raw = std::getenv("MOONCAKE_HF3FS_IOR_ENTRIES")) {
+        if (auto value = TryParseEnvironmentValue<int>(raw)) {
+            config.ior_entries = static_cast<size_t>(*value);
+        }
+    }
+    return config;
 }
 
 std::optional<std::string> ExistingAncestor(std::filesystem::path path) {
@@ -169,6 +187,150 @@ TEST_F(Hf3fsAdapterTest, WriteAtReadAtThroughUsrbio) {
 
     EXPECT_TRUE(adapter.CloseFile(*fd).has_value());
     EXPECT_TRUE(adapter.Shutdown().has_value());
+}
+
+TEST_F(Hf3fsAdapterTest, BatchIoAcrossRingAndPerEntryBufferCapacity) {
+    Hf3fsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(test_dir_->path()));
+    const Hf3fsConfig config = ConfigFromEnv();
+    const size_t count = config.ior_entries + 3;
+    std::vector<std::string> values(count);
+    std::vector<std::array<iovec, 3>> iovs(count);
+    std::vector<FdIoRequest> requests(count);
+    std::vector<int> fds;
+    // Two files, with multiple positional requests sharing each registered fd.
+    for (int i = 0; i < 2; ++i) {
+        auto fd =
+            adapter.OpenFile(test_dir_->file("batch_" + std::to_string(i)));
+        ASSERT_TRUE(fd);
+        fds.push_back(*fd);
+    }
+    int64_t offset = 7;
+    for (size_t i = 0; i < count; ++i) {
+        values[i].assign(i == 0 ? config.iov_size + 4097 : 4097, 'A' + i % 26);
+        iovs[i] = {{{values[i].data(), 31},
+                    {nullptr, 0},
+                    {values[i].data() + 31, values[i].size() - 31}}};
+        requests[i] = {fds[i % fds.size()], iovs[i].data(), 3, offset};
+        offset += values[i].size() + 13;
+    }
+    const auto writes = adapter.BatchWriteAt(requests);
+    ASSERT_EQ(writes.size(), count);
+    for (size_t i = 0; i < count; ++i) {
+        ASSERT_TRUE(writes[i]);
+        EXPECT_EQ(*writes[i], values[i].size());
+        std::fill(values[i].begin(), values[i].end(), '?');
+    }
+    const auto reads = adapter.BatchReadAt(requests);
+    ASSERT_EQ(reads.size(), count);
+    for (size_t i = 0; i < count; ++i) {
+        ASSERT_TRUE(reads[i]);
+        EXPECT_EQ(*reads[i], values[i].size());
+        EXPECT_EQ(values[i], std::string(values[i].size(), 'A' + i % 26));
+    }
+    for (int fd : fds) EXPECT_TRUE(adapter.CloseFile(fd));
+    EXPECT_TRUE(adapter.Shutdown());
+}
+
+TEST_F(Hf3fsAdapterTest, StagingPoolLargerThanOneBufferRegistration) {
+    // 3FS registers each buffer block for RDMA separately; a single 1.5 GiB
+    // registration failed every I/O on a local cluster.
+    constexpr size_t kEntrySize = 48 << 20;
+    constexpr int kEntries = 32;
+    std::vector<std::pair<const char*, std::optional<std::string>>> saved;
+    for (const char* name :
+         {"MOONCAKE_HF3FS_IOV_SIZE", "MOONCAKE_HF3FS_IOR_ENTRIES"}) {
+        const char* value = std::getenv(name);
+        saved.emplace_back(
+            name, value ? std::optional<std::string>(value) : std::nullopt);
+    }
+    ASSERT_EQ(setenv("MOONCAKE_HF3FS_IOV_SIZE",
+                     std::to_string(kEntrySize).c_str(), 1),
+              0);
+    ASSERT_EQ(setenv("MOONCAKE_HF3FS_IOR_ENTRIES",
+                     std::to_string(kEntries).c_str(), 1),
+              0);
+    Hf3fsAdapter adapter;
+    const auto init = adapter.Init(test_dir_->path());
+    for (const auto& [name, value] : saved) {
+        if (value) {
+            setenv(name, value->c_str(), 1);
+        } else {
+            unsetenv(name);
+        }
+    }
+    ASSERT_TRUE(init);
+
+    auto fd = adapter.OpenFile(test_dir_->file("large_pool.data"));
+    ASSERT_TRUE(fd);
+    // One small request per entry reaches the last staging slice.
+    std::vector<std::string> values(kEntries);
+    std::vector<iovec> iovs(kEntries);
+    std::vector<FdIoRequest> requests(kEntries);
+    for (int i = 0; i < kEntries; ++i) {
+        values[i].assign(4096, 'a' + i % 26);
+        iovs[i] = {values[i].data(), values[i].size()};
+        requests[i] = {*fd, &iovs[i], 1, static_cast<int64_t>(i) * 4096};
+    }
+    for (const auto& result : adapter.BatchWriteAt(requests)) {
+        ASSERT_TRUE(result);
+    }
+    for (auto& value : values) std::fill(value.begin(), value.end(), '?');
+    for (const auto& result : adapter.BatchReadAt(requests)) {
+        ASSERT_TRUE(result);
+    }
+    for (int i = 0; i < kEntries; ++i) {
+        EXPECT_EQ(values[i], std::string(4096, 'a' + i % 26));
+    }
+    EXPECT_TRUE(adapter.CloseFile(*fd));
+    EXPECT_TRUE(adapter.Shutdown());
+}
+
+TEST_F(Hf3fsAdapterTest, BatchIsolatesRequestFailuresOnRealRing) {
+    Hf3fsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(test_dir_->path()));
+    const std::string path = test_dir_->file("isolation.data");
+    auto rw_fd = adapter.OpenFile(path);
+    ASSERT_TRUE(rw_fd);
+    // 3FS rejects writes through a read-only registration at prep time.
+    const int ro_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    ASSERT_GE(ro_fd, 0);
+    ASSERT_LE(hf3fs_reg_fd(ro_fd, 0), 0);
+
+    std::string data(4096, 'I');
+    std::string rejected(4096, 'X');
+    iovec data_iov{data.data(), data.size()};
+    iovec rejected_iov{rejected.data(), rejected.size()};
+    const std::array<FdIoRequest, 2> writes{
+        {{*rw_fd, &data_iov, 1, 0}, {ro_fd, &rejected_iov, 1, 4096}}};
+    const auto write_results = adapter.BatchWriteAt(writes);
+    ASSERT_TRUE(write_results[0]);
+    EXPECT_EQ(*write_results[0], data.size());
+    ASSERT_FALSE(write_results[1]);
+    EXPECT_EQ(write_results[1].error(), ErrorCode::FILE_WRITE_FAIL);
+
+    // A read past EOF is short and fails alone; its neighbor still succeeds.
+    std::string full(data.size(), '?');
+    std::string past_eof(2 * data.size(), '?');
+    iovec full_iov{full.data(), full.size()};
+    iovec past_eof_iov{past_eof.data(), past_eof.size()};
+    const std::array<FdIoRequest, 2> reads{
+        {{ro_fd, &past_eof_iov, 1, 0}, {*rw_fd, &full_iov, 1, 0}}};
+    const auto read_results = adapter.BatchReadAt(reads);
+    ASSERT_FALSE(read_results[0]);
+    EXPECT_EQ(read_results[0].error(), ErrorCode::FILE_READ_FAIL);
+    ASSERT_TRUE(read_results[1]);
+    EXPECT_EQ(full, data);
+
+    // The thread's rings remain usable after per-request failures.
+    std::fill(full.begin(), full.end(), '?');
+    ASSERT_TRUE(adapter.ReadAt(ro_fd, &full_iov, 1, 0));
+    EXPECT_EQ(full, data);
+
+    hf3fs_dereg_fd(ro_fd);
+    EXPECT_EQ(::close(ro_fd), 0);
+    EXPECT_TRUE(adapter.CloseFile(*rw_fd));
+    EXPECT_TRUE(adapter.Shutdown());
 }
 
 TEST_F(Hf3fsAdapterTest, DistributedBackendBatchWriteAndRead) {

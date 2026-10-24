@@ -37,6 +37,63 @@ cmake -DUSE_3FS=ON ...
 
 Then build and install Mooncake as usual.
 
+## USRBIO resource settings
+
+The adapter reads these optional environment variables once during
+initialization:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MOONCAKE_HF3FS_IOV_SIZE` | `16777216` (16 MiB) | Staging buffer size in bytes per ring entry |
+| `MOONCAKE_HF3FS_IOR_ENTRIES` | `8` | Requested entries in each thread's read and write ring |
+
+Each I/O thread allocates one shared staging buffer of
+`MOONCAKE_HF3FS_IOR_ENTRIES * MOONCAKE_HF3FS_IOV_SIZE` bytes for its read and
+write rings. The defaults allocate `8 * 16 MiB = 128 MiB` per thread.
+
+For example, allocate 2 GiB of staging memory per I/O thread:
+
+```bash
+export MOONCAKE_HF3FS_IOV_SIZE=67108864  # 64 MiB per ring entry
+export MOONCAKE_HF3FS_IOR_ENTRIES=32    # Entries per read/write ring
+```
+
+Set these variables before starting each process that uses the HF3FS adapter.
+They are process-local tuning settings and may differ between clients and the
+master. Resources are allocated lazily on first I/O using the settings captured
+at adapter initialization; restart the process to apply changes.
+
+Values must be positive decimal integers. The product of the two settings must
+fit in `ptrdiff_t`, and ring entries must be less than `INT_MAX` because 3FS
+reserves one additional internal slot. Empty, malformed, zero, negative, or
+out-of-range values fail adapter initialization. Allocation can still fail if
+available shared memory or 3FS limits are exceeded.
+
+Each ring entry's staging slice is registered with 3FS as a separate buffer
+block, so `MOONCAKE_HF3FS_IOV_SIZE` must stay within the 3FS client's
+buffer-registration limit. Otherwise buffer creation still succeeds, but every
+I/O through the adapter fails; on a local test cluster, entries larger than
+1 GiB failed with permission errors.
+
+Staging memory scales with both the ring entry count and the number of I/O
+threads: the example above uses 16 GiB with eight I/O threads, plus ring
+overhead. Each active request uses a separate slice of up to
+`MOONCAKE_HF3FS_IOV_SIZE` bytes; larger requests use multiple waves. Increasing
+ring entries increases total staging memory and preserves the per-entry size.
+
+## Failed writes and range reuse
+
+After a fatal completion-wait error, the adapter retires the thread's client
+rings and staging buffer. This does not cancel writes already accepted by a
+3FS worker: they can still land in the original inode after failure is returned.
+Closing the file descriptor or recreating the rings does not make the failed
+file ranges safe to reuse.
+
+Conservatively abandon allocated ranges for positional requests that return
+`FILE_WRITE_FAIL`. Retry at fresh, nonoverlapping offsets or in a new inode;
+do not overwrite or recycle the failed ranges unless all earlier I/O is known
+to have finished. The adapter cannot establish that after a fatal wait error.
+
 ## Usage
 
 ### Master
