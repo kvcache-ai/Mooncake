@@ -799,6 +799,12 @@ ErrorCode MasterService::ValidateStandbyRemountSegment(
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    // Single-flight for remounts. The locks below are acquired and released
+    // in phases, so this dedicated mutex replaces the implicit serialization
+    // the old whole-body client_mutex_ + master_state_mutex_ exclusive hold
+    // provided, without coupling Ping (client_mutex_ shared) to remount
+    // progress.
+    std::lock_guard<std::mutex> remount_serialization_guard(remount_mutex_);
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
         auto [record_it, record_inserted] =
@@ -865,6 +871,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         std::vector<SegmentRestore> restores;
         restores.reserve(segments.size());
         std::vector<bool> segment_existed(segments.size());
+        // Flipped when client_mutex_ is released for the metadata restore
+        // pass below, so failure paths know whether they still own it.
+        bool client_lock_released = false;
         auto rollback_new_segments = [&] {
             ScopedSegmentAccess segment_access =
                 segment_manager_.getSegmentAccess();
@@ -890,6 +899,19 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         auto fail_remount =
             [&](ErrorCode error) -> tl::expected<void, ErrorCode> {
             rollback_new_segments();
+            // Once client_mutex_ has been released for the metadata restore
+            // pass, re-acquire it for the provisional-record discard only
+            // after releasing master_state_mutex_ AND the liveness retaining
+            // guard: acquiring client_mutex_ exclusive while holding either
+            // would invert the documented lock order (client_mutex_ before
+            // master_state_mutex_, and mount admission takes client_mutex_
+            // before the record's transition mutex via ObserveAndRun) and can
+            // deadlock against a concurrent mount or remount admission.
+            if (client_lock_released) {
+                snapshot_lock.unlock();
+                remount_guard.reset();
+                client_lock.lock();
+            }
             discard_provisional_record();
             return tl::make_unexpected(error);
         };
@@ -928,6 +950,18 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         if (remount_error != ErrorCode::OK) {
             return fail_remount(remount_error);
         }
+
+        // Release client_mutex_ before the metadata restore pass below. That
+        // pass walks every metadata shard to rebuild the standby replicas
+        // (raw Replica* pointers are stashed while walking the shards and
+        // used after the walk), and holding client_mutex_ exclusive across
+        // the O(total keys) walk is exactly the park that froze every Ping
+        // handler -- all of them client_mutex_ shared readers -- for the
+        // duration of a remount. The liveness record's retaining guard keeps
+        // the client monitor from retiring the record mid-pass, so expiry
+        // cannot interleave here.
+        client_lock.unlock();
+        client_lock_released = true;
 
         bool ambiguous_endpoint = false;
         bool unsupported_cxl = false;
@@ -1118,8 +1152,22 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             }
         }
 
-        // Change the client status to OK
+        // Change the client status to OK. The metadata restore pass is done,
+        // so master_state_mutex_ and the liveness retaining guard are released
+        // first: acquiring client_mutex_ exclusive while still holding either
+        // would invert the documented lock order (client_mutex_ before
+        // master_state_mutex_; mount admission takes client_mutex_ before the
+        // record's transition mutex via ObserveAndRun) and can deadlock
+        // against a concurrent mount or remount admission.
+        snapshot_lock.unlock();
+        remount_guard.reset();
+        client_lock.lock();
         ok_client_.insert(client_id);
+        {
+            std::unique_lock<std::shared_mutex> status_lock(
+                client_status_mutex_);
+            client_status_view_.insert(client_id);
+        }
         MasterMetricManager::instance().inc_active_clients();
     }
 
@@ -2410,11 +2458,39 @@ void MasterService::CleanupExpiredSoftPins(
 }
 
 void MasterService::ClearInvalidHandles() {
-    std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
-    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
-    auto retaining_clients = GetRetainingClientIdsLocked();
-    client_lock.unlock();
-    ClearInvalidHandles(retaining_clients);
+    // Liveness-complement sweep: the retaining-client set is re-captured
+    // periodically during the sweep instead of once for the whole table. A
+    // client that mounts or remounts while the sweep is in progress is then
+    // seen alive before its remaining replicas are classified, so they cannot
+    // be misjudged as stale. The capture runs under client_mutex_ shared only
+    // and between object accessor acquisitions, so the documented
+    // client-before-shard lock order is preserved and callers must not hold
+    // master_state_mutex_.
+    constexpr auto kRetainingSetRefreshInterval = std::chrono::milliseconds(100);
+    auto capture = [this]() {
+        std::unordered_set<UUID, boost::hash<UUID>> retained;
+        std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+        retained = GetRetainingClientIdsLocked();
+        return retained;
+    };
+    std::unordered_set<UUID, boost::hash<UUID>> retaining_clients = capture();
+    auto last_refresh = std::chrono::steady_clock::now();
+    (void)ClearStaleHandles(
+        [&retaining_clients](const Replica& replica) {
+            return (replica.has_invalid_mem_handle() ||
+                    replica.has_invalid_nof_handle() ||
+                    replica.has_stale_local_disk_client(retaining_clients)) &&
+                   replica.is_completed();
+        },
+        [this, &capture, &retaining_clients, &last_refresh,
+         interval = kRetainingSetRefreshInterval]() {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_refresh < interval) {
+                return;
+            }
+            retaining_clients = capture();
+            last_refresh = now;
+        });
 }
 
 void MasterService::ClearInvalidHandles(
@@ -2435,9 +2511,13 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
 }
 
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
-    const std::function<bool(const Replica&)>& is_stale) {
+    const std::function<bool(const Replica&)>& is_stale,
+    const std::function<void()>& refresh_retaining) {
     std::optional<ErrorCode> first_persist_error;
     VisitTenants([&](const TenantId& tenant_id) {
+        if (refresh_retaining) {
+            refresh_retaining();
+        }
         // Reader pre-check: an object with nothing to sweep never takes the
         // write lock. Each picked object is classified again under its own
         // write lock below, since it may have changed, and one torn down or
@@ -2451,6 +2531,9 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
         }
         std::bitset<kNumShards> erased_shards;
         for (const auto& object : to_sweep) {
+            if (refresh_retaining) {
+                refresh_retaining();
+            }
             // The by-reference accessor skips the invalid-replica cleanup,
             // which would drop the stale replicas before this pass could see
             // what it erased.
@@ -2729,12 +2812,9 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     -> tl::expected<void, ErrorCode> {
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
-    std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
-    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    auto retaining_clients = GetRetainingClientIdsLocked();
-    client_lock.unlock();
     // 1. Prepare to unmount the segment by deleting its allocator
     {
+        std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
         ErrorCode err = segment_access.PrepareUnmountSegment(
@@ -2751,22 +2831,27 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     // Keep HA, snapshot, and CXL behavior unchanged. Regular memory segments
     // become unreadable as soon as PrepareUnmountSegment releases their
     // allocator; only the physical metadata sweep is deferred.
+    // ClearInvalidHandles re-captures the retaining-client set under
+    // client_mutex_ per shard, so it must run without the caller holding
+    // master_state_mutex_: acquiring client_mutex_ under master_state_mutex_
+    // would invert the documented lock order.
     if (enable_async_segment_cleanup_) {
         replica_cleanup_worker_.Schedule();
     } else {
-        ClearInvalidHandles(retaining_clients);
+        ClearInvalidHandles();
     }
 
-    // Cache endpoint before commit removes segment from registry.
+    // 2. Commit the unmount operation. Cache endpoint before commit removes
+    // segment from registry.
     std::string segment_name;
     std::string te_endpoint;
-    if (!segment_manager_.GetSegmentBasicInfo(segment_id, segment_name,
-                                              te_endpoint)) {
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    }
-
-    // 3. Commit the unmount operation
     {
+        std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+        if (!segment_manager_.GetSegmentBasicInfo(segment_id, segment_name,
+                                                  te_endpoint)) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
         auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
@@ -2835,13 +2920,9 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
 #else
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
-    std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
-    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    auto retaining_clients = GetRetainingClientIdsLocked();
-    client_lock.unlock();
-
     // 1. Prepare to unmount the segment by deleting its allocator
     {
+        std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         ScopedNoFSegmentAccess segment_access =
             nof_segment_manager_.getNoFSegmentAccess();
         ErrorCode err = segment_access.PrepareUnmountSegment(
@@ -2856,20 +2937,25 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
     }  // Release the segment mutex before long-running step 2 and avoid
        // deadlocks
 
-    // 2. Remove the metadata of the related objects
-    ClearInvalidHandles(retaining_clients);
+    // 2. Remove the metadata of the related objects. ClearInvalidHandles
+    // re-captures the retaining-client set under client_mutex_ per shard, so
+    // it must run without the caller holding master_state_mutex_.
+    ClearInvalidHandles();
 
     // 3. Commit the unmount operation
-    ScopedNoFSegmentAccess segment_access =
-        nof_segment_manager_.getNoFSegmentAccess();
-    auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
-                                                   metrics_dec_capacity);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
-    }
     {
-        std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
-        nof_heartbeat_states_.erase(segment_id);
+        std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+        ScopedNoFSegmentAccess segment_access =
+            nof_segment_manager_.getNoFSegmentAccess();
+        auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
+                                                       metrics_dec_capacity);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+        {
+            std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
+            nof_heartbeat_states_.erase(segment_id);
+        }
     }
     return {};
 #endif
@@ -8074,24 +8160,37 @@ size_t MasterService::GetKeyCount() const {
 
 auto MasterService::Ping(const UUID& client_id)
     -> tl::expected<PingResponse, ErrorCode> {
-    std::shared_lock<std::shared_mutex> lock(client_mutex_);
-    const auto record_it = client_liveness_records_.find(client_id);
     bool observation_accepted = false;
-    if (record_it != client_liveness_records_.end()) {
-        const auto observation =
-            record_it->second->Observe(ClientLivenessRecord::Clock::now());
-        observation_accepted =
-            observation != ClientLivenessObservation::REJECTED_OFFLINE;
-        if (observation == ClientLivenessObservation::RECOVERED_ACTIVE) {
-            MasterMetricManager::instance().client_liveness_recovered();
-            LOG(INFO) << "client_id=" << client_id
-                      << ", action=client_liveness_recovered, signal=ping";
+    {
+        std::shared_lock<std::shared_mutex> lock(client_mutex_);
+        const auto record_it = client_liveness_records_.find(client_id);
+        if (record_it != client_liveness_records_.end()) {
+            const auto observation =
+                record_it->second->Observe(ClientLivenessRecord::Clock::now());
+            observation_accepted =
+                observation != ClientLivenessObservation::REJECTED_OFFLINE;
+            if (observation == ClientLivenessObservation::RECOVERED_ACTIVE) {
+                MasterMetricManager::instance().client_liveness_recovered();
+                LOG(INFO) << "client_id=" << client_id
+                          << ", action=client_liveness_recovered, signal=ping";
+            }
         }
     }
-    const ClientStatus client_status =
-        observation_accepted && ok_client_.contains(client_id)
-            ? ClientStatus::OK
-            : ClientStatus::NEED_REMOUNT;
+    // Read the mirror of ok_client_ instead of ok_client_ itself under
+    // client_mutex_: the mirror is only ever held exclusively for the
+    // microseconds of a client insert or erase, so heartbeat processing
+    // cannot stall behind a remount admission or a monitor expiry erasure
+    // the way a client_mutex_ shared read can. The status is advisory for
+    // the store either way -- a stale NEED_REMOUNT just triggers an
+    // idempotent remount.
+    bool client_ok = false;
+    {
+        std::shared_lock<std::shared_mutex> lock(client_status_mutex_);
+        client_ok = client_status_view_.contains(client_id);
+    }
+    const ClientStatus client_status = observation_accepted && client_ok
+                                           ? ClientStatus::OK
+                                           : ClientStatus::NEED_REMOUNT;
     return PingResponse(view_version_, client_status);
 }
 
@@ -11145,6 +11244,11 @@ void MasterService::ClientMonitorFunc() {
                             MasterMetricManager::instance()
                                 .dec_active_clients();
                         }
+                        {
+                            std::unique_lock<std::shared_mutex> status_lock(
+                                client_status_mutex_);
+                            client_status_view_.erase(client_id);
+                        }
                         client_host_id_.erase(client_id);
                     }
                     graceful_unmount_scheduler_.RemoveIf(
@@ -11266,11 +11370,8 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     const MountedNoFSegmentSnapshot& snapshot,
     const std::string& error_reason) {
     size_t metrics_dec_capacity = 0;
-    std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
-    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
-    auto retaining_clients = GetRetainingClientIdsLocked();
-    client_lock.unlock();
     {
+        std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
         ErrorCode err = nof_segment_access.PrepareUnmountSegment(
             snapshot.segment_id, metrics_dec_capacity);
@@ -11293,9 +11394,13 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
         }
     }
 
-    ClearInvalidHandles(retaining_clients);
+    // ClearInvalidHandles re-captures the retaining-client set under
+    // client_mutex_ per shard, so it must run without the caller holding
+    // master_state_mutex_.
+    ClearInvalidHandles();
 
     {
+        std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
         ErrorCode err = nof_segment_access.CommitUnmountSegment(
             snapshot.segment_id, snapshot.client_id, metrics_dec_capacity);
