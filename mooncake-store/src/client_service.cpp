@@ -1662,160 +1662,11 @@ std::optional<StoreScatterTransferOperation> Client::SubmitScatterNative(
     return transfer_submitter_->submitNativeScatter(transfers, intent);
 }
 
-struct BatchGetOperation {
-    std::vector<Replica::Descriptor> replicas;
-    std::vector<std::vector<Slice>> batched_slices;
-    std::vector<size_t> key_indexes;
-    std::vector<bool> cache_used;  // Track which keys used cache
-    std::vector<TransferFuture> futures;
-};
-
-std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
-    const std::vector<std::string>& object_keys,
-    const std::vector<QueryResult>& query_results,
-    std::unordered_map<std::string, std::vector<Slice>>& slices) {
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.resize(object_keys.size());
-
-    auto select_replica = MakeReadReplicaSelector();
-    std::unordered_map<std::string, BatchGetOperation> seg_to_op_map{};
-    for (size_t i = 0; i < object_keys.size(); ++i) {
-        const auto& key = object_keys[i];
-        const auto& replica_list = query_results[i].replicas;
-        auto slices_it = slices.find(key);
-        if (slices_it == slices.end()) {
-            LOG(ERROR) << "Slices not found for key: " << key;
-            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-            continue;
-        }
-        Replica::Descriptor replica;
-        ErrorCode err =
-            select_replica(replica_list, slices_it->second, replica);
-        if (err != ErrorCode::OK) {
-            if (err == ErrorCode::INVALID_REPLICA) {
-                LOG(ERROR) << "no_complete_replicas_found key=" << key;
-            }
-            results[i] = tl::unexpected(err);
-            continue;
-        }
-        if (!replica.is_memory_replica()) {
-            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
-            continue;
-        }
-
-        // Check local hot cache and update replica descriptor if cache hit
-        bool cache_used = false;
-        if (hot_cache_ && replica.is_memory_replica()) {
-            cache_used = RedirectToHotCache(key, replica);
-        }
-
-        auto& memory_descriptor = replica.get_memory_descriptor();
-        if (memory_descriptor.buffer_descriptor.size_ == 0) {
-            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
-            continue;
-        }
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
-        auto seg = buffer_descriptor.transport_endpoint_;
-        auto& op = seg_to_op_map[seg];
-        op.replicas.emplace_back(replica);
-        op.batched_slices.emplace_back(slices_it->second);
-        op.key_indexes.emplace_back(i);
-        op.cache_used.emplace_back(cache_used);
-    }
-    for (auto& seg_to_op : seg_to_op_map) {
-        auto& op = seg_to_op.second;
-        auto future = transfer_submitter_->submit_batch(
-            op.replicas, op.batched_slices, TransferRequest::READ,
-            TransferIntent::kForegroundGet);
-        if (!future) {
-            for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
-                auto index = op.key_indexes[idx];
-                if (hot_cache_ && idx < op.cache_used.size() &&
-                    op.cache_used[idx]) {
-                    hot_cache_->ReleaseHotKey(object_keys[index]);
-                }
-                results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
-                LOG(ERROR) << "Failed to submit transfer operation for key: "
-                           << object_keys[index];
-            }
-            continue;
-        }
-        op.futures.emplace_back(std::move(*future));
-    }
-    for (auto& seg_to_op : seg_to_op_map) {
-        auto& op = seg_to_op.second;
-        if (op.futures.empty()) {
-            continue;
-        }
-        ErrorCode result = op.futures[0].get();
-        if (result != ErrorCode::OK) {
-            for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
-                auto index = op.key_indexes[idx];
-                // Release cache block even on failure (memcpy may have started)
-                if (hot_cache_ && idx < op.cache_used.size() &&
-                    op.cache_used[idx]) {
-                    hot_cache_->ReleaseHotKey(object_keys[index]);
-                }
-                results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
-                LOG(ERROR) << "Failed to submit transfer operation for key: "
-                           << object_keys[index];
-            }
-        } else {
-            for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
-                auto index = op.key_indexes[idx];
-                VLOG(1) << "Transfer completed successfully for key: "
-                        << object_keys[index];
-
-                // Release the cache block after transfer completes (memcpy is
-                // done)
-                if (hot_cache_ && idx < op.cache_used.size() &&
-                    op.cache_used[idx]) {
-                    hot_cache_->ReleaseHotKey(object_keys[index]);
-                }
-
-                auto checksum_result = VerifyObjectChecksum(
-                    object_keys[index], op.batched_slices[idx],
-                    calculate_total_size(op.replicas[idx]),
-                    query_results[index].object_checksum);
-                if (!checksum_result) {
-                    results[index] = tl::unexpected(checksum_result.error());
-                    continue;
-                }
-                results[index] = {};
-
-                // Frequency admission: only promote frequently accessed keys.
-                // Skip when cache was used (data served from local cache).
-                if (idx < op.replicas.size() &&
-                    idx < op.batched_slices.size() &&
-                    ShouldAdmitToHotCache(
-                        object_keys[index],
-                        idx < op.cache_used.size() && op.cache_used[idx])) {
-                    ProcessSlicesAsync(object_keys[index],
-                                       op.batched_slices[idx],
-                                       op.replicas[idx]);
-                }
-            }
-        }
-    }
-    // A successful transfer is only valid while its read lease is live.
-    // Check once all segment batches have completed, as in the regular
-    // BatchGet path, and preserve errors from validation or transfer.
-    auto now = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < object_keys.size(); ++i) {
-        if (results[i].has_value() && query_results[i].IsLeaseExpired(now)) {
-            LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
-                         << object_keys[i];
-            results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
-        }
-    }
-    return results;
-}
-
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
-    bool prefer_alloc_in_same_node) {
+    bool group_by_target) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -1838,15 +1689,19 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
         return results;
     }
-    if (prefer_alloc_in_same_node) {
-        return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
-    }
 
     // Collect all transfer operations for parallel execution
     // Tuple: (index, key, future, replica, cache_used)
     std::vector<std::tuple<size_t, std::string, TransferFuture,
                            Replica::Descriptor, bool>>
         pending_transfers;
+    struct TargetReadGroup {
+        std::vector<size_t> indexes;
+        std::vector<Replica::Descriptor> replicas;
+        std::vector<std::vector<Slice>> slices;
+        std::vector<bool> cache_used;
+    };
+    std::unordered_map<std::string, TargetReadGroup> target_groups;
     std::vector<DfsReadRequest> dfs_read_requests;
     std::vector<size_t> dfs_read_indices;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
@@ -1917,6 +1772,20 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 replica, slices_it->second, TransferRequest::READ,
                 contiguous_range->ptr, contiguous_range->size,
                 TransferIntent::kForegroundGet);
+        } else if (group_by_target && replica.is_memory_replica() &&
+                   CalculateSliceSize(slices_it->second) ==
+                       replica.get_memory_descriptor()
+                           .buffer_descriptor.size_) {
+            // A size mismatch would fail the whole group in submit_batch, so
+            // such a key stays on the per-key path and fails alone.
+            auto& group =
+                target_groups[replica.get_memory_descriptor()
+                                  .buffer_descriptor.transport_endpoint_];
+            group.indexes.push_back(i);
+            group.replicas.push_back(replica);
+            group.slices.push_back(slices_it->second);
+            group.cache_used.push_back(cache_used);
+            continue;
         } else {
             future = transfer_submitter_->submit(
                 replica, slices_it->second, TransferRequest::READ, nullptr, 0,
@@ -1938,6 +1807,30 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         pending_transfers.emplace_back(i, key, std::move(*future), replica,
                                        cache_used);
+    }
+
+    for (auto& [endpoint, group] : target_groups) {
+        auto future = transfer_submitter_->submit_batch(
+            group.replicas, group.slices, TransferRequest::READ,
+            TransferIntent::kForegroundGet);
+        for (size_t j = 0; j < group.indexes.size(); ++j) {
+            const size_t index = group.indexes[j];
+            const auto& key = object_keys[index];
+            if (!future) {
+                if (hot_cache_ && group.cache_used[j]) {
+                    hot_cache_->ReleaseHotKey(key);
+                }
+                LOG(ERROR) << "Failed to submit batch transfer to " << endpoint
+                           << " for key: " << key;
+                results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                continue;
+            }
+            pending_transfers.emplace_back(index, key, future->share(),
+                                           group.replicas[j],
+                                           group.cache_used[j]);
+        }
+        VLOG(1) << "Submitted batch read of " << group.indexes.size()
+                << " keys from " << endpoint;
     }
 
     if (!dfs_read_requests.empty()) {
@@ -2935,7 +2828,8 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
     }
 }
 
-void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
+void Client::SubmitTransfers(std::vector<PutOperation>& ops,
+                             bool group_by_target) {
     if (std::all_of(ops.begin(), ops.end(),
                     [](const PutOperation& op) { return op.IsResolved(); })) {
         return;
@@ -2952,6 +2846,13 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         }
         return;
     }
+
+    struct TargetWriteGroup {
+        std::vector<Replica::Descriptor> replicas;
+        std::vector<std::vector<Slice>> slices;
+        std::vector<PutOperation*> ops;
+    };
+    std::unordered_map<std::string, TargetWriteGroup> target_groups;
 
     for (auto& op : ops) {
         // Skip operations that already failed in previous stages
@@ -2984,6 +2885,19 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         for (size_t replica_idx = 0; replica_idx < op.replicas.size();
              ++replica_idx) {
             const auto& replica = op.replicas[replica_idx];
+            if (group_by_target && replica.is_memory_replica() &&
+                CalculateSliceSize(op.slices) ==
+                    replica.get_memory_descriptor().buffer_descriptor.size_) {
+                // A size mismatch would fail the whole group in submit_batch,
+                // so such a replica stays on the per-key path and fails alone.
+                auto& group =
+                    target_groups[replica.get_memory_descriptor()
+                                      .buffer_descriptor.transport_endpoint_];
+                group.replicas.push_back(replica);
+                group.slices.push_back(op.slices);
+                group.ops.push_back(&op);
+                continue;
+            }
             if (replica.is_memory_replica() || replica.is_nof_replica()) {
                 const auto replica_type = replica.is_memory_replica()
                                               ? ReplicaType::MEMORY
@@ -3028,6 +2942,25 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
 
         VLOG(1) << "Submitted " << op.pending_transfers.size()
                 << " transfers for key " << op.key;
+    }
+
+    for (auto& [endpoint, group] : target_groups) {
+        auto submit_result = transfer_submitter_->submit_batch(
+            group.replicas, group.slices, TransferRequest::WRITE,
+            TransferIntent::kUnspecified);
+        for (auto* op : group.ops) {
+            if (!submit_result) {
+                op->transfer_summary.RecordFailure(ReplicaType::MEMORY,
+                                                   ErrorCode::TRANSFER_FAIL);
+                op->AppendFailureContext("Failed to submit batch transfer to " +
+                                         endpoint);
+                continue;
+            }
+            op->pending_transfers.emplace_back(ReplicaType::MEMORY,
+                                               submit_result->share());
+        }
+        VLOG(1) << "Submitted batch write of " << group.ops.size()
+                << " replicas to " << endpoint;
     }
 }
 
@@ -3660,112 +3593,6 @@ void Client::StageWriteBuffersForRemoteReplicas(
     }
 }
 
-std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
-    std::vector<PutOperation>& ops, bool is_upsert) {
-    auto t0 = std::chrono::steady_clock::now();
-    std::unordered_map<std::string, PutOperation> seg_to_ops{};
-    for (auto& op : ops) {
-        if (op.IsResolved()) {
-            continue;
-        }
-        if (op.replicas.empty()) {
-            op.SetError(ErrorCode::INTERNAL_ERROR,
-                        "No replicas available for transfer");
-            continue;
-        }
-        auto replica = op.replicas[0];
-        if (!replica.is_memory_replica()) {
-            op.SetError(ErrorCode::INVALID_PARAMS, "only memory is supported.");
-            continue;
-        }
-        auto& memory_descriptor = replica.get_memory_descriptor();
-        if (memory_descriptor.buffer_descriptor.size_ == 0) {
-            op.SetError(ErrorCode::INVALID_PARAMS, "buffer size is 0.");
-            continue;
-        }
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
-        auto seg = buffer_descriptor.transport_endpoint_;
-        if (seg_to_ops.find(seg) == seg_to_ops.end()) {
-            seg_to_ops.emplace(seg, PutOperation(op.key, op.slices));
-        }
-        // multiple replica-slices
-        seg_to_ops.at(seg).batched_slices.emplace_back(op.slices);
-        seg_to_ops.at(seg).replicas.emplace_back(replica);
-    }
-    std::vector<PutOperation> merged_ops;
-    merged_ops.reserve(seg_to_ops.size());
-    for (auto& seg_to_op : seg_to_ops) {
-        auto& op = seg_to_op.second;
-        bool all_transfers_submitted = true;
-        std::string failure_context;
-        merged_ops.emplace_back(op.key, op.slices);
-        auto& merged_op = merged_ops.back();
-        merged_op.replicas = op.replicas;
-        merged_op.transfer_summary.allocated_memory_replicas = 1;
-        auto submit_result = transfer_submitter_->submit_batch(
-            op.replicas, op.batched_slices, TransferRequest::WRITE,
-            TransferIntent::kUnspecified);
-        if (!submit_result) {
-            failure_context = "Failed to submit batch transfer";
-            all_transfers_submitted = false;
-        } else {
-            merged_op.pending_transfers.emplace_back(
-                ReplicaType::MEMORY, std::move(submit_result.value()));
-        }
-        if (!all_transfers_submitted) {
-            LOG(ERROR) << "Transfer submission failed for key " << op.key
-                       << ": " << failure_context;
-            merged_op.transfer_summary.RecordFailure(ReplicaType::MEMORY,
-                                                     ErrorCode::TRANSFER_FAIL);
-            merged_op.failure_context = failure_context;
-            merged_op.pending_transfers.clear();
-        } else {
-            VLOG(1) << "Successfully submitted "
-                    << merged_op.pending_transfers.size()
-                    << " transfers for key " << merged_ops.back().key;
-        }
-    }
-    WaitForTransfers(merged_ops);
-    for (auto& op : merged_ops) {
-        auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
-        auto seg = buffer_descriptor.transport_endpoint_;
-        seg_to_ops.at(seg).transfer_summary = op.transfer_summary;
-        seg_to_ops.at(seg).failure_context = op.failure_context;
-    }
-    for (auto& op : ops) {
-        if (op.IsResolved()) {
-            continue;
-        }
-        auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
-        auto seg = buffer_descriptor.transport_endpoint_;
-        op.transfer_summary.successful_memory_transfers =
-            seg_to_ops.at(seg).transfer_summary.successful_memory_transfers > 0
-                ? 1
-                : 0;
-        op.transfer_summary.failed_memory_transfers =
-            seg_to_ops.at(seg).transfer_summary.failed_memory_transfers > 0 ? 1
-                                                                            : 0;
-        op.transfer_summary.first_error =
-            seg_to_ops.at(seg).transfer_summary.first_error;
-        op.failure_context = seg_to_ops.at(seg).failure_context;
-    }
-    SubmitDfsWrites(ops);
-    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - t0)
-                  .count();
-    if (metrics_) {
-        metrics_->transfer_metric.batch_put_latency_us.observe(us);
-    }
-    if (is_upsert) {
-        FinalizeBatchUpsert(ops);
-    } else {
-        FinalizeBatchPut(ops);
-    }
-    return CollectResults(ops);
-}
-
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
@@ -3776,7 +3603,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
-    const ReplicateConfig& config, const WriteBufferStager& stager) {
+    const ReplicateConfig& config, const WriteBufferStager& stager,
+    bool group_by_target) {
     if (!config.ValidSessionIds(keys.size()) ||
         !config.HasValidKeyHints(keys.size())) {
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -3793,15 +3621,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
         }
-        StartBatchPut(ops, client_cfg);
-        StageWriteBuffersForRemoteReplicas(ops, stager);
-        return BatchWriteWhenPreferSameNode(ops, false);
     }
     StartBatchPut(ops, client_cfg);
     StageWriteBuffersForRemoteReplicas(ops, stager);
 
     auto t0 = std::chrono::steady_clock::now();
-    SubmitTransfers(ops);
+    SubmitTransfers(ops,
+                    group_by_target || client_cfg.prefer_alloc_in_same_node);
     WaitForTransfers(ops);
     SubmitDfsWrites(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -3827,7 +3653,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
 std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
-    const ReplicateConfig& config, const WriteBufferStager& stager) {
+    const ReplicateConfig& config, const WriteBufferStager& stager,
+    bool group_by_target) {
     if (!config.ValidSessionIds(keys.size()) ||
         !config.HasValidKeyHints(keys.size())) {
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -3844,15 +3671,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
         }
-        StartBatchUpsert(ops, client_cfg);
-        StageWriteBuffersForRemoteReplicas(ops, stager);
-        return BatchWriteWhenPreferSameNode(ops, true);
     }
 
     StartBatchUpsert(ops, client_cfg);
     StageWriteBuffersForRemoteReplicas(ops, stager);
     auto t0 = std::chrono::steady_clock::now();
-    SubmitTransfers(ops);
+    SubmitTransfers(ops,
+                    group_by_target || client_cfg.prefer_alloc_in_same_node);
     WaitForTransfers(ops);
     SubmitDfsWrites(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(

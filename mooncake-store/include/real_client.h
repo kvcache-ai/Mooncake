@@ -181,6 +181,9 @@ class RealClient : public PyClient {
      * @param all_buffers Vector of vectors of pointers to the pre-allocated
      * buffers
      * @param all_sizes Vector of vectors of sizes of the buffers
+     * @param prefer_alloc_in_same_node Group exact-size memory replicas on
+     * one segment into one transfer. A size mismatch stays on the per-key
+     * path. Ascend and ascend_direct group even when this flag is false.
      * @return Vector of integers, where each element is the number of bytes
      * read on success, or a negative value on error
      * @note The buffer addresses must resolve to Store-managed registered
@@ -191,7 +194,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool prefer_alloc_in_same_node);
 
     /**
      * @brief Put object data directly from a pre-allocated buffer
@@ -728,7 +731,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool prefer_alloc_in_same_node);
 
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,

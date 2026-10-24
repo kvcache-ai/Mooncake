@@ -323,6 +323,14 @@ class TransferFuture {
      */
     TransferStrategy strategy() const;
 
+    /**
+     * @brief Create another future that observes the same operation
+     *
+     * Used when one submitted batch carries several keys, so each key can
+     * wait on it independently.
+     */
+    TransferFuture share() const { return TransferFuture(state_); }
+
    private:
     std::shared_ptr<OperationState> state_;
 };

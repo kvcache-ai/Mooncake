@@ -262,9 +262,17 @@ tl::expected<std::vector<Slice>, ErrorCode> StageWriteSlices(
     return staged_slices;
 }
 
+// prefer_alloc_in_same_node on the multi-buffer APIs selects group-by-target.
+// Ascend protocols group by default when the caller leaves that flag false.
+bool GroupMultiBufferTransfers(const std::string &protocol,
+                               bool prefer_alloc_in_same_node) {
+    return prefer_alloc_in_same_node || protocol == "ascend" ||
+           protocol == "ascend_direct";
+}
+
 using BatchWriteMethod = std::vector<tl::expected<void, ErrorCode>> (Client::*)(
     const std::vector<ObjectKey> &, std::vector<std::vector<Slice>> &,
-    const ReplicateConfig &, const Client::WriteBufferStager &);
+    const ReplicateConfig &, const Client::WriteBufferStager &, bool);
 
 std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     const std::shared_ptr<Client> &client, const std::vector<std::string> &keys,
@@ -293,7 +301,10 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
             return StageWriteSlices(allocator, slices, staging_handles);
         };
     }
-    return ((*client).*write)(keys, batched_slices.value(), config, stager);
+    const bool group_by_target = GroupMultiBufferTransfers(
+        client->GetProtocol(), config.prefer_alloc_in_same_node);
+    return ((*client).*write)(keys, batched_slices.value(), config, stager,
+                              group_by_target);
 }
 
 // Backing slot for RealClient::SetNofRuntimeFactoryForTesting.
@@ -1311,10 +1322,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 if (!split_limit.has_value() || cap < *split_limit) {
                     split_limit = cap;
                 }
-                LOG(INFO) << "Agent-mode store chunk cap: " << cap
-                          << " bytes across "
+                LOG(INFO) << "Agent mode splits the store segment of "
+                          << global_segment_size << " bytes across "
                           << ContextManager::getInstance().getDeviceCount()
-                          << " device(s)";
+                          << " devices, at most " << cap
+                          << " bytes on each device";
             }
         }
 #endif
@@ -8194,6 +8206,8 @@ RealClient::batch_get_into_multi_buffers_internal(
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
+    const bool group_by_target = GroupMultiBufferTransfers(
+        client_->GetProtocol(), prefer_alloc_in_same_node);
 
     if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size()) {
         LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
@@ -8366,9 +8380,8 @@ RealClient::batch_get_into_multi_buffers_internal(
             batch_slices[op.key] = op.slices;
         }
 
-        auto batch_get_results =
-            client_->BatchGet(batch_keys, batch_query_results, batch_slices,
-                              prefer_alloc_in_same_node);
+        auto batch_get_results = client_->BatchGet(
+            batch_keys, batch_query_results, batch_slices, group_by_target);
 
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
             const auto &op = valid_operations[dedup.primaries[j]];
@@ -8563,9 +8576,9 @@ RealClient::batch_get_into_multi_buffers_internal(
             }
 
             if (!disk_batch_keys.empty()) {
-                auto disk_results = client_->BatchGet(
-                    disk_batch_keys, disk_batch_qrs, disk_batch_slices,
-                    prefer_alloc_in_same_node);
+                auto disk_results =
+                    client_->BatchGet(disk_batch_keys, disk_batch_qrs,
+                                      disk_batch_slices, group_by_target);
 
                 for (size_t di = 0; di < disk_key_order.size(); ++di) {
                     const auto &key = disk_key_order[di];
