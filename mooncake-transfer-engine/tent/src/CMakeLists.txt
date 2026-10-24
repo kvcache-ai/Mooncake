@@ -42,13 +42,22 @@ if(USE_HYLINK)
   target_compile_definitions(tent_interface INTERFACE USE_HYLINK)
 endif()
 
-# GDS
+# GDS. With USE_XPU_GDS, cufile.h and libcufile.so come from a cuFile-compatible
+# library for Intel XPU; pass -DCUFILE_INCLUDE=<dir> and -DCUFILE_LIB=<path>
+# when they are outside the default search paths.
 find_library(CUFILE_LIB cufile HINTS ${CUDAToolkit_LIBRARY_DIR})
 find_path(CUFILE_INCLUDE cufile.h HINTS ${CUDAToolkit_INCLUDE_DIRS})
-if(USE_CUDA
-   AND CUDAToolkit_FOUND
-   AND CUFILE_LIB
-   AND CUFILE_INCLUDE)
+if(USE_XPU_GDS AND NOT (CUFILE_LIB AND CUFILE_INCLUDE))
+  message(
+    FATAL_ERROR
+      "USE_XPU_GDS=ON requires cufile.h and libcufile.so from a "
+      "cuFile-compatible library (found CUFILE_INCLUDE='${CUFILE_INCLUDE}', "
+      "CUFILE_LIB='${CUFILE_LIB}'). Pass -DCUFILE_INCLUDE=<dir> and "
+      "-DCUFILE_LIB=<path/to/libcufile.so>.")
+endif()
+if(CUFILE_LIB
+   AND CUFILE_INCLUDE
+   AND ((USE_CUDA AND CUDAToolkit_FOUND) OR USE_XPU_GDS))
   message(STATUS "GDS: Enabled")
   target_compile_definitions(tent_interface INTERFACE USE_GDS)
   target_include_directories(tent_interface INTERFACE ${CUFILE_INCLUDE})
