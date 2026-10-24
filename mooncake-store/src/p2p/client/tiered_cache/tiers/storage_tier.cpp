@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <exception>
 
 #include "p2p/client/tiered_cache/tiers/storage_tier.h"
 #include "p2p/client/tiered_cache/tiered_backend.h"
@@ -9,6 +10,208 @@
 #include "utils.h"
 
 namespace mooncake {
+
+namespace {
+
+tl::expected<v1::BucketStorageConfig, ErrorCode> ParseStorageConfig(
+    const Json::Value& tier_config) {
+    auto backend_type =
+        GetEnvStringOr("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                       "bucket_storage_backend");
+    if (backend_type != "bucket_storage_backend" &&
+        backend_type != "file_per_key_storage_backend" &&
+        backend_type != "offset_allocator_storage_backend") {
+        LOG(ERROR) << "Unknown storage backend.";
+        backend_type = "bucket_storage_backend";
+    }
+    if (tier_config.isMember("storage_backend_type")) {
+        const auto type = tier_config["storage_backend_type"].asString();
+        if (type == "bucket_storage_backend" ||
+            type == "file_per_key_storage_backend") {
+            backend_type = type;
+        } else {
+            LOG(WARNING) << "Unknown storage_backend_type: " << type
+                         << ", keeping current value";
+        }
+    }
+    if (backend_type != "bucket_storage_backend") {
+        LOG(ERROR) << "StorageTier only supports bucket storage backend. "
+                      "Check MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR "
+                      "or the storage_backend_type field in tier config.";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    v1::BucketStorageConfig config;
+    config.storage_filepath = GetEnvStringOr(
+        "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
+    config.total_keys_limit = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", config.total_keys_limit);
+    config.total_size_limit = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", config.total_size_limit);
+    config.bucket_keys_limit = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", config.bucket_keys_limit);
+    config.bucket_size_limit = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", config.bucket_size_limit);
+
+    if (tier_config.isMember("storage_filepath")) {
+        config.storage_filepath = tier_config["storage_filepath"].asString();
+    }
+    if (tier_config.isMember("total_size_limit")) {
+        const auto& node = tier_config["total_size_limit"];
+        if (node.isString()) {
+            config.total_size_limit =
+                static_cast<int64_t>(string_to_byte_size(node.asString()));
+        } else if (node.isIntegral()) {
+            config.total_size_limit = node.asInt64();
+        } else {
+            LOG(WARNING) << "total_size_limit has unexpected type, ignored";
+        }
+    }
+    if (tier_config.isMember("bucket_size_limit")) {
+        const auto& node = tier_config["bucket_size_limit"];
+        if (node.isString()) {
+            config.bucket_size_limit =
+                static_cast<int64_t>(string_to_byte_size(node.asString()));
+        } else if (node.isIntegral()) {
+            config.bucket_size_limit = node.asInt64();
+        } else {
+            LOG(WARNING) << "bucket_size_limit has unexpected type, ignored";
+        }
+    }
+    if (tier_config.isMember("bucket_keys_limit")) {
+        const auto& node = tier_config["bucket_keys_limit"];
+        if (node.isIntegral()) {
+            config.bucket_keys_limit = node.asInt64();
+        } else {
+            LOG(WARNING) << "bucket_keys_limit has unexpected type, ignored";
+        }
+    }
+    if (config.bucket_keys_limit <= 0 || config.bucket_size_limit <= 0) {
+        LOG(ERROR) << "Bucket size and key limits must be greater than zero";
+        // The previous backend factory surfaced invalid bucket limits through
+        // StorageTier::Init's INTERNAL_ERROR path.
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return config;
+}
+
+}  // namespace
+
+namespace v1 {
+
+tl::expected<int64_t, ErrorCode> SelectBucketForEviction(
+    const BucketStorageBackend& backend) {
+    const auto buckets = backend.GetBucketStats();
+    if (buckets.empty()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    constexpr float kFragmentationThreshold = 0.5f;
+    int64_t best_fragmented = -1;
+    for (const auto& bucket : buckets) {
+        if (bucket.total_keys == 0) continue;
+        const float fragmentation =
+            1.0f - static_cast<float>(bucket.valid_keys) / bucket.total_keys;
+        if (fragmentation > kFragmentationThreshold &&
+            (best_fragmented == -1 || bucket.bucket_id < best_fragmented)) {
+            best_fragmented = bucket.bucket_id;
+        }
+    }
+    if (best_fragmented != -1) {
+        LOG(INFO) << "Selected fragmented bucket " << best_fragmented
+                  << " for eviction";
+        return best_fragmented;
+    }
+    const int64_t oldest_bucket = buckets.front().bucket_id;
+    LOG(INFO) << "Selected oldest bucket " << oldest_bucket << " for eviction";
+    return oldest_bucket;
+}
+
+}  // namespace v1
+
+void StorageTier::CleanStoragePath() {
+    namespace fs = std::filesystem;
+    // This is best-effort cleanup and is invoked from StorageTier's destructor,
+    // which is implicitly noexcept. Wrap the whole body so that no exception
+    // (filesystem_error from iteration, bad_alloc, ...) can escape into the
+    // destructor and trip std::terminate().
+    try {
+        const std::string& path = storage_config_.storage_filepath;
+        if (path.empty()) {
+            LOG(WARNING) << "CleanStoragePath: storage path is empty, skipping";
+            return;
+        }
+
+        // Refuse to wipe dangerous paths. Requiring an absolute, non-root
+        // directory rejects "", ".", ".." and any relative path, so a
+        // misconfigured storage_filepath cannot wipe the current working
+        // directory, its parent, or the filesystem root.
+        const fs::path normalized = fs::path(path).lexically_normal();
+        if (!normalized.is_absolute() || normalized == normalized.root_path()) {
+            LOG(ERROR) << "CleanStoragePath: refusing to clean unsafe path "
+                          "(must be an absolute, non-root directory): "
+                       << path;
+            return;
+        }
+
+        std::error_code ec;
+        const bool exists = fs::exists(normalized, ec);
+        if (ec) {
+            LOG(ERROR) << "CleanStoragePath: failed to stat " << path
+                       << ", error: " << ec.message();
+            return;
+        }
+        if (!exists) {
+            return;
+        }
+        const bool is_directory = fs::is_directory(normalized, ec);
+        if (ec) {
+            LOG(ERROR) << "CleanStoragePath: failed to inspect " << path
+                       << ", error: " << ec.message();
+            return;
+        }
+        if (!is_directory) {
+            LOG(WARNING) << "CleanStoragePath: not a directory, skipping: "
+                         << path;
+            return;
+        }
+
+        // Snapshot entries first so removal does not invalidate the iterator.
+        // Use the non-throwing increment(ec) overload: a range-based for loop
+        // would call the throwing operator++(), which ignores the ec passed to
+        // the constructor and raises filesystem_error if the directory changes
+        // mid-traversal.
+        std::vector<fs::path> entries;
+        for (fs::directory_iterator it(normalized, ec), end; !ec && it != end;
+             it.increment(ec)) {
+            entries.push_back(it->path());
+        }
+        if (ec) {
+            LOG(ERROR) << "CleanStoragePath: failed to iterate " << path
+                       << ", error: " << ec.message();
+        }
+
+        size_t removed = 0;
+        for (const auto& entry : entries) {
+            std::error_code rm_ec;
+            fs::remove_all(entry, rm_ec);
+            if (rm_ec) {
+                LOG(ERROR) << "CleanStoragePath: failed to remove " << entry
+                           << ", error: " << rm_ec.message();
+            } else {
+                ++removed;
+            }
+        }
+        LOG(INFO) << "CleanStoragePath: wiped storage path " << path
+                  << ", removed " << removed << " top-level entries";
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "CleanStoragePath: unexpected exception, skipping: "
+                   << e.what();
+    } catch (...) {
+        LOG(ERROR) << "CleanStoragePath: unexpected non-standard exception, "
+                      "skipping";
+    }
+}
 
 StorageTier::StorageTier(UUID tier_id, const std::vector<std::string>& tags,
                          size_t capacity)
@@ -73,7 +276,7 @@ StorageTier::~StorageTier() {
     // worker threads stop and file handles close, releasing the inodes. Scoped
     // to the P2P path only (centralized FileStorage is unaffected).
     if (storage_backend_) {
-        storage_backend_->CleanStoragePath();
+        CleanStoragePath();
         storage_backend_.reset();
     }
 }
@@ -89,20 +292,11 @@ tl::expected<void, ErrorCode> StorageTier::Init(
     static_cast<void>(engine);
     backend_ = backend;
     try {
-        {
-            auto fs_config = FileStorageConfig::FromEnvironment();
-            if (!tier_config.isNull()) {
-                fs_config.MergeFromJson(tier_config);
-            }
-            // StorageTier only supports bucket backend
-            if (fs_config.storage_backend_type != StorageBackendType::kBucket) {
-                LOG(ERROR)
-                    << "StorageTier only supports bucket storage backend. "
-                       "Check MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR "
-                       "or the storage_backend_type field in tier config.";
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            }
+        auto config = ParseStorageConfig(tier_config);
+        if (!config) {
+            return tl::make_unexpected(config.error());
         }
+        storage_config_ = std::move(config.value());
 
         if (!tier_config.isNull()) {
             if (tier_config.isMember("staging_buffer_capacity")) {
@@ -141,19 +335,14 @@ tl::expected<void, ErrorCode> StorageTier::Init(
             segment_name, reinterpret_cast<uintptr_t>(staging_memory_.get()),
             staging_buffer_capacity_, segment_name);
 
-        auto backend_res = CreateStorageBackend(tier_config);
-        if (!backend_res) {
-            LOG(ERROR) << "Failed to create underlying storage backend: "
-                       << backend_res.error();
-            return tl::make_unexpected(backend_res.error());
-        }
-        storage_backend_ = backend_res.value();
+        storage_backend_ =
+            std::make_shared<v1::BucketStorageBackend>(storage_config_);
 
         // P2P tiered cache treats SSD as a purely ephemeral tier: wipe any
         // leftover contents from a previous run on startup, before the backend
         // scans the path. This is scoped to the P2P path only; the centralized
         // FileStorage path keeps its persist/recover-across-restart behavior.
-        storage_backend_->CleanStoragePath();
+        CleanStoragePath();
 
         auto init_res = storage_backend_->Init();
         if (!init_res) {
@@ -355,7 +544,7 @@ tl::expected<void, ErrorCode> StorageTier::FlushInternal() {
     }
 
     // 2. IO without lock
-    auto res = storage_backend_->BatchOffload(batch_to_write, nullptr);
+    auto res = storage_backend_->BatchOffload(batch_to_write);
 
     // 3. Finalize under lock: update state and notify waiters
     {
@@ -363,6 +552,11 @@ tl::expected<void, ErrorCode> StorageTier::FlushInternal() {
 
         if (!res) {
             LOG(ERROR) << "Flush failed: " << res.error();
+            // Known V1 limitation: physical space/quota exhaustion does not
+            // trigger bucket reclaim here. Deleted keys lower live usage but
+            // leave files behind, so Allocate may never trigger eviction and
+            // these pending writes can eventually exhaust the staging pool.
+            // Intentionally deferred: retire V1 after V2 validation/deployment.
             // Restore pending entries on failure
             for (auto& kv : snapshot) {
                 kv.second->SetFlushing(false);
@@ -391,7 +585,7 @@ size_t StorageTier::GetCapacity() const {
     }
     // Fallback to storage backend config
     if (storage_backend_) {
-        return storage_backend_->file_storage_config_.total_size_limit;
+        return storage_config_.total_size_limit;
     }
     return 1024ULL * 1024 * 1024 * 1024;  // 1TB fallback
 }
@@ -412,14 +606,7 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    // Try to cast to BucketStorageBackend
-    auto* bucket_backend =
-        dynamic_cast<BucketStorageBackend*>(storage_backend_.get());
-    if (!bucket_backend) {
-        LOG(WARNING) << "Storage backend is not BucketStorageBackend, "
-                        "bucket eviction not supported";
-        return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
-    }
+    auto* bucket_backend = storage_backend_.get();
 
     size_t total_freed = 0;
     constexpr int MAX_EVICTION_ATTEMPTS = 10;  // Prevent infinite loop
@@ -427,7 +614,7 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
 
     // If target_free_size is 0, evict just one bucket
     if (target_free_size == 0) {
-        auto select_res = bucket_backend->SelectBucketForEviction();
+        auto select_res = v1::SelectBucketForEviction(*bucket_backend);
         if (!select_res) {
             LOG(ERROR) << "Failed to select bucket for eviction: "
                        << select_res.error();
@@ -470,7 +657,7 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
 
     // Loop until we free enough space or run out of buckets
     while (total_freed < target_free_size && attempts < MAX_EVICTION_ATTEMPTS) {
-        auto select_res = bucket_backend->SelectBucketForEviction();
+        auto select_res = v1::SelectBucketForEviction(*bucket_backend);
         if (!select_res) {
             // No more buckets to evict
             if (total_freed > 0) {

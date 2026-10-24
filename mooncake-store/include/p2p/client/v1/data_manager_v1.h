@@ -1,5 +1,9 @@
 #pragma once
 
+// Temporary implementation retained for the V1 rollout and V2 validation.
+// Remove this class and its V1-only implementation/tests once V2 is stable and
+// has replaced V1 in production; retain the shared DataManager interface.
+
 // DataManagerV1: the original TieredBackend-backed implementation, moved here
 // unchanged apart from (a) implementing the `DataManager` interface and (b) the
 // three defect fixes covered by the regression tests at the end of
