@@ -309,12 +309,63 @@ class HAIntegrationTest : public ::testing::Test {
         return c;
     }
 
+    class ScopedBufferRegistration {
+       public:
+        explicit ScopedBufferRegistration(P2PClientService& client)
+            : client_(client) {}
+
+        ScopedBufferRegistration(const ScopedBufferRegistration&) = delete;
+        ScopedBufferRegistration& operator=(const ScopedBufferRegistration&) =
+            delete;
+
+        ~ScopedBufferRegistration() {
+            if (addr_ == nullptr) {
+                return;
+            }
+            auto result = client_.unregisterLocalMemory(addr_);
+            if (!result) {
+                LOG(ERROR) << "HA test buffer unregistration failed, addr="
+                           << addr_ << ", error=" << result.error();
+                ADD_FAILURE() << "Failed to unregister HA test buffer: "
+                              << result.error();
+            }
+        }
+
+        tl::expected<void, ErrorCode> Register(void* addr, size_t size) {
+            // Leave empty-buffer validation to the operation under test.
+            if (size == 0) {
+                return {};
+            }
+            auto result = client_.RegisterLocalMemory(addr, size, "*");
+            if (!result) {
+                LOG(ERROR) << "HA test buffer registration failed, addr="
+                           << addr << ", size=" << size
+                           << ", error=" << result.error();
+                return result;
+            }
+            addr_ = addr;
+            return {};
+        }
+
+       private:
+        P2PClientService& client_;
+        void* addr_ = nullptr;
+    };
+
     static tl::expected<void, ErrorCode> PutData(
         std::shared_ptr<P2PClientService>& client, const std::string& key,
         const std::string& data,
         const P2PWriteRouteConfig& config = LocalWriteConfig()) {
+        // Reverse remote writes read this buffer through the caller's TE.
+        ScopedBufferRegistration registration(*client);
+        auto registered =
+            registration.Register(const_cast<char*>(data.data()), data.size());
+        if (!registered) {
+            return tl::unexpected(registered.error());
+        }
         std::vector<Slice> slices;
         slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+        // Put waits for its task before the registration leaves scope.
         return client->Put(key, slices, config);
     }
 
@@ -322,6 +373,12 @@ class HAIntegrationTest : public ::testing::Test {
         std::shared_ptr<P2PClientService>& client, const std::string& key,
         size_t buf_size) {
         std::vector<char> buf(buf_size, 0);
+        // Destroy the registration before buf, including on error returns.
+        ScopedBufferRegistration registration(*client);
+        auto registered = registration.Register(buf.data(), buf.size());
+        if (!registered) {
+            return tl::unexpected(registered.error());
+        }
         auto result = client->Get(key, {(void*)buf.data()}, {buf.size()});
         if (!result.has_value()) {
             return tl::unexpected(result.error());
