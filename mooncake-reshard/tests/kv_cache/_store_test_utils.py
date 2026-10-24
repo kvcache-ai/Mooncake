@@ -63,6 +63,53 @@ def _reference(layout, layer_ids, head_start, head_count, component):
     return result
 
 
+class MemoryNative:
+    def __init__(self):
+        self.parts = {}
+        self.range_reads = 0
+
+    def batch_put_parts_from(self, keys, index, count, manifest, pointers, sizes):
+        for key, ptrs, lengths in zip(keys, pointers, sizes):
+            _, parts = self.parts.setdefault(key, (manifest, [None] * count))
+            parts[index] = b"".join(
+                ctypes.string_at(p, n) for p, n in zip(ptrs, lengths)
+            )
+        return [0] * len(keys)
+
+    def prepare_get_into_ranges_template(self, dst, src, sizes):
+        return (dst, src, sizes)
+
+    def prepare_get_parts_snapshot(self, keys, manifests, counts):
+        result = {}
+        for key, ref, count in zip(keys, manifests, counts):
+            entry = self.parts.get(key)
+            if (
+                entry
+                and entry[0] == ref
+                and len(entry[1]) == count
+                and all(v is not None for v in entry[1])
+            ):
+                result.update(
+                    {key + f"\x1fp{i}": value for i, value in enumerate(entry[1])}
+                )
+        return result
+
+    def get_into_ranges_from_template(
+        self, snapshot, templates, buffers, indices, keys, deltas, **kwargs
+    ):
+        self.range_reads += 1
+        result = []
+        for (dst, src, sizes), i, key, delta in zip(templates, indices, keys, deltas):
+            data = snapshot.get(key)
+            ok = data is not None
+            if ok:
+                for d, s, n in zip(dst, src, sizes):
+                    assert s + n <= len(data)
+                    ctypes.memmove(buffers[i] + delta + d, data[s : s + n], n)
+            result.append(ok)
+        return result
+
+
 def memory_binding(
     placement,
     participant,
