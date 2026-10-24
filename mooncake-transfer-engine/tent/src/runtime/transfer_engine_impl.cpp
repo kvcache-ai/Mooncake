@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <memory>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -81,15 +82,65 @@ struct Batch {
     size_t reclaim_failures{0};
     bool reclaim_abandoned{false};
 
-    struct SubmitHook {
+    // One record per submitTransfer. RDMA last-slice success publishes
+    // `finished` so getBatchStatus can skip the owner walk (TE #4199) while
+    // maybeFireSubmitHooks still fires per interval (TENT #4001).
+    struct SubmitInterval {
         size_t start_task_id{0};
         size_t end_task_id{0};  // [start, end)
+        uint64_t expected_owners{0};
+        std::atomic<uint64_t> finished{0};
+        bool has_notify{false};
         Notification notifi;
         bool fired{false};
         std::unordered_set<SegmentID> targets;
     };
-    std::vector<SubmitHook> submit_hooks;
+    std::vector<std::unique_ptr<SubmitInterval>> submit_intervals;
+    // False once any owner needs a foreground poll (TCP/NVLink/staging/queue/
+    // cancel). RDMA-only batches keep the PR #4199 in-flight shortcut.
+    bool counter_eligible{true};
 };
+
+uint64_t countNonDerivedOwners(const Batch* batch, size_t start, size_t end) {
+    uint64_t n = 0;
+    const size_t last = std::min(end, batch->task_list.size());
+    for (size_t tid = start; tid < last; ++tid) {
+        if (!batch->task_list[tid].derived) ++n;
+    }
+    return n;
+}
+
+bool intervalOwnersComplete(const Batch::SubmitInterval& interval) {
+    if (interval.expected_owners == 0) return true;
+    return interval.finished.load(std::memory_order_acquire) >=
+           interval.expected_owners;
+}
+
+bool allSubmitIntervalsComplete(const Batch* batch) {
+    if (batch->submit_intervals.empty()) return false;
+    for (const auto& interval : batch->submit_intervals) {
+        if (!intervalOwnersComplete(*interval)) return false;
+    }
+    return true;
+}
+
+Batch::SubmitInterval* intervalForTask(Batch* batch, size_t task_id) {
+    if (!batch) return nullptr;
+    for (auto& interval : batch->submit_intervals) {
+        if (task_id >= interval->start_task_id &&
+            task_id < interval->end_task_id) {
+            return interval.get();
+        }
+    }
+    return nullptr;
+}
+
+void bindIntervalPublishCounter(Transport::SubBatchRef sub_batch,
+                                Batch::SubmitInterval* interval) {
+    if (!sub_batch) return;
+    sub_batch->publish_finished_counter =
+        interval ? &interval->finished : nullptr;
+}
 
 struct PreservedTentConfigOverrides {
     std::optional<std::string> metadata_type;
@@ -2431,6 +2482,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
                          << printRequest(merged_request);
+            noteBatchPollRequirement(batch, UNSPEC, false);
             merged_task_id_map[merged_task_id] = task;
             continue;
         }
@@ -2450,9 +2502,11 @@ Status TransferEngineImpl::commitPreparedSubmit(
             } else {
                 task.post_time = std::chrono::steady_clock::now();
             }
+            noteBatchPollRequirement(batch, task.type, true);
             continue;
         }
 
+        noteBatchPollRequirement(batch, task.type, false);
         if (!batch->sub_batch[task.type]) {
             auto& transport = transport_list_[task.type];
             auto status = transport->allocateSubBatch(
@@ -2460,6 +2514,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
             if (!status.ok()) {
                 LOG(WARNING) << "Failed to allocate SubBatch " << task.type
                              << ":" << status.ToString();
+                noteBatchPollRequirement(batch, UNSPEC, false);
                 merged_task_id_map[merged_task_id] = task;
                 continue;
             }
@@ -2522,6 +2577,8 @@ Status TransferEngineImpl::commitPreparedSubmit(
                 sub_batch->device_mask = first_task.device_mask;
                 if (type == RDMA) sub_batch->qp_pool = first_task.qp_pool;
             }
+            bindIntervalPublishCounter(sub_batch,
+                                       intervalForTask(batch, group.front()));
 
             std::vector<Request> requests;
             requests.reserve(group.size());
@@ -2536,6 +2593,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
             }
             auto status = transport->submitTransferTasks(sub_batch, requests);
             if (!status.ok()) {
+                noteBatchPollRequirement(batch, UNSPEC, false);
                 auto attempt_end = std::chrono::steady_clock::now();
                 // failure_stage must be marked in this first segment, before
                 // any recovery/failover attempt on the failure: a task that
@@ -2585,6 +2643,7 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
                                                  QueueOwnerKind owner_kind) {
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     if (prepared.tasks.empty()) return Status::OK();
+    batch->counter_eligible = false;
     if (prepared.tasks.size() > batch->max_size - batch->task_list.size()) {
         return Status::TooManyRequests(
             "batch public task capacity exceeded" LOC_MARK);
@@ -2818,6 +2877,8 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         if (task.type == RDMA) sub_batch->qp_pool = task.qp_pool;
     }
     task.sub_task_id = sub_batch->size();
+    bindIntervalPublishCounter(sub_batch,
+                               intervalForTask(batch, queued.owner_task_id));
     startTransportAttempt(task, task.type, std::chrono::steady_clock::now());
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
@@ -2946,24 +3007,41 @@ Status TransferEngineImpl::submitTransfer(
         CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared,
                                    require_post_submit_cancellation));
 
-        if (shouldQueueSubmit(prepared, owner_kind)) {
-            CHECK_STATUS(
-                enqueuePreparedSubmit(batch_ref.get(), prepared, owner_kind));
-            auto dispatch_status = refillDispatchWindow();
-            if (!dispatch_status.ok()) {
-                LOG(WARNING)
-                    << "runtime queue dispatch failed after admission: "
-                    << dispatch_status.ToString();
-            }
-            notifyRuntimeQueueReady();
-        } else {
-            CHECK_STATUS(commitPreparedSubmit(batch_ref.get(), prepared));
-        }
-
+        auto interval = std::make_unique<Batch::SubmitInterval>();
+        interval->start_task_id = start_task_id;
+        interval->end_task_id = start_task_id + request_list.size();
         if (notifi) {
-            addSubmitHook(batch_ref.get(), start_task_id, request_list,
-                          *notifi);
+            interval->has_notify = true;
+            interval->notifi = *notifi;
+            for (const auto& request : request_list)
+                interval->targets.insert(request.target_id);
         }
+        auto* interval_ptr = interval.get();
+        batch_ref.get()->submit_intervals.push_back(std::move(interval));
+
+        Status submit_status;
+        if (shouldQueueSubmit(prepared, owner_kind)) {
+            submit_status =
+                enqueuePreparedSubmit(batch_ref.get(), prepared, owner_kind);
+            if (submit_status.ok()) {
+                auto dispatch_status = refillDispatchWindow();
+                if (!dispatch_status.ok()) {
+                    LOG(WARNING)
+                        << "runtime queue dispatch failed after admission: "
+                        << dispatch_status.ToString();
+                }
+                notifyRuntimeQueueReady();
+            }
+        } else {
+            submit_status = commitPreparedSubmit(batch_ref.get(), prepared);
+        }
+        if (!submit_status.ok()) {
+            batch_ref.get()->submit_intervals.pop_back();
+            return submit_status;
+        }
+        interval_ptr->expected_owners =
+            countNonDerivedOwners(batch_ref.get(), interval_ptr->start_task_id,
+                                  interval_ptr->end_task_id);
     }
     // releaseBatch may sweep deferred frees under progress_mutex_. Drop the
     // shard first so this path preserves the global -> shard lock order.
@@ -2988,27 +3066,22 @@ Status TransferEngineImpl::submitStagingTransfer(
                           QueueOwnerKind::StagingInternal);
 }
 
-void TransferEngineImpl::addSubmitHook(Batch* batch, size_t start_task_id,
-                                       const std::vector<Request>& request_list,
-                                       const Notification& notifi) {
-    Batch::SubmitHook hook;
-    hook.start_task_id = start_task_id;
-    hook.end_task_id = start_task_id + request_list.size();
-    hook.notifi = notifi;
-    hook.fired = false;
-    for (const auto& request : request_list)
-        hook.targets.insert(request.target_id);
-    batch->submit_hooks.emplace_back(std::move(hook));
-}
-
-Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
-    for (auto& hook : batch->submit_hooks) {
-        if (hook.fired) continue;
-        bool all_completed = true;
-        if (check) {
+Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch,
+                                                bool allow_owner_scan) {
+    for (auto& interval : batch->submit_intervals) {
+        auto& hook = *interval;
+        if (hook.fired || !hook.has_notify) continue;
+        // Counter-only on the RDMA skip path. Do not initialize this to true:
+        // an unfinished interval with allow_owner_scan=false would fire early.
+        bool all_completed = intervalOwnersComplete(hook);
+        if (!all_completed && allow_owner_scan) {
+            all_completed = true;
             for (size_t tid = hook.start_task_id; tid < hook.end_task_id;
                  ++tid) {
                 auto& t = batch->task_list[tid];
+#ifdef TENT_HOOK_OWNER_SCAN_COUNTER
+                hook_owner_scans_.fetch_add(1, std::memory_order_relaxed);
+#endif
                 // Merged requests are carried by one owning task; the derived
                 // ones keep their initial status forever, so checking them
                 // would make this hook never fire. getBatchStatus() skips them
@@ -3062,6 +3135,7 @@ Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
     if (task_id >= batch->task_list.size()) {
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     }
+    batch->counter_eligible = false;
 
     size_t owner_task_id = task_id;
     bool queued_owner_resolved = false;
@@ -3197,6 +3271,8 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     }
     task.sub_task_id = sub_batch->size();
     task.type = type;
+    noteBatchPollRequirement(batch, type, false);
+    bindIntervalPublishCounter(sub_batch, intervalForTask(batch, task_id));
     startTransportAttempt(task, type, std::chrono::steady_clock::now());
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
@@ -3604,6 +3680,50 @@ Status TransferEngineImpl::getTransferStatus(
     return Status::OK();
 }
 
+void TransferEngineImpl::noteBatchPollRequirement(Batch* batch,
+                                                  TransportType type,
+                                                  bool staging) {
+    if (!batch || !batch->counter_eligible) return;
+    if (staging || type == UNSPEC) {
+        batch->counter_eligible = false;
+        return;
+    }
+    auto& transport = transport_list_[type];
+    if (!transport || !transport->publishesBatchCompletionCounter()) {
+        batch->counter_eligible = false;
+    }
+}
+
+bool TransferEngineImpl::trySkipInFlightOwnerWalk(
+    Batch* batch, TransferStatus& overall_status) {
+    if (!batch->counter_eligible || batch->queue_token != 0) return false;
+    // Batch status stays PENDING while any submit interval is unfinished
+    // (TE #4199). Unfired hooks are not a skip veto: ready intervals fire
+    // from their own counters (TENT #4001) without scanning TaskInfo.
+
+    Transport::SubBatchRef publisher = nullptr;
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        auto* sub_batch = batch->sub_batch[type];
+        if (!sub_batch) continue;
+        auto& transport = transport_list_[type];
+        if (!transport || !transport->publishesBatchCompletionCounter()) {
+            return false;
+        }
+        if (publisher) return false;
+        publisher = sub_batch;
+    }
+    if (!publisher) return false;
+    if (publisher->has_failure.load(std::memory_order_acquire)) return false;
+
+    const uint64_t owners = publisher->size();
+    if (owners == 0) return false;
+    if (allSubmitIntervalsComplete(batch)) return false;
+
+    overall_status.s = PENDING;
+    overall_status.transferred_bytes = 0;
+    return true;
+}
+
 Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
                                           TransferStatus& overall_status,
                                           bool force_failover) {
@@ -3615,6 +3735,10 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
     Batch* batch = (Batch*)(batch_id);
     overall_status.s = PENDING;
     overall_status.transferred_bytes = 0;
+    if (trySkipInFlightOwnerWalk(batch, overall_status)) {
+        CHECK_STATUS(maybeFireSubmitHooks(batch, /*allow_owner_scan=*/false));
+        return Status::OK();
+    }
     size_t success_tasks = 0;
     size_t failed_tasks = 0;
     size_t total_tasks = 0;
