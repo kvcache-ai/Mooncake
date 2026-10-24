@@ -200,8 +200,11 @@ export MC_USE_TENT=1
 
 XPU requires TENT; the classic Transfer Engine has no XPU support. Use `tcp`
 or `rdma` for Store setup. With `rdma`, XPU memory uses dma-buf RDMA when
-available and is otherwise staged through host memory. XPUs on the same node,
-including in different processes, copy directly over P2P/IPC.
+available and is otherwise staged through host memory. XPUs on the same node
+copy directly only when the devices have peer access; across processes, this
+also needs same-node IPC (same PID namespace, and Yama `ptrace_scope` 0 or 1,
+or `CAP_SYS_PTRACE` for scope 2). Otherwise the copy goes through host memory
+or the network path.
 See {ref}`build-with-intel-xpu` and
 {ref}`Intel XPU Transport <intel-xpu-transport>` for details and limitations.
 :::

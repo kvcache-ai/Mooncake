@@ -231,10 +231,12 @@ In addition, if the error `Failed to get description of XXX` is displayed, it in
 - **Choosing a protocol:** `xpu` is a local transport (host staging and
   same-node XPU copies), not a network protocol. Pass `tcp` or `rdma` to Store
   setup; see {ref}`Intel XPU Transport <intel-xpu-transport>`.
-- **Same-node transfers still use the network:** Check that
-  `/proc/sys/kernel/yama/ptrace_scope` is 0 or 1 (or grant `CAP_SYS_PTRACE`),
-  that `transports/xpu/disable_ipc` is not `true`, and that any selector policy
-  with a `transports` list includes `"xpu"` ahead of `"rdma"`.
+- **Same-node transfers still use the network:** Check that both processes
+  are in the same PID namespace, that the copying device has peer access to
+  the device holding the buffer, and that `/proc/sys/kernel/yama/ptrace_scope`
+  is 0 or 1 (`CAP_SYS_PTRACE` covers scope 2 only; scope 3 always falls back).
+  Also check that `transports/xpu/disable_ipc` is not `true`, and that any
+  selector policy with a `transports` list includes `"xpu"` ahead of `"rdma"`.
 
 ## Memory Allocator
 
