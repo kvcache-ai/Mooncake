@@ -918,7 +918,7 @@ void ResourceTracker::startSignalThread() {
     });
 }
 
-RealClient::RealClient() {
+RealClient::RealClient() : prefetcher_(std::make_unique<SsdPrefetcher>()) {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
     use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
@@ -1562,6 +1562,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             ->register_handler<&RealClient::release_offload_buffer>(this);
         offload_rpc_server_->register_handler<&RealClient::verify_disk_replica>(
             this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::prefetch_offload_object>(this);
         offload_rpc_server_->async_start();
         auto err = offload_rpc_server_->get_errc();
         if (err) {
@@ -1614,6 +1616,21 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             });
     }
     client_requester_ = std::make_shared<ClientRequester>();
+    if (enable_ssd_prefetch_) {
+        // Prefetch needs the master-facing client for metadata and task
+        // registration; local promotion additionally needs file_storage_.
+        // A read-only client (no local SSD offload) can still trigger remote
+        // holders.
+        prefetcher_->throttle()->configure(ssd_prefetch_cooldown_sec_,
+                                           ssd_prefetch_dedup_ttl_sec_);
+        prefetcher_->Init(client_, file_storage_, client_requester_,
+                          local_rpc_addr);
+        LOG(INFO) << "SSD prefetch enabled: "
+                  << CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC << "="
+                  << ssd_prefetch_cooldown_sec_ << "s, "
+                  << CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC << "="
+                  << ssd_prefetch_dedup_ttl_sec_ << "s";
+    }
     const bool should_start_http_server =
         enable_client_http_server || FLAGS_enable_http_server;
     const int selected_http_port =
@@ -1803,6 +1820,25 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
+    // SSD prefetch knobs (all default off; see
+    // docs/source/design/store/ssd-prefetch.md).
+    enable_ssd_prefetch_ =
+        get_config_bool(config, CONFIG_KEY_ENABLE_SSD_PREFETCH, false);
+    auto prefetch_cooldown_opt =
+        get_config_size(config, CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC,
+                        DEFAULT_SSD_PREFETCH_COOLDOWN_SEC);
+    auto prefetch_dedup_ttl_opt =
+        get_config_size(config, CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC,
+                        DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC);
+    if (!prefetch_cooldown_opt.has_value() ||
+        !prefetch_dedup_ttl_opt.has_value()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    ssd_prefetch_cooldown_sec_ =
+        static_cast<int64_t>(prefetch_cooldown_opt.value());
+    ssd_prefetch_dedup_ttl_sec_ =
+        static_cast<int64_t>(prefetch_dedup_ttl_opt.value());
+
     auto egm_config = ParseEgmStorePoolConfig(
         config, protocol, global_segment_size, local_buffer_size);
     if (!egm_config) return tl::unexpected(egm_config.error());
@@ -1867,6 +1903,15 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
             return tl::unexpected(shm_rc);
         }
         return {};
+    }
+
+    // Drain the prefetch pool before any resource release below. Pool jobs
+    // capture shared_ptrs locked at submission, so a job blocked on its
+    // metadata RPC keeps Client alive past client_.reset(); segment memory
+    // must not be released (and must not stay registered with TE / published
+    // on the master) while such a job is still running.
+    if (prefetcher_) {
+        prefetcher_->Shutdown();
     }
 
     stop_ipc_server();
@@ -3003,9 +3048,19 @@ tl::expected<bool, ErrorCode> RealClient::isExist_internal(
 }
 
 int RealClient::isExist(const std::string &key) {
+    return isExist(key, ExistOptions{});
+}
+
+int RealClient::isExist(const std::string &key, const ExistOptions &options) {
     auto result = isExist_internal(key);
 
     if (result.has_value()) {
+        // Best-effort SSD prefetch: synchronous part is a throttle dedup plus
+        // a pool enqueue; no RPC is added to the exist path.
+        if (options.prefetch_to_memory && *result && enable_ssd_prefetch_ &&
+            prefetcher_) {
+            prefetcher_->TriggerPrefetch({key});
+        }
         return *result ? 1 : 0;  // 1 if exists, 0 if not
     } else {
         return toInt(result.error());
@@ -3014,16 +3069,32 @@ int RealClient::isExist(const std::string &key) {
 
 std::vector<int> RealClient::batchIsExist(
     const std::vector<std::string> &keys) {
+    return batchIsExist(keys, ExistOptions{});
+}
+
+std::vector<int> RealClient::batchIsExist(const std::vector<std::string> &keys,
+                                          const ExistOptions &options) {
     auto internal_results = batchIsExist_internal(keys);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
-    for (const auto &result : internal_results) {
+    const bool maybe_prefetch =
+        options.prefetch_to_memory && enable_ssd_prefetch_ && prefetcher_;
+    std::vector<std::string> prefetch_candidates;
+    for (size_t i = 0; i < internal_results.size(); ++i) {
+        const auto &result = internal_results[i];
         if (result.has_value()) {
             results.push_back(result.value() ? 1 : 0);  // 1 if exists, 0 if not
+            if (maybe_prefetch && result.value()) {
+                prefetch_candidates.push_back(keys[i]);
+            }
         } else {
             results.push_back(toInt(result.error()));
         }
+    }
+
+    if (!prefetch_candidates.empty()) {
+        prefetcher_->TriggerPrefetch(prefetch_candidates);
     }
 
     return results;
@@ -3906,6 +3977,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         LOG(ERROR) << "No usable replica for key: " << key;
         return nullptr;
     }
+    // Same demand-side kick as the batch path: a plain get headed for SSD is
+    // the strongest hotness signal there is.
+    KickPrefetchForDiskHeadedKeys({key}, {query_result}, local_endpoints);
 
     const auto &replica = *best_replica;
     uint64_t total_length = calculate_total_size(replica);
@@ -8182,6 +8256,35 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
     return results;
 }
 
+void RealClient::KickPrefetchForDiskHeadedKeys(
+    const std::vector<std::string> &keys,
+    const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
+    const std::unordered_set<std::string> &local_endpoints) {
+    if (!enable_ssd_prefetch_ || !prefetcher_) {
+        return;
+    }
+    std::vector<std::string> disk_keys;
+    disk_keys.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!query_results[i] || query_results[i].value().replicas.empty()) {
+            continue;
+        }
+        const auto *best = SelectBestReplica(query_results[i].value().replicas,
+                                             local_endpoints);
+        if (best != nullptr && best->is_local_disk_replica()) {
+            disk_keys.push_back(keys[i]);
+        }
+    }
+    if (disk_keys.empty()) {
+        return;
+    }
+    // Without this kick, a request whose exist-triggered promotion was
+    // dropped by a saturated backoff window pays the SSD read with no retry.
+    VLOG(1) << "SSD prefetch: get-side kick, disk_keys=" << disk_keys.size()
+            << ", in_cooldown=" << prefetcher_->throttle()->inCooldown();
+    prefetcher_->TriggerPrefetch(disk_keys, /*ignore_cooldown=*/true);
+}
+
 std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_multi_buffers_internal(
     const std::vector<std::string> &keys,
@@ -8247,6 +8350,7 @@ RealClient::batch_get_into_multi_buffers_internal(
     std::vector<DuplicateDiskOp> duplicate_disk_ops;
     valid_operations.reserve(num_keys);
     auto local_endpoints = client_->GetLocalEndpoints();
+    KickPrefetchForDiskHeadedKeys(keys, query_results, local_endpoints);
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
         // Handle query failures
@@ -8962,6 +9066,30 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
     return file_storage_->ReleaseBuffer(batch_id);
 }
 
+bool RealClient::prefetch_offload_object(const std::vector<std::string> &keys,
+                                         const std::vector<int64_t> &sizes,
+                                         const std::string &tenant_id) {
+    if (!enable_ssd_prefetch_ || !prefetcher_ || !file_storage_) {
+        VLOG(1) << "prefetch_offload_object called but SSD prefetch is "
+                   "disabled or SSD offload is not set up";
+        return false;
+    }
+    if (keys.empty()) {
+        return true;
+    }
+    if (keys.size() != sizes.size()) {
+        LOG(WARNING) << "prefetch_offload_object keys/sizes size mismatch: "
+                     << keys.size() << " vs " << sizes.size();
+        return false;
+    }
+    // Best-effort and asynchronous: dedup + pool enqueue, never blocks the
+    // RPC thread on SSD reads. The requester's tenant travels with the keys:
+    // a shared SSD holder stores objects from other tenants and must look
+    // up / register / promote under the object's own tenant.
+    prefetcher_->RunLocalPrefetch(keys, sizes, tenant_id);
+    return true;
+}
+
 async_simple::coro::Lazy<tl::expected<VerifyDiskReplicaResponse, ErrorCode>>
 RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
     if (!file_storage_) {
@@ -9338,6 +9466,19 @@ void ClientRequester::release_offload_buffer(const std::string &client_addr,
     } else {
         VLOG(1) << "Successfully released buffer for batch_id=" << batch_id
                 << " at " << client_addr;
+    }
+}
+
+void ClientRequester::prefetch_offload_object(
+    const std::string &client_addr, const std::vector<std::string> &keys,
+    const std::vector<int64_t> &sizes, const std::string &tenant_id) {
+    // Best-effort: old peers reject the unknown handler and network errors
+    // are logged, never propagated. The keys simply stay SSD-only.
+    auto result = invoke_rpc<&RealClient::prefetch_offload_object, bool>(
+        client_addr, keys, sizes, tenant_id);
+    if (!result) {
+        VLOG(1) << "Failed to invoke prefetch_offload_object, client_addr = "
+                << client_addr << ", error is: " << result.error();
     }
 }
 

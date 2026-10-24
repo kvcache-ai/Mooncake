@@ -12,6 +12,7 @@ _CPP_EXPORTS = frozenset(
         "ObjectDataType",
         "SoftPinAction",
         "ReplicateConfig",
+        "ExistOptions",
         "ReplicaStatus",
         "MemoryDescriptor",
         "DiskDescriptor",
