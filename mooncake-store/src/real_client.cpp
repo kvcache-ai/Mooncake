@@ -1326,7 +1326,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             ReplicaSelectionConfig::FromEnvironment().hca_numa_segments_enabled;
         std::vector<int> seg_numa_nodes;
         if (protocol == "rdma") {
-            seg_numa_nodes = client_->GetNicNumaNodes();
+            // Only the NIC nodes this process may allocate from: binding a
+            // region to a node outside its cpuset fails setup with EINVAL.
+            seg_numa_nodes =
+                FilterNumaNodesToAllowed(client_->GetNicNumaNodes());
             if (seg_numa_nodes.size() > 1 ||
                 (partition_numa && !seg_numa_nodes.empty())) {
                 std::string nodes_str;
