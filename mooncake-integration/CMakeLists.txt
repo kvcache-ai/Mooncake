@@ -106,6 +106,19 @@ if(WITH_TE)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_first_buffer.py)
     set_tests_properties(tent_python_first_buffer_test PROPERTIES TIMEOUT 60)
   endif()
+
+  if(BUILD_UNIT_TESTS AND USE_TCP)
+    add_test(
+      NAME python_check_status_all_tasks_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env MC_FORCE_TCP=1
+        MOONCAKE_LOCAL_HOSTNAME=127.0.0.1 PYTHONPATH=$<TARGET_FILE_DIR:engine>
+        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:asio_shared>
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_check_status_all_tasks.py)
+    set_tests_properties(python_check_status_all_tasks_test PROPERTIES TIMEOUT
+                                                                       60)
+  endif()
 endif()
 
 set(ALLOCATOR_SO_PATH
