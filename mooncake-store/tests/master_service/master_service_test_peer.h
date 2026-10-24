@@ -48,6 +48,12 @@ class MasterServiceTestPeer {
     // the fields that payload carries.
     static std::string SerializeMetadataForOpLogForTesting(
         MasterService& service, const ObjectMetadata& metadata);
+    static std::string SerializeMetadataForOpLogWithoutMemReplicasForTesting(
+        MasterService& service, const ObjectMetadata& metadata);
+    static std::string
+    SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
+        MasterService& service, const ObjectMetadata& metadata,
+        const std::vector<Replica::Descriptor>& replicas);
 
     // Drive one eviction cycle synchronously, without the periodic worker.
     void RunBatchEvictForTesting(double evict_ratio_target,

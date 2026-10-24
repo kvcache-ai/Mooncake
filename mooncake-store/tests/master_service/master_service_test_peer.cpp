@@ -27,6 +27,20 @@ std::string MasterServiceTestPeer::SerializeMetadataForOpLogForTesting(
     return service.SerializeMetadataForOpLog(metadata);
 }
 
+std::string
+MasterServiceTestPeer::SerializeMetadataForOpLogWithoutMemReplicasForTesting(
+    MasterService& service, const ObjectMetadata& metadata) {
+    return service.SerializeMetadataForOpLogWithoutMemReplicas(metadata);
+}
+
+std::string MasterServiceTestPeer::
+    SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
+        MasterService& service, const ObjectMetadata& metadata,
+        const std::vector<Replica::Descriptor>& replicas) {
+    return service.SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                   replicas);
+}
+
 void MasterServiceTestPeer::RunBatchEvictForTesting(
     double evict_ratio_target, double evict_ratio_lowerbound) {
     service_.BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
