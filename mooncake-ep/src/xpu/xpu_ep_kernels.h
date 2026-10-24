@@ -28,9 +28,18 @@ struct PeerView {
     void* const* peer_bases;  // device table, nullptr for an unmapped rank
 };
 
+// One dispatch's slice of the receive table (see recv_table_ints), for a
+// dispatch given top-k weights; all null otherwise.
+struct RecvTable {
+    int* count;      // [num_ranks] distinct tokens received from each rank
+    int* npicks;     // [num_ranks][kTopkShadowMaxTokens]
+    int32_t* picks;  // [num_ranks][kTopkShadowMaxTokens][kTopkShadowMaxTopk][2]
+};
+
 struct DispatchArgs {
     const void* x;
     const int64_t* topk_idx;
+    const float* topk_weights;  // null: combine does not pre-reduce
     int32_t* active_ranks;
     void* packed_recv_x;
     float* packed_recv_x_scales;
@@ -40,9 +49,13 @@ struct DispatchArgs {
     int* ready;       // this call's half
     int* next_ready;  // the other half, cleaned by this call
     uint8_t* staging;
-    int32_t* slot_shadow;  // [num_tokens][num_topk] list slot of each pick
+    // [num_tokens][num_topk] per pick: list slot (kNoSlot if dropped) |
+    // position in the destination rank's token list << 16
+    int32_t* slot_shadow;
     int* counter_per_expert;
+    int* counter_per_rank;
     int* done_counter;
+    RecvTable recv;
     PeerView peers;
     int num_tokens, hidden, num_topk, num_max_dispatch_tokens_per_rank;
     int num_experts, rank, num_ranks;
@@ -54,8 +67,8 @@ struct DispatchArgs {
 struct CombineArgs {
     const void* x;  // [num_local][num_ranks * T][hidden] expert outputs
     const int64_t* topk_idx;     // the dispatch-time snapshot
-    const int32_t* slot_shadow;  // the dispatch-time list slots
-    const float* topk_weights;
+    const int32_t* slot_shadow;  // the dispatch-time picks
+    const float* topk_weights;   // unused when recv.count is set
     const int64_t* layout_range;
     int32_t* active_ranks;
     void* combined_x;
@@ -63,6 +76,7 @@ struct CombineArgs {
     int* next_ready;
     uint8_t* staging;
     int* done_counter;
+    RecvTable recv;  // set: rows are pre-reduced with the dispatch's weights
     PeerView peers;
     int num_combined_tokens, hidden, num_topk, num_max_dispatch_tokens_per_rank;
     int num_experts, rank, num_ranks;

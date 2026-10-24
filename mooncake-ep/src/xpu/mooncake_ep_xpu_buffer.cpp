@@ -27,11 +27,13 @@ namespace xpu_ep {
 namespace {
 
 // Workspace (not shared with peers): per-expert slot counters, the two
-// send-kernel arrival counters, then per dispatch slot the top-k snapshot and
-// the list slot of every pick.
+// send-kernel arrival counters and the per-rank counters, then per dispatch
+// slot the top-k snapshot and the packed entry of every pick.
 constexpr size_t kCounterBytes = 64 * 1024;
 constexpr int kMaxExperts = kCounterBytes / sizeof(int);
 constexpr size_t kDoneOffset = kCounterBytes;
+constexpr size_t kRankCounterOffset = kDoneOffset + kLineBytes;
+constexpr int kMaxRanks = (4096 - kLineBytes) / sizeof(int);
 constexpr size_t kShadowOffset = kCounterBytes + 4096;
 constexpr size_t kSlotShadowOffset =
     kShadowOffset + kTopkShadowSlots * kTopkShadowBytes;
@@ -63,6 +65,8 @@ MooncakeEpXpuBuffer::MooncakeEpXpuBuffer(int rank, int num_ranks,
       p2p_enabled_(!disable_p2p),
       queue_(*asQueue(stream_ptr)) {
     XPU_EP_CHECK(num_ep_buffer_bytes > 0, "EP buffer size must be positive");
+    XPU_EP_CHECK(num_ranks > 0 && num_ranks <= kMaxRanks,
+                 "too many ranks for the XPU EP buffer");
     XPU_EP_CHECK(queue_.is_in_order(), "the torch.xpu stream must be in-order");
     ipc_ = std::make_unique<XpuIpcBuffer>(
         queue_, static_cast<size_t>(num_ep_buffer_bytes), rank, num_ranks);
@@ -88,6 +92,7 @@ MooncakeEpXpuBuffer::~MooncakeEpXpuBuffer() {
     } catch (...) {
     }
     if (workspace_) sycl::free(workspace_, queue_);
+    if (recv_tables_) sycl::free(recv_tables_, queue_);
     ipc_.reset();
 }
 
@@ -144,6 +149,19 @@ int MooncakeEpXpuBuffer::takeShadowSlot(uint64_t src_info_ptr) {
     return slot;
 }
 
+RecvTable MooncakeEpXpuBuffer::recvTable(int slot) {
+    if (!recv_tables_) {
+        recv_tables_ = sycl::malloc_device<int32_t>(
+            kTopkShadowSlots * recv_table_ints(num_ranks_), queue_);
+        XPU_EP_CHECK(recv_tables_ != nullptr,
+                     "receive table allocation failed");
+    }
+    int32_t* base = recv_tables_ + slot * recv_table_ints(num_ranks_);
+    return {base, base + num_ranks_,
+            base + num_ranks_ +
+                static_cast<size_t>(num_ranks_) * kTopkShadowMaxTokens};
+}
+
 int64_t MooncakeEpXpuBuffer::timeoutTicks(int timeout_us) const {
     return timeout_us < 0 ? -1 : clock_mhz_ * static_cast<int64_t>(timeout_us);
 }
@@ -185,7 +203,7 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::dispatch(
     bool use_fp8, uint64_t packed_recv_x_ptr, uint64_t packed_recv_x_scales_ptr,
     uint64_t packed_recv_count_ptr, uint64_t packed_recv_src_info_ptr,
     uint64_t packed_recv_layout_range_ptr, bool async, bool return_recv_hook,
-    uint64_t compute_stream_ptr) {
+    uint64_t compute_stream_ptr, uint64_t topk_weights_ptr) {
     XPU_EP_CHECK(!(async && return_recv_hook),
                  "async and return_recv_hook are mutually exclusive");
     checkShape(hidden, num_topk, num_max_dispatch_tokens_per_rank, num_experts);
@@ -203,6 +221,7 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::dispatch(
     const int cur = buffer_idx_;
     buffer_idx_ ^= 1;
     const int shadow_slot = takeShadowSlot(packed_recv_src_info_ptr);
+    slot_reduced_[shadow_slot] = topk_weights_ptr != 0;
     orderAfterLast(q);
     if (num_tokens > 0)
         q.memcpy(topkShadow(shadow_slot), reinterpret_cast<void*>(topk_idx_ptr),
@@ -211,6 +230,7 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::dispatch(
     DispatchArgs a{};
     a.x = reinterpret_cast<const void*>(x_ptr);
     a.topk_idx = reinterpret_cast<const int64_t*>(topk_idx_ptr);
+    a.topk_weights = reinterpret_cast<const float*>(topk_weights_ptr);
     a.active_ranks = reinterpret_cast<int32_t*>(active_ranks_ptr);
     a.packed_recv_x = reinterpret_cast<void*>(packed_recv_x_ptr);
     a.packed_recv_x_scales = reinterpret_cast<float*>(packed_recv_x_scales_ptr);
@@ -223,7 +243,10 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::dispatch(
     a.staging = layout.halves[cur].staging;
     a.slot_shadow = slotShadow(shadow_slot);
     a.counter_per_expert = reinterpret_cast<int*>(workspace_);
+    a.counter_per_rank =
+        reinterpret_cast<int*>(workspace_ + kRankCounterOffset);
     a.done_counter = reinterpret_cast<int*>(workspace_ + kDoneOffset);
+    if (topk_weights_ptr) a.recv = recvTable(shadow_slot);
     a.peers = PeerView{ipc_->base(), ipc_->peerBases()};
     a.num_tokens = num_tokens;
     a.hidden = hidden;
@@ -302,6 +325,7 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::combine(
     a.next_ready = layout.halves[cur ^ 1].ready;
     a.staging = layout.halves[cur].staging;
     a.done_counter = reinterpret_cast<int*>(workspace_ + kDoneOffset) + 1;
+    if (slot_reduced_[shadow_slot]) a.recv = recvTable(shadow_slot);
     a.peers = PeerView{ipc_->base(), ipc_->peerBases()};
     a.num_combined_tokens = num_combined_tokens;
     a.hidden = hidden;

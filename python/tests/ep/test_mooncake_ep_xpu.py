@@ -64,7 +64,11 @@ def _expert_scale(expert: torch.Tensor) -> torch.Tensor:
     return 1.0 + (expert.float() + 1.0) / 64.0
 
 
-def check_round(buffer, group, rank, world, args, num_tokens, use_fp8, hook_mode):
+def check_round(
+    buffer, group, rank, world, args, num_tokens, use_fp8, hook_mode, with_weights
+):
+    """with_weights passes the top-k weights to dispatch, so combine reduces on
+    the expert side; combine then gets zero weights, which it must not read."""
     device = torch.device("xpu", torch.xpu.current_device())
     hidden, num_experts, num_topk = args.hidden, args.num_experts, args.num_topk
     max_tokens = args.max_tokens
@@ -85,6 +89,7 @@ def check_round(buffer, group, rank, world, args, num_tokens, use_fp8, hook_mode
         use_fp8=use_fp8,
         async_finish=not hook_mode,
         return_recv_hook=hook_mode,
+        topk_weights=topk_weights if with_weights else None,
     )
     hook() if hook_mode else event.current_stream_wait()
     recv_x, recv_scales = recv if use_fp8 else (recv, None)
@@ -156,7 +161,7 @@ def check_round(buffer, group, rank, world, args, num_tokens, use_fp8, hook_mode
     combined, event, hook = buffer.combine(
         expert_out,
         topk_idx,
-        topk_weights,
+        torch.zeros_like(topk_weights) if with_weights else topk_weights,
         active,
         args.timeout_us,
         handle,
@@ -232,7 +237,8 @@ def check_two_batch_overlap(buffer, group, rank, world, args):
     hidden, num_experts, num_topk = args.hidden, args.num_experts, args.num_topk
     active = torch.ones((world,), dtype=torch.int32, device=device)
     batches = []
-    for _ in range(2):
+    # One micro-batch reduces on the expert side, the other does not.
+    for with_weights in (True, False):
         n = random.randint(1, args.max_tokens)
         x = torch.randn((n, hidden), device=device).to(torch.bfloat16)
         idx = _route(n, num_experts, num_topk, 0, device)
@@ -246,15 +252,16 @@ def check_two_batch_overlap(buffer, group, rank, world, args):
             args.timeout_us,
             use_fp8=False,
             return_recv_hook=True,
+            topk_weights=w if with_weights else None,
         )
         hook()
-        batches.append((x, idx, w, recv, handle))
-    for x, idx, w, recv, handle in reversed(batches):
+        batches.append((x, idx, w, recv, handle, with_weights))
+    for x, idx, w, recv, handle, with_weights in reversed(batches):
         # Pass a different top-k tensor: combine must use the dispatch's.
         combined, _, hook = buffer.combine(
             recv,
             torch.zeros_like(idx),
-            w,
+            torch.zeros_like(w) if with_weights else w,
             active,
             args.timeout_us,
             handle,
@@ -266,7 +273,7 @@ def check_two_batch_overlap(buffer, group, rank, world, args):
         torch.testing.assert_close(combined.float(), ref, rtol=2e-2, atol=2e-2)
 
 
-def check_duplicate_experts(buffer, group, rank, world, args):
+def check_duplicate_experts(buffer, group, rank, world, args, with_weights):
     """Every token names expert 0 in all its top-k slots, so more than T picks
     target one expert. The excess is dropped (as no CUDA buffer has room for
     it), never written past the expert's region, and the buffer stays usable."""
@@ -284,6 +291,7 @@ def check_duplicate_experts(buffer, group, rank, world, args):
         args.num_experts,
         args.timeout_us,
         use_fp8=False,
+        topk_weights=w if with_weights else None,
     )
     combined, _, _ = buffer.combine(recv, idx, w, active, args.timeout_us, handle)
     torch.xpu.synchronize()
@@ -302,10 +310,17 @@ def _identity_round(buffer, world, args, n, timeout_us=None):
     return x, idx, w, active, timeout_us or args.timeout_us
 
 
-def _dispatch(buffer, args, rnd):
-    x, idx, _, active, timeout_us = rnd
+def _dispatch(buffer, args, rnd, with_weights=False):
+    x, idx, w, active, timeout_us = rnd
     recv, _, handle, _, _ = buffer.dispatch(
-        x, idx, active, args.max_tokens, args.num_experts, timeout_us, use_fp8=False
+        x,
+        idx,
+        active,
+        args.max_tokens,
+        args.num_experts,
+        timeout_us,
+        use_fp8=False,
+        topk_weights=w if with_weights else None,
     )
     return recv, handle
 
@@ -347,7 +362,7 @@ def check_reused_src_info(buffer, group, rank, world, args):
     a = _identity_round(buffer, world, args, n)
     torch.empty = empty_reusing_first
     try:
-        recv_a, handle_a = _dispatch(buffer, args, a)
+        recv_a, handle_a = _dispatch(buffer, args, a, with_weights=True)
     finally:
         torch.empty = real_empty
     assert handle_a[0].data_ptr() == first.data_ptr(), "src_info was not reused"
@@ -364,7 +379,13 @@ def check_unknown_handle(buffer, group, rank, world, args):
     with a copy of it must be rejected, not reduced with another's routing."""
     rnd = _identity_round(buffer, world, args, args.max_tokens)
     recv, handle = _dispatch(buffer, args, rnd)
-    copied = (handle[0].clone(),) + tuple(handle[1:])
+    # One element into a fresh block: no allocation starts there, so unlike a
+    # clone the copy cannot land on an earlier dispatch's freed src_info.
+    storage = torch.empty(
+        handle[0].numel() + 1, dtype=handle[0].dtype, device=handle[0].device
+    )
+    copy = storage[1:].view_as(handle[0]).copy_(handle[0])
+    copied = (copy,) + tuple(handle[1:])
     try:
         buffer.combine(recv, rnd[1], rnd[2], rnd[3], rnd[4], copied)
     except RuntimeError as e:
@@ -389,7 +410,7 @@ def check_cross_stream(buffer, group, rank, world, args):
     outs = []
     for i, rnd in enumerate(rounds):
         with torch.xpu.stream(streams[i % 2]):
-            recv, handle = _dispatch(buffer, args, rnd)
+            recv, handle = _dispatch(buffer, args, rnd, with_weights=bool(i % 2))
             out, _, _ = buffer.combine(recv, rnd[1], rnd[2], rnd[3], rnd[4], handle)
             outs.append(out)
     for s in streams:
@@ -446,7 +467,14 @@ def check_dead_rank(buffer, group, rank, world, args):
     active = torch.ones((world,), dtype=torch.int32, device=device)
     timeout_us = 2_000_000
     recv, cnt, handle, _, _ = buffer.dispatch(
-        x, idx, active, args.max_tokens, num_experts, timeout_us, use_fp8=False
+        x,
+        idx,
+        active,
+        args.max_tokens,
+        num_experts,
+        timeout_us,
+        use_fp8=False,
+        topk_weights=w if args.dead_rank_weights else None,
     )
     combined, _, _ = buffer.combine(recv, idx, w, active, timeout_us, handle)
     torch.xpu.synchronize()
@@ -498,19 +526,27 @@ def _worker(local_rank, world, args, port):
         # All ranks must agree on the dtype/hook mode; vary per round.
         use_fp8 = bool(i % 2)
         hook_mode = bool((i // 2) % 2)
-        check_round(buffer, group, local_rank, world, args, n, use_fp8, hook_mode)
+        with_weights = bool((i // 4) % 2)
+        check_round(
+            buffer, group, local_rank, world, args, n, use_fp8, hook_mode, with_weights
+        )
         if local_rank == 0:
             print(
-                f"round {i}: tokens={n} fp8={use_fp8} hook={hook_mode} ok", flush=True
+                f"round {i}: tokens={n} fp8={use_fp8} hook={hook_mode} "
+                f"weights_at_dispatch={with_weights} ok",
+                flush=True,
             )
     for _ in range(4):
         check_two_batch_overlap(buffer, group, local_rank, world, args)
-    check_duplicate_experts(buffer, group, local_rank, world, args)
+    check_duplicate_experts(buffer, group, local_rank, world, args, False)
+    check_duplicate_experts(buffer, group, local_rank, world, args, True)
     check_reused_src_info(buffer, group, local_rank, world, args)
     check_unknown_handle(buffer, group, local_rank, world, args)
     check_cross_stream(buffer, group, local_rank, world, args)
     check_fast_path_agreement(buffer, group, local_rank, world, args)
-    check_round(buffer, group, local_rank, world, args, args.max_tokens, False, False)
+    check_round(
+        buffer, group, local_rank, world, args, args.max_tokens, False, False, True
+    )
     if world > 2:
         check_dead_rank(buffer, group, local_rank, world, args)
     # Free the buffer only once no peer can still be reading from it.
@@ -540,6 +576,11 @@ def main():
     p.add_argument("--num-masked", type=int, default=10)
     p.add_argument("--rounds", type=int, default=12)
     p.add_argument("--timeout-us", type=int, default=30_000_000)
+    p.add_argument(
+        "--dead-rank-weights",
+        action="store_true",
+        help="give the dead-rank check's dispatch its top-k weights",
+    )
     args = p.parse_args()
     port = 29500 + random.randint(0, 1000)
     mp.spawn(worker, args=(args.num_ranks, args, port), nprocs=args.num_ranks)

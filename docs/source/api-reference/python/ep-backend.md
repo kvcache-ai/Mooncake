@@ -373,6 +373,7 @@ recv_x, recv_count, handle, event, hook = buffer.dispatch(
     use_fp8=True,
     async_finish=False,
     return_recv_hook=False,
+    topk_weights=None,
 )
 ```
 
@@ -393,6 +394,11 @@ Arguments:
   event for stream-lifetime management.
 - `return_recv_hook`: when `True`, call the returned `hook()` to complete receive
   synchronization; otherwise use `event.current_stream_wait()`.
+- `topk_weights`: optional FP32 tensor shaped like `topk_idx`, holding the
+  weights the matching `combine()` will be called with. Every rank must pass it
+  or none. On Intel XPU, combine then sums each token's rows on the expert side
+  with these weights and ignores its own `topk_weights`. Other backends ignore
+  this argument.
 
 Returns:
 

@@ -10,10 +10,14 @@ the next peer-to-peer send several-fold, which a busy MoE layer never sees.
     python mooncake-ep/benchmarks/xpu_buffer_perf.py --num-ranks 4 \\
         --hidden 7168 --experts 256 --topk 8 --tokens 1,16,64,128
 
---impl fallback times the torch.distributed fallback of the same Buffer;
---impl alltoall times two XCCL all_to_all_single calls that move the bytes a
-dispatch and a combine move, with no routing work: a lower bound for an EP
-built on torch.distributed collectives.
+--pipelined instead issues the iterations back to back with no host sync in
+between, as consecutive MoE layers do, and reports the mean per iteration.
+--weights-at-dispatch passes the top-k weights to dispatch, so combine
+reduces on the expert side. --impl fallback times the torch.distributed
+fallback of the same Buffer; --impl alltoall times two XCCL
+all_to_all_single calls that move the bytes a dispatch and a combine move,
+with no routing work: a lower bound for an EP built on torch.distributed
+collectives.
 """
 
 import argparse
@@ -90,6 +94,7 @@ def bench(buffer, cpu_group, rank, world, args, num_tokens, use_fp8):
             args.experts,
             args.timeout_us,
             use_fp8=use_fp8,
+            **({"topk_weights": topk_w} if args.weights_at_dispatch else {}),
         )
 
     def combine(recv, handle):
@@ -100,6 +105,8 @@ def bench(buffer, cpu_group, rank, world, args, num_tokens, use_fp8):
             expert_out, topk_idx, topk_w, active, args.timeout_us, handle, out=out
         )
 
+    if args.pipelined:
+        return bench_pipelined(dispatch, combine, cpu_group, args)
     t_d, t_rt = [], []
     for it in range(args.warmup + args.iters):
         for times, with_combine in ((t_d, False), (t_rt, True)):
@@ -125,6 +132,27 @@ def bench(buffer, cpu_group, rank, world, args, num_tokens, use_fp8):
     return stats.tolist()
 
 
+def bench_pipelined(dispatch, combine, cpu_group, args):
+    def run(with_combine, iters):
+        for _ in range(iters):
+            recv, _, handle, _, _ = dispatch()
+            if with_combine:
+                combine(recv, handle)
+
+    stats = []
+    for with_combine in (False, True):
+        run(with_combine, args.warmup)
+        torch.xpu.synchronize()
+        dist.barrier(cpu_group)
+        t0 = time.perf_counter()
+        run(with_combine, args.iters)
+        torch.xpu.synchronize()
+        stats.append((time.perf_counter() - t0) / args.iters)
+    stats = torch.tensor(stats, dtype=torch.float64)
+    dist.all_reduce(stats, op=dist.ReduceOp.MAX, group=cpu_group)
+    return stats.tolist()
+
+
 def worker(local_rank, world, args, port):
     torch.xpu.set_device(_device_for(local_rank))
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
@@ -140,7 +168,8 @@ def worker(local_rank, world, args, port):
     if local_rank == 0:
         print(
             f"impl={args.impl} ranks={world} hidden={args.hidden} experts={args.experts} "
-            f"topk={args.topk}  (median us, worst rank)"
+            f"topk={args.topk}  ({'mean' if args.pipelined else 'median'} us, "
+            "worst rank)"
         )
         print(f"{'tokens':>6} {'dtype':>5} {'dispatch':>10} {'dispatch+combine':>17}")
     for n in [int(t) for t in args.tokens.split(",")]:
@@ -171,6 +200,8 @@ def main():
     p.add_argument("--max-tokens", type=int, default=128)
     p.add_argument("--tokens", default="1,8,32,64,128")
     p.add_argument("--fp8", action="store_true")
+    p.add_argument("--weights-at-dispatch", action="store_true")
+    p.add_argument("--pipelined", action="store_true")
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--iters", type=int, default=30)
     p.add_argument("--timeout-us", type=int, default=30_000_000)

@@ -62,11 +62,12 @@ constexpr size_t kSlotShadowBytes = static_cast<size_t>(kTopkShadowMaxTokens) *
 //
 // Each half holds, from its base:
 //   ready[num_ranks]        one cache line per source rank, written by peers
-//   staging                 written by this rank, read by peers, either
-//     dispatch: msg[T] (line-padded token messages), count[E] (tokens this
-//               rank sends to each expert), list[E][T] (which tokens)
+//   staging                 written by this rank, either
+//     dispatch: see DispatchStaging
 //     combine:  row[num_local][num_ranks][T] (expert output rows, ordered as
-//               the receiving dispatch listed them)
+//               the receiving dispatch listed them) or, when the dispatch had
+//               top-k weights, row[num_ranks][T] (per source token, the
+//               weighted sum of this rank's experts' rows)
 // A call uses one half; consecutive calls alternate halves, as on CUDA.
 struct HalfLayout {
     int* ready;  // rank r's flag at ready[r * kReadyStride]
@@ -76,6 +77,47 @@ struct HalfLayout {
 constexpr int kReadyStride = kLineBytes / sizeof(int);
 
 inline size_t dispatch_msg_bytes(int hidden, bool use_fp8);
+
+// Dispatch staging, by offset. Peers read everything before local_stage:
+//   msg[T]                  line-padded token messages
+//   count[E], list[E][T]    tokens this rank sends to each expert; a list
+//                           entry is token | rank_list position << 16
+//   rank_count[R], rank_list[R][T]
+//                           the distinct tokens this rank sends to each rank;
+//                           an entry is token | picks on that rank << 16
+//   rank_pick[R][T][kTopkShadowMaxTopk]
+//                           those picks as {local expert | list slot << 16,
+//                           top-k weight}, written when weights are given
+// local_stage[R][T] is this rank's own: the receive kernel pulls each token
+// a peer sent here into it once, then copies it to every expert that picked it.
+// Offsets follow the BF16 message size, so FP8 and BF16 calls share a layout.
+struct DispatchStaging {
+    size_t counts, lists, rank_counts, rank_lists, rank_picks, local_stage, end;
+    DispatchStaging(int hidden, int T, int num_experts, int num_ranks) {
+        const size_t msg = dispatch_msg_bytes(hidden, false);
+        const size_t t = T, r = num_ranks;
+        counts = t * msg;
+        lists = counts + round_up(num_experts * sizeof(int), kLineBytes);
+        rank_counts =
+            lists + round_up(num_experts * t * sizeof(int), kLineBytes);
+        rank_lists = rank_counts + round_up(r * sizeof(int), kLineBytes);
+        rank_picks = rank_lists + round_up(r * t * sizeof(int), kLineBytes);
+        local_stage =
+            rank_picks +
+            round_up(r * t * kTopkShadowMaxTopk * 2 * sizeof(int), kLineBytes);
+        end = local_stage + r * t * msg;
+    }
+};
+
+// What a rank received from a dispatch given top-k weights, kept per dispatch
+// for its combine to pre-reduce: per source rank, the number of distinct
+// tokens, and per token its picks of this rank's experts (as rank_pick).
+// Indexed with the maximum token and top-k counts, so one layout fits all.
+inline size_t recv_table_ints(int num_ranks) {
+    return static_cast<size_t>(num_ranks) *
+           (1 + static_cast<size_t>(kTopkShadowMaxTokens) *
+                    (1 + 2 * kTopkShadowMaxTopk));
+}
 
 struct BufferPair {
     size_t total_bytes = 0;
@@ -87,9 +129,8 @@ struct BufferPair {
         const size_t T = num_max_dispatch_tokens_per_rank;
         const size_t ready_bytes = round_up(num_ranks * kLineBytes, 4096);
         const size_t dispatch_bytes =
-            T * dispatch_msg_bytes(hidden, false) +
-            round_up(num_experts * sizeof(int), kLineBytes) +
-            num_experts * T * sizeof(int);
+            DispatchStaging(hidden, static_cast<int>(T), num_experts, num_ranks)
+                .end;
         const size_t combine_bytes =
             static_cast<size_t>(num_experts) * T * hidden * kBf16Size;
         half_bytes = round_up(

@@ -132,6 +132,11 @@ provides the P2P / IPC fast path only:
 - Data is pulled rather than pushed: each rank stages what it sends in its own
   half of the buffer and only writes small ready flags to peers. On PCIe a GPU
   writing to several peers at once is far slower than one reading from several.
+- A token that picks several experts on one rank crosses PCIe once: dispatch
+  pulls it once and copies it to each of those experts locally. When
+  `dispatch()` is given `topk_weights`, combine also sums each token's rows on
+  the expert side, so one row per rank travels back. The partial sum is rounded
+  to BF16 once.
 - Kernels run on the caller's `torch.xpu` stream. Zero-copy combine and the
   elastic buffer are not supported.
 

@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "xpu_ep_common.h"
+#include "xpu_ep_kernels.h"
 #include "xpu_ipc.h"
 
 namespace mooncake {
@@ -77,7 +78,8 @@ class MooncakeEpXpuBuffer {
                     uint64_t packed_recv_count_ptr,
                     uint64_t packed_recv_src_info_ptr,
                     uint64_t packed_recv_layout_range_ptr, bool async,
-                    bool return_recv_hook, uint64_t compute_stream_ptr);
+                    bool return_recv_hook, uint64_t compute_stream_ptr,
+                    uint64_t topk_weights_ptr);
 
     Result combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
                    uint64_t topk_weights_ptr, uint64_t src_info_ptr,
@@ -93,6 +95,7 @@ class MooncakeEpXpuBuffer {
     // Both need mu_ held.
     void orderAfterLast(sycl::queue& q);
     int takeShadowSlot(uint64_t src_info_ptr);
+    RecvTable recvTable(int slot);
     int64_t timeoutTicks(int timeout_us) const;
     int64_t* topkShadow(int slot) const;
     int32_t* slotShadow(int slot) const;
@@ -119,7 +122,13 @@ class MooncakeEpXpuBuffer {
     // keeps its own top-k snapshot, keyed by its src_info tensor, for combine.
     std::unordered_map<uint64_t, int> shadow_slots_;
     std::array<uint64_t, kTopkShadowSlots> slot_owner_{};
+    // Whether the slot's dispatch had top-k weights, so its combine reads
+    // pre-reduced rows.
+    std::array<bool, kTopkShadowSlots> slot_reduced_{};
     int next_shadow_slot_ = 0;
+    // recv_table_ints(num_ranks) per slot, allocated by the first dispatch
+    // given top-k weights.
+    int32_t* recv_tables_ = nullptr;
 };
 
 }  // namespace xpu_ep

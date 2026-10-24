@@ -424,6 +424,7 @@ class Buffer:
         use_fp8: Optional[bool] = None,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        topk_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[
         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
         torch.Tensor,
@@ -431,6 +432,10 @@ class Buffer:
         EventOverlap,
         Callable,
     ]:
+        # topk_weights, if given, must be the weights the matching combine is
+        # called with, and every rank must pass it or none: on XPU the combine
+        # then reduces each token's rows on the expert side with them and does
+        # not read its own topk_weights. Other backends ignore it.
         assert x.dim() == 2 and x.is_contiguous()
         assert x.dtype == torch.bfloat16
         assert topk_idx.dim() == 2 and topk_idx.is_contiguous()
@@ -439,6 +444,10 @@ class Buffer:
         assert x.size(0) <= num_max_dispatch_tokens_per_rank
         assert x.size(1) % 16 == 0 and x.size(1) % 128 == 0
         assert num_experts % self.group_size == 0
+        if topk_weights is not None:
+            assert topk_weights.shape == topk_idx.shape
+            assert topk_weights.dtype == torch.float32
+            assert topk_weights.is_contiguous()
         caller_active_ranks = active_ranks
         if active_ranks is None:
             active_ranks = self._active_ranks_tensor(device=x.device, dtype=torch.int32)
@@ -549,6 +558,11 @@ class Buffer:
             native_async_finish = async_finish and not (
                 _USE_SPLIT_SEND_RECV and runtime_return_recv_hook
             )
+            native_weights = ()
+            if self.device_type == "xpu":
+                native_weights = (
+                    0 if topk_weights is None else topk_weights.data_ptr(),
+                )
             event, hook = self.runtime.dispatch(
                 x.data_ptr(),
                 topk_idx.data_ptr(),
@@ -568,6 +582,7 @@ class Buffer:
                 native_async_finish,
                 runtime_return_recv_hook,
                 _native_current_stream_ptr(),
+                *native_weights,
             )
             if _USE_SPLIT_SEND_RECV:
                 hook = self._wrap_maca_recv_hook(hook, event)
@@ -584,6 +599,7 @@ class Buffer:
         tensors_to_record = (
             x,
             topk_idx,
+            topk_weights,
             packed_recv_x,
             packed_recv_x_scales,
             packed_recv_count,
