@@ -1,5 +1,6 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <csignal>
@@ -12,6 +13,7 @@
 #include <unistd.h>
 #include <sys/uio.h>
 #include <string_view>
+#include <thread>
 #include <vector>
 #include "file_interface.h"
 #include "../src/uring_submit.h"
@@ -322,6 +324,68 @@ TEST_F(PosixFileTest, UringBatchReadReportsPerRequestResultsAcrossQueueDepth) {
         EXPECT_EQ(descs[i].bytes_read, kBlockSize);
         EXPECT_EQ(actual[i], expected[i]);
     }
+}
+
+// The kernel caps one fixed buffer at 1 GiB; a larger global buffer is
+// registered in pieces. Reads inside either piece, and one crossing the piece
+// boundary (which must go unfixed), all land the right bytes.
+TEST_F(PosixFileTest, UringRegistersGlobalBufferLargerThanOneGiB) {
+    constexpr size_t kGiB = 1ULL << 30;
+    constexpr size_t kLen = kGiB + (16ULL << 20);
+    constexpr size_t kBlock = 4096;
+    struct rlimit rl{};
+    if (geteuid() != 0 && getrlimit(RLIMIT_MEMLOCK, &rl) == 0 &&
+        rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < kLen) {
+        GTEST_SKIP() << "RLIMIT_MEMLOCK too small to pin " << kLen << " bytes";
+    }
+    void* raw = nullptr;
+    ASSERT_EQ(posix_memalign(&raw, kBlock, kLen), 0);
+    std::unique_ptr<void, decltype(&free)> owner(raw, free);
+    memset(raw, 0, kLen);
+    ASSERT_TRUE(UringFile::register_global_buffer(raw, kLen));
+
+    const char fill[3] = {'X', 'Y', 'Z'};
+    for (int i = 0; i < 3; ++i) {
+        std::vector<char> block(kBlock, fill[i]);
+        ASSERT_EQ(pwrite(test_fd, block.data(), kBlock,
+                         static_cast<off_t>(i * kBlock)),
+                  static_cast<ssize_t>(kBlock));
+    }
+    int uring_fd = dup(test_fd);
+    ASSERT_GE(uring_fd, 0);
+    UringFile uring_file(test_filename, uring_fd, 32, false);
+    char* base = static_cast<char*>(raw);
+    std::array<UringFile::ReadDesc, 3> descs{
+        UringFile::ReadDesc{base + kBlock, kBlock, 0},              // piece 0
+        UringFile::ReadDesc{base + kGiB + kBlock, kBlock, kBlock},  // piece 1
+        UringFile::ReadDesc{base + kGiB - kBlock / 2, kBlock,
+                            2 * kBlock}};  // crosses the boundary
+    auto result = uring_file.batch_read(descs.data(), descs.size());
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(descs[i].error, ErrorCode::OK);
+        EXPECT_EQ(descs[i].bytes_read, kBlock);
+        const char* got = static_cast<const char*>(descs[i].buf);
+        EXPECT_EQ(std::count(got, got + kBlock, fill[i]),
+                  static_cast<std::ptrdiff_t>(kBlock))
+            << "read " << i;
+    }
+
+    // Another thread's ring takes the same registration (cloned, not pinned
+    // again) and reads into the second piece.
+    memset(base + kGiB + kBlock, 0, kBlock);
+    bool other_ok = false;
+    std::thread reader([&] {
+        UringFile::ReadDesc d{base + kGiB + kBlock, kBlock, kBlock};
+        auto r = uring_file.batch_read(&d, 1);
+        other_ok = r.has_value() && d.error == ErrorCode::OK &&
+                   d.bytes_read == kBlock &&
+                   std::count(base + kGiB + kBlock, base + kGiB + 2 * kBlock,
+                              fill[1]) == static_cast<std::ptrdiff_t>(kBlock);
+    });
+    reader.join();
+    EXPECT_TRUE(other_ok);
+    UringFile::unregister_global_buffer();
 }
 
 TEST_F(PosixFileTest, UringBatchReadReportsShortReadPerRequest) {
