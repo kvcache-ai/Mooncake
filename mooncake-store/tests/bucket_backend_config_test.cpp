@@ -228,9 +228,24 @@ TEST_F(BucketBackendConfigTest, PreservesEvictionPolicyAliasPrecedence) {
               BucketEvictionPolicy::FIFO);
 }
 
-TEST_F(BucketBackendConfigTest, UnknownPolicyDisablesEvictionWithoutWarning) {
+TEST_F(BucketBackendConfigTest, EvictionPolicyIsCaseInsensitive) {
+    env.eviction_policy.Set("FIFO");
+    EXPECT_EQ(BucketBackendConfig::FromEnvironment().value().eviction_policy,
+              BucketEvictionPolicy::FIFO);
+    env.eviction_policy.Set("Lru");
+    EXPECT_EQ(BucketBackendConfig::FromEnvironment().value().eviction_policy,
+              BucketEvictionPolicy::LRU);
+
+    env.eviction_policy.Set("NONE");
+    ::testing::internal::CaptureStderr();
+    EXPECT_EQ(BucketBackendConfig::FromEnvironment().value().eviction_policy,
+              BucketEvictionPolicy::NONE);
+    EXPECT_TRUE(::testing::internal::GetCapturedStderr().empty());
+}
+
+TEST_F(BucketBackendConfigTest, UnknownPolicyDisablesEvictionWithWarning) {
     env.legacy_eviction_policy.Set("lru");
-    for (const char* value : {"", "FIFO", "unknown"}) {
+    for (const char* value : {"", "fif0"}) {
         env.eviction_policy.Set(value);
         ::testing::internal::CaptureStderr();
 
@@ -238,7 +253,8 @@ TEST_F(BucketBackendConfigTest, UnknownPolicyDisablesEvictionWithoutWarning) {
         const std::string logs = ::testing::internal::GetCapturedStderr();
 
         EXPECT_EQ(config.eviction_policy, BucketEvictionPolicy::NONE) << value;
-        EXPECT_TRUE(logs.empty()) << value;
+        EXPECT_NE(logs.find("'" + std::string(value) + "'"), std::string::npos)
+            << value;
     }
 }
 
