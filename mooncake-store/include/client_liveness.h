@@ -148,10 +148,18 @@ class ClientLivenessRecord {
     [[nodiscard]] ClientLivenessTransition EvaluateAndRetire(
         TimePoint now, Clock::duration active_ttl,
         Clock::duration suspicion_ttl, ReserveRetirement&& reserve_retirement,
-        RetireOperation&& retire_operation) {
+        RetireOperation&& retire_operation, bool wait_for_guard = true) {
         ClientLivenessTransition transition = ClientLivenessTransition::NONE;
         {
-            std::lock_guard<std::mutex> lock(transition_mutex_);
+            std::unique_lock<std::mutex> lock(transition_mutex_,
+                                              std::defer_lock);
+            if (wait_for_guard) {
+                lock.lock();
+            } else if (!lock.try_lock()) {
+                // The monitor holds the registry lock. Do not pin that lock
+                // while a mount or remount retains the client's resources.
+                return ClientLivenessTransition::NONE;
+            }
             std::lock_guard<std::mutex> observation_lock(observation_mutex_);
             switch (state_.load(std::memory_order_relaxed)) {
                 case ClientLivenessState::ACTIVE:

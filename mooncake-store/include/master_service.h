@@ -1086,14 +1086,8 @@ class MasterService {
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
-    // Liveness-complement sweep that re-captures the retaining-client set
-    // periodically during the walk: a client that mounts or remounts while
-    // the sweep is in progress is seen alive before its remaining replicas
-    // are classified, so they cannot be misclassified as stale (a
-    // point-in-time capture taken before an O(total keys) walk could erase a
-    // concurrently mounting client's fresh replicas). The set is re-captured
-    // under client_mutex_ shared only and between object accessor
-    // acquisitions, so callers must not hold master_state_mutex_.
+    // Classify LOCAL_DISK replicas using their bound liveness incarnation.
+    // Object locks protect the binding; OFFLINE records cannot become live.
     void ClearInvalidHandles();
     // Same sweep, but classification uses the caller-provided retaining set
     // for every shard (point-in-time liveness). Kept for tests that
@@ -1113,15 +1107,11 @@ class MasterService {
     // cleaned, each under its own write lock: a mass client expiry marks
     // handles stale table-wide, and walking a whole shard while holding it
     // exclusively blocked every RPC for that shard until the sweep moved on.
-    // refresh_retaining, when provided, runs at each tenant visit and before
-    // each picked object's accessor, at points where no shard lock is held,
-    // so the is_stale classification can use a fresher liveness view.
     // serialize_remount protects replica access by the background sweep, which
     // runs without master_state_mutex_. Callers holding that lock must leave
     // this false to preserve the remount-before-master-state lock order.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale,
-        const std::function<void()>& refresh_retaining = nullptr,
         bool serialize_remount = false);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     // We need to clean up finished tasks periodically to avoid memory leak
@@ -2295,6 +2285,10 @@ class MasterService {
     std::mutex remount_mutex_;
     std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
     ClientOffboardingWorker client_offboarding_worker_{this};
+    void EvaluateClientLiveness(
+        const UUID& client_id,
+        const std::shared_ptr<ClientLivenessRecord>& record,
+        ClientLivenessRecord::TimePoint now);
     void ClientMonitorFunc();
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};
@@ -2590,6 +2584,9 @@ class MasterService {
     bool kv_track_tenant_epochs_{false};
     std::atomic<uint64_t> kv_cleared_published_{0};
     std::atomic<uint64_t> kv_cleared_suppressed_by_epoch_{0};
+    // Test barriers installed before starting the operation being exercised.
+    std::function<void()> stale_handles_before_read_hook_;
+    std::function<void()> remount_before_client_reacquire_hook_;
     // Fires once per tenant whose objects a RemoveAll has finished removing,
     // so a test can commit into a tenant the walk already passed.
     std::function<void(const TenantId&)> kv_remove_all_tenant_hook_;

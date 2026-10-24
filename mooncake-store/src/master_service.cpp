@@ -836,13 +836,18 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             if (!record_inserted) {
                 return;
             }
+            const auto current = client_liveness_records_.find(client_id);
+            if (current == client_liveness_records_.end() ||
+                current->second != record) {
+                return;
+            }
             {
                 std::unique_lock<std::shared_mutex> status_lock(
                     client_status_mutex_);
-                client_liveness_records_.erase(client_id);
+                client_liveness_records_.erase(current);
             }
             MasterMetricManager::instance().on_client_liveness_record_removed(
-                ClientLivenessState::ACTIVE);
+                record->state());
         };
         std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         for (const auto& segment : segments) {
@@ -926,6 +931,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             if (client_lock_released) {
                 snapshot_lock.unlock();
                 remount_guard.reset();
+                if (remount_before_client_reacquire_hook_) {
+                    remount_before_client_reacquire_hook_();
+                }
                 client_lock.lock();
             }
             discard_provisional_record();
@@ -1163,7 +1171,23 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         // against a concurrent mount or remount admission.
         snapshot_lock.unlock();
         remount_guard.reset();
+        if (remount_before_client_reacquire_hook_) {
+            remount_before_client_reacquire_hook_();
+        }
         client_lock.lock();
+        // Retirement may have won the handoff. Never publish readiness for
+        // a removed/replaced incarnation or one whose resources are retiring.
+        const auto current = client_liveness_records_.find(client_id);
+        if (current == client_liveness_records_.end() ||
+            current->second != record) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        remount_guard = record->TryAcquireRetainingGuard();
+        if (!remount_guard) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
         ok_client_.insert(client_id);
         {
             std::unique_lock<std::shared_mutex> status_lock(
@@ -2460,39 +2484,20 @@ void MasterService::CleanupExpiredSoftPins(
 }
 
 void MasterService::ClearInvalidHandles() {
-    // Liveness-complement sweep: the retaining-client set is re-captured
-    // periodically during the sweep instead of once for the whole table. A
-    // client that mounts or remounts while the sweep is in progress is then
-    // seen alive before its remaining replicas are classified, so they cannot
-    // be misjudged as stale. The capture runs under client_mutex_ shared only
-    // and between object accessor acquisitions, so the documented
-    // client-before-shard lock order is preserved and callers must not hold
-    // master_state_mutex_.
-    constexpr auto kRetainingSetRefreshInterval =
-        std::chrono::milliseconds(100);
-    auto capture = [this]() {
-        std::unordered_set<UUID, boost::hash<UUID>> retained;
-        std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
-        retained = GetRetainingClientIdsLocked();
-        return retained;
-    };
-    std::unordered_set<UUID, boost::hash<UUID>> retaining_clients = capture();
-    auto last_refresh = std::chrono::steady_clock::now();
+    // Each published LOCAL_DISK replica is bound to its owner's incarnation.
+    // Check that record under the object lock rather than a cached registry
+    // snapshot. OFFLINE is terminal, so a stale record cannot become live
+    // between classification and deletion.
     (void)ClearStaleHandles(
-        [&retaining_clients](const Replica& replica) {
+        [](const Replica& replica) {
+            const auto record = replica.is_local_disk_replica()
+                                    ? replica.getClientLiveness()
+                                    : nullptr;
             return (replica.has_invalid_mem_handle() ||
                     replica.has_invalid_nof_handle() ||
-                    replica.has_stale_local_disk_client(retaining_clients)) &&
+                    (replica.is_local_disk_replica() &&
+                     (!record || !record->ShouldRetainResources()))) &&
                    replica.is_completed();
-        },
-        [this, &capture, &retaining_clients, &last_refresh,
-         interval = kRetainingSetRefreshInterval]() {
-            const auto now = std::chrono::steady_clock::now();
-            if (now - last_refresh < interval) {
-                return;
-            }
-            retaining_clients = capture();
-            last_refresh = now;
         },
         /*serialize_remount=*/true);
 }
@@ -2508,19 +2513,21 @@ void MasterService::ClearInvalidHandles(
 }
 
 void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
-    (void)ClearStaleHandles([&owner](const Replica& replica) {
-        return replica.is_local_disk_replica() && replica.is_completed() &&
-               replica.get_local_disk_client_id() == owner;
-    });
+    (void)ClearStaleHandles(
+        [&owner](const Replica& replica) {
+            return replica.is_local_disk_replica() && replica.is_completed() &&
+                   replica.get_local_disk_client_id() == owner;
+        },
+        /*serialize_remount=*/true);
 }
 
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
     const std::function<bool(const Replica&)>& is_stale,
-    const std::function<void()>& refresh_retaining, bool serialize_remount) {
+    bool serialize_remount) {
     std::optional<ErrorCode> first_persist_error;
     VisitTenants([&](const TenantId& tenant_id) {
-        if (refresh_retaining) {
-            refresh_retaining();
+        if (stale_handles_before_read_hook_) {
+            stale_handles_before_read_hook_();
         }
         // Reader pre-check: an object with nothing to sweep never takes the
         // write lock. Each picked object is classified again under its own
@@ -2552,9 +2559,6 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                                                       std::defer_lock);
             if (serialize_remount) {
                 remount_lock.lock();
-            }
-            if (refresh_retaining) {
-                refresh_retaining();
             }
             // The by-reference accessor skips the invalid-replica cleanup,
             // which would drop the stale replicas before this pass could see
@@ -11248,6 +11252,110 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
             << ", total_freed_size=" << total_freed_size;
 }
 
+void MasterService::EvaluateClientLiveness(
+    const UUID& client_id, const std::shared_ptr<ClientLivenessRecord>& record,
+    ClientLivenessRecord::TimePoint now) {
+    // Serialize identity validation, transition and registry removal with
+    // remount publication/rollback. A captured record may already be gone.
+    std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+    const auto current = client_liveness_records_.find(client_id);
+    if (current == client_liveness_records_.end() ||
+        current->second != record) {
+        return;
+    }
+    const auto transition = record->EvaluateAndRetire(
+        now, std::chrono::seconds(client_active_ttl_sec_),
+        std::chrono::seconds(client_suspicion_ttl_sec_),
+        [&] { client_offboarding_worker_.ReserveJob(); },
+        [&] {
+            {
+                if (ok_client_.erase(client_id) != 0) {
+                    MasterMetricManager::instance().dec_active_clients();
+                }
+                {
+                    std::unique_lock<std::shared_mutex> status_lock(
+                        client_status_mutex_);
+                    client_status_view_.erase(client_id);
+                }
+                client_host_id_.erase(client_id);
+                MasterMetricManager::instance()
+                    .client_liveness_became_offline();
+            }
+            client_lock.unlock();
+            graceful_unmount_scheduler_.RemoveIf(
+                [&client_id](const GracefulUnmountDeadlineRecord& pending) {
+                    return pending.client_id == client_id;
+                });
+
+            ClientOffboardingJob job;
+            job.client_id = client_id;
+            job.liveness = record;
+            std::shared_lock<std::shared_mutex> snapshot_lock(
+                master_state_mutex_);
+            {
+                ScopedSegmentAccess segment_access =
+                    segment_manager_.getSegmentAccess();
+                std::vector<Segment> segments;
+                const auto get_result =
+                    segment_access.GetClientSegments(client_id, segments);
+                if (get_result == ErrorCode::OK) {
+                    for (const auto& segment : segments) {
+                        SegmentStatus status = SegmentStatus::UNDEFINED;
+                        const auto status_result =
+                            segment_access.GetSegmentStatusById(segment.id,
+                                                                status);
+                        if (status_result == ErrorCode::SEGMENT_NOT_FOUND) {
+                            continue;
+                        }
+                        if (status_result == ErrorCode::OK &&
+                            status == SegmentStatus::UNMOUNTING) {
+                            job.pending_prepare_segments.push_back(
+                                {.segment_id = segment.id,
+                                 .segment_name = segment.name,
+                                 .transport_endpoint = segment.te_endpoint});
+                            continue;
+                        }
+
+                        size_t metrics_dec_capacity = 0;
+                        const auto prepare_result =
+                            segment_access.PrepareUnmountSegment(
+                                segment.id, metrics_dec_capacity);
+                        if (prepare_result == ErrorCode::OK) {
+                            job.prepared_segments.push_back(
+                                {.segment_id = segment.id,
+                                 .segment_name = segment.name,
+                                 .transport_endpoint = segment.te_endpoint,
+                                 .metrics_dec_capacity = metrics_dec_capacity});
+                        } else if (prepare_result !=
+                                   ErrorCode::SEGMENT_NOT_FOUND) {
+                            job.pending_prepare_segments.push_back(
+                                {.segment_id = segment.id,
+                                 .segment_name = segment.name,
+                                 .transport_endpoint = segment.te_endpoint});
+                            LOG(ERROR)
+                                << "client_id=" << client_id
+                                << ", segment_name=" << segment.name
+                                << ", action=prepare_client_offboarding"
+                                << ", error=" << toString(prepare_result);
+                        }
+                    }
+                }
+            }
+
+            client_offboarding_worker_.ScheduleReserved(std::move(job));
+        },
+        /*wait_for_guard=*/false);
+
+    if (transition == ClientLivenessTransition::BECAME_SUSPECTED) {
+        MasterMetricManager::instance().client_liveness_became_suspected();
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=client_liveness_suspected";
+    } else if (transition == ClientLivenessTransition::BECAME_OFFLINE) {
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=client_liveness_offline";
+    }
+}
+
 void MasterService::ClientMonitorFunc() {
     while (client_monitor_running_) {
         const auto now = ClientLivenessRecord::Clock::now();
@@ -11262,111 +11370,7 @@ void MasterService::ClientMonitorFunc() {
         }
 
         for (const auto& [client_id, record] : clients) {
-            const auto transition = record->EvaluateAndRetire(
-                now, std::chrono::seconds(client_active_ttl_sec_),
-                std::chrono::seconds(client_suspicion_ttl_sec_),
-                [&] { client_offboarding_worker_.ReserveJob(); },
-                [&] {
-                    {
-                        std::unique_lock<std::shared_mutex> client_lock(
-                            client_mutex_);
-                        const auto current =
-                            client_liveness_records_.find(client_id);
-                        CHECK(current != client_liveness_records_.end());
-                        CHECK(current->second == record);
-                        if (ok_client_.erase(client_id) != 0) {
-                            MasterMetricManager::instance()
-                                .dec_active_clients();
-                        }
-                        {
-                            std::unique_lock<std::shared_mutex> status_lock(
-                                client_status_mutex_);
-                            client_status_view_.erase(client_id);
-                        }
-                        client_host_id_.erase(client_id);
-                    }
-                    graceful_unmount_scheduler_.RemoveIf(
-                        [&client_id](
-                            const GracefulUnmountDeadlineRecord& pending) {
-                            return pending.client_id == client_id;
-                        });
-
-                    ClientOffboardingJob job;
-                    job.client_id = client_id;
-                    job.liveness = record;
-                    std::shared_lock<std::shared_mutex> snapshot_lock(
-                        master_state_mutex_);
-                    {
-                        ScopedSegmentAccess segment_access =
-                            segment_manager_.getSegmentAccess();
-                        std::vector<Segment> segments;
-                        const auto get_result =
-                            segment_access.GetClientSegments(client_id,
-                                                             segments);
-                        if (get_result == ErrorCode::OK) {
-                            for (const auto& segment : segments) {
-                                SegmentStatus status = SegmentStatus::UNDEFINED;
-                                const auto status_result =
-                                    segment_access.GetSegmentStatusById(
-                                        segment.id, status);
-                                if (status_result ==
-                                    ErrorCode::SEGMENT_NOT_FOUND) {
-                                    continue;
-                                }
-                                if (status_result == ErrorCode::OK &&
-                                    status == SegmentStatus::UNMOUNTING) {
-                                    job.pending_prepare_segments.push_back(
-                                        {.segment_id = segment.id,
-                                         .segment_name = segment.name,
-                                         .transport_endpoint =
-                                             segment.te_endpoint});
-                                    continue;
-                                }
-
-                                size_t metrics_dec_capacity = 0;
-                                const auto prepare_result =
-                                    segment_access.PrepareUnmountSegment(
-                                        segment.id, metrics_dec_capacity);
-                                if (prepare_result == ErrorCode::OK) {
-                                    job.prepared_segments.push_back(
-                                        {.segment_id = segment.id,
-                                         .segment_name = segment.name,
-                                         .transport_endpoint =
-                                             segment.te_endpoint,
-                                         .metrics_dec_capacity =
-                                             metrics_dec_capacity});
-                                } else if (prepare_result !=
-                                           ErrorCode::SEGMENT_NOT_FOUND) {
-                                    job.pending_prepare_segments.push_back(
-                                        {.segment_id = segment.id,
-                                         .segment_name = segment.name,
-                                         .transport_endpoint =
-                                             segment.te_endpoint});
-                                    LOG(ERROR)
-                                        << "client_id=" << client_id
-                                        << ", segment_name=" << segment.name
-                                        << ", action=prepare_client_offboarding"
-                                        << ", error="
-                                        << toString(prepare_result);
-                                }
-                            }
-                        }
-                    }
-
-                    MasterMetricManager::instance()
-                        .client_liveness_became_offline();
-                    client_offboarding_worker_.ScheduleReserved(std::move(job));
-                });
-
-            if (transition == ClientLivenessTransition::BECAME_SUSPECTED) {
-                MasterMetricManager::instance()
-                    .client_liveness_became_suspected();
-                LOG(INFO) << "client_id=" << client_id
-                          << ", action=client_liveness_suspected";
-            } else if (transition == ClientLivenessTransition::BECAME_OFFLINE) {
-                LOG(INFO) << "client_id=" << client_id
-                          << ", action=client_liveness_offline";
-            }
+            EvaluateClientLiveness(client_id, record, now);
         }
 
         std::this_thread::sleep_for(

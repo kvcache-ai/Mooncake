@@ -58,6 +58,28 @@ TEST(ClientLivenessRecordTest, FailedOperationDoesNotRecoverOrRefresh) {
               ClientLivenessTransition::BECAME_OFFLINE);
 }
 
+TEST(ClientLivenessRecordTest, MonitorEvaluationDoesNotWaitForRetainingGuard) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    ClientLivenessRecord record(initial);
+    auto guard = record.TryAcquireRetainingGuard();
+    ASSERT_TRUE(guard);
+    bool reserved = false;
+    bool retired = false;
+    auto evaluation = std::async(std::launch::async, [&] {
+        return record.EvaluateAndRetire(
+            initial + 30s, 10s, 20s, [&] { reserved = true; },
+            [&] { retired = true; },
+            /*wait_for_guard=*/false);
+    });
+    const auto status = evaluation.wait_for(1s);
+    guard.reset();
+    EXPECT_EQ(evaluation.get(), ClientLivenessTransition::NONE);
+    EXPECT_EQ(status, std::future_status::ready);
+    EXPECT_FALSE(reserved);
+    EXPECT_FALSE(retired);
+    EXPECT_EQ(record.state(), ClientLivenessState::ACTIVE);
+}
+
 TEST(ClientLivenessRecordTest, HeartbeatRefreshesWhileResourcesAreRetained) {
     const auto initial = ClientLivenessRecord::TimePoint{};
     ClientLivenessRecord record(initial);
