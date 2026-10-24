@@ -15,8 +15,8 @@ class PosixFsAdapter : public FileSystemAdapter {
 
     tl::expected<int, ErrorCode> OpenFile(const std::string& path) override;
 
-    tl::expected<int, ErrorCode> OpenExistingFile(
-        const std::string& path) override;
+    tl::expected<int, ErrorCode> OpenExistingFile(const std::string& path,
+                                                  bool write) override;
 
     tl::expected<void, ErrorCode> CloseFile(int fd) override;
 

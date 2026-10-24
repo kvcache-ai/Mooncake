@@ -326,7 +326,7 @@ bool DistributedStorageBackend::UsesBucketAllocator() const {
 }
 
 tl::expected<int, ErrorCode> DistributedStorageBackend::OpenBucket(
-    const DistributedFSDescriptor& descriptor) {
+    const DistributedFSDescriptor& descriptor, bool write) {
     const auto path =
         std::filesystem::path(descriptor.file_path).lexically_normal();
     auto root = std::filesystem::path(root_dir_).lexically_normal();
@@ -353,7 +353,7 @@ tl::expected<int, ErrorCode> DistributedStorageBackend::OpenBucket(
         canonical_path.filename() != path.filename()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return fs_adapter_->OpenExistingFile(file_path);
+    return fs_adapter_->OpenExistingFile(file_path, write);
 }
 
 tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
@@ -454,7 +454,7 @@ struct DistributedStorageBackend::DfsIoOp {
 tl::expected<void, ErrorCode> DistributedStorageBackend::ExecuteSingleIo(
     DfsIoOp& op, bool write) {
     if (UsesBucketAllocator()) {
-        auto fd = OpenBucket(op.descriptor);
+        auto fd = OpenBucket(op.descriptor, write);
         if (!fd) return tl::make_unexpected(fd.error());
         auto result = TransferAll(*fs_adapter_, *fd, std::move(op.iovs),
                                   static_cast<int64_t>(op.descriptor.offset),
@@ -557,7 +557,7 @@ void DistributedStorageBackend::ExecuteBucketBatchIo(
         for (; next != buckets.end() && opened.size() < kMaxOpenBucketsPerBatch;
              ++next) {
             const auto& bucket_ops = next->second;
-            auto fd = OpenBucket(bucket_ops.front()->descriptor);
+            auto fd = OpenBucket(bucket_ops.front()->descriptor, write);
             if (!fd) {
                 LOG(ERROR) << "Failed to open DFS bucket " << next->first.first
                            << ": " << fd.error();
