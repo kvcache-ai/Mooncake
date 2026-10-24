@@ -2014,6 +2014,560 @@ TEST_F(MasterServiceHATest, RemountRefreshesLeaseWhenAnotherReplicaIsReadable) {
               std::chrono::system_clock::now());
 }
 
+TEST_F(MasterServiceHATest, PingStaysResponsiveDuringRemountMetadataWalk) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_default_kv_lease_ttl(10000)
+                              .build());
+    // Standby objects keep their segments accounted, so ReMountSegment runs
+    // the metadata restore walk that visits every metadata shard. Two standby
+    // segments: the walk segment whose remount is parked below, and the
+    // pinger segment whose remount completes up front. Ping only answers OK
+    // for admitted clients, and admission happens on remount -- mounting a
+    // segment alone leaves the client in NEED_REMOUNT by design.
+    const std::string walk_endpoint = "ping_walk_remount_segment";
+    const std::string pinger_endpoint = "ping_walk_pinger_segment";
+    const std::string key = "ping_walk_remount_key";
+    auto object = MakeStandbyObject(key, walk_endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {object}, 7,
+                        {MakeStandbyMemorySegment(walk_endpoint),
+                         MakeStandbyMemorySegment(pinger_endpoint)})
+                    .has_value());
+
+    // Admit the pinger before the parked remount starts. Its segment sits at
+    // a disjoint base, so its own restore walk finds no replica to rebuild
+    // and completes without touching the walk segment's range.
+    const UUID pinger_client = generate_uuid();
+    const UUID remount_client = generate_uuid();
+    ASSERT_TRUE(service
+                    .ReMountSegment(
+                        {MakeSegment(pinger_endpoint, kDefaultSegmentBase +
+                                                          kDefaultSegmentSize)},
+                        pinger_client)
+                    .has_value());
+    ASSERT_EQ(service.Ping(pinger_client)->client_status, ClientStatus::OK);
+
+    // Park the walk on the first shard it visits, so the remount cannot leave
+    // the restore pass while the lock is held.
+    std::string park_key;
+    for (int i = 0; i < 1000000; ++i) {
+        const std::string candidate = "ping_walk_park_" + std::to_string(i);
+        if (MasterServiceTestPeer(service).getShardIndex(kDefaultTenant,
+                                                         candidate) == 0) {
+            park_key = candidate;
+            break;
+        }
+    }
+    ASSERT_FALSE(park_key.empty());
+    auto park_lock =
+        LockMetadataShardForTesting(service, kDefaultTenant, park_key);
+
+    auto remount = std::async(std::launch::async, [&] {
+        return service.ReMountSegment({MakeSegment(walk_endpoint)},
+                                      remount_client);
+    });
+
+    // The remount is inside the restore pass once it has released
+    // client_mutex_ but still holds master_state exclusively -- the same
+    // observable PutStartHoldsSnapshotAfterClientReleaseForTesting detects.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool walk_reached = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(service)) {
+            walk_reached = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+
+    // Every heartbeat must complete with OK while the remount is parked in
+    // the walk. Before the fix the remount held client_mutex_ exclusively
+    // for the whole walk, so each Ping blocked until the walk finished --
+    // which is also why the loop only runs once the remount is known to be
+    // inside the walk: a Ping issued outside that state would hang instead
+    // of failing.
+    constexpr int kPings = 8;
+    std::vector<tl::expected<PingResponse, ErrorCode>> pings;
+    std::vector<std::chrono::steady_clock::duration> ping_durations;
+    if (walk_reached) {
+        pings.reserve(kPings);
+        ping_durations.reserve(kPings);
+        for (int i = 0; i < kPings; ++i) {
+            const auto start = std::chrono::steady_clock::now();
+            pings.push_back(service.Ping(pinger_client));
+            ping_durations.push_back(std::chrono::steady_clock::now() - start);
+        }
+    }
+    // The remount is still parked in the walk, so the pings above really
+    // overlapped it.
+    const bool still_in_walk =
+        walk_reached &&
+        PutStartHoldsSnapshotAfterClientReleaseForTesting(service);
+
+    // The remounting client's own heartbeat must also complete. Its
+    // retaining guard pins resources, but must not pin heartbeat observation.
+    auto remount_ping = std::async(
+        std::launch::async, [&] { return service.Ping(remount_client); });
+    const auto remount_ping_status =
+        remount_ping.wait_for(std::chrono::seconds(1));
+    park_lock.unlock();
+    const auto remount_result = remount.get();
+    const auto remount_ping_result = remount_ping.get();
+
+    ASSERT_TRUE(walk_reached)
+        << "remount never entered the metadata restore walk";
+    for (size_t i = 0; i < pings.size(); ++i) {
+        ASSERT_TRUE(pings[i].has_value());
+        EXPECT_EQ(pings[i]->client_status, ClientStatus::OK);
+        EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(
+                      ping_durations[i])
+                      .count(),
+                  2000)
+            << "ping " << i << " blocked behind the remount walk";
+    }
+    EXPECT_TRUE(still_in_walk);
+    EXPECT_EQ(remount_ping_status, std::future_status::ready);
+    ASSERT_TRUE(remount_ping_result.has_value());
+    if (remount_ping_status == std::future_status::ready) {
+        EXPECT_EQ(remount_ping_result->client_status,
+                  ClientStatus::NEED_REMOUNT);
+    }
+    ASSERT_TRUE(remount_result.has_value()) << toString(remount_result.error());
+    EXPECT_EQ(service.Ping(remount_client)->client_status, ClientStatus::OK);
+}
+
+TEST_F(MasterServiceHATest, PingStaysResponsiveWhileRemountWaitsForSnapshot) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const UUID pinger_client = generate_uuid();
+    const UUID remount_client = generate_uuid();
+    ASSERT_TRUE(service
+                    .ReMountSegment({MakeSegment("snapshot_wait_pinger")},
+                                    pinger_client)
+                    .has_value());
+    ASSERT_EQ(service.Ping(pinger_client)->client_status, ClientStatus::OK);
+
+    auto snapshot_lock = LockSnapshotForTesting(service);
+    auto remount = std::async(std::launch::async, [&] {
+        return service.ReMountSegment(
+            {MakeSegment("snapshot_wait_remount",
+                         kDefaultSegmentBase + kDefaultSegmentSize)},
+            remount_client);
+    });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool admission_reached = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::shared_lock<std::shared_mutex> client_lock(
+            MasterServiceTestPeer::ClientMutex(service), std::try_to_lock);
+        if (!client_lock.owns_lock()) {
+            admission_reached = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+
+    auto ping = std::async(std::launch::async,
+                           [&] { return service.Ping(pinger_client); });
+    const auto ping_status = ping.wait_for(std::chrono::seconds(1));
+    const auto remount_status = remount.wait_for(std::chrono::seconds(0));
+    snapshot_lock.unlock();
+    const auto ping_result = ping.get();
+    const auto remount_result = remount.get();
+
+    ASSERT_TRUE(admission_reached);
+    EXPECT_EQ(remount_status, std::future_status::timeout);
+    EXPECT_EQ(ping_status, std::future_status::ready);
+    ASSERT_TRUE(ping_result.has_value());
+    EXPECT_EQ(ping_result->client_status, ClientStatus::OK);
+    ASSERT_TRUE(remount_result.has_value()) << toString(remount_result.error());
+    EXPECT_EQ(service.Ping(remount_client)->client_status, ClientStatus::OK);
+}
+
+TEST_F(MasterServiceHATest, LocalDiskOwnerCleanupWaitsForRemountGuard) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    MasterServiceTestPeer peer(service);
+    peer.StopClientMonitor();
+    const std::string endpoint = "owner_cleanup_segment";
+    const std::string key = "owner_cleanup_key";
+    const UUID owner = generate_uuid();
+    auto object = MakeStandbyObject(key, endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto disk = MakeStandbyLocalDiskReplica(owner, endpoint);
+    disk.id = 2;
+    object.metadata.replicas.insert(object.metadata.replicas.begin(), disk);
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {object}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto released = release.get_future();
+    peer.SetStaleHandlesBeforeReadHook([&] {
+        entered.set_value();
+        released.wait();
+    });
+    std::unique_lock guard(MasterServiceTestPeer::RemountMutex(service));
+    auto cleanup = std::async(
+        std::launch::async, [&] { peer.ClearLocalDiskHandlesOwnedBy(owner); });
+    const auto entered_status =
+        entered.get_future().wait_for(std::chrono::seconds(5));
+    release.set_value();
+    const auto cleanup_status =
+        cleanup.wait_for(std::chrono::milliseconds(100));
+    const auto during = ReplicaCountForTesting(service, kDefaultTenant, key);
+    guard.unlock();
+    cleanup.get();
+    peer.SetStaleHandlesBeforeReadHook({});
+    EXPECT_EQ(entered_status, std::future_status::ready);
+    EXPECT_EQ(cleanup_status, std::future_status::timeout);
+    EXPECT_EQ(during, 2u);
+    const auto remaining =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, key);
+    ASSERT_EQ(remaining.size(), 1u);
+    EXPECT_TRUE(remaining.front().is_memory_replica());
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+    EXPECT_TRUE(service.GetReplicaList(key, kDefaultTenant).has_value());
+}
+
+TEST_F(MasterServiceHATest, NewlyRetainingOwnerSurvivesConcurrentCleanup) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    MasterServiceTestPeer peer(service);
+    peer.StopClientMonitor();
+    const std::string endpoint = "fresh_owner_segment";
+    auto seed = MakeStandbyObject("fresh_owner_seed", endpoint);
+    seed.metadata.replicas = {
+        MakeStandbyLocalDiskReplica(generate_uuid(), endpoint)};
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({seed}, 7, {}).has_value());
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto released = release.get_future();
+    peer.SetStaleHandlesBeforeReadHook([&] {
+        entered.set_value();
+        released.wait();
+    });
+    auto cleanup =
+        std::async(std::launch::async, [&] { peer.ClearInvalidHandles(); });
+    const auto entered_status =
+        entered.get_future().wait_for(std::chrono::seconds(5));
+    const UUID owner = generate_uuid();
+    auto fresh = MakeStandbyObject("fresh_owner_key", endpoint);
+    fresh.metadata.replicas = {MakeStandbyLocalDiskReplica(owner, endpoint)};
+    // Publish after cleanup has started, before it reads this tenant. There
+    // is no sleep or dependence on a cache-refresh deadline.
+    auto restored = service.RestoreFromStandbySnapshot({fresh}, 8, {});
+    release.set_value();
+    cleanup.get();
+    peer.SetStaleHandlesBeforeReadHook({});
+    ASSERT_EQ(entered_status, std::future_status::ready);
+    ASSERT_TRUE(restored.has_value());
+    ASSERT_TRUE(ClientRecordForTesting(service, owner));
+    EXPECT_TRUE(ClientRecordForTesting(service, owner)->IsServing());
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "fresh_owner_key"), 1u);
+    EXPECT_TRUE(
+        service.GetReplicaList("fresh_owner_key", kDefaultTenant).has_value());
+}
+
+TEST_F(MasterServiceHATest, RemountDoesNotPublishOkAfterRetirementHandoff) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_client_active_ttl_sec(1)
+                              .set_client_suspicion_ttl_sec(1)
+                              .build());
+    MasterServiceTestPeer peer(service);
+    peer.StopClientMonitor();
+    const auto active_before =
+        MasterMetricManager::instance().get_active_clients();
+    const UUID client = generate_uuid();
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto released = release.get_future();
+    peer.SetRemountBeforeClientReacquireHook([&] {
+        entered.set_value();
+        released.wait();
+    });
+    auto remount = std::async(std::launch::async, [&] {
+        return service.ReMountSegment({MakeSegment("retired_handoff")}, client);
+    });
+    const auto entered_status =
+        entered.get_future().wait_for(std::chrono::seconds(5));
+    const auto record = ClientRecordForTesting(service, client);
+    if (entered_status == std::future_status::ready && record) {
+        const auto now =
+            ClientLivenessRecord::Clock::now() + std::chrono::seconds(2);
+        peer.EvaluateClientLiveness(client, record, now);
+        peer.EvaluateClientLiveness(client, record,
+                                    now + std::chrono::seconds(2));
+    }
+    release.set_value();
+    const auto result = remount.get();
+    peer.SetRemountBeforeClientReacquireHook({});
+    ASSERT_EQ(entered_status, std::future_status::ready);
+    ASSERT_TRUE(record);
+    EXPECT_EQ(record->state(), ClientLivenessState::OFFLINE);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_FALSE(peer.ClientIsOk(client));
+    EXPECT_EQ(service.Ping(client)->client_status, ClientStatus::NEED_REMOUNT);
+    EXPECT_EQ(MasterMetricManager::instance().get_active_clients(),
+              active_before);
+}
+
+TEST_F(MasterServiceHATest, FailedRemountDiscardsCapturedMonitorRecordSafely) {
+    // A stale monitor callback used to abort the process. Isolate this case
+    // so the regression reports a failed test instead of killing the suite.
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            MasterService service(MasterServiceConfig::builder()
+                                      .set_enable_ha(false)
+                                      .set_client_active_ttl_sec(1)
+                                      .set_client_suspicion_ttl_sec(1)
+                                      .build());
+            MasterServiceTestPeer peer(service);
+            peer.StopClientMonitor();
+            const std::string endpoint = "failed_handoff_segment";
+            auto object = MakeStandbyObject("failed_handoff_key", endpoint);
+            auto& descriptor = object.metadata.replicas.front()
+                                   .get_memory_descriptor()
+                                   .buffer_descriptor;
+            descriptor.buffer_address_ = kDefaultSegmentBase;
+            descriptor.protocol_ = "cxl";
+            ASSERT_TRUE(
+                service
+                    .RestoreFromStandbySnapshot(
+                        {object}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+            const UUID client = generate_uuid();
+            std::promise<void> entered;
+            std::promise<void> release;
+            auto released = release.get_future();
+            peer.SetRemountBeforeClientReacquireHook([&] {
+                entered.set_value();
+                released.wait();
+            });
+            auto remount = std::async(std::launch::async, [&] {
+                return service.ReMountSegment({MakeSegment(endpoint)}, client);
+            });
+            const auto entered_status =
+                entered.get_future().wait_for(std::chrono::seconds(5));
+            const auto record = ClientRecordForTesting(service, client);
+            const auto now =
+                ClientLivenessRecord::Clock::now() + std::chrono::seconds(2);
+            if (entered_status == std::future_status::ready && record) {
+                peer.EvaluateClientLiveness(client, record, now);
+            }
+            // Model the next monitor iteration capturing the SUSPECTED record
+            // before rollback, but evaluating it only after rollback removes
+            // it.
+            const auto captured = ClientRecordForTesting(service, client);
+            release.set_value();
+            const auto result = remount.get();
+            peer.SetRemountBeforeClientReacquireHook({});
+            ASSERT_EQ(entered_status, std::future_status::ready);
+            ASSERT_TRUE(captured);
+            ASSERT_FALSE(result.has_value());
+            EXPECT_FALSE(ClientRecordForTesting(service, client));
+            peer.EvaluateClientLiveness(client, captured,
+                                        now + std::chrono::seconds(2));
+            EXPECT_FALSE(peer.HasPendingOffboarding());
+            EXPECT_FALSE(peer.ClientIsOk(client));
+            _exit(::testing::Test::HasFailure() ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(MasterServiceHATest, StaleHandleCleanupWaitsForRemountGuard) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "cleanup_remount_segment";
+    const std::string key = "cleanup_remount_key";
+    const UUID disk_owner = generate_uuid();
+    auto object = MakeStandbyObject(key, endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    object.metadata.replicas.push_back(
+        MakeStandbyLocalDiskReplica(disk_owner, endpoint));
+    object.metadata.replicas.back().id = 2;
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {object}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+    const auto record = ClientRecordForTesting(service, disk_owner);
+    ASSERT_TRUE(record);
+    const auto now = ClientLivenessRecord::Clock::now();
+    ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                               std::chrono::hours(1)),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    MasterMetricManager::instance().client_liveness_became_suspected();
+    ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                               std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    MasterMetricManager::instance().client_liveness_became_offline();
+
+    // Model the lifetime of Replica pointers retained by ReMountSegment.
+    // Cleanup must not access replicas until the remount critical section
+    // ends. Do not hold a metadata lock: the remount mutex alone must preserve
+    // the memory and disk elements.
+    std::unique_lock<std::mutex> remount_lock(
+        MasterServiceTestPeer::RemountMutex(service));
+    std::promise<void> started;
+    auto cleanup = std::async(std::launch::async, [&] {
+        started.set_value();
+        ClearInvalidHandlesForTesting(service);
+    });
+    started.get_future().wait();
+    const auto cleanup_status =
+        cleanup.wait_for(std::chrono::milliseconds(100));
+    const auto replicas_during_remount =
+        ReplicaCountForTesting(service, kDefaultTenant, key);
+    remount_lock.unlock();
+    cleanup.get();
+
+    EXPECT_EQ(cleanup_status, std::future_status::timeout);
+    EXPECT_EQ(replicas_during_remount, 2u);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1u);
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+    ASSERT_TRUE(service.GetReplicaList(key, kDefaultTenant).has_value());
+}
+
+TEST_F(MasterServiceHATest,
+       ClearInvalidHandlesSeesOwnerThatBecameRetainingMidSweep) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "sweep_discovery_mount_segment";
+    const auto shard_of = [&](const std::string& key) {
+        return MasterServiceTestPeer(service).getShardIndex(kDefaultTenant,
+                                                            key);
+    };
+    // The sweep discovers tenants by walking every shard, so a lock on the
+    // middle shard parks it before any tenant is visited. The live key's
+    // object is only restored while the sweep is parked there, and lands on a
+    // shard the discovery walk has not passed yet.
+    std::string progress_key;
+    std::string park_key;
+    std::string live_key;
+    for (int i = 0; i < 1000000; ++i) {
+        const std::string candidate =
+            "sweep_discovery_mount_key_" + std::to_string(i);
+        const size_t shard = shard_of(candidate);
+        if (progress_key.empty() && shard <= 300) {
+            progress_key = candidate;
+        } else if (!progress_key.empty() && park_key.empty() && shard > 300 &&
+                   shard <= 700) {
+            park_key = candidate;
+        } else if (!park_key.empty() && live_key.empty() && shard > 700) {
+            live_key = candidate;
+            break;
+        }
+    }
+    ASSERT_FALSE(progress_key.empty());
+    ASSERT_FALSE(park_key.empty());
+    ASSERT_FALSE(live_key.empty());
+
+    const auto make_local_disk_object = [&](const std::string& key,
+                                            const UUID& owner) {
+        StandbyObjectMetadata metadata;
+        metadata.client_id = generate_uuid();
+        metadata.size = 1024;
+        metadata.replicas.push_back(
+            MakeStandbyLocalDiskReplica(owner, endpoint));
+        return StandbyObjectEntry{"default", key, std::move(metadata)};
+    };
+
+    const UUID offline_progress_owner = generate_uuid();
+    const UUID offline_park_owner = generate_uuid();
+    const UUID recovering_owner = generate_uuid();
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot(
+                {make_local_disk_object(progress_key, offline_progress_owner),
+                 make_local_disk_object(park_key, offline_park_owner)},
+                7, {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
+    for (const UUID& owner : {offline_progress_owner, offline_park_owner}) {
+        const auto record = ClientRecordForTesting(service, owner);
+        ASSERT_TRUE(record);
+        const auto now = ClientLivenessRecord::Clock::now();
+        EXPECT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                                   std::chrono::hours(1)),
+                  ClientLivenessTransition::BECAME_SUSPECTED);
+        EXPECT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                                   std::chrono::seconds::zero()),
+                  ClientLivenessTransition::BECAME_OFFLINE);
+    }
+
+    // Park the sweep during the tenant discovery walk, before the first
+    // tenant is visited and picked through. It cannot finish while the lock
+    // is held, and its one-time initial capture has run once it is parked.
+    auto park_lock =
+        LockMetadataShardForTesting(service, kDefaultTenant, park_key);
+    auto sweep = std::async(std::launch::async,
+                            [&] { ClearInvalidHandlesForTesting(service); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // While parked the sweep must hold no global lock: the restore below
+    // needs master_state exclusively. Fail instead of hanging on that code.
+    {
+        std::unique_lock<std::shared_mutex> probe(
+            MasterServiceTestPeer::MasterStateMutex(service), std::try_to_lock);
+        if (!probe.owns_lock()) {
+            park_lock.unlock();
+            sweep.get();
+            FAIL() << "sweep held master_state_mutex_ while parked during "
+                      "tenant discovery";
+            return;
+        }
+    }
+
+    // The sweep must still be parked -- not already finished -- when the
+    // owner registers, or the test would prove nothing. Release the park and
+    // reap it first so a failure here cannot hang on the still-held lock.
+    if (sweep.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        park_lock.unlock();
+        sweep.get();
+        FAIL() << "sweep finished before the owner registered";
+        return;
+    }
+
+    // The owner registers while the sweep is parked: the restore installs an
+    // ACTIVE liveness record for it and places its object on a shard the
+    // discovery walk has not reached yet. Its record is fresh -- an OFFLINE
+    // record cannot come back -- so an owner that was already swept away
+    // stays swept; this is the mounting owner the refresh must learn about.
+    const auto recovering_restore = service.RestoreFromStandbySnapshot(
+        {make_local_disk_object(live_key, recovering_owner)}, 7,
+        {MakeStandbyMemorySegment(endpoint)});
+
+    park_lock.unlock();
+    sweep.get();
+
+    ASSERT_TRUE(recovering_restore.has_value())
+        << toString(recovering_restore.error());
+    // The read pass sees the new owner's bound liveness record and keeps
+    // its replica. A point-in-time registry snapshot could miss that owner.
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, live_key), 1u);
+    // Owners that stayed offline are still swept, on both sides of the park.
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, progress_key),
+              0u);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, park_key), 0u);
+}
+
 TEST_F(MasterServiceHATest,
        LocalFirstAllocationDoesNotReacquireClientLockUnderSnapshotBarrier) {
     MasterService service(
@@ -2257,22 +2811,19 @@ TEST_F(MasterServiceHATest, NoFBatchEvictWaitsForSnapshotBarrier) {
     eviction.get();
 }
 
-TEST_F(MasterServiceHATest, InvalidHandleCleanupWaitsForSnapshotBarrier) {
+TEST_F(MasterServiceHATest, InvalidHandleCleanupDoesNotWaitForSnapshotBarrier) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
+    // The sweep takes remount and object locks, so it must
+    // complete while the global snapshot barrier is held exclusively. The
+    // old sweep kept master_state_mutex_ shared across the whole table walk,
+    // which is what the barrier-pinned predecessor of this test asserted.
     auto snapshot_lock = LockSnapshotForTesting(service);
-    std::promise<void> started;
-    auto started_future = started.get_future();
-    auto cleanup = std::async(std::launch::async, [&] {
-        started.set_value();
-        ClearInvalidHandlesForTesting(service);
-    });
-    started_future.wait();
-    EXPECT_EQ(cleanup.wait_for(std::chrono::milliseconds(100)),
-              std::future_status::timeout);
-    snapshot_lock.unlock();
+    auto cleanup = std::async(std::launch::async,
+                              [&] { ClearInvalidHandlesForTesting(service); });
     ASSERT_EQ(cleanup.wait_for(std::chrono::seconds(5)),
               std::future_status::ready);
+    snapshot_lock.unlock();
     cleanup.get();
 }
 
