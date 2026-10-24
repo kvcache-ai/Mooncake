@@ -69,6 +69,8 @@ Status SegmentTracker::add(uint64_t base, size_t length,
     new_desc.addr = base;
     new_desc.length = length;
     auto entries = Platform::getLoader().getLocation((void*)base, length);
+    if (entries.empty())
+        return Status::InternalError("Unable to determine buffer location");
     if (entries.size() == 1)
         new_desc.location = entries[0].location;
     else {

@@ -53,16 +53,31 @@ class CudaPluginContextTest : public testing::Test {
 
 extern "C" {
 CUresult __wrap_cuInit(unsigned int) { return CUDA_SUCCESS; }
-CUresult __wrap_cuPointerGetAttribute(void* value, CUpointer_attribute attr,
-                                      CUdeviceptr ptr) {
-    if (!device_pointer || ptr != (CUdeviceptr)device_pointer)
-        return CUDA_ERROR_INVALID_VALUE;
-    if (attr == CU_POINTER_ATTRIBUTE_MEMORY_TYPE)
-        *static_cast<unsigned int*>(value) = CU_MEMORYTYPE_DEVICE;
-    else if (attr == CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL)
-        *static_cast<int*>(value) = kBufferDevice;
-    else
-        return CUDA_ERROR_INVALID_VALUE;
+CUresult __wrap_cuDeviceGet(CUdevice* device, int ordinal) {
+    if (ordinal != kBufferDevice) return CUDA_ERROR_INVALID_DEVICE;
+    *device = ordinal;
+    return CUDA_SUCCESS;
+}
+CUresult __wrap_cuPointerGetAttributes(unsigned int count,
+                                       CUpointer_attribute* attributes,
+                                       void** values, CUdeviceptr ptr) {
+    const bool device = device_pointer && ptr == (CUdeviceptr)device_pointer;
+    for (unsigned int i = 0; i < count; ++i) {
+        switch (attributes[i]) {
+            case CU_POINTER_ATTRIBUTE_MEMORY_TYPE:
+                *static_cast<unsigned int*>(values[i]) =
+                    device ? CU_MEMORYTYPE_DEVICE : 0;
+                break;
+            case CU_POINTER_ATTRIBUTE_IS_MANAGED:
+                *static_cast<unsigned int*>(values[i]) = 0;
+                break;
+            case CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL:
+                *static_cast<int*>(values[i]) = device ? kBufferDevice : -2;
+                break;
+            default:
+                return CUDA_ERROR_INVALID_VALUE;
+        }
+    }
     return CUDA_SUCCESS;
 }
 CUresult __wrap_cuCtxGetCurrent(CUcontext* ctx) {
