@@ -322,6 +322,92 @@ class TestMluTensorStore(unittest.TestCase):
             torch.mlu.synchronize()
             self.assertTensorEqual(destinations[1], expected)
 
+    @contextlib.contextmanager
+    def busy_mlu_stream(self, materialized_view):
+        torch = self.torch
+        torch.mlu.synchronize()
+        stream = torch.mlu.Stream()
+        try:
+            with torch.mlu.stream(stream):
+                # Prime this stream's allocator with stale, distinct contents.
+                # A fresh device allocation can implicitly drain the stream
+                # and hide the race. TP keeps two materialized shards alive.
+                buffers = [
+                    torch.zeros(
+                        materialized_view.shape,
+                        dtype=materialized_view.dtype,
+                        device=materialized_view.device,
+                    )
+                    for _ in range(2)
+                ]
+                stream.synchronize()
+                del buffers
+                # Delay the binding's internal contiguous() behind unrelated
+                # work. The caller's source has already been synchronized.
+                torch.mlu._sleep(100_000_000)
+                self.assertFalse(stream.query())
+                yield
+        finally:
+            stream.synchronize()
+
+    def test_noncontiguous_writes_on_busy_nondefault_stream(self):
+        torch = self.torch
+        # Exercise a nondefault device too when two MLUs are visible.
+        device = min(torch.mlu.device_count(), 2) - 1
+        with torch.mlu.device(device):
+            for index, method in enumerate(
+                (
+                    "put_tensor",
+                    "upsert_tensor",
+                    "batch_put_tensor",
+                    "batch_upsert_tensor",
+                )
+            ):
+                with self.subTest(method=method, device=device):
+                    expected = (
+                        torch.arange(1024 * 1024, dtype=torch.int32) + index + 100
+                    ).reshape(1024, 1024)
+                    source = expected.to("mlu").t()
+                    self.assertFalse(source.is_contiguous())
+                    torch.mlu.synchronize()
+                    self.assertTensorEqual(source, expected.t())
+                    key = self.key(method)
+                    with self.busy_mlu_stream(source):
+                        if method.startswith("batch_"):
+                            host_key = self.key(method + "_host")
+                            result = getattr(self.store, method)(
+                                [key, host_key], [source, expected]
+                            )
+                        else:
+                            result = getattr(self.store, method)(key, source)
+                    self.assertEqual(
+                        result, [0, 0] if method.startswith("batch_") else 0
+                    )
+                    self.assertTensorEqual(self.store.get_tensor(key), expected.t())
+                    if method.startswith("batch_"):
+                        self.assertTensorEqual(
+                            self.store.get_tensor(host_key), expected
+                        )
+
+    def test_tp_materialization_on_busy_nondefault_stream(self):
+        torch = self.torch
+        expected = torch.arange(1024 * 1024, dtype=torch.int32).reshape(1024, 1024)
+        source = expected.to("mlu")
+        torch.mlu.synchronize()
+        self.assertTrue(source.is_contiguous())
+        # Splitting columns creates noncontiguous views of a contiguous input.
+        # The shard helper must wait for its own materialization, even though
+        # the later tensor inspection receives an already-contiguous shard.
+        self.assertFalse(source.narrow(1, 0, 512).is_contiguous())
+        key = self.key("busy_tp")
+        self.keys.extend(f"{key}_tp_{rank}" for rank in range(2))
+        with self.busy_mlu_stream(source.narrow(1, 0, 512)):
+            result = self.store.put_tensor_with_tp(key, source, tp_size=2, split_dim=1)
+        self.assertEqual(result, 0)
+        for rank in range(2):
+            actual = self.store.get_tensor_with_tp(key, tp_rank=rank, tp_size=2)
+            self.assertTensorEqual(actual, expected.narrow(1, rank * 512, 512))
+
     def test_nondefault_stream_handoff(self):
         torch = self.torch
         expected = expected_tensor(torch, 1 << 20)
