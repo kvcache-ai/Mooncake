@@ -277,9 +277,8 @@ int RocmPlatform::getPointerDeviceId(void* addr) {
     return attributes.device;
 }
 
-static inline uintptr_t alignPage(uintptr_t address) {
-    const static size_t kPageSize = 4096;
-    return address & ~(kPageSize - 1);
+static inline uintptr_t alignPage(uintptr_t address, size_t page_size) {
+    return address & ~(page_size - 1);
 }
 
 static inline std::string genCpuNodeName(int node) {
@@ -295,7 +294,6 @@ static inline std::string genRocmNodeName(int node) {
 const std::vector<RangeLocation> RocmPlatform::getLocation(void* start,
                                                            size_t len,
                                                            bool skip_prefault) {
-    const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
 
     hipPointerAttribute_t attributes;
@@ -313,18 +311,20 @@ const std::vector<RangeLocation> RocmPlatform::getLocation(void* start,
         return entries;
     }
 
-    uintptr_t aligned_start = alignPage((uintptr_t)start);
+    const size_t page_size = probePageSize(start, len);
+    uintptr_t aligned_start = alignPage((uintptr_t)start, page_size);
     int n =
-        (uintptr_t(start) - aligned_start + len + kPageSize - 1) / kPageSize;
+        (uintptr_t(start) - aligned_start + len + page_size - 1) / page_size;
     void** pages = (void**)malloc(sizeof(void*) * n);
     int* status = (int*)malloc(sizeof(int) * n);
 
     for (int i = 0; i < n; i++) {
-        pages[i] = (void*)((char*)aligned_start + i * kPageSize);
+        pages[i] = (void*)((char*)aligned_start + i * page_size);
     }
 
     if (!skip_prefault) {
-        prefaultBeforeProbe(pages, n, aligned_start, "RocmPlatform");
+        prefaultBeforeProbe(pages, n, aligned_start, "RocmPlatform",
+                            {.page_size = page_size});
     }
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
@@ -340,7 +340,8 @@ const std::vector<RangeLocation> RocmPlatform::getLocation(void* start,
     uint64_t new_start_addr;
     for (int i = 1; i < n; i++) {
         if (status[i] != node) {
-            new_start_addr = alignPage((uint64_t)start) + i * kPageSize;
+            new_start_addr =
+                alignPage((uint64_t)start, page_size) + i * page_size;
             entries.push_back({start_addr, size_t(new_start_addr - start_addr),
                                genCpuNodeName(node)});
             start_addr = new_start_addr;
