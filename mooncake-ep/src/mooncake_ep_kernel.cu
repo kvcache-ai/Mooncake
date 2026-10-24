@@ -45,8 +45,8 @@ template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
 __global__ EP_LAUNCH_BOUNDS(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
 dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
-         int* packed_recv_count, int32_t* active_ranks,
-         void* mxa_buffer,
+         int* packed_recv_count, int* cumulative_local_expert_recv_stats,
+         int32_t* active_ranks, void* mxa_buffer,
          int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
          void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
          void* cuda_counter_buffer, void* cuda_data_buffer,
@@ -57,7 +57,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int* next_clean_buffer,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
-         int64_t timeout_ticks,
+         int qp_num_ranks, int64_t timeout_ticks,
          int phases, int active_qps_per_rank) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -105,7 +105,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         raddrs, rkeys, qp_devctxs,
         rdma_send_signal_buffer, rdma_recv_signal_buffer,
         rank, num_ranks, MAX_QP_COUNT);
-    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
+    const size_t num_qp_per_rank = MAX_QP_COUNT / qp_num_ranks;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -177,11 +177,12 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
             // Issue sends
             if (dst_expert_idx >= 0) {
-                int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
-                slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
                 const auto dst_rank = dst_expert_idx / num_local_experts;
                 const auto dst_expert_local_idx = dst_expert_idx % num_local_experts;
-                const auto src_ptr = reinterpret_cast<const void*>(rdma_x_src_idx);
+                if (active_ranks[dst_rank]) {
+                    int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
+                    slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
+                    const auto src_ptr = reinterpret_cast<const void*>(rdma_x_src_idx);
                 const auto dst_ptr = reinterpret_cast<void*>(
                     reinterpret_cast<uint64_t>(rdma_recv_data_buffer) +
                     dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
@@ -221,8 +222,9 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     }
 #endif
                 }
+                }
 
-                // Increase counter after finishing
+                // Account for selected tokens even when a masked peer is skipped.
                 __syncwarp();
 #ifdef MOONCAKE_EP_USE_MUSA
                 mc_fence_noflush();
@@ -251,7 +253,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         if (sm_id == 0) {
             // The first SM is also responsible for cleaning the next buffer
             #pragma unroll
-            for (int i = lane_id; i < num_experts; i += 32)
+            for (int i = lane_id; i < qp_num_ranks * num_local_experts; i += 32)
                 next_clean_buffer[i] = 0;
 
             // Notify before executing `int_p`
@@ -322,18 +324,20 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                              responsible_expert_idx) != FINISHED_SUM_TAG * 2) {
         }
 #endif
-        if (dst_rank != rank) {
+        if (active_ranks[dst_rank]) {
+            if (dst_rank != rank) {
 #ifdef MOONCAKE_EP_USE_MUSA
-            mc_fence();
+                mc_fence();
 #endif
-            int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
-            mc_red_add(comm_ctx, dst_rank,
-                       ep_qp_channel(dst_expert_local_idx, num_qp_per_rank,
-                                     active_qps_per_rank),
-                       num_qp_per_rank, signal_ptr,
-                       static_cast<int32_t>(-num_tokens_sent - 1));
-        } else {
-            mc_st_release(rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1);
+                int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
+                mc_red_add(comm_ctx, dst_rank,
+                           ep_qp_channel(dst_expert_local_idx, num_qp_per_rank,
+                                         active_qps_per_rank),
+                           num_qp_per_rank, signal_ptr,
+                           static_cast<int32_t>(-num_tokens_sent - 1));
+            } else {
+                mc_st_release(rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1);
+            }
         }
 
         // Clean workspace for next use
@@ -377,18 +381,26 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
         if (sub_warp_id == 1 and lane_id == 0) {
             unsigned long long start_time = clock64();
-            while ((num_recv_tokens = mc_ld_acquire(rdma_recv_signal_buffer + local_expert_idx * num_ranks + src_rank)) == 0) {
-                unsigned long long end_time = clock64();
-                if (timeout_ticks != -1 && end_time - start_time > timeout_ticks) {
-                    active_ranks[src_rank] = 0;
+            if (active_ranks[src_rank]) {
+                while ((num_recv_tokens = mc_ld_acquire(
+                            rdma_recv_signal_buffer +
+                            local_expert_idx * num_ranks + src_rank)) == 0) {
+                    unsigned long long end_time = clock64();
+                    if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
+                        active_ranks[src_rank] = 0;
+                    if (!active_ranks[src_rank]) {
+                        num_recv_tokens = -1;
+                        break;
+                    }
                 }
-                if (!active_ranks[src_rank]) {
-                    num_recv_tokens = -1;
-                    break;
-                }
+            } else {
+                num_recv_tokens = -1;
             }
             num_recv_tokens = -num_recv_tokens - 1;
             recv_token_begin_idx = atomicAdd(packed_recv_count + local_expert_idx, num_recv_tokens);
+            if (cumulative_local_expert_recv_stats != nullptr)
+                atomicAdd(cumulative_local_expert_recv_stats + local_expert_idx,
+                          num_recv_tokens);
             shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
             shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx;
             recv_range[src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx);
@@ -434,8 +446,9 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
 void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int* packed_recv_src_info, int64_t* packed_recv_layout_range,
-              int* packed_recv_count, int32_t* active_ranks,
-              void* mxa_buffer,
+              int* packed_recv_count,
+              int* cumulative_local_expert_recv_stats,
+              int32_t* active_ranks, void* mxa_buffer,
               int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
               void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
               void* cuda_counter_buffer, void* cuda_data_buffer,
@@ -444,8 +457,9 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               const void* x, const int64_t* topk_idx,
               int* next_clean_buffer,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
-              int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
-              void* workspace, cudaStream_t stream,
+              int num_topk, int num_experts, int rank, int num_ranks,
+              int qp_num_ranks, bool use_fp8, void* workspace,
+              cudaStream_t stream,
               int64_t timeout_ticks, int phases, int active_qps_per_rank) {
     constexpr int kNumMaxTopK = 17;
     constexpr int kNumWarpsPerGroup = 4;
@@ -480,8 +494,8 @@ auto dispatch_func = use_fp8 ? dispatch<true, kNumWarpGroups, kNumWarpsPerGroup,
 LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
               packed_recv_src_info, packed_recv_layout_range, \
-              packed_recv_count, active_ranks, \
-              mxa_buffer, \
+              packed_recv_count, cumulative_local_expert_recv_stats, \
+              active_ranks, mxa_buffer, \
               rdma_send_signal_buffer, rdma_recv_signal_buffer, \
               rdma_send_data_buffer, rdma_recv_data_buffer, \
               cuda_counter_buffer, cuda_data_buffer, \
@@ -491,7 +505,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
               next_clean_buffer, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
-              num_topk, num_experts, rank, num_ranks, \
+              num_topk, num_experts, rank, num_ranks, qp_num_ranks, \
               timeout_ticks, phases, active_qps_per_rank); } break
 
 #define DISPATCH_LAUNCH_CASE(hidden) { \
@@ -526,7 +540,7 @@ combine(void* combined_x, int32_t* active_ranks,
         int* atomic_clean_flag,
         int num_combined_tokens, int hidden, int num_topk,
         int num_max_dispatch_tokens_per_rank,
-        int num_experts, int rank, int num_ranks,
+        int num_experts, int rank, int num_ranks, int qp_num_ranks,
         int64_t timeout_ticks,
         int phases, bool zero_copy, int active_qps_per_rank) {
     const auto sm_id = static_cast<int>(blockIdx.x);
@@ -553,7 +567,7 @@ combine(void* combined_x, int32_t* active_ranks,
         raddrs, rkeys, qp_devctxs,
         rdma_send_signal_buffer, rdma_recv_signal_buffer,
         rank, num_ranks, MAX_QP_COUNT);
-    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
+    const size_t num_qp_per_rank = MAX_QP_COUNT / qp_num_ranks;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -562,7 +576,7 @@ combine(void* combined_x, int32_t* active_ranks,
     // Clean up next buffer
     if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
         #pragma unroll
-        for (int i = lane_id; i < num_experts; i += 32)
+        for (int i = lane_id; i < qp_num_ranks * num_local_experts; i += 32)
             next_clean_buffer[i] = 0;
 
         // Notify before executing `int_p`
@@ -593,6 +607,7 @@ combine(void* combined_x, int32_t* active_ranks,
         // Unpack layout
         int offset, num_tokens_to_send;
         unpack2(layout, num_tokens_to_send, offset);
+        if (!active_ranks[dst_rank]) num_tokens_to_send = 0;
 
         // Issue IBGDA send
         for (int token_idx = offset + sub_warp_id; token_idx < offset + num_tokens_to_send; token_idx += kNumWarpsPerGroup) {
@@ -603,6 +618,8 @@ combine(void* combined_x, int32_t* active_ranks,
             // Copy directly to local rank, or copy to buffer and issue RDMA
             auto src_idx = __ldg(local_src_info + token_idx);
             const auto buf_ptr = reinterpret_cast<void*>(rdma_send_x_vec_row);
+            const auto* send_x_int4 =
+                zero_copy ? reinterpret_cast<const int4*>(buf_ptr) : x_int4;
             const auto dst_ptr = reinterpret_cast<void*>(
                 reinterpret_cast<uint64_t>(rdma_recv_data_buffer) +
                 (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot);
@@ -611,7 +628,8 @@ combine(void* combined_x, int32_t* active_ranks,
             if (write_dst != nullptr) {
                 // Local or P2P path — warp-cooperative copy
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
-                UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
+                UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr,
+                                   send_x_int4, mc_ld_nc, mc_st_na);
 #ifndef MOONCAKE_EP_USE_MUSA
                 mc_fence();
 #endif
@@ -655,14 +673,16 @@ combine(void* combined_x, int32_t* active_ranks,
 #else
             while (mc_ld_acquire(atomic_clean_flag) == 0);
 #endif
-            if (dst_rank != rank) {
-                int* signal_ptr = rdma_recv_signal_buffer + global_expert_idx;
-                mc_signal(comm_ctx, dst_rank,
-                          ep_qp_channel(local_expert_idx, num_qp_per_rank,
-                                        active_qps_per_rank),
-                          num_qp_per_rank, signal_ptr, 1);
-            } else {
-                mc_st_release(rdma_recv_signal_buffer + global_expert_idx, 1);
+            if (active_ranks[dst_rank]) {
+                if (dst_rank != rank) {
+                    int* signal_ptr = rdma_recv_signal_buffer + global_expert_idx;
+                    mc_signal(comm_ctx, dst_rank,
+                              ep_qp_channel(local_expert_idx, num_qp_per_rank,
+                                            active_qps_per_rank),
+                              num_qp_per_rank, signal_ptr, 1);
+                } else {
+                    mc_st_release(rdma_recv_signal_buffer + global_expert_idx, 1);
+                }
             }
 #ifdef MOONCAKE_EP_USE_MUSA
             // The peer signal already publishes the payload. This local tally
@@ -690,16 +710,14 @@ combine(void* combined_x, int32_t* active_ranks,
     if (responsible_expert_idx < num_experts) {
         const auto src_rank = responsible_expert_idx / num_local_experts;
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
-        if (sub_warp_id == 0 and lane_id == 0) {
+        if (sub_warp_id == 0 and lane_id == 0 &&
+            active_ranks[src_rank]) {
             unsigned long long start_time = clock64();
-            while (mc_ld_acquire(rdma_recv_signal_buffer + responsible_expert_idx) == 0) {
+            while (mc_ld_acquire(rdma_recv_signal_buffer + responsible_expert_idx) == 0 &&
+                   active_ranks[src_rank]) {
                 unsigned long long end_time = clock64();
-                if (timeout_ticks != -1 && end_time - start_time > timeout_ticks) {
+                if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
                     active_ranks[src_rank] = 0;
-                }
-                if (!active_ranks[src_rank]) {
-                    break;
-                }
             }
         }
     }
@@ -851,7 +869,7 @@ void combine(void* combined_x, int32_t* active_ranks,
              int* next_clean_buffer,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
              int num_topk, int num_experts, int rank, int num_ranks,
-             void* workspace, cudaStream_t stream,
+             int qp_num_ranks, void* workspace, cudaStream_t stream,
              int64_t timeout_ticks, int phases, bool zero_copy,
              int active_qps_per_rank) {
     constexpr int kNumWarpsPerGroup = 4;
@@ -881,12 +899,89 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               atomic_clean_flag, \
               num_combined_tokens, hidden, num_topk, \
               num_max_dispatch_tokens_per_rank, \
-              num_experts, rank, num_ranks, \
+              num_experts, rank, num_ranks, qp_num_ranks, \
               timeout_ticks, phases, zero_copy, active_qps_per_rank); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
+}
+
+__global__ void update_active_mask_kernel(int32_t* active_ranks, int rank,
+                                          int32_t active) {
+    if (threadIdx.x == 0) active_ranks[rank] = active;
+}
+
+void update_mask_buffer(int32_t* active_ranks, int rank, bool masked,
+                        cudaStream_t stream) {
+    SETUP_LAUNCH_CONFIG(1, 32, stream);
+    LAUNCH_KERNEL(&cfg, update_active_mask_kernel, active_ranks, rank,
+                  masked ? 0 : 1);
+}
+
+__global__ void query_mask_buffer_kernel(const int32_t* active_ranks,
+                                         int32_t* output_mask,
+                                         int num_ranks) {
+    int rank = blockIdx.x * blockDim.x + threadIdx.x;
+    if (rank < num_ranks) output_mask[rank] = active_ranks[rank] ? 0 : 1;
+}
+
+void query_mask_buffer(const int32_t* active_ranks, int num_ranks,
+                       int32_t* output_mask, cudaStream_t stream) {
+    constexpr int kThreads = 256;
+    SETUP_LAUNCH_CONFIG(cell_div(num_ranks, kThreads), kThreads, stream);
+    LAUNCH_KERNEL(&cfg, query_mask_buffer_kernel, active_ranks, output_mask,
+                  num_ranks);
+}
+
+__global__ void barrier_kernel(
+    int32_t* active_ranks, int* send_count, int* arrivals, void* gdr_buffer,
+    const int32_t* nvlink_available, void* const* ipc_peer_ptrs, void* raddrs,
+    void* rkeys, void* qp_devctxs, int rank, int rank_bound,
+    int capacity_ranks, int num_qp_per_rank, int64_t timeout_ticks) {
+    const int dst_rank = threadIdx.x;
+    if (dst_rank < rank_bound && dst_rank < capacity_ranks &&
+        dst_rank != rank && active_ranks[dst_rank]) {
+        const int sequence = atomicAdd(send_count + dst_rank, 1) + 1;
+        auto* remote_arrival_local = arrivals + rank;
+        const auto comm_ctx = make_comm_ctx(
+            gdr_buffer, nvlink_available, ipc_peer_ptrs, raddrs, rkeys,
+            qp_devctxs, send_count, arrivals, rank, capacity_ranks,
+            MAX_QP_COUNT);
+        void* p2p_dst = mc_route_put(comm_ctx, dst_rank, remote_arrival_local);
+        if (p2p_dst != nullptr) {
+            mc_st_release(reinterpret_cast<int*>(p2p_dst), sequence);
+        } else {
+            mc_fence();
+            mc_rdma_put(comm_ctx, 0, dst_rank, num_qp_per_rank,
+                        send_count + dst_rank, remote_arrival_local,
+                        sizeof(int), 0);
+        }
+
+        const auto start = clock64();
+        while (mc_ld_acquire(arrivals + dst_rank) != sequence) {
+            if (!active_ranks[dst_rank]) break;
+            if (timeout_ticks != -1 && clock64() - start > timeout_ticks) {
+                active_ranks[dst_rank] = 0;
+                break;
+            }
+        }
+    }
+    __syncthreads();
+}
+
+void barrier(int32_t* active_ranks, int* send_count, int* arrivals,
+             void* gdr_buffer, int32_t* nvlink_available,
+             void* const* ipc_peer_ptrs, void* raddrs, void* rkeys,
+             void* qp_devctxs, int rank, int rank_bound, int capacity_ranks,
+             int num_qp_per_rank, cudaStream_t stream,
+             int64_t timeout_ticks) {
+    constexpr int kThreads = MAX_QP_COUNT;
+    SETUP_LAUNCH_CONFIG(1, kThreads, stream);
+    LAUNCH_KERNEL(&cfg, barrier_kernel, active_ranks, send_count, arrivals,
+                  gdr_buffer, nvlink_available, ipc_peer_ptrs, raddrs, rkeys,
+                  qp_devctxs, rank, rank_bound, capacity_ranks,
+                  num_qp_per_rank, timeout_ticks);
 }
 
 } // namespace mooncake
