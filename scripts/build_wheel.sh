@@ -194,6 +194,8 @@ STORE_FACADE_STAGING_DIR="${MIGRATED_PYTHON_STAGING_DIR}/store"
 MIGRATED_PYTHON_INIT_BACKUP=""
 MIGRATED_PYTHON_MODULES=(
     __init__.py
+    py.typed
+    engine.pyi
     structured_object_store.py
     _fast_copy.c
     http_metadata_server.py

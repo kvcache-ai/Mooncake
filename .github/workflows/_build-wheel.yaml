@@ -290,6 +290,8 @@ jobs:
           "$smoke_venv/bin/python" -c \
             'from mooncake import engine; assert engine.SUPPORT_EFA, "EFA support missing"'
 
+          bash scripts/ci/check_wheel_typing.sh "$smoke_venv/bin/python"
+
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4
         with:
