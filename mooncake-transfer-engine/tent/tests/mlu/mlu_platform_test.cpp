@@ -16,6 +16,8 @@
 #include <cn_api.h>
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
+#include <unistd.h>
 #include <limits>
 #include <thread>
 #include <vector>
@@ -111,6 +113,10 @@ TEST_F(MluPlatformTest, CopiesExternalDriverAllocationAndRestoresContext) {
     ASSERT_TRUE(platform_.copy(ptr, seed.data(), seed.size()).ok());
     ASSERT_TRUE(platform_.copy(actual.data(), ptr, actual.size()).ok());
     EXPECT_EQ(actual, seed);
+    DmabufExport exported;
+    const auto export_status = platform_.exportDmabuf(ptr, 4096, exported);
+    if (!export_status.IsNotImplemented() || getenv("MC_TENT_MLU_REQUIRE_RDMA"))
+        EXPECT_TRUE(export_status.ok()) << export_status.ToString();
     CNcontext after = nullptr;
     ASSERT_EQ(cnCtxGetCurrent(&after), CN_SUCCESS);
     EXPECT_EQ(after, allocation.previous);
@@ -129,6 +135,52 @@ TEST_F(MluPlatformTest, RejectsDeviceOverrunAndInteriorFree) {
     EXPECT_FALSE(platform_.copy(device_, device_, 1).ok());
     EXPECT_EQ(host[0], 1);
     EXPECT_EQ(host[1], 2);
+}
+
+TEST_F(MluPlatformTest, DmabufSubrangeLifetimeAndContextRestoration) {
+    const size_t page = sysconf(_SC_PAGESIZE);
+    auto* interior = static_cast<char*>(device_) + page + 123;
+    for (int repeat = 0; repeat < 20; ++repeat) {
+        DmabufExport exported;
+        CNcontext before = nullptr, after = nullptr;
+        ASSERT_EQ(cnCtxGetCurrent(&before), CN_SUCCESS);
+        auto status = platform_.exportDmabuf(interior, page, exported);
+        if (status.IsNotImplemented() && !getenv("MC_TENT_MLU_REQUIRE_RDMA"))
+            GTEST_SKIP() << status.ToString();
+        ASSERT_TRUE(status.ok()) << status.ToString();
+        ASSERT_GE(exported.fd, 0);
+        EXPECT_EQ(exported.offset, 123u);
+        ASSERT_EQ(cnCtxGetCurrent(&after), CN_SUCCESS);
+        EXPECT_EQ(after, before);
+        const int fd = exported.fd;
+        auto shared = exported;
+        exported = DmabufExport{};
+        EXPECT_NE(fcntl(fd, F_GETFD), -1);
+        shared = DmabufExport{};
+        EXPECT_EQ(fcntl(fd, F_GETFD), -1);
+    }
+    std::thread worker([&] {
+        DmabufExport exported;
+        EXPECT_TRUE(platform_.exportDmabuf(interior, page, exported).ok());
+    });
+    worker.join();
+}
+
+TEST_F(MluPlatformTest, DmabufRejectsInvalidRangesAndHostPointers) {
+    DmabufExport exported;
+    char host[128];
+    EXPECT_TRUE(platform_.exportDmabuf(host, sizeof(host), exported)
+                    .IsInvalidArgument());
+    EXPECT_FALSE(platform_.exportDmabuf(device_, 0, exported).ok());
+    EXPECT_FALSE(
+        platform_
+            .exportDmabuf(device_, std::numeric_limits<size_t>::max(), exported)
+            .ok());
+    EXPECT_FALSE(
+        platform_
+            .exportDmabuf(static_cast<char*>(device_) + kSize - 1, 2, exported)
+            .ok());
+    EXPECT_EQ(exported.fd, -1);
 }
 
 TEST_F(MluPlatformTest, AllocationValidationAndContextPreservation) {

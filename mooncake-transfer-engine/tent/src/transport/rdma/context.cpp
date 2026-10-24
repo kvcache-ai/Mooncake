@@ -536,8 +536,33 @@ int RdmaContext::resume() {
                : -1;
 }
 
+Status RdmaContext::prepareMemReg(void* addr, size_t length,
+                                  DmabufExport& out) {
+    out = DmabufExport{};
+    auto& platform = Platform::getLoader();
+    const auto type = platform.getMemoryType(addr);
+    const bool requires_dmabuf = type == MTYPE_MLU || type == MTYPE_XPU;
+    if (!supportsDmabuf()) {
+        return requires_dmabuf ? Status::RdmaError(
+                                     "Device memory requires ibv_reg_dmabuf_mr")
+                               : Status::OK();
+    }
+    auto status = dmabuf_exporter_ ? dmabuf_exporter_(addr, length, out)
+                                   : platform.exportDmabuf(addr, length, out);
+    if (status.ok()) {
+        if (out.fd < 0) return Status::RdmaError("Invalid dma-buf descriptor");
+        return Status::OK();
+    }
+    out = DmabufExport{};
+    if (!requires_dmabuf &&
+        (status.IsNotImplemented() || status.IsInvalidArgument()))
+        return Status::OK();
+    return status;
+}
+
 RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
-                                                int access) {
+                                                int access,
+                                                const DmabufExport* prepared) {
     if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
         return nullptr;
@@ -601,45 +626,30 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
     }
 #endif
 
-    // Device memory with a dma-buf export (Intel XPU today): register the
-    // exported buffer so the NIC DMAs to VRAM directly. The exporter returns
-    // NotImplemented (platform has no export path) or InvalidArgument (not
-    // device memory) for everything that must take the plain ibv_reg_mr path
-    // below; any other failure, or a failed ibv_reg_dmabuf_mr, is reported as
-    // a registration failure so the buffer is staged instead of being
-    // registered as host memory (which would EFAULT or, worse, silently
-    // register the wrong pages).
-    if (verbs_.ibv_reg_dmabuf_mr) {
-        DmabufExport handle;
-        Status s = dmabuf_exporter_ ? dmabuf_exporter_(addr, length, handle)
-                                    : Platform::getLoader().exportDmabuf(
-                                          addr, length, handle);
-        if (s.ok()) {
-            ibv_mr* entry = verbs_.ibv_reg_dmabuf_mr(
-                native_pd_, handle.offset, length,
-                reinterpret_cast<uint64_t>(addr), handle.fd, access);
-            // The MR takes its own reference to the dma-buf. The fd itself
-            // stays with the exporting runtime (see DmabufExport): Level
-            // Zero hands out one cached descriptor per allocation, so
-            // closing it here would leave the driver with a stale fd.
-            if (!entry) {
-                const void* end = static_cast<const char*>(addr) + length;
-                PLOG(ERROR)
-                    << "Failed to register dma-buf device memory from " << addr
-                    << " to " << end << " in RDMA device " << device_name_;
-                return nullptr;
-            }
-            mr_set_mutex_.lock();
-            mr_set_.insert(entry);
-            dmabuf_mr_set_.insert(entry);
-            mr_set_mutex_.unlock();
-            return entry;
-        }
-        if (!s.IsNotImplemented() && !s.IsInvalidArgument()) {
-            LOG(ERROR) << "dma-buf export failed for device memory at " << addr
-                       << " (" << length << " bytes): " << s.message();
+    DmabufExport local_export;
+    if (!prepared) {
+        auto status = prepareMemReg(addr, length, local_export);
+        if (!status.ok()) {
+            LOG(ERROR) << "dma-buf preparation failed at " << addr << ": "
+                       << status.ToString();
             return nullptr;
         }
+        prepared = &local_export;
+    }
+    if (prepared->fd >= 0) {
+        if (!supportsDmabuf()) return nullptr;
+        ibv_mr* entry = verbs_.ibv_reg_dmabuf_mr(
+            native_pd_, prepared->offset, length,
+            reinterpret_cast<uint64_t>(addr), prepared->fd, access);
+        if (!entry) {
+            PLOG(ERROR) << "Failed to register dma-buf at " << addr << " ("
+                        << length << " bytes) on " << device_name_;
+            return nullptr;
+        }
+        std::lock_guard<std::mutex> guard(mr_set_mutex_);
+        mr_set_.insert(entry);
+        dmabuf_mr_set_.insert(entry);
+        return entry;
     }
 
     // Standard CPU memory registration
