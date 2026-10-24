@@ -943,6 +943,12 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
         return;  // Don't crash, just return early
     }
 
+    if (timed_out_) {
+        // The caller has already waited past the deadline; report failure
+        // even if the drained tasks eventually succeeded.
+        error_code = ErrorCode::TRANSFER_FAIL;
+    }
+
     VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
             << static_cast<int>(error_code);
     result_.emplace(error_code);
@@ -953,8 +959,14 @@ void TransferEngineOperationState::wait_for_completion() {
         return;
     }
 
-    // 60 seconds
-    constexpr int64_t timeout_milliseconds = 60 * 1000;
+    // On timeout the batch is reported as failed, but we still wait for every
+    // task to reach a terminal state before returning. Otherwise the caller
+    // would reuse its buffers while transfers can still read from or write
+    // into them.
+    const int64_t timeout_milliseconds = timeout_milliseconds_;
+    // How often to report a batch that is still draining after the timeout.
+    const int64_t drain_log_interval_milliseconds =
+        std::max<int64_t>(timeout_milliseconds, 1000);
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
     // TENT batches do not use the classic transport BatchDesc layout.
@@ -964,7 +976,7 @@ void TransferEngineOperationState::wait_for_completion() {
         // Wait directly on BatchDesc's condition variable.
         auto& batch_desc = Transport::toBatchDesc(batch_id_);
         bool completed;
-        bool failed = false;
+        bool timed_out = false;
 
         // Fast path: if already finished, avoid taking the mutex and waiting.
         // Use acquire here to pair with the writer's release-store, because
@@ -977,6 +989,9 @@ void TransferEngineOperationState::wait_for_completion() {
             // lock. Under the mutex, relaxed is sufficient; the mutex acquire
             // orders prior writes.
             std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
+            auto is_finished = [&batch_desc] {
+                return batch_desc.is_finished.load(std::memory_order_relaxed);
+            };
             const int64_t elapsed_milliseconds =
                 getCurrentTimeInMilli() - start_ts_;
             if (elapsed_milliseconds < timeout_milliseconds) {
@@ -984,48 +999,61 @@ void TransferEngineOperationState::wait_for_completion() {
                     lock,
                     std::chrono::milliseconds(timeout_milliseconds -
                                               elapsed_milliseconds),
-                    [&batch_desc] {
-                        return batch_desc.is_finished.load(
-                            std::memory_order_relaxed);
-                    });
+                    is_finished);
+            }
+            if (!completed) {
+                timed_out = true;
+                LOG(ERROR) << "Failed to complete transfers after "
+                           << timeout_milliseconds << " milliseconds for batch "
+                           << batch_id_
+                           << ", waiting for in-flight transfers to drain";
+                while (!batch_desc.completion_cv.wait_for(
+                    lock,
+                    std::chrono::milliseconds(drain_log_interval_milliseconds),
+                    is_finished)) {
+                    LOG(ERROR) << "Batch " << batch_id_
+                               << " still has in-flight transfers after "
+                               << getCurrentTimeInMilli() - start_ts_
+                               << " milliseconds";
+                }
             }
         }  // Explicitly release completion_mutex before acquiring mutex_
 
         // Once completion is observed, read failure flag.
-        if (completed) {
-            failed = batch_desc.has_failure.load(std::memory_order_relaxed);
-        }
+        const bool failed =
+            batch_desc.has_failure.load(std::memory_order_relaxed);
         ErrorCode error_code =
-            completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
-                      : ErrorCode::TRANSFER_FAIL;
+            (failed || timed_out) ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             set_result_internal(error_code);
         }
-        if (completed) {
-            VLOG(1) << "Transfer engine operation completed for batch "
-                    << batch_id_
-                    << " with result: " << static_cast<int>(error_code);
-        } else {
-            LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_milliseconds << " milliseconds for batch "
-                       << batch_id_;
-        }
+        VLOG(1) << "Transfer engine operation completed for batch " << batch_id_
+                << " with result: " << static_cast<int>(error_code);
         return;
     }
 #endif
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
 
+    int64_t next_log_ts = start_ts_ + timeout_milliseconds;
     while (true) {
-        if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
-            LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_milliseconds << " milliseconds for batch "
-                       << batch_id_;
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
-            return;
+        std::unique_lock<std::mutex> lock(mutex_);
+        const int64_t now = getCurrentTimeInMilli();
+        if (now - start_ts_ > timeout_milliseconds && now >= next_log_ts) {
+            if (!timed_out_) {
+                timed_out_ = true;
+                LOG(ERROR) << "Failed to complete transfers after "
+                           << timeout_milliseconds << " milliseconds for batch "
+                           << batch_id_
+                           << ", waiting for in-flight transfers to drain";
+            } else {
+                LOG(ERROR) << "Batch " << batch_id_
+                           << " still has in-flight transfers after "
+                           << now - start_ts_ << " milliseconds";
+            }
+            next_log_ts = now + drain_log_interval_milliseconds;
         }
 
-        std::unique_lock<std::mutex> lock(mutex_);
         check_task_status();
         if (result_.has_value()) {
             VLOG(1) << "Transfer engine operation completed for batch "

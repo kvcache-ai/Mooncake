@@ -665,6 +665,53 @@ TEST_F(TransferTaskTest, RemoteTransferWaitCompletesCorrectly) {
 }
 
 // Test TransferStrategy enum and stream operator
+TEST_F(TransferTaskTest, TimedOutTransferDrainsBeforeReturning) {
+    ScopedEnvVar tent_config("MC_TENT_CONF", nullptr);
+    constexpr size_t kSize = 64 * 1024 * 1024;
+    std::vector<char> local(kSize, 0), remote(kSize, 'A');
+    TransferEngine client(false), server(false);
+    ASSERT_EQ(client.init("P2PHANDSHAKE", "127.0.0.1:0", "", 0, "tcp"), 0);
+    ASSERT_EQ(server.init("P2PHANDSHAKE", "127.0.0.1:0", "", 0, "tcp"), 0);
+    if (client.isUsingTent()) GTEST_SKIP() << "Requires the classic engine";
+    ASSERT_NE(client.installTransport("tcp", nullptr), nullptr);
+    ASSERT_NE(server.installTransport("tcp", nullptr), nullptr);
+    ASSERT_EQ(client.registerLocalMemory(local.data(), local.size(), "cpu:0"),
+              0);
+    ASSERT_EQ(server.registerLocalMemory(remote.data(), remote.size(), "cpu:0"),
+              0);
+
+    auto segment = client.openSegment(server.getLocalIpAndPort());
+    BatchID batch_id = client.allocateBatchID(1);
+    ASSERT_NE(batch_id, INVALID_BATCH_ID);
+    TransferRequest request;
+    request.opcode = TransferRequest::READ;
+    request.source = local.data();
+    request.target_id = segment;
+    request.target_offset = reinterpret_cast<uint64_t>(remote.data());
+    request.length = kSize;
+    ASSERT_TRUE(client.submitTransfer(batch_id, {request}).ok());
+
+    {
+        // A zero timeout expires while the READ is still in flight. The wait
+        // must not return until the READ has stopped writing into `local`.
+        auto state = std::make_shared<TransferEngineOperationState>(
+            client, batch_id, 1, /*timeout_milliseconds=*/0);
+        TransferFuture future(state);
+        const bool ready_before_wait = future.isReady();
+        const ErrorCode result = future.wait();
+        if (!ready_before_wait) {
+            EXPECT_EQ(result, ErrorCode::TRANSFER_FAIL);
+        }
+
+        TransferStatus status;
+        ASSERT_TRUE(client.getTransferStatus(batch_id, 0, status).ok());
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(local, remote);
+    }
+    EXPECT_EQ(client.unregisterLocalMemory(local.data()), 0);
+    EXPECT_EQ(server.unregisterLocalMemory(remote.data()), 0);
+}
+
 TEST_F(TransferTaskTest, TransferStrategyEnum) {
     // Test enum values
     EXPECT_EQ(static_cast<int>(TransferStrategy::LOCAL_MEMCPY), 0);
