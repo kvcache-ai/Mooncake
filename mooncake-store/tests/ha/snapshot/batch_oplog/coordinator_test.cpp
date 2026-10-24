@@ -18,6 +18,7 @@
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_types.h"
+#include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/snapshot_maintenance_lease.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
@@ -90,13 +91,15 @@ class UnusedObjectStore final : public SnapshotObjectStore {
     std::string GetConnectionInfo() const override { return "unused"; }
 };
 
+OpLogBatchRecord MakeBatch();
+
 class RecordingBackend final : public HaKvBackend {
    public:
     ErrorCode DeleteRange(std::string_view begin,
                           std::string_view end) override {
         std::lock_guard<std::mutex> lock(mutex_);
         EXPECT_EQ(
-            "1",
+            expected_compaction_floor,
             values_[ha::BuildBatchOpLogSnapshotCompactionFloorKey("cluster")]);
         ++delete_count;
         values_.erase(values_.lower_bound(std::string(begin)),
@@ -104,6 +107,7 @@ class RecordingBackend final : public HaKvBackend {
         return ErrorCode::OK;
     }
     size_t delete_count{0};
+    std::string expected_compaction_floor{"1"};
 
     ErrorCode Get(std::string_view key, std::string& value) override {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -127,6 +131,29 @@ class RecordingBackend final : public HaKvBackend {
                     std::vector<KvPair>& output) override {
         std::lock_guard<std::mutex> lock(mutex_);
         if (pause_replay.load()) return ErrorCode::ETCD_OPERATION_ERROR;
+        if (grow_backlog.load()) {
+            DurablePrefix prefix;
+            if (!DecodeDurablePrefix(values_[BuildDurablePrefixKey("cluster")],
+                                     &prefix)) {
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            // Preserve Range's requested page size. A short page before the
+            // durable prefix means missing history to the reader, not backlog.
+            // Appending two pages keeps later polls behind their observed
+            // durable prefix even after applying one complete page.
+            const size_t append_count = limit == 0 ? 2048 : 2 * limit;
+            for (size_t i = 0; i < append_count; ++i) {
+                auto batch = MakeBatch();
+                batch.batch_id = batch.first_seq = batch.last_seq =
+                    ++prefix.batch_id;
+                prefix.last_seq = prefix.batch_id;
+                batch.entries.front().sequence_id = prefix.last_seq;
+                values_[BuildBatchRecordKey("cluster", batch.batch_id)] =
+                    EncodeOpLogBatchRecord(batch);
+            }
+            values_[BuildDurablePrefixKey("cluster")] =
+                EncodeDurablePrefix(prefix);
+        }
         output.clear();
         for (const auto& [key, value] : values_) {
             if (key >= begin && key < end &&
@@ -170,6 +197,7 @@ class RecordingBackend final : public HaKvBackend {
     }
 
     std::atomic<bool> pause_replay{false};
+    std::atomic<bool> grow_backlog{false};
 
    private:
     mutable std::mutex mutex_;
@@ -339,6 +367,8 @@ TEST(BatchOpLogSnapshotCoordinatorTest,
     BatchOpLogSnapshotCoordinatorConfig coordinator_config;
     coordinator_config.snapshot_root = "snapshots";
     coordinator_config.snapshot_interval_seconds = 0;
+    auto now = std::chrono::steady_clock::time_point{};
+    coordinator_config.clock = [&] { return now; };
     BatchOpLogSnapshotCoordinator coordinator(
         standby, *backend, objects, "cluster", coordinator_config, [&] {
             auto lease =
@@ -359,6 +389,7 @@ TEST(BatchOpLogSnapshotCoordinatorTest,
         active_lease->Release();
         throw std::runtime_error("upload failed after lease loss");
     };
+    now += std::chrono::seconds(5);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, coordinator.RunOnce());
     EXPECT_EQ(lost + 1, metrics.get_snapshot_runtime().lease_lost_total);
 
@@ -367,6 +398,7 @@ TEST(BatchOpLogSnapshotCoordinatorTest,
         add_batch(2);
         active_lease->Release();
     };
+    now += std::chrono::seconds(5);
     EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL, coordinator.RunOnce());
     EXPECT_EQ(lost + 2, metrics.get_snapshot_runtime().lease_lost_total);
     EXPECT_EQ(before.errors + 1,
@@ -374,6 +406,7 @@ TEST(BatchOpLogSnapshotCoordinatorTest,
     EXPECT_EQ(2u, metrics.get_snapshot_runtime().catch_up_target_batch);
     EXPECT_FALSE(
         backend->Contains(ha::BuildBatchOpLogSnapshotLatestKey("cluster")));
+    now += std::chrono::seconds(5);
     EXPECT_EQ(ErrorCode::OK, coordinator.RunOnce());
     EXPECT_EQ(HAMetricManager::SnapshotSkipReason::CatchUp,
               metrics.get_snapshot_runtime().skip_reason);
@@ -383,11 +416,120 @@ TEST(BatchOpLogSnapshotCoordinatorTest,
     backend->pause_replay = false;
     ASSERT_TRUE(wait_for_batch(2));
     EXPECT_EQ(0u, metrics.get_snapshot_runtime().catch_up_target_batch);
+    now += std::chrono::seconds(5);
     EXPECT_EQ(ErrorCode::OK, coordinator.RunOnce());
     EXPECT_EQ(before.total + 2,
               metrics.get_snapshot_operation(Operation::Publish).total);
     EXPECT_EQ(before.errors + 1,
               metrics.get_snapshot_operation(Operation::Publish).errors);
+    standby.Stop();
+}
+
+TEST(BatchOpLogSnapshotCoordinatorTest,
+     BackloggedCaptureRetriesFailuresButThrottlesSuccessfulPublication) {
+    auto backend = std::make_shared<RecordingBackend>();
+    const auto add_batch = [&](uint64_t id) {
+        auto batch = MakeBatch();
+        batch.batch_id = batch.first_seq = batch.last_seq = id;
+        batch.entries.front().sequence_id = id;
+        EXPECT_EQ(ErrorCode::OK,
+                  backend->Put(BuildBatchRecordKey("cluster", id),
+                               EncodeOpLogBatchRecord(batch)));
+        EXPECT_EQ(ErrorCode::OK, backend->Put(BuildDurablePrefixKey("cluster"),
+                                              EncodeDurablePrefix({id, id})));
+    };
+    add_batch(1);
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildProducerViewKey("cluster"), "7"));
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(ha::BuildBatchOpLogSnapshotMaintenanceKey("cluster"),
+                           "101"));
+    HotStandbyConfig standby_config;
+    standby_config.enable_verification = false;
+    standby_config.oplog_poll_interval_ms = 1;
+    HotStandbyService standby(standby_config);
+    standby.SetCatchUpBatchKvBackendForTesting(backend);
+    ASSERT_EQ(ErrorCode::OK, standby.Start("", "", "cluster"));
+    const auto wait_for_batch = [&](uint64_t id) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto prefix = standby.GetLastAppliedBatchOpLogSnapshotPrefix();
+            if (prefix && prefix->batch_id >= id) return true;
+            std::this_thread::yield();
+        }
+        return false;
+    };
+    ASSERT_TRUE(wait_for_batch(1));
+
+    RecordingObjectStore objects;
+    BatchOpLogSnapshotCoordinatorConfig config;
+    config.snapshot_root = "snapshots";
+    config.snapshot_interval_seconds = 60;
+    auto now = std::chrono::steady_clock::time_point{};
+    config.clock = [&] { return now; };
+    BatchOpLogSnapshotCoordinator coordinator(
+        standby, *backend, objects, "cluster", config, [] {
+            return SnapshotMaintenanceLease::MakeForTesting("cluster", "101",
+                                                            4);
+        });
+    backend->grow_backlog = true;
+    add_batch(2);
+    ASSERT_TRUE(wait_for_batch(2));
+    objects.on_upload = [] { throw std::runtime_error("upload failed"); };
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, coordinator.RunOnce());
+    ASSERT_EQ(StandbyState::WATCHING, standby.GetState());
+    EXPECT_EQ(1u, coordinator.GetStatus().attempts);
+
+    now += std::chrono::seconds(4);
+    EXPECT_EQ(ErrorCode::OK, coordinator.RunOnce());
+    EXPECT_EQ(1u, coordinator.GetStatus().attempts);
+    objects.on_upload = {};
+    if (const auto target = coordinator.GetStatus().catch_up_target) {
+        ASSERT_TRUE(wait_for_batch(target->batch_id));
+    }
+    now += std::chrono::seconds(1);
+    ASSERT_EQ(ErrorCode::OK, coordinator.RunOnce());
+    EXPECT_EQ(2u, coordinator.GetStatus().attempts);
+    std::string raw;
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Get(ha::BuildBatchOpLogSnapshotLatestKey("cluster"), raw));
+    auto descriptor = ha::DecodeBatchOpLogSnapshotDescriptor(raw);
+    ASSERT_TRUE(descriptor.has_value());
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Get(BuildDurablePrefixKey("cluster"), raw));
+    DurablePrefix durable;
+    ASSERT_TRUE(DecodeDurablePrefix(raw, &durable));
+    EXPECT_LT(descriptor->last_included_batch_id, durable.batch_id);
+    EXPECT_LT(descriptor->last_included_seq, durable.last_seq);
+
+    backend->grow_backlog = false;
+    // The final in-flight range may append two more pages before seeing
+    // grow_backlog=false. Waiting on the actual prefix also covers that race.
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Get(BuildDurablePrefixKey("cluster"), raw));
+    ASSERT_TRUE(DecodeDurablePrefix(raw, &durable));
+    ASSERT_TRUE(wait_for_batch(durable.batch_id));
+    BatchOpLogSnapshotProvider provider("cluster", *backend, objects,
+                                        "snapshots");
+    StandbyMetadataStore restored_metadata;
+    StandbySegmentRegistry restored_registry;
+    auto restored =
+        provider.RestoreBaseline(restored_metadata, restored_registry);
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(descriptor->last_included_batch_id,
+              restored->last_included_batch_id);
+    EXPECT_EQ(durable.batch_id, restored->last_applied_batch_id);
+    EXPECT_EQ(durable.last_seq, restored->last_applied_seq);
+    backend->expected_compaction_floor =
+        std::to_string(descriptor->last_included_batch_id);
+    now += std::chrono::seconds(59);
+    EXPECT_EQ(ErrorCode::OK, coordinator.RunOnce());
+    EXPECT_EQ(2u, coordinator.GetStatus().attempts);
+    now += std::chrono::seconds(1);
+    ASSERT_EQ(ErrorCode::OK, coordinator.RunOnce());
+    EXPECT_EQ(3u, coordinator.GetStatus().attempts);
     standby.Stop();
 }
 
