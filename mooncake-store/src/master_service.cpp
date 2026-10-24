@@ -11754,6 +11754,21 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
     return QueryTaskResponse(task_option.value());
 }
 
+tl::expected<ListTasksResponse, ErrorCode> MasterService::ListTasks(
+    const TaskListRequest& request) {
+    auto page = task_manager_.get_read_access().list_tasks(request);
+    if (!page) {
+        return tl::make_unexpected(page.error());
+    }
+    ListTasksResponse response;
+    response.tasks.reserve(page->tasks.size());
+    for (const auto& task : page->tasks) {
+        response.tasks.emplace_back(task);
+    }
+    response.next_page_token = std::move(page->next_page_token);
+    return response;
+}
+
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
     const UUID& client_id, size_t batch_size) {
     const auto liveness = FindClientRecord(client_id);
