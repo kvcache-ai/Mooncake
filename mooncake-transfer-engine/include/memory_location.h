@@ -69,8 +69,7 @@ bool parseSegmentsLocation(const std::string &name, SegmentsLocationInfo &info);
 // Resolve the actual "cpu:N" location for a given offset within a
 // segments-encoded buffer.
 std::string resolveSegmentsLocation(const SegmentsLocationInfo &info,
-                                    uint64_t buffer_length,
-                                    uint64_t offset);
+                                    uint64_t buffer_length, uint64_t offset);
 
 }  // namespace mooncake
 
