@@ -211,7 +211,7 @@ The following protocols are available at the C++ Transfer Engine level for speci
 Mooncake Store providers can use this transport for a default-off,
 EGM-backed DRAM tier. Configure the Python `setup(config)` overload with
 `enable_egm_store_pool=true`, `protocol="nvlink"`,
-`global_segment_size>0`, and `local_buffer_size=0`. `egm_numa_nodes` accepts
+and `global_segment_size>0`. `egm_numa_nodes` accepts
 `auto` (the default, using each visible GPU's CUDA
 `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID`) or a comma-separated node list. Consumers
 do not enable the pool; they use the ordinary `nvlink` protocol to access the
@@ -219,6 +219,12 @@ provider's mounted segments. Use `MC_MS_AUTO_DISC=0` for the manual selection
 shown below, for both Providers and Consumers. `MC_FORCE_MNNVL` is not needed
 in this mode. EGM requires a non-TENT Transfer Engine with the `nvlink`
 transport installed.
+
+`local_buffer_size` controls a separate client staging pool and can be zero
+or nonzero. Nonzero buffers use the existing client-buffer allocator, not
+the EGM pool allocator. A storage-only Provider can leave it at zero; a
+Provider that also uses staging APIs such as `put()` or `get_buffer()` needs
+a nonzero buffer.
 
 The requested EGM capacity is rounded down to a multiple of the common
 alignment: the maximum of the Store slab alignment and the selected nodes'

@@ -2453,22 +2453,31 @@ TEST_F(RealClientTest, NvlinkConfigHonorsDiscoveryOverride) {
          {"localhost:" + std::to_string(getFreeTcpPort()),
           std::string("localhost")}) {
         SCOPED_TRACE(hostname);
-        auto client = RealClient::create();
-        ConfigDict config = MakeConfigDict(hostname, "0", "0");
-        config[CONFIG_KEY_PROTOCOL] = "nvlink";
-        config[CONFIG_KEY_RDMA_DEVICES] = "";
-        config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "false";
-        config[CONFIG_KEY_EGM_NUMA_NODES] = "invalid";
+        for (const auto* local_buffer_size : {"0", "16MB"}) {
+            SCOPED_TRACE(local_buffer_size);
+            auto client = RealClient::create();
+            ConfigDict config =
+                MakeConfigDict(hostname, "0", local_buffer_size);
+            config[CONFIG_KEY_PROTOCOL] = "nvlink";
+            config[CONFIG_KEY_RDMA_DEVICES] = "";
+            config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "false";
+            config[CONFIG_KEY_EGM_NUMA_NODES] = "invalid";
 
-        // Disabled EGM ignores its node selection, and the explicit discovery
-        // override still permits TCP for the requested nvlink protocol.
-        ASSERT_TRUE(client->setup_internal(config).has_value());
-        ASSERT_NE(client->client_, nullptr);
-        EXPECT_TRUE(hasExplicitPort(client->get_hostname()));
-        auto details = master_.service()->GetSegmentsDetailForAdmin();
-        ASSERT_TRUE(details.has_value());
-        EXPECT_TRUE(details->empty());
-        EXPECT_EQ(client->tearDownAll(), 0);
+            // Disabled EGM ignores its node selection, and the explicit
+            // discovery override still permits TCP for the requested nvlink
+            // protocol.
+            ASSERT_TRUE(client->setup_internal(config).has_value());
+            ASSERT_NE(client->client_, nullptr);
+            ASSERT_NE(client->client_buffer_allocator_, nullptr);
+            EXPECT_EQ(
+                client->client_buffer_allocator_->size(),
+                std::string(local_buffer_size) == "0" ? 0 : 16 * 1024 * 1024);
+            EXPECT_TRUE(hasExplicitPort(client->get_hostname()));
+            auto details = master_.service()->GetSegmentsDetailForAdmin();
+            ASSERT_TRUE(details.has_value());
+            EXPECT_TRUE(details->empty());
+            EXPECT_EQ(client->tearDownAll(), 0);
+        }
     }
 }
 
@@ -2487,33 +2496,39 @@ TEST_F(RealClientTest, EgmConfigRejectsDiscoveredTcpBeforeAllocating) {
              {"localhost:" + std::to_string(getFreeTcpPort()),
               std::string("localhost")}) {
             SCOPED_TRACE(hostname);
-            auto client = RealClient::create();
-            ConfigDict config = MakeConfigDict(hostname, "16MB", "0");
-            config[CONFIG_KEY_PROTOCOL] = "nvlink";
-            config[CONFIG_KEY_RDMA_DEVICES] = "";
-            config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "true";
-            if (nodes) config[CONFIG_KEY_EGM_NUMA_NODES] = nodes;
+            for (const auto* local_buffer_size : {"0", "16MB"}) {
+                SCOPED_TRACE(local_buffer_size);
+                auto client = RealClient::create();
+                ConfigDict config =
+                    MakeConfigDict(hostname, "16MB", local_buffer_size);
+                config[CONFIG_KEY_PROTOCOL] = "nvlink";
+                config[CONFIG_KEY_RDMA_DEVICES] = "";
+                config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "true";
+                if (nodes) config[CONFIG_KEY_EGM_NUMA_NODES] = nodes;
 
-            ::testing::internal::CaptureStderr();
-            auto result = client->setup_internal(config);
-            const std::string logs = ::testing::internal::GetCapturedStderr();
+                ::testing::internal::CaptureStderr();
+                auto result = client->setup_internal(config);
+                const std::string logs =
+                    ::testing::internal::GetCapturedStderr();
 
-            ASSERT_FALSE(result.has_value());
-            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
-            EXPECT_NE(
-                logs.find("EGM Store requires the classic NVLink transport"),
-                std::string::npos)
-                << logs;
-            // Failed EGM setup must leave neither a live client nor host-backed
-            // capacity behind.
-            EXPECT_EQ(client->client_, nullptr);
-            EXPECT_EQ(client->client_buffer_allocator_, nullptr);
-            EXPECT_TRUE(client->segment_ptrs_.empty());
-            EXPECT_TRUE(client->hugepage_segment_ptrs_.empty());
-            auto details = master_.service()->GetSegmentsDetailForAdmin();
-            ASSERT_TRUE(details.has_value());
-            EXPECT_TRUE(details->empty());
-            EXPECT_EQ(client->tearDownAll(), 0);
+                ASSERT_FALSE(result.has_value());
+                EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+                EXPECT_NE(
+                    logs.find(
+                        "EGM Store requires the classic NVLink transport"),
+                    std::string::npos)
+                    << logs;
+                // Failed EGM setup must leave neither a live client nor
+                // host-backed capacity behind.
+                EXPECT_EQ(client->client_, nullptr);
+                EXPECT_EQ(client->client_buffer_allocator_, nullptr);
+                EXPECT_TRUE(client->segment_ptrs_.empty());
+                EXPECT_TRUE(client->hugepage_segment_ptrs_.empty());
+                auto details = master_.service()->GetSegmentsDetailForAdmin();
+                ASSERT_TRUE(details.has_value());
+                EXPECT_TRUE(details->empty());
+                EXPECT_EQ(client->tearDownAll(), 0);
+            }
         }
     }
 }
