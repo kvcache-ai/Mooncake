@@ -32,6 +32,10 @@ struct DfsReadRequest {
     std::string key;
     DistributedFSDescriptor descriptor;
     std::vector<Slice> slices;
+    // When range_read is set, slices are a window of the value starting at
+    // value_offset. Otherwise slices must cover the whole object.
+    uint64_t value_offset = 0;
+    bool range_read = false;
 };
 
 /**

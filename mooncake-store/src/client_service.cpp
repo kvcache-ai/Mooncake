@@ -5303,6 +5303,78 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
     return ErrorCode::OK;
 }
 
+std::vector<tl::expected<void, ErrorCode>> Client::BatchReadFileReplicaRanges(
+    const std::vector<std::string>& keys,
+    const std::vector<Replica::Descriptor>& replicas,
+    const std::vector<Slice>& windows,
+    const std::vector<uint64_t>& value_offsets) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (keys.size() != replicas.size() || keys.size() != windows.size() ||
+        keys.size() != value_offsets.size()) {
+        LOG(ERROR) << "BatchReadFileReplicaRanges size mismatch";
+        return results;
+    }
+
+    std::vector<DfsReadRequest> dfs_requests;
+    std::vector<size_t> dfs_indexes;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (windows[i].size >
+            static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+            continue;
+        }
+        if (replicas[i].is_disk_replica()) {
+            if (!storage_backend_) {
+                LOG(ERROR) << "Storage backend is not initialized";
+                results[i] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                continue;
+            }
+            if (value_offsets[i] >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                continue;
+            }
+            std::vector<Slice> slices{windows[i]};
+            auto loaded = storage_backend_->LoadObject(
+                replicas[i].get_disk_descriptor().file_path, slices,
+                static_cast<int64_t>(windows[i].size),
+                static_cast<int64_t>(value_offsets[i]));
+            results[i] = loaded ? tl::expected<void, ErrorCode>{}
+                                : tl::unexpected(loaded.error());
+            continue;
+        }
+        if (!replicas[i].is_dfs_replica()) {
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
+        }
+        if (!dfs_storage_backend_) {
+            results[i] = tl::unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+            continue;
+        }
+        dfs_requests.push_back(DfsReadRequest{keys[i],
+                                              replicas[i].get_dfs_descriptor(),
+                                              {windows[i]},
+                                              value_offsets[i],
+                                              true});
+        dfs_indexes.push_back(i);
+        results[i] = {};
+    }
+
+    if (dfs_requests.empty()) return results;
+    auto dfs_results = dfs_storage_backend_->BatchRead(dfs_requests);
+    if (dfs_results.size() != dfs_requests.size()) {
+        for (size_t index : dfs_indexes) {
+            results[index] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        return results;
+    }
+    for (size_t j = 0; j < dfs_results.size(); ++j) {
+        if (!dfs_results[j]) {
+            results[dfs_indexes[j]] = tl::unexpected(dfs_results[j].error());
+        }
+    }
+    return results;
+}
+
 ErrorCode Client::TransferReadRange(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
     uint64_t src_offset) {

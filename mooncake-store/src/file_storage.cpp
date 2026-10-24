@@ -264,6 +264,67 @@ FileStorage::LoadBatch(const std::vector<std::string>& keys,
     return allocated_batch;
 }
 
+tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
+FileStorage::LoadRanges(const std::vector<std::string>& keys,
+                        const std::vector<int64_t>& offsets,
+                        const std::vector<int64_t>& lengths,
+                        const std::vector<int64_t>& object_sizes,
+                        bool prefer_pinned) {
+    if (keys.size() != offsets.size() || keys.size() != lengths.size() ||
+        keys.size() != object_sizes.size()) {
+        LOG(ERROR) << "Mismatched range load arguments";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (offsets[i] < 0 || lengths[i] < 0 || object_sizes[i] < 0 ||
+            offsets[i] > object_sizes[i] ||
+            lengths[i] > object_sizes[i] - offsets[i]) {
+            LOG(ERROR) << "Value span out of range for key " << keys[i];
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    const bool use_pinned = prefer_pinned && pinned_restore_arena_allocator_;
+    auto& allocator = use_pinned ? *pinned_restore_arena_allocator_
+                                 : *client_buffer_allocator_;
+    auto allocate_res = AllocateBatch(keys, lengths, allocator);
+    if (!allocate_res && use_pinned &&
+        allocate_res.error() == ErrorCode::BUFFER_OVERFLOW) {
+        VLOG(1) << "Pinned SSD restore arena exhausted; using default arena";
+        allocate_res = AllocateBatch(keys, lengths, *client_buffer_allocator_);
+    }
+    if (!allocate_res) {
+        LOG(ERROR) << "Failed to allocate ranged batch objects";
+        return tl::make_unexpected(allocate_res.error());
+    }
+    auto allocated_batch = std::move(allocate_res.value());
+
+    std::unordered_map<std::string, StorageValueSpan> spans;
+    spans.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto it = allocated_batch->slices.find(keys[i]);
+        if (it == allocated_batch->slices.end()) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        spans.emplace(keys[i],
+                      StorageValueSpan{static_cast<uint64_t>(offsets[i]),
+                                       static_cast<uint64_t>(object_sizes[i]),
+                                       it->second});
+    }
+    auto result = BatchLoadSpans(spans);
+    if (!result) {
+        LOG(ERROR) << "Batch load span failed, err_code = " << result.error();
+        return tl::make_unexpected(result.error());
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& span = spans.at(keys[i]);
+        allocated_batch->slices[keys[i]].ptr = span.slice.ptr;
+        allocated_batch->pointers[i] =
+            reinterpret_cast<uintptr_t>(span.slice.ptr);
+    }
+    return allocated_batch;
+}
+
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
@@ -340,6 +401,38 @@ tl::expected<FileStorage::LocalBatchResult, ErrorCode>
 FileStorage::BatchGetLocal(const std::vector<std::string>& keys,
                            const std::vector<int64_t>& sizes) {
     auto load_result = LoadBatch(keys, sizes, true);
+    if (!load_result) return tl::make_unexpected(load_result.error());
+
+    auto batch = std::move(load_result.value());
+    LocalBatchResult result;
+    result.pointers = std::move(batch->pointers);
+    result.owner = std::move(batch);
+    return result;
+}
+
+tl::expected<FileStorage::BatchGetResult, ErrorCode>
+FileStorage::BatchGetRanges(const std::vector<std::string>& keys,
+                            const std::vector<int64_t>& offsets,
+                            const std::vector<int64_t>& lengths,
+                            const std::vector<int64_t>& object_sizes) {
+    auto load_result = LoadRanges(keys, offsets, lengths, object_sizes, false);
+    if (!load_result) return tl::make_unexpected(load_result.error());
+
+    auto allocated_batch = std::move(load_result.value());
+    uint64_t batch_id = allocated_batch->batch_id;
+    BatchGetResult batch_result{batch_id, allocated_batch->pointers};
+    MutexLocker locker(&client_buffer_mutex_);
+    client_buffer_allocated_batches_.emplace(batch_id,
+                                             std::move(allocated_batch));
+    return batch_result;
+}
+
+tl::expected<FileStorage::LocalBatchResult, ErrorCode>
+FileStorage::BatchGetLocalRanges(const std::vector<std::string>& keys,
+                                 const std::vector<int64_t>& offsets,
+                                 const std::vector<int64_t>& lengths,
+                                 const std::vector<int64_t>& object_sizes) {
+    auto load_result = LoadRanges(keys, offsets, lengths, object_sizes, true);
     if (!load_result) return tl::make_unexpected(load_result.error());
 
     auto batch = std::move(load_result.value());
@@ -1139,6 +1232,35 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
         ssd_metric_->ssd_read_latency_us.observe(elapsed_time);
         ssd_metric_->ssd_read_latency_summary.observe(elapsed_time);
         ssd_metric_->ssd_total_ops.inc(batch_object.size());
+        ssd_metric_->ssd_total_bytes.inc(total_bytes);
+        ssd_metric_->ssd_total_latency_us.observe(elapsed_time);
+        ssd_metric_->ssd_total_latency_summary.observe(elapsed_time);
+    }
+    return result;
+}
+
+tl::expected<void, ErrorCode> FileStorage::BatchLoadSpans(
+    std::unordered_map<std::string, StorageValueSpan>& spans) {
+    auto start_time = std::chrono::steady_clock::now();
+    auto result = storage_backend_->BatchLoadSpans(spans);
+    auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - start_time)
+                            .count();
+    if (!result) {
+        LOG(ERROR) << "Batch load span failed, err_code = " << result.error();
+        return result;
+    }
+    if (ssd_metric_) {
+        int64_t total_bytes = 0;
+        for (const auto& [key, span] : spans) {
+            (void)key;
+            total_bytes += static_cast<int64_t>(span.slice.size);
+        }
+        ssd_metric_->ssd_read_ops.inc(spans.size());
+        ssd_metric_->ssd_read_bytes.inc(total_bytes);
+        ssd_metric_->ssd_read_latency_us.observe(elapsed_time);
+        ssd_metric_->ssd_read_latency_summary.observe(elapsed_time);
+        ssd_metric_->ssd_total_ops.inc(spans.size());
         ssd_metric_->ssd_total_bytes.inc(total_bytes);
         ssd_metric_->ssd_total_latency_us.observe(elapsed_time);
         ssd_metric_->ssd_total_latency_summary.observe(elapsed_time);

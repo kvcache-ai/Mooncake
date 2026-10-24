@@ -259,6 +259,16 @@ struct FileStorageConfig {
     static FileStorageConfig FromEnvironment();
 };
 
+// A window inside one stored value. `offset` is relative to the value, not
+// the file. `slice` is the destination for `slice.size` bytes starting at
+// `offset`. `object_size` is the full value length when the caller knows it;
+// 0 means `slice.size` is the whole value.
+struct StorageValueSpan {
+    uint64_t offset = 0;
+    uint64_t object_size = 0;
+    Slice slice;
+};
+
 class StorageBackendInterface {
    public:
     explicit StorageBackendInterface(const FileStorageConfig& config)
@@ -279,6 +289,12 @@ class StorageBackendInterface {
 
     virtual tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) = 0;
+
+    // Reads a byte window of each value. The default reads the whole value
+    // and copies the window. Backends that can seek override this so a layer
+    // read does not load the rest of the object.
+    virtual tl::expected<void, ErrorCode> BatchLoadSpans(
+        std::unordered_map<std::string, StorageValueSpan>& spans);
 
     virtual tl::expected<bool, ErrorCode> IsExist(const std::string& key) = 0;
 
@@ -465,7 +481,8 @@ class StorageBackend {
      */
     tl::expected<void, ErrorCode> LoadObject(const std::string& path,
                                              std::vector<Slice>& slices,
-                                             int64_t length);
+                                             int64_t length,
+                                             int64_t file_offset = 0);
 
     /**
      * @brief Loads an object as a string
@@ -787,6 +804,9 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
 
+    tl::expected<void, ErrorCode> BatchLoadSpans(
+        std::unordered_map<std::string, StorageValueSpan>& spans) override;
+
     /**
      * @brief Retrieves the list of object keys belonging to a specific bucket.
      * @param bucket_id The unique identifier of the bucket to query.
@@ -918,6 +938,10 @@ class BucketStorageBackend : public StorageBackendInterface {
         EvictionHandler eviction_handler = nullptr) override;
 
    private:
+    tl::expected<void, ErrorCode> ReadBucketValues(
+        std::unordered_map<std::string, StorageValueSpan>& spans,
+        bool require_exact_size);
+
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -1196,6 +1220,9 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
 
+    tl::expected<void, ErrorCode> BatchLoadSpans(
+        std::unordered_map<std::string, StorageValueSpan>& spans) override;
+
     /**
      * @brief Checks whether an object with the specified key exists in the
      * storage system.
@@ -1377,6 +1404,10 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     };
 
    private:
+    tl::expected<void, ErrorCode> ReadOffsetValues(
+        std::unordered_map<std::string, StorageValueSpan>& spans,
+        bool require_exact_size);
+
     // Maximum key length accepted by BatchOffload and trusted on recovery.
     // Write-side enforcement (BatchOffload) and recovery-side validation
     // (RebuildShardMapsFromAllocator) must agree on this bound.
