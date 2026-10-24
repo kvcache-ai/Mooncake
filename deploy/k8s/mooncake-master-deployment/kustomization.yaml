@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: mooncake
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/name: mooncake-master
+      app.kubernetes.io/component: master
+      app.kubernetes.io/part-of: mooncake
+    includeTemplates: true
+    includeSelectors: true
+
+images:
+  - name: mooncake-master
+    newName: quay.io/grpereir/mooncake-master
+    newTag: test
