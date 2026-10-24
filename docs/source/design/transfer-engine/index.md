@@ -302,6 +302,9 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_MAX_PRC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
 - `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.
 - `MC_ENDPOINT_STORE_TYPE` Choose FIFO Endpoint Store (`FIFO`) or Sieve Endpoint Store (`SIEVE`), default is `SIEVE`.
+- `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets.
+- `MC_TCP_SLICE_SIZE` The segmentation granularity (in bytes) of TCP transport for splitting large transfers into socket read/write operations. Corresponds to `MC_SLICE_SIZE` for RDMA. Default value 65536 (64KB).
+- `MC_TCP_PROTO` When set to `1`, TCP initiators use the legacy unacknowledged framing even against servers that support acknowledged framing (protocol v2). Under v2 (the default against v2-capable servers), a WRITE completes only after the receiver confirms the payload has been applied to destination memory, and server-side rejections surface as failed transfers instead of silent data loss. Use this variable only as a rollback escape hatch during mixed-version upgrades.
 
 ## C++ API Reference
 

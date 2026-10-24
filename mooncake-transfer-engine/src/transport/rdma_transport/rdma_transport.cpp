@@ -294,6 +294,9 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = length;
+#ifdef ENABLE_MULTI_PROTOCOL
+    buffer_desc.protocol = "rdma";
+#endif
     int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (rc) return rc;
     return 0;
@@ -355,10 +358,15 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
 }
 
 int RdmaTransport::allocateLocalSegmentID() {
-    auto desc = std::make_shared<SegmentDesc>();
-    if (!desc) return ERR_MEMORY;
+    auto desc = metadata_->getSegmentDesc(local_server_name_);
+    if (!desc) desc = std::make_shared<SegmentDesc>();
     desc->name = local_server_name_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (!desc->protocol.empty()) desc->protocol += ",";
+    desc->protocol += "rdma";
+#else
     desc->protocol = "rdma";
+#endif
     for (auto &entry : context_list_) {
         TransferMetadata::DeviceDesc device_desc;
         device_desc.name = entry->deviceName();
@@ -691,10 +699,18 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
             continue;
         }
 
+        // Resolve NUMA-aware location for segmented buffers
+        std::string location = buffer.name;
+        SegmentsLocationInfo seg_info;
+        if (parseSegmentsLocation(buffer.name, seg_info)) {
+            location = resolveSegmentsLocation(
+                seg_info, buffer.length, offset - buffer.addr);
+        }
+
         device_id =
             hint.empty()
-                ? desc->topology.selectDevice(buffer.name, retry_count)
-                : desc->topology.selectDevice(buffer.name, hint, retry_count);
+                ? desc->topology.selectDevice(location, retry_count)
+                : desc->topology.selectDevice(location, hint, retry_count);
         if (device_id >= 0) return 0;
         device_id = hint.empty() ? desc->topology.selectDevice(
                                        kWildcardLocation, retry_count)

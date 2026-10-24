@@ -52,6 +52,9 @@ class TransferMetadata {
         std::string name;
         uint64_t addr;
         uint64_t length;
+#ifdef ENABLE_MULTI_PROTOCOL
+        std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
+#endif
         std::vector<uint32_t> lkey;  // for rdma
         std::vector<uint32_t> rkey;  // for rdma
         std::string shm_name;        // for nvlink and hip
@@ -96,6 +99,10 @@ class TransferMetadata {
         RankInfoDesc rank_info;
 
         int tcp_data_port;
+        // TCP data-plane protocol version advertised by this segment's
+        // server. v2 adds acknowledged WRITE framing and status-prefixed
+        // READ responses (#2086); absent/1 = legacy unacknowledged framing.
+        int tcp_proto_version{1};
 
         void dump() const;
     };
