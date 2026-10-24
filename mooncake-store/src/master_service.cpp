@@ -10229,25 +10229,32 @@ void MasterService::BatchEvict(double evict_ratio_target,
         return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
     };
 
-    // Returns freed bytes. Returns 0 if offload-queued and no additional
-    // replicas were evicted (all MEMORY replicas of the key are now pinned).
-    auto try_evict_or_offload =
-        [&, this](
-            const TenantId& tenant_id, const std::string& key,
-            ObjectMetadata& metadata, TenantQuotaHandle quota_account,
-            route::ObjectState& state,
-            std::vector<std::vector<Replica>>& deferred_replicas) -> uint64_t {
-        if (enable_oplog_) {
-            return evict_replicas(quota_account, metadata, deferred_replicas);
-        }
+    // Offload decision for one key, separate from the eviction itself so the
+    // HA record can be written between the two: pinning the offload source
+    // here makes it non-evictable, and the persisted descriptor list must see
+    // that survivor. kSkip leaves the key alone this cycle (queue unavailable
+    // and no force-evict opt-in).
+    enum class OffloadDecision { kEvict, kQueuedThenEvict, kSkip };
+
+    auto decide_offload = [&, this](
+                              const TenantId& tenant_id, const std::string& key,
+                              ObjectMetadata& metadata,
+                              route::ObjectState& state) -> OffloadDecision {
         if (!offload_on_evict_) {
-            // Original behavior
-            return evict_replicas(quota_account, metadata, deferred_replicas);
+            return OffloadDecision::kEvict;
         }
 
         // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
         if (has_local_disk_replica(metadata)) {
-            return evict_replicas(quota_account, metadata, deferred_replicas);
+            return OffloadDecision::kEvict;
+        }
+
+        // An in-flight offload already pins a source replica (for example a
+        // previous cycle's record failed after the queueing). Do not stack a
+        // second queue item behind it.
+        if (state.offloading_task) {
+            offload_deferred_count++;
+            return OffloadDecision::kQueuedThenEvict;
         }
 
         // Force-evict cap: if force_evict enabled and cap reached, force
@@ -10255,10 +10262,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // flooding.
         if (offload_force_evict_ && offload_queued_this_cycle >= offload_cap) {
             offload_cap_forced_count++;
-            return evict_replicas(quota_account, metadata, deferred_replicas);
+            return OffloadDecision::kEvict;
         }
 
-        // Queue one MEMORY replica for offload; others will be evicted below.
+        // Queue one MEMORY replica for offload; the remaining ones are evicted
+        // by the caller once the record is written.
         bool queued = false;
         metadata.VisitReplicas(
             is_evictable_memory_replica,
@@ -10282,10 +10290,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         if (queued) {
             offload_queued_this_cycle++;
             offload_deferred_count++;
-            // Any remaining MEMORY replicas with refcnt==0 are redundant copies
-            // (data survives via the pinned replica → disk). Evict them now to
-            // reclaim memory immediately rather than waiting another cycle.
-            return evict_replicas(quota_account, metadata, deferred_replicas);
+            return OffloadDecision::kQueuedThenEvict;
         }
 
         // PushOffloadingQueue failed. Default (data-preserving) behavior is to
@@ -10294,9 +10299,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // prevent silent data loss when the queue is unavailable.
         if (offload_force_evict_) {
             offload_push_failed_forced++;
-            return evict_replicas(quota_account, metadata, deferred_replicas);
+            return OffloadDecision::kEvict;
         }
-        return 0;
+        return OffloadDecision::kSkip;
     };
 
     // HA strong-consistency: persist the post-eviction state before the
@@ -10306,6 +10311,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
         [&, this](const TenantId& tenant_id, const std::string& key,
                   ObjectMetadata& metadata) -> tl::expected<void, ErrorCode> {
         if (!enable_oplog_) {
+            return {};
+        }
+
+        // Nothing evictable left (for example the offload pin just claimed the
+        // last candidate): there is no state change to record.
+        if (!metadata.HasReplica(is_evictable_memory_replica)) {
             return {};
         }
 
@@ -10402,14 +10413,25 @@ void MasterService::BatchEvict(double evict_ratio_target,
             }
 
             if (!metadata.IsGrouped()) {
+                // Offload decision first: pinning the offload source makes it
+                // non-evictable, so the HA record written next predicts the
+                // post-eviction list with that survivor in it (#4830). On
+                // kSkip no record is written and the key is left untouched.
+                const auto decision = decide_offload(tenant_id, key, metadata,
+                                                     trigger.GetState());
+                if (decision == OffloadDecision::kSkip) {
+                    return {};
+                }
                 auto submission =
                     persist_evict_oplog_or_skip(tenant_id, key, metadata);
                 if (!submission) {
                     return {.stop_scan = true};
                 }
-                uint64_t freed = try_evict_or_offload(
-                    tenant_id, key, metadata, trigger.QuotaAccount(),
-                    trigger.GetState(), deferred_replicas);
+                // Remaining MEMORY replicas with refcnt==0 are redundant
+                // copies (data survives via the pinned replica → disk); evict
+                // them now to reclaim memory immediately.
+                uint64_t freed = evict_replicas(trigger.QuotaAccount(),
+                                                metadata, deferred_replicas);
                 EvictionResult result{.freed_bytes = freed,
                                       .evicted_objects = freed > 0 ? 1 : 0};
                 if (!enable_oplog_ && freed > 0) {
@@ -10437,14 +10459,20 @@ void MasterService::BatchEvict(double evict_ratio_target,
             [&, this](MetadataAccessorRW& member) -> EvictMemberOutcome {
             const std::string& member_key = member.GetKey();
             auto& member_metadata = member.Get();
+            // Same order as the single-object path: the offload pin lands
+            // before the record so the survivor is in the predicted list.
+            const auto decision = decide_offload(
+                tenant_id, member_key, member_metadata, member.GetState());
+            if (decision == OffloadDecision::kSkip) {
+                return {};
+            }
             auto submission = persist_evict_oplog_or_skip(tenant_id, member_key,
                                                           member_metadata);
             if (!submission) {
                 return {.stop_scan = true};
             }
-            const uint64_t freed = try_evict_or_offload(
-                tenant_id, member_key, member_metadata, member.QuotaAccount(),
-                member.GetState(), deferred_replicas);
+            const uint64_t freed = evict_replicas(
+                member.QuotaAccount(), member_metadata, deferred_replicas);
             EvictMemberOutcome outcome{.freed_bytes = freed,
                                        .evicted_objects = freed > 0 ? 1 : 0};
             if (freed > 0 && !enable_oplog_) {
