@@ -114,6 +114,9 @@ DEFINE_uint64(num_threads, 1,
 DEFINE_string(storage_path, "/tmp/mooncake_bench_data",
               "Storage directory path");
 DEFINE_uint64(capacity_gb, 20, "Storage capacity in GB (default: 20GB)");
+DEFINE_bool(bucket_aligned_direct_write, false,
+            "bucket backend: write data files with O_DIRECT and 4 KiB-aligned "
+            "values (MOONCAKE_OFFLOAD_BUCKET_ALIGNED_DIRECT_WRITE)");
 DEFINE_bool(run_all, false,
             "Run full benchmark suite with all parameter combinations");
 DEFINE_bool(skip_cleanup, false,
@@ -819,6 +822,8 @@ std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
             mooncake::BucketBackendConfig bucket_config;
             bucket_config.bucket_size_limit = 256 * MB;
             bucket_config.bucket_keys_limit = 500;
+            bucket_config.aligned_direct_write =
+                FLAGS_bucket_aligned_direct_write;
             return std::make_shared<mooncake::BucketStorageBackend>(
                 config, bucket_config);
         }

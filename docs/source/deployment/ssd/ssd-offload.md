@@ -161,6 +161,7 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
 | `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
+| `MOONCAKE_OFFLOAD_BUCKET_ALIGNED_DIRECT_WRITE` | `0` | `1` writes bucket data files with `O_DIRECT` instead of through the page cache, each value at a 4 KiB-aligned file offset. Values in 4 KiB-aligned buffers are written from those buffers; other values are copied into a per-thread buffer that can grow to the bucket size. Each object takes up to about 8 KiB more disk space (measured: 3% with 128 KiB values; about 12% with 64 KiB + 100 B values by the layout), and the bucket size limit and the total size of written buckets count only keys and values, so it suits large values. Offloaded data is not left in the page cache. Buckets written this way remain readable with the option off. |
 
 ### File-per-key backend settings
 

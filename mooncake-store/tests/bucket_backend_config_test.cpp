@@ -51,6 +51,8 @@ struct BucketBackendEnvironment {
     ScopedEnvVar legacy_eviction_policy{"MOONCAKE_BUCKET_EVICTION_POLICY"};
     ScopedEnvVar flush_partial_buckets{
         "MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS"};
+    ScopedEnvVar aligned_direct_write{
+        "MOONCAKE_OFFLOAD_BUCKET_ALIGNED_DIRECT_WRITE"};
 };
 
 class BucketBackendConfigTest : public ::testing::Test {
@@ -68,6 +70,22 @@ TEST_F(BucketBackendConfigTest, UsesExistingDefaultsWhenEnvironmentIsUnset) {
     EXPECT_EQ(config.disk_scan_cache_ms, 500);
     EXPECT_EQ(config.eviction_policy, BucketEvictionPolicy::FIFO);
     EXPECT_FALSE(config.flush_partial_buckets);
+    EXPECT_FALSE(config.aligned_direct_write);
+}
+
+TEST_F(BucketBackendConfigTest, ReadsAlignedDirectWriteBooleanValues) {
+    struct Case {
+        const char* value;
+        bool enabled;
+    };
+    for (const auto& entry :
+         {Case{"1", true}, Case{"true", true}, Case{"0", false},
+          Case{"FALSE", false}, Case{"invalid", false}}) {
+        SCOPED_TRACE(entry.value);
+        env.aligned_direct_write.Set(entry.value);
+        EXPECT_EQ(BucketBackendConfig::FromEnvironment().aligned_direct_write,
+                  entry.enabled);
+    }
 }
 
 TEST_F(BucketBackendConfigTest, ReadsPartialFlushBooleanValues) {
