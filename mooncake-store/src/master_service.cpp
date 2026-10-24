@@ -5439,6 +5439,10 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         auto result = AppendOpLogVisibleBeforeDurable(
             OpType::PUT_END, object_id.tenant_id.value(), key, payload);
         if (!result) {
+            // The record never reaches the OpLog and is not retried, so the
+            // standby will not have this object; PutEnd still reports success.
+            // Count it: this branch is the only trace of that loss.
+            HAMetricManager::instance().inc_oplog_dropped_put_end();
             LOG(WARNING) << "PutEnd: OpLog queue failed for key=" << key
                          << ", err=" << static_cast<int>(result.error());
         }
