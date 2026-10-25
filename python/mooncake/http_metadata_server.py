@@ -63,16 +63,22 @@ class KVBootstrapServer:
         """
         self.port = port
         self.host = host
-        self.app = web.Application()
+        self.max_body_bytes = max(1, _int_env("MC_METADATA_MAX_BODY_BYTES", 1 << 20))
+        self.max_concurrent_puts = max(
+            1, _int_env("MC_METADATA_MAX_CONCURRENT_PUTS", 8)
+        )
+        self.app = web.Application(client_max_size=self.max_body_bytes)
         self.store = dict()
         self.lock = asyncio.Lock()
+        self._put_slots = asyncio.Semaphore(self.max_concurrent_puts)
         # Shared-token authentication (#4444). Both this server and every
         # engine's HTTPStoragePlugin read the same env. Unset is only
         # tolerated on loopback binds or with an explicit insecure opt-in;
         # run() refuses anything else.
         self.auth_token = os.environ.get("MC_METADATA_HTTP_TOKEN") or None
-        # The store is otherwise a memory faucet: many mid-size PUTs sail
-        # under aiohttp's per-body limit and grow RSS without bound.
+        # Store quotas account for key and value payload bytes. A separate
+        # semaphore bounds concurrent request-body reads so parallel PUTs
+        # cannot multiply the per-body memory cap without bound.
         self.max_keys = _int_env("MC_METADATA_MAX_KEYS", 65536)
         self.max_total_bytes = _int_env("MC_METADATA_MAX_TOTAL_BYTES", 1 << 30)
         self._total_bytes = 0
@@ -170,9 +176,14 @@ class KVBootstrapServer:
             )
         return web.Response(body=value, status=200, content_type="application/json")
 
+    @staticmethod
+    def _entry_bytes(key: str, value: bytes) -> int:
+        return len(key.encode("utf-8")) + len(value)
+
     async def _handle_put(self, key, request):
         """Handle PUT requests."""
-        data = await request.read()
+        async with self._put_slots:
+            data = await request.read()
         async with self.lock:
             if key.find("rpc_meta") != -1 and key in self.store:
                 # Re-publishing the same rpc_meta value is idempotent; only a
@@ -197,7 +208,9 @@ class KVBootstrapServer:
                     content_type="application/json",
                 )
             new_total = (
-                self._total_bytes - (len(old) if old is not None else 0) + len(data)
+                self._total_bytes
+                - (self._entry_bytes(key, old) if old is not None else 0)
+                + self._entry_bytes(key, data)
             )
             if new_total > self.max_total_bytes:
                 return web.Response(
@@ -220,7 +233,7 @@ class KVBootstrapServer:
                     status=404,
                     content_type="application/json",
                 )
-            self._total_bytes -= len(self.store[key])
+            self._total_bytes -= self._entry_bytes(key, self.store[key])
             del self.store[key]
         return web.Response(
             text="metadata deleted", status=200, content_type="application/json"

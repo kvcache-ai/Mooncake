@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import asyncio
 import os
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -199,6 +200,42 @@ class TestHttpMetadataServerBounds(unittest.IsolatedAsyncioTestCase):
         await self.server._handle_delete("k1")
         resp = await self.server._handle_put("k2", _request(b"0123456789"))
         self.assertEqual(resp.status, 200)
+
+    async def test_size_budget_counts_key_bytes(self) -> None:
+        await self.server._handle_put("12345678", _request(b"12345678"))
+        resp = await self.server._handle_put("x", _request(b""))
+        self.assertEqual(resp.status, 507)
+        self.assertNotIn("x", self.server.store)
+
+    async def test_concurrent_put_body_reads_are_bounded(self) -> None:
+        with patch.dict(os.environ, {"MC_METADATA_MAX_CONCURRENT_PUTS": "1"}):
+            server = KVBootstrapServer(port=0)
+
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        class BlockingRequest:
+            async def read(self):
+                first_started.set()
+                await release_first.wait()
+                return b"v1"
+
+        second = _request(b"v2")
+        first_task = asyncio.create_task(server._handle_put("k1", BlockingRequest()))
+        await first_started.wait()
+        second_task = asyncio.create_task(server._handle_put("k2", second))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertEqual(second.read.await_count, 0)
+
+        release_first.set()
+        first_response, second_response = await asyncio.gather(first_task, second_task)
+        self.assertEqual((first_response.status, second_response.status), (200, 200))
+
+    async def test_body_limit_is_passed_to_aiohttp(self) -> None:
+        with patch.dict(os.environ, {"MC_METADATA_MAX_BODY_BYTES": "123"}):
+            server = KVBootstrapServer(port=0)
+        self.assertEqual(server.app.client_max_size, 123)
 
     async def test_invalid_budget_env_falls_back_to_default(self) -> None:
         with patch.dict(os.environ, {"MC_METADATA_MAX_KEYS": "abc"}):
