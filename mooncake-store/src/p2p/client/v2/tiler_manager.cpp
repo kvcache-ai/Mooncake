@@ -98,6 +98,7 @@ tl::expected<ImmutableBlock, ErrorCode> TilerManager::RegisterWithHandle(
 tl::expected<ImmutableBlock, ErrorCode> TilerManager::InsertRegistered(
     CompletedBlock&& block, const BlockRegistrationHandle& registration,
     bool defer_notify) {
+    std::shared_lock<std::shared_mutex> mutation(replica_mutation_mu_);
     const size_t size_bytes = block.Size();
     auto inserted = block_index_->Insert(std::move(block), registration);
     if (!inserted) {
@@ -110,6 +111,7 @@ tl::expected<ImmutableBlock, ErrorCode> TilerManager::InsertRegistered(
     // inside whatever mutation guard the caller holds.
     eviction_index_->OnCommit(
         TokenOf(registration, tiler_id_, inserted->Id(), size_bytes));
+    if (replica_observer_) replica_observer_(registration, true);
     if (!defer_notify) {
         NotifyRegistered(registration, inserted->Id(), size_bytes);
     }
@@ -178,6 +180,7 @@ tl::expected<void, ErrorCode> TilerManager::Delete(
     std::optional<BlockId> expected_id, bool defer_notify) {
     if (!registration) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 
+    std::shared_lock<std::shared_mutex> mutation(replica_mutation_mu_);
     // Detached under the shard lock, released here: if a reader still holds a
     // snapshot the physical block survives until that reader is done.
     BlockEntryPtr detached = block_index_->Erase(registration, expected_id);
@@ -192,6 +195,7 @@ tl::expected<void, ErrorCode> TilerManager::Delete(
     eviction_index_->OnDelete(
         TokenOf(registration, tiler_id_, block_id, size_bytes));
 
+    if (replica_observer_) replica_observer_(registration, false);
     if (!defer_notify) {
         NotifyDeleted(registration, block_id, size_bytes);
     }
@@ -214,10 +218,17 @@ void TilerManager::NotifyDeleted(const BlockRegistrationHandle& registration,
 }
 
 std::vector<BlockEntryPtr> TilerManager::DrainAll() {
+    std::unique_lock<std::shared_mutex> mutation(replica_mutation_mu_);
     // Both halves, or the ordering would keep naming victims for a tier that
     // no longer indexes anything.
     eviction_index_->Clear();
-    return block_index_->Drain();
+    auto detached = block_index_->Drain();
+    if (replica_observer_) {
+        for (const auto& entry : detached) {
+            replica_observer_(entry->block.registration, false);
+        }
+    }
+    return detached;
 }
 
 BlockIndexSnapshot TilerManager::SnapshotTokens(size_t shard_id) const {
@@ -303,6 +314,43 @@ bool TilerManager::IsTeAddressable() const {
 size_t TilerManager::Capacity() const { return block_pool_->Capacity(); }
 
 size_t TilerManager::Usage() const { return block_pool_->Usage(); }
+
+std::function<size_t()> TilerManager::UsageReader() const {
+    return [weak = std::weak_ptr<BlockPool>(block_pool_)] {
+        auto pool = weak.lock();
+        return pool ? pool->Usage() : 0;
+    };
+}
+
+void TilerManager::ReconcileEviction(const Clock& clock,
+                                     Clock::time_point deadline) {
+    if (!eviction_index_->NeedsReconcile()) return;
+    std::unique_lock<std::mutex> lock(reconcile_mu_, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    try {
+        BlockIndexSnapshot full;
+        OpenSnapshot(full);
+        full.complete = true;
+        std::vector<BlockIndexSnapshot> partial;
+        for (size_t i = 0; i < ShardCount(); ++i) {
+            if (clock.Now() >= deadline) {
+                // Rotate so a short budget eventually reaches every shard.
+                for (const auto& snapshot : partial) {
+                    eviction_index_->Reconcile(snapshot);
+                }
+                return;
+            }
+            auto snapshot = SnapshotTokens(reconcile_cursor_++ % ShardCount());
+            full.entries.insert(full.entries.end(), snapshot.entries.begin(),
+                                snapshot.entries.end());
+            partial.push_back(std::move(snapshot));
+        }
+        eviction_index_->Reconcile(full);
+    } catch (const std::bad_alloc&) {
+        LOG(WARNING)
+            << "Eviction reconciliation deferred after allocation failure";
+    }
+}
 
 size_t TilerManager::FreeBytes() const {
     const size_t capacity = block_pool_->Capacity();

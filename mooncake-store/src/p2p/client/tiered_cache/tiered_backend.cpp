@@ -111,6 +111,7 @@ void TieredBackend::Destroy() {
 
     // Unmount segments from Master
     for (const auto& [id, tier] : tiers_) {
+        if (tier_metric_) tier_metric_->UnregisterTierUsage(id);
         if (!tier) continue;
         const auto& info = tier_info_.at(id);
         P2PSegment segment;
@@ -309,14 +310,14 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
         // Expose per-tier metrics before mounting so an early metrics read
         // already sees this tier.
         if (tier_metric_) {
-            // Borrowed, not owned: TieredBackend outlives the metric object it
-            // was handed, so capturing the tier by weak/shared pointer would
-            // only complicate shutdown without making anything safer.
+            std::weak_ptr<CacheTier> weak_tier = tiers_[id];
             CacheTier* tier = tiers_[id].get();
             tier_metric_->RegisterTier(
                 id, MakeTierSegmentName(id), tier->GetMemoryType(), priority,
-                tier->GetCapacity(),
-                [tier]() -> size_t { return tier->GetUsage(); });
+                tier->GetCapacity(), [weak_tier]() -> size_t {
+                    auto live = weak_tier.lock();
+                    return live ? live->GetUsage() : 0;
+                });
         }
 
         auto mount_result =

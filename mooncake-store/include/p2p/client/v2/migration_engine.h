@@ -179,8 +179,12 @@ class MigrationEngine : public MovementSink {
 
     std::vector<RouteStats> Routes() const;
     size_t QueuedCount() const;
+    size_t OutstandingCount() const;
 
     MigrationStats Stats() const;
+    void SetMovementObserver(std::function<void(UUID, UUID)> observer) {
+        movement_observer_ = std::move(observer);
+    }
 
    private:
     MultiTiler* tilers_ = nullptr;
@@ -220,11 +224,13 @@ class MigrationEngine : public MovementSink {
     std::vector<MovementRoute> route_order_;
     size_t next_route_ = 0;
     size_t queued_total_ = 0;
+    size_t running_total_ = 0;
     std::unordered_map<UUID, size_t, boost::hash<UUID>> device_inflight_;
     bool stopped_ = false;
 
     mutable std::mutex stats_mu_;
     MigrationStats stats_;
+    std::function<void(UUID, UUID)> movement_observer_;
 };
 
 }  // namespace mooncake::v2

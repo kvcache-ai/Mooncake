@@ -59,6 +59,8 @@ tl::expected<void, ErrorCode> MigrationEngine::Execute(
     TilerManager* source = tilers_->Find(request.source_tiler);
     TilerManager* destination = tilers_->Find(request.destination_tiler);
     if (source == nullptr || destination == nullptr) return note_stale();
+    if (source == destination)
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 
     // Staleness check 1: the identity may already be gone.
     auto registration = request.registration.Lock();
@@ -78,6 +80,38 @@ tl::expected<void, ErrorCode> MigrationEngine::Execute(
     // concurrent Delete detaches it meanwhile.
     ImmutableBlock source_block = std::move(matched.value());
     const size_t size_bytes = source_block.Size();
+
+    if (request.kind == MovementKind::kMigrate) {
+        bool backed = false;
+        {
+            auto guard = registration->LockMutation();
+            if (guard.IsRetired() || !registry_->IsCanonical(*registration))
+                return note_stale();
+            auto current = source->Match(*registration);
+            if (!current || !(current->Id() == request.source_block_id))
+                return note_stale();
+            if (destination->Match(*registration)) {
+                if (expired()) return note_expired();
+                auto removed =
+                    source->Delete(*registration, request.source_block_id,
+                                   /*defer_notify=*/true);
+                backed = removed.has_value();
+            }
+        }
+        if (backed) {
+            source->NotifyDeleted(*registration, request.source_block_id,
+                                  size_bytes);
+            if (callbacks_ && callbacks_->remove_replica) {
+                (void)callbacks_->remove_replica(registration->Key(),
+                                                 source->Id());
+            }
+            if (movement_observer_)
+                movement_observer_(source->Id(), destination->Id());
+            std::lock_guard<std::mutex> lock(stats_mu_);
+            ++stats_.succeeded;
+            return {};
+        }
+    }
 
     auto target =
         allocate_block_(destination->Id(), size_bytes,
@@ -188,6 +222,7 @@ tl::expected<void, ErrorCode> MigrationEngine::Execute(
         }
     }
 
+    if (movement_observer_) movement_observer_(source->Id(), destination->Id());
     std::lock_guard<std::mutex> lock(stats_mu_);
     ++stats_.succeeded;
     return {};
@@ -323,6 +358,7 @@ size_t MigrationEngine::RunOnce() {
             batch.push_back(std::move(item.request));
             leases.push_back(std::move(item.lease));
         }
+        running_total_ += batch.size();
         ++queue->inflight;
         ++device_inflight_[device];
 
@@ -359,6 +395,11 @@ size_t MigrationEngine::RunOnce() {
     for (size_t i = 0; i < leases.size(); ++i) {
         leases[i].Settle(i < results.size() && results[i].has_value());
     }
+    {
+        std::lock_guard<std::mutex> lock(queue_mu_);
+        running_total_ -= batch.size();
+    }
+    queue_cv_.notify_all();
     return batch.size();
 }
 
@@ -409,6 +450,11 @@ std::vector<RouteStats> MigrationEngine::Routes() const {
         stats.push_back(std::move(entry));
     }
     return stats;
+}
+
+size_t MigrationEngine::OutstandingCount() const {
+    std::lock_guard<std::mutex> lock(queue_mu_);
+    return queued_total_ + running_total_;
 }
 
 size_t MigrationEngine::QueuedCount() const {

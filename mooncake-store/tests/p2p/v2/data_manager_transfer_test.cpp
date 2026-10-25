@@ -108,7 +108,14 @@ class DelayedReadPeer {
     std::thread worker_;
 };
 
-enum class LeaseState { kLive, kExpired, kScanned, kReplaced, kTransferFailed };
+enum class LeaseState {
+    kLive,
+    kExpired,
+    kScanned,
+    kReplaced,
+    kTransferFailed,
+    kStopping
+};
 
 }  // namespace
 
@@ -144,6 +151,7 @@ class DataManagerTransferTest : public ::testing::TestWithParam<LeaseState> {
         ASSERT_TRUE(config.has_value());
         config->local_transfer.local_memcpy_async_worker_num = 0;
         config->local_transfer.te_async_poll_worker_num = 1;
+        config->stop_drain_timeout = 20ms;
         config->key_lease.duration_ms = 1000;
         config->key_lease.scan_interval_ms = 3600000;
         clock_ = std::make_shared<ManualClock>();
@@ -207,6 +215,13 @@ TEST_P(DataManagerTransferTest, ReverseWriteOwnsTargetUntilTransferDrains) {
         EXPECT_EQ(Usage(), retained * 2);
     }
 
+    std::optional<std::future<void>> stopping;
+    if (GetParam() == LeaseState::kStopping) {
+        stopping.emplace(
+            std::async(std::launch::async, [&] { manager_->Stop(); }));
+        EXPECT_EQ(stopping->wait_for(100ms), std::future_status::timeout);
+        EXPECT_EQ(Usage(), retained);
+    }
     EXPECT_EQ(completed.wait_for(0ms), std::future_status::timeout);
     peer.Release(GetParam() == LeaseState::kTransferFailed);
     EXPECT_EQ(completed.wait_for(3s), std::future_status::ready);
@@ -223,7 +238,9 @@ TEST_P(DataManagerTransferTest, ReverseWriteOwnsTargetUntilTransferDrains) {
         EXPECT_TRUE(manager_->Delete(key).has_value());
     } else {
         ASSERT_FALSE(result.has_value());
-        if (GetParam() == LeaseState::kTransferFailed) {
+        if (GetParam() == LeaseState::kStopping) {
+            EXPECT_EQ(result.error(), ErrorCode::SHUTTING_DOWN);
+        } else if (GetParam() == LeaseState::kTransferFailed) {
             EXPECT_EQ(result.error(), ErrorCode::TRANSFER_FAIL);
         } else if (GetParam() == LeaseState::kExpired) {
             EXPECT_EQ(result.error(), ErrorCode::LEASE_EXPIRED);
@@ -238,29 +255,34 @@ TEST_P(DataManagerTransferTest, ReverseWriteOwnsTargetUntilTransferDrains) {
         EXPECT_TRUE(manager_->WriteRevoke(key, replacement->write_operation_id)
                         .has_value());
     }
+    if (stopping) {
+        EXPECT_EQ(stopping->wait_for(2s), std::future_status::ready);
+        stopping->get();
+    }
     EXPECT_EQ(Usage(), 0u);
 }
 
-INSTANTIATE_TEST_SUITE_P(LeaseLifetime, DataManagerTransferTest,
-                         ::testing::Values(LeaseState::kLive,
-                                           LeaseState::kExpired,
-                                           LeaseState::kScanned,
-                                           LeaseState::kReplaced,
-                                           LeaseState::kTransferFailed),
-                         [](const ::testing::TestParamInfo<LeaseState>& info) {
-                             switch (info.param) {
-                                 case LeaseState::kLive:
-                                     return "Live";
-                                 case LeaseState::kExpired:
-                                     return "Expired";
-                                 case LeaseState::kScanned:
-                                     return "Scanned";
-                                 case LeaseState::kReplaced:
-                                     return "Replaced";
-                                 case LeaseState::kTransferFailed:
-                                     return "TransferFailed";
-                             }
-                             return "Unknown";
-                         });
+INSTANTIATE_TEST_SUITE_P(
+    LeaseLifetime, DataManagerTransferTest,
+    ::testing::Values(LeaseState::kLive, LeaseState::kExpired,
+                      LeaseState::kScanned, LeaseState::kReplaced,
+                      LeaseState::kTransferFailed, LeaseState::kStopping),
+    [](const ::testing::TestParamInfo<LeaseState>& info) {
+        switch (info.param) {
+            case LeaseState::kLive:
+                return "Live";
+            case LeaseState::kExpired:
+                return "Expired";
+            case LeaseState::kScanned:
+                return "Scanned";
+            case LeaseState::kReplaced:
+                return "Replaced";
+            case LeaseState::kStopping:
+                return "Stopping";
+            case LeaseState::kTransferFailed:
+                return "TransferFailed";
+        }
+        return "Unknown";
+    });
 
 }  // namespace mooncake::v2

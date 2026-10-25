@@ -422,6 +422,15 @@ DataManagerV2::DataManagerV2(const DataManagerV2Config& config,
         std::thread([pool = te_wait_pool_]() { pool->run(); }).detach();
     }
 
+    const size_t local_workers =
+        config_.local_transfer.mode == LocalTransferMode::MEMCPY
+            ? config_.local_transfer.local_memcpy_async_worker_num
+            : config_.local_transfer.te_async_poll_worker_num;
+    if (local_workers > 0) {
+        local_io_executor_ =
+            std::make_unique<AsyncMemcpyExecutor>(local_workers);
+    }
+
     // The coordinator first: the copy engine takes it so a TE-mode deployment
     // gets a TransferEngine copier instead of silently falling back to a
     // bounce buffer, which is what V2 did before.
@@ -573,17 +582,35 @@ tl::expected<void, ErrorCode> DataManagerV2::Init() {
     if (tier_metric_) {
         for (const auto& tiler : tilers_.by_priority) {
             const TierView view = tiler->GetView();
-            // Borrowed pointer: the tilers are members of this object and the
-            // metric sink is injected from outside and outlives it, so the
-            // callback cannot outlive what it reads.
-            TilerManager* borrowed = tiler.get();
-            tier_metric_->RegisterTier(
-                view.id, view.GetName(), view.type, view.priority,
-                view.capacity,
-                [borrowed]() -> size_t { return borrowed->Usage(); });
+            tier_metric_->RegisterTier(view.id, view.GetName(), view.type,
+                                       view.priority, view.capacity,
+                                       tiler->UsageReader());
         }
     }
 
+    for (const auto& tiler : tilers_.by_priority) {
+        tiler->SetReplicaObserver(
+            [this, id = tiler->Id()](
+                const BlockRegistrationHandle& registration, bool added) {
+                ObserveReplica(registration, id, added);
+            });
+    }
+    if (tier_metric_) {
+        migration_engine_->SetMovementObserver(
+            [metric = tier_metric_](UUID source, UUID destination) {
+                metric->OnMoved(source, destination);
+            });
+        evict_engine_->SetEvictionObserver(
+            [metric = tier_metric_](UUID id) { metric->OnEvicted(id); });
+    }
+    maintenance_worker_ = std::thread([this] {
+        std::unique_lock<std::mutex> lock(maintenance_mu_);
+        while (!maintenance_stopped_) {
+            MaintainTiers();
+            maintenance_cv_.wait_for(lock, std::chrono::milliseconds(20),
+                                     [this] { return maintenance_stopped_; });
+        }
+    });
     initialized_ = true;
     LOG(INFO) << "DataManagerV2 initialized with " << tilers_.Size()
               << " logical tilers, registry_shards="
@@ -595,6 +622,55 @@ tl::expected<void, ErrorCode> DataManagerV2::Init() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+void DataManagerV2::ObserveReplica(const BlockRegistrationHandle& registration,
+                                   const UUID& tiler_id, bool added) {
+    const auto change = registration.RecordReplicaChange(added);
+    if (tier_metric_) {
+        if (added)
+            tier_metric_->OnReplicaAdded(tiler_id);
+        else
+            tier_metric_->OnReplicaRemoved(tiler_id);
+    }
+    if (added) {
+        movement_tracker_->OnCommitted(registration.Key(), tiler_id,
+                                       registration.Id());
+    } else if (change.boundary) {
+        movement_tracker_->OnDeleted(registration.Key(), registration.Id());
+    }
+    if (change.boundary && key_retention_metric_) {
+        if (added)
+            key_retention_metric_->OnKeyCreated(change.birth);
+        else
+            key_retention_metric_->OnKeyRemoved(change.birth);
+    }
+}
+
+void DataManagerV2::MaintainTiers() {
+    for (const auto& tiler : tilers_.by_priority) {
+        tiler->ReconcileEviction(*clock_,
+                                 clock_->Now() + std::chrono::milliseconds(5));
+        BlockEvent event;
+        event.type = EventType::kCommit;
+        event.tiler_id = tiler->Id();
+        try {
+            offload_consumer_->Consume(event, DeliveryMode::kQueued);
+        } catch (const std::bad_alloc&) {
+            LOG(WARNING)
+                << "Offload proposal deferred after allocation failure";
+        }
+    }
+}
+
+std::unique_ptr<TaskHandle<void>> DataManagerV2::DispatchLocalTask(
+    std::unique_ptr<TaskHandle<void>> task) {
+    if (!local_io_executor_) return task;
+    auto future =
+        local_io_executor_->SubmitSingleTask<tl::expected<void, ErrorCode>>(
+            [task = std::move(task)]() mutable { return task->Wait(); });
+    return FutureHandle<void>::Create(std::shared_ptr<void>{},
+                                      std::move(future));
+}
 
 AllocationFailurePolicyConfig DataManagerV2::AllocationPolicyFor(
     const UUID& tiler_id) const {
@@ -834,11 +910,6 @@ tl::expected<void, ErrorCode> DataManagerV2::CommitBlock(const std::string& key,
         // tier", which is what the onboard decision reads.
         frequency_tracker_->OnCommit(handle.Id(), key);
         tiler.NotifyRegistered(handle, block_id, size_bytes);
-        if (tier_metric_) tier_metric_->OnReplicaAdded(tiler.Id());
-        if (key_retention_metric_) {
-            key_retention_metric_->OnKeyCreated(
-                std::chrono::steady_clock::now());
-        }
         // A commit of a key rectify recently asked Master to drop means that
         // miss was a false positive.
         NoteCommitForRectifyWitness(key);
@@ -968,12 +1039,14 @@ tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> DataManagerV2::Put(
         return tl::make_unexpected(attached.error());
     }
 
-    // The copy and the commit happen inside Wait(), on the caller's thread, so
-    // the task owns the key and carries the lifecycle guard.
+    // The copy and commit run on the configured executor, or at Wait() when
+    // its worker count is zero. Both paths carry ownership and admission.
     auto task = [this, owned_key, write_token = *token, slices, tiler = &target,
+                 execution = execution_,
                  lifecycle_guard = std::move(guard.value())]() mutable
         -> tl::expected<void, ErrorCode> {
-        if (!lifecycle_guard.IsUsable()) {
+        auto running = execution->Acquire();
+        if (!running || !lifecycle_guard.IsUsable()) {
             // Nothing below may touch the captured `this`. Stop() bounds its
             // wait and then cancels, so reaching here means the manager may
             // already be gone -- the guard keeps the gate alive, not the
@@ -1015,7 +1088,7 @@ tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> DataManagerV2::Put(
         return CommitBlock(owned_key, *tiler, std::move(completed.value()),
                            size_bytes);
     };
-    return CallableTaskHandle<void>::Create(std::move(task));
+    return DispatchLocalTask(CallableTaskHandle<void>::Create(std::move(task)));
 }
 
 tl::expected<ReadTaskHandle, ErrorCode> DataManagerV2::Get(
@@ -1060,15 +1133,16 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManagerV2::Get(
     result.is_local = true;
     // The snapshot travels with the task: a concurrent Delete may detach the
     // entry, but this read still completes against live memory.
-    result.task_handle = CallableTaskHandle<void>::Create(
-        [this, block = std::move(site->block), slices,
+    result.task_handle = DispatchLocalTask(CallableTaskHandle<void>::Create(
+        [this, execution = execution_, block = std::move(site->block), slices,
          lifecycle_guard = std::move(
              guard.value())]() mutable -> tl::expected<void, ErrorCode> {
-            if (!lifecycle_guard.IsUsable()) {
+            auto running = execution->Acquire();
+            if (!running || !lifecycle_guard.IsUsable()) {
                 return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
             }
             return local_copy_engine_->ReadToSlices(block, slices);
-        });
+        }));
     return result;
 }
 
@@ -1250,7 +1324,6 @@ tl::expected<void, ErrorCode> DataManagerV2::Delete(std::string_view key,
     }
     for (const auto& note : deferred) {
         note.tiler->NotifyDeleted(handle, note.block_id, note.size_bytes);
-        if (tier_metric_) tier_metric_->OnReplicaRemoved(note.tiler->Id());
     }
 
     if (removed.empty()) {
@@ -1625,6 +1698,8 @@ DataManagerV2::ReadRemoteDataAsync(
         co_return tl::make_unexpected(validated.error());
     }
 
+    auto running = execution_->Acquire();
+    if (!running) co_return tl::make_unexpected(running.error());
     auto prepared = PrepareRemoteRead(key);
     if (!prepared) {
         co_return tl::make_unexpected(prepared.error());
@@ -1650,6 +1725,8 @@ DataManagerV2::WriteRemoteDataAsync(
     }
     auto guard = lifecycle_->Acquire();
     if (!guard) co_return tl::make_unexpected(guard.error());
+    auto running = execution_->Acquire();
+    if (!running) co_return tl::make_unexpected(running.error());
     const std::string owned_key(key);
 
     size_t total = 0;
@@ -1830,6 +1907,14 @@ void DataManagerV2::Stop() {
         return;  // idempotent
     }
 
+    execution_->BeginStop();
+    {
+        std::lock_guard<std::mutex> lock(maintenance_mu_);
+        maintenance_stopped_ = true;
+    }
+    maintenance_cv_.notify_all();
+    if (maintenance_worker_.joinable()) maintenance_worker_.join();
+
     // Bounded: a caller may hold a TaskHandle and never call Wait(), so an
     // unbounded wait here would hang shutdown forever. On timeout the gate
     // switches to Cancel and outstanding handles fail with SHUTTING_DOWN.
@@ -1837,10 +1922,14 @@ void DataManagerV2::Stop() {
         stop_drain_timeout_hit_.fetch_add(1, std::memory_order_relaxed);
         LOG(WARNING) << "DataManagerV2::Stop timed out after "
                      << config_.stop_drain_timeout.count()
-                     << "ms with in-flight work; cancelling";
+                     << "ms with in-flight work; cancelling deferred handles";
         lifecycle_->BeginCancel();
     }
 
+    // Cancellation rejects deferred work; it is not proof that running work
+    // has exited. Keep all engines and coroutine executors alive until then.
+    execution_->WaitForNoInflight();
+    if (local_io_executor_) local_io_executor_->Shutdown();
     if (leases_) leases_->StopAndDrain();
     // Before the pools: an outstanding wait completes its promise here, so no
     // awaiter is left hanging by the shutdown.
@@ -1872,6 +1961,7 @@ void DataManagerV2::Destroy() {
     }
 
     for (const auto& tiler : tilers_.by_priority) {
+        if (tier_metric_) tier_metric_->UnregisterTierUsage(tiler->Id());
         // Detached here and released here; anything a reader still holds stays
         // alive through the shared pool state until that reader is done.
         auto detached = tiler->DrainAll();
@@ -1898,16 +1988,22 @@ void DataManagerV2::DrainForTest() {
     // settle. Without the second half a test could compare state while a
     // migration was still running.
     for (int attempt = 0; attempt < 1000; ++attempt) {
+        std::lock_guard<std::mutex> lock(maintenance_mu_);
+        if (!maintenance_stopped_) MaintainTiers();
         event_center_->DrainForTest();
         const EventCenterMetrics metrics = event_center_->Metrics();
         const size_t queued =
-            migration_engine_ ? migration_engine_->QueuedCount() : 0;
+            migration_engine_ ? migration_engine_->OutstandingCount() : 0;
         if (queued == 0 && metrics.event_queue_depth == 0) {
-            return;
+            if (!maintenance_stopped_) MaintainTiers();
+            event_center_->DrainForTest();
+            if (!migration_engine_ ||
+                migration_engine_->OutstandingCount() == 0)
+                return;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    LOG(WARNING) << "DrainForTest gave up waiting for the movement queue";
+    throw std::runtime_error("DataManagerV2::DrainForTest timed out");
 }
 
 // ---------------------------------------------------------------------------

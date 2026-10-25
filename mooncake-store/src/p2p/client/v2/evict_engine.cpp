@@ -102,6 +102,7 @@ EvictEngine::EvictOutcome EvictEngine::EvictVictim(TilerManager& tiler,
         ++stats_.victims_detached;
         if (sole_replica) ++stats_.victims_sole_replica;
     }
+    if (eviction_observer_) eviction_observer_(tiler.Id());
     return EvictOutcome{size_bytes, sole_replica};
 }
 
@@ -123,6 +124,7 @@ tl::expected<ReclaimResult, ErrorCode> EvictEngine::ReclaimOneRound(
     // selection is a property of one tier's contents, and keeping it beside
     // that tier's BlockIndex is what lets both be updated in a single
     // mutation instead of drifting apart.
+    tiler->ReconcileEviction(*clock_, request.deadline);
     const auto victims =
         tiler->Eviction()->SelectVictims(request.reclaim_target_bytes);
     // Every eviction is now a plain removal, so every one of them has to be

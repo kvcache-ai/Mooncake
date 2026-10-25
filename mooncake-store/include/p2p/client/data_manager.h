@@ -45,8 +45,9 @@ namespace mooncake {
  * Lifetime rules that both implementations must honour:
  *  - the destructor is virtual, and `Stop()` / `Destroy()` are idempotent;
  *  - no `std::string_view` argument may be retained past the call. Task
- *    handles returned by Put/Get run their work at `Wait()` time and therefore
- *    own a copy of the key; the caller only has to keep the *slices* alive.
+ *    handles returned by Put/Get own a copy of the key; the caller only has to
+ *    keep the *slices* alive until I/O completes. Zero local workers defer the
+ *    copy until Wait(); configured workers may start it before Wait().
  */
 class DataManager {
    public:

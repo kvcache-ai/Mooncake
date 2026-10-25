@@ -77,6 +77,20 @@ const std::string& BlockRegistrationHandle::Key() const {
     return inner_ ? inner_->key : EmptyKey();
 }
 
+BlockRegistrationHandle::ReplicaChange
+BlockRegistrationHandle::RecordReplicaChange(bool added) const {
+    std::unique_lock<std::mutex> lock(inner_->attachments_mu);
+    bool boundary;
+    if (added) {
+        boundary = inner_->replica_count++ == 0;
+        if (boundary) inner_->created_at = std::chrono::steady_clock::now();
+    } else {
+        CHECK_GT(inner_->replica_count, 0U);
+        boundary = --inner_->replica_count == 0;
+    }
+    return {std::move(lock), boundary, inner_->created_at};
+}
+
 RegistrationId BlockRegistrationHandle::Id() const {
     return inner_ ? inner_->registration_id : RegistrationId{};
 }
