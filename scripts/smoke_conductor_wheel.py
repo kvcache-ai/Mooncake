@@ -99,7 +99,8 @@ def main():
                 # Only the server subprocess may use build-time library paths.
                 # The client must resolve every dependency from its wheel.
                 env["CONDUCTOR_SERVER_LD_LIBRARY_PATH"] = os.environ.get(
-                    "LD_LIBRARY_PATH", ""
+                    "CONDUCTOR_SERVER_LD_LIBRARY_PATH",
+                    os.environ.get("LD_LIBRARY_PATH", ""),
                 )
             subprocess.run(
                 [python, "-I", "-m", "pip", "install", *dependencies],

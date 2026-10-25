@@ -2,6 +2,7 @@
 
 import importlib.util
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -96,6 +97,77 @@ class ConductorWheelGateTest(unittest.TestCase):
                 with patch.object(SMOKE.subprocess, "run", side_effect=run):
                     with self.assertRaises(subprocess.CalledProcessError):
                         self.invoke("--test-api")
+
+    def test_preserved_server_libraries_are_only_passed_to_server(self):
+        completed = subprocess.CompletedProcess([], 0)
+        with patch.dict(
+            os.environ,
+            {
+                "LD_LIBRARY_PATH": "/build/lib",
+                "CONDUCTOR_SERVER_LD_LIBRARY_PATH": "/preserved/server/lib",
+            },
+        ):
+            with patch.object(SMOKE.subprocess, "run", return_value=completed) as run:
+                self.invoke("--server", self.server)
+        test_call = next(
+            call for call in run.call_args_list if "pytest" in call.args[0]
+        )
+        self.assertNotIn("LD_LIBRARY_PATH", test_call.kwargs["env"])
+        self.assertEqual(
+            test_call.kwargs["env"]["CONDUCTOR_SERVER_LD_LIBRARY_PATH"],
+            "/preserved/server/lib",
+        )
+
+
+class ConductorServerPreservationTest(unittest.TestCase):
+    def test_server_survives_build_cleanup_and_is_removed_on_exit(self):
+        script = (Path(SMOKE.__file__).parent / "build_wheel.sh").read_text()
+        # Execute the actual staging/cleanup block, without building a GPU wheel.
+        start = script.index("# Preserve the Conductor server")
+        end = script.index("# Make the post-repair device library discoverable", start)
+        for cleanup_flag in ("CI", "FREE_BUILD_DIR"):
+            for absolute in (False, True):
+                for exit_code in (0, 23):
+                    with self.subTest(
+                        cleanup_flag=cleanup_flag,
+                        absolute=absolute,
+                        exit_code=exit_code,
+                    ), tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary).resolve()
+                        build = root / "build with spaces"
+                        server = build / "mooncake-conductor/mooncake_conductor"
+                        server.parent.mkdir(parents=True)
+                        server.write_text(
+                            '#!/bin/sh\ntest -f "$(dirname "$0")/libasio.so"\n'
+                        )
+                        server.chmod(0o755)
+                        library = build / "mooncake-common/libasio.so"
+                        library.parent.mkdir()
+                        library.write_bytes(b"server runtime dependency")
+                        build_arg = str(build) if absolute else build.name
+                        command = (
+                            "set -e\n"
+                            f"BUILD_DIR={shlex.quote(build_arg)}\n"
+                            f"BUILD_DIR_ABS={shlex.quote(str(build))}\n"
+                            'CUDA_EP_STAGING_DIR="$BUILD_DIR_ABS/ep_pg_staging"\n'
+                            + script[start:end]
+                            + '\ntest ! -d "$BUILD_DIR_ABS"\n'
+                            + '"$CONDUCTOR_SMOKE_DIR/mooncake_conductor"\n'
+                            + 'printf "%s" "$CONDUCTOR_SMOKE_DIR" > preserved-path\n'
+                            + f"exit {exit_code}\n"
+                        )
+                        env = dict(os.environ, CI="false", FREE_BUILD_DIR="0")
+                        env[cleanup_flag] = "true" if cleanup_flag == "CI" else "1"
+                        result = subprocess.run(
+                            ["bash", "-c", command],
+                            cwd=root,
+                            env=env,
+                            capture_output=True,
+                            text=True,
+                        )
+                        self.assertEqual(result.returncode, exit_code, result.stderr)
+                        preserved = Path((root / "preserved-path").read_text())
+                        self.assertFalse(preserved.exists())
 
 
 if __name__ == "__main__":
