@@ -2221,8 +2221,7 @@ TEST_F(MasterServiceHATest,
     // The sweep must still be parked -- not already finished -- when the
     // owner registers, or the test would prove nothing. Release the park and
     // reap it first so a failure here cannot hang on the still-held lock.
-    if (sweep.wait_for(std::chrono::seconds(0)) ==
-        std::future_status::ready) {
+    if (sweep.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         park_lock.unlock();
         sweep.get();
         FAIL() << "sweep finished before the owner registered";

@@ -2411,7 +2411,8 @@ void MasterService::ClearInvalidHandles() {
     // and between object accessor acquisitions, so the documented
     // client-before-shard lock order is preserved and callers must not hold
     // master_state_mutex_.
-    constexpr auto kRetainingSetRefreshInterval = std::chrono::milliseconds(100);
+    constexpr auto kRetainingSetRefreshInterval =
+        std::chrono::milliseconds(100);
     auto capture = [this]() {
         std::unordered_set<UUID, boost::hash<UUID>> retained;
         std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
