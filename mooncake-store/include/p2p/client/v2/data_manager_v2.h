@@ -10,8 +10,8 @@
 // Two structural rules from the design are load-bearing here:
 //
 //  - A LifecycleGate::Guard travels with the TaskHandle, not with the API call
-//    stack, because Put/Get do their real work inside Wait() on the caller's
-//    thread.
+//    stack, because synchronous-mode Put/Get defer work until Wait(), while
+//    configured asynchronous I/O may run before it.
 //  - Movement workers belong to DataManagerV2, not to the EventCenter. They
 //    call the migration and eviction engines, so if the EventCenter owned them
 //    those engines would be destroyed first in member order and a destructor
@@ -32,6 +32,7 @@
 #include <ylt/coro_io/io_context_pool.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include "p2p/client/async_memcpy_executor.h"
 #include "p2p/client/data_manager.h"
 #include "p2p/client/data_manager_test_hook.h"
 #include "p2p/client/data_manager_types.h"
@@ -81,9 +82,8 @@ struct DataManagerV2Config {
     // Sustained put/delete churn on one key would otherwise livelock it.
     uint32_t max_registration_retry = 8;
 
-    // Upper bound on how long Stop() waits for in-flight guards. Exceeding it
-    // is not an error: Stop switches to Cancel and keeps going, because a
-    // caller may simply never call Wait() on a handle it still holds.
+    // Initial in-flight wait. On timeout deferred handles are cancelled;
+    // already executing I/O still drains. Service callers drain before Stop().
     std::chrono::milliseconds stop_drain_timeout{5000};
 
     // Shard count for the lease tables.
@@ -140,8 +140,8 @@ struct DataManagerV2Metrics {
     /** Non-zero means a key is being put and deleted fast enough to starve
      *  its own registration; those Puts failed with INTERNAL_ERROR. */
     uint64_t registration_retry_exhausted = 0;
-    /** Non-zero means Stop() gave up waiting and cancelled: some caller was
-     *  holding a TaskHandle it never waited on. */
+    /** Operations or deferred handles that exceeded the initial shutdown
+     *  timeout. Executing I/O still drains before resources are destroyed. */
     uint64_t stop_drain_timeout_hit = 0;
     /** Rising means RectifyReadRoute asked Master to drop replicas that were
      *  in fact live: rectify is best-effort and can race a concurrent commit.
@@ -342,6 +342,11 @@ class DataManagerV2 final : public DataManager, public DataManagerTestHook {
 
     /** Consumes the movement queue until the EventCenter closes it. */
     void MovementWorkerMain();
+    void MaintainTiers();
+    void ObserveReplica(const BlockRegistrationHandle& registration,
+                        const UUID& tiler_id, bool added);
+    std::unique_ptr<TaskHandle<void>> DispatchLocalTask(
+        std::unique_ptr<TaskHandle<void>> task);
 
     /** Remember that rectify just asked Master to drop `key`. */
     void NoteRectifyWitness(std::string_view key) const;
@@ -361,7 +366,11 @@ class DataManagerV2 final : public DataManager, public DataManagerTestHook {
     // allows to survive this object -- keeps the gate alive.
     std::shared_ptr<LifecycleGate> lifecycle_ =
         std::make_shared<LifecycleGate>();
+    // Unlike lifecycle_, contains no deferred handles. Stop must drain it.
+    std::shared_ptr<LifecycleGate> execution_ =
+        std::make_shared<LifecycleGate>();
     std::atomic<uint64_t> access_tick_{0};
+    std::unique_ptr<AsyncMemcpyExecutor> local_io_executor_;
 
     BlockRegistry block_registry_;
     MultiTiler tilers_;
@@ -416,6 +425,10 @@ class DataManagerV2 final : public DataManager, public DataManagerTestHook {
     std::unique_ptr<MigrationEngine> migration_engine_;
     std::unique_ptr<EvictEngine> evict_engine_;
     std::vector<std::thread> movement_workers_;
+    std::mutex maintenance_mu_;
+    std::condition_variable maintenance_cv_;
+    bool maintenance_stopped_ = false;
+    std::thread maintenance_worker_;
 };
 
 }  // namespace mooncake::v2

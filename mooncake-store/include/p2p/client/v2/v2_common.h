@@ -142,8 +142,9 @@ const char* ToString(LifecycleState state);
  * @brief Admission control plus an in-flight counter for the public API.
  *
  * A Guard is move-only and may be moved into a TaskHandle: Put/Get do their
- * copy and commit inside TaskHandle::Wait(), on the caller's thread, so the
- * guard has to follow the handle rather than the API call stack. Dropping the
+ * copy and commit after the API call returns, so the guard follows the work
+ * rather than the API call stack. Executing I/O uses a separate gate that
+ * Stop drains without a timeout. Dropping the
  * handle without ever calling Wait() releases the guard, which is why Stop()
  * can bound its wait: after `stop_drain_timeout` it switches to Cancel mode,
  * every outstanding Guard reports IsUsable() == false, and their holders must
@@ -190,6 +191,7 @@ class LifecycleGate : public std::enable_shared_from_this<LifecycleGate> {
     /** @return false on timeout; the caller should then BeginCancel(). */
     bool WaitForNoInflight(std::chrono::milliseconds timeout);
 
+    void WaitForNoInflight();
     void BeginCancel();
     bool IsCancelled() const;
     void MarkStopped();

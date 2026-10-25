@@ -125,6 +125,9 @@ class EvictEngine {
     tl::expected<void, ErrorCode> EvictOne(const BlockToken& token);
 
     EvictStats Stats() const;
+    void SetEvictionObserver(std::function<void(UUID)> observer) {
+        eviction_observer_ = std::move(observer);
+    }
 
    private:
     /**
@@ -160,6 +163,7 @@ class EvictEngine {
 
     mutable std::mutex stats_mu_;
     EvictStats stats_;
+    std::function<void(UUID)> eviction_observer_;
 };
 
 }  // namespace mooncake::v2

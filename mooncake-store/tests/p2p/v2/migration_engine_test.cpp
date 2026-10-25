@@ -16,6 +16,7 @@
 #include <functional>
 #include <memory>
 #include <chrono>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -330,6 +331,44 @@ TEST_F(MigrationEngineTest, ReplicateCopiesTheBytesAndKeepsBothReplicas) {
     const MigrationStats stats = engine_->Stats();
     EXPECT_EQ(stats.executed, 1U);
     EXPECT_EQ(stats.succeeded, 1U);
+}
+
+TEST_F(MigrationEngineTest,
+       AlreadyBackedMigrationDropsSourceWithoutAllocation) {
+    const std::string key = "backed";
+    auto payload = Pattern(kBlockSize, 0x41);
+    auto source = Commit(*fast_, key, payload);
+    auto registration = registry_.Match(key);
+    ASSERT_TRUE(registration);
+    auto replicate = MakeRequest(MovementKind::kReplicate, key, *registration,
+                                 source.Id(), fast_, slow_);
+    ASSERT_TRUE(engine_->Execute(replicate));
+    const auto allocations = allocations_.size();
+    const auto slow_usage = slow_->Usage();
+    auto migrate = MakeRequest(MovementKind::kMigrate, key, *registration,
+                               source.Id(), fast_, slow_);
+    allocate_failure_ = ErrorCode::NO_AVAILABLE_HANDLE;
+    ASSERT_TRUE(engine_->Execute(migrate));
+    EXPECT_FALSE(fast_->Match(*registration));
+    auto destination = slow_->Match(*registration);
+    ASSERT_TRUE(destination);
+    EXPECT_EQ(ReadAll(*destination), payload);
+    EXPECT_EQ(allocations_.size(), allocations);
+    EXPECT_EQ(slow_->Usage(), slow_usage);
+    EXPECT_EQ(added_.size(), 1u);
+    EXPECT_EQ(removed_.size(), 1u);
+}
+
+TEST_F(MigrationEngineTest, SelfMigrationNeverRemovesTheOnlyReplica) {
+    auto source = Commit(*fast_, "self", Pattern(kBlockSize, 0x42));
+    auto registration = registry_.Match("self");
+    ASSERT_TRUE(registration);
+    auto result =
+        engine_->Execute(MakeRequest(MovementKind::kMigrate, "self",
+                                     *registration, source.Id(), fast_, fast_));
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_TRUE(fast_->Match(*registration));
 }
 
 TEST_F(MigrationEngineTest, MigrateRemovesTheSourceOnceTheDestinationIsUp) {
@@ -932,6 +971,36 @@ class MigrationSchedulerTest : public MigrationEngineTest {
 // The three triggers the design names, each on its own. Without all three a
 // route either waits for company that never comes or submits one item at a
 // time forever.
+TEST_F(MigrationSchedulerTest, OutstandingIncludesRunningBatchAndSettlement) {
+    MigrationSchedulerConfig scheduler;
+    scheduler.max_batch_items = 1;
+    Rebuild(scheduler);
+    auto source = Commit(*fast_, "running", Pattern(kBlockSize, 0x51));
+    auto registration = registry_.Match("running");
+    ASSERT_TRUE(registration);
+    auto request = MakeRequest(MovementKind::kMigrate, "running", *registration,
+                               source.Id(), fast_, slow_);
+    request.route.kind = MovementKind::kMigrate;
+    request.route.source_tiler = fast_->Id();
+    request.route.destination_tiler = slow_->Id();
+    std::promise<void> entered, release;
+    auto released = release.get_future().share();
+    on_allocate_ = [&] {
+        entered.set_value();
+        released.wait();
+    };
+    ASSERT_TRUE(Submit(std::move(request)));
+    auto worker =
+        std::async(std::launch::async, [&] { return engine_->RunOnce(); });
+    entered.get_future().wait();
+    EXPECT_EQ(engine_->QueuedCount(), 0u);
+    EXPECT_EQ(engine_->OutstandingCount(), 1u);
+    release.set_value();
+    EXPECT_EQ(worker.get(), 1u);
+    EXPECT_EQ(engine_->OutstandingCount(), 0u);
+    EXPECT_EQ(tracker_->Stats().inflight, 0u);
+}
+
 TEST_F(MigrationSchedulerTest, ABatchFormsWhenEnoughItemsAreQueued) {
     for (int i = 0; i < 4; ++i) {
         ASSERT_TRUE(Submit(StaleRequest("items/" + std::to_string(i), 16,

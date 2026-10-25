@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -190,6 +191,13 @@ class TilerManager {
 
     size_t Capacity() const;
     size_t Usage() const;
+    std::function<size_t()> UsageReader() const;
+    using ReplicaObserver =
+        std::function<void(const BlockRegistrationHandle&, bool)>;
+    void SetReplicaObserver(ReplicaObserver observer) {
+        replica_observer_ = std::move(observer);
+    }
+    void ReconcileEviction(const Clock& clock, Clock::time_point deadline);
     size_t FreeBytes() const;
     BlockIndexStats IndexStats() const;
 
@@ -229,6 +237,11 @@ class TilerManager {
     BlockRegistry block_registry_;
     EventPublisher event_publisher_;
     std::atomic<bool> stopped_{false};
+    ReplicaObserver replica_observer_;
+    // DrainAll must observe additions/removals after their lifecycle hooks.
+    mutable std::shared_mutex replica_mutation_mu_;
+    std::mutex reconcile_mu_;
+    size_t reconcile_cursor_ = 0;
 };
 
 /**

@@ -167,6 +167,13 @@ bool LifecycleGate::WaitForNoInflight(std::chrono::milliseconds timeout) {
     });
 }
 
+void LifecycleGate::WaitForNoInflight() {
+    std::unique_lock<std::mutex> lock(wait_mu_);
+    wait_cv_.wait(lock, [this] {
+        return inflight_.load(std::memory_order_acquire) == 0;
+    });
+}
+
 void LifecycleGate::BeginCancel() {
     cancelled_.store(true, std::memory_order_release);
     std::lock_guard<std::mutex> lock(wait_mu_);

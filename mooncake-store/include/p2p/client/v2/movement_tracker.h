@@ -220,10 +220,11 @@ class MovementTracker {
         MovementDirection direction);
 
     /** A block became visible on a tier; starts its residency clock. */
-    void OnCommitted(std::string_view key, const UUID& tiler_id);
+    void OnCommitted(std::string_view key, const UUID& tiler_id,
+                     RegistrationId registration_id = {});
 
     /** Forget everything about a key. Called when its last replica goes. */
-    void OnDeleted(std::string_view key);
+    void OnDeleted(std::string_view key, RegistrationId registration_id = {});
 
     /**
      * @brief Reject further acquisitions; outstanding leases still settle.
@@ -240,6 +241,7 @@ class MovementTracker {
     friend class MovementLease;
 
     struct Record {
+        RegistrationId registration_id;
         /** Per tiler, when the current block arrived. */
         std::unordered_map<UUID, Clock::time_point, boost::hash<UUID>> since;
         /** Per direction, when the last successful move settled. */

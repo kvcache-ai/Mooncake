@@ -119,34 +119,42 @@ class OffloadConsumer final : public EventConsumer {
 
         // The block that arrived is not the one that should leave: what to
         // shed is a property of the tier's contents, and its eviction index is
-        // what orders them. Asking for one victim's worth keeps this a single
-        // decision per event rather than a burst.
-        auto victims = source->Eviction()->SelectVictims(1);
-        if (victims.empty()) return ConsumeResult::kIgnored;
-        const BlockToken& victim = victims.front();
+        // what orders them. The index bounds the candidate window; skip
+        // temporarily ineligible entries and enqueue at most one command.
+        auto victims = source->Eviction()->SelectVictims(source->Capacity());
+        for (const BlockToken& victim : victims) {
+            auto registration = victim.registration.Lock();
+            if (!registration.has_value() || registration->IsRetired()) {
+                continue;
+            }
+            if (!deps_.registry->IsCanonical(*registration)) {
+                continue;
+            }
 
-        auto registration = victim.registration.Lock();
-        if (!registration.has_value() || registration->IsRetired()) {
-            return ConsumeResult::kIgnored;
+            const FrequencySnapshot heat =
+                deps_.frequency->Get(registration->Id(), victim.key);
+            BlockEvent subject = event;
+            subject.key = victim.key;
+            subject.size_bytes = victim.size_bytes;
+
+            PlacementContext context = MakeContext(
+                deps_, victim.key, event.tiler_id, MovementDirection::kOffload,
+                victim.size_bytes, heat.read_heat, *registration);
+            auto decision = deps_.placement->Select(context);
+            if (!decision.has_value()) {
+                // The executor can release a fast replica already backed by the
+                // selected slow tier without allocating or copying again.
+                context.already_present = [](const UUID&) { return false; };
+                decision = deps_.placement->Select(context);
+            }
+            if (!decision.has_value()) continue;
+
+            const auto result =
+                Propose(deps_, config_, *decision, subject, *registration,
+                        victim.block_id, MovementDirection::kOffload);
+            if (result == ConsumeResult::kCommandEnqueued) return result;
         }
-        if (!deps_.registry->IsCanonical(*registration)) {
-            return ConsumeResult::kIgnored;
-        }
-
-        const FrequencySnapshot heat =
-            deps_.frequency->Get(registration->Id(), victim.key);
-        BlockEvent subject = event;
-        subject.key = victim.key;
-        subject.size_bytes = victim.size_bytes;
-
-        const PlacementContext context = MakeContext(
-            deps_, victim.key, event.tiler_id, MovementDirection::kOffload,
-            victim.size_bytes, heat.read_heat, *registration);
-        auto decision = deps_.placement->Select(context);
-        if (!decision.has_value()) return ConsumeResult::kIgnored;
-
-        return Propose(deps_, config_, *decision, subject, *registration,
-                       victim.block_id, MovementDirection::kOffload);
+        return ConsumeResult::kIgnored;
     }
 
    private:

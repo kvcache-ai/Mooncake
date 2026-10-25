@@ -18,6 +18,7 @@
 //     registration id and the raw pointer identity still match, which is what
 //     makes concurrent delete-then-recreate safe.
 
+#include <chrono>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -124,6 +125,15 @@ class BlockRegistrationHandle {
     void MarkAbsent(const UUID& tiler_id) const;
     std::vector<UUID> PresenceHint() const;
 
+    struct ReplicaChange {
+        // Keep lifecycle observers ordered even when DrainAll races a commit.
+        std::unique_lock<std::mutex> lock;
+        bool boundary;
+        std::chrono::steady_clock::time_point birth;
+    };
+    // boundary means first addition / last removal. No events or external
+    // callbacks may be invoked while the returned attachment lock is held.
+    ReplicaChange RecordReplicaChange(bool added) const;
     WeakBlockRegistrationHandle Downgrade() const;
     explicit operator bool() const { return inner_ != nullptr; }
 
@@ -175,10 +185,14 @@ struct BlockRegistrationHandleInner {
     const RegistrationId registration_id;
     std::weak_ptr<RegistryState> registry;
     std::atomic<bool> retired{false};
+    // Protected by attachments_mu. Birth restarts if an evicted identity is
+    // reused while a detached reader still holds its old registration.
+    size_t replica_count = 0;
+    std::chrono::steady_clock::time_point created_at{};
     // Serializes Register / Delete / Migrate for this key.
     mutable std::mutex mutation_mu;
-    // Guards presence_tilers only; taken after the mutation guard and the
-    // BlockIndex shard lock have been released.
+    // Guards presence, replica count and lifecycle observer ordering. Never
+    // held together with a BlockIndex shard lock or while publishing events.
     mutable std::mutex attachments_mu;
     std::unordered_set<UUID, boost::hash<UUID>> presence_tilers;
 

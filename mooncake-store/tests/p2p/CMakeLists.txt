@@ -204,3 +204,6 @@ target_link_libraries(redis_election_helper_test PUBLIC mooncake_store transfer_
     set_tests_properties(redis_election_helper_test redis_oplog_store_test
         PROPERTIES LABELS "p2p;ha;redis")
 endif()
+
+add_p2p_store_test(v2_review_regression_test v2/review_regression_test.cpp)
+set_tests_properties(v2_review_regression_test PROPERTIES TIMEOUT 60)

@@ -301,7 +301,8 @@ tl::expected<MovementLease, MovementRejection> MovementTracker::TryAcquire(
     return MovementLease(this, dedup, direction, std::string(key), lease_id);
 }
 
-void MovementTracker::OnCommitted(std::string_view key, const UUID& tiler_id) {
+void MovementTracker::OnCommitted(std::string_view key, const UUID& tiler_id,
+                                  RegistrationId registration_id) {
     const Clock::time_point now = clock_->Now();
     auto& shard = ShardFor(key);
     std::lock_guard<std::mutex> lock(shard.mu);
@@ -310,7 +311,12 @@ void MovementTracker::OnCommitted(std::string_view key, const UUID& tiler_id) {
     // A record created here is a new incarnation of the name: if a delete
     // just removed the old one, a movement of the old block may still be
     // running, and its settle must not mistake this record for its own.
-    if (inserted) record.incarnation = NextStamp();
+    if (inserted || (!(registration_id == RegistrationId{}) &&
+                     !(record.registration_id == registration_id))) {
+        record = Record{};
+        record.registration_id = registration_id;
+        record.incarnation = NextStamp();
+    }
     // Overwritten, not kept: a second commit on the same tier is a different
     // block, and its residency starts now.
     record.since[tiler_id] = now;
@@ -318,11 +324,16 @@ void MovementTracker::OnCommitted(std::string_view key, const UUID& tiler_id) {
     TrimLocked(shard);
 }
 
-void MovementTracker::OnDeleted(std::string_view key) {
+void MovementTracker::OnDeleted(std::string_view key,
+                                RegistrationId registration_id) {
     auto& shard = ShardFor(key);
     std::lock_guard<std::mutex> lock(shard.mu);
     auto it = shard.records.find(key);
-    if (it != shard.records.end()) shard.records.erase(it);
+    if (it != shard.records.end() &&
+        (registration_id == RegistrationId{} ||
+         it->second.registration_id == registration_id)) {
+        shard.records.erase(it);
+    }
     // The dedup slots deliberately stay. A movement that was running an
     // instant ago is still running now, and freeing its slot here would let a
     // second command be issued against the same source block while the first
