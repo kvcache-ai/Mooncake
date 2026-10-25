@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -19,6 +20,7 @@
 #include <string>
 #include <thread>
 
+#include "config.h"
 #include "dummy_client.h"
 #include "real_client_test_helper.h"
 #if defined(MOONCAKE_STORE_CLIENT_P2P)
@@ -31,6 +33,18 @@
 
 namespace mooncake::testing {
 namespace {
+
+class ScopedMaxMrSize {
+   public:
+    explicit ScopedMaxMrSize(size_t value)
+        : original_(globalConfig().max_mr_size) {
+        globalConfig().max_mr_size = value;
+    }
+    ~ScopedMaxMrSize() { globalConfig().max_mr_size = original_; }
+
+   private:
+    size_t original_;
+};
 
 class SharedFile {
    public:
@@ -431,6 +445,56 @@ class RealClientDeploymentTest : public ::testing::Test {
     InProcMaster master_;
 #endif
 };
+
+TEST_F(RealClientDeploymentTest,
+       InvalidShmRegistrationClosesFdAndLeavesNoContext) {
+    auto client = RealClient::create();
+    auto config = DeploymentConfig();
+    ASSERT_EQ(client->setup(config), 0);
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> file(std::tmpfile(),
+                                                         std::fclose);
+    ASSERT_NE(file, nullptr);
+    const int fd = fileno(file.get());
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, 4096), 0);
+    struct stat original{};
+    ASSERT_EQ(fstat(fd, &original), 0);
+    const int passed_fd = dup(fd);
+    ASSERT_GE(passed_fd, 0);
+    {
+        // Reject the shared size check before calling the transfer engine.
+        ScopedMaxMrSize limit(1);
+        auto result = RealClientTestHelper::MapShm(
+            *client, passed_fd, 0x100000, 4096, false, {1, 2});
+        EXPECT_FALSE(result);
+    }
+    struct stat after{};
+    const bool duplicate_still_open = fstat(passed_fd, &after) == 0 &&
+                                      after.st_dev == original.st_dev &&
+                                      after.st_ino == original.st_ino;
+    EXPECT_FALSE(duplicate_still_open);
+    if (duplicate_still_open && close(passed_fd) != 0) {
+        LOG(ERROR) << "Cannot close leaked SHM test descriptor: "
+                   << strerror(errno);
+    }
+    EXPECT_EQ(RealClientTestHelper::FindShmContext(*client, {1, 2}), nullptr);
+    EXPECT_EQ(client->tearDownAll(), 0);
+}
+
+TEST_F(RealClientDeploymentTest, FailedLocalPoolRegistrationRejectsSetup) {
+    auto config = DeploymentConfig();
+    auto client = RealClient::create();
+    {
+        ScopedMaxMrSize limit(1);
+        EXPECT_NE(client->setup(config), 0);
+        EXPECT_FALSE(client->is_initialized());
+    }
+    EXPECT_EQ(client->tearDownAll(), 0);
+    // Recovery uses a fresh object after restoring the registration limit.
+    client = RealClient::create();
+    ASSERT_EQ(client->setup(config), 0);
+    EXPECT_EQ(client->tearDownAll(), 0);
+}
 
 TEST_F(RealClientDeploymentTest, IpcRecoveryAndClose) {
     CheckIpcRecovery(DeploymentConfig(), LocalWriteConfig());
