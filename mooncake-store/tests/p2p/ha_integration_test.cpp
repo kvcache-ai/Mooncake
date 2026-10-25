@@ -1198,6 +1198,20 @@ TEST_F(HAIntegrationTest, HeartbeatResponseOnlyMapsCommunicationEvents) {
     EXPECT_EQ(client->recovery_worker_->GetStatus(),
               MetadataRecoveryWorker::Status::IDLE);
     client->service_state_.store(P2PClientServiceState::ONLINE);
+    HeartbeatTaskResult task;
+    task.type = HeartbeatTaskType::SYNC_SEGMENT_META;
+    task.detail =
+        SyncSegmentMetaResult{{{generate_uuid(), ErrorCode::INVALID_PARAMS}}};
+    response.task_results = {task};
+    response.status = P2PClientStatus::HEALTH;
+    EXPECT_EQ(client->HandleHeartbeatResponse(response),
+              ClientEvent::HEARTBEAT_HEALTHY);
+    auto& sub = std::get<SyncSegmentMetaResult>(response.task_results[0].detail)
+                    .sub_results[0];
+    sub.error = ErrorCode::SEGMENT_NOT_FOUND;
+    EXPECT_EQ(client->HandleHeartbeatResponse(response),
+              ClientEvent::REGISTRATION_REQUIRED);
+    EXPECT_EQ(client->GetServiceState(), P2PClientServiceState::ONLINE);
     for (auto status :
          {P2PClientStatus::DISCONNECTION, P2PClientStatus::CRASHED,
           static_cast<P2PClientStatus>(-1)}) {
@@ -2179,6 +2193,84 @@ TEST_F(HAIntegrationTest, ReRegisterReportsCurrentTierSegments) {
     }
 
     ForceRecover(client1_);
+}
+
+TEST_F(HAIntegrationTest, HeartbeatRepairsMissingTierSegment) {
+    for (const auto& version : {"v1", "v2"}) {
+        SCOPED_TRACE(version);
+        StartupMaster endpoint(master_.GetWrapped());
+        ASSERT_TRUE(endpoint.Start());
+        auto config = LifecycleConfig();
+        config.master_server_entry = endpoint.Address();
+        config.data_manager_version = version;
+        config.te_async_poll_worker_num = 1;
+        config.local_memcpy_async_worker_num = 1;
+        config.tiered_backend_config["tiers"][0]["capacity"] = 8u << 20;
+        auto second_tier = config.tiered_backend_config["tiers"][0];
+        second_tier["priority"] = 10;
+        config.tiered_backend_config["tiers"].append(second_tier);
+        auto created = P2PClientService::Create(config);
+        ASSERT_TRUE(created.has_value());
+        auto client = *created;
+        StopHeartbeatForManualEvents(client);
+        endpoint.forward_heartbeats = true;
+
+        auto& service = master_.GetWrapped().GetMasterService();
+        auto& manager = service.GetClientManager();
+        auto original_client = manager.GetClient(client->GetClientID());
+        ASSERT_NE(original_client, nullptr);
+        const auto segments = client->CollectTierSegments();
+        ASSERT_EQ(segments.size(), 2u);
+        ASSERT_TRUE(
+            service.UnmountSegment(segments.back().id, client->GetClientID())
+                .has_value());
+
+        // Failed repairs must stay degraded and leave the client registered.
+        for (bool reject : {true, false}) {
+            endpoint.reject_registration = reject;
+            auto response = client->GetMasterClient().Heartbeat(
+                client->build_heartbeat_request());
+            ASSERT_TRUE(response.has_value());
+            ASSERT_EQ(response->status, P2PClientStatus::HEALTH);
+            const auto event = client->HandleHeartbeatResponse(*response);
+            ASSERT_EQ(event, ClientEvent::REGISTRATION_REQUIRED);
+            EXPECT_EQ(HandleEvent(client, *event),
+                      reject ? ErrorCode::RPC_FAIL : ErrorCode::OK);
+            EXPECT_EQ(client->GetServiceState(),
+                      reject ? P2PClientServiceState::DEGRADED
+                             : P2PClientServiceState::ONLINE);
+            EXPECT_EQ(manager.GetClient(client->GetClientID()),
+                      original_client);
+            EXPECT_EQ(endpoint.unregistration_calls.load(), 0);
+        }
+        WaitForRecovery(client);
+
+        auto registered = manager.GetClientSegments(client->GetClientID());
+        ASSERT_TRUE(registered.has_value());
+        ASSERT_EQ(registered->size(), segments.size());
+        for (const auto& segment : segments) {
+            auto found =
+                manager.QuerySegment(client->GetClientID(), segment.id);
+            ASSERT_TRUE(found.has_value());
+            EXPECT_EQ(found->name, segment.name);
+            EXPECT_EQ(found->size, segment.size);
+            EXPECT_EQ(found->memory_type, segment.memory_type);
+        }
+        auto response = client->GetMasterClient().Heartbeat(
+            client->build_heartbeat_request());
+        ASSERT_TRUE(response.has_value());
+        EXPECT_EQ(client->HandleHeartbeatResponse(*response),
+                  ClientEvent::HEARTBEAT_HEALTHY);
+        ASSERT_FALSE(response->task_results.empty());
+        const auto* sync = std::get_if<SyncSegmentMetaResult>(
+            &response->task_results.front().detail);
+        ASSERT_NE(sync, nullptr);
+        ASSERT_EQ(sync->sub_results.size(), segments.size());
+        for (const auto& sub : sync->sub_results) {
+            EXPECT_EQ(sub.error, ErrorCode::OK);
+        }
+        client->Stop();
+    }
 }
 
 // ============================================================================

@@ -19,6 +19,7 @@
 #include "p2p/ha/oplog/p2p_oplog_types.h"
 #include "p2p/common/p2p_rpc_types.h"
 #include "types.h"
+#include "mock_oplog_store.h"
 
 namespace mooncake::test {
 namespace {
@@ -215,7 +216,7 @@ TEST_F(P2PRecordOplogTest, RegisterClientRecordsOplog) {
     EXPECT_EQ(payload.segments[0].name, segment.name);
 }
 
-TEST_F(P2PRecordOplogTest, DuplicateRegisterClientDoesNotRecordOplog) {
+TEST_F(P2PRecordOplogTest, DuplicateRegisterClientRecordsSegmentOplog) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{1, 1};
     const UUID segment_id{2, 2};
@@ -233,7 +234,47 @@ TEST_F(P2PRecordOplogTest, DuplicateRegisterClientDoesNotRecordOplog) {
 
     auto* manager = service.GetOpLogManager();
     ASSERT_NE(manager, nullptr);
-    EXPECT_EQ(manager->GetLastSequenceId(), 1);
+    EXPECT_EQ(manager->GetLastSequenceId(), 2);
+    OpLogEntry entry = ReadEntry(2);
+    EXPECT_EQ(entry.op_type, OpType_MOUNT_SEGMENT);
+    MountSegmentPayload payload;
+    ASSERT_TRUE(DeserializeP2PPayload(entry.payload, payload));
+    EXPECT_EQ(payload.client_id, client_id);
+    EXPECT_EQ(payload.segment.id, req.segments.front().id);
+}
+
+TEST_F(P2PRecordOplogTest, DuplicateRegisterClientRetriesFailedSegmentOplog) {
+    P2PMasterService service(MakeConfig());
+    const UUID client_id{1, 1};
+    RegisterClient(service, client_id, MakeSegment({2, 2}));
+
+    auto store = std::make_shared<MockOpLogStore>();
+    auto* manager = service.GetOpLogManager();
+    ASSERT_NE(manager, nullptr);
+    manager->SetOpLogStore(store);
+    store->SetWriteError(ErrorCode::INTERNAL_ERROR);
+
+    P2PRegisterClientRequest req;
+    req.client_id = client_id;
+    req.ip_address = "127.0.0.1";
+    req.rpc_port = 50051;
+    req.segments = {MakeSegment({3, 3})};
+    auto failed = service.RegisterClient(req);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ErrorCode::INTERNAL_ERROR);
+    // The mount already succeeded in memory; a retry must still persist it.
+    EXPECT_TRUE(service.QuerySegments(req.segments.front().name).has_value());
+
+    store->SetWriteError(ErrorCode::OK);
+    ASSERT_TRUE(service.RegisterClient(req).has_value());
+    OpLogEntry entry;
+    ASSERT_EQ(store->ReadOpLog(manager->GetLastSequenceId(), entry),
+              ErrorCode::OK);
+    EXPECT_EQ(entry.op_type, OpType_MOUNT_SEGMENT);
+    MountSegmentPayload payload;
+    ASSERT_TRUE(DeserializeP2PPayload(entry.payload, payload));
+    EXPECT_EQ(payload.client_id, client_id);
+    EXPECT_EQ(payload.segment.id, req.segments.front().id);
 }
 
 TEST_F(P2PRecordOplogTest, RegisterClientRejectsMissingEndpoint) {

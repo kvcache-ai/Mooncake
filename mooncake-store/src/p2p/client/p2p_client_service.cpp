@@ -290,14 +290,18 @@ P2PClientService::HandleHeartbeatResponse(
                      << ", master version: " << response.view_version
                      << ", client version: " << view_version_.load();
     }
+    bool registration_required = false;
     for (const auto& task_result : response.task_results) {
-        HandleHeartbeatTaskResult(task_result);
+        if (HandleHeartbeatTaskResult(task_result)) {
+            registration_required = true;
+        }
     }
     switch (response.status) {
         case P2PClientStatus::UNDEFINED:
             return ClientEvent::REGISTRATION_REQUIRED;
         case P2PClientStatus::HEALTH:
-            return ClientEvent::HEARTBEAT_HEALTHY;
+            return registration_required ? ClientEvent::REGISTRATION_REQUIRED
+                                         : ClientEvent::HEARTBEAT_HEALTHY;
         default:
             LOG(ERROR) << "P2P heartbeat did not report HEALTH or UNDEFINED: "
                        << static_cast<int>(response.status)
@@ -306,7 +310,7 @@ P2PClientService::HandleHeartbeatResponse(
     }
 }
 
-void P2PClientService::HandleHeartbeatTaskResult(
+bool P2PClientService::HandleHeartbeatTaskResult(
     const HeartbeatTaskResult& task_result) {
     if (task_result.error != ErrorCode::OK) {
         LOG(ERROR) << "Failed to process heartbeat task"
@@ -314,10 +318,15 @@ void P2PClientService::HandleHeartbeatTaskResult(
                    << ", error=" << toString(task_result.error);
     }
 
-    if (std::holds_alternative<SyncSegmentMetaResult>(task_result.detail)) {
+    bool registration_required = false;
+    if (task_result.type == HeartbeatTaskType::SYNC_SEGMENT_META &&
+        std::holds_alternative<SyncSegmentMetaResult>(task_result.detail)) {
         const auto& sync_res =
             std::get<SyncSegmentMetaResult>(task_result.detail);
         for (const auto& sub : sync_res.sub_results) {
+            if (sub.error == ErrorCode::SEGMENT_NOT_FOUND) {
+                registration_required = true;
+            }
             if (sub.error != ErrorCode::OK) {
                 LOG(WARNING) << "Failed to sync segment usage"
                              << ", segment_id=" << sub.segment_id
@@ -325,6 +334,7 @@ void P2PClientService::HandleHeartbeatTaskResult(
             }
         }
     }
+    return registration_required;
 }
 
 ErrorCode P2PClientService::ReconnectToMaster() {
@@ -1157,7 +1167,8 @@ ErrorCode P2PClientService::HandleHeartbeatEventLocked(ClientEvent event) {
             break;
         case ClientEvent::REGISTRATION_REQUIRED:
             // Stop publishing metadata until Master confirms registration.
-            error = EnterDegraded("Master has no client registration");
+            error =
+                EnterDegraded("Master is missing client or segment metadata");
             if (error == ErrorCode::OK) {
                 error = EnterOnline(P2PClientServiceState::DEGRADED);
             }
