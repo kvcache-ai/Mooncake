@@ -17,9 +17,12 @@
 #include <bits/stdint-uintn.h>
 #include "cuda_alike.h"
 #include <glog/logging.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
@@ -166,6 +169,18 @@ static CudaStreamEntry getStreamForRequest(const void *source) {
         if (device_id < 0) device_id = 0;
     }
     return tl_device_stream_pool.getOrCreate(device_id);
+}
+
+// MC_NVLINK_VMM=0 turns off sharing of virtual-memory (cuMemCreate) buffers.
+static bool vmmEnabled() {
+    static const bool enabled = [] {
+        const char *value = getenv("MC_NVLINK_VMM");
+        if (!value) return true;
+        std::string v(value);
+        std::transform(v.begin(), v.end(), v.begin(), ::tolower);
+        return !(v == "0" || v == "false" || v == "off" || v == "no");
+    }();
+    return enabled;
 }
 
 }  // anonymous namespace
@@ -395,10 +410,38 @@ IntraNodeNvlinkTransport::IntraNodeNvlinkTransport() {}
 // }
 
 IntraNodeNvlinkTransport::~IntraNodeNvlinkTransport() {
+    // The fd server thread calls back into this object; stop it first.
+    vmm_fd_server_.stop();
     for (auto &entry : remap_entries_) {
-        cudaIpcCloseMemHandle(entry.second.shm_addr);
+        releaseOpenedEntry(entry.second);
     }
     remap_entries_.clear();
+#ifdef USE_CUDA
+    for (auto &kv : vmm_exports_) {
+        for (uint64_t handle : kv.second.handles) {
+            cuMemRelease((CUmemGenericAllocationHandle)handle);
+        }
+    }
+#endif
+    vmm_exports_.clear();
+    vmm_ids_by_base_.clear();
+}
+
+void IntraNodeNvlinkTransport::releaseOpenedEntry(OpenedShmEntry &entry) {
+    if (!entry.vmm) {
+        cudaIpcCloseMemHandle(entry.shm_addr);
+        return;
+    }
+#ifdef USE_CUDA
+    CUdeviceptr va = (CUdeviceptr)entry.shm_addr;
+    for (const auto &chunk : entry.vmm_chunks) {
+        cuMemUnmap(va + chunk.offset, chunk.size);
+    }
+    cuMemAddressFree(va, entry.length);
+    for (uint64_t handle : entry.vmm_handles) {
+        cuMemRelease((CUmemGenericAllocationHandle)handle);
+    }
+#endif
 }
 
 int IntraNodeNvlinkTransport::install(
@@ -644,6 +687,25 @@ int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
         return -1;
     }
 
+#ifdef USE_CUDA
+    // Virtual-memory (cuMemCreate) allocations have no cudaIpc handle. This
+    // includes PyTorch with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
+    // cuMemRetainAllocationHandle only succeeds for them.
+    CUmemGenericAllocationHandle probe_handle;
+    if (cuMemRetainAllocationHandle(&probe_handle, addr) == CUDA_SUCCESS) {
+        cuMemRelease(probe_handle);
+        if (vmmEnabled()) {
+            return registerVmmMemory(addr, length, attr.device, location);
+        }
+        LOG(ERROR) << "IntraNodeNvlinkTransport: buffer " << addr
+                   << " is a virtual-memory (cuMemCreate) allocation, and "
+                      "MC_NVLINK_VMM=0 turns off sharing such buffers. Unset "
+                      "MC_NVLINK_VMM, or register memory allocated with "
+                      "cudaMalloc/cuMemAlloc.";
+        return -1;
+    }
+#endif
+
     // Resolve the true cudaMalloc base address. Framework caching allocators
     // (PyTorch, etc.) sub-allocate tensors within larger cudaMalloc segments.
     // cudaIpcGetMemHandle always returns a handle for the entire segment, so
@@ -699,6 +761,326 @@ int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
     return rc;
 }
 
+// Registers [addr, addr + length) of VMM memory. For VMM memory,
+// cuMemGetAddressRange returns the extent of the one physical allocation
+// mapped at an address, so walk the range chunk by chunk. The published
+// buffer covers the chunks completely; importers map them the same way.
+int IntraNodeNvlinkTransport::registerVmmMemory(void *addr, size_t length,
+                                                int device,
+                                                const std::string &location) {
+#ifdef USE_CUDA
+    const uint64_t end = (uint64_t)addr + length;
+    VmmExport vmm_export;
+    vmm_export.base = 0;
+    vmm_export.device = device;
+    auto release_handles = [](VmmExport &e) {
+        for (uint64_t handle : e.handles) {
+            cuMemRelease((CUmemGenericAllocationHandle)handle);
+        }
+        e.handles.clear();
+    };
+
+    uint64_t cursor = (uint64_t)addr;
+    while (cursor < end) {
+        CUdeviceptr base = 0;
+        size_t size = 0;
+        CUresult res = cuMemGetAddressRange(&base, &size, (CUdeviceptr)cursor);
+        if (res != CUDA_SUCCESS) {
+            LOG(ERROR) << "IntraNodeNvlinkTransport: VMM buffer " << addr
+                       << " (length " << length << ") is not fully mapped: "
+                       << "nothing is mapped at " << (void *)cursor
+                       << " (error " << res
+                       << "). Register only memory that "
+                          "is mapped and stays mapped.";
+            release_handles(vmm_export);
+            return -1;
+        }
+        CUmemGenericAllocationHandle handle;
+        res = cuMemRetainAllocationHandle(&handle, (void *)base);
+        if (res != CUDA_SUCCESS) {
+            LOG(ERROR) << "IntraNodeNvlinkTransport: buffer " << addr
+                       << " mixes virtual-memory and other allocations at "
+                       << (void *)base;
+            release_handles(vmm_export);
+            return -1;
+        }
+        vmm_export.handles.push_back((uint64_t)handle);
+        CUmemAllocationProp prop = {};
+        res = cuMemGetAllocationPropertiesFromHandle(&prop, handle);
+        if (res != CUDA_SUCCESS) {
+            LOG(ERROR) << "IntraNodeNvlinkTransport: "
+                          "cuMemGetAllocationPropertiesFromHandle failed for "
+                       << (void *)base << " (error " << res << ")";
+            release_handles(vmm_export);
+            return -1;
+        }
+        if (!(prop.requestedHandleTypes &
+              CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR)) {
+            if (prop.requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC) {
+                // PyTorch picks FABRIC when the device has fabric access
+                // (e.g. IMEX is configured).
+                LOG(ERROR) << "IntraNodeNvlinkTransport: virtual-memory buffer "
+                           << addr
+                           << " only has a FABRIC handle; nvlink_intra shares "
+                              "virtual memory through POSIX file descriptors. "
+                              "For PyTorch, add "
+                              "expandable_segments_handle_type:posix_fd to "
+                              "PYTORCH_CUDA_ALLOC_CONF.";
+            } else {
+                LOG(ERROR) << "IntraNodeNvlinkTransport: virtual-memory buffer "
+                           << addr
+                           << " cannot be shared: it was created without "
+                              "CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR in "
+                              "requestedHandleTypes. For PyTorch with "
+                              "expandable_segments:True, set "
+                              "TORCH_CUDA_EXPANDABLE_SEGMENTS_IPC=1 before "
+                              "CUDA is initialized, or disable "
+                              "expandable_segments.";
+            }
+            release_handles(vmm_export);
+            return -1;
+        }
+        if (vmm_export.chunks.empty()) vmm_export.base = base;
+        vmm_export.chunks.push_back({base - vmm_export.base, size});
+        cursor = base + size;
+    }
+    vmm_export.length = cursor - vmm_export.base;
+
+    std::lock_guard<std::mutex> lock(vmm_mutex_);
+    auto existing = vmm_ids_by_base_.find(vmm_export.base);
+    if (existing != vmm_ids_by_base_.end()) {
+        auto &old = vmm_exports_[existing->second];
+        if (old.length >= vmm_export.length) {
+            release_handles(vmm_export);
+            return 0;
+        }
+        // The new range extends a registered one with the same first chunk:
+        // replace it, since buffers are keyed by their base address.
+        release_handles(old);
+        vmm_exports_.erase(existing->second);
+        vmm_ids_by_base_.erase(existing);
+        metadata_->removeLocalMemoryBuffer((void *)vmm_export.base, false);
+    }
+
+    if (!vmm_fd_server_.running()) {
+        const char *dir = getenv("MC_NVLINK_FD_DIR");
+        int rc = vmm_fd_server_.start(
+            dir ? dir : "", [this](uint64_t buffer_id, std::vector<int> &fds) {
+                return exportVmmFds(buffer_id, fds);
+            });
+        if (rc != 0) {
+            release_handles(vmm_export);
+            return -1;
+        }
+    }
+
+    intranode_vmm::VmmBufferInfo info;
+    info.buffer_id = next_vmm_buffer_id_++;
+    info.endpoint = vmm_fd_server_.endpoint();
+    info.chunks = vmm_export.chunks;
+    std::vector<unsigned char> payload =
+        intranode_vmm::encodeVmmBufferInfo(info);
+    if (payload.empty()) {
+        LOG(ERROR) << "IntraNodeNvlinkTransport: cannot encode VMM buffer "
+                   << addr;
+        release_handles(vmm_export);
+        return -1;
+    }
+
+    BufferDesc desc;
+    desc.addr = vmm_export.base;
+    desc.length = vmm_export.length;
+    desc.name = location;
+    desc.shm_name = serializeBinaryData(payload.data(), payload.size());
+    const uint64_t base = vmm_export.base;
+    const size_t num_chunks = vmm_export.chunks.size();
+    vmm_exports_[info.buffer_id] = std::move(vmm_export);
+    vmm_ids_by_base_[base] = info.buffer_id;
+    int rc = metadata_->addLocalMemoryBuffer(desc, true);
+    if (rc != 0) {
+        release_handles(vmm_exports_[info.buffer_id]);
+        vmm_exports_.erase(info.buffer_id);
+        vmm_ids_by_base_.erase(base);
+        return rc;
+    }
+    if (globalConfig().trace) {
+        LOG(INFO) << "IntraNodeNvlinkTransport: registered VMM buffer "
+                  << (void *)base << " length " << desc.length << " in "
+                  << num_chunks << " chunk(s)";
+    }
+    return 0;
+#else
+    (void)addr;
+    (void)length;
+    (void)device;
+    (void)location;
+    LOG(ERROR) << "IntraNodeNvlinkTransport: virtual-memory buffers need a "
+                  "CUDA build";
+    return -1;
+#endif
+}
+
+bool IntraNodeNvlinkTransport::unregisterVmmMemory(uint64_t base,
+                                                   bool update_metadata,
+                                                   int &rc) {
+    {
+        std::lock_guard<std::mutex> lock(vmm_mutex_);
+        auto it = vmm_ids_by_base_.find(base);
+        if (it == vmm_ids_by_base_.end()) return false;
+#ifdef USE_CUDA
+        for (uint64_t handle : vmm_exports_[it->second].handles) {
+            cuMemRelease((CUmemGenericAllocationHandle)handle);
+        }
+#endif
+        vmm_exports_.erase(it->second);
+        vmm_ids_by_base_.erase(it);
+    }
+    rc = metadata_->removeLocalMemoryBuffer((void *)base, update_metadata);
+    return true;
+}
+
+// Called on the fd server thread. Exports a new fd per chunk on each request
+// so that registered buffers do not hold file descriptors.
+int IntraNodeNvlinkTransport::exportVmmFds(uint64_t buffer_id,
+                                           std::vector<int> &fds) {
+#ifdef USE_CUDA
+    std::lock_guard<std::mutex> lock(vmm_mutex_);
+    auto it = vmm_exports_.find(buffer_id);
+    if (it == vmm_exports_.end()) return -ENOENT;
+    cudaSetDevice(it->second.device);
+    for (uint64_t handle : it->second.handles) {
+        int fd = -1;
+        CUresult res = cuMemExportToShareableHandle(
+            &fd, (CUmemGenericAllocationHandle)handle,
+            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0);
+        if (res != CUDA_SUCCESS) {
+            LOG(ERROR) << "IntraNodeNvlinkTransport: "
+                          "cuMemExportToShareableHandle failed for VMM buffer "
+                       << buffer_id << " (error " << res << ")";
+            for (int opened : fds) close(opened);
+            fds.clear();
+            return -EIO;
+        }
+        fds.push_back(fd);
+    }
+    return 0;
+#else
+    (void)buffer_id;
+    (void)fds;
+    return -ENOTSUP;
+#endif
+}
+
+// Maps a peer's VMM buffer into this process: fetch one fd per chunk,
+// import them, map them back to back into a new reservation and grant
+// access to every visible device.
+int IntraNodeNvlinkTransport::openVmmBuffer(
+    const intranode_vmm::VmmBufferInfo &info, uint64_t length,
+    OpenedShmEntry &shm_entry) {
+#ifdef USE_CUDA
+    const auto &last = info.chunks.back();
+    if (last.offset + last.size != length) {
+        LOG(ERROR) << "IntraNodeNvlinkTransport: VMM buffer " << info.buffer_id
+                   << " chunks do not match its length " << length;
+        return -1;
+    }
+    std::vector<int> fds;
+    if (intranode_vmm::fetchVmmFds(info.endpoint, info.buffer_id,
+                                   info.chunks.size(), fds) != 0) {
+        return -1;
+    }
+    std::vector<uint64_t> handles;
+    CUresult res = CUDA_SUCCESS;
+    for (int &fd : fds) {
+        if (res == CUDA_SUCCESS) {
+            CUmemGenericAllocationHandle handle;
+            res = cuMemImportFromShareableHandle(
+                &handle, (void *)(uintptr_t)fd,
+                CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+            if (res == CUDA_SUCCESS) handles.push_back((uint64_t)handle);
+        }
+        close(fd);
+    }
+    OpenedShmEntry opened;
+    opened.shm_addr = nullptr;
+    opened.length = length;
+    opened.vmm = true;
+    opened.vmm_handles = std::move(handles);
+    if (res != CUDA_SUCCESS) {
+        LOG(ERROR) << "IntraNodeNvlinkTransport: "
+                      "cuMemImportFromShareableHandle failed (error "
+                   << res << ")";
+        for (uint64_t handle : opened.vmm_handles) {
+            cuMemRelease((CUmemGenericAllocationHandle)handle);
+        }
+        return -1;
+    }
+
+    CUdeviceptr va = 0;
+    res = cuMemAddressReserve(&va, length, 0, 0, 0);
+    if (res != CUDA_SUCCESS) {
+        LOG(ERROR) << "IntraNodeNvlinkTransport: cuMemAddressReserve of "
+                   << length << " bytes failed (error " << res << ")";
+        for (uint64_t handle : opened.vmm_handles) {
+            cuMemRelease((CUmemGenericAllocationHandle)handle);
+        }
+        return -1;
+    }
+    opened.shm_addr = (void *)va;
+    for (size_t i = 0; i < info.chunks.size(); ++i) {
+        const auto &chunk = info.chunks[i];
+        res = cuMemMap(va + chunk.offset, chunk.size, 0,
+                       (CUmemGenericAllocationHandle)opened.vmm_handles[i], 0);
+        if (res != CUDA_SUCCESS) {
+            LOG(ERROR) << "IntraNodeNvlinkTransport: cuMemMap of VMM chunk "
+                       << i << " failed (error " << res << ")";
+            break;
+        }
+        opened.vmm_chunks.push_back(chunk);
+    }
+    if (res == CUDA_SUCCESS) {
+        int device_count = 0;
+        cudaGetDeviceCount(&device_count);
+        std::vector<CUmemAccessDesc> access(device_count);
+        for (int i = 0; i < device_count; ++i) {
+            access[i].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access[i].location.id = i;
+            access[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        }
+        res = cuMemSetAccess(va, length, access.data(), device_count);
+        if (res != CUDA_SUCCESS) {
+            // Some visible device may lack peer access to the owner; the
+            // copies only need the current one.
+            int current = 0;
+            cudaGetDevice(&current);
+            CUmemAccessDesc one = {};
+            one.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            one.location.id = current;
+            one.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            res = cuMemSetAccess(va, length, &one, 1);
+            if (res != CUDA_SUCCESS) {
+                LOG(ERROR) << "IntraNodeNvlinkTransport: cuMemSetAccess failed "
+                              "(error "
+                           << res << ")";
+            }
+        }
+    }
+    if (res != CUDA_SUCCESS) {
+        releaseOpenedEntry(opened);
+        return -1;
+    }
+    shm_entry = std::move(opened);
+    return 0;
+#else
+    (void)info;
+    (void)length;
+    (void)shm_entry;
+    LOG(ERROR) << "IntraNodeNvlinkTransport: virtual-memory buffers need a "
+                  "CUDA build";
+    return -1;
+#endif
+}
+
 int IntraNodeNvlinkTransport::unregisterLocalMemory(void *addr,
                                                     bool update_metadata) {
     CUdeviceptr base_ptr = 0;
@@ -714,6 +1096,11 @@ int IntraNodeNvlinkTransport::unregisterLocalMemory(void *addr,
             << "IntraNodeNvlinkTransport: cuMemGetAddressRange failed for "
             << "addr " << addr << " during unregister (error " << cu_err
             << "). Memory may already be freed, using provided address.";
+    }
+
+    int vmm_rc = 0;
+    if (unregisterVmmMemory((uint64_t)key_ptr, update_metadata, vmm_rc)) {
+        return vmm_rc;
     }
 
     {
@@ -780,8 +1167,18 @@ int IntraNodeNvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     remap_entries_[std::make_pair(target_id, entry.addr)] =
                         shm_entry;
                 } else {
-                    LOG(ERROR) << "Mismatched NVLink data transfer method";
-                    return -1;
+                    intranode_vmm::VmmBufferInfo info;
+                    if (!intranode_vmm::decodeVmmBufferInfo(output_buffer,
+                                                            info)) {
+                        LOG(ERROR) << "Mismatched NVLink data transfer method";
+                        return -1;
+                    }
+                    OpenedShmEntry shm_entry;
+                    if (openVmmBuffer(info, entry.length, shm_entry) != 0) {
+                        return -1;
+                    }
+                    remap_entries_[std::make_pair(target_id, entry.addr)] =
+                        std::move(shm_entry);
                 }
             }
             auto shm_addr =
