@@ -44,8 +44,9 @@ class RdmaCQ {
     // ibv_post_send to HW. if there are no available CQEs, the function returns
     // false.
     //
-    // Unsignaled work requests do not consume CQE quota; a later signaled
-    // completion resolves their posting-order prefix.
+    // Data QPs reserve quota for every posted WR, including unsignaled WRs,
+    // because a QP error can generate a flush CQE for each outstanding WR.
+    // Normal signaled completions release quota for their whole prefix.
     bool reserveQuota(int num_entries = 1);
 
     void cancelQuota(int num_entries);

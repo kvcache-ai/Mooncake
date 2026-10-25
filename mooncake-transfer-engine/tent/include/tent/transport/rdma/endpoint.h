@@ -37,7 +37,6 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // (submitSlices / acknowledge) or the endpoint write lock (teardown).
     struct BoundedSliceQueue {
         size_t head, tail, capacity, count;
-        size_t signaled_count = 0;
         std::vector<RdmaSlice*> entries;
         std::unordered_set<RdmaSlice*> slice_set;
 
@@ -56,15 +55,12 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
         bool full() const { return count == capacity; }
 
-        size_t signaledCount() const { return signaled_count; }
-
         void push(RdmaSlice* slice) {
             if (count == capacity) throw std::runtime_error("queue overflow");
             entries[tail] = slice;
             tail = (tail + 1) % capacity;
             slice_set.insert(slice);
             count++;
-            if (slice->completion_signaled) signaled_count++;
         }
 
         RdmaSlice* peek() {
@@ -78,7 +74,6 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
             head = (head + 1) % capacity;
             slice_set.erase(cur);
             count--;
-            if (cur->completion_signaled) signaled_count--;
             return cur;
         }
 
@@ -223,6 +218,12 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // for slices it never sees otherwise.
     size_t acknowledge(RdmaSlice* slice, TransferStatusEnum status,
                        const std::function<void(RdmaSlice*)>& on_each = {});
+
+    // Resolve a posting-order prefix without retiring its hardware/CQ
+    // accounting. Used for software timeouts: the endpoint is moved to ERR
+    // and its eventual completions still have to drain the queue and quota.
+    size_t markPrefix(RdmaSlice* slice, TransferStatusEnum status,
+                      const std::function<void(RdmaSlice*)>& on_each = {});
 
     // Pop the posting-order prefix ending at `tail` without resolving slice
     // status. The caller must finish accounting and status handling before it

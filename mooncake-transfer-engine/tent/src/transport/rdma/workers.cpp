@@ -833,6 +833,26 @@ void Workers::asyncPostSend() {
         int num_submitted = endpoint->submitSlices(
             slices, tl_wid,
             [&](RdmaSlice* posted) { markPosted(worker, posted, post_ts); });
+        int first_failed = num_submitted;
+        for (int id = 0; id < num_submitted; ++id) {
+            if (slices[id]->failed) {
+                first_failed = id;
+                break;
+            }
+        }
+        // A partial post can leave an accepted prefix with no signaled tail.
+        // Retire this local QP so ERR flushes every accepted WR; this local
+        // posting failure must not be recorded as a failed rail.
+        if (first_failed > 0 && first_failed < num_submitted &&
+            !slices[first_failed - 1]->completion_signaled &&
+            path.local_device_id >= 0 &&
+            path.local_device_id <
+                static_cast<int>(transport_->context_set_.size())) {
+            auto* context =
+                transport_->context_set_[path.local_device_id].get();
+            if (context && context->endpointStore())
+                context->endpointStore()->remove(endpoint.get());
+        }
         for (int id = 0; id < num_submitted; ++id) {
             auto slice = slices[id];
             if (!slice->failed) continue;
@@ -855,7 +875,6 @@ void Workers::asyncPostSend() {
                 transport_->params_->workers.max_retry_count) {
                 LOG(WARNING)
                     << "Slice " << slice << " failed: retry count exceeded";
-                disableEndpoint(slice);
                 discountFromOwner(worker, slice);
                 updateSliceStatus(slice, FAILED);
             } else {
@@ -969,18 +988,29 @@ void Workers::expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns) {
             auto ep = slice->ep_weak_ptr.lock();
             LOG(WARNING) << "Slice " << slice
                          << " failed: transfer timeout (software)";
-            // The slice turns terminal here, not on the CQ. Its flush
-            // completion may never be polled (acknowledge() zeroes wr_depth,
-            // so the endpoint destroys the QP and its unpolled CQEs), so
-            // return the selector charge now for it and every slice swept
-            // with it; releaseSliceQuota() is idempotent.
+            // Resolve the task and return its selector charge now, but keep
+            // WR/CQ reservations until polling drains them. The QP's ERR
+            // transition can produce flush CQEs on a CQ shared by endpoints.
             if (!ep) {
                 retire(slice);
                 updateSliceStatus(slice, TIMEOUT);
                 continue;
             }
-            auto num_slices = ep->acknowledge(slice, TIMEOUT, retire);
-            disableEndpoint(slice);
+            auto num_slices = ep->markPrefix(slice, TIMEOUT, retire);
+            if (num_slices > 0) {
+                bool retired = false;
+                if (slice->source_dev_id >= 0 &&
+                    slice->source_dev_id <
+                        static_cast<int>(transport_->context_set_.size())) {
+                    auto* context =
+                        transport_->context_set_[slice->source_dev_id].get();
+                    if (context && context->endpointStore()) {
+                        retired =
+                            context->endpointStore()->remove(ep.get()) == 0;
+                    }
+                }
+                if (!retired) ep->beginDestroy();
+            }
             if (num_slices == 0) {
                 // A neighbour's retry already popped it off the queue pair
                 // and discounted it there, so only its charge and its set
@@ -1067,10 +1097,20 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
     }
     if (slice->word != PENDING) {
         // Resolved before its completion was polled -- swept off the queue
-        // pair by a neighbour, timed out, or cancelled by a teardown. The
-        // charge came back above; the lane count is settled here in case
-        // that path could not (idempotent, so a path that did is unharmed).
-        discountFromOwner(worker, slice);
+        // pair by a neighbour, timed out, or cancelled by a teardown. A
+        // timeout leaves the WR queued so its flush CQE can release the WR
+        // and CQ reservations. A prefix already drained by asyncPollCq has
+        // already paid those reservations back.
+        if (ep && !queue_already_drained) {
+            const auto retired =
+                ep->acknowledge(slice, slice->word, [&sweep](RdmaSlice* swept) {
+                    sweep.self->retireSweptSlice(*sweep.worker, swept,
+                                                 sweep.now_ns, nullptr);
+                });
+            if (retired == 0) discountFromOwner(worker, slice);
+        } else {
+            discountFromOwner(worker, slice);
+        }
         return;
     }
     if (!ep) {
@@ -1079,7 +1119,8 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
         return;
     }
     if (wc.status != IBV_WC_SUCCESS) {
-        if (wc.status != IBV_WC_WR_FLUSH_ERR) {
+        const bool flush_error = wc.status == IBV_WC_WR_FLUSH_ERR;
+        if (!flush_error) {
             // TE handles them automatically
             LOG(INFO) << "Detected error WQE for slice " << slice
                       << " (opcode: " << slice->task->request.opcode
@@ -1124,7 +1165,7 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
                                                  sweep.now_ns, nullptr);
                 });
             }
-            disableEndpoint(slice);
+            if (!flush_error) disableEndpoint(slice);
         } else {
             // Popped but still in flight: their work requests are
             // live and their completions are still coming, so only
@@ -1136,7 +1177,7 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
                     discountFromOwner(worker, swept);
                 });
             }
-            disableEndpoint(slice);
+            if (!flush_error) disableEndpoint(slice);
             if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
                 updateSliceStatus(slice, CANCELED);
             } else {
@@ -1207,8 +1248,7 @@ void Workers::asyncPollCq() {
             completion_prefix.reserve(transport_->params_->endpoint.max_qp_wr);
         for (int i = 0; i < nr_poll; ++i) {
             const auto& raw = wc[i];
-            if (transport_->params_->endpoint.signal_interval <= 1 ||
-                raw.status == IBV_WC_WR_FLUSH_ERR) {
+            if (transport_->params_->endpoint.signal_interval <= 1) {
                 handleCompletion(worker, *context, raw, poll_ts,
                                  i + 1 == nr_poll);
                 continue;
@@ -1225,14 +1265,17 @@ void Workers::asyncPollCq() {
                 auto logical = raw;
                 logical.wr_id =
                     reinterpret_cast<uint64_t>(completion_prefix[index]);
-                if (raw.status != IBV_WC_SUCCESS)
-                    logical.status = raw.status;
-                else if (index + 1 != completion_prefix.size())
+                // A regular completion identifies its tail, so earlier WRs
+                // in its ordered SQ prefix completed successfully. A flush
+                // completion instead applies to every outstanding WR in the
+                // prefix because the QP entered ERR before they completed.
+                if (raw.status != IBV_WC_WR_FLUSH_ERR &&
+                    index + 1 != completion_prefix.size())
                     logical.status = IBV_WC_SUCCESS;
                 handleCompletion(
                     worker, *context, logical, poll_ts,
                     i + 1 == nr_poll && index + 1 == completion_prefix.size(),
-                    true, index + 1 == completion_prefix.size());
+                    true, true);
             }
         }
     }
