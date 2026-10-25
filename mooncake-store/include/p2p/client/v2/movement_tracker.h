@@ -24,10 +24,9 @@
 // substitute for validating the token against the index.
 //
 // Every acquire must be settled. A lease that is never released blocks that
-// key's dedup slot for the process lifetime, so the settle (the design doc
-// calls it OnSettled; here it is MovementLease::Settle) runs on every exit
-// path -- success, failure, stale, deadline, cancellation, shutdown -- and
-// the RAII lease makes "every path" mean it.
+// key's dedup slot for the process lifetime. MovementLease::Settle therefore
+// runs on success, failure, stale tokens, deadlines, cancellation and shutdown.
+// The RAII lease ensures that every exit path settles.
 //
 // A settle frees exactly the slot its own acquire took, and nothing else ever
 // frees that slot: not a delete of the key, not the record cap. That is what

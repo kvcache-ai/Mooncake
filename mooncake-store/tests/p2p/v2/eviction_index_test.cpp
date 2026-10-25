@@ -1,5 +1,4 @@
-// Component tests for the per-tiler EvictionIndex (design doc sections 3.2,
-// 3.3 and 9).
+// Component tests for the per-tiler EvictionIndex.
 //
 // The concrete index is private to eviction_index.cpp, so everything here goes
 // through CreateEvictionIndex -- the same surface TilerManager uses. Two

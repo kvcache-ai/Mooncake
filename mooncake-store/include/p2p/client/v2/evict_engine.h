@@ -8,7 +8,7 @@
 // deadline and the try_evict switch all live in AllocateWithPolicy -- so it
 // can never loop on its own.
 //
-// Reclamation is tier-local, and deliberately so (design section 4.1). This
+// Reclamation is tier-local, and deliberately so. This
 // engine never looks at another tier, never asks whether a replica exists
 // elsewhere, never demotes a block to a slower tier and never waits for an
 // offload. Cross-tier copies and durability belong entirely to the offload
@@ -83,10 +83,10 @@ struct EvictStats {
     uint64_t deadline_reached = 0;
     /**
      * Evictions that removed the last replica of an object, so the object is
-     * gone. Not a failure of this engine -- it is what section 4.1 asks for --
-     * but the one number that says how much data the offload pipeline is
-     * failing to keep ahead of. A non-zero value here means offload is not
-     * keeping up, or its threshold is too close to the reclaim watermark.
+     * gone. Reclamation does not wait for offload, so this counter records
+     * how much data the offload pipeline is failing to keep ahead of. A
+     * non-zero value means offload is not keeping up, or its threshold is too
+     * close to the reclaim watermark.
      */
     uint64_t victims_sole_replica = 0;
 };

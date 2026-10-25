@@ -10,8 +10,7 @@
 //
 // Entries are keyed by RegistrationId rather than by key string. That is what
 // makes delete-then-recreate of the same key unambiguous, and it is also why a
-// key lookup has to go through the BlockRegistry first (section 9.4 tracks the
-// cost of that extra hop).
+// key lookup has to go through the BlockRegistry first.
 
 #include <cstddef>
 #include <cstdint>

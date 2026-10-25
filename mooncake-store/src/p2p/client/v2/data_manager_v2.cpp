@@ -724,7 +724,7 @@ tl::expected<MutableBlock, ErrorCode> DataManagerV2::AllocateWithPolicy(
 
     counters.retry_failed.fetch_add(1, std::memory_order_relaxed);
     // Never another tier: a full fast tier is NO_AVAILABLE_HANDLE, not a
-    // silent write to slower storage (section 6.1.1).
+    // silent write to slower storage.
     return last;
 }
 
@@ -927,7 +927,7 @@ tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> DataManagerV2::Put(
     if (!guard) return tl::make_unexpected(guard.error());
 
     // Claim the key before allocating anything: N concurrent writers of the
-    // same key then produce exactly one allocation (section 5.9).
+    // same key then produce exactly one allocation.
     const auto deadline = clock_->Now() + leases_->LeaseDuration();
     auto token = leases_->ReservePendingWrite(key, deadline);
     if (!token) return tl::make_unexpected(token.error());
@@ -1295,8 +1295,8 @@ tl::expected<long, ErrorCode> DataManagerV2::RemoveAll() {
     // does when it removes the last one. Skipping it would leave an identity
     // alive for as long as some reader still holds a detached snapshot, and a
     // later Put of the same key would reuse that identity -- putting the old
-    // detached block and the new one under one registration, which invariant
-    // 7.4.7 forbids.
+    // detached block and the new one under one registration. Retiring the old
+    // registration gives the replacement a fresh identity.
     std::vector<BlockRegistrationHandle> retired;
     for (const auto& [id, handle] : registrations) {
         auto mutation = handle.LockMutation();
@@ -1309,7 +1309,7 @@ tl::expected<long, ErrorCode> DataManagerV2::RemoveAll() {
         retired.push_back(handle);
     }
     // Presence markers are touched only after every mutation guard and index
-    // shard lock has been released (section 7.3 constraint 2).
+    // shard lock has been released.
     for (const auto& handle : retired) {
         for (const auto& tiler : tilers_.by_priority) {
             handle.MarkAbsent(tiler->Id());
@@ -1730,8 +1730,8 @@ void DataManagerV2::RectifyReadRoute(std::string_view key,
 
     // Best effort by construction: the miss check and the callback are not
     // atomic with respect to a concurrent Put, so a false positive is possible
-    // and accepted. Holding a metadata lock across a Master RPC costs more
-    // (section 7.3).
+    // and accepted. Holding a metadata lock across a Master RPC would block
+    // mutations of every key in that metadata shard.
     RectifyRouteCallback callback;
     {
         std::lock_guard<std::mutex> lock(rectify_mu_);

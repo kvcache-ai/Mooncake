@@ -61,7 +61,7 @@ EvictEngine::EvictOutcome EvictEngine::EvictVictim(TilerManager& tiler,
 
         // Unconditional. No walk of the other tilers, no "is this the last
         // copy" question, no demotion: reclamation is tier-local, and
-        // durability is the offload pipeline's job (section 4.1). Asking the
+        // durability is the offload pipeline's job. Asking the
         // question here would read every other tier under this key's mutation
         // guard, and acting on the answer would copy a whole block on a path a
         // request thread is waiting on.
@@ -79,7 +79,7 @@ EvictEngine::EvictOutcome EvictEngine::EvictVictim(TilerManager& tiler,
     // Observed, not consulted. The set of tiers holding this key lives on the
     // registration and is maintained by whoever inserts or deletes, so reading
     // it costs one lock on that registration and touches no other tier -- it
-    // is not the cross-tier scan section 4.1 forbids, and it comes after a
+    // avoids a cross-tier index scan, and it comes after a
     // removal it could not have prevented. Two things need it: the access
     // tracker should stop tracking a key that no longer exists anywhere, and
     // the trade-off this design accepts has to be countable.

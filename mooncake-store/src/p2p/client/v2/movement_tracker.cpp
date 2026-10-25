@@ -167,7 +167,7 @@ MovementTracker::MovementTracker(const MovementTrackerConfig& config,
 MovementTracker::~MovementTracker() {
     // A lease holds a raw back-pointer, so an outstanding one at destruction
     // is a use-after-free waiting to happen rather than a leak we can absorb.
-    // Said out loud because the owner's Stop order (section 9, invariant 11)
+    // Said out loud because the owner's Stop order
     // is what prevents it. The count is exact: a slot outlives a delete of
     // its key precisely so that this check cannot be fooled by one.
     size_t outstanding = 0;

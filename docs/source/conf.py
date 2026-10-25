@@ -228,9 +228,7 @@ autodoc_mock_imports = [
     "PIL",
     "numpy",
     "tqdm",
-    # The mocks below are required by
-    # docs/source/serving/openai_compatible_server.md's
-    # vllm.entrypoints.openai.cli_args
+    # Optional dependencies imported by serving-related API modules.
     "openai",
     "fastapi",
     "partial_json_parser",

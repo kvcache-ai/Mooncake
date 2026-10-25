@@ -61,9 +61,9 @@ tl::expected<ImmutableBlock, ErrorCode> BlockIndex::Insert(
 
     // The entry is built before the lock and, on any failure below, destroyed
     // after it: allocating the control block can throw, and destroying an
-    // armed entry calls BlockPool::Free. Neither may happen under a shard lock
-    // (section 7.3 constraint 5). Declaring `entry` outside the lock scope is
-    // what guarantees the second half -- the lock guard is destroyed first.
+    // armed entry calls BlockPool::Free. Neither may happen under a shard lock.
+    // Declaring `entry` outside the lock scope guarantees the second half:
+    // the lock guard is destroyed first.
     Block block_value;
     block_value.id.tiler_id = tiler_id_;
     // Copied from the physical id so a recycled slot cannot be mistaken for

@@ -1,7 +1,7 @@
 #pragma once
 
 // Block identity, physical handles and the three capability wrappers that
-// encode a block's lifecycle stage (section 5.4 - 5.8).
+// encode a block's lifecycle stage.
 //
 //   BlockPool::Allocate --> MutableBlock --Complete--> CompletedBlock
 //             |                  |                          |
@@ -137,7 +137,7 @@ class BlockDataHandle {
  * @brief Move-only RAII lease on one physical allocation.
  *
  * This is the *only* thing that frees a physical block: pools never reclaim on
- * their own (section 3.5). The shared BlockPoolState keeps the pool's memory
+ * their own. The shared BlockPoolState keeps the pool's memory
  * alive for as long as any allocation exists, so a BlockEntry snapshot handed
  * out before a Stop() stays valid until the last reader drops it.
  */

@@ -99,7 +99,7 @@ class TilerManager {
      *        NotifyRegistered once it has released the registration's mutation
      *        guard. Publishing under that guard would run a queue push -- and,
      *        on a full queue, a whole inline policy update -- while the key is
-     *        locked, which section 7.3 forbids.
+     *        locked, blocking other mutations of the same key.
      */
     tl::expected<ImmutableBlock, ErrorCode> RegisterWithHandle(
         CompletedBlock&& block, const BlockRegistrationHandle& registration,
@@ -251,7 +251,7 @@ struct MultiTiler {
      * @brief Tilers whose blocks expose a TransferEngine-usable address, in
      *        descending priority order.
      *
-     * This is the request-path placement set (invariant 7.4.14) and the set a
+     * This is the request-path placement set and the set a
      * forward write or pin may publish an address from. It is a medium
      * property: a slow tier exposes no address and is therefore never in it.
      * Whether the process actually registered that memory with an engine is a

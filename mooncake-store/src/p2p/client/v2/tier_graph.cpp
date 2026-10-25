@@ -398,7 +398,7 @@ tl::expected<void, ErrorCode> ValidateTierPlacementPolicyConfig(
     }
     if (!config.onboard_keeps_source) {
         // Rejected rather than warned about. Reclamation is tier-local and
-        // destroys an object that exists on only one tier (section 4.1), so an
+        // destroys an object that exists on only one tier, so an
         // onboard that deletes the slow copy moves the object from the one
         // tier where it was safe to the one tier that will drop it -- and it
         // does that to precisely the keys that are being read. Every onboarded

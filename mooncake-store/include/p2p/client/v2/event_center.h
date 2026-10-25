@@ -1,6 +1,6 @@
 #pragma once
 
-// Facts and commands (section 3.8).
+// Facts and commands.
 //
 // A BlockEvent states something that already happened (a block was read,
 // committed, deleted; an allocation failed). A MovementRequest is a command
@@ -401,7 +401,7 @@ enum class EventCenterStopMode : uint8_t {
  * consume its output belong to DataManagerV2, because they call the migration
  * and eviction engines: if the EventCenter owned them, member destruction
  * order would tear those engines down first and a destructor that skipped
- * Stop() would be a use-after-free (section 5.2).
+ * Stop() would be a use-after-free.
  */
 class EventCenter final : public EventSink,
                           public std::enable_shared_from_this<EventCenter> {

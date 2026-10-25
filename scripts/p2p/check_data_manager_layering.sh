@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Enforces the layering rules from remake_kvbm/new_data_manager.md
-# (acceptance items 11 and 12):
+# Enforces the DataManager implementation boundaries:
 #   1. No header under p2p/client/v2/ may include tiered_backend.h or anything
 #      under tiered_cache/. "V2 does not reuse TieredBackend" has to be a
 #      compile-time fact, not a comment.

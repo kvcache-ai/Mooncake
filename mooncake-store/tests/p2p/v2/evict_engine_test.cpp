@@ -1,4 +1,4 @@
-// Component tests for EvictEngine (design doc sections 5.10, 6.7, 9.3).
+// Component tests for EvictEngine.
 //
 // The invariant this file exists to protect: detaching an entry from an index
 // is a *logical* removal, and the physical bytes only come back when the last
@@ -665,7 +665,7 @@ TEST_F(EvictEngineTest, ExecuteRemovesTheNamedReplicaAndLeavesTheOtherTier) {
 }
 
 // ---------------------------------------------------------------------------
-// Reclamation is tier-local (design section 4.1)
+// Reclamation is tier-local
 // ---------------------------------------------------------------------------
 
 // The decided trade-off, asserted rather than left implicit: a replica that

@@ -1,4 +1,4 @@
-// Component tests for the event pipeline (sections 3.8 and 5.10).
+// Component tests for the event pipeline.
 //
 // Everything below is about what a queue does when it is full. The pipeline
 // exists so that a fact can never stall the request path that produced it, so
@@ -442,7 +442,7 @@ TEST_F(EventCenterTest, AnAccessEventThatCannotBeQueuedIsSimplyLost) {
     EXPECT_EQ(center_->Metrics().events_enqueued, 1U);
 }
 
-// The central rule of section 3.8: Commit and Delete may not be silently
+// Commit and Delete events may not be silently
 // lost, and may not block their publisher either. A full queue therefore
 // leaves exactly one option, applying the fact on the producer's thread.
 TEST_F(EventCenterTest, ALifecycleEventThatCannotBeQueuedIsAppliedInline) {

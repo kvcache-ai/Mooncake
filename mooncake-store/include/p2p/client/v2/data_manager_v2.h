@@ -11,7 +11,7 @@
 //
 //  - A LifecycleGate::Guard travels with the TaskHandle, not with the API call
 //    stack, because Put/Get do their real work inside Wait() on the caller's
-//    thread (section 5.2).
+//    thread.
 //  - Movement workers belong to DataManagerV2, not to the EventCenter. They
 //    call the migration and eviction engines, so if the EventCenter owned them
 //    those engines would be destroyed first in member order and a destructor
@@ -130,8 +130,8 @@ tl::expected<void, ErrorCode> ValidateDataManagerV2Config(
 
 /**
  * @struct DataManagerV2Metrics
- * @brief The counters section 11 item 7 requires beyond the shared tier
- *        metrics. Each answers a question an operator has during a rollout.
+ * @brief V2-specific counters beyond the shared tier metrics. Each answers
+ *        a question an operator has during a rollout.
  */
 struct DataManagerV2Metrics {
     /** Rising means the event queue is saturated: the policy is still correct
@@ -144,13 +144,13 @@ struct DataManagerV2Metrics {
      *  holding a TaskHandle it never waited on. */
     uint64_t stop_drain_timeout_hit = 0;
     /** Rising means RectifyReadRoute asked Master to drop replicas that were
-     *  in fact live -- the accepted false-positive risk of section 7.3 turning
-     *  into real damage. */
+     *  in fact live: rectify is best-effort and can race a concurrent commit.
+     */
     uint64_t rectify_false_positive_suspected = 0;
     /**
      * Objects destroyed by reclamation because they existed on only one tier.
      *
-     * Reclamation is tier-local by design (section 4.1): it does not demote and
+     * Reclamation is tier-local by design: it does not demote and
      * does not wait for an offload, so an object the offload pipeline has not
      * copied down yet is lost when its tier fills. This is the number that says
      * how often that is actually happening. Non-zero means offload is not
@@ -392,8 +392,7 @@ class DataManagerV2 final : public DataManager, public DataManagerTestHook {
     /**
      * Keys RectifyReadRoute recently asked Master to drop. A commit of one of
      * them means the miss was a false positive. Bounded and sampled rather
-     * than exact: it must not put a lock on the commit path, and section 7.3
-     * only promises the risk is observable, not measured precisely.
+     * than exact: observing this risk must not put a lock on the commit path.
      */
     static constexpr size_t kRectifyWitnessSlots = 256;
     mutable std::array<std::atomic<uint64_t>, kRectifyWitnessSlots>

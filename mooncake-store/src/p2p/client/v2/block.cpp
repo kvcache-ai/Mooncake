@@ -123,7 +123,7 @@ MutableBlock::~MutableBlock() { Abort(); }
 
 void MutableBlock::Abort() {
     // Unconsumed wrappers return their allocation; there is no other cleanup
-    // path, which is what makes every failure branch in section 6 a rollback.
+    // path, so every failure before ownership transfer rolls back the block.
     armed_ = false;
     allocation_.Reset();
 }

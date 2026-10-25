@@ -9,10 +9,10 @@
 // Allocate/Free/Get/Capacity/Usage/Capabilities and never learns a NUMA node, a
 // device path or a file offset.
 //
-// Architectural constraint (sections 3.5, 5.6, invariant 7.4.12): a pool NEVER
-// reclaims on its own. Not inside Allocate, not from a background thread, not
-// on a watermark. Out of space has exactly one legal answer,
-// NO_AVAILABLE_HANDLE; deciding what to release is the EvictEngine's job, and
+// Architectural constraint: a pool never reclaims on its own, whether inside
+// Allocate, in a background thread or on a watermark. Out of space has exactly
+// one legal answer, NO_AVAILABLE_HANDLE; deciding what to release is the
+// EvictEngine's job, and
 // releasing happens only when a BlockAllocation is destroyed. This is a
 // deliberate departure from V1's StorageTier, which evicted whole buckets from
 // under the metadata layer and then reported it upwards via
