@@ -65,6 +65,68 @@ static int getCudaDeviceId(void* addr) {
     return -1;
 }
 
+#ifndef USE_MLU
+static cudaError_t syncTcpCallerStream(int device) {
+    int previous_device = 0;
+    cudaError_t status = cudaGetDevice(&previous_device);
+    if (status != cudaSuccess) return status;
+    if (previous_device != device) {
+        status = cudaSetDevice(device);
+        if (status != cudaSuccess) return status;
+    }
+
+    cudaEvent_t event = nullptr;
+    status = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    if (status == cudaSuccess) {
+        status = cudaEventRecord(event, cudaStreamPerThread);
+    }
+    if (status == cudaSuccess) {
+        status = cudaEventSynchronize(event);
+    }
+    if (event) {
+        const cudaError_t destroy_status = cudaEventDestroy(event);
+        if (status == cudaSuccess) status = destroy_status;
+    }
+    if (previous_device != device) {
+        const cudaError_t restore_status = cudaSetDevice(previous_device);
+        if (status == cudaSuccess) status = restore_status;
+    }
+    return status;
+}
+#endif
+
+// A private staging stream no longer inherits ordering from producer work on
+// the caller's stream. Establish that dependency on the submitting thread,
+// once per device and submission, before any network I/O starts.
+class TcpCallerStreamSync {
+   public:
+    Status sync(const TransferRequest& request) {
+#ifdef USE_MLU
+        // The MLU copy below deliberately stays synchronous because its shim
+        // has no event or per-thread-stream API.
+        (void)request;
+        return Status::OK();
+#else
+        const int device = getCudaDeviceId(request.source);
+        if (device < 0 || !synced_devices_.insert(device).second) {
+            return Status::OK();
+        }
+        const cudaError_t status = syncTcpCallerStream(device);
+        if (status != cudaSuccess) {
+            return Status::Context(
+                "TCP caller-stream synchronization failed: " +
+                std::string(cudaGetErrorString(status)));
+        }
+        return Status::OK();
+#endif
+    }
+
+   private:
+#ifndef USE_MLU
+    std::unordered_set<int> synced_devices_;
+#endif
+};
+
 class TcpStagingBuffer {
    public:
     char* ensure(size_t size) {
@@ -86,14 +148,15 @@ class TcpStagingBuffer {
 // wait. A private non-blocking stream keeps the copy off that lane; the sync
 // at the end preserves the copy's completion contract for the caller.
 static cudaError_t copyTcpCudaMemory(void* dst, const void* src, size_t size) {
-    cudaStream_t stream;
 #ifdef USE_MLU
-    // CNRT queues have no CUDA stream-flags API in the MLU shim.
-    cudaError_t status = cudaStreamCreate(&stream);
+    // CNRT exposes neither the event/per-thread dependency API used above nor
+    // CUDA stream flags. Keep the previous synchronous copy so this backend
+    // does not trade producer ordering for a private queue.
+    return cudaMemcpy(dst, src, size, cudaMemcpyDefault);
 #else
+    cudaStream_t stream;
     cudaError_t status =
         cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-#endif
     if (status != cudaSuccess) return status;
 
     status = cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault, stream);
@@ -103,6 +166,7 @@ static cudaError_t copyTcpCudaMemory(void* dst, const void* src, size_t size) {
 
     cudaError_t destroy_status = cudaStreamDestroy(stream);
     return status == cudaSuccess ? destroy_status : status;
+#endif
 }
 #endif
 
