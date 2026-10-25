@@ -1,4 +1,5 @@
 #include "task_manager.h"
+#include <algorithm>
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -10,6 +11,114 @@ std::optional<Task> ScopedTaskReadAccess::find_task_by_id(
         return it->second;
     }
     return std::nullopt;
+}
+
+tl::expected<TaskListPage, ErrorCode> ScopedTaskReadAccess::list_tasks(
+    const TaskListRequest& request) const {
+    const TenantId tenant(request.tenant_id);
+    if (!tenant.IsValid() || request.limit == 0 || request.limit > 1000 ||
+        (request.status && *request.status != TaskStatus::PENDING &&
+         *request.status != TaskStatus::PROCESSING &&
+         *request.status != TaskStatus::FAILED &&
+         *request.status != TaskStatus::SUCCESS) ||
+        (request.type && *request.type != TaskType::REPLICA_COPY &&
+         *request.type != TaskType::REPLICA_MOVE)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::optional<UUID> after;
+    constexpr std::string_view prefix = "v1:";
+    if (!request.page_token.empty()) {
+        UUID id;
+        const auto token = std::string_view(request.page_token);
+        if (!token.starts_with(prefix) ||
+            !StringToUuid(std::string(token.substr(prefix.size())), id) ||
+            token.substr(prefix.size()) != UuidToString(id)) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        after = id;
+    }
+    const auto less = [](const Task* lhs, const Task* rhs) {
+        return lhs->id < rhs->id;
+    };
+    std::priority_queue<const Task*, std::vector<const Task*>, decltype(less)>
+        selected(less);
+    const auto matches_payload = [&](const auto& payload) {
+        const TenantId payload_tenant(payload.tenant_id);
+        return payload_tenant.IsValid() && payload_tenant == tenant &&
+               (!request.key || payload.key == *request.key);
+    };
+    for (const auto& [id, task] : manager_->all_tasks_) {
+        if ((after && id <= *after) ||
+            (request.status && task.status != *request.status) ||
+            (request.type && task.type != *request.type) ||
+            (request.assigned_client &&
+             task.assigned_client != *request.assigned_client)) {
+            continue;
+        }
+        bool matches = false;
+        try {
+            // The typed reader alone permits trailing content and duplicate
+            // keys. Validate a complete object before trusting its tenant.
+            // Views avoid copying strings during this validation pass.
+            if (task.payload.empty()) {
+                continue;
+            }
+            {
+                struct_json::jvalue value;
+                auto it = task.payload.begin();
+                auto end = task.payload.end();
+                struct_json::parse<true>(value, it, end, true);
+                if (it != end ||
+                    !std::holds_alternative<struct_json::jobject>(value)) {
+                    continue;
+                }
+            }
+            switch (task.type) {
+                case TaskType::REPLICA_COPY: {
+                    ReplicaCopyPayload payload;
+                    struct_json::from_json(payload, task.payload);
+                    matches = matches_payload(payload);
+                    break;
+                }
+                case TaskType::REPLICA_MOVE: {
+                    ReplicaMovePayload payload;
+                    struct_json::from_json(payload, task.payload);
+                    matches = matches_payload(payload);
+                    break;
+                }
+            }
+        } catch (const std::exception&) {
+            // An unreadable payload must never cross a tenant boundary.
+            continue;
+        }
+        if (matches) {
+            selected.push(&task);
+            if (selected.size() > static_cast<size_t>(request.limit) + 1) {
+                selected.pop();
+            }
+        }
+    }
+    const bool has_more = selected.size() > request.limit;
+    if (has_more) {
+        selected.pop();
+    }
+    std::vector<const Task*> ordered;
+    ordered.reserve(selected.size());
+    while (!selected.empty()) {
+        ordered.push_back(selected.top());
+        selected.pop();
+    }
+    std::reverse(ordered.begin(), ordered.end());
+    TaskListPage page;
+    page.tasks.reserve(ordered.size());
+    for (const Task* task : ordered) {
+        page.tasks.push_back(*task);
+    }
+    if (has_more) {
+        page.next_page_token =
+            std::string(prefix) + UuidToString(ordered.back()->id);
+    }
+    return page;
 }
 
 ScopedTaskReadAccess::task_iterator ScopedTaskReadAccess::begin() const {

@@ -274,6 +274,12 @@ struct QueryTaskResponse {
 YLT_REFL(QueryTaskResponse, id, type, status, created_at_ms_epoch,
          last_updated_at_ms_epoch, assigned_client, message);
 
+struct ListTasksResponse {
+    std::vector<QueryTaskResponse> tasks;
+    std::string next_page_token;
+};
+YLT_REFL(ListTasksResponse, tasks, next_page_token);
+
 /**
  * @brief Task execution structure
  */

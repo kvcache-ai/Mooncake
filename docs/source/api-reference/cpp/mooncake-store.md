@@ -186,6 +186,35 @@ Typical query-time failure:
 - `--processing_task_timeout_sec`: timeout for tasks that remain in `PROCESSING` (`0` disables it)
 - `--max_retry_attempts`: retry limit for `NO_AVAILABLE_HANDLE` execution failures
 
+### MasterClient::ListTasks
+
+```C++
+tl::expected<ListTasksResponse, ErrorCode> ListTasks(TaskListRequest request = {});
+```
+
+The native `MasterClient` can discover retained copy/move tasks without knowing
+their IDs. Optional `status`, `type`, `assigned_client`, and exact `key` filters
+are combined. The client replaces `request.tenant_id` with its configured tenant;
+a master with multi-tenancy disabled uses the default tenant, as for other reads.
+This filters results; it does not add an authentication boundary.
+
+`limit` defaults to 100 and must be between 1 and 1000. The response contains
+`tasks` (the same summaries returned by `QueryTask`) and `next_page_token`.
+Pass a nonempty token back in `request.page_token`, keeping the filters fixed.
+Treat tokens as opaque; malformed tokens and invalid limits or filter enums
+return `INVALID_PARAMS`.
+
+Results are ordered by task ID, not creation time. Each page reads current state
+under the task-manager read lock. Pages do not form a snapshot: status changes
+and history pruning can remove matches, and a newly added task at or before the
+cursor will not appear in later pages. A cursor remains usable after its task is
+pruned. Start a new traversal to refresh the view.
+
+Listing does not dispatch or cancel tasks or change their quotas. Task payloads
+with unreadable tenant/key metadata are omitted. Each request scans retained
+tasks; only the smallest `limit + 1` matching IDs are retained for selection.
+This method is currently exposed through native RPC and `MasterClient` only.
+
 ### BatchQueryIp
 
 ```C++
