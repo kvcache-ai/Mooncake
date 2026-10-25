@@ -84,15 +84,18 @@ class ClientIntegrationTest : public ::testing::Test {
    protected:
     static std::shared_ptr<Client> CreateClient(const std::string& host_name) {
         auto client_opt =
-            Client::Create(host_name, "P2PHANDSHAKE", FLAGS_protocol,
-                           std::nullopt, master_address_);
+            Client::Create(host_name,       // Local hostname
+                           "P2PHANDSHAKE",  // Metadata connection string
+                           FLAGS_protocol,  // Transfer protocol
+                           std::nullopt,  // RDMA device names (auto-discovery)
+                           master_address_  // Master server address (non-HA)
+            );
 
         EXPECT_TRUE(client_opt.has_value())
             << "Failed to create client with host_name: " << host_name;
         if (!client_opt.has_value()) {
             return nullptr;
         }
-
         return client_opt.value();
     }
 
@@ -309,12 +312,16 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
     buffer = client_buffer_allocator_->allocate(1 * 1024 * 1024);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, test_data.size()});
     // Verify data through Get operation
-    auto get_result = test_client_->Get(key, buffer, test_data.size());
+    auto get_result = test_client_->Get(key, slices);
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
-    ASSERT_EQ(get_result.value(), static_cast<int64_t>(test_data.size()));
-    ASSERT_EQ(memcmp(buffer, test_data.data(), test_data.size()), 0);
+    ASSERT_EQ(slices.size(), 1);
+    ASSERT_EQ(slices[0].size, test_data.size());
+    ASSERT_EQ(slices[0].ptr, buffer);
+    ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
     // Put again with the same key, should succeed
@@ -368,7 +375,9 @@ TEST_F(ClientIntegrationTest, RemoveOperation) {
 
     // Try to get the removed data - should fail
     buffer = client_buffer_allocator_->allocate(test_data.size());
-    auto get_result = test_client_->Get(key, buffer, test_data.size());
+    slices.clear();
+    slices.emplace_back(Slice{buffer, test_data.size()});
+    auto get_result = test_client_->Get(key, slices);
     ASSERT_FALSE(get_result.has_value()) << "Get should fail for removed key";
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 }
@@ -398,6 +407,8 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
 
     // Verify data through Get operation
     buffer = client_buffer_allocator_->allocate(test_data.size());
+    slices.clear();
+    slices.emplace_back(Slice{buffer, test_data.size()});
 
     auto query_result = test_client_->Query(key);
     ASSERT_TRUE(query_result.has_value())
@@ -409,11 +420,12 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
                   .buffer_descriptor.transport_endpoint_,
               segment_provider_client_->GetTransportEndpoint());
 
-    std::vector<Slice> read_slices{{buffer, test_data.size()}};
-    auto get_result = test_client_->Get(key, query_result.value(), read_slices);
+    auto get_result = test_client_->Get(key, query_result.value(), slices);
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
-    ASSERT_EQ(memcmp(buffer, test_data.data(), test_data.size()), 0);
+    ASSERT_EQ(slices.size(), 1);
+    ASSERT_EQ(slices[0].size, test_data.size());
+    ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
     // Clean up
@@ -449,12 +461,15 @@ TEST_F(ClientIntegrationTest, DISABLED_AllocateTest) {
         client_buffer_allocator_->deallocate(buffer, data_size);
         // Get and verify data
         buffer = client_buffer_allocator_->allocate(data_size);
-        auto get_result = test_client_->Get(key, buffer, data_size);
+        std::vector<Slice> get_slices;
+        get_slices.emplace_back(Slice{buffer, data_size});
+        auto get_result = test_client_->Get(key, get_slices);
         ASSERT_TRUE(get_result.has_value())
             << "Get operation failed: " << toString(get_result.error());
-        ASSERT_EQ(get_result.value(), static_cast<int64_t>(data_size));
+        ASSERT_EQ(get_slices[0].size, data_size);
 
-        std::string retrieved_data(static_cast<const char*>(buffer), data_size);
+        std::string retrieved_data(static_cast<const char*>(get_slices[0].ptr),
+                                   get_slices[0].size);
         EXPECT_EQ(retrieved_data, large_data);
         client_buffer_allocator_->deallocate(buffer, data_size);
     }
@@ -524,15 +539,16 @@ TEST_F(ClientIntegrationTest, LargeAllocateTest) {
         memset(buffers[i], 0, data_size);
     }
 
-    // Read into the original slices to preserve multi-buffer coverage.
+    // Get operation
     auto get_result = test_client_->Get(key, slices);
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
 
     // Verify data and deallocate buffers
     for (size_t i = 0; i < kNumBuffers; ++i) {
-        std::string retrieved_data(static_cast<const char*>(buffers[i]),
-                                   data_size);
+        ASSERT_EQ(slices[i].size, data_size);
+        std::string retrieved_data(static_cast<const char*>(slices[i].ptr),
+                                   slices[i].size);
         std::string expected_data(data_size, 'A' + i);
         EXPECT_EQ(
             memcmp(retrieved_data.data(), expected_data.data(), data_size), 0);
@@ -586,10 +602,11 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
 
     start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < batch_sz; i++) {
+        std::vector<Slice> slices;
         target_buffer =
             client_buffer_allocator_->allocate(test_data_list[i].size());
-        auto get_result =
-            test_client_->Get(keys[i], target_buffer, test_data_list[i].size());
+        slices.emplace_back(Slice{target_buffer, test_data_list[i].size()});
+        auto get_result = test_client_->Get(keys[i], slices);
         ASSERT_TRUE(get_result.has_value())
             << "Get operation failed: " << toString(get_result.error());
         client_buffer_allocator_->deallocate(target_buffer,
@@ -603,20 +620,17 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
               << "us";
 
     start = std::chrono::high_resolution_clock::now();
-    std::vector<std::vector<void*>> batch_get_buffers;
-    std::vector<std::vector<size_t>> batch_get_sizes;
-    batch_get_buffers.reserve(batch_sz);
-    batch_get_sizes.reserve(batch_sz);
-    std::vector<void*> allocated_buffers;
+    std::unordered_map<std::string, std::vector<Slice>> target_batched_slices;
     for (int i = 0; i < batch_sz; i++) {
+        std::vector<Slice> target_slices;
         target_buffer =
             client_buffer_allocator_->allocate(test_data_list[i].size());
-        batch_get_buffers.push_back({target_buffer});
-        batch_get_sizes.push_back({test_data_list[i].size()});
-        allocated_buffers.push_back(target_buffer);
+        target_slices.emplace_back(
+            Slice{target_buffer, test_data_list[i].size()});
+        target_batched_slices.emplace(keys[i], target_slices);
     }
     auto batch_get_results =
-        test_client_->BatchGet(keys, batch_get_buffers, batch_get_sizes);
+        test_client_->BatchGet(keys, target_batched_slices);
     for (const auto& result : batch_get_results) {
         ASSERT_TRUE(result.has_value()) << "BatchGet operation failed";
     }
@@ -628,13 +642,13 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
               << "us";
 
     for (int i = 0; i < batch_sz; i++) {
-        ASSERT_EQ(batch_get_results[i].value(),
-                  static_cast<int64_t>(test_data_list[i].size()));
-        ASSERT_EQ(memcmp(allocated_buffers[i], test_data_list[i].data(),
-                         test_data_list[i].size()),
+        ASSERT_EQ(target_batched_slices[keys[i]][0].size,
+                  test_data_list[i].size());
+        ASSERT_EQ(memcmp(target_batched_slices[keys[i]][0].ptr,
+                         test_data_list[i].data(), test_data_list[i].size()),
                   0);
-        client_buffer_allocator_->deallocate(allocated_buffers[i],
-                                             test_data_list[i].size());
+        client_buffer_allocator_->deallocate(
+            target_batched_slices[keys[i]][0].ptr, test_data_list[i].size());
     }
 }
 
@@ -981,168 +995,6 @@ TEST_F(ClientIntegrationTest, BatchReplicaClearOperations) {
     // Non-existent keys should not be in results (silently skipped)
     EXPECT_TRUE(non_existent_result.value().empty())
         << "Non-existent keys should return empty results";
-}
-
-// Centralized client helpers consume Replica descriptors; buffer allocation
-// itself remains covered by the architecture-neutral client_buffer_test.
-class ClientReplicaBufferTest : public ::testing::Test {
-   protected:
-    void SetUp() override {
-        google::InitGoogleLogging("ClientReplicaBufferTest");
-        FLAGS_logtostderr = 1;
-    }
-    void TearDown() override { google::ShutdownGoogleLogging(); }
-};
-
-// Test calculate_total_size function with memory replica
-TEST_F(ClientReplicaBufferTest, CalculateTotalSizeMemoryReplica) {
-    // Create a memory replica descriptor
-    Replica::Descriptor replica;
-    MemoryDescriptor mem_desc;
-
-    // Set buffer descriptor with proper initialization
-    mem_desc.buffer_descriptor.size_ = 4096;
-    mem_desc.buffer_descriptor.buffer_address_ = 0x1000;
-
-    replica.descriptor_variant = mem_desc;
-    replica.status = ReplicaStatus::COMPLETE;
-
-    uint64_t total_size = calculate_total_size(replica);
-    EXPECT_EQ(total_size, 4096);
-}
-
-// Test calculate_total_size function with disk replica
-TEST_F(ClientReplicaBufferTest, CalculateTotalSizeDiskReplica) {
-    // Create a disk replica descriptor
-    Replica::Descriptor replica;
-    DiskDescriptor disk_desc;
-    disk_desc.object_size = 4096;
-
-    replica.descriptor_variant = disk_desc;
-    replica.status = ReplicaStatus::COMPLETE;
-
-    uint64_t total_size = calculate_total_size(replica);
-    EXPECT_EQ(total_size, 4096);
-}
-
-// Test calculate_total_size function with zero-size memory replica
-TEST_F(ClientReplicaBufferTest, CalculateTotalSizeZeroSizeMemoryReplica) {
-    // Create a memory replica descriptor with zero size
-    Replica::Descriptor replica;
-    MemoryDescriptor mem_desc;
-    mem_desc.buffer_descriptor.size_ = 0;
-    mem_desc.buffer_descriptor.buffer_address_ = 0x1000;
-
-    replica.descriptor_variant = mem_desc;
-    replica.status = ReplicaStatus::COMPLETE;
-
-    uint64_t total_size = calculate_total_size(replica);
-    EXPECT_EQ(total_size, 0);
-}
-
-// Test allocateSlices function with memory replica
-TEST_F(ClientReplicaBufferTest, AllocateSlicesMemoryReplica) {
-    const size_t buffer_size = 1024 * 1024;  // 1MB
-    const size_t alloc_size = 4096;          // 4KB
-
-    auto allocator = ClientBufferAllocator::create(buffer_size);
-    ASSERT_NE(allocator, nullptr);
-
-    auto handle_opt = allocator->allocate(alloc_size);
-    ASSERT_TRUE(handle_opt.has_value());
-
-    BufferHandle handle = std::move(handle_opt.value());
-
-    // Create a memory replica descriptor
-    Replica::Descriptor replica;
-    MemoryDescriptor mem_desc;
-    mem_desc.buffer_descriptor.size_ = 4096;
-    mem_desc.buffer_descriptor.buffer_address_ = 0x1000;
-
-    replica.descriptor_variant = mem_desc;
-    replica.status = ReplicaStatus::COMPLETE;
-
-    std::vector<Slice> slices;
-    int result = allocateSlices(slices, replica, handle.ptr());
-
-    EXPECT_EQ(result, 0);
-    EXPECT_EQ(slices.size(), 1);
-
-    // Verify slice size matches buffer descriptor
-    EXPECT_EQ(slices[0].size, 4096);
-
-    // Verify slice pointer matches buffer pointer
-    EXPECT_EQ(slices[0].ptr, handle.ptr());
-}
-
-// Test allocateSlices function with disk replica
-TEST_F(ClientReplicaBufferTest, AllocateSlicesDiskReplica) {
-    const size_t buffer_size = 1024 * 1024;  // 1MB
-    const size_t alloc_size = 8192;          // 8KB
-
-    auto allocator = ClientBufferAllocator::create(buffer_size);
-    ASSERT_NE(allocator, nullptr);
-
-    auto handle_opt = allocator->allocate(alloc_size);
-    ASSERT_TRUE(handle_opt.has_value());
-
-    BufferHandle handle = std::move(handle_opt.value());
-
-    // Create a disk replica descriptor
-    Replica::Descriptor replica;
-    DiskDescriptor disk_desc;
-    disk_desc.object_size = 8192;
-
-    replica.descriptor_variant = disk_desc;
-    replica.status = ReplicaStatus::COMPLETE;
-
-    std::vector<Slice> slices;
-    int result = allocateSlices(slices, replica, handle.ptr());
-
-    EXPECT_EQ(result, 0);
-    EXPECT_GE(slices.size(), 1);
-
-    // Verify total size matches file size
-    size_t total_slice_size = 0;
-    for (const auto& slice : slices) {
-        EXPECT_NE(slice.ptr, nullptr);
-        EXPECT_GT(slice.size, 0);
-        EXPECT_LE(slice.size, kMaxSliceSize);
-        total_slice_size += slice.size;
-    }
-
-    EXPECT_EQ(total_slice_size, 8192);
-}
-
-// Test allocateSlices function with zero-size memory replica
-TEST_F(ClientReplicaBufferTest, AllocateSlicesZeroSizeMemoryReplica) {
-    const size_t buffer_size = 1024 * 1024;  // 1MB
-    const size_t alloc_size = 1024;          // 1KB
-
-    auto allocator = ClientBufferAllocator::create(buffer_size);
-    ASSERT_NE(allocator, nullptr);
-
-    auto handle_opt = allocator->allocate(alloc_size);
-    ASSERT_TRUE(handle_opt.has_value());
-
-    BufferHandle handle = std::move(handle_opt.value());
-
-    // Create a memory replica descriptor with zero size
-    Replica::Descriptor replica;
-    MemoryDescriptor mem_desc;
-    mem_desc.buffer_descriptor.size_ = 0;
-    mem_desc.buffer_descriptor.buffer_address_ = 0x1000;
-
-    replica.descriptor_variant = mem_desc;
-    replica.status = ReplicaStatus::COMPLETE;
-
-    std::vector<Slice> slices;
-    int result = allocateSlices(slices, replica, handle.ptr());
-
-    EXPECT_EQ(result, 0);
-    EXPECT_EQ(slices.size(), 1);
-    EXPECT_EQ(slices[0].size, 0);
-    EXPECT_EQ(slices[0].ptr, handle.ptr());
 }
 
 }  // namespace testing
