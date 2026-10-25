@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Check a release wheel's Conductor contents and isolated installed import."""
+"""Check Conductor in an isolated wheel install, optionally against a server."""
 
+import argparse
 import os
 import subprocess
 import sys
@@ -10,9 +11,17 @@ from pathlib import Path
 
 
 def main():
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: smoke_conductor_wheel.py WHEEL")
-    wheel = Path(sys.argv[1]).resolve()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("wheel", type=Path)
+    parser.add_argument("--test-api", action="store_true", help="Run native API tests")
+    parser.add_argument(
+        "--server", type=Path, help="Also run E2E against this built Conductor server"
+    )
+    args = parser.parse_args()
+    wheel = args.wheel.resolve()
+    server = args.server.resolve() if args.server else None
+    if server is not None and (not server.is_file() or not os.access(server, os.X_OK)):
+        parser.error(f"Conductor server is missing or not executable: {server}")
     with zipfile.ZipFile(wheel) as archive:
         names = archive.namelist()
         if "mooncake/conductor.py" not in names or not any(
@@ -64,7 +73,10 @@ def main():
                 python,
                 "-I",
                 "-c",
+                "import sys; from pathlib import Path; "
                 "import mooncake.conductor, mooncake._conductor; "
+                "assert all(Path(m.__file__).resolve().is_relative_to(sys.prefix) "
+                "for m in (mooncake.conductor, mooncake._conductor)); "
                 "client = mooncake.conductor.ConductorClient(); "
                 "assert client.health_check() == mooncake.conductor.HEALTH_NOT_INITIALIZED; "
                 "assert client.close() == mooncake.conductor.OK; "
@@ -74,6 +86,47 @@ def main():
             env=env,
             check=True,
         )
+        if args.test_api or server is not None:
+            dependencies = ["pytest>=7,<9", "pytest-timeout>=2,<3"]
+            tests_dir = (
+                Path(__file__).resolve().parents[1] / "mooncake-conductor/tests/python"
+            )
+            tests = [str(tests_dir / "test_client_validation.py")]
+            if server is not None:
+                dependencies += ["msgpack>=1,<2", "pyzmq>=25,<28"]
+                tests.append(str(tests_dir / "test_client_e2e.py"))
+                env["CONDUCTOR_BINARY"] = str(server)
+                # Only the server subprocess may use build-time library paths.
+                # The client must resolve every dependency from its wheel.
+                env["CONDUCTOR_SERVER_LD_LIBRARY_PATH"] = os.environ.get(
+                    "LD_LIBRARY_PATH", ""
+                )
+            subprocess.run(
+                [python, "-I", "-m", "pip", "install", *dependencies],
+                env=env,
+                check=True,
+            )
+            env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+            env.pop("PYTEST_ADDOPTS", None)
+            env.pop("PYTEST_PLUGINS", None)
+            subprocess.run(
+                [
+                    python,
+                    "-I",
+                    "-m",
+                    "pytest",
+                    "-p",
+                    "pytest_timeout",
+                    "--timeout=60",
+                    "--import-mode=importlib",
+                    f"--confcutdir={tests_dir}",
+                    "-q",
+                    *tests,
+                ],
+                cwd=temporary,
+                env=env,
+                check=True,
+            )
 
 
 if __name__ == "__main__":

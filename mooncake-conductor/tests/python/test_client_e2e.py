@@ -7,18 +7,16 @@ Run from the repo root:
     CONDUCTOR_BINARY=mooncake-conductor/build/mooncake_conductor \
       python3.12 -m pytest mooncake-conductor/tests/python/test_client_e2e.py -v
 
-Requires ``build/mooncake-integration/_conductor.*.so`` to be built
-(``-DWITH_CONDUCTOR=ON``); the interpreter must match that .so's cp tag.
+Requires an installed wheel with Conductor support, pytest, msgpack and pyzmq.
+The client always uses the installed public API, including its native extension.
 """
 
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -28,18 +26,9 @@ import msgpack
 import pytest
 import zmq
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-_MODULE_DIR = REPO_ROOT / "build" / "mooncake-integration"
-_LIBASIO = REPO_ROOT / "build" / "mooncake-common" / "libasio.so"
+from mooncake.conductor import ConductorClient
 
-# `_conductor` has DT_NEEDED on libasio.so (SONAME) and the build tree sets
-# no RPATH; preloading libasio with RTLD_GLOBAL lets the dlopen of
-# `_conductor` resolve against the already-loaded library, so callers need
-# not set LD_LIBRARY_PATH. An import failure raises explicitly at collection
-# time instead of being silently skipped.
-ctypes.CDLL(str(_LIBASIO), mode=ctypes.RTLD_GLOBAL)
-sys.path.insert(0, str(_MODULE_DIR))
-from _conductor import ConductorClient  # noqa: E402
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _free_port() -> int:
@@ -59,6 +48,8 @@ def _log_tail(log_path: str, max_bytes: int = 4000) -> str:
 @pytest.fixture
 def conductor_endpoints():
     http_port, rpc_port = _free_port(), _free_port()
+    while rpc_port == http_port:
+        rpc_port = _free_port()
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(
             {
@@ -70,6 +61,9 @@ def conductor_endpoints():
         )
         path = f.name
     env = dict(os.environ, CONDUCTOR_CONFIG_PATH=path)
+    server_library_path = env.pop("CONDUCTOR_SERVER_LD_LIBRARY_PATH", None)
+    if server_library_path is not None:
+        env["LD_LIBRARY_PATH"] = server_library_path
     binary = os.environ["CONDUCTOR_BINARY"]  # points at the built binary
     # Log to a temp file instead of a PIPE (a full pipe buffer would block
     # the subprocess); the tail is attached when the process fails to start.
@@ -101,6 +95,9 @@ def conductor_endpoints():
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
+            # Pytest retains this output on failure, including failures after
+            # startup (e.g. event ingestion or RPC regressions).
+            print(f"Conductor server log:\n{_log_tail(log_path)}")
     finally:
         log.close()
         os.unlink(path)
@@ -113,15 +110,15 @@ def conductor_server(conductor_endpoints):
 
 
 def test_query_roundtrip(conductor_server):
-    client = ConductorClient()
-    assert client.setup(f"127.0.0.1:{conductor_server}") == 0
-    assert client.health_check() == 0
-    result = client.query(model_name="m", block_size=16, token_ids=[1, 2, 3])
-    assert result["ret"] == 0
-    assert result["hits"] == {}
-    assert client.list_services()["ret"] == 0
-    assert client.close() == 0
+    with ConductorClient() as client:
+        assert client.setup(f"127.0.0.1:{conductor_server}") == 0
+        assert client.health_check() == 0
+        result = client.query(model_name="m", block_size=16, token_ids=[1, 2, 3])
+        assert result["ret"] == 0
+        assert result["hits"] == {}
+        assert client.list_services() == {"ret": 0, "count": 0, "services": []}
     assert client.health_check() == 1
+    assert client.close() == 0
 
 
 def test_unavailable_codes(conductor_server):
@@ -247,5 +244,18 @@ def test_query_rank_keys_match_http(conductor_endpoints, rank):
                 http_result = msgpack.unpackb(response.read(), raw=False)
             # Both channels expose the same tier names, rank keys and token counts.
             assert result["hits"] == http_result["instances"]
+            services = client.list_services()
+            assert services["ret"] == 0
+            assert services["count"] == 1
+            assert services["services"][0]["InstanceID"] == "rank-test"
+            assert services["services"][0]["DPRank"] == rank
+            view = client.get_global_view()
+            assert view["ret"] == 0
+            assert view["context_count"] == 1
+            assert view["contexts"][0]["instances"] == {"rank-test": {rank}}
+            assert view["contexts"][0]["prefix_count"] == len(case["expected"])
+            assert client.unregister("rank-test", dp_rank=rank) == 0
+            assert client.list_services() == {"ret": 0, "count": 0, "services": []}
+            assert client.unregister("rank-test", dp_rank=rank) == -2001
         finally:
             client.close()

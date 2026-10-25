@@ -678,6 +678,7 @@ WHEEL_OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
 cd ..
 
 # Validate the final repaired artifact, not the build tree.
-python${PYTHON_VERSION} scripts/smoke_conductor_wheel.py "${WHEEL_OUTPUT_DIR}"/*.whl
+python${PYTHON_VERSION} scripts/smoke_conductor_wheel.py "${WHEEL_OUTPUT_DIR}"/*.whl \
+    --server "${BUILD_DIR_ABS}/mooncake-conductor/mooncake_conductor"
 
 echo "Wheel package built and repaired successfully!"

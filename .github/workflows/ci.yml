@@ -95,6 +95,12 @@ jobs:
         bash scripts/test_installation.sh
       shell: bash
 
+    - name: Test installed Conductor wheel API
+      # Recheck the repaired artifact on both consumer distributions, without
+      # build-tree imports or loader overrides masking missing dependencies.
+      run: python scripts/smoke_conductor_wheel.py mooncake-wheel/dist/*.whl --test-api
+      shell: bash
+
     - name: Run in-process master e2e tests (no mooncake_master)
       run: |
         source test_env/bin/activate
