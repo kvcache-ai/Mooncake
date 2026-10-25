@@ -17,7 +17,7 @@ namespace mooncake::v2 {
 namespace {
 
 constexpr int64_t kWaitTimeoutSeconds = 10;
-constexpr int64_t kDrainTimeoutSeconds = 10;
+constexpr auto kDrainReportInterval = std::chrono::seconds(10);
 constexpr auto kPollInterval = std::chrono::microseconds(100);
 
 async_simple::Future<tl::expected<void, ErrorCode>> MakeReadyFuture(
@@ -251,36 +251,38 @@ TransferCoordinator::PollResult TransferCoordinator::PollOnce(
 }
 
 bool TransferCoordinator::IsDrained(Transport::BatchID batch_id,
-                                    size_t num_tasks) {
+                                    size_t num_tasks, bool uses_tent) {
     for (size_t i = 0; i < num_tasks; ++i) {
         TransferStatus status;
         Status s = transfer_engine_->getTransferStatus(batch_id, i, status);
-        if (!s.ok() || (status.s != TransferStatusEnum::COMPLETED &&
-                        status.s != TransferStatusEnum::FAILED)) {
-            return false;
+        if (!s.ok()) return false;
+        if (status.s == TransferStatusEnum::COMPLETED ||
+            status.s == TransferStatusEnum::FAILED) {
+            continue;
         }
+        // Classic TE can report TIMEOUT while slices still access buffers.
+        // TENT's CANCELED/TIMEOUT are terminal after its slices resolve.
+        if (uses_tent && (status.s == TransferStatusEnum::CANCELED ||
+                          status.s == TransferStatusEnum::TIMEOUT)) {
+            continue;
+        }
+        return false;
     }
     return true;
 }
 
 void TransferCoordinator::CancelBatch(Transport::BatchID batch_id,
                                       size_t num_tasks) {
-    // TODO(V2-TE-DRAIN): Match V1's backend-aware drain semantics. A timeout
-    // must only report stalled cleanup, not return while TE may still access
-    // caller-owned buffers; leaking BatchDesc does not retain those buffers.
-    // There is no cancel primitive, and freeBatchID only releases the
-    // descriptor once every task is finished. So "cancel" is: poll until the
-    // batch is terminal, then free. The timeout bounds shutdown at the cost of
-    // knowingly leaking one descriptor.
-    const auto start = std::chrono::steady_clock::now();
-    while (!IsDrained(batch_id, num_tasks)) {
-        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                                 std::chrono::steady_clock::now() - start)
-                                 .count();
-        if (elapsed >= kDrainTimeoutSeconds) {
-            LOG(WARNING) << "Giving up draining batch " << batch_id << " after "
-                         << elapsed << "s; its descriptor may leak";
-            return;
+    // Submitted batches belong to an initialized engine. As in V1, Classic
+    // TE retains metadata while TENT returns nullptr.
+    const bool uses_tent = transfer_engine_->getMetadata() == nullptr;
+    auto next_report = std::chrono::steady_clock::now() + kDrainReportInterval;
+    while (!IsDrained(batch_id, num_tasks, uses_tent)) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_report) {
+            LOG(ERROR) << "Still draining batch " << batch_id
+                       << "; retaining buffers until tasks finish";
+            next_report = now + kDrainReportInterval;
         }
         std::this_thread::sleep_for(kPollInterval);
     }
@@ -293,17 +295,14 @@ void TransferCoordinator::CancelBatch(Transport::BatchID batch_id,
 
 async_simple::coro::Lazy<void> TransferCoordinator::CancelBatchCoro(
     Transport::BatchID batch_id, size_t num_tasks) {
-    // TODO(V2-TE-DRAIN): Apply the same buffer-safe drain as CancelBatch;
-    // completing this coroutine currently lets its caller release buffers.
-    const auto start = std::chrono::steady_clock::now();
-    while (!IsDrained(batch_id, num_tasks)) {
-        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                                 std::chrono::steady_clock::now() - start)
-                                 .count();
-        if (elapsed >= kDrainTimeoutSeconds) {
-            LOG(WARNING) << "Giving up draining batch " << batch_id << " after "
-                         << elapsed << "s; its descriptor may leak";
-            co_return;
+    const bool uses_tent = transfer_engine_->getMetadata() == nullptr;
+    auto next_report = std::chrono::steady_clock::now() + kDrainReportInterval;
+    while (!IsDrained(batch_id, num_tasks, uses_tent)) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_report) {
+            LOG(ERROR) << "Still draining batch " << batch_id
+                       << "; retaining buffers until tasks finish";
+            next_report = now + kDrainReportInterval;
         }
         (void)co_await coro_io::sleep_for(kPollInterval);
     }

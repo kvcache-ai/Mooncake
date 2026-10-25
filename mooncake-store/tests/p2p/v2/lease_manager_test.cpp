@@ -354,6 +354,42 @@ TEST_F(LeaseManagerTest, AttachWithAForeignTokenReleasesTheTransaction) {
                     .has_value());
 }
 
+TEST_F(LeaseManagerTest, AttachRejectsAnExpiredClaimBeforeTheScannerRuns) {
+    auto token = leases_->ReservePendingWrite(kKey, Deadline(kLease));
+    ASSERT_TRUE(token.has_value());
+    clock_->Advance(kLease + 1ms);
+
+    auto attached = leases_->AttachPendingWriteTransaction(
+        kKey, *token, generate_uuid(), MakeTransaction());
+    ASSERT_FALSE(attached.has_value());
+    EXPECT_EQ(attached.error(), ErrorCode::LEASE_EXPIRED);
+    EXPECT_EQ(pool_->Usage(), 0u);
+}
+
+TEST_F(LeaseManagerTest, DetachedTransactionSurvivesExpiryAndCannotReattach) {
+    auto token = leases_->ReservePendingWrite(kKey, Deadline(kLease));
+    ASSERT_TRUE(token.has_value());
+    const UUID tiler_id = generate_uuid();
+    ASSERT_TRUE(leases_
+                    ->AttachPendingWriteTransaction(kKey, *token, tiler_id,
+                                                    MakeTransaction())
+                    .has_value());
+    auto detached = leases_->DetachPendingWriteTransaction(kKey, *token);
+    ASSERT_TRUE(detached.has_value());
+    const size_t retained = pool_->Usage();
+    ASSERT_GT(retained, 0u);
+
+    clock_->Advance(kLease + 1ms);
+    EXPECT_EQ(leases_->ScanExpiredNow(), 1u);
+    EXPECT_EQ(leases_->PendingWriteCount(), 0u);
+    EXPECT_EQ(pool_->Usage(), retained);
+
+    auto attached = leases_->AttachPendingWriteTransaction(
+        kKey, *token, detached->tiler_id, std::move(detached->transaction));
+    EXPECT_FALSE(attached.has_value());
+    EXPECT_EQ(pool_->Usage(), 0u);
+}
+
 TEST_F(LeaseManagerTest,
        TakePendingWriteHandsBackTheRecordForTheMatchingToken) {
     auto token = leases_->ReservePendingWrite(kKey, Deadline(kLease));

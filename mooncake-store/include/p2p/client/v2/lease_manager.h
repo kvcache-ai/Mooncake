@@ -172,7 +172,7 @@ class LeaseManager {
     tl::expected<UUID, ErrorCode> ReservePendingWrite(
         std::string_view key, Clock::time_point deadline);
 
-    /** Attach the allocated transaction to an existing claim. */
+    /** Attach the allocated transaction to a matching, unexpired claim. */
     tl::expected<void, ErrorCode> AttachPendingWriteTransaction(
         std::string_view key, const UUID& token, const UUID& tiler_id,
         std::variant<MutableBlock, CompletedBlock> transaction);

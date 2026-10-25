@@ -10,9 +10,9 @@
 //      keeps running against a caller that has already been told it failed.
 //   2. A batch id is only freed once every task in it has reached a terminal
 //      state. The TransferEngine has no cancel primitive and freeBatchID is a
-//      no-op until then, so "cancel" means drain-then-free, with a timeout
-//      after which the descriptor is knowingly leaked rather than blocking
-//      shutdown forever.
+//      no-op until then, so "cancel" means drain-then-free. A timeout only
+//      reports stalled cleanup: callers must retain their buffers until the
+//      backend confirms that no transfer can still access them.
 //
 // Waiting is offloaded to a dedicated pool when one is configured, so a poll
 // loop never occupies an RPC thread.
@@ -80,6 +80,8 @@ class TransferCoordinator {
     void Stop();
 
    private:
+    friend class TransferCoordinatorTest;
+
     // (batch id, task count, segment endpoint)
     using Batch = std::tuple<Transport::BatchID, size_t, std::string>;
 
@@ -108,7 +110,8 @@ class TransferCoordinator {
     async_simple::coro::Lazy<tl::expected<void, ErrorCode>> WaitAllCoro(
         std::vector<Batch> batches);
 
-    bool IsDrained(Transport::BatchID batch_id, size_t num_tasks);
+    bool IsDrained(Transport::BatchID batch_id, size_t num_tasks,
+                   bool uses_tent);
     void CancelBatch(Transport::BatchID batch_id, size_t num_tasks);
     async_simple::coro::Lazy<void> CancelBatchCoro(Transport::BatchID batch_id,
                                                    size_t num_tasks);

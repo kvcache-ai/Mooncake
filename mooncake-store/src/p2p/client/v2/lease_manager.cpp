@@ -110,6 +110,7 @@ tl::expected<void, ErrorCode> LeaseManager::AttachPendingWriteTransaction(
 
     // Held so the rejected transaction is destroyed outside the shard lock.
     std::optional<std::variant<MutableBlock, CompletedBlock>> rejected;
+    ErrorCode error = ErrorCode::INVALID_WRITE;
     {
         std::lock_guard<std::mutex> lock(shard.mu);
         auto it = shard.records.find(key);
@@ -117,6 +118,9 @@ tl::expected<void, ErrorCode> LeaseManager::AttachPendingWriteTransaction(
             rejected = std::move(transaction);
         } else if (it->second.write_token != token) {
             rejected = std::move(transaction);
+        } else if (it->second.deadline <= clock_->Now()) {
+            rejected = std::move(transaction);
+            error = ErrorCode::LEASE_EXPIRED;
         } else {
             it->second.tiler_id = tiler_id;
             it->second.transaction = std::move(transaction);
@@ -124,10 +128,11 @@ tl::expected<void, ErrorCode> LeaseManager::AttachPendingWriteTransaction(
         }
     }
     if (rejected.has_value()) {
-        LOG(ERROR) << "AttachPendingWriteTransaction: no matching claim, key="
-                   << key;
+        LOG(ERROR)
+            << "AttachPendingWriteTransaction: no matching live claim, key="
+            << key;
     }
-    return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    return tl::make_unexpected(error);
 }
 
 tl::expected<LeaseManager::DetachedPendingWrite, ErrorCode>

@@ -1648,6 +1648,9 @@ DataManagerV2::WriteRemoteDataAsync(
     if (!validated) {
         co_return tl::make_unexpected(validated.error());
     }
+    auto guard = lifecycle_->Acquire();
+    if (!guard) co_return tl::make_unexpected(guard.error());
+    const std::string owned_key(key);
 
     size_t total = 0;
     for (const auto& buffer : src_buffers) total += buffer.size;
@@ -1665,19 +1668,23 @@ DataManagerV2::WriteRemoteDataAsync(
     }
     const UUID target_id = (*target)->Id();
 
-    // Reuses the forward protocol: PreWrite claims the key and allocates,
-    // WriteCommit publishes, WriteRevoke rolls back. That keeps one
-    // implementation of the claim ordering instead of two.
-    // TODO(V2-REVERSE-WRITE-LIFETIME): Move the pending-write transaction into
-    // this coroutine before submitting TE and retain its MutableBlock across
-    // the await. Lease expiry can currently free the target behind this raw
-    // address. Reattach only after TE drains and the token/deadline still
-    // match; this also requires fixing V2-TE-DRAIN in TransferCoordinator.
-    auto reserved = PreWrite(key, total, target_id);
+    // Reuse the forward claim ordering, but own the allocation across the
+    // transfer: lease expiry or revoke must not free a target TE still writes.
+    auto reserved = PreWrite(owned_key, total, target_id);
     if (!reserved) {
         co_return tl::make_unexpected(reserved.error());
     }
     const UUID write_token = reserved->write_operation_id;
+    struct ClaimGuard {
+        LeaseManager* leases;
+        const std::string* key;
+        UUID token;
+        ~ClaimGuard() { (void)leases->TakePendingWrite(*key, token); }
+    } claim{leases_.get(), &owned_key, write_token};
+
+    auto detached =
+        leases_->DetachPendingWriteTransaction(owned_key, write_token);
+    if (!detached) co_return tl::make_unexpected(detached.error());
     void* const base = reinterpret_cast<void*>(reserved->remote_buffer.addr);
 
     auto transferred = co_await AwaitExpectedFuture(
@@ -1686,11 +1693,17 @@ DataManagerV2::WriteRemoteDataAsync(
         GetCoroExecutor());
     if (!transferred) {
         // Partial or failed transfer must not publish anything.
-        (void)WriteRevoke(key, write_token);
         co_return tl::make_unexpected(transferred.error());
     }
 
-    auto committed = WriteCommit(key, write_token);
+    // TE has drained. Only the original, still-live lease may publish these
+    // bytes; an expired or replaced claim rejects and releases the block.
+    auto attached = leases_->AttachPendingWriteTransaction(
+        owned_key, write_token, detached->tiler_id,
+        std::move(detached->transaction));
+    if (!attached) co_return tl::make_unexpected(attached.error());
+
+    auto committed = WriteCommit(owned_key, write_token);
     if (!committed) {
         co_return tl::make_unexpected(committed.error());
     }
