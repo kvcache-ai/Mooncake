@@ -326,7 +326,8 @@ class P2PClientService final {
     };
     std::optional<ClientEvent> HandleHeartbeatResponse(
         const P2PHeartbeatResponse& response);
-    void HandleHeartbeatTaskResult(const HeartbeatTaskResult& task_result);
+    // Returns true when missing segment metadata requires re-registration.
+    bool HandleHeartbeatTaskResult(const HeartbeatTaskResult& task_result);
     P2PHeartbeatRequest build_heartbeat_request();
     ErrorCode HandleEvent(ClientEvent event) EXCLUDES(lifecycle_mutex_);
     ErrorCode HandleEventLocked(ClientEvent event) REQUIRES(lifecycle_mutex_);
