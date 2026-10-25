@@ -17,6 +17,9 @@ For a detailed design discussion, see the [Mooncake Store Design](../design/stor
 
 ---
 
+For Ascend FabricMem deployments that must reserve a fixed budget before model
+loading, see [Pre-reserved KVPool capacity](ascend-reserved-kvpool.md).
+
 ## Quick Start
 
 Deploy a minimal single-node Mooncake Store in three steps.
