@@ -28,6 +28,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <dlfcn.h>
 #include <unistd.h>
 
 namespace mooncake {
@@ -121,7 +122,18 @@ double elapsed_sec(std::chrono::steady_clock::time_point begin) {
         .count();
 }
 
+// Directory of the library containing this code (libmooncake_ep_device.so).
+std::filesystem::path this_lib_dir() {
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<const void*>(&this_lib_dir), &info) == 0 ||
+        info.dli_fname == nullptr) {
+        return {};
+    }
+    return std::filesystem::path(info.dli_fname).parent_path();
+}
+
 std::filesystem::path configured_source_dir() {
+    // From the environment variable, if set.
     std::string path = env_value("MOONCAKE_EP_JIT_SOURCE_DIR");
     if (!path.empty()) return std::filesystem::path(path);
 
@@ -130,6 +142,16 @@ std::filesystem::path configured_source_dir() {
         return std::filesystem::path(ep_home) / "include" / "mooncake_ep";
     }
 
+    // From installed wheel: the headers sit next to the library.
+    const std::filesystem::path lib_dir = this_lib_dir();
+    if (!lib_dir.empty()) {
+        std::filesystem::path installed =
+            lib_dir / "mooncake_ep_jit" / "include" / "mooncake_ep";
+        std::error_code ec;
+        if (std::filesystem::is_directory(installed, ec)) return installed;
+    }
+
+    // Development build: the copy staged in the build tree.
     return std::filesystem::path(MOONCAKE_EP_JIT_SOURCE_DIR);
 }
 

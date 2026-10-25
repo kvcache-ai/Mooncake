@@ -142,7 +142,8 @@ if(USE_CUDA)
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-g0>
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
   target_link_libraries(mooncake_ep_device PRIVATE CUDA::cudart
-                                                   CUDA::cuda_driver)
+                                                   CUDA::cuda_driver
+                                                   ${CMAKE_DL_LIBS})
   if(USE_NCCL_DEVICE)
     target_link_libraries(mooncake_ep_device PRIVATE NCCL::nccl)
   endif()
