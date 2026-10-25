@@ -36,6 +36,7 @@
 #include <mutex>
 #include <optional>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 #include "common.h"
@@ -552,6 +553,12 @@ Status TcpTransport::submitTransfer(
             std::to_string(batch_id));
     }
 
+    TcpCallerStreamSync caller_sync;
+    for (const auto& request : entries) {
+        auto status = caller_sync.sync(request);
+        if (!status.ok()) return status;
+    }
+
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
@@ -566,6 +573,15 @@ Status TcpTransport::submitTransfer(
 
 Status TcpTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
+    TcpCallerStreamSync caller_sync;
+    for (auto* task : task_list) {
+        assert(task && task->request);
+        for (size_t j = 0; j < task->request_count; ++j) {
+            auto status = caller_sync.sync(task->request[j]);
+            if (!status.ok()) return status;
+        }
+    }
+
     for (size_t i = 0; i < task_list.size();) {
         auto* task = task_list[i];
         assert(task && task->request);
@@ -594,6 +610,15 @@ Status TcpTransport::submitTransferTask(
 
 Status TcpTransport::submitTransferTaskGroup(
     const std::vector<TransferTask*>& task_list) {
+    TcpCallerStreamSync caller_sync;
+    for (auto* task : task_list) {
+        assert(task && task->request);
+        for (size_t j = 0; j < task->request_count; ++j) {
+            auto status = caller_sync.sync(task->request[j]);
+            if (!status.ok()) return status;
+        }
+    }
+
     std::vector<Slice*> slices;
     slices.reserve(task_list.size());
     for (auto* task : task_list) {
