@@ -519,7 +519,7 @@ inline QueryResult FilterQueryResult(const QueryResult &qr,
                                    StoreHcaAffinityEnabled()),
         qr.lease_timeout,
         include_object_checksum ? qr.object_checksum : std::nullopt,
-        qr.resolved_tenant_id);
+        qr.resolved_tenant_id, qr.write_version);
 }
 
 // Shared object-byte range overflow check (same semantics as

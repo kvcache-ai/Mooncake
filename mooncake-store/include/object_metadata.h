@@ -99,8 +99,14 @@ struct ObjectMetadata {
 
     // Updated by UpsertStart (Case B) to reflect the new writer.
     UUID client_id;
-    // Updated by UpsertStart (Case B) to reset the discard timeout.
+    // Updated by UpsertStart (Case B) to reset the discard timeout. Case B is
+    // the only path that rewrites a memory replica's bytes under its existing
+    // ID, so this also serves as the object's write version.
     std::chrono::system_clock::time_point put_start_time;
+
+    uint64_t WriteVersion() const {
+        return static_cast<uint64_t>(put_start_time.time_since_epoch().count());
+    }
     const ObjectDataType data_type{ObjectDataType::UNKNOWN};
     const std::string group_id;
     const TenantId tenant_id;
