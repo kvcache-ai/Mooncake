@@ -1,9 +1,9 @@
-// Tests for BlockRegistry, the cross-tiler key-identity layer of section 3.3.
+// Tests for BlockRegistry, the cross-tiler key-identity layer.
 //
 // The registry owns identity and nothing else: it stores weak references only,
 // hands out one canonical handle per live key, and mints a brand new identity
 // once the previous one has been retired. The cases below pin exactly the
-// invariants section 9.3 lists for this component -- canonical reuse, fresh
+// identity invariants -- canonical reuse, fresh
 // identity after retire, automatic removal when the last strong handle dies,
 // idempotent presence hints, and the pointer-identity check that keeps a late
 // destructor from evicting a re-created registration.

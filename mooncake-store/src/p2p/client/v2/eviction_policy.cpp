@@ -49,14 +49,14 @@ size_t SaturatingAdd(size_t lhs, size_t rhs) {
 /**
  * @brief The bytes that stand between the tier and its target.
  *
- * Section 4.2 says to count committed, reserved, pending write and pending
- * migration bytes. `reserved_bytes` already is the pending-write figure (a
+ * Count committed, reserved, pending write and pending migration bytes.
+ * `reserved_bytes` already is the pending-write figure (a
  * PreWrite or an in-flight Put), so the sum is indexed + reserved + pending
  * migration -- with one deviation: the committed term is
  * max(indexed_bytes, physical_used_bytes), not indexed_bytes.
  *
  * Indexed bytes drop the instant a pinned block is detached, while the pool
- * still holds the space until the last reader goes away (section 4.3). A
+ * still holds the space until the last reader goes away. A
  * controller reading only the index would watch usage fall, conclude the round
  * succeeded and stop -- and the very next allocation would still fail because
  * nothing was physically freed. Taking the max keeps those retired-pinned
@@ -110,14 +110,14 @@ size_t ReclaimableBytes(const TierCapacitySnapshot& snapshot) {
 
 /**
  * @class DynamicWatermarkEvictionPolicy
- * @brief The controller of section 4.2: one write-rate estimate, one target
+ * @brief One write-rate estimate, one target
  *        moving inside [base_target, idle_target], one trigger above it.
  *
  * Every field lives behind one mutex because RecordWrite runs on commit
  * threads while the EvictEngine's controller thread plans, and both touch the
  * write-rate accumulator. The lock is only ever held across arithmetic -- no
  * callback, no index lookup, no allocation -- so it cannot take part in the
- * lock order that section 9 invariant 9 constrains.
+ * lock ordering between metadata and storage components.
  */
 class DynamicWatermarkEvictionPolicy final : public EvictionPolicy {
    public:

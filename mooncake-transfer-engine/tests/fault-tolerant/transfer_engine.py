@@ -14,7 +14,7 @@ class MooncakeTransferEngine:
         except ImportError as e:
             raise ImportError(
                 "Please install mooncake by following the instructions at "
-                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
+                "https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/getting_started/build.md "  # noqa: E501
                 "to run SGLang with MooncakeTransferEngine."
             ) from e
 

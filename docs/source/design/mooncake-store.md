@@ -838,7 +838,7 @@ The C++ API of Mooncake Store provides more low-level control capabilities. We p
 
 ## Version Management Policy
 
-The current version of Mooncake Store is defined in [`CMakeLists.txt`](../../mooncake-store/CMakeLists.txt) as `project(MooncakeStore VERSION 2.0.0)`.
+The current version of Mooncake Store is defined in [`CMakeLists.txt`](../../../mooncake-store/CMakeLists.txt) as `project(MooncakeStore VERSION 2.0.0)`.
 
 When to bump the version:
 

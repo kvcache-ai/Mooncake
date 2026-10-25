@@ -350,7 +350,7 @@ Value = {
 2. `PUT /metadata?key=$KEY`：更新 `$KEY` 对应的元数据为请求 body 的值。
 3. `DELETE /metadata?key=$KEY`：删除 `$KEY` 对应的元数据。
 
-具体实现，可以参考 [mooncake-transfer-engine/example/http-metadata-server](../../mooncake-transfer-engine/example/http-metadata-server) 用 Golang 实现的 demo 服务。
+具体实现，可以参考 [mooncake-transfer-engine/example/http-metadata-server](../../../mooncake-transfer-engine/example/http-metadata-server) 用 Golang 实现的 demo 服务。
 
 ### 构造函数与初始化
 TransferEngine 在完成构造后需要调用 `init` 函数进行初始化：
@@ -385,7 +385,7 @@ int init(const std::string &metadata_conn_string,
 编译项目时启用 `-DWITH_P2P_STORE=ON` 选项，则可以一并编译 P2P Store 样例程序。
 
 ### 使用 Rust 接口二次开发
-在 `mooncake-transfer-engine/rust` 下给出了 TransferEngine 的 Rust 接口实现，并根据该接口实现了 Rust 版本的样例程序，逻辑类似于 [transfer_engine_bench.cpp](../../mooncake-transfer-engine/example/transfer_engine_bench.cpp)。若想编译 rust example，需安装 Rust SDK，并在 cmake 命令中添加 `-DWITH_RUST_EXAMPLE=ON`。
+在 `mooncake-transfer-engine/rust` 下给出了 TransferEngine 的 Rust 接口实现，并根据该接口实现了 Rust 版本的样例程序，逻辑类似于 [transfer_engine_bench.cpp](../../../mooncake-transfer-engine/example/transfer_engine_bench.cpp)。若想编译 rust example，需安装 Rust SDK，并在 cmake 命令中添加 `-DWITH_RUST_EXAMPLE=ON`。
 
 ## 高级运行时选项
 对于高级用户，TransferEngine 提供了如下所示的高级运行时选项，均可通过 **环境变量（environment variable）** 方式传入。

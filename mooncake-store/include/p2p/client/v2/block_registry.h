@@ -7,7 +7,7 @@
 // TilerManager's BlockIndex. The Registry stores only weak pointers, so the
 // last strong handle disappearing removes the key automatically.
 //
-// Mechanism mirrors Dynamo's kvbm-logical registry (see section 3.3):
+// Mechanism mirrors Dynamo's kvbm-logical registry:
 //   - Register(key) reuses a live, non-retired registration or mints a new
 //     identity (registry_shard, shard_sequence++).
 //   - Deleting every replica retires the registration, so Match() stops
@@ -73,7 +73,7 @@ struct RegistrationIdHash {
  *
  * Holding it keeps the identity alive (it owns a strong reference) and excludes
  * every other mutation of the same key. Lock order: this guard is taken before
- * any BlockIndex shard lock and released after it (section 7.3).
+ * any BlockIndex shard lock and released after it.
  */
 class RegistrationMutationGuard {
    public:

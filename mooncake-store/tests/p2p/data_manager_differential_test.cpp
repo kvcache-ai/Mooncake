@@ -1,4 +1,4 @@
-// V1/V2 differential replay (section 9.2).
+// V1/V2 differential replay.
 //
 // One deterministic trace is replayed against both implementations and their
 // observations compared. What is compared is normalized: error codes, bytes
@@ -7,7 +7,7 @@
 // UUIDs, BlockIds, addresses, timestamps and the ordering of background work,
 // none of which any caller can depend on.
 //
-// The design's exemption list is encoded here rather than described: a step
+// Intended behavioral differences are recorded explicitly: a step
 // marked Compare::kExempt still runs and still records both answers, and the
 // reason travels with it. Deleting such a step instead would lose the evidence
 // that the difference is the one we intended.
@@ -165,9 +165,8 @@ class Replay {
                                     bool) -> tl::expected<void, ErrorCode> {
             return {};
         };
-        // Deliberately not logged into the comparable stream: section 7.3
-        // makes rectify best-effort and unordered against a concurrent write,
-        // so its callbacks are exemption 4.
+        // Rectify is best-effort and unordered against a concurrent write,
+        // so its callbacks cannot be compared across implementations.
         callbacks.rectify_route = [this](std::string_view key,
                                          std::optional<UUID>) {
             ++rectify_calls_;
@@ -654,7 +653,7 @@ class DataManagerDifferentialTest : public ::testing::Test {
 };
 
 // The whole point of the harness: replay one trace against both and hold them
-// to the same answers, except where the design says otherwise.
+// to the same answers, except for steps marked Compare::kExempt.
 TEST_F(DataManagerDifferentialTest, V1AndV2AnswerTheSameTraceIdentically) {
     const auto steps = BuildTrace();
     ASSERT_FALSE(steps.empty());

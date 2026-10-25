@@ -6,7 +6,7 @@ Ascend Direct Transport (referred to as Transport throughout this document) is l
 
 Transport is a transmission adapter layer built on CANN's ADXL capabilities, providing direct compatibility with the Mooncake Transfer Engine. With Transport, users can perform Host-to-Device, Device-to-Host, and Device-to-Device transfers in Ascend environments using various communication protocols such as HCCS and RDMA. Future enhancements will enable data transfer between heterogeneous Ascend and GPU environments.
 
-To build and use the Transport library, please follow the process described in `build.md` and enable the `USE_ASCEND_DIRECT` option.
+To build and use the Transport library, please follow the process described in the [build guide](../../getting_started/build.md) and enable the `USE_ASCEND_DIRECT` option.
 
 ### Additional Dependencies
 

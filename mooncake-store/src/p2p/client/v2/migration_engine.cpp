@@ -108,8 +108,8 @@ tl::expected<void, ErrorCode> MigrationEngine::Execute(
 
     // Captured inside the guard, published outside it. Publishing under the
     // key's mutation guard would push into an event queue -- and, on a full
-    // queue, run a whole inline fan-out -- while the key is locked, which
-    // section 9.9 forbids.
+    // queue, run a whole inline fan-out -- while the key is locked, delaying
+    // other mutations and potentially re-entering metadata code.
     // After the copy and before the guard: publishing a block whose deadline
     // has passed is worse than dropping it, because the caller has already
     // given up and may have arranged the move some other way.

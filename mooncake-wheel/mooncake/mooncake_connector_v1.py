@@ -357,7 +357,7 @@ class MooncakeConnectorWorker:
         except ImportError as e:
             raise ImportError(
                 "Please install mooncake by following the instructions at "
-                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
+                "https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/getting_started/build.md "  # noqa: E501
                 "to run VLLM with MooncakeTransferEngine.") from e
         logger.info("Initializing Mooncake Transfer Engine worker %s",
                     engine_id)

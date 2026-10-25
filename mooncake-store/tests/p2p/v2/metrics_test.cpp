@@ -1,4 +1,4 @@
-// V2's operator-facing metrics (acceptance item 7).
+// V2's operator-facing metrics.
 //
 // The point of these is a graduated rollout: someone switching
 // data_manager_version to v2 has to keep seeing the same tier series V1
@@ -180,7 +180,7 @@ TEST_F(V2MetricsTest, StopDrainTimeoutIsCounted) {
         << "Stop cancelled without recording that it had to";
 }
 
-// Section 7.3 accepts that rectify can fire on a key that is in fact live.
+// Best-effort rectify can race a commit and fire on a key that is live.
 // Accepting a risk is only reasonable while it stays visible.
 TEST_F(V2MetricsTest, ARectifiedKeyThatComesBackIsCountedAsAFalsePositive) {
     Build();

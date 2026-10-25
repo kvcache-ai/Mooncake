@@ -625,7 +625,7 @@ mooncake提供了DFS可用空间的配置，用户可以在启动master时指定
 启用持久化功能后，对于每次 `Put`或`BatchPut` 操作，都会发起一次同步的memory pool写入操作和一次异步的DFS持久化操作。之后执行 `Get`或 `BatchGet` 时，如果在memory pool中没有找到对应的kvcache，则会尝试从DFS中读取该文件数据，并返回给用户。
 
 #### 3FS USRBIO 插件
-如需通过3FS原生接口（USRBIO）实现高性能持久化文件读写，请参阅本文档的配置说明。[3FS USRBIO 插件配置](/mooncake-store/src/hf3fs/README.md)。
+如需通过3FS原生接口（USRBIO）实现高性能持久化文件读写，请参阅本文档的配置说明。[3FS USRBIO 插件配置](../getting_started/plugin-usage/3FS-USRBIO-Plugin.md)。
 
 ### 内置元数据服务器
 
@@ -692,7 +692,7 @@ sudo make install # 安装 Python 接口支持包
 **注意：** 使用高可用模式只需要开启 `-DSTORE_USE_ETCD`。`-DUSE_ETCD` 是 **Transfer Engine** 的编译选项，与高可用模式**无关**。
 
 ### 启动 Transfer Engine 的 Metadata 服务
-Mooncake Store 使用 Transfer Engine 作为核心传输引擎，因此需要启动元数据服务（etcd/redis/http），`metadata` 服务的启动与配置可以参考[Transfer Engine](./transfer-engine/index.md)的有关章节。特别注意：对于 etcd 服务，默认仅为本地进程提供服务，需要修改监听选项（IP 为 0.0.0.0，而不是默认的 127.0.0.1）。可使用 curl 等指令验证正确性。
+Mooncake Store 使用 Transfer Engine 作为核心传输引擎，因此需要启动元数据服务（etcd/redis/http），`metadata` 服务的启动与配置可以参考[Transfer Engine](transfer-engine.md)的有关章节。特别注意：对于 etcd 服务，默认仅为本地进程提供服务，需要修改监听选项（IP 为 0.0.0.0，而不是默认的 127.0.0.1）。可使用 curl 等指令验证正确性。
 
 ### 启动 Master Service
 
@@ -861,7 +861,7 @@ Mooncake Store 的 C++ API 提供了更底层的控制能力。我们提供一�
 
 ## 版本管理策略
 
-Mooncake Store 的当前版本定义在 [`CMakeLists.txt`](../../mooncake-store/CMakeLists.txt) 中，为 `project(MooncakeStore VERSION 2.0.0)`。
+Mooncake Store 的当前版本定义在 [`CMakeLists.txt`](../../../mooncake-store/CMakeLists.txt) 中，为 `project(MooncakeStore VERSION 2.0.0)`。
 
 何时需要升级版本：
 

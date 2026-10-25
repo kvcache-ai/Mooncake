@@ -16,7 +16,7 @@ Install mooncake-transfer-engine through pip:
 pip install mooncake-transfer-engine
 ```
 
-Note: If you encounter problems such as missing `lib*.so`, you should uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](../build.md).
+Note: If you encounter problems such as missing `lib*.so`, you should uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](../../build.md).
 
 ### Install vLLM
 
@@ -118,7 +118,7 @@ The following environment variables can be used to customize Mooncake behavior:
 
 ## Performance
 
-For detailed performance benchmarks and results, see the [vLLM Benchmark](../../performance/vllm-v1-support-benchmark.md) documentation.
+For detailed performance benchmarks and results, see the [vLLM Benchmark](../../../performance/vllm-v1-support-benchmark.md) documentation.
 
 ## Notes
 

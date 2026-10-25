@@ -1,4 +1,4 @@
-// Component tests for LeaseManager (design doc sections 5.9, 6.3, 6.4, 9.3).
+// Component tests for LeaseManager.
 //
 // Time is injected: every deadline in this file moves because ManualClock was
 // advanced, never because a thread waited. A sleeping lease test is a flaky
@@ -176,7 +176,7 @@ class LeaseManagerTest : public ::testing::Test {
 };
 
 // ---------------------------------------------------------------------------
-// Pending write: claim precedes allocation (section 6.3)
+// Pending write: claim precedes allocation
 // ---------------------------------------------------------------------------
 
 TEST_F(LeaseManagerTest, ReserveMintsAWriteTokenForAFreeKey) {
@@ -446,7 +446,7 @@ TEST_F(LeaseManagerTest, TakeReportsInvalidWriteOnMismatchAndKeepsTheClaim) {
 }
 
 // ---------------------------------------------------------------------------
-// Pinned read (section 6.4)
+// Pinned read
 // ---------------------------------------------------------------------------
 
 TEST_F(LeaseManagerTest, PinMintsAReadTokenAndIndexesItByToken) {

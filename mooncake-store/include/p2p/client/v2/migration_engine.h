@@ -51,7 +51,7 @@ using AllocateBlockCallback =
 
 /**
  * @struct MigrationSchedulerConfig
- * @brief What the route queues do. Section 10's MigrationEngine block.
+ * @brief Scheduling and concurrency limits for the migration route queues.
  */
 struct MigrationSchedulerConfig {
     /** A batch is submitted once any one of these is reached. */

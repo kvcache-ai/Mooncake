@@ -3,11 +3,10 @@
 // Small pieces shared by every V2 component: the injected clock, the lifecycle
 // gate, and the allocation-source / allocation-failure vocabulary.
 //
-// Note on file layout: remake_kvbm/new_data_manager.md section 8 lists the V2
-// headers by component. These types are used by several of them (Clock by the
-// lease manager, the movement queue and AllocateWithPolicy; LifecycleGate by
-// DataManagerV2 and the task handles it hands out), so putting them in any one
-// component header would create a cycle. They live here instead.
+// These types are shared across V2 components: Clock is used by leases,
+// movement queues and AllocateWithPolicy; LifecycleGate is used by
+// DataManagerV2 and its task handles. Keeping them in a component header would
+// introduce dependency cycles.
 
 #include <array>
 #include <atomic>
@@ -56,7 +55,7 @@ struct AllocationFailurePolicyConfig {
     size_t reclaim_margin_bytes = 0;
 };
 
-/** Validates the ranges documented in section 5.1. */
+/** Validates enabled eviction round limits and timeout bounds. */
 tl::expected<void, ErrorCode> ValidateAllocationFailurePolicy(
     const AllocationFailurePolicyConfig& config);
 

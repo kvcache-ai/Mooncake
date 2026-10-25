@@ -3,9 +3,8 @@
 // Every case here is written against `p2p/client/data_manager.h` and the
 // factory only: no concrete implementation type, no private member access.
 // The suite is parameterized over DataManagerVersion so the same assertions
-// run against V1 and (from Phase 2) V2. It is the executable form of the
-// contract table in remake_kvbm/new_data_manager.md section 4.2, and the
-// baseline the differential replay of section 9.2 compares against.
+// run against V1 and V2. They define the shared API behavior and provide the
+// baseline for data_manager_differential_test.cpp.
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -286,7 +285,7 @@ struct VersionCapabilities {
      *
      * Unlike the fields above, this one is NOT a phase still to land -- it is a
      * decided difference. V1 demotes such a replica to a slower tier. V2's
-     * reclaim path is tier-local by design (redesign section 4.1): it does not
+     * reclaim path is tier-local by design: it does not
      * look at other tiers, does not demote and does not wait for an offload,
      * and durability is delegated entirely to the offload pipeline. If offload
      * has not copied the block down when the tier fills, the object is lost.

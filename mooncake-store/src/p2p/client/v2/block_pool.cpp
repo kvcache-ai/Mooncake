@@ -212,7 +212,7 @@ class DramBlockPoolState final : public BlockPoolState {
             }
         }
         // Out of space is the only legal answer; reclaiming is not this
-        // layer's decision (section 5.6).
+        // layer's decision.
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 

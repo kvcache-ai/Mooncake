@@ -1,4 +1,4 @@
-// Component tests for the explicit tier topology (design doc section 7.1) and
+// Component tests for the explicit tier topology and
 // for the nearest-neighbour policy that walks it.
 //
 // The topology under test is the thing that replaced "derive the target from

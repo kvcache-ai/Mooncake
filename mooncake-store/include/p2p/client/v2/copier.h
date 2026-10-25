@@ -269,8 +269,8 @@ class TransferCoordinator;
  * while these two are properties of this copy engine. Putting them in the
  * shared struct would give V1 two fields it ignores.
  *
- * The design's section 10 also lists `copier_workers`. That knob already
- * exists as DataManagerV2Config::movement_worker_count -- the threads that run
+ * Copy worker concurrency is configured through
+ * DataManagerV2Config::movement_worker_count -- the threads that run
  * copies are the movement workers -- and adding a second name for it would let
  * the two disagree, so it is not duplicated here.
  */

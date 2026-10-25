@@ -12,7 +12,7 @@ This is the latest version of the MooncakeTransferEngine integration doc with th
 pip3 install mooncake-transfer-engine
 ```
 
-Note: If you encounter problems such as missing `lib*.so`, you should uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](build.md).
+Note: If you encounter problems such as missing `lib*.so`, you should uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](../build.md).
 
 ### Install the latest version of SGLang
 #### 1. Clone SGLang from official repo
