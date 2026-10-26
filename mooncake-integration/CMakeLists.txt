@@ -307,12 +307,15 @@ endif()
 if(WITH_EP)
   install(TARGETS _ep LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
                               COMPONENT python)
-  install(
-    DIRECTORY "${EP_PG_STAGING_DIR}/"
-    DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}"
-    COMPONENT python
-    FILES_MATCHING
-    PATTERN "*.so")
+  # XPU builds no Mooncake PG, so EP_PG_STAGING_DIR is unset there.
+  if(NOT USE_XPU)
+    install(
+      DIRECTORY "${EP_PG_STAGING_DIR}/"
+      DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}"
+      COMPONENT python
+      FILES_MATCHING
+      PATTERN "*.so")
+  endif()
   install(
     FILES
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/ep.py"
@@ -379,7 +382,7 @@ if(SKBUILD)
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()
 
-  if(WITH_EP)
+  if(WITH_EP AND NOT USE_XPU)
     install(TARGETS mooncake_pg
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()

@@ -354,13 +354,15 @@ if(USE_TPU)
 endif()
 
 if(USE_XPU)
-  # Every XPU source file lives under mooncake-transfer-engine/tent, which is
-  # only added when USE_TENT is ON. Without this guard -DUSE_XPU=ON configures
-  # and builds cleanly while compiling no XPU code at all.
-  if(NOT USE_TENT)
+  # XPU sources live under mooncake-transfer-engine/tent and mooncake-ep, which
+  # are only added when USE_TENT or WITH_EP is ON. Without this guard
+  # -DUSE_XPU=ON configures and builds cleanly while compiling no XPU code. An
+  # EP build without TENT must also leave out the Store; the top-level
+  # CMakeLists.txt checks that once WITH_STORE is defined.
+  if(NOT USE_TENT AND NOT WITH_EP)
     message(
       FATAL_ERROR
-        "USE_XPU=ON requires USE_TENT=ON: all XPU support lives in TENT. Re-run cmake with -DUSE_TENT=ON."
+        "USE_XPU=ON requires USE_TENT=ON (Transfer Engine) or WITH_EP=ON (Mooncake EP). Re-run cmake with either."
     )
   endif()
   # The XPU platform links oneAPI SYCL directly (native / direct-link): its
