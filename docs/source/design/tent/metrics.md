@@ -203,6 +203,11 @@ The HTTP server provides multiple endpoints:
   returned with `200` so it can be collected during an incident. Unlike
   `/ready`, this endpoint may scan live engine state and is not a probe path.
 
+The three serialization endpoints return HTTP `500` when their response cannot
+be serialized. The failed attempt is counted in
+`tent_metrics_serialization_failures_total` and becomes visible on the next
+successful Prometheus scrape. `/health` remains a liveness-only endpoint.
+
 `/health` is kept for compatibility. New probes should use `/live` for process
 liveness and `/ready` for traffic readiness.
 
@@ -293,17 +298,29 @@ tent_read_latency_us_bucket{transport="rdma",le="500"} 50
   "tent_write_failures_total": 1,
   "tent_metrics_runtime_enabled": 1,
   "tent_metrics_http_server_up": 1,
+  "tent_metrics_http_start_failures_total": 0,
   "tent_metrics_build_info": {
     "version": "0.3.7",
-    "commit": "f751cff",
-    "compile_time_enabled": true
+    "commit": "f751cff"
+  },
+  "tent_metrics_serialization_attempts_total": {
+    "prometheus": 12,
+    "json": 1
+  },
+  "tent_metrics_serialization_failures_total": {
+    "prometheus": 0,
+    "json": 0
+  },
+  "tent_metrics_last_success_timestamp_seconds": {
+    "prometheus": 1793016000,
+    "json": 1793016001
   }
 }
 ```
 
 **Summary Format (`/metrics/summary`)**:
 ```
-Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
+Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 ```
 
 **Readiness (`/ready`)**:
@@ -428,13 +445,13 @@ visible when runtime transfer recording is disabled.
 
 | Metric Name | Type | Labels | Description |
 |-------------|------|--------|-------------|
-| `tent_metrics_build_info` | Gauge | `version`, `commit`, `compile_time_enabled` | Build identity; the series value is always `1` |
+| `tent_metrics_build_info` | Gauge | `version`, `commit` | Build identity; the series value is always `1`. Its presence means metrics were compiled into the serving process. |
 | `tent_metrics_runtime_enabled` | Gauge | - | `1` when transfer metric recording is enabled at runtime, otherwise `0` |
 | `tent_metrics_http_server_up` | Gauge | - | `1` when the metrics HTTP server successfully bound its configured port |
 | `tent_metrics_http_start_failures_total` | Counter | - | Failed metrics HTTP server start attempts since process start |
 | `tent_metrics_serialization_attempts_total` | Counter | `format` | Metrics serialization attempts, including the current request |
 | `tent_metrics_serialization_failures_total` | Counter | `format` | Metrics serialization attempts that raised an exception |
-| `tent_metrics_last_success_timestamp_seconds` | Gauge | `format` | Unix timestamp of the most recent successful serialization |
+| `tent_metrics_last_success_timestamp_seconds` | Gauge | `format` | Unix timestamp of the most recent successful serialization; `0` means that format has never succeeded |
 
 **Notes**:
 - `*_requests_total` counts terminal logical/merged-transfer outcomes. Its `transport` label is the **final transport**: a request recovered by RDMA→TCP failover is counted once under `tcp`.
@@ -463,6 +480,7 @@ visible when runtime transfer recording is disabled.
 - Attempt latency currently ends when polling or the progress worker observes the terminal status, so it may include completion-observation delay.
 - `*_failures_total` does not record bytes; failed transfers transfer no bytes.
 - `tent_deadline_infeasible_total` is a dedicated counter (not a histogram sentinel) so infeasible-at-submit cases are distinguishable from genuine high-MLU samples.
+- `tent_metrics_last_success_timestamp_seconds{format="..."} == 0` means that format has never completed a successful serialization. Prometheus freshness alerts must select `format="prometheus"` and guard on a value greater than zero; a Prometheus-only deployment is not expected to serialize JSON.
 - yalantinglibs omits zero-valued transfer counters/histograms from the Prometheus output, so a transfer metric only appears once it has been observed at least once. The metrics-pipeline self-observability families above are emitted unconditionally.
 
 ### Labels
@@ -496,7 +514,6 @@ addresses, segment names, or other unbounded values are accepted.
 | `to` | (same set) | Transport that the failover switched to |
 | `version` | Build-time constant | TENT build version |
 | `commit` | Build-time constant | Git commit used for the build |
-| `compile_time_enabled` | `true` | Confirms metrics were compiled into this serving process |
 
 Transport label values come from the shared `transportTypeName()` mapping.
 `unspec` covers transfers that failed before a transport was selected.
@@ -510,8 +527,9 @@ has at most 17x2x2 = 68, worker progress has three series, each staging in-fligh
 family has two operation series, staging cleanup has three kind series, and
 each serialization family has exactly two series. Dynamic counters allocate
 only label combinations that actually occur. Build identity labels are
-constant for the life of the process. Total series across all metrics is
-bounded by these closed sets.
+constant for the life of the process; a served `tent_metrics_build_info` series
+itself confirms that metrics were compiled in. Total series across all metrics
+is bounded by these closed sets.
 
 Each RPC family is bounded to 13 methods. Attempts and attempt latency have at
 most 13x3 = 39 method/outcome series; retries have at most 13. These are
@@ -772,4 +790,16 @@ histogram_quantile(
     }[5m])
   )
 ) / 1000000
+
+# Transfer metrics recording disabled at runtime
+tent_metrics_runtime_enabled == 0
+
+# Any serialization failure in the last five minutes
+increase(tent_metrics_serialization_failures_total[5m]) > 0
+
+# Prometheus serialization has succeeded before, but is now stale. With the
+# 15-second scrape interval above, 45 seconds allows two missed intervals.
+(tent_metrics_last_success_timestamp_seconds{format="prometheus"} > 0)
+and
+(time() - tent_metrics_last_success_timestamp_seconds{format="prometheus"} > 45)
 ```

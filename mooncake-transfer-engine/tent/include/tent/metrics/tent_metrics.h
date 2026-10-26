@@ -579,6 +579,8 @@ class TentMetrics {
     DiagnosticsProvider readiness_provider_;
 
 #if TENT_METRICS_ENABLED
+    friend class TentMetricsTestPeer;
+
     static constexpr size_t kSerializationFormatCount = 2;
     static constexpr size_t kPrometheusFormat = 0;
     static constexpr size_t kJsonFormat = 1;
@@ -615,6 +617,19 @@ class TentMetrics {
     // /ready, and the redacted /diagnostics endpoint.
     void registerHttpHandlers();
     void appendReadinessPrometheus(std::string& out);
+
+    // Build an endpoint response and report whether serialization succeeded.
+    // The public string-returning methods retain their existing API, while the
+    // HTTP handlers use the boolean result to return 5xx on failure.
+    bool tryGetPrometheusMetrics(bool open_metrics, std::string& result);
+    bool tryGetJsonMetrics(std::string& result);
+
+    // Apply common attempt/failure/last-success accounting around both output
+    // formats. Kept off the transfer hot path; this runs only on scrape or
+    // direct serialization requests.
+    bool serializeWithAccounting(
+        size_t format, std::string& result,
+        const std::function<void(std::string&, uint64_t)>& serializer);
 
     // HTTP server for metrics endpoint
     std::unique_ptr<coro_http::coro_http_server> http_server_;
@@ -1198,7 +1213,6 @@ class TentMetrics {
                                       std::string& out,
                                       bool include_exemplars = false) const;
 
-    std::string serializePrometheusMetrics(bool open_metrics);
 #endif  // TENT_METRICS_ENABLED
 };
 

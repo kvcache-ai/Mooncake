@@ -88,8 +88,12 @@ TEST(TentMetricsHttpServer, DegradesToLogOnlyWhenConfiguredPortBusy) {
     EXPECT_NE(body.find("# TYPE tent_metrics_http_start_failures_total "
                         "counter\n"),
               std::string::npos);
-    EXPECT_EQ(body.find("tent_metrics_http_start_failures_total 0\n"),
+    EXPECT_NE(body.find("tent_metrics_http_start_failures_total 1\n"),
               std::string::npos);
+
+    const std::string summary = metrics.getSummaryString();
+    EXPECT_NE(summary.find("Metrics HTTP: down"), std::string::npos);
+    EXPECT_NE(summary.find("start failures: 1"), std::string::npos);
 
     metrics.shutdown();
 }
