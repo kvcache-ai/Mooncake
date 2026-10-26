@@ -95,14 +95,6 @@ AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
     }
 }
 
-bool AllocatedBuffer::copyTransferProtocolFrom(const AllocatedBuffer& source) {
-    if (protocol == "cxl" || source.protocol == "cxl") {
-        return false;
-    }
-    protocol = source.protocol;
-    return true;
-}
-
 std::string AllocatedBuffer::getTransportEndpoint(
     std::optional<SegmentLocality>* locality) const {
     auto alloc = allocator_.lock();

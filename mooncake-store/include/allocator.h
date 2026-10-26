@@ -153,8 +153,6 @@ class AllocatedBuffer {
     void* get_vaddr_from_cxl();
 
    private:
-    bool copyTransferProtocolFrom(const AllocatedBuffer& source);
-
     std::weak_ptr<BufferAllocatorBase> allocator_;
     // Both bindings are set before the buffer is published to readers and not
     // changed while readers can see it, so neither needs atomic access. The
