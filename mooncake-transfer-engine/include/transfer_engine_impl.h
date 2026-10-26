@@ -34,7 +34,8 @@
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #include "config.h"
-#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+     defined(USE_HYGON)) &&                                           \
     !defined(USE_CXI)
 #include "transport/device/device_transport.h"
 #endif
@@ -404,7 +405,8 @@ class TransferEngineImpl {
         return multi_transports_->getTransport(proto);
     }
 
-#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+     defined(USE_HYGON)) &&                                           \
     !defined(USE_CXI)
     // Device transport accessors — lazily created, owned by this impl.
     device::P2pTransport* getOrCreateP2pTransport(int num_ranks);
@@ -543,7 +545,8 @@ class TransferEngineImpl {
     std::vector<std::string> filter_;
     bool use_barex_ = false;
 
-#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+     defined(USE_HYGON)) &&                                           \
     !defined(USE_CXI)
     // Device transports (P2P + IBGDA) — lazily created, owned by this impl.
     // Referenced by EP and future CPU-proxy paths.

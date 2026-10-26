@@ -9,6 +9,8 @@
 #include "transport/device/musa/musa_ops.cuh"
 #elif defined(MOONCAKE_EP_USE_MACA)
 #include "transport/device/maca/maca_ops.cuh"
+#elif defined(MOONCAKE_EP_USE_HYGON)
+#include "transport/device/hygon/hygon_ops.cuh"
 #else
 #include "transport/device/cuda/cuda_ops.cuh"
 #endif

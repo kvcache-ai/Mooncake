@@ -43,6 +43,13 @@ def _using_maca() -> bool:
     return bool(getattr(getattr(torch, "version", None), "maca", None))
 
 
+def _using_hygon() -> bool:
+    configured = os.environ.get("MOONCAKE_EP_USE_HYGON")
+    if configured is not None:
+        return _env_enabled("MOONCAKE_EP_USE_HYGON")
+    return bool(getattr(getattr(torch, "version", None), "hip", None))
+
+
 def _load_torchada() -> None:
     """Install torchada's MUSA mappings before loading cpp_extension."""
     if not _using_musa():
@@ -76,6 +83,17 @@ def _mxcc_path() -> Path | None:
     return Path(mxcc) if mxcc else None
 
 
+def _hipcc_path() -> Path | None:
+    for variable in ("ROCM_HOME", "ROCM_PATH", "HIP_PATH"):
+        root = os.environ.get(variable)
+        if root:
+            candidate = Path(root) / "bin" / "hipcc"
+            if candidate.is_file():
+                return candidate
+    hipcc = shutil.which("hipcc")
+    return Path(hipcc) if hipcc else None
+
+
 def _source_dir() -> Path:
     installed = Path(__file__).with_name("_pg_jit")
     if installed.is_dir():
@@ -106,6 +124,7 @@ def _cache_key(source_dir: Path, core_path: Path, backend: str) -> str:
     digest.update(torch.__version__.encode())
     digest.update(str(torch.version.cuda).encode())
     digest.update(str(getattr(torch.version, "musa", None)).encode())
+    digest.update(str(getattr(torch.version, "hip", None)).encode())
     digest.update(str(torch._C._GLIBCXX_USE_CXX11_ABI).encode())
     digest.update(str(torch.version.git_version).encode())
     digest.update(backend.encode())
@@ -130,7 +149,11 @@ def _build_lock(lock_path: Path):
 
 
 def _adapter_module_name(is_musa: bool) -> str:
-    return "_mooncake_pg_jit_musa" if is_musa else "_mooncake_pg_jit_cuda"
+    if is_musa:
+        return "_mooncake_pg_jit_musa"
+    if _using_hygon():
+        return "_mooncake_pg_jit_hygon"
+    return "_mooncake_pg_jit_cuda"
 
 
 def _cached_extension_path(build_dir: Path, is_musa: bool) -> Path | None:
@@ -181,6 +204,8 @@ def _load_cached_extension(build_dir: Path, is_musa: bool):
 def _cache_directory(source_dir: Path, core_path: Path, is_musa: bool) -> Path:
     if is_musa:
         backend = f"musa:{os.environ.get('MTGPU_TARGET', 'mp_31')}"
+    elif _using_hygon():
+        backend = "hygon"
     elif _using_maca():
         backend = "maca"
     else:
@@ -280,7 +305,14 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
         extra_cflags += ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]
     else:
         # Retain the CUDA link contract validated by the fresh-wheel smoke.
-        if not is_maca:
+        if _using_hygon():
+            extra_ldflags += ["-lc10_hip", "-ltorch_hip"]
+            extra_cflags += [
+                "-DUSE_HYGON",
+                "-DMOONCAKE_EP_USE_HYGON=1",
+                "-DGLOG_USE_GLOG_EXPORT",
+            ]
+        elif not is_maca:
             extra_ldflags += ["-lc10_cuda", "-ltorch_cuda"]
         extra_cuda_cflags = None
         if is_maca:
@@ -355,6 +387,12 @@ def _load_jit_adapter():
                         "Mooncake PG MACA JIT requires the MACA compiler (mxcc). "
                         "Set MACA_HOME or add mxcc to PATH."
                     )
+            elif _using_hygon():
+                if _hipcc_path() is None:
+                    raise ImportError(
+                        "Mooncake PG Hygon JIT requires the DTK/ROCm compiler (hipcc). "
+                        "Set ROCM_HOME or add hipcc to PATH."
+                    )
             else:
                 from torch.utils.cpp_extension import CUDA_HOME
 
@@ -399,10 +437,14 @@ def _compatibility_report() -> int:
     is_maca = _using_maca()
     ready = True
     print("Mooncake PG JIT compatibility report")
+    is_hygon = _using_hygon()
     print(f"  torch: {torch.__version__}")
-    print(f"  backend: {'MUSA' if is_musa else 'MACA' if is_maca else 'CUDA'}")
+    print(
+        f"  backend: {'MUSA' if is_musa else 'HYGON' if is_hygon else 'MACA' if is_maca else 'CUDA'}"
+    )
     print(f"  torch.version.cuda: {torch.version.cuda}")
     print(f"  torch.version.musa: {getattr(torch.version, 'musa', None)}")
+    print(f"  torch.version.hip: {getattr(torch.version, 'hip', None)}")
     source_dir = _source_dir()
     core_path = Path(__file__).with_name("libmooncake_pg.so")
     source_ready = source_dir.is_dir() and all(
@@ -427,6 +469,10 @@ def _compatibility_report() -> int:
         print(f"  mcc: {mcc or 'missing'}")
         toolchain_ready = mcc is not None
         print(f"  MTGPU_TARGET: {os.environ.get('MTGPU_TARGET', 'mp_31')}")
+    elif is_hygon:
+        hipcc = _hipcc_path()
+        print(f"  hipcc: {hipcc or 'missing'}")
+        toolchain_ready = hipcc is not None
     elif is_maca:
         mxcc = _mxcc_path()
         print(f"  mxcc: {mxcc or 'missing'}")

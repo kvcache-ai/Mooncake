@@ -103,7 +103,10 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     // group_size declared at construction to validate future ranks passed to
     // new_group() before joinGroup() can run:
     // https://github.com/pytorch/pytorch/blob/release/2.13/torch/distributed/distributed_c10d.py#L6012
-    int getSize() const override;
+    // PyTorch 2.5 exposes getSize() as a non-virtual compatibility method;
+    // newer releases make it virtual.  Omitting the override specifier keeps
+    // this extension source-compatible with both APIs.
+    int getSize() const;
 
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.
@@ -145,9 +148,14 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         std::vector<std::vector<at::Tensor>>& inputTensors,
         const c10d::ScatterOptions& opts) override;
 
-    void shutdown() override;
+    // shutdown() is not virtual in the DTK-bundled PyTorch 2.5 API.
+    void shutdown();
 
-    at::Tensor getActiveRanksTensor() { return activeRanks_; }
+    // Return an authoritative host snapshot instead of exposing the
+    // asynchronously maintained caller-owned mirror.  In particular, a GPU
+    // mirror may be updated on a private runtime stream that PyTorch does not
+    // know about, so returning it directly can expose stale membership data.
+    at::Tensor getActiveRanksTensor();
     int getNumSyncedRanks();
     void extendGroupSizeTo(int size);
     std::vector<bool> getPeerState(const std::vector<int>& ranks);

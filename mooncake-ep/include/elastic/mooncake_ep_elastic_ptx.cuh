@@ -11,6 +11,14 @@
 
 namespace mooncake::elastic::ptx {
 
+// DTK accepts CUDA source but targets a non-PTX ISA.  Reuse this header's
+// portable intrinsic implementations without leaking the MUSA platform macro
+// into the rest of the translation unit.
+#ifdef MOONCAKE_EP_USE_HYGON
+#define MOONCAKE_EP_HYGON_PORTABLE_PTX 1
+#define MOONCAKE_EP_USE_MUSA 1
+#endif
+
 // Host-side placeholder with the same size/alignment as
 // cuda::barrier<thread_scope_block> (a single uint64_t atomic), so that
 // sizeof(mbarrier) is consistent across host and device.
@@ -26,7 +34,7 @@ static constexpr int kNumTMAAlignBytes = 32;
 
 /// Exceptions
 __forceinline__ __device__ void trap() {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_HYGON)
     return;
 #else
     asm volatile("trap;");
@@ -39,7 +47,7 @@ __forceinline__ __device__ int get_warp_idx() {
 }
 
 __forceinline__ __device__ int get_lane_idx() {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_HYGON)
     return static_cast<int>(threadIdx.x) & 31;
 #else
     int lane_idx;
@@ -50,7 +58,8 @@ __forceinline__ __device__ int get_lane_idx() {
 
 /// Election
 __forceinline__ __device__ int elect_one_sync() {
-#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(DISABLE_SM90_FEATURES) && \
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_HYGON) && \
+    !defined(DISABLE_SM90_FEATURES) && \
     defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     int pred = 0;
     asm volatile(
@@ -754,6 +763,11 @@ __device__ __forceinline__ void accumulate(float2& a, nv_bfloat162 b) {
 #endif
 }
 
+#endif
+
+#ifdef MOONCAKE_EP_HYGON_PORTABLE_PTX
+#undef MOONCAKE_EP_USE_MUSA
+#undef MOONCAKE_EP_HYGON_PORTABLE_PTX
 #endif
 
 }  // namespace mooncake::elastic::ptx

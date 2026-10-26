@@ -1,3 +1,4 @@
+// Mooncake EP dispatch & combine kernels (Hygon Stage 19: glc slc L2 bypass)
 // clang-format off
 
 #include <cstdio>
@@ -68,7 +69,12 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const auto warp_group_id = warp_id / kNumWarpsPerGroup;
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
-#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
+#ifdef MOONCAKE_EP_USE_HYGON
+    const int physical_lane_id = thread_id & 63;
+    const int send_route_idx = thread_id / 64;
+#endif
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA) || \
+    defined(MOONCAKE_EP_USE_HYGON)
     // C500 reports 64-thread hardware warps. Do not split the last hardware
     // warp by assigning only the final 32-thread pseudo-warp to count work.
     // Reserve one full warp group from the data path, but write counts from a
@@ -99,7 +105,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
-    // Communication context â€” platform dispatch is inside comm_device.cuh
+    // Communication context â€?platform dispatch is inside comm_device.cuh
     const CommCtx comm_ctx = make_comm_ctx(
         mxa_buffer, nvlink_available, ipc_peer_ptrs,
         raddrs, rkeys, qp_devctxs,
@@ -107,33 +113,65 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         rank, num_ranks, MAX_QP_COUNT);
     const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
 
+    // Keep send-loop constants before the phase jump. DTK Clang rejects a
+    // goto that bypasses even trivial initialized declarations.
+    constexpr int kNumElemsPerRead = sizeof(int4) / EP_BF16_SIZE;
+    EP_DEVICE_ASSERT(kHidden % kNumElemsPerRead == 0);
+    EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
+    const auto num_threads = num_send_threads;
+    const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
+
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
         goto LOW_LATENCY_DISPATCH_RECV;
 
     // Expert counts
     __shared__ int shared_num_tokens_sent_per_expert[kNumWarpGroups];
+#ifdef MOONCAKE_EP_USE_HYGON
+    // DTK's 64-lane shuffle compatibility does not provide a reliable
+    // broadcast between the lanes of each CUDA-style 32-lane logical warp.
+    // Publish each warp's allocated expert slot through CTA shared memory.
+    __shared__ int shared_slot_idx[kNumWarpGroups * kNumWarpsPerGroup];
+#endif
 
     // There are 2 kinds of execution lanes in this part:
     // 1. Data lanes for FP8 cast and sending top-k tokens.
     // 2. Count lanes for reading `topk_idx` and per-expert token counts.
-    // Non-CUDA backends reserve a full warp group for the count path. This
-    // keeps the final group out of the data path when MUSA uses five groups.
+    // Non-CUDA backends reserve a full warp group for the count path. Hygon's
+    // named-barrier emulation is CTA-wide, so only that build makes every
+    // group execute the token-loop barrier at the same program point. Other
+    // backends retain the original data/count-warp control flow.
+#ifndef MOONCAKE_EP_USE_HYGON
     if (is_data_warp) {
-        constexpr int kNumElemsPerRead = sizeof(int4) / EP_BF16_SIZE;
-        EP_DEVICE_ASSERT(kHidden % kNumElemsPerRead == 0);
-        EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
-        const auto num_threads = num_send_threads;
-        const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
+#endif
+    for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
+        int dst_expert_idx = -1;
+        int* rdma_x_src_idx = nullptr;
 
-        for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
-            const auto x_int4 = reinterpret_cast<const int4*>(x) + token_idx * hidden_bf16_int4;
-            const auto rdma_x_src_idx = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(rdma_send_data_buffer) + token_idx * num_bytes_per_msg);
-            const auto rdma_x_vec = reinterpret_cast<vec_t*>(reinterpret_cast<uint8_t*>(rdma_x_src_idx) + sizeof(int4));
-            const auto rdma_x_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(rdma_x_vec) + hidden_bytes);
+#ifdef MOONCAKE_EP_USE_HYGON
+        if (is_data_warp) {
+#endif
+            const auto x_int4 = reinterpret_cast<const int4*>(x) +
+                    token_idx * hidden_bf16_int4;
+            rdma_x_src_idx = reinterpret_cast<int*>(
+                    reinterpret_cast<uint8_t*>(rdma_send_data_buffer) +
+                    token_idx * num_bytes_per_msg);
+            const auto rdma_x_vec = reinterpret_cast<vec_t*>(
+                    reinterpret_cast<uint8_t*>(rdma_x_src_idx) + sizeof(int4));
+            const auto rdma_x_scales = reinterpret_cast<float*>(
+                    reinterpret_cast<uint8_t*>(rdma_x_vec) + hidden_bytes);
 
             // Overlap top-k index read and source token index write
-            auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
+#ifdef MOONCAKE_EP_USE_HYGON
+            dst_expert_idx = send_route_idx < num_topk
+                    ? static_cast<int>(__ldg(
+                            topk_idx + token_idx * num_topk + send_route_idx))
+                    : -1;
+#else
+            dst_expert_idx = warp_id < num_topk
+                    ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id))
+                    : -1;
+#endif
             thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
 
             // FP8 cast
@@ -172,13 +210,28 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                         // Reinterpret-cast is for C++14 compatibility
                         rdma_x_vec[i] = *reinterpret_cast<vec_t*>(&int4_value);
                     }
-                }
-            mc_bar_sync(1, num_threads);
+            }
+#ifdef MOONCAKE_EP_USE_HYGON
+        }
+#endif
 
-            // Issue sends
-            if (dst_expert_idx >= 0) {
-                int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
-                slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
+        mc_bar_sync(1, num_threads);
+
+        // Issue sends
+#ifdef MOONCAKE_EP_USE_HYGON
+        if (is_data_warp && dst_expert_idx >= 0 && physical_lane_id == 0)
+            shared_slot_idx[send_route_idx] =
+                    atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1);
+        mc_bar_sync(2, static_cast<int>(blockDim.x));
+        if (is_data_warp && dst_expert_idx >= 0) {
+            int slot_idx = shared_slot_idx[send_route_idx];
+#else
+        if (dst_expert_idx >= 0) {
+                int slot_idx = lane_id == 0
+                        ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1)
+                        : 0;
+                slot_idx = ep_shfl(slot_idx, 0);
+#endif
                 const auto dst_rank = dst_expert_idx / num_local_experts;
                 const auto dst_expert_local_idx = dst_expert_idx % num_local_experts;
                 const auto src_ptr = reinterpret_cast<const void*>(rdma_x_src_idx);
@@ -190,18 +243,28 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
                 void* write_dst = mc_route_put(comm_ctx, dst_rank, dst_ptr);
                 if (write_dst != nullptr) {
-                    // Local or P2P path â€” warp-cooperative copy
+                    // Local or P2P path â€?warp-cooperative copy
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
 #ifndef MOONCAKE_EP_USE_MUSA
                     mc_fence();
 #endif
+#ifdef MOONCAKE_EP_USE_HYGON
+                    // One physical 64-lane wave owns this route.  All lanes
+                    // cooperate on the same message with a physical-wave
+                    // stride, avoiding divergent 32-lane pointer streams.
+                    for (size_t i = physical_lane_id; i < num_int4_per_msg;
+                         i += 64)
+                        mc_st_na(dst_int4_ptr + i,
+                                 mc_ld_nc(src_int4_ptr + i));
+#else
                     UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, mc_ld_nc, mc_st_na);
+#endif
 #ifndef MOONCAKE_EP_USE_MUSA
                     mc_fence();
 #endif
                 } else {
-                    // IBGDA path â€” send directly from source buffer
+                    // IBGDA path â€?send directly from source buffer
                     mc_fence();
 #if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
                     // MACA and MUSA execute two 32-lane sub-warps in one
@@ -214,38 +277,48 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                                               num_qp_per_rank,
                                               active_qps_per_rank),
                                 dst_rank, num_qp_per_rank, src_ptr, dst_ptr,
-                                num_bytes_per_msg, lane_id);
+                                num_bytes_per_msg,
+#ifdef MOONCAKE_EP_USE_HYGON
+                                physical_lane_id);
+#else
+                                lane_id);
+#endif
 #if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
                         }
-                        __syncwarp();
+                        ep_syncwarp();
                     }
 #endif
                 }
 
                 // Increase counter after finishing
-                __syncwarp();
+                ep_syncwarp();
 #ifdef MOONCAKE_EP_USE_MUSA
                 mc_fence_noflush();
-#endif
                 lane_id == 0 ?
-#ifdef MOONCAKE_EP_USE_MUSA
                     mc_atomic_add_relaxed(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
+#elif defined(MOONCAKE_EP_USE_HYGON)
+                physical_lane_id == 0
+                    ? mc_atomic_add_release(
+                          atomic_finish_counter_per_expert + dst_expert_idx, 1)
+                    : 0;
 #else
+                lane_id == 0 ?
                     mc_atomic_add_release(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
 #endif
             }
         }
+#ifndef MOONCAKE_EP_USE_HYGON
     } else if (is_count_warp) {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        // Participate in __syncthreads() barriers from data warps.
-        // Each token iteration in the send loop above calls
-        // __syncthreads() once; the count path must match.
+        // Split-kernel backends may implement the data-warp barrier with a
+        // CTA barrier. Match the original count-warp participation.
         for (int token_idx = sm_id; token_idx < num_tokens;
              token_idx += num_sms) {
             __syncthreads();
         }
 #endif
     }
+#endif
     if (is_count_worker) {
         EP_DEVICE_ASSERT(num_sms > 1);
         if (sm_id == 0) {
@@ -255,11 +328,11 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 next_clean_buffer[i] = 0;
 
             // Notify before executing `int_p`
-            __syncwarp();
+            ep_syncwarp();
 #ifdef MOONCAKE_EP_USE_MUSA
             // Publish the cleared buffer once before any local ready tag.
             mc_fence();
-            __syncwarp();
+            ep_syncwarp();
 #endif
             #pragma unroll
             for (int i = lane_id; i < num_experts; i += 32)
@@ -344,7 +417,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         if (dst_rank == 0)
             packed_recv_count[dst_expert_local_idx] = 0;
     }
-    __syncwarp();
+    ep_syncwarp();
 
     // Receiving phase
     LOW_LATENCY_DISPATCH_RECV:
@@ -355,27 +428,45 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     if (phases & LOW_LATENCY_SEND_PHASE)
         mc_grid_sync();
 
-    // Receiving and packing
-    if (responsible_expert_idx < num_experts) {
-        const auto src_rank = responsible_expert_idx / num_local_experts;
-        const auto local_expert_idx = responsible_expert_idx % num_local_experts;
-        const auto rdma_recv_x_uint8 = reinterpret_cast<uint8_t*>(rdma_recv_data_buffer) +
+    // Shared between sub-warps in warp groups.  Keep the barrier below at one
+    // common program point: Hygon implements the CUDA named/subgroup barrier
+    // with a CTA-wide barrier, so placing participating groups in different
+    // branches is undefined and can leave the RECV kernel waiting forever.
+    __shared__ int shared_num_recv_tokens[kNumWarpGroups];
+    __shared__ int shared_recv_token_begin_idx[kNumWarpGroups];
+    const bool has_responsible_expert = responsible_expert_idx < num_experts;
+    int src_rank = 0, local_expert_idx = 0;
+    uint8_t* rdma_recv_x_uint8 = nullptr;
+    int4* recv_x_int4 = nullptr;
+    float* recv_x_scales = nullptr;
+    int* recv_src_info = nullptr;
+    int64_t* recv_range = nullptr;
+    int num_recv_tokens = 0, recv_token_begin_idx = 0;
+
+    if (has_responsible_expert) {
+        src_rank = responsible_expert_idx / num_local_experts;
+        local_expert_idx = responsible_expert_idx % num_local_experts;
+        rdma_recv_x_uint8 = reinterpret_cast<uint8_t*>(rdma_recv_data_buffer) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                 src_rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg;
-        const auto recv_x_int4 = reinterpret_cast<int4*>(packed_recv_x) +
+        recv_x_int4 = reinterpret_cast<int4*>(packed_recv_x) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_int4;
-        const auto recv_x_scales = packed_recv_x_scales + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_scales;
-        const auto recv_src_info = packed_recv_src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
-        const auto recv_range = packed_recv_layout_range + local_expert_idx * num_ranks;
-
-        // Shared between sub-warps in warp groups
-        __shared__ int shared_num_recv_tokens[kNumWarpGroups], shared_recv_token_begin_idx[kNumWarpGroups];
+        if (kUseFP8)
+            recv_x_scales = packed_recv_x_scales +
+                    local_expert_idx * num_ranks *
+                    num_max_dispatch_tokens_per_rank * num_scales;
+        recv_src_info = packed_recv_src_info +
+                local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
+        recv_range = packed_recv_layout_range + local_expert_idx * num_ranks;
 
         // Wait tokens to arrive
         // NOTES: using sub-warp 1 to overlap with sub-warp 0
-        int num_recv_tokens, recv_token_begin_idx;
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
+#ifdef MOONCAKE_EP_USE_HYGON
+        if (sub_warp_id == 0 && physical_lane_id == 0) {
+#else
         if (sub_warp_id == 1 and lane_id == 0) {
+#endif
             unsigned long long start_time = clock64();
             while ((num_recv_tokens = mc_ld_acquire(rdma_recv_signal_buffer + local_expert_idx * num_ranks + src_rank)) == 0) {
                 unsigned long long end_time = clock64();
@@ -393,19 +484,40 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx;
             recv_range[src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx);
         }
-        mc_bar_sync(warp_group_id + 2, kNumWarpsPerGroup * 32);
+    }
+
+    mc_bar_sync(warp_group_id + 2, kNumWarpsPerGroup * 32);
+
+    if (has_responsible_expert) {
         num_recv_tokens = shared_num_recv_tokens[warp_group_id];
         recv_token_begin_idx = shared_recv_token_begin_idx[warp_group_id];
 
         // Copy tokens
         EP_DEVICE_ASSERT(num_scales <= 64);
         mc_fence();
-        for (int i = sub_warp_id; i < num_recv_tokens; i += kNumWarpsPerGroup) {
+#ifdef MOONCAKE_EP_USE_HYGON
+        // A DTK physical wave owns one token row; all 64 lanes cooperate on
+        // that row instead of splitting into divergent logical half-warps.
+        const int recv_worker_idx = sub_warp_id / 2;
+        const int recv_worker_count = kNumWarpsPerGroup / 2;
+        const bool recv_worker_active = true;
+#else
+        const int recv_worker_idx = sub_warp_id;
+        const int recv_worker_count = kNumWarpsPerGroup;
+        const bool recv_worker_active = true;
+#endif
+        for (int i = recv_worker_idx;
+             recv_worker_active && i < num_recv_tokens;
+             i += recv_worker_count) {
             // Copy source info
             const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
+#ifdef MOONCAKE_EP_USE_HYGON
+            if (physical_lane_id == 0)
+#else
             if (lane_id == 0)
+#endif
                 recv_src_info[recv_token_begin_idx + i] = mc_ld_nc_s32(src_src_idx);
-            __syncwarp();
+            ep_syncwarp();
 
             // Copy data
             // NOTES: only 2 load iterations for 7K hidden with 7 unrolls
@@ -414,21 +526,29 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 #ifndef MOONCAKE_EP_USE_MUSA
             mc_fence();
 #endif
+#ifdef MOONCAKE_EP_USE_HYGON
+            for (size_t j = physical_lane_id; j < hidden_int4; j += 64)
+                mc_st_na(dst_data + j, mc_ld_nc(src_data + j));
+#else
             UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, mc_ld_nc, mc_st_na);
+#endif
 
             // Copy scales
             if (kUseFP8) {
                 const auto src_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
                 const auto dst_scales = reinterpret_cast<float*>(recv_x_scales + recv_token_begin_idx + i);
                 const auto scale_stride = num_ranks * num_max_dispatch_tokens_per_rank;
+#ifdef MOONCAKE_EP_USE_HYGON
+                for (int j = physical_lane_id; j < num_scales; j += 64)
+                    dst_scales[j * scale_stride] = mc_ld_nc_f32(src_scales + j);
+#else
                 auto scale_0 = lane_id < num_scales ? mc_ld_nc_f32(src_scales + lane_id) : 0;
                 auto scale_1 = (lane_id + 32) < num_scales ? mc_ld_nc_f32(src_scales + lane_id + 32) : 0;
                 lane_id < num_scales ? dst_scales[lane_id * scale_stride] = scale_0 : 0.0f;
                 (lane_id + 32) < num_scales ? dst_scales[(lane_id + 32) * scale_stride] = scale_1 : 0.0f;
+#endif
             }
         }
-    } else {
-        mc_bar_sync(warp_group_id + 2, kNumWarpsPerGroup * 32);
     }
 }
 
@@ -450,16 +570,26 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     constexpr int kNumMaxTopK = 17;
     constexpr int kNumWarpsPerGroup = 4;
     int num_warp_groups = 8;
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_HYGON)
     cudaDeviceProp device_prop{};
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaGetDeviceProperties(&device_prop, device));
     num_warp_groups = cell_div(num_experts, device_prop.multiProcessorCount);
+#ifdef MOONCAKE_EP_USE_MUSA
     // Select the group count from the device shape. The S5000's 56 SMs select
     // six groups for 288 experts and five groups for the 256-expert shape.
     // Five is the minimum valid value for the kNumMaxTopK capacity check.
     num_warp_groups = max(5, min(8, num_warp_groups));
+#elif defined(MOONCAKE_EP_USE_HYGON)
+    num_warp_groups = max(3, min(8, num_warp_groups));
+    // One DTK 64-lane physical wave owns one top-k route, while the final
+    // warp group remains reserved for expert counts. Each 128-thread group
+    // therefore provides two route waves.
+    num_warp_groups = max(num_warp_groups, cell_div(num_topk, 2) + 1);
+#else
+    num_warp_groups = max(3, min(8, num_warp_groups));
+#endif
 #endif
     EP_HOST_ASSERT(kNumMaxTopK + 1 <= num_warp_groups * kNumWarpsPerGroup &&
                    "Too many top-k selections");
@@ -538,6 +668,9 @@ combine(void* combined_x, int32_t* active_ranks,
     const auto warp_group_id = warp_id / kNumWarpsPerGroup;
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
+#ifdef MOONCAKE_EP_USE_HYGON
+    const int physical_lane_id = thread_id & 63;
+#endif
 
     // Data type staffs
     constexpr int kNumElemsPerInt4 = sizeof(int4) / EP_BF16_SIZE;
@@ -547,13 +680,18 @@ combine(void* combined_x, int32_t* active_ranks,
     constexpr size_t num_bytes_per_slot = kHidden * EP_BF16_SIZE;
     EP_STATIC_ASSERT(num_bytes_per_slot % sizeof(int4) == 0, "Invalid vectorization");
 
-    // Communication context â€” platform dispatch is inside comm_device.cuh
+    // Communication context â€?platform dispatch is inside comm_device.cuh
     const CommCtx comm_ctx = make_comm_ctx(
         mxa_buffer, nvlink_available, ipc_peer_ptrs,
         raddrs, rkeys, qp_devctxs,
         rdma_send_signal_buffer, rdma_recv_signal_buffer,
         rank, num_ranks, MAX_QP_COUNT);
     const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
+
+    // These values are also needed by the send path, but must be initialized
+    // before the phase jump so a RECV-only launch is valid C++ for DTK Clang.
+    const bool has_responsible_expert = responsible_expert_idx < num_experts;
+    int dst_rank = 0, local_expert_idx = 0, global_expert_idx = 0;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -566,10 +704,10 @@ combine(void* combined_x, int32_t* active_ranks,
             next_clean_buffer[i] = 0;
 
         // Notify before executing `int_p`
-        __syncwarp();
+        ep_syncwarp();
 #ifdef MOONCAKE_EP_USE_MUSA
         mc_fence();
-        __syncwarp();
+        ep_syncwarp();
         if (lane_id == 0)
             mc_atomic_add_relaxed(atomic_clean_flag, num_experts);
 #else
@@ -578,11 +716,12 @@ combine(void* combined_x, int32_t* active_ranks,
 #endif
     }
 
-    // Issue IBGDA sends
-    if (responsible_expert_idx < num_experts) {
-        const auto dst_rank = responsible_expert_idx / num_local_experts;
-        const auto local_expert_idx = responsible_expert_idx % num_local_experts;
-        const auto global_expert_idx = rank * num_local_experts + local_expert_idx;
+    // Issue transport sends.  Keep the group barrier at a common program
+    // point because Hygon maps the CUDA named barrier to a CTA-wide barrier.
+    if (has_responsible_expert) {
+        dst_rank = responsible_expert_idx / num_local_experts;
+        local_expert_idx = responsible_expert_idx % num_local_experts;
+        global_expert_idx = rank * num_local_experts + local_expert_idx;
         const auto layout = __ldg(layout_range + local_expert_idx * num_ranks + dst_rank);
         const auto local_x = reinterpret_cast<const int4*>(x) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_bf16_int4;
@@ -594,8 +733,20 @@ combine(void* combined_x, int32_t* active_ranks,
         int offset, num_tokens_to_send;
         unpack2(layout, num_tokens_to_send, offset);
 
-        // Issue IBGDA send
-        for (int token_idx = offset + sub_warp_id; token_idx < offset + num_tokens_to_send; token_idx += kNumWarpsPerGroup) {
+        // Issue transport sends. A DTK physical wave contains two logical
+        // 32-lane warps; both halves cooperate on one message row.
+#ifdef MOONCAKE_EP_USE_HYGON
+        const int send_worker_idx = sub_warp_id / 2;
+        const int send_worker_count = kNumWarpsPerGroup / 2;
+        const bool send_worker_active = true;
+#else
+        const int send_worker_idx = sub_warp_id;
+        const int send_worker_count = kNumWarpsPerGroup;
+        const bool send_worker_active = true;
+#endif
+        for (int token_idx = offset + send_worker_idx;
+             send_worker_active && token_idx < offset + num_tokens_to_send;
+             token_idx += send_worker_count) {
             const auto x_int4 = local_x + token_idx * hidden_bf16_int4;
             const auto rdma_send_type_row = reinterpret_cast<int*>(rdma_send_x_vec + token_idx * num_bytes_per_slot);
             const auto rdma_send_x_vec_row = reinterpret_cast<uint8_t*>(rdma_send_type_row);
@@ -609,18 +760,31 @@ combine(void* combined_x, int32_t* active_ranks,
 
             void* write_dst = mc_route_put(comm_ctx, dst_rank, dst_ptr);
             if (write_dst != nullptr) {
-                // Local or P2P path â€” warp-cooperative copy
+                // Local or P2P path â€?warp-cooperative copy
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
+#ifdef MOONCAKE_EP_USE_HYGON
+                for (size_t i = physical_lane_id; i < hidden_bf16_int4;
+                     i += 64)
+                    mc_st_na(dst_int4_ptr + i, mc_ld_nc(x_int4 + i));
+#else
                 UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
+#endif
 #ifndef MOONCAKE_EP_USE_MUSA
                 mc_fence();
 #endif
             } else {
-                // IBGDA path â€” stage to send buffer then RDMA write
+                // IBGDA path â€?stage to send buffer then RDMA write
                 const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
-                if (not zero_copy)
+                if (not zero_copy) {
+#ifdef MOONCAKE_EP_USE_HYGON
+                    for (size_t i = physical_lane_id; i < hidden_bf16_int4;
+                         i += 64)
+                        mc_st_na(buf_int4_ptr + i, mc_ld_nc(x_int4 + i));
+#else
                     UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
-                __syncwarp();
+#endif
+                }
+                ep_syncwarp();
 #if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
                 // Match dispatch publication and avoid concurrent posts from
                 // the two 32-lane sub-warps sharing one QP.
@@ -632,24 +796,38 @@ combine(void* combined_x, int32_t* active_ranks,
                             ep_qp_channel(local_expert_idx, num_qp_per_rank,
                                           active_qps_per_rank),
                             dst_rank, num_qp_per_rank, buf_ptr, dst_ptr,
-                            num_bytes_per_slot, lane_id);
+                            num_bytes_per_slot,
+#ifdef MOONCAKE_EP_USE_HYGON
+                            physical_lane_id);
+#else
+                            lane_id);
+#endif
 #if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
                     }
-                    __syncwarp();
+                    ep_syncwarp();
                 }
 #endif
             }
         }
-        // Put finishing flag
-        EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
+    }
+
+    EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
 #ifdef MOONCAKE_EP_USE_MUSA
-        // Publish all local/P2P payload stores once for this CTA before any
-        // expert completion word is made observable by a peer.
-        mc_fence_barrier_fence();
+    // Publish all local/P2P payload stores once for this CTA before any
+    // expert completion word is made observable by a peer.
+    mc_fence_barrier_fence();
 #else
-        mc_bar_sync(warp_group_id + 1, kNumWarpsPerGroup * 32);
+    mc_bar_sync(warp_group_id + 1, kNumWarpsPerGroup * 32);
 #endif
+
+    if (has_responsible_expert) {
+        // Put finishing flag only after every lane in every group has finished
+        // copying its payload.
+#ifdef MOONCAKE_EP_USE_HYGON
+        if (sub_warp_id == 0 && physical_lane_id == 0) {
+#else
         if (sub_warp_id == 1 and lane_id == 0) {
+#endif
 #ifdef MOONCAKE_EP_USE_MUSA
             while (atomicAdd(atomic_clean_flag, 0) == 0);
 #else
@@ -672,7 +850,7 @@ combine(void* combined_x, int32_t* active_ranks,
             mc_atomic_add_release(atomic_clean_flag, -1);
 #endif
         }
-        __syncwarp();
+        ep_syncwarp();
     } else {
 #ifdef MOONCAKE_EP_USE_MUSA
         mc_fence_barrier_fence();
@@ -690,7 +868,11 @@ combine(void* combined_x, int32_t* active_ranks,
     if (responsible_expert_idx < num_experts) {
         const auto src_rank = responsible_expert_idx / num_local_experts;
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
+#ifdef MOONCAKE_EP_USE_HYGON
+        if (sub_warp_id == 0 && physical_lane_id == 0) {
+#else
         if (sub_warp_id == 0 and lane_id == 0) {
+#endif
             unsigned long long start_time = clock64();
             while (mc_ld_acquire(rdma_recv_signal_buffer + responsible_expert_idx) == 0) {
                 unsigned long long end_time = clock64();

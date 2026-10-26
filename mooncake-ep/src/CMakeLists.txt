@@ -37,6 +37,53 @@ if(USE_CUDA)
   if(USE_NCCL_DEVICE)
     target_link_libraries(mooncake_ep_device PRIVATE NCCL::nccl)
   endif()
+elseif(USE_HYGON)
+  set(MOONCAKE_EP_SOURCES ${MOONCAKE_EP_HOST_SOURCES})
+  set(_ep_hygon_objects)
+  foreach(_ep_device_source IN LISTS MOONCAKE_EP_DEVICE_SOURCES)
+    get_filename_component(_ep_device_name "${_ep_device_source}" NAME_WE)
+    set(_ep_device_object
+        "${CMAKE_CURRENT_BINARY_DIR}/${_ep_device_name}_hygon.o")
+    set(_ep_device_depfile
+        "${CMAKE_CURRENT_BINARY_DIR}/${_ep_device_name}_hygon.d")
+    set(_ep_hygon_depfile_argument)
+    if(CMAKE_GENERATOR MATCHES "^Ninja" OR
+       (CMAKE_GENERATOR MATCHES "Makefiles" AND
+        CMAKE_VERSION VERSION_GREATER_EQUAL 3.20))
+      set(_ep_hygon_depfile_argument DEPFILE "${_ep_device_depfile}")
+    endif()
+    add_custom_command(
+      OUTPUT "${_ep_device_object}"
+      COMMAND "${DTK_NVCC_EXECUTABLE}"
+              -std=c++20 -O3 -Xcompiler=-fPIC -Xcompiler=-g0
+              -DUSE_HYGON -DMOONCAKE_EP_USE_HYGON=1
+              -DMOONCAKE_EP_SPLIT_SEND_RECV=1
+              -DDISABLE_SM90_FEATURES=1
+              -MMD -MT "${_ep_device_object}" -MF "${_ep_device_depfile}"
+              "-I${DTK_INCLUDE_DIR}"
+              "-I${CMAKE_CURRENT_SOURCE_DIR}/../include"
+              "-I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include"
+              -c "${_ep_device_source}" -o "${_ep_device_object}"
+      DEPENDS "${_ep_device_source}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../include/mooncake_ep_configs.cuh"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../include/mooncake_ep_device.h"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../include/mooncake_ep_utils.cuh"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include/transport/device/comm_device.cuh"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include/transport/device/ibgda_device.cuh"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include/transport/device/hygon/hygon_ops.cuh"
+      ${_ep_hygon_depfile_argument}
+      COMMENT "Compiling Mooncake EP Hygon device source ${_ep_device_name}"
+      VERBATIM)
+    set_source_files_properties("${_ep_device_object}"
+                                PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+    list(APPEND _ep_hygon_objects "${_ep_device_object}")
+  endforeach()
+  add_library(mooncake_ep_device SHARED ${_ep_hygon_objects})
+  set_target_properties(mooncake_ep_device PROPERTIES
+                        POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CXX)
+  target_include_directories(mooncake_ep_device PRIVATE ${DTK_INCLUDE_DIR})
+  target_link_directories(mooncake_ep_device PRIVATE ${DTK_LIB_DIR})
+  target_link_libraries(mooncake_ep_device PRIVATE cuda cudart rt)
 elseif(USE_MUSA)
   set(MOONCAKE_EP_SOURCES ${MOONCAKE_EP_HOST_SOURCES})
   if(DEFINED ENV{MUSA_HOME} AND NOT "$ENV{MUSA_HOME}" STREQUAL "")
@@ -139,7 +186,7 @@ else()
   set(MOONCAKE_EP_SOURCES ${MOONCAKE_EP_HOST_SOURCES})
 endif()
 
-if(USE_CUDA)
+if(USE_CUDA OR USE_HYGON)
   pybind11_add_module(_ep MODULE ${MOONCAKE_EP_HOST_SOURCES})
 else()
   pybind11_add_module(_ep MODULE ${MOONCAKE_EP_SOURCES})
@@ -152,12 +199,24 @@ endif()
 if(USE_MACA)
   target_compile_definitions(_ep PRIVATE MOONCAKE_EP_USE_MACA=1)
 endif()
+if(USE_HYGON)
+  target_compile_definitions(
+    _ep PRIVATE MOONCAKE_EP_USE_HYGON=1
+                MOONCAKE_EP_SPLIT_SEND_RECV=1)
+  target_include_directories(_ep PRIVATE ${DTK_INCLUDE_DIR})
+  set_property(TARGET _ep APPEND PROPERTY INSTALL_RPATH "${DTK_LIB_DIR}")
+  set_property(TARGET mooncake_ep_device APPEND PROPERTY INSTALL_RPATH "${DTK_LIB_DIR}")
+endif()
 
 target_include_directories(_ep PRIVATE ${Python3_INCLUDE_DIRS})
 if(USE_CUDA)
   target_link_libraries(_ep PRIVATE transfer_engine ibverbs mlx5 glog::glog
                                     gflags::gflags mooncake_ep_device
                                     CUDA::cudart)
+elseif(USE_HYGON)
+  target_link_directories(_ep PRIVATE ${DTK_LIB_DIR})
+  target_link_libraries(_ep PRIVATE transfer_engine ibverbs mlx5 glog::glog
+                                    gflags::gflags mooncake_ep_device cudart)
 else()
   target_link_libraries(_ep PRIVATE transfer_engine ibverbs mlx5 glog::glog
                                     gflags::gflags)

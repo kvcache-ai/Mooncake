@@ -113,7 +113,7 @@ static bool initRdmaTransport(device::RdmaTransport* t, void* gdr_buffer,
 }
 
 static bool macaHostPhaseFenceCoversPeers() {
-#ifdef MOONCAKE_EP_USE_MACA
+#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_HYGON)
     return true;
 #else
     return false;
