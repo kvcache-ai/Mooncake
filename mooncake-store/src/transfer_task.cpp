@@ -1170,8 +1170,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         return std::nullopt;
     }
 
-    bool use_local_memcpy =
-        op_code == TransferRequest::WRITE && !replicas.empty();
+    bool use_local_memcpy = !replicas.empty();
     size_t operation_count = 0;
     for (size_t i = 0; i < replicas.size(); ++i) {
         if (!replicas[i].is_memory_replica()) {

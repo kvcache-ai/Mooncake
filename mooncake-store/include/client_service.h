@@ -283,13 +283,17 @@ class Client {
      * @param object_keys Keys of the objects
      * @param query_results Previously queried object metadata for each key
      * @param slices Map of object keys to their data slices
+     * @param group_by_target Read exact-size memory replicas on the same
+     * segment with one transfer submission. A failed submission or transfer
+     * then fails every key in that group. A size mismatch stays per key.
+     * Defaults to false.
      * @return Vector of ErrorCode results for each object
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node = false);
+        bool group_by_target = false);
 
     /**
      * @brief Stores data with replication
@@ -308,6 +312,10 @@ class Client {
      * @param batched_slices Vector of vectors of data slices to store (indexed
      * to match keys)
      * @param config Replication configuration
+     * @param group_by_target Write every memory replica on the same segment
+     * with one transfer submission. A failed submission or transfer then
+     * fails that replica for every key in the group. Defaults to false.
+     * prefer_alloc_in_same_node also groups through this path.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
@@ -316,7 +324,8 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
-        const ReplicateConfig& config, const WriteBufferStager& stager);
+        const ReplicateConfig& config, const WriteBufferStager& stager,
+        bool group_by_target = false);
 
     /**
      * @brief Write slices into a memory replica at an object-byte offset.
@@ -385,6 +394,7 @@ class Client {
      * @param keys Object keys
      * @param batched_slices Vector of vectors of data slices
      * @param config Replication configuration
+     * @param group_by_target Same as BatchPut. Defaults to false.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
         const std::vector<ObjectKey>& keys,
@@ -393,7 +403,8 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
-        const ReplicateConfig& config, const WriteBufferStager& stager);
+        const ReplicateConfig& config, const WriteBufferStager& stager,
+        bool group_by_target = false);
 
     /**
      * @brief Removes an object and all its replicas
@@ -1089,7 +1100,7 @@ class Client {
     void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
     void StageWriteBuffersForRemoteReplicas(std::vector<PutOperation>& ops,
                                             const WriteBufferStager& stager);
-    void SubmitTransfers(std::vector<PutOperation>& ops);
+    void SubmitTransfers(std::vector<PutOperation>& ops, bool group_by_target);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void SubmitDfsWrites(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
@@ -1104,12 +1115,6 @@ class Client {
         const std::vector<const std::vector<Slice>*>& slice_lists,
         const std::vector<DistributedFSDescriptor>& descriptors);
 
-    std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
-        std::vector<PutOperation>& ops, bool is_upsert);
-    std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
-        const std::vector<std::string>& object_keys,
-        const std::vector<QueryResult>& query_results,
-        std::unordered_map<std::string, std::vector<Slice>>& slices);
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
     HcaAffinity MakeHcaAffinity() const;
     void AttachHcaAffinity(ReplicateConfig& config,
