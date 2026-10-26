@@ -118,6 +118,13 @@ struct GlobalConfig {
     // MC_EFA_CQ_DRAIN_TIMEOUT_MS; <= 0 waits forever (the stalled-wave escape
     // hatch still bounds a provider that refuses every post).
     int64_t efa_cq_drain_timeout_ms = 1000;
+    // Minimum wall time, in milliseconds, that EfaContext::submitSlicesOnPeer
+    // must see unbroken FI_EAGAIN waves before it gives up on a peer.  The
+    // wave count alone (kMaxStalledWaves) passes in microseconds when the
+    // provider is merely busy -- many submitters on one NIC, or the RDM
+    // handshake to a new peer still in flight -- and fails live transfers.
+    // Override with MC_EFA_STALL_MIN_MS; <= 0 restores the count-only check.
+    int64_t efa_stall_min_ms = 50;
     // Context-level circuit-breaker pause. Repeated local WC failures
     // deactivate the local RNIC context for this many milliseconds. The
     // monitor then reactivates it with a reset failure count. Must be positive

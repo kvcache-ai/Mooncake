@@ -1728,10 +1728,21 @@ int EfaContext::submitSlicesOnPeer(
     // multi-second stall: the request layer can only re-handshake once these
     // slices reach a terminal state, so failing fast is what lets the transfer
     // recover (0.01 GB/s on a 10s timer vs ~10 GB/s failing promptly).
+    //
+    // The count alone is not enough: a wave that bounces costs well under a
+    // microsecond, so 1024 of them pass in microseconds while the provider is
+    // only briefly busy (many submitters sharing the NIC, or the RDM handshake
+    // to a new peer still in flight) and completions keep arriving.  Also
+    // require the stall to have lasted efa_stall_min_ms of wall time; that
+    // still fails a dead peer within tens of milliseconds.
     const int kMaxStalledWaves = 1024;
+    const int64_t stall_min_ns = globalConfig().efa_stall_min_ms * 1000000;
     int stalled_waves = 0;
+    uint64_t stall_start_ns = 0;
     while (cursor < slice_list.size() || !retry_slices.empty()) {
-        if (stalled_waves > kMaxStalledWaves) {
+        if (stalled_waves > kMaxStalledWaves &&
+            (stall_min_ns <= 0 || monotonicNowNs() - stall_start_ns >=
+                                      static_cast<uint64_t>(stall_min_ns))) {
             // retry_slices holds the previous wave's bounced slices here (they
             // are spliced back in just below), so either side can name the
             // peer.
@@ -1740,9 +1751,10 @@ int EfaContext::submitSlicesOnPeer(
                     ? retry_slices.front()
                     : (cursor < slice_list.size() ? slice_list[cursor]
                                                   : nullptr);
-            LOG(WARNING) << "EFA submitSlicesOnPeer: " << kMaxStalledWaves
-                         << " consecutive FI_EAGAIN waves posted nothing on "
-                         << nicPath() << " -> "
+            LOG(WARNING) << "EFA submitSlicesOnPeer: " << stalled_waves
+                         << " consecutive FI_EAGAIN waves over "
+                         << (monotonicNowNs() - stall_start_ns) / 1000000
+                         << " ms posted nothing on " << nicPath() << " -> "
                          << ((probe && !probe->peer_nic_path.empty())
                                  ? probe->peer_nic_path
                                  : "unknown")
@@ -2049,10 +2061,11 @@ int EfaContext::submitSlicesOnPeer(
         // straight back onto retry_slices is submission genuinely stuck, so
         // that is the only case that keeps the stall clock running.
         if (batch_count > 0 &&
-            static_cast<int>(retry_slices.size()) >= batch_count)
-            ++stalled_waves;
-        else
+            static_cast<int>(retry_slices.size()) >= batch_count) {
+            if (stalled_waves++ == 0) stall_start_ns = monotonicNowNs();
+        } else {
             stalled_waves = 0;
+        }
     }
 
     slice_list.clear();
