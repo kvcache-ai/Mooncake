@@ -500,6 +500,30 @@ const char* segmentEventName(TentMetrics::SegmentEvent event) {
     return "unknown";
 }
 
+const char* selectionEventName(TentMetrics::SelectionEvent event) {
+    switch (event) {
+        case TentMetrics::SelectionEvent::Selected:
+            return "selected";
+        case TentMetrics::SelectionEvent::FallbackSelected:
+            return "fallback_selected";
+        case TentMetrics::SelectionEvent::CandidateUnavailable:
+            return "candidate_unavailable";
+        case TentMetrics::SelectionEvent::PolicyMiss:
+            return "policy_miss";
+        case TentMetrics::SelectionEvent::CandidateEmpty:
+            return "candidate_empty";
+        case TentMetrics::SelectionEvent::HintRejected:
+            return "hint_rejected";
+        case TentMetrics::SelectionEvent::HintUnavailable:
+            return "hint_unavailable";
+        case TentMetrics::SelectionEvent::Exhausted:
+            return "exhausted";
+        case TentMetrics::SelectionEvent::MetadataRefresh:
+            return "metadata_refresh";
+    }
+    return "unknown";
+}
+
 TentMetrics::StreamEvent streamOutcomeEvent(TentMetrics::StreamOutcome outcome) {
     switch (outcome) {
         case TentMetrics::StreamOutcome::Success:
@@ -727,6 +751,7 @@ void TentMetrics::registerMetrics() {
         &shm_mapping_events_total_,
         &shm_copy_events_total_,
         &segment_events_total_,
+        &selection_events_total_,
     };
 
     gauges_ = {
@@ -1147,6 +1172,17 @@ void TentMetrics::recordSegmentEvent(SegmentEvent event) {
     segment_events_total_.incCached(
         static_cast<size_t>(event), [event] {
             return std::array<std::string, 1>{segmentEventName(event)};
+        });
+}
+
+void TentMetrics::recordSelectionEvent(SelectionEvent event,
+                                       TransportType transport) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    selection_events_total_.incCached(
+        selectionEventSlot(event, transport), [event, transport] {
+            return std::array<std::string, 2>{selectionEventName(event),
+                                              transportTypeName(transport)};
         });
 }
 
@@ -1663,6 +1699,8 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&shm_copy_events_total_);
         root[segment_events_total_.str_name()] =
             sumCounterValues(&segment_events_total_);
+        root[selection_events_total_.str_name()] =
+            sumCounterValues(&selection_events_total_);
 
         // Gauges: aggregate across transport labels (total in-flight attempts
         // / total registered bytes). Per-transport breakdown is via the
@@ -1854,6 +1892,7 @@ void TentMetrics::recordStreamQueueWait(TransportType, Request::OpCode,
 void TentMetrics::recordShmMappingEvent(ShmMappingEvent) {}
 void TentMetrics::recordShmCopy(Request::OpCode, ShmCopyOutcome, double) {}
 void TentMetrics::recordSegmentEvent(SegmentEvent) {}
+void TentMetrics::recordSelectionEvent(SelectionEvent, TransportType) {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}

@@ -465,6 +465,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordShmCopy(Request::WRITE,
                           TentMetrics::ShmCopyOutcome::Success, 18.0);
     metrics.recordSegmentEvent(TentMetrics::SegmentEvent::CacheHit);
+    metrics.recordSelectionEvent(TentMetrics::SelectionEvent::Selected, RDMA);
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -474,7 +475,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 58>
+    const std::array<std::pair<std::string_view, std::string_view>, 59>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -505,6 +506,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_shm_mapping_events_total", "counter"},
             {"tent_shm_copy_events_total", "counter"},
             {"tent_segment_events_total", "counter"},
+            {"tent_transport_selection_events_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
             {"tent_worker_last_progress_timestamp_seconds", "gauge"},
@@ -808,6 +810,33 @@ TEST_F(MetricsRecordingTest, SegmentSignalsUseBoundedLifecycleEvents) {
                                    "generation_advanced"}) {
         const std::string series =
             "tent_segment_events_total{event=\"" + std::string(event) + "\"}";
+        EXPECT_EQ(after.series(series) - before.series(series), 1) << event;
+    }
+}
+
+TEST_F(MetricsRecordingTest, SelectionSignalsUseBoundedDecisionLabels) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordSelectionEvent(TentMetrics::SelectionEvent::Selected, RDMA);
+    metrics.recordSelectionEvent(TentMetrics::SelectionEvent::FallbackSelected,
+                                 TCP);
+    metrics.recordSelectionEvent(
+        TentMetrics::SelectionEvent::CandidateUnavailable, SHM);
+    metrics.recordSelectionEvent(TentMetrics::SelectionEvent::Exhausted);
+
+    auto after = MetricsSnapshot(metrics);
+    for (const auto& [event, transport] :
+         std::array<std::pair<std::string_view, std::string_view>, 4>{{
+             {"selected", "rdma"},
+             {"fallback_selected", "tcp"},
+             {"candidate_unavailable", "shm"},
+             {"exhausted", "unspec"},
+         }}) {
+        const std::string series =
+            "tent_transport_selection_events_total{event=\"" +
+            std::string(event) + "\",transport=\"" + std::string(transport) +
+            "\"}";
         EXPECT_EQ(after.series(series) - before.series(series), 1) << event;
     }
 }

@@ -373,6 +373,24 @@ class TentMetrics {
     // Segment names and handles are intentionally excluded from labels.
     void recordSegmentEvent(SegmentEvent event);
 
+    enum class SelectionEvent {
+        Selected,
+        FallbackSelected,
+        CandidateUnavailable,
+        PolicyMiss,
+        CandidateEmpty,
+        HintRejected,
+        HintUnavailable,
+        Exhausted,
+        MetadataRefresh,
+    };
+
+    // Selection metrics count decisions, not transfers. `transport` is the
+    // selected, rejected or unavailable bounded enum value; events without a
+    // concrete candidate use UNSPEC.
+    void recordSelectionEvent(SelectionEvent event,
+                              TransportType transport = UNSPEC);
+
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
     // sitting in the engine right now — a persistently high or stuck value
@@ -511,6 +529,8 @@ class TentMetrics {
     static inline const std::array<std::string, 2> kShmCopyLabels{"operation",
                                                                  "outcome"};
     static inline const std::array<std::string, 1> kSegmentEventLabel{"event"};
+    static inline const std::array<std::string, 2> kSelectionEventLabels{
+        "event", "transport"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -548,6 +568,9 @@ class TentMetrics {
     static constexpr size_t kShmCopyDomain =
         kOperationDomain * kShmCopyOutcomeDomain;
     static constexpr size_t kSegmentEventDomain = 13;
+    static constexpr size_t kSelectionEventValueDomain = 9;
+    static constexpr size_t kSelectionEventDomain =
+        kSelectionEventValueDomain * kTransportDomain;
     static constexpr size_t kRdmaEventDomain =
         kOperationDomain * kRdmaSliceEventDomain;
     static constexpr size_t kRdmaRetryDomain =
@@ -614,6 +637,11 @@ class TentMetrics {
                               ShmCopyOutcome outcome) {
         return operationSlot(operation) * kShmCopyOutcomeDomain +
                static_cast<size_t>(outcome);
+    }
+    static size_t selectionEventSlot(SelectionEvent event,
+                                     TransportType transport) {
+        return static_cast<size_t>(event) * kTransportDomain +
+               transportSlot(transport);
     }
 
     // Per-transport counters (label: transport). Values are int64_t.
@@ -735,6 +763,10 @@ class TentMetrics {
         "tent_segment_events_total",
         "Segment snapshot, registry and remote-cache lifecycle events",
         kSegmentEventLabel, kSegmentEventDomain};
+    metrics::CachedDynamicCounter<2> selection_events_total_{
+        "tent_transport_selection_events_total",
+        "Transport selector decisions by bounded event and transport",
+        kSelectionEventLabels, kSelectionEventDomain};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_

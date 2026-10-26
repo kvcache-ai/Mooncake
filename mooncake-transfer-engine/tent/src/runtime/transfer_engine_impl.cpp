@@ -2259,8 +2259,20 @@ SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
                                                      bool invalidate_on_fail) {
     auto result = getTransportType(req, transport_index);
     if (result.transport == UNSPEC && invalidate_on_fail) {
+        TentMetrics::instance().recordSelectionEvent(
+            TentMetrics::SelectionEvent::MetadataRefresh);
         metadata_->segmentManager().invalidateRemote(req.target_id);
         result = getTransportType(req, transport_index);
+    }
+    if (result.transport == UNSPEC) {
+        TentMetrics::instance().recordSelectionEvent(
+            TentMetrics::SelectionEvent::Exhausted);
+    } else {
+        TentMetrics::instance().recordSelectionEvent(
+            transport_index == 0
+                ? TentMetrics::SelectionEvent::Selected
+                : TentMetrics::SelectionEvent::FallbackSelected,
+            result.transport);
     }
     return result;
 }

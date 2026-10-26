@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include "tent/runtime/transport_selector.h"
+
+#include "tent/metrics/tent_metrics.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
@@ -553,6 +555,8 @@ SelectionResult TransportSelector::select(
     }
 
     if (!matching_policy) {
+        TentMetrics::instance().recordSelectionEvent(
+            TentMetrics::SelectionEvent::PolicyMiss);
         LOG(WARNING) << "No matching transport policy for segment_type="
                      << (context.segment_type == SegmentType::File ? "file"
                                                                    : "memory")
@@ -584,20 +588,35 @@ SelectionResult TransportSelector::select(
         : context.buffer_transports            ? *context.buffer_transports
                                                : kEmpty;
 
+    if (raw.empty()) {
+        TentMetrics::instance().recordSelectionEvent(
+            TentMetrics::SelectionEvent::CandidateEmpty);
+    }
+
     if (transport_index < 0) return result;
     const int original_index = transport_index;
 
     auto candidates = reorderWithHint(raw, hint);
-    if (!candidates) return result;  // UNSPEC -> task FAILED downstream
+    if (!candidates) {
+        TentMetrics::instance().recordSelectionEvent(
+            TentMetrics::SelectionEvent::HintRejected, hint);
+        return result;  // UNSPEC -> task FAILED downstream
+    }
 
     const bool has_hint = (hint != UNSPEC);
     for (size_t i = 0; i < candidates->size(); ++i) {
         TransportType type = (*candidates)[i];
         if (!isTransportAvailable(type, context, available_transports)) {
+            TentMetrics::instance().recordSelectionEvent(
+                TentMetrics::SelectionEvent::CandidateUnavailable, type);
             // The pinned hint at slot 0 must be available; if it isn't,
             // reject the request rather than falling through to another
             // transport the caller did not ask for.
-            if (has_hint && i == 0) return result;
+            if (has_hint && i == 0) {
+                TentMetrics::instance().recordSelectionEvent(
+                    TentMetrics::SelectionEvent::HintUnavailable, type);
+                return result;
+            }
             continue;
         }
         if (transport_index == 0) {
