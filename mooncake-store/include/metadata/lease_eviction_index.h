@@ -23,6 +23,11 @@
 // - Subsequent rank updates and removals go straight to `LockRecordedShard`.
 // - A scan schedules due (rank, shard) buckets in ascending rank order, taking
 //   only the oldest age band needed for small targets and widening on demand.
+//
+// Postpone moves a lone key to a later bucket of the shard it is filed in until
+// its next write, through the same refile a rank update takes, so serial and
+// range walks alike leave it out until it falls due again. Groups are never
+// postponed: their members may be skipped for different reasons.
 
 #include <atomic>
 #include <bit>
@@ -54,6 +59,8 @@ class LeaseEvictionIndex final : public EvictionIndex {
 
     void OnRead(const route::ReadGuard& guard) override;
     void OnWrite(const route::WriteGuard& guard) override;
+    void Postpone(const route::WriteGuard& guard,
+                  Clock::time_point not_before) override;
 
     [[nodiscard]] std::unique_ptr<Cursor> Scan(
         Clock::time_point now) const override;

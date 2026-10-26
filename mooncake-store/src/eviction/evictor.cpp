@@ -31,6 +31,13 @@ double Sanitized(const char* name, double ratio) {
     return std::min(ratio, 1.0);
 }
 
+// A lease that has not run out ends on its own, and a deferred key must stay
+// visible to the fallback, so only these two are worth postponing.
+bool Lasts(SkipReason reason) {
+    return reason == SkipReason::kSoftPinned ||
+           reason == SkipReason::kNothingToRelease;
+}
+
 uint32_t ChooseWorkerCount(uint32_t configured_workers, uint64_t filed_keys) {
     if (configured_workers > 0) {
         return configured_workers;
@@ -237,6 +244,10 @@ class Evictor::Pass {
         }
         auto plan = Judge(hold, /*fallback=*/entry == nullptr);
         if (!plan) {
+            if (Lasts(plan.error())) {
+                ns_.eviction_index().Postpone(
+                    hold, now_ + Evictor::kSkippedKeyBackoff);
+            }
             return {};
         }
         auto effect = evictor_.reclaimer_.Apply(ns_, hold, *plan, report_);

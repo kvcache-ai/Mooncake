@@ -35,6 +35,7 @@
 // holds across Run, it holds for the whole run.
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -77,6 +78,11 @@ struct ByteGoal {
 
 class Evictor {
    public:
+    // Keys skipped as soft-pinned or with nothing to release are passed over
+    // this long (or until written), so runs under pressure don't re-lock them.
+    static constexpr Clock::duration kSkippedKeyBackoff =
+        std::chrono::seconds(1);
+
     // Everything given outlives the evictor.
     Evictor(metadata::NamespaceTable& namespaces, const EvictionPolicy& policy,
             Reclaimer& reclaimer, std::vector<EvictionObserver*> observers,

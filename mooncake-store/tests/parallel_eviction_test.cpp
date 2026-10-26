@@ -259,6 +259,36 @@ TEST_F(ShardedLeaseIndexTest,
     }
 }
 
+// Runs that copied the same expired key before either locked it may each skip
+// and postpone it. The one that locks it second asks for the rank the first
+// one filed it at, or for an earlier one if it began earlier: the key stays
+// where it is, and the release of that guard, too, leaves it postponed.
+TEST_F(ShardedLeaseIndexTest, ASecondPostponeKeepsTheKeyWhereTheFirstPutIt) {
+    Publish("a");
+    const Clock::time_point later = now_ + std::chrono::seconds(1);
+    auto postpone = [&](Clock::time_point not_before) {
+        auto guard = ns_.objects.Write("a");
+        ASSERT_TRUE(guard);
+        ns_.eviction_index().Postpone(*guard, not_before);
+        EXPECT_TRUE(guard->owner_state().eviction.postponed);
+    };
+    auto due_at = [&](Clock::time_point at) {
+        return ns_.eviction_index().Scan(at)->Next().has_value();
+    };
+    postpone(later);
+    ASSERT_FALSE(due_at(now_));
+    for (const Clock::time_point not_before :
+         {later, later - std::chrono::milliseconds(500)}) {
+        postpone(not_before);
+        EXPECT_FALSE(due_at(now_));
+        EXPECT_FALSE(due_at(later - std::chrono::milliseconds(200)));
+        EXPECT_TRUE(due_at(later));
+    }
+    // The next write files it by its lease again.
+    ASSERT_TRUE(ns_.objects.Write("a").has_value());
+    EXPECT_TRUE(due_at(now_));
+}
+
 TEST_F(ShardedLeaseIndexTest, DisjointWorkersSeeEachKeyOnceAcrossShards) {
     constexpr int kCount = 4000;
     for (int i = 0; i < kCount; ++i) {

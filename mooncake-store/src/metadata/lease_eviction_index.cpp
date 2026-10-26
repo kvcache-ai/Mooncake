@@ -812,6 +812,9 @@ void LeaseEvictionIndex::OnRead(const route::ReadGuard&) {}
 
 void LeaseEvictionIndex::OnWrite(const route::WriteGuard& guard) {
     route::SlotEvictionState& state = guard.owner_state().eviction;
+    // Set only by a Postpone under this very guard: this release is the one
+    // that follows it. Every later write files the key by its lease again.
+    const bool postponed = std::exchange(state.postponed, false);
     if (!guard.has_object() || !Qualifies(guard.metadata())) {
         if (state.filed) {
             LockRecordedShard(state).shard.Unfile(guard.slot(), state);
@@ -826,6 +829,11 @@ void LeaseEvictionIndex::OnWrite(const route::WriteGuard& guard) {
         EntryIdentity::ForStandalone(guard.generation());
 
     if (Shard::IsSameFiledEntry(state, group_lease, standalone_id)) {
+        // The release that follows Postpone leaves the key where it was put,
+        // unless its lease now runs out later still.
+        if (postponed && group_lease == nullptr && rank <= state.rank) {
+            return;
+        }
         if (rank != state.rank) {
             LockRecordedShard(state).shard.UpdateRank(guard.slot(), state,
                                                       rank);
@@ -846,6 +854,26 @@ void LeaseEvictionIndex::OnWrite(const route::WriteGuard& guard) {
         target.shard.FileInGroup(target.id, guard.slot(), state, metadata,
                                  group_lease, rank);
     }
+}
+
+void LeaseEvictionIndex::Postpone(const route::WriteGuard& guard,
+                                  Clock::time_point not_before) {
+    route::SlotEvictionState& state = guard.owner_state().eviction;
+    // A group stays where its shared lease files it.
+    if (!state.filed || state.group != nullptr) {
+        return;
+    }
+    // A refile within the key's own shard, as a rank update is: a later wave
+    // of a walk that already copied the old bucket meets it again only if
+    // the new rank is due, which a postponed key's is not. A key filed later
+    // already (by a run that met it first, or by its lease) stays there.
+    const Rank rank = BucketOf(not_before);
+    if (rank > state.rank) {
+        LockRecordedShard(state).shard.UpdateRank(guard.slot(), state, rank);
+    }
+    // Marked either way, so that the release of this guard, which files the
+    // key by its lease unless it is marked, leaves it where it is.
+    state.postponed = true;
 }
 
 std::unique_ptr<EvictionIndex::Cursor> LeaseEvictionIndex::Scan(
