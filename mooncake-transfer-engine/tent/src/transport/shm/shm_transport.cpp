@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
@@ -34,6 +35,7 @@
 #include "tent/runtime/control_plane.h"
 #include "tent/common/utils/random.h"
 #include "tent/common/utils/string_builder.h"
+#include "tent/metrics/tent_metrics.h"
 
 namespace mooncake {
 namespace tent {
@@ -131,6 +133,7 @@ Status ShmTransport::submitTransferTasks(
 }
 
 void ShmTransport::startTransfer(ShmTask *task, ShmSubBatch *batch) {
+    const auto start = std::chrono::steady_clock::now();
     Status status;
     if (task->request.opcode == Request::READ)
         status = Platform::getLoader().copy(task->request.source,
@@ -140,6 +143,15 @@ void ShmTransport::startTransfer(ShmTask *task, ShmSubBatch *batch) {
         status = Platform::getLoader().copy((void *)task->target_addr,
                                             task->request.source,
                                             task->request.length);
+    const auto latency_us =
+        std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    TentMetrics::instance().recordShmCopy(
+        task->request.opcode,
+        status.ok() ? TentMetrics::ShmCopyOutcome::Success
+                    : TentMetrics::ShmCopyOutcome::Error,
+        latency_us);
     if (status.ok()) {
         task->transferred_bytes = task->request.length;
         task->status_word = TransferStatusEnum::COMPLETED;
@@ -302,8 +314,11 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         RWSpinlock::ReadGuard guard(relocate_lock_);
         auto target = relocate_map_.find(target_id);
         if (target != relocate_map_.end() &&
-            tryResolve(target->second, dest_addr, length))
+            tryResolve(target->second, dest_addr, length)) {
+            TentMetrics::instance().recordShmMappingEvent(
+                TentMetrics::ShmMappingEvent::CacheHit);
             return Status::OK();
+        }
     }
 
     RWSpinlock::WriteGuard guard(relocate_lock_);
@@ -315,8 +330,13 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     // pending. Recheck before opening and mapping the same shared-memory file.
     auto target = relocate_map_.find(target_id);
     if (target != relocate_map_.end() &&
-        tryResolve(target->second, dest_addr, length))
+        tryResolve(target->second, dest_addr, length)) {
+        TentMetrics::instance().recordShmMappingEvent(
+            TentMetrics::ShmMappingEvent::CacheHit);
         return Status::OK();
+    }
+    TentMetrics::instance().recordShmMappingEvent(
+        TentMetrics::ShmMappingEvent::CacheMiss);
 
     BufferDesc *buffer;
     // Owning reference: `buffer` is used after the lambda returns.
@@ -327,14 +347,19 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     // quiesce that proves no reader still holds a resolved address. POSIX
     // shm_unlink already keeps the object alive for existing mappings; keep
     // those mappings until uninstall().
-    CHECK_STATUS(segment_manager.withCachedSegment(
+    auto metadata_status = segment_manager.withCachedSegment(
         target_id, pin, [&](SegmentDesc *segment) {
             buffer = segment->findBuffer(dest_addr, length);
             if (!buffer || buffer->shm_path.empty())
                 return Status::NeedsRefreshCache(
                     "Requested address is not in registered buffer" LOC_MARK);
             return Status::OK();
-        }));
+        });
+    if (!metadata_status.ok()) {
+        TentMetrics::instance().recordShmMappingEvent(
+            TentMetrics::ShmMappingEvent::MetadataError);
+        return metadata_status;
+    }
 
     void *shm_addr = nullptr;
     bool mapping_found = false;
@@ -363,6 +388,8 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                 shm_fd = open(full_path.c_str(), O_RDWR, 0644);
             }
             if (shm_fd < 0) {
+                TentMetrics::instance().recordShmMappingEvent(
+                    TentMetrics::ShmMappingEvent::OpenError);
                 return Status::InternalError(
                     std::string("Failed to open shared memory file ") +
                     buffer->shm_path + LOC_MARK);
@@ -372,6 +399,8 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             struct stat st;
             if (fstat(shm_fd, &st) != 0) {
                 close(shm_fd);
+                TentMetrics::instance().recordShmMappingEvent(
+                    TentMetrics::ShmMappingEvent::StatError);
                 return Status::InternalError(
                     std::string("Failed to fstat shared memory file ") +
                     buffer->shm_path + LOC_MARK);
@@ -379,6 +408,8 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             if (st.st_size < 0 ||
                 static_cast<uint64_t>(st.st_size) < buffer->length) {
                 close(shm_fd);
+                TentMetrics::instance().recordShmMappingEvent(
+                    TentMetrics::ShmMappingEvent::SizeMismatch);
                 return Status::InternalError(
                     std::string("Shared memory file shorter than registered "
                                 "buffer length: ") +
@@ -388,6 +419,8 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                             MAP_SHARED, shm_fd, 0);
             if (shm_addr == MAP_FAILED) {
                 close(shm_fd);
+                TentMetrics::instance().recordShmMappingEvent(
+                    TentMetrics::ShmMappingEvent::MapError);
                 return Status::InternalError(
                     "Failed to map shared memory " LOC_MARK);
             }
@@ -400,6 +433,8 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             shm_entry.shm_addr = shm_addr;
             shm_entry.length = buffer->length;
             relocate_map_[target_id][buffer->addr] = shm_entry;
+            TentMetrics::instance().recordShmMappingEvent(
+                TentMetrics::ShmMappingEvent::Created);
         }
     }
 

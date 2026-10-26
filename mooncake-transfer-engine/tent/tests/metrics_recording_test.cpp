@@ -461,6 +461,9 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStreamAttempt(
         HP_TCP, Request::WRITE, TentMetrics::StreamOutcome::Success, 45.0);
     metrics.recordStreamQueueWait(TCP, Request::READ, 12.0);
+    metrics.recordShmMappingEvent(TentMetrics::ShmMappingEvent::CacheHit);
+    metrics.recordShmCopy(Request::WRITE,
+                          TentMetrics::ShmCopyOutcome::Success, 18.0);
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -470,7 +473,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 54>
+    const std::array<std::pair<std::string_view, std::string_view>, 57>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -498,6 +501,8 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_rdma_qp_transition_failures_total", "counter"},
             {"tent_rdma_notification_events_total", "counter"},
             {"tent_stream_events_total", "counter"},
+            {"tent_shm_mapping_events_total", "counter"},
+            {"tent_shm_copy_events_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
             {"tent_worker_last_progress_timestamp_seconds", "gauge"},
@@ -519,6 +524,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_rdma_completion_latency_us", "histogram"},
             {"tent_stream_attempt_latency_us", "histogram"},
             {"tent_stream_queue_wait_us", "histogram"},
+            {"tent_shm_copy_latency_us", "histogram"},
             {"tent_metrics_build_info", "gauge"},
             {"tent_metrics_runtime_enabled", "gauge"},
             {"tent_metrics_http_server_up", "gauge"},
@@ -748,6 +754,43 @@ TEST_F(MetricsRecordingTest, StreamSignalsSeparateQueueAndPhysicalAttempts) {
     EXPECT_EQ(after.histogramCount("tent_stream_queue_wait_us") -
                   before.histogramCount("tent_stream_queue_wait_us"),
               1);
+}
+
+TEST_F(MetricsRecordingTest, ShmSignalsUseBoundedOperationAndEventLabels) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordShmMappingEvent(TentMetrics::ShmMappingEvent::CacheMiss);
+    metrics.recordShmMappingEvent(TentMetrics::ShmMappingEvent::Created);
+    metrics.recordShmCopy(Request::WRITE,
+                          TentMetrics::ShmCopyOutcome::Success, 23.0);
+    metrics.recordShmCopy(Request::READ, TentMetrics::ShmCopyOutcome::Error,
+                          31.0);
+
+    auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(after.series("tent_shm_mapping_events_total{event=\"cache_miss\"}") -
+                  before.series(
+                      "tent_shm_mapping_events_total{event=\"cache_miss\"}"),
+              1);
+    EXPECT_EQ(after.series("tent_shm_mapping_events_total{event=\"created\"}") -
+                  before.series(
+                      "tent_shm_mapping_events_total{event=\"created\"}"),
+              1);
+    EXPECT_EQ(after.series("tent_shm_copy_events_total{operation=\"write\","
+                           "outcome=\"success\"}") -
+                  before.series(
+                      "tent_shm_copy_events_total{operation=\"write\","
+                      "outcome=\"success\"}"),
+              1);
+    EXPECT_EQ(after.series("tent_shm_copy_events_total{operation=\"read\","
+                           "outcome=\"error\"}") -
+                  before.series(
+                      "tent_shm_copy_events_total{operation=\"read\","
+                      "outcome=\"error\"}"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_shm_copy_latency_us") -
+                  before.histogramCount("tent_shm_copy_latency_us"),
+              2);
 }
 
 // ---------------------------------------------------------------------------

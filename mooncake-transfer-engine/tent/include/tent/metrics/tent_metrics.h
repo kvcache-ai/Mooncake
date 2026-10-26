@@ -333,6 +333,25 @@ class TentMetrics {
     void recordStreamQueueWait(TransportType transport,
                                Request::OpCode operation, double latency_us);
 
+    enum class ShmMappingEvent {
+        CacheHit,
+        CacheMiss,
+        MetadataError,
+        OpenError,
+        StatError,
+        SizeMismatch,
+        MapError,
+        Created,
+    };
+    enum class ShmCopyOutcome { Success, Error };
+
+    // SHM copies are synchronous physical attempts. Mapping events describe
+    // the remote-address relocation cache and backing-object setup; labels
+    // deliberately exclude segment ids, addresses and shm paths.
+    void recordShmMappingEvent(ShmMappingEvent event);
+    void recordShmCopy(Request::OpCode operation, ShmCopyOutcome outcome,
+                       double latency_us);
+
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
     // sitting in the engine right now — a persistently high or stuck value
@@ -466,6 +485,10 @@ class TentMetrics {
         "transport", "operation", "event"};
     static inline const std::array<std::string, 3> kStreamAttemptLabels{
         "transport", "operation", "outcome"};
+    static inline const std::array<std::string, 1> kShmMappingEventLabel{
+        "event"};
+    static inline const std::array<std::string, 2> kShmCopyLabels{"operation",
+                                                                 "outcome"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -498,6 +521,10 @@ class TentMetrics {
         kStreamOperationDomain * kStreamEventValueDomain;
     static constexpr size_t kStreamAttemptDomain =
         kStreamOperationDomain * kStreamOutcomeDomain;
+    static constexpr size_t kShmMappingEventDomain = 8;
+    static constexpr size_t kShmCopyOutcomeDomain = 2;
+    static constexpr size_t kShmCopyDomain =
+        kOperationDomain * kShmCopyOutcomeDomain;
     static constexpr size_t kRdmaEventDomain =
         kOperationDomain * kRdmaSliceEventDomain;
     static constexpr size_t kRdmaRetryDomain =
@@ -558,6 +585,11 @@ class TentMetrics {
                                     StreamOutcome outcome) {
         return streamOperationSlot(transport, operation) *
                    kStreamOutcomeDomain +
+               static_cast<size_t>(outcome);
+    }
+    static size_t shmCopySlot(Request::OpCode operation,
+                              ShmCopyOutcome outcome) {
+        return operationSlot(operation) * kShmCopyOutcomeDomain +
                static_cast<size_t>(outcome);
     }
 
@@ -668,6 +700,14 @@ class TentMetrics {
         "tent_stream_events_total",
         "TCP and HP-TCP queue, attempt, connection, retry and terminal events",
         kStreamEventLabels, kStreamEventDomain};
+    metrics::CachedDynamicCounter<1> shm_mapping_events_total_{
+        "tent_shm_mapping_events_total",
+        "SHM remote-address relocation and backing-object mapping events",
+        kShmMappingEventLabel, kShmMappingEventDomain};
+    metrics::CachedDynamicCounter<2> shm_copy_events_total_{
+        "tent_shm_copy_events_total",
+        "Synchronous physical SHM copy attempts by operation and outcome",
+        kShmCopyLabels, kShmCopyDomain};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_
@@ -777,6 +817,10 @@ class TentMetrics {
         "tent_stream_queue_wait_us",
         "TCP logical-task and HP-TCP physical-slice queue wait in microseconds",
         kLatencyBuckets, kAttemptLabels, kStreamOperationDomain};
+    metrics::CachedDynamicHistogram<2> shm_copy_latency_{
+        "tent_shm_copy_latency_us",
+        "Synchronous physical SHM copy latency in microseconds",
+        kLatencyBuckets, kShmCopyLabels, kShmCopyDomain};
 
     // Per-transport (N=1) histograms for unified serialization; the N=2
     // attempt histograms are serialized separately (see getPrometheusMetrics /
