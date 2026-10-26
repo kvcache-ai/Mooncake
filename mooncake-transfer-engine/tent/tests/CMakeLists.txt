@@ -77,7 +77,8 @@ add_test(NAME tent_metrics_recording_test COMMAND tent_metrics_recording_test)
 
 add_executable(admission_queue_test admission_queue_test.cpp
                                     ../src/runtime/admission_queue.cpp)
-target_link_libraries(admission_queue_test PRIVATE tent_common gtest gtest_main)
+target_link_libraries(admission_queue_test PRIVATE tent_common tent_metrics
+                                                   gtest gtest_main)
 target_include_directories(admission_queue_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME admission_queue_test COMMAND admission_queue_test)

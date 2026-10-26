@@ -466,6 +466,13 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
                           TentMetrics::ShmCopyOutcome::Success, 18.0);
     metrics.recordSegmentEvent(TentMetrics::SegmentEvent::CacheHit);
     metrics.recordSelectionEvent(TentMetrics::SelectionEvent::Selected, RDMA);
+    metrics.recordAdmissionEvent(TentMetrics::AdmissionOwnerKind::User,
+                                 TentMetrics::AdmissionEvent::Admitted);
+    metrics.recordAdmissionQueued(TentMetrics::AdmissionOwnerKind::User, 1,
+                                  1024);
+    metrics.recordAdmissionQueued(TentMetrics::AdmissionOwnerKind::User, -1,
+                                  -1024);
+    metrics.recordAdmissionWait(TentMetrics::AdmissionOwnerKind::User, 14.0);
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -475,7 +482,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 59>
+    const std::array<std::pair<std::string_view, std::string_view>, 63>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -507,6 +514,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_shm_copy_events_total", "counter"},
             {"tent_segment_events_total", "counter"},
             {"tent_transport_selection_events_total", "counter"},
+            {"tent_admission_events_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
             {"tent_worker_last_progress_timestamp_seconds", "gauge"},
@@ -515,6 +523,8 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_staging_cleanup_pending", "gauge"},
             {"tent_rdma_worker_inflight_slices", "gauge"},
             {"tent_rdma_posted_inflight_slices", "gauge"},
+            {"tent_admission_queue_owners", "gauge"},
+            {"tent_admission_queue_bytes", "gauge"},
             {"tent_read_latency_us", "histogram"},
             {"tent_write_latency_us", "histogram"},
             {"tent_read_size_bytes", "histogram"},
@@ -529,6 +539,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_stream_attempt_latency_us", "histogram"},
             {"tent_stream_queue_wait_us", "histogram"},
             {"tent_shm_copy_latency_us", "histogram"},
+            {"tent_admission_wait_us", "histogram"},
             {"tent_metrics_build_info", "gauge"},
             {"tent_metrics_runtime_enabled", "gauge"},
             {"tent_metrics_http_server_up", "gauge"},
@@ -839,6 +850,117 @@ TEST_F(MetricsRecordingTest, SelectionSignalsUseBoundedDecisionLabels) {
             "\"}";
         EXPECT_EQ(after.series(series) - before.series(series), 1) << event;
     }
+}
+
+TEST_F(MetricsRecordingTest, AdmissionSignalsTrackDecisionsQueueAndWait) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordAdmissionEvent(TentMetrics::AdmissionOwnerKind::Staging,
+                                 TentMetrics::AdmissionEvent::Admitted, 2);
+    metrics.recordAdmissionEvent(
+        TentMetrics::AdmissionOwnerKind::User,
+        TentMetrics::AdmissionEvent::RejectedOwnerCapacity);
+    metrics.recordAdmissionQueued(TentMetrics::AdmissionOwnerKind::Staging, 2,
+                                  4096);
+    metrics.recordAdmissionWait(TentMetrics::AdmissionOwnerKind::Staging,
+                                27.0);
+
+    auto active = MetricsSnapshot(metrics);
+    EXPECT_EQ(active.series("tent_admission_events_total{owner_kind=\"staging\","
+                            "event=\"admitted\"}") -
+                  before.series(
+                      "tent_admission_events_total{owner_kind=\"staging\","
+                      "event=\"admitted\"}"),
+              2);
+    EXPECT_EQ(active.series("tent_admission_events_total{owner_kind=\"user\","
+                            "event=\"rejected_owner_capacity\"}") -
+                  before.series(
+                      "tent_admission_events_total{owner_kind=\"user\","
+                      "event=\"rejected_owner_capacity\"}"),
+              1);
+    EXPECT_EQ(active.series(
+                  "tent_admission_queue_owners{owner_kind=\"staging\"}") -
+                  before.series(
+                      "tent_admission_queue_owners{owner_kind=\"staging\"}"),
+              2);
+    EXPECT_EQ(active.series(
+                  "tent_admission_queue_bytes{owner_kind=\"staging\"}") -
+                  before.series(
+                      "tent_admission_queue_bytes{owner_kind=\"staging\"}"),
+              4096);
+    EXPECT_EQ(active.histogramCount("tent_admission_wait_us") -
+                  before.histogramCount("tent_admission_wait_us"),
+              1);
+
+    metrics.recordAdmissionQueued(TentMetrics::AdmissionOwnerKind::Staging,
+                                  -2, -4096);
+    auto released = MetricsSnapshot(metrics);
+    EXPECT_EQ(released.series(
+                  "tent_admission_queue_owners{owner_kind=\"staging\"}"),
+              before.series(
+                  "tent_admission_queue_owners{owner_kind=\"staging\"}"));
+    EXPECT_EQ(released.series(
+                  "tent_admission_queue_bytes{owner_kind=\"staging\"}"),
+              before.series(
+                  "tent_admission_queue_bytes{owner_kind=\"staging\"}"));
+}
+
+TEST_F(MetricsRecordingTest, AdmissionQueueRecordsOwnedStateTransitions) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+    LocalTransferAdmissionQueue queue({1, 128, 0, 0});
+
+    auto makeSubmit = [](uint64_t token) {
+        QueueSubmit submit;
+        submit.batch_token = token;
+        submit.batch_slots_left = 1;
+        QueueOwnerInput owner;
+        owner.owner_task_id = 0;
+        owner.request.length = 32;
+        owner.kind = QueueOwnerKind::User;
+        submit.owners.push_back(owner);
+        return submit;
+    };
+
+    std::vector<QueueOwnerId> ids;
+    ASSERT_TRUE(queue.tryAdmit(makeSubmit(1), ids).ok());
+    ASSERT_EQ(ids.size(), 1u);
+    auto admitted = MetricsSnapshot(metrics);
+    EXPECT_EQ(admitted.series(
+                  "tent_admission_queue_owners{owner_kind=\"user\"}") -
+                  before.series(
+                      "tent_admission_queue_owners{owner_kind=\"user\"}"),
+              1);
+    EXPECT_EQ(admitted.series(
+                  "tent_admission_queue_bytes{owner_kind=\"user\"}") -
+                  before.series(
+                      "tent_admission_queue_bytes{owner_kind=\"user\"}"),
+              32);
+
+    std::vector<QueueOwnerId> rejected_ids;
+    EXPECT_TRUE(queue.tryAdmit(makeSubmit(2), rejected_ids).IsTooManyRequests());
+    auto rejected = MetricsSnapshot(metrics);
+    EXPECT_EQ(rejected.series(
+                  "tent_admission_events_total{owner_kind=\"user\","
+                  "event=\"rejected_owner_capacity\"}") -
+                  before.series(
+                      "tent_admission_events_total{owner_kind=\"user\","
+                      "event=\"rejected_owner_capacity\"}"),
+              1);
+
+    auto picked = queue.pickForDispatch(1, 128);
+    ASSERT_EQ(picked, ids);
+    ASSERT_TRUE(queue.complete(ids.front(), COMPLETED).ok());
+    auto completed = MetricsSnapshot(metrics);
+    EXPECT_EQ(completed.series(
+                  "tent_admission_queue_owners{owner_kind=\"user\"}"),
+              before.series(
+                  "tent_admission_queue_owners{owner_kind=\"user\"}"));
+    EXPECT_EQ(completed.series(
+                  "tent_admission_queue_bytes{owner_kind=\"user\"}"),
+              before.series(
+                  "tent_admission_queue_bytes{owner_kind=\"user\"}"));
 }
 
 // ---------------------------------------------------------------------------

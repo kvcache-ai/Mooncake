@@ -524,6 +524,44 @@ const char* selectionEventName(TentMetrics::SelectionEvent event) {
     return "unknown";
 }
 
+const char* admissionOwnerKindName(TentMetrics::AdmissionOwnerKind kind) {
+    switch (kind) {
+        case TentMetrics::AdmissionOwnerKind::User:
+            return "user";
+        case TentMetrics::AdmissionOwnerKind::Staging:
+            return "staging";
+        case TentMetrics::AdmissionOwnerKind::All:
+            return "all";
+    }
+    return "all";
+}
+
+const char* admissionEventName(TentMetrics::AdmissionEvent event) {
+    switch (event) {
+        case TentMetrics::AdmissionEvent::Admitted:
+            return "admitted";
+        case TentMetrics::AdmissionEvent::RejectedBatchCapacity:
+            return "rejected_batch_capacity";
+        case TentMetrics::AdmissionEvent::RejectedOwnerCapacity:
+            return "rejected_owner_capacity";
+        case TentMetrics::AdmissionEvent::RejectedByteCapacity:
+            return "rejected_byte_capacity";
+        case TentMetrics::AdmissionEvent::RejectedUserOwnerCapacity:
+            return "rejected_user_owner_capacity";
+        case TentMetrics::AdmissionEvent::RejectedUserByteCapacity:
+            return "rejected_user_byte_capacity";
+        case TentMetrics::AdmissionEvent::RejectedDispatchWindow:
+            return "rejected_dispatch_window";
+        case TentMetrics::AdmissionEvent::Dispatched:
+            return "dispatched";
+        case TentMetrics::AdmissionEvent::DeadlineDropped:
+            return "deadline_dropped";
+        case TentMetrics::AdmissionEvent::Canceled:
+            return "canceled";
+    }
+    return "unknown";
+}
+
 TentMetrics::StreamEvent streamOutcomeEvent(TentMetrics::StreamOutcome outcome) {
     switch (outcome) {
         case TentMetrics::StreamOutcome::Success:
@@ -752,6 +790,7 @@ void TentMetrics::registerMetrics() {
         &shm_copy_events_total_,
         &segment_events_total_,
         &selection_events_total_,
+        &admission_events_total_,
     };
 
     gauges_ = {
@@ -763,6 +802,8 @@ void TentMetrics::registerMetrics() {
         &staging_cleanup_pending_,
         &rdma_worker_inflight_slices_,
         &rdma_posted_inflight_slices_,
+        &admission_queue_owners_,
+        &admission_queue_bytes_,
     };
 
     // Register the N=1 per-transport histograms for unified serialization.
@@ -772,6 +813,7 @@ void TentMetrics::registerMetrics() {
     histograms_ = {
         &read_latency_, &write_latency_,    &read_size_,      &write_size_,
         &deadline_mlu_, &stage_queue_wait_, &stage_dispatch_, &stage_transport_,
+        &admission_wait_latency_,
     };
 }
 
@@ -1184,6 +1226,47 @@ void TentMetrics::recordSelectionEvent(SelectionEvent event,
             return std::array<std::string, 2>{selectionEventName(event),
                                               transportTypeName(transport)};
         });
+}
+
+void TentMetrics::recordAdmissionEvent(AdmissionOwnerKind kind,
+                                       AdmissionEvent event, int64_t count) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed) ||
+        count <= 0)
+        return;
+    admission_events_total_.incCached(
+        admissionEventSlot(kind, event),
+        [kind, event] {
+            return std::array<std::string, 2>{admissionOwnerKindName(kind),
+                                              admissionEventName(event)};
+        },
+        count);
+}
+
+void TentMetrics::recordAdmissionQueued(AdmissionOwnerKind kind,
+                                        int64_t owner_delta,
+                                        int64_t byte_delta) {
+    if (!initialized_) return;
+    const size_t slot = static_cast<size_t>(kind);
+    auto label = [kind] {
+        return std::array<std::string, 1>{admissionOwnerKindName(kind)};
+    };
+    if (owner_delta != 0)
+        admission_queue_owners_.incCached(slot, label, owner_delta);
+    if (byte_delta != 0)
+        admission_queue_bytes_.incCached(slot, label, byte_delta);
+}
+
+void TentMetrics::recordAdmissionWait(AdmissionOwnerKind kind,
+                                      double latency_us) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed) ||
+        latency_us < 0.0)
+        return;
+    admission_wait_latency_.observeCached(
+        static_cast<size_t>(kind),
+        [kind] {
+            return std::array<std::string, 1>{admissionOwnerKindName(kind)};
+        },
+        static_cast<int64_t>(latency_us));
 }
 
 // Gauge updates below deliberately ignore runtime_enabled_: gauges track
@@ -1701,6 +1784,8 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&segment_events_total_);
         root[selection_events_total_.str_name()] =
             sumCounterValues(&selection_events_total_);
+        root[admission_events_total_.str_name()] =
+            sumCounterValues(&admission_events_total_);
 
         // Gauges: aggregate across transport labels (total in-flight attempts
         // / total registered bytes). Per-transport breakdown is via the
@@ -1721,6 +1806,10 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&rdma_worker_inflight_slices_);
         root[rdma_posted_inflight_slices_.str_name()] =
             sumCounterValues(&rdma_posted_inflight_slices_);
+        root[admission_queue_owners_.str_name()] =
+            sumCounterValues(&admission_queue_owners_);
+        root[admission_queue_bytes_.str_name()] =
+            sumCounterValues(&admission_queue_bytes_);
 
         // Histograms: sum bucket counts across all transport labels. The
         // templated helper also reads back the histogram's sum counter so the
@@ -1740,6 +1829,7 @@ std::string TentMetrics::getJsonMetrics() {
         serializeHistogramToJson(root, stream_attempt_latency_);
         serializeHistogramToJson(root, stream_queue_wait_);
         serializeHistogramToJson(root, shm_copy_latency_);
+        serializeHistogramToJson(root, admission_wait_latency_);
 
         root["tent_metrics_build_info"] = {
             {"version", TENT_BUILD_VERSION},
@@ -1893,6 +1983,10 @@ void TentMetrics::recordShmMappingEvent(ShmMappingEvent) {}
 void TentMetrics::recordShmCopy(Request::OpCode, ShmCopyOutcome, double) {}
 void TentMetrics::recordSegmentEvent(SegmentEvent) {}
 void TentMetrics::recordSelectionEvent(SelectionEvent, TransportType) {}
+void TentMetrics::recordAdmissionEvent(AdmissionOwnerKind, AdmissionEvent,
+                                       int64_t) {}
+void TentMetrics::recordAdmissionQueued(AdmissionOwnerKind, int64_t, int64_t) {}
+void TentMetrics::recordAdmissionWait(AdmissionOwnerKind, double) {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}
