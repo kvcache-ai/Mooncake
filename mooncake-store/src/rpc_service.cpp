@@ -10,6 +10,8 @@
 
 #include "master_metric_manager.h"
 #include "master_service.h"
+#include "ha/oplog/oplog_test_failpoint.h"
+#include "rpc_worker_pool.h"
 #include "rpc_helper.h"
 #include "types.h"
 #include "common/scoped_vlog_timer.h"
@@ -72,6 +74,31 @@ auto WithWriteTenant(std::string_view raw, bool enable_multi_tenants, Fn&& fn) {
         return Result(tl::make_unexpected(tenant_id.error()));
     }
     return std::invoke(std::forward<Fn>(fn), tenant_id.value());
+}
+
+template <typename Request>
+void BindWeightRequestTenant(Request& request, const TenantId& tenant_id) {
+    if constexpr (requires { request.identity.tenant_id; }) {
+        request.identity.tenant_id = tenant_id.value();
+    } else {
+        request.tenant_id = tenant_id.value();
+    }
+}
+
+template <typename Request, typename Fn>
+auto WithWeightRequestTenant(Request request, std::string_view raw,
+                             bool enable_multi_tenants, bool write, Fn&& fn) {
+    using Result = std::invoke_result_t<Fn, const Request&>;
+    auto tenant_id =
+        write ? ResolveTenantIdForWrite(raw, enable_multi_tenants)
+              : ResolveRequestTenantId(
+                    enable_multi_tenants ? raw : TenantId::kDefaultValue);
+    if (!tenant_id) {
+        return Result(
+            tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT));
+    }
+    BindWeightRequestTenant(request, *tenant_id);
+    return std::invoke(std::forward<Fn>(fn), request);
 }
 
 }  // namespace
@@ -180,7 +207,8 @@ tl::expected<bool, ErrorCode> WrappedMasterService::ProbeKey(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchProbeKey(
-    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
+    const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "BatchProbeKey");
     timer.LogRequest("keys_count=", keys.size());
 
@@ -188,7 +216,8 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchProbeKey(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
         keys.size(), [&](const TenantId& resolved_tenant_id) {
-            return master_service_.BatchProbeKey(keys, resolved_tenant_id);
+            return master_service_.BatchProbeKey(policy, keys,
+                                                 resolved_tenant_id);
         });
 }
 
@@ -516,11 +545,11 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                    << " != slice_lengths.size()=" << slice_lengths.size();
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-    } else if (config.group_ids.has_value() &&
-               config.group_ids->size() != keys.size()) {
-        LOG(ERROR) << "BatchPutStart: group_ids.size()="
-                   << config.group_ids->size()
-                   << " != keys.size()=" << keys.size();
+    } else if (!config.ValidSessionIds(keys.size())) {
+        results.assign(keys.size(),
+                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (!config.HasValidKeyHints(keys.size())) {
+        LOG(ERROR) << "BatchPutStart: per-key hint count does not match keys";
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     } else if (!resolved_tenant_id) {
@@ -529,10 +558,10 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     } else if (config.prefer_alloc_in_same_node) {
         ReplicateConfig new_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
-            auto key_config = new_config.ForSingleKey(i);
+            new_config.SetKeyIds(config, i);
             auto result = master_service_.PutStart(
                 client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config);
+                slice_lengths[i], new_config);
             results.emplace_back(result);
             if ((i == 0) && result.has_value()) {
                 std::string preferred_segment;
@@ -551,8 +580,9 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
             }
         }
     } else {
+        ReplicateConfig key_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
-            auto key_config = config.ForSingleKey(i);
+            key_config.SetKeyIds(config, i);
             results.emplace_back(master_service_.PutStart(
                 client_id, keys[i], resolved_tenant_id.value(),
                 slice_lengths[i], key_config));
@@ -771,11 +801,12 @@ WrappedMasterService::BatchUpsertStart(
                    << " != slice_lengths.size()=" << slice_lengths.size();
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-    } else if (config.group_ids.has_value() &&
-               config.group_ids->size() != keys.size()) {
-        LOG(ERROR) << "BatchUpsertStart: group_ids.size()="
-                   << config.group_ids->size()
-                   << " != keys.size()=" << keys.size();
+    } else if (!config.ValidSessionIds(keys.size())) {
+        results.assign(keys.size(),
+                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (!config.HasValidKeyHints(keys.size())) {
+        LOG(ERROR)
+            << "BatchUpsertStart: per-key hint count does not match keys";
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     } else if (auto resolved_tenant_id = ResolveTenantIdForWrite(
@@ -959,6 +990,19 @@ long WrappedMasterService::RemoveAll(bool force, const std::string& tenant_id) {
     return result;
 }
 
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchUpdateSoftPin(const std::vector<std::string>& keys,
+                                         uint64_t ttl_ms,
+                                         const std::string& tenant_id) {
+    return WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        keys.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchUpdateSoftPin(keys, resolved_tenant_id,
+                                                      ttl_ms);
+        });
+}
+
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
     const std::vector<std::string>& keys, bool force,
     const std::string& tenant_id) {
@@ -990,6 +1034,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
     const Segment& segment, const UUID& client_id) {
+    TestFailPoint::Wait("rpc_mount_segment_before_service");
     return execute_rpc(
         "MountSegment",
         [&] { return master_service_.MountSegment(segment, client_id); },
@@ -1736,6 +1781,22 @@ WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
     return master_service_.PromotionObjectHeartbeat(client_id);
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::RegisterPrefetchTask(
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "RegisterPrefetchTask");
+    timer.LogRequest("action=register_prefetch_task");
+    auto result = WithRequestTenant(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        [&](const TenantId& resolved_tenant_id) {
+            return master_service_.RegisterPrefetchTask(client_id, key,
+                                                        resolved_tenant_id);
+        });
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 WrappedMasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
@@ -1823,6 +1884,120 @@ tl::expected<void, ErrorCode> WrappedMasterService::SetSegmentStatus(
     return master_service_.SetSegmentStatus(segment_name, status);
 }
 
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::BeginWeightImport(const BeginWeightImportRequest& request,
+                                        const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.BeginWeightImport(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::CommitWeightImport(
+    const CommitWeightImportRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.CommitWeightImport(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::AbortWeightImport(const AbortWeightImportRequest& request,
+                                        const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.AbortWeightImport(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionView>
+WrappedMasterService::GetWeightRevision(const GetWeightRevisionRequest& request,
+                                        const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
+        [this](const auto& bound) {
+            return master_service_.GetWeightRevision(bound);
+        });
+}
+
+WeightMetadataStore::Result<ListWeightRevisionsResponse>
+WrappedMasterService::ListWeightRevisions(
+    const ListWeightRevisionsRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
+        [this](const auto& bound) {
+            return master_service_.ListWeightRevisions(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionLease>
+WrappedMasterService::AcquireWeightRevisionLease(
+    const AcquireWeightRevisionLeaseRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.AcquireWeightRevisionLease(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionLease>
+WrappedMasterService::RenewWeightRevisionLease(
+    const RenewWeightRevisionLeaseRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.RenewWeightRevisionLease(bound);
+        });
+}
+
+WeightMetadataStore::Result<void>
+WrappedMasterService::ReleaseWeightRevisionLease(
+    const ReleaseWeightRevisionLeaseRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.ReleaseWeightRevisionLease(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightResidencyOperation>
+WrappedMasterService::StartWeightResidencyOperation(
+    const StartWeightResidencyOperationRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.StartWeightResidencyOperation(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightResidencyOperation>
+WrappedMasterService::QueryWeightOperation(
+    const QueryWeightOperationRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
+        [this](const auto& bound) {
+            return master_service_.QueryWeightOperation(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::DeleteWeightRevision(
+    const DeleteWeightRevisionRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.DeleteWeightRevision(bound);
+        });
+}
+
 bool WrappedMasterService::KvEventsEnabled() const {
     return master_service_.KvEventsEnabled();
 }
@@ -1857,163 +2032,108 @@ WrappedMasterService::RestoreFromBatchOpLogPromotion(
         chunk_object_count);
 }
 
-void RegisterRpcService(
-    coro_rpc::coro_rpc_server& server,
-    mooncake::WrappedMasterService& wrapped_master_service) {
-    server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
+namespace {
+
+template <auto... Methods>
+void RegisterPooledHandlers(coro_rpc::coro_rpc_server& server,
+                            WrappedMasterService& service,
+                            RpcWorkerPool* worker_pool) {
+    if (worker_pool == nullptr) {
+        server.register_handler<Methods...>(&service);
+        return;
+    }
+    (worker_pool->Register<Methods>(server, service), ...);
+}
+
+}  // namespace
+
+void RegisterRpcService(coro_rpc::coro_rpc_server& server,
+                        WrappedMasterService& wrapped_master_service,
+                        RpcWorkerPool* worker_pool) {
+    server.register_handler<&WrappedMasterService::Ping,
+                            &WrappedMasterService::ServiceReady>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::ProbeKey>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchReplicaClear>(
+    RegisterPooledHandlers<
+        &WrappedMasterService::ExistKey, &WrappedMasterService::ProbeKey,
+        &WrappedMasterService::BatchQueryIp,
+        &WrappedMasterService::BatchReplicaClear,
+        &WrappedMasterService::GetReplicaListByRegex,
+        &WrappedMasterService::GetReplicaList,
+        &WrappedMasterService::BatchGetReplicaList,
+        &WrappedMasterService::PutStart, &WrappedMasterService::PutEnd,
+        &WrappedMasterService::PutRevoke, &WrappedMasterService::BatchPutStart,
+        &WrappedMasterService::BatchPutEnd,
+        &WrappedMasterService::BatchPutRevoke,
+        &WrappedMasterService::UpsertStart, &WrappedMasterService::UpsertEnd,
+        &WrappedMasterService::UpsertRevoke,
+        &WrappedMasterService::BatchUpsertStart,
+        &WrappedMasterService::BatchUpsertEnd,
+        &WrappedMasterService::BatchUpsertRevoke, &WrappedMasterService::Remove,
+        &WrappedMasterService::RemoveByRegex, &WrappedMasterService::RemoveAll,
+        &WrappedMasterService::BatchRemove, &WrappedMasterService::MountSegment,
+        &WrappedMasterService::MountNoFSegment,
+        &WrappedMasterService::ReMountSegment,
+        &WrappedMasterService::ReMountNoFSegment,
+        &WrappedMasterService::UnmountSegment,
+        &WrappedMasterService::GracefulUnmountSegment,
+        &WrappedMasterService::UnmountNoFSegment,
+        &WrappedMasterService::GetAllNoFSegments,
+        &WrappedMasterService::GetNoFSegmentsByName,
+        &WrappedMasterService::GetFsdir,
+        &WrappedMasterService::QuerySegmentStatus,
+        &WrappedMasterService::QuerySegmentStatusById,
+        &WrappedMasterService::GetStorageConfig,
+        &WrappedMasterService::BatchExistKey,
+        &WrappedMasterService::BatchProbeKey,
+        &WrappedMasterService::MountLocalDiskSegment,
+        &WrappedMasterService::UnmountLocalDiskSegment,
+        &WrappedMasterService::OffloadObjectHeartbeat,
+        &WrappedMasterService::ReportSsdCapacity,
+        &WrappedMasterService::NotifyOffloadSuccess,
+        &WrappedMasterService::PromotionObjectHeartbeat,
+        &WrappedMasterService::PromotionAllocStart,
+        &WrappedMasterService::NotifyPromotionSuccess,
+        &WrappedMasterService::NotifyPromotionFailure,
+        &WrappedMasterService::CopyStart,
+        &WrappedMasterService::DynamicReplicaCopyStart,
+        &WrappedMasterService::CopyEnd,
+        &WrappedMasterService::DynamicReplicaCopyEnd,
+        &WrappedMasterService::CopyRevoke,
+        &WrappedMasterService::DynamicReplicaCopyRevoke,
+        &WrappedMasterService::MoveStart, &WrappedMasterService::MoveEnd,
+        &WrappedMasterService::MoveRevoke,
+        &WrappedMasterService::EvictDiskReplica,
+        &WrappedMasterService::EvictDiskReplicaIfCurrent,
+        &WrappedMasterService::BatchEvictDiskReplica,
+        &WrappedMasterService::PollRemoveAll,
+        &WrappedMasterService::CreateCopyTask,
+        &WrappedMasterService::CreateMoveTask, &WrappedMasterService::QueryTask,
+        &WrappedMasterService::FetchTasks,
+        &WrappedMasterService::MarkTaskToComplete,
+        &WrappedMasterService::BeginWeightImport,
+        &WrappedMasterService::CommitWeightImport,
+        &WrappedMasterService::AbortWeightImport,
+        &WrappedMasterService::GetWeightRevision,
+        &WrappedMasterService::ListWeightRevisions,
+        &WrappedMasterService::AcquireWeightRevisionLease,
+        &WrappedMasterService::RenewWeightRevisionLease,
+        &WrappedMasterService::ReleaseWeightRevisionLease,
+        &WrappedMasterService::StartWeightResidencyOperation,
+        &WrappedMasterService::QueryWeightOperation,
+        &WrappedMasterService::DeleteWeightRevision>(
+        server, wrapped_master_service, worker_pool);
+    // The prefetch additions stay individual registrations on top of the
+    // pool: read-only replica queries (no lease, no promotion-on-hit, no
+    // metrics) and the prefetch task RPC. Purely additive for old peers.
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetReplicaListForAdmin>(
         &wrapped_master_service);
     server.register_handler<
-        &mooncake::WrappedMasterService::GetReplicaListByRegex>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
-        &wrapped_master_service);
-    server
-        .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
-            &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::PutStart>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::PutEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::PutRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchPutStart>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchPutEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchPutRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::UpsertStart>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::UpsertEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::UpsertRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchUpsertStart>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchUpsertEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchUpsertRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::Remove>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::RemoveByRegex>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::RemoveAll>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchRemove>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::MountNoFSegment>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::ReMountSegment>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::ReMountNoFSegment>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
+        &mooncake::WrappedMasterService::BatchGetReplicaListForAdmin>(
         &wrapped_master_service);
     server.register_handler<
-        &mooncake::WrappedMasterService::GracefulUnmountSegment>(
+        &mooncake::WrappedMasterService::RegisterPrefetchTask>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::UnmountNoFSegment>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetAllNoFSegments>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::GetNoFSegmentsByName>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::Ping>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetFsdir>(
-        &wrapped_master_service);
-    server
-        .register_handler<&mooncake::WrappedMasterService::QuerySegmentStatus>(
-            &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::QuerySegmentStatusById>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetStorageConfig>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::BatchProbeKey>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::MountLocalDiskSegment>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::UnmountLocalDiskSegment>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::OffloadObjectHeartbeat>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::ReportSsdCapacity>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::NotifyOffloadSuccess>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::PromotionObjectHeartbeat>(
-        &wrapped_master_service);
-    server
-        .register_handler<&mooncake::WrappedMasterService::PromotionAllocStart>(
-            &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::NotifyPromotionSuccess>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::NotifyPromotionFailure>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::CopyStart>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::DynamicReplicaCopyStart>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::CopyEnd>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::DynamicReplicaCopyEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::CopyRevoke>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::DynamicReplicaCopyRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::MoveStart>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::MoveEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::MoveRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::EvictDiskReplica>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::EvictDiskReplicaIfCurrent>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::BatchEvictDiskReplica>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::PollRemoveAll>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::CreateCopyTask>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::CreateMoveTask>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::QueryTask>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::FetchTasks>(
-        &wrapped_master_service);
-    server
-        .register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(
-            &wrapped_master_service);
 }
 
 }  // namespace mooncake

@@ -54,6 +54,10 @@ class TenantQuotaAccount {
     static constexpr uint64_t kMaxChargedBytes = kChargedBytesMask;
 
     TenantQuotaChargeResult TryCharge(uint64_t bytes);
+    // Charges `bytes` whatever the quota and the admission state, saturating
+    // at kMaxChargedBytes: for memory already in use that was not charged up
+    // front.
+    void ChargeUnchecked(uint64_t bytes);
     TenantQuotaResult Release(uint64_t bytes);
 
     uint64_t ChargedBytes() const;

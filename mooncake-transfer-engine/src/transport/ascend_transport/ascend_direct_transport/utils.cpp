@@ -65,6 +65,21 @@ bool ProtocolDescValueContainsRoce(const Json::Value& value) {
     return false;
 }
 
+bool ProtocolDescValueContainsExact(const Json::Value& value,
+                                    const std::string& expected) {
+    if (value.isString()) {
+        return value.asString() == expected;
+    }
+    if (value.isArray()) {
+        for (const auto& item : value) {
+            if (item.isString() && item.asString() == expected) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 const Json::Value* FindProtocolDescValue(const Json::Value& root) {
     if (root.isMember(kProtocolDescFlatKey)) {
         return &root[kProtocolDescFlatKey];
@@ -99,6 +114,15 @@ bool ParseGlobalResourceConfigObject(const char* config_str,
     }
     return true;
 }
+
+bool ObjectSelectsRoceHost(const Json::Value& object) {
+    if (!object.isObject()) {
+        return false;
+    }
+    const Json::Value* protocol_desc = FindProtocolDescValue(object);
+    return protocol_desc != nullptr &&
+           ProtocolDescValueContainsExact(*protocol_desc, "roce:host");
+}
 }  // namespace
 
 bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str) {
@@ -111,6 +135,20 @@ bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str) {
         return false;
     }
     return ProtocolDescValueContainsRoce(*protocol_desc);
+}
+
+bool HasRoceHostProtocolDescInGlobalResourceConfig(const char* config_str) {
+    Json::Value root;
+    if (!ParseGlobalResourceConfigObject(config_str, root)) {
+        return false;
+    }
+    if (ObjectSelectsRoceHost(root)) {
+        return true;
+    }
+    // "store" is a sibling config, not a protocol_desc value. Host segments
+    // are allocated after the store-role flag is cleared, so look here too.
+    return root.isMember(kStoreConfigKey) &&
+           ObjectSelectsRoceHost(root[kStoreConfigKey]);
 }
 
 std::string ResolveAscendGlobalResourceConfig(const char* config_str) {

@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "tent/common/concurrent/thread_local_storage.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
 
@@ -110,6 +111,7 @@ class IOUringTransport : public Transport {
     using FileContextMap =
         std::unordered_map<SegmentID, std::shared_ptr<IOUringFileContext>>;
     FileContextMap file_context_map_;
+    ThreadLocalStorage<FileContextMap> tl_file_context_map_;
     uint64_t async_memcpy_threshold_;
 };
 }  // namespace tent

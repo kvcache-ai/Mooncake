@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -32,7 +33,6 @@ namespace mooncake {
 
 class PutOperation;
 class DistributedStorageBackend;
-class RealClient;
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol);
@@ -79,6 +79,35 @@ class Client {
    public:
     virtual ~Client();
 
+    // One topology/registration snapshot serves every key or fragment in a
+    // batch. Returned names remain owned by that snapshot.
+    using HcaAffinity =
+        std::function<const std::vector<std::string>&(std::span<const Slice>)>;
+    static HcaAffinity MakeHcaAffinity(const Topology& topology,
+                                       std::vector<SegmentBufferInfo> buffers);
+    static std::optional<SegmentLocality> DiscoverSegmentLocality(
+        const Topology& topology, const std::string& location);
+    class ReadReplicaSelector {
+       public:
+        ErrorCode operator()(const std::vector<Replica::Descriptor>& replicas,
+                             std::span<const Slice> destinations,
+                             Replica::Descriptor& result);
+
+       private:
+        friend class Client;
+        explicit ReadReplicaSelector(const Client* client) : client_(client) {}
+        struct Context {
+            HcaAffinity infer;
+            std::unordered_set<std::string> endpoints;
+        };
+        const Client* client_;
+        std::unique_ptr<Context> context_;
+        bool initialized_{false};
+    };
+    ReadReplicaSelector MakeReadReplicaSelector() const {
+        return ReadReplicaSelector(this);
+    }
+
     using WriteBufferStager =
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(
             const std::vector<Slice>&)>;
@@ -107,7 +136,19 @@ class Client {
         const std::string& master_server_entry = kDefaultMasterAddress,
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
         std::map<std::string, std::string> labels = {},
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        std::shared_ptr<NVMeoFInitiator> nof_initiator = nullptr);
+
+    // Test-only seam: when set, Client::Create builds the default NoF
+    // initiator from this factory instead of CreateNofRuntime() whenever the
+    // caller passes no initiator (nullptr). Not thread-safe; set before
+    // Create and reset (pass nullptr) after the test.
+    static void SetDefaultNofInitiatorFactoryForTesting(
+        std::function<std::shared_ptr<NVMeoFInitiator>()> factory);
+
+    // Test-only accessor for the wiring above: the initiator this client
+    // ended up with (nullptr = NoF unavailable in this process).
+    std::shared_ptr<NVMeoFInitiator> GetNofInitiatorForTesting() const;
 
     /**
      * @brief Retrieves data for a given key
@@ -147,6 +188,23 @@ class Client {
     tl::expected<QueryResult, ErrorCode> Query(const std::string& object_key);
 
     /**
+     * @brief Read-only variant of Query(): fetches replica metadata without
+     * granting a lease, triggering promotion-on-hit, or counting valid_get
+     * metrics on the master.
+     *
+     * The returned QueryResult carries an already-expired lease
+     * (lease_ttl_ms is forced to 0): callers must not start data transfers
+     * based on it without a subsequent lease-granting Query().
+     *
+     * Intended for best-effort background paths (e.g. SSD prefetch metadata
+     * classification) that must not perturb hot-path state.
+     * @param object_key Key to query
+     * @return QueryResult containing replicas, or ErrorCode indicating failure
+     */
+    tl::expected<QueryResult, ErrorCode> QueryReadOnly(
+        const std::string& object_key);
+
+    /**
      * @brief Queries replica lists for object keys that match a regex pattern.
      * @param str The regular expression string to match against object keys.
      * @return An expected object containing a map from object keys to their
@@ -166,6 +224,16 @@ class Client {
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys);
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
+        const std::vector<std::string>& object_keys,
+        const std::string& tenant_id);
+
+    /**
+     * @brief Read-only variant of BatchQuery(); see QueryReadOnly() for the
+     * lease/metrics semantics. Per-key results keep input order.
+     */
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQueryReadOnly(
+        const std::vector<std::string>& object_keys);
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQueryReadOnly(
         const std::vector<std::string>& object_keys,
         const std::string& tenant_id);
 
@@ -268,7 +336,8 @@ class Client {
         const std::vector<Replica::Descriptor>& replicas,
         const std::vector<std::vector<Slice>>& slices,
         const std::vector<std::vector<uint64_t>>& src_offsets,
-        TransferIntent intent = TransferIntent::kUnspecified);
+        TransferIntent intent = TransferIntent::kUnspecified,
+        std::span<const QueryResult* const> query_results = {});
 
     /**
      * @brief Batch ranged read from restored LOCAL_DISK arenas.
@@ -468,14 +537,38 @@ class Client {
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys);
 
+    WeightRpcResult<WeightRevisionMetadata> BeginWeightImport(
+        const BeginWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> CommitWeightImport(
+        const CommitWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> AbortWeightImport(
+        const AbortWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionView> GetWeightRevision(
+        const GetWeightRevisionRequest& request);
+    WeightRpcResult<ListWeightRevisionsResponse> ListWeightRevisions(
+        const ListWeightRevisionsRequest& request);
+    WeightRpcResult<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request);
+    WeightRpcResult<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request);
+    WeightRpcResult<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request);
+    WeightRpcResult<WeightResidencyOperation> StartWeightResidencyOperation(
+        const StartWeightResidencyOperationRequest& request);
+    WeightRpcResult<WeightResidencyOperation> QueryWeightOperation(
+        const QueryWeightOperationRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> DeleteWeightRevision(
+        const DeleteWeightRevisionRequest& request);
+
     /**
-     * @brief Point-in-time existence check for multiple objects, granting no
-     *        read leases
+     * @brief Probe multiple objects, optionally leasing the last complete
+     *        candidate. LastHitOnly leases the last all-true candidate.
      * @param keys Vector of keys to check
-     * @return Vector of existence results for each key
+     * @return Per-key existence results in input order
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys,
+        const GrantLeasePolicy& policy = {});
 
     /**
      * @brief Create a copy task to copy an object's replicas to target segments
@@ -572,6 +665,16 @@ class Client {
     // Virtual to enable subclassing in unit tests.
     virtual tl::expected<void, ErrorCode> PromotionObjectHeartbeat(
         std::vector<PromotionTaskItem>& promotion_objects);
+
+    /**
+     * @brief Register a master-side promotion task for SSD prefetch, without
+     * the promotion-on-hit admission gate or heartbeat mailbox. This client
+     * must hold the key's LOCAL_DISK replica. Best-effort:
+     * PROMOTION_ALREADY_EXISTS means skip quietly. The client's tenant
+     * applies.
+     */
+    virtual tl::expected<void, ErrorCode> RegisterPrefetchTask(
+        const std::string& object_key, const std::string& tenant_id);
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during
@@ -712,6 +815,11 @@ class Client {
     }
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
+
+    [[nodiscard]] bool HasClassicTransport(const std::string& protocol) const {
+        return transfer_engine_ && !transfer_engine_->isUsingTent() &&
+               transfer_engine_->getTransport(protocol) != nullptr;
+    }
 
     [[nodiscard]] bool CanUseLocalMemcpy(const std::string& endpoint) const {
         return transfer_submitter_ != nullptr &&
@@ -968,7 +1076,7 @@ class Client {
      */
     ErrorCode FindFirstCompleteReplica(
         const std::vector<Replica::Descriptor>& replica_list,
-        Replica::Descriptor& replica);
+        Replica::Descriptor& replica) const;
 
     /**
      * @brief Batch put helper methods for structured approach
@@ -1003,6 +1111,12 @@ class Client {
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
+    HcaAffinity MakeHcaAffinity() const;
+    void AttachHcaAffinity(ReplicateConfig& config,
+                           const std::vector<Slice>& slices) const;
+    ReplicateConfig AttachBatchHcaAffinity(
+        const ReplicateConfig& config, const std::vector<PutOperation>& ops,
+        const std::vector<size_t>& indices) const;
 
     // Client identification
     const UUID client_id_;
@@ -1014,6 +1128,8 @@ class Client {
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
+    // NoF initiator injected by RealClient; nullptr when NoF is unavailable.
+    std::shared_ptr<NVMeoFInitiator> nof_initiator_;
 
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;

@@ -26,6 +26,17 @@ namespace mooncake {
 
 namespace {
 constexpr size_t kMemcpyBatchLimit = 4096U;
+
+// aclrtPointerGetAttributes reports an imported memfd as UNREGISTERED.
+// That memory is still host memory. Copy() classifies a whole slice list
+// from the first pointer, so leaving this as DEFAULT sends every slice
+// through aclrtMemcpy.
+uint32_t HostLikeLocation(uint32_t type) {
+    if (type == ACL_MEM_LOCATION_TYPE_UNREGISTERED) {
+        return ACL_MEM_LOCATION_TYPE_HOST;
+    }
+    return type;
+}
 }  // namespace
 
 namespace {
@@ -123,8 +134,18 @@ aclrtStream LocalCopyEngine::GetOrCreateStreamForCurrentDevice() {
     return stream;
 }
 
+void *LocalCopyEngine::DestAddr(const std::vector<Slice *> &slice_list,
+                                const std::vector<void *> &dest_addrs,
+                                size_t index) {
+    if (!dest_addrs.empty()) {
+        return dest_addrs[index];
+    }
+    return reinterpret_cast<void *>(slice_list[index]->ascend_direct.dest_addr);
+}
+
 void LocalCopyEngine::Copy(TransferRequest::OpCode opcode,
-                           const std::vector<Slice *> &slice_list) {
+                           const std::vector<Slice *> &slice_list,
+                           const std::vector<void *> &dest_addrs) {
     if (slice_list.empty()) {
         return;
     }
@@ -137,9 +158,17 @@ void LocalCopyEngine::Copy(TransferRequest::OpCode opcode,
         return;
     }
 
+    if (!dest_addrs.empty() && dest_addrs.size() != slice_list.size()) {
+        LOG(ERROR) << "Rebased destination count " << dest_addrs.size()
+                   << " does not match slice count " << slice_list.size();
+        for (auto &slice : slice_list) {
+            slice->markFailed();
+        }
+        return;
+    }
+
     auto &first_slice = slice_list[0];
-    auto remote_ptr =
-        reinterpret_cast<void *>(first_slice->ascend_direct.dest_addr);
+    auto remote_ptr = DestAddr(slice_list, dest_addrs, 0);
 
     aclrtPtrAttributes src_attrs;
     auto ret = aclrtPointerGetAttributes(first_slice->source_addr, &src_attrs);
@@ -166,13 +195,13 @@ void LocalCopyEngine::Copy(TransferRequest::OpCode opcode,
 
     // For host-to-host or default cases, use sync copy
     if (kind == ACL_MEMCPY_HOST_TO_HOST || kind == ACL_MEMCPY_DEFAULT) {
-        CopyWithSync(opcode, slice_list, kind);
+        CopyWithSync(opcode, slice_list, dest_addrs, kind);
         return;
     }
 
     // For device-to-device, use async copy
     if (kind == ACL_MEMCPY_DEVICE_TO_DEVICE) {
-        CopyWithAsync(opcode, slice_list, kind);
+        CopyWithAsync(opcode, slice_list, dest_addrs, kind);
         return;
     }
 
@@ -181,12 +210,13 @@ void LocalCopyEngine::Copy(TransferRequest::OpCode opcode,
     size_t slice_index = 0;
     while (left_num > 0) {
         auto batch_num = std::min(left_num, kMemcpyBatchLimit);
-        ret = CopyWithBatch(opcode, slice_list, kind, batch_num, slice_index);
+        ret = CopyWithBatch(opcode, slice_list, dest_addrs, kind, batch_num,
+                            slice_index);
         if (ret == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
             // Fallback to async copy if batch copy is not supported
             VLOG(1) << "aclrtMemcpyBatch FEATURE_NOT_SUPPORT (207000); "
                        "falling back to CopyWithAsync";
-            CopyWithAsync(opcode, slice_list, kind);
+            CopyWithAsync(opcode, slice_list, dest_addrs, kind);
             return;
         }
         left_num -= batch_num;
@@ -197,18 +227,20 @@ void LocalCopyEngine::Copy(TransferRequest::OpCode opcode,
 aclrtMemcpyKind LocalCopyEngine::GetMemcpyKind(TransferRequest::OpCode opcode,
                                                aclrtPtrAttributes &src_attrs,
                                                aclrtPtrAttributes &dst_attrs) {
-    if (src_attrs.location.type == ACL_MEM_LOCATION_TYPE_HOST &&
-        dst_attrs.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
+    const uint32_t src_type = HostLikeLocation(src_attrs.location.type);
+    const uint32_t dst_type = HostLikeLocation(dst_attrs.location.type);
+    if (src_type == ACL_MEM_LOCATION_TYPE_HOST &&
+        dst_type == ACL_MEM_LOCATION_TYPE_HOST) {
         return ACL_MEMCPY_HOST_TO_HOST;
-    } else if (src_attrs.location.type == ACL_MEM_LOCATION_TYPE_DEVICE &&
-               dst_attrs.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+    } else if (src_type == ACL_MEM_LOCATION_TYPE_DEVICE &&
+               dst_type == ACL_MEM_LOCATION_TYPE_DEVICE) {
         return ACL_MEMCPY_DEVICE_TO_DEVICE;
-    } else if (src_attrs.location.type == ACL_MEM_LOCATION_TYPE_HOST &&
-               dst_attrs.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+    } else if (src_type == ACL_MEM_LOCATION_TYPE_HOST &&
+               dst_type == ACL_MEM_LOCATION_TYPE_DEVICE) {
         return (opcode == TransferRequest::WRITE) ? ACL_MEMCPY_HOST_TO_DEVICE
                                                   : ACL_MEMCPY_DEVICE_TO_HOST;
-    } else if (src_attrs.location.type == ACL_MEM_LOCATION_TYPE_DEVICE &&
-               dst_attrs.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
+    } else if (src_type == ACL_MEM_LOCATION_TYPE_DEVICE &&
+               dst_type == ACL_MEM_LOCATION_TYPE_HOST) {
         return (opcode == TransferRequest::WRITE) ? ACL_MEMCPY_DEVICE_TO_HOST
                                                   : ACL_MEMCPY_HOST_TO_DEVICE;
     }
@@ -217,6 +249,7 @@ aclrtMemcpyKind LocalCopyEngine::GetMemcpyKind(TransferRequest::OpCode opcode,
 
 aclError LocalCopyEngine::CopyWithBatch(TransferRequest::OpCode opcode,
                                         const std::vector<Slice *> &slice_list,
+                                        const std::vector<void *> &dest_addrs,
                                         aclrtMemcpyKind kind, size_t batch_num,
                                         size_t slice_index) const {
     std::vector<void *> void_remote_addrs(batch_num);
@@ -245,7 +278,7 @@ aclError LocalCopyEngine::CopyWithBatch(TransferRequest::OpCode opcode,
         auto &slice = slice_list[slice_index + i];
         void_local_addrs[i] = slice->source_addr;
         void_remote_addrs[i] =
-            reinterpret_cast<void *>(slice->ascend_direct.dest_addr);
+            DestAddr(slice_list, dest_addrs, slice_index + i);
         sizes[i] = slice->length;
     }
 
@@ -284,11 +317,12 @@ aclError LocalCopyEngine::CopyWithBatch(TransferRequest::OpCode opcode,
 
 void LocalCopyEngine::CopyWithSync(TransferRequest::OpCode opcode,
                                    const std::vector<Slice *> &slice_list,
+                                   const std::vector<void *> &dest_addrs,
                                    aclrtMemcpyKind kind) {
-    for (auto &slice : slice_list) {
+    for (size_t i = 0; i < slice_list.size(); ++i) {
+        auto &slice = slice_list[i];
         auto local_ptr = slice->source_addr;
-        auto remote_ptr =
-            reinterpret_cast<void *>(slice->ascend_direct.dest_addr);
+        auto remote_ptr = DestAddr(slice_list, dest_addrs, i);
         auto len = slice->length;
 
         aclError ret;
@@ -310,6 +344,7 @@ void LocalCopyEngine::CopyWithSync(TransferRequest::OpCode opcode,
 
 void LocalCopyEngine::CopyWithAsync(TransferRequest::OpCode opcode,
                                     const std::vector<Slice *> &slice_list,
+                                    const std::vector<void *> &dest_addrs,
                                     aclrtMemcpyKind kind) {
     aclrtStream stream = GetOrCreateStreamForCurrentDevice();
     if (stream == nullptr) {
@@ -322,10 +357,10 @@ void LocalCopyEngine::CopyWithAsync(TransferRequest::OpCode opcode,
     std::vector<Slice *> async_list;
     async_list.reserve(slice_list.size());
 
-    for (auto &slice : slice_list) {
+    for (size_t i = 0; i < slice_list.size(); ++i) {
+        auto &slice = slice_list[i];
         auto local_ptr = slice->source_addr;
-        auto remote_ptr =
-            reinterpret_cast<void *>(slice->ascend_direct.dest_addr);
+        auto remote_ptr = DestAddr(slice_list, dest_addrs, i);
         auto len = slice->length;
 
         aclError ret;

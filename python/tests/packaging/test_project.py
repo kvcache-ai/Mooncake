@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -24,6 +25,11 @@ CLI_ENTRY_POINTS = {
     "transfer_engine_bench": "mooncake.cli_bench:main",
     "transfer_engine_topology_dump": "mooncake.transfer_engine_topology_dump:main",
 }
+STORE_RS_CLI_ENTRY_POINTS = {
+    "mooncake-store-rs-client": "mooncake._launcher:store_rs_client",
+    "mooncake-store-rs-admin": "mooncake._launcher:store_rs_admin",
+    "mooncake-store-rs-bench": "mooncake._launcher:store_rs_bench",
+}
 
 
 def test_scikit_build_core_is_the_only_build_backend() -> None:
@@ -43,6 +49,7 @@ def test_scikit_build_core_is_the_only_build_backend() -> None:
     assert "pip>=23" in project["build-system"]["requires"]
     assert project["tool"]["scikit-build"]["cmake"]["define"]["USE_CUDA"] is False
     assert project["tool"]["scikit-build"]["cmake"]["define"]["WITH_EP"] is False
+    assert project["tool"]["scikit-build"]["cmake"]["define"]["WITH_STORE_RS"] is False
 
 
 def test_dependency_boundaries_are_declared() -> None:
@@ -254,9 +261,9 @@ def test_scikit_build_consumes_unified_python_sources() -> None:
     (the \"unified\" Python sources) while mooncake-integration installs the
     CLI binaries next to the package so the console scripts resolve them.
 
-    The legacy mooncake-wheel tree still supplies the not-yet-migrated pure-
-    Python modules at install time (Python/CMakeLists.txt DIRECTORY rule);
-    Phase 2 should move those into python/mooncake and drop the rule.
+    The root facade and Store-RS implementation are installed from the
+    canonical python/mooncake tree. Other integrations keep their current
+    source ownership until their separate migration.
     """
     root_cmake = (REPOSITORY_ROOT / "CMakeLists.txt").read_text()
     # SKBUILD must route through the unified python/CMakeLists.txt.
@@ -280,25 +287,35 @@ def test_scikit_build_consumes_unified_python_sources() -> None:
     integration_cmake = (
         REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
     ).read_text()
-    # The store CLI binaries ship next to the package under SKBUILD so the
-    # mooncake.cli / mooncake.cli_client wrappers resolve them in place.
+    # The C++ Store extension is private; Python imports it through the facade.
     assert "install(TARGETS mooncake_master mooncake_client" in integration_cmake
     assert "RUNTIME DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}" in integration_cmake
     assert "if(WITH_TE AND BUILD_EXAMPLES)" in integration_cmake
+    assert 'OUTPUT_NAME "_store"' in integration_cmake
+    assert "../python/mooncake/store/" in integration_cmake
+    binding = (REPOSITORY_ROOT / "mooncake-integration/store/store_py.cpp").read_text()
+    assert "PYBIND11_MODULE(_store, m)" in binding
+
+    store_rs = REPOSITORY_ROOT / "mooncake-store-rs"
+    assert not (store_rs / "pyproject.toml").exists()
+    assert not (store_rs / "python/mooncake_store_rs.pth").exists()
+    assert not (store_rs / "python/mooncake_store_rs/_shim.py").exists()
+    assert (REPOSITORY_ROOT / "python/mooncake/store/rs/store.py").is_file()
+    assert (
+        REPOSITORY_ROOT / "python/tests/store/rs/test_structured_object_store.py"
+    ).is_file()
 
 
-def test_python_package_init_keeps_namespace_extension() -> None:
-    """The unified python/mooncake package must behave like the legacy wheel
-    package: both extend the namespace so independently installed mooncake
-    subpackages (e.g. mooncake-reshard / mooncake-pg) remain importable."""
+def test_python_package_init_keeps_store_import_lazy() -> None:
+    """Importing Mooncake must leave backend selection to mooncake.store."""
     init = (REPOSITORY_ROOT / "python" / "mooncake" / "__init__.py").read_text()
-    assert "extend_path" in init
-    assert "__path__ = extend_path(__path__, __name__)" in init
+    assert "from mooncake.buffer_pool import" not in init
+    assert "def __getattr__" in init
+    assert "from .store import BufferPool" in init
 
-    legacy_init = (
-        REPOSITORY_ROOT / "mooncake-wheel" / "mooncake" / "__init__.py"
-    ).read_text()
-    assert "extend_path" in legacy_init
+    facade = (REPOSITORY_ROOT / "python/mooncake/store/__init__.py").read_text()
+    assert 'os.environ.get("MOONCAKE_STORE_BACKEND", "cpp")' in facade
+    assert "sys.meta_path" not in facade
 
 
 def test_cli_entry_points_remain_stable_across_build_interfaces() -> None:
@@ -310,6 +327,18 @@ def test_cli_entry_points_remain_stable_across_build_interfaces() -> None:
         scripts = project["project"]["scripts"]
         assert {name: scripts[name] for name in CLI_ENTRY_POINTS} == CLI_ENTRY_POINTS
 
+    root_project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    scripts = root_project["project"]["scripts"]
+    assert {
+        name: scripts[name] for name in STORE_RS_CLI_ENTRY_POINTS
+    } == STORE_RS_CLI_ENTRY_POINTS
+    old_store_rs_commands = {
+        "mooncake-store-client",
+        "mooncake-store-admin",
+        "mooncake-store-bench",
+    }
+    assert old_store_rs_commands.isdisjoint(scripts)
+
 
 def test_cli_build_inputs_use_the_canonical_sources() -> None:
     legacy_build = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
@@ -318,6 +347,8 @@ def test_cli_build_inputs_use_the_canonical_sources() -> None:
         assert module in legacy_build
     # The shared launcher must also be staged so the setuptools wheel has it.
     assert "_launcher.py" in legacy_build
+    assert 'STORE_FACADE_SOURCE_DIR="python/mooncake/store"' in legacy_build
+    assert 'cp -R "${STORE_FACADE_SOURCE_DIR}"' in legacy_build
 
     integration_cmake = (
         REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
@@ -352,6 +383,54 @@ def test_lightweight_modules_have_one_authoritative_source() -> None:
     assert not (
         REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_buffer_pool_native.py"
     ).exists()
+
+
+def test_engine_typing_ships_from_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+    typing_files = ("py.typed", "engine.pyi")
+
+    for name in typing_files:
+        assert (package_root / name).is_file()
+        assert not (legacy_package_root / name).exists()
+
+    legacy_build_script = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    migrated_modules = (
+        legacy_build_script.split("MIGRATED_PYTHON_MODULES=(", 1)[1]
+        .split(")", 1)[0]
+        .split()
+    )
+    assert set(typing_files) <= set(migrated_modules)
+
+    legacy = tomllib.loads(
+        (REPOSITORY_ROOT / "mooncake-wheel" / "pyproject.toml").read_text()
+    )
+    package_data = legacy["tool"]["setuptools"]["package-data"]["mooncake"]
+    assert {"*.pyi", "py.typed"} <= set(package_data)
+
+    integration_cmake = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    for name in typing_files:
+        assert f"../python/mooncake/{name}" in integration_cmake
+
+    stub = (package_root / "engine.pyi").read_text()
+    for binding in (
+        "mooncake-integration/transfer_engine/transfer_engine_py.cpp",
+        "mooncake-integration/transfer_engine/shared_segment_py.cpp",
+        "mooncake-transfer-engine/src/transport/rpc_communicator/rpc_interface.cpp",
+    ):
+        source = (REPOSITORY_ROOT / binding).read_text()
+        bound_names = re.findall(
+            r'(?:\.def\w*|m\.attr|py::(?:class_|enum_)<.*?>)\(\s*(?:m,\s*)?"(\w+)"',
+            source,
+        )
+        bound_names += re.findall(r'\.value\(\s*"(\w+)"', source)
+        assert bound_names, binding
+        missing = sorted(
+            name for name in set(bound_names) if not re.search(rf"\b{name}\b", stub)
+        )
+        assert not missing, f"{binding} binds names missing from engine.pyi: {missing}"
 
 
 def test_ssd_administration_modules_have_one_authoritative_source() -> None:

@@ -130,6 +130,7 @@ option(USE_FABRIC
        OFF)
 option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
 option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
+option(USE_MEMFABRIC "option for using memfabric transport" OFF)
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -154,9 +155,36 @@ if(USE_EFA)
 
   include_directories(${LIBFABRIC_INCLUDE_DIR})
   add_compile_definitions(USE_EFA)
+
+  # AWS Neuron device memory needs both the FI_HMEM_NEURON enumerator and
+  # fi_mr_attr::device.neuron, which arrive together and are absent from older
+  # libfabric -- including distro packages such as Ubuntu 22.04's libfabric-dev.
+  # Probed rather than gated on a version so that a build against any libfabric
+  # keeps working; when it is missing, efa_neuron.cpp reports Neuron as
+  # unsupported instead of registering its HBM as host memory.
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES ${LIBFABRIC_INCLUDE_DIR})
+  check_cxx_source_compiles(
+    "
+    #include <rdma/fabric.h>
+    #include <rdma/fi_domain.h>
+    int main() {
+      struct fi_mr_attr attr = {};
+      attr.iface = FI_HMEM_NEURON;
+      attr.device.neuron = 0;
+      return 0;
+    }
+    "
+    MOONCAKE_HAVE_FI_HMEM_NEURON)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  if(MOONCAKE_HAVE_FI_HMEM_NEURON)
+    add_compile_definitions(MOONCAKE_HAVE_FI_HMEM_NEURON)
+  endif()
+
   message(STATUS "AWS EFA (libfabric) transport is enabled")
   message(STATUS "  libfabric include: ${LIBFABRIC_INCLUDE_DIR}")
   message(STATUS "  libfabric is loaded at runtime (dlopen)")
+  message(STATUS "  Neuron (FI_HMEM_NEURON): ${MOONCAKE_HAVE_FI_HMEM_NEURON}")
 endif()
 if(USE_CXI)
   # Find libfabric headers and library; default to AWS EFA installer path
@@ -634,13 +662,19 @@ if(USE_TCP)
   add_compile_definitions(USE_TCP)
 endif()
 
+if(USE_MEMFABRIC)
+  add_compile_definitions(USE_MEMFABRIC)
+  message(STATUS "memfabric transport is enabled")
+endif()
+
 if(USE_BAREX)
   add_compile_definitions(USE_BAREX)
 endif()
 
 if(USE_ASCEND
    OR USE_ASCEND_DIRECT
-   OR USE_UBSHMEM)
+   OR USE_UBSHMEM
+   OR USE_MEMFABRIC)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DOPEN_BUILD_PROJECT ")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DOPEN_BUILD_PROJECT ")
   string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" CURRENT_CPU)

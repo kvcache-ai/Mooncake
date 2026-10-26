@@ -116,7 +116,8 @@ class DynamicReplicationTest : public ::testing::Test {
             proposal.observed_version_epoch =
                 MasterServiceTestPeer(service).DynamicReplicationVersionEpoch(
                     metadata);
-            proposal.object_size_bytes = static_cast<uint64_t>(metadata.size);
+            proposal.object_size_bytes =
+                static_cast<uint64_t>(metadata.TotalLength());
         }
         if (admit) {
             AdmitDynamicReplication(service, key);
@@ -231,14 +232,10 @@ class DynamicReplicationTest : public ::testing::Test {
             TenantId::Default(), key, accessor.GetState());
     }
 
-    void DiscardExpiredProcessingReplicas(MasterService& service,
-                                          const std::string& key) const {
-        const size_t shard_idx = MasterServiceTestPeer(service).getShardIndex(
-            TenantId::Default(), key);
-        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
-                                                             shard_idx);
+    void DiscardExpiredProcessingReplicas(MasterService& service) const {
         MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
-            shard, std::chrono::system_clock::now() + std::chrono::seconds(1));
+            TenantId::Default(),
+            std::chrono::system_clock::now() + std::chrono::seconds(1));
     }
 
     bool ObserveDynamicReplicationAccess(MasterService& service,
@@ -830,7 +827,7 @@ TEST_F(DynamicReplicationTest, ExpiredDynamicCopyTaskClearsDynamicState) {
     ASSERT_TRUE(HasIncompleteDynamicReplica(service, "expired-copy-task-key",
                                             lease->target_segment));
 
-    DiscardExpiredProcessingReplicas(service, "expired-copy-task-key");
+    DiscardExpiredProcessingReplicas(service);
 
     EXPECT_EQ(DynamicReplicaCount(service, "expired-copy-task-key"), 0u);
     EXPECT_FALSE(

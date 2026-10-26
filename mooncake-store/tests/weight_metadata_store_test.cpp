@@ -423,7 +423,8 @@ TEST(WeightMetadataStoreTest, UnchangedOperationProgressIsIdempotent) {
     ASSERT_TRUE(operation.has_value());
 
     auto progress = metadata_store.PrepareUpdateOperationProgress(
-        operation->operation_id, 0, 4, {}, 400);
+        operation->operation_id, 0, 4, {}, ready.availability, ready.residency,
+        400);
     ASSERT_TRUE(progress.has_value());
     EXPECT_FALSE(progress->no_op);
     auto published = metadata_store.Publish(*progress);
@@ -431,12 +432,71 @@ TEST(WeightMetadataStoreTest, UnchangedOperationProgressIsIdempotent) {
     EXPECT_EQ(400, published->updated_at_ms);
 
     auto retry = metadata_store.PrepareUpdateOperationProgress(
-        operation->operation_id, 0, 4, {}, 500);
+        operation->operation_id, 0, 4, {}, ready.availability, ready.residency,
+        500);
     ASSERT_TRUE(retry.has_value());
     EXPECT_TRUE(retry->no_op);
     auto retried = metadata_store.Publish(*retry);
     ASSERT_TRUE(retried.has_value());
     EXPECT_EQ(400, retried->updated_at_ms);
+}
+
+TEST(WeightMetadataStoreTest, OperationObservationPreservesRecoveryFences) {
+    WeightMetadataStore metadata_store;
+    auto ready = PublishReady(metadata_store);
+    auto start = metadata_store.PrepareStartOperation(
+        {.identity = ready.identity,
+         .expected_metadata_generation = ready.metadata_generation,
+         .target_residency = WeightResidencyState::COLD},
+        300);
+    ASSERT_TRUE(start);
+    auto operation = metadata_store.Publish(*start);
+    ASSERT_TRUE(operation);
+
+    auto invalid = metadata_store.PrepareUpdateOperationProgress(
+        operation->operation_id, 0, 4, {}, WeightAvailabilityState::READY,
+        WeightResidencyState::ABSENT, 400);
+    ASSERT_FALSE(invalid);
+    EXPECT_EQ(WeightManagementError::INVALID_ARGUMENT, invalid.error());
+    auto loss = metadata_store.PrepareUpdateOperationProgress(
+        operation->operation_id, 0, 4, {}, WeightAvailabilityState::DEGRADED,
+        WeightResidencyState::ABSENT, 400);
+    ASSERT_TRUE(loss);
+    EXPECT_EQ(start->metadata.next->metadata_generation + 1,
+              loss->metadata.next->metadata_generation);
+    EXPECT_EQ(loss->metadata.next->metadata_generation,
+              loss->next->fenced_metadata_generation);
+    ASSERT_TRUE(metadata_store.Publish(*loss));
+    WeightMetadataStore restored;
+    ASSERT_TRUE(restored.RestoreSnapshot(metadata_store.ExportSnapshot()));
+    auto retry = restored.PrepareUpdateOperationProgress(
+        operation->operation_id, 0, 4, {}, WeightAvailabilityState::DEGRADED,
+        WeightResidencyState::ABSENT, 500);
+    ASSERT_TRUE(retry);
+    EXPECT_TRUE(retry->no_op);
+
+    auto exhausted_snapshot = restored.ExportSnapshot();
+    exhausted_snapshot.metadata.front().metadata_generation =
+        std::numeric_limits<uint64_t>::max() - 1;
+    exhausted_snapshot.operations.front().fenced_metadata_generation =
+        std::numeric_limits<uint64_t>::max() - 1;
+    WeightMetadataStore exhausted;
+    ASSERT_TRUE(exhausted.RestoreSnapshot(exhausted_snapshot));
+    auto rejected = exhausted.PrepareUpdateOperationProgress(
+        operation->operation_id, 0, 4, {}, WeightAvailabilityState::READY,
+        WeightResidencyState::HOT, 600);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(WeightManagementError::GENERATION_EXHAUSTED, rejected.error());
+    EXPECT_EQ(exhausted_snapshot, exhausted.ExportSnapshot());
+
+    auto finish = restored.PrepareFinishOperation(
+        operation->operation_id, WeightResidencyState::COLD, 600);
+    ASSERT_TRUE(finish);
+    EXPECT_EQ(WeightAvailabilityState::READY,
+              finish->metadata.next->availability);
+    ASSERT_TRUE(restored.Publish(*finish));
+    WeightMetadataStore completed;
+    EXPECT_TRUE(completed.RestoreSnapshot(restored.ExportSnapshot()));
 }
 
 TEST(WeightMetadataStoreTest, OperationTimestampsRemainMonotonic) {
@@ -454,7 +514,8 @@ TEST(WeightMetadataStoreTest, OperationTimestampsRemainMonotonic) {
     ASSERT_TRUE(operation.has_value());
 
     auto progress = metadata_store.PrepareUpdateOperationProgress(
-        operation->operation_id, 1, 2, "member-1", 250);
+        operation->operation_id, 1, 2, "member-1", ready.availability,
+        ready.residency, 250);
     ASSERT_TRUE(progress.has_value());
     operation = metadata_store.Publish(*progress);
     ASSERT_TRUE(operation.has_value());

@@ -28,7 +28,7 @@ Transport selection is driven by configuration with pattern-based rules.
       "intent_type": "foreground_get",
       "priority": "high",
       "devices": ["mlx5_0", "mlx5_1", "mlx5_2"],
-      "transports": ["nvlink", "rdma", "shm"]
+      "transports": ["nvlink", "xpu", "rdma", "shm"]
     },
     {
       "name": "low_prio_slow",
@@ -56,6 +56,13 @@ Transport selection is driven by configuration with pattern-based rules.
 | `intent_type` | string or int | No | Match a standard transfer intent such as `"foreground_get"`, `"background_prefetch"`, `"migration"`, `"checkpoint"`, `"weight_loading"`, or `"staging_internal"` |
 | `devices` | array[string] | No | List of allowed device names (empty = all devices) |
 | `transports` | array[string] | No | Transport preference list (evaluated in order) |
+
+A non-empty `transports` list replaces the transports registered on the
+buffer, so it must name every transport the policy should use. In particular,
+same-host Intel XPU peer-to-peer copies (Level Zero IPC between processes)
+are only used when the list contains `"xpu"`; put it ahead of `"rdma"`, as in
+the example above. A policy that omits it keeps such requests on the network
+path (RDMA dma-buf or host staging).
 
 ### Intent-Based Policy Binding
 
@@ -103,7 +110,16 @@ For `memory` segments, you can filter by source/destination memory type:
 | `"cpu"` | CPU/host memory |
 | `"hip"` | ROCm/HIP GPU memory |
 | `"npu"` | Ascend NPU memory |
+| `"xpu"` | Intel GPU device memory (host/shared USM matches `"cpu"`) |
 | `"*"` | Any memory type |
+
+For standard `tcp`, the local memory type always describes the initiating
+process's buffer, for both READ and WRITE. A CPU-only build can transfer between
+its host buffer and a peer's registered GPU buffer when the peer exports that
+buffer over TCP. The peer's device-enabled RPC handler performs the GPU copy
+through host staging; the initiator does not need a local GPU runtime. Local GPU
+buffers still require a device-enabled build. This applies to standard `tcp`;
+`hp_tcp` currently supports host memory only.
 
 ### Size Filters
 
@@ -190,6 +206,25 @@ If no `policy` is configured, TENT falls back to original behavior:
 |--------------|-------------------------|
 | File | GDS → IOURING → RDMA |
 | Memory | Uses `buffer_transports` order from buffer registration |
+
+### UB as a selectable transport
+
+UB (`TransportType::UB`) takes part in the same policy machinery as every other
+transport: it can be listed in a policy's `transports` array, pinned with
+`transport_hint`, or reached through `transport_index`. Two places name it
+explicitly instead:
+
+* **Local memory allocation.** When the requested transport is `UNSPEC`,
+  allocation walks `MNNVL → RDMA → UB → FABRIC → TCP → HP_TCP` (with `SHM` taking the
+  host-memory slot ahead of RDMA for CPU and wildcard locations), so an
+  installed UB transport is preferred over the generic TCP paths.
+* **TPU staging.** The TPU staging policy needs a host-DRAM network transport
+  for the host↔host hop and gates on `RDMA`, `UB`, `FABRIC`, `TCP` or `HP_TCP`.
+
+Once UB is the selected transport, the rail for each slice is chosen inside
+`UbTransport` rather than by this selector; see {ref}`TENT Failover
+<tent-failover>` for UB rail health, path ranking and endpoint rebuild
+behaviour.
 
 ## Complete Example
 

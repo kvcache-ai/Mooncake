@@ -97,10 +97,21 @@ class WorkerPool {
     GidRefreshResult refreshPublishedLocalGid();
     bool handleContextEvent(ibv_event_type event_type, bool injected_for_test,
                             struct ibv_async_event *event = nullptr);
-    void scheduleContextRecovery(uint64_t delay_ns = kContextRecoveryDelayNs);
+    void scheduleContextRecovery(uint64_t delay_ns = kContextRecoveryDelayNs,
+                                 bool override_breaker = true);
     void maybeActivateRecoveredContext();
+    // Safety net for a PORT_ERR whose PORT_ACTIVE never arrived. At most the
+    // 1 Hz monitor tick calls this, and only when context_disabling_event_
+    // is IBV_EVENT_PORT_ERR. On IBV_PORT_ACTIVE it arms the same delayed GID
+    // probe as the event path. DEVICE_FATAL, CQ_ERR, WQ_FATAL and LID_CHANGE
+    // stay inactive: the probe does not rebuild a failed CQ or device.
+    // Breaker-owned pauses are left alone so TTL reactivation still owns
+    // local-WC downtime.
+    void resumePausedContext();
     bool hasAvailablePeerRailAlternative(Transport::Slice *slice,
                                          const std::string &failed_peer_path);
+    bool recordAutoGidDataPathFailure(Transport::Slice *slice);
+    void recordAutoGidDataPathSuccess(Transport::Slice *slice);
 
     static bool isLocalWcFailure(const ibv_wc &wc);
 
@@ -153,6 +164,9 @@ class WorkerPool {
 
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
     std::atomic<uint64_t> recovery_activate_after_ns_{0};
+    // Fatal async event that owns the inactive context, or -1 when none does.
+    // The 1 Hz port poll resumes only IBV_EVENT_PORT_ERR.
+    std::atomic<int> context_disabling_event_{-1};
 
     // Rail state management: peer_nic_path -> RailState
     std::unordered_map<std::string, RailState> rail_states_;

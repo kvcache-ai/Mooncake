@@ -54,7 +54,7 @@ class WrappedMasterService {
         const std::string& tenant_id = "default");
 
     std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
-        const std::vector<std::string>& keys,
+        const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
         const std::string& tenant_id = "default");
 
     tl::expected<
@@ -161,6 +161,10 @@ class WrappedMasterService {
     long RemoveAll(bool force = false,
                    const std::string& tenant_id = "default");
 
+    std::vector<tl::expected<void, ErrorCode>> BatchUpdateSoftPin(
+        const std::vector<std::string>& keys, uint64_t ttl_ms,
+        const std::string& tenant_id = "default");
+
     std::vector<tl::expected<void, ErrorCode>> BatchRemove(
         const std::vector<std::string>& keys, bool force = false,
         const std::string& tenant_id = "default");
@@ -245,6 +249,15 @@ class WrappedMasterService {
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
 
+    // SSD prefetch RPC. Registers a promotion task without the
+    // promotion-on-hit admission gates and without the holder's heartbeat
+    // mailbox; the caller drives the execution chain itself. Best-effort:
+    // PROMOTION_ALREADY_EXISTS is a normal "skip" outcome. Additive RPC —
+    // older masters reject it and prefetch degrades to a no-op.
+    tl::expected<void, ErrorCode> RegisterPrefetchTask(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
+
     tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id, uint64_t size,
@@ -276,6 +289,41 @@ class WrappedMasterService {
         const UUID& segment_id);
     tl::expected<void, ErrorCode> SetSegmentStatus(
         const std::string& segment_name, SegmentStatus status);
+
+    WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
+        const BeginWeightImportRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(
+        const CommitWeightImportRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> AbortWeightImport(
+        const AbortWeightImportRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionView> GetWeightRevision(
+        const GetWeightRevisionRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<ListWeightRevisionsResponse>
+    ListWeightRevisions(const ListWeightRevisionsRequest& request,
+                        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightResidencyOperation>
+    StartWeightResidencyOperation(
+        const StartWeightResidencyOperationRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightResidencyOperation> QueryWeightOperation(
+        const QueryWeightOperationRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> DeleteWeightRevision(
+        const DeleteWeightRevisionRequest& request,
+        const std::string& tenant_id = "default");
 
     // Internal method called by supervisor during promotion; NOT an RPC
     // endpoint.
@@ -377,7 +425,13 @@ class WrappedMasterService {
     MasterService master_service_;
 };
 
+class RpcWorkerPool;
+
+// With a worker pool, every handler except Ping and ServiceReady runs on its
+// worker threads; those two stay on the io threads, which the pool keeps
+// free. Without one, every handler runs inline on the io threads.
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
-                        mooncake::WrappedMasterService& wrapped_master_service);
+                        mooncake::WrappedMasterService& wrapped_master_service,
+                        RpcWorkerPool* worker_pool = nullptr);
 
 }  // namespace mooncake
