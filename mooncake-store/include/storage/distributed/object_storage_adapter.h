@@ -113,7 +113,7 @@ class ObjectStorageAdapter {
 
     // True only when Put never retries an ambiguous physical upload. A fresh
     // retry could materialize after DELETE even if a later PUT succeeds.
-    // Required by the immutable-attempt backend/catalog protocol. Existing
+    // Required by the immutable-attempt backend protocol. Existing
     // whole-object offload and batch operations keep their own retry policy.
     virtual bool SupportsSinglePutAttempt() const { return false; }
 };

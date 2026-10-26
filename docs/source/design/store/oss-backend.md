@@ -213,78 +213,13 @@ replicas, or decide when deletion is safe. Those responsibilities remain with
 the caller, which can use the adapter's existing `Delete` operation. Sharing an
 adapter across concurrent operations requires a thread-safe adapter.
 
-## Durable Object Lifecycle Component
-
-`ObjectStorageCatalog` pairs with the I/O component above. Production persistence
-currently requires an initialized `EtcdHaKvBackend` and transactional etcd, even
-without Master HA. The injected `HaKvBackend` interface also permits component
-testing. Transaction support alone is insufficient: the backend must support
-the catalog's keyspace and finite range operations. The existing Redis HA
-backend accepts only oplog keys and is unsupported; catalog startup with it
-returns `INVALID_PARAMS`.
-
-The catalog stores Base64-encoded records under
-`/mooncake/object-storage/<cluster_id>/`; cluster IDs must be nonempty and contain
-neither `/` nor NUL. `ObjectStorageCatalogConfig.storage_namespace` binds the
-catalog to the full provider, endpoint, bucket, region, prefix and path style.
-Provider, endpoint, bucket and prefix must be nonempty. Credentials stay local
-to the adapter. A changed target fails catalog startup.
-If the durable catalog is lost or independently rebuilt, use a distinct cluster
-ID and object prefix; generations must not restart against an old namespace.
-
-The lifecycle is explicit:
-
-1. `Open` acquires a strictly increasing epoch with a fresh owner identity and
-   restores records and heads.
-   Zero selects the next epoch automatically. Every mutation compares this
-   durable fence, so an older catalog cannot authorize another upload.
-2. `Prepare` durably allocates a bounded name from a SHA-256 digest of the
-   cluster, tenant and logical key, followed by the generation. A logical key
-   can be prepared again after its current attempt
-   is retired. Names are never reused, including after physical reclamation.
-3. `Claim` authorizes one physical PUT. Repeating the claim fails. The caller
-   then calls the I/O backend and reports `COMPLETE`, `NOT_STARTED` or `UNKNOWN`
-   through `Finish`. Completion notifications may be repeated; contradictory
-   terminal outcomes are rejected. A new physical upload requires a new name.
-4. `Commit` records foreground success and an optional checksum independently
-   of upload completion. The integration must require both for a readable
-   synchronous object replica. The catalog itself does not grant read leases
-   or publish replicas.
-5. `Retire` makes the attempt permanently ineligible for commit. The caller
-   must first stop issuing new read leases and supply the latest outstanding
-   lease deadline as absolute Unix time in milliseconds. Deadlines can be
-   extended until reclamation is admitted;
-   extending one after that point fails explicitly.
-6. `Reclaim` waits for that deadline, performs provider DELETE outside the
-   catalog mutex, and retains uncertain upload attempts for repeated deletion.
-   An upload may materialize after a successful DELETE. Its tombstone remains
-   until the uploader supplies a terminal outcome, followed by another cleanup
-   round. A missing uploader can leave a tombstone indefinitely.
-
-The defaults are 256 MiB per new object, 1 GiB of pending bytes, 10,000 pending
-objects, and 32 inspected reclamation records per call. Each call rotates
-through retired records so a persistent tombstone or future deadline cannot
-starve later cleanup. DELETE requests are sequential and use the adapter's request
-timeout; there is no separate wall-clock deadline for a reclamation call.
-Upload intents, uncommitted uploads and retirement obligations consume pending
-capacity. Retirement can increase backlog beyond admission limits; subsequent
-admission applies backpressure. A known-not-started attempt can be replaced
-atomically with the next generation, even with one pending slot.
-
-Lost transaction replies are checked against all intended records and the
-durable fence. If the outcome cannot be confirmed, operations fail closed until
-`Open` succeeds again. Recovery retains pending obligations even when configured
-admission limits are lower than the restored backlog. Logical heads remain
-after physical GC to prevent older generations being reused or revived; heads
-are not currently compacted.
-
-`Find`, `Head` and `Records` read this catalog instance's recovered cache.
-Master integration must enforce current leadership before using cached state
-to grant leases or serve metadata.
-
-This PR delivers independently tested I/O and catalog components. Wiring them
-into Master/Client RPCs, replica selection, source ownership and snapshot/HA
-reconciliation belongs to the subsequent synchronous-replica integration.
+The bounded I/O component is the first review unit for
+[RFC #4296](https://github.com/kvcache-ai/Mooncake/issues/4296). Persistent
+upload/cleanup records and their relationship to the Master's metadata,
+ordered log and snapshots are a separate review unit. This component does not
+add a first-class replica type or enable owner-independent Store reads.
+Master/Client integration must provide durable attempt identity, commit,
+recovery and lease-aware reclamation before exposing those guarantees.
 
 ## Current Limitations
 

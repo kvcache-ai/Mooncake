@@ -15,7 +15,6 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     config/store_cluster_identity_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/object_storage_backend.cpp
-    storage/distributed/object_storage_catalog.cpp
     storage/distributed/posix_fs_adapter.cpp
     common/file_util.cpp)
 
@@ -497,7 +496,6 @@ target_link_libraries(
           glog::glog
           gflags::gflags
           mooncake_common
-          OpenSSL::Crypto
           $<$<PLATFORM_ID:Linux>:numa>
           asio_shared
           yalantinglibs::yalantinglibs)
