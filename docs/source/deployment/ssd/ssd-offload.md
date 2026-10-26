@@ -163,7 +163,7 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
-| `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
+| `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | Delay between completed background directory scans. The `mc-ssd-scan` thread performs traversal outside metadata locks; I/O workers read a cached estimate that also budgets writes admitted since the scan began. `<= 0` selects a 1 ms delay. |
 
 ### Optional parallel Bucket offload writes
 

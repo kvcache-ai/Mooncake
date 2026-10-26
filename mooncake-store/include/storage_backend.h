@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -25,6 +27,9 @@
 #include "types.h"
 
 namespace mooncake {
+namespace test {
+class BucketStorageBackendTestPeer;
+}
 struct FileRecord {
     std::string path;
     uint64_t size;
@@ -1057,15 +1062,31 @@ class BucketStorageBackend : public StorageBackendInterface {
      * This is ground truth — the same block-based accounting kubelet uses for
      * emptyDir sizeLimit — so it captures bucket files that linger after their
      * objects are logically evicted (which the in-memory total_size_ misses).
-     * Result is cached for bucket_backend_config_.disk_scan_cache_ms to bound
-     * the scan cost regardless of offload rate. Caller must hold mutex_.
+     * Reads a snapshot maintained by the background scanner, including a
+     * conservative budget for writes admitted since that scan began. Never
+     * performs filesystem I/O. Caller must hold mutex_.
      */
     int64_t ActualDiskBytesUsedLocked() const;
 
-    // Cached result of ActualDiskBytesUsedLocked() and when it was taken.
+    void StartDiskUsageScanner();
+    void StopDiskUsageScanner();
+    void RequestDiskUsageScan();
+    void DiskUsageScanLoop();
+    tl::expected<int64_t, ErrorCode> ScanPhysicalDiskBytes() const;
+
+    friend class test::BucketStorageBackendTestPeer;
+    // Scanner publication only holds mutex_ briefly; directory traversal never
+    // holds mutex_ or offload_publish_mutex_. A negative snapshot fails closed.
     mutable int64_t cached_disk_bytes_ GUARDED_BY(mutex_) = -1;
-    mutable std::chrono::steady_clock::time_point cached_disk_bytes_at_
-        GUARDED_BY(mutex_);
+    uint64_t physical_write_bytes_ GUARDED_BY(mutex_) = 0;
+    uint64_t scanned_write_bytes_ GUARDED_BY(mutex_) = 0;
+    std::mutex disk_scan_mutex_;
+    std::condition_variable disk_scan_cv_;
+    std::thread disk_scan_thread_;
+    std::atomic<bool> disk_scan_stopping_{false};
+    bool disk_scan_requested_ = false;
+    bool disk_scan_ready_ = false;
+    std::function<void()> disk_scan_hook_for_test_;
 
     /**
      * @brief Phase 2 of eviction: delete persisted metadata for each evicted

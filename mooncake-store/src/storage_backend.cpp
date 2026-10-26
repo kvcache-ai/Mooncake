@@ -7,6 +7,9 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <errno.h>
+#if defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
+#endif
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -1517,6 +1520,7 @@ BucketStorageBackend::BucketStorageBackend(
 
 BucketStorageBackend::~BucketStorageBackend() {
     write_stopping_.store(true, std::memory_order_release);
+    StopDiskUsageScanner();
     if (write_io_scheduler_) write_io_scheduler_->Shutdown();
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
@@ -2509,6 +2513,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             if (!writer) return tl::make_unexpected(writer.error());
             write_io_scheduler_ = std::move(writer.value());
         }
+        // Startup recovery above owns the metadata lock. Release it before
+        // waiting for the scanner's first snapshot; the scanner publishes
+        // under the same lock. No foreground I/O is admitted until Init ends.
+        lock.unlock();
+        StartDiskUsageScanner();
         initialized_.store(true, std::memory_order_release);
     } catch (const std::exception& e) {
         LOG(ERROR) << "Bucket storage backend initialize error: " << e.what()
@@ -3085,53 +3094,134 @@ BucketStorageBackend::SelectEvictionCandidate() {
     }
 }
 
+namespace {
+int64_t AddPhysicalUsageBudget(int64_t bytes, uint64_t extra) {
+    const auto remaining =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - bytes);
+    return extra > remaining ? std::numeric_limits<int64_t>::max()
+                             : bytes + static_cast<int64_t>(extra);
+}
+}  // namespace
+
 int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
-    namespace fs = std::filesystem;
-    auto now = std::chrono::steady_clock::now();
-    if (cached_disk_bytes_ >= 0 &&
-        now - cached_disk_bytes_at_ <
-            std::chrono::milliseconds(
-                bucket_backend_config_.disk_scan_cache_ms)) {
-        return cached_disk_bytes_;
+    if (cached_disk_bytes_ < 0)
+        return bucket_backend_config_.max_physical_bytes;
+    return AddPhysicalUsageBudget(cached_disk_bytes_,
+                                  physical_write_bytes_ - scanned_write_bytes_);
+}
+
+void BucketStorageBackend::StartDiskUsageScanner() {
+    if (bucket_backend_config_.max_physical_bytes <= 0) return;
+    disk_scan_thread_ =
+        std::thread(&BucketStorageBackend::DiskUsageScanLoop, this);
+    // Seed the capacity check before accepting the first write. Only startup
+    // waits; foreground readers/writers never wait for a directory traversal.
+    std::unique_lock<std::mutex> lock(disk_scan_mutex_);
+    disk_scan_cv_.wait(lock, [this] { return disk_scan_ready_; });
+}
+
+void BucketStorageBackend::StopDiskUsageScanner() {
+    disk_scan_stopping_.store(true, std::memory_order_release);
+    disk_scan_cv_.notify_all();
+    if (disk_scan_thread_.joinable()) disk_scan_thread_.join();
+}
+
+void BucketStorageBackend::RequestDiskUsageScan() {
+    if (bucket_backend_config_.max_physical_bytes <= 0) return;
+    {
+        std::lock_guard<std::mutex> lock(disk_scan_mutex_);
+        disk_scan_requested_ = true;
     }
+    disk_scan_cv_.notify_all();
+}
+
+void BucketStorageBackend::DiskUsageScanLoop() {
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "mc-ssd-scan");
+#elif defined(__APPLE__)
+    pthread_setname_np("mc-ssd-scan");
+#endif
+    LOG(INFO) << "Background disk usage scanner started: name=mc-ssd-scan";
+    const auto interval = std::chrono::milliseconds(
+        std::max<int64_t>(1, bucket_backend_config_.disk_scan_cache_ms));
+    std::unique_lock<std::mutex> scan_lock(disk_scan_mutex_);
+    while (!disk_scan_stopping_.load(std::memory_order_acquire)) {
+        disk_scan_requested_ = false;
+        auto hook = disk_scan_hook_for_test_;
+        scan_lock.unlock();
+        uint64_t write_start = 0;
+        uint64_t pending_start = 0;
+        tl::expected<int64_t, ErrorCode> scanned =
+            tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        try {
+            {
+                SharedMutexLocker lock(&mutex_, shared_lock);
+                write_start = physical_write_bytes_;
+                // Reservations already in flight may not have allocated their
+                // files yet. Include them even if the scan misses those files.
+                // Two files per bucket can each consume a final partial block;
+                // using the key count is a conservative bucket-count bound.
+                pending_start =
+                    static_cast<uint64_t>(pending_write_size_) +
+                    pending_write_keys_.size() * 2 * kDirectIOAlignment;
+            }
+            if (hook) hook();
+            scanned = ScanPhysicalDiskBytes();
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Background disk usage scan failed: " << e.what();
+        } catch (...) {
+            LOG(WARNING) << "Background disk usage scan failed";
+        }
+        if (!disk_scan_stopping_.load(std::memory_order_acquire)) {
+            SharedMutexLocker lock(&mutex_);
+            cached_disk_bytes_ =
+                scanned ? AddPhysicalUsageBudget(*scanned, pending_start) : -1;
+            scanned_write_bytes_ = write_start;
+        }
+        scan_lock.lock();
+        disk_scan_ready_ = true;
+        disk_scan_cv_.notify_all();
+        // The interval starts AFTER completion, including slow scans. An
+        // invalidation during a scan requests another pass without losing it.
+        disk_scan_cv_.wait_for(scan_lock, interval, [this] {
+            return disk_scan_stopping_.load(std::memory_order_acquire) ||
+                   disk_scan_requested_;
+        });
+    }
+}
+
+tl::expected<int64_t, ErrorCode> BucketStorageBackend::ScanPhysicalDiskBytes()
+    const {
+    namespace fs = std::filesystem;
     int64_t total = 0;
     std::error_code ec;
-    // Recursive scan: matches Init()'s recursive_directory_iterator and the
-    // du/kubelet accounting basis (the whole subtree, not just top-level
-    // entries), so nested content can never be silently missed.
     fs::recursive_directory_iterator it(storage_path_, ec), end;
     if (ec) {
-        // Cannot even open storage_path_. This is a hard safety cap, so fail
-        // CLOSED: report the cap as reached so eviction/rejection engages
-        // instead of letting the disk overflow, and do NOT cache the result
-        // (next call re-scans once the directory is readable again).
-        LOG(WARNING) << "[Bucket] physcap disk scan could not open "
-                     << storage_path_ << ": " << ec.message()
-                     << ", failing closed";
-        return bucket_backend_config_.max_physical_bytes;
+        LOG(WARNING)
+            << "[Bucket] background physical-usage scan could not open "
+            << storage_path_ << ": " << ec.message();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
-    for (; it != end; it.increment(ec)) {
-        if (ec) {
-            // Iteration errored partway. Returning the partial total would
-            // under-count and silently open the cap; fail closed and skip
-            // caching so the next call re-scans.
-            LOG(WARNING) << "[Bucket] physcap disk scan error under "
-                         << storage_path_ << ": " << ec.message()
-                         << ", failing closed";
-            return bucket_backend_config_.max_physical_bytes;
-        }
+    while (it != end) {
+        if (disk_scan_stopping_.load(std::memory_order_acquire))
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         struct stat st;
-        // st_blocks counts 512-byte blocks actually allocated on disk — the
-        // same basis as du / kubelet's emptyDir accounting (handles block
-        // rounding; ignores apparent size). A per-entry stat failure (e.g. a
-        // file concurrently deleted during eviction) is skipped best-effort:
-        // that only under-counts by ~one file and avoids spurious fail-closed.
         if (::stat(it->path().c_str(), &st) == 0) {
-            total += static_cast<int64_t>(st.st_blocks) * 512;
+            total = AddPhysicalUsageBudget(
+                total, static_cast<uint64_t>(st.st_blocks) * 512);
+        } else if (errno != ENOENT) {
+            LOG(WARNING) << "[Bucket] background physical-usage stat failed: "
+                         << it->path() << ": " << strerror(errno);
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        it.increment(ec);
+        if (ec) {
+            LOG(WARNING) << "[Bucket] background physical-usage scan failed: "
+                         << storage_path_ << ": " << ec.message();
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
     }
-    cached_disk_bytes_ = total;
-    cached_disk_bytes_at_ = now;
     return total;
 }
 
@@ -3219,7 +3309,9 @@ BucketStorageBackend::PrepareEviction(
     // physical check below so we free enough room for THIS write, not merely
     // enough to bring current usage back under the cap.
     const int64_t incoming_physical_size =
-        write_keys.empty() ? 0 : required_size;
+        write_keys.empty()
+            ? 0
+            : AddPhysicalUsageBudget(required_size, 2 * kDirectIOAlignment);
 
     // Ground-truth physical usage of the offload directory (cached),
     // snapshotted once. As buckets are selected for eviction their files get
@@ -3235,10 +3327,13 @@ BucketStorageBackend::PrepareEviction(
     // physical cap. Shared by the in-loop "keep evicting" test and the
     // post-loop "reject the write" test.
     const auto phys_over_cap = [&](uint64_t freed) {
+        const uint64_t projected = static_cast<uint64_t>(AddPhysicalUsageBudget(
+            physical_used_start, incoming_physical_size));
         return bucket_backend_config_.max_physical_bytes > 0 &&
-               physical_used_start + incoming_physical_size -
-                       static_cast<int64_t>(freed) >
-                   bucket_backend_config_.max_physical_bytes;
+               projected > freed &&
+               projected - freed >
+                   static_cast<uint64_t>(
+                       bucket_backend_config_.max_physical_bytes);
     };
 
     while (!buckets_.empty() && evict_count < kMaxEvictionBuckets) {
@@ -3322,6 +3417,12 @@ BucketStorageBackend::PrepareEviction(
                   << " total_after=" << total_size_;
     }
 
+    if (result.write_size > 0) {
+        // Monotonic admission accounting: scans add all reservations admitted
+        // after their start, even when a file was not seen by the iterator.
+        physical_write_bytes_ +=
+            static_cast<uint64_t>(result.write_size) + 2 * kDirectIOAlignment;
+    }
     return result;
 }
 
@@ -3488,12 +3589,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
     if (!pending.buckets.empty()) {
         LOG(INFO) << "[Evict] finalized: attempted=" << pending.buckets.size()
                   << " cleanup_failed=" << cleanup_failed_count;
-        // Files were just deleted; force the next physical-usage query to
-        // rescan rather than return the now-stale (higher) cached value.
-        {
-            SharedMutexLocker lock(&mutex_);
-            cached_disk_bytes_ = -1;
-        }
+        // Keep the previous (conservative, higher) estimate until the
+        // background scan observes deletion. Never traverse on an I/O worker.
+        RequestDiskUsageScan();
     }
     if (cleanup_failed_count != 0) {
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
