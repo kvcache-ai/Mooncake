@@ -70,6 +70,7 @@ add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(l4_task_id_wire_test l4_task_id_wire_test.cpp)
 add_store_test(background_worker_test background_worker_test.cpp)
 add_store_test(session_tag_test session_tag_test.cpp)
+add_store_test(master_service_quiesce_test master_service_quiesce_test.cpp)
 add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
 if(ENABLE_KV_EVENTS)
   target_compile_definitions(kv_event_publisher_test

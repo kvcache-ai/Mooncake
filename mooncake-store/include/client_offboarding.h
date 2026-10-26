@@ -62,6 +62,8 @@ class ClientOffboardingWorker {
 
     void Start();
     void Stop();
+    // True while the worker thread exists (started and not yet joined).
+    [[nodiscard]] bool Joinable() const { return thread_.joinable(); }
     [[nodiscard]] bool HasPending() const {
         return pending_jobs_.load(std::memory_order_acquire) != 0;
     }
