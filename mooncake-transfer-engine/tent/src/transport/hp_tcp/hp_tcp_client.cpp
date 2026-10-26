@@ -70,6 +70,10 @@ class HighPerformanceTcpClient::Lane
             completeStandalone(std::move(operation), FAILED, 0);
             return;
         }
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordStreamQueueDepth(TransportType::HP_TCP,
+                                                       1);
+#endif
         if (!current_) startNext();
     }
 
@@ -79,6 +83,8 @@ class HighPerformanceTcpClient::Lane
             Operation operation = std::move(queue_.front());
             queue_.pop_front();
 #if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordStreamQueueDepth(
+                TransportType::HP_TCP, -1);
             TentMetrics::instance().recordStreamEvent(
                 TransportType::HP_TCP, streamOperation(operation.opcode),
                 terminal == TIMEOUT ? TentMetrics::StreamEvent::Timeout
@@ -104,6 +110,8 @@ class HighPerformanceTcpClient::Lane
             Operation operation = std::move(*it);
             queue_.erase(it);
 #if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordStreamQueueDepth(
+                TransportType::HP_TCP, -1);
             TentMetrics::instance().recordStreamEvent(
                 TransportType::HP_TCP, streamOperation(operation.opcode),
                 TentMetrics::StreamEvent::Canceled);
@@ -148,6 +156,10 @@ class HighPerformanceTcpClient::Lane
         body_offset_ = 0;
         remote_write_outcome_unknown_ = false;
 #if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordStreamQueueDepth(TransportType::HP_TCP,
+                                                       -1);
+        TentMetrics::instance().recordStreamBusyWorkers(TransportType::HP_TCP,
+                                                        1);
         const uint64_t attempt_start_ns = getCurrentTimeInNano();
         if (current_->enqueue_ts_ns != 0) {
             TentMetrics::instance().recordStreamQueueWait(
@@ -277,6 +289,12 @@ class HighPerformanceTcpClient::Lane
 #endif
                 self->parent_->connections_created_.fetch_add(
                     1, std::memory_order_relaxed);
+#if TENT_METRICS_ENABLED
+                self->connection_counted_ = true;
+                TentMetrics::instance().recordStreamConnection(
+                    TransportType::HP_TCP,
+                    TentMetrics::StreamConnectionRole::Client, 1);
+#endif
                 self->writeHeader(epoch);
             });
         };
@@ -485,6 +503,14 @@ class HighPerformanceTcpClient::Lane
             socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
             socket_.close(ignored);
         }
+#if TENT_METRICS_ENABLED
+        if (connection_counted_) {
+            connection_counted_ = false;
+            TentMetrics::instance().recordStreamConnection(
+                TransportType::HP_TCP,
+                TentMetrics::StreamConnectionRole::Client, -1);
+        }
+#endif
     }
 
     void finishProtocolError() {
@@ -557,6 +583,10 @@ class HighPerformanceTcpClient::Lane
             remote_status = HighPerformanceTcpStatus::kInternalError;
         }
         current_.reset();
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordStreamBusyWorkers(TransportType::HP_TCP,
+                                                        -1);
+#endif
         ++operation_epoch_;  // invalidate late timer/cancel callbacks
         forced_terminal_.reset();
         remote_write_outcome_unknown_ = false;
@@ -599,6 +629,7 @@ class HighPerformanceTcpClient::Lane
     uint64_t attempt_start_ts_ns_{0};
     TentMetrics::StreamOutcome attempt_outcome_{
         TentMetrics::StreamOutcome::IoError};
+    bool connection_counted_{false};
 #endif
 };
 

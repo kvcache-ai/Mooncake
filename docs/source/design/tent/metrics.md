@@ -189,12 +189,14 @@ The HTTP server provides multiple endpoints:
 - **`/live`**: Versioned JSON process liveness. This remains `200` while the
   metrics HTTP event loop can serve requests, even when the engine is not
   ready.
-- **`/ready`**: Versioned JSON engine readiness. It returns `200` only when an
-  engine diagnostics provider is registered and all mandatory checks pass;
-  otherwise it returns `503` with stable reason identifiers.
-- **`/diagnostics`**: The same versioned, redacted engine snapshot as
-  `/ready`, always returned with `200` so it can be collected during an
-  incident.
+- **`/ready`**: Versioned JSON engine readiness. It returns `200` only when a
+  bounded readiness provider is registered and all mandatory checks pass;
+  otherwise it returns `503` with stable reason identifiers. The provider is
+  O(1): it reads atomically maintained aggregate state and never scans live
+  batches or tasks.
+- **`/diagnostics`**: A versioned, redacted full engine snapshot, always
+  returned with `200` so it can be collected during an incident. Unlike
+  `/ready`, this endpoint may scan live engine state and is not a probe path.
 
 `/health` is kept for compatibility. New probes should use `/live` for process
 liveness and `/ready` for traffic readiness.
@@ -382,6 +384,13 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_rdma_posted_inflight_slices` | Gauge | `operation` | RDMA slices reserved for posting or posted and not yet resolved |
 | `tent_admission_queue_owners` | Gauge | `owner_kind` | Owners currently accounted by runtime admission control |
 | `tent_admission_queue_bytes` | Gauge | `owner_kind` | Bytes currently accounted by runtime admission control |
+| `tent_engine_ready` | Gauge | - | `1` when the bounded readiness snapshot has no blocker, otherwise `0` |
+| `tent_engine_readiness_reason` | Gauge | `reason` | One-hot bounded readiness blockers; every known reason is always emitted |
+| `tent_stream_queue_depth` | Gauge | `transport` | TCP tasks or HP-TCP operations waiting to start |
+| `tent_stream_busy_workers` | Gauge | `transport` | TCP workers or HP-TCP lanes currently executing an operation |
+| `tent_stream_admitted_tasks` | Gauge | `transport` | HP-TCP tasks currently reserved by admission control |
+| `tent_stream_admitted_bytes` | Gauge | `transport` | HP-TCP bytes currently reserved by admission control |
+| `tent_stream_connections` | Gauge | `transport`, `role` | Open stream connections split by client and server role |
 | `tent_read_latency_us` | Histogram | `transport` | Read latency distribution in microseconds |
 | `tent_write_latency_us` | Histogram | `transport` | Write latency distribution in microseconds |
 | `tent_read_size_bytes` | Histogram | `transport` | Read request size distribution in bytes |
@@ -418,6 +427,9 @@ visible when runtime transfer recording is disabled.
 
 **Notes**:
 - `*_requests_total` counts terminal logical/merged-transfer outcomes. Its `transport` label is the **final transport**: a request recovered by RDMA→TCP failover is counted once under `tcp`.
+- State gauges ignore the runtime sampling switch. Every queue, worker,
+  admission, and connection increment is paired with a decrement on success,
+  cancellation, timeout, dispatch failure, and shutdown paths.
 - `tent_logical_requests_started_total - sum(tent_logical_request_outcomes_total)` is the process-local conservation balance. Compare it with `tent_logical_requests_inflight`; a persistent mismatch means a terminal edge was lost or telemetry was disabled during only one side of the interval.
 - `tent_transport_attempts_total` and `tent_transport_attempt_outcomes_total` provide the equivalent physical-attempt conservation check. A recovered RDMA→TCP request contributes one failed RDMA attempt and one successful TCP attempt.
 - `tent_transport_attempt_failures_total` is a compatibility aggregate of the `failed`, `timeout`, and `canceled` attempt outcomes.

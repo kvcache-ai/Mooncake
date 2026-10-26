@@ -66,6 +66,31 @@ groups:
             Logical transfers on {{ $labels.instance }} are failing above the
             default threshold while request traffic is non-trivial.
 
+      - alert: TentEngineNotReady
+        expr: tent_engine_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: TENT engine is not ready
+          description: >-
+            The bounded readiness check on {{ $labels.instance }} has remained
+            unsuccessful for two minutes. Inspect
+            tent_engine_readiness_reason and /diagnostics.
+
+      - alert: TentStreamQueueBacklog
+        expr: >-
+          sum by (job, instance, transport) (tent_stream_queue_depth) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: TENT stream work is persistently queued
+          description: >-
+            {{ $labels.transport }} work on {{ $labels.instance }} has remained
+            queued for five minutes. Compare busy workers, admission state,
+            connections, and queue-wait latency.
+
       - alert: TentTransportAttemptFailureRateHigh
         expr: |-
           sum by (job, instance, transport) (

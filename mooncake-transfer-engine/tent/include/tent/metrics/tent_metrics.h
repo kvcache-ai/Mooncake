@@ -376,6 +376,15 @@ class TentMetrics {
                              double latency_us);
     void recordStreamQueueWait(TransportType transport,
                                Request::OpCode operation, double latency_us);
+    enum class StreamConnectionRole { Client, Server };
+    // Paired stream state gauges. These updates remain active when runtime
+    // sampling is disabled so current state cannot drift.
+    void recordStreamQueueDepth(TransportType transport, int64_t delta);
+    void recordStreamBusyWorkers(TransportType transport, int64_t delta);
+    void recordStreamAdmission(TransportType transport, int64_t task_delta,
+                               int64_t byte_delta);
+    void recordStreamConnection(TransportType transport,
+                                StreamConnectionRole role, int64_t delta);
 
     enum class ShmMappingEvent {
         CacheHit,
@@ -504,8 +513,14 @@ class TentMetrics {
     // clearDiagnosticsProvider waits for an in-flight callback to finish.
     void setDiagnosticsProvider(const void* owner,
                                 DiagnosticsProvider provider);
+    // /ready and scrape-time readiness gauges use this lightweight provider;
+    // /diagnostics retains the full, potentially O(number of live tasks)
+    // snapshot. setDiagnosticsProvider also installs the same callback as the
+    // default readiness provider for backward compatibility with embedders.
+    void setReadinessProvider(const void* owner, DiagnosticsProvider provider);
     void clearDiagnosticsProvider(const void* owner);
     bool getDiagnosticsSnapshot(DiagnosticsSnapshot& snapshot);
+    bool getReadinessSnapshot(DiagnosticsSnapshot& snapshot);
 
    private:
     TentMetrics() = default;
@@ -525,6 +540,7 @@ class TentMetrics {
     std::mutex diagnostics_provider_mutex_;
     const void* diagnostics_provider_owner_{nullptr};
     DiagnosticsProvider diagnostics_provider_;
+    DiagnosticsProvider readiness_provider_;
 
 #if TENT_METRICS_ENABLED
     static constexpr size_t kSerializationFormatCount = 2;
@@ -562,6 +578,7 @@ class TentMetrics {
     // Register metrics plus compatibility /health, process /live, engine
     // /ready, and the redacted /diagnostics endpoint.
     void registerHttpHandlers();
+    void appendReadinessPrometheus(std::string& out);
 
     // HTTP server for metrics endpoint
     std::unique_ptr<coro_http::coro_http_server> http_server_;
@@ -615,6 +632,8 @@ class TentMetrics {
         "transport", "operation", "event"};
     static inline const std::array<std::string, 3> kStreamAttemptLabels{
         "transport", "operation", "outcome"};
+    static inline const std::array<std::string, 2> kStreamConnectionLabels{
+        "transport", "role"};
     static inline const std::array<std::string, 1> kShmMappingEventLabel{
         "event"};
     static inline const std::array<std::string, 2> kShmCopyLabels{"operation",
@@ -662,6 +681,7 @@ class TentMetrics {
         kStreamOperationDomain * kStreamEventValueDomain;
     static constexpr size_t kStreamAttemptDomain =
         kStreamOperationDomain * kStreamOutcomeDomain;
+    static constexpr size_t kStreamConnectionDomain = kTransportDomain * 2;
     static constexpr size_t kShmMappingEventDomain = 8;
     static constexpr size_t kShmCopyOutcomeDomain = 2;
     static constexpr size_t kShmCopyDomain =
@@ -737,6 +757,10 @@ class TentMetrics {
         return streamOperationSlot(transport, operation) *
                    kStreamOutcomeDomain +
                static_cast<size_t>(outcome);
+    }
+    static size_t streamConnectionSlot(TransportType transport,
+                                       StreamConnectionRole role) {
+        return transportSlot(transport) * 2 + static_cast<size_t>(role);
     }
     static size_t shmCopySlot(Request::OpCode operation,
                               ShmCopyOutcome outcome) {
@@ -904,6 +928,23 @@ class TentMetrics {
         "tent_logical_requests_inflight",
         "Accepted logical requests without a terminal outcome",
         kOperationLabel, kOperationDomain};
+    metrics::CachedDynamicCounter<1> stream_queue_depth_{
+        "tent_stream_queue_depth", "Queued stream transport operations",
+        kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> stream_busy_workers_{
+        "tent_stream_busy_workers", "Stream workers executing operations",
+        kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> stream_admitted_tasks_{
+        "tent_stream_admitted_tasks",
+        "HP-TCP tasks holding bounded admission capacity", kTransportLabel,
+        kTransportDomain};
+    metrics::CachedDynamicCounter<1> stream_admitted_bytes_{
+        "tent_stream_admitted_bytes",
+        "HP-TCP bytes holding bounded admission capacity", kTransportLabel,
+        kTransportDomain};
+    metrics::CachedDynamicCounter<2> stream_connections_{
+        "tent_stream_connections", "Open stream connections by endpoint role",
+        kStreamConnectionLabels, kStreamConnectionDomain};
     metrics::CachedDynamicCounter<1> registered_buffer_bytes_{
         "tent_registered_buffer_bytes", "Registered local buffer bytes",
         kTransportLabel, kTransportDomain};
@@ -1038,7 +1079,8 @@ class TentMetrics {
 
     // Serialize a gauge backed by a cached-cell counter: emits the current
     // value per label with # TYPE ... gauge.
-    void serializeGaugePrometheus(metrics::CachedDynamicCounter<1>& gauge,
+    template <uint8_t N>
+    void serializeGaugePrometheus(metrics::CachedDynamicCounter<N>& gauge,
                                   std::string& out) const;
 
     // Append the fixed single-series metrics-pipeline state plus the

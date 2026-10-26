@@ -192,7 +192,19 @@ Status TcpTransport::submitTransferTasks(
 
     for (size_t i = start_idx; i < tcp_batch->task_list.size(); ++i) {
         TcpTask *task_ptr = &tcp_batch->task_list[i];
-        thread_pool_->enqueue([this, task_ptr]() { startTransfer(task_ptr); });
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordStreamQueueDepth(TransportType::TCP, 1);
+#endif
+        try {
+            thread_pool_->enqueue(
+                [this, task_ptr]() { startTransfer(task_ptr); });
+        } catch (...) {
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordStreamQueueDepth(TransportType::TCP,
+                                                           -1);
+#endif
+            throw;
+        }
     }
     return Status::OK();
 }
@@ -229,6 +241,8 @@ void TcpTransport::startTransfer(TcpTask *task) {
     const auto progress_batch_id = task->progress_batch_id;
     bool completed = false;
 #if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordStreamQueueDepth(TransportType::TCP, -1);
+    TentMetrics::instance().recordStreamBusyWorkers(TransportType::TCP, 1);
     if (task->enqueue_ts_ns != 0) {
         TentMetrics::instance().recordStreamQueueWait(
             TransportType::TCP, task->request.opcode,
@@ -271,6 +285,9 @@ void TcpTransport::startTransfer(TcpTask *task) {
         task->status_word.store(TransferStatusEnum::FAILED,
                                 std::memory_order_release);
     }
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordStreamBusyWorkers(TransportType::TCP, -1);
+#endif
     if (notify_progress) notify_progress(progress_batch_id);
 }
 

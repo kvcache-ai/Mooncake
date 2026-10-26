@@ -470,6 +470,67 @@ EngineDiagnosticsSnapshot TransferEngineImpl::buildDiagnosticsSnapshot() {
     return snapshot;
 }
 
+EngineDiagnosticsSnapshot TransferEngineImpl::buildReadinessSnapshot() {
+    EngineDiagnosticsSnapshot snapshot;
+    snapshot.engine_available = available();
+    snapshot.control_plane_available = metadata_ != nullptr;
+    snapshot.progress_worker_enabled = enable_progress_worker_;
+    snapshot.progress_worker_running =
+        progress_worker_ && progress_worker_->running();
+    snapshot.runtime_queue_enabled = runtime_queue_config_.enabled;
+
+    // Transport slots are immutable after construction. This bounded scan is
+    // O(number of transport kinds), not O(number of batches or requests).
+    for (size_t type = 0; type < transport_list_.size(); ++type) {
+        if (!transport_list_[type]) continue;
+        ++snapshot.loaded_transport_count;
+        snapshot.loaded_transports.emplace_back(
+            transportTypeName(static_cast<TransportType>(type)));
+    }
+
+    const uint64_t fallback_us = static_cast<uint64_t>(std::max<int64_t>(
+        0, runtime_queue_config_.progress_fallback_interval.count()));
+    const uint64_t derived_threshold_seconds =
+        (fallback_us * 3 + 999999ULL) / 1000000ULL;
+    snapshot.worker_stall_threshold_seconds =
+        std::max<uint64_t>(5, derived_threshold_seconds);
+    if (progress_worker_) {
+        snapshot.worker_progress_age_seconds =
+            progress_worker_->lastProgressAgeSeconds();
+    }
+
+    const uint64_t inflight =
+        logical_requests_inflight_.load(std::memory_order_acquire);
+    const uint64_t since_ns =
+        logical_inflight_since_ns_.load(std::memory_order_acquire);
+    if (inflight != 0 && since_ns != 0) {
+        const uint64_t now_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        if (now_ns > since_ns) {
+            snapshot.oldest_inflight_age_us = (now_ns - since_ns) / 1000ULL;
+        }
+    }
+
+    if (!snapshot.engine_available)
+        snapshot.readiness_reasons.emplace_back("engine_unavailable");
+    if (!snapshot.control_plane_available)
+        snapshot.readiness_reasons.emplace_back("control_plane_unavailable");
+    if (snapshot.loaded_transport_count == 0)
+        snapshot.readiness_reasons.emplace_back("no_transport_available");
+    if (snapshot.progress_worker_enabled && !snapshot.progress_worker_running) {
+        snapshot.readiness_reasons.emplace_back("progress_worker_unavailable");
+    } else if (snapshot.progress_worker_running && inflight != 0 &&
+               snapshot.oldest_inflight_age_us >=
+                   snapshot.worker_stall_threshold_seconds * 1000000ULL &&
+               snapshot.worker_progress_age_seconds >=
+                   snapshot.worker_stall_threshold_seconds) {
+        snapshot.readiness_reasons.emplace_back("progress_worker_stalled");
+    }
+    return snapshot;
+}
+
 std::string randomSegmentName() {
     std::string name = "segment_noname_";
     for (int i = 0; i < 8; ++i) name += 'a' + SimpleRandom::Get().next(26);
@@ -734,6 +795,8 @@ Status TransferEngineImpl::construct() {
             } else {
                 TentMetrics::instance().setDiagnosticsProvider(
                     this, [this]() { return buildDiagnosticsSnapshot(); });
+                TentMetrics::instance().setReadinessProvider(
+                    this, [this]() { return buildReadinessSnapshot(); });
                 LOG(INFO) << "TENT Metrics system initialized";
             }
         }
@@ -2611,6 +2674,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
             task.observability_attempt_id = 0;
             task.observability_trace_retained = false;
             task.logical_observability_active = false;
+            task.logical_request_active = false;
             task.terminal_observability_recorded = false;
             auto owner_it = owner_task_id_by_merged_task.find(merged_task_id);
             if (owner_it != owner_task_id_by_merged_task.end()) {
@@ -4113,6 +4177,17 @@ void TransferEngineImpl::recordTaskCompletionObservability(
         task.terminal_observability_recorded)
         return;
     task.terminal_observability_recorded = true;
+    if (task.logical_request_active) {
+        task.logical_request_active = false;
+        const uint64_t previous =
+            logical_requests_inflight_.fetch_sub(1, std::memory_order_acq_rel);
+        if (previous == 1) {
+            logical_inflight_since_ns_.store(0, std::memory_order_release);
+        } else if (previous == 0) {
+            logical_requests_inflight_.store(0, std::memory_order_release);
+            LOG(ERROR) << "TENT logical request accounting underflow";
+        }
+    }
 
     const auto end_time = std::chrono::steady_clock::now();
     int64_t duration_us = -1;
@@ -4288,7 +4363,17 @@ void TransferEngineImpl::recordTaskCompletionObservability(
 }
 
 void TransferEngineImpl::startLogicalRequestObservability(TaskInfo& task) {
-    if (task.derived || task.logical_observability_active) return;
+    if (task.derived || task.logical_request_active) return;
+    task.logical_request_active = true;
+    if (logical_requests_inflight_.fetch_add(1, std::memory_order_acq_rel) ==
+        0) {
+        const auto now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        logical_inflight_since_ns_.store(static_cast<uint64_t>(now_ns),
+                                         std::memory_order_release);
+    }
 #if TENT_METRICS_ENABLED
     task.logical_observability_active =
         TentMetrics::instance().recordLogicalRequestStarted(task.request.opcode);

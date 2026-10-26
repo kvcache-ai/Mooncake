@@ -17,6 +17,7 @@
 #include <glog/logging.h>
 #include <tent/thirdparty/nlohmann/json.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <iomanip>
@@ -47,13 +48,37 @@ void TentMetrics::setDiagnosticsProvider(const void* owner,
     std::lock_guard<std::mutex> lock(diagnostics_provider_mutex_);
     diagnostics_provider_owner_ = owner;
     diagnostics_provider_ = std::move(provider);
+    readiness_provider_ = diagnostics_provider_;
+}
+
+void TentMetrics::setReadinessProvider(const void* owner,
+                                       DiagnosticsProvider provider) {
+    if (owner == nullptr || !provider) return;
+    std::lock_guard<std::mutex> lock(diagnostics_provider_mutex_);
+    if (diagnostics_provider_owner_ != owner) return;
+    readiness_provider_ = std::move(provider);
 }
 
 void TentMetrics::clearDiagnosticsProvider(const void* owner) {
     std::lock_guard<std::mutex> lock(diagnostics_provider_mutex_);
     if (owner != diagnostics_provider_owner_) return;
     diagnostics_provider_ = nullptr;
+    readiness_provider_ = nullptr;
     diagnostics_provider_owner_ = nullptr;
+}
+
+bool TentMetrics::getReadinessSnapshot(DiagnosticsSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(diagnostics_provider_mutex_);
+    if (!readiness_provider_) return false;
+    try {
+        snapshot = readiness_provider_();
+        return true;
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "TENT readiness provider failed: " << error.what();
+    } catch (...) {
+        LOG(ERROR) << "TENT readiness provider failed with unknown error";
+    }
+    return false;
 }
 
 bool TentMetrics::getDiagnosticsSnapshot(DiagnosticsSnapshot& snapshot) {
@@ -534,6 +559,16 @@ const char* streamOutcomeName(TentMetrics::StreamOutcome outcome) {
     return "unknown";
 }
 
+const char* streamConnectionRoleName(TentMetrics::StreamConnectionRole role) {
+    switch (role) {
+        case TentMetrics::StreamConnectionRole::Client:
+            return "client";
+        case TentMetrics::StreamConnectionRole::Server:
+            return "server";
+    }
+    return "unknown";
+}
+
 const char* shmMappingEventName(TentMetrics::ShmMappingEvent event) {
     switch (event) {
         case TentMetrics::ShmMappingEvent::CacheHit:
@@ -849,7 +884,9 @@ void TentMetrics::registerHttpHandlers() {
 
     auto diagnostics = [this](coro_http_response& resp, bool readiness) {
         DiagnosticsSnapshot snapshot;
-        const bool provider_available = getDiagnosticsSnapshot(snapshot);
+        const bool provider_available = readiness
+                                            ? getReadinessSnapshot(snapshot)
+                                            : getDiagnosticsSnapshot(snapshot);
         if (!provider_available) {
             snapshot.readiness_reasons = {"engine_diagnostics_unavailable"};
         }
@@ -949,16 +986,13 @@ void TentMetrics::registerMetrics() {
     };
 
     gauges_ = {
-        &inflight_attempts_,
-        &logical_requests_inflight_,
-        &registered_buffer_bytes_,
-        &worker_last_progress_timestamp_seconds_,
-        &staging_inflight_tasks_,
-        &staging_inflight_bytes_,
-        &staging_cleanup_pending_,
-        &rdma_worker_inflight_slices_,
-        &rdma_posted_inflight_slices_,
-        &admission_queue_owners_,
+        &inflight_attempts_,           &logical_requests_inflight_,
+        &stream_queue_depth_,          &stream_busy_workers_,
+        &stream_admitted_tasks_,       &stream_admitted_bytes_,
+        &registered_buffer_bytes_,     &worker_last_progress_timestamp_seconds_,
+        &staging_inflight_tasks_,      &staging_inflight_bytes_,
+        &staging_cleanup_pending_,     &rdma_worker_inflight_slices_,
+        &rdma_posted_inflight_slices_, &admission_queue_owners_,
         &admission_queue_bytes_,
     };
 
@@ -1380,6 +1414,55 @@ void TentMetrics::recordStreamQueueWait(TransportType transport,
         static_cast<int64_t>(latency_us));
 }
 
+void TentMetrics::recordStreamQueueDepth(TransportType transport,
+                                         int64_t delta) {
+    if (!initialized_ || delta == 0) return;
+    stream_queue_depth_.incCached(
+        transportSlot(transport),
+        [transport] {
+            return std::array<std::string, 1>{transportTypeName(transport)};
+        },
+        delta);
+}
+
+void TentMetrics::recordStreamBusyWorkers(TransportType transport,
+                                          int64_t delta) {
+    if (!initialized_ || delta == 0) return;
+    stream_busy_workers_.incCached(
+        transportSlot(transport),
+        [transport] {
+            return std::array<std::string, 1>{transportTypeName(transport)};
+        },
+        delta);
+}
+
+void TentMetrics::recordStreamAdmission(TransportType transport,
+                                        int64_t task_delta,
+                                        int64_t byte_delta) {
+    if (!initialized_) return;
+    auto labels = [transport] {
+        return std::array<std::string, 1>{transportTypeName(transport)};
+    };
+    const size_t slot = transportSlot(transport);
+    if (task_delta != 0)
+        stream_admitted_tasks_.incCached(slot, labels, task_delta);
+    if (byte_delta != 0)
+        stream_admitted_bytes_.incCached(slot, labels, byte_delta);
+}
+
+void TentMetrics::recordStreamConnection(TransportType transport,
+                                         StreamConnectionRole role,
+                                         int64_t delta) {
+    if (!initialized_ || delta == 0) return;
+    stream_connections_.incCached(
+        streamConnectionSlot(transport, role),
+        [transport, role] {
+            return std::array<std::string, 2>{transportTypeName(transport),
+                                              streamConnectionRoleName(role)};
+        },
+        delta);
+}
+
 void TentMetrics::recordShmMappingEvent(ShmMappingEvent event) {
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
@@ -1669,6 +1752,8 @@ std::string TentMetrics::serializePrometheusMetrics(bool open_metrics) {
         for (auto* gauge : gauges_) {
             serializeGaugePrometheus(*gauge, result);
         }
+        serializeGaugePrometheus(stream_connections_, result);
+        appendReadinessPrometheus(result);
 
         const uint64_t success_timestamp = unixTimestampSeconds();
         appendSelfMetricsPrometheus(result, success_timestamp);
@@ -1898,8 +1983,9 @@ void TentMetrics::serializeHistogramPrometheus(
     }
 }
 
+template <uint8_t N>
 void TentMetrics::serializeGaugePrometheus(
-    metrics::CachedDynamicCounter<1>& gauge, std::string& out) const {
+    metrics::CachedDynamicCounter<N>& gauge, std::string& out) const {
     auto cells = gauge.copy();
     if (cells.empty()) return;
     const std::string& name = gauge.str_name();
@@ -1910,12 +1996,15 @@ void TentMetrics::serializeGaugePrometheus(
         .append("\n");
     out.append("# TYPE ").append(name).append(" gauge\n");
     for (auto& e : cells) {
-        out.append(name)
-            .append("{")
-            .append(gauge.labels_name()[0])
-            .append("=\"")
-            .append(e->label[0])
-            .append("\"} ")
+        out.append(name).append("{");
+        for (uint8_t i = 0; i < N; ++i) {
+            if (i != 0) out.append(",");
+            out.append(gauge.labels_name()[i])
+                .append("=\"")
+                .append(escapePrometheusLabelValue(e->label[i]))
+                .append("\"");
+        }
+        out.append("} ")
             .append(std::to_string(e->value.load(std::memory_order_relaxed)))
             .append("\n");
     }
@@ -2001,6 +2090,38 @@ void TentMetrics::appendSelfMetricsPrometheus(
         "tent_metrics_last_success_timestamp_seconds",
         "Unix timestamp of the last successful TENT metrics serialization",
         "gauge", last_serialization_success_timestamp_seconds_, true);
+}
+
+void TentMetrics::appendReadinessPrometheus(std::string& out) {
+    DiagnosticsSnapshot snapshot;
+    const bool provider_available = getReadinessSnapshot(snapshot);
+    if (!provider_available) {
+        snapshot.readiness_reasons = {"engine_diagnostics_unavailable"};
+    }
+    const bool ready = provider_available && snapshot.readiness_reasons.empty();
+    out.append(
+           "# HELP tent_engine_ready Whether the TENT engine is ready to "
+           "serve transfers\n")
+        .append("# TYPE tent_engine_ready gauge\n")
+        .append("tent_engine_ready ")
+        .append(ready ? "1\n" : "0\n")
+        .append(
+            "# HELP tent_engine_readiness_reason Active bounded TENT "
+            "readiness blockers\n")
+        .append("# TYPE tent_engine_readiness_reason gauge\n");
+    for (std::string_view reason :
+         {"engine_diagnostics_unavailable", "engine_unavailable",
+          "control_plane_unavailable", "no_transport_available",
+          "progress_worker_unavailable", "progress_worker_stalled"}) {
+        const bool active =
+            std::find(snapshot.readiness_reasons.begin(),
+                      snapshot.readiness_reasons.end(),
+                      reason) != snapshot.readiness_reasons.end();
+        out.append("tent_engine_readiness_reason{reason=\"")
+            .append(reason)
+            .append("\"} ")
+            .append(active ? "1\n" : "0\n");
+    }
 }
 
 std::string TentMetrics::getJsonMetrics() {
@@ -2107,6 +2228,37 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&admission_queue_owners_);
         root[admission_queue_bytes_.str_name()] =
             sumCounterValues(&admission_queue_bytes_);
+        root[stream_queue_depth_.str_name()] =
+            sumCounterValues(&stream_queue_depth_);
+        root[stream_busy_workers_.str_name()] =
+            sumCounterValues(&stream_busy_workers_);
+        root[stream_admitted_tasks_.str_name()] =
+            sumCounterValues(&stream_admitted_tasks_);
+        root[stream_admitted_bytes_.str_name()] =
+            sumCounterValues(&stream_admitted_bytes_);
+        root[stream_connections_.str_name()] =
+            sumCounterValues(&stream_connections_);
+
+        DiagnosticsSnapshot readiness;
+        const bool readiness_available = getReadinessSnapshot(readiness);
+        root["tent_engine_ready"] =
+            readiness_available && readiness.readiness_reasons.empty() ? 1 : 0;
+        nlohmann::json readiness_reasons;
+        for (std::string_view reason :
+             {"engine_diagnostics_unavailable", "engine_unavailable",
+              "control_plane_unavailable", "no_transport_available",
+              "progress_worker_unavailable", "progress_worker_stalled"}) {
+            readiness_reasons[std::string(reason)] =
+                std::find(readiness.readiness_reasons.begin(),
+                          readiness.readiness_reasons.end(),
+                          reason) != readiness.readiness_reasons.end()
+                    ? 1
+                    : 0;
+        }
+        if (!readiness_available) {
+            readiness_reasons["engine_diagnostics_unavailable"] = 1;
+        }
+        root["tent_engine_readiness_reason"] = std::move(readiness_reasons);
 
         // Histograms: sum bucket counts across all transport labels. The
         // templated helper also reads back the histogram's sum counter so the
@@ -2283,6 +2435,11 @@ void TentMetrics::recordStreamAttempt(TransportType, Request::OpCode,
                                       StreamOutcome, double) {}
 void TentMetrics::recordStreamQueueWait(TransportType, Request::OpCode,
                                         double) {}
+void TentMetrics::recordStreamQueueDepth(TransportType, int64_t) {}
+void TentMetrics::recordStreamBusyWorkers(TransportType, int64_t) {}
+void TentMetrics::recordStreamAdmission(TransportType, int64_t, int64_t) {}
+void TentMetrics::recordStreamConnection(TransportType, StreamConnectionRole,
+                                         int64_t) {}
 void TentMetrics::recordShmMappingEvent(ShmMappingEvent) {}
 void TentMetrics::recordShmCopy(Request::OpCode, ShmCopyOutcome, double) {}
 void TentMetrics::recordSegmentEvent(SegmentEvent) {}

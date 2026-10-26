@@ -32,6 +32,11 @@ Do not treat `/health` as an engine-readiness check. It only proves that the
 metrics HTTP event loop can serve a request. Use `/live` for liveness and
 `/ready` for traffic readiness.
 
+`/ready` is safe for frequent probes: it reads bounded aggregate state and
+does not walk batches or tasks. Collect `/diagnostics` for incident detail,
+but do not use it as the Kubernetes readiness probe because it may scan live
+engine state.
+
 ## Triage flow
 
 1. If `/live` is unavailable, check process health and metrics port ownership.
@@ -110,7 +115,7 @@ Interpret the combinations as follows:
 | Throughput drop | read/write byte rates | request rate, in-flight work, attempt errors, failover, admission rejection |
 | Engine stall | worker progress age plus in-flight attempts | oldest in-flight age, RDMA posted/worker gauges, stream/staging state |
 | RDMA degradation | retry exhausted, CQ poll errors | slice events, completion outcomes, endpoint events, QP transition failures, notification events |
-| TCP or HP-TCP degradation | stream terminal events | connection/IO/timeout outcome, retry exhaustion, attempt and queue latency |
+| TCP or HP-TCP degradation | stream terminal events | queue depth, busy workers, admitted tasks/bytes, open connections, connection/IO/timeout outcome, retry exhaustion, attempt and queue latency |
 | Admission pressure | rejected admission events | queue owners/bytes, admission wait, deadline drops, owner kind |
 | Staging leak or shutdown delay | cleanup pending and cleanup timeouts | staging in-flight tasks/bytes, staging worker progress, quarantined batches |
 | Shared-memory failure | SHM mapping/copy events | operation/outcome and copy latency |
@@ -173,6 +178,13 @@ Connection errors suggest endpoint establishment, while `io_error`, `timeout`,
 `tent_stream_queue_wait_us` with `tent_stream_attempt_latency_us`: high queue
 wait points toward local saturation, while high attempt latency points toward
 the connection or remote side.
+
+For a persistent queue, compare `tent_stream_queue_depth` with
+`tent_stream_busy_workers`. HP-TCP also exposes
+`tent_stream_admitted_tasks`, `tent_stream_admitted_bytes`, and client/server
+`tent_stream_connections`; use them to distinguish admission pressure, lane
+saturation, and connection churn. These are current-state gauges, so they
+should return to zero after the corresponding work or connection closes.
 
 ### SHM and segment metadata
 

@@ -119,6 +119,7 @@ struct TaskInfo {
     // sample switch. `logical_observability_active` means the in-flight gauge
     // was incremented and therefore must be decremented exactly once.
     bool logical_observability_active{false};
+    bool logical_request_active{false};
     bool terminal_observability_recorded{false};
 
     TaskInfo() = default;
@@ -154,6 +155,7 @@ struct TaskInfo {
           observability_attempt_id(other.observability_attempt_id),
           observability_trace_retained(other.observability_trace_retained),
           logical_observability_active(other.logical_observability_active),
+          logical_request_active(other.logical_request_active),
           terminal_observability_recorded(
               other.terminal_observability_recorded) {}
 
@@ -188,6 +190,7 @@ struct TaskInfo {
           observability_attempt_id(other.observability_attempt_id),
           observability_trace_retained(other.observability_trace_retained),
           logical_observability_active(other.logical_observability_active),
+          logical_request_active(other.logical_request_active),
           terminal_observability_recorded(
               other.terminal_observability_recorded) {}
 
@@ -225,6 +228,7 @@ struct TaskInfo {
             observability_attempt_id = other.observability_attempt_id;
             observability_trace_retained = other.observability_trace_retained;
             logical_observability_active = other.logical_observability_active;
+            logical_request_active = other.logical_request_active;
             terminal_observability_recorded =
                 other.terminal_observability_recorded;
         }
@@ -265,6 +269,7 @@ struct TaskInfo {
             observability_attempt_id = other.observability_attempt_id;
             observability_trace_retained = other.observability_trace_retained;
             logical_observability_active = other.logical_observability_active;
+            logical_request_active = other.logical_request_active;
             terminal_observability_recorded =
                 other.terminal_observability_recorded;
         }
@@ -453,6 +458,7 @@ class TransferEngineImpl {
     Status deconstruct();
 
     EngineDiagnosticsSnapshot buildDiagnosticsSnapshot();
+    EngineDiagnosticsSnapshot buildReadinessSnapshot();
 
     Status setupLocalSegment();
 
@@ -721,6 +727,8 @@ class TransferEngineImpl {
     size_t dispatch_inflight_owners_{0};
     size_t dispatch_inflight_bytes_{0};
     uint64_t next_batch_token_{1};
+    std::atomic<uint64_t> logical_requests_inflight_{0};
+    std::atomic<uint64_t> logical_inflight_since_ns_{0};
 
     // Serializes engine-global progress: runtime queue, lazyFreeBatch
     // freelist, and ProgressWorker. Recursive because freeBatch ->

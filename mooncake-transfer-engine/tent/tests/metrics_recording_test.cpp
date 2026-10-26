@@ -487,6 +487,16 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStreamAttempt(
         HP_TCP, Request::WRITE, TentMetrics::StreamOutcome::Success, 45.0);
     metrics.recordStreamQueueWait(TCP, Request::READ, 12.0);
+    metrics.recordStreamQueueDepth(TCP, 1);
+    metrics.recordStreamBusyWorkers(TCP, 1);
+    metrics.recordStreamAdmission(HP_TCP, 2, 4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, 1);
+    metrics.recordStreamQueueDepth(TCP, -1);
+    metrics.recordStreamBusyWorkers(TCP, -1);
+    metrics.recordStreamAdmission(HP_TCP, -2, -4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, -1);
     metrics.recordShmMappingEvent(TentMetrics::ShmMappingEvent::CacheHit);
     metrics.recordShmCopy(Request::WRITE,
                           TentMetrics::ShmCopyOutcome::Success, 18.0);
@@ -508,7 +518,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 69>
+    const std::array<std::pair<std::string_view, std::string_view>, 76>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -555,6 +565,13 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_rdma_posted_inflight_slices", "gauge"},
             {"tent_admission_queue_owners", "gauge"},
             {"tent_admission_queue_bytes", "gauge"},
+            {"tent_engine_ready", "gauge"},
+            {"tent_engine_readiness_reason", "gauge"},
+            {"tent_stream_queue_depth", "gauge"},
+            {"tent_stream_busy_workers", "gauge"},
+            {"tent_stream_admitted_tasks", "gauge"},
+            {"tent_stream_admitted_bytes", "gauge"},
+            {"tent_stream_connections", "gauge"},
             {"tent_read_latency_us", "histogram"},
             {"tent_write_latency_us", "histogram"},
             {"tent_read_size_bytes", "histogram"},
@@ -2281,6 +2298,33 @@ TEST_F(MetricsRecordingTest, StagingGaugesSurviveEnableToggle) {
               0);
 }
 
+TEST_F(MetricsRecordingTest, StreamStateGaugesSurviveEnableToggle) {
+    auto& metrics = TentMetrics::instance();
+    const auto before = MetricsSnapshot(metrics);
+
+    TentMetrics::setEnabled(true);
+    metrics.recordStreamQueueDepth(HP_TCP, 1);
+    metrics.recordStreamBusyWorkers(HP_TCP, 1);
+    metrics.recordStreamAdmission(HP_TCP, 2, 4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, 1);
+    TentMetrics::setEnabled(false);
+    metrics.recordStreamQueueDepth(HP_TCP, -1);
+    metrics.recordStreamBusyWorkers(HP_TCP, -1);
+    metrics.recordStreamAdmission(HP_TCP, -2, -4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, -1);
+    TentMetrics::setEnabled(true);
+
+    const auto after = MetricsSnapshot(metrics);
+    for (const char* family :
+         {"tent_stream_queue_depth", "tent_stream_busy_workers",
+          "tent_stream_admitted_tasks", "tent_stream_admitted_bytes",
+          "tent_stream_connections"}) {
+        EXPECT_EQ(after.counter(family) - before.counter(family), 0) << family;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // L2 HTTP integration: scrape the real /metrics, /metrics/json, /health
 // endpoints via coro_http_client and assert on status + body. Validates the
@@ -2428,6 +2472,13 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_stream_events_total"));
     EXPECT_TRUE(json.contains("tent_stream_attempt_latency_us"));
     EXPECT_TRUE(json.contains("tent_stream_queue_wait_us"));
+    EXPECT_TRUE(json.contains("tent_engine_ready"));
+    EXPECT_TRUE(json.contains("tent_engine_readiness_reason"));
+    EXPECT_TRUE(json.contains("tent_stream_queue_depth"));
+    EXPECT_TRUE(json.contains("tent_stream_busy_workers"));
+    EXPECT_TRUE(json.contains("tent_stream_admitted_tasks"));
+    EXPECT_TRUE(json.contains("tent_stream_admitted_bytes"));
+    EXPECT_TRUE(json.contains("tent_stream_connections"));
     EXPECT_TRUE(json.contains("tent_metrics_build_info"));
     EXPECT_EQ(json["tent_metrics_runtime_enabled"], 1);
     EXPECT_EQ(json["tent_metrics_http_server_up"], 1);
@@ -2640,6 +2691,53 @@ TEST_F(MetricsHttpTest, LiveReadyAndDiagnosticsExposeRedactedState) {
     ASSERT_FALSE(stalled_json.is_discarded());
     EXPECT_EQ(stalled_json["readiness_reasons"][0],
               "progress_worker_stalled");
+
+    TentMetrics::instance().clearDiagnosticsProvider(&owner);
+}
+
+TEST_F(MetricsHttpTest,
+       ReadyUsesBoundedProviderAndDiagnosticsUsesFullProvider) {
+    int owner = 0;
+    std::atomic<int> readiness_calls{0};
+    std::atomic<int> diagnostics_calls{0};
+
+    EngineDiagnosticsSnapshot full;
+    full.engine_available = true;
+    full.control_plane_available = true;
+    full.loaded_transport_count = 2;
+    full.loaded_transports = {"rdma", "tcp"};
+    full.alive_batches = 99;
+    TentMetrics::instance().setDiagnosticsProvider(&owner, [&] {
+        diagnostics_calls.fetch_add(1, std::memory_order_relaxed);
+        return full;
+    });
+
+    EngineDiagnosticsSnapshot bounded = full;
+    bounded.loaded_transport_count = 1;
+    bounded.loaded_transports = {"tcp"};
+    bounded.alive_batches = 0;
+    TentMetrics::instance().setReadinessProvider(&owner, [&] {
+        readiness_calls.fetch_add(1, std::memory_order_relaxed);
+        return bounded;
+    });
+
+    auto ready = retryGet("/ready");
+    ASSERT_EQ(ready.http_status, 200);
+    auto ready_json = nlohmann::json::parse(ready.body, nullptr, false);
+    ASSERT_FALSE(ready_json.is_discarded());
+    EXPECT_EQ(ready_json["engine"]["loaded_transport_count"], 1);
+    EXPECT_EQ(ready_json["work"]["alive_batches"], 0);
+    EXPECT_EQ(readiness_calls.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(diagnostics_calls.load(std::memory_order_relaxed), 0);
+
+    auto diagnostics = retryGet("/diagnostics");
+    ASSERT_EQ(diagnostics.http_status, 200);
+    auto diagnostics_json =
+        nlohmann::json::parse(diagnostics.body, nullptr, false);
+    ASSERT_FALSE(diagnostics_json.is_discarded());
+    EXPECT_EQ(diagnostics_json["engine"]["loaded_transport_count"], 2);
+    EXPECT_EQ(diagnostics_json["work"]["alive_batches"], 99);
+    EXPECT_EQ(diagnostics_calls.load(std::memory_order_relaxed), 1);
 
     TentMetrics::instance().clearDiagnosticsProvider(&owner);
 }
