@@ -35,6 +35,7 @@
 #include "client_buffer.h"
 #include "replica_selection.h"
 #include "batch_read_fanout.h"
+#include "gpu_read_staging.h"
 #include "common.h"
 #include "config.h"
 #include "config/rpc_protocol_config.h"
@@ -1202,6 +1203,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    gpu_read_staging_ = GpuReadStaging::Create(client_);
+
     // Local_buffer_size is allowed to be 0, but we only register memory when
     // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
     // fail in some rdma implementations.
@@ -1931,6 +1934,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_http_server();
 
     ErrorCode cleanup_error = ErrorCode::OK;
+    gpu_read_staging_.reset();
     if (client_) {
         if (!egm_segment_ptrs_.empty()) {
             // Callers must quiesce in-flight requests before close. FileStorage
@@ -8530,8 +8534,20 @@ RealClient::batch_get_into_multi_buffers_internal(
             batch_slices[op.key] = op.slices;
         }
 
-        auto batch_get_results = client_->BatchGet(
-            batch_keys, batch_query_results, batch_slices, group_by_target);
+        std::optional<GpuReadStaging::Results> staged;
+        if (gpu_read_staging_) {
+            staged = gpu_read_staging_->Read(
+                batch_keys, batch_query_results, batch_slices, group_by_target,
+                [this](void *ptr) -> std::optional<GpuReadRegion> {
+                    auto region = resolve_writable_buffer_region(ptr);
+                    if (!region) return std::nullopt;
+                    return GpuReadRegion{region->base, region->size};
+                });
+        }
+        auto batch_get_results =
+            staged ? std::move(*staged)
+                   : client_->BatchGet(batch_keys, batch_query_results,
+                                       batch_slices, group_by_target);
 
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
             const auto &op = valid_operations[dedup.primaries[j]];

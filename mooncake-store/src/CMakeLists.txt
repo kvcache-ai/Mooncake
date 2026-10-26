@@ -129,6 +129,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     client_buffer.cpp
     aligned_client_buffer.cpp
     real_client.cpp
+    gpu_read_staging.cpp
     config/registered_pinned_memory_config.cpp
     registered_pinned_memory.cpp
     dummy_client.cpp
@@ -523,6 +524,14 @@ string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
 # so SDK presence must not enable CUDA support by itself.
 if(USE_CUDA)
   find_package(CUDAToolkit REQUIRED)
+  enable_language(CUDA)
+  add_library(mooncake_gpu_read_scatter STATIC gpu_read_staging_kernel.cu)
+  set_target_properties(
+    mooncake_gpu_read_scatter PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                         CUDA_STANDARD 17)
+  target_include_directories(mooncake_gpu_read_scatter
+                             PRIVATE ${MOONCAKE_STORE_INCLUDE_ROOT})
+  target_link_libraries(mooncake_gpu_read_scatter PRIVATE CUDA::cudart)
 elseif(USE_HIP)
   find_package(hip REQUIRED)
 endif()
@@ -732,7 +741,8 @@ if(TARGET Mooncake::liburing)
   target_link_libraries(mooncake_store PUBLIC Mooncake::liburing)
 endif()
 if(USE_CUDA)
-  target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
+  target_link_libraries(mooncake_store PRIVATE CUDA::cudart
+                                               mooncake_gpu_read_scatter)
 elseif(USE_HIP)
   target_link_libraries(mooncake_store PRIVATE hip::host)
 endif()

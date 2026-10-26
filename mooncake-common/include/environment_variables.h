@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
 
 #include "environment_variable.h"
@@ -60,6 +61,11 @@ struct ClientAutoPortEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_SETUP_RETRIES);
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MIN_PORT);
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MAX_PORT);
+};
+
+struct GpuReadStagingEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MC_STORE_GPU_STAGING);
+    MC_DEFINE_ENV_VAR(size_t, MC_STORE_GPU_STAGING_BUFFER_BYTES);
 };
 
 struct EmbeddedMasterEnvironmentVariables {
