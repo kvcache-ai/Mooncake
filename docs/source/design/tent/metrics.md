@@ -247,8 +247,13 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_memory_operation_bytes_total` | Counter | `transport`, `operation`, `outcome` | Bytes covered by physical backend memory register/unregister calls |
 | `tent_deadline_infeasible_total` | Counter | `transport` | Transfers whose deadline was already in the past at submit time |
 | `tent_quarantined_batches_total` | Counter | - | Batches abandoned after repeated reclaim failures and retained until engine teardown |
+| `tent_staging_cleanup_timeouts_total` | Counter | - | Staging shutdown drains that reached their configured deadline |
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
 | `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
+| `tent_worker_last_progress_timestamp_seconds` | Gauge | `worker` | Unix timestamp of the last observed engine-progress or staging-worker progress |
+| `tent_staging_inflight_tasks` | Gauge | `operation` | Parent staging tasks currently executing in staging workers |
+| `tent_staging_inflight_bytes` | Gauge | `operation` | Parent request bytes currently executing in staging workers |
+| `tent_staging_cleanup_pending` | Gauge | `kind` | Deferred cleanup groups, child batches, or remote operations still awaiting safe release |
 | `tent_read_latency_us` | Histogram | `transport` | Read latency distribution in microseconds |
 | `tent_write_latency_us` | Histogram | `transport` | Write latency distribution in microseconds |
 | `tent_read_size_bytes` | Histogram | `transport` | Read request size distribution in bytes |
@@ -301,6 +306,8 @@ addresses, segment names, or other unbounded values are accepted.
 | `phase` | `metadata`, `admission`, `selection`, `connect`, `register`, `submit`, `queue`, `post`, `poll`, `completion`, `retry`, `failover`, `notify`, `cleanup`, `shutdown` | Stable phase where a terminal failure originated |
 | `reason` | `submit`, `poll`, `timeout`, `canceled` for `tent_task_failures_total`; `timeout`, `unavailable`, `queue_full`, `resource_exhausted`, `protocol`, `stale_generation`, `wc_error`, `cq_error`, `mr_error`, `peer_closed`, `canceled`, `internal` for `tent_terminal_failures_total` | Bounded failure classification |
 | `outcome` | `success`, `failure` | Memory lifecycle call outcome |
+| `worker` | `engine_progress`, `staging` | Worker subsystem reporting forward progress |
+| `kind` | `group`, `batch`, `remote_operation` | Deferred staging cleanup resource kind |
 | `format` | `prometheus`, `json` | Serialization output format |
 | `from` | (same set) | Transport that failed before failover |
 | `to` | (same set) | Transport that the failover switched to |
@@ -316,10 +323,26 @@ Transport label values come from the shared `transportTypeName()` mapping.
 few pairs ever occur), each attempt metric has at most 17x2 = 34
 transport/operation combinations, task failures have at most 17x4 = 68,
 terminal failures have at most 17x15x12 = 3060, each memory lifecycle family
-has at most 17x2x2 = 68, and each serialization family has exactly two series.
-Dynamic counters allocate only label combinations that actually occur. Build
-identity labels are constant for the life of the process. Total series across
-all metrics is bounded by these closed sets.
+has at most 17x2x2 = 68, worker progress has two series, each staging in-flight
+family has two operation series, staging cleanup has three kind series, and
+each serialization family has exactly two series. Dynamic counters allocate
+only label combinations that actually occur. Build identity labels are
+constant for the life of the process. Total series across all metrics is
+bounded by these closed sets.
+
+`tent_worker_last_progress_timestamp_seconds` advances when the engine progress
+worker completes a wake cycle and when a staging worker changes a chunk state
+or finishes a parent task. An idle worker is expected to retain its previous
+timestamp; alert on its age only when the corresponding in-flight or queue
+signals show outstanding work. The JSON endpoint reports the most recent
+timestamp across workers, while Prometheus preserves the per-worker labels.
+
+Staging in-flight gauges cover parent tasks after a staging worker dequeues
+them and before it hands any undrained resources to deferred cleanup. Work
+waiting in a staging shard queue is not included. Deferred cleanup is exposed
+separately by `tent_staging_cleanup_pending`, and its `batch` and
+`remote_operation` series are decremented only after those resources reach a
+confirmed terminal state or ownership moves into bounded shutdown teardown.
 
 ### Per-rail load (`getNicLoadStats`)
 

@@ -424,6 +424,14 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordTaskFailure(RDMA, TentMetrics::TaskFailureReason::Timeout);
     metrics.recordMemoryOperation(RDMA, TentMetrics::MemoryOperation::Register,
                                   TentMetrics::OperationOutcome::Success, 4096);
+    metrics.recordWorkerProgress(TentMetrics::WorkerKind::EngineProgress);
+    metrics.recordStagingTaskStarted(Request::WRITE, 4096);
+    metrics.recordStagingTaskFinished(Request::WRITE, 4096);
+    metrics.recordStagingCleanupPending(TentMetrics::StagingCleanupKind::Group,
+                                        1);
+    metrics.recordStagingCleanupPending(TentMetrics::StagingCleanupKind::Group,
+                                        -1);
+    metrics.recordStagingCleanupTimeout();
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -433,7 +441,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 33>
+    const std::array<std::pair<std::string_view, std::string_view>, 38>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -450,8 +458,13 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_memory_operation_bytes_total", "counter"},
             {"tent_deadline_infeasible_total", "counter"},
             {"tent_quarantined_batches_total", "counter"},
+            {"tent_staging_cleanup_timeouts_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
+            {"tent_worker_last_progress_timestamp_seconds", "gauge"},
+            {"tent_staging_inflight_tasks", "gauge"},
+            {"tent_staging_inflight_bytes", "gauge"},
+            {"tent_staging_cleanup_pending", "gauge"},
             {"tent_read_latency_us", "histogram"},
             {"tent_write_latency_us", "histogram"},
             {"tent_read_size_bytes", "histogram"},
@@ -1560,6 +1573,34 @@ TEST_F(MetricsRecordingTest, RegisteredBytesGaugeSurvivesEnableToggle) {
         0);
 }
 
+TEST_F(MetricsRecordingTest, StagingGaugesSurviveEnableToggle) {
+    auto& m = TentMetrics::instance();
+    auto before = MetricsSnapshot(m);
+
+    TentMetrics::setEnabled(true);
+    m.recordStagingTaskStarted(Request::WRITE, 4096);
+    m.recordStagingCleanupPending(TentMetrics::StagingCleanupKind::Batch, 2);
+    TentMetrics::setEnabled(false);
+    m.recordStagingTaskFinished(Request::WRITE, 4096);
+    m.recordStagingCleanupPending(TentMetrics::StagingCleanupKind::Batch, -2);
+    m.recordWorkerProgress(TentMetrics::WorkerKind::Staging);
+    TentMetrics::setEnabled(true);
+
+    auto after = MetricsSnapshot(m);
+    EXPECT_EQ(after.counter("tent_staging_inflight_tasks") -
+                  before.counter("tent_staging_inflight_tasks"),
+              0);
+    EXPECT_EQ(after.counter("tent_staging_inflight_bytes") -
+                  before.counter("tent_staging_inflight_bytes"),
+              0);
+    EXPECT_EQ(after.counter("tent_staging_cleanup_pending") -
+                  before.counter("tent_staging_cleanup_pending"),
+              0);
+    EXPECT_GT(after.series("tent_worker_last_progress_timestamp_seconds{worker="
+                           "\"staging\"}"),
+              0);
+}
+
 // ---------------------------------------------------------------------------
 // L2 HTTP integration: scrape the real /metrics, /metrics/json, /health
 // endpoints via coro_http_client and assert on status + body. Validates the
@@ -1657,6 +1698,11 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_terminal_failures_total"));
     EXPECT_TRUE(json.contains("tent_memory_operations_total"));
     EXPECT_TRUE(json.contains("tent_memory_operation_bytes_total"));
+    EXPECT_TRUE(json.contains("tent_staging_cleanup_timeouts_total"));
+    EXPECT_TRUE(json.contains("tent_worker_last_progress_timestamp_seconds"));
+    EXPECT_TRUE(json.contains("tent_staging_inflight_tasks"));
+    EXPECT_TRUE(json.contains("tent_staging_inflight_bytes"));
+    EXPECT_TRUE(json.contains("tent_staging_cleanup_pending"));
     EXPECT_TRUE(json.contains("tent_metrics_build_info"));
     EXPECT_EQ(json["tent_metrics_runtime_enabled"], 1);
     EXPECT_EQ(json["tent_metrics_http_server_up"], 1);

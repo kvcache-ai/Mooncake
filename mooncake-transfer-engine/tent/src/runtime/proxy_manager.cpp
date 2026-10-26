@@ -14,6 +14,7 @@
 
 #include "tent/runtime/proxy_manager.h"
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/metrics/tent_metrics.h"
 #include "remote_stage_operation.h"
 #include <algorithm>
 #include <cstring>
@@ -67,9 +68,20 @@ void ProxyManager::flushPendingCleanups(bool unpin_remote_buffers) {
                 }
                 batches_to_release.push_back((Batch*)*batch_it);
                 batch_it = it->batches.erase(batch_it);
+                TentMetrics::instance().recordStagingCleanupPending(
+                    TentMetrics::StagingCleanupKind::Batch, -1);
             }
 
+            const size_t remote_operations_before =
+                it->remote_operations.size();
             internal::pollRemoteOperations(it->remote_operations);
+            const size_t completed_remote_operations =
+                remote_operations_before - it->remote_operations.size();
+            if (completed_remote_operations != 0) {
+                TentMetrics::instance().recordStagingCleanupPending(
+                    TentMetrics::StagingCleanupKind::RemoteOperation,
+                    -static_cast<int64_t>(completed_remote_operations));
+            }
             if (it->batches.empty()) {
                 local_addrs_to_unpin.insert(local_addrs_to_unpin.end(),
                                             it->local_addrs.begin(),
@@ -86,6 +98,8 @@ void ProxyManager::flushPendingCleanups(bool unpin_remote_buffers) {
             if (it->local_addrs.empty() && it->remote_addrs.empty() &&
                 it->batches.empty() && it->remote_operations.empty()) {
                 it = pending_cleanups_.erase(it);
+                TentMetrics::instance().recordStagingCleanupPending(
+                    TentMetrics::StagingCleanupKind::Group, -1);
                 continue;
             }
             ++it;
@@ -128,6 +142,7 @@ Status ProxyManager::deconstruct() {
         std::chrono::steady_clock::now() + shutdown_drain_timeout_;
     while (has_pending_batches()) {
         if (std::chrono::steady_clock::now() >= drain_deadline) {
+            TentMetrics::instance().recordStagingCleanupTimeout();
             LOG(WARNING) << "Timed out waiting for in-flight staging batches "
                             "to reach a terminal state during shutdown; "
                             "leaving the remaining cleanups pinned";
@@ -141,11 +156,32 @@ Status ProxyManager::deconstruct() {
     std::vector<PendingBufferCleanup> remaining;
     std::vector<BatchID> deferred_batches;
     std::vector<uint64_t> deferred_local_addrs;
+    size_t remaining_batches = 0;
+    size_t remaining_remote_operations = 0;
     {
         std::lock_guard<std::mutex> lk(pending_cleanups_mu_);
         remaining = std::move(pending_cleanups_);
         pending_cleanups_.clear();
         has_pending_cleanups_.store(false, std::memory_order_relaxed);
+        for (const auto& pending : remaining) {
+            remaining_batches += pending.batches.size();
+            remaining_remote_operations += pending.remote_operations.size();
+        }
+    }
+    if (!remaining.empty()) {
+        TentMetrics::instance().recordStagingCleanupPending(
+            TentMetrics::StagingCleanupKind::Group,
+            -static_cast<int64_t>(remaining.size()));
+    }
+    if (remaining_batches != 0) {
+        TentMetrics::instance().recordStagingCleanupPending(
+            TentMetrics::StagingCleanupKind::Batch,
+            -static_cast<int64_t>(remaining_batches));
+    }
+    if (remaining_remote_operations != 0) {
+        TentMetrics::instance().recordStagingCleanupPending(
+            TentMetrics::StagingCleanupKind::RemoteOperation,
+            -static_cast<int64_t>(remaining_remote_operations));
     }
     for (auto& pending : remaining) {
         if (!pending.batches.empty()) {
@@ -431,6 +467,12 @@ void ProxyManager::runner(size_t id) {
         }
 
         if (!task.native) continue;
+        const auto operation = task.native->request.opcode;
+        const size_t request_bytes = task.native->request.length;
+        TentMetrics::instance().recordStagingTaskStarted(operation,
+                                                         request_bytes);
+        TentMetrics::instance().recordWorkerProgress(
+            TentMetrics::WorkerKind::Staging);
         flushPendingCleanups();
         StageBufferCache cache(*this);
         bool buffers_safe_to_release = true;
@@ -485,6 +527,18 @@ void ProxyManager::runner(size_t id) {
             pending.remote_operations = std::move(undrained_remote_operations);
             {
                 std::lock_guard<std::mutex> lk(pending_cleanups_mu_);
+                TentMetrics::instance().recordStagingCleanupPending(
+                    TentMetrics::StagingCleanupKind::Group, 1);
+                if (!pending.batches.empty()) {
+                    TentMetrics::instance().recordStagingCleanupPending(
+                        TentMetrics::StagingCleanupKind::Batch,
+                        static_cast<int64_t>(pending.batches.size()));
+                }
+                if (!pending.remote_operations.empty()) {
+                    TentMetrics::instance().recordStagingCleanupPending(
+                        TentMetrics::StagingCleanupKind::RemoteOperation,
+                        static_cast<int64_t>(pending.remote_operations.size()));
+                }
                 pending_cleanups_.push_back(std::move(pending));
                 has_pending_cleanups_.store(true, std::memory_order_relaxed);
             }
@@ -494,6 +548,10 @@ void ProxyManager::runner(size_t id) {
                                               std::memory_order_release);
             impl_->notifyBatchMaybeReady(task.batch);
         }
+        TentMetrics::instance().recordWorkerProgress(
+            TentMetrics::WorkerKind::Staging);
+        TentMetrics::instance().recordStagingTaskFinished(operation,
+                                                          request_bytes);
     }
 }
 
@@ -832,10 +890,13 @@ Status ProxyManager::transferEventLoop(
         if (chunk.state != state_before) swept_progress = true;
         if (sweep_remaining > 0) --sweep_remaining;
         if (sweep_remaining == 0) {
-            if (swept_progress)
+            if (swept_progress) {
                 idle_sweeps = 0;
-            else
+                TentMetrics::instance().recordWorkerProgress(
+                    TentMetrics::WorkerKind::Staging);
+            } else {
                 waitBeforeNextPoll(idle_sweeps++);
+            }
             swept_progress = false;
             sweep_remaining = event_queue.size();
         }

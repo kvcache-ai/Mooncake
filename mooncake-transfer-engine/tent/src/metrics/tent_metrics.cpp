@@ -179,6 +179,28 @@ const char* operationOutcomeName(TentMetrics::OperationOutcome outcome) {
     }
     return "unknown";
 }
+
+const char* workerKindName(TentMetrics::WorkerKind worker) {
+    switch (worker) {
+        case TentMetrics::WorkerKind::EngineProgress:
+            return "engine_progress";
+        case TentMetrics::WorkerKind::Staging:
+            return "staging";
+    }
+    return "unknown";
+}
+
+const char* stagingCleanupKindName(TentMetrics::StagingCleanupKind kind) {
+    switch (kind) {
+        case TentMetrics::StagingCleanupKind::Group:
+            return "group";
+        case TentMetrics::StagingCleanupKind::Batch:
+            return "batch";
+        case TentMetrics::StagingCleanupKind::RemoteOperation:
+            return "remote_operation";
+    }
+    return "unknown";
+}
 }  // namespace
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
@@ -373,11 +395,16 @@ void TentMetrics::registerMetrics() {
         &memory_operation_bytes_total_,
         &deadline_infeasible_total_,
         &quarantined_batches_total_,
+        &staging_cleanup_timeouts_total_,
     };
 
     gauges_ = {
         &inflight_attempts_,
         &registered_buffer_bytes_,
+        &worker_last_progress_timestamp_seconds_,
+        &staging_inflight_tasks_,
+        &staging_inflight_bytes_,
+        &staging_cleanup_pending_,
     };
 
     // Register the N=1 per-transport histograms for unified serialization.
@@ -505,6 +532,54 @@ void TentMetrics::recordMemoryOperation(TransportType tp,
                                             operationOutcomeName(outcome)};
     memory_operations_total_.inc(labels);
     memory_operation_bytes_total_.inc(labels, static_cast<int64_t>(bytes));
+}
+
+void TentMetrics::recordWorkerProgress(WorkerKind worker) {
+    if (!initialized_) return;
+    worker_last_progress_timestamp_seconds_.setCached(
+        static_cast<size_t>(worker),
+        [worker] { return std::array<std::string, 1>{workerKindName(worker)}; },
+        static_cast<int64_t>(unixTimestampSeconds()));
+}
+
+void TentMetrics::recordStagingTaskStarted(Request::OpCode operation,
+                                           size_t bytes) {
+    if (!initialized_) return;
+    const size_t slot = operationSlot(operation);
+    auto label = [operation] {
+        return std::array<std::string, 1>{operationName(operation)};
+    };
+    staging_inflight_tasks_.incCached(slot, label);
+    staging_inflight_bytes_.incCached(slot, label, static_cast<int64_t>(bytes));
+}
+
+void TentMetrics::recordStagingTaskFinished(Request::OpCode operation,
+                                            size_t bytes) {
+    if (!initialized_) return;
+    const size_t slot = operationSlot(operation);
+    auto label = [operation] {
+        return std::array<std::string, 1>{operationName(operation)};
+    };
+    staging_inflight_tasks_.incCached(slot, label, -1);
+    staging_inflight_bytes_.incCached(slot, label,
+                                      -static_cast<int64_t>(bytes));
+}
+
+void TentMetrics::recordStagingCleanupPending(StagingCleanupKind kind,
+                                              int64_t delta) {
+    if (!initialized_) return;
+    staging_cleanup_pending_.incCached(
+        static_cast<size_t>(kind),
+        [kind] {
+            return std::array<std::string, 1>{stagingCleanupKindName(kind)};
+        },
+        delta);
+}
+
+void TentMetrics::recordStagingCleanupTimeout() {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    staging_cleanup_timeouts_total_.inc();
 }
 
 // Gauge updates below deliberately ignore runtime_enabled_: gauges track
@@ -682,6 +757,15 @@ int64_t sumCounterValues(CounterPtr counter) {
         total += e->value.load(std::memory_order_relaxed);
     }
     return total;
+}
+
+template <typename CounterPtr>
+int64_t maxCounterValue(CounterPtr counter) {
+    int64_t maximum = 0;
+    for (auto& e : counter->copy()) {
+        maximum = std::max(maximum, e->value.load(std::memory_order_relaxed));
+    }
+    return maximum;
 }
 
 template <uint8_t N>
@@ -978,6 +1062,8 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&deadline_infeasible_total_);
         root[quarantined_batches_total_.str_name()] =
             static_cast<int64_t>(quarantined_batches_total_.value());
+        root[staging_cleanup_timeouts_total_.str_name()] =
+            static_cast<int64_t>(staging_cleanup_timeouts_total_.value());
 
         // Gauges: aggregate across transport labels (total in-flight attempts
         // / total registered bytes). Per-transport breakdown is via the
@@ -986,6 +1072,14 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&inflight_attempts_);
         root[registered_buffer_bytes_.str_name()] =
             sumCounterValues(&registered_buffer_bytes_);
+        root[worker_last_progress_timestamp_seconds_.str_name()] =
+            maxCounterValue(&worker_last_progress_timestamp_seconds_);
+        root[staging_inflight_tasks_.str_name()] =
+            sumCounterValues(&staging_inflight_tasks_);
+        root[staging_inflight_bytes_.str_name()] =
+            sumCounterValues(&staging_inflight_bytes_);
+        root[staging_cleanup_pending_.str_name()] =
+            sumCounterValues(&staging_cleanup_pending_);
 
         // Histograms: sum bucket counts across all transport labels. The
         // templated helper also reads back the histogram's sum counter so the
@@ -1124,6 +1218,11 @@ void TentMetrics::recordTerminalFailure(TransportType, FailurePhase,
                                         FailureReason) {}
 void TentMetrics::recordMemoryOperation(TransportType, MemoryOperation,
                                         OperationOutcome, size_t) {}
+void TentMetrics::recordWorkerProgress(WorkerKind) {}
+void TentMetrics::recordStagingTaskStarted(Request::OpCode, size_t) {}
+void TentMetrics::recordStagingTaskFinished(Request::OpCode, size_t) {}
+void TentMetrics::recordStagingCleanupPending(StagingCleanupKind, int64_t) {}
+void TentMetrics::recordStagingCleanupTimeout() {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}

@@ -99,6 +99,19 @@ class CachedDynamicCounter
         cell->fetch_add(value, std::memory_order_relaxed);
     }
 
+    // Set an absolute gauge value via the cached cell. This is intentionally
+    // separate from incCached(): counters and paired gauges use fetch_add,
+    // while timestamps and other sampled state replace the prior value.
+    template <typename LabelFn>
+    void setCached(size_t label_index, LabelFn&& make_label, int64_t value) {
+        std::atomic<int64_t>* cell = slots_[label_index].load();
+        if (cell == nullptr) [[unlikely]] {
+            cell = resolve(make_label());
+            slots_[label_index].store(cell);
+        }
+        cell->store(value, std::memory_order_relaxed);
+    }
+
    private:
     std::vector<CellSlot> slots_;
 };

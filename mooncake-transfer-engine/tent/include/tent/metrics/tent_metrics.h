@@ -193,6 +193,18 @@ class TentMetrics {
     void recordMemoryOperation(TransportType tp, MemoryOperation operation,
                                OperationOutcome outcome, size_t bytes);
 
+    enum class WorkerKind { EngineProgress, Staging };
+    enum class StagingCleanupKind { Group, Batch, RemoteOperation };
+
+    // Worker timestamps and staging gauges are current state, so updates stay
+    // visible across runtime enable/disable transitions. Staging add/sub
+    // updates must remain paired.
+    void recordWorkerProgress(WorkerKind worker);
+    void recordStagingTaskStarted(Request::OpCode operation, size_t bytes);
+    void recordStagingTaskFinished(Request::OpCode operation, size_t bytes);
+    void recordStagingCleanupPending(StagingCleanupKind kind, int64_t delta);
+    void recordStagingCleanupTimeout();
+
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
     // sitting in the engine right now — a persistently high or stuck value
@@ -304,6 +316,9 @@ class TentMetrics {
         "transport", "phase", "reason"};
     static inline const std::array<std::string, 3> kMemoryOperationLabels{
         "transport", "operation", "outcome"};
+    static inline const std::array<std::string, 1> kWorkerLabel{"worker"};
+    static inline const std::array<std::string, 1> kOperationLabel{"operation"};
+    static inline const std::array<std::string, 1> kCleanupKindLabel{"kind"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -313,6 +328,9 @@ class TentMetrics {
         static_cast<size_t>(kNumTransportTypes);
     static constexpr size_t kAttemptDomain = kTransportDomain * 2;
     static constexpr size_t kTaskFailureDomain = kTransportDomain * 4;
+    static constexpr size_t kWorkerDomain = 2;
+    static constexpr size_t kOperationDomain = 2;
+    static constexpr size_t kCleanupKindDomain = 3;
 
     // Stable slot indices into the cached-cell label domain.
     static size_t transportSlot(TransportType tp) {
@@ -323,6 +341,9 @@ class TentMetrics {
     }
     static size_t taskFailureSlot(TransportType tp, TaskFailureReason reason) {
         return static_cast<size_t>(tp) * 4 + static_cast<size_t>(reason);
+    }
+    static size_t operationSlot(Request::OpCode operation) {
+        return operation == Request::READ ? 0u : 1u;
     }
 
     // Per-transport counters (label: transport). Values are int64_t.
@@ -390,6 +411,9 @@ class TentMetrics {
         "tent_quarantined_batches_total",
         "Batches abandoned by lazyFreeBatch after repeated failed reclaim "
         "attempts; reclaimed only at engine teardown"};
+    ylt::metric::counter_t staging_cleanup_timeouts_total_{
+        "tent_staging_cleanup_timeouts_total",
+        "Staging shutdown drains that reached their configured deadline"};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_
@@ -401,6 +425,22 @@ class TentMetrics {
     metrics::CachedDynamicCounter<1> registered_buffer_bytes_{
         "tent_registered_buffer_bytes", "Registered local buffer bytes",
         kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> worker_last_progress_timestamp_seconds_{
+        "tent_worker_last_progress_timestamp_seconds",
+        "Unix timestamp of the last observed worker progress", kWorkerLabel,
+        kWorkerDomain};
+    metrics::CachedDynamicCounter<1> staging_inflight_tasks_{
+        "tent_staging_inflight_tasks",
+        "Parent staging tasks currently executing in staging workers",
+        kOperationLabel, kOperationDomain};
+    metrics::CachedDynamicCounter<1> staging_inflight_bytes_{
+        "tent_staging_inflight_bytes",
+        "Parent request bytes currently executing in staging workers",
+        kOperationLabel, kOperationDomain};
+    metrics::CachedDynamicCounter<1> staging_cleanup_pending_{
+        "tent_staging_cleanup_pending",
+        "Deferred staging cleanup resources still awaiting safe release",
+        kCleanupKindLabel, kCleanupKindDomain};
     std::vector<metrics::CachedDynamicCounter<1>*> gauges_;
 
     // Latency histograms use microseconds (us) as unit
