@@ -198,10 +198,10 @@ TEST(ProxyShutdownTimeout, TimedOutDrainHandsResourcesToDeferredTeardown) {
 
     // 64-byte chunks over a 128-byte request: two chunks, each with its own
     // local-stage batch that will never leave PENDING.
-    auto manager = std::make_unique<ProxyManager>(engine.get(), 64, 16);
+    auto manager = std::make_unique<ProxyManager>(engine.get(), 64, 10);
     // Leave only the two slots this request needs. Reserving the entire
     // pipeline would fail before either transfer reaches the transport.
-    std::vector<uint64_t> occupied(14);
+    std::vector<uint64_t> occupied(8);
     for (auto& addr : occupied) {
         ASSERT_TRUE(manager->pinStageBuffer(kWildcardLocation, addr).ok());
     }
