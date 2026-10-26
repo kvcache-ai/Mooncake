@@ -373,24 +373,28 @@ bool ReadFirstLine(const std::string& path, std::string* line) {
 
 // numa_out is the node id. The returned CPUs are that node's cpulist,
 // intersected with this process's cpuset. Empty means do not bind.
-// DSMI ids are physical. ASCEND_RT_VISIBLE_DEVICES renumbers ACL logic ids,
-// so the UB device name must be queried with the physical id.
+// DSMI uses the device id visible to this process. Inside an Ascend container
+// that id is renumbered, even though ACL can still report the physical id.
 std::vector<int> CpusForLogicDevice(DsmiInfoFn info, int32_t logic_id,
                                     int* numa_out) {
     *numa_out = -1;
-    int32_t physical_id = -1;
-    const aclError phy_ret =
-        aclrtGetPhyDevIdByLogicDevId(logic_id, &physical_id);
-    if (phy_ret != ACL_ERROR_NONE || physical_id < 0) {
+    int32_t user_id = -1;
+    const aclError user_ret =
+        aclrtGetUserDevIdByLogicDevId(logic_id, &user_id);
+    if (user_ret != ACL_ERROR_NONE || user_id < 0) {
+        LOG(WARNING) << "[affinity] cannot resolve user id for ACL logic device "
+                     << logic_id << ", ret=" << user_ret;
         return {};
     }
 
     char name[kUrmaNameCap];
     std::memset(name, 0, sizeof(name));
     unsigned int size = sizeof(name);
-    const int ret = info(static_cast<unsigned int>(physical_id), kDsmiMainCmdUb,
+    const int ret = info(static_cast<unsigned int>(user_id), kDsmiMainCmdUb,
                          kDsmiUbSubUrmaName, name, &size);
     if (ret != 0 || name[0] == '\0') {
+        LOG(WARNING) << "[affinity] DSMI URMA name unavailable for user device "
+                     << user_id << ", ret=" << ret;
         return {};
     }
 

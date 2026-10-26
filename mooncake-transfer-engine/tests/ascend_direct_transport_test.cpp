@@ -292,6 +292,12 @@ aclError aclrtGetPhyDevIdByLogicDevId(int32_t logic_dev_id,
     return ACL_ERROR_NONE;
 }
 
+aclError aclrtGetUserDevIdByLogicDevId(int32_t logic_dev_id,
+                                       int32_t* user_dev_id) {
+    *user_dev_id = logic_dev_id;
+    return ACL_ERROR_NONE;
+}
+
 aclError aclrtMallocPhysical(aclrtDrvMemHandle* handle, size_t size,
                              aclrtPhysicalMemProp* prop, uint32_t flags) {
     (void)prop;
