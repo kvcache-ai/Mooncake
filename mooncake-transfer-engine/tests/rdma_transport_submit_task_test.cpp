@@ -373,6 +373,12 @@ class ChunkedSubmitTest : public SubmitTransferTaskTest {
 
 TEST_F(ChunkedSubmitTest,
        SmallRequestsPublishBoundedChunksIncludingCachedSlices) {
+    {
+        auto req = request(16384);
+        Transport::TransferTask task;
+        task.request = &req;
+        ASSERT_EQ(transport_->submitTransferTask({&task}), Status::OK());
+    }
     for (const auto &expected : {std::vector<size_t>{kWatermark - 1},
                                  {kWatermark},
                                  {kWatermark, 1},
@@ -380,8 +386,6 @@ TEST_F(ChunkedSubmitTest,
         const size_t count =
             std::accumulate(expected.begin(), expected.end(), size_t{0});
         SCOPED_TRACE(count);
-        auto &cache = Transport::getSliceCache();
-        cache.deallocate(cache.allocate());
         std::vector<Transport::TransferRequest> requests;
         for (size_t i = 0; i < count; ++i)
             requests.push_back(request(16384, i * 16384));
