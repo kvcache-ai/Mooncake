@@ -17,9 +17,12 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <string_view>
+
+#ifdef __linux__
+#include <numa.h>
+#endif
 
 namespace mooncake {
 namespace tent {
@@ -32,9 +35,8 @@ struct NumaMapsPlacement {
 NumaMapsPlacement parseNumaMapsPlacement(std::string_view maps_line);
 
 #ifdef __linux__
-// Saves the calling thread's affinity, pins to one allowed CPU on `node`,
-// and restores on destruction. Does not pin if the original mask cannot be
-// saved.
+// Saves the calling thread's affinity, runs it on `node`, and restores on
+// destruction. Does not change affinity if the original mask cannot be saved.
 class CpuAffinityGuard {
    public:
     explicit CpuAffinityGuard(int node);
@@ -45,8 +47,7 @@ class CpuAffinityGuard {
     bool pinned() const { return pinned_ok_; }
 
    private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+    struct bitmask* saved_ = nullptr;
     bool pinned_ok_ = false;
 };
 
