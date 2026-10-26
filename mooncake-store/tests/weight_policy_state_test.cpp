@@ -284,7 +284,7 @@ TEST(WeightPolicyStateTest, TracksUnitAndByteProgress) {
     ASSERT_TRUE(operation.has_value());
 
     auto progress = metadata_store.PrepareUpdateOperationProgress(
-        operation->operation_id, 1, 2, 1024, 4096, {},
+        operation->operation_id, 1, 2, 1024, 4096, {}, {},
         WeightAvailabilityState::READY, WeightResidencyState::HOT, 1.0, 301);
     ASSERT_TRUE(progress.has_value());
     auto published = metadata_store.Publish(*progress);

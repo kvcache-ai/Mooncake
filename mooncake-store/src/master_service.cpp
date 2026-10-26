@@ -1617,14 +1617,14 @@ std::vector<std::string> MasterService::GetGroupMemberKeys(
     return ns->objects.GroupMembers(group_id);
 }
 
-void MasterService::QueueManagedWeightMemberOffload(
+bool MasterService::QueueManagedWeightMemberOffload(
     const WeightRevisionMetadata& revision, const std::string& member_key) {
     const TenantId tenant_id(revision.identity.tenant_id);
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentity(member_key, tenant_id));
     if (!accessor.Exists()) {
-        return;
+        return false;
     }
     auto& metadata = accessor.Get();
     if (metadata.group_id != revision.manifest.payload_group_id ||
@@ -1632,11 +1632,12 @@ void MasterService::QueueManagedWeightMemberOffload(
         metadata.HasReplica([this](const Replica& replica) {
             return !replica.is_memory_replica() && IsReplicaReadable(replica);
         })) {
-        return;
+        return metadata.group_id == revision.manifest.payload_group_id &&
+               metadata.data_type == ObjectDataType::WEIGHT;
     }
     auto& offloading_task = accessor.GetState().offloading_task;
     if (offloading_task) {
-        return;
+        return true;
     }
     std::optional<ReplicaID> source_id;
     std::vector<UUID> mirror_clients;
@@ -1659,8 +1660,9 @@ void MasterService::QueueManagedWeightMemberOffload(
     if (source_id.has_value()) {
         offloading_task =
             OffloadingTask{*source_id, std::chrono::system_clock::now(),
-                           std::move(mirror_clients)};
+                           std::move(mirror_clients), revision.operation_id};
     }
+    return source_id.has_value();
 }
 
 void MasterService::EvictManagedWeightMembersToCold(
@@ -5419,7 +5421,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         if (source_id.has_value() && !state.offloading_task) {
             state.offloading_task =
                 OffloadingTask{*source_id, std::chrono::system_clock::now(),
-                               std::move(mirror_clients)};
+                               std::move(mirror_clients), std::nullopt};
         }
     }
 
@@ -8159,6 +8161,7 @@ auto MasterService::NotifyOffloadSuccess(
     // below). NACK cleanups still run for the rest of the batch; the caller
     // gets SEGMENT_NOT_FOUND so a rescan stops re-registering.
     bool refused_unmounted = false;
+    std::vector<uint64_t> failed_weight_operation_ids;
 
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
@@ -8178,6 +8181,10 @@ auto MasterService::NotifyOffloadSuccess(
             if (accessor.Exists()) {
                 auto& offloading_task = accessor.GetState().offloading_task;
                 if (offloading_task) {
+                    if (offloading_task->weight_operation_id.has_value()) {
+                        failed_weight_operation_ids.push_back(
+                            *offloading_task->weight_operation_id);
+                    }
                     auto source = accessor.Get().GetReplicaByID(
                         offloading_task->source_id);
                     if (source != nullptr) {
@@ -8319,11 +8326,18 @@ auto MasterService::NotifyOffloadSuccess(
         }
     }
 
+    const bool operation_error_persist_failed =
+        !weight_manager_.RecordOffloadFailures(
+            std::move(failed_weight_operation_ids));
+
     if (refused_unmounted) {
         LOG(WARNING) << "client_id=" << client_id
                      << ", action=notify_offload_success_refused"
                      << ", error=no_local_disk_segment";
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    if (operation_error_persist_failed) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     return {};
 }

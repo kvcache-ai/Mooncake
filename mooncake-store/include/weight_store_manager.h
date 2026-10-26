@@ -59,6 +59,7 @@ class WeightStoreManager {
     tl::expected<ImportWriteGuard, ErrorCode> TrackImportWrite(
         const TenantId& tenant, const std::string& group);
     void RecordImportWrite(const TenantId& tenant, const std::string& group);
+    bool RecordOffloadFailures(std::vector<uint64_t> operation_ids);
     bool HasActiveLease(const WeightRevisionIdentity& identity,
                         uint64_t generation, uint64_t now_ms) const {
         return weight_metadata_.HasActiveLease(identity, generation, now_ms);

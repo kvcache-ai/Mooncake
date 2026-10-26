@@ -164,7 +164,8 @@ class WeightReconciliationTest : public MasterServiceTest {
     }
     void CheckPublicPayloadLoss(size_t lost_payloads, bool start_cold,
                                 WeightResidencyState expected_residency,
-                                double expected_hot_ratio) {
+                                double expected_hot_ratio,
+                                bool lose_completed_member = false) {
         MasterServiceConfig config;
         config.default_kv_lease_ttl = 0;
         config.enable_offload = start_cold;
@@ -240,6 +241,70 @@ class WeightReconciliationTest : public MasterServiceTest {
                 service.OffloadObjectHeartbeat(context.client_id, true);
             ASSERT_TRUE(tasks.has_value());
             ASSERT_EQ(2u, tasks->size());
+            if (lose_completed_member) {
+                const auto completed_task = tasks->front();
+                StorageObjectMetadata completed_metadata{};
+                completed_metadata.key_size = completed_task.key.size();
+                completed_metadata.data_size = completed_task.size;
+                completed_metadata.transport_endpoint = "test_segment";
+                ASSERT_TRUE(service.NotifyOffloadSuccess(
+                    context.client_id, {completed_task}, {completed_metadata}));
+                const auto partial = service.ReconcileWeightRevision(
+                    ReconcileWeightRevisionRequest{.identity = identity});
+                ASSERT_TRUE(partial.has_value());
+                ASSERT_TRUE(partial->operation_id.has_value());
+                ASSERT_EQ(WeightAvailabilityState::READY,
+                          partial->availability);
+                ASSERT_EQ(WeightResidencyState::MIXED, partial->residency);
+                ASSERT_DOUBLE_EQ(0.5, partial->observed_hot_ratio);
+                const auto before =
+                    service.QueryWeightOperation(QueryWeightOperationRequest{
+                        .operation_id = started->operation_id,
+                    });
+                ASSERT_TRUE(before.has_value());
+                ASSERT_EQ(1u, before->processed_units);
+                ASSERT_EQ(1024u, before->processed_bytes);
+                ASSERT_EQ(2u, before->total_units);
+                ASSERT_EQ(2048u, before->total_bytes);
+                ASSERT_NE("completed", before->message);
+                const auto cleared = service.BatchReplicaClear(
+                    {completed_task.key}, context.client_id, "");
+                ASSERT_TRUE(cleared.has_value());
+                ASSERT_EQ(std::vector<std::string>{completed_task.key},
+                          *cleared);
+                ASSERT_FALSE(
+                    service.ExistKey(completed_task.key, TenantId::Default())
+                        .value_or(true));
+                const auto remaining_key = completed_task.key == payload_keys[0]
+                                               ? payload_keys[1]
+                                               : payload_keys[0];
+                ASSERT_TRUE(service.ExistKey(remaining_key, TenantId::Default())
+                                .value_or(false));
+                const auto reconciled = service.ReconcileWeightRevision(
+                    ReconcileWeightRevisionRequest{.identity = identity});
+                EXPECT_TRUE(reconciled.has_value());
+                const auto after = service.GetWeightRevision(
+                    GetWeightRevisionRequest{.identity = identity});
+                ASSERT_TRUE(after.has_value());
+                EXPECT_EQ(WeightAvailabilityState::DEGRADED,
+                          after->metadata.availability);
+                EXPECT_EQ(expected_residency, after->metadata.residency);
+                EXPECT_DOUBLE_EQ(expected_hot_ratio,
+                                 after->metadata.observed_hot_ratio);
+                EXPECT_EQ(started->operation_id, after->metadata.operation_id);
+                const auto operation =
+                    service.QueryWeightOperation(QueryWeightOperationRequest{
+                        .operation_id = started->operation_id,
+                    });
+                ASSERT_TRUE(operation.has_value());
+                EXPECT_EQ(before->processed_units, operation->processed_units);
+                EXPECT_EQ(before->processed_bytes, operation->processed_bytes);
+                EXPECT_EQ(before->cursor, operation->cursor);
+                EXPECT_NE("completed", operation->message);
+                EXPECT_EQ(after->metadata.metadata_generation,
+                          operation->fenced_metadata_generation);
+                return;
+            }
             std::vector<StorageObjectMetadata> disk_metadata;
             for (const auto& task : *tasks) {
                 ASSERT_TRUE(task.key == payload_keys[0] ||
@@ -688,6 +753,66 @@ TEST_F(WeightReconciliationTest, RestoredImportGetsFullInactivityGrace) {
     ASSERT_TRUE(restored);
     EXPECT_EQ(WeightAvailabilityState::IMPORTING,
               restored->metadata.availability);
+}
+TEST_F(WeightReconciliationTest,
+       PublicMemberLossDuringColdMigrationBecomesDegraded) {
+    for (const bool lose_manifest : {true, false}) {
+        SCOPED_TRACE(lose_manifest ? "manifest loss" : "payload loss");
+        MasterServiceConfig config;
+        config.default_kv_lease_ttl = 0;
+        config.enable_offload = true;
+        config.offload_on_evict = true;
+        MasterService service(config);
+        const auto context = PrepareSimpleSegment(service);
+        ASSERT_TRUE(service.MountLocalDiskSegment(context.client_id, true));
+        const auto ready = PublishReady(service, context.client_id,
+                                        "step-active-migration-loss");
+        const auto started = service.StartWeightResidencyOperation(
+            StartWeightResidencyOperationRequest{
+                .identity = ready.identity,
+                .expected_metadata_generation = ready.metadata_generation,
+                .target_residency = WeightResidencyState::COLD,
+                .mixed_hot_ratio = std::nullopt,
+            });
+        ASSERT_TRUE(started.has_value());
+        const auto lost_key = lose_manifest
+                                  ? ManifestKey(ready.identity)
+                                  : ready.identity.revision + "-payload";
+        const auto cleared =
+            service.BatchReplicaClear({lost_key}, context.client_id, "");
+        ASSERT_TRUE(cleared.has_value());
+        ASSERT_EQ(std::vector<std::string>{lost_key}, *cleared);
+        ASSERT_FALSE(
+            service.ExistKey(lost_key, TenantId::Default()).value_or(true));
+        const auto reconciled = service.ReconcileWeightRevision(
+            ReconcileWeightRevisionRequest{.identity = ready.identity});
+        EXPECT_TRUE(reconciled.has_value());
+        const auto view = service.GetWeightRevision(
+            GetWeightRevisionRequest{.identity = ready.identity});
+        ASSERT_TRUE(view.has_value());
+        EXPECT_EQ(WeightAvailabilityState::DEGRADED,
+                  view->metadata.availability);
+        EXPECT_EQ(lose_manifest ? WeightResidencyState::HOT
+                                : WeightResidencyState::ABSENT,
+                  view->metadata.residency);
+        EXPECT_DOUBLE_EQ(lose_manifest ? 1.0 : 0.0,
+                         view->metadata.observed_hot_ratio);
+        ASSERT_TRUE(view->metadata.operation_id.has_value());
+        EXPECT_EQ(started->operation_id, *view->metadata.operation_id);
+        const auto operation =
+            service.QueryWeightOperation(QueryWeightOperationRequest{
+                .operation_id = started->operation_id,
+            });
+        ASSERT_TRUE(operation.has_value());
+        EXPECT_EQ(WeightOperationKind::MIGRATING, operation->kind);
+        EXPECT_EQ(WeightResidencyState::COLD, operation->target_residency);
+        EXPECT_NE("completed", operation->message);
+    }
+}
+
+TEST_F(WeightReconciliationTest,
+       PublicCompletedMigrationMemberLossStillUpdatesAvailability) {
+    CheckPublicPayloadLoss(1, true, WeightResidencyState::HOT, 1.0, true);
 }
 TEST_F(WeightReconciliationTest, PublicPayloadLossRetainsPartialHotCoverage) {
     CheckPublicPayloadLoss(1, false, WeightResidencyState::HOT, 1.0);

@@ -26,7 +26,7 @@ class WeightStoreBackend {
     // The consumer must arbitrate completion before publishing metadata.
     using DurableFinalize = std::function<void(const DurableResult&)>;
     virtual ~WeightStoreBackend() = default;
-    virtual void QueueManagedWeightMemberOffload(
+    virtual bool QueueManagedWeightMemberOffload(
         const WeightRevisionMetadata& revision, const std::string& key) = 0;
     virtual void EvictManagedWeightMembersToCold(
         const WeightRevisionMetadata& revision,
@@ -54,8 +54,8 @@ class MasterService;
 class MasterStoreBackend final : public WeightStoreBackend {
    public:
     explicit MasterStoreBackend(MasterService& master) : master_(master) {}
-    void QueueManagedWeightMemberOffload(
-        const WeightRevisionMetadata& revision, const std::string& key) override;
+    bool QueueManagedWeightMemberOffload(const WeightRevisionMetadata& revision,
+                                         const std::string& key) override;
     void EvictManagedWeightMembersToCold(
         const WeightRevisionMetadata& revision,
         const std::vector<std::string>& keys) override;

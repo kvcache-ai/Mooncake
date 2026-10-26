@@ -714,6 +714,7 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
     };
 
     std::set<std::string> hot_affinities;
+    bool offload_failed = false;
     if (active_operation.has_value() && !absent &&
         active_operation->kind == WeightOperationKind::MIGRATING) {
         auto affinities = aggregate_affinities(*members);
@@ -793,7 +794,9 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
             }
 
             for (const auto& key : affinity.keys_without_cold) {
-                backend_.QueueManagedWeightMemberOffload(current, key);
+                offload_failed =
+                    !backend_.QueueManagedWeightMemberOffload(current, key) ||
+                    offload_failed;
             }
             if (affinity.all_have_cold && view->active_lease_count == 0) {
                 backend_.EvictManagedWeightMembersToCold(current,
@@ -898,13 +901,22 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
             }
             return reconciled->metadata;
         }
+        // Progress is a high-water mark; current readability is reported
+        // independently so lost replicas do not block availability updates.
+        processed_units =
+            std::max(operation.processed_units,
+                     std::min(processed_units, operation.total_units));
+        processed_bytes =
+            std::max(operation.processed_bytes,
+                     std::min(processed_bytes, operation.total_bytes));
+        if (processed_units == operation.processed_units &&
+            processed_bytes == operation.processed_bytes) {
+            cursor = operation.cursor;
+        }
         auto progress = weight_metadata_.PrepareUpdateOperationProgress(
-            operation.operation_id,
-            std::min(processed_units, operation.total_units),
-            operation.total_units, std::min(processed_bytes,
-                                            operation.total_bytes),
-            operation.total_bytes,
-            std::move(cursor),
+            operation.operation_id, processed_units, operation.total_units,
+            processed_bytes, operation.total_bytes, std::move(cursor),
+            offload_failed ? "cold replica write failed" : "",
             complete ? WeightAvailabilityState::READY
                      : WeightAvailabilityState::DEGRADED,
             observed_residency, observed_hot_ratio, now_ms);
@@ -1180,5 +1192,53 @@ WeightStoreManager::UpdateWeightPolicy(const UpdateWeightPolicyRequest& request)
     return PersistAndPublishWeightMutation(*mutation);
 }
 
+bool WeightStoreManager::RecordOffloadFailures(
+    std::vector<uint64_t> failed_weight_operation_ids) {
+    std::sort(failed_weight_operation_ids.begin(),
+              failed_weight_operation_ids.end());
+    failed_weight_operation_ids.erase(
+        std::unique(failed_weight_operation_ids.begin(),
+                    failed_weight_operation_ids.end()),
+        failed_weight_operation_ids.end());
+    bool operation_error_persist_failed = false;
+    for (const uint64_t operation_id : failed_weight_operation_ids) {
+        auto operation = weight_metadata_.QueryOperation(operation_id);
+        if (!operation) {
+            if (operation.error() != WeightManagementError::NOT_FOUND) {
+                operation_error_persist_failed = true;
+            }
+            continue;
+        }
+        const auto canonical_group =
+            MakeWeightPayloadGroupId(operation->identity);
+        if (canonical_group.empty()) {
+            operation_error_persist_failed = true;
+            continue;
+        }
+        [[maybe_unused]] auto group_operation_lock =
+            LockGroup(operation->identity);
+        const auto now_ms = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        auto mutation = weight_metadata_.PrepareRecordOperationError(
+            operation_id, "cold replica write failed", now_ms);
+        if (!mutation) {
+            if (mutation.error() != WeightManagementError::NOT_FOUND &&
+                mutation.error() != WeightManagementError::CONFLICT) {
+                operation_error_persist_failed = true;
+            }
+            continue;
+        }
+        auto published = PersistAndPublishWeightOperationMutation(*mutation);
+        if (!published) {
+            operation_error_persist_failed = true;
+            LOG(ERROR) << "Failed to persist weight offload error"
+                       << ", operation_id=" << operation_id
+                       << ", error=" << static_cast<int>(published.error());
+        }
+    }
+    return !operation_error_persist_failed;
+}
 
 }  // namespace mooncake

@@ -597,6 +597,69 @@ TEST_F(WeightGroupLifecycleTest,
 }
 
 TEST_F(WeightGroupLifecycleTest,
+       ColdWriteFailureStaysReadyAndOperationRemainsRetryable) {
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 0;
+    config.enable_offload = true;
+    config.offload_on_evict = true;
+    MasterService service(config);
+    const auto context = PrepareSimpleSegment(service);
+    ASSERT_TRUE(service.MountLocalDiskSegment(context.client_id, true));
+    auto ready = PublishReady(service, context.client_id);
+    auto started = service.StartWeightResidencyOperation(
+        StartWeightResidencyOperationRequest{
+            .identity = ready.identity,
+            .expected_metadata_generation = ready.metadata_generation,
+            .target_residency = WeightResidencyState::COLD,
+            .mixed_hot_ratio = std::nullopt,
+        });
+    ASSERT_TRUE(started.has_value());
+    ASSERT_TRUE(service.ReconcileWeightRevision(
+        ReconcileWeightRevisionRequest{.identity = ready.identity}));
+    auto failed_task = service.OffloadObjectHeartbeat(context.client_id, true);
+    ASSERT_TRUE(failed_task.has_value());
+    ASSERT_EQ(1u, failed_task->size());
+    ASSERT_TRUE(service.NotifyOffloadSuccess(
+        context.client_id, *failed_task,
+        {StorageObjectMetadata{-1, 0, 0, -1, ""}}));
+
+    auto failed = service.GetWeightRevision(
+        GetWeightRevisionRequest{.identity = ready.identity});
+    ASSERT_TRUE(failed.has_value());
+    EXPECT_EQ(WeightAvailabilityState::READY, failed->metadata.availability);
+    EXPECT_EQ(WeightResidencyState::HOT, failed->metadata.residency);
+    ASSERT_TRUE(failed->metadata.operation_id.has_value());
+    auto failed_operation =
+        service.QueryWeightOperation(QueryWeightOperationRequest{
+            .operation_id = *failed->metadata.operation_id,
+        });
+    ASSERT_TRUE(failed_operation.has_value());
+    EXPECT_EQ("cold replica write failed", failed_operation->message);
+    const auto readable_members = GetWeightGroupResidencyForTest(
+        service, ready.identity, ready.manifest.payload_group_id);
+    for (const auto& member : readable_members) {
+        EXPECT_TRUE(member.has_memory);
+    }
+
+    ASSERT_TRUE(service.ReconcileWeightRevision(
+        ReconcileWeightRevisionRequest{.identity = ready.identity}));
+    auto retry_task = service.OffloadObjectHeartbeat(context.client_id, true);
+    ASSERT_TRUE(retry_task.has_value());
+    ASSERT_EQ(1u, retry_task->size());
+    StorageObjectMetadata disk_metadata;
+    disk_metadata.key_size = retry_task->front().key.size();
+    disk_metadata.data_size = retry_task->front().size;
+    disk_metadata.transport_endpoint = "test_segment";
+    ASSERT_TRUE(service.NotifyOffloadSuccess(context.client_id, *retry_task,
+                                             {disk_metadata}));
+    auto cold = service.ReconcileWeightRevision(
+        ReconcileWeightRevisionRequest{.identity = ready.identity});
+    ASSERT_TRUE(cold.has_value());
+    EXPECT_EQ(WeightResidencyState::COLD, cold->residency);
+    EXPECT_FALSE(cold->operation_id.has_value());
+}
+
+TEST_F(WeightGroupLifecycleTest,
        MixedOperationKeepsEveryAffinityWholeAndReportsActualRatio) {
     MasterServiceConfig config;
     config.default_kv_lease_ttl = 0;

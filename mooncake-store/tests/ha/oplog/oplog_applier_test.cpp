@@ -835,7 +835,7 @@ TEST_F(OpLogApplierTest, RestoresDegradedRevisionWithActiveOperation) {
         SCOPED_TRACE(static_cast<int>(residency));
         const auto progress = primary.PrepareUpdateOperationProgress(
             start->next->operation_id, 0, start->next->total_units, 0,
-            start->next->total_bytes, {}, WeightAvailabilityState::DEGRADED,
+            start->next->total_bytes, {}, {}, WeightAvailabilityState::DEGRADED,
             residency, residency == WeightResidencyState::HOT ? 1.0 : 0.0,
             300 + sequence);
         ASSERT_TRUE(progress.has_value());

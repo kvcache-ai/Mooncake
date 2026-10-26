@@ -6,9 +6,9 @@
 
 namespace mooncake {
 
-void MasterStoreBackend::QueueManagedWeightMemberOffload(
+bool MasterStoreBackend::QueueManagedWeightMemberOffload(
     const WeightRevisionMetadata& revision, const std::string& key) {
-    master_.QueueManagedWeightMemberOffload(revision, key);
+    return master_.QueueManagedWeightMemberOffload(revision, key);
 }
 
 void MasterStoreBackend::EvictManagedWeightMembersToCold(

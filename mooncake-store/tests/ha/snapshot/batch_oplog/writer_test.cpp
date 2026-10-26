@@ -621,7 +621,7 @@ class BatchOpLogSnapshotWriterTest : public ::testing::Test {
         auto& metadata_store = MasterServiceTestPeer::WeightMetadata(primary);
         const auto late_progress =
             metadata_store.PrepareUpdateOperationProgress(
-                9, 1, 1, 1024, 2048, "late-member",
+                9, 1, 1, 1024, 2048, "late-member", {},
                 WeightAvailabilityState::DEGRADED, WeightResidencyState::ABSENT,
                 0.0, 201);
         ASSERT_TRUE(late_progress);
