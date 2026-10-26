@@ -290,6 +290,7 @@ add_store_test(local_hot_cache_concurrency_test
                local_hot_cache_concurrency_test.cpp)
 add_store_test(real_client_hugepage_register_test real_client_hugepage_register_test.cpp)
 add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
+add_store_test(real_client_uninitialized_test real_client_uninitialized_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(standalone_client_test standalone_client_test.cpp)
