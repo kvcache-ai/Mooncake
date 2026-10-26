@@ -141,6 +141,11 @@ void WrappedMasterService::ActivateServing() {
     master_service_.ActivateServing();
 }
 
+MasterService::RestoreLifecycleState
+WrappedMasterService::GetRestoreLifecycleState() const {
+    return master_service_.GetRestoreLifecycleState();
+}
+
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();

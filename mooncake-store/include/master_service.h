@@ -976,12 +976,36 @@ class MasterService {
      * place, so this slice changes no locking behavior. The Stopping state
      * and the RPC-level admission gate land with the follow-up slices that
      * actually remove the global lock from ordinary paths.
+     *
+     * Serving is a commitment about restore, not an observation about
+     * reachability. It marks the point after which this instance refuses
+     * restore; it does NOT mean the RPC endpoint is already accepting
+     * requests. Each entry point commits at the moment its instance stops
+     * needing restore, which lands on both sides of the publish boundary:
+     *
+     *   non-HA master    Constructed -> Ready -> Serving, then register RPC.
+     *                    There is no restore path, so committing early is free.
+     *   EmbeddedMaster   Constructed -> Ready -> Serving, then register RPC.
+     *                    Same reasoning, aligned with the non-HA path so that
+     *                    the contract does not depend on the entry point.
+     *   HA supervisor    promotion restore -> Ready, publish readiness, then
+     *                    Ready -> Serving. The commit is last because the term
+     *                    is only committed once readiness is out; a failed
+     *                    publication destroys the instance (release_service)
+     *                    rather than reusing it, so the retry builds a fresh
+     *                    service and no Serving -> Recovering edge is needed.
+     *
+     * The invariant the follow-up admission work can rely on is the same on
+     * every path: once Serving is observed, restore cannot happen for this
+     * instance, so an admission decision taken in that state needs no
+     * restore-window reasoning. Callers that need "is it reachable yet" must
+     * consult the transport, not this state machine.
      */
     enum class RestoreLifecycleState {
         kConstructed,  // components built; workers admitted (see below)
         kRecovering,   // HA promotion restore in flight; workers paused
         kReady,        // restore + durable repair done; serving not activated
-        kServing,      // service registered and exposed
+        kServing,      // committed to normal operation; restore refused
         kFailed,       // restore failed; the candidate must be destroyed
     };
 
@@ -990,16 +1014,18 @@ class MasterService {
 
     /**
      * @brief Non-HA initialization step: Constructed -> Ready.
-     * The non-HA path has no restore, so it opens the lifecycle directly.
-     * Refuses (logs) any other source state.
+     * The non-HA and embedded paths have no restore, so they open the
+     * lifecycle directly. Refuses (logs) any other source state.
      */
     void MarkReadyForServing();
 
     /**
      * @brief Activate serving: Ready -> Serving.
-     * Called once the RPC service is registered and exposed. Refuses
-     * (logs) any other source state: serving must never be activated on a
-     * service whose restore did not succeed.
+     * The commit point: after this, restore is refused for the lifetime of
+     * this instance. Whether it runs before or after the transport starts
+     * accepting requests depends on the entry point -- see the contract
+     * above. Refuses (logs) any other source state: serving must never be
+     * activated on a service whose restore did not succeed.
      */
     void ActivateServing();
 
@@ -2079,10 +2105,11 @@ class MasterService {
     // Restore lifecycle state (RFC #4700, slice 1). Declared next to
     // master_state_mutex_ because the follow-up slices replace that lock's
     // restore-window protection with this state machine. kConstructed keeps
-    // business workers admitted so tests and embedded users keep the
+    // business workers admitted so direct construction in tests keeps the
     // constructor-starts-workers behavior; tightening that to "paused until
     // activation" is part of the later slices once callers carry explicit
-    // activation.
+    // activation. The embedded master no longer relies on this: it commits
+    // Constructed -> Ready -> Serving before it serves RPCs.
     std::atomic<RestoreLifecycleState> lifecycle_state_{
         RestoreLifecycleState::kConstructed};
 
