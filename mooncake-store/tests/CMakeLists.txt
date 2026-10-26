@@ -31,6 +31,7 @@ function(add_ha_test name)
            glog::glog
            gflags::gflags
            ibverbs
+           aio
            gtest
            gtest_main
            pthread)
