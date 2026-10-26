@@ -211,10 +211,14 @@ class FakeSubBatch : public Transport::SubBatch {
 class FakeTransport : public Transport {
    public:
     explicit FakeTransport(TransportType self_type, bool force_fail = false,
-                           bool force_submit_fail = false)
+                           bool force_submit_fail = false,
+                           bool force_register_fail = false,
+                           bool force_unregister_fail = false)
         : self_type_(self_type),
           force_fail_(force_fail),
-          force_submit_fail_(force_submit_fail) {
+          force_submit_fail_(force_submit_fail),
+          force_register_fail_(force_register_fail),
+          force_unregister_fail_(force_unregister_fail) {
         caps.dram_to_dram = true;
     }
     std::atomic<int> submit_calls{0};
@@ -269,6 +273,9 @@ class FakeTransport : public Transport {
     }
 
     Status addMemoryBuffer(BufferDesc& desc, const MemoryOptions&) override {
+        if (force_register_fail_) {
+            return Status::InternalError("forced register failure" LOC_MARK);
+        }
         desc.transports.push_back(self_type_);
         return Status::OK();
     }
@@ -283,6 +290,9 @@ class FakeTransport : public Transport {
     }
 
     Status removeMemoryBuffer(BufferDesc& desc) override {
+        if (force_unregister_fail_) {
+            return Status::InternalError("forced unregister failure" LOC_MARK);
+        }
         desc.transports.erase(std::remove(desc.transports.begin(),
                                           desc.transports.end(), self_type_),
                               desc.transports.end());
@@ -309,6 +319,8 @@ class FakeTransport : public Transport {
     TransportType self_type_;
     bool force_fail_;
     bool force_submit_fail_;
+    bool force_register_fail_;
+    bool force_unregister_fail_;
 };
 
 std::shared_ptr<Config> makeMetricsTestConfig() {
@@ -429,6 +441,8 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordDeadlineInfeasible(TCP);
     metrics.recordBatchQuarantined();
     metrics.recordTaskFailure(RDMA, TentMetrics::TaskFailureReason::Timeout);
+    metrics.recordMemoryOperation(RDMA, TentMetrics::MemoryOperation::Register,
+                                  TentMetrics::OperationOutcome::Success, 4096);
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -438,7 +452,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 30>
+    const std::array<std::pair<std::string_view, std::string_view>, 33>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -450,6 +464,9 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_transport_attempts_total", "counter"},
             {"tent_transport_attempt_failures_total", "counter"},
             {"tent_task_failures_total", "counter"},
+            {"tent_terminal_failures_total", "counter"},
+            {"tent_memory_operations_total", "counter"},
+            {"tent_memory_operation_bytes_total", "counter"},
             {"tent_deadline_infeasible_total", "counter"},
             {"tent_quarantined_batches_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
@@ -1333,6 +1350,85 @@ TEST_F(MetricsRecordingTest, ConcurrentRecordsAcrossTransportsAreExact) {
               0);
 }
 
+TEST_F(MetricsRecordingTest, MemoryLifecycleRecordsBackendCallsAndBytes) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xBC);
+    auto before = MetricsSnapshot(TentMetrics::instance());
+
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kLen).ok());
+    auto after_register = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(
+        after_register.series(
+            "tent_memory_operations_total{transport=\"rdma\",operation="
+            "\"register\",outcome=\"success\"}") -
+            before.series("tent_memory_operations_total{transport=\"rdma\","
+                          "operation=\"register\",outcome=\"success\"}"),
+        1);
+    EXPECT_EQ(after_register.series(
+                  "tent_memory_operation_bytes_total{transport=\"rdma\","
+                  "operation=\"register\",outcome=\"success\"}") -
+                  before.series(
+                      "tent_memory_operation_bytes_total{transport=\"rdma\","
+                      "operation=\"register\",outcome=\"success\"}"),
+              static_cast<double>(kLen));
+
+    ASSERT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
+    auto after_unregister = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(after_unregister.series(
+                  "tent_memory_operations_total{transport=\"rdma\",operation="
+                  "\"unregister\",outcome=\"success\"}") -
+                  after_register.series(
+                      "tent_memory_operations_total{transport=\"rdma\","
+                      "operation=\"unregister\",outcome=\"success\"}"),
+              1);
+    EXPECT_EQ(after_unregister.series(
+                  "tent_memory_operation_bytes_total{transport=\"rdma\","
+                  "operation=\"unregister\",outcome=\"success\"}") -
+                  after_register.series(
+                      "tent_memory_operation_bytes_total{transport=\"rdma\","
+                      "operation=\"unregister\",outcome=\"success\"}"),
+              static_cast<double>(kLen));
+}
+
+TEST_F(MetricsRecordingTest, MemoryRegisterFailureRecordsFailedBackendCall) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA, /*force_fail=*/false,
+                                                /*force_submit_fail=*/false,
+                                                /*force_register_fail=*/true);
+    installFakeRdma(engine, fake);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xBD);
+    auto before = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_FALSE(engine.registerLocalMemory(buf.data(), kLen).ok());
+    auto after = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(
+        after.series(
+            "tent_memory_operations_total{transport=\"rdma\",operation="
+            "\"register\",outcome=\"failure\"}") -
+            before.series("tent_memory_operations_total{transport=\"rdma\","
+                          "operation=\"register\",outcome=\"failure\"}"),
+        1);
+    EXPECT_EQ(
+        after.series("tent_memory_operation_bytes_total{transport=\"rdma\","
+                     "operation=\"register\",outcome=\"failure\"}") -
+            before.series(
+                "tent_memory_operation_bytes_total{transport=\"rdma\","
+                "operation=\"register\",outcome=\"failure\"}"),
+        static_cast<double>(kLen));
+}
+
 // Task failure with reason="submit": a synchronously rejected submit fails
 // the attempt at the submit site, so recordTaskCompletionMetrics sees
 // attempt_active == false. The counter must attribute the failure to the
@@ -1373,6 +1469,13 @@ TEST_F(MetricsRecordingTest, SubmitFailureRecordsTaskFailureWithSubmitReason) {
             "\"}") -
             before.series("tent_task_failures_total{transport=\"rdma\",reason="
                           "\"submit\"}"),
+        1);
+    EXPECT_EQ(
+        after.series("tent_terminal_failures_total{transport=\"rdma\",phase="
+                     "\"submit\",reason=\"internal\"}") -
+            before.series(
+                "tent_terminal_failures_total{transport=\"rdma\",phase="
+                "\"submit\",reason=\"internal\"}"),
         1);
     EXPECT_EQ(
         after.series(
@@ -1425,6 +1528,13 @@ TEST_F(MetricsRecordingTest, PollFailureRecordsTaskFailureWithPollReason) {
             before.series(
                 "tent_task_failures_total{transport=\"rdma\",reason=\""
                 "poll\"}"),
+        1);
+    EXPECT_EQ(
+        after.series("tent_terminal_failures_total{transport=\"rdma\",phase="
+                     "\"poll\",reason=\"internal\"}") -
+            before.series(
+                "tent_terminal_failures_total{transport=\"rdma\",phase="
+                "\"poll\",reason=\"internal\"}"),
         1);
     EXPECT_EQ(
         after.series(
@@ -1582,6 +1692,9 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_deadline_infeasible_total"));
     EXPECT_TRUE(json.contains("tent_read_latency_us"));
     EXPECT_TRUE(json.contains("tent_task_failures_total"));
+    EXPECT_TRUE(json.contains("tent_terminal_failures_total"));
+    EXPECT_TRUE(json.contains("tent_memory_operations_total"));
+    EXPECT_TRUE(json.contains("tent_memory_operation_bytes_total"));
     EXPECT_TRUE(json.contains("tent_metrics_build_info"));
     EXPECT_FALSE(
         json["tent_metrics_build_info"].contains("compile_time_enabled"));

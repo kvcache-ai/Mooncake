@@ -93,6 +93,92 @@ const char* taskFailureReasonName(TentMetrics::TaskFailureReason reason) {
     }
     return "unknown";
 }
+
+const char* failurePhaseName(TentMetrics::FailurePhase phase) {
+    switch (phase) {
+        case TentMetrics::FailurePhase::Metadata:
+            return "metadata";
+        case TentMetrics::FailurePhase::Admission:
+            return "admission";
+        case TentMetrics::FailurePhase::Selection:
+            return "selection";
+        case TentMetrics::FailurePhase::Connect:
+            return "connect";
+        case TentMetrics::FailurePhase::Register:
+            return "register";
+        case TentMetrics::FailurePhase::Submit:
+            return "submit";
+        case TentMetrics::FailurePhase::Queue:
+            return "queue";
+        case TentMetrics::FailurePhase::Post:
+            return "post";
+        case TentMetrics::FailurePhase::Poll:
+            return "poll";
+        case TentMetrics::FailurePhase::Completion:
+            return "completion";
+        case TentMetrics::FailurePhase::Retry:
+            return "retry";
+        case TentMetrics::FailurePhase::Failover:
+            return "failover";
+        case TentMetrics::FailurePhase::Notify:
+            return "notify";
+        case TentMetrics::FailurePhase::Cleanup:
+            return "cleanup";
+        case TentMetrics::FailurePhase::Shutdown:
+            return "shutdown";
+    }
+    return "internal";
+}
+
+const char* failureReasonName(TentMetrics::FailureReason reason) {
+    switch (reason) {
+        case TentMetrics::FailureReason::Timeout:
+            return "timeout";
+        case TentMetrics::FailureReason::Unavailable:
+            return "unavailable";
+        case TentMetrics::FailureReason::QueueFull:
+            return "queue_full";
+        case TentMetrics::FailureReason::ResourceExhausted:
+            return "resource_exhausted";
+        case TentMetrics::FailureReason::Protocol:
+            return "protocol";
+        case TentMetrics::FailureReason::StaleGeneration:
+            return "stale_generation";
+        case TentMetrics::FailureReason::WcError:
+            return "wc_error";
+        case TentMetrics::FailureReason::CqError:
+            return "cq_error";
+        case TentMetrics::FailureReason::MrError:
+            return "mr_error";
+        case TentMetrics::FailureReason::PeerClosed:
+            return "peer_closed";
+        case TentMetrics::FailureReason::Canceled:
+            return "canceled";
+        case TentMetrics::FailureReason::Internal:
+            return "internal";
+    }
+    return "internal";
+}
+
+const char* memoryOperationName(TentMetrics::MemoryOperation operation) {
+    switch (operation) {
+        case TentMetrics::MemoryOperation::Register:
+            return "register";
+        case TentMetrics::MemoryOperation::Unregister:
+            return "unregister";
+    }
+    return "unknown";
+}
+
+const char* operationOutcomeName(TentMetrics::OperationOutcome outcome) {
+    switch (outcome) {
+        case TentMetrics::OperationOutcome::Success:
+            return "success";
+        case TentMetrics::OperationOutcome::Failure:
+            return "failure";
+    }
+    return "unknown";
+}
 }  // namespace
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
@@ -295,6 +381,9 @@ void TentMetrics::registerMetrics() {
         &transport_attempts_total_,
         &transport_attempt_failures_total_,
         &task_failures_total_,
+        &terminal_failures_total_,
+        &memory_operations_total_,
+        &memory_operation_bytes_total_,
         &deadline_infeasible_total_,
         &quarantined_batches_total_,
     };
@@ -388,6 +477,47 @@ void TentMetrics::recordTaskFailure(TransportType tp,
         return std::array<std::string, 2>{transportTypeName(tp),
                                           taskFailureReasonName(reason)};
     });
+
+    switch (reason) {
+        case TaskFailureReason::Submit:
+            recordTerminalFailure(tp, FailurePhase::Submit,
+                                  FailureReason::Internal);
+            break;
+        case TaskFailureReason::Poll:
+            recordTerminalFailure(tp, FailurePhase::Poll,
+                                  FailureReason::Internal);
+            break;
+        case TaskFailureReason::Timeout:
+            recordTerminalFailure(tp, FailurePhase::Completion,
+                                  FailureReason::Timeout);
+            break;
+        case TaskFailureReason::Canceled:
+            recordTerminalFailure(tp, FailurePhase::Completion,
+                                  FailureReason::Canceled);
+            break;
+    }
+}
+
+void TentMetrics::recordTerminalFailure(TransportType tp, FailurePhase phase,
+                                        FailureReason reason) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    terminal_failures_total_.inc(std::array<std::string, 3>{
+        transportTypeName(tp), failurePhaseName(phase),
+        failureReasonName(reason)});
+}
+
+void TentMetrics::recordMemoryOperation(TransportType tp,
+                                        MemoryOperation operation,
+                                        OperationOutcome outcome,
+                                        size_t bytes) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    const std::array<std::string, 3> labels{transportTypeName(tp),
+                                            memoryOperationName(operation),
+                                            operationOutcomeName(outcome)};
+    memory_operations_total_.inc(labels);
+    memory_operation_bytes_total_.inc(labels, static_cast<int64_t>(bytes));
 }
 
 // Gauge updates below deliberately ignore runtime_enabled_: gauges track
@@ -884,6 +1014,12 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&transport_attempt_failures_total_);
             root[task_failures_total_.str_name()] =
                 sumCounterValues(&task_failures_total_);
+            root[terminal_failures_total_.str_name()] =
+                sumCounterValues(&terminal_failures_total_);
+            root[memory_operations_total_.str_name()] =
+                sumCounterValues(&memory_operations_total_);
+            root[memory_operation_bytes_total_.str_name()] =
+                sumCounterValues(&memory_operation_bytes_total_);
             root[deadline_infeasible_total_.str_name()] =
                 sumCounterValues(&deadline_infeasible_total_);
             root[quarantined_batches_total_.str_name()] =
@@ -1035,6 +1171,10 @@ void TentMetrics::recordDeadlineMLU(TransportType, double) {}
 void TentMetrics::recordDeadlineInfeasible(TransportType) {}
 void TentMetrics::recordBatchQuarantined() {}
 void TentMetrics::recordTaskFailure(TransportType, TaskFailureReason) {}
+void TentMetrics::recordTerminalFailure(TransportType, FailurePhase,
+                                        FailureReason) {}
+void TentMetrics::recordMemoryOperation(TransportType, MemoryOperation,
+                                        OperationOutcome, size_t) {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}

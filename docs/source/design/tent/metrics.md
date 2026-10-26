@@ -259,6 +259,9 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_transport_attempts_total` | Counter | `transport`, `operation` | Physical transport attempts submitted for execution |
 | `tent_transport_attempt_failures_total` | Counter | `transport`, `operation` | Physical transport attempts that terminated with `FAILED` |
 | `tent_task_failures_total` | Counter | `transport`, `reason` | Task failures grouped by terminal transport and failure reason |
+| `tent_terminal_failures_total` | Counter | `transport`, `phase`, `reason` | Terminal logical task failures grouped by the bounded public failure taxonomy |
+| `tent_memory_operations_total` | Counter | `transport`, `operation`, `outcome` | Physical backend memory register/unregister calls |
+| `tent_memory_operation_bytes_total` | Counter | `transport`, `operation`, `outcome` | Bytes covered by physical backend memory register/unregister calls |
 | `tent_deadline_infeasible_total` | Counter | `transport` | Transfers whose deadline was already in the past at submit time |
 | `tent_quarantined_batches_total` | Counter | - | Batches abandoned after repeated reclaim failures and retained until engine teardown |
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
@@ -304,15 +307,18 @@ Transfer and attempt metrics carry a `transport` label (the
 `tent_transport_failover_total` counter uses `from` and `to` instead) so they
 can be sliced by transport without grepping logs. Attempt metrics also carry
 an `operation` label. Task failures add a closed-set `reason` label and metrics
-serialization adds a two-valued `format` label. Label values come from bounded
-sets; no request IDs, addresses, segment names, or other unbounded values are
-accepted.
+serialization adds a two-valued `format` label. Terminal failures use the
+bounded `phase` and `reason` taxonomy, while memory lifecycle metrics use an
+`outcome` label. Label values come from bounded sets; no request IDs,
+addresses, segment names, or other unbounded values are accepted.
 
 | Label | Values | Description |
 |-------|--------|-------------|
 | `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu`, `ub`, `mpcomm`, `hp_tcp`, `xpu`, `hylink`, `fabric`, `mlu`, `memfabric` | The transport that handled the transfer |
-| `operation` | `read`, `write` | Attempt operation |
-| `reason` | `submit`, `poll`, `timeout`, `canceled` | Task failure classification |
+| `operation` | `read`, `write`; `register`, `unregister` | Attempt or memory lifecycle operation, depending on the metric family |
+| `phase` | `metadata`, `admission`, `selection`, `connect`, `register`, `submit`, `queue`, `post`, `poll`, `completion`, `retry`, `failover`, `notify`, `cleanup`, `shutdown` | Stable phase where a terminal failure originated |
+| `reason` | `submit`, `poll`, `timeout`, `canceled` for `tent_task_failures_total`; `timeout`, `unavailable`, `queue_full`, `resource_exhausted`, `protocol`, `stale_generation`, `wc_error`, `cq_error`, `mr_error`, `peer_closed`, `canceled`, `internal` for `tent_terminal_failures_total` | Bounded failure classification |
+| `outcome` | `success`, `failure` | Memory lifecycle call outcome |
 | `format` | `prometheus`, `json` | Serialization output format |
 | `from` | (same set) | Transport that failed before failover |
 | `to` | (same set) | Transport that the failover switched to |
@@ -325,11 +331,13 @@ Transport label values come from the shared `transportTypeName()` mapping.
 **Cardinality**: the `transport` label has 19 values; the failover
 `from`/`to` pair has at most 19x19 = 361 combinations (in practice only a
 few pairs ever occur), each attempt metric has at most 19x2 = 38
-transport/operation combinations, task failures have at most 19x4 = 76, and
-each serialization family has exactly two series. Build identity labels are
-constant for the life of the process; a served `tent_metrics_build_info` series
-itself confirms that metrics were compiled in. Total series across all metrics
-is bounded by these closed sets.
+transport/operation combinations, task failures have at most 19x4 = 76,
+terminal failures have at most 19x15x12 = 3420, each memory lifecycle family
+has at most 19x2x2 = 76, and each serialization family has exactly two series.
+Dynamic counters allocate only label combinations that actually occur. Build
+identity labels are constant for the life of the process; a served
+`tent_metrics_build_info` series itself confirms that metrics were compiled
+in. Total series across all metrics is bounded by these closed sets.
 
 ### Per-rail load (`getNicLoadStats`)
 
