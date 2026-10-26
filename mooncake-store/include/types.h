@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -19,6 +20,15 @@
 #include "ylt/struct_pack.hpp"
 
 namespace mooncake {
+
+enum class ProbeLeaseMode : uint8_t { None = 0, LastHitOnly = 1 };
+
+// Candidates are consecutive groups of candidate_size keys in caller order.
+// None preserves the lease-free existence probe and ignores candidate_size.
+struct GrantLeasePolicy {
+    ProbeLeaseMode lease_mode{ProbeLeaseMode::None};
+    uint64_t candidate_size{1};
+};
 
 // Constants
 static constexpr uint64_t WRONG_VERSION = 0;
@@ -86,7 +96,7 @@ static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
 static constexpr uint64_t DEFAULT_MAX_KV_SOFT_PIN_TTL_MS =
-    24 * 60 * 60 * 1000;  // 24 hours
+    7 * 24 * 60 * 60 * 1000;  // 7 days
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
@@ -124,6 +134,9 @@ constexpr const char* PUT_NO_SPACE_HELPER_STR =  // A helpful string
     " due to insufficient space. Consider lowering "
     "eviction_high_watermark_ratio or mounting more segments.";
 static constexpr uint64_t DEFAULT_PUT_START_DISCARD_TIMEOUT = 30;  // 30 seconds
+// How long RestoreFromStandbySnapshot waits for conflict-repair records to
+// become durable. 0 waits on the writer's durability future with no cap.
+static constexpr uint64_t DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS = 10000;
 static constexpr uint64_t DEFAULT_PUT_START_RELEASE_TIMEOUT =
     600;  // 10 minutes
 
@@ -218,10 +231,15 @@ constexpr const char* CONFIG_KEY_PROTOCOL = "protocol";
 constexpr const char* CONFIG_KEY_RDMA_DEVICES = "rdma_devices";
 constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
 constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
+constexpr const char* CONFIG_KEY_ENABLE_EGM_STORE_POOL =
+    "enable_egm_store_pool";
+constexpr const char* CONFIG_KEY_EGM_NUMA_NODES = "egm_numa_nodes";
 constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
 constexpr const char* CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER =
     "enable_client_http_server";
 constexpr const char* CONFIG_KEY_CLIENT_HTTP_PORT = "client_http_port";
+constexpr const char* CONFIG_KEY_ENABLE_EMBEDDED_MASTER =
+    "enable_embedded_master";
 
 // Store client configuration defaults
 static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB
@@ -289,6 +307,14 @@ enum class ErrorCode : int32_t {
 
     // Buffer allocation errors (Range: -20 to -99)
     BUFFER_OVERFLOW = -10,  ///< Insufficient buffer space.
+
+    // Memory registration errors
+    NOF_REGISTRATION_STUCK =
+        -11,  ///< NoF DMA registration failed after partially changing backend
+              ///< state; cleanup could not be confirmed. The range stays
+              ///< quarantined (never munmap without a successful unregister).
+    NOT_REGISTERED = -12,  ///< The address is not registered with the transfer
+                           ///< engine.
 
     // Segment selection errors (Range: -100 to -199)
     SHARD_INDEX_OUT_OF_RANGE = -100,  ///< Shard index is out of bounds.
@@ -411,17 +437,6 @@ inline std::ostream& operator<<(std::ostream& os,
     return os << toString(errorCode);
 }
 
-struct SerializationError {
-    ErrorCode code;
-    std::string message;
-
-    SerializationError(ErrorCode c, const std::string& msg)
-        : code(c), message(msg) {}
-
-    // Construct from ErrorCode
-    explicit SerializationError(ErrorCode c) : code(c), message(toString(c)) {}
-};
-
 /**
  * @brief Represents a contiguous memory region
  */
@@ -433,6 +448,37 @@ struct Slice {
 const static uint64_t kMinSliceSize = facebook::cachelib::Slab::kMinAllocSize;
 const static uint64_t kMaxSliceSize =
     facebook::cachelib::Slab::kSize - 16;  // should be lower than limit
+
+// The entire allocation range belongs to this NUMA node. hca_names contains
+// only RDMA devices local to that node, as discovered on the storage host.
+struct SegmentLocality {
+    int32_t numa_node{-1};
+    std::vector<std::string> hca_names;
+
+    bool operator==(const SegmentLocality&) const = default;
+};
+YLT_REFL(SegmentLocality, numa_node, hca_names);
+
+// Match HCA names on the receiver; unknown locality precedes a known mismatch.
+inline int HcaAffinityTier(const SegmentLocality* locality,
+                           const std::vector<std::string>& hcas) {
+    if (hcas.empty()) return 0;
+    if (!locality || locality->numa_node < 0 || locality->hca_names.empty())
+        return 1;
+    return std::all_of(hcas.begin(), hcas.end(),
+                       [&](const auto& hca) {
+                           return std::find(locality->hca_names.begin(),
+                                            locality->hca_names.end(),
+                                            hca) != locality->hca_names.end();
+                       })
+               ? 0
+               : 2;
+}
+
+inline int HcaAffinityTier(const std::optional<SegmentLocality>& locality,
+                           const std::vector<std::string>& hcas) {
+    return HcaAffinityTier(locality ? &*locality : nullptr, hcas);
+}
 
 /**
  * @brief Represents a contiguous memory region
@@ -446,10 +492,12 @@ struct Segment {
     std::string te_endpoint{};
     std::string protocol;
     std::string host_id{};
+    struct_pack::compatible<SegmentLocality, 1> locality;
     Segment() = default;
     bool operator==(const Segment&) const = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id,
+         locality);
 
 /**
  * @brief Allocation strategy type for segment allocation

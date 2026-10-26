@@ -110,6 +110,10 @@ class TransferEngineImplTestPeer {
         return engine.autoDiscoverTransport();
     }
 
+    static bool autoDiscoverUsesEfa(const TransferEngineImpl& engine) {
+        return engine.autoDiscoverUsesEfa();
+    }
+
     static void setUseBarex(TransferEngineImpl& engine, bool use_barex) {
         engine.use_barex_ = use_barex;
     }
@@ -172,14 +176,16 @@ class TransferEngineImplTestPeer {
         return slice;
     }
 
-#ifdef USE_EVENT_DRIVEN_COMPLETION
     static void prepareFinishedBatchWithActiveCallback(
         MultiTransport& transport, Transport::BatchID batch_id) {
         auto& batch = Transport::toBatchDesc(batch_id);
         auto& task = batch.task_list.emplace_back();
         task.batch_id = batch_id;
         task.slice_count = 1;
+        task.success_slice_count = 1;
         task.is_finished = true;
+        // Model a completion callback that already published the terminal
+        // slice count but is still unwinding while holding its pin.
         batch.active_completion_callbacks.store(1, std::memory_order_release);
     }
 
@@ -188,7 +194,6 @@ class TransferEngineImplTestPeer {
         auto& batch = Transport::toBatchDesc(batch_id);
         batch.active_completion_callbacks.store(0, std::memory_order_release);
     }
-#endif
 
     static bool isCleanupDeferred(MultiTransport& transport,
                                   Transport::BatchID batch_id) {
@@ -296,6 +301,30 @@ TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
     EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine), "efa");
 }
 
+// EFA discovery must keep EFA NICs and install EFA in every USE_EFA build;
+// any other selection keeps excluding them.
+TEST(TransferEngineAutoDiscoverTest, EfaProtocolKeepsEfaNics) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
+#ifdef USE_EFA
+    EXPECT_TRUE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine));
+#else
+    EXPECT_FALSE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine));
+#endif
+
+    TransferEngineImplTestPeer::setUseBarex(engine, true);
+    EXPECT_FALSE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine));
+}
+
+TEST(TransferEngineAutoDiscoverTest, OtherProtocolsExcludeEfaNics) {
+    for (const char* protocol : {"", "rdma", "tcp"}) {
+        TransferEngineImpl engine(false);
+        engine.setAutoDiscover({.enabled = true, .protocol = protocol});
+        EXPECT_FALSE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine))
+            << "protocol=" << protocol;
+    }
+}
+
 TEST(TransferEngineAutoDiscoverTest, BarexOverrideTakesPrecedence) {
     TransferEngineImpl engine(false);
     engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
@@ -316,6 +345,78 @@ TEST(TransferEngineAutoDiscoverTest, BoolSetterPreservesDefaultSelection) {
     EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine),
               "rdma");
 }
+
+TEST(TransferEngineAscendTransportTest, AscendHintsSelectAscendTransport) {
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+    EXPECT_TRUE(shouldInstallAscendTransport(""));
+    EXPECT_TRUE(shouldInstallAscendTransport("ascend"));
+    EXPECT_TRUE(shouldInstallAscendTransport("ascend_direct"));
+#else
+    EXPECT_FALSE(shouldInstallAscendTransport(""));
+    EXPECT_FALSE(shouldInstallAscendTransport("ascend"));
+#endif
+}
+
+TEST(TransferEngineAscendTransportTest, HostHintsKeepHostTransportPath) {
+#if defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
+    // HCCL builds always install Ascend, whatever the hint names.
+    EXPECT_TRUE(shouldInstallAscendTransport("rdma"));
+    EXPECT_TRUE(shouldInstallAscendTransport("tcp"));
+#else
+    EXPECT_FALSE(shouldInstallAscendTransport("rdma"));
+    EXPECT_FALSE(shouldInstallAscendTransport("tcp"));
+#endif
+}
+
+TEST(TransferEngineAscendTransportTest, ProtocolHintMergeKeepsStoredProtocol) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "rdma"});
+
+    // Store configures the protocol before init(); an omitted one must not
+    // wipe it, while an explicit one wins.
+    engine.applyProtocolHint("");
+    auto config = TransferEngineImplTestPeer::autoDiscoverConfig(engine);
+    EXPECT_TRUE(config.enabled);
+    EXPECT_EQ(config.protocol, "rdma");
+
+    engine.applyProtocolHint("ascend");
+    config = TransferEngineImplTestPeer::autoDiscoverConfig(engine);
+    EXPECT_TRUE(config.enabled);
+    EXPECT_EQ(config.protocol, "ascend");
+
+#if !defined(USE_EFA)
+    // "efa" is dropped instead of being handed to auto-discovery, which could
+    // only fail on a build without the EFA transport.
+    engine.applyProtocolHint("efa");
+    EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverConfig(engine).protocol,
+              "ascend");
+#endif
+}
+
+TEST(TransferEngineAscendTransportTest, InitProtocolHintReachesEngine) {
+    TransferEngine engine(/*auto_discover=*/false);
+
+    // The hint is recorded before init() picks a transport, so the assertion
+    // holds whatever init() returns on this host.
+    (void)engine.init(P2PHANDSHAKE, "127.0.0.1:18465", "", 0, "rdma");
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    const auto config = TransferEngineImplTestPeer::autoDiscoverConfig(impl);
+    EXPECT_FALSE(config.enabled);
+    EXPECT_EQ(config.protocol, "rdma");
+}
+
+#if defined(USE_ASCEND_DIRECT)
+TEST(TransferEngineAscendTransportTest, RdmaHintNeverInstallsAscendDirect) {
+    TransferEngine engine(/*auto_discover=*/false);
+
+    // End to end over the public API: with discovery off, the hint alone
+    // decides and no host transport is installed here; that is the caller's
+    // job, the way Store does it. An "rdma" hint never selects Ascend Direct,
+    // which the pre-fix code did and which fails the install without an NPU.
+    EXPECT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:18463", "", 0, "rdma"), 0);
+    EXPECT_EQ(engine.getTransport("ascend"), nullptr);
+}
+#endif
 
 #ifdef USE_TENT
 // RDMA is left enabled and TCP disabled so a regression that drops forceTcp()
@@ -348,6 +449,63 @@ TEST(TransferEngineTentCompatibilityTest, CheckSegmentStatusRejectsDeadPeer) {
     // wrapper's handle_map_ never dropped a dead peer and kept reusing the same
     // stale handle forever. Refs #3995 (P0-stale-handle).
     EXPECT_FALSE(engine.CheckSegmentStatus(1ull << 40).ok());
+}
+
+TEST(TransferEngineTentCompatibilityTest, NotifyByNamePreservesOpenSegment) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+    std::array<char, 4096> source{};
+    std::array<char, 4096> destination{};
+    source.fill('n');
+    TransferEngine target(true);
+    TransferEngine initiator(true);
+    ASSERT_EQ(target.init(P2PHANDSHAKE, "", "", 0, "tcp"), 0);
+    ASSERT_EQ(initiator.init(P2PHANDSHAKE, "", "", 0, "tcp"), 0);
+    ASSERT_EQ(
+        target.registerLocalMemory(destination.data(), destination.size()), 0);
+    ASSERT_EQ(initiator.registerLocalMemory(source.data(), source.size()), 0);
+    const std::string target_name =
+        "127.0.0.1:" + std::to_string(target.getRpcPort());
+    const auto peer = initiator.openSegment(target_name);
+    ASSERT_NE(peer, static_cast<Transport::SegmentHandle>(-1));
+
+    ASSERT_EQ(initiator.sendNotifyByName(target_name, {"test", "ready"}), 0);
+    std::vector<TransferMetadata::NotifyDesc> notifications;
+    ASSERT_EQ(target.getNotifies(notifications), 0);
+    ASSERT_EQ(notifications.size(), 1u);
+    EXPECT_EQ(notifications.front().notify_msg, "ready");
+    EXPECT_TRUE(initiator.CheckSegmentStatus(peer).ok());
+    EXPECT_EQ(initiator.openSegment(target_name), peer);
+
+    const auto batch = initiator.allocateBatchID(1);
+    TransferRequest request;
+    request.opcode = TransferRequest::WRITE;
+    request.source = source.data();
+    request.target_id = peer;
+    request.target_offset = reinterpret_cast<uint64_t>(destination.data());
+    request.length = source.size();
+    auto submitted = initiator.submitTransfer(batch, {request});
+    EXPECT_TRUE(submitted.ok()) << submitted.ToString();
+    if (submitted.ok()) {
+        TransferStatus status;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        do {
+            ASSERT_TRUE(initiator.getTransferStatus(batch, 0, status).ok());
+            if (status.s != TransferStatusEnum::WAITING &&
+                status.s != TransferStatusEnum::PENDING)
+                break;
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(source, destination);
+    }
+    EXPECT_TRUE(initiator.freeBatchID(batch).ok());
+    EXPECT_EQ(initiator.closeSegment(peer), 0);
+    EXPECT_EQ(initiator.unregisterLocalMemory(source.data()), 0);
+    EXPECT_EQ(target.unregisterLocalMemory(destination.data()), 0);
 }
 
 TEST(TransferEngineTentCompatibilityTest, TcpProtocolForcesTcpTransport) {
@@ -1040,7 +1198,6 @@ TEST_F(TransportTest, TimedOutBatchIsReclaimedAfterCallbacksFinish) {
     EXPECT_TRUE(callback_called.load(std::memory_order_acquire));
 }
 
-#ifdef USE_EVENT_DRIVEN_COMPLETION
 TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
     std::string server_name = "unit-test-server:1234";
     MultiTransport multi_transport(nullptr, server_name);
@@ -1067,7 +1224,6 @@ TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
     EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
                                                                batch_id));
 }
-#endif
 
 TEST_F(TransportTest, TransferTaskDestructorRunsSliceCleanup) {
     int cleanup_count = 0;
@@ -1580,7 +1736,10 @@ TEST_F(TransportTest, TcpScatterCombinesRequestsIntoOneTask) {
         }
         ASSERT_EQ(remaining, 0u)
             << "TCP scatter did not reach physical completion";
-        EXPECT_TRUE(engine.freeBatchID(submission.batch_id).ok());
+        // The last io callback may still hold its BatchDesc pin here;
+        // a deferred cleanup is a legal terminal outcome.
+        Status free_status = engine.freeBatchID(submission.batch_id);
+        EXPECT_TRUE(free_status.ok() || free_status.IsBatchCleanupDeferred());
         EXPECT_TRUE(submitted.ok());
         EXPECT_TRUE(successful);
         EXPECT_EQ(memcmp(source, destination, kBytes), 0);
@@ -1926,6 +2085,101 @@ TEST_F(TransportTest, LegacyScatterDrainWaitsForEventPublication) {
     EXPECT_FALSE(operation.wait().ok());
 }
 #endif
+TEST_F(TransportTest, CqMarkSuccessPublishesBatchFinishedTaskCount) {
+    Transport::BatchDesc batch{};
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.batch_size = 2;
+
+    Transport::TransferTask first;
+    Transport::TransferTask second;
+    first.batch_id = batch.id;
+    second.batch_id = batch.id;
+    first.slice_count = 1;
+    second.slice_count = 1;
+
+    Transport::Slice first_slice{};
+    first_slice.task = &first;
+    first_slice.length = 4;
+    first_slice.markSuccess();
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    EXPECT_TRUE(first.is_finished);
+#else
+    EXPECT_FALSE(first.is_finished);
+#endif
+    EXPECT_FALSE(batch.is_finished.load());
+    EXPECT_EQ(batch.finished_task_count.load(), 1u);
+
+    Transport::Slice second_slice{};
+    second_slice.task = &second;
+    second_slice.length = 4;
+    second_slice.markSuccess();
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    EXPECT_TRUE(second.is_finished);
+    EXPECT_TRUE(batch.is_finished.load());
+#else
+    EXPECT_FALSE(second.is_finished);
+    // Foreground aggregation publishes the status/byte cache when polling.
+    EXPECT_FALSE(batch.is_finished.load());
+#endif
+    EXPECT_EQ(batch.finished_task_count.load(), 2u);
+    // Completion callbacks drop their BatchDesc pins when they unwind.
+    EXPECT_EQ(batch.active_completion_callbacks.load(), 0u);
+}
+
+TEST_F(TransportTest, SealPublishesWhenAllSlicesCompletedFirst) {
+    Transport::BatchDesc batch{};
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.batch_size = 1;
+    Transport::TransferTask task;
+    task.batch_id = batch.id;
+    task.slice_count = 1;
+    Transport::Slice::unsealTaskSubmission(&task);
+
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.length = 4;
+    slice.markSuccess();
+    EXPECT_FALSE(task.completion_published);
+    EXPECT_EQ(batch.finished_task_count.load(), 0u);
+
+    Transport::Slice::sealTaskSubmission(&task);
+    EXPECT_TRUE(task.completion_published);
+    EXPECT_EQ(batch.finished_task_count.load(), 1u);
+    EXPECT_EQ(batch.active_completion_callbacks.load(), 0u);
+}
+
+TEST_F(TransportTest, MarkFailedWithoutBatchIdDoesNotTouchBatchDesc) {
+    Transport::TransferTask task;
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.markFailed();
+    EXPECT_EQ(task.failed_slice_count, 1u);
+    EXPECT_FALSE(task.completion_published);
+}
+
+TEST_F(TransportTest, LastSliceAndSealConcurrentlyStillPublish) {
+    for (int iter = 0; iter < 2000; ++iter) {
+        Transport::BatchDesc batch{};
+        batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+        batch.batch_size = 1;
+        Transport::TransferTask task;
+        task.batch_id = batch.id;
+        task.slice_count = 1;
+        Transport::Slice::unsealTaskSubmission(&task);
+
+        Transport::Slice slice{};
+        slice.task = &task;
+        slice.length = 4;
+
+        std::thread cq([&] { slice.markSuccess(); });
+        std::thread sealer(
+            [&] { Transport::Slice::sealTaskSubmission(&task); });
+        cq.join();
+        sealer.join();
+        EXPECT_TRUE(task.completion_published) << "iter=" << iter;
+        EXPECT_EQ(batch.finished_task_count.load(), 1u) << "iter=" << iter;
+    }
+}
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
 TEST_F(TransportTest, GroupedTaskCompletionWaitsForSubmissionSeal) {
@@ -1935,7 +2189,7 @@ TEST_F(TransportTest, GroupedTaskCompletionWaitsForSubmissionSeal) {
     Transport::TransferTask task;
     task.batch_id = batch.id;
     task.request_count = 2;
-    task.submission_sealed = false;
+    Transport::Slice::unsealTaskSubmission(&task);
 
     auto complete_slice = [&] {
         __atomic_add_fetch(&task.slice_count, 1, __ATOMIC_ACQ_REL);

@@ -340,6 +340,11 @@ struct RpcNameTraits<&WrappedMasterService::EvictDiskReplica> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::EvictDiskReplicaIfCurrent> {
+    static constexpr const char* value = "EvictDiskReplicaIfCurrent";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplica> {
     static constexpr const char* value = "BatchEvictDiskReplica";
 };
@@ -348,6 +353,26 @@ template <>
 struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
     static constexpr const char* value = "PollRemoveAll";
 };
+
+#define DEFINE_WEIGHT_RPC_NAME(method)                    \
+    template <>                                           \
+    struct RpcNameTraits<&WrappedMasterService::method> { \
+        static constexpr const char* value = #method;     \
+    }
+
+DEFINE_WEIGHT_RPC_NAME(BeginWeightImport);
+DEFINE_WEIGHT_RPC_NAME(CommitWeightImport);
+DEFINE_WEIGHT_RPC_NAME(AbortWeightImport);
+DEFINE_WEIGHT_RPC_NAME(GetWeightRevision);
+DEFINE_WEIGHT_RPC_NAME(ListWeightRevisions);
+DEFINE_WEIGHT_RPC_NAME(AcquireWeightRevisionLease);
+DEFINE_WEIGHT_RPC_NAME(RenewWeightRevisionLease);
+DEFINE_WEIGHT_RPC_NAME(ReleaseWeightRevisionLease);
+DEFINE_WEIGHT_RPC_NAME(StartWeightResidencyOperation);
+DEFINE_WEIGHT_RPC_NAME(QueryWeightOperation);
+DEFINE_WEIGHT_RPC_NAME(DeleteWeightRevision);
+
+#undef DEFINE_WEIGHT_RPC_NAME
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
@@ -482,6 +507,47 @@ void MasterClient::EnableHaConnectionPolicy() {
     ha_connection_policy_enabled_.store(true, std::memory_order_release);
 }
 
+#define DEFINE_WEIGHT_CLIENT_METHOD(method, request_type, result_type)       \
+    WeightRpcResult<result_type> MasterClient::method(                       \
+        const request_type& request) {                                       \
+        return invoke_rpc<&WrappedMasterService::method,                     \
+                          tl::expected<result_type, WeightManagementError>>( \
+            request, tenant_id_.value());                                    \
+    }
+
+DEFINE_WEIGHT_CLIENT_METHOD(BeginWeightImport, BeginWeightImportRequest,
+                            WeightRevisionMetadata)
+DEFINE_WEIGHT_CLIENT_METHOD(CommitWeightImport, CommitWeightImportRequest,
+                            WeightRevisionMetadata)
+DEFINE_WEIGHT_CLIENT_METHOD(AbortWeightImport, AbortWeightImportRequest,
+                            WeightRevisionMetadata)
+DEFINE_WEIGHT_CLIENT_METHOD(GetWeightRevision, GetWeightRevisionRequest,
+                            WeightRevisionView)
+DEFINE_WEIGHT_CLIENT_METHOD(ListWeightRevisions, ListWeightRevisionsRequest,
+                            ListWeightRevisionsResponse)
+DEFINE_WEIGHT_CLIENT_METHOD(AcquireWeightRevisionLease,
+                            AcquireWeightRevisionLeaseRequest,
+                            WeightRevisionLease)
+DEFINE_WEIGHT_CLIENT_METHOD(RenewWeightRevisionLease,
+                            RenewWeightRevisionLeaseRequest,
+                            WeightRevisionLease)
+DEFINE_WEIGHT_CLIENT_METHOD(StartWeightResidencyOperation,
+                            StartWeightResidencyOperationRequest,
+                            WeightResidencyOperation)
+DEFINE_WEIGHT_CLIENT_METHOD(QueryWeightOperation, QueryWeightOperationRequest,
+                            WeightResidencyOperation)
+DEFINE_WEIGHT_CLIENT_METHOD(DeleteWeightRevision, DeleteWeightRevisionRequest,
+                            WeightRevisionMetadata)
+
+#undef DEFINE_WEIGHT_CLIENT_METHOD
+
+WeightRpcResult<void> MasterClient::ReleaseWeightRevisionLease(
+    const ReleaseWeightRevisionLeaseRequest& request) {
+    return invoke_rpc<&WrappedMasterService::ReleaseWeightRevisionLease,
+                      tl::expected<void, WeightManagementError>>(
+        request, tenant_id_.value());
+}
+
 ErrorCode MasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "MasterClient::Connect");
     timer.LogRequest("master_addr=", master_addr);
@@ -560,12 +626,13 @@ tl::expected<bool, ErrorCode> MasterClient::ProbeKey(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchProbeKey(
-    const std::vector<std::string>& object_keys) {
+    const std::vector<std::string>& object_keys,
+    const GrantLeasePolicy& policy) {
     ScopedVLogTimer timer(1, "MasterClient::BatchProbeKey");
     timer.LogRequest("keys_count=", object_keys.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchProbeKey, bool>(
-        object_keys.size(), object_keys, tenant_id_.value());
+        object_keys.size(), policy, object_keys, tenant_id_.value());
     timer.LogResponse("result=", result.size(), " keys");
     return result;
 }
@@ -1425,6 +1492,21 @@ tl::expected<void, ErrorCode> MasterClient::EvictDiskReplica(
 
     auto result = invoke_rpc<&WrappedMasterService::EvictDiskReplica, void>(
         client_id_, key, tenant_id, replica_type);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<bool, ErrorCode> MasterClient::EvictDiskReplicaIfCurrent(
+    const std::string& key, const std::string& tenant_id,
+    ReplicaType replica_type, ReplicaID expected_replica_id) {
+    ScopedVLogTimer timer(1, "MasterClient::EvictDiskReplicaIfCurrent");
+    timer.LogRequest("key=", key, ", tenant_id=", tenant_id,
+                     ", replica_type=", replica_type,
+                     ", expected_replica_id=", expected_replica_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::EvictDiskReplicaIfCurrent, bool>(
+            client_id_, key, tenant_id, replica_type, expected_replica_id);
     timer.LogResponseExpected(result);
     return result;
 }

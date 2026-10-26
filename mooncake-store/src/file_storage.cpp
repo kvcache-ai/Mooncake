@@ -286,6 +286,56 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     return batch_result;
 }
 
+void FileStorage::PartitionUnbucketedTasks(
+    const std::unordered_map<std::string, OffloadTaskItem>& task_by_storage_key,
+    const std::unordered_set<std::string>& all_bucket_keys,
+    const std::vector<std::string>& deferred_keys,
+    const std::unordered_map<std::string, OffloadTaskItem>& previously_carried,
+    const std::unordered_set<std::string>& redrained_carried_keys,
+    std::vector<OffloadTaskItem>& failed_tasks,
+    std::unordered_map<std::string, OffloadTaskItem>& carried_tasks) {
+    for (const auto& storage_key : deferred_keys) {
+        auto it = task_by_storage_key.find(storage_key);
+        if (it != task_by_storage_key.end()) {
+            carried_tasks.emplace(storage_key, it->second);
+        } else {
+            // A deferred key with no known task can be neither carried nor
+            // NACKed; the pool will re-emit it and it will be dropped — the
+            // pre-fix behavior. Unreachable while the invariant holds
+            // (deferred keys are a subset of this cycle's effective input);
+            // logged at WARNING so a caller change that breaks the contract
+            // is observable rather than a silent regression.
+            LOG(WARNING) << "[OFFLOAD] deferred key has no known task and "
+                            "cannot be carried; it will be dropped on "
+                            "re-emission (broken caller invariant?): "
+                         << storage_key;
+        }
+    }
+    // Retain previously carried keys the backend did not emit this cycle:
+    // their pooled copies are still waiting (the pool only moves on a call
+    // with non-empty input), so their tasks must stay alive. Keys re-drained
+    // this cycle are excluded: the caller dropped their pooled copies on
+    // collision, so nothing is waiting for them and the fresh task — already
+    // in task_by_storage_key — is the only live one. Retaining a stale task
+    // here would both strand it forever and suppress the fresh task's NACK
+    // in the sweep below when the backend skipped the key outright.
+    for (const auto& [storage_key, task] : previously_carried) {
+        if (redrained_carried_keys.find(storage_key) !=
+            redrained_carried_keys.end()) {
+            continue;
+        }
+        if (all_bucket_keys.find(storage_key) == all_bucket_keys.end()) {
+            carried_tasks.emplace(storage_key, task);
+        }
+    }
+    for (const auto& [storage_key, task] : task_by_storage_key) {
+        if (all_bucket_keys.find(storage_key) == all_bucket_keys.end() &&
+            carried_tasks.find(storage_key) == carried_tasks.end()) {
+            failed_tasks.push_back(task);
+        }
+    }
+}
+
 tl::expected<FileStorage::LocalBatchResult, ErrorCode>
 FileStorage::BatchGetLocal(const std::vector<std::string>& keys,
                            const std::vector<int64_t>& sizes) {
@@ -320,11 +370,41 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         task_by_storage_key.emplace(storage_key, task);
     }
 
+    auto bucket_backend =
+        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+
+    // Merge in tasks carried across a bucket deferral (see
+    // deferred_task_by_storage_key_): the backend's ungrouped pool will
+    // re-emit those keys in a bucket this call, and they need their original
+    // tasks to be queried, stored and success-notified. Collision (a carried
+    // key re-drained before re-emission, i.e. re-PUT while deferred): the
+    // fresh drain wins entirely -- drop the pooled copy so the key flows
+    // through grouping as new input with its current size, under its fresh
+    // task. Without this the fresh task would win the task map while the
+    // pooled stale size won the packing accounting. Collided keys are recorded
+    // so the partition below does not also retain their stale carried tasks —
+    // nothing is waiting for a key whose pooled copy we just dropped.
+    std::unordered_set<std::string> redrained_carried_keys;
+    for (const auto& [storage_key, task] : deferred_task_by_storage_key_) {
+        if (storage_object_sizes.find(storage_key) !=
+            storage_object_sizes.end()) {
+            if (bucket_backend) {
+                bucket_backend->RemoveUngroupedOffloadingObject(storage_key);
+            }
+            redrained_carried_keys.insert(storage_key);
+            VLOG(1) << "Deferred offload key re-drained before re-emission; "
+                       "fresh task and size supersede the pooled copy: "
+                    << storage_key;
+            continue;
+        }
+        task_by_storage_key.emplace(storage_key, task);
+    }
+
     std::vector<std::vector<std::string>> buckets_keys;
-    if (auto bucket_backend =
-            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
+    std::vector<std::string> deferred_keys;
+    if (bucket_backend) {
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
-            storage_object_sizes, buckets_keys);
+            storage_object_sizes, buckets_keys, &deferred_keys);
         if (!allocate_res) {
             LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
                        << allocate_res.error();
@@ -368,7 +448,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 
     // Collect keys drained from master queue but not actually offloaded.
     // Report them back with data_size=-1 sentinel so the master can clean up
-    // orphaned offloading_tasks and release source replica refcounts.
+    // orphaned offloading tasks and release source replica refcounts.
     std::vector<OffloadTaskItem> failed_tasks;
     std::unordered_set<std::string> all_bucket_keys;
     // Set when a whole-cycle error aborts the bucket loop early. We still fall
@@ -547,13 +627,35 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
     }
 
-    // Keys skipped by GroupOffloadingKeysByBucket don't appear in any bucket,
-    // so they never reach BatchOffload or complete_handler.
-    for (const auto& [storage_key, task] : task_by_storage_key) {
-        if (all_bucket_keys.find(storage_key) == all_bucket_keys.end()) {
+    // Keys absent from every bucket are either (a) deliberately skipped by
+    // GroupOffloadingKeysByBucket (size over bucket limit / already on disk)
+    // — NACK those so the master releases task + refcount — or (b) DEFERRED
+    // to the backend's ungrouped pool for the next cycle. Deferred keys must
+    // keep their tasks alive across the deferral instead of being NACKed:
+    // the pool carries only key+size, and a re-emitted key without a task
+    // was silently dropped above — the deferred-tail leak (upstream #3006).
+    std::unordered_map<std::string, OffloadTaskItem> carried_tasks;
+    PartitionUnbucketedTasks(task_by_storage_key, all_bucket_keys,
+                             deferred_keys, deferred_task_by_storage_key_,
+                             redrained_carried_keys, failed_tasks,
+                             carried_tasks);
+    if (abort_error == ErrorCode::KEYS_ULTRA_LIMIT) {
+        // Offloading is now disabled, so no later heartbeat can consume the
+        // deferred tail. Release its tasks along with the failed buckets and
+        // discard the corresponding pooled keys to keep both states in sync.
+        for (const auto& [_, task] : carried_tasks) {
             failed_tasks.push_back(task);
         }
+        carried_tasks.clear();
+        if (bucket_backend) {
+            bucket_backend->ClearUngroupedOffloadingObjects();
+        }
     }
+    if (!carried_tasks.empty()) {
+        VLOG(1) << "Carrying " << carried_tasks.size()
+                << " deferred offload task(s) to the next cycle";
+    }
+    deferred_task_by_storage_key_ = std::move(carried_tasks);
 
     if (!failed_tasks.empty()) {
         std::vector<StorageObjectMetadata> failed_metadatas;
@@ -776,13 +878,9 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
-    // === STEP 2: Poll whether master requested a full SSD clear ===
-    auto remove_all_result = client_->PollRemoveAll();
-    if (remove_all_result && remove_all_result.value()) {
-        RemoveAll();
-    }
-
-    // === STEP 3: Persist offloaded objects (trigger actual data migration) ===
+    // Generic removal reclaims files through metadata-checked eviction, not a
+    // backend-wide wipe that could remove managed objects or another tenant.
+    // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
     if (!offloading_objects.empty()) {
         auto offload_result = OffloadObjects(offloading_objects);
         if (!offload_result) {
@@ -812,14 +910,10 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
 }
 
 void FileStorage::RemoveAll() {
-    // TODO(tenant-isolation): This performs a tenant-UNAWARE global wipe of the
-    // storage directory. Storage backends store physical files without a
-    // tenant dimension, so a tenant-scoped master RemoveAll("tenant_A") that
-    // signals this client will also delete tenant_B's SSD files here, while
-    // master still holds valid metadata for tenant_B (subsequent reads get
-    // OBJECT_NOT_FOUND on this node). Safe for the global RemoveAll(force) and
-    // for single-tenant / shared-nothing deployments. Proper per-tenant
-    // physical isolation needs backend-level tenant-scoped layout (follow-up).
+    // Explicit physical reset: this bypasses per-object metadata protection
+    // and clears every tenant sharing the backend. Generic Client::RemoveAll
+    // must not request it; callers must ensure no live object depends on the
+    // files being removed.
     if (storage_backend_) {
         storage_backend_->RemoveAll();
     }

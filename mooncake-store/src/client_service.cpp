@@ -6,10 +6,12 @@
 #include "ascii_string.h"
 #include "allocator.h"
 #include "segment.h"
+#include "nof/nof_runtime.h"
 
 #include <csignal>
 #include <algorithm>
 #include <cassert>
+#include <charconv>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -17,7 +19,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
-#ifdef USE_NOF
+#if defined(__linux__)
 #include <numa.h>
 #endif
 #include <optional>
@@ -41,6 +43,7 @@
 #include "common/network.h"
 #include "config/client_host_identity_config.h"
 #include "config/client_object_checksum_config.h"
+#include "replica_selection.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
 #include "config/client_auto_discovery_config.h"
@@ -84,8 +87,8 @@ class ScopedObjectChecksumBuffer {
     PinnedBufferPool::Buffer buffer_;
 };
 
-#ifdef USE_NOF
 int GetCurrentNumaSocketId() {
+#if defined(__linux__)
     if (numa_available() < 0) {
         return 0;
     }
@@ -95,8 +98,18 @@ int GetCurrentNumaSocketId() {
     }
     int node = numa_node_of_cpu(cpu);
     return node < 0 ? 0 : node;
-}
+#else
+    // libnuma is Linux-only; default to socket 0 elsewhere.
+    return 0;
 #endif
+}
+
+// Backing slot for Client::SetDefaultNofInitiatorFactoryForTesting.
+std::function<std::shared_ptr<NVMeoFInitiator>()>&
+DefaultNofInitiatorFactoryForTestingSlot() {
+    static std::function<std::shared_ptr<NVMeoFInitiator>()> factory;
+    return factory;
+}
 
 struct ContiguousSliceRange {
     void* ptr = nullptr;
@@ -574,6 +587,118 @@ ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
     return client_cfg;
 }
 
+std::optional<SegmentLocality> Client::DiscoverSegmentLocality(
+    const Topology& topology, const std::string& location) {
+    if (!location.starts_with("cpu:")) return std::nullopt;
+    int32_t node = -1;
+    const auto value = std::string_view(location).substr(4);
+    const auto [end, error] =
+        std::from_chars(value.data(), value.data() + value.size(), node);
+    if (error != std::errc{} || end != value.data() + value.size() || node < 0)
+        return std::nullopt;
+    const auto matrix = topology.getMatrix();
+    const auto entry = matrix.find(location);
+    return SegmentLocality{node, entry == matrix.end()
+                                     ? std::vector<std::string>{}
+                                     : entry->second.preferred_hca};
+}
+
+Client::HcaAffinity Client::MakeHcaAffinity(
+    const Topology& topology, std::vector<SegmentBufferInfo> buffers) {
+    auto matrix = topology.getMatrix();
+    for (auto& [location, entry] : matrix) {
+        auto& hcas = entry.preferred_hca;
+        std::sort(hcas.begin(), hcas.end());
+        hcas.erase(std::unique(hcas.begin(), hcas.end()), hcas.end());
+    }
+    return
+        [matrix = std::move(matrix), buffers = std::move(buffers)](
+            std::span<const Slice> slices) -> const std::vector<std::string>& {
+            static const std::vector<std::string> empty;
+            const std::vector<std::string>* common = nullptr;
+            for (const auto& slice : slices) {
+                if (slice.size == 0) continue;
+                if (!slice.ptr) return empty;
+                const auto address = reinterpret_cast<uintptr_t>(slice.ptr);
+                std::string location;
+                for (const auto& buffer : buffers) {
+                    if (address < buffer.addr) continue;
+                    const auto offset = address - buffer.addr;
+                    if (offset >= buffer.length ||
+                        slice.size > buffer.length - offset)
+                        continue;
+                    location = buffer.location;
+                    SegmentsLocationInfo segments;
+                    if (parseSegmentsLocation(location, segments)) {
+                        location = resolveSegmentsLocation(
+                            segments, buffer.length, offset);
+                        if (location !=
+                            resolveSegmentsLocation(segments, buffer.length,
+                                                    offset + slice.size - 1))
+                            return empty;
+                    }
+                    break;
+                }
+                const auto entry = matrix.find(location);
+                if (entry == matrix.end() ||
+                    entry->second.preferred_hca.empty())
+                    return empty;
+                if (!common)
+                    common = &entry->second.preferred_hca;
+                else if (*common != entry->second.preferred_hca)
+                    return empty;
+            }
+            return common ? *common : empty;
+        };
+}
+
+Client::HcaAffinity Client::MakeHcaAffinity() const {
+    if (protocol_ != "rdma" || !StoreHcaAffinityEnabled() || !transfer_engine_)
+        return {};
+    const auto topology = transfer_engine_->getLocalTopology();
+    std::vector<SegmentBufferInfo> buffers;
+    if (!topology ||
+        transfer_engine_->getSegmentBuffers(LOCAL_SEGMENT_ID, buffers) != 0)
+        return {};
+    return MakeHcaAffinity(*topology, std::move(buffers));
+}
+
+void Client::AttachHcaAffinity(ReplicateConfig& config,
+                               const std::vector<Slice>& slices) const {
+    if (config.preferred_hca_names) return;
+    if (auto infer = MakeHcaAffinity()) {
+        auto hcas = infer(slices);
+        if (!hcas.empty()) config.preferred_hca_names = std::move(hcas);
+    }
+}
+
+ErrorCode Client::ReadReplicaSelector::operator()(
+    const std::vector<Replica::Descriptor>& replicas,
+    std::span<const Slice> destinations, Replica::Descriptor& result) {
+    // No topology copies, registration lookups or callback allocations for
+    // disabled affinity, non-RDMA clients or single-copy reads.
+    if (!StoreHcaAffinityEnabled() || client_->protocol_ != "rdma" ||
+        replicas.size() <= 1) {
+        return client_->FindFirstCompleteReplica(replicas, result);
+    }
+    if (!initialized_) {
+        initialized_ = true;
+        if (auto infer = client_->MakeHcaAffinity()) {
+            context_ = std::make_unique<Context>(std::move(infer),
+                                                 client_->GetLocalEndpoints());
+        }
+    }
+    if (!context_) return client_->FindFirstCompleteReplica(replicas, result);
+    const auto& hcas = context_->infer(destinations);
+    if (hcas.empty())
+        return client_->FindFirstCompleteReplica(replicas, result);
+    const auto* selected =
+        SelectBestReplica(replicas, context_->endpoints, hcas);
+    if (!selected) return ErrorCode::INVALID_REPLICA;
+    result = *selected;
+    return ErrorCode::OK;
+}
+
 static std::vector<std::string> ParseDeviceNames(std::string_view value) {
     std::vector<std::string> devices;
     boost::split(devices, std::string(value), boost::is_any_of(","),
@@ -939,8 +1064,8 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
-        } else if (protocol == "ascend" || protocol == "ubshmem" ||
-                   protocol == "sunrise_link") {
+        } else if (protocol == "nvlink" || protocol == "ascend" ||
+                   protocol == "ubshmem" || protocol == "sunrise_link") {
             if (device_names.has_value()) {
                 LOG(WARNING) << protocol
                              << " protocol does not use device names, ignoring";
@@ -1028,18 +1153,28 @@ void Client::InitTransferSubmitter() {
     // Initialize TransferSubmitter after transfer engine is ready
     // Keep using logical local_hostname for name-based behaviors; endpoint is
     // used separately where needed.
-#ifdef USE_NOF
+    // Unconditional; no NofWorkerPool is created when nof_initiator_ is null.
     const int numa_socket_id =
         ClientNumaConfig::FromEnvironment().socket_id.value_or(
             GetCurrentNumaSocketId());
-    transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        *transfer_engine_, storage_backend_, local_hostname_,
-        metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id);
-#else
-    transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        *transfer_engine_, storage_backend_, local_hostname_,
-        metrics_ ? &metrics_->transfer_metric : nullptr);
+    // ClientMetric::nof_metric exists only in USE_NOF builds.
+    NofMetric* nof_metric = nullptr;
+#ifdef USE_NOF
+    nof_metric = metrics_ ? &metrics_->nof_metric : nullptr;
 #endif
+    transfer_submitter_ = std::make_unique<TransferSubmitter>(
+        *transfer_engine_, storage_backend_, local_hostname_,
+        metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id,
+        nof_initiator_, nof_metric);
+}
+
+void Client::SetDefaultNofInitiatorFactoryForTesting(
+    std::function<std::shared_ptr<NVMeoFInitiator>()> factory) {
+    DefaultNofInitiatorFactoryForTestingSlot() = std::move(factory);
+}
+
+std::shared_ptr<NVMeoFInitiator> Client::GetNofInitiatorForTesting() const {
+    return nof_initiator_;
 }
 
 std::optional<std::shared_ptr<Client>> Client::Create(
@@ -1047,9 +1182,24 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& protocol, const std::optional<std::string>& device_names,
     const std::string& master_server_entry,
     const std::shared_ptr<TransferEngine>& transfer_engine,
-    std::map<std::string, std::string> labels, const std::string& tenant_id) {
+    std::map<std::string, std::string> labels, const std::string& tenant_id,
+    std::shared_ptr<NVMeoFInitiator> nof_initiator) {
+    // Reused engines retain their metadata mode. In particular, P2PHANDSHAKE
+    // must publish the engine's actual endpoint rather than the Store hostname.
+    const auto& resolved_metadata =
+        transfer_engine && metadata_connstring.empty()
+            ? transfer_engine->getMetadataConnectionString()
+            : metadata_connstring;
     auto client = std::shared_ptr<Client>(new Client(
-        local_hostname, metadata_connstring, protocol, labels, tenant_id));
+        local_hostname, resolved_metadata, protocol, labels, tenant_id));
+    if (!nof_initiator) {
+        // nullptr means "use the process default", not "disable NoF" —
+        // existing callers keep the pre-parameter behavior. Explicit disable
+        // is MC_NOF_BACKEND=none; explicit injection is a non-null initiator.
+        auto& factory = DefaultNofInitiatorFactoryForTestingSlot();
+        nof_initiator = factory ? factory() : CreateNofRuntime().initiator;
+    }
+    client->nof_initiator_ = std::move(nof_initiator);
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
@@ -1241,7 +1391,7 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     return tl::expected<QueryResult, ErrorCode>(
         tl::in_place, std::move(result.value().replicas),
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
-        result.value().object_checksum);
+        result.value().object_checksum, result.value().resolved_tenant_id);
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
@@ -1275,7 +1425,8 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
                 tl::in_place, std::move(response[i].value().replicas),
                 start_time +
                     std::chrono::milliseconds(response[i].value().lease_ttl_ms),
-                response[i].value().object_checksum);
+                response[i].value().object_checksum,
+                response[i].value().resolved_tenant_id);
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -1374,9 +1525,10 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices) {
-    // Find the first complete replica
+    // Select a complete replica for this request's destination.
     Replica::Descriptor replica;
-    ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
+    ErrorCode err =
+        MakeReadReplicaSelector()(query_result.replicas, slices, replica);
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::INVALID_REPLICA) {
             LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
@@ -1452,7 +1604,8 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           std::vector<Slice>& slices,
                                           uint64_t src_offset) {
     Replica::Descriptor replica;
-    ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
+    ErrorCode err =
+        MakeReadReplicaSelector()(query_result.replicas, slices, replica);
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::INVALID_REPLICA) {
             LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
@@ -1524,6 +1677,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
     std::vector<tl::expected<void, ErrorCode>> results;
     results.resize(object_keys.size());
 
+    auto select_replica = MakeReadReplicaSelector();
     std::unordered_map<std::string, BatchGetOperation> seg_to_op_map{};
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
@@ -1535,7 +1689,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             continue;
         }
         Replica::Descriptor replica;
-        ErrorCode err = FindFirstCompleteReplica(replica_list, replica);
+        ErrorCode err =
+            select_replica(replica_list, slices_it->second, replica);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << key;
@@ -1701,6 +1856,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     // Collect cache hit statistics for the entire batch
     size_t total_cache_hits = 0;
 
+    auto select_replica = MakeReadReplicaSelector();
     // Submit all transfers in parallel
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
@@ -1713,10 +1869,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             continue;
         }
 
-        // Find the first complete replica for this key
+        // Select a complete replica for this key's destination.
         Replica::Descriptor replica;
         ErrorCode err =
-            FindFirstCompleteReplica(query_result.replicas, replica);
+            select_replica(query_result.replicas, slices_it->second, replica);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << key;
@@ -1968,6 +2124,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     ReplicateConfig client_cfg = AttachHostId(config);
+    AttachHcaAffinity(client_cfg, slices);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -1980,7 +2137,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
     if (!start_result &&
         start_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
-        healDanglingLocalDiskReplica(key)) {
+        healDanglingLocalDiskReplica(key) == DiskReplicaHealResult::kEvicted) {
         start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
     }
     if (!start_result) {
@@ -2131,34 +2288,38 @@ bool HasOnlyClientLocalDiskReplicas(
 
 }  // namespace
 
-bool Client::healDanglingLocalDiskReplica(const ObjectKey& key) {
+Client::DiskReplicaHealResult Client::healDanglingLocalDiskReplica(
+    const ObjectKey& key) {
     auto replicas = master_client_.GetReplicaList(key);
     if (!replicas ||
         !HasOnlyClientLocalDiskReplicas(replicas->replicas, client_id_) ||
         !local_disk_probe_fn_) {
-        return false;
+        return DiskReplicaHealResult::kNotDangling;
     }
-    // RemoveAll wipes client SSD files while master keeps the metadata
-    // (issue #3709), leaving a completed entry whose backing file is gone.
+    // A physical SSD wipe can leave master metadata naming a completed entry
+    // whose backing file is gone (issue #3709).
     // Reporting success for a Put on top of it would store nothing. Ask the
     // installed probe (the offload file storage owned by RealClient) whether
     // the file is still there. Only a proven-gone answer evicts; present or
     // unknown (transport/config trouble) keeps the old idempotent path, so a
     // healthy replica can never be evicted by mistake.
     const std::optional<bool> file_gone = local_disk_probe_fn_(key);
+    if (file_gone == false) {
+        return DiskReplicaHealResult::kPresent;
+    }
     if (file_gone != true) {
-        return false;
+        return DiskReplicaHealResult::kUnknown;
     }
     auto evicted =
         master_client_.EvictDiskReplica(key, ReplicaType::LOCAL_DISK);
     if (!evicted) {
         LOG(WARNING) << "Failed to evict dangling LOCAL_DISK replica for key="
                      << key << ": " << toString(evicted.error());
-        return false;
+        return DiskReplicaHealResult::kUnknown;
     }
     LOG(WARNING) << "Evicted dangling LOCAL_DISK replica for key=" << key
                  << " (backing file already gone)";
-    return true;
+    return DiskReplicaHealResult::kEvicted;
 }
 
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
@@ -2181,6 +2342,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     ReplicateConfig client_cfg = AttachHostId(config);
+    AttachHcaAffinity(client_cfg, slices);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -2311,50 +2473,6 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     return {};
-}
-
-std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
-    const std::vector<ObjectKey>& keys,
-    std::vector<std::vector<Slice>>& batched_slices,
-    const ReplicateConfig& config) {
-    return BatchUpsert(keys, batched_slices, config, {});
-}
-
-std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
-    const std::vector<ObjectKey>& keys,
-    std::vector<std::vector<Slice>>& batched_slices,
-    const ReplicateConfig& config, const WriteBufferStager& stager) {
-    ReplicateConfig client_cfg = AttachHostId(config);
-    if (protocol_ == "cxl") {
-        client_cfg.preferred_segment = local_hostname_;
-    }
-    std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
-    ComputeBatchObjectChecksums(ops);
-    if (client_cfg.prefer_alloc_in_same_node) {
-        if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
-            return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(*err));
-        }
-        StartBatchUpsert(ops, client_cfg);
-        StageWriteBuffersForRemoteReplicas(ops, stager);
-        return BatchWriteWhenPreferSameNode(ops, true);
-    }
-
-    StartBatchUpsert(ops, client_cfg);
-    StageWriteBuffersForRemoteReplicas(ops, stager);
-    auto t0 = std::chrono::steady_clock::now();
-    SubmitTransfers(ops);
-    WaitForTransfers(ops);
-    SubmitDfsWrites(ops);
-    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - t0)
-                  .count();
-    if (metrics_) {
-        metrics_->transfer_metric.batch_put_latency_us.observe(us);
-    }
-
-    FinalizeBatchUpsert(ops);
-    return CollectResults(ops);
 }
 
 // TODO: `client.cpp` is too long, consider split it into multiple files
@@ -2502,6 +2620,25 @@ void Client::ComputeBatchObjectChecksums(std::vector<PutOperation>& ops) {
     }
 }
 
+ReplicateConfig Client::AttachBatchHcaAffinity(
+    const ReplicateConfig& config, const std::vector<PutOperation>& ops,
+    const std::vector<size_t>& indices) const {
+    if (!StoreHcaAffinityEnabled()) return config;
+    auto request = config.ForKeySubset(indices);
+    if (request.preferred_hca_names || request.per_key_preferred_hca_names)
+        return request;
+    if (auto infer = MakeHcaAffinity()) {
+        std::vector<std::vector<std::string>> hints;
+        bool has_hint = false;
+        for (auto index : indices) {
+            hints.push_back(infer(ops[index].slices));
+            has_hint |= !hints.back().empty();
+        }
+        if (has_hint) request.per_key_preferred_hca_names = std::move(hints);
+    }
+    return request;
+}
+
 void Client::healDanglingLocalDiskBatchStarts(
     std::vector<PutOperation>& ops, const std::vector<size_t>& active_indices,
     const std::vector<size_t>& already_exists,
@@ -2549,6 +2686,7 @@ void Client::healDanglingLocalDiskBatchStarts(
     std::vector<std::string> retry_keys;
     std::vector<std::vector<uint64_t>> retry_slices;
     std::vector<size_t> retry_positions;
+    std::vector<size_t> retry_config_indices;
     for (size_t j = 0; j < evict_keys.size(); ++j) {
         if (!evicted[j]) {
             LOG(WARNING) << "Failed to evict dangling LOCAL_DISK replica for "
@@ -2559,6 +2697,7 @@ void Client::healDanglingLocalDiskBatchStarts(
         LOG(WARNING) << "Evicted dangling LOCAL_DISK replica for key="
                      << evict_keys[j] << " (backing file already gone)";
         retry_positions.emplace_back(evict_positions[j]);
+        retry_config_indices.push_back(already_exists[evict_positions[j]]);
         retry_keys.emplace_back(keys[already_exists[evict_positions[j]]]);
         retry_slices.emplace_back(
             slice_lengths[already_exists[evict_positions[j]]]);
@@ -2566,8 +2705,13 @@ void Client::healDanglingLocalDiskBatchStarts(
     if (retry_keys.empty()) {
         return;
     }
-    auto retry_responses =
-        master_client_.BatchPutStart(retry_keys, retry_slices, config);
+    const auto retry_config =
+        config.group_ids || config.session_ids ||
+                config.per_key_preferred_hca_names
+            ? std::make_optional(config.ForKeySubset(retry_config_indices))
+            : std::nullopt;
+    auto retry_responses = master_client_.BatchPutStart(
+        retry_keys, retry_slices, retry_config ? *retry_config : config);
     if (retry_responses.size() != retry_keys.size()) {
         return;
     }
@@ -2596,7 +2740,7 @@ void Client::healDanglingLocalDiskBatchStarts(
 }
 
 void Client::StartBatchPut(std::vector<PutOperation>& ops,
-                           const ReplicateConfig& config) {
+                           const ReplicateConfig& base_config) {
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
     std::vector<size_t> active_indices;
@@ -2632,6 +2776,16 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         return;
     }
 
+    std::optional<ReplicateConfig> active_config;
+    if (StoreHcaAffinityEnabled()) {
+        active_config =
+            AttachBatchHcaAffinity(base_config, ops, active_indices);
+    } else if (active_indices.size() != ops.size() &&
+               (base_config.group_ids || base_config.session_ids ||
+                base_config.per_key_preferred_hca_names)) {
+        active_config = base_config.ForKeySubset(active_indices);
+    }
+    const auto& config = active_config ? *active_config : base_config;
     auto start_responses =
         master_client_.BatchPutStart(keys, slice_lengths, config);
 
@@ -2695,7 +2849,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
 }
 
 void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
-                              const ReplicateConfig& config) {
+                              const ReplicateConfig& base_config) {
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
     std::vector<size_t> active_indices;
@@ -2731,6 +2885,16 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
         return;
     }
 
+    std::optional<ReplicateConfig> active_config;
+    if (StoreHcaAffinityEnabled()) {
+        active_config =
+            AttachBatchHcaAffinity(base_config, ops, active_indices);
+    } else if (active_indices.size() != ops.size() &&
+               (base_config.group_ids || base_config.session_ids ||
+                base_config.per_key_preferred_hca_names)) {
+        active_config = base_config.ForKeySubset(active_indices);
+    }
+    const auto& config = active_config ? *active_config : base_config;
     auto start_responses =
         master_client_.BatchUpsertStart(keys, slice_lengths, config);
 
@@ -3613,6 +3777,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    if (!config.ValidSessionIds(keys.size()) ||
+        !config.HasValidKeyHints(keys.size())) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3646,12 +3815,67 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     return CollectResults(ops);
 }
 
+// Defined after PutOperation: std::vector<PutOperation> must be instantiated
+// on a complete type (clang-based compilers diagnose this; GCC defers it).
+std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config) {
+    return BatchUpsert(keys, batched_slices, config, {});
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config, const WriteBufferStager& stager) {
+    if (!config.ValidSessionIds(keys.size()) ||
+        !config.HasValidKeyHints(keys.size())) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    ReplicateConfig client_cfg = AttachHostId(config);
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
+    std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    ComputeBatchObjectChecksums(ops);
+    if (client_cfg.prefer_alloc_in_same_node) {
+        if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(*err));
+        }
+        StartBatchUpsert(ops, client_cfg);
+        StageWriteBuffersForRemoteReplicas(ops, stager);
+        return BatchWriteWhenPreferSameNode(ops, true);
+    }
+
+    StartBatchUpsert(ops, client_cfg);
+    StageWriteBuffersForRemoteReplicas(ops, stager);
+    auto t0 = std::chrono::steady_clock::now();
+    SubmitTransfers(ops);
+    WaitForTransfers(ops);
+    SubmitDfsWrites(ops);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+    if (metrics_) {
+        metrics_->transfer_metric.batch_put_latency_us.observe(us);
+    }
+
+    FinalizeBatchUpsert(ops);
+    return CollectResults(ops);
+}
+
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
                               const std::vector<uint64_t>& object_sizes,
                               const ReplicateConfig& config) {
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (!config.ValidSessionIds(keys.size()) ||
+        !config.HasValidKeyHints(keys.size())) {
+        return results;
+    }
     if (keys.size() != object_sizes.size()) {
         LOG(ERROR) << "StartBatchPutForSizes size mismatch: keys="
                    << keys.size() << ", sizes=" << object_sizes.size();
@@ -3735,11 +3959,8 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     }
 
     auto result = master_client_.RemoveAll(force);
-    if (result) {
-        if (storage_backend_) {
-            storage_backend_->RemoveAll();
-        }
-    }
+    // The master can retain protected objects. Local disk cleanup must use
+    // per-object eviction, not an unconditional wipe of this client's files.
     if (result && result.value() > 0 && hot_cache_) {
         hot_cache_->RemoveAllHotKeys();
     }
@@ -3779,6 +4000,13 @@ tl::expected<void, ErrorCode> Client::EvictDiskReplica(
     const std::string& key, const std::string& tenant_id,
     ReplicaType replica_type) {
     return master_client_.EvictDiskReplica(key, tenant_id, replica_type);
+}
+
+tl::expected<bool, ErrorCode> Client::EvictDiskReplicaIfCurrent(
+    const std::string& key, const std::string& tenant_id,
+    ReplicaType replica_type, ReplicaID expected_replica_id) {
+    return master_client_.EvictDiskReplicaIfCurrent(
+        key, tenant_id, replica_type, expected_replica_id);
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchEvictDiskReplica(
@@ -3905,6 +4133,11 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         segment.size = size;
         segment.protocol = protocol;
         segment.host_id = host_id_;
+        if (protocol == "rdma" && StoreHcaAffinityEnabled()) {
+            if (auto topology = transfer_engine_->getLocalTopology()) {
+                segment.locality = DiscoverSegmentLocality(*topology, location);
+            }
+        }
         if (metadata_connstring_ == P2PHANDSHAKE) {
             segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
         } else {
@@ -4064,9 +4297,15 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
 
 tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
     void* addr, bool update_metadata) {
-    if (this->transfer_engine_->unregisterLocalMemory(addr, update_metadata) !=
-        0) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    const int rc =
+        transfer_engine_->unregisterLocalMemory(addr, update_metadata);
+    if (rc != 0) {
+        // Distinguish "not registered" from real failures so callers can
+        // tell an already-cleaned buffer apart from a live registration
+        // whose deregistration failed.
+        return tl::unexpected(rc == ERR_ADDRESS_NOT_REGISTERED
+                                  ? ErrorCode::NOT_REGISTERED
+                                  : ErrorCode::INVALID_PARAMS);
     }
     return {};
 }
@@ -4104,8 +4343,8 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchProbeKey(
-    const std::vector<std::string>& keys) {
-    auto response = master_client_.BatchProbeKey(keys);
+    const std::vector<std::string>& keys, const GrantLeasePolicy& policy) {
+    auto response = master_client_.BatchProbeKey(keys, policy);
 
     // Check if we got the expected number of responses
     if (response.size() != keys.size()) {
@@ -4121,6 +4360,61 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchProbeKey(
     }
 
     return response;
+}
+
+WeightRpcResult<WeightRevisionMetadata> Client::BeginWeightImport(
+    const BeginWeightImportRequest& request) {
+    return master_client_.BeginWeightImport(request);
+}
+
+WeightRpcResult<WeightRevisionMetadata> Client::CommitWeightImport(
+    const CommitWeightImportRequest& request) {
+    return master_client_.CommitWeightImport(request);
+}
+
+WeightRpcResult<WeightRevisionMetadata> Client::AbortWeightImport(
+    const AbortWeightImportRequest& request) {
+    return master_client_.AbortWeightImport(request);
+}
+
+WeightRpcResult<WeightRevisionView> Client::GetWeightRevision(
+    const GetWeightRevisionRequest& request) {
+    return master_client_.GetWeightRevision(request);
+}
+
+WeightRpcResult<ListWeightRevisionsResponse> Client::ListWeightRevisions(
+    const ListWeightRevisionsRequest& request) {
+    return master_client_.ListWeightRevisions(request);
+}
+
+WeightRpcResult<WeightRevisionLease> Client::AcquireWeightRevisionLease(
+    const AcquireWeightRevisionLeaseRequest& request) {
+    return master_client_.AcquireWeightRevisionLease(request);
+}
+
+WeightRpcResult<WeightRevisionLease> Client::RenewWeightRevisionLease(
+    const RenewWeightRevisionLeaseRequest& request) {
+    return master_client_.RenewWeightRevisionLease(request);
+}
+
+WeightRpcResult<void> Client::ReleaseWeightRevisionLease(
+    const ReleaseWeightRevisionLeaseRequest& request) {
+    return master_client_.ReleaseWeightRevisionLease(request);
+}
+
+WeightRpcResult<WeightResidencyOperation> Client::StartWeightResidencyOperation(
+    const StartWeightResidencyOperationRequest& request) {
+    return master_client_.StartWeightResidencyOperation(request);
+}
+
+WeightRpcResult<WeightResidencyOperation> Client::QueryWeightOperation(
+    const QueryWeightOperationRequest& request) {
+    return master_client_.QueryWeightOperation(request);
+}
+
+WeightRpcResult<WeightRevisionMetadata> Client::DeleteWeightRevision(
+    const DeleteWeightRevisionRequest& request) {
+    return master_client_.DeleteWeightRevision(request);
 }
 
 void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }
@@ -4706,11 +5000,12 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
     const std::vector<Replica::Descriptor>& replicas,
     const std::vector<std::vector<Slice>>& slices,
     const std::vector<std::vector<uint64_t>>& src_offsets,
-    TransferIntent intent) {
+    TransferIntent intent, std::span<const QueryResult* const> query_results) {
     std::vector<tl::expected<int64_t, ErrorCode>> results(
         replicas.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     if (replicas.size() != slices.size() ||
-        replicas.size() != src_offsets.size()) {
+        replicas.size() != src_offsets.size() ||
+        (!query_results.empty() && query_results.size() != replicas.size())) {
         LOG(ERROR) << "BatchTransferReadRanges size mismatch: replicas="
                    << replicas.size() << ", slices=" << slices.size()
                    << ", offsets=" << src_offsets.size();
@@ -4722,6 +5017,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
         fragment_count += entry.size();
     }
 
+    auto select_replica = MakeReadReplicaSelector();
     // Every fragment of every entry goes into one scatter submit so the
     // transport sees the whole layer at once instead of one transfer per key.
     ScatterRangeBuilder builder(fragment_count);
@@ -4738,15 +5034,30 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
             continue;
         }
 
-        const auto& handle =
-            replicas[i].get_memory_descriptor().buffer_descriptor;
+        Replica::Descriptor selected;
+        const auto* selected_replica = &replicas[i];
         int64_t transferred = 0;
         for (size_t j = 0; j < slices[i].size(); ++j) {
+            if (!query_results.empty() && query_results[i]) {
+                if (select_replica(query_results[i]->replicas,
+                                   std::span<const Slice>(&slices[i][j], 1),
+                                   selected) != ErrorCode::OK ||
+                    !selected.is_memory_replica()) {
+                    entry_errors[i] = ErrorCode::INVALID_REPLICA;
+                    break;
+                }
+                selected_replica = &selected;
+            }
+            const auto& handle =
+                selected_replica->get_memory_descriptor().buffer_descriptor;
             builder.Add(TransferRequest::READ, handle, slices[i][j],
                         src_offsets[i][j], &entry_errors[i]);
             transferred += static_cast<int64_t>(slices[i][j].size);
         }
-        results[i] = transferred;  // optimistic; corrected on await
+        results[i] = entry_errors[i]
+                         ? tl::expected<int64_t, ErrorCode>(
+                               tl::unexpected(*entry_errors[i]))
+                         : tl::expected<int64_t, ErrorCode>(transferred);
     }
 
     CompleteScatterRanges(*this, builder, results, entry_errors,
@@ -5410,7 +5721,7 @@ void Client::StorageHeartbeatThreadMain() {
 
 ErrorCode Client::FindFirstCompleteReplica(
     const std::vector<Replica::Descriptor>& replica_list,
-    Replica::Descriptor& replica) {
+    Replica::Descriptor& replica) const {
     // Find the first complete replica
     for (size_t i = 0; i < replica_list.size(); ++i) {
         if (replica_list[i].status == ReplicaStatus::COMPLETE) {
@@ -5575,13 +5886,29 @@ void Client::ProcessSlicesAsync(const std::string& key,
         return;
     }
 
+    // The writeback copies out of the read destination with a host memcpy
+    // (LocalHotCacheHandler::SubmitPutTask), so a slice that landed in device
+    // memory (e.g. batch_get_into into CUDA buffers) would fault the reader.
+    // Device-resident results are not cached through this path.
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    size_t device_dest_slices = 0;
     // Identify TE transfer slices (non-local) and submit async put tasks
     for (size_t i = 0; i < slices.size(); ++i) {
+        if (runtime_accelerator.FindDeviceForPointer(slices[i].ptr) !=
+            nullptr) {
+            ++device_dest_slices;
+            continue;
+        }
         if (!hot_cache_handler_->SubmitPutTask(key, slices[i])) {
             LOG(ERROR) << "Failed to submit hot cache put task for key=" << key
                        << " slice_idx=" << i;
             return;
         }
+    }
+    if (device_dest_slices > 0) {
+        LOG(INFO) << "Skipped hot-cache writeback for " << device_dest_slices
+                  << " device-resident slice(s), key=" << key;
     }
 }
 

@@ -79,6 +79,10 @@ enum class PeerLiveness : uint8_t {
 
 struct AutoDiscoverConfig {
     bool enabled = false;
+    // Transport hint, read whether or not auto-discovery is enabled: "efa"
+    // selects EFA, and on an Ascend Direct build the hint decides between
+    // Ascend Direct and the host transports. Written by setAutoDiscover(), or
+    // by the protocol argument of init() when that is not empty.
     std::string protocol;
 };
 
@@ -140,6 +144,12 @@ class TransferEngine {
     // compat-layer type conversion. Returns nullptr when not in TENT mode.
     std::shared_ptr<mooncake::tent::TransferEngine> getTentEngine() const {
         return use_tent_ ? impl_tent_ : nullptr;
+    }
+
+    // Configuration of the successfully initialized engine, for clients that
+    // reuse it without repeating the metadata connection string.
+    const std::string& getMetadataConnectionString() const {
+        return metadata_conn_string_;
     }
 
     SegmentHandle openSegment(const std::string& segment_name);
@@ -349,6 +359,7 @@ class TransferEngine {
     // Classic callers provide this through TransferEngine(auto_discover,
     // filter) before init() creates the native TENT engine.
     std::vector<std::string> tent_device_filter_;
+    std::string metadata_conn_string_;
     bool use_tent_{false};
     friend class TransferEngineImplTestPeer;
 };

@@ -52,6 +52,161 @@ def _collective_payload(
         dist.broadcast(tensor, src=0)
         return {"value": int(tensor.cpu().item())}
 
+    if case_name == "noncontiguous_collectives":
+
+        def make_matrix(values: torch.Tensor, transposed: bool) -> torch.Tensor:
+            storage = torch.empty((2, 2), dtype=torch.int32, device=device)
+            tensor = storage.t() if transposed else storage
+            tensor.copy_(values)
+            return tensor
+
+        transposed = rank % 2 == 0
+        errors = []
+        broadcast = make_matrix(
+            torch.full((2, 2), -1, dtype=torch.int32, device=device), transposed
+        )
+        if rank == 0:
+            broadcast.copy_(torch.tensor([[1, 2], [3, 4]], device=device))
+        dist.broadcast(broadcast, src=0)
+        if broadcast.cpu().tolist() != [[1, 2], [3, 4]]:
+            errors.append("broadcast returned incorrect logical values")
+
+        allreduce = make_matrix(
+            torch.arange(4, dtype=torch.int32, device=device).view(2, 2) + rank,
+            transposed,
+        )
+        dist.all_reduce(allreduce, op=dist.ReduceOp.SUM)
+        rank_sum = world_size * (world_size - 1) // 2
+        expected = (
+            torch.arange(4, dtype=torch.int32, device=device)
+            .view(2, 2)
+            .mul(world_size)
+            .add(rank_sum)
+        )
+        if allreduce.cpu().tolist() != expected.cpu().tolist():
+            errors.append("all_reduce returned incorrect logical values")
+
+        allgather_input = make_matrix(
+            torch.arange(4, dtype=torch.int32, device=device).view(2, 2) + rank,
+            transposed,
+        )
+        allgather_outputs = [
+            make_matrix(
+                torch.zeros((2, 2), dtype=torch.int32, device=device),
+                peer % 2 != 0,
+            )
+            for peer in range(world_size)
+        ]
+        dist.all_gather(allgather_outputs, allgather_input)
+        if [item.cpu().tolist() for item in allgather_outputs] != [
+            (torch.arange(4, dtype=torch.int32).view(2, 2) + peer).tolist()
+            for peer in range(world_size)
+        ]:
+            errors.append("all_gather returned incorrect logical values")
+
+        gather_input = make_matrix(
+            torch.arange(4, dtype=torch.int32, device=device).view(2, 2) + rank,
+            transposed,
+        )
+        if rank == 0:
+            gather_outputs = [
+                make_matrix(
+                    torch.zeros((2, 2), dtype=torch.int32, device=device),
+                    peer % 2 != 0,
+                )
+                for peer in range(world_size)
+            ]
+            dist.gather(gather_input, gather_outputs, dst=0)
+            if [item.cpu().tolist() for item in gather_outputs] != [
+                (torch.arange(4).view(2, 2) + peer).tolist()
+                for peer in range(world_size)
+            ]:
+                errors.append("gather returned incorrect logical values")
+        else:
+            dist.gather(gather_input, dst=0)
+
+        reduce_input = make_matrix(
+            torch.arange(4, dtype=torch.int32, device=device).view(2, 2) + rank,
+            transposed,
+        )
+        dist.reduce(reduce_input, dst=0, op=dist.ReduceOp.SUM)
+        if rank == 0:
+            expected_reduce = (
+                torch.arange(4, dtype=torch.int32)
+                .view(2, 2)
+                .mul(world_size)
+                .add(rank_sum)
+            )
+            if reduce_input.cpu().tolist() != expected_reduce.tolist():
+                errors.append("reduce returned incorrect logical values")
+
+        scatter_output = make_matrix(
+            torch.zeros((2, 2), dtype=torch.int32, device=device), transposed
+        )
+        if rank == 0:
+            scatter_inputs = []
+            for peer in range(world_size):
+                scatter_inputs.append(
+                    make_matrix(
+                        torch.arange(4, dtype=torch.int32, device=device)
+                        .view(2, 2)
+                        .add(peer * 10),
+                        peer % 2 == 0,
+                    )
+                )
+            dist.scatter(scatter_output, scatter_inputs, src=0)
+        else:
+            dist.scatter(scatter_output, src=0)
+        expected_scatter = (torch.arange(4).view(2, 2) + rank * 10).tolist()
+        if scatter_output.cpu().tolist() != expected_scatter:
+            errors.append("scatter returned incorrect logical values")
+
+        allgather_base_input_storage = torch.empty(
+            (2, 2), dtype=torch.int32, device=device
+        )
+        allgather_base_input = allgather_base_input_storage[:, 0]
+        allgather_base_input.copy_(
+            torch.tensor([rank * 10, rank * 10 + 1], dtype=torch.int32, device=device)
+        )
+        allgather_base_output_storage = torch.empty(
+            (world_size * 2, 2), dtype=torch.int32, device=device
+        )
+        allgather_base_output = allgather_base_output_storage[:, 0]
+        dist.all_gather_into_tensor(allgather_base_output, allgather_base_input)
+        expected_allgather_base = [
+            value for peer in range(world_size) for value in (peer * 10, peer * 10 + 1)
+        ]
+        if allgather_base_output.cpu().tolist() != expected_allgather_base:
+            errors.append("all_gather_into_tensor returned incorrect values")
+
+        reduce_scatter_base_input_storage = torch.empty(
+            (world_size * 2, 2), dtype=torch.int32, device=device
+        )
+        reduce_scatter_base_input = reduce_scatter_base_input_storage[:, 0]
+        reduce_scatter_base_input.copy_(
+            torch.arange(world_size * 2, dtype=torch.int32, device=device) * 10 + rank
+        )
+        reduce_scatter_base_output_storage = torch.empty(
+            (2, 2), dtype=torch.int32, device=device
+        )
+        reduce_scatter_base_output = reduce_scatter_base_output_storage[:, 0]
+        dist.reduce_scatter_tensor(
+            reduce_scatter_base_output,
+            reduce_scatter_base_input,
+            op=dist.ReduceOp.SUM,
+        )
+        rank_sum = world_size * (world_size - 1) // 2
+        expected_reduce_scatter_base = [
+            rank * 20 * world_size + rank_sum,
+            (rank * 20 + 10) * world_size + rank_sum,
+        ]
+        if reduce_scatter_base_output.cpu().tolist() != expected_reduce_scatter_base:
+            errors.append("reduce_scatter_tensor returned incorrect values")
+
+        if errors:
+            raise AssertionError("; ".join(errors))
+        return {"value": "ok"}
+
     if case_name == "all_gather_into_tensor":
         local = torch.tensor([rank], dtype=torch.int32, device=device)
         gathered = torch.empty(world_size, dtype=torch.int32, device=device)
@@ -212,6 +367,14 @@ class _CollectiveTestMixin:
         self.assert_all_ok(rows)
         for row in rows:
             self.assertEqual(row["value"], 111)
+
+    def test_noncontiguous_collectives(self) -> None:
+        rows = self.spawn_backend_and_collect(
+            _collective_worker, "noncontiguous_collectives"
+        )
+        self.assert_all_ok(rows)
+        for row in rows:
+            self.assertEqual(row["value"], "ok")
 
     def test_all_gather_into_tensor(self) -> None:
         rows = self.spawn_backend_and_collect(
