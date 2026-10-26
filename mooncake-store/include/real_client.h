@@ -1251,6 +1251,9 @@ class RealClient : public PyClient {
     void wait_session_put_idle(std::unique_lock<std::mutex> &lock,
                                const std::vector<std::string> &keys);
 
+    std::vector<tl::expected<void, ErrorCode>> prepare_put_session_finalize(
+        const std::vector<std::string> &keys);
+
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
                                 size_t offset, size_t size,
