@@ -70,19 +70,14 @@ class HipTransport : public Transport {
         uint64_t length;
     };
 
-    struct PendingTransfer {
-        hipEvent_t event;
-        int device_id;
-        Slice* slice;
-    };
+    // Enqueue the copies without waiting for them; getTransferStatus() polls
+    // the recorded events.
+    Status submitTasks(
+        const std::vector<std::pair<TransferTask*, const TransferRequest*>>&
+            tasks);
 
-    // Start async transfer and return pending transfer info
-    Status startAsyncTransfer(const TransferRequest& request,
-                              TransferTask& task, PendingTransfer& pending);
-
-    // Synchronize pending transfers
-    void synchronizePendingTransfers(
-        std::vector<PendingTransfer>& pending_transfers);
+    // Enqueue one device's copies on one stream, followed by one event.
+    void submitDeviceCopies(int device_id, const std::vector<Slice*>& slices);
 
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
         remap_entries_;

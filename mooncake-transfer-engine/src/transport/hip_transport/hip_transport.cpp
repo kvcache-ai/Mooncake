@@ -16,11 +16,13 @@
 
 #include <glog/logging.h>
 
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cerrno>
 #include <cstring>
+#include <map>
 #include <unistd.h>
 #include <sys/syscall.h>
 
@@ -453,101 +455,180 @@ int HipTransport::install(std::string& local_server_name,
     return 0;
 }
 
-Status HipTransport::startAsyncTransfer(const TransferRequest& request,
-                                        TransferTask& task,
-                                        PendingTransfer& pending) {
-    hipError_t err;
+namespace {
+
+// One event recorded after a device's copies. Each of their slices holds a
+// reference; the last one to finish returns the event to the pool.
+struct HipCompletionEvent {
+    hipEvent_t event;
     int device_id;
+    EventPool* pool;
+    std::atomic<size_t> refs;
+};
 
-    HipDeviceGuard device_guard;
-
-    if (setDeviceContext(request.source, device_id) != 0) {
-        return Status::InvalidArgument("Failed to set device context");
+void releaseCompletionEvent(HipCompletionEvent* completion) {
+    if (completion->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        completion->pool->putEvent(completion->event, completion->device_id);
+        delete completion;
     }
-
-    // Relocate shared memory address if needed
-    uint64_t dest_addr = request.target_offset;
-    if (request.target_id != LOCAL_SEGMENT_ID) {
-        int rc = relocateSharedMemoryAddress(dest_addr, request.length,
-                                             request.target_id);
-        if (rc) return Status::Memory("device memory not registered");
-    }
-
-    task.total_bytes = request.length;
-
-    // Allocate and configure slice
-    Slice* slice = getSliceCache().allocate();
-    slice->source_addr = (char*)request.source;
-    slice->local.dest_addr = (char*)dest_addr;
-    slice->length = request.length;
-    slice->opcode = request.opcode;
-    slice->task = &task;
-    slice->target_id = request.target_id;
-    slice->status = Slice::PENDING;
-
-    task.slice_list.push_back(slice);
-
-    __sync_fetch_and_add(&task.slice_count, 1);
-
-    // Get event and stream from pools
-    hipEvent_t event = event_pool_.getEvent(device_id);
-    hipStream_t stream = stream_pool_.getNextStream(device_id);
-
-    if (event == nullptr || stream == nullptr) {
-        slice->markFailed();
-        if (event != nullptr) {
-            event_pool_.putEvent(event, device_id);
-        }
-        return Status::Memory("Failed to get event or stream from pool");
-    }
-
-    // Perform async memory copy
-    if (slice->opcode == TransferRequest::READ) {
-        err = hipMemcpyAsync(slice->source_addr, (void*)slice->local.dest_addr,
-                             slice->length, hipMemcpyDefault, stream);
-    } else {
-        err = hipMemcpyAsync((void*)slice->local.dest_addr, slice->source_addr,
-                             slice->length, hipMemcpyDefault, stream);
-    }
-
-    if (!checkHip(err, "HipTransport: hipMemcpyAsync failed")) {
-        slice->markFailed();
-        event_pool_.putEvent(event, device_id);
-        return Status::Memory("HipTransport: Async memory copy failed");
-    }
-
-    // Record event on the stream
-    err = hipEventRecord(event, stream);
-    if (!checkHip(err, "HipTransport: hipEventRecord failed")) {
-        slice->markFailed();
-        event_pool_.putEvent(event, device_id);
-        return Status::Memory("HipTransport: Failed to record event");
-    }
-
-    // Store pending transfer info
-    pending.event = event;
-    pending.device_id = device_id;
-    pending.slice = slice;
-
-    return Status::OK();
 }
 
-void HipTransport::synchronizePendingTransfers(
-    std::vector<PendingTransfer>& pending_transfers) {
-    for (auto& pt : pending_transfers) {
-        // Wait for event to complete
-        hipError_t err = hipEventSynchronize(pt.event);
-        if (err == hipSuccess) {
-            pt.slice->markSuccess();
-        } else {
-            LOG(ERROR) << "HipTransport: hipEventSynchronize failed: "
-                       << hipGetErrorString(err);
-            pt.slice->markFailed();
-        }
+// Only the caller that takes the event may query it and finish the slice.
+HipCompletionEvent* takeCompletionEvent(Transport::Slice* slice) {
+    return static_cast<HipCompletionEvent*>(__atomic_exchange_n(
+        &slice->local.hip_event, nullptr, __ATOMIC_ACQ_REL));
+}
 
-        // Return event to pool
-        event_pool_.putEvent(pt.event, pt.device_id);
+// Slice cleanup hook: drop the reference of a slice freed while in flight.
+// Finishes the slice if its copies are done (with wait, once they are), and
+// returns whether it is finished.
+bool finishSlice(Transport::Slice* slice, bool wait) {
+    HipCompletionEvent* completion = takeCompletionEvent(slice);
+    if (completion == nullptr) return true;
+    hipError_t err = wait ? hipEventSynchronize(completion->event)
+                          : hipEventQuery(completion->event);
+    if (err == hipErrorNotReady) {
+        // Still in flight; hand the event back for the next poll.
+        __atomic_store_n(&slice->local.hip_event, completion, __ATOMIC_RELEASE);
+        return false;
     }
+    if (checkHip(err, "HipTransport: waiting for the copy event failed")) {
+        slice->markSuccess();
+    } else {
+        slice->markFailed();
+    }
+    releaseCompletionEvent(completion);
+    return true;
+}
+
+void releaseSliceEvent(Transport::Slice* slice) {
+    if (auto* completion = takeCompletionEvent(slice)) {
+        releaseCompletionEvent(completion);
+    }
+}
+
+}  // namespace
+
+void HipTransport::submitDeviceCopies(int device_id,
+                                      const std::vector<Slice*>& slices) {
+    hipStream_t stream = stream_pool_.getNextStream(device_id);
+    hipEvent_t event = stream ? event_pool_.getEvent(device_id) : nullptr;
+    if (event == nullptr) {
+        LOG(ERROR) << "HipTransport: failed to get a stream or event on device "
+                   << device_id;
+        for (Slice* slice : slices) slice->markFailed();
+        return;
+    }
+
+    std::vector<Slice*> posted;
+    for (Slice* slice : slices) {
+        hipError_t err;
+        if (slice->opcode == TransferRequest::READ) {
+            err = hipMemcpyAsync(slice->source_addr, slice->local.dest_addr,
+                                 slice->length, hipMemcpyDefault, stream);
+        } else {
+            err = hipMemcpyAsync(slice->local.dest_addr, slice->source_addr,
+                                 slice->length, hipMemcpyDefault, stream);
+        }
+        if (checkHip(err, "HipTransport: hipMemcpyAsync failed")) {
+            posted.push_back(slice);
+        } else {
+            slice->markFailed();
+        }
+    }
+    if (posted.empty()) {
+        event_pool_.putEvent(event, device_id);
+        return;
+    }
+
+    if (!checkHip(hipEventRecord(event, stream),
+                  "HipTransport: hipEventRecord failed")) {
+        // Without an event, drain the copies in flight before failing them.
+        event_pool_.putEvent(event, device_id);
+        (void)hipStreamSynchronize(stream);
+        for (Slice* slice : posted) slice->markFailed();
+        return;
+    }
+
+    auto* completion =
+        new HipCompletionEvent{event, device_id, &event_pool_, {posted.size()}};
+    for (Slice* slice : posted) {
+        slice->status = Slice::POSTED;
+        __atomic_store_n(&slice->local.hip_event, completion, __ATOMIC_RELEASE);
+    }
+}
+
+Status HipTransport::submitTasks(
+    const std::vector<std::pair<TransferTask*, const TransferRequest*>>&
+        tasks) {
+    // Resolve every request first, so a bad one fails the whole submission
+    // instead of leaving earlier copies in flight behind an error. Switch to
+    // the device that will run the copy (the local buffer's) before the first
+    // relocation of a target opens its IPC handle, which hipIpcOpenMemHandle
+    // maps for the current device.
+    HipDeviceGuard device_guard;
+    std::vector<uint64_t> dest_addrs(tasks.size());
+    std::vector<int> device_ids(tasks.size(), -1);
+    Status status = Status::OK();
+    for (size_t i = 0; i < tasks.size() && status.ok(); ++i) {
+        const TransferRequest& request = *tasks[i].second;
+        dest_addrs[i] = request.target_offset;
+        if (setDeviceContext(request.source, device_ids[i]) != 0) {
+            status = Status::InvalidArgument("failed to set device context");
+        } else if (request.target_id != LOCAL_SEGMENT_ID &&
+                   relocateSharedMemoryAddress(dest_addrs[i], request.length,
+                                               request.target_id)) {
+            status = Status::Memory("device memory not registered");
+        }
+    }
+
+    std::map<int, std::vector<Slice*>> device_slices;
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        TransferTask& task = *tasks[i].first;
+        const TransferRequest& request = *tasks[i].second;
+        task.total_bytes = request.length;
+
+        Slice* slice = getSliceCache().allocate();
+        slice->source_addr = (char*)request.source;
+        slice->local.dest_addr = (char*)dest_addrs[i];
+        slice->local.hip_event = nullptr;
+        slice->length = request.length;
+        slice->opcode = request.opcode;
+        slice->task = &task;
+        slice->target_id = request.target_id;
+        slice->status = Slice::PENDING;
+        slice->ts = getCurrentTimeInNano();
+        slice->cleanup_callback = releaseSliceEvent;
+        task.slice_list.push_back(slice);
+        __sync_fetch_and_add(&task.slice_count, 1);
+
+        if (!status.ok()) {
+            // Every task gets a failed slice so none reads as COMPLETED.
+            slice->markFailed();
+            continue;
+        }
+        device_slices[device_ids[i]].push_back(slice);
+    }
+
+    for (auto& [device_id, slices] : device_slices) {
+        if (!checkHip(hipSetDevice(device_id),
+                      "HipTransport: failed to set device context")) {
+            for (Slice* slice : slices) slice->markFailed();
+            continue;
+        }
+        submitDeviceCopies(device_id, slices);
+    }
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    // Event-driven waiters (e.g. Mooncake Store) block on the batch's
+    // condition variable and never call getTransferStatus, which is what
+    // finishes a slice here. Finish the copies before returning instead, as
+    // before submission became asynchronous.
+    for (auto& [device_id, slices] : device_slices) {
+        for (Slice* slice : slices) finishSlice(slice, true);
+    }
+#endif
+    return status;
 }
 
 Status HipTransport::submitTransfer(
@@ -564,30 +645,11 @@ Status HipTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
-    // Submit async transfers and collect pending transfer info
-    std::vector<PendingTransfer> pending_transfers;
-    pending_transfers.reserve(entries.size());
-
+    std::vector<std::pair<TransferTask*, const TransferRequest*>> tasks;
     for (auto& request : entries) {
-        TransferTask& task = batch_desc.task_list[task_id];
-        ++task_id;
-
-        PendingTransfer pending;
-        Status status = startAsyncTransfer(request, task, pending);
-        if (!status.ok()) {
-            // Clean up any pending transfers we've already created
-            for (auto& pt : pending_transfers) {
-                event_pool_.putEvent(pt.event, pt.device_id);
-            }
-            return status;
-        }
-        pending_transfers.push_back(pending);
+        tasks.emplace_back(&batch_desc.task_list[task_id++], &request);
     }
-
-    // Synchronize all pending transfers and mark slices as complete
-    synchronizePendingTransfers(pending_transfers);
-
-    return Status::OK();
+    return submitTasks(tasks);
 }
 
 Status HipTransport::getTransferStatus(BatchID batch_id, size_t task_id,
@@ -603,6 +665,7 @@ Status HipTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
     // Get task and status info
     auto& task = batch_desc.task_list[task_id];
+    for (Slice* slice : task.slice_list) finishSlice(slice, false);
     uint64_t success_slice_count =
         __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
     uint64_t failed_slice_count =
@@ -628,32 +691,12 @@ Status HipTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
 Status HipTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
-    // Submit async transfers and collect pending transfer info
-    std::vector<PendingTransfer> pending_transfers;
-    pending_transfers.reserve(task_list.size());
-
+    std::vector<std::pair<TransferTask*, const TransferRequest*>> tasks;
     for (auto* task_ptr : task_list) {
-        assert(task_ptr);
-        auto& task = *task_ptr;
-        assert(task.request);
-        auto& request = *task.request;
-
-        PendingTransfer pending;
-        Status status = startAsyncTransfer(request, task, pending);
-        if (!status.ok()) {
-            // Clean up any pending transfers we've already created
-            for (auto& pt : pending_transfers) {
-                event_pool_.putEvent(pt.event, pt.device_id);
-            }
-            return status;
-        }
-        pending_transfers.push_back(pending);
+        assert(task_ptr && task_ptr->request);
+        tasks.emplace_back(task_ptr, task_ptr->request);
     }
-
-    // Synchronize all pending transfers and mark slices as complete
-    synchronizePendingTransfers(pending_transfers);
-
-    return Status::OK();
+    return submitTasks(tasks);
 }
 
 int HipTransport::registerLocalMemory(void* addr, size_t length,
