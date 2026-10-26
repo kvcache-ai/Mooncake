@@ -26,10 +26,12 @@ def _int_env(name: str, default: int) -> int:
     if not raw:
         return default
     try:
-        return int(raw)
-    except ValueError:
-        logging.warning(f"Ignoring invalid {name}={raw!r}: not an integer")
-        return default
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+    return value
 
 
 def _is_loopback(host: str) -> bool:
@@ -63,10 +65,8 @@ class KVBootstrapServer:
         """
         self.port = port
         self.host = host
-        self.max_body_bytes = max(1, _int_env("MC_METADATA_MAX_BODY_BYTES", 1 << 20))
-        self.max_concurrent_puts = max(
-            1, _int_env("MC_METADATA_MAX_CONCURRENT_PUTS", 8)
-        )
+        self.max_body_bytes = _int_env("MC_METADATA_MAX_BODY_BYTES", 1 << 20)
+        self.max_concurrent_puts = _int_env("MC_METADATA_MAX_CONCURRENT_PUTS", 8)
         self.app = web.Application(client_max_size=self.max_body_bytes)
         self.store = dict()
         self.lock = asyncio.Lock()
@@ -159,6 +159,15 @@ class KVBootstrapServer:
         if request.method == "GET":
             return await self._handle_get(key)
         elif request.method == "PUT":
+            if (
+                request.content_length is not None
+                and request.content_length > self.max_body_bytes
+            ):
+                return web.Response(
+                    text="request body too large",
+                    status=413,
+                    content_type="application/json",
+                )
             return await self._handle_put(key, request)
         elif request.method == "DELETE":
             return await self._handle_delete(key)

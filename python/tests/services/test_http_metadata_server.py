@@ -4,6 +4,7 @@ import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from aiohttp.test_utils import TestClient, TestServer
 from mooncake.http_metadata_server import KVBootstrapServer
 
 
@@ -12,6 +13,7 @@ class FakeRequest:
         self.method = method
         self.query = {} if key is None else {"key": key}
         self.body = body
+        self.content_length = len(body)
         self.headers = {} if headers is None else headers
 
     async def read(self):
@@ -242,10 +244,35 @@ class TestHttpMetadataServerBounds(unittest.IsolatedAsyncioTestCase):
         if app_limit is not None:
             self.assertEqual(app_limit, 123)
 
-    async def test_invalid_budget_env_falls_back_to_default(self) -> None:
-        with patch.dict(os.environ, {"MC_METADATA_MAX_KEYS": "abc"}):
+    async def test_aiohttp_rejects_oversized_put_before_handler(self) -> None:
+        with patch.dict(os.environ, {"MC_METADATA_MAX_BODY_BYTES": "4"}):
             server = KVBootstrapServer(port=0)
-        self.assertEqual(server.max_keys, 65536)
+
+        with patch.object(
+            server, "_handle_put", AsyncMock(wraps=server._handle_put)
+        ) as handle_put:
+            async with TestClient(TestServer(server.app)) as client:
+                response = await client.put("/metadata?key=too-big", data=b"12345")
+
+            self.assertEqual(response.status, 413)
+            handle_put.assert_not_awaited()
+        self.assertEqual(server.store, {})
+
+    async def test_invalid_budget_env_is_rejected_at_startup(self) -> None:
+        names = (
+            "MC_METADATA_MAX_BODY_BYTES",
+            "MC_METADATA_MAX_CONCURRENT_PUTS",
+            "MC_METADATA_MAX_KEYS",
+            "MC_METADATA_MAX_TOTAL_BYTES",
+        )
+        for name in names:
+            for value in ("0", "-1", "abc"):
+                with self.subTest(name=name, value=value):
+                    with patch.dict(os.environ, {name: value}):
+                        with self.assertRaisesRegex(
+                            ValueError, f"{name}.*positive integer"
+                        ):
+                            KVBootstrapServer(port=0)
 
 
 class TestHttpMetadataServerBindGate(unittest.TestCase):
