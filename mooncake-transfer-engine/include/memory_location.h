@@ -41,6 +41,16 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
 // Returns the kernel page size backing the VMA containing addr.
 size_t detectBufferPageSize(void *addr);
 
+// True if the VMA containing addr was madvise(MADV_HUGEPAGE)'d. Such memory is
+// anonymous host memory, so it is safe to touch from the CPU.
+bool hasHugepageAdvice(void *addr);
+
+// True if [addr, addr + length) is resident and backed only by transparent
+// huge pages: the VMAs overlapping it cover it, and all of their resident
+// memory is THP (smaps Rss == AnonHugePages). The kernel may merge adjacent
+// mappings into one VMA, so this checks whole VMAs; fault the range in first.
+bool isThpBacked(void *addr, size_t length);
+
 const static std::string kWildcardLocation = "*";
 const static std::string kSegmentsLocationPrefix = "segments:";
 

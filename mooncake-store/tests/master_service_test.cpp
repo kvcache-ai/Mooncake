@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "config/replica_selection_config.h"
 #include "master_service/master_service_test_peer.h"
 #include "rpc_service.h"
 
@@ -26,7 +27,8 @@
 
 #include <unistd.h>
 
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
+#include "random.h"
 #include "types.h"
 #include "master_service_test_fixture.h"
 
@@ -132,6 +134,164 @@ std::string GenerateKeyForSegment(const UUID& client_id,
             // Ignore cleanup failure
         }
     }
+}
+
+TEST_F(MasterServiceTest, HcaHintFallsBackForLargeOffsetObject) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    const auto owner = generate_uuid();
+    constexpr size_t mib = 1024 * 1024;
+    auto matching = MakeSegment("receiver");
+    matching.size = 16 * mib;
+    matching.locality = SegmentLocality{7, {"mlx5_0"}};
+    auto original = matching;
+    original.id = generate_uuid();
+    original.base += matching.size;
+    original.size = 32 * mib;
+    original.locality.reset();
+    ASSERT_TRUE(service.MountSegment(matching, owner));
+    ASSERT_TRUE(service.MountSegment(original, owner));
+    ReplicateConfig request;
+    request.preferred_hca_names = std::vector<std::string>{"mlx5_0"};
+    const auto result = service.PutStart(
+        owner, "large-hca-object", TenantId::Default(), 24 * mib, request);
+    ASSERT_TRUE(result) << toString(result.error());
+    const auto& buffer = (*result)[0].get_memory_descriptor().buffer_descriptor;
+    EXPECT_EQ(buffer.size_, 24 * mib);
+    EXPECT_GE(buffer.buffer_address_, original.base);
+    EXPECT_LT(buffer.buffer_address_, original.base + original.size);
+}
+
+TEST_F(MasterServiceTest, MixedGpuBatchUsesEachKeysHcaHint) {
+    if (!StoreHcaAffinityEnabled()) GTEST_SKIP();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    const auto owner = generate_uuid();
+    auto first = MakeSegment("receiver");
+    first.protocol = "rdma";
+    first.locality = SegmentLocality{7, {"mlx5_0"}};
+    auto second = first;
+    second.id = generate_uuid();
+    second.base += first.size;
+    second.locality = SegmentLocality{0, {"mlx5_1"}};
+    ASSERT_TRUE(service.MountSegment(first, owner));
+    ASSERT_TRUE(service.MountSegment(second, owner));
+    ReplicateConfig config;
+    config.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_0"}, {"mlx5_1"}};
+    auto results = service.BatchUpsertStart(
+        owner, {"gpu0", "gpu1"}, TenantId::Default(), {1024, 1024}, config);
+    ASSERT_EQ(results.size(), 2);
+    for (size_t i = 0; i < results.size(); ++i) {
+        ASSERT_TRUE(results[i]);
+        const auto& memory = (*results[i])[0].get_memory_descriptor();
+        ASSERT_TRUE(memory.locality);
+        EXPECT_EQ(memory.locality->numa_node, i == 0 ? 7 : 0);
+    }
+    config.per_key_preferred_hca_names->pop_back();
+    results =
+        service.BatchUpsertStart(owner, {"invalid0", "invalid1"},
+                                 TenantId::Default(), {1024, 1024}, config);
+    for (const auto& result : results) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+}
+
+TEST_F(MasterServiceTest, PutAndBatchUpsertHonorReceiverHcaLocality) {
+    if (!StoreHcaAffinityEnabled()) GTEST_SKIP();
+    auto config = MasterServiceConfig::builder()
+                      .set_memory_allocator(BufferAllocatorType::OFFSET)
+                      .build();
+    MasterService service(config);
+    const auto owner = generate_uuid();
+    auto other = MakeSegment("receiver");
+    other.protocol = "rdma";
+    other.locality = SegmentLocality{0, {"mlx5_1"}};
+    auto matching = other;
+    matching.id = generate_uuid();
+    matching.base += matching.size;
+    matching.locality = SegmentLocality{7, {"mlx5_0"}};
+    ASSERT_TRUE(service.MountSegment(other, owner));
+    ASSERT_TRUE(service.MountSegment(matching, owner));
+    ReplicateConfig request;
+    request.preferred_hca_names = std::vector<std::string>{"mlx5_0"};
+    auto result = service.PutStart(owner, "hca-put", TenantId::Default(),
+                                   {1024}, request);
+    ASSERT_TRUE(result);
+    const auto address =
+        (*result)[0].get_memory_descriptor().buffer_descriptor.buffer_address_;
+    EXPECT_GE(address, matching.base);
+    EXPECT_LT(address, matching.base + matching.size);
+    auto conflicting = matching;
+    conflicting.locality = SegmentLocality{0, {"mlx5_1"}};
+    auto remounted = service.ReMountSegment({conflicting}, owner);
+    ASSERT_FALSE(remounted);
+    EXPECT_EQ(remounted.error(), ErrorCode::INVALID_PARAMS);
+    auto batch =
+        service.BatchUpsertStart(owner, {"hca-upsert-a", "hca-upsert-b"},
+                                 TenantId::Default(), {1024, 1024}, request);
+    ASSERT_EQ(batch.size(), 2);
+    for (const auto& entry : batch) {
+        ASSERT_TRUE(entry);
+        const auto target = (*entry)[0]
+                                .get_memory_descriptor()
+                                .buffer_descriptor.buffer_address_;
+        EXPECT_GE(target, matching.base);
+        EXPECT_LT(target, matching.base + matching.size);
+    }
+}
+
+TEST_F(MasterServiceTest, DisabledAffinityIgnoresExplicitHints) {
+    if (StoreHcaAffinityEnabled()) GTEST_SKIP();
+    MasterService service(
+        MasterServiceConfig::builder()
+            .set_memory_allocator(BufferAllocatorType::OFFSET)
+            .set_allocation_strategy_type(AllocationStrategyType::RANDOM)
+            .build());
+    const auto owner = generate_uuid();
+    auto first = MakeSegment("receiver");
+    first.locality = SegmentLocality{0, {"mlx5_0"}};
+    auto second = first;
+    second.id = generate_uuid();
+    second.base += first.size;
+    second.locality = SegmentLocality{1, {"mlx5_1"}};
+    ASSERT_TRUE(service.MountSegment(first, owner));
+    ASSERT_TRUE(service.MountSegment(second, owner));
+    const auto engine = threadLocalRandomEngine();
+    auto baseline =
+        service.PutStart(owner, "without-hint", TenantId::Default(), 1024, {});
+    ASSERT_TRUE(baseline);
+    const auto locality = baseline->front().get_memory_descriptor().locality;
+    ASSERT_TRUE(locality);
+    ReplicateConfig request;
+    request.preferred_hca_names = std::vector<std::string>{
+        locality->numa_node == 0 ? "mlx5_1" : "mlx5_0"};
+    threadLocalRandomEngine() = engine;
+    auto hinted = service.PutStart(owner, "with-hint", TenantId::Default(),
+                                   1024, request);
+    ASSERT_TRUE(hinted);
+    EXPECT_EQ(hinted->front().get_memory_descriptor().locality, locality);
+}
+
+TEST_F(MasterServiceTest, DuplicateMountEnrichesOnlyUnknownLocality) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    const auto owner = generate_uuid();
+    auto legacy = MakeSegment("legacy-locality");
+    ASSERT_TRUE(service.MountSegment(legacy, owner));
+    auto known = legacy;
+    known.locality = SegmentLocality{7, {"mlx5_0"}};
+    ASSERT_TRUE(service.MountSegment(known, owner));
+    ASSERT_TRUE(service.MountSegment(legacy, owner));
+    auto replicas = service.PutStart(owner, "enriched-locality",
+                                     TenantId::Default(), 1024, {});
+    ASSERT_TRUE(replicas);
+    EXPECT_EQ(replicas->front().get_memory_descriptor().locality,
+              known.locality);
 }
 
 TEST_F(MasterServiceTest, MountUnmountSegmentWithCachelibAllocator) {
@@ -263,6 +423,120 @@ TEST_F(MasterServiceTest, MountUnmountSegmentWithOffsetAllocator) {
     EXPECT_TRUE(mount_result7.has_value());
     auto unmount_result4 = service_->UnmountSegment(segment.id, client_id);
     EXPECT_TRUE(unmount_result4.has_value());
+}
+
+TEST_F(MasterServiceTest, StandaloneSoftPinLifecycle) {
+    auto config = MasterServiceConfig::builder()
+                      .set_max_kv_soft_pin_ttl(60000)
+                      .set_default_kv_soft_pin_ttl(1000)
+                      .build();
+    MasterService service(config);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const auto client = generate_uuid();
+    ASSERT_TRUE(service.PutStart(client, "pin-key", TenantId::Default(), 1024,
+                                 ReplicateConfig{}));
+    ASSERT_TRUE(service.PutEnd(client, {"pin-key", std::nullopt},
+                               TenantId::Default(), ReplicaType::MEMORY));
+    const auto baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+    auto results = service.BatchUpdateSoftPin({"pin-key", "missing", ""},
+                                              TenantId::Default(), 30000);
+    ASSERT_EQ(results.size(), 3);
+    ASSERT_TRUE(results[0]);
+    EXPECT_EQ(results[1].error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(results[2].error(), ErrorCode::INVALID_PARAMS);
+    auto first = GetSoftPinDeadline(service, "pin-key");
+    ASSERT_TRUE(first);
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline + 1);
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(), 60000)[0]);
+    auto renewed = GetSoftPinDeadline(service, "pin-key");
+    ASSERT_GT(*renewed, *first);
+    CleanupExpiredSoftPinsAt(service, *first);
+    EXPECT_EQ(GetSoftPinDeadline(service, "pin-key"), renewed);
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(), 10000)[0]);
+    auto shortened = GetSoftPinDeadline(service, "pin-key");
+    ASSERT_LT(*shortened, *renewed);
+    CleanupExpiredSoftPinsAt(service, *shortened);
+    EXPECT_FALSE(GetSoftPinDeadline(service, "pin-key"));
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(), 60000)[0]);
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(), 0)[0]);
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"pin-key"}, TenantId::Default(), 0)[0]);
+    EXPECT_FALSE(GetSoftPinDeadline(service, "pin-key"));
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+    EXPECT_TRUE(service.ExistKey("pin-key", TenantId::Default()).value());
+}
+
+TEST_F(MasterServiceTest, StandaloneSoftPinRejectsPendingWriteAndInvalidTtl) {
+    MasterService service(MasterServiceConfig::builder().build());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const auto client = generate_uuid();
+    ReplicateConfig config;
+    config.soft_pin_action = SoftPinAction::ENABLE;
+    config.soft_pin_ttl_ms = 30000;
+    ASSERT_TRUE(service.PutStart(client, "pending-pin", TenantId::Default(),
+                                 1024, config));
+    auto pending =
+        service.BatchUpdateSoftPin({"pending-pin"}, TenantId::Default(), 0);
+    EXPECT_EQ(pending[0].error(), ErrorCode::REPLICA_IS_NOT_READY);
+    ASSERT_TRUE(service.PutEnd(client, {"pending-pin", std::nullopt},
+                               TenantId::Default(), ReplicaType::MEMORY));
+    auto deadline = GetSoftPinDeadline(service, "pending-pin");
+    ASSERT_TRUE(deadline);
+    auto invalid =
+        service.BatchUpdateSoftPin({"pending-pin"}, TenantId::Default(),
+                                   std::numeric_limits<uint64_t>::max());
+    EXPECT_EQ(invalid[0].error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(GetSoftPinDeadline(service, "pending-pin"), deadline);
+    EXPECT_TRUE(service.BatchUpdateSoftPin({}, TenantId::Default(), 0).empty());
+}
+
+TEST_F(MasterServiceTest,
+       StandaloneSoftPinIsTenantScopedAndPreservesOtherMetadata) {
+    MasterService service(MakeStrictTenantConfig({"pin-a", "pin-b"}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const auto client = generate_uuid();
+    ReplicateConfig config;
+    config.with_hard_pin = true;
+    config.session_ids = std::vector<std::string>{"writing-session"};
+    for (const auto& tenant : {TenantId("pin-a"), TenantId("pin-b")}) {
+        ASSERT_TRUE(
+            service.PutStart(client, "shared-key", tenant, 1024, config));
+        ASSERT_TRUE(service.PutEnd(client, {"shared-key", std::nullopt}, tenant,
+                                   ReplicaType::MEMORY));
+    }
+    auto read_deadline = [&]() {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
+                "shared-key", TenantId("pin-a")));
+        EXPECT_TRUE(accessor.Get().IsHardPinned());
+        EXPECT_EQ(accessor.Get().session_id,
+                  std::optional<std::string>("writing-session"));
+        return accessor.Get().EvictionDeadline();
+    };
+    const auto lease = read_deadline();
+    ASSERT_TRUE(service.BatchUpdateSoftPin({"shared-key"}, TenantId("pin-a"),
+                                           30000)[0]);
+    EXPECT_FALSE(GetSoftPinDeadline(service, "shared-key", "pin-b"));
+    ASSERT_TRUE(service.BatchUpdateSoftPin({"shared-key"}, TenantId("pin-b"),
+                                           30000)[0]);
+    const auto other_deadline =
+        GetSoftPinDeadline(service, "shared-key", "pin-b");
+    ASSERT_TRUE(
+        service.BatchUpdateSoftPin({"shared-key"}, TenantId("pin-a"), 0)[0]);
+    EXPECT_FALSE(GetSoftPinDeadline(service, "shared-key", "pin-a"));
+    EXPECT_EQ(GetSoftPinDeadline(service, "shared-key", "pin-b"),
+              other_deadline);
+    EXPECT_EQ(read_deadline(), lease);
 }
 
 TEST_F(MasterServiceTest, SoftPinZeroTtlSkipsSoftPinRegistration) {
@@ -578,6 +852,150 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
     std::filesystem::remove_all(dfs_root, ec);
 }
 
+// A one-object shard allocator: any DFS extent leaked by a lifecycle path makes
+// the next DFS-only allocation fail.
+class OneSlotDfsShardEnv {
+   public:
+    explicit OneSlotDfsShardEnv(const std::string& root)
+        : enable_dfs_("MOONCAKE_ENABLE_DFS", "1"),
+          fs_adapter_("MOONCAKE_DFS_FS_ADAPTER", "posix"),
+          root_dir_("MOONCAKE_DFS_ROOT_DIR", root.c_str()),
+          shard_count_("MOONCAKE_DFS_SHARD_COUNT", "1"),
+          shard_capacity_("MOONCAKE_DFS_SHARD_CAPACITY", "32768"),
+          alignment_("MOONCAKE_DFS_ALIGNMENT", "4096"),
+          eviction_("MOONCAKE_DFS_EVICTION_ENABLED", "0"),
+          deferred_free_("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0"),
+          single_tenant_("MOONCAKE_DFS_SINGLE_TENANT", "true") {}
+
+    static constexpr uint64_t kObjectSize = 20480;
+
+   private:
+    ScopedEnvVar enable_dfs_, fs_adapter_, root_dir_, shard_count_,
+        shard_capacity_, alignment_, eviction_, deferred_free_, single_tenant_;
+};
+
+ReplicateConfig DfsOnlyConfig() {
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.dfs_replica_num = 1;
+    return config;
+}
+
+TEST_F(MasterServiceTest, DfsOnlyLifecyclePathsReleaseTheExtent) {
+    const auto dfs_root = (std::filesystem::temp_directory_path() /
+                           ("master_dfs_only_" + std::to_string(::getpid())))
+                              .string();
+    std::filesystem::create_directories(dfs_root);
+    OneSlotDfsShardEnv env(dfs_root);
+    constexpr uint64_t kSize = OneSlotDfsShardEnv::kObjectSize;
+
+    MasterServiceConfig master_config;
+    master_config.put_start_discard_timeout_sec = 1;
+    master_config.put_start_release_timeout_sec = 2;
+    MasterService service(master_config);
+    const UUID writer = generate_uuid();
+    const UUID other = generate_uuid();
+
+    auto start = service.PutStart(writer, "a", TenantId::Default(), kSize,
+                                  DfsOnlyConfig());
+    ASSERT_TRUE(start.has_value()) << toString(start.error());
+    ASSERT_EQ(start->size(), 1u);
+    EXPECT_TRUE(start->front().is_dfs_replica());
+    auto not_ready = service.GetReplicaList("a", TenantId::Default());
+    ASSERT_FALSE(not_ready.has_value());
+    EXPECT_EQ(not_ready.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    auto full = service.PutStart(writer, "b", TenantId::Default(), kSize,
+                                 DfsOnlyConfig());
+    ASSERT_FALSE(full.has_value());
+    EXPECT_EQ(full.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    // Revoke releases the extent.
+    ASSERT_TRUE(
+        service.PutRevoke(writer, "a", TenantId::Default(), ReplicaType::ALL));
+    auto revoked = service.GetReplicaList("a", TenantId::Default());
+    ASSERT_FALSE(revoked.has_value());
+    EXPECT_EQ(revoked.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    // Upsert preemption releases the in-flight writer's extent.
+    ASSERT_TRUE(service.PutStart(writer, "b", TenantId::Default(), kSize,
+                                 DfsOnlyConfig()));
+    ASSERT_TRUE(service.UpsertStart(other, "b", TenantId::Default(), kSize,
+                                    DfsOnlyConfig()));
+    auto stale_end =
+        service.PutEnd(writer, "b", TenantId::Default(), ReplicaType::ALL);
+    ASSERT_FALSE(stale_end.has_value());
+    EXPECT_EQ(stale_end.error(), ErrorCode::ILLEGAL_CLIENT);
+    ASSERT_TRUE(
+        service.UpsertEnd(other, "b", TenantId::Default(), ReplicaType::ALL));
+    auto complete = service.GetReplicaList("b", TenantId::Default());
+    ASSERT_TRUE(complete.has_value());
+    ASSERT_EQ(complete->replicas.size(), 1u);
+    EXPECT_EQ(complete->replicas[0].status, ReplicaStatus::COMPLETE);
+
+    // Remove honours the read lease, then releases the extent.
+    auto leased = service.Remove("b", TenantId::Default());
+    ASSERT_FALSE(leased.has_value());
+    EXPECT_EQ(leased.error(), ErrorCode::OBJECT_HAS_LEASE);
+    ASSERT_TRUE(service.Remove("b", TenantId::Default(), /*force=*/true));
+
+    // An abandoned write is reaped after the release timeout.
+    ASSERT_TRUE(service.PutStart(writer, "c", TenantId::Default(), kSize,
+                                 DfsOnlyConfig()));
+    std::this_thread::sleep_for(std::chrono::seconds(4));
+    auto reaped = service.GetReplicaList("c", TenantId::Default());
+    ASSERT_FALSE(reaped.has_value());
+    EXPECT_EQ(reaped.error(), ErrorCode::OBJECT_NOT_FOUND);
+    auto reuse = service.PutStart(other, "d", TenantId::Default(), kSize,
+                                  DfsOnlyConfig());
+    ASSERT_TRUE(reuse.has_value()) << toString(reuse.error());
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsOnlyObjectsIgnoreMemoryEvictionAndSegmentLoss) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_only_eviction_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    OneSlotDfsShardEnv env(dfs_root);
+
+    MasterServiceConfig master_config;
+    master_config.default_kv_lease_ttl = 1;
+    MasterService service(master_config);
+    const auto context = PrepareSimpleSegment(service);
+    const UUID writer = generate_uuid();
+
+    ASSERT_TRUE(service.PutStart(writer, "dfs_only", TenantId::Default(),
+                                 OneSlotDfsShardEnv::kObjectSize,
+                                 DfsOnlyConfig()));
+    ASSERT_TRUE(service.PutEnd(writer, "dfs_only", TenantId::Default(),
+                               ReplicaType::ALL));
+    ReplicateConfig memory_config;
+    memory_config.replica_num = 1;
+    for (int i = 0; i < 8; ++i) {
+        const auto key = "memory_" + std::to_string(i);
+        ASSERT_TRUE(service.PutStart(writer, key, TenantId::Default(), 1 << 20,
+                                     memory_config));
+        ASSERT_TRUE(service.PutEnd(writer, key, TenantId::Default(),
+                                   ReplicaType::MEMORY));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
+
+    auto query = service.GetReplicaList("dfs_only", TenantId::Default());
+    ASSERT_TRUE(query.has_value()) << toString(query.error());
+    ASSERT_EQ(query->replicas.size(), 1u);
+    EXPECT_TRUE(query->replicas[0].is_dfs_replica());
+    ASSERT_TRUE(service.UnmountSegment(context.segment_id, context.client_id));
+    EXPECT_TRUE(
+        service.GetReplicaList("dfs_only", TenantId::Default()).has_value());
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
 TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
     const auto dfs_root =
         (std::filesystem::temp_directory_path() /
@@ -741,6 +1159,70 @@ TEST_F(MasterServiceTest, DfsBucketUpsertRestoresEvictedReplica) {
                               return descriptor.is_dfs_replica();
                           }),
             1);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+// A bucket goes as a whole: one member under a live lease keeps every
+// member's replica in it.
+TEST_F(MasterServiceTest, DfsBucketEvictionKeepsBucketWithLeasedMember) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_bucket_leased_member_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "8192");
+    ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "2");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "1");
+    ScopedEnvVar high_watermark("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.7");
+    ScopedEnvVar low_watermark("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.5");
+    ScopedEnvVar eviction_interval("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL",
+                                   "60");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        // The first two keys fill the first bucket, the third starts another.
+        for (const std::string key :
+             {"leased_member", "bucket_0_peer", "bucket_1_peer"}) {
+            auto start = service.PutStart(context.client_id, key,
+                                          TenantId::Default(), 4096, config);
+            ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, key, TenantId::Default(),
+                                    ReplicaType::ALL)
+                            .has_value());
+        }
+        // A read leases the member.
+        ASSERT_TRUE(service.GetReplicaList("leased_member", TenantId::Default())
+                        .has_value());
+
+        MasterServiceTestPeer(service).RunDfsEvictionForTesting();
+
+        for (const std::string key : {"leased_member", "bucket_0_peer"}) {
+            auto replicas = service.GetReplicaList(key, TenantId::Default());
+            ASSERT_TRUE(replicas.has_value()) << key;
+            EXPECT_EQ(std::count_if(replicas->replicas.begin(),
+                                    replicas->replicas.end(),
+                                    [](const Replica::Descriptor& descriptor) {
+                                        return descriptor.is_dfs_replica();
+                                    }),
+                      1)
+                << key;
+        }
     }
 
     std::error_code ec;
@@ -1025,10 +1507,10 @@ TEST_F(MasterServiceTest, RemoveAllKeepsObjectWhenOpLogReservationFails) {
         << "the object survived, so the tenant was never emptied";
 }
 
-// RemoveAll holds one shard lock at a time, so a commit can land in a shard the
-// scan already passed. The scan's own bookkeeping cannot see it, and publishing
+// RemoveAll holds no lock across its walk, so a commit can land in a tenant the
+// walk already passed. The walk's own bookkeeping cannot see it, and publishing
 // `cleared` would order it after that commit's `stored` — telling subscribers
-// to drop an object that is live. Pause the scan right after the shard the new
+// to drop an object that is live. Pause the walk right after the tenant the new
 // key belongs to, commit there, and the clear must be withheld.
 TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
     MasterService service;
@@ -1046,13 +1528,12 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
                             TenantId::Default(), ReplicaType::ALL)
                     .has_value());
 
-    const size_t racer_shard = ShardIndexForKey(service, "racer_key");
     bool committed = false;
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
-        [&](size_t shard) {
-            // Commit exactly once, immediately after the scan releases the
-            // shard the new key hashes to, so the scan can never observe it.
-            if (shard != racer_shard || committed) {
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(
+        [&](const TenantId& tenant_id) {
+            // Commit exactly once, immediately after the walk finishes the
+            // tenant the new key belongs to, so the walk can never observe it.
+            if (!tenant_id.IsDefault() || committed) {
                 return;
             }
             committed = true;
@@ -1067,7 +1548,7 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
         });
 
     service.RemoveAll(true);
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
     auto exists = service.ExistKey("racer_key", TenantId::Default());
@@ -1126,11 +1607,10 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
                             TenantId::Default(), ReplicaType::ALL)
                     .has_value());
 
-    const size_t racer_shard = ShardIndexForKey(service, "scoped_racer");
     bool committed = false;
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
-        [&](size_t shard) {
-            if (shard != racer_shard || committed) {
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(
+        [&](const TenantId& tenant_id) {
+            if (!tenant_id.IsDefault() || committed) {
                 return;
             }
             committed = true;
@@ -1145,13 +1625,119 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
         });
 
     service.RemoveAll(TenantId::Default(), true);
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
     EXPECT_EQ(0u,
               MasterServiceTestPeer(service).GetKvClearedPublishedForTesting());
     EXPECT_EQ(
         1u, MasterServiceTestPeer(service).GetKvClearedSuppressedForTesting());
+}
+
+namespace {
+
+StandbyObjectEntry MakeStandbyEntry(const std::string& key, uint64_t obj_size,
+                                    uintptr_t addr,
+                                    const std::string& endpoint) {
+    StandbyObjectEntry entry;
+    entry.tenant_id = TenantId::Default().value();
+    entry.key = key;
+    entry.metadata.client_id = generate_uuid();
+    entry.metadata.size = obj_size;
+    AllocatedBuffer::Descriptor buf;
+    buf.size_ = obj_size;
+    buf.buffer_address_ = addr;
+    buf.transport_endpoint_ = endpoint;
+    Replica::Descriptor desc;
+    desc.id = addr;
+    desc.descriptor_variant = MemoryDescriptor{buf};
+    desc.status = ReplicaStatus::COMPLETE;
+    entry.metadata.replicas.push_back(desc);
+    return entry;
+}
+
+StandbySegmentInfo MakeStandbySegment(const std::string& name,
+                                      const std::string& endpoint,
+                                      uint64_t capacity) {
+    StandbySegmentInfo seg;
+    seg.segment_name = name;
+    seg.transport_endpoint = endpoint;
+    seg.capacity = capacity;
+    seg.is_memory_segment = true;
+    return seg;
+}
+
+}  // namespace
+
+TEST_F(MasterServiceTest, StandbyRemountFindsSameEndpointRangeByAddress) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    auto first = MakeSegment("shared-range");
+    auto second = first;
+    second.id = generate_uuid();
+    second.base += first.size;
+    first.locality = SegmentLocality{0, {"mlx5_0"}};
+    second.locality = SegmentLocality{1, {"mlx5_1"}};
+    auto a = MakeStandbyEntry("range-a", 1024, first.base, first.te_endpoint);
+    auto b = MakeStandbyEntry("range-b", 1024, second.base, second.te_endpoint);
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        {a, b}, 1,
+        {MakeStandbySegment(first.name, first.te_endpoint, first.size)}));
+    ASSERT_TRUE(service.ReMountSegment({first, second}, generate_uuid()));
+    for (const auto& [key, address] :
+         {std::pair{"range-a", first.base}, {"range-b", second.base}}) {
+        auto result = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result->replicas.front()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.buffer_address_,
+                  address);
+    }
+}
+
+TEST_F(MasterServiceTest, StandbyRestoreSkipsInvalidObjectAndRestoresTheRest) {
+    // #3760: one bad descriptor must not cost the whole index.
+    MasterService service(MakeStrictTenantConfig({"default"}));
+    // Mount the endpoint live: replicas restored onto an unmounted endpoint
+    // stay unreadable until the segment comes back, which is not what this
+    // test checks.
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service, "ep1");
+    const auto seg = MakeStandbySegment("seg", "ep1", 4096);
+    auto good = MakeStandbyEntry("good_key", 128, 0x1000, "ep1");
+    auto bad = MakeStandbyEntry("bad_key", 128, 0x2000, "ep1");
+    bad.metadata.size = 256;  // descriptor size no longer matches metadata
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {good, bad},
+        /*initial_oplog_sequence_id=*/0, {seg});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(
+        service.ExistKey("good_key", TenantId::Default()).value_or(false));
+    EXPECT_FALSE(
+        service.ExistKey("bad_key", TenantId::Default()).value_or(true));
+}
+
+TEST_F(MasterServiceTest, StandbyRestoreDiscardsAmbiguousOverlap) {
+    // #3760: eviction frees and reallocates a buffer; a standby that missed
+    // the removal replays both replicas at the same address. No replay order
+    // reaches the promotion context, so neither side can prove it is newer:
+    // both are discarded, and with nothing restored the restore fails closed.
+    MasterService service(MakeStrictTenantConfig({"default"}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service, "ep1");
+    const auto seg = MakeStandbySegment("seg", "ep1", 4096);
+    auto stale = MakeStandbyEntry("stale_key", 128, 0x1000, "ep1");
+    auto fresh = MakeStandbyEntry("fresh_key", 128, 0x1040, "ep1");
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {stale, fresh},
+        /*initial_oplog_sequence_id=*/0, {seg});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_FALSE(
+        service.ExistKey("stale_key", TenantId::Default()).value_or(true));
+    EXPECT_FALSE(
+        service.ExistKey("fresh_key", TenantId::Default()).value_or(false));
 }
 
 TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
@@ -1618,11 +2204,11 @@ TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
 }
 
 // A mass client expiry marks handles stale all over the metadata table, so
-// the sweep cleans a shard in bounded write-lock batches instead of holding
-// it exclusively for the whole walk. Dropping and retaking the lock mid-shard
-// must not cost coverage: every key of the departed segment is erased, and
-// every key of a live segment survives. The keys are forced onto one shard
-// because the batch bound is per shard.
+// the sweep cleans each object under its own write lock instead of holding a
+// shard exclusively for the whole walk. Dropping and retaking the lock
+// mid-shard must not cost coverage: every key of the departed segment is
+// erased, and every key of a live segment survives. The keys are forced onto
+// one shard so the sweep returns to it many times.
 TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsShardAcrossLockBatches) {
     auto service = std::make_unique<MasterService>();
     PauseReplicaCleanup(*service);
@@ -1696,6 +2282,60 @@ TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsShardAcrossLockBatches) {
         EXPECT_TRUE(get_result->replicas[0].is_memory_replica())
             << "key=" << key;
     }
+}
+
+// The sweep walks one tenant at a time, so a departed segment's replicas must
+// be cleared from every tenant, and one tenant's sweep must leave another's
+// object under the same user key alone.
+TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsEveryTenant) {
+    const TenantId tenant_a("sweep_tenant_a");
+    const TenantId tenant_b("sweep_tenant_b");
+    auto service = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()}));
+    PauseReplicaCleanup(*service);
+
+    const std::string stale_segment_name = "tenant_sweep_stale_segment";
+    const std::string live_segment_name = "tenant_sweep_live_segment";
+    const auto stale_segment =
+        PrepareSimpleSegment(*service, stale_segment_name, 0x300000000);
+    const auto live_segment =
+        PrepareSimpleSegment(*service, live_segment_name, 0x400000000);
+
+    ReplicateConfig stale_config;
+    stale_config.replica_num = 1;
+    stale_config.preferred_segments = {stale_segment_name};
+    ReplicateConfig live_config;
+    live_config.replica_num = 1;
+    live_config.preferred_segments = {live_segment_name};
+    for (const auto& tenant_id : {tenant_a, tenant_b}) {
+        PutCompletedObject(*service, stale_segment.client_id, "stale_key",
+                           tenant_id, stale_config);
+        PutCompletedObject(*service, live_segment.client_id, "live_key",
+                           tenant_id, live_config);
+    }
+    // tenant_b also holds the user key tenant_a loses, on the live segment.
+    PutCompletedObject(*service, live_segment.client_id, "mixed_key", tenant_b,
+                       live_config);
+    PutCompletedObject(*service, stale_segment.client_id, "mixed_key", tenant_a,
+                       stale_config);
+
+    ASSERT_TRUE(
+        service
+            ->UnmountSegment(stale_segment.segment_id, stale_segment.client_id)
+            .has_value());
+    ClearInvalidHandlesForTest(*service);
+
+    EXPECT_EQ(3u, service->GetKeyCount());
+    for (const auto& tenant_id : {tenant_a, tenant_b}) {
+        auto stale = service->GetReplicaList("stale_key", tenant_id);
+        ASSERT_FALSE(stale.has_value()) << "tenant=" << tenant_id;
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, stale.error())
+            << "tenant=" << tenant_id;
+        EXPECT_TRUE(service->GetReplicaList("live_key", tenant_id).has_value())
+            << "tenant=" << tenant_id;
+    }
+    EXPECT_FALSE(service->GetReplicaList("mixed_key", tenant_a).has_value());
+    EXPECT_TRUE(service->GetReplicaList("mixed_key", tenant_b).has_value());
 }
 
 TEST_F(MasterServiceTest, UnmountSegmentKeepsSynchronousCleanupInHaMode) {
@@ -2355,8 +2995,7 @@ TEST_F(MasterServiceTest, SoftPinDeadlineHeapCompactsRepeatedUpdates) {
     constexpr size_t kUpdates = 5000;
     for (size_t i = 0; i < kUpdates; ++i) {
         UpsertSoftPinDeadlineIndexForTest(
-            service, "compaction_key", 0,
-            base + std::chrono::milliseconds(i + 1));
+            service, "compaction_key", base + std::chrono::milliseconds(i + 1));
     }
 
     EXPECT_EQ(SoftPinRegistrationCount(service), 1u);
@@ -2596,7 +3235,7 @@ TEST_F(MasterServiceTest, BatchProbeKeyReportsPointInTimeExistence) {
 
     const std::string missing_key = "probe_batch_missing_key";
     auto results = service_->BatchProbeKey(
-        {existing_key, missing_key, existing_key}, TenantId::Default());
+        {}, {existing_key, missing_key, existing_key}, TenantId::Default());
     ASSERT_EQ(3u, results.size());
     ASSERT_TRUE(results[0].has_value());
     EXPECT_TRUE(*results[0]);
@@ -3071,6 +3710,65 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
     }
     EXPECT_TRUE(segment_names.contains("segment_1"));
     EXPECT_FALSE(segment_names.contains("segment_0"));
+}
+
+// Drain plans and completes one tenant at a time: the segment counts as
+// drained only once every tenant's object under the same user key has left
+// it.
+TEST_F(MasterServiceTest, DrainJobMovesObjectsOfEveryTenant) {
+    const TenantId tenant_a("drain_tenant_a");
+    const TenantId tenant_b("drain_tenant_b");
+    auto service_config =
+        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()});
+    service_config.default_kv_lease_ttl = 0;
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"segment_0"};
+    const std::string key = "drain_shared_key";
+    for (const auto& tenant_id : {tenant_a, tenant_b}) {
+        PutCompletedObject(*service_, generate_uuid(), key, tenant_id, config);
+    }
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 2;
+
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    WaitUntil(
+        [&] {
+            (void)ExecutePendingMoveTasks(*service_, ctx0.client_id);
+            auto query = service_->QueryDrainJob(job_id.value());
+            return query.has_value() && query->status == JobStatus::SUCCEEDED;
+        },
+        std::chrono::seconds(10));
+
+    auto query = service_->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->succeeded_units, 2u);
+
+    auto segment_status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(segment_status.has_value());
+    EXPECT_EQ(segment_status.value(), SegmentStatus::DRAINED);
+
+    for (const auto& tenant_id : {tenant_a, tenant_b}) {
+        auto replicas = service_->GetReplicaList(key, tenant_id);
+        ASSERT_TRUE(replicas.has_value()) << "tenant=" << tenant_id;
+        ASSERT_EQ(1u, replicas->replicas.size()) << "tenant=" << tenant_id;
+        EXPECT_EQ("segment_1", replicas->replicas[0]
+                                   .get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_)
+            << "tenant=" << tenant_id;
+    }
 }
 
 TEST_F(MasterServiceTest, CancelDrainJobRestoresSegmentStatus) {

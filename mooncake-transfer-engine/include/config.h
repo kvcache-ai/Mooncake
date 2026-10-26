@@ -57,6 +57,10 @@ struct GlobalConfig {
     // one it honors the operator's value, clamped to the hardware.  The RDMA
     // transport passes max_wr to ibv_create_qp() and is unaffected.
     bool max_wr_from_env = false;
+    // 1 = signal every RDMA WR (historical). >1 enables unsignaled WRs with
+    // a signaled completion every N WRs plus the end of each ibv_post_send
+    // chain. Override via MC_RDMA_SIGNAL_INTERVAL.
+    int rdma_signal_interval = 1;
     size_t max_inline = 64;
     ibv_mtu mtu_length = IBV_MTU_4096;
     uint16_t handshake_port = 12001;
@@ -97,6 +101,23 @@ struct GlobalConfig {
     // not-yet-posted slices fail/redispatch instead of hanging. 0 disables.
     // Override via MC_CONN_PAUSE_TTL_MS.
     int conn_pause_ttl_ms = 0;
+    // Tell the EFA provider that every peer runs our platform, build, and
+    // capabilities, which lets it skip the per-peer RDM handshake. That
+    // handshake is what limits the first transfers to a new peer to 16 queued
+    // ops before returning FI_EAGAIN, endpoint-wide rather than per-peer.
+    // Defaults OFF: without the handshake, a passively connected endpoint can
+    // write before the peer has inserted our address, which fails the write
+    // with prov_errno=14 under bilateral first contact. Opt in with
+    // MC_EFA_HOMOGENEOUS_PEERS=1 only for one-directional traffic between
+    // identical hosts. See buildSharedEndpoint() for the full rationale.
+    bool efa_homogeneous_peers = false;
+    // Wall-clock safety net for the WR/CQ credit wait in
+    // EfaContext::submitSlicesOnPeer, in milliseconds.  A credit wait is
+    // ordinary backpressure and resolves on its own; only a wait this long
+    // means completions have genuinely stopped coming back.  Override with
+    // MC_EFA_CQ_DRAIN_TIMEOUT_MS; <= 0 waits forever (the stalled-wave escape
+    // hatch still bounds a provider that refuses every post).
+    int64_t efa_cq_drain_timeout_ms = 1000;
     // Context-level circuit-breaker pause. Repeated local WC failures
     // deactivate the local RNIC context for this many milliseconds. The
     // monitor then reactivates it with a reset failure count. Must be positive
@@ -131,6 +152,13 @@ struct GlobalConfig {
     bool with_nvidia_peermem = true;
     // Register dma_buf MRs with mlx5 Data Direct. Set via MC_RDMA_DATA_DIRECT.
     bool rdma_data_direct = false;
+    // Pair Data Direct registrations and topology with the GPU's PCI root.
+    // Fail-closed: topology discovery is rejected when any NIC has no Data
+    // Direct function or any GPU has no paired NIC, instead of falling back
+    // to PCIe distance (which could select a NIC that cannot register the
+    // memory). Set via MC_RDMA_DATA_DIRECT_PAIRING; requires
+    // MC_RDMA_DATA_DIRECT.
+    bool rdma_data_direct_pairing = false;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;

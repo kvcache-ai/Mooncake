@@ -54,7 +54,7 @@ The following environment variables can be configured to control Ascend Direct T
 | `ASCEND_GLOBAL_RESOURCE_CONFIG` | Global resource configuration | - | `ASCEND_GLOBAL_RESOURCE_CONFIG="{\"fabric_memory.max_capacity\":32}"` |
 | `ASCEND_CONNECT_TIMEOUT` | Link establishment timeout in milliseconds | 10000 | `ASCEND_CONNECT_TIMEOUT=5000` |
 | `ASCEND_TRANSFER_TIMEOUT` | Data transfer timeout in milliseconds | 10000 | `ASCEND_TRANSFER_TIMEOUT=10000` |
-| `ASCEND_THREAD_POOL_SIZE` | Number of worker threads in the transfer thread pool | 8 (1 for buffer pool mode) | `ASCEND_THREAD_POOL_SIZE=16` |
+| `ASCEND_THREAD_POOL_SIZE` | Number of worker threads in the transfer thread pool | 16 (1 for buffer pool mode) | `ASCEND_THREAD_POOL_SIZE=32` |
 | `ASCEND_USE_SHORT_CONNECTION` | Enable short connection mode (disconnect after each transfer) | 0 (disabled) | `ASCEND_USE_SHORT_CONNECTION=1` |
 | `ASCEND_BUFFER_POOL` | Buffer pool configuration for intermediate transfer mode (BUFFER_NUM:BUFFER_SIZE_MB) | "0:0" (disabled) | `ASCEND_BUFFER_POOL=4:8` |
 | `ASCEND_BASE_PORT` | Base port for ADXL engine port allocation | 20000 | `ASCEND_BASE_PORT=20000` |
@@ -82,7 +82,7 @@ The following environment variables can be configured to control Ascend Direct T
 5. **Timeout Configuration**:
    - Use the `ASCEND_CONNECT_TIMEOUT` environment variable to control link establishment timeout (default: 10 seconds)
    - Use the `ASCEND_TRANSFER_TIMEOUT` environment variable to control data transfer timeout (default: 10 seconds)
-   - When the caller drives transfers through the Python API, ensure the outer `MC_TRANSFER_TIMEOUT` (seconds, default 30) is **strictly greater** than `ASCEND_TRANSFER_TIMEOUT` (milliseconds). If the outer timeout fires first, the transfer can still be in flight inside the Ascend transport, and the caller cannot tell whether it has quiesced — so do not reuse or unregister the target buffer until the transfer is known to have drained.
+   - When the caller drives transfers through the Python API, keep the outer `MC_TRANSFER_TIMEOUT` (seconds, default 30) **strictly greater than twice** `ASCEND_TRANSFER_TIMEOUT` (milliseconds, default 10000). A transfer that hits the inner timeout is retried, so the inner budget can be spent twice; the outer deadline has to cover both attempts. If the outer timeout fires first, the transfer can still be in flight inside the Ascend transport, and the caller cannot tell whether it has quiesced — so do not reuse or unregister the target buffer until the transfer is known to have drained. Ascend Direct checks this when it initializes a transfer executor and logs a warning naming both values if the outer deadline is too small.
 
 6. **RDMA Timeout and Retry Configuration**:
    - Use `HCCL_RDMA_TIMEOUT` to configure the RDMA NIC packet retransmission timeout coefficient. The actual packet retransmission timeout is `4.096us * 2 ^ $HCCL_RDMA_TIMEOUT`

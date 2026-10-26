@@ -72,6 +72,105 @@ class StoreModuleCompatibilityTest(unittest.TestCase):
             sys.modules.pop(module_name, None)
 
 
+class ReplicaConfigTest(unittest.TestCase):
+    def test_rejects_all_replica_counts_zero(self):
+        args = bench.build_parser().parse_args(
+            [
+                "--scenario=read_perf",
+                "--memory-replica-num=0",
+                "--nof-replica-num=0",
+                "--dfs-replica-num=0",
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "at least one.*replica"):
+            bench.BenchmarkRunner(args)
+
+    def test_dfs_only_preparation_and_reads(self):
+        payload = b"x" * 512
+
+        def read_into(keys, ptrs, sizes):
+            for ptr in ptrs:
+                ctypes.memmove(ptr, payload, len(payload))
+            return [len(payload)] * len(keys)
+
+        for scenario in ("read_perf", "verify_write", "mixed_rw"):
+            for io_api in ("plain", "zcopy"):
+                for batch_size in (1, 2):
+                    with self.subTest(
+                        scenario=scenario, io_api=io_api, batch_size=batch_size
+                    ):
+                        args = bench.build_parser().parse_args(
+                            [
+                                f"--scenario={scenario}",
+                                f"--io-api={io_api}",
+                                f"--batch-size={batch_size}",
+                                "--nr-objects=3",
+                                "--value-size=512",
+                                "--memory-replica-num=0",
+                                "--nof-replica-num=0",
+                                "--dfs-replica-num=1",
+                                "--enable-ssd-offload",
+                                "--verify",
+                                "--pattern=x",
+                            ]
+                            + (["--runtime=1"] if scenario == "mixed_rw" else [])
+                        )
+                        store = Mock()
+                        store.setup.return_value = 0
+                        store.put.return_value = 0
+                        store.put_batch.return_value = 0
+                        store.put_from.return_value = 0
+                        store.batch_put_from.side_effect = (
+                            lambda keys, ptrs, sizes, config: [0] * len(keys)
+                        )
+                        store.get.return_value = payload
+                        store.get_batch.side_effect = lambda keys: [payload] * len(keys)
+                        store.get_into.side_effect = lambda key, ptr, size: read_into(
+                            [key], [ptr], [size]
+                        )[0]
+                        store.batch_get_into.side_effect = read_into
+                        runner = bench.BenchmarkRunner(args)
+                        with patch.object(
+                            bench, "MooncakeDistributedStore", return_value=store
+                        ):
+                            try:
+                                phases = runner.run()
+                            finally:
+                                runner.close()
+
+                        self.assertEqual(phases[0].successful_kvs, 3)
+                        self.assertGreater(phases[1].successful_kvs, 0)
+                        if scenario != "mixed_rw":
+                            self.assertEqual(phases[1].successful_kvs, 3)
+                        write_api, read_api = {
+                            ("plain", 1): ("put", "get"),
+                            ("plain", 2): ("put_batch", "get_batch"),
+                            ("zcopy", 1): ("put_from", "get_into"),
+                            ("zcopy", 2): ("batch_put_from", "batch_get_into"),
+                        }[io_api, batch_size]
+                        getattr(store, read_api).assert_called()
+                        for phase in phases:
+                            self.assertEqual(phase.failed_kvs, 0)
+                            self.assertEqual(phase.verify_failures, 0)
+                        writes = getattr(store, write_api).call_args_list
+                        self.assertTrue(writes)
+                        for call in writes:
+                            config = call.args[-1]
+                            self.assertEqual(
+                                (
+                                    config.replica_num,
+                                    config.nof_replica_num,
+                                    config.dfs_replica_num,
+                                ),
+                                (0, 0, 1),
+                            )
+                        store.setup.assert_called_once()
+                        self.assertTrue(
+                            store.setup.call_args.kwargs["enable_ssd_offload"]
+                        )
+                        store.close.assert_called_once()
+
+
 class MetadataWorkloadModelTest(unittest.TestCase):
     def test_percentages_and_lane_choices_are_deterministic(self):
         weights = {"put": 40, "get": 30, "exist": 20, "remove": 10}
@@ -148,6 +247,7 @@ class StoreSessionMetadataTest(unittest.TestCase):
         args = SimpleNamespace(
             memory_replica_num=1,
             nof_replica_num=0,
+            dfs_replica_num=0,
             key_prefix="metadata",
             key_size=24,
             value_size=512,

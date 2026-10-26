@@ -89,6 +89,12 @@ struct PromotionCandidate {
     // consumption; reset only when a genuinely new chain starts (fresh
     // insert with 0, e.g. after a give-up or a success).
     uint32_t execution_failures{0};
+    // True when the task was registered by a prefetch caller
+    // (RegisterPrefetchTask) rather than promotion-on-hit admission. Same
+    // execution chain, but failure handling differs: a prefetch failure is
+    // retried by the client-side throttle, not re-recorded as an on-hit
+    // candidate.
+    bool from_prefetch{false};
 };
 
 // NotifyPromotionSuccess should commit, so a concurrent Put on the
@@ -99,8 +105,8 @@ struct PromotionCandidate {
 // and reset at PromotionAllocStart so each phase (queue-wait and
 // active-transfer) gets its own full put_start_release_timeout_sec_
 // window. Without the reset a backlogged task could enter active
-// transfer with little TTL left, and the reaper could free the
-// staged replica via EraseReplicaByID mid-RDMA-write.
+// transfer with little TTL left, and the reaper could erase the
+// staged replica by its allocation id mid-RDMA-write.
 //
 // holder_id is the client owning the source LOCAL_DISK segment and
 // the only one authorized to commit (NotifyPromotionSuccess) or
@@ -122,6 +128,9 @@ struct PromotionTask {
     // copies candidate -> task verbatim, failure re-record writes
     // task+1 -> candidate.
     uint32_t execution_failures{0};
+    // SSD prefetch admission. NotifyPromotionSuccess grants a read lease
+    // so the promoted replica survives until the follow-up get.
+    bool from_prefetch{false};
 };
 
 }  // namespace mooncake
