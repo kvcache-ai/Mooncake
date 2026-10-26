@@ -502,6 +502,21 @@ bool Workers::dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice) {
     return true;
 }
 
+bool Workers::expireUnpostedSlice(WorkerContext& worker, RdmaSlice* slice,
+                                  uint64_t now_ns, bool admitted) {
+    if (!slice || !slice->task || now_ns <= slice->enqueue_ts ||
+        now_ns - slice->enqueue_ts <= slice_timeout_ns_)
+        return false;
+    const bool canceled =
+        slice->task->cancel_requested.load(std::memory_order_acquire);
+    if (admitted && slice->rail_monitor)
+        slice->rail_monitor->cancelProbe(slice->source_dev_id,
+                                         slice->target_dev_id);
+    retireSweptSlice(worker, slice, now_ns, nullptr);
+    updateSliceStatus(slice, canceled ? CANCELED : TIMEOUT);
+    return true;
+}
+
 void Workers::releaseSliceQuota(RdmaSlice* slice, uint64_t now_ns,
                                 double latency) {
     if (!slice || !device_selector_) return;
@@ -707,12 +722,16 @@ void Workers::asyncPostSend() {
         if (!result.empty()) break;
     }
 
+    const auto dequeue_ts = result.empty() ? 0 : getCurrentTimeInNano();
     for (auto& slice_list : result) {
         if (slice_list.num_slices == 0) continue;
         auto slice = slice_list.first;
         for (int id = 0; id < slice_list.num_slices; ++id) {
-            if (dropUnpostableSlice(worker, slice)) {
-                slice = slice->next;
+            // A terminal status lets the caller free the slice chain.
+            auto* next = slice->next;
+            if (expireUnpostedSlice(worker, slice, dequeue_ts) ||
+                dropUnpostableSlice(worker, slice)) {
+                slice = next;
                 continue;
             }
             auto status = generatePostPath(slice);
@@ -742,7 +761,7 @@ void Workers::asyncPostSend() {
                 if (auto* rail = slice->rail_monitor)
                     rail->cancelProbe(slice->source_dev_id,
                                       slice->target_dev_id);
-                slice = slice->next;
+                slice = next;
                 continue;
             } else {
                 PostPath path{
@@ -751,7 +770,7 @@ void Workers::asyncPostSend() {
                     .remote_device_id = slice->target_dev_id};
                 worker.requests[path].push_back(slice);
             }
-            slice = slice->next;
+            slice = next;
         }
     }
 
@@ -759,6 +778,15 @@ void Workers::asyncPostSend() {
         auto& path = entry.first;
         auto& slices = entry.second;
         if (slices.empty()) continue;
+        auto expire_unposted = [&](uint64_t now_ns) {
+            slices.erase(std::remove_if(slices.begin(), slices.end(),
+                                        [&](RdmaSlice* slice) {
+                                            return expireUnpostedSlice(
+                                                worker, slice, now_ns, true);
+                                        }),
+                         slices.end());
+        };
+        expire_unposted(getCurrentTimeInNano());
         slices.erase(std::remove_if(slices.begin(), slices.end(),
                                     [&](RdmaSlice* slice) {
                                         if (!dropUnpostableSlice(worker, slice))
@@ -776,6 +804,10 @@ void Workers::asyncPostSend() {
                      slices.end());
         if (slices.empty()) continue;
         auto endpoint = getEndpoint(path);
+        // Bootstrap may outlast the transfer, whether it succeeds or fails.
+        // Check again before posting or consuming another retry.
+        expire_unposted(getCurrentTimeInNano());
+        if (slices.empty()) continue;
         if (!endpoint) {
             std::vector<RdmaSlice*> clone;
             slices.swap(clone);

@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "tent/common/config.h"
+#include "tent/common/utils/string_builder.h"
 #include "tent/common/types.h"
 #include "tent/transfer_engine.h"
 #include "tent/runtime/platform.h"
@@ -68,6 +69,20 @@ constexpr int kGdrFailureThreshold = 2;
 // Friend accessor for driving initializeContexts() without a full install().
 class RdmaTransportTestPeer {
    public:
+    static std::shared_ptr<RdmaEndPoint> getEndpoint(Workers& workers,
+                                                     int local_device,
+                                                     SegmentID target,
+                                                     int remote_device) {
+        return workers.getEndpoint({local_device, target, remote_device});
+    }
+
+    static void postPending(Workers& workers) {
+        const int previous = tl_wid;
+        tl_wid = 0;
+        workers.asyncPostSend();
+        tl_wid = previous;
+    }
+
     static Status generatePostPath(Workers& workers, RdmaSlice* slice) {
         const int previous = tl_wid;
         tl_wid = 0;
@@ -3571,6 +3586,153 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
 RdmaWorkersSharedQpTest::FakeState RdmaWorkersSharedQpTest::fake;
 std::mutex RdmaWorkersSharedQpTest::post_mutex;
 std::vector<RdmaSlice*> RdmaWorkersSharedQpTest::post_order;
+
+class RdmaWorkersDeadlineTest : public RdmaWorkersSharedQpTest {
+   protected:
+    void SetUp() override {
+        RdmaWorkersSharedQpTest::SetUp();
+        metadata_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        RdmaTransportTestPeer::bindMetadata(transport_, metadata_);
+        peer_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        uint16_t port = 0;
+        ASSERT_TRUE(peer_->start(port).ok());
+        peer_name_ = "127.0.0.1:" + std::to_string(port);
+        ASSERT_TRUE(
+            peer_->segmentManager()
+                .updateLocal([&](SegmentDesc& segment) {
+                    segment.type = SegmentType::Memory;
+                    segment.name = peer_name_;
+                    segment.rpc_server_addr = peer_name_;
+                    return std::get<MemorySegmentDesc>(segment.detail)
+                        .topology.parse(
+                            R"({"nics":[{"name":"rnic0","type":0,"numa_node":0}]})");
+                })
+                .ok());
+        ASSERT_TRUE(
+            metadata_->segmentManager().openRemote(target_, peer_name_).ok());
+        key_ = MakeNicPath(peer_name_, "rnic0");
+        old_ = context_->endpointStore()->getOrInsert(key_);
+        ASSERT_NE(old_, nullptr);
+    }
+
+    void TearDown() override {
+        if (peer_) peer_->setBootstrapRdmaCallback(nullptr);
+        // Drain the store while its fake CQ/PD are still bound, including
+        // retired endpoints retained by this fixture.
+        if (context_) {
+            EXPECT_EQ(context_->endpointStore()->clear(), 0);
+        }
+        old_.reset();
+        peer_.reset();
+        RdmaWorkersSharedQpTest::TearDown();
+    }
+
+    void serveBootstrap(std::function<void()> during_bootstrap = {}) {
+        peer_->setBootstrapRdmaCallback(
+            [&, during_bootstrap](const BootstrapDesc&, BootstrapDesc& reply) {
+                ++calls_;
+                if (during_bootstrap) during_bootstrap();
+                reply.local_nic_path = key_;
+                reply.local_gid = context_->address().gid;
+                reply.qp_num = {42};
+                return 0;
+            });
+    }
+
+    std::shared_ptr<RdmaEndPoint> connect() {
+        return RdmaTransportTestPeer::getEndpoint(*workers_, kDev, target_, 0);
+    }
+
+    RdmaSlice* admitForBootstrap() {
+        RdmaTransportTestPeer::setSliceTimeout(*workers_, 10'000'000'000ULL);
+        auto* slice = makeSlice();
+        slice->source_dev_id = kDev;
+        slice->target_dev_id = 0;
+        slice->task->request.target_id = target_;
+        slice->enqueue_ts = getCurrentTimeInNano();
+        slice->owner_worker = 0;
+        slice->counted_lane = 0;
+        RdmaTransportTestPeer::rechargeSlice(*workers_, slice, kDev);
+        auto& worker = RdmaTransportTestPeer::workerContext(*workers_, 0);
+        worker.inflight_slices.fetch_add(1);
+        worker.requests[{kDev, target_, 0}].push_back(slice);
+        return slice;
+    }
+
+    void armProbe(RailMonitor& rail, RdmaSlice* slice) {
+        auto topo = topologyWithRdmaNics(2);
+        Config conf;
+        conf.set(RailMonitor::kCfgErrorThreshold, 1);
+        conf.set(RailMonitor::kCfgProbeIntervalSecs, 0);
+        ASSERT_TRUE(rail.load(topo, topo, "", &conf).ok());
+        ASSERT_TRUE(rail.admit(kDev, 0));
+        rail.markFailed(kDev, 0);
+        ASSERT_TRUE(rail.admit(kDev, 0));
+        slice->rail_monitor = &rail;
+    }
+
+    void expectUnposted(RdmaSlice* slice, TransferStatusEnum expected) {
+        EXPECT_EQ(slice->word, expected);
+        EXPECT_TRUE(post_order.empty());
+        EXPECT_EQ(slice->charged_dev.load(), -1);
+        EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+        EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
+        EXPECT_EQ(RdmaTransportTestPeer::workerContext(*workers_, 0)
+                      .inflight_slices.load(),
+                  0);
+        // Keep the negative-control run safe when the old worker did post.
+        if (slice->completions_owed.load() > 0) {
+            slice->task->cancel_requested.store(true);
+            completeWith(slice, IBV_WC_WR_FLUSH_ERR);
+        }
+    }
+
+    std::shared_ptr<ControlService> metadata_, peer_;
+    std::shared_ptr<RdmaEndPoint> old_;
+    std::string peer_name_, key_;
+    SegmentID target_ = 0;
+    std::atomic<int> calls_{0};
+};
+
+TEST_F(RdmaWorkersDeadlineTest, TimeoutDuringBootstrapDoesNotPost) {
+    auto* slice = admitForBootstrap();
+    RailMonitor rail;
+    armProbe(rail, slice);
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 1'000'000'000ULL);
+    serveBootstrap([] {
+        // Let the original deadline expire inside the RPC, without mutating
+        // worker-owned slice state from its server thread.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    });
+    RdmaTransportTestPeer::postPending(*workers_);
+    EXPECT_EQ(calls_.load(), 1);
+    expectUnposted(slice, TIMEOUT);
+    EXPECT_TRUE(rail.admit(kDev, 0));
+    rail.cancelProbe(kDev, 0);
+}
+
+TEST_F(RdmaWorkersDeadlineTest, ExpiredAdmittedRequestDoesNotBootstrap) {
+    auto* slice = admitForBootstrap();
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 0);
+    serveBootstrap();
+    RdmaTransportTestPeer::postPending(*workers_);
+    EXPECT_EQ(calls_.load(), 0);
+    expectUnposted(slice, TIMEOUT);
+}
+
+TEST_F(RdmaWorkersDeadlineTest, QpCapacityWaitKeepsOriginalDeadline) {
+    serveBootstrap();
+    ASSERT_NE(connect(), nullptr);
+    auto* slice = admitForBootstrap();
+    params_->endpoint.max_qp_wr = 0;
+    RdmaTransportTestPeer::postPending(*workers_);
+    ASSERT_EQ(slice->word, PENDING);
+    ASSERT_TRUE(post_order.empty());
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 0);
+    RdmaTransportTestPeer::postPending(*workers_);
+    EXPECT_EQ(calls_.load(), 1);
+    expectUnposted(slice, TIMEOUT);
+}
 
 TEST_F(RdmaWorkersSharedQpTest, EndpointPinsConstructionAddressGeneration) {
     const auto endpoint_address =
