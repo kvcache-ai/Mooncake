@@ -132,6 +132,7 @@ class TEBenchRunner : public BenchRunner {
     std::vector<void*> pinned_buffer_list_;
     std::vector<char> shm_backed_;
     std::vector<char> hugepage_backed_;
+    std::vector<char> mmap_backed_;
     std::vector<SegmentID> target_handles_;
     std::vector<std::shared_ptr<TransferMetadata::SegmentDesc>> target_infos_;
 

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdio>
 #include <fstream>
 
 #include "te_backend.h"
@@ -21,7 +22,10 @@
 #include "char_util.h"
 
 #include <linux/mman.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 
 #if defined(USE_CUDA)
 #include <bits/stdint-uintn.h>
@@ -106,6 +110,155 @@ void signalHandlerV0(int signum) {
     g_te_triggered_sig = true;
 }
 
+#ifdef __linux__
+static bool saveCpuAffinity(cpu_set_t* set) {
+    CPU_ZERO(set);
+    return pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), set) == 0;
+}
+
+static void restoreCpuAffinity(const cpu_set_t* set, bool saved) {
+    if (!saved) return;
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), set) != 0) {
+        PLOG(WARNING)
+            << "tebench: failed to restore CPU affinity after DRAM allocation";
+    }
+}
+
+static int currentCpuId() {
+#ifdef SYS_getcpu
+    unsigned cpu = 0;
+    if (::syscall(SYS_getcpu, &cpu, nullptr, nullptr) == 0)
+        return static_cast<int>(cpu);
+#endif
+    return -1;
+}
+
+static void firstTouchPages(void* addr, size_t size) {
+    if (!addr || size == 0) return;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    auto* p = static_cast<char*>(addr);
+    if (page_size > 0) {
+        for (size_t off = 0; off < size; off += static_cast<size_t>(page_size))
+            p[off] = 0;
+    }
+    p[size - 1] = 0;
+}
+
+// numa_maps has no end address; pick the greatest VMA start <= addr.
+static std::string numaMapsLine(void* addr) {
+    std::ifstream in("/proc/self/numa_maps");
+    if (!in) return "numa_maps unavailable";
+    const uintptr_t target = reinterpret_cast<uintptr_t>(addr);
+    std::string line, best;
+    unsigned long best_start = 0;
+    bool found = false;
+    while (std::getline(in, line)) {
+        unsigned long start = 0;
+        if (std::sscanf(line.c_str(), "%lx", &start) != 1) continue;
+        if (start <= target && (!found || start >= best_start)) {
+            best_start = start;
+            best = line;
+            found = true;
+        }
+    }
+    return found ? best : "not found in numa_maps";
+}
+
+// bindToSocket() sets a whole-socket mask. If the current CPU is already in
+// that mask, the kernel will not migrate, and first-touch then lands on the
+// wrong node. Pin to one CPU of `node` and wait until getcpu agrees, so
+// first-touch works when mbind is denied (Docker without CAP_SYS_NICE).
+static bool pinToOneCpuOnNode(int node) {
+    if (node < 0 || numa_available() < 0) return false;
+    struct bitmask* cpu_list = numa_allocate_cpumask();
+    if (!cpu_list) return false;
+    {
+        std::lock_guard<std::mutex> guard(numaNodeCpuCacheMutex());
+        numa_node_to_cpus(node, cpu_list);
+    }
+    int pick = -1;
+    const int nr = numa_num_possible_cpus();
+    for (int cpu = 0; cpu < nr; ++cpu) {
+        if (numa_bitmask_isbitset(cpu_list, cpu) && numa_all_cpus_ptr &&
+            numa_bitmask_isbitset(numa_all_cpus_ptr, cpu)) {
+            pick = cpu;
+            break;
+        }
+    }
+    numa_free_cpumask(cpu_list);
+    if (pick < 0) return false;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(pick, &set);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
+        PLOG(WARNING) << "tebench: pinToOneCpuOnNode(" << node
+                      << ") setaffinity cpu=" << pick << " failed";
+        return false;
+    }
+    for (int i = 0; i < 10000; ++i) {
+        const int cpu = currentCpuId();
+        if (cpu >= 0 && numa_node_of_cpu(cpu) == node) return true;
+        sched_yield();
+    }
+    const int cpu = currentCpuId();
+    LOG(WARNING) << "tebench: wanted node " << node << " cpu " << pick
+                 << " but sched_getcpu()=" << cpu
+                 << " node=" << (cpu >= 0 ? numa_node_of_cpu(cpu) : -1);
+    return cpu >= 0 && numa_node_of_cpu(cpu) == node;
+}
+
+static bool bindAllocatingThread(int node) {
+    if (pinToOneCpuOnNode(node)) return true;
+    LOG(WARNING) << "tebench: pinToOneCpuOnNode(" << node
+                 << ") failed; first-touch may land on the wrong NUMA node";
+    return bindToSocket(node) == 0;
+}
+
+// Place DRAM with CPU affinity + first-touch so pages land on `node` even
+// when mbind/get_mempolicy are denied.
+static void* allocateDramOnNode(size_t size, int node) {
+    cpu_set_t old_set;
+    const bool saved = saveCpuAffinity(&old_set);
+    bindAllocatingThread(node);
+    // Do not MAP_POPULATE: it can commit pages before this thread has
+    // actually migrated onto `node`.
+    void* buf = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf == MAP_FAILED) {
+        PLOG(ERROR) << "mmap DRAM buffer failed, size=" << size
+                    << " node=" << node;
+        restoreCpuAffinity(&old_set, saved);
+        return nullptr;
+    }
+    if (numa_available() >= 0 && node >= 0) {
+        numa_tonode_memory(buf, size, node);
+    }
+    firstTouchPages(buf, size);
+    restoreCpuAffinity(&old_set, saved);
+    const std::string maps = numaMapsLine(buf);
+    const std::string local_tok = "N" + std::to_string(node) + "=";
+    if (maps.find(local_tok) == std::string::npos) {
+        LOG(WARNING) << "tebench: first-touch cpu:" << node
+                     << " did not land on that node (need local free memory): "
+                     << maps;
+    }
+    LOG(INFO) << "tebench: DRAM first-touch cpu:" << node << " addr=" << buf
+              << " size=" << size << " " << maps;
+    return buf;
+}
+#else
+static void firstTouchPages(void* addr, size_t size) {
+    if (!addr || size == 0) return;
+    auto* p = static_cast<char*>(addr);
+    p[0] = 0;
+    p[size - 1] = 0;
+}
+
+static void* allocateDramOnNode(size_t size, int node) {
+    return numa_alloc_onnode(size, node);
+}
+#endif
+
 static void* allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
@@ -136,7 +289,7 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
         return d_buf;
     }
 #endif
-    return numa_alloc_onnode(size, buffer_id);
+    return allocateDramOnNode(size, buffer_id);
 }
 
 static int parseIndex(const std::string& loc) {
@@ -147,28 +300,33 @@ static int parseIndex(const std::string& loc) {
     return std::stoi(loc.substr(pos + 1));
 }
 
-// POSIX shm mmap does not place pages. Bind the mapping before first touch
-// so DRAM buffers land on the same node as numa_alloc_onnode(size, node).
+// POSIX shm mmap does not place pages. Pin the allocating thread then
+// first-touch so pages land on `node` even when mbind is denied.
 static void bindShmBufferToNode(void* addr, size_t size, int node) {
     if (!addr || size == 0) return;
+#ifdef __linux__
     if (numa_available() < 0) {
         LOG(WARNING)
             << "tebench: NUMA unavailable; shm buffer not bound to cpu:"
             << node;
+        firstTouchPages(addr, size);
         return;
     }
     if (node < 0 || node >= numa_num_configured_nodes()) {
         LOG(WARNING) << "tebench: invalid NUMA node " << node;
+        firstTouchPages(addr, size);
         return;
     }
+    cpu_set_t old_set;
+    const bool saved = saveCpuAffinity(&old_set);
+    bindAllocatingThread(node);
     numa_tonode_memory(addr, size, node);
-    const long page_size = sysconf(_SC_PAGESIZE);
-    auto* p = static_cast<char*>(addr);
-    if (page_size > 0) {
-        for (size_t off = 0; off < size; off += static_cast<size_t>(page_size))
-            p[off] = 0;
-    }
-    p[size - 1] = 0;
+    firstTouchPages(addr, size);
+    restoreCpuAffinity(&old_set, saved);
+#else
+    (void)node;
+    firstTouchPages(addr, size);
+#endif
 }
 
 static std::string cpuLocationFromPages(void* addr, int expected_node) {
@@ -221,20 +379,35 @@ static void* allocateHugepageOnNode(size_t size, int node) {
                    << " is not a multiple of hugepage size " << hp;
         return nullptr;
     }
+#ifdef __linux__
+    cpu_set_t old_set;
+    const bool saved = saveCpuAffinity(&old_set);
+    if (node >= 0) bindAllocatingThread(node);
+#endif
     void* buf = mmap(nullptr, size, PROT_READ | PROT_WRITE,
                      hugepageMmapFlags(hp), -1, 0);
     if (buf == MAP_FAILED) {
         PLOG(ERROR) << "MAP_HUGETLB mmap failed for " << size
                     << " bytes (hp=" << hp
                     << "); refusing 4K fallback to avoid blowing NIC PTEs";
+#ifdef __linux__
+        restoreCpuAffinity(&old_set, saved);
+#endif
         return nullptr;
     }
+#ifdef __linux__
     if (numa_available() >= 0 && node >= 0) {
         numa_tonode_memory(buf, size, node);
     }
+    firstTouchPages(buf, size);
+    restoreCpuAffinity(&old_set, saved);
+    LOG(INFO) << "tebench: hugepage first-touch cpu:" << node << " addr=" << buf
+              << " " << numaMapsLine(buf);
+#else
     auto* p = static_cast<char*>(buf);
     for (size_t off = 0; off < size; off += hp) p[off] = 0;
     if (size > 0) p[size - 1] = 0;
+#endif
     return buf;
 }
 
@@ -272,6 +445,7 @@ int TEBenchRunner::allocateBuffers() {
         pinned_buffer_list_.resize(num_buffers, nullptr);
         shm_backed_.assign(num_buffers, 0);
         hugepage_backed_.assign(num_buffers, 0);
+        mmap_backed_.assign(num_buffers, 0);
         for (int i = 0; i < num_buffers; ++i) {
             std::string location = "cpu:" + std::to_string(i);
             if (use_shm) {
@@ -293,12 +467,19 @@ int TEBenchRunner::allocateBuffers() {
                 pinned_buffer_list_[i] =
                     allocateHugepageOnNode(total_buffer_size, i);
                 hugepage_backed_[i] = 1;
+                mmap_backed_[i] = 1;
                 if (pinned_buffer_list_[i]) {
                     location = cpuLocationFromPages(pinned_buffer_list_[i], i);
                 }
             } else {
                 pinned_buffer_list_[i] =
                     allocateMemoryPool(total_buffer_size, i, false);
+#ifdef __linux__
+                mmap_backed_[i] = 1;
+#endif
+                if (pinned_buffer_list_[i]) {
+                    location = cpuLocationFromPages(pinned_buffer_list_[i], i);
+                }
             }
             if (!pinned_buffer_list_[i]) return -1;
             if (engine_->registerLocalMemory(pinned_buffer_list_[i],
@@ -316,6 +497,9 @@ int TEBenchRunner::allocateBuffers() {
             LOG(INFO) << "tebench: DRAM buffers allocated with MAP_HUGETLB "
                          "hugepages (hp="
                       << hugepageBytes() << ") for RDMA MR registration";
+        } else {
+            LOG(INFO) << "tebench: DRAM allocated " << num_buffers
+                      << " NUMA-local buffers via CPU affinity + first-touch";
         }
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
     } else if (XferBenchConfig::seg_type == "VRAM") {
@@ -357,6 +541,7 @@ int TEBenchRunner::freeBuffers() {
         pinned_buffer_list_.clear();
         shm_backed_.clear();
         hugepage_backed_.clear();
+        mmap_backed_.clear();
         return 0;
     }
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
@@ -366,9 +551,9 @@ int TEBenchRunner::freeBuffers() {
             engine_->freeSharedMemory(pinned_buffer_list_[i]);
         } else {
             engine_->unregisterLocalMemory(pinned_buffer_list_[i]);
-            if (i < hugepage_backed_.size() && hugepage_backed_[i]) {
+            if (i < mmap_backed_.size() && mmap_backed_[i]) {
                 if (munmap(pinned_buffer_list_[i], total_buffer_size) != 0) {
-                    PLOG(WARNING) << "munmap hugepage buffer failed";
+                    PLOG(WARNING) << "munmap DRAM buffer failed";
                 }
             } else {
                 freeMemoryPool(pinned_buffer_list_[i], total_buffer_size);
@@ -378,6 +563,7 @@ int TEBenchRunner::freeBuffers() {
     pinned_buffer_list_.clear();
     shm_backed_.clear();
     hugepage_backed_.clear();
+    mmap_backed_.clear();
     return 0;
 }
 
