@@ -1305,10 +1305,6 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
     }
     auto result = std::make_shared<AllocatedBatch>();
     result->batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
-    std::chrono::steady_clock::time_point now =
-        std::chrono::steady_clock::now();
-    auto lease_timeout =
-        now + std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
     static constexpr size_t kDirectIOAlignment = 4096;
 
     u_int64_t total_size = 0;
@@ -1406,8 +1402,11 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
         // correction)
         result->pointers.emplace_back(reinterpret_cast<uintptr_t>(data_ptr));
         result->handles.emplace_back(std::move(alloc_result.value()));
-        result->lease_timeout = lease_timeout;
     }
+    // Waiting for earlier readers must not consume the new batch's lease.
+    result->lease_timeout =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
     result->total_size = total_size;
     return result;
 }
