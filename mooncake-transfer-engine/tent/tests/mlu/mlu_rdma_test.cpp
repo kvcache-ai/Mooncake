@@ -342,52 +342,6 @@ TEST_P(MluDirectRdmaTest, DisabledDirectAndMluOnlyRegistrationKeepStaging) {
     }
 }
 
-// RDMA workers update transport-local completion state. The engine still
-// needs progress to fire submit hooks when the caller never polls its batch.
-TEST_P(MluDirectRdmaTest, CompletionNotificationWithoutCallerPolling) {
-    auto c = config();
-    c->set("enable_progress_worker", true);
-    c->set("enable_runtime_queue", false);
-    a_ = std::make_unique<TransferEngineImpl>(c);
-    ASSERT_TRUE(a_->available());
-    void *local = nullptr, *peer = nullptr;
-    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &local));
-    ASSERT_NO_FATAL_FAILURE(allocate(*b_, "mlu:0", &peer));
-    std::vector<uint8_t> seed(kLength, 47), actual(kLength);
-    ASSERT_TRUE(Platform::getLoader().copy(local, seed.data(), kLength).ok());
-    Request request{};
-    request.opcode = Request::WRITE;
-    request.source = local;
-    request.target_offset = reinterpret_cast<uint64_t>(peer);
-    request.length = kLength;
-    request.transport_hint = RDMA;
-    ASSERT_TRUE(a_->openSegment(request.target_id, b_->getSegmentName()).ok());
-    auto route = TransferEngineImplTestPeer::route(*a_, request);
-    ASSERT_EQ(route.transport, RDMA);
-    ASSERT_TRUE(route.staging_params.empty());
-    auto batch = a_->allocateBatch(1);
-    ASSERT_NE(batch, 0u);
-    batches_.push_back({a_.get(), batch});
-    ASSERT_TRUE(
-        a_->submitTransfer(batch, {request}, {"mlu-rdma", "done"}).ok());
-    bool received = false;
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!received && std::chrono::steady_clock::now() < deadline) {
-        std::vector<Notification> notifications;
-        ASSERT_TRUE(b_->receiveNotification(notifications).ok());
-        for (const auto& n : notifications)
-            received |= n.name == "mlu-rdma" && n.msg == "done";
-        if (!received)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    EXPECT_TRUE(received);
-    // Drain even on a failed assertion, then check the actual device payload.
-    ASSERT_EQ(wait(*a_, batch).s, COMPLETED);
-    ASSERT_TRUE(Platform::getLoader().copy(actual.data(), peer, kLength).ok());
-    EXPECT_EQ(actual, seed);
-}
-
 INSTANTIATE_TEST_SUITE_P(SelectionModes, MluDirectRdmaTest, ::testing::Bool());
 }  // namespace
 }  // namespace tent

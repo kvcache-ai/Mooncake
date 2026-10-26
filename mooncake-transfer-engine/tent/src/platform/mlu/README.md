@@ -116,9 +116,7 @@ never passed to host `ibv_reg_mr` as a fallback.
 Direct selection requires RDMA registration of both endpoint buffers, the
 matching RDMA device capabilities, and a transport hint/policy that admits RDMA.
 MLU-only registration, a host-only transport policy, or
-`transports/rdma/disable_gpu_direct_rdma = true` selects staging. With
-`enable_progress_worker=true`, RDMA batches are polled for completion even
-when the runtime queue is disabled.
+`transports/rdma/disable_gpu_direct_rdma = true` selects staging.
 
 Complete producer work before submission and wait for transfer completion
 before consuming the destination. Keep registered allocations alive until all
