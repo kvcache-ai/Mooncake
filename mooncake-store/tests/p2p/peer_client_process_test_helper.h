@@ -27,7 +27,6 @@
 #include "transfer_engine.h"
 #include "common_types.h"
 #include "utils.h"
-#include "../utils/common.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -215,7 +214,8 @@ class PeerClientRpcServerStack {
         }
 
         auto tiered_backend = std::make_unique<TieredBackend>();
-        auto init_result = InitTieredBackendForTest(*tiered_backend, config);
+        auto init_result =
+            tiered_backend->Init(config, nullptr, nullptr, nullptr, nullptr);
         if (!init_result.has_value()) {
             return false;
         }

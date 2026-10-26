@@ -12,7 +12,6 @@
 #include "p2p/client/tiered_cache/scheduler/scheduler_factory.h"  // detail::ReadMultiLRUConfig
 #include "p2p/client/tiered_cache/tiered_backend.h"
 #include "p2p/client/tiered_cache/tiers/cache_tier.h"  // TempDRAMBuffer
-#include "../utils/common.h"  // InitTieredBackendForTest
 
 namespace mooncake {
 namespace {
@@ -90,15 +89,12 @@ MultiLRUPolicy::Config TestConfig() {
     return c;
 }
 
-// NOTE: the TEST bodies live inside this anonymous namespace so that the
-// test-local kMB shadows storage_backend.h's mooncake::kMB (pulled in via
-// utils/common.h) — otherwise references to kMB would be ambiguous.
-
 TEST(MultiLRUPolicyTest, OnAccessReturnsOffloadForHotFastKey) {
     TieredBackend backend;
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, TwoTierConfig(16 * kMB, 64 * kMB))
-            .has_value());
+    ASSERT_TRUE(backend
+                    .Init(TwoTierConfig(16 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr)
+                    .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
     MultiLRUPolicy policy(TestConfig());
@@ -119,9 +115,10 @@ TEST(MultiLRUPolicyTest, OnAccessReturnsOffloadForHotFastKey) {
 
 TEST(MultiLRUPolicyTest, NoOffloadWhenAlreadyOnSlow) {
     TieredBackend backend;
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, TwoTierConfig(16 * kMB, 64 * kMB))
-            .has_value());
+    ASSERT_TRUE(backend
+                    .Init(TwoTierConfig(16 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr)
+                    .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
     MultiLRUPolicy policy(TestConfig());
@@ -140,9 +137,10 @@ TEST(MultiLRUPolicyTest, NoOffloadWhenAlreadyOnSlow) {
 
 TEST(MultiLRUPolicyTest, OnAccessReturnsOnboardForHotSlowKey) {
     TieredBackend backend;
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, TwoTierConfig(16 * kMB, 64 * kMB))
-            .has_value());
+    ASSERT_TRUE(backend
+                    .Init(TwoTierConfig(16 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr)
+                    .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
     MultiLRUPolicy policy(TestConfig());
@@ -163,9 +161,10 @@ TEST(MultiLRUPolicyTest, OnAccessReturnsOnboardForHotSlowKey) {
 
 TEST(MultiLRUPolicyTest, DecideEvictAboveWatermarkEmitsEvicts) {
     TieredBackend backend;
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, TwoTierConfig(4 * kMB, 64 * kMB))
-            .has_value());
+    ASSERT_TRUE(backend
+                    .Init(TwoTierConfig(4 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr)
+                    .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
     MultiLRUPolicy::Config cfg = TestConfig();
@@ -192,9 +191,10 @@ TEST(MultiLRUPolicyTest, DecideEvictAboveWatermarkEmitsEvicts) {
 
 TEST(MultiLRUPolicyTest, DecideEvictBelowWatermarkEmpty) {
     TieredBackend backend;
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, TwoTierConfig(64 * kMB, 64 * kMB))
-            .has_value());
+    ASSERT_TRUE(backend
+                    .Init(TwoTierConfig(64 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr)
+                    .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
     MultiLRUPolicy policy(TestConfig());  // default bounds [0.70, 0.90]
@@ -217,9 +217,10 @@ TEST(MultiLRUPolicyTest, InitialWatermarkStartsAtLowBound) {
 
 TEST(MultiLRUPolicyTest, WatermarkFloatsDownWithWriteLoad) {
     TieredBackend backend;
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, TwoTierConfig(4 * kMB, 64 * kMB))
-            .has_value());
+    ASSERT_TRUE(backend
+                    .Init(TwoTierConfig(4 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr)
+                    .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
     MultiLRUPolicy::Config cfg = TestConfig();  // low 0.70, high 0.90
@@ -248,9 +249,10 @@ TEST(MultiLRUPolicyTest, HysteresisBandBelowFloor) {
 // accumulate to pull the trigger all the way to the low bound (and relax back).
 TEST(MultiLRUPolicyTest, SustainedWriteLoadDrivesTriggerAcrossFullRange) {
     TieredBackend backend;
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, TwoTierConfig(4 * kMB, 64 * kMB))
-            .has_value());
+    ASSERT_TRUE(backend
+                    .Init(TwoTierConfig(4 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr)
+                    .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
     MultiLRUPolicy::Config cfg = TestConfig();  // low 0.70, high 0.90
@@ -298,9 +300,10 @@ TEST(MultiLRUPolicyTest, SustainedWriteLoadDrivesTriggerAcrossFullRange) {
 // eviction.
 TEST(MultiLRUPolicyTest, AllocFailurePathDoesNotConsumeWriteLoad) {
     TieredBackend backend;
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, TwoTierConfig(4 * kMB, 64 * kMB))
-            .has_value());
+    ASSERT_TRUE(backend
+                    .Init(TwoTierConfig(4 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr)
+                    .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
     MultiLRUPolicy::Config cfg = TestConfig();  // low 0.70, high 0.90
@@ -322,9 +325,10 @@ TEST(MultiLRUPolicyTest, AllocFailurePathDoesNotConsumeWriteLoad) {
 // Zero-size commits must not enter MultiLRU and stall eviction progress.
 TEST(MultiLRUPolicyTest, ZeroSizeCommitProducesNoVictim) {
     TieredBackend backend;
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, TwoTierConfig(4 * kMB, 64 * kMB))
-            .has_value());
+    ASSERT_TRUE(backend
+                    .Init(TwoTierConfig(4 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr)
+                    .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
     MultiLRUPolicy policy(TestConfig());
