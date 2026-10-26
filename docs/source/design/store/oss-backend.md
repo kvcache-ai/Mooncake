@@ -213,13 +213,11 @@ replicas, or decide when deletion is safe. Those responsibilities remain with
 the caller, which can use the adapter's existing `Delete` operation. Sharing an
 adapter across concurrent operations requires a thread-safe adapter.
 
-The bounded I/O component is the first review unit for
-[RFC #4296](https://github.com/kvcache-ai/Mooncake/issues/4296). Persistent
-upload/cleanup records and their relationship to the Master's metadata,
-ordered log and snapshots are a separate review unit. This component does not
-add a first-class replica type or enable owner-independent Store reads.
-Master/Client integration must provide durable attempt identity, commit,
-recovery and lease-aware reclamation before exposing those guarantees.
+This component does not add a first-class replica type or enable
+owner-independent Store reads. Those guarantees require Master/Client
+integration with durable attempt identity, commit, recovery and lease-aware
+reclamation. See [RFC #4296](https://github.com/kvcache-ai/Mooncake/issues/4296)
+for context.
 
 ## Current Limitations
 

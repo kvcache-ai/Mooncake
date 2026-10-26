@@ -3,27 +3,61 @@
 #include <algorithm>
 #include <limits>
 #include <new>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
 namespace mooncake {
 namespace {
 
-struct StagingReservation {
-    std::atomic<uint64_t>& bytes;
-    uint64_t size;
-    ~StagingReservation() { bytes.fetch_sub(size); }
+constexpr uint64_t kMaxReadChunkBytes = 4ULL * 1024 * 1024;
+
+class StagingReservation {
+   public:
+    static std::optional<StagingReservation> TryAcquire(
+        std::atomic<uint64_t>& bytes, uint64_t limit, uint64_t size) {
+        auto current = bytes.load();
+        do {
+            if (size > limit - current) {
+                return std::nullopt;
+            }
+        } while (!bytes.compare_exchange_weak(current, current + size));
+        return StagingReservation(bytes, size);
+    }
+
+    StagingReservation(const StagingReservation&) = delete;
+    StagingReservation& operator=(const StagingReservation&) = delete;
+    StagingReservation(StagingReservation&& other) noexcept
+        : bytes_(std::exchange(other.bytes_, nullptr)), size_(other.size_) {}
+    StagingReservation& operator=(StagingReservation&&) = delete;
+
+    ~StagingReservation() {
+        if (bytes_ != nullptr) {
+            bytes_->fetch_sub(size_);
+        }
+    }
+
+   private:
+    StagingReservation(std::atomic<uint64_t>& bytes, uint64_t size)
+        : bytes_(&bytes), size_(size) {}
+
+    std::atomic<uint64_t>* bytes_;
+    uint64_t size_;
 };
 
 tl::expected<uint64_t, ErrorCode> SliceBytes(const std::vector<Slice>& slices,
                                              uint64_t available) {
-    uint64_t size = 0;
+    uint64_t total_bytes = 0;
     for (const auto& slice : slices) {
-        if ((slice.size && !slice.ptr) || slice.size > available - size)
+        if (slice.size != 0 && slice.ptr == nullptr) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        size += slice.size;
+        }
+        if (slice.size > available - total_bytes) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        total_bytes += slice.size;
     }
-    return size;
+    return total_bytes;
 }
 
 }  // namespace
@@ -32,75 +66,116 @@ ObjectStorageBackend::ObjectStorageBackend(
     ObjectStorageBackendConfig config,
     std::shared_ptr<ObjectStorageAdapter> adapter)
     : config_(config), adapter_(std::move(adapter)) {
-    if (!adapter_ || !config_.max_object_bytes || !config_.max_staging_bytes)
+    if (!adapter_ || config_.max_object_bytes == 0 ||
+        config_.max_staging_bytes == 0) {
         throw std::invalid_argument(
             "Invalid object storage backend configuration");
-}
-
-bool ObjectStorageBackend::Reserve(uint64_t bytes) {
-    auto current = staging_bytes_.load();
-    do {
-        if (bytes > config_.max_staging_bytes - current) return false;
-    } while (!staging_bytes_.compare_exchange_weak(current, current + bytes));
-    return true;
+    }
 }
 
 ErrorCode ObjectStorageBackend::Write(const std::string& object_key,
                                       uint64_t object_size,
                                       const std::vector<Slice>& slices,
-                                      const Copy& copy, bool* upload_started) {
-    if (upload_started) *upload_started = false;
+                                      const Copy& to_host,
+                                      bool* upload_started) {
+    if (upload_started != nullptr) {
+        *upload_started = false;
+    }
     if (object_size > config_.max_object_bytes ||
-        object_size > std::numeric_limits<size_t>::max())
+        object_size > std::numeric_limits<size_t>::max()) {
         return ErrorCode::INVALID_PARAMS;
-    const auto size = SliceBytes(slices, object_size);
-    if (!size || *size != object_size || (object_size && !copy))
+    }
+    const auto total_bytes = SliceBytes(slices, object_size);
+    if (!total_bytes) {
+        return total_bytes.error();
+    }
+    if (*total_bytes != object_size) {
         return ErrorCode::INVALID_PARAMS;
-    if (!adapter_->SupportsSinglePutAttempt()) return ErrorCode::NOT_SUPPORTED;
-    if (!Reserve(object_size)) return ErrorCode::NO_AVAILABLE_HANDLE;
-    StagingReservation reservation{staging_bytes_, object_size};
+    }
+    if (object_size != 0 && !to_host) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (!adapter_->SupportsSinglePutAttempt()) {
+        return ErrorCode::NOT_SUPPORTED;
+    }
+
+    auto reservation = StagingReservation::TryAcquire(
+        staging_bytes_, config_.max_staging_bytes, object_size);
+    if (!reservation) {
+        return ErrorCode::NO_AVAILABLE_HANDLE;
+    }
     std::unique_ptr<char[]> staging(new (std::nothrow) char[object_size]);
-    if (!staging) return ErrorCode::NO_AVAILABLE_HANDLE;
+    if (!staging) {
+        return ErrorCode::NO_AVAILABLE_HANDLE;
+    }
+
     size_t offset = 0;
     for (const auto& slice : slices) {
-        if (slice.size && !copy(staging.get() + offset, slice.ptr, slice.size))
+        if (slice.size != 0 &&
+            !to_host(staging.get() + offset, slice.ptr, slice.size)) {
             return ErrorCode::TRANSFER_FAIL;
+        }
         offset += slice.size;
     }
-    if (upload_started) *upload_started = true;
-    const auto result = adapter_->Put(object_key, {staging.get(), *size});
+
+    if (upload_started != nullptr) {
+        *upload_started = true;
+    }
+    const auto result =
+        adapter_->Put(object_key, {staging.get(), *total_bytes});
     return result ? ErrorCode::OK : result.error();
 }
 
 ErrorCode ObjectStorageBackend::Read(const std::string& object_key,
                                      uint64_t object_size,
                                      const std::vector<Slice>& slices,
-                                     uint64_t offset, const Copy& copy) {
-    if (object_size > config_.max_object_bytes || offset > object_size)
+                                     uint64_t offset, const Copy& from_host) {
+    if (object_size > config_.max_object_bytes || offset > object_size) {
         return ErrorCode::INVALID_PARAMS;
-    const auto size = SliceBytes(slices, object_size - offset);
-    if (!size || (*size && !copy)) return ErrorCode::INVALID_PARAMS;
-    if (!*size) return ErrorCode::OK;
+    }
+    const auto total_bytes = SliceBytes(slices, object_size - offset);
+    if (!total_bytes) {
+        return total_bytes.error();
+    }
+    if (*total_bytes != 0 && !from_host) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (*total_bytes == 0) {
+        return ErrorCode::OK;
+    }
     const auto max_offset =
         static_cast<uint64_t>(std::numeric_limits<off_t>::max());
-    if (offset > max_offset || *size - 1 > max_offset - offset)
+    if (offset > max_offset || *total_bytes - 1 > max_offset - offset) {
         return ErrorCode::INVALID_PARAMS;
+    }
+
     const auto chunk =
-        std::min({*size, uint64_t{4 * 1024 * 1024}, config_.max_staging_bytes});
-    if (!Reserve(chunk)) return ErrorCode::NO_AVAILABLE_HANDLE;
-    StagingReservation reservation{staging_bytes_, chunk};
+        std::min({*total_bytes, kMaxReadChunkBytes, config_.max_staging_bytes});
+    auto reservation = StagingReservation::TryAcquire(
+        staging_bytes_, config_.max_staging_bytes, chunk);
+    if (!reservation) {
+        return ErrorCode::NO_AVAILABLE_HANDLE;
+    }
     std::unique_ptr<char[]> staging(new (std::nothrow) char[chunk]);
-    if (!staging) return ErrorCode::NO_AVAILABLE_HANDLE;
+    if (!staging) {
+        return ErrorCode::NO_AVAILABLE_HANDLE;
+    }
+
     for (const auto& slice : slices) {
         for (size_t done = 0; done < slice.size;) {
             const auto length = std::min<uint64_t>(chunk, slice.size - done);
             const auto result = adapter_->GetRange(
                 object_key, staging.get(), length, static_cast<off_t>(offset));
-            if (!result) return result.error();
-            if (*result != length) return ErrorCode::FILE_READ_FAIL;
-            if (!copy(static_cast<char*>(slice.ptr) + done, staging.get(),
-                      length))
+            if (!result) {
+                return result.error();
+            }
+            if (*result != length) {
+                return ErrorCode::FILE_READ_FAIL;
+            }
+            if (!from_host(static_cast<char*>(slice.ptr) + done, staging.get(),
+                           length)) {
                 return ErrorCode::TRANSFER_FAIL;
+            }
             done += length;
             offset += length;
         }

@@ -45,7 +45,6 @@ class ObjectStorageBackend {
                    const Copy& from_host);
 
    private:
-    bool Reserve(uint64_t bytes);
     const ObjectStorageBackendConfig config_;
     const std::shared_ptr<ObjectStorageAdapter> adapter_;
     std::atomic<uint64_t> staging_bytes_{0};
