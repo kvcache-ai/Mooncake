@@ -30,6 +30,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -840,6 +841,31 @@ class RdmaPeerRailAllocationTest : public ::testing::TestWithParam<bool> {
     Request request_{};
     std::vector<char> buffer_ = std::vector<char>(16 * 4096);
 };
+
+TEST_P(RdmaPeerRailAllocationTest, WakesProgressAfterEachPublishedSubmission) {
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    ASSERT_TRUE(transport_.allocateSubBatch(batch_, 2).ok());
+    request_.length = 4096;
+    batch_->progress_batch_id = 123;
+    size_t wakes = 0;
+    batch_->notify_progress = [&](BatchID id) {
+        EXPECT_EQ(id, 123u);
+        EXPECT_TRUE(batch_->needsProgressPolling());
+        auto* rdma_batch = static_cast<RdmaSubBatch*>(batch_);
+        EXPECT_EQ(rdma_batch->task_list.size(), ++wakes);
+        EXPECT_EQ(rdma_batch->slice_chain.size(), wakes);
+        EXPECT_EQ(rdma_batch->task_list.back()->num_slices, 1);
+    };
+
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {}).ok());
+    EXPECT_EQ(wakes, 0u);
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    EXPECT_EQ(wakes, 1u);
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    EXPECT_EQ(wakes, 2u);
+    EXPECT_FALSE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    EXPECT_EQ(wakes, 2u);
+}
 
 TEST_P(RdmaPeerRailAllocationTest, AggregateExcludesUnpairedLocalNic) {
     ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
@@ -4404,6 +4430,77 @@ TEST(RdmaTransportIntegrationTest, WriteThenReadAcrossProcesses) {
     const int status = child_guard.finish();
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST(RdmaTransportIntegrationTest, CompletionNotificationWithoutCallerPolling) {
+    if (!hasRdmaDevice()) GTEST_SKIP() << "no RDMA device detected";
+
+    constexpr size_t kLength = 1 << 20;
+    for (bool runtime_queue : {false, true}) {
+        SCOPED_TRACE(runtime_queue);
+        // Buffers must outlive both engines, including on an assertion failure.
+        std::vector<uint8_t> source(kLength, 0x5A), destination(kLength, 0);
+        auto config = makeRdmaConfig();
+        config->set("rpc_server_hostname", "127.0.0.1");
+        config->set("rpc_server_port", 0);
+        config->set("enable_progress_worker", true);
+        config->set("enable_runtime_queue", runtime_queue);
+        config->set("runtime_queue/progress_fallback_interval_us", 0UL);
+        if (const char* nic = std::getenv("MC_TENT_TEST_NIC"))
+            config->set("topology/rdma_whitelist",
+                        std::vector<std::string>{nic});
+        if (const char* gid = std::getenv("MC_TENT_TEST_GID_INDEX"))
+            config->set("transports/rdma/device/gid_index", std::stoi(gid));
+        TransferEngine server(config), client(config);
+        ASSERT_TRUE(server.available());
+        ASSERT_TRUE(client.available());
+        ASSERT_TRUE(
+            server.registerLocalMemory(destination.data(), kLength).ok());
+        ASSERT_TRUE(client.registerLocalMemory(source.data(), kLength).ok());
+        SegmentID segment = 0;
+        ASSERT_TRUE(client.openSegment(segment, server.getSegmentName()).ok());
+
+        Request request{};
+        request.opcode = Request::WRITE;
+        request.source = source.data();
+        request.target_id = segment;
+        request.target_offset = reinterpret_cast<uint64_t>(destination.data());
+        request.length = kLength;
+        request.transport_hint = RDMA;
+        const auto batch = client.allocateBatch(2);
+        ASSERT_NE(batch, 0u);
+        for (int round = 0; round < 2; ++round) {
+            SCOPED_TRACE(round);
+            std::fill(source.begin(), source.end(), 0x5A + round);
+            Notification notification;
+            notification.name = "rdma-progress";
+            notification.msg = std::to_string(round);
+            ASSERT_TRUE(
+                client.submitTransfer(batch, {request}, notification).ok());
+            bool received = false;
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!received && std::chrono::steady_clock::now() < deadline) {
+                std::vector<Notification> notifications;
+                ASSERT_TRUE(server.receiveNotification(notifications).ok());
+                for (const auto& item : notifications)
+                    received |= item.name == notification.name &&
+                                item.msg == notification.msg;
+                if (!received)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            EXPECT_TRUE(received) << "completion requires caller polling";
+            // Drain only after observing notification delivery. The second
+            // round appends to a batch whose first submission has completed.
+            ASSERT_TRUE(waitBatchDone(client, batch));
+            EXPECT_EQ(destination, source);
+        }
+        EXPECT_TRUE(client.freeBatch(batch).ok());
+        EXPECT_TRUE(client.closeSegment(segment).ok());
+        EXPECT_TRUE(client.unregisterLocalMemory(source.data(), kLength).ok());
+        EXPECT_TRUE(
+            server.unregisterLocalMemory(destination.data(), kLength).ok());
+    }
 }
 
 TEST(RdmaQuiesceTest, TransportQuiesceWithoutInstallIsOk) {
