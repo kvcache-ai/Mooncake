@@ -97,6 +97,8 @@ struct SlotOwnerState {
     // Whether the owner's eviction index files the slot, at what rank, and
     // under which of the index's own entries for a group, if any.
     bool eviction_filed{false};
+    // True from Postpone until the release of the guard it was called under.
+    bool eviction_postponed{false};
     int64_t eviction_rank{0};
     void* eviction_group{nullptr};
     // Two words for the owner's namespace policy.

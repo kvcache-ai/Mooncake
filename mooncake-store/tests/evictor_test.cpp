@@ -341,6 +341,10 @@ TEST_F(EvictorTest, DeferredObjectsGoOnlyWhileShortOfTheMinimum) {
     reclaimer_.applied.clear();
     observer_.skipped.clear();
     policy_.defer_soft_pinned = true;
+    // Refile "pinned", which the first run postponed under the old policy.
+    ASSERT_TRUE(namespaces_.GetOrCreate(TenantId("a"))
+                    .objects.Write("pinned")
+                    .has_value());
     Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
     EXPECT_EQ(reclaimer_.applied,
               (std::vector<std::string>{"plain", "pinned"}));
@@ -529,6 +533,67 @@ TEST_F(EvictorTest, AKeyWhoseLeaseWasExtendedIsRefiledNotEvicted) {
     EXPECT_EQ(observer_.skipped.front(),
               std::make_pair(std::string("k"), SkipReason::kMoved));
     EXPECT_FALSE(ns.eviction_index().Scan(Clock::now())->Next().has_value());
+}
+
+TEST_F(EvictorTest, ASkippedKeyWaitsOutTheBackoffUnlessWritten) {
+    Publish("a", "pinned", seconds(10));
+    policy_.soft_pinned = {"pinned"};
+    metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
+    const ObjectGoal all{.target_ratio = 1.0, .min_ratio = 1.0};
+
+    Run(all);
+    ASSERT_EQ(observer_.skipped.size(), 1u);
+    observer_.skipped.clear();
+    Run(all);
+    EXPECT_TRUE(observer_.skipped.empty());
+    const auto cursor = ns.eviction_index().Scan(
+        Clock::now() + eviction::Evictor::kSkippedKeyBackoff +
+        metadata::LeaseEvictionIndex::kBucketWidth);
+    const auto entry = cursor->Next();
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_EQ(entry->keys.front(), "pinned");
+
+    // A write files it by its lease again.
+    ASSERT_TRUE(ns.objects.Write("pinned").has_value());
+    Run(all);
+    EXPECT_EQ(observer_.skipped.size(), 1u);
+
+    // Torn down while postponed, it leaves nothing filed.
+    {
+        auto hold = ns.objects.Write("pinned");
+        ASSERT_TRUE(hold.has_value());
+        hold->TearDown();
+    }
+    EXPECT_FALSE(ns.eviction_index()
+                     .Scan(Clock::now() + std::chrono::hours(1))
+                     ->Next()
+                     .has_value());
+}
+
+TEST_F(EvictorTest, ADeferredKeyIsNotPostponed) {
+    Publish("a", "pinned", seconds(10));
+    policy_.soft_pinned = {"pinned"};
+    policy_.defer_soft_pinned = true;
+
+    for (int run = 0; run < 2; ++run) {
+        observer_.skipped.clear();
+        Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 0});
+        EXPECT_EQ(observer_.skipped,
+                  (std::vector<std::pair<std::string, SkipReason>>{
+                      {"pinned", SkipReason::kDeferred}}));
+    }
+}
+
+TEST_F(EvictorTest, AGroupIsNotPostponed) {
+    Publish("a", "m1", seconds(10), "g");
+    Publish("a", "m2", seconds(10), "g");
+    policy_.soft_pinned = {"m1", "m2"};
+
+    for (int run = 0; run < 2; ++run) {
+        observer_.skipped.clear();
+        Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+        EXPECT_EQ(observer_.skipped.size(), 2u);
+    }
 }
 
 TEST_F(EvictorTest, ObserversHearOfEachObjectAndTheRun) {
