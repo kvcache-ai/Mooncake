@@ -1711,6 +1711,32 @@ TEST_F(MasterServiceTest, StandbyRemountFindsSameEndpointRangeByAddress) {
     }
 }
 
+TEST_F(MasterServiceTest,
+       RemountedReplicaAdvertisesTheSegmentsCurrentProtocol) {
+    // A snapshot taken before the segment changed protocol, or by a master
+    // that stamped every replica "tcp", must not outlive the remount.
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    auto segment = MakeSegment("egm-provider");
+    segment.protocol = "nvlink";
+    auto entry =
+        MakeStandbyEntry("egm-object", 1024, segment.base, segment.te_endpoint);
+    std::get<MemoryDescriptor>(entry.metadata.replicas[0].descriptor_variant)
+        .buffer_descriptor.protocol_ = "tcp";
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        {entry}, 1,
+        {MakeStandbySegment(segment.name, segment.te_endpoint, segment.size)}));
+    ASSERT_TRUE(service.ReMountSegment({segment}, generate_uuid()));
+
+    auto result = service.GetReplicaList("egm-object", TenantId::Default());
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.protocol_,
+              "nvlink");
+}
+
 TEST_F(MasterServiceTest, StandbyRestoreSkipsInvalidObjectAndRestoresTheRest) {
     // #3760: one bad descriptor must not cost the whole index.
     MasterService service(MakeStrictTenantConfig({"default"}));
