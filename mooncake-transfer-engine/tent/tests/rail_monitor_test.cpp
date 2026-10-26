@@ -129,6 +129,32 @@ TEST(RailMonitorConfigTest, CustomJsonOverridesAutomaticPeerMapping) {
     EXPECT_FALSE(rail.isAvailable(/*local_nic=*/0, /*remote_nic=*/0));
 }
 
+TEST(RailMonitorConfigTest, UnknownRemoteNumaSkipsUnavailableDirectRail) {
+    auto local = makeTwoNicTopology("local0", "local1");
+    auto remote = makeTwoNicTopology("remote0", "remote1");
+    const std::string rail_json = R"({
+        "all": [
+            {"local": "local0", "remote": "remote1"},
+            {"local": "local0", "remote": "remote0"},
+            {"local": "local1", "remote": "remote0"}
+        ],
+        "direct": [
+            {"local": "local0", "remote": "remote1"},
+            {"local": "local1", "remote": "remote0"}
+        ]
+    })";
+
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote, rail_json, nullptr).ok());
+    for (int i = 0; i < 3; ++i)
+        rail.markFailed(/*local_nic=*/0, /*remote_nic=*/1);
+
+    EXPECT_FALSE(rail.isAvailable(/*local_nic=*/0, /*remote_nic=*/1));
+    EXPECT_TRUE(rail.isAvailable(/*local_nic=*/0, /*remote_nic=*/0));
+    EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/0, /*remote_numa=*/-1),
+              0);
+}
+
 TEST(RailMonitorConfigTest, AllocationMaskUsesConfiguredPairsAndTargetMemory) {
     auto local = makeTwoNicTopology("local0", "local1");
     auto remote = makeTwoNicTopology("remote0", "remote1");
@@ -254,6 +280,25 @@ TEST(RailMonitorCrossNumaTest, CrossNumaPrefersSameNameDevice) {
     // local mlx5_x (idx0, NUMA 0) reaching remote NUMA-1 domain: same-name
     // remote mlx5_x is at idx1. Must map there, not positionally to idx0.
     EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/0, /*remote_numa=*/1), 1);
+
+    // With unknown target NUMA (wildcard memory location), the explicit
+    // same-name direct rail remains the best peer across all remote NUMA
+    // domains.
+    EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/0, /*remote_numa=*/-1),
+              1);
+}
+
+TEST(RailMonitorCrossNumaTest, UnknownRemoteNumaPrefersDirectPeer) {
+    // The same-name peers are on the same NUMA node, but another remote NIC
+    // occupies the first remote NUMA domain. A wildcard target has no NUMA
+    // preference, so its mapping must still use the direct same-name peer.
+    auto local = makeNamedNumaTopology("mlx5_x", 1, "mlx5_y", 0);
+    auto remote = makeNamedNumaTopology("mlx5_x", 1, "mlx5_y", 0);
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote).ok());
+
+    EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/0, /*remote_numa=*/-1),
+              0);
 }
 
 // ---------------------------------------------------------------------------

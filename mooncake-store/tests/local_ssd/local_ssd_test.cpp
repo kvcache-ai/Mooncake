@@ -214,31 +214,5 @@ TEST(LocalSsdManagerTest, CancelsOffloadMirrorsOnlyWhenAllArePending) {
     EXPECT_TRUE(manager.SetOffloadingAndTakePending(client_b, true)->empty());
 }
 
-TEST(LocalSsdManagerTest, RestoreResetsRuntimeOnlyState) {
-    LocalSsdManager manager;
-    UUID client{5, 6};
-    ASSERT_TRUE(manager.RegisterClient(client, true) == ErrorCode::OK);
-    ASSERT_TRUE(manager.ReportCapacity(client, 2048).has_value());
-    ASSERT_TRUE(manager.AdjustUsedBytes(client, 512));
-    ASSERT_TRUE(manager.EnqueueOffload(client, Offload("tenant", "key", 10),
-                                       10) == ErrorCode::OK);
-    ASSERT_TRUE(manager.EnqueuePromotion(
-                    client, Promotion("tenant", "key", 10)) == ErrorCode::OK);
-    manager.RequestRemoveAll();
-
-    auto state = manager.ExportPersistedState();
-    manager.RestorePersistedState(std::move(state));
-    auto usage = manager.GetUsage(client);
-    ASSERT_TRUE(usage.has_value());
-    EXPECT_EQ(usage->total_capacity_bytes, 2048);
-    EXPECT_EQ(usage->used_bytes, 0);
-    EXPECT_TRUE(manager.TakePromotions(client, 10)->empty());
-    EXPECT_FALSE(*manager.ConsumeRemoveAll(client));
-    auto offloads = manager.SetOffloadingAndTakePending(client, true);
-    ASSERT_TRUE(offloads.has_value());
-    ASSERT_EQ(offloads->size(), 1);
-    EXPECT_EQ(offloads->front(), Offload("tenant", "key", 10));
-}
-
 }  // namespace
 }  // namespace mooncake

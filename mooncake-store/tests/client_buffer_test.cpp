@@ -1,5 +1,6 @@
 // client_buffer_test.cpp
 #include "client_buffer.h"
+#include "nof/nof_runtime.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -65,11 +66,16 @@ TEST_F(ClientBufferTest, SpdkDmaAllocatorDestroysWithSpdkFree) {
     constexpr size_t buffer_size = 4096;
     constexpr size_t alloc_size = 64;
 
+    auto runtime = CreateNofRuntime();
+    if (!runtime.initiator) {
+        GTEST_SKIP() << "NoF unavailable";
+    }
+
     std::shared_ptr<ClientBufferAllocator> allocator;
     try {
         allocator = ClientBufferAllocator::create(buffer_size, "tcp",
                                                   /*use_hugepage=*/false,
-                                                  /*use_spdk_dma=*/true);
+                                                  runtime.dma_allocator);
     } catch (const std::bad_alloc&) {
         GTEST_SKIP()
             << "SPDK DMA allocation is unavailable in this environment";

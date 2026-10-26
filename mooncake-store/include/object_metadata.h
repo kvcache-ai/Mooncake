@@ -408,6 +408,14 @@ struct ObjectMetadata {
             std::move(*pending_soft_pin_action);
         pending_soft_pin_action.reset();
 
+        return ApplySoftPin({pending.action, pending.ttl}, now);
+    }
+
+    // Caller holds the object's metadata write lock. Independent commands do
+    // not consume or replace a pending write's soft-pin action.
+    SoftPinEvaluation ApplySoftPin(
+        const ResolvedSoftPinRequest& request,
+        const std::chrono::system_clock::time_point& now) {
         SpinLocker locker(&lock);
         int metric_delta = 0;
         std::optional<std::chrono::system_clock::time_point> removed_deadline;
@@ -418,11 +426,11 @@ struct ObjectMetadata {
             --metric_delta;
         }
 
-        switch (pending.action) {
+        switch (request.action) {
             case SoftPinAction::PRESERVE:
                 break;
             case SoftPinAction::ENABLE:
-                if (pending.ttl == std::chrono::milliseconds::zero()) {
+                if (request.ttl == std::chrono::milliseconds::zero()) {
                     if (soft_pin_timeout) {
                         removed_deadline = *soft_pin_timeout;
                         soft_pin_timeout.reset();
@@ -432,7 +440,7 @@ struct ObjectMetadata {
                     if (!soft_pin_timeout) {
                         ++metric_delta;
                     }
-                    soft_pin_timeout = ComputeSoftPinDeadline(now, pending.ttl);
+                    soft_pin_timeout = ComputeSoftPinDeadline(now, request.ttl);
                     deadline_to_index = soft_pin_timeout;
                     // Upserting the latest registration supersedes any
                     // expired or previously active deadline.
