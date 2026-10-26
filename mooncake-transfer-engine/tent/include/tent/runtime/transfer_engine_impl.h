@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -359,6 +360,16 @@ class TransferEngineImpl {
         if (type >= 0 && type < (TransportType)kSupportedTransportTypes) {
             transport_list_[type] = std::move(xport);
         }
+    }
+
+    // Test-only hook: CI hosts have no device memory, so no request is ever
+    // staged. A test can force a staging policy for the requests it selects
+    // (return true and fill `policy`) to drive a staged owner end to end.
+    // Set before the first submit; not thread-safe with in-flight transfers.
+    using StagingPolicyForTest =
+        std::function<bool(const Request&, std::vector<std::string>&)>;
+    void setStagingPolicyForTest(StagingPolicyForTest hook) {
+        staging_policy_for_test_ = std::move(hook);
     }
 
     Status publishRuntimeConfigForTest(
@@ -720,6 +731,7 @@ class TransferEngineImpl {
     std::string local_segment_name_;
 
     std::unique_ptr<ProxyManager> staging_proxy_;
+    StagingPolicyForTest staging_policy_for_test_;
     bool merge_requests_;
     std::shared_ptr<const RuntimeConfigSnapshot> runtime_config_snapshot_;
     bool notify_rpc_fallback_{true};

@@ -2261,6 +2261,8 @@ bool TransferEngineImpl::xpuIpcReady(const Request& request,
 
 void TransferEngineImpl::findStagingPolicy(const Request& request,
                                            std::vector<std::string>& policy) {
+    if (staging_policy_for_test_ && staging_policy_for_test_(request, policy))
+        return;
     if (request.target_id == LOCAL_SEGMENT_ID) return;
 
     SegmentDesc* desc = nullptr;

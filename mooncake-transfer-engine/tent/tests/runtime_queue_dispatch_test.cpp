@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
@@ -28,6 +29,7 @@
 #include "tent/common/types.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/runtime/proxy_manager.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
 
@@ -68,6 +70,12 @@ class TransferEngineImplTestPeer {
         engine.runtime_queue_->setDegradationPolicy(
             [bytes_per_second]() { return bytes_per_second; },
             tent::DegradationHooks{}, nullptr);
+    }
+    // Small chunks so a short request splits into several staged chunks.
+    static void useSmallStagePool(tent::TransferEngineImpl& engine,
+                                  size_t chunk_size, size_t chunk_count) {
+        engine.staging_proxy_ = std::make_unique<tent::ProxyManager>(
+            &engine, chunk_size, chunk_count);
     }
     static void adoptDeferredBatches(tent::TransferEngineImpl& engine,
                                      std::vector<tent::BatchID> batches) {
@@ -1536,6 +1544,140 @@ TEST(RuntimeQueueDispatch, TcpControlDataUsesLegacyFramingWithoutCredit) {
                     .IsInvalidArgument());
     EXPECT_TRUE(
         engine.unregisterLocalMemory(target.data(), target.size()).ok());
+}
+
+// A staged owner holds the receiver credit for all of its chunks; the chunks
+// themselves are credit-exempt. If one chunk fails while a sibling's cross
+// stage is still writing into the receiver, the owner must not turn terminal
+// (and so must not return the credit) until that write has drained.
+// Otherwise the receiver could grant the same capacity to another sender
+// while the old write is still landing.
+TEST(RuntimeQueueDispatch, StagedFailureKeepsReceiverCreditUntilChunksDrain) {
+    constexpr size_t kChunk = 64;
+    constexpr size_t kStagedLen = 2 * kChunk;
+    constexpr size_t kSmallLen = 32;
+    auto cfg = makeRuntimeQueueConfig(8, 1UL << 20);
+    cfg->set("max_failover_attempts", 0);
+    cfg->set("receiver_credit/enable", true);
+    cfg->set("receiver_credit/data_bytes", uint64_t{kStagedLen});
+    cfg->set("receiver_credit/request_slots", uint64_t{1});
+    cfg->set("receiver_credit/freshness_ttl_ms", uint32_t{1000});
+    std::vector<uint8_t> source(kStagedLen, 0x5a);
+    std::vector<uint8_t> target(kStagedLen, 0);
+    std::vector<uint8_t> small_source(kSmallLen, 0x6b);
+    std::vector<uint8_t> small_target(kSmallLen, 0);
+    // Declared after the buffers the fake transport and hook capture.
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto in = [](const void* addr, const std::vector<uint8_t>& buf) {
+        auto p = reinterpret_cast<uintptr_t>(addr);
+        auto base = reinterpret_cast<uintptr_t>(buf.data());
+        return p >= base && p < base + buf.size();
+    };
+
+    std::atomic<bool> cross_inflight{false};
+    std::atomic<bool> release_cross{false};
+    std::atomic<int> failed_polls{0};
+    std::atomic<int> small_polls{0};
+    auto fake_tcp =
+        std::make_shared<FakeTransport>(TCP, [&](const Request& request, int) {
+            const auto* src = static_cast<const uint8_t*>(request.source);
+            const auto* dst =
+                reinterpret_cast<const void*>(request.target_offset);
+            // Second chunk's local stage: fail only once the first chunk's
+            // cross stage is writing into the receiver.
+            if (src == source.data() + kChunk) {
+                if (!cross_inflight.load()) return TransferStatus{PENDING, 0};
+                ++failed_polls;
+                return TransferStatus{FAILED, 0};
+            }
+            // Cross stage into the receiver: held until the test lets go.
+            if (in(dst, target)) {
+                cross_inflight = true;
+                if (!release_cross.load()) return TransferStatus{PENDING, 0};
+            }
+            if (in(src, small_source)) ++small_polls;
+            std::memcpy(const_cast<void*>(dst), request.source, request.length);
+            return TransferStatus{COMPLETED, request.length};
+        });
+    std::string seg_name = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+    TransferEngineImplTestPeer::useSmallStagePool(engine, kChunk, 2);
+    // CI has no device memory, so force host staging for the large write.
+    engine.setStagingPolicyForTest(
+        [&](const Request& request, std::vector<std::string>& policy) {
+            if (request.source != source.data() || request.length != kStagedLen)
+                return false;
+            policy = {"", kWildcardLocation, ""};
+            return true;
+        });
+
+    for (auto* buf : {&source, &target, &small_source, &small_target})
+        ASSERT_TRUE(engine.registerLocalMemory(buf->data(), buf->size()).ok());
+
+    auto make_write = [](std::vector<uint8_t>& from, std::vector<uint8_t>& to) {
+        Request request;
+        request.opcode = Request::WRITE;
+        request.source = from.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(to.data());
+        request.length = from.size();
+        request.transport_hint = TCP;
+        return request;
+    };
+    auto wait_until = [](const std::function<bool()>& done) {
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!done() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return done();
+    };
+
+    BatchID staged = engine.allocateBatch(1);
+    ASSERT_NE(staged, (BatchID)0);
+    ASSERT_TRUE(
+        engine.submitTransfer(staged, {make_write(source, target)}).ok());
+    ASSERT_TRUE(wait_until([&] { return failed_polls.load() > 0; }))
+        << "second chunk never failed while the first was in its cross stage";
+    // Let the failure path run while the first chunk's write is held.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    TransferStatus staged_status{};
+    ASSERT_TRUE(engine.getTransferStatus(staged, 0, staged_status).ok());
+    EXPECT_EQ(staged_status.s, PENDING);
+
+    // The staged owner still holds the only request slot, so a second
+    // credit-gated write must wait instead of reaching the transport.
+    BatchID small = engine.allocateBatch(1);
+    ASSERT_NE(small, (BatchID)0);
+    ASSERT_TRUE(
+        engine.submitTransfer(small, {make_write(small_source, small_target)})
+            .ok());
+    TransferStatus small_status{};
+    ASSERT_TRUE(engine.getTransferStatus(small, 0, small_status).ok());
+    EXPECT_EQ(small_status.s, PENDING);
+    EXPECT_EQ(small_polls.load(), 0);
+
+    // Once the held write drains, the owner fails and returns the credit.
+    release_cross = true;
+    ASSERT_TRUE(wait_until([&] {
+        return engine.getTransferStatus(staged, 0, staged_status).ok() &&
+               staged_status.s != PENDING;
+    }));
+    EXPECT_EQ(staged_status.s, FAILED);
+    ASSERT_TRUE(wait_until([&] {
+        return engine.getTransferStatus(small, 0, small_status).ok() &&
+               small_status.s != PENDING;
+    }));
+    EXPECT_EQ(small_status.s, COMPLETED);
+    EXPECT_EQ(small_target, small_source);
+
+    EXPECT_TRUE(engine.freeBatch(staged).ok());
+    EXPECT_TRUE(engine.freeBatch(small).ok());
+    for (auto* buf : {&source, &target, &small_source, &small_target})
+        EXPECT_TRUE(
+            engine.unregisterLocalMemory(buf->data(), buf->size()).ok());
 }
 
 }  // namespace
