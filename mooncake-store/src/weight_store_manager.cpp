@@ -2,6 +2,7 @@
 #include "weight_residency_planner.h"
 
 #include <map>
+#include <stdexcept>
 #include "master_metric_manager.h"
 
 #include <chrono>
@@ -153,6 +154,16 @@ void WeightStoreManager::Clear() {
     import_activity_.clear();
 }
 
+WeightStoreManager::WeightStoreManager(WeightStoreBackend& backend,
+                                       WeightStoragePolicy policy)
+    : backend_(backend), default_weight_storage_policy_(std::move(policy)) {
+    const auto validation =
+        ValidateWeightStoragePolicy(default_weight_storage_policy_);
+    if (!validation.ok()) {
+        throw std::invalid_argument("Invalid default weight storage policy: " +
+                                    validation.message());
+    }
+}
 std::unique_lock<std::mutex> WeightStoreManager::LockGroup(
     const WeightRevisionIdentity& identity) {
     const auto key = TenantId(identity.tenant_id)
@@ -172,6 +183,9 @@ WeightStoreManager::BeginWeightImport(const BeginWeightImportRequest& request) {
         return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
     }
     normalized.payload_group_id = canonical_group;
+    if (!normalized.policy.has_value()) {
+        normalized.policy = default_weight_storage_policy_;
+    }
     auto operation_lock = LockGroup(request.identity);
     const auto now_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(

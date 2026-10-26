@@ -37,6 +37,60 @@ enum class WeightMigrationMode : uint8_t {
     AUTO = 2,
 };
 
+inline std::optional<WeightResidencyState> ParseWeightResidencyTarget(
+    std::string_view value) {
+    if (value == "hot") {
+        return WeightResidencyState::HOT;
+    }
+    if (value == "cold") {
+        return WeightResidencyState::COLD;
+    }
+    if (value == "mixed") {
+        return WeightResidencyState::MIXED;
+    }
+    return std::nullopt;
+}
+
+inline std::optional<WeightMigrationMode> ParseWeightMigrationMode(
+    std::string_view value) {
+    if (value == "pinned") {
+        return WeightMigrationMode::PINNED;
+    }
+    if (value == "manual") {
+        return WeightMigrationMode::MANUAL;
+    }
+    if (value == "auto") {
+        return WeightMigrationMode::AUTO;
+    }
+    return std::nullopt;
+}
+
+inline std::string_view WeightResidencyTargetName(
+    WeightResidencyState residency) {
+    switch (residency) {
+        case WeightResidencyState::HOT:
+            return "hot";
+        case WeightResidencyState::COLD:
+            return "cold";
+        case WeightResidencyState::MIXED:
+            return "mixed";
+        default:
+            return "unknown";
+    }
+}
+
+inline std::string_view WeightMigrationModeName(WeightMigrationMode mode) {
+    switch (mode) {
+        case WeightMigrationMode::PINNED:
+            return "pinned";
+        case WeightMigrationMode::MANUAL:
+            return "manual";
+        case WeightMigrationMode::AUTO:
+            return "auto";
+    }
+    return "unknown";
+}
+
 enum class WeightOperationKind : uint8_t {
     MIGRATING = 0,
     REPAIRING = 1,

@@ -24,8 +24,8 @@ class WeightStoreManager {
     };
 
    public:
-    explicit WeightStoreManager(WeightStoreBackend& backend)
-        : backend_(backend) {}
+    explicit WeightStoreManager(WeightStoreBackend& backend,
+                                WeightStoragePolicy policy = {});
 
     // A successful guard excludes append-to-publication mutations while the
     // caller captures the OpLog boundary and weight state together.
@@ -135,6 +135,7 @@ class WeightStoreManager {
     std::mutex import_activity_mutex_;
     std::unordered_map<std::string, std::shared_ptr<ImportActivity>>
         import_activity_;
+    const WeightStoragePolicy default_weight_storage_policy_;
     WeightMetadataStore weight_metadata_;
     std::shared_mutex mutation_mutex_;
     std::array<std::mutex, 4096> group_locks_;

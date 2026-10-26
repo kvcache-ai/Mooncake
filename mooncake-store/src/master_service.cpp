@@ -407,7 +407,8 @@ struct MasterService::MemoryEviction {
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
-    : graceful_unmount_scheduler_(
+    : weight_manager_(weight_backend_, config.default_weight_storage_policy),
+      graceful_unmount_scheduler_(
           [this](const GracefulUnmountDeadlineRecord& record) {
               auto result =
                   this->UnmountSegment(record.segment_id, record.client_id);

@@ -123,6 +123,22 @@ TEST(WeightManagementContractTest, RejectsInvalidStoragePolicyEnums) {
     EXPECT_FALSE(ValidateWeightStoragePolicy(policy).ok());
 }
 
+TEST(WeightManagementContractTest, ParsesWeightPolicyConfigStrictly) {
+    EXPECT_EQ(WeightResidencyState::HOT, ParseWeightResidencyTarget("hot"));
+    EXPECT_EQ(WeightResidencyState::COLD, ParseWeightResidencyTarget("cold"));
+    EXPECT_EQ(WeightResidencyState::MIXED, ParseWeightResidencyTarget("mixed"));
+    EXPECT_FALSE(ParseWeightResidencyTarget("HOT").has_value());
+    EXPECT_FALSE(ParseWeightResidencyTarget("unknown").has_value());
+    EXPECT_EQ("mixed", WeightResidencyTargetName(WeightResidencyState::MIXED));
+
+    EXPECT_EQ(WeightMigrationMode::PINNED, ParseWeightMigrationMode("pinned"));
+    EXPECT_EQ(WeightMigrationMode::MANUAL, ParseWeightMigrationMode("manual"));
+    EXPECT_EQ(WeightMigrationMode::AUTO, ParseWeightMigrationMode("auto"));
+    EXPECT_FALSE(ParseWeightMigrationMode("AUTO").has_value());
+    EXPECT_FALSE(ParseWeightMigrationMode("automatic").has_value());
+    EXPECT_EQ("manual", WeightMigrationModeName(WeightMigrationMode::MANUAL));
+}
+
 TEST(WeightManagementContractTest, EnforcesStateCombinationAndOperationIds) {
     WeightRevisionMetadata metadata{
         .identity = ValidIdentity(),
