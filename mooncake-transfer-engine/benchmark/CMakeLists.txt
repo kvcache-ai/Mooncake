@@ -138,4 +138,16 @@ if(BUILD_UNIT_TESTS)
   target_include_directories(tebench_split_output_test
                              PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   add_test(NAME tebench_split_output_test COMMAND tebench_split_output_test)
+
+  add_executable(tebench_numa_first_touch_test tests/numa_first_touch_test.cpp
+                                               numa_first_touch.cpp)
+  target_link_libraries(tebench_numa_first_touch_test PRIVATE gtest gtest_main
+                                                              pthread)
+  if(UNIX AND NOT APPLE)
+    target_link_libraries(tebench_numa_first_touch_test PRIVATE numa)
+  endif()
+  target_include_directories(tebench_numa_first_touch_test
+                             PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  add_test(NAME tebench_numa_first_touch_test
+           COMMAND tebench_numa_first_touch_test)
 endif()
