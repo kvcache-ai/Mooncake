@@ -25,6 +25,8 @@
 #include <fstream>
 
 #ifdef __linux__
+#include "common.h"
+
 #include <cerrno>
 #include <mutex>
 #include <numa.h>
@@ -211,6 +213,24 @@ std::string numaMapsLineFor(void* addr) {
     return found ? best : "not found in numa_maps";
 }
 
+bool vmaRangeFor(void* addr, uintptr_t* start_out, uintptr_t* end_out) {
+    if (!addr || !start_out || !end_out) return false;
+    std::ifstream in("/proc/self/maps");
+    if (!in) return false;
+    const uintptr_t target = reinterpret_cast<uintptr_t>(addr);
+    std::string line;
+    while (std::getline(in, line)) {
+        unsigned long start = 0, end = 0;
+        if (std::sscanf(line.c_str(), "%lx-%lx", &start, &end) != 2) continue;
+        if (target >= start && target < end) {
+            *start_out = start;
+            *end_out = end;
+            return true;
+        }
+    }
+    return false;
+}
+
 static int currentCpuId() {
 #ifdef SYS_getcpu
     unsigned cpu = 0;
@@ -224,9 +244,8 @@ int pickAllowedCpuOnNode(int node, const CpuAffinityMask& allowed) {
     if (node < 0 || numa_available() < 0 || !allowed.valid()) return -1;
     struct bitmask* cpu_list = numa_allocate_cpumask();
     if (!cpu_list) return -1;
-    static std::mutex numa_cpu_cache_mu;
     {
-        std::lock_guard<std::mutex> guard(numa_cpu_cache_mu);
+        std::lock_guard<std::mutex> guard(::mooncake::numaNodeCpuCacheMutex());
         numa_node_to_cpus(node, cpu_list);
     }
     int pick = -1;

@@ -133,6 +133,9 @@ class TEBenchRunner : public BenchRunner {
     std::vector<char> shm_backed_;
     std::vector<char> hugepage_backed_;
     std::vector<char> mmap_backed_;
+    // Anonymous DRAM mappings with PROT_NONE guards so adjacent mmaps do not
+    // merge into one VMA (whole-VMA numa_maps would then mix buffers).
+    std::vector<char> mmap_isolated_;
     std::vector<SegmentID> target_handles_;
     std::vector<std::shared_ptr<TransferMetadata::SegmentDesc>> target_infos_;
 

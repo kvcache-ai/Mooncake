@@ -16,6 +16,7 @@
 #define TEBENCH_NUMA_FIRST_TOUCH_H
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -71,6 +72,9 @@ class CpuAffinityGuard {
 
 void firstTouchPages(void* addr, size_t size);
 std::string numaMapsLineFor(void* addr);
+
+// VMA covering `addr` from /proc/self/maps. False if the range is missing.
+bool vmaRangeFor(void* addr, uintptr_t* start, uintptr_t* end);
 
 // CPU on `node` that is also in `allowed`. -1 if the cpuset has no overlap.
 int pickAllowedCpuOnNode(int node, const CpuAffinityMask& allowed);
