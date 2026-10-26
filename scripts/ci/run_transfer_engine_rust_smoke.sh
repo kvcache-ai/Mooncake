@@ -25,9 +25,6 @@ export LD_LIBRARY_PATH="$MOONCAKE_BUILD_DIR/mooncake-asio:$MOONCAKE_BUILD_DIR/mo
 if [ -d "$MOONCAKE_BUILD_DIR/mooncake-transfer-engine/tent/src" ]; then
     export LD_LIBRARY_PATH="$MOONCAKE_BUILD_DIR/mooncake-transfer-engine/tent/src:${LD_LIBRARY_PATH}"
 fi
-if [ -d /usr/local/cuda/lib64/stubs ]; then
-    export LD_LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH}"
-fi
 if [ -d /usr/local/cuda/lib64 ]; then
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
 fi

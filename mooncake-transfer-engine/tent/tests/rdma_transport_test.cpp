@@ -22,7 +22,7 @@
 #include <unistd.h>
 
 #ifdef USE_CUDA
-#include <cuda.h>
+#include "cuda_driver.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -4432,15 +4432,16 @@ TEST(RdmaQuiesceTest, SynchronizeDevicesDoesNotCreateIdlePrimaryContexts) {
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
         GTEST_SKIP() << "need at least 2 CUDA devices";
     }
-    ASSERT_EQ(cuInit(0), CUDA_SUCCESS);
+    ASSERT_EQ(MOONCAKE_CUDA_SYMBOL(cuInit)(0), CUDA_SUCCESS);
 
     auto primary_active = [](int device) {
         CUdevice cu_dev = 0;
-        if (cuDeviceGet(&cu_dev, device) != CUDA_SUCCESS) return false;
+        if (MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(&cu_dev, device) != CUDA_SUCCESS)
+            return false;
         unsigned int flags = 0;
         int active = 0;
-        return cuDevicePrimaryCtxGetState(cu_dev, &flags, &active) ==
-                   CUDA_SUCCESS &&
+        return MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxGetState)(
+                   cu_dev, &flags, &active) == CUDA_SUCCESS &&
                active != 0;
     };
 

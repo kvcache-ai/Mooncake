@@ -585,9 +585,9 @@ static bool supportFabricMem() {
 #ifdef USE_CUDA
     for (int device_id = 0; device_id < num_devices; ++device_id) {
         int device_support_fabric_mem = 0;
-        cuDeviceGetAttribute(&device_support_fabric_mem,
-                             CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
-                             device_id);
+        MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute)(
+            &device_support_fabric_mem,
+            CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device_id);
         if (!device_support_fabric_mem) {
             return false;
         }
@@ -1033,7 +1033,8 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
 #endif
 
         CUmemGenericAllocationHandle handle;
-        auto result = cuMemRetainAllocationHandle(&handle, addr);
+        auto result =
+            MOONCAKE_CUDA_SYMBOL(cuMemRetainAllocationHandle)(&handle, addr);
         if (result != CUDA_SUCCESS) {
             LOG(WARNING) << "Memory region " << addr
                          << " is not allocated by cuMemCreate, "
@@ -1044,8 +1045,8 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         // Find whole physical page for memory registration
         void *real_addr;
         size_t real_size;
-        result = cuMemGetAddressRange((CUdeviceptr *)&real_addr, &real_size,
-                                      (CUdeviceptr)addr);
+        result = MOONCAKE_CUDA_SYMBOL(cuMemGetAddressRange)(
+            (CUdeviceptr *)&real_addr, &real_size, (CUdeviceptr)addr);
         if (result != CUDA_SUCCESS) {
             LOG(WARNING) << "NvlinkTransport: cuMemGetAddressRange failed: "
                          << result;
@@ -1055,8 +1056,8 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         }
 
         CUmemFabricHandle export_handle;
-        result = cuMemExportToShareableHandle(&export_handle, handle,
-                                              CU_MEM_HANDLE_TYPE_FABRIC, 0);
+        result = MOONCAKE_CUDA_SYMBOL(cuMemExportToShareableHandle)(
+            &export_handle, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0);
         if (result != CUDA_SUCCESS) {
             LOG(ERROR)
                 << "NvlinkTransport: cuMemExportToShareableHandle failed: "
@@ -1367,24 +1368,25 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                            sizeof(export_handle));
                     void *shm_addr = nullptr;
                     CUmemGenericAllocationHandle handle;
-                    auto result = cuMemImportFromShareableHandle(
-                        &handle, &export_handle, CU_MEM_HANDLE_TYPE_FABRIC);
+                    auto result =
+                        MOONCAKE_CUDA_SYMBOL(cuMemImportFromShareableHandle)(
+                            &handle, &export_handle, CU_MEM_HANDLE_TYPE_FABRIC);
                     if (result != CUDA_SUCCESS) {
                         LOG(ERROR) << "NvlinkTransport: "
                                       "cuMemImportFromShareableHandle failed: "
                                    << result;
                         return -1;
                     }
-                    result = cuMemAddressReserve((CUdeviceptr *)&shm_addr,
-                                                 entry.length, 0, 0, 0);
+                    result = MOONCAKE_CUDA_SYMBOL(cuMemAddressReserve)(
+                        (CUdeviceptr *)&shm_addr, entry.length, 0, 0, 0);
                     if (result != CUDA_SUCCESS) {
                         LOG(ERROR)
                             << "NvlinkTransport: cuMemAddressReserve failed: "
                             << result;
                         return -1;
                     }
-                    result = cuMemMap((CUdeviceptr)shm_addr, entry.length, 0,
-                                      handle, 0);
+                    result = MOONCAKE_CUDA_SYMBOL(cuMemMap)(
+                        (CUdeviceptr)shm_addr, entry.length, 0, handle, 0);
                     if (result != CUDA_SUCCESS) {
                         LOG(ERROR)
                             << "NvlinkTransport: cuMemMap failed: " << result;
@@ -1402,8 +1404,9 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                         accessDesc[device_id].flags =
                             CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
                     }
-                    result = cuMemSetAccess((CUdeviceptr)shm_addr, entry.length,
-                                            accessDesc, device_count);
+                    result = MOONCAKE_CUDA_SYMBOL(cuMemSetAccess)(
+                        (CUdeviceptr)shm_addr, entry.length, accessDesc,
+                        device_count);
                     if (result != CUDA_SUCCESS) {
                         LOG(ERROR) << "NvlinkTransport: cuMemSetAccess failed: "
                                    << result;
@@ -1482,7 +1485,7 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
                    << cudaGetErrorString(err);
         return nullptr;
     }
-    CUresult result = cuDeviceGet(&currentDev, cudaDev);
+    CUresult result = MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(&currentDev, cudaDev);
     if (result != CUDA_SUCCESS) {
         LOG(ERROR) << "NvlinkTransport: cuDeviceGet failed: " << result;
         return nullptr;
@@ -1491,7 +1494,7 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
     prop.location.id = currentDev;
-    result = cuDeviceGetAttribute(
+    result = MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute)(
         &flag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
         currentDev);
     if (result != CUDA_SUCCESS) {
@@ -1500,8 +1503,8 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
         return nullptr;
     }
     if (flag) prop.allocFlags.gpuDirectRDMACapable = 1;
-    result = cuMemGetAllocationGranularity(&granularity, &prop,
-                                           CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+    result = MOONCAKE_CUDA_SYMBOL(cuMemGetAllocationGranularity)(
+        &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
     if (result != CUDA_SUCCESS) {
         LOG(ERROR) << "NvlinkTransport: cuMemGetAllocationGranularity failed: "
                    << result;
@@ -1510,22 +1513,24 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     // fix size
     size = (size + granularity - 1) & ~(granularity - 1);
     if (size == 0) size = granularity;
-    result = cuMemCreate(&handle, size, &prop, 0);
+    result = MOONCAKE_CUDA_SYMBOL(cuMemCreate)(&handle, size, &prop, 0);
     if (result != CUDA_SUCCESS) {
         LOG(ERROR) << "NvlinkTransport: cuMemCreate failed: " << result;
         return nullptr;
     }
-    result = cuMemAddressReserve((CUdeviceptr *)&ptr, size, granularity, 0, 0);
+    result = MOONCAKE_CUDA_SYMBOL(cuMemAddressReserve)((CUdeviceptr *)&ptr,
+                                                       size, granularity, 0, 0);
     if (result != CUDA_SUCCESS) {
         LOG(ERROR) << "NvlinkTransport: cuMemAddressReserve failed: " << result;
-        cuMemRelease(handle);
+        MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
         return nullptr;
     }
-    result = cuMemMap((CUdeviceptr)ptr, size, 0, handle, 0);
+    result =
+        MOONCAKE_CUDA_SYMBOL(cuMemMap)((CUdeviceptr)ptr, size, 0, handle, 0);
     if (result != CUDA_SUCCESS) {
         LOG(ERROR) << "NvlinkTransport: cuMemMap failed: " << result;
-        cuMemAddressFree((CUdeviceptr)ptr, size);
-        cuMemRelease(handle);
+        MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)((CUdeviceptr)ptr, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
         return nullptr;
     }
     int device_count;
@@ -1536,12 +1541,13 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
         accessDesc[idx].location.id = idx;
         accessDesc[idx].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     }
-    result = cuMemSetAccess((CUdeviceptr)ptr, size, accessDesc, device_count);
+    result = MOONCAKE_CUDA_SYMBOL(cuMemSetAccess)((CUdeviceptr)ptr, size,
+                                                  accessDesc, device_count);
     if (result != CUDA_SUCCESS) {
         LOG(ERROR) << "NvlinkTransport: cuMemSetAccess failed: " << result;
-        cuMemUnmap((CUdeviceptr)ptr, size);
-        cuMemAddressFree((CUdeviceptr)ptr, size);
-        cuMemRelease(handle);
+        MOONCAKE_CUDA_SYMBOL(cuMemUnmap)((CUdeviceptr)ptr, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)((CUdeviceptr)ptr, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
         return nullptr;
     }
     return ptr;
@@ -1554,17 +1560,19 @@ void NvlinkTransport::freePinnedLocalMemory(void *ptr) {
     }
     CUmemGenericAllocationHandle handle;
     size_t size = 0;
-    auto result = cuMemRetainAllocationHandle(&handle, ptr);
+    auto result =
+        MOONCAKE_CUDA_SYMBOL(cuMemRetainAllocationHandle)(&handle, ptr);
     if (result != CUDA_SUCCESS) {
         LOG(ERROR) << "NvlinkTransport: cuMemRetainAllocationHandle failed: "
                    << result;
         return;
     }
-    result = cuMemGetAddressRange(NULL, &size, (CUdeviceptr)ptr);
+    result = MOONCAKE_CUDA_SYMBOL(cuMemGetAddressRange)(NULL, &size,
+                                                        (CUdeviceptr)ptr);
     if (result == CUDA_SUCCESS) {
-        cuMemUnmap((CUdeviceptr)ptr, size);
-        cuMemAddressFree((CUdeviceptr)ptr, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemUnmap)((CUdeviceptr)ptr, size);
+        MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)((CUdeviceptr)ptr, size);
     }
-    cuMemRelease(handle);
+    MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle);
 }
 }  // namespace mooncake

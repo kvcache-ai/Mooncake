@@ -63,19 +63,19 @@ NvlinkHostNumaAllocation::OwnedRanges() {
 NvlinkHostNumaAllocation::DriverApi
 NvlinkHostNumaAllocation::ProductionDriverApi() {
     return DriverApi{
-        cuDeviceGetCount,
-        cuDeviceGet,
-        cuDeviceGetAttribute,
-        cuMemGetAllocationGranularity,
-        cuMemCreate,
-        cuMemAddressReserve,
-        cuMemMap,
-        cuMemSetAccess,
-        cuMemUnmap,
-        cuMemAddressFree,
-        cuMemRelease,
-        cuMemRetainAllocationHandle,
-        cuMemExportToShareableHandle,
+        MOONCAKE_CUDA_SYMBOL(cuDeviceGetCount),
+        MOONCAKE_CUDA_SYMBOL(cuDeviceGet),
+        MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute),
+        MOONCAKE_CUDA_SYMBOL(cuMemGetAllocationGranularity),
+        MOONCAKE_CUDA_SYMBOL(cuMemCreate),
+        MOONCAKE_CUDA_SYMBOL(cuMemAddressReserve),
+        MOONCAKE_CUDA_SYMBOL(cuMemMap),
+        MOONCAKE_CUDA_SYMBOL(cuMemSetAccess),
+        MOONCAKE_CUDA_SYMBOL(cuMemUnmap),
+        MOONCAKE_CUDA_SYMBOL(cuMemAddressFree),
+        MOONCAKE_CUDA_SYMBOL(cuMemRelease),
+        MOONCAKE_CUDA_SYMBOL(cuMemRetainAllocationHandle),
+        MOONCAKE_CUDA_SYMBOL(cuMemExportToShareableHandle),
     };
 }
 

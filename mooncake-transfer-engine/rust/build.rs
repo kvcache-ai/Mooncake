@@ -233,9 +233,7 @@ fn main() {
         .or_else(|_| env::var("CUDA_PATH"))
         .unwrap_or_else(|_| "/usr/local/cuda".to_string());
     for dir in [
-        PathBuf::from(&cuda_home).join("lib64/stubs"),
         PathBuf::from(&cuda_home).join("lib64"),
-        PathBuf::from(&cuda_home).join("lib/stubs"),
         PathBuf::from(&cuda_home).join("lib"),
     ] {
         push_dir(&mut search_dirs, dir);
@@ -342,14 +340,9 @@ fn main() {
         }
     }
 
-    if flag_on("MOONCAKE_WITH_CUDA")
-        || has_library(&search_dirs, "cudart")
-        || has_library(&search_dirs, "cuda")
-    {
+    if flag_on("MOONCAKE_WITH_CUDA") || has_library(&search_dirs, "cudart") {
         println!("cargo:rustc-link-lib=cudart");
-        if has_library(&search_dirs, "cuda") {
-            println!("cargo:rustc-link-lib=cuda");
-        }
+        println!("cargo:rustc-link-lib=dl");
         println!("cargo:rustc-link-lib=rt");
     }
 

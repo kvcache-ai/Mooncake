@@ -614,7 +614,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 #if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
         if (!dmabufUmemRegEx()) return false;
         CUdevice device;
-        CUresult result = cuCtxGetDevice(&device);
+        CUresult result = MOONCAKE_CUDA_SYMBOL(cuCtxGetDevice)(&device);
         if (result != CUDA_SUCCESS) {
             LOG(WARNING) << "[EP IBGDA] cuCtxGetDevice failed while probing "
                             "DMA-BUF control support: "
@@ -623,7 +623,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
 
         int supported = 0;
-        result = cuDeviceGetAttribute(
+        result = MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute)(
             &supported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, device);
         if (result != CUDA_SUCCESS) {
             LOG(WARNING) << "[EP IBGDA] CUDA DMA-BUF capability query failed: "
@@ -647,8 +647,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 #if defined(USE_CUDA)
         const char* name = nullptr;
         const char* message = nullptr;
-        cuGetErrorName(result, &name);
-        cuGetErrorString(result, &message);
+        MOONCAKE_CUDA_SYMBOL(cuGetErrorName)(result, &name);
+        MOONCAKE_CUDA_SYMBOL(cuGetErrorString)(result, &message);
         return std::string(name ? name : "CUDA_ERROR_UNKNOWN") + ": " +
                (message ? message : "unknown CUDA driver error");
 #else
@@ -684,7 +684,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
 
         int sync_memops = 1;
-        CUresult result = cuPointerSetAttribute(
+        CUresult result = MOONCAKE_CUDA_SYMBOL(cuPointerSetAttribute)(
             &sync_memops, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS,
             reinterpret_cast<CUdeviceptr>(addr));
         if (result != CUDA_SUCCESS) {
@@ -697,7 +697,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
 
         int dmabuf_fd = -1;
-        result = cuMemGetHandleForAddressRange(
+        result = MOONCAKE_CUDA_SYMBOL(cuMemGetHandleForAddressRange)(
             &dmabuf_fd, reinterpret_cast<CUdeviceptr>(addr), size,
             CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
         if (result != CUDA_SUCCESS) {

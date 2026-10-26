@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "cuda_driver.h"
+
 #include "tent/device_plugin.h"
 #include "tent/platform/cuda_utils.h"
 
@@ -105,7 +107,7 @@ static int cuda_memcpy_sync(void* ctx_, void* dst, void* src, size_t length) {
     // cannot distinguish a custom context from its device's primary context,
     // and a caller that started without a context must remain without one.
     CUcontext caller_ctx = nullptr;
-    CUresult ctx_result = cuCtxGetCurrent(&caller_ctx);
+    CUresult ctx_result = MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(&caller_ctx);
     if (ctx_result != CUDA_SUCCESS) {
         LOG(ERROR) << "CUDA plugin cuCtxGetCurrent: " << ctx_result;
         return TENT_DEVICE_PLUGIN_ERROR;
@@ -135,7 +137,7 @@ static int cuda_memcpy_sync(void* ctx_, void* dst, void* src, size_t length) {
             result = TENT_DEVICE_PLUGIN_ERROR;
         }
     }
-    ctx_result = cuCtxSetCurrent(caller_ctx);
+    ctx_result = MOONCAKE_CUDA_SYMBOL(cuCtxSetCurrent)(caller_ctx);
     if (ctx_result != CUDA_SUCCESS) {
         LOG(ERROR) << "CUDA plugin cuCtxSetCurrent(restore): " << ctx_result;
         result = TENT_DEVICE_PLUGIN_ERROR;

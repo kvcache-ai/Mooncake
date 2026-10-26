@@ -698,7 +698,7 @@ int EfaContext::deconstruct() {
 // driver call that actually failed.
 static void logCudaFailure(const char* call, CUresult ret, int device_ordinal) {
     const char* err = nullptr;
-    cuGetErrorString(ret, &err);
+    MOONCAKE_CUDA_SYMBOL(cuGetErrorString)(ret, &err);
     LOG(WARNING) << "EFA: " << call << " failed"
                  << (device_ordinal >= 0
                          ? " for CUDA device " + std::to_string(device_ordinal)
@@ -713,7 +713,7 @@ static void logCudaFailure(const char* call, CUresult ret, int device_ordinal) {
 class ScopedCudaContext {
    public:
     ScopedCudaContext() {
-        CUresult ret = cuCtxGetCurrent(&previous_);
+        CUresult ret = MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(&previous_);
         if (ret != CUDA_SUCCESS) {
             logCudaFailure("cuCtxGetCurrent", ret, -1);
             return;
@@ -734,21 +734,22 @@ class ScopedCudaContext {
         if (!valid_ || retained_) return false;
         device_ordinal_ = device_ordinal;
 
-        CUresult ret = cuDeviceGet(&device_, device_ordinal_);
+        CUresult ret =
+            MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(&device_, device_ordinal_);
         if (ret != CUDA_SUCCESS) {
             logCudaFailure("cuDeviceGet", ret, device_ordinal_);
             return false;
         }
 
         CUcontext primary = nullptr;
-        ret = cuDevicePrimaryCtxRetain(&primary, device_);
+        ret = MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxRetain)(&primary, device_);
         if (ret != CUDA_SUCCESS) {
             logCudaFailure("cuDevicePrimaryCtxRetain", ret, device_ordinal_);
             return false;
         }
         retained_ = true;
 
-        ret = cuCtxSetCurrent(primary);
+        ret = MOONCAKE_CUDA_SYMBOL(cuCtxSetCurrent)(primary);
         if (ret != CUDA_SUCCESS) {
             logCudaFailure("cuCtxSetCurrent", ret, device_ordinal_);
             return false;
@@ -761,14 +762,14 @@ class ScopedCudaContext {
         restored_ = true;
         if (!valid_) return false;
 
-        CUresult ret = cuCtxSetCurrent(previous_);
+        CUresult ret = MOONCAKE_CUDA_SYMBOL(cuCtxSetCurrent)(previous_);
         restore_ok_ = ret == CUDA_SUCCESS;
         if (!restore_ok_) {
             logCudaFailure("cuCtxSetCurrent (restore)", ret, device_ordinal_);
         }
 
         if (retained_) {
-            ret = cuDevicePrimaryCtxRelease(device_);
+            ret = MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxRelease)(device_);
             if (ret != CUDA_SUCCESS) {
                 logCudaFailure("cuDevicePrimaryCtxRelease", ret,
                                device_ordinal_);

@@ -107,10 +107,10 @@ if(USE_CUDA)
   target_include_directories(transfer_engine
                              PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
   if(USE_CXI)
-    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart
+    target_link_libraries(transfer_engine PUBLIC ${CMAKE_DL_LIBS} CUDA::cudart
                                                  rt)
   else()
-    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart
+    target_link_libraries(transfer_engine PUBLIC ${CMAKE_DL_LIBS} CUDA::cudart
                                                  rt mlx5)
   endif()
   if(USE_NVMEOF)

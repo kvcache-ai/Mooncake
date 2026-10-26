@@ -14,7 +14,7 @@
 
 #include "tent/device_plugin.h"
 
-#include <cuda.h>
+#include "cuda_driver.h"
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <array>
@@ -24,6 +24,8 @@
 extern "C" int tent_register_device_plugin(device_plugin_t* out);
 
 #ifdef TENT_CUDA_PLUGIN_CONTEXT_MOCK
+#include <dlfcn.h>
+
 #include "tent/runtime/memory_prober.h"
 
 namespace {
@@ -33,6 +35,7 @@ bool fail_copy, fail_switch, fail_context_query, fail_context_restore;
 bool fail_device_restore;
 bool fail_device_query;
 const void* device_pointer;
+int cuda_driver_handle;
 constexpr int kBufferDevice = 2;
 
 class CudaPluginContextTest : public testing::Test {
@@ -52,6 +55,9 @@ class CudaPluginContextTest : public testing::Test {
 }  // namespace
 
 extern "C" {
+void* __real_dlopen(const char* filename, int flags);
+void* __real_dlsym(void* handle, const char* name);
+
 CUresult __wrap_cuInit(unsigned int) { return CUDA_SUCCESS; }
 CUresult __wrap_cuPointerGetAttribute(void* value, CUpointer_attribute attr,
                                       CUdeviceptr ptr) {
@@ -99,6 +105,28 @@ cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t size,
     if (fail_copy) return cudaErrorUnknown;
     std::memcpy(dst, src, size);
     return cudaSuccess;
+}
+
+// Driver calls are resolved with dlsym rather than linked directly. Keep the
+// context tests independent of an installed NVIDIA driver, including when the
+// CUDA plugin is loaded as a separate shared library by MemoryProber.
+void* __wrap_dlopen(const char* filename, int flags) {
+    if (filename && std::strcmp(filename, "libcuda.so.1") == 0)
+        return &cuda_driver_handle;
+    return __real_dlopen(filename, flags);
+}
+
+void* __wrap_dlsym(void* handle, const char* name) {
+    if (handle != &cuda_driver_handle) return __real_dlsym(handle, name);
+    if (std::strcmp(name, "cuInit") == 0)
+        return reinterpret_cast<void*>(&__wrap_cuInit);
+    if (std::strcmp(name, "cuPointerGetAttribute") == 0)
+        return reinterpret_cast<void*>(&__wrap_cuPointerGetAttribute);
+    if (std::strcmp(name, "cuCtxGetCurrent") == 0)
+        return reinterpret_cast<void*>(&__wrap_cuCtxGetCurrent);
+    if (std::strcmp(name, "cuCtxSetCurrent") == 0)
+        return reinterpret_cast<void*>(&__wrap_cuCtxSetCurrent);
+    return nullptr;
 }
 }
 
@@ -222,37 +250,38 @@ TEST(CudaPluginContextGpuTest, DeviceCopyPreservesCallerOnSuccessAndError) {
     ASSERT_EQ(0, tent_register_device_plugin(&plugin));
     CUcontext custom = nullptr;
 #if CUDA_VERSION >= 13000
-    ASSERT_EQ(CUDA_SUCCESS, cuCtxCreate(&custom, nullptr, 0, 0));
+    ASSERT_EQ(CUDA_SUCCESS,
+              MOONCAKE_CUDA_SYMBOL(cuCtxCreate)(&custom, nullptr, 0, 0));
 #else
-    ASSERT_EQ(CUDA_SUCCESS, cuCtxCreate(&custom, 0, 0));
+    ASSERT_EQ(CUDA_SUCCESS, MOONCAKE_CUDA_SYMBOL(cuCtxCreate)(&custom, 0, 0));
 #endif
     for (bool error : {false, true}) {
-        ASSERT_EQ(CUDA_SUCCESS, cuCtxSetCurrent(custom));
+        ASSERT_EQ(CUDA_SUCCESS, MOONCAKE_CUDA_SYMBOL(cuCtxSetCurrent)(custom));
         int rc = plugin.memcpy_sync(nullptr, device,
                                     error ? nullptr : src.data(), src.size());
         EXPECT_EQ(!error, rc == 0);
         CUcontext after = nullptr;
-        ASSERT_EQ(CUDA_SUCCESS, cuCtxGetCurrent(&after));
+        ASSERT_EQ(CUDA_SUCCESS, MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(&after));
         EXPECT_EQ(custom, after);
         (void)cudaGetLastError();
     }
     std::thread worker([&] {
         CUcontext before = nullptr, after = nullptr;
-        ASSERT_EQ(CUDA_SUCCESS, cuCtxGetCurrent(&before));
+        ASSERT_EQ(CUDA_SUCCESS, MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(&before));
         ASSERT_EQ(nullptr, before);
         ASSERT_EQ(0,
                   plugin.memcpy_sync(nullptr, dst.data(), device, dst.size()));
         EXPECT_EQ(src, dst);
-        ASSERT_EQ(CUDA_SUCCESS, cuCtxGetCurrent(&after));
+        ASSERT_EQ(CUDA_SUCCESS, MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(&after));
         EXPECT_EQ(nullptr, after);
         EXPECT_NE(0, plugin.memcpy_sync(nullptr, device, nullptr, src.size()));
-        ASSERT_EQ(CUDA_SUCCESS, cuCtxGetCurrent(&after));
+        ASSERT_EQ(CUDA_SUCCESS, MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(&after));
         EXPECT_EQ(nullptr, after);
         (void)cudaGetLastError();
     });
     worker.join();
-    ASSERT_EQ(CUDA_SUCCESS, cuCtxSetCurrent(nullptr));
-    ASSERT_EQ(CUDA_SUCCESS, cuCtxDestroy(custom));
+    ASSERT_EQ(CUDA_SUCCESS, MOONCAKE_CUDA_SYMBOL(cuCtxSetCurrent)(nullptr));
+    ASSERT_EQ(CUDA_SUCCESS, MOONCAKE_CUDA_SYMBOL(cuCtxDestroy)(custom));
     ASSERT_EQ(cudaSuccess, cudaSetDevice(0));
     EXPECT_EQ(cudaSuccess, cudaFree(device));
 }

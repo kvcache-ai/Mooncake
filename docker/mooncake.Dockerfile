@@ -69,19 +69,15 @@ RUN mkdir -p build && \
         -DSTORE_USE_ETCD=ON \
         -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
-    export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
     cmake --build . --parallel "${BUILD_JOBS}" && \
     cd /workspace && \
     export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH && \
-    export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH && \
-    export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
     mkdir -p build/mooncake-transfer-engine/nvlink-allocator && \
     cd mooncake-transfer-engine/nvlink-allocator && \
     bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/ && \
     cd /workspace && \
     OUTPUT_DIR=dist ./scripts/build_wheel.sh && \
     python${PYTHON_VERSION} -m pip install --no-cache-dir mooncake-wheel/dist/*.whl && \
-    ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 && \
     python${PYTHON_VERSION} -m mooncake.pg --prebuild && \
     if [ "${CLEAN_BUILD_ARTIFACTS}" = "1" ]; then \
         rm -rf build; \

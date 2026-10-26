@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "cuda_driver.h"
+
 #include "tent/transport/nvlink/nvlink_transport.h"
 
 #include <bits/stdint-uintn.h>
@@ -445,10 +447,10 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
         // VMM allocations have driver allocation handles, but
         // cudaIpcGetMemHandle only supports cudaMalloc-backed pointers.
         CUmemGenericAllocationHandle generic_handle;
-        CUresult retain_result =
-            cuMemRetainAllocationHandle(&generic_handle, (void*)desc.addr);
+        CUresult retain_result = MOONCAKE_CUDA_SYMBOL(
+            cuMemRetainAllocationHandle)(&generic_handle, (void*)desc.addr);
         if (retain_result == CUDA_SUCCESS) {
-            cuMemRelease(generic_handle);
+            MOONCAKE_CUDA_SYMBOL(cuMemRelease)(generic_handle);
             CHECK_STATUS(restoreCudaDeviceForLocation(location, saved_dev));
             LOG(INFO) << "NVLinkTransport: memory region " << (void*)desc.addr
                       << " is not cudaMalloc-backed; skip CUDA IPC export.";
@@ -461,8 +463,8 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
         // segment, so we need to register at segment granularity.
         CUdeviceptr base_ptr = 0;
         size_t alloc_size = 0;
-        CUresult cu_err = cuMemGetAddressRange(&base_ptr, &alloc_size,
-                                               (CUdeviceptr)desc.addr);
+        CUresult cu_err = MOONCAKE_CUDA_SYMBOL(cuMemGetAddressRange)(
+            &base_ptr, &alloc_size, (CUdeviceptr)desc.addr);
         if (cu_err != CUDA_SUCCESS) {
             LOG(ERROR) << "NVLinkTransport: cuMemGetAddressRange failed for "
                        << "addr 0x" << std::hex << desc.addr << std::dec
@@ -536,8 +538,8 @@ Status NVLinkTransport::removeMemoryBuffer(BufferDesc& desc) {
 
         CUdeviceptr base_ptr = 0;
         size_t alloc_size = 0;
-        CUresult cu_err = cuMemGetAddressRange(&base_ptr, &alloc_size,
-                                               (CUdeviceptr)desc.addr);
+        CUresult cu_err = MOONCAKE_CUDA_SYMBOL(cuMemGetAddressRange)(
+            &base_ptr, &alloc_size, (CUdeviceptr)desc.addr);
         CHECK_STATUS(restoreCudaDeviceForLocation(location, saved_dev));
 
         uint64_t key = desc.addr;

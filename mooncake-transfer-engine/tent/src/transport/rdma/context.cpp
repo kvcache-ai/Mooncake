@@ -34,7 +34,7 @@
 #include <dlfcn.h>
 
 #ifdef USE_CUDA
-#include <cuda.h>
+#include "cuda_driver.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -547,13 +547,13 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
     // Ensure CUDA context is current for GPU memory registration
     // This is needed for worker threads or callers from non-CUDA threads
     CUmemorytype memType;
-    CUresult result = cuPointerGetAttribute(
+    CUresult result = MOONCAKE_CUDA_SYMBOL(cuPointerGetAttribute)(
         &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
 
     if (result == CUDA_SUCCESS && memType == CU_MEMORYTYPE_DEVICE) {
         // Get device ordinal and set primary context current
         unsigned int devOrd = 0;
-        result = cuPointerGetAttribute(
+        result = MOONCAKE_CUDA_SYMBOL(cuPointerGetAttribute)(
             &devOrd, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)addr);
         if (result != CUDA_SUCCESS) {
             LOG(ERROR) << "Failed to get CUDA device ordinal: " << result;
@@ -561,23 +561,23 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
         }
 
         CUdevice cuDev;
-        result = cuDeviceGet(&cuDev, devOrd);
+        result = MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(&cuDev, devOrd);
         if (result != CUDA_SUCCESS) {
             LOG(ERROR) << "Failed to get CUDA device: " << result;
             return nullptr;
         }
 
         CUcontext cuCtx;
-        result = cuDevicePrimaryCtxRetain(&cuCtx, cuDev);
+        result = MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxRetain)(&cuCtx, cuDev);
         if (result != CUDA_SUCCESS) {
             LOG(ERROR) << "Failed to retain CUDA primary context: " << result;
             return nullptr;
         }
 
-        result = cuCtxSetCurrent(cuCtx);
+        result = MOONCAKE_CUDA_SYMBOL(cuCtxSetCurrent)(cuCtx);
         if (result != CUDA_SUCCESS) {
             LOG(ERROR) << "Failed to set CUDA context current: " << result;
-            cuDevicePrimaryCtxRelease(cuDev);
+            MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxRelease)(cuDev);
             return nullptr;
         }
 
@@ -586,7 +586,7 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
             verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
 
         // Release primary context reference
-        cuDevicePrimaryCtxRelease(cuDev);
+        MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxRelease)(cuDev);
 
         if (!entry) {
             const void* end = static_cast<const char*>(addr) + length;

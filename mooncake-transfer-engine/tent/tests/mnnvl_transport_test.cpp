@@ -23,7 +23,7 @@
 #include <string>
 #include <vector>
 
-#include <cuda.h>
+#include "cuda_driver.h"
 #include <cuda_runtime.h>
 
 #include "tent/common/config.h"
@@ -110,9 +110,10 @@ class PeerFdExporter {
             return 2;
 
         CUdevice device;
-        if (cuDeviceGet(&device, 0) != CUDA_SUCCESS) return 3;
+        if (MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(&device, 0) != CUDA_SUCCESS)
+            return 3;
         int fd_supported = 0;
-        cuDeviceGetAttribute(
+        MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute)(
             &fd_supported,
             CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED,
             device);
@@ -127,8 +128,8 @@ class PeerFdExporter {
         prop.location.id = device;
         prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
         size_t granularity = 0;
-        if (cuMemGetAllocationGranularity(&granularity, &prop,
-                                          CU_MEM_ALLOC_GRANULARITY_MINIMUM) !=
+        if (MOONCAKE_CUDA_SYMBOL(cuMemGetAllocationGranularity)(
+                &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) !=
             CUDA_SUCCESS)
             return 4;
         size_t size =
@@ -136,13 +137,21 @@ class PeerFdExporter {
 
         CUmemGenericAllocationHandle handle;
         CUdeviceptr ptr = 0;
-        if (cuMemCreate(&handle, size, &prop, 0) != CUDA_SUCCESS) return 5;
-        if (cuMemAddressReserve(&ptr, size, 0, 0, 0) != CUDA_SUCCESS) return 6;
-        if (cuMemMap(ptr, size, 0, handle, 0) != CUDA_SUCCESS) return 7;
+        if (MOONCAKE_CUDA_SYMBOL(cuMemCreate)(&handle, size, &prop, 0) !=
+            CUDA_SUCCESS)
+            return 5;
+        if (MOONCAKE_CUDA_SYMBOL(cuMemAddressReserve)(&ptr, size, 0, 0, 0) !=
+            CUDA_SUCCESS)
+            return 6;
+        if (MOONCAKE_CUDA_SYMBOL(cuMemMap)(ptr, size, 0, handle, 0) !=
+            CUDA_SUCCESS)
+            return 7;
         CUmemAccessDesc access = {};
         access.location = prop.location;
         access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        if (cuMemSetAccess(ptr, size, &access, 1) != CUDA_SUCCESS) return 8;
+        if (MOONCAKE_CUDA_SYMBOL(cuMemSetAccess)(ptr, size, &access, 1) !=
+            CUDA_SUCCESS)
+            return 8;
 
         std::vector<uint32_t> pattern(kBufferLength / sizeof(uint32_t),
                                       kPattern);
@@ -151,7 +160,7 @@ class PeerFdExporter {
             return 9;
 
         int shared_fd = -1;
-        if (cuMemExportToShareableHandle(
+        if (MOONCAKE_CUDA_SYMBOL(cuMemExportToShareableHandle)(
                 &shared_fd, handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
                 0) != CUDA_SUCCESS)
             return 10;

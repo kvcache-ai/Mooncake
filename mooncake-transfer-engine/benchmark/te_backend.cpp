@@ -241,7 +241,8 @@ static void* allocateHugepageOnNode(size_t size, int node) {
 static void freeMemoryPool(void* addr, size_t size) {
 #if defined(USE_CUDA) && defined(USE_MNNVL)
     CUmemGenericAllocationHandle handle;
-    auto result = cuMemRetainAllocationHandle(&handle, addr);
+    auto result =
+        MOONCAKE_CUDA_SYMBOL(cuMemRetainAllocationHandle)(&handle, addr);
     if (result == CUDA_SUCCESS) {
         mooncake::NvlinkTransport::freePinnedLocalMemory(addr);
         return;

@@ -40,6 +40,7 @@ add_fabric_allocator_build_target(
   BUILD_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/nvlink_allocator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../include/cuda_alike.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-common/include/cuda_driver.h
   ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/allocator_build_common.sh
   ${_extra_build_depends}
   COMMENT

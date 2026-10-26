@@ -530,7 +530,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     // dma_buf fd that every NIC then imports, so the driver keeps a single
     // BAR1 window for the buffer instead of one per NIC.
     CUmemorytype memType;
-    CUresult result = cuPointerGetAttribute(
+    CUresult result = MOONCAKE_CUDA_SYMBOL(cuPointerGetAttribute)(
         &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
 
     if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
@@ -547,19 +547,36 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         // Ensure a CUDA context is current — worker threads or callers
         // from non-CUDA threads may lack one.
         unsigned int devOrd = 0;
-        cuPointerGetAttribute(&devOrd, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
-                              (CUdeviceptr)addr);
+        result = MOONCAKE_CUDA_SYMBOL(cuPointerGetAttribute)(
+            &devOrd, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)addr);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "Failed to get CUDA device ordinal: " << result;
+            return ERR_CONTEXT;
+        }
         CUdevice cuDev;
+        result = MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(&cuDev, devOrd);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "Failed to get CUDA device: " << result;
+            return ERR_CONTEXT;
+        }
         CUcontext cuCtx;
-        cuDeviceGet(&cuDev, devOrd);
-        cuDevicePrimaryCtxRetain(&cuCtx, cuDev);
-        cuCtxSetCurrent(cuCtx);
+        result = MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxRetain)(&cuCtx, cuDev);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "Failed to retain CUDA primary context: " << result;
+            return ERR_CONTEXT;
+        }
+        result = MOONCAKE_CUDA_SYMBOL(cuCtxSetCurrent)(cuCtx);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "Failed to set CUDA context current: " << result;
+            MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxRelease)(cuDev);
+            return ERR_CONTEXT;
+        }
         // Remember which PCI root the GPU hangs off: Data Direct registration
         // only works on NICs whose Data Direct function shares that root.
         {
             char pci_bus_id[32] = {0};
-            if (cuDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), cuDev) ==
-                CUDA_SUCCESS)
+            if (MOONCAKE_CUDA_SYMBOL(cuDeviceGetPCIBusId)(
+                    pci_bus_id, sizeof(pci_bus_id), cuDev) == CUDA_SUCCESS)
                 out.pci_root = pciSysfsRoot(pci_bus_id);
         }
 
@@ -571,15 +588,15 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
 #endif
         CUdeviceptr allocBase;
         size_t allocSize;
-        result =
-            cuMemGetAddressRange(&allocBase, &allocSize, (CUdeviceptr)addr);
+        result = MOONCAKE_CUDA_SYMBOL(cuMemGetAddressRange)(
+            &allocBase, &allocSize, (CUdeviceptr)addr);
         if (result != CUDA_SUCCESS) {
             const char *errStr;
-            cuGetErrorString(result, &errStr);
+            MOONCAKE_CUDA_SYMBOL(cuGetErrorString)(result, &errStr);
             LOG(ERROR) << "Failed to call cuMemGetAddressRange for "
                        << (uintptr_t)addr << " cuda error=" << errStr;
 #if defined(USE_CUDA) || defined(USE_SUPA)
-            cuDevicePrimaryCtxRelease(cuDev);
+            MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxRelease)(cuDev);
 #endif
             return ERR_CONTEXT;
         }
@@ -640,18 +657,18 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         if (data_direct)
             export_flags = CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE;
 #endif
-        result = cuMemGetHandleForAddressRange(
+        result = MOONCAKE_CUDA_SYMBOL(cuMemGetHandleForAddressRange)(
             &dmabuf_fd, exportBase, exportSize,
             CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, export_flags);
         if (result != CUDA_SUCCESS) {
             const char *errStr;
-            cuGetErrorString(result, &errStr);
+            MOONCAKE_CUDA_SYMBOL(cuGetErrorString)(result, &errStr);
             LOG(ERROR) << "Failed to retrieve dmabuf for " << (uintptr_t)addr
                        << " base=" << (uintptr_t)exportBase
                        << " size=" << exportSize << " flags=" << export_flags
                        << " cuda error=" << errStr;
 #if defined(USE_CUDA) || defined(USE_SUPA)
-            cuDevicePrimaryCtxRelease(cuDev);
+            MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxRelease)(cuDev);
 #endif
             return ERR_CONTEXT;
         }
@@ -659,7 +676,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         out.fd = dmabuf_fd;
         out.offset = exportOffset;
 #if defined(USE_CUDA) || defined(USE_SUPA)
-        cuDevicePrimaryCtxRelease(cuDev);
+        MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxRelease)(cuDev);
 #endif
     }
 #elif defined(USE_HIP_DMABUF)
@@ -1525,7 +1542,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
                 // cuInit is process-global and idempotent; call it once before
                 // the per-device loop, not per cuDeviceGet.
 #if defined(USE_CUDA) || defined(USE_SUPA)
-                CUresult result = cuInit(0);
+                CUresult result = MOONCAKE_CUDA_SYMBOL(cuInit)(0);
                 if (result != CUDA_SUCCESS) {
                     LOG(ERROR) << "Failed to initialize CUDA driver for RNIC "
                                << device_name;
@@ -1534,14 +1551,15 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
 #endif
                 for (int gpu_device : mapped_gpu_devices) {
                     CUdevice cuDevice;
-                    CUresult result = cuDeviceGet(&cuDevice, gpu_device);
+                    CUresult result = MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(
+                        &cuDevice, gpu_device);
                     if (result != CUDA_SUCCESS) {
                         LOG(ERROR) << "Failed to query GPU device "
                                    << gpu_device << " for RNIC " << device_name;
                         goto cleanup_context_and_devices;
                     }
                     int dmaBufSupported;
-                    result = cuDeviceGetAttribute(
+                    result = MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute)(
                         &dmaBufSupported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED,
                         cuDevice);
                     if (result != CUDA_SUCCESS) {

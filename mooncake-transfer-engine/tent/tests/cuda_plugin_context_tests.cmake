@@ -5,21 +5,12 @@ endif()
 set(cuda_plugin_context_source
     ${CMAKE_CURRENT_LIST_DIR}/../plugins/cuda/cuda_plugin.cpp)
 set(cuda_plugin_context_wrap_options)
-foreach(
-  symbol
-  cuInit
-  cuPointerGetAttribute
-  cuCtxGetCurrent
-  cuCtxSetCurrent
-  cudaGetDevice
-  cudaSetDevice
-  cudaMemcpy)
+foreach(symbol dlopen dlsym cudaGetDevice cudaSetDevice cudaMemcpy)
   list(APPEND cuda_plugin_context_wrap_options "-Wl,--wrap=${symbol}")
 endforeach()
 
 add_library(cuda_plugin_context_mock SHARED ${cuda_plugin_context_source})
-target_link_libraries(cuda_plugin_context_mock PRIVATE tent_common CUDA::cudart
-                                                       CUDA::cuda_driver)
+target_link_libraries(cuda_plugin_context_mock PRIVATE tent_common CUDA::cudart)
 target_link_options(cuda_plugin_context_mock PRIVATE
                     ${cuda_plugin_context_wrap_options})
 set_target_properties(
@@ -33,14 +24,8 @@ add_executable(
   ${cuda_plugin_context_source}
   ${CMAKE_CURRENT_LIST_DIR}/../src/runtime/memory_prober.cpp)
 target_link_libraries(
-  tent_cuda_plugin_context_test
-  PRIVATE tent_common
-          gtest
-          gtest_main
-          CUDA::cudart
-          CUDA::cuda_driver
-          numa
-          ${CMAKE_DL_LIBS})
+  tent_cuda_plugin_context_test PRIVATE tent_common gtest gtest_main
+                                        CUDA::cudart numa ${CMAKE_DL_LIBS})
 target_link_options(tent_cuda_plugin_context_test PRIVATE
                     ${cuda_plugin_context_wrap_options})
 target_compile_definitions(
@@ -58,8 +43,7 @@ add_executable(
   tent_cuda_plugin_context_gpu_test
   ${CMAKE_CURRENT_LIST_DIR}/cuda_plugin_context_test.cpp
   ${cuda_plugin_context_source})
-target_link_libraries(
-  tent_cuda_plugin_context_gpu_test PRIVATE tent_common gtest gtest_main
-                                            CUDA::cudart CUDA::cuda_driver)
+target_link_libraries(tent_cuda_plugin_context_gpu_test
+                      PRIVATE tent_common gtest gtest_main CUDA::cudart)
 add_test(NAME tent_cuda_plugin_context_gpu_test
          COMMAND tent_cuda_plugin_context_gpu_test)
