@@ -154,6 +154,25 @@ class TentMetrics {
     // the only failure metric that records TIMEOUT/CANCELED outcomes.
     void recordTaskFailure(TransportType tp, TaskFailureReason reason);
 
+    enum class ShmMappingEvent {
+        CacheHit,
+        CacheMiss,
+        MetadataError,
+        OpenError,
+        StatError,
+        SizeMismatch,
+        MapError,
+        Created,
+    };
+    enum class ShmCopyOutcome { Success, Error };
+
+    // SHM copies are synchronous physical attempts. Mapping events describe
+    // the remote-address relocation cache and backing-object setup; labels
+    // deliberately exclude segment ids, addresses and shm paths.
+    void recordShmMappingEvent(ShmMappingEvent event);
+    void recordShmCopy(Request::OpCode operation, ShmCopyOutcome outcome,
+                       double latency_us);
+
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
     // sitting in the engine right now — a persistently high or stuck value
@@ -287,6 +306,10 @@ class TentMetrics {
         "transport", "operation", "outcome"};
     static inline const std::array<std::string, 2> kTaskFailureLabels{
         "transport", "reason"};
+    static inline const std::array<std::string, 1> kShmMappingEventLabel{
+        "event"};
+    static inline const std::array<std::string, 2> kShmCopyLabels{"operation",
+                                                                  "outcome"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -302,6 +325,9 @@ class TentMetrics {
     static constexpr size_t kAttemptOutcomeDomain =
         kAttemptDomain * kOutcomeValueDomain;
     static constexpr size_t kTaskFailureDomain = kTransportDomain * 4;
+    static constexpr size_t kShmMappingEventDomain = 8;
+    static constexpr size_t kShmCopyOutcomeDomain = 2;
+    static constexpr size_t kShmCopyDomain = 2 * kShmCopyOutcomeDomain;
 
     // Stable slot indices into the cached-cell label domain.
     static size_t transportSlot(TransportType tp) {
@@ -327,6 +353,12 @@ class TentMetrics {
     }
     static size_t taskFailureSlot(TransportType tp, TaskFailureReason reason) {
         return static_cast<size_t>(tp) * 4 + static_cast<size_t>(reason);
+    }
+    static size_t shmCopySlot(Request::OpCode operation,
+                              ShmCopyOutcome outcome) {
+        const size_t operation_slot = operation == Request::READ ? 0u : 1u;
+        return operation_slot * kShmCopyOutcomeDomain +
+               static_cast<size_t>(outcome);
     }
 
     // Per-transport counters (label: transport). Values are int64_t.
@@ -390,6 +422,14 @@ class TentMetrics {
         "tent_quarantined_batches_total",
         "Batches abandoned by lazyFreeBatch after repeated failed reclaim "
         "attempts; reclaimed only at engine teardown"};
+    metrics::CachedDynamicCounter<1> shm_mapping_events_total_{
+        "tent_shm_mapping_events_total",
+        "SHM remote-address relocation and backing-object mapping events",
+        kShmMappingEventLabel, kShmMappingEventDomain};
+    metrics::CachedDynamicCounter<2> shm_copy_events_total_{
+        "tent_shm_copy_events_total",
+        "Synchronous physical SHM copy attempts by operation and outcome",
+        kShmCopyLabels, kShmCopyDomain};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_
@@ -463,6 +503,10 @@ class TentMetrics {
         "tent_transport_attempt_latency_us",
         "Observed physical transport attempt latency in microseconds",
         kLatencyBuckets, kAttemptLabels, kAttemptDomain};
+    metrics::CachedDynamicHistogram<2> shm_copy_latency_{
+        "tent_shm_copy_latency_us",
+        "Synchronous physical SHM copy latency in microseconds",
+        kLatencyBuckets, kShmCopyLabels, kShmCopyDomain};
 
     // Per-transport (N=1) histograms for unified serialization; the N=2
     // transport_attempt_latency_ histogram is serialized separately (see
