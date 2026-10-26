@@ -143,6 +143,56 @@ class TentMetrics {
     // the only failure metric that records TIMEOUT/CANCELED outcomes.
     void recordTaskFailure(TransportType tp, TaskFailureReason reason);
 
+    // Stable public failure taxonomy. Native transport details (errno, WC
+    // status, peer identity, etc.) belong in logs/traces; metric labels stay
+    // within these bounded enums.
+    enum class FailurePhase {
+        Metadata,
+        Admission,
+        Selection,
+        Connect,
+        Register,
+        Submit,
+        Queue,
+        Post,
+        Poll,
+        Completion,
+        Retry,
+        Failover,
+        Notify,
+        Cleanup,
+        Shutdown,
+    };
+    enum class FailureReason {
+        Timeout,
+        Unavailable,
+        QueueFull,
+        ResourceExhausted,
+        Protocol,
+        StaleGeneration,
+        WcError,
+        CqError,
+        MrError,
+        PeerClosed,
+        Canceled,
+        Internal,
+    };
+
+    // Record one terminal logical task failure. Callers must use the phase
+    // where the failure originated when known, and Internal rather than
+    // guessing a more specific native cause.
+    void recordTerminalFailure(TransportType tp, FailurePhase phase,
+                               FailureReason reason);
+
+    enum class MemoryOperation { Register, Unregister };
+    enum class OperationOutcome { Success, Failure };
+
+    // Record one physical backend memory lifecycle call and the bytes covered
+    // by that call. A batched register counts as one operation whose bytes are
+    // the sum of the descriptors in the batch.
+    void recordMemoryOperation(TransportType tp, MemoryOperation operation,
+                               OperationOutcome outcome, size_t bytes);
+
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
     // sitting in the engine right now — a persistently high or stuck value
@@ -250,6 +300,10 @@ class TentMetrics {
                                                                   "operation"};
     static inline const std::array<std::string, 2> kTaskFailureLabels{
         "transport", "reason"};
+    static inline const std::array<std::string, 3> kTerminalFailureLabels{
+        "transport", "phase", "reason"};
+    static inline const std::array<std::string, 3> kMemoryOperationLabels{
+        "transport", "operation", "outcome"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -310,6 +364,22 @@ class TentMetrics {
         "tent_task_failures_total",
         "Task-level failures by terminal transport and failure reason",
         kTaskFailureLabels, kTaskFailureDomain};
+    // Terminal failures and memory lifecycle operations are rare control-path
+    // events, so they use the plain dynamic counter instead of reserving the
+    // full bounded-label cross product in cached cells.
+    ylt::metric::basic_dynamic_counter<int64_t, 3> terminal_failures_total_{
+        "tent_terminal_failures_total",
+        "Terminal logical task failures by transport, phase and reason",
+        kTerminalFailureLabels};
+    ylt::metric::basic_dynamic_counter<int64_t, 3> memory_operations_total_{
+        "tent_memory_operations_total",
+        "Physical backend memory lifecycle calls by outcome",
+        kMemoryOperationLabels};
+    ylt::metric::basic_dynamic_counter<int64_t, 3>
+        memory_operation_bytes_total_{
+            "tent_memory_operation_bytes_total",
+            "Bytes covered by physical backend memory lifecycle calls",
+            kMemoryOperationLabels};
     metrics::CachedDynamicCounter<1> deadline_infeasible_total_{
         "tent_deadline_infeasible_total",
         "Transfers whose deadline was already in the past at submit",

@@ -1040,8 +1040,15 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                  transports.front() == HP_TCP);
             std::vector<TransportType> registered_transports;
             Status first_error = Status::OK();
+            size_t total_bytes = 0;
+            for (const auto& desc : descs) total_bytes += desc.length;
             for (auto type : transports) {
                 auto s = transport_list_[type]->addMemoryBuffer(descs, options);
+                TentMetrics::instance().recordMemoryOperation(
+                    type, TentMetrics::MemoryOperation::Register,
+                    s.ok() ? TentMetrics::OperationOutcome::Success
+                           : TentMetrics::OperationOutcome::Failure,
+                    total_bytes);
                 if (!s.ok()) {
                     // addMemoryBuffer implementations are required to be
                     // transactional, but invoke remove on the failing
@@ -1050,6 +1057,12 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                     for (auto& desc : descs) {
                         auto cleanup =
                             transport_list_[type]->removeMemoryBuffer(desc);
+                        TentMetrics::instance().recordMemoryOperation(
+                            type, TentMetrics::MemoryOperation::Unregister,
+                            cleanup.ok()
+                                ? TentMetrics::OperationOutcome::Success
+                                : TentMetrics::OperationOutcome::Failure,
+                            desc.length);
                         if (!cleanup.ok()) LOG(WARNING) << cleanup.ToString();
                     }
                     if (first_error.ok()) first_error = s;
@@ -1148,6 +1161,11 @@ Status TransferEngineImpl::deregisterRemovedBuffer(BufferDesc& desc) {
         if (!advertised && !transport->tracksLocalBuffer(transport_desc))
             continue;
         auto status = transport->removeMemoryBuffer(transport_desc);
+        TentMetrics::instance().recordMemoryOperation(
+            transport_type, TentMetrics::MemoryOperation::Unregister,
+            status.ok() ? TentMetrics::OperationOutcome::Success
+                        : TentMetrics::OperationOutcome::Failure,
+            original_desc.length);
         if (!status.ok()) {
             if (first_error.ok()) first_error = status;
             continue;
