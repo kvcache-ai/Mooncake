@@ -56,6 +56,9 @@ class RestObjectStorageAdapter : public ObjectStorageAdapter {
     tl::expected<size_t, ErrorCode> GetSize(const std::string& logical_key);
 
    protected:
+    // Shared by experimental payload transports using the same S3 namespace.
+    std::string LogicalToPhysicalKey(const std::string& logical_key) const;
+
     // Returns complete "Name: value" header lines for one request, including
     // Authorization unless the adapter is anonymous. Called when the request
     // is about to be sent, so the signing time is current.
@@ -129,7 +132,6 @@ class RestObjectStorageAdapter : public ObjectStorageAdapter {
         const std::vector<BatchRequest>& requests,
         std::vector<std::string>& transient_error);
 
-    std::string LogicalToPhysicalKey(const std::string& logical_key) const;
     tl::expected<std::string, ErrorCode> PhysicalToLogicalKey(
         const std::string& physical_key) const;
     std::string PhysicalPrefix() const;
