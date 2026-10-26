@@ -6,12 +6,28 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include <cstdlib>
+#include <map>
+#include <string>
+
 using namespace mooncake;
 
 TEST(UtilsTest, IsZeroUUID) {
     EXPECT_TRUE(IsZeroUUID(UUID{0, 0}));
     EXPECT_FALSE(IsZeroUUID(UUID{0, 1}));
     EXPECT_FALSE(IsZeroUUID(UUID{1, 0}));
+}
+
+TEST(UtilsTest, MergeLabelsPreservesClusterPrecedence) {
+    const std::map<std::string, std::string> labels = {
+        {"cluster_id", "caller-cluster"}, {"instance", "test-instance"}};
+    const auto merged = merge_labels(labels);
+    // The helper caches the cluster ID at process startup; do not change it here.
+    const char* cluster = std::getenv("MC_STORE_CLUSTER_ID");
+    EXPECT_EQ(merged.at("cluster_id"),
+              cluster && *cluster ? cluster : "caller-cluster");
+    EXPECT_EQ(merged.at("instance"), "test-instance");
+    EXPECT_EQ(labels.at("cluster_id"), "caller-cluster");
 }
 
 TEST(UtilsTest, ByteSizeToString) {
