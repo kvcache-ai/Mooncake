@@ -50,11 +50,10 @@ TransferEngineMetrics::DirectionMetrics::DirectionMetrics(std::string direction)
                      "Total " + direction + " transfers failed or canceled"),
       timeouts_total(metricName(direction, "_timeouts_total"),
                      "Total " + direction + " transfers timed out"),
-      latency_us(
-          metricName(direction, "_latency_us"),
-          "Latency distribution of completed " + direction +
-              " transfers, submission to first observation, in microseconds",
-          kLatencyBucketsUs),
+      latency_us(metricName(direction, "_latency_us"),
+                 "Latency distribution of completed " + direction +
+                     " transfers, in microseconds",
+                 kLatencyBucketsUs),
       size_bytes(metricName(direction, "_size_bytes"),
                  "Size distribution of completed " + direction +
                      " transfers, in bytes",

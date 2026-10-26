@@ -357,6 +357,17 @@ class EngineMetricsTest : public MetricsTestBase {
         return s;
     }
 
+    // Finish a task through its slice counters alone, without a poll.
+    static void finishOk(Transport::TransferTask& task, size_t bytes) {
+        task.success_slice_count = 1;
+        task.transferred_bytes = bytes;
+        task.is_finished = true;
+    }
+    static void finishFailed(Transport::TransferTask& task) {
+        task.failed_slice_count = 1;
+        task.is_finished = true;
+    }
+
     std::unique_ptr<TransferEngineImpl> engine_;
     Transport::TransferRequest request_{};
     BatchID batch_ = 0;
@@ -448,6 +459,77 @@ TEST_F(EngineMetricsTest, FreeBatchRecordsTasksBehindBusyTask) {
     EXPECT_TRUE(tryFree().IsBatchBusy());
     EXPECT_EQ(requestsTotal(Direction::Write), 3);
 }
+
+// A task can be finished without any poll or completion callback, as the
+// scatter drain does once its slice counters are complete. Freeing the batch
+// records such tasks from their counters.
+TEST_F(EngineMetricsTest, FreeBatchRecordsTasksFinishedWithoutPoll) {
+    auto transport = std::make_shared<FakeTransport>(4096);
+    buildBatch("127.0.0.1:0", transport, Transport::TransferRequest::READ, 3);
+    auto& tasks = Transport::toBatchDesc(batch_).task_list;
+    finishOk(tasks[0], 4096);
+    finishFailed(tasks[1]);
+    // Counters still incomplete: not a known outcome, so not recorded.
+    tasks[2].slice_count = 2;
+    tasks[2].success_slice_count = 1;
+    tasks[2].is_finished = true;
+
+    ASSERT_TRUE(tryFree().ok());
+    EXPECT_EQ(requestsTotal(Direction::Read), 2);
+    EXPECT_EQ(failuresTotal(Direction::Read), 1);
+    EXPECT_EQ(timeoutsTotal(Direction::Read), 0);
+    EXPECT_EQ(bytesTotal(Direction::Read), 4096);
+    EXPECT_EQ(latencyCount(Direction::Read), 1);
+}
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+// Latency from submission to the completion time the callback stamped.
+int64_t latencyUs(const Transport::TransferTask& task) {
+    using Clock = std::chrono::steady_clock;
+    const auto end = Clock::time_point(Clock::duration(task.end_ticks));
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               end - task.start_time)
+        .count();
+}
+
+// The completion callback finishes tasks that nobody polls; freeing the batch
+// records them, and a task that was already polled is not counted again.
+TEST_F(EngineMetricsTest, FreeBatchRecordsEventDrivenCompletions) {
+    auto transport = std::make_shared<FakeTransport>(4096);
+    buildBatch("127.0.0.1:0", transport, Transport::TransferRequest::WRITE, 3);
+    // Only task 0 is polled.
+    transport->status = TransferStatusEnum::WAITING;
+    transport->task_status[0] = TransferStatusEnum::COMPLETED;
+    auto& tasks = Transport::toBatchDesc(batch_).task_list;
+    std::vector<Transport::Slice> slices(tasks.size());
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        slices[i].task = &tasks[i];
+        slices[i].length = 4096;
+    }
+
+    slices[0].markSuccess();
+    TransferStatus status;
+    engine_->getTransferStatus(batch_, 0, status);
+    ASSERT_FALSE(tasks[1].is_finished);
+    ASSERT_FALSE(tasks[2].is_finished);
+    slices[1].markSuccess();
+    slices[2].markFailed();
+    ASSERT_TRUE(Transport::toBatchDesc(batch_).is_finished.load());
+    const int64_t expected_latency_us =
+        latencyUs(tasks[0]) + latencyUs(tasks[1]);
+
+    // Latency ends at the callback, so this delay before the free is excluded.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_TRUE(tryFree().ok());
+    EXPECT_EQ(requestsTotal(Direction::Write), 3);
+    EXPECT_EQ(failuresTotal(Direction::Write), 1);
+    EXPECT_EQ(timeoutsTotal(Direction::Write), 0);
+    EXPECT_EQ(bytesTotal(Direction::Write), 2 * 4096);
+    EXPECT_EQ(latencyCount(Direction::Write), 2);
+    EXPECT_EQ(seriesFor(Direction::Write).latency_us.sum.load(),
+              expected_latency_us);
+}
+#endif
 
 class EngineMetricsOutcomeTest
     : public EngineMetricsTest,
