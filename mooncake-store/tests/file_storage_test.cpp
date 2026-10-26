@@ -622,6 +622,7 @@ class FileStorageTest : public ::testing::Test {
     struct AllocOutcome {
         ErrorCode error;
         uint64_t total_size;
+        std::chrono::steady_clock::time_point lease_timeout{};
     };
 
     AllocOutcome TryAllocate(FileStorage& fileStorage,
@@ -631,7 +632,8 @@ class FileStorageTest : public ::testing::Test {
         if (!result) {
             return AllocOutcome{result.error(), 0};
         }
-        return AllocOutcome{ErrorCode::OK, result.value()->total_size};
+        return AllocOutcome{ErrorCode::OK, result.value()->total_size,
+                            result.value()->lease_timeout};
     }
 
     void SetPinnedRestoreArena(FileStorage& fileStorage, void* address,
@@ -1279,6 +1281,37 @@ TEST_F(FileStorageTest, StagingAllocWaitsForReleaseInsteadOfFailing) {
     EXPECT_GE(waited, std::chrono::milliseconds(250))
         << "the waiter should actually have waited, not failed fast";
     EXPECT_EQ(waiter_result.total_size, 2 * 1024 * 1024);
+}
+
+TEST_F(FileStorageTest, StagingAllocWaitDoesNotConsumeBatchLease) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 3 * 1024 * 1024;
+    file_storage_config.client_buffer_alloc_wait_ms = 3000;
+    file_storage_config.client_buffer_gc_ttl_ms = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    auto holder =
+        FileStorageAllocateBatch(fileStorage, {"holder"}, {2 * 1024 * 1024});
+    ASSERT_TRUE(holder);
+    const uint64_t holder_id = holder.value()->batch_id;
+    RegisterHolderBatch(fileStorage, std::move(holder.value()));
+
+    bool released = false;
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+        released = fileStorage.ReleaseBuffer(holder_id);
+    });
+    auto start = std::chrono::steady_clock::now();
+    auto waiter_result =
+        TryAllocate(fileStorage, {"waiter"}, {2 * 1024 * 1024});
+    releaser.join();
+
+    ASSERT_TRUE(released);
+    ASSERT_EQ(waiter_result.error, ErrorCode::OK);
+    EXPECT_GT(waiter_result.lease_timeout,
+              start + std::chrono::milliseconds(2000))
+        << "time spent waiting for arena space must not expire the new batch";
 }
 
 TEST_F(FileStorageTest, StagingAllocWaitExpiresToBufferOverflow) {
