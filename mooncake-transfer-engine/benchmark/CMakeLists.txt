@@ -34,10 +34,6 @@ if(NOT USE_TENT)
   list(APPEND TEBENCH_SOURCES
        "${CMAKE_CURRENT_SOURCE_DIR}/../tent/src/common/qos_metrics.cpp")
 endif()
-# file(GLOB) without a CMakeLists change does not reconfigure existing build
-# trees. Name the new TU explicitly so `cmake --build` still links it.
-list(APPEND TEBENCH_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/numa_first_touch.cpp")
-list(REMOVE_DUPLICATES TEBENCH_SOURCES)
 add_executable(tebench ${TEBENCH_SOURCES})
 target_link_libraries(tebench PUBLIC transfer_engine)
 if(USE_TENT)

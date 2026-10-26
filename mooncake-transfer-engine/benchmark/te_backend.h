@@ -128,14 +128,21 @@ class TEBenchRunner : public BenchRunner {
     int localTargetThreadId(int thread_id) const;
 
    private:
+    enum class DramBacking {
+        kNone,
+        kNuma,
+        kSharedMemory,
+        kMmap,
+        kIsolatedMmap,
+    };
+
     std::unique_ptr<mooncake::TransferEngine> engine_;
     std::vector<void*> pinned_buffer_list_;
-    std::vector<char> shm_backed_;
-    std::vector<char> hugepage_backed_;
-    std::vector<char> mmap_backed_;
-    // Anonymous DRAM mappings with PROT_NONE guards so adjacent mmaps do not
-    // merge into one VMA (whole-VMA numa_maps would then mix buffers).
-    std::vector<char> mmap_isolated_;
+    DramBacking dram_backing_ = DramBacking::kNone;
+    // Isolated anonymous mmap: leading PROT_NONE size and full mapping length
+    // saved at allocation so munmap does not recompute (and overflow).
+    size_t mmap_guard_ = 0;
+    size_t mmap_span_ = 0;
     std::vector<SegmentID> target_handles_;
     std::vector<std::shared_ptr<TransferMetadata::SegmentDesc>> target_infos_;
 

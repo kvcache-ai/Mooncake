@@ -14,6 +14,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <limits>
 
 #include "te_backend.h"
 #include "utils.h"
@@ -109,56 +110,73 @@ void signalHandlerV0(int signum) {
 }
 
 #ifdef __linux__
+struct IsolatedLayout {
+    size_t guard = 0;
+    size_t inner = 0;
+    size_t map_len = 0;
+};
+
 static size_t dramPageSize() {
     const long ps = sysconf(_SC_PAGESIZE);
     return ps > 0 ? static_cast<size_t>(ps) : 4096;
 }
 
-static size_t dramPageAlignUp(size_t n) {
+static bool dramPageAlignUp(size_t n, size_t* aligned) {
+    if (!aligned) return false;
     const size_t pg = dramPageSize();
-    return (n + pg - 1) / pg * pg;
+    const size_t max = std::numeric_limits<size_t>::max();
+    if (pg == 0 || n > max - (pg - 1)) return false;
+    *aligned = (n + pg - 1) / pg * pg;
+    return true;
+}
+
+static bool makeIsolatedLayout(size_t size, IsolatedLayout* out) {
+    if (!out) return false;
+    const size_t pg = dramPageSize();
+    const size_t max = std::numeric_limits<size_t>::max();
+    size_t inner = 0;
+    if (pg == 0 || pg > max / 2 || !dramPageAlignUp(size, &inner)) return false;
+    if (inner > max - 2 * pg) return false;
+    out->guard = pg;
+    out->inner = inner;
+    out->map_len = inner + 2 * pg;
+    return true;
 }
 
 // Sandwich the buffer with PROT_NONE pages so adjacent anonymous mmaps
 // cannot merge. numa_maps is per-VMA; a merged VMA would mix nodes.
-static void* mmapIsolatedAnonymous(size_t size) {
-    const size_t pg = dramPageSize();
-    const size_t inner = dramPageAlignUp(size);
-    const size_t map_len = inner + 2 * pg;
-    void* base = mmap(nullptr, map_len, PROT_READ | PROT_WRITE,
+static void* mmapIsolatedAnonymous(const IsolatedLayout& layout) {
+    void* base = mmap(nullptr, layout.map_len, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (base == MAP_FAILED) return MAP_FAILED;
     auto* p = static_cast<char*>(base);
-    if (mprotect(p, pg, PROT_NONE) != 0 ||
-        mprotect(p + pg + inner, pg, PROT_NONE) != 0) {
-        munmap(base, map_len);
+    if (mprotect(p, layout.guard, PROT_NONE) != 0 ||
+        mprotect(p + layout.guard + layout.inner, layout.guard, PROT_NONE) !=
+            0) {
+        munmap(base, layout.map_len);
         return MAP_FAILED;
     }
-    return p + pg;
+    return p + layout.guard;
 }
 
-static int munmapIsolatedAnonymous(void* addr, size_t size) {
+static int munmapIsolatedAnonymous(void* addr, const IsolatedLayout& layout) {
     if (!addr) return 0;
-    const size_t pg = dramPageSize();
-    const size_t inner = dramPageAlignUp(size);
-    return munmap(static_cast<char*>(addr) - pg, inner + 2 * pg);
+    return munmap(static_cast<char*>(addr) - layout.guard, layout.map_len);
 }
 
 // Place DRAM with CPU affinity + first-touch so pages land on `node` even
 // when mbind/get_mempolicy are denied. If affinity cannot be saved, do not
 // pin: a later restore would be skipped and the thread would stay bound.
-static void* allocateDramOnNode(size_t size, int node) {
-    CpuAffinityGuard guard;
-    if (!guard.saved()) {
-        LOG(WARNING) << "tebench: cannot save CPU affinity; allocating cpu:"
-                     << node << " without pinning";
-    } else if (!pinToOneCpuOnNode(node, guard.mask())) {
-        LOG(WARNING) << "tebench: no allowed CPU on NUMA node " << node
-                     << "; first-touch will follow the current cpuset";
+static void* allocateDramOnNode(size_t size, int node,
+                                const IsolatedLayout& layout) {
+    CpuAffinityGuard guard(node);
+    if (!guard.pinned()) {
+        LOG(WARNING) << "tebench: allocating cpu:" << node
+                     << " without pinning to that node";
     }
     // Do not MAP_POPULATE: it can commit pages before this thread has
     // actually migrated onto `node`.
-    void* buf = mmapIsolatedAnonymous(size);
+    void* buf = mmapIsolatedAnonymous(layout);
     if (buf == MAP_FAILED) {
         PLOG(ERROR) << "mmap DRAM buffer failed, size=" << size
                     << " node=" << node;
@@ -168,16 +186,6 @@ static void* allocateDramOnNode(size_t size, int node) {
         numa_tonode_memory(buf, size, node);
     }
     firstTouchPages(buf, size);
-    const std::string maps = numaMapsLineFor(buf);
-    const int actual = parseNumaMapsDominantNode(maps);
-    if (actual != node) {
-        LOG(WARNING) << "tebench: first-touch cpu:" << node
-                     << " did not land on that node (need local free memory"
-                        " or an allowed CPU): "
-                     << maps;
-    }
-    LOG(INFO) << "tebench: DRAM first-touch cpu:" << node << " addr=" << buf
-              << " size=" << size << " " << maps;
     return buf;
 }
 #else
@@ -223,7 +231,13 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
         return d_buf;
     }
 #endif
+#ifndef __linux__
     return allocateDramOnNode(size, buffer_id);
+#else
+    (void)size;
+    (void)buffer_id;
+    return nullptr;
+#endif
 }
 
 static int parseIndex(const std::string& loc) {
@@ -246,13 +260,10 @@ static void bindShmBufferToNode(void* addr, size_t size, int node) {
         firstTouchPages(addr, size);
         return;
     }
-    CpuAffinityGuard guard;
-    if (!guard.saved()) {
-        LOG(WARNING) << "tebench: cannot save CPU affinity for shm cpu:"
-                     << node;
-    } else if (!pinToOneCpuOnNode(node, guard.mask())) {
-        LOG(WARNING) << "tebench: no allowed CPU on NUMA node " << node
-                     << " for shm first-touch";
+    CpuAffinityGuard guard(node);
+    if (!guard.pinned()) {
+        LOG(WARNING) << "tebench: shm first-touch cpu:" << node
+                     << " without pinning to that node";
     } else if (numa_available() >= 0) {
         numa_tonode_memory(addr, size, node);
     }
@@ -276,7 +287,14 @@ static std::string cpuLocationFromPages(void* addr, size_t size,
         return {};
     }
     const uintptr_t buf = reinterpret_cast<uintptr_t>(addr);
-    const uintptr_t expect_end = buf + dramPageAlignUp(size);
+    size_t aligned = 0;
+    if (!dramPageAlignUp(size, &aligned) ||
+        buf > std::numeric_limits<uintptr_t>::max() - aligned) {
+        LOG(ERROR) << "tebench: DRAM buffer intended for " << expected
+                   << " has a size that overflows VMA bounds";
+        return {};
+    }
+    const uintptr_t expect_end = buf + aligned;
     if (vma_start != buf || vma_end < buf + size || vma_end > expect_end) {
         LOG(ERROR) << "tebench: DRAM buffer intended for " << expected
                    << " shares a VMA with other mappings ([" << std::hex
@@ -286,23 +304,26 @@ static std::string cpuLocationFromPages(void* addr, size_t size,
         return {};
     }
     const std::string maps = numaMapsLineFor(addr);
-    const int actual = parseNumaMapsDominantNode(maps);
-    if (actual < 0) {
+    const auto placement = parseNumaMapsPlacement(maps);
+    if (placement.dominant_node < 0) {
         LOG(ERROR) << "tebench: cannot resolve NUMA node for DRAM buffer "
                       "intended for "
                    << expected << " (" << maps << ")";
         return {};
     }
-    if (parseNumaMapsNodeCount(maps) > 1) {
+    if (placement.node_count > 1) {
         LOG(ERROR) << "tebench: DRAM buffer intended for " << expected
                    << " is split across NUMA nodes (" << maps
                    << "); free memory on that node and retry";
         return {};
     }
-    auto location = "cpu:" + std::to_string(actual);
-    if (actual != expected_node) {
+    auto location = "cpu:" + std::to_string(placement.dominant_node);
+    if (placement.dominant_node != expected_node) {
         LOG(WARNING) << "tebench: DRAM buffer intended for " << expected
                      << " is on " << location << " (" << maps << ")";
+    } else {
+        LOG(INFO) << "tebench: DRAM buffer " << expected << " addr=" << addr
+                  << " size=" << size << " " << maps;
     }
     return location;
 #else
@@ -358,17 +379,11 @@ static void* allocateHugepageOnNode(size_t size, int node) {
         return nullptr;
     }
 #ifdef __linux__
-    CpuAffinityGuard guard;
-    bool pinned = false;
-    if (!guard.saved()) {
-        LOG(WARNING) << "tebench: cannot save CPU affinity for hugepage cpu:"
-                     << node;
-    } else if (node >= 0) {
-        pinned = pinToOneCpuOnNode(node, guard.mask());
-        if (!pinned) {
-            LOG(WARNING) << "tebench: no allowed CPU on NUMA node " << node
-                         << " for hugepage first-touch";
-        }
+    CpuAffinityGuard guard(node);
+    const bool pinned = guard.pinned();
+    if (!pinned) {
+        LOG(WARNING) << "tebench: hugepage first-touch cpu:" << node
+                     << " without pinning to that node";
     }
     void* buf = mmap(nullptr, size, PROT_READ | PROT_WRITE,
                      hugepageMmapFlags(hp, pinned), -1, 0);
@@ -387,8 +402,6 @@ static void* allocateHugepageOnNode(size_t size, int node) {
         numa_tonode_memory(buf, size, node);
     }
     firstTouchPages(buf, size);
-    LOG(INFO) << "tebench: hugepage first-touch cpu:" << node << " addr=" << buf
-              << " " << numaMapsLineFor(buf);
 #else
     auto* p = static_cast<char*>(buf);
     for (size_t off = 0; off < size; off += hp) p[off] = 0;
@@ -429,13 +442,30 @@ int TEBenchRunner::allocateBuffers() {
     if (XferBenchConfig::seg_type == "DRAM") {
         int num_buffers = numa_num_configured_nodes();
         pinned_buffer_list_.resize(num_buffers, nullptr);
-        shm_backed_.assign(num_buffers, 0);
-        hugepage_backed_.assign(num_buffers, 0);
-        mmap_backed_.assign(num_buffers, 0);
-        mmap_isolated_.assign(num_buffers, 0);
+#ifdef __linux__
+        IsolatedLayout isolated{};
+#endif
+        if (use_shm) {
+            dram_backing_ = DramBacking::kSharedMemory;
+        } else if (XferBenchConfig::use_hugepage) {
+            dram_backing_ = DramBacking::kMmap;
+        } else {
+#ifdef __linux__
+            if (!makeIsolatedLayout(total_buffer_size, &isolated)) {
+                LOG(ERROR) << "tebench: total_buffer_size=" << total_buffer_size
+                           << " overflows isolated mmap length";
+                return -1;
+            }
+            mmap_guard_ = isolated.guard;
+            mmap_span_ = isolated.map_len;
+            dram_backing_ = DramBacking::kIsolatedMmap;
+#else
+            dram_backing_ = DramBacking::kNuma;
+#endif
+        }
         for (int i = 0; i < num_buffers; ++i) {
             std::string location = "cpu:" + std::to_string(i);
-            if (use_shm) {
+            if (dram_backing_ == DramBacking::kSharedMemory) {
                 mooncake::SharedMemoryOptions opt;
                 // Populate after pinning; MAP_POPULATE here would first-touch
                 // on the allocating thread's current node.
@@ -447,28 +477,26 @@ int TEBenchRunner::allocateBuffers() {
                 }
                 pinned_buffer_list_[i] =
                     engine_->allocateSharedMemory(total_buffer_size, opt);
-                shm_backed_[i] = 1;
                 if (pinned_buffer_list_[i]) {
                     bindShmBufferToNode(pinned_buffer_list_[i],
                                         total_buffer_size, i);
                     location = cpuLocationFromPages(pinned_buffer_list_[i],
                                                     total_buffer_size, i);
                 }
-            } else if (XferBenchConfig::use_hugepage) {
+            } else if (dram_backing_ == DramBacking::kMmap) {
                 pinned_buffer_list_[i] =
                     allocateHugepageOnNode(total_buffer_size, i);
-                hugepage_backed_[i] = 1;
-                mmap_backed_[i] = 1;
                 if (pinned_buffer_list_[i]) {
                     location = cpuLocationFromPages(pinned_buffer_list_[i],
                                                     total_buffer_size, i);
                 }
             } else {
-                pinned_buffer_list_[i] =
-                    allocateMemoryPool(total_buffer_size, i, false);
 #ifdef __linux__
-                mmap_backed_[i] = 1;
-                mmap_isolated_[i] = 1;
+                pinned_buffer_list_[i] =
+                    allocateDramOnNode(total_buffer_size, i, isolated);
+#else
+                pinned_buffer_list_[i] =
+                    allocateDramOnNode(total_buffer_size, i);
 #endif
                 if (pinned_buffer_list_[i]) {
                     location = cpuLocationFromPages(pinned_buffer_list_[i],
@@ -538,27 +566,25 @@ int TEBenchRunner::freeBuffers() {
                      << " transfer batch(es) were still in flight when the "
                         "run stopped; leaving the local buffers allocated";
         pinned_buffer_list_.clear();
-        shm_backed_.clear();
-        hugepage_backed_.clear();
-        mmap_backed_.clear();
-        mmap_isolated_.clear();
+        dram_backing_ = DramBacking::kNone;
+        mmap_guard_ = 0;
+        mmap_span_ = 0;
         return 0;
     }
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
     for (size_t i = 0; i < pinned_buffer_list_.size(); ++i) {
         if (!pinned_buffer_list_[i]) continue;
-        if (i < shm_backed_.size() && shm_backed_[i]) {
+        if (dram_backing_ == DramBacking::kSharedMemory) {
             engine_->freeSharedMemory(pinned_buffer_list_[i]);
         } else {
             engine_->unregisterLocalMemory(pinned_buffer_list_[i]);
-            if (i < mmap_backed_.size() && mmap_backed_[i]) {
+            if (dram_backing_ == DramBacking::kIsolatedMmap) {
 #ifdef __linux__
-                const int rc =
-                    (i < mmap_isolated_.size() && mmap_isolated_[i])
-                        ? munmapIsolatedAnonymous(pinned_buffer_list_[i],
-                                                  total_buffer_size)
-                        : munmap(pinned_buffer_list_[i], total_buffer_size);
-                if (rc != 0) {
+                IsolatedLayout layout;
+                layout.guard = mmap_guard_;
+                layout.map_len = mmap_span_;
+                if (munmapIsolatedAnonymous(pinned_buffer_list_[i], layout) !=
+                    0) {
                     PLOG(WARNING) << "munmap DRAM buffer failed";
                 }
 #else
@@ -566,16 +592,19 @@ int TEBenchRunner::freeBuffers() {
                     PLOG(WARNING) << "munmap DRAM buffer failed";
                 }
 #endif
+            } else if (dram_backing_ == DramBacking::kMmap) {
+                if (munmap(pinned_buffer_list_[i], total_buffer_size) != 0) {
+                    PLOG(WARNING) << "munmap DRAM buffer failed";
+                }
             } else {
                 freeMemoryPool(pinned_buffer_list_[i], total_buffer_size);
             }
         }
     }
     pinned_buffer_list_.clear();
-    shm_backed_.clear();
-    hugepage_backed_.clear();
-    mmap_backed_.clear();
-    mmap_isolated_.clear();
+    dram_backing_ = DramBacking::kNone;
+    mmap_guard_ = 0;
+    mmap_span_ = 0;
     return 0;
 }
 
