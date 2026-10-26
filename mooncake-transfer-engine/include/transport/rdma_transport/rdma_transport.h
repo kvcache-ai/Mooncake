@@ -77,7 +77,8 @@ class RdmaTransport : public Transport {
                          const TransferMetadata::NotifyDesc &notify);
 #ifdef MOONCAKE_ENABLE_PXN
     // Override PXN slice completion handler
-    // Implementation is in src/transport/rdma_transport/pxn/pxn_slice_completion.cpp
+    // Implementation is in
+    // src/transport/rdma_transport/pxn/pxn_slice_completion.cpp
     void pxnSliceCompletion(Slice *slice) override;
 
     // Override PXN task-owned CW reclaim hook. Implemented in
@@ -208,7 +209,9 @@ class RdmaTransport : public Transport {
     // Returns the PxnRuntimeManager owned by this transport, or nullptr if
     // the transport has not been installed yet (e.g. during unit tests that
     // bypass install()). Callers must null-check.
-    pxn::PxnRuntimeManager *PxnRuntimeMgr() const { return pxn_runtime_mgr_.get(); }
+    pxn::PxnRuntimeManager *PxnRuntimeMgr() const {
+        return pxn_runtime_mgr_.get();
+    }
 #endif
 };
 

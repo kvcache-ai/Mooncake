@@ -54,7 +54,7 @@ struct PxnWorkerPoolState {
     int pxn_proxy_gpu_id = -1;
 
     // ===== Per-thread runtime =====
-    std::vector<std::unique_ptr<PxnMemcpyDispatcherRuntime>>    pxn_dispatchers;
+    std::vector<std::unique_ptr<PxnMemcpyDispatcherRuntime>> pxn_dispatchers;
 
     int pxn_numa_socket_id = -1;
 

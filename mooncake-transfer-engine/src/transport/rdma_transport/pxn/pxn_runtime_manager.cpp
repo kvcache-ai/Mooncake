@@ -33,8 +33,8 @@ namespace pxn {
 static void PxnReclaimCwFromShell(void *shell_raw) {
     Transport::Slice *shell = static_cast<Transport::Slice *>(shell_raw);
     if (shell == nullptr || !shell->pxn_info.is_copy_worker) return;
-    PxnCopyWorker *cw = static_cast<PxnCopyWorker *>(
-        shell->pxn_info.pxn_copy_worker);
+    PxnCopyWorker *cw =
+        static_cast<PxnCopyWorker *>(shell->pxn_info.pxn_copy_worker);
     if (cw != nullptr) {
         PxnGetCopyWorkerCache().PxnDeallocate(cw);
         shell->pxn_info.pxn_copy_worker = nullptr;
@@ -42,8 +42,7 @@ static void PxnReclaimCwFromShell(void *shell_raw) {
 }
 
 PxnWorkerPoolState::~PxnWorkerPoolState() {
-    for (int shard_idx = 0; shard_idx < pxn_worker_thread_count;
-         ++shard_idx) {
+    for (int shard_idx = 0; shard_idx < pxn_worker_thread_count; ++shard_idx) {
         for (auto *shell_raw : pxn_slice_queue[shard_idx]) {
             PxnReclaimCwFromShell(shell_raw);
         }
@@ -80,22 +79,23 @@ PxnWorkerPoolState::~PxnWorkerPoolState() {
 
 // construct PxnRuntimeManager and memcpy backend
 // (CUDA>=12.8 BatchAsync，or peer-async fallback)
-PxnRuntimeManager::PxnRuntimeManager(const std::vector<std::string>& hca_list,
+PxnRuntimeManager::PxnRuntimeManager(const std::vector<std::string> &hca_list,
                                      bool IbRelaxOrderEn)
     : pxn_ib_relaxed_ordering_(IbRelaxOrderEn),
       pxn_backend_(PxnCreateMemcpyBackend()) {
     int rc = PxnTopologyManager::PxnCreateAndBuild(pxn_topo_mgr_ref_, hca_list);
     if (rc != 0) {
-        LOG(WARNING) << "PxnRuntimeManager: PxnCreateAndBuild failed rc="
-                     << rc << ", PXN topology disabled";
+        LOG(WARNING) << "PxnRuntimeManager: PxnCreateAndBuild failed rc=" << rc
+                     << ", PXN topology disabled";
     }
 }
 
-// src_gpu: cuda device physics id, local_device_id:pxn_hca_list_ group subscript
-// return pxn_cuda_list_ group subscript
+// src_gpu: cuda device physics id, local_device_id:pxn_hca_list_ group
+// subscript return pxn_cuda_list_ group subscript
 int PxnRuntimeManager::PxnLookupProxyGpu(int src_gpu,
                                          int local_device_id) const {
-    if (pxn_topo_mgr_ref_ == nullptr || !pxn_topo_mgr_ref_->PxnIsBuilt()) return -1;
+    if (pxn_topo_mgr_ref_ == nullptr || !pxn_topo_mgr_ref_->PxnIsBuilt())
+        return -1;
     if (src_gpu < 0 || local_device_id < 0) return -1;
     int src_idx = pxn_topo_mgr_ref_->PxnCudaDeviceToIndex(src_gpu);
     if (src_idx < 0) return -1;
@@ -113,14 +113,15 @@ int PxnRuntimeManager::PxnLookupProxyGpu(int src_gpu,
 //   4) create per-worker CUDA stream + slot events
 // ============================================================
 // init worker pool resource
-int PxnRuntimeManager::PxnInitWorkerPoolState(PxnWorkerPoolState *state,
-                                      RdmaContext *context,
-                                      int worker_thread_count,
-                                      bool (*can_post_fn)(int thread_id)) {
+int PxnRuntimeManager::PxnInitWorkerPoolState(
+    PxnWorkerPoolState *state, RdmaContext *context, int worker_thread_count,
+    bool (*can_post_fn)(int thread_id)) {
     if (state == nullptr || context == nullptr) return -1;
-    if (pxn_topo_mgr_ref_ == nullptr || !pxn_topo_mgr_ref_->PxnIsBuilt()) return 0;
+    if (pxn_topo_mgr_ref_ == nullptr || !pxn_topo_mgr_ref_->PxnIsBuilt())
+        return 0;
 
-    // one nic->one rdma context->one rdma pxn context resource->one worker pool object
+    // one nic->one rdma context->one rdma pxn context resource->one worker pool
+    // object
     auto *ctx_res = context->getPxnResource();
     if (ctx_res == nullptr || ctx_res->pxn_dev_pool == nullptr ||
         ctx_res->pxn_mr == nullptr) {
@@ -144,11 +145,10 @@ int PxnRuntimeManager::PxnInitWorkerPoolState(PxnWorkerPoolState *state,
 
     // Shard queues + submit-side scratch sized to worker_thread_count.
     state->pxn_slice_queue =
-        std::vector<std::vector<void*>>(worker_thread_count);
+        std::vector<std::vector<void *>>(worker_thread_count);
     state->pxn_slice_queue_count =
         std::vector<std::atomic<uint64_t>>(worker_thread_count);
-    state->pxn_slice_queue_lock =
-        std::vector<TicketLock>(worker_thread_count);
+    state->pxn_slice_queue_lock = std::vector<TicketLock>(worker_thread_count);
     for (int i = 0; i < worker_thread_count; ++i) {
         state->pxn_slice_queue_count[i].store(0, std::memory_order_relaxed);
     }
@@ -156,9 +156,11 @@ int PxnRuntimeManager::PxnInitWorkerPoolState(PxnWorkerPoolState *state,
     // thread-granular independent resources
     state->pxn_dispatchers.resize(worker_thread_count);
     for (int idx = 0; idx < worker_thread_count; ++idx) {
-        bool need_dispatcher = (can_post_fn == nullptr) ? true : can_post_fn(idx);
-        LOG(INFO) << "PXN: thread " << idx << " need_dispatcher=" << need_dispatcher
-                  << " can_post_fn=" << (can_post_fn != nullptr ? "set" : "null");
+        bool need_dispatcher =
+            (can_post_fn == nullptr) ? true : can_post_fn(idx);
+        LOG(INFO) << "PXN: thread " << idx
+                  << " need_dispatcher=" << need_dispatcher << " can_post_fn="
+                  << (can_post_fn != nullptr ? "set" : "null");
         if (need_dispatcher) {
             state->pxn_dispatchers[idx].reset(new PxnMemcpyDispatcherRuntime());
         }
@@ -181,7 +183,8 @@ int PxnRuntimeManager::PxnInitWorkerPoolState(PxnWorkerPoolState *state,
 
     int dispatcher_count = 0;
     for (int worker_idx = 0; worker_idx < worker_thread_count; ++worker_idx) {
-        bool need_dispatcher = (can_post_fn == nullptr) ? true : can_post_fn(worker_idx);
+        bool need_dispatcher =
+            (can_post_fn == nullptr) ? true : can_post_fn(worker_idx);
         if (!need_dispatcher) continue;
         auto &disp_rt = *state->pxn_dispatchers[worker_idx];
 
@@ -217,18 +220,18 @@ int PxnRuntimeManager::PxnInitWorkerPoolState(PxnWorkerPoolState *state,
     state->pxn_dispatcher_count = dispatcher_count;
     if (prev_device >= 0) cudaSetDevice(prev_device);
 
-    LOG(INFO) << "PXN: initialized WorkerPool state nic=" << context->deviceName()
+    LOG(INFO) << "PXN: initialized WorkerPool state nic="
+              << context->deviceName()
               << " proxy_gpu=" << ctx_res->pxn_proxy_gpu_id
-              << " threads=" << worker_thread_count
-              << " slot=" << slot_size << "x" << slots_per_worker;
+              << " threads=" << worker_thread_count << " slot=" << slot_size
+              << "x" << slots_per_worker;
     return 0;
 }
 
 // use BufferDesc select device
 int PxnRuntimeManager::PxnSelectDeviceForBuffer(
     TransferMetadata::SegmentDesc *desc,
-    const TransferMetadata::BufferDesc &buffer,
-    int retry_count) {
+    const TransferMetadata::BufferDesc &buffer, int retry_count) {
     std::string location = buffer.name;
     int device_id = desc->topology.selectDevice(location, retry_count);
     if (device_id >= 0) return device_id;
@@ -250,9 +253,8 @@ static inline void PxnSealCurrentCw(PxnPackingContext &ctx) {
 }
 
 // seg-level: seal if pack_key changed (called once per seg, before slice loop)
-static inline void PxnSealIfKeyChanged(
-    PxnPackingContext &ctx,
-    const PxnDataSeg &seg) {
+static inline void PxnSealIfKeyChanged(PxnPackingContext &ctx,
+                                       const PxnDataSeg &seg) {
     PxnPackKey pack_key;
     pack_key.pxn_context = nullptr;
     pack_key.pxn_src_gpu = seg.src_gpu;
@@ -266,13 +268,9 @@ static inline void PxnSealIfKeyChanged(
 
 // slice-level: seal if slot full + ensure cw exists
 void PxnRuntimeManager::PxnEnsureSlotSpace(
-    PxnPackingContext &ctx,
-    const PxnDataSeg &seg,
-    const std::shared_ptr<RdmaContext> &context,
-    Transport::TransferTask *task,
-    size_t slice_length,
-    size_t slot_size,
-    int peer_device_id) {
+    PxnPackingContext &ctx, const PxnDataSeg &seg,
+    const std::shared_ptr<RdmaContext> &context, Transport::TransferTask *task,
+    size_t slice_length, size_t slot_size, int peer_device_id) {
     if (ctx.pxn_current_cw != nullptr &&
         ctx.pxn_current_cw->pxn_cumulative_size + slice_length > slot_size) {
         PxnSealCurrentCw(ctx);
@@ -317,15 +315,13 @@ void PxnRuntimeManager::PxnEnsureSlotSpace(
                 1, std::memory_order_relaxed);
             task->pxn_copy_worker_list.push_back(ctx.pxn_current_cw);
             ctx.pxn_current_task = task;
-
         }
     }
 }
 
 // attach rdma worker and seg range to copy worker
-static inline void PxnAttachSliceToCw(
-    PxnPackingContext &ctx,
-    Transport::Slice *slice) {
+static inline void PxnAttachSliceToCw(PxnPackingContext &ctx,
+                                      Transport::Slice *slice) {
     auto *cw = ctx.pxn_current_cw;
 
     uint64_t slice_src = reinterpret_cast<uint64_t>(slice->source_addr);
@@ -376,8 +372,7 @@ static uint64_t PxnFlushSealedCopyWorkers(PxnPackingContext &ctx, bool force) {
 
 // according remote nic, find local same rail nic
 static int PxnFindLocalRailNic(
-    const std::string &peer_nic_name,
-    const PxnTopologyManager &topo_mgr,
+    const std::string &peer_nic_name, const PxnTopologyManager &topo_mgr,
     const std::vector<std::shared_ptr<RdmaContext>> &context_list) {
     int local_device_id = topo_mgr.PxnHcaNameToIndex(peer_nic_name);
     if (local_device_id < 0 ||
@@ -394,12 +389,12 @@ static int PxnFindLocalRailNic(
 // Check if a peer rail is available (not paused due to errors)
 // Returns true if available, false if paused
 bool PxnRuntimeManager::PxnIsRailAvailable(
-    PxnPackingContext &ctx,
-    const std::string &peer_nic_path,
+    PxnPackingContext &ctx, const std::string &peer_nic_path,
     int local_device_id,
     const std::vector<std::shared_ptr<RdmaContext>> &context_list) {
-    auto &cached = ctx.pxn_rail_available_cache[
-        peer_nic_path + "@" + std::to_string(local_device_id)];
+    auto &cached =
+        ctx.pxn_rail_available_cache[peer_nic_path + "@" +
+                                     std::to_string(local_device_id)];
     if (cached != 0) return cached == 1;
 
     if (local_device_id < 0 ||
@@ -425,24 +420,22 @@ bool PxnRuntimeManager::PxnIsRailAvailable(
 
 static inline void PxnPushBypassRequest(
     std::vector<Transport::TransferRequest> &bypass_requests,
-    const Transport::TransferRequest &basereq,
-    uint64_t dst_start, uint64_t dst_end) {
-
+    const Transport::TransferRequest &basereq, uint64_t dst_start,
+    uint64_t dst_end) {
     bypass_requests.push_back(basereq);
     auto &req = bypass_requests.back();
 
     uint64_t src_base = reinterpret_cast<uint64_t>(basereq.source);
-    req.source = reinterpret_cast<void *>(src_base + (dst_start - basereq.target_offset));
+    req.source = reinterpret_cast<void *>(src_base +
+                                          (dst_start - basereq.target_offset));
     req.target_offset = dst_start;
     req.length = dst_end - dst_start;
 }
 
 // Based on the remote buffer boundary, split the remote kvcache memory.
 static inline const TransferMetadata::BufferDesc *PxnFindRemoteBufBoundary(
-    const TransferMetadata::SegmentDesc *peer_desc,
-    uint64_t remaining_start,
-    uint64_t remaining_end,
-    uint64_t &seg_end) {
+    const TransferMetadata::SegmentDesc *peer_desc, uint64_t remaining_start,
+    uint64_t remaining_end, uint64_t &seg_end) {
     seg_end = remaining_end;
     for (const auto &buf : peer_desc->buffers) {
         uint64_t buf_end = buf.addr + buf.length;
@@ -463,10 +456,8 @@ static inline const TransferMetadata::BufferDesc *PxnFindRemoteBufBoundary(
 
 // Based on the local buffer boundary, segment the local data block.
 static inline const TransferMetadata::BufferDesc *PxnFindLocalBufBoundary(
-    const TransferMetadata::SegmentDesc *local_desc,
-    uint64_t src_start,
-    uint64_t src_end,
-    uint64_t &seg_end) {
+    const TransferMetadata::SegmentDesc *local_desc, uint64_t src_start,
+    uint64_t src_end, uint64_t &seg_end) {
     seg_end = src_end;
     for (const auto &buf : local_desc->buffers) {
         uint64_t buf_end = buf.addr + buf.length;
@@ -487,14 +478,11 @@ static inline const TransferMetadata::BufferDesc *PxnFindLocalBufBoundary(
 
 // task -> copy worker list, each copy worker with rdma worker list
 int PxnRuntimeManager::PxnPlanAndPack(
-    const std::vector<Transport::TransferTask *> &task_list,
-    size_t task_index,
+    const std::vector<Transport::TransferTask *> &task_list, size_t task_index,
     size_t request_index,
     const std::vector<std::shared_ptr<RdmaContext>> &context_list,
-    TransferMetadata::SegmentDesc *local_desc,
-    size_t submit_watermark,
+    TransferMetadata::SegmentDesc *local_desc, size_t submit_watermark,
     PxnPackingContext &ctx) {
-
     uint64_t seg_slice_count = 0;
     int peer_device_id;
     auto &bypass_requests = ctx.pxn_bypass_requests;
@@ -534,42 +522,46 @@ int PxnRuntimeManager::PxnPlanAndPack(
     while (remaining_start < remaining_end) {
         // remote buffer boundary
         uint64_t remote_seg_end;
-        const TransferMetadata::BufferDesc *segRemoteBuf = PxnFindRemoteBufBoundary(
-            peer_desc.get(), remaining_start, remaining_end, remote_seg_end);
+        const TransferMetadata::BufferDesc *segRemoteBuf =
+            PxnFindRemoteBufBoundary(peer_desc.get(), remaining_start,
+                                     remaining_end, remote_seg_end);
         // cannot find remote buffer, or remote buffer not gpu memory
         if (!segRemoteBuf || !segRemoteBuf->isGpuMem) {
-            PxnPushBypassRequest(bypass_requests, request,
-                remaining_start, remote_seg_end);
+            PxnPushBypassRequest(bypass_requests, request, remaining_start,
+                                 remote_seg_end);
             remaining_start = remote_seg_end;
             continue;
         }
 
-        peer_device_id = PxnSelectDeviceForBuffer(
-            peer_desc.get(), *segRemoteBuf);
+        peer_device_id =
+            PxnSelectDeviceForBuffer(peer_desc.get(), *segRemoteBuf);
         if (peer_device_id < 0 ||
             static_cast<size_t>(peer_device_id) >= peer_desc->devices.size()) {
-            PxnPushBypassRequest(bypass_requests, request,
-                remaining_start, remote_seg_end);
+            PxnPushBypassRequest(bypass_requests, request, remaining_start,
+                                 remote_seg_end);
             remaining_start = remote_seg_end;
             continue;
         }
 
-        const std::string &peer_nic_name = peer_desc->devices[peer_device_id].name;
-        std::string cached_peer_nic_path = MakeNicPath(peer_desc->name, peer_nic_name);
+        const std::string &peer_nic_name =
+            peer_desc->devices[peer_device_id].name;
+        std::string cached_peer_nic_path =
+            MakeNicPath(peer_desc->name, peer_nic_name);
 
-        int local_device_id = PxnFindLocalRailNic(
-            peer_nic_name, *PxnTopoMgrRef(), context_list);
+        int local_device_id =
+            PxnFindLocalRailNic(peer_nic_name, *PxnTopoMgrRef(), context_list);
         if (local_device_id < 0) {
-            PxnPushBypassRequest(bypass_requests, request,
-                remaining_start, remote_seg_end);
+            PxnPushBypassRequest(bypass_requests, request, remaining_start,
+                                 remote_seg_end);
             remaining_start = remote_seg_end;
             continue;
         }
 
         // Check if the rail is available (not paused due to errors)
-        if (!PxnIsRailAvailable(ctx, cached_peer_nic_path, local_device_id, context_list)) {
-            PxnPushBypassRequest(bypass_requests, request,
-                remaining_start, remote_seg_end);
+        if (!PxnIsRailAvailable(ctx, cached_peer_nic_path, local_device_id,
+                                context_list)) {
+            PxnPushBypassRequest(bypass_requests, request, remaining_start,
+                                 remote_seg_end);
             remaining_start = remote_seg_end;
             continue;
         }
@@ -578,10 +570,13 @@ int PxnRuntimeManager::PxnPlanAndPack(
         while (local_cursor < remote_seg_end) {
             PxnDataSeg seg;
             uint64_t local_src_end;
-            seg.src_addr = src_start_addr + (local_cursor - request.target_offset);
-            const TransferMetadata::BufferDesc *segLocalBuf = PxnFindLocalBufBoundary(
-                local_desc, seg.src_addr,
-                seg.src_addr + (remote_seg_end - local_cursor), local_src_end);
+            seg.src_addr =
+                src_start_addr + (local_cursor - request.target_offset);
+            const TransferMetadata::BufferDesc *segLocalBuf =
+                PxnFindLocalBufBoundary(
+                    local_desc, seg.src_addr,
+                    seg.src_addr + (remote_seg_end - local_cursor),
+                    local_src_end);
 
             seg.length = local_src_end - seg.src_addr;
             seg.dst_addr = local_cursor;
@@ -602,8 +597,8 @@ int PxnRuntimeManager::PxnPlanAndPack(
             } while (false);
 
             if (!seg.is_pxn) {
-                PxnPushBypassRequest(bypass_requests, request,
-                    local_cursor, (local_cursor + seg.length));
+                PxnPushBypassRequest(bypass_requests, request, local_cursor,
+                                     (local_cursor + seg.length));
                 local_cursor = seg.dst_addr + seg.length;
                 continue;
             }
@@ -612,7 +607,8 @@ int PxnRuntimeManager::PxnPlanAndPack(
             uint32_t local_lkey = segLocalBuf->lkey[seg.local_device_id];
             PxnSealIfKeyChanged(ctx, seg);
             for (uint64_t off = 0; off < seg.length; off += kBlockSize) {
-                bool merge_final = seg.length - off <= kBlockSize + kFragmentSize;
+                bool merge_final =
+                    seg.length - off <= kBlockSize + kFragmentSize;
                 size_t this_len = merge_final ? seg.length - off : kBlockSize;
                 Transport::Slice *slice = Transport::getSliceCache().allocate();
                 if (!slice->from_cache) ctx.pxn_nr_slices++;
@@ -635,8 +631,8 @@ int PxnRuntimeManager::PxnPlanAndPack(
                 slice->pxn_info.pxn_fallback_source_lkey = local_lkey;
                 task->slice_list.push_back(slice);
 
-                PxnEnsureSlotSpace(ctx, seg, context, task,
-                    this_len, slot_size, peer_device_id);
+                PxnEnsureSlotSpace(ctx, seg, context, task, this_len, slot_size,
+                                   peer_device_id);
                 PxnAttachSliceToCw(ctx, slice);
 
                 task->total_bytes += this_len;
@@ -664,7 +660,7 @@ int PxnRuntimeManager::PxnPlanAndPack(
     // ctx.pxn_current_cw, because task-A's slices may complete and
     // deallocate the CW before task-B starts touching it, leaving
     // ctx.pxn_current_cw as a dangling pointer.
-    //if (ctx.pxn_current_shell != nullptr) {
+    // if (ctx.pxn_current_shell != nullptr) {
     //    PxnSealCurrentCw(ctx);
     //}
 
@@ -681,12 +677,11 @@ int PxnRuntimeManager::PxnPlanAndPack(
 void PxnRuntimeManager::PxnFailPendingSlices(PxnPackingContext &ctx) {
     auto fail_cw_shell = [](Transport::Slice *shell) {
         if (shell == nullptr) return;
-        auto *cw = static_cast<PxnCopyWorker *>(
-            shell->pxn_info.pxn_copy_worker);
+        auto *cw =
+            static_cast<PxnCopyWorker *>(shell->pxn_info.pxn_copy_worker);
         if (cw != nullptr) {
             for (auto *rdma_raw : cw->pxn_rdma_workers) {
-                auto *rdma_slice =
-                    static_cast<Transport::Slice *>(rdma_raw);
+                auto *rdma_slice = static_cast<Transport::Slice *>(rdma_raw);
                 if (rdma_slice != nullptr &&
                     rdma_slice->status == Transport::Slice::PENDING) {
                     rdma_slice->markFailed();
@@ -711,45 +706,44 @@ void PxnRuntimeManager::PxnFailPendingSlices(PxnPackingContext &ctx) {
 
 // WorkerPool::submitPostSend call, route copy worker to worker pool thread
 int PxnRuntimeManager::PxnRouteSlicesToShards(
-    PxnWorkerPoolState *state,
-    const std::vector<Transport::Slice *> &slices,
+    PxnWorkerPoolState *state, const std::vector<Transport::Slice *> &slices,
     uint64_t &submitted_slice_count) {
     if (state == nullptr) return ERR_INVALID_ARGUMENT;
     if (state->pxn_worker_thread_count <= 0) {
         LOG(ERROR) << "PXN: PxnRouteSlicesToShards state not initialized "
-                      "(worker_count=" << state->pxn_worker_thread_count
-                   << ")";
+                      "(worker_count="
+                   << state->pxn_worker_thread_count << ")";
         return ERR_INVALID_ARGUMENT;
     }
 
-    thread_local std::vector<std::vector<void*>> per_shard;
-    if (static_cast<int>(per_shard.size()) <
-        state->pxn_worker_thread_count) {
+    thread_local std::vector<std::vector<void *>> per_shard;
+    if (static_cast<int>(per_shard.size()) < state->pxn_worker_thread_count) {
         per_shard.resize(state->pxn_worker_thread_count);
     }
     for (int i = 0; i < state->pxn_worker_thread_count; ++i) {
-        per_shard[i].clear();   // keep capacity, drop stale entries
+        per_shard[i].clear();  // keep capacity, drop stale entries
     }
 
     for (auto *shell : slices) {
         if (shell == nullptr || !shell->pxn_info.is_copy_worker) {
             LOG(ERROR) << "PXN: PxnRouteSlicesToShards received a non-shell "
-                          "slice (slice=" << shell << "); dropping";
+                          "slice (slice="
+                       << shell << "); dropping";
             continue;
         }
-        auto *cw = static_cast<PxnCopyWorker *>(
-            shell->pxn_info.pxn_copy_worker);
+        auto *cw =
+            static_cast<PxnCopyWorker *>(shell->pxn_info.pxn_copy_worker);
         if (cw == nullptr) {
             LOG(ERROR) << "PXN: CopyWorker shell without PxnCopyWorker "
-                          "(shell=" << shell << "); dropping";
+                          "(shell="
+                       << shell << "); dropping";
             continue;
         }
 
-        size_t shard_id =
-            (static_cast<size_t>(shell->target_id) * 10007 +
-             static_cast<size_t>(cw->peer_device_id) +
-             static_cast<size_t>(cw->pxn_src_gpu_id)) %
-            static_cast<size_t>(state->pxn_worker_thread_count);
+        size_t shard_id = (static_cast<size_t>(shell->target_id) * 10007 +
+                           static_cast<size_t>(cw->peer_device_id) +
+                           static_cast<size_t>(cw->pxn_src_gpu_id)) %
+                          static_cast<size_t>(state->pxn_worker_thread_count);
 
         per_shard[shard_id].push_back(shell);
         submitted_slice_count += cw->pxn_rdma_workers_cnt;
@@ -771,12 +765,9 @@ int PxnRuntimeManager::PxnRouteSlicesToShards(
 }
 
 void PxnRuntimeManager::PxnAssembleMemcpy(
-    Transport::Slice *shell,
-    PxnSlotPool *pool,
-    std::vector<Transport::Slice *> *batch,
-    std::vector<void *> *dsts,
-    std::vector<const void *> *srcs,
-    std::vector<size_t> *sizes) {
+    Transport::Slice *shell, PxnSlotPool *pool,
+    std::vector<Transport::Slice *> *batch, std::vector<void *> *dsts,
+    std::vector<const void *> *srcs, std::vector<size_t> *sizes) {
     auto *cw = static_cast<PxnCopyWorker *>(shell->pxn_info.pxn_copy_worker);
     if (cw == nullptr) return;
     int slot_idx = cw->pxn_slot_idx;
@@ -790,18 +781,18 @@ void PxnRuntimeManager::PxnAssembleMemcpy(
     batch->push_back(shell);
 }
 
-// pxn_send_threads[thread_id].pxn_per_thread_workers copy worker, 
+// pxn_send_threads[thread_id].pxn_per_thread_workers copy worker,
 // insert slot cascade queue
-void PxnRuntimeManager::PxnSubmitPendingWorkers(
-    std::vector<void *> &queue, PxnSlotPool &pool) {
+void PxnRuntimeManager::PxnSubmitPendingWorkers(std::vector<void *> &queue,
+                                                PxnSlotPool &pool) {
     if (queue.empty()) return;
     for (auto *shell_raw : queue) {
         auto *shell = static_cast<Transport::Slice *>(shell_raw);
         if (shell == nullptr || !shell->pxn_info.is_copy_worker) {
             continue;
         }
-        auto *cw = static_cast<PxnCopyWorker *>(
-            shell->pxn_info.pxn_copy_worker);
+        auto *cw =
+            static_cast<PxnCopyWorker *>(shell->pxn_info.pxn_copy_worker);
         if (cw == nullptr) continue;
 
         uint8_t st = cw->pxn_state.load(std::memory_order_acquire);
@@ -813,8 +804,8 @@ void PxnRuntimeManager::PxnSubmitPendingWorkers(
             continue;
         }
 
-        int slot_idx = static_cast<int>(pool.pxn_global_step %
-                                        pool.pxn_slot_count);
+        int slot_idx =
+            static_cast<int>(pool.pxn_global_step % pool.pxn_slot_count);
         auto &slot = pool.pxn_slots[slot_idx];
         cw->pxn_slot_idx = slot_idx;
         cw->pxn_slot_pool = &pool;
@@ -822,12 +813,11 @@ void PxnRuntimeManager::PxnSubmitPendingWorkers(
 
         if (slot.pxn_cascade_tail == nullptr) {
             if (slot.pxn_cascade_head != nullptr) {
-                LOG(ERROR)
-                    << "PXN: attaching to slot " << slot_idx
-                    << " with cascade_tail=nullptr but cascade_head="
-                    << slot.pxn_cascade_head
-                    << " (invariant violated); forcing head reset. cw="
-                    << cw;
+                LOG(ERROR) << "PXN: attaching to slot " << slot_idx
+                           << " with cascade_tail=nullptr but cascade_head="
+                           << slot.pxn_cascade_head
+                           << " (invariant violated); forcing head reset. cw="
+                           << cw;
             }
             slot.pxn_cascade_head = shell;
             slot.pxn_cascade_tail = shell;
@@ -835,8 +825,8 @@ void PxnRuntimeManager::PxnSubmitPendingWorkers(
             cw->pxn_state.store(PxnCopyWorker::kWaitingSlot,
                                 std::memory_order_release);
         } else {
-            auto *tail_shell = static_cast<Transport::Slice *>(
-                slot.pxn_cascade_tail);
+            auto *tail_shell =
+                static_cast<Transport::Slice *>(slot.pxn_cascade_tail);
             auto *tail_cw = static_cast<PxnCopyWorker *>(
                 tail_shell->pxn_info.pxn_copy_worker);
             tail_cw->pxn_cascade_next = shell;
@@ -878,19 +868,20 @@ static int PxnDispatcherProcessAllSlots(
 
     bool pool_event_added = false;
     bool contains_cascade_tail = false;
-    const size_t batch_threshold =
-        static_cast<size_t>(pool.pxn_slot_count) / 2;
+    const size_t batch_threshold = static_cast<size_t>(pool.pxn_slot_count) / 2;
 
     for (int slot_idx = 0; slot_idx < pool.pxn_slot_count; ++slot_idx) {
         auto &slot = pool.pxn_slots[slot_idx];
         if (slot.pxn_in_pending_batch) {
             continue;
         }
-        auto *head_shell = static_cast<Transport::Slice *>(slot.pxn_cascade_head);
+        auto *head_shell =
+            static_cast<Transport::Slice *>(slot.pxn_cascade_head);
         if (head_shell == nullptr) {
             continue;
         }
-        auto *head = static_cast<PxnCopyWorker *>(head_shell->pxn_info.pxn_copy_worker);
+        auto *head =
+            static_cast<PxnCopyWorker *>(head_shell->pxn_info.pxn_copy_worker);
         if (head == nullptr) {
             continue;
         }
@@ -908,12 +899,13 @@ static int PxnDispatcherProcessAllSlots(
                  slice_idx < head->pxn_rdma_workers.size(); ++slice_idx) {
                 auto *slice = reinterpret_cast<Transport::Slice *>(
                     head->pxn_rdma_workers[slice_idx]);
-                slice->source_addr =
-                    static_cast<char *>(pool.pxn_dev_pool) +
-                    static_cast<size_t>(head->pxn_slot_idx) * pool.pxn_slot_size +
-                    head->pxn_offsets_in_slot[slice_idx];
+                slice->source_addr = static_cast<char *>(pool.pxn_dev_pool) +
+                                     static_cast<size_t>(head->pxn_slot_idx) *
+                                         pool.pxn_slot_size +
+                                     head->pxn_offsets_in_slot[slice_idx];
                 slice->rdma.source_lkey = pool.pxn_mr->lkey;
-                (*collective_slice_queue)[slice->peer_nic_path].push_back(slice);
+                (*collective_slice_queue)[slice->peer_nic_path].push_back(
+                    slice);
             }
             // cascade_head point to next
             void *next_shell = head->pxn_cascade_next;
@@ -935,21 +927,25 @@ static int PxnDispatcherProcessAllSlots(
                 }
             }
             int this_slot_idx = head->pxn_slot_idx;
-            char *slot_base = static_cast<char *>(pool.pxn_dev_pool) +
-                              static_cast<size_t>(this_slot_idx) * pool.pxn_slot_size;
+            char *slot_base =
+                static_cast<char *>(pool.pxn_dev_pool) +
+                static_cast<size_t>(this_slot_idx) * pool.pxn_slot_size;
             for (auto *range : head->pxn_seg_ranges) {
                 dsts.push_back(slot_base + range->pxn_offset_in_slot);
-                srcs.push_back(reinterpret_cast<const void *>(range->pxn_src_start));
+                srcs.push_back(
+                    reinterpret_cast<const void *>(range->pxn_src_start));
                 sizes.push_back(range->pxn_src_end - range->pxn_src_start);
             }
             batch.push_back(head_shell);
             slot.pxn_in_pending_batch = true;
 
             if (!pool_event_added) {
-                events.push_back(pool.pxn_slots[head->pxn_slot_idx].pxn_send_event);
+                events.push_back(
+                    pool.pxn_slots[head->pxn_slot_idx].pxn_send_event);
                 pool_event_added = true;
             } else {
-                events.back() = pool.pxn_slots[head->pxn_slot_idx].pxn_send_event;
+                events.back() =
+                    pool.pxn_slots[head->pxn_slot_idx].pxn_send_event;
             }
 
             // CW is cascade tail, need flush
@@ -959,9 +955,10 @@ static int PxnDispatcherProcessAllSlots(
         }
     }
 
-    should_flush = contains_cascade_tail ||
-                   batch.size() >= batch_threshold ||
-                   (!batch.empty() && batch.size() >= static_cast<size_t>(pool.pxn_active_slot_count));
+    should_flush =
+        contains_cascade_tail || batch.size() >= batch_threshold ||
+        (!batch.empty() &&
+         batch.size() >= static_cast<size_t>(pool.pxn_active_slot_count));
     return 0;
 }
 
@@ -979,8 +976,7 @@ void PxnRuntimeManager::PxnRunDispatcherOnce(
     // drain shard queues into per-dispatcher pending list
     int disp_idx = disp_rt.pxn_disp_idx;
     int dispatcher_count = state->pxn_dispatcher_count;
-    for (int shard_id = disp_idx;
-         shard_id < state->pxn_worker_thread_count;
+    for (int shard_id = disp_idx; shard_id < state->pxn_worker_thread_count;
          shard_id += dispatcher_count) {
         if (state->pxn_slice_queue_count[shard_id].load(
                 std::memory_order_relaxed) == 0)
@@ -990,8 +986,8 @@ void PxnRuntimeManager::PxnRunDispatcherOnce(
             disp_rt.pxn_pending_cws.push_back(shell_raw);
         }
         state->pxn_slice_queue[shard_id].clear();
-        state->pxn_slice_queue_count[shard_id].store(
-            0, std::memory_order_relaxed);
+        state->pxn_slice_queue_count[shard_id].store(0,
+                                                     std::memory_order_relaxed);
         state->pxn_slice_queue_lock[shard_id].unlock();
     }
 
@@ -1005,8 +1001,7 @@ void PxnRuntimeManager::PxnRunDispatcherOnce(
 
     bool should_flush = false;
     auto &batch = disp_rt.pxn_reuse_batch;
-    PxnDispatcherProcessAllSlots(disp_rt, should_flush,
-                                 collective_slice_queue);
+    PxnDispatcherProcessAllSlots(disp_rt, should_flush, collective_slice_queue);
 
     if (should_flush && !batch.empty()) {
         auto &dsts = disp_rt.pxn_reuse_dsts;
@@ -1020,13 +1015,13 @@ void PxnRuntimeManager::PxnRunDispatcherOnce(
                        << cudaGetErrorString(err);
         }
         cudaEvent_t *shared_event =
-            &pool.pxn_slots[
-                static_cast<PxnCopyWorker *>(
-                    batch.back()->pxn_info.pxn_copy_worker)->pxn_slot_idx
-            ].pxn_send_event;
+            &pool.pxn_slots[static_cast<PxnCopyWorker *>(
+                                batch.back()->pxn_info.pxn_copy_worker)
+                                ->pxn_slot_idx]
+                 .pxn_send_event;
         for (auto *shell : batch) {
-            auto *cw = static_cast<PxnCopyWorker *>(
-                shell->pxn_info.pxn_copy_worker);
+            auto *cw =
+                static_cast<PxnCopyWorker *>(shell->pxn_info.pxn_copy_worker);
             if (cw == nullptr) continue;
             cw->pxn_event_ptr = shared_event;
             cw->pxn_state.store(PxnCopyWorker::kMemcpyIssued,

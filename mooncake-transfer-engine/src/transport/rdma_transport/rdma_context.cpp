@@ -358,13 +358,11 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
             auto &mcConfig = globalConfig();
             pxn::PxnTopologyManager *pxn_topo_mgr = pxn_mgr->PxnTopoMgrRef();
             // alloc rdma pxn context resource
-            pxn::PxnAllocContextResource(pd_, device_name_,
-                                     transfer_worker_count_,
-                                     pxn_topo_mgr,
-                                     &pxn_resource_,
-                                     mcConfig.pxn_slot_size,
-                                     mcConfig.pxn_slot_count_per_worker,
-                                     pxn_mgr->PxnIbRelaxedOrderingEnabled());
+            pxn::PxnAllocContextResource(
+                pd_, device_name_, transfer_worker_count_, pxn_topo_mgr,
+                &pxn_resource_, mcConfig.pxn_slot_size,
+                mcConfig.pxn_slot_count_per_worker,
+                pxn_mgr->PxnIbRelaxedOrderingEnabled());
         }
     }
 #endif

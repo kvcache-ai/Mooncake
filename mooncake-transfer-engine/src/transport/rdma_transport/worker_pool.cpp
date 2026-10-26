@@ -244,8 +244,8 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
 #ifdef MOONCAKE_ENABLE_PXN
     if (auto *pxn_mgr = context_.engine().PxnRuntimeMgr()) {
         pxn_state_.reset(new pxn::PxnWorkerPoolState(numa_socket_id_));
-        pxn_mgr->PxnInitWorkerPoolState(
-            pxn_state_.get(), &context_, worker_count_, NULL);
+        pxn_mgr->PxnInitWorkerPoolState(pxn_state_.get(), &context_,
+                                        worker_count_, NULL);
     }
 #endif
     for (int i = 0; i < worker_count_; ++i)

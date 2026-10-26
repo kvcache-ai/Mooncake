@@ -18,9 +18,8 @@
 namespace mooncake {
 namespace pxn {
 
-
 int PxnEnsureGpuMemory(void *start, bool &isGpuMem, uint32_t &gpuidx);
 }
-}
+}  // namespace mooncake
 
 #endif

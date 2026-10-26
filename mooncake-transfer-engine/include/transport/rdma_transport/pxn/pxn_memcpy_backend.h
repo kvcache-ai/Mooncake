@@ -42,18 +42,15 @@ class PxnMemcpyBackend {
     //   stream, event - CUDA resources; must be created on dst_device
     //
     // Returns cudaError_t; on failure the event may not be recorded.
-    virtual cudaError_t PxnSubmitBatch(
-        const std::vector<void*>& dsts,
-        const std::vector<const void*>& srcs,
-        const std::vector<size_t>& sizes,
-        cudaStream_t stream,
-        cudaEvent_t event) = 0;
+    virtual cudaError_t PxnSubmitBatch(const std::vector<void*>& dsts,
+                                       const std::vector<const void*>& srcs,
+                                       const std::vector<size_t>& sizes,
+                                       cudaStream_t stream,
+                                       cudaEvent_t event) = 0;
 
     virtual cudaError_t PxnSubmitBatchMultiEvent(
-        const std::vector<void*>& dsts,
-        const std::vector<const void*>& srcs,
-        const std::vector<size_t>& sizes,
-        cudaStream_t stream,
+        const std::vector<void*>& dsts, const std::vector<const void*>& srcs,
+        const std::vector<size_t>& sizes, cudaStream_t stream,
         const std::vector<cudaEvent_t>& events) = 0;
 
     virtual const char* PxnBackendName() const = 0;

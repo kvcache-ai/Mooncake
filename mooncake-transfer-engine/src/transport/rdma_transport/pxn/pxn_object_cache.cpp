@@ -54,7 +54,7 @@ PxnCopyWorker* PxnCopyWorkerCache::PxnAllocate() {
 
 void PxnCopyWorkerCache::PxnDeallocate(PxnCopyWorker* cw) {
     if (cw == nullptr) return;
-    for (auto *range : cw->pxn_seg_ranges) {
+    for (auto* range : cw->pxn_seg_ranges) {
         PxnGetSegRangeCache().PxnDeallocate(range);
     }
     cw->pxn_seg_ranges.clear();
@@ -68,9 +68,7 @@ void PxnCopyWorkerCache::PxnDeallocate(PxnCopyWorker* cw) {
 
 thread_local static PxnCopyWorkerCache tl_pxn_copy_worker_cache;
 
-PxnCopyWorkerCache& PxnGetCopyWorkerCache() {
-    return tl_pxn_copy_worker_cache;
-}
+PxnCopyWorkerCache& PxnGetCopyWorkerCache() { return tl_pxn_copy_worker_cache; }
 
 // ============================================================
 // PxnSegRangeCache
@@ -113,9 +111,7 @@ void PxnSegRangeCache::PxnDeallocate(PxnSegRange* range) {
 
 thread_local static PxnSegRangeCache tl_pxn_seg_range_cache;
 
-PxnSegRangeCache& PxnGetSegRangeCache() {
-    return tl_pxn_seg_range_cache;
-}
+PxnSegRangeCache& PxnGetSegRangeCache() { return tl_pxn_seg_range_cache; }
 
 }  // namespace pxn
 }  // namespace mooncake

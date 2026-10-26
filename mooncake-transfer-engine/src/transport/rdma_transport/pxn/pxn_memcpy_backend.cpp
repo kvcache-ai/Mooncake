@@ -39,13 +39,14 @@ namespace detail {
 // 9-arg call. Enabled only when the current toolkit's
 // cudaMemcpyBatchAsync accepts a `size_t* failIdx` in that position.
 template <typename Stream>
-inline auto PxnInvokeMemcpyBatchAsync(
-    void* const* dsts, void** srcs, const size_t* sizes, size_t count,
-    cudaMemcpyAttributes* attrs, size_t* attrs_idxs, size_t num_attrs,
-    size_t* fail_idx, Stream stream, int /*tag*/ = 0)
+inline auto PxnInvokeMemcpyBatchAsync(void* const* dsts, void** srcs,
+                                      const size_t* sizes, size_t count,
+                                      cudaMemcpyAttributes* attrs,
+                                      size_t* attrs_idxs, size_t num_attrs,
+                                      size_t* fail_idx, Stream stream,
+                                      int /*tag*/ = 0)
     -> decltype(cudaMemcpyBatchAsync(dsts, srcs, sizes, count, attrs,
-                                     attrs_idxs, num_attrs, fail_idx,
-                                     stream)) {
+                                     attrs_idxs, num_attrs, fail_idx, stream)) {
     return cudaMemcpyBatchAsync(dsts, srcs, sizes, count, attrs, attrs_idxs,
                                 num_attrs, fail_idx, stream);
 }
@@ -66,12 +67,11 @@ inline cudaError_t PxnInvokeMemcpyBatchAsync(
 // CUDA 12.8+
 class PxnBatchAsyncBackend : public PxnMemcpyBackend {
    public:
-    cudaError_t PxnSubmitBatch(
-        const std::vector<void*>& dsts,
-        const std::vector<const void*>& srcs,
-        const std::vector<size_t>& sizes,
-        cudaStream_t stream,
-        cudaEvent_t event) override {
+    cudaError_t PxnSubmitBatch(const std::vector<void*>& dsts,
+                               const std::vector<const void*>& srcs,
+                               const std::vector<size_t>& sizes,
+                               cudaStream_t stream,
+                               cudaEvent_t event) override {
         if (dsts.empty()) return cudaSuccess;
 
         cudaMemcpyAttributes attr = {};
@@ -80,29 +80,21 @@ class PxnBatchAsyncBackend : public PxnMemcpyBackend {
         size_t attrs_idxs = 0;
         size_t fail_idx = 0;
         cudaError_t err = detail::PxnInvokeMemcpyBatchAsync(
-            dsts.data(),
-            const_cast<void**>(srcs.data()),
-            sizes.data(),
-            dsts.size(),
-            &attr,
-            &attrs_idxs,
-            /*numAttrs=*/1,
-            &fail_idx,
-            stream);
+            dsts.data(), const_cast<void**>(srcs.data()), sizes.data(),
+            dsts.size(), &attr, &attrs_idxs,
+            /*numAttrs=*/1, &fail_idx, stream);
         if (err != cudaSuccess) {
             LOG(ERROR) << "PXN: cudaMemcpyBatchAsync failed"
-                       << " (failIdx=" << fail_idx << "): "
-                       << cudaGetErrorString(err);
+                       << " (failIdx=" << fail_idx
+                       << "): " << cudaGetErrorString(err);
             return err;
         }
         return cudaEventRecord(event, stream);
     }
 
     cudaError_t PxnSubmitBatchMultiEvent(
-        const std::vector<void*>& dsts,
-        const std::vector<const void*>& srcs,
-        const std::vector<size_t>& sizes,
-        cudaStream_t stream,
+        const std::vector<void*>& dsts, const std::vector<const void*>& srcs,
+        const std::vector<size_t>& sizes, cudaStream_t stream,
         const std::vector<cudaEvent_t>& events) override {
         if (dsts.empty()) return cudaSuccess;
 
@@ -112,20 +104,13 @@ class PxnBatchAsyncBackend : public PxnMemcpyBackend {
         size_t attrs_idxs = 0;
         size_t fail_idx = 0;
         cudaError_t err = detail::PxnInvokeMemcpyBatchAsync(
-            dsts.data(),
-            const_cast<void**>(srcs.data()),
-            sizes.data(),
-            dsts.size(),
-            &attr,
-            &attrs_idxs,
-            1,
-            &fail_idx,
-            stream);
+            dsts.data(), const_cast<void**>(srcs.data()), sizes.data(),
+            dsts.size(), &attr, &attrs_idxs, 1, &fail_idx, stream);
 
         if (err != cudaSuccess) {
             LOG(ERROR) << "PXN: cudaMemcpyBatchAsync failed"
-                       << " (failIdx=" << fail_idx << "): "
-                       << cudaGetErrorString(err);
+                       << " (failIdx=" << fail_idx
+                       << "): " << cudaGetErrorString(err);
             return err;
         }
         for (auto ev : events) {
@@ -160,12 +145,11 @@ class PxnPeerAsyncBackend : public PxnMemcpyBackend {
    public:
     PxnPeerAsyncBackend() = default;
 
-    cudaError_t PxnSubmitBatch(
-        const std::vector<void*>& dsts,
-        const std::vector<const void*>& srcs,
-        const std::vector<size_t>& sizes,
-        cudaStream_t stream,
-        cudaEvent_t event) override {
+    cudaError_t PxnSubmitBatch(const std::vector<void*>& dsts,
+                               const std::vector<const void*>& srcs,
+                               const std::vector<size_t>& sizes,
+                               cudaStream_t stream,
+                               cudaEvent_t event) override {
         if (dsts.empty()) return cudaSuccess;
         for (size_t entry_idx = 0; entry_idx < dsts.size(); ++entry_idx) {
             int src_device = -1;
@@ -183,10 +167,9 @@ class PxnPeerAsyncBackend : public PxnMemcpyBackend {
             }
             src_device = src_attr.device;
             dst_device = dst_attr.device;
-            cudaError_t err = cudaMemcpyPeerAsync(
-                dsts[entry_idx], dst_device,
-                srcs[entry_idx], src_device,
-                sizes[entry_idx], stream);
+            cudaError_t err = cudaMemcpyPeerAsync(dsts[entry_idx], dst_device,
+                                                  srcs[entry_idx], src_device,
+                                                  sizes[entry_idx], stream);
             if (err != cudaSuccess) {
                 LOG(ERROR) << "PXN: cudaMemcpyPeerAsync failed at index "
                            << entry_idx << ": " << cudaGetErrorString(err);
@@ -197,10 +180,8 @@ class PxnPeerAsyncBackend : public PxnMemcpyBackend {
     }
 
     cudaError_t PxnSubmitBatchMultiEvent(
-        const std::vector<void*>& dsts,
-        const std::vector<const void*>& srcs,
-        const std::vector<size_t>& sizes,
-        cudaStream_t stream,
+        const std::vector<void*>& dsts, const std::vector<const void*>& srcs,
+        const std::vector<size_t>& sizes, cudaStream_t stream,
         const std::vector<cudaEvent_t>& events) override {
         if (dsts.empty()) return cudaSuccess;
         for (size_t entry_idx = 0; entry_idx < dsts.size(); ++entry_idx) {
@@ -214,9 +195,8 @@ class PxnPeerAsyncBackend : public PxnMemcpyBackend {
                 return cudaErrorInvalidValue;
             }
             cudaError_t err = cudaMemcpyPeerAsync(
-                dsts[entry_idx], dst_attr.device,
-                srcs[entry_idx], src_attr.device,
-                sizes[entry_idx], stream);
+                dsts[entry_idx], dst_attr.device, srcs[entry_idx],
+                src_attr.device, sizes[entry_idx], stream);
             if (err != cudaSuccess) return err;
         }
         for (auto ev : events) {
@@ -248,9 +228,8 @@ std::unique_ptr<PxnMemcpyBackend> PxnCreateMemcpyBackend() {
 #endif
     static bool logged = false;
     if (!logged) {
-        LOG(WARNING)
-            << "PXN: using cudaMemcpyPeerAsync loop fallback; "
-            << "upgrade to CUDA 12.8+ for optimal PXN performance";
+        LOG(WARNING) << "PXN: using cudaMemcpyPeerAsync loop fallback; "
+                     << "upgrade to CUDA 12.8+ for optimal PXN performance";
         logged = true;
     }
     return std::unique_ptr<PxnMemcpyBackend>(new PxnPeerAsyncBackend());

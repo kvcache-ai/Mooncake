@@ -103,8 +103,7 @@ int PxnTopologyManager::PxnCreateAndBuild(
     return 0;
 }
 
-int PxnTopologyManager::PxnBuild(
-    const std::vector<PxnNicRecord>& hca_records) {
+int PxnTopologyManager::PxnBuild(const std::vector<PxnNicRecord>& hca_records) {
     if (pxn_built_) return 0;  // idempotent
 
     int device_count = 0;
@@ -139,7 +138,8 @@ int PxnTopologyManager::PxnBuild(
         if (hca.pxn_pci_bus_id.empty()) {
             char link_path[PATH_MAX];
             snprintf(link_path, sizeof(link_path),
-                     "/sys/class/infiniband/%s/device", hca.pxn_nic_name.c_str());
+                     "/sys/class/infiniband/%s/device",
+                     hca.pxn_nic_name.c_str());
             char resolved[PATH_MAX];
             if (realpath(link_path, resolved) != nullptr) {
                 char* pci_bus_basename = basename(resolved);
@@ -178,8 +178,7 @@ int PxnTopologyManager::PxnBuild(
             // current nic and gpu is affinity,not belong pxn
             if (proxy_gpu_idx < 0 || proxy_gpu_idx == src_gpu_idx) continue;
 
-            int src_cuda_dev =
-                pxn_cuda_list_[src_gpu_idx].pxn_cuda_device_id;
+            int src_cuda_dev = pxn_cuda_list_[src_gpu_idx].pxn_cuda_device_id;
             int proxy_cuda_dev =
                 pxn_cuda_list_[proxy_gpu_idx].pxn_cuda_device_id;
             // input cuda physics id, judge has nvlink
@@ -188,25 +187,25 @@ int PxnTopologyManager::PxnBuild(
             if (!peermem_loaded) continue;
             if (!PxnGpuSupportsGdr(proxy_cuda_dev)) {
                 LOG(ERROR) << "PXN: proxy GPU cuda:" << proxy_cuda_dev
-                        << " does not support GDR; skipping "
-                        << "src cuda:" << src_cuda_dev << " -> nic "
-                        << pxn_hca_list_[nic_idx].pxn_nic_name;
+                           << " does not support GDR; skipping "
+                           << "src cuda:" << src_cuda_dev << " -> nic "
+                           << pxn_hca_list_[nic_idx].pxn_nic_name;
                 continue;
             }
 
             // pxn_hca_list_ and pxn_cuda_list_ group id
             pxn_nic_paths_[src_gpu_idx][nic_idx] = proxy_gpu_idx;
             LOG(INFO) << "PXN: nic_paths src_gpu_physics_idx:" << src_cuda_dev
-                << " nic_name:" << pxn_hca_list_[nic_idx].pxn_nic_name
-                << " proxy_gpu_physics_idx:" << proxy_cuda_dev
-                << " src_gpu_idx:" << src_gpu_idx
-                << " nic_idx:" << nic_idx
-                << " proxy_gpu_idx:" << proxy_gpu_idx;
+                      << " nic_name:" << pxn_hca_list_[nic_idx].pxn_nic_name
+                      << " proxy_gpu_physics_idx:" << proxy_cuda_dev
+                      << " src_gpu_idx:" << src_gpu_idx
+                      << " nic_idx:" << nic_idx
+                      << " proxy_gpu_idx:" << proxy_gpu_idx;
         }
     }
 
-    LOG(INFO) << "PXN: topology built. " << gpu_count << " GPUs, "
-              << nic_count << " NICs.";
+    LOG(INFO) << "PXN: topology built. " << gpu_count << " GPUs, " << nic_count
+              << " NICs.";
     pxn_built_ = true;
     return 0;
 }
@@ -227,7 +226,7 @@ int PxnTopologyManager::PxnLookupNicAffinityGpu(int nic_id) const {
     // get affinity pxn_cuda_list_ group subscript
     int idx = pxn_nic_affinity_gpu_[nic_id];
     if (idx < 0) return -1;
-    // return cuda device physics id 
+    // return cuda device physics id
     return pxn_cuda_list_[idx].pxn_cuda_device_id;
 }
 
@@ -268,7 +267,8 @@ int PxnTopologyManager::PxnComputeAffinityGpu(int nic_id) const {
     int best_gpu_idx = -1;
     int best_distance = INT_MAX;
     for (int gpu_idx = 0; gpu_idx < (int)pxn_cuda_list_.size(); ++gpu_idx) {
-        if (PxnCrossesHostBridge(nic_pci, pxn_cuda_list_[gpu_idx].pxn_pci_bus_id.c_str())) {
+        if (PxnCrossesHostBridge(
+                nic_pci, pxn_cuda_list_[gpu_idx].pxn_pci_bus_id.c_str())) {
             continue;
         }
         int distance = PxnPciDistance(
@@ -279,7 +279,8 @@ int PxnTopologyManager::PxnComputeAffinityGpu(int nic_id) const {
             best_gpu_idx = gpu_idx;
         }
     }
-    LOG(INFO) << "  -> best_gpu_idx=" << best_gpu_idx << " distance=" << best_distance;
+    LOG(INFO) << "  -> best_gpu_idx=" << best_gpu_idx
+              << " distance=" << best_distance;
     return best_gpu_idx;
 }
 
@@ -287,7 +288,8 @@ int PxnTopologyManager::PxnComputeAffinityGpu(int nic_id) const {
 bool PxnTopologyManager::PxnHasNvLink(int src_cuda, int proxy_cuda) const {
     if (src_cuda == proxy_cuda) return false;
     int can_access = 0;
-    cudaError_t err = cudaDeviceCanAccessPeer(&can_access, src_cuda, proxy_cuda);
+    cudaError_t err =
+        cudaDeviceCanAccessPeer(&can_access, src_cuda, proxy_cuda);
     if (err != cudaSuccess) {
         cudaGetLastError();
         return false;
@@ -302,8 +304,7 @@ bool PxnTopologyManager::PxnCheckNvidiaPeermemLoaded() {
             S_ISDIR(st.st_mode)) {
             return true;
         }
-        if (stat("/sys/module/nv_peer_mem", &st) == 0 &&
-            S_ISDIR(st.st_mode)) {
+        if (stat("/sys/module/nv_peer_mem", &st) == 0 && S_ISDIR(st.st_mode)) {
             return true;
         }
         LOG(WARNING) << "PXN: nvidia_peermem kernel module not loaded; "

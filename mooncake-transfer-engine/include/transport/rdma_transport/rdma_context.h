@@ -65,7 +65,7 @@ class EndpointStore;
 
 #ifdef MOONCAKE_ENABLE_PXN
 namespace pxn {
-struct PxnContextResource;   // defined in pxn/pxn_context_resource.h
+struct PxnContextResource;  // defined in pxn/pxn_context_resource.h
 }
 #endif
 
@@ -440,11 +440,9 @@ class RdmaContext {
 
 #ifdef MOONCAKE_ENABLE_PXN
    public:
-    std::shared_ptr<WorkerPool> getWorkerPool() const {
-        return worker_pool_;
-    }
+    std::shared_ptr<WorkerPool> getWorkerPool() const { return worker_pool_; }
 
-    pxn::PxnContextResource* getPxnResource() const {
+    pxn::PxnContextResource *getPxnResource() const {
         return pxn_resource_.get();
     }
 #endif

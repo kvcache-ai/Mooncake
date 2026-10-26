@@ -18,16 +18,12 @@
 namespace mooncake {
 namespace pxn {
 
-void PxnAllocContextResource(
-    ibv_pd* pd,
-    const std::string& nic_name,
-    int worker_thread_count,
-    PxnTopologyManager* topo_mgr,
-    std::unique_ptr<PxnContextResource>* out,
-    size_t slot_size,
-    int slot_count_per_worker,
-    bool ib_relaxed_ordering) {
-
+void PxnAllocContextResource(ibv_pd* pd, const std::string& nic_name,
+                             int worker_thread_count,
+                             PxnTopologyManager* topo_mgr,
+                             std::unique_ptr<PxnContextResource>* out,
+                             size_t slot_size, int slot_count_per_worker,
+                             bool ib_relaxed_ordering) {
     if (out == nullptr) return;
     out->reset();
 
@@ -68,8 +64,8 @@ void PxnAllocContextResource(
     int prev_device = -1;
     cudaGetDevice(&prev_device);
     if (cudaSetDevice(proxy_gpu) != cudaSuccess) {
-        LOG(WARNING) << "PXN: cudaSetDevice(" << proxy_gpu << ") failed for NIC "
-                     << nic_name;
+        LOG(WARNING) << "PXN: cudaSetDevice(" << proxy_gpu
+                     << ") failed for NIC " << nic_name;
         return;
     }
 
@@ -83,10 +79,9 @@ void PxnAllocContextResource(
         if (can_access) {
             cudaError_t pe = cudaDeviceEnablePeerAccess(gpu, 0);
             if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) {
-                LOG(WARNING) << "PXN: cudaDeviceEnablePeerAccess("
-                                << gpu << ") from proxy_gpu "
-                                << proxy_gpu << " failed: "
-                                << cudaGetErrorString(pe);
+                LOG(WARNING) << "PXN: cudaDeviceEnablePeerAccess(" << gpu
+                             << ") from proxy_gpu " << proxy_gpu
+                             << " failed: " << cudaGetErrorString(pe);
             }
         }
     }
@@ -101,8 +96,8 @@ void PxnAllocContextResource(
     }
 
     const int PxnBaseAccessRights = IBV_ACCESS_LOCAL_WRITE |
-                                  IBV_ACCESS_REMOTE_WRITE |
-                                  IBV_ACCESS_REMOTE_READ;
+                                    IBV_ACCESS_REMOTE_WRITE |
+                                    IBV_ACCESS_REMOTE_READ;
     int PxnAccessRights = PxnBaseAccessRights;
     if (ib_relaxed_ordering) {
         PxnAccessRights |= IBV_ACCESS_RELAXED_ORDERING;
@@ -120,10 +115,9 @@ void PxnAllocContextResource(
     if (prev_device >= 0) cudaSetDevice(prev_device);
 
     LOG(INFO) << "PXN: allocated context resource for NIC " << nic_name
-              << " proxy_gpu=" << proxy_gpu
-              << " total=" << total << " bytes"
-              << " (" << slot_size << " x " << slot_count_per_worker
-              << " x " << worker_thread_count << ")";
+              << " proxy_gpu=" << proxy_gpu << " total=" << total << " bytes"
+              << " (" << slot_size << " x " << slot_count_per_worker << " x "
+              << worker_thread_count << ")";
     *out = std::move(res);
 }
 

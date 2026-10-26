@@ -633,7 +633,8 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         }
         buffer_desc.name = resolved_name;
 #ifdef MOONCAKE_ENABLE_PXN
-        pxn::PxnEnsureGpuMemory(chunk_addr, buffer_desc.isGpuMem, buffer_desc.gpuid);
+        pxn::PxnEnsureGpuMemory(chunk_addr, buffer_desc.isGpuMem,
+                                buffer_desc.gpuid);
 #endif
         buffer_desc.addr = (uint64_t)chunk_addr;
         buffer_desc.length = chunk_len;
@@ -1099,7 +1100,8 @@ Status RdmaTransport::submitTransferTask(
         slice->markFailed();
         fail_unposted_slices();
 #ifdef MOONCAKE_ENABLE_PXN
-        if (auto *mgr = PxnRuntimeMgr()) mgr->PxnFailPendingSlices(pxn_pack_ctx);
+        if (auto *mgr = PxnRuntimeMgr())
+            mgr->PxnFailPendingSlices(pxn_pack_ctx);
 #endif
         fail_unstarted_tasks(task_index + 1);
     };
@@ -1137,162 +1139,168 @@ Status RdmaTransport::submitTransferTask(
 #ifdef MOONCAKE_ENABLE_PXN
         for (const auto &request : pxn_pack_ctx.pxn_bypass_requests) {
 #endif
-        auto target_desc_it = target_segment_descs.find(request.target_id);
-        if (target_desc_it == target_segment_descs.end()) {
-            target_desc_it =
-                target_segment_descs
-                    .emplace(request.target_id,
-                             metadata_->getSegmentDescByID(request.target_id))
-                    .first;
-        }
-        const auto &target_segment_desc = target_desc_it->second;
-        if (request.target_id != last_remote_target_id) {
-            last_remote_buffer_id = -1;
-            last_remote_target_id = request.target_id;
-        }
-
-        // Select once per request so all of its slices normally use the same
-        // local RNIC. The advisory hint affects initial submission only;
-        // submit-level retries keep the existing topology policy.
-        auto request_buffer_id = -1, request_device_id = -1;
-        const std::string_view request_hint =
-            request.advise_retry_cnt == 0 ? nic_hint_name(request.nic_hint)
-                                          : std::string_view{};
-        const int local_hint_device_id =
-            request_hint.empty() &&
-                    last_local_device_buffer_id == last_local_buffer_id
-                ? last_local_device_id
-                : -1;
-        if (local_device_cache.select(
-                local_segment_desc, (uint64_t)request.source, request.length,
-                request_buffer_id, request_device_id, [&] {
-                    return selectDevice(
-                        local_segment_desc.get(), (uint64_t)request.source,
-                        request.length, request_hint, request_buffer_id,
-                        request_device_id, 0, last_local_buffer_id,
-                        local_hint_device_id);
-                })) {
-            request_buffer_id = -1;
-            request_device_id = -1;
-        } else {
-            last_local_buffer_id = request_buffer_id;
-            last_local_device_id = request_device_id;
-            last_local_device_buffer_id = request_buffer_id;
-        }
-
-        SliceLengthCalculator slice_calc{request,
-                                         kBlockSize,
-                                         kFragmentSize,
-                                         local_segment_desc.get(),
-                                         target_segment_desc.get(),
-                                         &last_local_buffer_id,
-                                         &last_remote_buffer_id};
-        for (uint64_t offset = 0; offset < request.length;) {
-            size_t slice_length = slice_calc.calculate(offset);
-
-            Slice *slice = getSliceCache().allocate();
-            assert(slice);
-            if (!slice->from_cache) {
-                nr_slices++;
+            auto target_desc_it = target_segment_descs.find(request.target_id);
+            if (target_desc_it == target_segment_descs.end()) {
+                target_desc_it =
+                    target_segment_descs
+                        .emplace(
+                            request.target_id,
+                            metadata_->getSegmentDescByID(request.target_id))
+                        .first;
+            }
+            const auto &target_segment_desc = target_desc_it->second;
+            if (request.target_id != last_remote_target_id) {
+                last_remote_buffer_id = -1;
+                last_remote_target_id = request.target_id;
             }
 
-            slice->source_addr = (char *)request.source + offset;
-            slice->length = slice_length;
-            slice->source_location.clear();
-            slice->opcode = request.opcode;
-            slice->rdma.dest_addr = request.target_offset + offset;
-            slice->rdma.retry_cnt = request.advise_retry_cnt;
-            slice->rdma.max_retry_cnt = kMaxRetryCount;
-            slice->task = &task;
-            slice->target_id = request.target_id;
-            slice->status = Slice::PENDING;
-            slice->ts = 0;
-            task.slice_list.push_back(slice);
-
-            int buffer_id = -1, device_id = -1,
-                retry_cnt = request.advise_retry_cnt;
-            bool found_device = false;
-            if (request_buffer_id >= 0 && request_device_id >= 0) {
-                auto &request_context = context_list_[request_device_id];
-                if (request_context && request_context->active()) {
-                    found_device = true;
-                    buffer_id = request_buffer_id;
-                    device_id = request_device_id;
-                }
-            }
-            while (retry_cnt < kMaxRetryCount && !found_device) {
-                // The request-level lookup above can fail when a request spans
-                // registered-memory boundaries even though each slice is
-                // valid. Honor the hint for the initial per-slice attempt too,
-                // then drop it so retries can fail over to another RNIC.
-                const std::string_view slice_hint =
-                    retry_cnt == 0 ? nic_hint_name(request.nic_hint)
-                                   : std::string_view{};
-                const int slice_hint_device_id =
-                    slice_hint.empty() &&
-                            last_local_device_buffer_id == last_local_buffer_id
-                        ? last_local_device_id
-                        : -1;
-                if (selectDevice(local_segment_desc.get(),
-                                 (uint64_t)slice->source_addr, slice->length,
-                                 slice_hint, buffer_id, device_id, retry_cnt++,
-                                 last_local_buffer_id, slice_hint_device_id))
-                    continue;
-                assert(device_id >= 0 &&
-                       static_cast<size_t>(device_id) < context_list_.size());
-                auto &context = context_list_[device_id];
-                assert(context.get());
-                if (!context->active()) continue;
-                assert(buffer_id >= 0 &&
-                       static_cast<size_t>(buffer_id) <
-                           local_segment_desc->buffers.size());
-                assert(local_segment_desc->buffers[buffer_id].lkey.size() ==
-                       context_list_.size());
-                found_device = true;
-                last_local_buffer_id = buffer_id;
-                last_local_device_id = device_id;
-                last_local_device_buffer_id = buffer_id;
-                break;
-            }
-            if (!found_device) {
-                auto source_addr = slice->source_addr;
-                fail_task_and_cleanup(task, slice, current_task_index);
-                LOG(ERROR)
-                    << "Memory region not registered by any active device(s): "
-                    << source_addr;
-                return Status::AddressNotRegistered(
-                    "Memory region not registered by any active device(s): " +
-                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
+            // Select once per request so all of its slices normally use the
+            // same local RNIC. The advisory hint affects initial submission
+            // only; submit-level retries keep the existing topology policy.
+            auto request_buffer_id = -1, request_device_id = -1;
+            const std::string_view request_hint =
+                request.advise_retry_cnt == 0 ? nic_hint_name(request.nic_hint)
+                                              : std::string_view{};
+            const int local_hint_device_id =
+                request_hint.empty() &&
+                        last_local_device_buffer_id == last_local_buffer_id
+                    ? last_local_device_id
+                    : -1;
+            if (local_device_cache.select(
+                    local_segment_desc, (uint64_t)request.source,
+                    request.length, request_buffer_id, request_device_id, [&] {
+                        return selectDevice(
+                            local_segment_desc.get(), (uint64_t)request.source,
+                            request.length, request_hint, request_buffer_id,
+                            request_device_id, 0, last_local_buffer_id,
+                            local_hint_device_id);
+                    })) {
+                request_buffer_id = -1;
+                request_device_id = -1;
             } else {
-                auto &context = context_list_[device_id];
-                if (!context->active()) {
+                last_local_buffer_id = request_buffer_id;
+                last_local_device_id = request_device_id;
+                last_local_device_buffer_id = request_buffer_id;
+            }
+
+            SliceLengthCalculator slice_calc{request,
+                                             kBlockSize,
+                                             kFragmentSize,
+                                             local_segment_desc.get(),
+                                             target_segment_desc.get(),
+                                             &last_local_buffer_id,
+                                             &last_remote_buffer_id};
+            for (uint64_t offset = 0; offset < request.length;) {
+                size_t slice_length = slice_calc.calculate(offset);
+
+                Slice *slice = getSliceCache().allocate();
+                assert(slice);
+                if (!slice->from_cache) {
+                    nr_slices++;
+                }
+
+                slice->source_addr = (char *)request.source + offset;
+                slice->length = slice_length;
+                slice->source_location.clear();
+                slice->opcode = request.opcode;
+                slice->rdma.dest_addr = request.target_offset + offset;
+                slice->rdma.retry_cnt = request.advise_retry_cnt;
+                slice->rdma.max_retry_cnt = kMaxRetryCount;
+                slice->task = &task;
+                slice->target_id = request.target_id;
+                slice->status = Slice::PENDING;
+                slice->ts = 0;
+                task.slice_list.push_back(slice);
+
+                int buffer_id = -1, device_id = -1,
+                    retry_cnt = request.advise_retry_cnt;
+                bool found_device = false;
+                if (request_buffer_id >= 0 && request_device_id >= 0) {
+                    auto &request_context = context_list_[request_device_id];
+                    if (request_context && request_context->active()) {
+                        found_device = true;
+                        buffer_id = request_buffer_id;
+                        device_id = request_device_id;
+                    }
+                }
+                while (retry_cnt < kMaxRetryCount && !found_device) {
+                    // The request-level lookup above can fail when a request
+                    // spans registered-memory boundaries even though each slice
+                    // is valid. Honor the hint for the initial per-slice
+                    // attempt too, then drop it so retries can fail over to
+                    // another RNIC.
+                    const std::string_view slice_hint =
+                        retry_cnt == 0 ? nic_hint_name(request.nic_hint)
+                                       : std::string_view{};
+                    const int slice_hint_device_id =
+                        slice_hint.empty() && last_local_device_buffer_id ==
+                                                  last_local_buffer_id
+                            ? last_local_device_id
+                            : -1;
+                    if (selectDevice(
+                            local_segment_desc.get(),
+                            (uint64_t)slice->source_addr, slice->length,
+                            slice_hint, buffer_id, device_id, retry_cnt++,
+                            last_local_buffer_id, slice_hint_device_id))
+                        continue;
+                    assert(device_id >= 0 && static_cast<size_t>(device_id) <
+                                                 context_list_.size());
+                    auto &context = context_list_[device_id];
+                    assert(context.get());
+                    if (!context->active()) continue;
+                    assert(buffer_id >= 0 &&
+                           static_cast<size_t>(buffer_id) <
+                               local_segment_desc->buffers.size());
+                    assert(local_segment_desc->buffers[buffer_id].lkey.size() ==
+                           context_list_.size());
+                    found_device = true;
+                    last_local_buffer_id = buffer_id;
+                    last_local_device_id = device_id;
+                    last_local_device_buffer_id = buffer_id;
+                    break;
+                }
+                if (!found_device) {
+                    auto source_addr = slice->source_addr;
                     fail_task_and_cleanup(task, slice, current_task_index);
-                    LOG(ERROR) << "Device " << device_id << " is not active";
-                    return Status::InvalidArgument("Device " +
-                                                   std::to_string(device_id) +
-                                                   " is not active");
+                    LOG(ERROR) << "Memory region not registered by any active "
+                                  "device(s): "
+                               << source_addr;
+                    return Status::AddressNotRegistered(
+                        "Memory region not registered by any active "
+                        "device(s): " +
+                        std::to_string(
+                            reinterpret_cast<uintptr_t>(source_addr)));
+                } else {
+                    auto &context = context_list_[device_id];
+                    if (!context->active()) {
+                        fail_task_and_cleanup(task, slice, current_task_index);
+                        LOG(ERROR)
+                            << "Device " << device_id << " is not active";
+                        return Status::InvalidArgument(
+                            "Device " + std::to_string(device_id) +
+                            " is not active");
+                    }
+                    slice->rdma.source_lkey =
+                        local_segment_desc->buffers[buffer_id].lkey[device_id];
+                    if (globalConfig().log_rdma_slice_affinity) {
+                        slice->source_location = resolveBufferLocation(
+                            local_segment_desc->buffers[buffer_id],
+                            reinterpret_cast<uint64_t>(slice->source_addr));
+                    }
+                    slices_to_post[context].push_back(slice);
+                    task.total_bytes += slice->length;
+                    __sync_fetch_and_add(&task.slice_count, 1);
                 }
-                slice->rdma.source_lkey =
-                    local_segment_desc->buffers[buffer_id].lkey[device_id];
-                if (globalConfig().log_rdma_slice_affinity) {
-                    slice->source_location = resolveBufferLocation(
-                        local_segment_desc->buffers[buffer_id],
-                        reinterpret_cast<uint64_t>(slice->source_addr));
+
+                if (nr_slices >= kSubmitWatermark) {
+                    for (auto &entry : slices_to_post)
+                        entry.first->submitPostSend(entry.second);
+                    slices_to_post.clear();
+                    nr_slices = 0;
                 }
-                slices_to_post[context].push_back(slice);
-                task.total_bytes += slice->length;
-                __sync_fetch_and_add(&task.slice_count, 1);
-            }
 
-            if (nr_slices >= kSubmitWatermark) {
-                for (auto &entry : slices_to_post)
-                    entry.first->submitPostSend(entry.second);
-                slices_to_post.clear();
-                nr_slices = 0;
+                offset += slice->length;
             }
-
-            offset += slice->length;
-        }
 #ifdef MOONCAKE_ENABLE_PXN
         }  // end for bypass_requests
 #endif

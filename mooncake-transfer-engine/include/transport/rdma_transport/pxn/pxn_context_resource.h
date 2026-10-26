@@ -30,7 +30,7 @@ class PxnTopologyManager;
 //   - slot geometry (size, total count)
 // ============================================================
 struct PxnContextResource {
-    // proxy gpu physics cuda id 
+    // proxy gpu physics cuda id
     int pxn_proxy_gpu_id = -1;
     // cudaMalloc whole cuda memory
     void* pxn_dev_pool = nullptr;
@@ -43,8 +43,7 @@ struct PxnContextResource {
 
     // current proxy gpu need calloc memory size
     size_t PxnTotalBytes() const {
-        return pxn_slot_size *
-               static_cast<size_t>(pxn_slot_count_per_worker) *
+        return pxn_slot_size * static_cast<size_t>(pxn_slot_count_per_worker) *
                static_cast<size_t>(pxn_worker_thread_count);
     }
 
@@ -62,15 +61,13 @@ struct PxnContextResource {
 //   - nic not in topology / have no affinity GPU
 //   - cudaMalloc or ibv_reg_mr failed
 // ============================================================
-void PxnAllocContextResource(
-    ibv_pd* pd,
-    const std::string& nic_name,
-    int worker_thread_count,
-    PxnTopologyManager* topo_mgr,
-    std::unique_ptr<PxnContextResource>* out,
-    size_t slot_size = kPxnDefaultSlotSize,
-    int slot_count_per_worker = kPxnDefaultSlotCount,
-    bool ib_relaxed_ordering = false);
+void PxnAllocContextResource(ibv_pd* pd, const std::string& nic_name,
+                             int worker_thread_count,
+                             PxnTopologyManager* topo_mgr,
+                             std::unique_ptr<PxnContextResource>* out,
+                             size_t slot_size = kPxnDefaultSlotSize,
+                             int slot_count_per_worker = kPxnDefaultSlotCount,
+                             bool ib_relaxed_ordering = false);
 
 void PxnFreeContextResource(std::unique_ptr<PxnContextResource>* out);
 

@@ -26,10 +26,12 @@ void RdmaTransport::pxnSliceCompletion(Slice *slice) {
     if (slice->pxn_info.is_copy_worker) return;
 
     // Get the shell slice (which contains the CopyWorker)
-    auto *shell = reinterpret_cast<Transport::Slice *>(slice->pxn_info.pxn_copy_worker);
+    auto *shell =
+        reinterpret_cast<Transport::Slice *>(slice->pxn_info.pxn_copy_worker);
     if (shell == nullptr) return;
 
-    auto *cw = reinterpret_cast<pxn::PxnCopyWorker *>(shell->pxn_info.pxn_copy_worker);
+    auto *cw =
+        reinterpret_cast<pxn::PxnCopyWorker *>(shell->pxn_info.pxn_copy_worker);
     if (cw == nullptr) return;
 
     // Clear the pointer to prevent duplicate calls
@@ -67,8 +69,8 @@ void RdmaTransport::pxnFreeTaskCws(std::vector<void *> &cws) {
     for (auto *cw_raw : cws) {
         auto *cw = static_cast<pxn::PxnCopyWorker *>(cw_raw);
         if (cw == nullptr) continue;
-        int prev = cw->pxn_task_refcount.fetch_sub(
-            1, std::memory_order_acq_rel);
+        int prev =
+            cw->pxn_task_refcount.fetch_sub(1, std::memory_order_acq_rel);
         if (prev == 1) {
             // Last task holding this CW: safe to return to the pool.
             pxn::PxnGetCopyWorkerCache().PxnDeallocate(cw);

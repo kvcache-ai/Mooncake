@@ -36,15 +36,15 @@ struct PxnDataSeg {
     uint64_t src_addr = 0;
     // remote gpu addr
     uint64_t dst_addr = 0;
-    size_t   length = 0;
+    size_t length = 0;
 
-    bool     is_pxn = false;
+    bool is_pxn = false;
 
     // is_pxn=true fill these
-    int      src_gpu = -1;
-    int      proxy_gpu = -1;
+    int src_gpu = -1;
+    int proxy_gpu = -1;
     // same rail local nic group index
-    int      local_device_id = -1;
+    int local_device_id = -1;
     uint32_t remote_rkey = 0;
     std::string peer_nic_path;
 };
@@ -80,7 +80,8 @@ struct PxnPackingContext {
     size_t pxn_fin_cw_rdma_cnt = 0;
     // context + copy worker
     std::unordered_map<std::shared_ptr<RdmaContext>,
-                       std::vector<Transport::Slice *>> pxn_pending_shells;
+                       std::vector<Transport::Slice *>>
+        pxn_pending_shells;
     // PXN rdma worker cumulative count
     uint64_t pxn_nr_slices = 0;
 
@@ -88,16 +89,13 @@ struct PxnPackingContext {
 
     std::vector<Transport::TransferRequest> pxn_bypass_requests;
 
-
     std::unordered_map<Transport::SegmentID,
                        std::shared_ptr<TransferMetadata::SegmentDesc>>
         pxn_segment_desc_cache;
 
-
     std::unordered_map<std::string, int8_t> pxn_rail_available_cache;
 
-    explicit PxnPackingContext(const GlobalConfig *config)
-        : cfg(config) {
+    explicit PxnPackingContext(const GlobalConfig *config) : cfg(config) {
         pxn_bypass_requests.reserve(kPxnBypassRequestsReserve);
     }
 };
@@ -108,7 +106,7 @@ class PxnRuntimeManager {
     // manager. If topology build fails, the runtime manager still
     // constructs successfully but with a null topology reference;
     // downstream PXN operations will safely no-op via null checks.
-    explicit PxnRuntimeManager(const std::vector<std::string>& hca_list,
+    explicit PxnRuntimeManager(const std::vector<std::string> &hca_list,
                                bool IbRelaxOrderEn);
     ~PxnRuntimeManager() = default;
     PxnRuntimeManager(const PxnRuntimeManager &) = delete;
@@ -116,7 +114,9 @@ class PxnRuntimeManager {
 
     // Access the topology manager captured at construction. Callers on
     // the hot path (PxnAllocContextResource, PxnInitWorkerPoolState)
-    PxnTopologyManager *PxnTopoMgrRef() const { return pxn_topo_mgr_ref_.get(); }
+    PxnTopologyManager *PxnTopoMgrRef() const {
+        return pxn_topo_mgr_ref_.get();
+    }
 
     // get the memcpy backend (BatchAsync or PeerAsync) used by this manager.
     PxnMemcpyBackend *PxnBackend() const { return pxn_backend_.get(); }
@@ -124,21 +124,18 @@ class PxnRuntimeManager {
     int PxnLookupProxyGpu(int src_gpu, int local_device_id) const;
 
     // given a specific buffer, select the compatible device_id.
-    int PxnSelectDeviceForBuffer(
-        TransferMetadata::SegmentDesc *desc,
-        const TransferMetadata::BufferDesc &buffer,
-        int retry_count = 0);
+    int PxnSelectDeviceForBuffer(TransferMetadata::SegmentDesc *desc,
+                                 const TransferMetadata::BufferDesc &buffer,
+                                 int retry_count = 0);
 
     // init worker pool pxn resource
-    int PxnInitWorkerPoolState(PxnWorkerPoolState *state,
-                               RdmaContext *context,
+    int PxnInitWorkerPoolState(PxnWorkerPoolState *state, RdmaContext *context,
                                int worker_thread_count,
                                bool (*can_post_fn)(int thread_id));
 
     // Check if a peer rail is available (not paused due to errors)
     bool PxnIsRailAvailable(
-        PxnPackingContext &ctx,
-        const std::string &peer_nic_path,
+        PxnPackingContext &ctx, const std::string &peer_nic_path,
         int local_device_id,
         const std::vector<std::shared_ptr<RdmaContext>> &context_list);
 
@@ -149,11 +146,9 @@ class PxnRuntimeManager {
     // Return value: 0 on success, non-zero on failure.
     int PxnPlanAndPack(
         const std::vector<Transport::TransferTask *> &task_list,
-        size_t task_index,
-        size_t request_index,
+        size_t task_index, size_t request_index,
         const std::vector<std::shared_ptr<RdmaContext>> &context_list,
-        TransferMetadata::SegmentDesc *local_desc,
-        size_t submit_watermark,
+        TransferMetadata::SegmentDesc *local_desc, size_t submit_watermark,
         PxnPackingContext &ctx);
 
     void PxnFailPendingSlices(PxnPackingContext &ctx);
@@ -170,16 +165,14 @@ class PxnRuntimeManager {
 
     int PxnDemoteSlice(void *slice_raw);
 
-    bool PxnIbRelaxedOrderingEnabled() const { return pxn_ib_relaxed_ordering_; }
+    bool PxnIbRelaxedOrderingEnabled() const {
+        return pxn_ib_relaxed_ordering_;
+    }
 
-    void PxnEnsureSlotSpace(
-        PxnPackingContext &ctx,
-        const PxnDataSeg &seg,
-        const std::shared_ptr<RdmaContext> &context,
-        Transport::TransferTask *task,
-        size_t slice_length,
-        size_t slot_size,
-        int peer_device_id);
+    void PxnEnsureSlotSpace(PxnPackingContext &ctx, const PxnDataSeg &seg,
+                            const std::shared_ptr<RdmaContext> &context,
+                            Transport::TransferTask *task, size_t slice_length,
+                            size_t slot_size, int peer_device_id);
 
    private:
     // Shared ownership of the PxnTopologyManager. Uses shared_ptr (not a
@@ -201,8 +194,7 @@ class PxnRuntimeManager {
 
     // Assemble one CopyWorker's memcpy parameters (dsts/srcs/sizes) and
     // push it into `batch`.
-    void PxnAssembleMemcpy(Transport::Slice *shell,
-                           PxnSlotPool *pool,
+    void PxnAssembleMemcpy(Transport::Slice *shell, PxnSlotPool *pool,
                            std::vector<Transport::Slice *> *batch,
                            std::vector<void *> *dsts,
                            std::vector<const void *> *srcs,

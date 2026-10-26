@@ -160,8 +160,7 @@ class RdmaPxnRouteSlicesTest : public ::testing::Test {
             std::vector<std::vector<void *>>(kWorkerCount);
         state_->pxn_slice_queue_count =
             std::vector<std::atomic<uint64_t>>(kWorkerCount);
-        state_->pxn_slice_queue_lock =
-            std::vector<TicketLock>(kWorkerCount);
+        state_->pxn_slice_queue_lock = std::vector<TicketLock>(kWorkerCount);
         for (int i = 0; i < kWorkerCount; ++i) {
             state_->pxn_slice_queue_count[i].store(0,
                                                    std::memory_order_relaxed);
@@ -222,19 +221,18 @@ TEST_F(RdmaPxnRouteSlicesTest, SingleSliceLandsOnDeterministicShard) {
     std::vector<Transport::Slice *> slices{shell};
     uint64_t submitted = 0;
 
-    ASSERT_EQ(pxn_runtime_->PxnRouteSlicesToShards(state_.get(), slices,
-                                                   submitted),
-              0);
+    ASSERT_EQ(
+        pxn_runtime_->PxnRouteSlicesToShards(state_.get(), slices, submitted),
+        0);
 
     const size_t expected = expectedShard(target, peer, gpu);
     for (int i = 0; i < kWorkerCount; ++i) {
         if (i == static_cast<int>(expected)) {
             EXPECT_EQ(state_->pxn_slice_queue[i].size(), 1u);
             EXPECT_EQ(state_->pxn_slice_queue[i].front(), shell);
-            EXPECT_EQ(
-                state_->pxn_slice_queue_count[i].load(
-                    std::memory_order_relaxed),
-                1u);
+            EXPECT_EQ(state_->pxn_slice_queue_count[i].load(
+                          std::memory_order_relaxed),
+                      1u);
         } else {
             EXPECT_TRUE(state_->pxn_slice_queue[i].empty());
         }
@@ -253,9 +251,9 @@ TEST_F(RdmaPxnRouteSlicesTest, DistinctKeysLandOnPredictedShards) {
     }
     uint64_t submitted = 0;
 
-    ASSERT_EQ(pxn_runtime_->PxnRouteSlicesToShards(state_.get(), slices,
-                                                   submitted),
-              0);
+    ASSERT_EQ(
+        pxn_runtime_->PxnRouteSlicesToShards(state_.get(), slices, submitted),
+        0);
 
     uint64_t total = 0;
     for (int i = 0; i < kWorkerCount; ++i) {
@@ -285,9 +283,9 @@ TEST_F(RdmaPxnRouteSlicesTest, IdenticalKeysCollapseOntoSameShard) {
     }
     uint64_t submitted = 0;
 
-    ASSERT_EQ(pxn_runtime_->PxnRouteSlicesToShards(state_.get(), slices,
-                                                   submitted),
-              0);
+    ASSERT_EQ(
+        pxn_runtime_->PxnRouteSlicesToShards(state_.get(), slices, submitted),
+        0);
 
     const size_t expected = expectedShard(42, 5, 6);
     for (int i = 0; i < kWorkerCount; ++i) {
@@ -311,8 +309,7 @@ TEST_F(RdmaPxnRouteSlicesTest, ThreadLocalScratchHoldsAcrossInitiators) {
     std::vector<Transport::Slice *> slices_a;
     std::vector<Transport::Slice *> slices_b;
     for (int i = 0; i < kNumSlicesPerThread; ++i) {
-        slices_a.push_back(
-            makeShell(/*target=*/i, /*peer=*/0, /*gpu=*/0));
+        slices_a.push_back(makeShell(/*target=*/i, /*peer=*/0, /*gpu=*/0));
         slices_b.push_back(
             makeShell(/*target=*/i + 10'000, /*peer=*/1, /*gpu=*/1));
     }
@@ -345,8 +342,7 @@ TEST_F(RdmaPxnRouteSlicesTest, ThreadLocalScratchHoldsAcrossInitiators) {
     for (int i = 0; i < kWorkerCount; ++i) {
         total += state_->pxn_slice_queue[i].size();
     }
-    EXPECT_EQ(total,
-              static_cast<uint64_t>(kNumSlicesPerThread) * 2);
+    EXPECT_EQ(total, static_cast<uint64_t>(kNumSlicesPerThread) * 2);
 }
 
 }  // namespace

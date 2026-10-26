@@ -35,10 +35,9 @@ constexpr int kPxnDefaultSlotCount = 16;
 struct PxnSegRange {
     uint64_t pxn_src_start = 0;
     uint64_t pxn_src_end = 0;
-    size_t   pxn_offset_in_slot = 0;
-    bool     pxn_from_cache = false;
+    size_t pxn_offset_in_slot = 0;
+    bool pxn_from_cache = false;
 };
-
 
 struct PxnCopyWorker {
     //   kPending
@@ -76,7 +75,7 @@ struct PxnCopyWorker {
     void* pxn_slot_pool = nullptr;
 
     // ---- Packed slices ----
-    // pack all original slice pointers into this slot + the 
+    // pack all original slice pointers into this slot + the
     // offset of each slice within the slot.
     std::vector<void*> pxn_rdma_workers;
     std::vector<size_t> pxn_offsets_in_slot;
@@ -84,7 +83,7 @@ struct PxnCopyWorker {
     size_t pxn_rdma_workers_cnt = 0;
 
     // ---- Seg-level memcpy ranges ----
-    // A contiguous source memory segment at the seg granularity 
+    // A contiguous source memory segment at the seg granularity
     // (multiple slices within the same seg are merged into one).
     std::vector<PxnSegRange*> pxn_seg_ranges;
 
@@ -107,11 +106,11 @@ struct PxnCopyWorker {
     void* pxn_cascade_next = nullptr;
 
     // ---- Source routing (used at scheduling / debugging) ----
-    int pxn_src_gpu_id = -1;           // cuda device id
-    int pxn_proxy_gpu_id = -1;         // cuda device id
+    int pxn_src_gpu_id = -1;    // cuda device id
+    int pxn_proxy_gpu_id = -1;  // cuda device id
 
     // ---- Cache bookkeeping ----
-    // Whether it comes from the object pool (true = reuse; 
+    // Whether it comes from the object pool (true = reuse;
     // false = new allocation). Hot paths are not currently used.
     bool pxn_from_cache = false;
     int peer_device_id;
@@ -126,7 +125,7 @@ struct alignas(64) PxnSlotEntry {
     // recorded by send/cascade stream
     cudaEvent_t pxn_send_event{nullptr};
 
-    // save slot cascade copy worker list 
+    // save slot cascade copy worker list
     void* pxn_cascade_head{nullptr};
     void* pxn_cascade_tail{nullptr};
 

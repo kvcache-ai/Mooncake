@@ -547,7 +547,8 @@ void loadGlobalConfig(GlobalConfig& config) {
         long kb = atol(pxn_slot_size_kb_env);
         if (kb > 0) {
             config.pxn_slot_size = static_cast<size_t>(kb) * 1024;
-            config.pxn_slot_size = std::max(config.pxn_slot_size, config.slice_size);
+            config.pxn_slot_size =
+                std::max(config.pxn_slot_size, config.slice_size);
         } else {
             LOG(WARNING)
                 << "Ignore value from environment variable MC_PXN_SLOT_SIZE_KB";

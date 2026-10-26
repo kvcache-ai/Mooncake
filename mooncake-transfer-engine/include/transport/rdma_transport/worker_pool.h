@@ -32,7 +32,7 @@ namespace mooncake {
 namespace pxn {
 struct PxnWorkerPoolState;  // defined in pxn/pxn_worker_pool_state.h
 class PxnRuntimeManager;    // allow access to PXN-related private members
-}
+}  // namespace pxn
 #endif
 
 class WorkerPoolTestPeer;

@@ -36,9 +36,8 @@ class PxnTopologyManager {
     // unchanged (avoids repeated CUDA/nvml/realpath syscalls). Otherwise
     // rebuilds and writes the new manager back through `pxn_mgr`.
     // Returns 0 on success, non-zero on failure.
-    static int PxnCreateAndBuild(
-        std::unique_ptr<PxnTopologyManager>& pxn_mgr,
-        const std::vector<std::string>& hca_list);
+    static int PxnCreateAndBuild(std::unique_ptr<PxnTopologyManager>& pxn_mgr,
+                                 const std::vector<std::string>& hca_list);
 
     // PxnCreateAndBuild call PxnBuild
     int PxnBuild(const std::vector<PxnNicRecord>& hca_records);

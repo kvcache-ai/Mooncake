@@ -20,15 +20,16 @@ namespace pxn {
 
 // Not executed or execution failed, treated as not gpu memory
 int PxnEnsureGpuMemory(void *start, bool &isGpuMem, uint32_t &gpuidx) {
-
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
     cudaPointerAttributes attributes;
     cudaError_t result = cudaPointerGetAttributes(&attributes, start);
     if (result != cudaSuccess) {
-        LOG(ERROR) << "ensure gpu memory cudaPointerGetAttributes failed (Error code: " << result
-                   << " - " << cudaGetErrorString(result) << ")" << std::endl;
+        LOG(ERROR)
+            << "ensure gpu memory cudaPointerGetAttributes failed (Error code: "
+            << result << " - " << cudaGetErrorString(result) << ")"
+            << std::endl;
         isGpuMem = false;
         return -1;
     }
@@ -41,6 +42,5 @@ int PxnEnsureGpuMemory(void *start, bool &isGpuMem, uint32_t &gpuidx) {
     return 0;
 }
 
-
-} // pxn namespace
-} // mooncake namespace
+}  // namespace pxn
+}  // namespace mooncake
