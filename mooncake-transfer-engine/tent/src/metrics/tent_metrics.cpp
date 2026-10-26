@@ -422,6 +422,28 @@ const char* rdmaCompletionOutcomeName(
     return "unknown";
 }
 
+const char* rdmaWcErrorCategoryName(TentMetrics::RdmaWcErrorCategory category) {
+    switch (category) {
+        case TentMetrics::RdmaWcErrorCategory::Flush:
+            return "flush";
+        case TentMetrics::RdmaWcErrorCategory::RetryExceeded:
+            return "retry_exceeded";
+        case TentMetrics::RdmaWcErrorCategory::RnrRetryExceeded:
+            return "rnr_retry_exceeded";
+        case TentMetrics::RdmaWcErrorCategory::LocalProtection:
+            return "local_protection";
+        case TentMetrics::RdmaWcErrorCategory::RemoteAccess:
+            return "remote_access";
+        case TentMetrics::RdmaWcErrorCategory::RemoteOperation:
+            return "remote_operation";
+        case TentMetrics::RdmaWcErrorCategory::Protocol:
+            return "protocol";
+        case TentMetrics::RdmaWcErrorCategory::Other:
+            return "other";
+    }
+    return "other";
+}
+
 const char* rdmaEndpointEventName(TentMetrics::RdmaEndpointEvent event) {
     switch (event) {
         case TentMetrics::RdmaEndpointEvent::Constructed:
@@ -567,6 +589,30 @@ const char* streamConnectionRoleName(TentMetrics::StreamConnectionRole role) {
             return "server";
     }
     return "unknown";
+}
+
+const char* protocolErrorKindName(TentMetrics::ProtocolErrorKind kind) {
+    switch (kind) {
+        case TentMetrics::ProtocolErrorKind::InvalidSize:
+            return "invalid_size";
+        case TentMetrics::ProtocolErrorKind::BadMagic:
+            return "bad_magic";
+        case TentMetrics::ProtocolErrorKind::BadVersion:
+            return "bad_version";
+        case TentMetrics::ProtocolErrorKind::InvalidReserved:
+            return "invalid_reserved";
+        case TentMetrics::ProtocolErrorKind::BadOpcode:
+            return "bad_opcode";
+        case TentMetrics::ProtocolErrorKind::BadLength:
+            return "bad_length";
+        case TentMetrics::ProtocolErrorKind::InvalidStatus:
+            return "invalid_status";
+        case TentMetrics::ProtocolErrorKind::RequestIdMismatch:
+            return "request_id_mismatch";
+        case TentMetrics::ProtocolErrorKind::CommittedLengthMismatch:
+            return "committed_length_mismatch";
+    }
+    return "invalid_reserved";
 }
 
 const char* shmMappingEventName(TentMetrics::ShmMappingEvent event) {
@@ -973,11 +1019,14 @@ void TentMetrics::registerMetrics() {
         &rdma_slice_events_total_,
         &rdma_retries_total_,
         &rdma_retry_exhausted_total_,
+        &rdma_wc_errors_total_,
         &rdma_cq_poll_errors_total_,
         &rdma_endpoint_events_total_,
         &rdma_qp_transition_failures_total_,
         &rdma_notification_events_total_,
         &stream_events_total_,
+        &protocol_errors_total_,
+        &tcp_retransmissions_total_,
         &shm_mapping_events_total_,
         &shm_copy_events_total_,
         &segment_events_total_,
@@ -1332,6 +1381,18 @@ void TentMetrics::recordRdmaCompletion(Request::OpCode operation,
         static_cast<int64_t>(latency_us));
 }
 
+void TentMetrics::recordRdmaWcError(Request::OpCode operation,
+                                    RdmaWcErrorCategory category) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    const size_t slot = operationSlot(operation) * kRdmaWcErrorCategoryDomain +
+                        static_cast<size_t>(category);
+    rdma_wc_errors_total_.incCached(slot, [operation, category] {
+        return std::array<std::string, 2>{operationName(operation),
+                                          rdmaWcErrorCategoryName(category)};
+    });
+}
+
 void TentMetrics::recordRdmaEndpointEvent(RdmaEndpointEvent event) {
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
@@ -1461,6 +1522,37 @@ void TentMetrics::recordStreamConnection(TransportType transport,
                                               streamConnectionRoleName(role)};
         },
         delta);
+}
+
+void TentMetrics::recordProtocolError(TransportType transport,
+                                      ProtocolErrorKind kind) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    protocol_errors_total_.incCached(
+        protocolErrorSlot(transport, kind), [transport, kind] {
+            return std::array<std::string, 2>{transportTypeName(transport),
+                                              protocolErrorKindName(kind)};
+        });
+}
+
+void TentMetrics::recordTcpSocketSample(TransportType transport,
+                                        StreamConnectionRole role,
+                                        uint32_t retransmit_delta,
+                                        uint32_t rtt_us,
+                                        uint32_t congestion_window_segments) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    const size_t slot = streamConnectionSlot(transport, role);
+    auto labels = [transport, role] {
+        return std::array<std::string, 2>{transportTypeName(transport),
+                                          streamConnectionRoleName(role)};
+    };
+    if (retransmit_delta != 0) {
+        tcp_retransmissions_total_.incCached(slot, labels, retransmit_delta);
+    }
+    tcp_rtt_us_.observeCached(slot, labels, rtt_us);
+    tcp_congestion_window_segments_.observeCached(slot, labels,
+                                                  congestion_window_segments);
 }
 
 void TentMetrics::recordShmMappingEvent(ShmMappingEvent event) {
@@ -1746,6 +1838,8 @@ std::string TentMetrics::serializePrometheusMetrics(bool open_metrics) {
         serializeHistogramPrometheus(rdma_completion_latency_, result);
         serializeHistogramPrometheus(stream_attempt_latency_, result);
         serializeHistogramPrometheus(stream_queue_wait_, result);
+        serializeHistogramPrometheus(tcp_rtt_us_, result);
+        serializeHistogramPrometheus(tcp_congestion_window_segments_, result);
         serializeHistogramPrometheus(shm_copy_latency_, result);
 
         // Gauges: current value per label.
@@ -2182,6 +2276,8 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&rdma_retries_total_);
         root[rdma_retry_exhausted_total_.str_name()] =
             sumCounterValues(&rdma_retry_exhausted_total_);
+        root[rdma_wc_errors_total_.str_name()] =
+            sumCounterValues(&rdma_wc_errors_total_);
         root[rdma_cq_poll_errors_total_.str_name()] =
             static_cast<int64_t>(rdma_cq_poll_errors_total_.value());
         root[rdma_endpoint_events_total_.str_name()] =
@@ -2192,6 +2288,10 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&rdma_notification_events_total_);
         root[stream_events_total_.str_name()] =
             sumCounterValues(&stream_events_total_);
+        root[protocol_errors_total_.str_name()] =
+            sumCounterValues(&protocol_errors_total_);
+        root[tcp_retransmissions_total_.str_name()] =
+            sumCounterValues(&tcp_retransmissions_total_);
         root[shm_mapping_events_total_.str_name()] =
             sumCounterValues(&shm_mapping_events_total_);
         root[shm_copy_events_total_.str_name()] =
@@ -2279,6 +2379,8 @@ std::string TentMetrics::getJsonMetrics() {
         serializeHistogramToJson(root, rdma_completion_latency_);
         serializeHistogramToJson(root, stream_attempt_latency_);
         serializeHistogramToJson(root, stream_queue_wait_);
+        serializeHistogramToJson(root, tcp_rtt_us_);
+        serializeHistogramToJson(root, tcp_congestion_window_segments_);
         serializeHistogramToJson(root, shm_copy_latency_);
         serializeHistogramToJson(root, admission_wait_latency_);
 
@@ -2426,6 +2528,7 @@ void TentMetrics::recordRdmaWorkerInflight(Request::OpCode, int64_t) {}
 void TentMetrics::recordRdmaPostedInflight(Request::OpCode, int64_t) {}
 void TentMetrics::recordRdmaCompletion(Request::OpCode, RdmaCompletionOutcome,
                                        double) {}
+void TentMetrics::recordRdmaWcError(Request::OpCode, RdmaWcErrorCategory) {}
 void TentMetrics::recordRdmaEndpointEvent(RdmaEndpointEvent) {}
 void TentMetrics::recordRdmaQpTransitionFailure(RdmaQpType, RdmaQpTransition) {}
 void TentMetrics::recordRdmaNotificationEvent(RdmaNotificationEvent, int64_t) {}
@@ -2440,6 +2543,9 @@ void TentMetrics::recordStreamBusyWorkers(TransportType, int64_t) {}
 void TentMetrics::recordStreamAdmission(TransportType, int64_t, int64_t) {}
 void TentMetrics::recordStreamConnection(TransportType, StreamConnectionRole,
                                          int64_t) {}
+void TentMetrics::recordProtocolError(TransportType, ProtocolErrorKind) {}
+void TentMetrics::recordTcpSocketSample(TransportType, StreamConnectionRole,
+                                        uint32_t, uint32_t, uint32_t) {}
 void TentMetrics::recordShmMappingEvent(ShmMappingEvent) {}
 void TentMetrics::recordShmCopy(Request::OpCode, ShmCopyOutcome, double) {}
 void TentMetrics::recordSegmentEvent(SegmentEvent) {}

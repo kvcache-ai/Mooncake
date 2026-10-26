@@ -53,6 +53,31 @@ RailMonitor& getOrCreateRail(
     auto [ins, _] = rails.emplace(machine_id, std::make_unique<RailMonitor>());
     return *ins->second;
 }
+#if TENT_METRICS_ENABLED
+TentMetrics::RdmaWcErrorCategory rdmaWcErrorCategory(ibv_wc_status status) {
+    switch (status) {
+        case IBV_WC_WR_FLUSH_ERR:
+            return TentMetrics::RdmaWcErrorCategory::Flush;
+        case IBV_WC_RETRY_EXC_ERR:
+            return TentMetrics::RdmaWcErrorCategory::RetryExceeded;
+        case IBV_WC_RNR_RETRY_EXC_ERR:
+            return TentMetrics::RdmaWcErrorCategory::RnrRetryExceeded;
+        case IBV_WC_LOC_PROT_ERR:
+        case IBV_WC_LOC_ACCESS_ERR:
+        case IBV_WC_MW_BIND_ERR:
+            return TentMetrics::RdmaWcErrorCategory::LocalProtection;
+        case IBV_WC_REM_ACCESS_ERR:
+            return TentMetrics::RdmaWcErrorCategory::RemoteAccess;
+        case IBV_WC_REM_OP_ERR:
+            return TentMetrics::RdmaWcErrorCategory::RemoteOperation;
+        case IBV_WC_BAD_RESP_ERR:
+        case IBV_WC_REM_INV_REQ_ERR:
+            return TentMetrics::RdmaWcErrorCategory::Protocol;
+        default:
+            return TentMetrics::RdmaWcErrorCategory::Other;
+    }
+}
+#endif
 }  // namespace
 
 Workers::Workers(RdmaTransport* transport)
@@ -1113,6 +1138,10 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
     double enqueue_lat = (slice->submit_ts - slice->enqueue_ts) / 1000.0;
     double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
 #if TENT_METRICS_ENABLED
+    if (wc.status != IBV_WC_SUCCESS) {
+        TentMetrics::instance().recordRdmaWcError(
+            slice->task->request.opcode, rdmaWcErrorCategory(wc.status));
+    }
     TentMetrics::RdmaCompletionOutcome metric_outcome;
     if (slice->word != PENDING) {
         metric_outcome = TentMetrics::RdmaCompletionOutcome::Late;

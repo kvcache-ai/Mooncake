@@ -189,6 +189,47 @@ groups:
             {{ $labels.operation }} slices exhausted retries due to
             {{ $labels.cause }} on {{ $labels.instance }}.
 
+      - alert: TentRdmaHardwareRetryExhausted
+        expr: >-
+          increase(tent_rdma_wc_errors_total{
+            category=~"retry_exceeded|rnr_retry_exceeded"
+          }[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: TENT RDMA hardware retry budget was exhausted
+          description: >-
+            {{ $labels.operation }} work on {{ $labels.instance }} completed
+            with {{ $labels.category }}. Inspect rail, peer, and NIC counters.
+
+      - alert: TentProtocolError
+        expr: increase(tent_protocol_errors_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: TENT rejected an inconsistent protocol frame
+          description: >-
+            {{ $labels.transport }} on {{ $labels.instance }} observed
+            {{ $labels.kind }}. Check peer versions and correlated logs.
+
+      - alert: TentTcpRetransmissionsHigh
+        expr: >-
+          sum by (job, instance, transport, role) (
+            increase(tent_tcp_retransmissions_total[5m])
+          ) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: TENT HP-TCP retransmissions are elevated
+          description: >-
+            {{ $labels.role }} {{ $labels.transport }} sockets on
+            {{ $labels.instance }} observed more than 100 kernel TCP
+            retransmissions in five minutes. Tune this absolute threshold to
+            the deployment's connection and traffic volume.
+
       - alert: TentAdmissionRejecting
         expr: >-
           sum by (job, instance, owner_kind, event) (

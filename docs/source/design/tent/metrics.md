@@ -363,11 +363,14 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_rdma_slice_events_total` | Counter | `operation`, `event` | RDMA slice lifecycle events from initial worker enqueue through post, completion, timeout, or pre-post failure |
 | `tent_rdma_retries_total` | Counter | `operation`, `cause` | RDMA slice retries actually re-enqueued after endpoint, post, or completion failure |
 | `tent_rdma_retry_exhausted_total` | Counter | `operation`, `cause` | RDMA slices terminated after reaching the configured retry limit |
+| `tent_rdma_wc_errors_total` | Counter | `operation`, `category` | Non-success RDMA work completions split into flush, hardware retry/RNR exhaustion, local protection, remote access/operation, protocol, and other categories |
 | `tent_rdma_cq_poll_errors_total` | Counter | - | Completion queue polls that returned an error |
 | `tent_rdma_endpoint_events_total` | Counter | `event` | RDMA endpoint construction, ready, retirement and destruction transitions |
 | `tent_rdma_qp_transition_failures_total` | Counter | `qp_type`, `transition` | Failed data or notification QP state transitions |
 | `tent_rdma_notification_events_total` | Counter | `event` | Notification receive posting/delivery, send posting/completion and channel failures |
 | `tent_stream_events_total` | Counter | `transport`, `operation`, `event` | TCP and HP-TCP queue, physical attempt, connection, retry and terminal events |
+| `tent_protocol_errors_total` | Counter | `transport`, `kind` | Malformed or inconsistent HP-TCP frames, including header fields, request IDs, and committed lengths |
+| `tent_tcp_retransmissions_total` | Counter | `transport`, `role` | Delta of Linux `TCP_INFO.tcpi_total_retrans` sampled from HP-TCP sockets |
 | `tent_shm_mapping_events_total` | Counter | `event` | SHM address relocation and backing-object mapping outcomes |
 | `tent_shm_copy_events_total` | Counter | `operation`, `outcome` | Synchronous physical SHM copy attempts |
 | `tent_segment_events_total` | Counter | `event` | Segment snapshot, registry, remote-cache and generation lifecycle events |
@@ -406,6 +409,8 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_rdma_completion_latency_us` | Histogram | `operation`, `outcome` | Post-to-CQ latency of physical RDMA slice completions |
 | `tent_stream_attempt_latency_us` | Histogram | `transport`, `operation`, `outcome` | End-to-end latency of physical TCP or HP-TCP network attempts |
 | `tent_stream_queue_wait_us` | Histogram | `transport`, `operation` | TCP logical-task and HP-TCP physical-slice queue wait before an attempt starts |
+| `tent_tcp_rtt_us` | Histogram | `transport`, `role` | Linux TCP_INFO smoothed RTT samples from HP-TCP sockets |
+| `tent_tcp_congestion_window_segments` | Histogram | `transport`, `role` | Linux TCP_INFO send congestion-window samples from HP-TCP sockets |
 | `tent_shm_copy_latency_us` | Histogram | `operation`, `outcome` | Synchronous physical SHM copy latency |
 | `tent_admission_wait_us` | Histogram | `owner_kind` | Runtime admission wait before dispatch |
 
@@ -430,6 +435,16 @@ visible when runtime transfer recording is disabled.
 - State gauges ignore the runtime sampling switch. Every queue, worker,
   admission, and connection increment is paired with a decrement on success,
   cancellation, timeout, dispatch failure, and shutdown paths.
+- TENT software retries, kernel TCP retransmissions, and RDMA hardware retry
+  exhaustion are different signals. `tent_rdma_retries_total` counts software
+  re-enqueue, `tent_tcp_retransmissions_total` comes from TCP_INFO, and
+  `tent_rdma_wc_errors_total{category=~"retry_exceeded|rnr_retry_exceeded"}`
+  reports only the terminal RDMA WC status after hardware retries are
+  exhausted. Per-packet RDMA retry counts require NIC/vendor telemetry.
+- TCP_INFO is sampled every 256 completed HP-TCP operations and once before a
+  connection closes. The classic RPC-backed TCP transport does not expose its
+  socket handle here; pair TENT metrics with host TCP retransmission telemetry
+  for that transport.
 - `tent_logical_requests_started_total - sum(tent_logical_request_outcomes_total)` is the process-local conservation balance. Compare it with `tent_logical_requests_inflight`; a persistent mismatch means a terminal edge was lost or telemetry was disabled during only one side of the interval.
 - `tent_transport_attempts_total` and `tent_transport_attempt_outcomes_total` provide the equivalent physical-attempt conservation check. A recovered RDMA→TCP request contributes one failed RDMA attempt and one successful TCP attempt.
 - `tent_transport_attempt_failures_total` is a compatibility aggregate of the `failed`, `timeout`, and `canceled` attempt outcomes.

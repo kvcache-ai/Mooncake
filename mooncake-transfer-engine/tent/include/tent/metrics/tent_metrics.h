@@ -286,6 +286,16 @@ class TentMetrics {
     };
     enum class RdmaRetryCause { Endpoint, Post, Completion };
     enum class RdmaCompletionOutcome { Success, WcError, Flush, Late };
+    enum class RdmaWcErrorCategory {
+        Flush,
+        RetryExceeded,
+        RnrRetryExceeded,
+        LocalProtection,
+        RemoteAccess,
+        RemoteOperation,
+        Protocol,
+        Other,
+    };
     enum class RdmaEndpointEvent {
         Constructed,
         ConstructFailure,
@@ -335,6 +345,8 @@ class TentMetrics {
     void recordRdmaPostedInflight(Request::OpCode operation, int64_t delta);
     void recordRdmaCompletion(Request::OpCode operation,
                               RdmaCompletionOutcome outcome, double latency_us);
+    void recordRdmaWcError(Request::OpCode operation,
+                           RdmaWcErrorCategory category);
     void recordRdmaEndpointEvent(RdmaEndpointEvent event);
     void recordRdmaQpTransitionFailure(RdmaQpType qp_type,
                                        RdmaQpTransition transition);
@@ -377,6 +389,17 @@ class TentMetrics {
     void recordStreamQueueWait(TransportType transport,
                                Request::OpCode operation, double latency_us);
     enum class StreamConnectionRole { Client, Server };
+    enum class ProtocolErrorKind {
+        InvalidSize,
+        BadMagic,
+        BadVersion,
+        InvalidReserved,
+        BadOpcode,
+        BadLength,
+        InvalidStatus,
+        RequestIdMismatch,
+        CommittedLengthMismatch,
+    };
     // Paired stream state gauges. These updates remain active when runtime
     // sampling is disabled so current state cannot drift.
     void recordStreamQueueDepth(TransportType transport, int64_t delta);
@@ -385,6 +408,11 @@ class TentMetrics {
                                int64_t byte_delta);
     void recordStreamConnection(TransportType transport,
                                 StreamConnectionRole role, int64_t delta);
+    void recordProtocolError(TransportType transport, ProtocolErrorKind kind);
+    void recordTcpSocketSample(TransportType transport,
+                               StreamConnectionRole role,
+                               uint32_t retransmit_delta, uint32_t rtt_us,
+                               uint32_t congestion_window_segments);
 
     enum class ShmMappingEvent {
         CacheHit,
@@ -620,6 +648,8 @@ class TentMetrics {
                                                                     "event"};
     static inline const std::array<std::string, 2> kRdmaRetryLabels{"operation",
                                                                     "cause"};
+    static inline const std::array<std::string, 2> kRdmaWcErrorLabels{
+        "operation", "category"};
     static inline const std::array<std::string, 2> kRdmaCompletionLabels{
         "operation", "outcome"};
     static inline const std::array<std::string, 1> kRdmaEndpointEventLabel{
@@ -634,6 +664,8 @@ class TentMetrics {
         "transport", "operation", "outcome"};
     static inline const std::array<std::string, 2> kStreamConnectionLabels{
         "transport", "role"};
+    static inline const std::array<std::string, 2> kProtocolErrorLabels{
+        "transport", "kind"};
     static inline const std::array<std::string, 1> kShmMappingEventLabel{
         "event"};
     static inline const std::array<std::string, 2> kShmCopyLabels{"operation",
@@ -667,6 +699,7 @@ class TentMetrics {
         kRpcMethodDomain * kRpcOutcomeDomain;
     static constexpr size_t kRdmaSliceEventDomain = 9;
     static constexpr size_t kRdmaRetryCauseDomain = 3;
+    static constexpr size_t kRdmaWcErrorCategoryDomain = 8;
     static constexpr size_t kRdmaCompletionOutcomeDomain = 4;
     static constexpr size_t kRdmaEndpointEventDomain = 7;
     static constexpr size_t kRdmaQpTypeDomain = 2;
@@ -682,6 +715,9 @@ class TentMetrics {
     static constexpr size_t kStreamAttemptDomain =
         kStreamOperationDomain * kStreamOutcomeDomain;
     static constexpr size_t kStreamConnectionDomain = kTransportDomain * 2;
+    static constexpr size_t kProtocolErrorKindDomain = 9;
+    static constexpr size_t kProtocolErrorDomain =
+        kTransportDomain * kProtocolErrorKindDomain;
     static constexpr size_t kShmMappingEventDomain = 8;
     static constexpr size_t kShmCopyOutcomeDomain = 2;
     static constexpr size_t kShmCopyDomain =
@@ -698,6 +734,8 @@ class TentMetrics {
         kOperationDomain * kRdmaSliceEventDomain;
     static constexpr size_t kRdmaRetryDomain =
         kOperationDomain * kRdmaRetryCauseDomain;
+    static constexpr size_t kRdmaWcErrorDomain =
+        kOperationDomain * kRdmaWcErrorCategoryDomain;
     static constexpr size_t kRdmaCompletionDomain =
         kOperationDomain * kRdmaCompletionOutcomeDomain;
 
@@ -761,6 +799,11 @@ class TentMetrics {
     static size_t streamConnectionSlot(TransportType transport,
                                        StreamConnectionRole role) {
         return transportSlot(transport) * 2 + static_cast<size_t>(role);
+    }
+    static size_t protocolErrorSlot(TransportType transport,
+                                    ProtocolErrorKind kind) {
+        return transportSlot(transport) * kProtocolErrorKindDomain +
+               static_cast<size_t>(kind);
     }
     static size_t shmCopySlot(Request::OpCode operation,
                               ShmCopyOutcome outcome) {
@@ -877,6 +920,10 @@ class TentMetrics {
         "tent_rdma_retry_exhausted_total",
         "RDMA slices terminated after exhausting retries by cause",
         kRdmaRetryLabels, kRdmaRetryDomain};
+    metrics::CachedDynamicCounter<2> rdma_wc_errors_total_{
+        "tent_rdma_wc_errors_total",
+        "RDMA work completions with a non-success status by bounded category",
+        kRdmaWcErrorLabels, kRdmaWcErrorDomain};
     ylt::metric::counter_t rdma_cq_poll_errors_total_{
         "tent_rdma_cq_poll_errors_total",
         "RDMA completion queue poll calls that returned an error"};
@@ -896,6 +943,14 @@ class TentMetrics {
         "tent_stream_events_total",
         "TCP and HP-TCP queue, attempt, connection, retry and terminal events",
         kStreamEventLabels, kStreamEventDomain};
+    metrics::CachedDynamicCounter<2> protocol_errors_total_{
+        "tent_protocol_errors_total",
+        "Rejected or inconsistent transport protocol frames",
+        kProtocolErrorLabels, kProtocolErrorDomain};
+    metrics::CachedDynamicCounter<2> tcp_retransmissions_total_{
+        "tent_tcp_retransmissions_total",
+        "Kernel TCP retransmissions observed through TCP_INFO deltas",
+        kStreamConnectionLabels, kStreamConnectionDomain};
     metrics::CachedDynamicCounter<1> shm_mapping_events_total_{
         "tent_shm_mapping_events_total",
         "SHM remote-address relocation and backing-object mapping events",
@@ -1002,6 +1057,8 @@ class TentMetrics {
     // Buckets span 10us to 500ms to capture both fast RDMA and slower TCP.
     static inline const std::vector<double> kStageBuckets{
         10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000};
+    static inline const std::vector<double> kCongestionWindowBuckets{
+        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 4096};
 
     // Histograms are composed of cached-cell counters: one counter per bucket
     // plus a sum counter. The sum is part of the histogram itself, so no
@@ -1059,6 +1116,14 @@ class TentMetrics {
         "tent_stream_attempt_latency_us",
         "Physical TCP and HP-TCP attempt latency in microseconds",
         kLatencyBuckets, kStreamAttemptLabels, kStreamAttemptDomain};
+    metrics::CachedDynamicHistogram<2> tcp_rtt_us_{
+        "tent_tcp_rtt_us", "Kernel smoothed TCP RTT samples in microseconds",
+        kLatencyBuckets, kStreamConnectionLabels, kStreamConnectionDomain};
+    metrics::CachedDynamicHistogram<2> tcp_congestion_window_segments_{
+        "tent_tcp_congestion_window_segments",
+        "Kernel TCP send congestion window samples in segments",
+        kCongestionWindowBuckets, kStreamConnectionLabels,
+        kStreamConnectionDomain};
     metrics::CachedDynamicHistogram<2> stream_queue_wait_{
         "tent_stream_queue_wait_us",
         "TCP logical-task and HP-TCP physical-slice queue wait in microseconds",

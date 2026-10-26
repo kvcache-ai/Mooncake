@@ -170,6 +170,12 @@ before posting points toward endpoint selection, queueing, or post failures.
 5. Confirm whether logical success stayed healthy because RDMA failed over to
    TCP. Do not close the incident based only on logical success.
 
+`tent_rdma_retries_total` is a TENT software re-enqueue, not a packet retry.
+Use `tent_rdma_wc_errors_total{category="retry_exceeded"}` for a QP whose
+hardware retry budget was exhausted and `category="rnr_retry_exceeded"` for
+receiver-not-ready exhaustion. Individual on-wire RDMA retry counts are below
+the verbs WC boundary and must come from NIC/vendor counters.
+
 ### TCP and HP-TCP
 
 Split `tent_stream_events_total` by `transport`, `operation`, and `event`.
@@ -185,6 +191,17 @@ For a persistent queue, compare `tent_stream_queue_depth` with
 `tent_stream_connections`; use them to distinguish admission pressure, lane
 saturation, and connection churn. These are current-state gauges, so they
 should return to zero after the corresponding work or connection closes.
+
+For HP-TCP loss symptoms, inspect the rate of
+`tent_tcp_retransmissions_total` together with `tent_tcp_rtt_us` and
+`tent_tcp_congestion_window_segments`. Samples are taken every 256 completed
+operations and at connection close, so short-lived connections are still
+accounted while long-lived connections avoid a syscall on every request.
+`tent_protocol_errors_total` separates malformed headers from response
+correlation failures such as `request_id_mismatch` and
+`committed_length_mismatch`. A rising protocol counter is not ordinary packet
+loss: TCP delivers an ordered byte stream, so investigate mixed versions,
+framing bugs, or peer corruption.
 
 ### SHM and segment metadata
 

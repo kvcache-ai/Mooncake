@@ -475,6 +475,8 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordRdmaPostedInflight(Request::WRITE, -1);
     metrics.recordRdmaCompletion(
         Request::WRITE, TentMetrics::RdmaCompletionOutcome::Success, 35.0);
+    metrics.recordRdmaWcError(Request::WRITE,
+                              TentMetrics::RdmaWcErrorCategory::RetryExceeded);
     metrics.recordRdmaEndpointEvent(
         TentMetrics::RdmaEndpointEvent::Constructed);
     metrics.recordRdmaQpTransitionFailure(
@@ -497,6 +499,10 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStreamAdmission(HP_TCP, -2, -4096);
     metrics.recordStreamConnection(
         HP_TCP, TentMetrics::StreamConnectionRole::Client, -1);
+    metrics.recordProtocolError(
+        HP_TCP, TentMetrics::ProtocolErrorKind::RequestIdMismatch);
+    metrics.recordTcpSocketSample(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, 2, 120, 32);
     metrics.recordShmMappingEvent(TentMetrics::ShmMappingEvent::CacheHit);
     metrics.recordShmCopy(Request::WRITE,
                           TentMetrics::ShmCopyOutcome::Success, 18.0);
@@ -518,7 +524,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 76>
+    const std::array<std::pair<std::string_view, std::string_view>, 81>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -544,11 +550,14 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_rdma_slice_events_total", "counter"},
             {"tent_rdma_retries_total", "counter"},
             {"tent_rdma_retry_exhausted_total", "counter"},
+            {"tent_rdma_wc_errors_total", "counter"},
             {"tent_rdma_cq_poll_errors_total", "counter"},
             {"tent_rdma_endpoint_events_total", "counter"},
             {"tent_rdma_qp_transition_failures_total", "counter"},
             {"tent_rdma_notification_events_total", "counter"},
             {"tent_stream_events_total", "counter"},
+            {"tent_protocol_errors_total", "counter"},
+            {"tent_tcp_retransmissions_total", "counter"},
             {"tent_shm_mapping_events_total", "counter"},
             {"tent_shm_copy_events_total", "counter"},
             {"tent_segment_events_total", "counter"},
@@ -587,6 +596,8 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_rdma_completion_latency_us", "histogram"},
             {"tent_stream_attempt_latency_us", "histogram"},
             {"tent_stream_queue_wait_us", "histogram"},
+            {"tent_tcp_rtt_us", "histogram"},
+            {"tent_tcp_congestion_window_segments", "histogram"},
             {"tent_shm_copy_latency_us", "histogram"},
             {"tent_admission_wait_us", "histogram"},
             {"tent_metrics_build_info", "gauge"},
@@ -704,6 +715,8 @@ TEST_F(MetricsRecordingTest, RdmaDataPathSignalsUseBoundedLabels) {
     metrics.recordRdmaPostedInflight(Request::WRITE, 1);
     metrics.recordRdmaCompletion(
         Request::WRITE, TentMetrics::RdmaCompletionOutcome::WcError, 42.0);
+    metrics.recordRdmaWcError(Request::WRITE,
+                              TentMetrics::RdmaWcErrorCategory::RemoteAccess);
 
     auto active = MetricsSnapshot(metrics);
     EXPECT_EQ(
@@ -737,6 +750,11 @@ TEST_F(MetricsRecordingTest, RdmaDataPathSignalsUseBoundedLabels) {
               1);
     EXPECT_EQ(active.histogramCount("tent_rdma_completion_latency_us") -
                   before.histogramCount("tent_rdma_completion_latency_us"),
+              1);
+    EXPECT_EQ(active.series("tent_rdma_wc_errors_total{operation=\"write\","
+                            "category=\"remote_access\"}") -
+                  before.series("tent_rdma_wc_errors_total{operation=\"write\","
+                                "category=\"remote_access\"}"),
               1);
 
     metrics.recordRdmaWorkerInflight(Request::READ, -2);
@@ -817,6 +835,36 @@ TEST_F(MetricsRecordingTest, StreamSignalsSeparateQueueAndPhysicalAttempts) {
               1);
     EXPECT_EQ(after.histogramCount("tent_stream_queue_wait_us") -
                   before.histogramCount("tent_stream_queue_wait_us"),
+              1);
+}
+
+TEST_F(MetricsRecordingTest, NetworkAndProtocolSignalsUseBoundedLabels) {
+    auto& metrics = TentMetrics::instance();
+    const auto before = MetricsSnapshot(metrics);
+
+    metrics.recordProtocolError(
+        HP_TCP, TentMetrics::ProtocolErrorKind::CommittedLengthMismatch);
+    metrics.recordTcpSocketSample(
+        HP_TCP, TentMetrics::StreamConnectionRole::Server, 3, 240, 64);
+
+    const auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        after.series("tent_protocol_errors_total{transport=\"hp_tcp\","
+                     "kind=\"committed_length_mismatch\"}") -
+            before.series("tent_protocol_errors_total{transport=\"hp_tcp\","
+                          "kind=\"committed_length_mismatch\"}"),
+        1);
+    EXPECT_EQ(
+        after.series("tent_tcp_retransmissions_total{transport=\"hp_tcp\","
+                     "role=\"server\"}") -
+            before.series("tent_tcp_retransmissions_total{transport=\"hp_tcp\","
+                          "role=\"server\"}"),
+        3);
+    EXPECT_EQ(after.histogramCount("tent_tcp_rtt_us") -
+                  before.histogramCount("tent_tcp_rtt_us"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_tcp_congestion_window_segments") -
+                  before.histogramCount("tent_tcp_congestion_window_segments"),
               1);
 }
 
@@ -2462,6 +2510,7 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_rdma_slice_events_total"));
     EXPECT_TRUE(json.contains("tent_rdma_retries_total"));
     EXPECT_TRUE(json.contains("tent_rdma_retry_exhausted_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_wc_errors_total"));
     EXPECT_TRUE(json.contains("tent_rdma_cq_poll_errors_total"));
     EXPECT_TRUE(json.contains("tent_rdma_worker_inflight_slices"));
     EXPECT_TRUE(json.contains("tent_rdma_posted_inflight_slices"));
@@ -2472,6 +2521,10 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_stream_events_total"));
     EXPECT_TRUE(json.contains("tent_stream_attempt_latency_us"));
     EXPECT_TRUE(json.contains("tent_stream_queue_wait_us"));
+    EXPECT_TRUE(json.contains("tent_protocol_errors_total"));
+    EXPECT_TRUE(json.contains("tent_tcp_retransmissions_total"));
+    EXPECT_TRUE(json.contains("tent_tcp_rtt_us"));
+    EXPECT_TRUE(json.contains("tent_tcp_congestion_window_segments"));
     EXPECT_TRUE(json.contains("tent_engine_ready"));
     EXPECT_TRUE(json.contains("tent_engine_readiness_reason"));
     EXPECT_TRUE(json.contains("tent_stream_queue_depth"));
