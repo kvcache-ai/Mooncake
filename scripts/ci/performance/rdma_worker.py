@@ -258,8 +258,10 @@ class Worker:
             return output.read_text()
         require(self.target is None, "a target is already running")
         with (self.logs / log).open("w") as stream:
+            # The worker watchdog bounds target lifetime. A timeout wrapper would
+            # forward stop()'s group SIGTERM a second time, forcing TENT to exit(1).
             self.target = subprocess.Popen(
-                ["timeout", "--preserve-status", "--kill-after=10s", "180s", *argv],
+                argv,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=stream,

@@ -29,10 +29,11 @@ on:
 permissions:
   contents: read
 
-# One fixed hardware pair; do not interrupt an older measurement to start a new one.
+# One fixed hardware pair; retain up to 100 waiting runs without interrupting it.
 concurrency:
   group: rdma-performance-pair
   cancel-in-progress: false
+  queue: max
 
 jobs:
   rdma:

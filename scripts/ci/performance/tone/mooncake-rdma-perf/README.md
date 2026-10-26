@@ -60,6 +60,10 @@ exact harness revision. `RDMA_HOSTS_FILE` belongs to the template configuration.
 
 Each host acquires `~/.mooncake-rdma-perf.lock` for the entire run. A busy host
 fails immediately; all suites sharing the pair must honor this lock/account.
+The GitHub workflow serializes the fixed pair with `queue: max`, retaining up to
+100 pending runs instead of replacing the previous pending run. Additional runs
+are canceled when the queue is full. This queue does not cover jobs submitted
+directly to T-One; the host leases still reject those if the pair is busy.
 The two hosts build both revisions using the **same harness benchmark source**,
 baseline tracked CMake recipes and Release flags, with CUDA/Store disabled and
 TENT enabled. Candidate-only CMake recipes are removed from disposable checkouts;
@@ -104,6 +108,13 @@ failures. A 45-minute controller timeout or a cancellation requests T-One stop;
 workers also have a 45-minute watchdog. SSH EOF normally releases each host
 lease and stops only that job's processes. Network partitions/build timeouts can
 delay cleanup until the worker timeout. Do not override a busy lease.
+
+Targets run directly in their own process group, without an inner `timeout`
+wrapper that could forward the group's SIGTERM a second time. Normal stop sends
+one SIGTERM and waits up to ten seconds for a clean exit before escalating to
+SIGKILL; an already-dead target or a nonzero exit remains an ERROR. Initiator
+commands retain their per-sample timeout, and the worker watchdog bounds target
+lifetime if the controller disconnects without delivering EOF.
 
 The GitHub workflow uses existing `TONE_USER_NAME`/`TONE_USER_TOKEN` secrets.
 Optional variables `TONE_WORKSPACE`, `TONE_PROJECT`, and `TONE_RDMA_TEMPLATE`

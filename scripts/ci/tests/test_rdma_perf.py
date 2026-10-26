@@ -7,6 +7,7 @@ import importlib
 import io
 import json
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -434,7 +435,21 @@ child.wait()
         numactl.chmod(0o755)
         timeout = shim / "timeout"
         timeout.write_text(
-            '#!/bin/sh\nwhile [ "${1#-}" != "$1" ]; do shift; done\nshift\nexec "$@"\n'
+            f"#!{sys.executable}\n"
+            + """
+import signal, subprocess, sys, time
+args = sys.argv[1:]
+while args[0].startswith("-"):
+    args.pop(0)
+child = subprocess.Popen(args[1:])
+def forward(signum, frame):
+    # Like GNU timeout, forward a signal also delivered to the child by killpg.
+    # Delay forwarding so the fixture observes two distinct signal deliveries.
+    time.sleep(0.05)
+    child.send_signal(signum)
+signal.signal(signal.SIGTERM, forward)
+sys.exit(child.wait())
+"""
         )
         timeout.chmod(0o755)
         instance.env["PATH"] = str(shim) + ":/usr/bin:/bin"
@@ -444,7 +459,17 @@ child.wait()
             f"#!{sys.executable}\n"
             + """
 import json, os, pathlib, signal, sys, time
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+signals = 0
+def terminate(signum, frame):
+    global signals
+    signals += 1
+    pathlib.Path(__file__).with_suffix(".signals").write_text(str(signals))
+    if signals > 1:
+        sys.exit(1)
+    # Model TENT's graceful teardown window and second-signal failure.
+    time.sleep(0.2)
+    sys.exit(0)
+signal.signal(signal.SIGTERM, terminate)
 flags = dict(arg[2:].split("=", 1) for arg in sys.argv[1:])
 if "target_seg_name" not in flags:
     print("./tebench --target_seg_name=192.0.2.10:12345 --seg_type=DRAM", flush=True)
@@ -454,7 +479,6 @@ else:
 """
         )
         binary.chmod(0o755)
-        self.addCleanup(worker.stop, instance.target)
         request = {"side": "baseline", "tag": "fixture", "case": "read-4k"}
         try:
             target = instance.launch(request)
@@ -477,10 +501,49 @@ else:
             self.assertNotIn("MC_FORCE_TCP", result["env"])
             pid = instance.target
             instance.handle({"op": "stop"})
-            self.assertIsNotNone(pid.returncode)
+            self.assertEqual(pid.returncode, 0)
+            self.assertEqual(binary.with_suffix(".signals").read_text(), "1")
             self.assertIsNone(instance.target)
         finally:
             worker.stop(instance.target)
+
+    def test_worker_stop_rejects_a_dead_or_unresponsive_target(self):
+        remote = self.root / "remote"
+        remote.mkdir()
+        instance = worker.Worker(remote)
+        dead = subprocess.Popen(
+            [sys.executable, "-c", "raise SystemExit(7)"], start_new_session=True
+        )
+        self.addCleanup(worker.stop, dead)
+        dead.wait(timeout=5)
+        instance.target = dead
+        with self.assertRaisesRegex(ValueError, "target died during sample"):
+            instance.handle({"op": "stop"})
+
+        ready = self.root / "ready"
+        hung = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import signal, time; from pathlib import Path; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                f"Path({str(ready)!r}).touch(); time.sleep(60)",
+            ],
+            start_new_session=True,
+        )
+        self.addCleanup(worker.stop, hung)
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(ready.exists(), "target did not become ready")
+        instance.target = hung
+        wait = hung.wait
+        with patch.object(
+            hung, "wait", side_effect=lambda timeout: wait(min(timeout, 0.2))
+        ):
+            with self.assertRaisesRegex(ValueError, "did not shut down cleanly"):
+                instance.handle({"op": "stop"})
+        self.assertEqual(hung.returncode, -signal.SIGKILL)
 
     def test_worker_lease_excludes_another_job_and_releases_on_eof(self):
         import os
