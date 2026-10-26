@@ -779,6 +779,35 @@ publish session tags. Upgrade the Store client and Master to enable attribution.
 A storage node's disk scan alone cannot reconstruct metadata tags after all
 Master metadata is lost; preserve the metadata recovery artifacts as well.
 
+#### residency_affinity_ids
+**Type:** `Optional[List[str]]`
+**Default:** `None`
+
+Optional opaque per-key residency affinity metadata. Supply one entry per input
+key, including one entry for a single-key write. An empty string records no
+affinity; an empty list is invalid for a nonempty write. Batch splitting and
+retry subsets preserve the IDs in key order.
+
+```python
+config = ReplicateConfig()
+config.residency_affinity_ids = ["tensor-a", "tensor-a", ""]
+store.put_batch(["key-a", "key-b", "key-c"], [b"a", b"b", b"c"], config)
+config.residency_affinity_ids = None
+```
+
+Upsert preserves an existing object's affinity when the field is omitted,
+including when storage is reallocated. An explicitly different ID is rejected;
+remove and recreate the object to change its affinity. Duplicate Put leaves
+the existing metadata unchanged.
+
+Affinity survives metadata OpLog replay, snapshots, and standby promotion.
+Persisted object metadata appends affinity after the existing session and
+checksum extensions. Old records default to empty affinity, and old readers
+can ignore the new field.
+Upgrade clients and Masters together to retain affinity throughout recovery.
+This field only records metadata: it does not enable migration, change placement
+or eviction policy, or alter the weight metadata snapshot schema.
+
 #### group_ids
 **Type:** `List[str] | None`
 **Default:** `None`
