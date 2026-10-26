@@ -2259,7 +2259,6 @@ TEST(KVEventHandlerTest, VllmCpuAndGpuAreIndexedWhileDiskIsIgnored) {
         }
         EXPECT_TRUE(info.Contains("hash_count=1"));
     }
-    // Unsupport media are traced, not reported as rejected events.
     for (const auto& medium : ignored_media) {
         EXPECT_FALSE(
             warnings.Contains("event_type=BlockStored medium=" + medium));
