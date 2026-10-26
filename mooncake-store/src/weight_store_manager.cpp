@@ -206,7 +206,8 @@ WeightStoreManager::CommitWeightImport(
     if (mutation->no_op) {
         return PersistAndPublishWeightMutation(*mutation);
     }
-    auto validation = ValidateWeightGroupForCommit(request);
+    auto validation =
+        ValidateWeightGroupForCommit(request, mutation->next->affinity_count);
     if (!validation) {
         return tl::make_unexpected(validation.error());
     }
@@ -266,7 +267,8 @@ WeightStoreManager::ListWeightRevisions(
 
 WeightMetadataStore::Result<void>
 WeightStoreManager::ValidateWeightGroupForCommit(
-    const CommitWeightImportRequest& request) const {
+    const CommitWeightImportRequest& request,
+    uint64_t expected_affinity_count) const {
     const auto expected_manifest_key = MakeWeightManifestKey(request.identity);
     if (request.manifest.manifest_key != expected_manifest_key) {
         return tl::make_unexpected(WeightManagementError::CONFLICT);
@@ -283,6 +285,7 @@ WeightStoreManager::ValidateWeightGroupForCommit(
 
     bool found_manifest = false;
     uint64_t logical_bytes = 0;
+    std::unordered_set<std::string> affinity_ids;
     std::vector<std::string> payload_keys;
     payload_keys.reserve(request.manifest.payload_count);
     for (const auto& member : *members) {
@@ -298,17 +301,20 @@ WeightStoreManager::ValidateWeightGroupForCommit(
             continue;
         }
         if (member.data_type != ObjectDataType::WEIGHT ||
+            member.residency_affinity_id.empty() ||
             member.size >
                 std::numeric_limits<uint64_t>::max() - logical_bytes) {
             return tl::make_unexpected(WeightManagementError::CONFLICT);
         }
         logical_bytes += member.size;
+        affinity_ids.insert(member.residency_affinity_id);
         payload_keys.push_back(member.key);
     }
     if (!found_manifest) {
         return tl::make_unexpected(WeightManagementError::NOT_FOUND);
     }
     if (logical_bytes != request.manifest.logical_bytes ||
+        affinity_ids.size() != expected_affinity_count ||
         payload_keys.size() != request.manifest.payload_count ||
         ComputeWeightPayloadKeysSha256(payload_keys) !=
             request.manifest.payload_keys_sha256) {
@@ -335,7 +341,7 @@ WeightStoreManager::PersistAndPublishWeightMutation(
         type = OpType::WEIGHT_METADATA_UPSERT;
         const auto encoded = struct_pack::serialize(WeightMetadataUpsertOp{
             .metadata = *mutation.next,
-            .operation = std::nullopt,
+            .operation = mutation.operation,
         });
         payload.assign(encoded.begin(), encoded.end());
     } else if (mutation.previous.has_value()) {
@@ -519,14 +525,6 @@ WeightStoreManager::StartWeightResidencyOperation(
                 mutation->metadata.next->manifest.payload_count + 1) {
             return tl::make_unexpected(WeightManagementError::NOT_READY);
         }
-        if (request.target_residency == WeightResidencyState::COLD &&
-            std::any_of(members->begin(), members->end(),
-                        [](const auto& member) {
-                            return !member.readable || !member.has_cold;
-                        })) {
-            return tl::make_unexpected(WeightManagementError::NOT_READY);
-        }
-        mutation->next->total_members = members->size();
     }
     return PersistAndPublishWeightOperationMutation(*mutation);
 }
@@ -631,16 +629,29 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
         if (!removed) {
             return tl::make_unexpected(removed.error());
         }
-    } else if (current.operation == WeightOperationState::EVICTING) {
-        backend_.EvictManagedWeightMembersToCold(
-            current, SelectReconciliationMembers(current, member_budget));
-    } else if (current.operation == WeightOperationState::REHYDRATING) {
-        const auto tenant_id = TenantId(current.identity.tenant_id);
-        for (const auto& key :
-             SelectReconciliationMembers(current, member_budget)) {
-            const auto result = backend_.PromoteWeightObject(tenant_id, key);
-            VLOG(1) << "weight_rehydrate_promotion key=" << key
-                    << " result=" << static_cast<int>(result);
+    }
+    std::optional<WeightResidencyOperation> active_operation;
+    if (current.operation_id.has_value()) {
+        auto operation = weight_metadata_.QueryOperation(*current.operation_id);
+        if (!operation) {
+            return tl::make_unexpected(operation.error());
+        }
+        active_operation = *operation;
+        if (operation->kind == WeightOperationKind::MIGRATING &&
+            operation->target_residency == WeightResidencyState::COLD &&
+            view->active_lease_count == 0) {
+            backend_.EvictManagedWeightMembersToCold(
+                current, SelectReconciliationMembers(current, member_budget));
+        } else if (operation->kind == WeightOperationKind::MIGRATING &&
+                   operation->target_residency ==
+                       WeightResidencyState::HOT) {
+            const auto tenant_id = TenantId(current.identity.tenant_id);
+            for (const auto& key :
+                 SelectReconciliationMembers(current, member_budget)) {
+                const auto result = backend_.PromoteWeightObject(tenant_id, key);
+                VLOG(1) << "weight_rehydrate_promotion key=" << key
+                        << " result=" << static_cast<int>(result);
+            }
         }
     }
 
@@ -675,27 +686,28 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
     bool complete =
         !absent && members->size() == current.manifest.payload_count + 1;
     bool manifest_found = false;
-    bool all_memory = true;
-    bool all_cold = true;
-    bool any_readable = false;
+    bool any_payload_readable = false;
     uint64_t logical_bytes = 0;
+    uint64_t readable_bytes = 0;
+    uint64_t hot_bytes = 0;
     std::vector<std::string> payload_keys;
     if (!absent) {
         for (const auto& member : *members) {
             complete = complete && member.readable;
-            any_readable = any_readable || member.readable;
-            if (member.readable) {
-                all_memory = all_memory && member.has_memory;
-                all_cold = all_cold && member.has_cold && !member.has_memory;
-            }
             if (member.key == current.manifest.manifest_key &&
                 member.data_type == ObjectDataType::METADATA) {
-                manifest_found = true;
+                manifest_found = member.readable && member.has_memory;
             } else if (member.data_type == ObjectDataType::WEIGHT &&
                        member.size <= std::numeric_limits<uint64_t>::max() -
                                           logical_bytes) {
                 logical_bytes += member.size;
+                if (member.readable) readable_bytes += member.size;
                 payload_keys.push_back(member.key);
+                any_payload_readable =
+                    any_payload_readable || member.readable;
+                if (member.readable && member.has_memory) {
+                    hot_bytes += member.size;
+                }
             } else {
                 complete = false;
             }
@@ -706,21 +718,24 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
                logical_bytes == current.manifest.logical_bytes &&
                ComputeWeightPayloadKeysSha256(payload_keys) ==
                    current.manifest.payload_keys_sha256;
+    const double observed_hot_ratio =
+        readable_bytes == 0 ? 0.0
+                            : static_cast<double>(hot_bytes) /
+                                  static_cast<double>(readable_bytes);
     const auto observed_residency =
-        absent || !any_readable
+        absent || !any_payload_readable
             ? WeightResidencyState::ABSENT
-            : (all_memory ? WeightResidencyState::HOT
-                          : (all_cold ? WeightResidencyState::COLD
-                                      : WeightResidencyState::MIXED));
+            : (observed_hot_ratio == 1.0
+                   ? WeightResidencyState::HOT
+                   : (observed_hot_ratio == 0.0 ? WeightResidencyState::COLD
+                                                : WeightResidencyState::MIXED));
 
-    if (current.operation != WeightOperationState::NONE) {
-        auto operation = weight_metadata_.QueryOperation(current.operation_id);
-        if (!operation) {
-            return tl::make_unexpected(operation.error());
-        }
-        if (complete && observed_residency == operation->target_residency) {
+    if (active_operation.has_value()) {
+        const auto& operation = *active_operation;
+        if (complete && observed_residency == operation.target_residency) {
             auto mutation = weight_metadata_.PrepareFinishOperation(
-                operation->operation_id, observed_residency, now_ms);
+                operation.operation_id, observed_residency,
+                observed_hot_ratio, now_ms);
             if (!mutation) {
                 return tl::make_unexpected(mutation.error());
             }
@@ -735,28 +750,32 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
             }
             return reconciled->metadata;
         }
-        uint64_t processed_members = 0;
+        uint64_t processed_units = 0;
+        uint64_t processed_bytes = 0;
         std::string cursor;
         if (!absent) {
             for (const auto& member : *members) {
                 const bool satisfied =
-                    operation->target_residency == WeightResidencyState::HOT
+                    operation.target_residency == WeightResidencyState::HOT
                         ? member.has_memory
                         : member.has_cold && !member.has_memory;
-                if (satisfied) {
-                    ++processed_members;
+                if (satisfied && member.data_type == ObjectDataType::WEIGHT) {
+                    ++processed_units;
+                    processed_bytes += member.size;
                     cursor = member.key;
                 }
             }
         }
         auto progress = weight_metadata_.PrepareUpdateOperationProgress(
-            operation->operation_id, processed_members,
-            operation->total_members == 0 ? current.manifest.payload_count + 1
-                                          : operation->total_members,
+            operation.operation_id,
+            std::min(processed_units, operation.total_units),
+            operation.total_units, std::min(processed_bytes,
+                                            operation.total_bytes),
+            operation.total_bytes,
             std::move(cursor),
             complete ? WeightAvailabilityState::READY
                      : WeightAvailabilityState::DEGRADED,
-            observed_residency, now_ms);
+            observed_residency, observed_hot_ratio, now_ms);
         if (!progress) {
             return tl::make_unexpected(progress.error());
         }
@@ -775,7 +794,7 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
                                        : WeightAvailabilityState::DEGRADED;
     auto mutation = weight_metadata_.PrepareReconcile(
         current.identity, current.metadata_generation, availability,
-        observed_residency, now_ms);
+        observed_residency, observed_hot_ratio, now_ms);
     if (!mutation) {
         return tl::make_unexpected(mutation.error());
     }
@@ -1014,5 +1033,20 @@ size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
         weight_metadata_.ExportSnapshot(), now_ms);
     return actions;
 }
+
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WeightStoreManager::UpdateWeightPolicy(const UpdateWeightPolicyRequest& request) {
+    const auto now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    auto mutation = weight_metadata_.PrepareUpdatePolicy(request, now_ms);
+    if (!mutation) {
+        return tl::make_unexpected(mutation.error());
+    }
+    return PersistAndPublishWeightMutation(*mutation);
+}
+
 
 }  // namespace mooncake

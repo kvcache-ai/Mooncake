@@ -513,6 +513,21 @@ class MasterServiceTest : public ::testing::Test {
         return ns->objects.GroupMembers(group_id);
     }
 
+    std::vector<std::string> GetWeightGroupAffinityIdsForTest(
+        MasterService& service, const WeightRevisionIdentity& identity,
+        const std::string& group_id) {
+        auto result =
+            MasterStoreBackend(service).SnapshotWeightGroup(identity, group_id);
+        EXPECT_TRUE(result.has_value());
+        std::vector<std::string> affinity_ids;
+        if (!result) return affinity_ids;
+        affinity_ids.reserve(result->size());
+        for (const auto& member : *result) {
+            affinity_ids.push_back(member.residency_affinity_id);
+        }
+        return affinity_ids;
+    }
+
     std::shared_ptr<Lease> GetGroupLeaseForTest(
         MasterService& service, const std::string& group_id,
         const std::string& tenant_id = "default") {

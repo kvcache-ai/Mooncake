@@ -185,10 +185,18 @@ class FileStorageTest : public ::testing::Test {
                                               .resource_id = "ssd-weight",
                                               .revision = "v1",
                                               .weight_generation = 1};
-        auto begin = client->BeginWeightImport({.identity = identity,
-                                                .payload_group_id = {},
-                                                .expected_payload_count = 1,
-                                                .expected_logical_bytes = 128});
+        auto begin = client->BeginWeightImport({
+            .identity = identity,
+            .payload_group_id = {},
+            .expected_payload_count = 1,
+            .expected_logical_bytes = 128,
+            .policy =
+                WeightStoragePolicy{
+                    .preferred_residency = WeightResidencyState::HOT,
+                    .migration_mode = WeightMigrationMode::MANUAL},
+            .affinity_summary = {.affinity_count = 1,
+                                 .affinity_digest = std::string(64, 'c')},
+        });
         ASSERT_TRUE(begin && *begin);
         const auto manifest_key = MakeWeightManifestKey(identity);
         const std::vector<std::string> keys{"ordinary-ssd", "managed-payload",
@@ -206,6 +214,10 @@ class FileStorageTest : public ::testing::Test {
                 config.group_ids = {(*begin)->manifest.payload_group_id};
                 config.data_type =
                     i == 1 ? ObjectDataType::WEIGHT : ObjectDataType::METADATA;
+                if (i == 1) {
+                    config.residency_affinity_ids =
+                        std::vector<std::string>{"payload"};
+                }
             }
             std::vector<Slice> slices{{buffer, values[i].size()}};
             ASSERT_TRUE(client->Put(keys[i], slices, config));

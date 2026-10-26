@@ -1178,6 +1178,7 @@ class MooncakeStorePyWrapper {
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices, int repeat_count) const {
         if (!config.group_ids && !config.session_ids &&
+            !config.residency_affinity_ids &&
             !config.per_key_preferred_hca_names) {
             return config;
         }
@@ -1201,9 +1202,10 @@ class MooncakeStorePyWrapper {
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
         if (!config.HasValidKeyHints(key_count)) {
-            LOG(ERROR) << operation_name
-                       << ": group_ids and per-key HCA hint counts must match "
-                          "keys size";
+            LOG(ERROR)
+                << operation_name
+                << ": group, affinity and per-key HCA hint counts must match "
+                   "keys size";
             return std::vector<int>(key_count,
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
@@ -2174,6 +2176,8 @@ PYBIND11_MODULE(_store, m) {
                 config.session_ids.reset();
                 if (ids) config.session_ids = std::move(*ids);
             })
+        .def_readwrite("residency_affinity_ids",
+                       &ReplicateConfig::residency_affinity_ids)
         .def_property(
             "preferred_hca_names",
             [](const ReplicateConfig &config)

@@ -147,6 +147,8 @@ class MasterService {
     WeightMetadataStore::Result<WeightRevisionMetadata> DeleteWeightRevision(
         const DeleteWeightRevisionRequest& request);
 
+    WeightMetadataStore::Result<WeightRevisionMetadata> UpdateWeightPolicy(
+        const UpdateWeightPolicyRequest& request);
     WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
         const BeginWeightImportRequest& request);
     WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(
@@ -1387,6 +1389,7 @@ class MasterService {
     auto InsertMetadata(MetadataAccessorRW& accessor, const UUID& client_id,
                         uint64_t value_length, const ReplicateConfig& config,
                         const std::string& group_id,
+                        const std::string& residency_affinity_id,
                         const std::chrono::system_clock::time_point& now,
                         const ResolvedSoftPinRequest& soft_pin_request,
                         std::vector<Replica>&& replicas,
@@ -1401,6 +1404,7 @@ class MasterService {
         MetadataAccessorRW& accessor, const UUID& client_id,
         uint64_t value_length, const ReplicateConfig& config,
         const std::string& writer_host_id, const std::string& group_id,
+        const std::string& residency_affinity_id,
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
@@ -1414,6 +1418,7 @@ class MasterService {
         // The writer's host, for same-node placement; empty when unused.
         std::string writer_host_id;
         std::string group_id;
+        std::string residency_affinity_id;
     };
     // The checks and setup PutStart and UpsertStart share before they take the
     // key: validates `config` for a write of `slice_length` bytes, records the

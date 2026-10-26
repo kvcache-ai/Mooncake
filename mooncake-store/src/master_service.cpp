@@ -123,6 +123,22 @@ tl::expected<std::string, ErrorCode> GetGroupIdForKey(
     return config.group_ids->at(key_index);
 }
 
+tl::expected<std::string, ErrorCode> GetResidencyAffinityIdForKey(
+    const ReplicateConfig& config, size_t key_count, size_t key_index) {
+    if (!config.residency_affinity_ids.has_value()) {
+        return "";
+    }
+    if (config.residency_affinity_ids->size() != key_count ||
+        key_index >= key_count) {
+        LOG(ERROR) << "residency_affinity_ids.size()="
+                   << config.residency_affinity_ids->size()
+                   << ", key_count=" << key_count
+                   << ", error=invalid_residency_affinity_ids";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return config.residency_affinity_ids->at(key_index);
+}
+
 }  // namespace
 
 // Defined unconditionally (CreateNofRuntime() exists in every build and
@@ -1586,6 +1602,10 @@ MasterService::DeleteWeightRevision(
     return weight_manager_.DeleteWeightRevision(request);
 }
 
+WeightMetadataStore::Result<WeightRevisionMetadata>
+MasterService::UpdateWeightPolicy(const UpdateWeightPolicyRequest& request) {
+    return weight_manager_.UpdateWeightPolicy(request);
+}
 std::vector<std::string> MasterService::GetGroupMemberKeys(
     const TenantId& tenant_id, const std::string& group_id) const {
     const metadata::Namespace* ns = namespaces_.Lookup(tenant_id);
@@ -1627,6 +1647,10 @@ void MasterService::EvictManagedWeightMembersToCold(
             continue;
         }
         ObjectMetadata& metadata = hold->metadata();
+        if (metadata.group_id != revision.manifest.payload_group_id ||
+            metadata.data_type != ObjectDataType::WEIGHT) {
+            continue;
+        }
         const bool has_cold =
             metadata.HasReplica([this](const Replica& replica) {
                 return !replica.is_memory_replica() &&
@@ -3445,7 +3469,9 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
             standby_meta.client_id, now, standby_meta.size,
             std::move(object.replicas), std::nullopt,
             standby_meta.hard_pinned.value_or(false), standby_meta.data_type,
-            standby_meta.group_id, object.tenant_id, object.user_key);
+            standby_meta.group_id,
+            standby_meta.residency_affinity_id.value_or(""), object.tenant_id,
+            object.user_key);
         auto& metadata = accessor.Get();
         metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         metadata.session_id = standby_meta.session_id.value_or("");
@@ -4853,6 +4879,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
 auto MasterService::InsertMetadata(
     MetadataAccessorRW& accessor, const UUID& client_id, uint64_t value_length,
     const ReplicateConfig& config, const std::string& group_id,
+    const std::string& residency_affinity_id,
     const std::chrono::system_clock::time_point& now,
     const ResolvedSoftPinRequest& soft_pin_request,
     std::vector<Replica>&& replicas,
@@ -4899,7 +4926,7 @@ auto MasterService::InsertMetadata(
     accessor.Publish(client_id, now, value_length, std::move(replicas),
                      std::move(committed_soft_pin_timeout),
                      config.with_hard_pin, config.data_type, group_id,
-                     tenant_id, key);
+                     residency_affinity_id, tenant_id, key);
     auto& metadata = accessor.Get();
     metadata.BeginSessionTag(config.SessionId(), eligible_replica_ids);
     metadata.BeginSoftPinAction(soft_pin_request,
@@ -4917,6 +4944,7 @@ auto MasterService::AllocateAndInsertMetadata(
     MetadataAccessorRW& accessor, const UUID& client_id, uint64_t value_length,
     const ReplicateConfig& config, const std::string& writer_host_id,
     const std::string& group_id,
+    const std::string& residency_affinity_id,
     const std::chrono::system_clock::time_point& now,
     const ResolvedSoftPinRequest& soft_pin_request,
     std::optional<std::chrono::system_clock::time_point>
@@ -4939,6 +4967,7 @@ auto MasterService::AllocateAndInsertMetadata(
     }
 
     return InsertMetadata(accessor, client_id, value_length, config, group_id,
+                          residency_affinity_id,
                           now, soft_pin_request,
                           std::move(allocation_result.value()),
                           std::move(committed_soft_pin_timeout));
@@ -5032,9 +5061,14 @@ auto MasterService::PrepareWriteStart(
     if (!IsTenantRegistered(tenant_id)) {
         return tl::make_unexpected(ErrorCode::TENANT_NOT_REGISTERED);
     }
+    auto affinity_id = GetResidencyAffinityIdForKey(config, 1, 0);
+    if (!affinity_id) {
+        return tl::make_unexpected(affinity_id.error());
+    }
     return WriteStartPlan{.soft_pin_request = std::move(*soft_pin_request),
                           .writer_host_id = std::move(writer_host_id),
-                          .group_id = std::move(*group_id)};
+                          .group_id = std::move(*group_id),
+                          .residency_affinity_id = std::move(*affinity_id)};
 }
 
 auto MasterService::CleanupStaleBeforeWrite(
@@ -5165,7 +5199,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
         return AllocateAndInsertMetadata(
             accessor, client_id, slice_length, config, plan->writer_host_id,
-            plan->group_id, now, plan->soft_pin_request, std::nullopt,
+            plan->group_id, plan->residency_affinity_id, now, plan->soft_pin_request, std::nullopt,
             dfs_allocation_failed);
     };
 
@@ -5412,7 +5446,7 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
             client_id, std::chrono::system_clock::now(),
             replica.get_descriptor().get_local_disk_descriptor().object_size,
             std::vector<Replica>{}, std::nullopt, false,
-            ObjectDataType::UNKNOWN, std::string{}, object_id.tenant_id, key);
+            ObjectDataType::UNKNOWN, std::string{}, std::string{}, object_id.tenant_id, key);
     }
     auto& metadata = accessor.Get();
     const auto previous_kv_media = KvMediaSnapshot(metadata);
@@ -5676,11 +5710,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     }
     const std::string& writer_host_id = plan->writer_host_id;
     const std::string& group_id = plan->group_id;
+    const std::string& residency_affinity_id = plan->residency_affinity_id;
     const ResolvedSoftPinRequest& soft_pin_request = plan->soft_pin_request;
 
     ReplicateConfig allocation_config = config;
     std::string allocation_group_id = group_id;
     std::string allocation_session_id;
+    std::string allocation_residency_affinity_id = residency_affinity_id;
     std::optional<std::chrono::system_clock::time_point>
         allocation_committed_soft_pin_timeout;
     auto admit = [&](bool* dfs_allocation_failed)
@@ -5710,6 +5746,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 accessor.Get().group_id != group_id) {
                 LOG(ERROR) << "key=" << key
                            << ", error=group_membership_is_immutable";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+
+            // Managed writes must acquire the group lock before the shard
+            if (accessor.IsPublished() && config.residency_affinity_ids &&
+                accessor.Get().residency_affinity_id != residency_affinity_id) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
 
@@ -5824,7 +5866,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
                 auto result = AllocateAndInsertMetadata(
                     accessor, client_id, slice_length, allocation_config,
-                    writer_host_id, allocation_group_id, now, soft_pin_request,
+                    writer_host_id, allocation_group_id, allocation_residency_affinity_id, now, soft_pin_request,
                     allocation_committed_soft_pin_timeout,
                     dfs_allocation_failed);
                 if (result) {
@@ -5959,6 +6001,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
                 allocation_group_id = metadata.group_id;
                 allocation_session_id = metadata.session_id;
+                allocation_residency_affinity_id = metadata.residency_affinity_id;
                 const auto previous_kv_media = KvMediaSnapshot(metadata);
                 // A leased memory snapshot still references the old replica
                 // descriptors. Allocate the replacement before removing the
@@ -6013,14 +6056,14 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         replacement_replicas.has_value()
                             ? InsertMetadata(
                                   accessor, client_id, slice_length,
-                                  allocation_config, allocation_group_id, now,
+                                  allocation_config, allocation_group_id, allocation_residency_affinity_id, now,
                                   soft_pin_request,
                                   std::move(*replacement_replicas),
                                   allocation_committed_soft_pin_timeout)
                             : AllocateAndInsertMetadata(
                                   accessor, client_id, slice_length,
                                   allocation_config, writer_host_id,
-                                  allocation_group_id, now, soft_pin_request,
+                                  allocation_group_id, allocation_residency_affinity_id, now, soft_pin_request,
                                   allocation_committed_soft_pin_timeout,
                                   dfs_allocation_failed);
                 if (allocate_result && accessor.IsPublished()) {
@@ -6084,6 +6127,15 @@ MasterService::BatchUpsertStart(const UUID& client_id,
     if (!config.HasValidKeyHints(keys.size())) {
         LOG(ERROR)
             << "BatchUpsertStart: per-key hint count does not match keys";
+        return std::vector<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (config.residency_affinity_ids.has_value() &&
+        config.residency_affinity_ids->size() != keys.size()) {
+        LOG(ERROR) << "BatchUpsertStart: residency_affinity_ids.size()="
+                   << config.residency_affinity_ids->size()
+                   << " != keys.size()=" << keys.size();
         return std::vector<
             tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
@@ -11364,6 +11416,7 @@ std::string MasterService::SerializeMetadataForOpLog(
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
     payload.object_checksum = metadata.GetPart(0).checksum();
+    payload.residency_affinity_id = metadata.residency_affinity_id;
 
     // Extract replica descriptors - get them all at once
     const auto& replicas = metadata.GetAllReplicas();
@@ -11392,6 +11445,7 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
     payload.object_checksum = metadata.GetPart(0).checksum();
+    payload.residency_affinity_id = metadata.residency_affinity_id;
 
     const auto& replicas = metadata.GetAllReplicas();
     payload.replicas.reserve(replicas.size());
@@ -11418,6 +11472,7 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
     payload.object_checksum = metadata.GetPart(0).checksum();
+    payload.residency_affinity_id = metadata.residency_affinity_id;
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }

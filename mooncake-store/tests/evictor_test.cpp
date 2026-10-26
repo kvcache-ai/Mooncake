@@ -137,9 +137,10 @@ class EvictorTest : public ::testing::Test {
             list.emplace_back(allocator_->allocate(128),
                               ReplicaStatus::COMPLETE);
         }
-        (void)guard.Publish(
-            UUID{1, 2}, Clock::time_point{}, 128, std::move(list), std::nullopt,
-            false, ObjectDataType::UNKNOWN, group_id, TenantId(tenant), key);
+        (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
+                            std::move(list), std::nullopt, false,
+                            ObjectDataType::UNKNOWN, group_id, std::string(),
+                            TenantId(tenant), key);
         SetDeadline(guard.metadata(), Clock::now() - age);
     }
 
@@ -390,7 +391,7 @@ TEST_F(EvictorTest, AReplacedDeferredObjectIsLeftAlone) {
         (void)hold->Publish(UUID{1, 2}, Clock::time_point{}, 128,
                             std::move(list), std::nullopt, false,
                             ObjectDataType::UNKNOWN, std::string(),
-                            TenantId("a"), "pinned");
+                            std::string(), TenantId("a"), "pinned");
     };
 
     Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
@@ -451,7 +452,7 @@ TEST_F(EvictorTest, AMemberReplacedBeforeItsTurnIsLeftAlone) {
         (void)hold->Publish(UUID{1, 2}, Clock::time_point{}, 128,
                             std::move(list), std::nullopt, false,
                             ObjectDataType::UNKNOWN, std::string(),
-                            TenantId("a"), replaced);
+                            std::string(), TenantId("a"), replaced);
         SetDeadline(hold->metadata(), Clock::now() + std::chrono::hours(1));
     };
 

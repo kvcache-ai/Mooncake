@@ -128,6 +128,8 @@ struct ReplicateConfig {
     // eviction treats the group as a unit (all-or-none). Object routing is
     // always hash(tenant, key) and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
+    // Per-key opaque IDs define indivisible units for weight residency.
+    std::optional<std::vector<std::string>> residency_affinity_ids{};
     // Per-key write attribution, independent of key identity and eviction
     // groups. Preserve the session extension already used by main.
     struct_pack::compatible<std::vector<std::string>, 1> session_ids;
@@ -140,12 +142,20 @@ struct ReplicateConfig {
 
     bool HasValidKeyHints(size_t key_count) const {
         return (!group_ids || group_ids->size() == key_count) &&
+               (!residency_affinity_ids ||
+                residency_affinity_ids->size() == key_count) &&
                (!per_key_preferred_hca_names ||
                 per_key_preferred_hca_names->size() == key_count);
     }
 
     ReplicateConfig ForKeySubset(const std::vector<size_t>& indices) const {
         ReplicateConfig result = *this;
+        if (residency_affinity_ids) {
+            result.residency_affinity_ids = std::vector<std::string>{};
+            for (auto index : indices)
+                result.residency_affinity_ids->push_back(
+                    residency_affinity_ids->at(index));
+        }
         if (group_ids) {
             result.group_ids = std::vector<std::string>{};
             for (auto index : indices)
@@ -206,6 +216,10 @@ struct ReplicateConfig {
                 batch_config.per_key_preferred_hca_names->at(key_index);
             per_key_preferred_hca_names.reset();
         }
+        if (batch_config.residency_affinity_ids) {
+            residency_affinity_ids = std::vector<std::string>{
+                batch_config.residency_affinity_ids->at(key_index)};
+        }
     }
 
     ReplicateConfig ForSingleKey(size_t key_index) const {
@@ -254,6 +268,14 @@ struct ReplicateConfig {
             for (size_t i = 0; i < config.group_ids->size(); ++i) {
                 os << config.group_ids->at(i);
                 if (i + 1 < config.group_ids->size()) os << ", ";
+            }
+            os << "]";
+        }
+        if (config.residency_affinity_ids.has_value()) {
+            os << ", residency_affinity_ids: [";
+            for (size_t i = 0; i < config.residency_affinity_ids->size(); ++i) {
+                os << config.residency_affinity_ids->at(i);
+                if (i + 1 < config.residency_affinity_ids->size()) os << ", ";
             }
             os << "]";
         }

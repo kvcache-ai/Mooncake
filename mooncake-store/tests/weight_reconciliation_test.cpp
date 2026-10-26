@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string>
 #include <thread>
 #include <vector>
@@ -30,6 +31,22 @@ class WeightReconciliationTest : public MasterServiceTest {
                std::to_string(identity.weight_generation) + "/manifest";
     }
 
+    static BeginWeightImportRequest ImportRequest(
+        const WeightRevisionIdentity& identity, uint64_t payload_count,
+        uint64_t logical_bytes) {
+        return {
+            .identity = identity,
+            .expected_payload_count = payload_count,
+            .expected_logical_bytes = logical_bytes,
+            .policy =
+                WeightStoragePolicy{
+                    .preferred_residency = WeightResidencyState::HOT,
+                    .migration_mode = WeightMigrationMode::MANUAL},
+            .affinity_summary = {.affinity_count = 1,
+                                 .affinity_digest = std::string(64, 'c')},
+        };
+    }
+
     WeightRevisionMetadata PublishReady(MasterService& service,
                                         const UUID& client_id,
                                         std::string revision) {
@@ -39,6 +56,16 @@ class WeightReconciliationTest : public MasterServiceTest {
             .payload_group_id = {},
             .expected_payload_count = 1,
             .expected_logical_bytes = 1024,
+            .policy =
+                WeightStoragePolicy{
+                    .preferred_residency = WeightResidencyState::HOT,
+                    .migration_mode = WeightMigrationMode::MANUAL,
+                },
+            .affinity_summary =
+                WeightAffinitySummary{
+                    .affinity_count = 1,
+                    .affinity_digest = std::string(64, 'c'),
+                },
         });
         EXPECT_TRUE(importing.has_value());
         const auto payload_key = identity.revision + "-payload";
@@ -47,9 +74,12 @@ class WeightReconciliationTest : public MasterServiceTest {
         config.with_hard_pin = true;
         config.group_ids =
             std::vector<std::string>{importing->manifest.payload_group_id};
+        config.residency_affinity_ids =
+            std::vector<std::string>{"affinity-" + identity.revision};
         config.data_type = ObjectDataType::WEIGHT;
         PutCompletedObject(service, client_id, payload_key, config, 1024);
         config.data_type = ObjectDataType::METADATA;
+        config.residency_affinity_ids.reset();
         PutCompletedObject(service, client_id, ManifestKey(identity), config,
                            128);
         auto ready = service.CommitWeightImport(CommitWeightImportRequest{
@@ -139,11 +169,8 @@ TEST_F(WeightReconciliationTest, ConfiguredIdleTimeoutControlsAbandonment) {
                       .set_weight_import_idle_timeout_ms(50)
                       .build();
     MasterService service(config);
-    const auto importing = service.BeginWeightImport({
-        .identity = Identity("configured-idle"),
-        .expected_payload_count = 1,
-        .expected_logical_bytes = 1024,
-    });
+    const auto importing = service.BeginWeightImport(
+        ImportRequest(Identity("configured-idle"), 1, 1024));
     ASSERT_TRUE(importing);
     MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
         importing->updated_at_ms + 100, 32);
@@ -159,16 +186,15 @@ TEST_F(WeightReconciliationTest, ConfiguredIdleTimeoutControlsAbandonment) {
 TEST_F(WeightReconciliationTest, AcceptedPutStartRefreshesImportInactivity) {
     MasterService service;
     const auto context = PrepareSimpleSegment(service);
-    const auto importing = service.BeginWeightImport({
-        .identity = Identity("active-start"),
-        .expected_payload_count = 1,
-        .expected_logical_bytes = 1024,
-    });
+    const auto importing = service.BeginWeightImport(
+        ImportRequest(Identity("active-start"), 1, 1024));
     ASSERT_TRUE(importing);
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     ReplicateConfig config;
     config.replica_num = 1;
     config.data_type = ObjectDataType::WEIGHT;
+    config.residency_affinity_ids =
+        std::vector<std::string>{"affinity-" + importing->identity.revision};
     config.group_ids =
         std::vector<std::string>{importing->manifest.payload_group_id};
     ASSERT_TRUE(service.PutStart(context.client_id, "active-start-payload",
@@ -185,15 +211,14 @@ TEST_F(WeightReconciliationTest, AcceptedPutStartRefreshesImportInactivity) {
 TEST_F(WeightReconciliationTest, AcceptedPutEndRefreshesImportInactivity) {
     MasterService service;
     const auto context = PrepareSimpleSegment(service);
-    const auto importing = service.BeginWeightImport({
-        .identity = Identity("active-end"),
-        .expected_payload_count = 1,
-        .expected_logical_bytes = 1024,
-    });
+    const auto importing = service.BeginWeightImport(
+        ImportRequest(Identity("active-end"), 1, 1024));
     ASSERT_TRUE(importing);
     ReplicateConfig config;
     config.replica_num = 1;
     config.data_type = ObjectDataType::WEIGHT;
+    config.residency_affinity_ids =
+        std::vector<std::string>{"affinity-" + importing->identity.revision};
     config.group_ids =
         std::vector<std::string>{importing->manifest.payload_group_id};
     ASSERT_TRUE(service.PutStart(context.client_id, "active-end-payload",
@@ -218,15 +243,14 @@ TEST_F(WeightReconciliationTest,
        UpsertWithExplicitGroupRefreshesImportInactivity) {
     MasterService service;
     const auto context = PrepareSimpleSegment(service);
-    const auto importing = service.BeginWeightImport({
-        .identity = Identity("active-upsert"),
-        .expected_payload_count = 1,
-        .expected_logical_bytes = 1024,
-    });
+    const auto importing = service.BeginWeightImport(
+        ImportRequest(Identity("active-upsert"), 1, 1024));
     ASSERT_TRUE(importing);
     ReplicateConfig config;
     config.replica_num = 1;
     config.data_type = ObjectDataType::WEIGHT;
+    config.residency_affinity_ids =
+        std::vector<std::string>{"affinity-" + importing->identity.revision};
     config.group_ids =
         std::vector<std::string>{importing->manifest.payload_group_id};
     PutCompletedObject(service, context.client_id, "active-upsert-payload",
@@ -285,15 +309,14 @@ TEST_F(WeightReconciliationTest,
        UpsertWithInheritedManagedGroupRejectsDeleting) {
     MasterService service;
     const auto context = PrepareSimpleSegment(service);
-    const auto importing = service.BeginWeightImport({
-        .identity = Identity("upsert-deleting"),
-        .expected_payload_count = 1,
-        .expected_logical_bytes = 1024,
-    });
+    const auto importing = service.BeginWeightImport(
+        ImportRequest(Identity("upsert-deleting"), 1, 1024));
     ASSERT_TRUE(importing);
     ReplicateConfig config;
     config.replica_num = 1;
     config.data_type = ObjectDataType::WEIGHT;
+    config.residency_affinity_ids =
+        std::vector<std::string>{"affinity-" + importing->identity.revision};
     config.group_ids =
         std::vector<std::string>{importing->manifest.payload_group_id};
     PutCompletedObject(service, context.client_id, "upsert-deleting-payload",
@@ -343,15 +366,14 @@ TEST_F(WeightReconciliationTest,
        UpsertWithInheritedManagedGroupRejectsImporting) {
     MasterService service;
     const auto context = PrepareSimpleSegment(service);
-    const auto importing = service.BeginWeightImport({
-        .identity = Identity("upsert-importing"),
-        .expected_payload_count = 1,
-        .expected_logical_bytes = 1024,
-    });
+    const auto importing = service.BeginWeightImport(
+        ImportRequest(Identity("upsert-importing"), 1, 1024));
     ASSERT_TRUE(importing);
     ReplicateConfig config;
     config.replica_num = 1;
     config.data_type = ObjectDataType::WEIGHT;
+    config.residency_affinity_ids =
+        std::vector<std::string>{"affinity-" + importing->identity.revision};
     config.group_ids =
         std::vector<std::string>{importing->manifest.payload_group_id};
     PutCompletedObject(service, context.client_id, "upsert-importing-payload",
@@ -379,11 +401,8 @@ TEST_F(WeightReconciliationTest,
         const auto context = PrepareSimpleSegment(service);
         const auto ready =
             PublishReady(service, context.client_id, "upsert-original");
-        const auto importing = service.BeginWeightImport({
-            .identity = Identity("upsert-other"),
-            .expected_payload_count = 1,
-            .expected_logical_bytes = 1024,
-        });
+        const auto importing = service.BeginWeightImport(
+            ImportRequest(Identity("upsert-other"), 1, 1024));
         ASSERT_TRUE(importing);
         const auto key =
             manifest ? ManifestKey(ready.identity) : "upsert-original-payload";
@@ -449,16 +468,14 @@ TEST_F(WeightReconciliationTest,
        RetriesAndRejectedWritesDoNotRefreshInactivity) {
     MasterService service;
     const auto context = PrepareSimpleSegment(service);
-    const BeginWeightImportRequest request{
-        .identity = Identity("idle-retries"),
-        .expected_payload_count = 1,
-        .expected_logical_bytes = 1024,
-    };
+    const auto request = ImportRequest(Identity("idle-retries"), 1, 1024);
     const auto importing = service.BeginWeightImport(request);
     ASSERT_TRUE(importing);
     ReplicateConfig config;
     config.replica_num = 1;
     config.data_type = ObjectDataType::WEIGHT;
+    config.residency_affinity_ids =
+        std::vector<std::string>{"affinity-" + importing->identity.revision};
     config.group_ids =
         std::vector<std::string>{importing->manifest.payload_group_id};
     PutCompletedObject(service, context.client_id, "idle-retries-payload",
@@ -494,7 +511,7 @@ TEST_F(WeightReconciliationTest, UnreadableMemberDoesNotChangeHotResidency) {
     {
         MasterServiceTestPeer::MetadataAccessorRW member(
             &service, MasterServiceTestPeer::ObjectIdentity{
-                          TenantId::Default(), "unreadable-payload"});
+                          TenantId::Default(), ManifestKey(ready.identity)});
         ASSERT_TRUE(member.Exists());
         member.Get().VisitReplicas(
             [](const Replica&) { return true; },
@@ -507,13 +524,31 @@ TEST_F(WeightReconciliationTest, UnreadableMemberDoesNotChangeHotResidency) {
     EXPECT_EQ(WeightResidencyState::HOT, observed->residency);
 }
 
+TEST_F(WeightReconciliationTest, UnreadableOnlyPayloadBecomesAbsent) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const auto ready = PublishReady(service, context.client_id, "unreadable");
+    {
+        MasterServiceTestPeer::MetadataAccessorRW member(
+            &service, MasterServiceTestPeer::ObjectIdentity{
+                          TenantId::Default(), "unreadable-payload"});
+        ASSERT_TRUE(member.Exists());
+        member.Get().VisitReplicas(
+            [](const Replica&) { return true; },
+            [](Replica& replica) { replica.mark_processing(); });
+    }
+    const auto observed =
+        service.ReconcileWeightRevision({.identity = ready.identity});
+    ASSERT_TRUE(observed);
+    EXPECT_EQ(WeightAvailabilityState::DEGRADED, observed->availability);
+    EXPECT_EQ(WeightResidencyState::ABSENT, observed->residency);
+    EXPECT_DOUBLE_EQ(0.0, observed->observed_hot_ratio);
+}
+
 TEST_F(WeightReconciliationTest, RestoredImportGetsFullInactivityGrace) {
     MasterService service;
-    auto importing = service.BeginWeightImport({
-        .identity = Identity("restored-import"),
-        .expected_payload_count = 1,
-        .expected_logical_bytes = 1024,
-    });
+    auto importing = service.BeginWeightImport(
+        ImportRequest(Identity("restored-import"), 1, 1024));
     ASSERT_TRUE(importing);
     auto snapshot =
         MasterServiceTestPeer::WeightManager(service).ExportSnapshot();
@@ -534,11 +569,8 @@ TEST_F(WeightReconciliationTest, RevisionWindowsAdvancePastExaminedRows) {
     MasterService service;
     const auto context = PrepareSimpleSegment(service);
     for (const auto& revision : {"00-fresh-import", "01-fresh-import"}) {
-        ASSERT_TRUE(service.BeginWeightImport({
-            .identity = Identity(revision),
-            .expected_payload_count = 1,
-            .expected_logical_bytes = 1024,
-        }));
+        ASSERT_TRUE(service.BeginWeightImport(
+            ImportRequest(Identity(revision), 1, 1024)));
     }
     std::vector<WeightRevisionIdentity> identities;
     uint64_t now_ms = 0;
@@ -594,21 +626,21 @@ TEST_F(WeightReconciliationTest,
     MasterService service;
     const auto context = PrepareSimpleSegment(service);
     const auto identity = Identity("unbounded-delete");
-    const auto importing = service.BeginWeightImport({
-        .identity = identity,
-        .expected_payload_count = 1,
-        .expected_logical_bytes = 1024,
-    });
+    const auto importing =
+        service.BeginWeightImport(ImportRequest(identity, 1, 1024));
     ASSERT_TRUE(importing);
     ReplicateConfig config;
     config.replica_num = 1;
     config.with_hard_pin = true;
     config.group_ids =
         std::vector<std::string>{importing->manifest.payload_group_id};
+    config.residency_affinity_ids =
+        std::vector<std::string>{"affinity-" + importing->identity.revision};
     config.data_type = ObjectDataType::WEIGHT;
     PutCompletedObject(service, context.client_id, "unbounded-delete-payload",
                        config, 1024);
     config.data_type = ObjectDataType::METADATA;
+    config.residency_affinity_ids.reset();
     PutCompletedObject(service, context.client_id, ManifestKey(identity),
                        config, 128);
     ASSERT_TRUE(service.AbortWeightImport({
@@ -649,6 +681,11 @@ TEST_F(WeightReconciliationTest, ExpiresLeasesAndAbortsAbandonedImports) {
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy = std::nullopt,
+        .affinity_summary = WeightAffinitySummary{
+            .affinity_count = 1,
+            .affinity_digest = std::string(64, 'c'),
+        },
     });
     ASSERT_TRUE(importing.has_value());
     const uint64_t now_ms = std::max(
@@ -682,12 +719,22 @@ TEST_F(WeightReconciliationTest, WorkLimitBoundsAbandonedImportTransitions) {
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy = std::nullopt,
+        .affinity_summary = WeightAffinitySummary{
+            .affinity_count = 1,
+            .affinity_digest = std::string(64, 'c'),
+        },
     });
     auto second = service.BeginWeightImport(BeginWeightImportRequest{
         .identity = Identity("step-b"),
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy = std::nullopt,
+        .affinity_summary = WeightAffinitySummary{
+            .affinity_count = 1,
+            .affinity_digest = std::string(64, 'c'),
+        },
     });
     ASSERT_TRUE(first.has_value());
     ASSERT_TRUE(second.has_value());
@@ -714,6 +761,44 @@ TEST_F(WeightReconciliationTest, WorkLimitBoundsAbandonedImportTransitions) {
     EXPECT_EQ(1, importing);
 }
 
+TEST_F(WeightReconciliationTest,
+       PublicManifestReplicaClearReconcilesToDegraded) {
+    auto config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(100).build();
+    MasterService service(config);
+    const auto context = PrepareSimpleSegment(service);
+    const auto ready =
+        PublishReady(service, context.client_id, "step-public-manifest-clear");
+    const auto manifest_key = ManifestKey(ready.identity);
+    const auto payload_key = ready.identity.revision + "-payload";
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool cleared = false;
+    do {
+        const auto result =
+            service.BatchReplicaClear({manifest_key}, context.client_id, "");
+        ASSERT_TRUE(result.has_value());
+        cleared = result->size() == 1 && result->front() == manifest_key;
+        if (!cleared) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    } while (!cleared && std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(cleared);
+    EXPECT_FALSE(
+        service.ExistKey(manifest_key, TenantId::Default()).value_or(true));
+    EXPECT_TRUE(
+        service.ExistKey(payload_key, TenantId::Default()).value_or(false));
+    const auto reconciled = service.ReconcileWeightRevision(
+        ReconcileWeightRevisionRequest{.identity = ready.identity});
+    EXPECT_TRUE(reconciled.has_value());
+    const auto view = service.GetWeightRevision(
+        GetWeightRevisionRequest{.identity = ready.identity});
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(WeightAvailabilityState::DEGRADED, view->metadata.availability);
+    EXPECT_EQ(WeightResidencyState::HOT, view->metadata.residency);
+    EXPECT_DOUBLE_EQ(1.0, view->metadata.observed_hot_ratio);
+}
+
 TEST_F(WeightReconciliationTest, MissingPayloadOrManifestBecomesDegraded) {
     MasterService service;
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
@@ -728,39 +813,48 @@ TEST_F(WeightReconciliationTest, MissingPayloadOrManifestBecomesDegraded) {
     MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
         std::max(payload_loss.updated_at_ms, manifest_loss.updated_at_ms) + 1,
         32);
-    for (const auto& metadata : {payload_loss, manifest_loss}) {
-        auto view = service.GetWeightRevision(
-            GetWeightRevisionRequest{.identity = metadata.identity});
-        ASSERT_TRUE(view.has_value());
-        EXPECT_EQ(WeightAvailabilityState::DEGRADED,
-                  view->metadata.availability);
-        EXPECT_EQ(WeightResidencyState::HOT, view->metadata.residency);
-    }
+    auto payload_loss_view = service.GetWeightRevision(
+        GetWeightRevisionRequest{.identity = payload_loss.identity});
+    ASSERT_TRUE(payload_loss_view.has_value());
+    EXPECT_EQ(WeightAvailabilityState::DEGRADED,
+              payload_loss_view->metadata.availability);
+    EXPECT_EQ(WeightResidencyState::ABSENT,
+              payload_loss_view->metadata.residency);
+
+    auto manifest_loss_view = service.GetWeightRevision(
+        GetWeightRevisionRequest{.identity = manifest_loss.identity});
+    ASSERT_TRUE(manifest_loss_view.has_value());
+    EXPECT_EQ(WeightAvailabilityState::DEGRADED,
+              manifest_loss_view->metadata.availability);
+    EXPECT_EQ(WeightResidencyState::HOT,
+              manifest_loss_view->metadata.residency);
     EXPECT_EQ(2, MasterMetricManager::instance().get_weight_revision_count(
                      "degraded"));
+    EXPECT_EQ(1, MasterMetricManager::instance().get_weight_residency_count(
+                     "absent"));
     EXPECT_EQ(
-        2, MasterMetricManager::instance().get_weight_residency_count("hot"));
+        1, MasterMetricManager::instance().get_weight_residency_count("hot"));
 }
 
 TEST_F(WeightReconciliationTest, MemberBudgetBoundsDeletionAndResumes) {
     MasterService service;
     const auto context = PrepareSimpleSegment(service);
     const auto identity = Identity("bounded-delete");
-    auto importing = service.BeginWeightImport({
-        .identity = identity,
-        .expected_payload_count = 2,
-        .expected_logical_bytes = 2048,
-    });
+    auto importing =
+        service.BeginWeightImport(ImportRequest(identity, 2, 2048));
     ASSERT_TRUE(importing);
     ReplicateConfig config;
     config.replica_num = 1;
     config.with_hard_pin = true;
     config.group_ids =
         std::vector<std::string>{importing->manifest.payload_group_id};
+    config.residency_affinity_ids =
+        std::vector<std::string>{"affinity-" + importing->identity.revision};
     config.data_type = ObjectDataType::WEIGHT;
     PutCompletedObject(service, context.client_id, "bounded-a", config, 1024);
     PutCompletedObject(service, context.client_id, "bounded-b", config, 1024);
     config.data_type = ObjectDataType::METADATA;
+    config.residency_affinity_ids.reset();
     PutCompletedObject(service, context.client_id, ManifestKey(identity),
                        config, 128);
     ASSERT_TRUE(service.AbortWeightImport({
@@ -796,17 +890,16 @@ TEST_F(WeightReconciliationTest, MemberBudgetIsSharedAcrossRevisions) {
     std::vector<std::string> keys;
     for (const auto& revision : {"shared-a", "shared-b"}) {
         const auto identity = Identity(revision);
-        const auto importing = service.BeginWeightImport({
-            .identity = identity,
-            .expected_payload_count = 2,
-            .expected_logical_bytes = 2048,
-        });
+        const auto importing =
+            service.BeginWeightImport(ImportRequest(identity, 2, 2048));
         ASSERT_TRUE(importing);
         ReplicateConfig config;
         config.replica_num = 1;
         config.with_hard_pin = true;
         config.group_ids =
             std::vector<std::string>{importing->manifest.payload_group_id};
+        config.residency_affinity_ids = std::vector<std::string>{
+            "affinity-" + importing->identity.revision};
         config.data_type = ObjectDataType::WEIGHT;
         for (int i = 0; i < 2; ++i) {
             keys.push_back(std::string(revision) + std::to_string(i));
@@ -814,6 +907,7 @@ TEST_F(WeightReconciliationTest, MemberBudgetIsSharedAcrossRevisions) {
                                1024);
         }
         config.data_type = ObjectDataType::METADATA;
+        config.residency_affinity_ids.reset();
         keys.push_back(ManifestKey(identity));
         PutCompletedObject(service, context.client_id, keys.back(), config,
                            128);
@@ -855,6 +949,7 @@ TEST_F(WeightReconciliationTest, ProjectsLeaseAndOperationMetrics) {
             .identity = ready.identity,
             .expected_metadata_generation = ready.metadata_generation,
             .target_residency = WeightResidencyState::HOT,
+            .mixed_hot_ratio = std::nullopt,
         });
     ASSERT_TRUE(operation.has_value());
     ASSERT_TRUE(MasterServiceTestPeer(service).DropWeightGroupMemberForTesting(
