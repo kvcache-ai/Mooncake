@@ -1681,7 +1681,7 @@ void MasterService::EvictManagedWeightMembersToCold(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
     if (weight_manager_.HasActiveLease(revision.identity,
-                                      revision.metadata_generation, now_ms)) {
+                                       revision.metadata_generation, now_ms)) {
         return;
     }
     const TenantId tenant_id(revision.identity.tenant_id);
@@ -5032,8 +5032,7 @@ auto MasterService::AllocateAndInsertMetadata(
     }
 
     return InsertMetadata(accessor, client_id, value_length, config, group_id,
-                          residency_affinity_id,
-                          now, soft_pin_request,
+                          residency_affinity_id, now, soft_pin_request,
                           std::move(allocation_result.value()),
                           std::move(committed_soft_pin_timeout));
 }

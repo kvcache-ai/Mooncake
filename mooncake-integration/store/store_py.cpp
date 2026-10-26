@@ -2176,8 +2176,18 @@ PYBIND11_MODULE(_store, m) {
                 config.session_ids.reset();
                 if (ids) config.session_ids = std::move(*ids);
             })
-        .def_readwrite("residency_affinity_ids",
-                       &ReplicateConfig::residency_affinity_ids)
+        .def_property(
+            "residency_affinity_ids",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::string>> {
+                if (!config.residency_affinity_ids) return std::nullopt;
+                return *config.residency_affinity_ids;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::string>> ids) {
+                config.residency_affinity_ids.reset();
+                if (ids) config.residency_affinity_ids = std::move(*ids);
+            })
         .def_property(
             "preferred_hca_names",
             [](const ReplicateConfig &config)

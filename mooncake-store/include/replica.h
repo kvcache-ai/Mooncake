@@ -128,8 +128,6 @@ struct ReplicateConfig {
     // eviction treats the group as a unit (all-or-none). Object routing is
     // always hash(tenant, key) and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
-    // Per-key opaque IDs define indivisible units for weight residency.
-    std::optional<std::vector<std::string>> residency_affinity_ids{};
     // Per-key write attribution, independent of key identity and eviction
     // groups. Preserve the session extension already used by main.
     struct_pack::compatible<std::vector<std::string>, 1> session_ids;
@@ -139,6 +137,8 @@ struct ReplicateConfig {
     // Batch hints follow the key order; an empty entry means no preference.
     struct_pack::compatible<std::vector<std::vector<std::string>>, 3>
         per_key_preferred_hca_names;
+    // Per-key opaque IDs define indivisible units for weight residency.
+    struct_pack::compatible<std::vector<std::string>, 4> residency_affinity_ids;
 
     bool HasValidKeyHints(size_t key_count) const {
         return (!group_ids || group_ids->size() == key_count) &&
