@@ -78,18 +78,18 @@ Heartbeat Thread          Master                  Local Memory Segment
       │                     │                             │
       │  BatchOffload(slices) → StorageBackend → SSD      │
       │                     │                             │
-      │─ NotifyOffloadSuccess(keys, metadata) ───────────▶│
+      │─ NotifyOffloadTaskSuccess(items, metadata) ──────▶│
       │                     │  (master adds LOCAL_DISK    │
       │                     │   replica to object entry)  │
 ```
 
 Step by step:
 
-1. **Heartbeat**: The heartbeat thread wakes up every `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` seconds and calls `client_->OffloadObjectHeartbeat(enable_offloading_, offloading_objects)`. The master replies with a map of `{key → size}` for objects it has selected to evict from memory.
+1. **Heartbeat**: The heartbeat thread wakes up every `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` seconds and calls `client_->OffloadObjectHeartbeat(enable_offloading_, offloading_objects)`. The master replies with the offload items (`tenant_id`, `key`, `size`, `task_id`) of the objects it has selected to offload, and records this client as a taker of each item's task. Every offload task has an L4 task id (`L4TaskId{epoch, seq}`; the epoch is drawn at random for every master instance). An item without a task id comes from a master that predates task ids; the store NACKs it without copying.
 2. **Read slices from memory**: `FileStorage::OffloadObjects` groups the keys into buckets (for `BucketStorageBackend`) and calls `BatchQuerySegmentSlices` to obtain `{key → Slice}` from the local memory segment via `client_->BatchQuery`.
 3. **Eviction** (if capacity limit is set): Before writing, `PrepareEviction` removes old buckets from metadata under the exclusive lock and collects their keys. The `eviction_handler` callback calls `client_->BatchEvictDiskReplica` to notify the master in one batched RPC. `FinalizeEviction` then deletes the corresponding files.
 4. **Write to SSD**: `StorageBackend::BatchOffload` serializes and writes the key-value data to disk.
-5. **Notify master**: On success, the `complete_handler` calls `client_->NotifyOffloadSuccess(keys, metadatas)`. The master adds a `LOCAL_DISK` replica entry (carrying the real client's RPC address as `transport_endpoint`) to the object's replica list.
+5. **Notify master**: After the bucket is written, the store checks that the memory replica each key was copied from still exists (otherwise the bucket is rolled back and NACKed), then the `complete_handler` calls `client_->NotifyOffloadTaskSuccess(items, metadatas)`, echoing the drained items. The master adds a `LOCAL_DISK` replica entry (carrying the real client's RPC address as `transport_endpoint`) to the object's replica list only if the item names the key's current offload task, this client took it, the copy came from the replica the task pins, and the size matches. Anything else is refused and never creates an object. NACKs (`data_size < 0`) go through `NotifyOffloadSuccess`, and end only the task they name.
 
 ### Load (SSD → memory)
 
@@ -294,6 +294,21 @@ To prevent `io_uring`'s `FOLL_LONGTERM` page pinning from failing on systems wit
 
 ## Metadata Recovery on Restart
 
-On startup, `FileStorage::Init` calls `StorageBackend::ScanMeta`, which reads on-disk metadata and invokes a callback for each discovered object. The callback calls `MasterClient::NotifyOffloadSuccess` to re-register the objects with the master. This restores the full disk-replica view without any application-level intervention for the backends that preserve restart metadata, namely `BucketStorageBackend` and the file-per-key backend.
+Offloaded files are not re-registered with the master. A file the store already has can predate the current object of its key (`Remove` does not delete it), so the master registers a `LOCAL_DISK` replica only as the completion of an offload task. When the store's LOCAL_DISK registration is new (`FileStorage::Init`, and the re-mount after the master answers `SEGMENT_NOT_FOUND`), the store drops its offloaded files before it takes any offload task. A shared backend (object storage) is left untouched. L4 contents therefore do not survive a store restart or a master restart; later offloads repopulate them.
+
+Offload tasks that the store carries across heartbeats while the bucket backend waits for a full bucket keep the item they were drained with, task id included, so their completions are registered like any other. When the LOCAL_DISK registration is new, the store NACKs the tasks it carries: they were taken under the earlier registration. When the store drains items whose task id epoch differs from that of a carried task (another master, while the store kept its registration), it drops that task and its pooled key without writing them, because the current master would refuse the completion.
 
 `OffsetAllocatorStorageBackend` is the exception. It truncates its pre-allocated data file during initialization and clears its in-memory metadata, so previously offloaded objects are not recoverable after a real client restart.
+
+## Mixed Master and Store Versions
+
+L4 task ids change what masters and stores send each other, and a roll can pair a master and stores from either side of that change for a while. Such a pairing registers no disk replica: L4 serves nothing new, reads that it would have served become misses, and no read returns another object's bytes. Memory replicas are not affected. Treat a mixed pairing as L4 being off, not as offload succeeding.
+
+- **Older master, newer store.** The master's offload items carry no task id. The store NACKs them over `NotifyOffloadSuccess`, which that master has, without copying them, and logs `action=nack_offload_items, reason=no_task_id`. A completion that does carry an id (its items came from a newer master that was replaced before the store reported) goes to `NotifyOffloadTaskSuccess`. The older master does not have that RPC and answers with an error; the store rolls the bucket back and NACKs, as for any failed completion (`NotifyOffloadTaskSuccess failed` in the store log).
+- **Newer master, older store.** The store ignores the task ids and reports its completions under `NotifyOffloadSuccess` without one. The master drops completions sent under that name (`reason=completion_without_task_rpc` in the master log) and keeps their tasks until they time out (`put_start_release_timeout`). The store's NACKs still end the task of their key. Its re-registration of the files it finds at startup is dropped the same way, with an OK result, so it does not retry. The store keeps the files it wrote until its own eviction removes them.
+- **Promotion** follows the same rule. A newer store stages nothing for a promotion item without a task id and only ends that task. A newer master refuses the key-only `PromotionAllocStart` and `NotifyPromotionSuccess` of an older store.
+- **SSD prefetch** registers its promotion task with `RegisterPrefetchPromotionTask`, which returns the task id. An older master does not have that RPC, and an older store calls `RegisterPrefetchTask`, which a newer master does not have; either way the call fails before a task exists, and prefetch does nothing.
+
+**Roll order.** When upgrading, roll the master first, then the stores. When rolling back, roll the stores back first, then the master. A newer master refuses every completion without a task id, whichever store sends it, so in this order the fix also covers the older stores for the whole roll. Neither order adds a wrong read, and rolling with L4 disabled also works; while versions are mixed, only the L4 hit rate drops.
+
+**What the tests cover.** `l4_task_id_wire_test` packs offload and promotion items in the layout from before task ids and unpacks them in the current one, and the other way round. `FileStorageTest.CompletionToAMasterWithoutTheTaskRpcIsRolledBack` serves `NotifyOffloadSuccess` but not `NotifyOffloadTaskSuccess`, as an older master does, sends a store's completion there over RPC, and checks that the call fails and the bucket is rolled back and NACKed. No test runs an older master or store binary. The older-master direction is safe by construction: whatever error the completion RPC returns, the store takes the same rollback path.

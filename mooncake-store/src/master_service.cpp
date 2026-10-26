@@ -161,6 +161,18 @@ bool MasterService::DefaultProbeNofSegment(const std::string& te_endpoint,
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
+uint64_t MasterService::DrawL4TaskEpoch() {
+    // Two independent 64-bit halves of a random (OS-seeded) UUID; 0 is kept
+    // for "no id".
+    for (;;) {
+        const UUID random = generate_uuid();
+        const uint64_t epoch = random.first ^ random.second;
+        if (epoch != 0) {
+            return epoch;
+        }
+    }
+}
+
 MasterService::MasterService(const MasterServiceConfig& config)
     : graceful_unmount_scheduler_(
           [this](const GracefulUnmountDeadlineRecord& record) {
@@ -346,6 +358,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
                          "cap will be evicted without disk offload";
         }
     }
+
+    LOG(INFO) << "l4_task_epoch=" << std::hex << l4_task_epoch_ << std::dec;
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY. Only meaningful when offload is enabled
@@ -2268,12 +2282,11 @@ MasterService::ObjectMap::iterator MasterService::EraseMetadata(
     // When BatchEvict deletes metadata, Store Worker may still have an
     // in-flight offload for this key. Without this cleanup the task
     // becomes an orphan that only expires after 600s.
+    // A store that already took the task may still be copying; its late
+    // report names this task, so it can never complete a later task of a
+    // re-put object under the same key.
     if (state.offloading_task) {
-        auto source = metadata.GetReplicaByID(state.offloading_task->source_id);
-        if (source != nullptr) {
-            source->dec_refcnt();
-        }
-        state.offloading_task.reset();
+        ReleaseOffloadingTask(&metadata, state.offloading_task);
 
         // The mailbox entry must be dropped too, otherwise the next
         // OffloadObjectHeartbeat drains a task-less key back to the client and
@@ -5610,31 +5623,45 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(settle_result.error());
     }
 
+    // A key has at most one offload task: a second push would replace the
+    // queued item of the current task with one whose id no task has.
     if (replica_type != ReplicaType::DFS && enable_offload_ &&
-        !offload_on_evict_ && !metadata.HasReplica([](const Replica& replica) {
+        !offload_on_evict_ && !accessor.GetState().offloading_task &&
+        !metadata.HasReplica([](const Replica& replica) {
             return replica.is_dfs_replica() && replica.is_processing();
         })) {
         auto& state = accessor.GetState();
         // One marker covers every mirror pushed below, so the mirrors are
         // collected before the marker is recorded.
+        const L4TaskId task_id = NextL4TaskId();
         std::optional<ReplicaID> source_id;
         std::vector<UUID> mirror_clients;
+        std::vector<UUID> source_clients;
         metadata.VisitReplicas(
             [](const Replica& replica) {
                 return replica.is_completed() && replica.is_memory_replica();
             },
-            [this, &object_id, &source_id, &mirror_clients](Replica& replica) {
-                auto result =
-                    PushOffloadingQueue(object_id, replica, &mirror_clients);
+            [this, &object_id, &task_id, &source_id, &mirror_clients,
+             &source_clients](Replica& replica) {
+                const size_t pushed_before = mirror_clients.size();
+                auto result = PushOffloadingQueue(object_id, replica, task_id,
+                                                  &mirror_clients);
                 if (result && !source_id.has_value()) {
                     replica.inc_refcnt();
                     source_id = replica.id();
+                    source_clients.assign(
+                        mirror_clients.begin() + pushed_before,
+                        mirror_clients.end());
                 }
             });
-        if (source_id.has_value() && !state.offloading_task) {
+        if (source_id.has_value()) {
             state.offloading_task =
-                OffloadingTask{*source_id, std::chrono::system_clock::now(),
-                               std::move(mirror_clients)};
+                OffloadingTask{.source_id = *source_id,
+                               .start_time = std::chrono::system_clock::now(),
+                               .mirror_clients = std::move(mirror_clients),
+                               .source_clients = std::move(source_clients),
+                               .takers = {},
+                               .task_id = task_id};
         }
     }
 
@@ -8479,7 +8506,7 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         return tl::make_unexpected(pending.error());
     }
     if (enable_offloading) {
-        return std::move(*pending);
+        return RecordOffloadTakers(client_id, *pending);
     }
     // Offloading is disabled: clear the pending queue to prevent unbounded
     // growth that would trigger KEYS_ULTRA_LIMIT in PushOffloadingQueue. We
@@ -8492,17 +8519,65 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         MetadataAccessorRW accessor(this, object_id);
         if (accessor.Exists()) {
             auto& offloading_task = accessor.GetState().offloading_task;
-            if (offloading_task) {
-                auto source =
-                    accessor.Get().GetReplicaByID(offloading_task->source_id);
-                if (source) {
-                    source->dec_refcnt();
-                }
-                offloading_task.reset();
+            // Only the task the item was queued for: an item left over from
+            // an earlier task of the key must not release a newer one.
+            if (offloading_task && task.task_id.has_value() &&
+                *task.task_id == offloading_task->task_id) {
+                ReleaseOffloadingTask(&accessor.Get(), offloading_task);
             }
         }
     }
     return std::vector<OffloadTaskItem>{};
+}
+
+std::vector<OffloadTaskItem> MasterService::RecordOffloadTakers(
+    const UUID& client_id, const std::vector<OffloadTaskItem>& drained) {
+    // A store copies and reports every item it gets. An item is handed out
+    // only if it names the key's current task and this drain makes the
+    // client a taker of that task. Any other item (no object, no task,
+    // another task's id, not a mirror, or a task this client already took)
+    // is dropped here, so a store never copies for a task it cannot report.
+    std::vector<OffloadTaskItem> taken;
+    for (const auto& item : drained) {
+        const TenantId item_tenant = enable_multi_tenants_
+                                         ? TenantId(item.tenant_id)
+                                         : TenantId::Default();
+        const auto object_id =
+            MakeObjectIdentityForRequest(item.key, item_tenant);
+        MetadataAccessorRW accessor(this, object_id);
+        if (!accessor.Exists()) {
+            continue;
+        }
+        auto& task = accessor.GetState().offloading_task;
+        if (!task) {
+            continue;
+        }
+        if (!item.task_id.has_value() || *item.task_id != task->task_id) {
+            continue;
+        }
+        const auto& mirrors = task->mirror_clients;
+        if (std::find(mirrors.begin(), mirrors.end(), client_id) ==
+            mirrors.end()) {
+            continue;
+        }
+        if (std::find(task->takers.begin(), task->takers.end(), client_id) ==
+            task->takers.end()) {
+            task->takers.push_back(client_id);
+            taken.push_back(item);
+        }
+    }
+    return taken;
+}
+
+void MasterService::ReleaseOffloadingTask(ObjectMetadata* metadata,
+                                          HeapOptional<OffloadingTask>& task) {
+    if (metadata != nullptr) {
+        auto source = metadata->GetReplicaByID(task->source_id);
+        if (source != nullptr) {
+            source->dec_refcnt();
+        }
+    }
+    task.reset();
 }
 
 auto MasterService::PollRemoveAll(const UUID& client_id)
@@ -8565,6 +8640,19 @@ auto MasterService::NotifyOffloadSuccess(
     // below). NACK cleanups still run for the rest of the batch; the caller
     // gets SEGMENT_NOT_FOUND so a rescan stops re-registering.
     bool refused_unmounted = false;
+    // Completions refused because they are not the report of a task this
+    // client took: re-registrations (a store's rescan of files it already
+    // had) and reports of a client that never took the task.
+    size_t refused_untasked = 0;
+    // Task-backed completions refused because the copy may not hold this
+    // object's bytes: its size differs, or it was not copied from the
+    // pinned source replica.
+    size_t refused_stale = 0;
+    // Completions refused by their task id: none (a store that predates
+    // task ids, or a rescan entry) or another task's (a late report of an
+    // earlier offload of the key, possibly from an earlier master).
+    size_t refused_no_task_id = 0;
+    size_t refused_task_id_mismatch = 0;
 
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
@@ -8575,21 +8663,29 @@ auto MasterService::NotifyOffloadSuccess(
         const auto request_object_id =
             MakeObjectIdentityForRequest(task.key, task_tenant);
 
-        // NACK sentinel: offload failed on worker. Clean up the
-        // offloading_task + dec_refcnt but skip AddReplica.
+        // NACK sentinel: the store did not persist the key. Release the
+        // task if this client was one of its mirrors, but skip AddReplica.
+        // A completion RPC that failed at the store is rolled back and
+        // NACKed, and the master may still process it after this NACK; it
+        // names the released task, so it is refused then.
         if (metadata.data_size < 0) {
             std::shared_lock<std::shared_mutex> shared_lock(
                 master_state_mutex_);
             MetadataAccessorRW accessor(this, request_object_id);
-            if (accessor.Exists()) {
-                auto& offloading_task = accessor.GetState().offloading_task;
-                if (offloading_task) {
-                    auto source = accessor.Get().GetReplicaByID(
-                        offloading_task->source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
-                    }
-                    offloading_task.reset();
+            if (!accessor.Exists()) {
+                continue;  // no object, no task to release
+            }
+            auto& offloading_task = accessor.GetState().offloading_task;
+            // A NACK ends only the task its item was queued for. One without
+            // an id comes from a store that predates task ids; releasing is
+            // always safe, so it ends the current task as before.
+            if (offloading_task &&
+                (!task.task_id.has_value() ||
+                 *task.task_id == offloading_task->task_id)) {
+                const auto& mirrors = offloading_task->mirror_clients;
+                if (std::find(mirrors.begin(), mirrors.end(), client_id) !=
+                    mirrors.end()) {
+                    ReleaseOffloadingTask(&accessor.Get(), offloading_task);
                     MasterMetricManager::instance().inc_offload_failed(
                         UuidToString(client_id));
                 }
@@ -8600,7 +8696,6 @@ auto MasterService::NotifyOffloadSuccess(
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE,
                         record);
-        bool handled_existing_object = false;
         bool added_new_local_disk_replica = false;
         {
             std::shared_lock<std::shared_mutex> shared_lock(
@@ -8612,43 +8707,91 @@ auto MasterService::NotifyOffloadSuccess(
             // removal (which holds master_state_mutex_ exclusively): either the
             // replica lands first and its sweep erases it, or the check here
             // sees the segment gone and refuses. Without this, a
-            // registration racing a deregistration -- an in-flight rescan
-            // batch, or an offload completion from a heartbeat that was past
-            // its own drain check -- could land after the sweep and leave
-            // the master advertising a departed owner. Scoped to
-            // enable_offload_, where the segment registry exists and a
-            // deregistration can race; with the subsystem off both the mount
-            // and unmount RPCs refuse, so there is nothing to check against
-            // and no race to close.
+            // registration racing a deregistration -- an offload completion
+            // from a heartbeat that was past its own drain check -- could
+            // land after the sweep and leave the master advertising a
+            // departed owner. Scoped to enable_offload_, where the segment
+            // registry exists and a deregistration can race; with the
+            // subsystem off both the mount and unmount RPCs refuse, so there
+            // is nothing to check against and no race to close.
             const bool segment_mounted =
                 !enable_offload_ || HasMountedLocalDiskSegment(client_id);
             MetadataAccessorRW accessor(this, request_object_id);
+            // A completion is registered only as the report of the key's
+            // current offload task, by a client that took it
+            // (OffloadObjectHeartbeat records takers), echoing that task's
+            // id. Anything else is refused and never creates an object: a
+            // re-registration of a file the store already had (no id), whose
+            // bytes may predate the current object because Remove does not
+            // delete the file; a late completion of an earlier task of the
+            // key (another id: the key may have been removed and re-put
+            // meanwhile, and the store's file may hold another object's
+            // bytes); a mirror that never took this task.
+            bool task_backed = false;
+            // Set when the refusal is already counted by its task id.
+            bool refused_by_id = false;
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
-                const auto previous_kv_media = KvMediaSnapshot(obj_metadata);
                 auto& offloading_task = accessor.GetState().offloading_task;
-                if (offloading_task &&
-                    replica.type() != ReplicaType::LOCAL_DISK) {
-                    LOG(ERROR) << "Invalid replica type: " << replica.type()
-                               << ". Expected ReplicaType::LOCAL_DISK.";
-                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                }
-
-                // Existing orphan objects can only bypass tenant registration
-                // for a master-admitted offload completion. Without this task
-                // marker, fall through to the regular registration check.
                 if (offloading_task) {
-                    auto source =
-                        obj_metadata.GetReplicaByID(offloading_task->source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
+                    const auto& takers = offloading_task->takers;
+                    const bool is_taker =
+                        std::find(takers.begin(), takers.end(), client_id) !=
+                        takers.end();
+                    if (!task.task_id.has_value()) {
+                        refused_by_id = true;
+                        ++refused_no_task_id;
+                        if (is_taker) {
+                            // A store that predates task ids took this task
+                            // and reports it. Its copy is never registered,
+                            // but the task ends here instead of pinning its
+                            // source until the TTL reaper; ending a task is
+                            // always safe.
+                            ReleaseOffloadingTask(&obj_metadata,
+                                                  offloading_task);
+                        }
+                    } else if (*task.task_id != offloading_task->task_id) {
+                        // Another task's report; this task is untouched.
+                        refused_by_id = true;
+                        ++refused_task_id_mismatch;
+                    } else {
+                        task_backed = is_taker;
                     }
-                    offloading_task.reset();
+                }
+                if (task_backed) {
+                    if (replica.type() != ReplicaType::LOCAL_DISK) {
+                        LOG(ERROR) << "Invalid replica type: " << replica.type()
+                                   << ". Expected ReplicaType::LOCAL_DISK.";
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                    const auto previous_kv_media =
+                        KvMediaSnapshot(obj_metadata);
+                    // The copy holds this object's bytes only if the store
+                    // read the buffer the task pins: the source replica must
+                    // be this client's and must still exist (a replica that
+                    // existed at the push and still exists was never freed).
+                    const auto& source_clients =
+                        offloading_task->source_clients;
+                    const Replica* source =
+                        obj_metadata.GetReplicaByID(offloading_task->source_id);
+                    const bool from_pinned_source =
+                        source != nullptr && source->is_memory_replica() &&
+                        source->is_completed() &&
+                        std::find(source_clients.begin(), source_clients.end(),
+                                  client_id) != source_clients.end();
+                    ReleaseOffloadingTask(&obj_metadata, offloading_task);
 
                     if (!segment_mounted) {
                         // The offload bookkeeping above still ran; only the
                         // registration is refused.
                         refused_unmounted = true;
+                    } else if (!from_pinned_source ||
+                               metadata.data_size !=
+                                   static_cast<int64_t>(
+                                       obj_metadata.TotalLength())) {
+                        // The file may not describe this object; never let a
+                        // read reach it.
+                        ++refused_stale;
                     } else if (!obj_metadata.HasReplica(
                                    &Replica::fn_is_local_disk_replica)) {
                         std::vector<Replica> replicas;
@@ -8682,50 +8825,47 @@ auto MasterService::NotifyOffloadSuccess(
                                         .object_size;
                             });
                     }
-                    handled_existing_object = true;
                     SyncKvObjectState(request_object_id.user_key, obj_metadata,
                                       request_object_id.tenant_id,
                                       previous_kv_media);
                 }
             }
-        }
-
-        if (!handled_existing_object) {
-            auto normalized_tenant_result =
-                ResolveTenantIdForWrite(request_object_id.tenant_id);
-            if (!normalized_tenant_result) {
-                return tl::make_unexpected(normalized_tenant_result.error());
-            }
-            const ObjectIdentity object_id{
-                std::move(normalized_tenant_result.value()),
-                request_object_id.user_key};
-
-            auto res = AddReplicaForRetainedClient(
-                client_id, object_id.user_key, object_id.tenant_id, replica);
-            if (!res) {
-                if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
-                    continue;
-                }
-                if (res.error() == ErrorCode::SEGMENT_NOT_FOUND) {
-                    // AddReplica's own mounted-segment check refused it (the
-                    // segment entry vanished under a deregistration). Finish
-                    // the batch so remaining NACK cleanups still run.
+            if (!task_backed) {
+                if (!segment_mounted) {
+                    // Keeps a rescan racing a deregistration from going on.
                     refused_unmounted = true;
-                    continue;
+                } else if (!refused_by_id) {
+                    ++refused_untasked;
                 }
-                LOG(ERROR) << "Failed to add replica: error=" << res.error()
-                           << ", client_id=" << client_id
-                           << ", tenant_id=" << object_id.tenant_id.value()
-                           << ", key=" << object_id.user_key;
-                return tl::make_unexpected(res.error());
             }
-            added_new_local_disk_replica = res.value();
         }
         if (metadata.data_size > 0 && added_new_local_disk_replica) {
             local_ssd_manager_.AdjustUsedBytes(client_id, metadata.data_size);
         }
     }
 
+    if (refused_untasked > 0) {
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=notify_offload_success_refused"
+                  << ", reason=no_offload_task_taken, count="
+                  << refused_untasked;
+    }
+    if (refused_stale > 0) {
+        LOG(WARNING) << "client_id=" << client_id
+                     << ", action=notify_offload_success_refused"
+                     << ", reason=stale_disk_replica, count=" << refused_stale;
+    }
+    if (refused_no_task_id > 0) {
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=notify_offload_success_refused"
+                  << ", reason=no_task_id, count=" << refused_no_task_id;
+    }
+    if (refused_task_id_mismatch > 0) {
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=notify_offload_success_refused"
+                  << ", reason=task_id_mismatch, count="
+                  << refused_task_id_mismatch;
+    }
     if (refused_unmounted) {
         LOG(WARNING) << "client_id=" << client_id
                      << ", action=notify_offload_success_refused"
@@ -8736,7 +8876,7 @@ auto MasterService::NotifyOffloadSuccess(
 }
 
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
-    const ObjectIdentity& object_id, Replica& replica,
+    const ObjectIdentity& object_id, Replica& replica, const L4TaskId& task_id,
     std::vector<UUID>* mirror_clients) {
     const auto& segment_names = replica.get_segment_names();
     // No source segment names means there is no usable source segment to
@@ -8794,7 +8934,8 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             *client_id,
             OffloadTaskItem{.tenant_id = object_id.tenant_id.value(),
                             .key = object_id.user_key,
-                            .size = size},
+                            .size = size,
+                            .task_id = task_id},
             offloading_queue_limit_);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
             return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
@@ -8838,13 +8979,9 @@ bool MasterService::CancelQueuedOffloadTask(ObjectRecord& record,
         return false;
     }
 
-    auto source = record.metadata.GetReplicaByID(offloading_task->source_id);
-    if (source != nullptr) {
-        source->dec_refcnt();
-    }
     MasterMetricManager::instance().inc_offload_cancelled(
         UuidToString(mirror_clients[0]));
-    offloading_task.reset();
+    ReleaseOffloadingTask(&record.metadata, offloading_task);
     return true;
 }
 
@@ -8854,7 +8991,8 @@ bool MasterService::CancelQueuedOffloadTask(ObjectRecord& record,
 // via the LOCAL_DISK replica's embedded client_id rather than via the
 // segment-name reverse lookup.
 tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
-    const ObjectIdentity& object_id, Replica& source_replica) {
+    const ObjectIdentity& object_id, Replica& source_replica,
+    const L4TaskId& task_id) {
     auto holder_id = source_replica.get_local_disk_client_id();
     if (!holder_id.has_value()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -8874,7 +9012,8 @@ tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
                                       .size = static_cast<int64_t>(
                                           source_replica.get_descriptor()
                                               .get_local_disk_descriptor()
-                                              .object_size)});
+                                              .object_size),
+                                      .task_id = task_id});
     if (err == ErrorCode::SEGMENT_NOT_FOUND) {
         // Holder client expired or never registered LocalSSD;
         // the LOCAL_DISK replica will be cleaned up by ClientMonitorFunc on
@@ -9300,7 +9439,8 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         source->get_descriptor().get_local_disk_descriptor().object_size;
 
     // Try to enqueue on the holder client. On failure, drop the refcnt back.
-    auto push_result = PushPromotionQueue(object_id, *source);
+    const L4TaskId task_id = NextL4TaskId();
+    auto push_result = PushPromotionQueue(object_id, *source, task_id);
     if (!push_result) {
         source->dec_refcnt();
         VLOG(1) << "promotion_push_failed key=" << key
@@ -9340,7 +9480,8 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
                       .object_size = object_size,
                       .start_time = std::chrono::system_clock::now(),
                       .holder_id = holder_id,
-                      .execution_failures = execution_failures};
+                      .execution_failures = execution_failures,
+                      .task_id = task_id};
     promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
     MasterMetricManager::instance().inc_promotion_in_flight();
     MasterMetricManager::instance().inc_promotion_admitted();
@@ -9351,7 +9492,7 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
 auto MasterService::RegisterPrefetchTask(const UUID& client_id,
                                          const std::string& key,
                                          const TenantId& tenant_id)
-    -> tl::expected<void, ErrorCode> {
+    -> tl::expected<L4TaskId, ErrorCode> {
     const auto record = FindClientRecord(client_id);
     auto serving_guard =
         record ? record->TryAcquireServingGuard() : std::nullopt;
@@ -9424,6 +9565,7 @@ auto MasterService::RegisterPrefetchTask(const UUID& client_id,
         source->get_descriptor().get_local_disk_descriptor().object_size;
     const uint32_t execution_failures = promotion_candidates_.ConsumeLocked(
         object_id.tenant_id, object_id.user_key, accessor.GetState());
+    const L4TaskId task_id = NextL4TaskId();
     promotion_task =
         PromotionTask{.source_id = source->id(),
                       .alloc_id = 0,
@@ -9431,12 +9573,13 @@ auto MasterService::RegisterPrefetchTask(const UUID& client_id,
                       .start_time = std::chrono::system_clock::now(),
                       .holder_id = holder_id.value(),
                       .execution_failures = execution_failures,
-                      .from_prefetch = true};
+                      .from_prefetch = true,
+                      .task_id = task_id};
     promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
     MasterMetricManager::instance().inc_promotion_in_flight();
     VLOG(1) << "prefetch_task_registered key=" << object_id.user_key
-            << " size=" << object_size;
-    return {};
+            << " size=" << object_size << " task_id=" << task_id;
+    return task_id;
 }
 
 auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
@@ -9455,13 +9598,64 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
     // stay queued in the mailbox for subsequent heartbeats. The
     // cap must live here (server side) rather than on the client so
     // leftover work isn't silently dropped.
-    return local_ssd_manager_.TakePromotions(client_id,
-                                             promotion_max_per_heartbeat_);
+    auto taken = local_ssd_manager_.TakePromotions(
+        client_id, promotion_max_per_heartbeat_);
+    if (!taken) {
+        return taken;
+    }
+    // Hand out only items of the key's current task held by this client: an
+    // item left over from an earlier promotion of the key names a task that
+    // no longer exists, and the holder could not act on it.
+    std::vector<PromotionTaskItem> current;
+    current.reserve(taken->size());
+    for (auto& item : *taken) {
+        if (!item.task_id.has_value()) {
+            continue;
+        }
+        const TenantId item_tenant = enable_multi_tenants_
+                                         ? TenantId(item.tenant_id)
+                                         : TenantId::Default();
+        const auto object_id =
+            MakeObjectIdentityForRequest(item.key, item_tenant);
+        MetadataAccessorRW accessor(this, object_id);
+        if (!accessor.Exists()) {
+            continue;
+        }
+        const auto& task = accessor.GetState().promotion_task;
+        if (!task || task->task_id != *item.task_id ||
+            task->holder_id != client_id) {
+            continue;
+        }
+        current.push_back(std::move(item));
+    }
+    return current;
 }
 
 auto MasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     uint64_t size, const std::vector<std::string>& preferred_segments)
+    -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
+    return PromotionAllocStartFor(client_id, key, tenant_id, size,
+                                  preferred_segments, std::nullopt);
+}
+
+auto MasterService::PromotionTaskAllocStart(
+    const UUID& client_id, const PromotionTaskItem& item,
+    const TenantId& tenant_id,
+    const std::vector<std::string>& preferred_segments)
+    -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
+    if (item.size < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return PromotionAllocStartFor(client_id, item.key, tenant_id,
+                                  static_cast<uint64_t>(item.size),
+                                  preferred_segments, item.task_id);
+}
+
+auto MasterService::PromotionAllocStartFor(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    uint64_t size, const std::vector<std::string>& preferred_segments,
+    const std::optional<L4TaskId>& task_id)
     -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     const auto record = FindClientRecord(client_id);
@@ -9495,6 +9689,11 @@ auto MasterService::PromotionAllocStart(
     const TenantQuotaHandle quota_account = accessor.QuotaAccount();
     auto& promotion_task = accessor.GetState().promotion_task;
     if (!promotion_task) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    // The caller's task must be this one (see PromotionTask::task_id); a
+    // key-only call cannot name it and never stages a buffer.
+    if (!task_id.has_value() || *task_id != promotion_task->task_id) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
@@ -9597,6 +9796,20 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
                                            const std::string& key,
                                            const TenantId& tenant_id)
     -> tl::expected<void, ErrorCode> {
+    return NotifyPromotionSuccessFor(client_id, key, tenant_id, std::nullopt);
+}
+
+auto MasterService::NotifyPromotionTaskSuccess(const UUID& client_id,
+                                               const PromotionTaskItem& item,
+                                               const TenantId& tenant_id)
+    -> tl::expected<void, ErrorCode> {
+    return NotifyPromotionSuccessFor(client_id, item.key, tenant_id,
+                                     item.task_id);
+}
+
+auto MasterService::NotifyPromotionSuccessFor(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    const std::optional<L4TaskId>& task_id) -> tl::expected<void, ErrorCode> {
     const auto record = FindClientRecord(client_id);
     auto retaining_guard =
         record ? record->TryAcquireRetainingGuard() : std::nullopt;
@@ -9620,6 +9833,12 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     // replica.
     auto& promotion_task = accessor.GetState().promotion_task;
     if (!promotion_task || promotion_task->alloc_id == 0) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    // Only the report of this task commits its staged replica: a late
+    // success of an earlier promotion of the key would make a buffer the
+    // holder is still writing readable. A key-only call is never accepted.
+    if (!task_id.has_value() || *task_id != promotion_task->task_id) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
@@ -9732,6 +9951,22 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
                                            const std::string& key,
                                            const TenantId& tenant_id)
     -> tl::expected<void, ErrorCode> {
+    return NotifyPromotionFailureFor(client_id, key, tenant_id, std::nullopt);
+}
+
+auto MasterService::NotifyPromotionTaskFailure(const UUID& client_id,
+                                               const PromotionTaskItem& item,
+                                               const TenantId& tenant_id)
+    -> tl::expected<void, ErrorCode> {
+    // An item without an id names no task of this master (every task id
+    // has a non-zero epoch), so it ends nothing.
+    return NotifyPromotionFailureFor(client_id, item.key, tenant_id,
+                                     item.task_id.value_or(L4TaskId{}));
+}
+
+auto MasterService::NotifyPromotionFailureFor(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    const std::optional<L4TaskId>& task_id) -> tl::expected<void, ErrorCode> {
     const auto record = FindClientRecord(client_id);
     auto retaining_guard =
         record ? record->TryAcquireRetainingGuard() : std::nullopt;
@@ -9753,6 +9988,17 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
         // client never had a task here. Return OK to keep this RPC
         // idempotent — repeated failure notifications on the same key
         // should be safe.
+        return {};
+    }
+
+    // Only the failure of this task ends it: a late failure of an earlier
+    // promotion of the key must not free the buffer this one's holder is
+    // writing into (the range could be handed to another put meanwhile). A
+    // key-only call cannot name the task; it ends only a task that has no
+    // staged replica, which is the only kind such a caller can hold (its
+    // AllocStart is refused).
+    if (task_id.has_value() ? *task_id != promotion_task->task_id
+                            : promotion_task->alloc_id != 0) {
         return {};
     }
 
@@ -10174,13 +10420,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
         if (ttl > now) {
             continue;
         }
-        auto source = accessor.Get().GetReplicaByID(task->source_id);
-        if (source != nullptr) {
-            source->dec_refcnt();
-        }
         LOG(WARNING) << "Offloading task expired for key: " << key
                      << " tenant=" << tenant_id;
-        task.reset();
+        ReleaseOffloadingTask(&accessor.Get(), task);
     }
 
     for (const auto& key : keys) {
@@ -10310,6 +10552,13 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             return evict_replicas(quota_account, metadata, deferred_replicas);
         }
 
+        // Already queued for offload (its source replica is pinned): never
+        // push a second item, which would replace the queued item of the
+        // current task and pin another replica that no task releases.
+        if (state.offloading_task) {
+            return evict_replicas(quota_account, metadata, deferred_replicas);
+        }
+
         if (offload_force_evict_ && offload_queued_this_call >= offload_cap) {
             ++offload_cap_forced_count;
             return evict_replicas(quota_account, metadata, deferred_replicas);
@@ -10324,16 +10573,22 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                     return;
                 }
                 std::vector<UUID> mirror_clients;
+                const L4TaskId task_id = NextL4TaskId();
                 auto result = PushOffloadingQueue(
                     MakeObjectIdentity(key, normalized_tenant), replica,
-                    &mirror_clients);
+                    task_id, &mirror_clients);
                 if (result) {
                     replica.inc_refcnt();
-                    auto& task = state.offloading_task;
-                    if (!task) {
-                        task = OffloadingTask{replica.id(), now,
-                                              std::move(mirror_clients)};
-                    }
+                    // Only this replica was pushed, so every mirror copies
+                    // from the pinned source.
+                    auto source_clients = mirror_clients;
+                    state.offloading_task = OffloadingTask{
+                        .source_id = replica.id(),
+                        .start_time = now,
+                        .mirror_clients = std::move(mirror_clients),
+                        .source_clients = std::move(source_clients),
+                        .takers = {},
+                        .task_id = task_id};
                     queued = true;
                 }
             });
@@ -10602,6 +10857,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
             return evict_replicas(quota_account, metadata, deferred_replicas);
         }
 
+        // Already queued for offload (its source replica is pinned): never
+        // push a second item, which would replace the queued item of the
+        // current task and pin another replica that no task releases.
+        if (state.offloading_task) {
+            return evict_replicas(quota_account, metadata, deferred_replicas);
+        }
+
         // Force-evict cap: if force_evict enabled and cap reached, force
         // delete. Warning is aggregated at the end of the cycle to avoid log
         // flooding.
@@ -10617,16 +10879,22 @@ void MasterService::BatchEvict(double evict_ratio_target,
             [this, &tenant_id, &key, &state, &queued, &now](Replica& replica) {
                 if (queued) return;  // only need to pin one replica for offload
                 std::vector<UUID> mirror_clients;
+                const L4TaskId task_id = NextL4TaskId();
                 auto result =
                     PushOffloadingQueue(MakeObjectIdentity(key, tenant_id),
-                                        replica, &mirror_clients);
+                                        replica, task_id, &mirror_clients);
                 if (result) {
                     replica.inc_refcnt();
-                    auto& task = state.offloading_task;
-                    if (!task) {
-                        task = OffloadingTask{replica.id(), now,
-                                              std::move(mirror_clients)};
-                    }
+                    // Only this replica was pushed, so every mirror copies
+                    // from the pinned source.
+                    auto source_clients = mirror_clients;
+                    state.offloading_task = OffloadingTask{
+                        .source_id = replica.id(),
+                        .start_time = now,
+                        .mirror_clients = std::move(mirror_clients),
+                        .source_clients = std::move(source_clients),
+                        .takers = {},
+                        .task_id = task_id};
                     queued = true;
                 }
             });

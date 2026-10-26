@@ -110,14 +110,17 @@ class FileStorage {
      * @brief Promote a set of keys from local SSD to DRAM (SSD prefetch).
      *
      * Each key must already have a promotion task registered on the master
-     * (Client::RegisterPrefetchTask) with this client as holder; this method
-     * runs the promotion execution chain (PromotionAllocStart -> staging
-     * AllocateBatch -> BatchLoad -> PromotionWrite -> NotifyPromotionSuccess).
+     * (Client::RegisterPrefetchPromotionTask) with this client as holder;
+     * this method runs the promotion execution chain (PromotionTaskAllocStart
+     * -> staging AllocateBatch -> BatchLoad -> PromotionWrite ->
+     * NotifyPromotionTaskSuccess), naming each key's task by its task id.
      * Failures are reported per-key via on_key_done and do not propagate;
      * this is best-effort.
      *
      * @param keys  Keys to promote
      * @param sizes Corresponding object sizes in bytes
+     * @param task_ids The task id the master returned for each key's
+     *        registration
      * @param dram_pressure Optional out-flag, set to true if any key failed
      *        because the master is out of DRAM (PromotionAllocStart returned
      *        NO_AVAILABLE_HANDLE), so the caller can back off prefetch and let
@@ -131,7 +134,7 @@ class FileStorage {
 
     tl::expected<void, ErrorCode> PrefetchKeys(
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
-        bool* dram_pressure = nullptr,
+        const std::vector<L4TaskId>& task_ids, bool* dram_pressure = nullptr,
         PrefetchKeyCallback on_key_done = nullptr,
         const std::string& tenant_id = "");
 
@@ -162,6 +165,10 @@ class FileStorage {
         FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplica_Test;
     friend class
         FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket_Test;
+    friend class
+        FileStorageTest_RemountAfterSegmentNotFoundDropsUnregisteredFiles_Test;
+    friend class
+        FileStorageTest_OffloadSourcesUnchangedDetectsAReplacedSource_Test;
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
@@ -186,6 +193,24 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> OffloadObjects(
         const std::vector<OffloadTaskItem>& offloading_objects);
+
+    /**
+     * @brief Handles the offload items of one heartbeat drain: NACKs items
+     * without a task id without copying them, drops carried tasks of another
+     * master (DropCarriedOffloadTasksOfAnotherEpoch) and offloads the rest
+     * (OffloadObjects).
+     */
+    tl::expected<void, ErrorCode> ProcessDrainedOffloads(
+        std::vector<OffloadTaskItem> drained);
+
+    // Drops the carried tasks (deferred_task_by_storage_key_) whose task id
+    // epoch is not that of `drained`, the items just drained from the current
+    // master, together with their keys in the bucket backend's pool.
+    void DropCarriedOffloadTasksOfAnotherEpoch(
+        const std::vector<OffloadTaskItem>& drained);
+
+    // NACKs every carried task and empties the bucket backend's pool.
+    void NackCarriedOffloadTasks();
 
     /**
      * @brief Classifies a BatchOffload error as affecting only the current
@@ -240,13 +265,14 @@ class FileStorage {
      * NotifyPromotionFailure on every failure path (RAII guard).
      *
      * Shared by the heartbeat-driven promotion-on-hit path
-     * (ProcessPromotionTasks) and the prefetch path (PrefetchKeys).
+     * (ProcessPromotionTasks) and the prefetch path (PrefetchKeys). Every
+     * call names the task by `task`'s task id; an item without one stages
+     * nothing and only ends its task.
      * @param dram_pressure Optional out-flag set when PromotionAllocStart
      *        failed with NO_AVAILABLE_HANDLE (master out of DRAM).
      */
     tl::expected<void, ErrorCode> PromoteOneKeyFromLocalDisk(
-        const std::string& key, const std::string& tenant_id, int64_t size,
-        bool* dram_pressure);
+        const PromotionTaskItem& task, bool* dram_pressure);
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
@@ -258,9 +284,19 @@ class FileStorage {
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batch_object);
 
+    // Slices of each key's first readable memory replica in this process's
+    // segments; `replica_ids` (optional) receives that replica's id.
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
         const std::vector<std::string>& keys, const std::string& tenant_id,
-        std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
+        std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
+        std::unordered_map<std::string, ReplicaID>* replica_ids = nullptr);
+
+    // True if every key's copied source replica (by id) is still the key's
+    // first readable local memory replica.
+    bool OffloadSourcesUnchanged(
+        const std::vector<std::string>& storage_keys,
+        const std::unordered_map<std::string, OffloadTaskItem>& tasks,
+        const std::unordered_map<std::string, ReplicaID>& sources);
 
     tl::expected<void, ErrorCode> RegisterLocalMemory();
 
@@ -274,12 +310,10 @@ class FileStorage {
 
     void ClientBufferGCThreadFunc();
 
-    /**
-     * @brief Re-registers all offloaded objects with the master.
-     * Called after master restart recovery to sync SSD object metadata.
-     * This is the same logic as the ScanMeta step in Init().
-     */
-    tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
+    // Wipes the offload index when the LOCAL_DISK registration is new (process
+    // start, re-mount after SEGMENT_NOT_FOUND): the master never registers a
+    // file the store already had, so such files are useless.
+    void DropUnregisteredFiles(const char* reason);
 
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
@@ -357,6 +391,9 @@ class FileStorage {
     // a bucket. Only touched from the offload worker path (single-threaded);
     // lost on restart together with the backend's in-memory ungrouped pool,
     // in which case the master's TTL reaper reclaims the orphaned tasks.
+    // NACKed when the LOCAL_DISK segment is mounted anew
+    // (NackCarriedOffloadTasks), and dropped once the store drains items of
+    // another master (DropCarriedOffloadTasksOfAnotherEpoch).
     std::unordered_map<std::string, OffloadTaskItem>
         deferred_task_by_storage_key_;
 
@@ -366,15 +403,18 @@ class FileStorage {
     std::thread heartbeat_thread_;
     std::atomic<bool> client_buffer_gc_running_;
     std::thread client_buffer_gc_thread_;
-    std::future<void> rescan_future_;
-    std::atomic<bool> metadata_resync_pending_{false};
     // Set by DrainLocalDiskSegment under offloading_mutex_. Stops the
     // heartbeat -- which would otherwise re-mount the segment the drain just
-    // deregistered -- and aborts an in-flight metadata rescan. Checked at
-    // Heartbeat entry (fast path, also guards the rescan-retry block) and
-    // again under offloading_mutex_ before the heartbeat RPC, because a tick
-    // parked on that lock passed the entry check before the drain latched.
+    // deregistered. Checked at Heartbeat entry (fast path) and again under
+    // offloading_mutex_ before the heartbeat RPC, because a tick parked on that
+    // lock passed the entry check before the drain latched.
     std::atomic<bool> draining_{false};
+    // Test-only replacement for the offload completion RPC
+    // (Client::NotifyOffloadTaskSuccess).
+    std::function<tl::expected<void, ErrorCode>(
+        const std::vector<OffloadTaskItem>&,
+        const std::vector<StorageObjectMetadata>&)>
+        test_offload_completion_rpc_;
 };
 
 }  // namespace mooncake

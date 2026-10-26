@@ -174,8 +174,8 @@ class ClientRequester {
      * given keys. Used for cross-node SSD prefetch: the holder must register
      * the promotion task itself (the master validates holder_id ==
      * client_id), so the requester delegates via this RPC instead of calling
-     * RegisterPrefetchTask locally. Best-effort: errors are logged, not
-     * propagated, and never block the originating exist() call. Old peers
+     * RegisterPrefetchPromotionTask locally. Best-effort: errors are logged,
+     * not propagated, and never block the originating exist() call. Old peers
      * reject the RPC and the keys simply stay SSD-only.
      * @param client_addr Network address of the holder's offload RPC service.
      * @param keys SSD-only keys held by the remote node.

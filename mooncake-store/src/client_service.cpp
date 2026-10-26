@@ -4558,17 +4558,16 @@ tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
 }
 
 tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
-    const std::vector<std::string>& keys,
-    const std::vector<StorageObjectMetadata>& metadatas) {
-    auto response =
-        master_client_.NotifyOffloadSuccess(client_id_, keys, metadatas);
-    return response;
-}
-
-tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas) {
     return master_client_.NotifyOffloadSuccess(client_id_, tasks, metadatas);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyOffloadTaskSuccess(
+    const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    return master_client_.NotifyOffloadTaskSuccess(client_id_, tasks,
+                                                   metadatas);
 }
 
 void Client::SetDfsStorageBackend(
@@ -4587,11 +4586,11 @@ tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     return {};
 }
 
-tl::expected<void, ErrorCode> Client::RegisterPrefetchTask(
+tl::expected<L4TaskId, ErrorCode> Client::RegisterPrefetchPromotionTask(
     const std::string& object_key, const std::string& tenant_id) {
     // Default (empty) means this client's own tenant; a delegated prefetch
     // carries the requester's tenant explicitly.
-    return master_client_.RegisterPrefetchTask(
+    return master_client_.RegisterPrefetchPromotionTask(
         client_id_, object_key,
         tenant_id.empty() ? master_client_.tenant_id() : tenant_id);
 }
@@ -4630,6 +4629,24 @@ tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
 tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
     const std::string& key, const std::string& tenant_id) {
     return master_client_.NotifyPromotionFailure(client_id_, key, tenant_id);
+}
+
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+Client::PromotionTaskAllocStart(
+    const PromotionTaskItem& item,
+    const std::vector<std::string>& preferred_segments) {
+    return master_client_.PromotionTaskAllocStart(client_id_, item,
+                                                  preferred_segments);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionTaskSuccess(
+    const PromotionTaskItem& item) {
+    return master_client_.NotifyPromotionTaskSuccess(client_id_, item);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionTaskFailure(
+    const PromotionTaskItem& item) {
+    return master_client_.NotifyPromotionTaskFailure(client_id_, item);
 }
 
 ErrorCode Client::PromotionWrite(const Replica::Descriptor& memory_descriptor,
@@ -5645,8 +5662,7 @@ void Client::StorageHeartbeatThreadMain() {
         }
         // Note: LOCAL_DISK segment remount is NOT done here.
         // It is handled by FileStorage::Heartbeat() when it detects
-        // SEGMENT_NOT_FOUND, which also triggers ScanMeta to
-        // re-register offloaded object metadata.
+        // SEGMENT_NOT_FOUND.
     };
     // Use another thread to remount segments to avoid blocking the ping
     // thread

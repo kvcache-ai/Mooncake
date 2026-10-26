@@ -96,11 +96,13 @@ void RegisterAndPromote(Client& client, FileStorage& file_storage,
         }
     };
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto register_result = client.RegisterPrefetchTask(keys[i], tenant_id);
+        auto register_result =
+            client.RegisterPrefetchPromotionTask(keys[i], tenant_id);
         if (!register_result) {
             if (register_result.error() !=
                 ErrorCode::PROMOTION_ALREADY_EXISTS) {
-                VLOG(1) << "SSD prefetch: RegisterPrefetchTask failed for key="
+                VLOG(1) << "SSD prefetch: RegisterPrefetchPromotionTask "
+                           "failed for key="
                         << keys[i] << ", error=" << register_result.error();
                 if (throttle) {
                     throttle->markFailed(
@@ -114,8 +116,9 @@ void RegisterAndPromote(Client& client, FileStorage& file_storage,
                 ScopeTenantKey(own_tenant, tenant_id, keys[i]));
         }
         bool dram_pressure = false;
-        auto prefetch_res = file_storage.PrefetchKeys(
-            {keys[i]}, {sizes[i]}, &dram_pressure, on_key_done, tenant_id);
+        auto prefetch_res =
+            file_storage.PrefetchKeys({keys[i]}, {sizes[i]}, {*register_result},
+                                      &dram_pressure, on_key_done, tenant_id);
         if (!prefetch_res) {
             LOG(WARNING) << "SSD prefetch: PrefetchKeys failed for key="
                          << keys[i] << ", error=" << prefetch_res.error();

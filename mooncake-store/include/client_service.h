@@ -671,9 +671,11 @@ class Client {
      * the promotion-on-hit admission gate or heartbeat mailbox. This client
      * must hold the key's LOCAL_DISK replica. Best-effort:
      * PROMOTION_ALREADY_EXISTS means skip quietly. The client's tenant
-     * applies.
+     * applies. Returns the task's id: the promotion calls that run the
+     * prefetch (PromotionTaskAllocStart, NotifyPromotionTaskSuccess,
+     * NotifyPromotionTaskFailure) name the task by it.
      */
-    virtual tl::expected<void, ErrorCode> RegisterPrefetchTask(
+    virtual tl::expected<L4TaskId, ErrorCode> RegisterPrefetchPromotionTask(
         const std::string& object_key, const std::string& tenant_id);
 
     /**
@@ -708,6 +710,19 @@ class Client {
         const std::string& key, const std::string& tenant_id);
 
     /**
+     * @brief The promotion calls for a drained item: they name the task by
+     * the item's task id, so a late call for an earlier promotion of the key
+     * can never stage, commit or free a buffer of a newer one.
+     */
+    virtual tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionTaskAllocStart(const PromotionTaskItem& item,
+                            const std::vector<std::string>& preferred_segments);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionTaskSuccess(
+        const PromotionTaskItem& item);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionTaskFailure(
+        const PromotionTaskItem& item);
+
+    /**
      * @brief Write `slices` into the memory replica described by
      * `memory_descriptor` via Transfer Engine. Used by FileStorage to fill a
      * PROCESSING memory replica staged by PromotionAllocStart before calling
@@ -737,17 +752,18 @@ class Client {
         TransferIntent intent = TransferIntent::kForegroundGet);
 
     /**
-     * @brief Notifies the master that offloading of specified objects has
-     * succeeded.
-     * @param keys         A list of object keys (names) that were successfully
-     * offloaded.
-     * @param metadatas    The corresponding metadata for each offloaded object,
-     * including size, storage location, etc.
+     * @brief Reports offload NACKs (data_size < 0) for the items this client
+     * drained, echoing each item (task id included).
+     * @param tasks        The drained items.
+     * @param metadatas    The corresponding metadata for each item.
      */
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
-        const std::vector<std::string>& keys,
+        const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
-    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+    // Completions are registered only through this RPC name (see
+    // MasterClient::NotifyOffloadTaskSuccess); NotifyOffloadSuccess above
+    // carries NACKs.
+    tl::expected<void, ErrorCode> NotifyOffloadTaskSuccess(
         const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
     void SetDfsStorageBackend(
