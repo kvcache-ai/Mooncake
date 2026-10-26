@@ -254,6 +254,9 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_rdma_retries_total` | Counter | `operation`, `cause` | RDMA slice retries actually re-enqueued after endpoint, post, or completion failure |
 | `tent_rdma_retry_exhausted_total` | Counter | `operation`, `cause` | RDMA slices terminated after reaching the configured retry limit |
 | `tent_rdma_cq_poll_errors_total` | Counter | - | Completion queue polls that returned an error |
+| `tent_rdma_endpoint_events_total` | Counter | `event` | RDMA endpoint construction, ready, retirement and destruction transitions |
+| `tent_rdma_qp_transition_failures_total` | Counter | `qp_type`, `transition` | Failed data or notification QP state transitions |
+| `tent_rdma_notification_events_total` | Counter | `event` | Notification receive posting/delivery, send posting/completion and channel failures |
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
 | `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
 | `tent_worker_last_progress_timestamp_seconds` | Gauge | `worker` | Unix timestamp of the last observed engine-progress, staging, or RDMA-worker progress |
@@ -319,8 +322,10 @@ addresses, segment names, or other unbounded values are accepted.
 | `worker` | `engine_progress`, `staging`, `rdma` | Worker subsystem reporting forward progress |
 | `kind` | `group`, `batch`, `remote_operation` | Deferred staging cleanup resource kind |
 | `method` | `get_segment_desc`, `bootstrap_rdma`, `bootstrap_ub`, `send_data`, `recv_data`, `notify`, `probe`, `delegate`, `pin`, `unpin`, `subscribe_segment_update`, `notify_segment_updated`, `unknown` | TENT RPC method; `unknown` safely bounds extension methods |
-| `event` | `enqueued`, `post_attempt`, `path_error`, `post_error`, `completion_success`, `completion_error`, `completion_flush`, `late_completion`, `software_timeout` | RDMA slice lifecycle transition observed at its canonical owner |
+| `event` | RDMA slice: `enqueued`, `post_attempt`, `path_error`, `post_error`, `completion_success`, `completion_error`, `completion_flush`, `late_completion`, `software_timeout`; endpoint: `constructed`, `construct_failure`, `ready_active`, `ready_passive`, `retiring`, `destroyed`, `destroy_error`; notification: `recv_posted`, `recv_post_error`, `recv_delivered`, `recv_invalid`, `recv_dropped`, `send_posted`, `send_completed`, `send_unavailable`, `send_encode_error`, `send_post_error`, `completion_error`, `cq_poll_error`, `unknown_qp`, `channel_disabled` | Family-specific bounded RDMA lifecycle event |
 | `cause` | `endpoint`, `post`, `completion` | RDMA retry or retry-exhaustion source |
+| `qp_type` | `data`, `notification` | RDMA queue-pair role; QP numbers are never labels |
+| `transition` | `create`, `reset`, `init`, `rtr`, `rts`, `error`, `destroy` | Queue-pair transition that failed |
 | `format` | `prometheus`, `json` | Serialization output format |
 | `from` | (same set) | Transport that failed before failover |
 | `to` | (same set) | Transport that the failover switched to |
@@ -360,6 +365,13 @@ from the posted gauge. `late_completion` is a CQE for a slice already resolved
 by timeout, cancellation, or an adjacent queue-pair sweep. A retry is counted
 only when the slice is actually re-enqueued; an exhausted attempt increments
 only `tent_rdma_retry_exhausted_total`.
+
+Endpoint lifecycle metrics have seven event series. QP transition failures
+have at most 2x7 = 14 QP-type/transition series, and notification diagnostics
+have fourteen event series. These metrics identify the failing lifecycle phase
+without exposing endpoint names, peer addresses, connection generations or QP
+numbers. Expected flush completions from an endpoint already retiring are not
+counted as notification completion errors.
 
 `tent_worker_last_progress_timestamp_seconds` advances when the engine progress
 worker completes a wake cycle, when a staging worker changes a chunk state or

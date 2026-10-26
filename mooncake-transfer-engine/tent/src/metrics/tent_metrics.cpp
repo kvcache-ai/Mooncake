@@ -298,6 +298,91 @@ const char* rdmaCompletionOutcomeName(
     }
     return "unknown";
 }
+
+const char* rdmaEndpointEventName(TentMetrics::RdmaEndpointEvent event) {
+    switch (event) {
+        case TentMetrics::RdmaEndpointEvent::Constructed:
+            return "constructed";
+        case TentMetrics::RdmaEndpointEvent::ConstructFailure:
+            return "construct_failure";
+        case TentMetrics::RdmaEndpointEvent::ReadyActive:
+            return "ready_active";
+        case TentMetrics::RdmaEndpointEvent::ReadyPassive:
+            return "ready_passive";
+        case TentMetrics::RdmaEndpointEvent::Retiring:
+            return "retiring";
+        case TentMetrics::RdmaEndpointEvent::Destroyed:
+            return "destroyed";
+        case TentMetrics::RdmaEndpointEvent::DestroyError:
+            return "destroy_error";
+    }
+    return "unknown";
+}
+
+const char* rdmaQpTypeName(TentMetrics::RdmaQpType qp_type) {
+    switch (qp_type) {
+        case TentMetrics::RdmaQpType::Data:
+            return "data";
+        case TentMetrics::RdmaQpType::Notification:
+            return "notification";
+    }
+    return "unknown";
+}
+
+const char* rdmaQpTransitionName(TentMetrics::RdmaQpTransition transition) {
+    switch (transition) {
+        case TentMetrics::RdmaQpTransition::Create:
+            return "create";
+        case TentMetrics::RdmaQpTransition::Reset:
+            return "reset";
+        case TentMetrics::RdmaQpTransition::Init:
+            return "init";
+        case TentMetrics::RdmaQpTransition::Rtr:
+            return "rtr";
+        case TentMetrics::RdmaQpTransition::Rts:
+            return "rts";
+        case TentMetrics::RdmaQpTransition::Error:
+            return "error";
+        case TentMetrics::RdmaQpTransition::Destroy:
+            return "destroy";
+    }
+    return "unknown";
+}
+
+const char* rdmaNotificationEventName(
+    TentMetrics::RdmaNotificationEvent event) {
+    switch (event) {
+        case TentMetrics::RdmaNotificationEvent::RecvPosted:
+            return "recv_posted";
+        case TentMetrics::RdmaNotificationEvent::RecvPostError:
+            return "recv_post_error";
+        case TentMetrics::RdmaNotificationEvent::RecvDelivered:
+            return "recv_delivered";
+        case TentMetrics::RdmaNotificationEvent::RecvInvalid:
+            return "recv_invalid";
+        case TentMetrics::RdmaNotificationEvent::RecvDropped:
+            return "recv_dropped";
+        case TentMetrics::RdmaNotificationEvent::SendPosted:
+            return "send_posted";
+        case TentMetrics::RdmaNotificationEvent::SendCompleted:
+            return "send_completed";
+        case TentMetrics::RdmaNotificationEvent::SendUnavailable:
+            return "send_unavailable";
+        case TentMetrics::RdmaNotificationEvent::SendEncodeError:
+            return "send_encode_error";
+        case TentMetrics::RdmaNotificationEvent::SendPostError:
+            return "send_post_error";
+        case TentMetrics::RdmaNotificationEvent::CompletionError:
+            return "completion_error";
+        case TentMetrics::RdmaNotificationEvent::CqPollError:
+            return "cq_poll_error";
+        case TentMetrics::RdmaNotificationEvent::UnknownQp:
+            return "unknown_qp";
+        case TentMetrics::RdmaNotificationEvent::ChannelDisabled:
+            return "channel_disabled";
+    }
+    return "unknown";
+}
 }  // namespace
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
@@ -499,6 +584,9 @@ void TentMetrics::registerMetrics() {
         &rdma_retries_total_,
         &rdma_retry_exhausted_total_,
         &rdma_cq_poll_errors_total_,
+        &rdma_endpoint_events_total_,
+        &rdma_qp_transition_failures_total_,
+        &rdma_notification_events_total_,
     };
 
     gauges_ = {
@@ -804,6 +892,39 @@ void TentMetrics::recordRdmaCompletion(Request::OpCode operation,
                 operationName(operation), rdmaCompletionOutcomeName(outcome)};
         },
         static_cast<int64_t>(latency_us));
+}
+
+void TentMetrics::recordRdmaEndpointEvent(RdmaEndpointEvent event) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    rdma_endpoint_events_total_.incCached(static_cast<size_t>(event), [event] {
+        return std::array<std::string, 1>{rdmaEndpointEventName(event)};
+    });
+}
+
+void TentMetrics::recordRdmaQpTransitionFailure(
+    RdmaQpType qp_type, RdmaQpTransition transition) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    rdma_qp_transition_failures_total_.incCached(
+        rdmaQpFailureSlot(qp_type, transition), [qp_type, transition] {
+            return std::array<std::string, 2>{rdmaQpTypeName(qp_type),
+                                              rdmaQpTransitionName(transition)};
+        });
+}
+
+void TentMetrics::recordRdmaNotificationEvent(RdmaNotificationEvent event,
+                                               int64_t count) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed) ||
+        count <= 0)
+        return;
+    rdma_notification_events_total_.incCached(
+        static_cast<size_t>(event),
+        [event] {
+            return std::array<std::string, 1>{
+                rdmaNotificationEventName(event)};
+        },
+        count);
 }
 
 // Gauge updates below deliberately ignore runtime_enabled_: gauges track
@@ -1302,6 +1423,12 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&rdma_retry_exhausted_total_);
         root[rdma_cq_poll_errors_total_.str_name()] =
             static_cast<int64_t>(rdma_cq_poll_errors_total_.value());
+        root[rdma_endpoint_events_total_.str_name()] =
+            sumCounterValues(&rdma_endpoint_events_total_);
+        root[rdma_qp_transition_failures_total_.str_name()] =
+            sumCounterValues(&rdma_qp_transition_failures_total_);
+        root[rdma_notification_events_total_.str_name()] =
+            sumCounterValues(&rdma_notification_events_total_);
 
         // Gauges: aggregate across transport labels (total in-flight attempts
         // / total registered bytes). Per-transport breakdown is via the
@@ -1478,6 +1605,9 @@ void TentMetrics::recordRdmaWorkerInflight(Request::OpCode, int64_t) {}
 void TentMetrics::recordRdmaPostedInflight(Request::OpCode, int64_t) {}
 void TentMetrics::recordRdmaCompletion(Request::OpCode, RdmaCompletionOutcome,
                                        double) {}
+void TentMetrics::recordRdmaEndpointEvent(RdmaEndpointEvent) {}
+void TentMetrics::recordRdmaQpTransitionFailure(RdmaQpType, RdmaQpTransition) {}
+void TentMetrics::recordRdmaNotificationEvent(RdmaNotificationEvent, int64_t) {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}

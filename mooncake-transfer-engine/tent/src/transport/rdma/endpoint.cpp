@@ -34,6 +34,7 @@
 #include "tent/common/types.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/string_builder.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/thirdparty/nlohmann/json.h"
 #include "tent/transport/rdma/context.h"
@@ -93,6 +94,10 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     EndPointStatus expected = EP_UNINIT;
     if (!status_.compare_exchange_strong(expected, EP_HANDSHAKING,
                                          std::memory_order_acq_rel)) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaEndpointEvent(
+            TentMetrics::RdmaEndpointEvent::ConstructFailure);
+#endif
         LOG(ERROR) << "Endpoint can only be constructed from EP_UNINIT, got "
                    << statusToString(expected);
         return -1;
@@ -111,6 +116,10 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     QpPoolLayout layout =
         computeQpPoolSegments(params_->qp_pools, params_->qp_mul_factor);
     if (!layout.valid) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaEndpointEvent(
+            TentMetrics::RdmaEndpointEvent::ConstructFailure);
+#endif
         LOG(ERROR) << "Invalid QP count " << layout.total_qp
                    << " (qp_mul_factor=" << params_->qp_mul_factor
                    << ", pools=" << params_->qp_pools.size() << ")";
@@ -141,6 +150,13 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
         qp_list_[i] =
             context_->verbs_.ibv_create_qp(context_->nativePD(), &attr);
         if (!qp_list_[i]) {
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordRdmaQpTransitionFailure(
+                TentMetrics::RdmaQpType::Data,
+                TentMetrics::RdmaQpTransition::Create);
+            TentMetrics::instance().recordRdmaEndpointEvent(
+                TentMetrics::RdmaEndpointEvent::ConstructFailure);
+#endif
             PLOG(ERROR) << "ibv_create_qp";
             deconstruct();
             return -1;
@@ -163,6 +179,13 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     notify_qp_ =
         context_->verbs_.ibv_create_qp(context_->nativePD(), &notify_attr);
     if (!notify_qp_) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaQpTransitionFailure(
+            TentMetrics::RdmaQpType::Notification,
+            TentMetrics::RdmaQpTransition::Create);
+        TentMetrics::instance().recordRdmaEndpointEvent(
+            TentMetrics::RdmaEndpointEvent::ConstructFailure);
+#endif
         PLOG(ERROR) << "Failed to create notification QP";
         deconstruct();
         return -1;
@@ -179,6 +202,13 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     if (context_->verbs_.ibv_modify_qp(notify_qp_, &qp_attr,
                                        IBV_QP_STATE | IBV_QP_PKEY_INDEX |
                                            IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaQpTransitionFailure(
+            TentMetrics::RdmaQpType::Notification,
+            TentMetrics::RdmaQpTransition::Init);
+        TentMetrics::instance().recordRdmaEndpointEvent(
+            TentMetrics::RdmaEndpointEvent::ConstructFailure);
+#endif
         PLOG(ERROR) << "Failed to modify notification QP to INIT";
         deconstruct();
         return -1;
@@ -192,6 +222,10 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
         context_->nativePD(), notify_recv_buffer_.data(),
         notify_recv_buffer_.size(), IBV_ACCESS_LOCAL_WRITE);
     if (!notify_recv_mr_) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaEndpointEvent(
+            TentMetrics::RdmaEndpointEvent::ConstructFailure);
+#endif
         PLOG(ERROR) << "Failed to register notification recv buffer";
         deconstruct();
         return -1;
@@ -204,11 +238,19 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
         context_->nativePD(), notify_send_buffer_.data(),
         notify_send_buffer_.size(), IBV_ACCESS_LOCAL_WRITE);
     if (!notify_send_mr_) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaEndpointEvent(
+            TentMetrics::RdmaEndpointEvent::ConstructFailure);
+#endif
         PLOG(ERROR) << "Failed to register notification send buffer";
         deconstruct();
         return -1;
     }
 
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordRdmaEndpointEvent(
+        TentMetrics::RdmaEndpointEvent::Constructed);
+#endif
     return 0;
 }
 
@@ -234,6 +276,10 @@ int RdmaEndPoint::deconstructUnlocked() {
     // though it never reached EP_HANDSHAKING.
     if (!context_) {
         status_.store(EP_DESTROYED, std::memory_order_release);
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaEndpointEvent(
+            TentMetrics::RdmaEndpointEvent::Destroyed);
+#endif
         return 0;
     }
 
@@ -246,6 +292,11 @@ int RdmaEndPoint::deconstructUnlocked() {
             // Unregister from transport before destroying
             context_->transport_.unregisterNotifyQp(notify_qp_->qp_num);
             if (context_->verbs_.ibv_destroy_qp(notify_qp_)) {
+#if TENT_METRICS_ENABLED
+                TentMetrics::instance().recordRdmaQpTransitionFailure(
+                    TentMetrics::RdmaQpType::Notification,
+                    TentMetrics::RdmaQpTransition::Destroy);
+#endif
                 PLOG(ERROR) << "Failed to destroy notification QP";
                 result = -1;
             } else {
@@ -289,6 +340,11 @@ int RdmaEndPoint::deconstructUnlocked() {
         }
         if (!qp_list_[i]) continue;
         if (context_->verbs_.ibv_destroy_qp(qp_list_[i])) {
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordRdmaQpTransitionFailure(
+                TentMetrics::RdmaQpType::Data,
+                TentMetrics::RdmaQpTransition::Destroy);
+#endif
             PLOG(ERROR) << "Failed to destroy data QP[" << i << "]";
             result = -1;
             all_qps_destroyed = false;
@@ -312,8 +368,16 @@ int RdmaEndPoint::deconstructUnlocked() {
         // path health table) without taking lock_, and nothing needs them
         // cleared - EP_DESTROYED already says the endpoint is gone.
         status_.store(EP_DESTROYED, std::memory_order_release);
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaEndpointEvent(
+            TentMetrics::RdmaEndpointEvent::Destroyed);
+#endif
         return 0;
     }
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordRdmaEndpointEvent(
+        TentMetrics::RdmaEndpointEvent::DestroyError);
+#endif
     return -1;
 }
 
@@ -329,6 +393,10 @@ void RdmaEndPoint::beginDestroyNoLock() {
 
     destroy_start_time_ = getCurrentTimeInNano();
     status_.store(EP_DESTROYING, std::memory_order_release);
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordRdmaEndpointEvent(
+        TentMetrics::RdmaEndpointEvent::Retiring);
+#endif
 
     // The notify QP stays published until deconstruct(): notifications that
     // already landed (the sender saw them acked) may still sit in the CQ
@@ -356,11 +424,21 @@ void RdmaEndPoint::beginDestroyNoLock() {
         int ret =
             context_->verbs_.ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
         if (ret) {
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordRdmaQpTransitionFailure(
+                TentMetrics::RdmaQpType::Data,
+                TentMetrics::RdmaQpTransition::Error);
+#endif
             PLOG(ERROR) << "Failed to modify QP to ERR in beginDestroy";
         }
     }
     if (notify_qp_ &&
         context_->verbs_.ibv_modify_qp(notify_qp_, &attr, IBV_QP_STATE)) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaQpTransitionFailure(
+            TentMetrics::RdmaQpType::Notification,
+            TentMetrics::RdmaQpTransition::Error);
+#endif
         PLOG(ERROR) << "Failed to modify notification QP to ERR in "
                        "beginDestroy";
     }
@@ -574,6 +652,10 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
                 "Failed to configure RDMA endpoint" LOC_MARK);
         }
         peer_qp_num_list_ = qp_num;
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaEndpointEvent(
+            TentMetrics::RdmaEndpointEvent::ReadyActive);
+#endif
 
         // Setup notification QP connection if peer supports it
         if (peer_desc.notify_qp_num != 0 && notify_qp_) {
@@ -678,6 +760,10 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
             "Failed to configure RDMA endpoint" LOC_MARK);
     }
     peer_qp_num_list_ = peer_desc.qp_num;
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordRdmaEndpointEvent(
+        TentMetrics::RdmaEndpointEvent::ReadyPassive);
+#endif
 
     // Setup notification QP connection if peer supports it
     if (peer_desc.notify_qp_num != 0 && notify_qp_) {
@@ -986,6 +1072,11 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
         qp, &attr,
         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
     if (ret) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaQpTransitionFailure(
+            TentMetrics::RdmaQpType::Data,
+            TentMetrics::RdmaQpTransition::Init);
+#endif
         std::stringstream ss;
         ss << "Failed to modify QP's state to INIT in endpoint "
            << peer_nic_name_ << " of " << peer_server_name_
@@ -1033,6 +1124,11 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
         IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_MIN_RNR_TIMER | IBV_QP_AV |
             IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN);
     if (ret) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaQpTransitionFailure(
+            TentMetrics::RdmaQpType::Data,
+            TentMetrics::RdmaQpTransition::Rtr);
+#endif
         std::stringstream ss;
         ss << "Failed to modify QP's state to RTR in endpoint "
            << peer_nic_name_ << " of " << peer_server_name_
@@ -1057,6 +1153,11 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
         IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
             IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
     if (ret) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaQpTransitionFailure(
+            TentMetrics::RdmaQpType::Data,
+            TentMetrics::RdmaQpTransition::Rts);
+#endif
         std::stringstream ss;
         ss << "Failed to modify QP's state to RTS in endpoint "
            << peer_nic_name_ << " of " << peer_server_name_ << ", error code "
@@ -1112,8 +1213,13 @@ bool RdmaEndPoint::decodeNotifyPayload(const char* data, size_t byte_len,
 
 void RdmaEndPoint::postNotifyRecv(size_t idx) {
     if (!notify_qp_ || !notify_recv_mr_ || idx >= kNotifyMaxPendingSends ||
-        notify_recv_buffer_.size() < (idx + 1) * kNotifyBufferSize)
+        notify_recv_buffer_.size() < (idx + 1) * kNotifyBufferSize) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaNotificationEvent(
+            TentMetrics::RdmaNotificationEvent::RecvPostError);
+#endif
         return;
+    }
 
     ibv_sge sge = {};
     sge.addr = reinterpret_cast<uint64_t>(
@@ -1129,11 +1235,19 @@ void RdmaEndPoint::postNotifyRecv(size_t idx) {
     ibv_recv_wr* bad_wr = nullptr;
     int ret = ibv_post_recv(notify_qp_, &wr, &bad_wr);
     if (ret) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaNotificationEvent(
+            TentMetrics::RdmaNotificationEvent::RecvPostError);
+#endif
         LOG(ERROR) << "Failed to post notification recv: " << strerror(abs(ret))
                    << " [" << ret << "]";
         return;
     }
     notify_inflight_.fetch_add(1, std::memory_order_release);
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordRdmaNotificationEvent(
+        TentMetrics::RdmaNotificationEvent::RecvPosted);
+#endif
 }
 
 void RdmaEndPoint::rearmNotifyRecv(size_t idx) {
@@ -1163,6 +1277,11 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
     qp_attr.qp_state = IBV_QPS_RESET;
     int ret = ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE);
     if (ret) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaQpTransitionFailure(
+            TentMetrics::RdmaQpType::Notification,
+            TentMetrics::RdmaQpTransition::Reset);
+#endif
         PLOG(ERROR) << "Failed to modify notification QP to RESET";
         return -1;
     }
@@ -1176,6 +1295,11 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
         qp, &qp_attr,
         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
     if (ret) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaQpTransitionFailure(
+            TentMetrics::RdmaQpType::Notification,
+            TentMetrics::RdmaQpTransition::Init);
+#endif
         PLOG(ERROR) << "Failed to modify notification QP to INIT";
         return -1;
     }
@@ -1219,6 +1343,11 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                             IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
                             IBV_QP_MIN_RNR_TIMER | IBV_QP_AV);
     if (ret) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaQpTransitionFailure(
+            TentMetrics::RdmaQpType::Notification,
+            TentMetrics::RdmaQpTransition::Rtr);
+#endif
         PLOG(ERROR) << "Failed to modify notification QP to RTR";
         return -1;
     }
@@ -1238,6 +1367,11 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                             IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
                             IBV_QP_MAX_QP_RD_ATOMIC);
     if (ret) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaQpTransitionFailure(
+            TentMetrics::RdmaQpType::Notification,
+            TentMetrics::RdmaQpTransition::Rts);
+#endif
         PLOG(ERROR) << "Failed to modify notification QP to RTS";
         return -1;
     }
@@ -1254,6 +1388,10 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
                notify_pending_count_ < kNotifyMaxPendingSends;
     });
     if (!notify_connected_) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaNotificationEvent(
+            TentMetrics::RdmaNotificationEvent::SendUnavailable);
+#endif
         // Every send on this endpoint fails the same way until it is
         // rebuilt, and the caller has a fallback path; one line per hundred
         // is enough to show it is happening.
@@ -1262,7 +1400,13 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
         return false;
     }
     std::lock_guard<std::mutex> resource_guard(notify_resource_mutex_);
-    if (!notify_qp_ || !notify_send_mr_) return false;
+    if (!notify_qp_ || !notify_send_mr_) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaNotificationEvent(
+            TentMetrics::RdmaNotificationEvent::SendUnavailable);
+#endif
+        return false;
+    }
 
     // Pick the next send slot — flow control guarantees this slot's previous
     // DMA has completed (at most kNotifyMaxPendingSends-1 in-flight).
@@ -1270,6 +1414,10 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     char* slot_ptr = notifySlotPtr(notify_send_buffer_.data(), slot);
     uint32_t total_size = 0;
     if (!encodeNotifyPayload(slot_ptr, name, msg, &total_size)) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaNotificationEvent(
+            TentMetrics::RdmaNotificationEvent::SendEncodeError);
+#endif
         LOG(ERROR) << "Failed to encode notification payload";
         return false;
     }
@@ -1290,6 +1438,10 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     ibv_send_wr* bad_wr = nullptr;
     int ret = ibv_post_send(notify_qp_, &wr, &bad_wr);
     if (ret) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaNotificationEvent(
+            TentMetrics::RdmaNotificationEvent::SendPostError);
+#endif
         LOG(ERROR) << "Failed to post notification send: " << strerror(abs(ret))
                    << " [" << ret << "], "
                    << "bad_wr id: " << (bad_wr ? bad_wr->wr_id : -1)
@@ -1303,12 +1455,20 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     ++notify_send_wr_id_;
     notify_pending_count_++;
     notify_inflight_.fetch_add(1, std::memory_order_release);
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordRdmaNotificationEvent(
+        TentMetrics::RdmaNotificationEvent::SendPosted);
+#endif
     return true;
 }
 
 bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     std::lock_guard<std::mutex> resource_guard(notify_resource_mutex_);
     if (!notify_recv_mr_) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaNotificationEvent(
+            TentMetrics::RdmaNotificationEvent::RecvDropped);
+#endif
         // The endpoint was deconstructed while this completion was in the
         // worker's batch. Rare, and not a malformed completion.
         LOG_EVERY_N(WARNING, 100)
@@ -1318,12 +1478,20 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     }
     if (buffer_idx >= kNotifyMaxPendingSends ||
         notify_recv_buffer_.size() < (buffer_idx + 1) * kNotifyBufferSize) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaNotificationEvent(
+            TentMetrics::RdmaNotificationEvent::RecvDropped);
+#endif
         LOG(ERROR) << "Invalid recv buffer index: " << buffer_idx;
         return false;
     }
 
     // Silent retry for byte_len == 0
     if (byte_len == 0) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaNotificationEvent(
+            TentMetrics::RdmaNotificationEvent::RecvInvalid);
+#endif
         rearmNotifyRecv(buffer_idx);
         return false;
     }
@@ -1332,6 +1500,10 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     std::string name;
     std::string msg;
     if (!decodeNotifyPayload(data, byte_len, &name, &msg)) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaNotificationEvent(
+            TentMetrics::RdmaNotificationEvent::RecvInvalid);
+#endif
         LOG(ERROR) << "Invalid notification message size or format: "
                    << byte_len;
         rearmNotifyRecv(buffer_idx);
@@ -1340,6 +1512,10 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
 
     // Add directly to transport queue (skip endpoint queue for lower latency)
     context_->transport_.addNotificationToQueue(name, msg);
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordRdmaNotificationEvent(
+        TentMetrics::RdmaNotificationEvent::RecvDelivered);
+#endif
 
     // Repost recv buffer
     rearmNotifyRecv(buffer_idx);
@@ -1350,6 +1526,10 @@ void RdmaEndPoint::handleNotifySendComplete(uint64_t wr_id) {
     std::lock_guard<std::mutex> lock(notify_send_mutex_);
     if (notify_pending_count_ > 0) {
         notify_pending_count_--;
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRdmaNotificationEvent(
+            TentMetrics::RdmaNotificationEvent::SendCompleted);
+#endif
         notify_send_cv_.notify_one();
     }
 }
@@ -1361,6 +1541,10 @@ void RdmaEndPoint::disableNotification(const std::string& reason) {
         if (!notify_connected_.exchange(false)) return;
         notify_send_cv_.notify_all();
     }
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordRdmaNotificationEvent(
+        TentMetrics::RdmaNotificationEvent::ChannelDisabled);
+#endif
     LOG(WARNING) << "Notifications disabled on endpoint " << endpoint_name_
                  << ", data path kept alive: " << reason;
     // The QP stays published: notifications already in the CQ are still

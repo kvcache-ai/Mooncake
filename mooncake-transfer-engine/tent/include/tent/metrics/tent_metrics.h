@@ -242,6 +242,41 @@ class TentMetrics {
     };
     enum class RdmaRetryCause { Endpoint, Post, Completion };
     enum class RdmaCompletionOutcome { Success, WcError, Flush, Late };
+    enum class RdmaEndpointEvent {
+        Constructed,
+        ConstructFailure,
+        ReadyActive,
+        ReadyPassive,
+        Retiring,
+        Destroyed,
+        DestroyError,
+    };
+    enum class RdmaQpType { Data, Notification };
+    enum class RdmaQpTransition {
+        Create,
+        Reset,
+        Init,
+        Rtr,
+        Rts,
+        Error,
+        Destroy,
+    };
+    enum class RdmaNotificationEvent {
+        RecvPosted,
+        RecvPostError,
+        RecvDelivered,
+        RecvInvalid,
+        RecvDropped,
+        SendPosted,
+        SendCompleted,
+        SendUnavailable,
+        SendEncodeError,
+        SendPostError,
+        CompletionError,
+        CqPollError,
+        UnknownQp,
+        ChannelDisabled,
+    };
 
     // RDMA data-path metrics count slices, not logical requests. Retry
     // counters advance only when another worker-queue attempt is actually
@@ -256,6 +291,11 @@ class TentMetrics {
     void recordRdmaPostedInflight(Request::OpCode operation, int64_t delta);
     void recordRdmaCompletion(Request::OpCode operation,
                               RdmaCompletionOutcome outcome, double latency_us);
+    void recordRdmaEndpointEvent(RdmaEndpointEvent event);
+    void recordRdmaQpTransitionFailure(RdmaQpType qp_type,
+                                       RdmaQpTransition transition);
+    void recordRdmaNotificationEvent(RdmaNotificationEvent event,
+                                     int64_t count = 1);
 
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
@@ -380,6 +420,12 @@ class TentMetrics {
                                                                     "cause"};
     static inline const std::array<std::string, 2> kRdmaCompletionLabels{
         "operation", "outcome"};
+    static inline const std::array<std::string, 1> kRdmaEndpointEventLabel{
+        "event"};
+    static inline const std::array<std::string, 2> kRdmaQpFailureLabels{
+        "qp_type", "transition"};
+    static inline const std::array<std::string, 1> kRdmaNotificationEventLabel{
+        "event"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -399,6 +445,12 @@ class TentMetrics {
     static constexpr size_t kRdmaSliceEventDomain = 9;
     static constexpr size_t kRdmaRetryCauseDomain = 3;
     static constexpr size_t kRdmaCompletionOutcomeDomain = 4;
+    static constexpr size_t kRdmaEndpointEventDomain = 7;
+    static constexpr size_t kRdmaQpTypeDomain = 2;
+    static constexpr size_t kRdmaQpTransitionDomain = 7;
+    static constexpr size_t kRdmaQpFailureDomain =
+        kRdmaQpTypeDomain * kRdmaQpTransitionDomain;
+    static constexpr size_t kRdmaNotificationEventDomain = 14;
     static constexpr size_t kRdmaEventDomain =
         kOperationDomain * kRdmaSliceEventDomain;
     static constexpr size_t kRdmaRetryDomain =
@@ -437,6 +489,11 @@ class TentMetrics {
                                      RdmaCompletionOutcome outcome) {
         return operationSlot(operation) * kRdmaCompletionOutcomeDomain +
                static_cast<size_t>(outcome);
+    }
+    static size_t rdmaQpFailureSlot(RdmaQpType qp_type,
+                                    RdmaQpTransition transition) {
+        return static_cast<size_t>(qp_type) * kRdmaQpTransitionDomain +
+               static_cast<size_t>(transition);
     }
 
     // Per-transport counters (label: transport). Values are int64_t.
@@ -530,6 +587,18 @@ class TentMetrics {
     ylt::metric::counter_t rdma_cq_poll_errors_total_{
         "tent_rdma_cq_poll_errors_total",
         "RDMA completion queue poll calls that returned an error"};
+    metrics::CachedDynamicCounter<1> rdma_endpoint_events_total_{
+        "tent_rdma_endpoint_events_total",
+        "RDMA endpoint lifecycle transitions", kRdmaEndpointEventLabel,
+        kRdmaEndpointEventDomain};
+    metrics::CachedDynamicCounter<2> rdma_qp_transition_failures_total_{
+        "tent_rdma_qp_transition_failures_total",
+        "RDMA queue-pair transition failures by QP type and transition",
+        kRdmaQpFailureLabels, kRdmaQpFailureDomain};
+    metrics::CachedDynamicCounter<1> rdma_notification_events_total_{
+        "tent_rdma_notification_events_total",
+        "RDMA notification channel events", kRdmaNotificationEventLabel,
+        kRdmaNotificationEventDomain};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_

@@ -34,6 +34,7 @@
 
 #include "tent/common/status.h"
 #include "tent/common/utils/ip.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/transport/rdma/buffers.h"
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/workers.h"
@@ -1071,6 +1072,10 @@ int RdmaTransport::processNotifyCompletions() {
         int completed = ibv_poll_cq(notify_cq->cq(), 16, wc);
 
         if (completed < 0) {
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordRdmaNotificationEvent(
+                TentMetrics::RdmaNotificationEvent::CqPollError);
+#endif
             PLOG(ERROR) << "Failed to poll notification CQ";
             continue;
         }
@@ -1124,6 +1129,10 @@ int RdmaTransport::processNotifyCompletions() {
                     wc[i].status, endpoint != nullptr, endpoint_ready);
                 if (action == NotifyCompletionAction::SkipSilently) continue;
 
+#if TENT_METRICS_ENABLED
+                TentMetrics::instance().recordRdmaNotificationEvent(
+                    TentMetrics::RdmaNotificationEvent::CompletionError);
+#endif
                 LOG(ERROR) << "Notification completion failed: " << wc[i].status
                            << ", qp_num=" << wc[i].qp_num;
                 if (action == NotifyCompletionAction::DisableNotification) {
@@ -1136,6 +1145,10 @@ int RdmaTransport::processNotifyCompletions() {
             }
 
             if (!endpoint) {
+#if TENT_METRICS_ENABLED
+                TentMetrics::instance().recordRdmaNotificationEvent(
+                    TentMetrics::RdmaNotificationEvent::UnknownQp);
+#endif
                 LOG(WARNING) << "Received notification from unknown QP: "
                              << wc[i].qp_num;
                 continue;

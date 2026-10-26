@@ -449,6 +449,13 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordRdmaPostedInflight(Request::WRITE, -1);
     metrics.recordRdmaCompletion(
         Request::WRITE, TentMetrics::RdmaCompletionOutcome::Success, 35.0);
+    metrics.recordRdmaEndpointEvent(
+        TentMetrics::RdmaEndpointEvent::Constructed);
+    metrics.recordRdmaQpTransitionFailure(
+        TentMetrics::RdmaQpType::Data,
+        TentMetrics::RdmaQpTransition::Rtr);
+    metrics.recordRdmaNotificationEvent(
+        TentMetrics::RdmaNotificationEvent::RecvPosted);
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -458,7 +465,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 48>
+    const std::array<std::pair<std::string_view, std::string_view>, 51>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -482,6 +489,9 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_rdma_retries_total", "counter"},
             {"tent_rdma_retry_exhausted_total", "counter"},
             {"tent_rdma_cq_poll_errors_total", "counter"},
+            {"tent_rdma_endpoint_events_total", "counter"},
+            {"tent_rdma_qp_transition_failures_total", "counter"},
+            {"tent_rdma_notification_events_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
             {"tent_worker_last_progress_timestamp_seconds", "gauge"},
@@ -664,6 +674,37 @@ TEST_F(MetricsRecordingTest, RdmaDataPathSignalsUseBoundedLabels) {
                   before.series("tent_rdma_posted_inflight_slices{operation="
                                 "\"write\"}"),
               0);
+}
+
+TEST_F(MetricsRecordingTest, RdmaLifecycleSignalsUseBoundedLabels) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordRdmaEndpointEvent(
+        TentMetrics::RdmaEndpointEvent::ReadyActive);
+    metrics.recordRdmaQpTransitionFailure(
+        TentMetrics::RdmaQpType::Notification,
+        TentMetrics::RdmaQpTransition::Rts);
+    metrics.recordRdmaNotificationEvent(
+        TentMetrics::RdmaNotificationEvent::RecvPostError, 2);
+
+    auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(after.series("tent_rdma_endpoint_events_total{event="
+                           "\"ready_active\"}") -
+                  before.series("tent_rdma_endpoint_events_total{event="
+                                "\"ready_active\"}"),
+              1);
+    EXPECT_EQ(
+        after.series("tent_rdma_qp_transition_failures_total{qp_type="
+                     "\"notification\",transition=\"rts\"}") -
+            before.series("tent_rdma_qp_transition_failures_total{qp_type="
+                          "\"notification\",transition=\"rts\"}"),
+        1);
+    EXPECT_EQ(after.series("tent_rdma_notification_events_total{event="
+                           "\"recv_post_error\"}") -
+                  before.series("tent_rdma_notification_events_total{event="
+                                "\"recv_post_error\"}"),
+              2);
 }
 
 // ---------------------------------------------------------------------------
@@ -1855,6 +1896,9 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_rdma_worker_inflight_slices"));
     EXPECT_TRUE(json.contains("tent_rdma_posted_inflight_slices"));
     EXPECT_TRUE(json.contains("tent_rdma_completion_latency_us"));
+    EXPECT_TRUE(json.contains("tent_rdma_endpoint_events_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_qp_transition_failures_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_notification_events_total"));
     EXPECT_TRUE(json.contains("tent_metrics_build_info"));
     EXPECT_EQ(json["tent_metrics_runtime_enabled"], 1);
     EXPECT_EQ(json["tent_metrics_http_server_up"], 1);
