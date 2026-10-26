@@ -186,8 +186,7 @@ bool ParseEnvEnabled(const char* name) {
 }
 
 std::string InjectNicTopoPathFromCustomTopoTent(
-    const std::string& resolved_config,
-    const std::string& custom_topo_json) {
+    const std::string& resolved_config, const std::string& custom_topo_json) {
     // TE support for configuring HIXL's comm_resource_config.nic_topo_path:
     // the custom topology path is written into it when it is empty.
     if (custom_topo_json.empty()) {

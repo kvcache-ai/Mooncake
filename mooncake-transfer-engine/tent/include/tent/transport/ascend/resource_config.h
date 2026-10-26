@@ -63,8 +63,7 @@ bool ParseEnvEnabled(const char* name);
 //     {"comm_resource_config.nic_topo_path":"..."} object.
 // A non-empty but unparsable input is returned unchanged (HIXL rejects it).
 std::string InjectNicTopoPathFromCustomTopoTent(
-    const std::string& resolved_config,
-    const std::string& custom_topo_json);
+    const std::string& resolved_config, const std::string& custom_topo_json);
 
 AscendDirectOptions LoadAscendDirectOptions(
     const std::shared_ptr<Config>& conf);

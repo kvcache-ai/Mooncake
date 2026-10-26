@@ -793,8 +793,8 @@ TEST(AscendDirectResourceConfigTest, WithHixlListenPortReplacesFlatPort) {
 }
 
 TEST(AscendDirectResourceConfigTest, InjectNicTopoPath_EmptyConfigCreates) {
-    auto out = InjectNicTopoPathFromCustomTopoTent(
-        "", "/etc/mooncake/nic_topo.json");
+    auto out =
+        InjectNicTopoPathFromCustomTopoTent("", "/etc/mooncake/nic_topo.json");
     const auto parsed = nlohmann::json::parse(out);
     EXPECT_EQ(parsed.at("comm_resource_config.nic_topo_path"),
               "/etc/mooncake/nic_topo.json");
@@ -803,9 +803,9 @@ TEST(AscendDirectResourceConfigTest, InjectNicTopoPath_EmptyConfigCreates) {
 TEST(AscendDirectResourceConfigTest, InjectNicTopoPath_ExplicitWins) {
     const std::string cfg =
         R"({"comm_resource_config.nic_topo_path":"/explicit.json"})";
-    EXPECT_EQ(InjectNicTopoPathFromCustomTopoTent(
-                  cfg, "/etc/mooncake/nic_topo.json"),
-              cfg);
+    EXPECT_EQ(
+        InjectNicTopoPathFromCustomTopoTent(cfg, "/etc/mooncake/nic_topo.json"),
+        cfg);
 }
 
 TEST(AscendDirectResourceConfigTest, InjectNicTopoPath_NestedDropsFlat) {
@@ -822,9 +822,9 @@ TEST(AscendDirectResourceConfigTest, InjectNicTopoPath_NestedDropsFlat) {
 
 TEST(AscendDirectResourceConfigTest, InjectNicTopoPath_InvalidJsonUnchanged) {
     const std::string cfg = "{not json";
-    EXPECT_EQ(InjectNicTopoPathFromCustomTopoTent(
-                  cfg, "/etc/mooncake/nic_topo.json"),
-              cfg);
+    EXPECT_EQ(
+        InjectNicTopoPathFromCustomTopoTent(cfg, "/etc/mooncake/nic_topo.json"),
+        cfg);
 }
 
 TEST(AscendDirectResourceConfigTest, LoadOptionsInjectsCustomTopoJson) {
