@@ -1243,20 +1243,20 @@ class BucketStorageBackend : public StorageBackendInterface {
     SelectEvictionCandidate(int disk_index);
 
     /**
-     * @brief Actual on-disk bytes of one disk's offload directory, measured
-     *        by summing real file allocation (stat st_blocks * 512) over every
-     *        file under that disk's root.
+     * @brief Per-disk on-disk bytes as published by the background scanner
+     *        (DiskUsageScanLoop below), which owns all directory traversal.
      *
-     * This is ground truth — the same block-based accounting kubelet uses for
-     * emptyDir sizeLimit — so it captures bucket files that linger after their
-     * objects are logically evicted (which the in-memory total_size misses).
-     * max_physical_bytes is a per-disk cap: each root sits on its own device
-     * (or its own emptyDir quota), so scanning and capping them together would
-     * make one busy disk reject writes on an idle one.
-     * Result is cached for bucket_backend_config_.disk_scan_cache_ms to bound
-     * the scan cost regardless of offload rate. Caller must hold mutex_.
+     * Ground truth — the same block-based accounting kubelet uses for
+     * emptyDir sizeLimit — so it captures bucket files that linger after
+     * their objects are logically evicted (which the in-memory total_size
+     * misses). max_physical_bytes is a per-disk cap: each root sits on its
+     * own device (or its own emptyDir quota), so scanning and capping them
+     * together would make one busy disk reject writes on an idle one.
+     * Never performs filesystem I/O: a never-scanned or failed disk fails
+     * closed (reports the cap as reached) until the scanner republishes.
+     * Caller must hold mutex_.
      *
-     * @param disk_index The disk whose root is scanned.
+     * @param disk_index The disk whose snapshot is read.
      */
     int64_t ActualDiskBytesUsedLocked(int disk_index) const;
     /**
@@ -1271,7 +1271,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     void StopDiskUsageScanner();
     void RequestDiskUsageScan();
     void DiskUsageScanLoop();
-    tl::expected<int64_t, ErrorCode> ScanPhysicalDiskBytes() const;
+    tl::expected<std::vector<int64_t>, ErrorCode> ScanPhysicalDiskBytes()
+        const;
 
     friend class test::BucketStorageBackendTestPeer;
     // Scanner publication only holds mutex_ briefly; directory traversal never

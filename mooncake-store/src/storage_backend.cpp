@@ -1705,6 +1705,9 @@ struct BucketStorageBackend::WritePlan {
     // One plan, one immutable file identity; ranges never span plans.
     BucketStorageBackend* const backend;
     const int64_t id;
+    // Set once PrepareEviction places the bucket on a disk; every cleanup
+    // helper needs it (the per-disk signatures carried over from dev).
+    int disk_index = 0;
     OffloadObjects objects;
     std::shared_ptr<BucketMetadata> bucket;
     std::vector<iovec> iovs;
@@ -1732,7 +1735,8 @@ struct BucketStorageBackend::WritePlan {
                 else
                     backend->RestorePreparedEviction(std::move(*pending));
             }
-            if (file_created && !committed) backend->CleanupOrphanedBucket(id);
+            if (file_created && !committed)
+                backend->CleanupOrphanedBucket(id, disk_index);
         } catch (...) {
             LOG(ERROR) << "Failed to clean offload plan " << id;
         }
@@ -1859,19 +1863,21 @@ tl::expected<void, ErrorCode> BucketStorageBackend::InitializeWritePlan(
     if (!*enabled) return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
     std::unique_lock<std::mutex> publish_lock(offload_publish_mutex_);
     if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
+        // Keys-only fast fail: size quotas are enforced per disk inside
+        // PrepareEviction (dev moved the global total_size_/pending budget
+        // into per-disk accounting).
         SharedMutexLocker lock(&mutex_, shared_lock);
-        const auto required = plan.bucket->data_size + plan.bucket->meta_size;
         if (object_bucket_map_.size() + pending_write_keys_.size() +
-                    plan.objects.size() >
-                static_cast<size_t>(file_storage_config_.total_keys_limit) ||
-            required > file_storage_config_.total_size_limit - total_size_ -
-                           pending_write_size_)
+                plan.objects.size() >
+            static_cast<size_t>(file_storage_config_.total_keys_limit))
             return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
     }
     auto reserved = PrepareEviction(
         plan.bucket->data_size + plan.bucket->meta_size, plan.bucket->keys);
     if (!reserved) return tl::make_unexpected(reserved.error());
     plan.pending = std::move(*reserved);
+    plan.disk_index = plan.pending->disk_index;
+    plan.bucket->disk_index = plan.disk_index;
     if (plan.eviction && !plan.pending->keys.empty()) {
         auto notified = plan.eviction(plan.pending->keys);
         if (!notified) return notified;
@@ -1882,7 +1888,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::InitializeWritePlan(
     auto finalized = FinalizeEviction(*plan.pending);
     if (!finalized)
         LOG(WARNING) << "Offload eviction cleanup: " << finalized.error();
-    auto path = GetBucketDataPath(plan.id);
+    auto path = GetBucketDataPath(plan.id, plan.disk_index);
     if (!path) return tl::make_unexpected(path.error());
     // Existing OpenFile writes are buffered POSIX, even with use_uring set.
     // Open/truncate once per bucket, never once per sub batch.
@@ -1951,7 +1957,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinishWritePlan(
             if (test_datasync_failure_.load(std::memory_order_relaxed))
                 result = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-        if (result) result = StoreBucketMetadata(plan.id, plan.bucket);
+        if (result)
+            result = StoreBucketMetadata(plan.id, plan.bucket,
+                                         plan.disk_index);
         if (result) {
             auto committed =
                 CommitOffloadedBucket(plan.id, plan.bucket, plan.metadatas,
@@ -1966,7 +1974,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinishWritePlan(
     }
     if (!result && plan.file_created) {
         // Handles callback exceptions as well as ordinary write failures.
-        RollbackCommittedBucket(plan.id, plan.bucket->keys);
+        RollbackCommittedBucket(plan.id, plan.bucket->keys, plan.disk_index);
     }
     plan.file.reset();
     if (plan.pending) {
@@ -1976,7 +1984,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinishWritePlan(
             RestorePreparedEviction(std::move(*plan.pending));
         plan.pending.reset();
     }
-    if (!plan.committed && plan.file_created) CleanupOrphanedBucket(plan.id);
+    if (!plan.committed && plan.file_created)
+        CleanupOrphanedBucket(plan.id, plan.disk_index);
     plan.file_created = false;
     // Source loader owns device staging. Release it at this bucket's terminal
     // state, not after the slowest bucket of the heartbeat finishes.
@@ -2078,6 +2087,9 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::CommitOffloadedBucket(
     std::vector<StorageObjectMetadata>& metadatas, PendingEviction& pending,
     const OffloadComplete& complete_handler) {
     std::lock_guard<std::mutex> publish_lock(offload_publish_mutex_);
+    // dev's commit bookkeeping is per disk; the plan/bucket was placed by
+    // PrepareEviction, which records the disk here.
+    const int disk_index = pending.disk_index;
     // Save a copy of bucket->keys before std::move(bucket) into buckets_
     // consumes the shared_ptr. Needed for complete_handler and rollback.
     const auto bucket_keys = bucket->keys;
@@ -3798,6 +3810,15 @@ BucketStorageBackend::SelectEvictionCandidate(int disk_index) {
     }
 }
 
+namespace {
+int64_t AddPhysicalUsageBudget(int64_t bytes, uint64_t extra) {
+    const auto remaining =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - bytes);
+    return extra > remaining ? std::numeric_limits<int64_t>::max()
+                             : bytes + static_cast<int64_t>(extra);
+}
+}  // namespace
+
 tl::expected<int, ErrorCode> BucketStorageBackend::SelectDiskForWrite(
     int64_t required_size) {
     // Must be called with mutex_ held (exclusive).
@@ -3832,63 +3853,19 @@ tl::expected<int, ErrorCode> BucketStorageBackend::SelectDiskForWrite(
 }
 
 int64_t BucketStorageBackend::ActualDiskBytesUsedLocked(int disk_index) const {
-    namespace fs = std::filesystem;
-    auto& disk = disks_[disk_index];
-    const std::string& disk_path = disk_paths_[disk_index];
-    auto now = std::chrono::steady_clock::now();
-    if (disk.cached_disk_bytes >= 0 &&
-        now - disk.cached_disk_bytes_at <
-            std::chrono::milliseconds(
-                bucket_backend_config_.disk_scan_cache_ms)) {
-        return disk.cached_disk_bytes;
-    }
-    int64_t total = 0;
-    std::error_code ec;
-    // Physical usage includes the whole subtree (du/kubelet accounting), even
-    // though recovery and eviction only manage buckets in this directory.
-    fs::recursive_directory_iterator it(disk_path, ec), end;
-    if (ec) {
-        // Cannot even open the disk root. This is a hard safety cap, so fail
-        // CLOSED: report the cap as reached so eviction/rejection engages
-        // instead of letting the disk overflow, and do NOT cache the result
-        // (next call re-scans once the directory is readable again).
-        LOG(WARNING) << "[Bucket] physcap disk scan could not open "
-                     << disk_path << ": " << ec.message() << ", failing closed";
+    // The background scanner owns all directory traversal (orthogonal to the
+    // multi-disk layout). This reads its latest per-disk snapshot: writes
+    // admitted since that snapshot are budgeted via pending_write_size, and a
+    // never-scanned or failed disk fails CLOSED (reports the cap as reached,
+    // so eviction/rejection engages) until the scanner republishes.
+    const auto& disk = disks_[disk_index];
+    if (disk.cached_disk_bytes < 0) {
         return bucket_backend_config_.max_physical_bytes;
     }
-    for (; it != end; it.increment(ec)) {
-        if (ec) {
-            // Iteration errored partway. Returning the partial total would
-            // under-count and silently open the cap; fail closed and skip
-            // caching so the next call re-scans.
-            LOG(WARNING) << "[Bucket] physcap disk scan error under "
-                         << disk_path << ": " << ec.message()
-                         << ", failing closed";
-            return bucket_backend_config_.max_physical_bytes;
-        }
-        struct stat st;
-        // st_blocks counts 512-byte blocks actually allocated on disk — the
-        // same basis as du / kubelet's emptyDir accounting (handles block
-        // rounding; ignores apparent size). A per-entry stat failure (e.g. a
-        // file concurrently deleted during eviction) is skipped best-effort:
-        // that only under-counts by ~one file and avoids spurious fail-closed.
-        if (::stat(it->path().c_str(), &st) == 0) {
-            total += static_cast<int64_t>(st.st_blocks) * 512;
-        }
-    }
-    disk.cached_disk_bytes = total;
-    disk.cached_disk_bytes_at = now;
-    return total;
+    return AddPhysicalUsageBudget(disk.cached_disk_bytes,
+                                  static_cast<uint64_t>(
+                                      disk.pending_write_size));
 }
-
-namespace {
-int64_t AddPhysicalUsageBudget(int64_t bytes, uint64_t extra) {
-    const auto remaining =
-        static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - bytes);
-    return extra > remaining ? std::numeric_limits<int64_t>::max()
-                             : bytes + static_cast<int64_t>(extra);
-}
-}  // namespace
 
 int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
     if (cached_disk_bytes_ < 0)
@@ -3938,7 +3915,8 @@ void BucketStorageBackend::DiskUsageScanLoop() {
         scan_lock.unlock();
         uint64_t write_start = 0;
         uint64_t pending_start = 0;
-        tl::expected<int64_t, ErrorCode> scanned =
+        std::vector<int64_t> per_disk_pending;
+        tl::expected<std::vector<int64_t>, ErrorCode> scanned =
             tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         try {
             {
@@ -3949,8 +3927,18 @@ void BucketStorageBackend::DiskUsageScanLoop() {
                 // Two files per bucket can each consume a final partial block;
                 // using the key count is a conservative bucket-count bound.
                 pending_start =
-                    static_cast<uint64_t>(pending_write_size_) +
                     pending_write_keys_.size() * 2 * kDirectIOAlignment;
+                // Per-disk in-flight write bytes, matched to disk_paths_ by
+                // position for the per-disk snapshot budget below. The global
+                // budget above sums the same values (dev has no global
+                // pending_write_size_ counter).
+                per_disk_pending.reserve(disks_.size());
+                for (const auto& disk : disks_) {
+                    per_disk_pending.push_back(
+                        static_cast<uint64_t>(disk.pending_write_size));
+                    pending_start += static_cast<uint64_t>(
+                        disk.pending_write_size);
+                }
             }
             if (hook) hook();
             scanned = ScanPhysicalDiskBytes();
@@ -3961,9 +3949,45 @@ void BucketStorageBackend::DiskUsageScanLoop() {
         }
         if (!disk_scan_stopping_.load(std::memory_order_acquire)) {
             SharedMutexLocker lock(&mutex_);
-            cached_disk_bytes_ =
-                scanned ? AddPhysicalUsageBudget(*scanned, pending_start) : -1;
-            scanned_write_bytes_ = write_start;
+            if (scanned) {
+                // Publish the per-disk snapshots the synchronous readers
+                // consume, then derive the global total from them so both
+                // views come from one scan pass.
+                int64_t total = 0;
+                for (size_t index = 0; index < disks_.size(); ++index) {
+                    int64_t published =
+                        index < scanned->size()
+                            ? AddPhysicalUsageBudget((*scanned)[index],
+                                                     per_disk_pending[index])
+                            : -1;
+                    disks_[index].cached_disk_bytes = published;
+                    disks_[index].cached_disk_bytes_at =
+                        std::chrono::steady_clock::now();
+                    if (published >= 0) {
+                        total = AddPhysicalUsageBudget(total,
+                                                       static_cast<uint64_t>(
+                                                           published));
+                    } else {
+                        // One unreadable disk fails the whole view closed.
+                        total = -1;
+                        break;
+                    }
+                }
+                cached_disk_bytes_ = total < 0
+                                         ? -1
+                                         : AddPhysicalUsageBudget(
+                                               total, pending_start);
+                scanned_write_bytes_ = write_start;
+            } else {
+                // A failed pass cannot be trusted for any view: fail the
+                // global total AND every per-disk snapshot closed (single-
+                // disk included), so eviction/rejection engages until the
+                // next pass republishes.
+                cached_disk_bytes_ = -1;
+                for (auto& disk : disks_) {
+                    disk.cached_disk_bytes = -1;
+                }
+            }
         }
         scan_lock.lock();
         disk_scan_ready_ = true;
@@ -3977,13 +4001,14 @@ void BucketStorageBackend::DiskUsageScanLoop() {
     }
 }
 
-tl::expected<int64_t, ErrorCode> BucketStorageBackend::ScanPhysicalDiskBytes()
-    const {
+tl::expected<std::vector<int64_t>, ErrorCode>
+BucketStorageBackend::ScanPhysicalDiskBytes() const {
     namespace fs = std::filesystem;
-    int64_t total = 0;
-    // The dev backend is multi-disk: sum every disk root so the background
-    // snapshot matches the per-disk caps that eviction enforces.
-    for (const std::string& disk_path : disk_paths_) {
+    // One entry per disk root: each root is scanned and accounted on its own,
+    // matching the per-disk physical caps that eviction enforces.
+    std::vector<int64_t> per_disk(disk_paths_.size(), 0);
+    for (size_t index = 0; index < disk_paths_.size(); ++index) {
+        const std::string& disk_path = disk_paths_[index];
         std::error_code ec;
         // Physical usage includes the whole subtree (du/kubelet accounting),
         // even though recovery and eviction only manage buckets in this
@@ -4001,8 +4026,9 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::ScanPhysicalDiskBytes()
                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
             struct stat st;
             if (::stat(it->path().c_str(), &st) == 0) {
-                total = AddPhysicalUsageBudget(
-                    total, static_cast<uint64_t>(st.st_blocks) * 512);
+                per_disk[index] = AddPhysicalUsageBudget(
+                    per_disk[index],
+                    static_cast<uint64_t>(st.st_blocks) * 512);
             } else if (errno != ENOENT) {
                 LOG(WARNING) << "[Bucket] background physical-usage stat "
                                 "failed: "
@@ -4018,7 +4044,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::ScanPhysicalDiskBytes()
             }
         }
     }
-    return total;
+    return per_disk;
 }
 
 tl::expected<BucketStorageBackend::PendingEviction, ErrorCode>
@@ -4430,16 +4456,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
     if (!pending.buckets.empty()) {
         LOG(INFO) << "[Evict] finalized: attempted=" << pending.buckets.size()
                   << " cleanup_failed=" << cleanup_failed_count;
-        // Files were just deleted; force the next physical-usage query to
-        // rescan rather than return the now-stale (higher) cached value.
+        // Files were just deleted; drop the affected per-disk snapshots so
+        // reads fail closed (cap treated as reached) until the background
+        // scanner — never an I/O thread — walks the directory again.
         {
             SharedMutexLocker lock(&mutex_);
             for (const auto& [bucket_id, bucket_meta] : pending.buckets) {
                 disks_[bucket_meta->disk_index].cached_disk_bytes = -1;
             }
         }
-        // Keep the previous (conservative, higher) estimate until the
-        // background scan observes deletion. Never traverse on an I/O worker.
         RequestDiskUsageScan();
     }
     if (cleanup_failed_count != 0) {
