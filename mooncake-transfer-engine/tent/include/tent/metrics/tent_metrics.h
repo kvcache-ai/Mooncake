@@ -18,6 +18,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -49,6 +50,28 @@ namespace mooncake::tent {
 // optimization)
 constexpr size_t kPrometheusBufferSize = 4096;
 
+// Versioned, bounded engine state exposed by /ready and /diagnostics. Keep
+// this free of peer identities, segment names, addresses, request identifiers,
+// and other unbounded or sensitive values.
+struct EngineDiagnosticsSnapshot {
+    bool engine_available{false};
+    bool control_plane_available{false};
+    bool progress_worker_enabled{false};
+    bool progress_worker_running{false};
+    bool runtime_queue_enabled{false};
+    uint64_t loaded_transport_count{0};
+    std::vector<std::string> loaded_transports;
+    uint64_t alive_batches{0};
+    uint64_t outstanding_owners{0};
+    uint64_t outstanding_bytes{0};
+    uint64_t dispatch_inflight_owners{0};
+    uint64_t dispatch_inflight_bytes{0};
+    uint64_t oldest_inflight_age_us{0};
+    uint64_t worker_progress_age_seconds{0};
+    uint64_t worker_stall_threshold_seconds{0};
+    std::vector<std::string> readiness_reasons;
+};
+
 /**
  * @brief TENT metrics system with HTTP server for Prometheus scraping
  *
@@ -66,6 +89,9 @@ constexpr size_t kPrometheusBufferSize = 4096;
  */
 class TentMetrics {
    public:
+    using DiagnosticsSnapshot = EngineDiagnosticsSnapshot;
+    using DiagnosticsProvider = std::function<DiagnosticsSnapshot()>;
+
     static TentMetrics& instance();
 
     // Build-time capability query for embedders and diagnostics. A build with
@@ -453,6 +479,15 @@ class TentMetrics {
         return bound_http_port_.load(std::memory_order_relaxed);
     }
 
+    // The owner token makes registration safe when multiple engines share the
+    // process-wide metrics singleton: teardown only clears its own provider.
+    // getDiagnosticsSnapshot invokes the provider under the same mutex, so
+    // clearDiagnosticsProvider waits for an in-flight callback to finish.
+    void setDiagnosticsProvider(const void* owner,
+                                DiagnosticsProvider provider);
+    void clearDiagnosticsProvider(const void* owner);
+    bool getDiagnosticsSnapshot(DiagnosticsSnapshot& snapshot);
+
    private:
     TentMetrics() = default;
     ~TentMetrics();
@@ -468,6 +503,9 @@ class TentMetrics {
     // separate from config_.http_port and atomic because httpPort() may be read
     // by other threads while the initializing thread is still binding a port.
     std::atomic<uint16_t> bound_http_port_{0};
+    std::mutex diagnostics_provider_mutex_;
+    const void* diagnostics_provider_owner_{nullptr};
+    DiagnosticsProvider diagnostics_provider_;
 
 #if TENT_METRICS_ENABLED
     static constexpr size_t kSerializationFormatCount = 2;
@@ -493,8 +531,8 @@ class TentMetrics {
     // then degrades to log-only metrics); on success bound_http_port_ is set.
     Status initHttpServer();
 
-    // Register the /metrics, /metrics/summary, /metrics/json and /health
-    // endpoints on the current http_server_ instance.
+    // Register metrics plus compatibility /health, process /live, engine
+    // /ready, and the redacted /diagnostics endpoint.
     void registerHttpHandlers();
 
     // HTTP server for metrics endpoint

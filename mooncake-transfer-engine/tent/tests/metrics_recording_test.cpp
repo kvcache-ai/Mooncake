@@ -2308,6 +2308,72 @@ TEST_F(MetricsHttpTest, HealthEndpointOk) {
     EXPECT_EQ(resp.body, "OK");
 }
 
+TEST_F(MetricsHttpTest, LiveReadyAndDiagnosticsExposeRedactedState) {
+    auto live = retryGet("/live");
+    ASSERT_EQ(live.http_status, 200);
+    auto live_json = nlohmann::json::parse(live.body, nullptr, false);
+    ASSERT_FALSE(live_json.is_discarded());
+    EXPECT_EQ(live_json["schema_version"], 1);
+    EXPECT_EQ(live_json["status"], "live");
+
+    // No provider means the process is live but the engine is not ready.
+    auto unavailable = FetchUrl(port_, "/ready");
+    ASSERT_EQ(unavailable.http_status, 503);
+    auto unavailable_json =
+        nlohmann::json::parse(unavailable.body, nullptr, false);
+    ASSERT_FALSE(unavailable_json.is_discarded());
+    EXPECT_FALSE(unavailable_json["ready"]);
+    EXPECT_EQ(unavailable_json["readiness_reasons"][0],
+              "engine_diagnostics_unavailable");
+
+    int owner = 0;
+    EngineDiagnosticsSnapshot snapshot;
+    snapshot.engine_available = true;
+    snapshot.control_plane_available = true;
+    snapshot.progress_worker_enabled = true;
+    snapshot.progress_worker_running = true;
+    snapshot.runtime_queue_enabled = true;
+    snapshot.loaded_transport_count = 2;
+    snapshot.loaded_transports = {"rdma", "tcp"};
+    snapshot.alive_batches = 3;
+    snapshot.outstanding_owners = 4;
+    snapshot.outstanding_bytes = 4096;
+    snapshot.dispatch_inflight_owners = 2;
+    snapshot.dispatch_inflight_bytes = 2048;
+    snapshot.oldest_inflight_age_us = 1234;
+    snapshot.worker_progress_age_seconds = 1;
+    snapshot.worker_stall_threshold_seconds = 5;
+    TentMetrics::instance().setDiagnosticsProvider(
+        &owner, [snapshot]() { return snapshot; });
+
+    auto ready = retryGet("/ready");
+    ASSERT_EQ(ready.http_status, 200);
+    auto ready_json = nlohmann::json::parse(ready.body, nullptr, false);
+    ASSERT_FALSE(ready_json.is_discarded());
+    EXPECT_TRUE(ready_json["ready"]);
+    EXPECT_EQ(ready_json["engine"]["loaded_transport_count"], 2);
+    EXPECT_EQ(ready_json["runtime_queue"]["outstanding_bytes"], 4096);
+    EXPECT_TRUE(ready_json["redaction"]["peer_identifiers_omitted"]);
+    EXPECT_EQ(ready.body.find("10.0.0.1"), std::string::npos);
+    EXPECT_EQ(ready.body.find("segment_name"), std::string::npos);
+
+    auto diagnostics = retryGet("/diagnostics");
+    EXPECT_EQ(diagnostics.http_status, 200);
+    EXPECT_EQ(diagnostics.body, ready.body);
+
+    snapshot.readiness_reasons = {"progress_worker_stalled"};
+    TentMetrics::instance().setDiagnosticsProvider(
+        &owner, [snapshot]() { return snapshot; });
+    auto stalled = FetchUrl(port_, "/ready");
+    ASSERT_EQ(stalled.http_status, 503);
+    auto stalled_json = nlohmann::json::parse(stalled.body, nullptr, false);
+    ASSERT_FALSE(stalled_json.is_discarded());
+    EXPECT_EQ(stalled_json["readiness_reasons"][0],
+              "progress_worker_stalled");
+
+    TentMetrics::instance().clearDiagnosticsProvider(&owner);
+}
+
 #else  // !TENT_METRICS_ENABLED
 
 // When metrics are disabled at compile time, the recording path is a no-op

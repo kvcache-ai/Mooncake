@@ -41,6 +41,35 @@ TentMetrics& TentMetrics::instance() {
 
 TentMetrics::~TentMetrics() { shutdown(); }
 
+void TentMetrics::setDiagnosticsProvider(const void* owner,
+                                         DiagnosticsProvider provider) {
+    if (owner == nullptr || !provider) return;
+    std::lock_guard<std::mutex> lock(diagnostics_provider_mutex_);
+    diagnostics_provider_owner_ = owner;
+    diagnostics_provider_ = std::move(provider);
+}
+
+void TentMetrics::clearDiagnosticsProvider(const void* owner) {
+    std::lock_guard<std::mutex> lock(diagnostics_provider_mutex_);
+    if (owner != diagnostics_provider_owner_) return;
+    diagnostics_provider_ = nullptr;
+    diagnostics_provider_owner_ = nullptr;
+}
+
+bool TentMetrics::getDiagnosticsSnapshot(DiagnosticsSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(diagnostics_provider_mutex_);
+    if (!diagnostics_provider_) return false;
+    try {
+        snapshot = diagnostics_provider_();
+        return true;
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "TENT diagnostics provider failed: " << error.what();
+    } catch (...) {
+        LOG(ERROR) << "TENT diagnostics provider failed with unknown error";
+    }
+    return false;
+}
+
 #if TENT_METRICS_ENABLED
 
 namespace {
@@ -52,6 +81,46 @@ uint64_t unixTimestampSeconds() {
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
+}
+
+std::string diagnosticsJson(const EngineDiagnosticsSnapshot& snapshot,
+                            bool provider_available) {
+    const bool ready =
+        provider_available && snapshot.readiness_reasons.empty();
+    nlohmann::json body = {
+        {"schema_version", 1},
+        {"build",
+         {{"version", TENT_BUILD_VERSION}, {"git_commit", TENT_GIT_COMMIT}}},
+        {"ready", ready},
+        {"provider_available", provider_available},
+        {"readiness_reasons", snapshot.readiness_reasons},
+        {"engine",
+         {{"available", snapshot.engine_available},
+          {"control_plane_available", snapshot.control_plane_available},
+          {"loaded_transport_count", snapshot.loaded_transport_count},
+          {"loaded_transports", snapshot.loaded_transports}}},
+        {"progress_worker",
+         {{"enabled", snapshot.progress_worker_enabled},
+          {"running", snapshot.progress_worker_running},
+          {"last_progress_age_seconds",
+           snapshot.worker_progress_age_seconds},
+          {"stall_threshold_seconds",
+           snapshot.worker_stall_threshold_seconds}}},
+        {"runtime_queue",
+         {{"enabled", snapshot.runtime_queue_enabled},
+          {"outstanding_owners", snapshot.outstanding_owners},
+          {"outstanding_bytes", snapshot.outstanding_bytes},
+          {"dispatch_inflight_owners",
+           snapshot.dispatch_inflight_owners},
+          {"dispatch_inflight_bytes", snapshot.dispatch_inflight_bytes}}},
+        {"work",
+         {{"alive_batches", snapshot.alive_batches},
+          {"oldest_inflight_age_us", snapshot.oldest_inflight_age_us}}},
+        {"redaction",
+         {{"peer_identifiers_omitted", true},
+          {"memory_addresses_omitted", true},
+          {"request_identifiers_omitted", true}}}};
+    return body.dump();
 }
 
 std::string escapePrometheusLabelValue(std::string_view value) {
@@ -720,6 +789,42 @@ void TentMetrics::registerHttpHandlers() {
         "/health", [](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain");
             resp.set_status_and_content(status_type::ok, "OK");
+        });
+
+    // Process liveness is deliberately independent from engine readiness.
+    http_server_->set_http_handler<GET>(
+        "/live", [](coro_http_request& req, coro_http_response& resp) {
+            resp.add_header("Content-Type", "application/json");
+            resp.set_status_and_content(
+                status_type::ok,
+                R"({"schema_version":1,"status":"live"})");
+        });
+
+    auto diagnostics = [this](coro_http_response& resp, bool readiness) {
+        DiagnosticsSnapshot snapshot;
+        const bool provider_available = getDiagnosticsSnapshot(snapshot);
+        if (!provider_available) {
+            snapshot.readiness_reasons = {"engine_diagnostics_unavailable"};
+        }
+        const bool ready =
+            provider_available && snapshot.readiness_reasons.empty();
+        resp.add_header("Content-Type", "application/json");
+        resp.set_status_and_content(
+            readiness && !ready ? status_type::service_unavailable
+                                : status_type::ok,
+            diagnosticsJson(snapshot, provider_available));
+    };
+
+    http_server_->set_http_handler<GET>(
+        "/ready", [diagnostics](coro_http_request& req,
+                                 coro_http_response& resp) {
+            diagnostics(resp, true);
+        });
+
+    http_server_->set_http_handler<GET>(
+        "/diagnostics", [diagnostics](coro_http_request& req,
+                                       coro_http_response& resp) {
+            diagnostics(resp, false);
         });
 }
 
