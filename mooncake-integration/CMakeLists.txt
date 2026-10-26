@@ -237,6 +237,7 @@ if(NOT SKBUILD)
   install(
     FILES
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/__init__.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/py.typed"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/buffer_pool.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/http_metadata_server.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/_launcher.py"
@@ -252,6 +253,11 @@ if(NOT SKBUILD)
     COMPONENT python
     FILES_MATCHING
     PATTERN "*.py")
+
+  if(WITH_TE)
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/engine.pyi"
+            DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR})
+  endif()
 
   if(WITH_STORE)
     install(
