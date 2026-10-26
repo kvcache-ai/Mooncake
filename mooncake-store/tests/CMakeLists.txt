@@ -269,6 +269,7 @@ target_link_libraries(local_ssd_test PRIVATE mooncake_local_ssd gtest
                                              gtest_main)
 add_test(NAME local_ssd_test COMMAND local_ssd_test)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
+add_store_test(crc32c_test crc32c_test.cpp)
 add_store_test(byte_size_test byte_size_test.cpp)
 add_store_test(network_test network_test.cpp)
 add_store_test(hugepage_config_test hugepage_config_test.cpp)
