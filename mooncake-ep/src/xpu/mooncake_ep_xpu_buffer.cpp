@@ -142,20 +142,6 @@ void MooncakeEpXpuBuffer::orderAfterLast(sycl::queue& q) {
     last_queue_ = q;
 }
 
-int MooncakeEpXpuBuffer::takeShadowSlot(uint64_t src_info_ptr) {
-    // Every dispatch takes the next slot, even when the caching allocator
-    // hands it the src_info block of an earlier dispatch: otherwise a later
-    // dispatch could take the slot of one that is still held.
-    const int slot = next_shadow_slot_;
-    next_shadow_slot_ = (next_shadow_slot_ + 1) % kTopkShadowSlots;
-    auto prev = shadow_slots_.find(slot_owner_[slot]);
-    if (prev != shadow_slots_.end() && prev->second == slot)
-        shadow_slots_.erase(prev);
-    slot_owner_[slot] = src_info_ptr;
-    shadow_slots_[src_info_ptr] = slot;
-    return slot;
-}
-
 RecvTable MooncakeEpXpuBuffer::recvTable(int slot) {
     if (!recv_tables_) {
         recv_tables_ = sycl::malloc_device<int32_t>(
@@ -232,7 +218,7 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::dispatch(
     std::lock_guard<std::mutex> lock(mu_);
     const int cur = buffer_idx_;
     buffer_idx_ ^= 1;
-    const int shadow_slot = takeShadowSlot(packed_recv_src_info_ptr);
+    const int shadow_slot = dispatch_slots_.take(packed_recv_src_info_ptr);
     slot_reduced_[shadow_slot] = with_topk_weights;
     orderAfterLast(q);
     if (num_tokens > 0)
@@ -314,13 +300,12 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::combine(
     BufferPair layout(ipc_->base(), num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks_, num_experts);
     std::lock_guard<std::mutex> lock(mu_);
-    auto it = shadow_slots_.find(src_info_ptr);
-    XPU_EP_CHECK(it != shadow_slots_.end(),
+    const int shadow_slot = dispatch_slots_.find(src_info_ptr);
+    XPU_EP_CHECK(shadow_slot >= 0,
                  "the combine handle must come from one of the last " +
-                     std::to_string(kTopkShadowSlots) +
+                     std::to_string(kEpDispatchSlots) +
                      " dispatches on this buffer (it is found by its "
                      "src_info tensor)");
-    const int shadow_slot = it->second;
     const int cur = buffer_idx_;
     buffer_idx_ ^= 1;
     orderAfterLast(q);

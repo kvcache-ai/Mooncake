@@ -141,6 +141,11 @@ endif()
 add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
 
 add_subdirectory(mooncake-common)
+if(BUILD_UNIT_TESTS)
+  # Tests of the EP code shared across backends: host-only, so they run
+  # without WITH_EP or a GPU.
+  add_subdirectory(mooncake-ep/tests)
+endif()
 include_directories(mooncake-common/etcd)
 include_directories(mooncake-common/k8s-lease)
 include_directories(mooncake-common/include)

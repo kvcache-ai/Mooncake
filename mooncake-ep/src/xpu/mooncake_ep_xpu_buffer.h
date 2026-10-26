@@ -23,7 +23,6 @@
 #include <mutex>
 #include <optional>
 #include <tuple>
-#include <unordered_map>
 #include <vector>
 
 #include "xpu_ep_common.h"
@@ -94,7 +93,6 @@ class MooncakeEpXpuBuffer {
     sycl::queue& queueFor(uint64_t stream_ptr);
     // Both need mu_ held.
     void orderAfterLast(sycl::queue& q);
-    int takeShadowSlot(uint64_t src_info_ptr);
     RecvTable recvTable(int slot);
     int64_t timeoutTicks(int timeout_us) const;
     int64_t* topkShadow(int slot) const;
@@ -118,14 +116,11 @@ class MooncakeEpXpuBuffer {
     // it, so calls run in issue order whichever streams they come from.
     sycl::event last_event_;
     std::optional<sycl::queue> last_queue_;
-    // Two-batch overlap runs two dispatchers on one buffer; each dispatch
-    // keeps its own top-k snapshot, keyed by its src_info tensor, for combine.
-    std::unordered_map<uint64_t, int> shadow_slots_;
-    std::array<uint64_t, kTopkShadowSlots> slot_owner_{};
-    // Whether the slot's dispatch had top-k weights, so its combine reads
-    // pre-reduced rows.
+    // Each dispatch's slot for its top-k snapshot, shared with the CUDA
+    // buffer, and whether that dispatch had top-k weights, so its combine
+    // reads pre-reduced rows.
+    DispatchSlots dispatch_slots_;
     std::array<bool, kTopkShadowSlots> slot_reduced_{};
-    int next_shadow_slot_ = 0;
     // recv_table_ints(num_ranks) per slot, allocated by the first dispatch
     // given top-k weights.
     int32_t* recv_tables_ = nullptr;

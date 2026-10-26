@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <mooncake_ep_dispatch_slots.h>
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
@@ -46,7 +47,7 @@ inline size_t round_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
 
 constexpr int kTopkShadowMaxTokens = 1024;
 constexpr int kTopkShadowMaxTopk = 32;
-constexpr int kTopkShadowSlots = 8;
+constexpr int kTopkShadowSlots = kEpDispatchSlots;
 constexpr size_t kTopkShadowBytes = static_cast<size_t>(kTopkShadowMaxTokens) *
                                     kTopkShadowMaxTopk * sizeof(int64_t);
 // Per (token, top-k) slot in the destination expert's list, kept with the

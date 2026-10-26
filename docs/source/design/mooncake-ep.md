@@ -120,8 +120,11 @@ fallback flag after metadata exchange.
 
 On Intel XPU the native buffer is a SYCL implementation
 (`mooncake-ep/src/xpu/`) with the same Python-facing methods, so
-`mooncake_ep_buffer.Buffer`, its outputs and its handle are unchanged. It
-provides the P2P / IPC fast path only:
+`mooncake_ep_buffer.Buffer`, its outputs and its handle are unchanged. The
+Python wrapper and the `ep_py.cpp` bindings are shared with CUDA, as is the
+host bookkeeping that pairs each combine with its dispatch
+(`mooncake_ep_dispatch_slots.h`); the kernels and transport are XPU-specific.
+It provides the P2P / IPC fast path only:
 
 - Peers share one device buffer through Level Zero IPC handles, exchanged over
   the process group like the CUDA IPC handles. Ranks must be on one host and in
@@ -264,6 +267,9 @@ python python/tests/ep/test_mooncake_ep.py
 
 # Intel XPU correctness test (exact payloads, hooks, two batches, timeouts)
 python python/tests/ep/test_mooncake_ep_xpu.py --num-ranks 4 --num-experts 256
+
+# Host-only test of the dispatch bookkeeping shared by every backend
+ctest --test-dir build -R ep_dispatch_slots_test
 ```
 
 Adapt launch commands to the target environment and number of GPUs.
