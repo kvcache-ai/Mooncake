@@ -55,6 +55,16 @@ void MasterServiceTestPeer::RunDfsEvictionForTesting() {
     service_.RunDfsEviction();
 }
 
+void MasterServiceTestPeer::CleanupHttpMetadataForTesting(
+    const std::string& segment_name) {
+    service_.cleanupHttpMetadata(segment_name);
+}
+
+size_t MasterServiceTestPeer::HttpMetadataCleanupQueueSizeForTesting() const {
+    std::lock_guard<std::mutex> lk(service_.http_metadata_cleanup_mutex_);
+    return service_.http_metadata_cleanup_queue_.size();
+}
+
 void MasterServiceTestPeer::RunTenantEvictForTesting() {
     service_.EvictTenantsOverWatermark();
 }

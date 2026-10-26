@@ -1020,6 +1020,17 @@ class MasterService {
      */
     void setHttpMetadataRemoteUrl(const std::string& metadata_connstring);
 
+    /**
+     * @brief Stop the remote HTTP metadata cleanup worker: drop queued work,
+     * skip the rest of a running batch and join. Returns after at most one
+     * in-flight DELETE completes or times out: the wait is the HTTP client's
+     * connect and request timeouts (name resolution included), and the
+     * shutdown watchdog bounds the process. Later cleanup requests are
+     * ignored. Safe when the worker never started. Call from one thread;
+     * sequential calls are safe.
+     */
+    void StopHttpMetadataCleanup();
+
    private:
     tl::expected<void, ErrorCode> RestoreFromStandbyState(
         const std::vector<StandbyObjectEntry>* legacy_objects,

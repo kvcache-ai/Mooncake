@@ -77,6 +77,13 @@ class MasterServiceTestPeer {
 
     void RunDfsEvictionForTesting();
 
+    // Queue one segment through the private HTTP metadata cleanup path, as the
+    // client monitor does when a client times out.
+    void CleanupHttpMetadataForTesting(const std::string& segment_name);
+
+    // Segments waiting in the remote HTTP metadata cleanup queue.
+    size_t HttpMetadataCleanupQueueSizeForTesting() const;
+
     // Drive one tenant watermark eviction pass without the periodic worker.
     void RunTenantEvictForTesting();
 
