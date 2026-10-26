@@ -24,7 +24,8 @@
 #include "tent/platform/rocm.h"
 #elif defined(USE_SUNRISE)
 #include "tent/platform/sunrise.h"
-#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
+    defined(USE_MEMFABRIC)
 #include "tent/platform/ascend.h"
 #elif defined(USE_TPU)
 #include "tent/platform/tpu.h"
@@ -49,7 +50,8 @@ Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
         g_instance = std::make_shared<RocmPlatform>(conf);
 #elif defined(USE_SUNRISE)
         g_instance = std::make_shared<SunrisePlatform>(conf);
-#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
+    defined(USE_MEMFABRIC)
         g_instance = std::make_shared<AscendPlatform>(conf);
 #elif defined(USE_TPU)
         g_instance = std::make_shared<TpuPlatform>(conf);
@@ -67,6 +69,14 @@ Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
 Status Platform::synchronizeDevices(const Topology* topology) {
     (void)topology;
     return Status::OK();
+}
+
+Status Platform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
+    (void)addr;
+    (void)length;
+    out = DmabufExport{};
+    return Status::NotImplemented(
+        "dma-buf export is not supported by this platform" LOC_MARK);
 }
 
 std::vector<int> Platform::topologyDeviceIndices(const Topology* topology,

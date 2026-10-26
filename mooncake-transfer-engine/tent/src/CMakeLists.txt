@@ -67,6 +67,7 @@ if(IBVERBS_LIB AND IBVERBS_INCLUDE)
   target_compile_definitions(tent_interface INTERFACE USE_RDMA)
   target_include_directories(tent_interface INTERFACE ${IBVERBS_INCLUDE})
   target_link_libraries(tent_interface INTERFACE ${IBVERBS_LIB})
+  set(TENT_FEATURE_RDMA ON)
   # ibv_port_attr::active_speed is a uint8_t and reads 0 for XDR (encoding 256);
   # newer rdma-core adds active_speed_ex to carry it.
   include(CheckStructHasMember)
@@ -96,8 +97,8 @@ else()
   message(STATUS "RDMA: Disabled")
 endif()
 
-# libfabric (EFA, and tcp;ofi_rxm for tests). USE_EFA/USE_CXI already resolve
-# libfabric in mooncake-common/common.cmake.
+# libfabric (EFA, and tcp;ofi_rxm for tests). USE_EFA/USE_CXI already
+# resolve libfabric in mooncake-common/common.cmake.
 if(USE_FABRIC
    OR USE_EFA
    OR USE_CXI)
@@ -136,9 +137,15 @@ if(TARGET Mooncake::liburing)
   message(STATUS "Uring: Enabled")
   target_compile_definitions(tent_interface INTERFACE USE_URING)
   target_link_libraries(tent_interface INTERFACE Mooncake::liburing)
+  set(TENT_FEATURE_URING ON)
 else()
   message(STATUS "Uring: Disabled")
 endif()
+
+# Configure diagnostics only after optional local capabilities have been
+# detected. The resulting library is deliberately independent of tent_interface
+# so the CLI cannot initialize transports or device runtimes.
+add_subdirectory(diagnostics)
 
 if(USE_SUNRISE)
   target_compile_definitions(tent_interface INTERFACE USE_SUNRISE)
@@ -208,6 +215,7 @@ foreach(
   tent_xport_mpcomm
   tent_xport_hylink
   tent_xport_fabric
+  tent_xport_memfabric
   tent_metrics)
   if(TARGET ${tgt})
     target_link_libraries(tent_link_group INTERFACE ${tgt})

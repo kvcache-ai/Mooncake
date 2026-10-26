@@ -24,6 +24,7 @@
 #include "mutex.h"
 #include "common/network.h"
 #include "pyclient.h"
+#include "nof/nof_runtime.h"
 #include "rpc_types.h"
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
@@ -134,12 +135,11 @@ class RealClient : public PyClient {
     /**
      * @brief Get object data directly into a pre-allocated buffer
      * @param key Key of the object to get
-     * @param buffer Pointer to a writable Store buffer, either explicitly
-     * registered with register_buffer() or inside the setup-time local buffer
+     * @param buffer Pointer to a writable Store buffer
      * @param size Size of the buffer
      * @return Number of bytes read on success, negative value on error
-     * @note The buffer address must resolve to Store-managed registered memory
-     * for zero-copy operations
+     * @note Direct RDMA reads require register_buffer() or the setup-time local
+     * buffer. NVLink can read directly into an ordinary device allocation.
      */
     int64_t get_into(const std::string &key, void *buffer, size_t size);
 
@@ -362,6 +362,20 @@ class RealClient : public PyClient {
 
     int tearDownAll();
 
+    // Test-only seam: when set, setup_internal() builds the NoF runtime from
+    // this factory instead of CreateNofRuntime(). Not thread-safe; set before
+    // setup and reset (pass nullptr) after the test.
+    static void SetNofRuntimeFactoryForTesting(
+        std::function<NofRuntime()> factory);
+
+    // Test-only seam: when set, unregister_buffer_internal() calls this hook
+    // instead of Client::unregisterLocalMemory, so a test can replay a TE
+    // failure sequence (e.g. partial deregistration failure followed by
+    // NOT_REGISTERED) that TCP cannot produce. Not thread-safe; reset (pass
+    // nullptr) after the test.
+    static void SetTeUnregisterHookForTesting(
+        std::function<tl::expected<void, ErrorCode>(void *)> hook);
+
     int health_check() override;
 
     /**
@@ -379,6 +393,29 @@ class RealClient : public PyClient {
      */
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
 
+    WeightRpcResult<WeightRevisionMetadata> begin_weight_import(
+        const BeginWeightImportRequest &request) override;
+    WeightRpcResult<WeightRevisionMetadata> commit_weight_import(
+        const CommitWeightImportRequest &request) override;
+    WeightRpcResult<WeightRevisionMetadata> abort_weight_import(
+        const AbortWeightImportRequest &request) override;
+    WeightRpcResult<WeightRevisionView> get_weight_revision(
+        const GetWeightRevisionRequest &request) override;
+    WeightRpcResult<ListWeightRevisionsResponse> list_weight_revisions(
+        const ListWeightRevisionsRequest &request) override;
+    WeightRpcResult<WeightRevisionLease> acquire_weight_revision_lease(
+        const AcquireWeightRevisionLeaseRequest &request) override;
+    WeightRpcResult<WeightRevisionLease> renew_weight_revision_lease(
+        const RenewWeightRevisionLeaseRequest &request) override;
+    WeightRpcResult<void> release_weight_revision_lease(
+        const ReleaseWeightRevisionLeaseRequest &request) override;
+    WeightRpcResult<WeightResidencyOperation> start_weight_residency_operation(
+        const StartWeightResidencyOperationRequest &request) override;
+    WeightRpcResult<WeightResidencyOperation> query_weight_operation(
+        const QueryWeightOperationRequest &request) override;
+    WeightRpcResult<WeightRevisionMetadata> delete_weight_revision(
+        const DeleteWeightRevisionRequest &request) override;
+
     /**
      * @brief Point-in-time existence check that grants no read lease
      * @param key Key to check
@@ -388,13 +425,14 @@ class RealClient : public PyClient {
     int probeKey(const std::string &key);
 
     /**
-     * @brief Point-in-time existence check for multiple objects, granting
-     * no read leases
+     * @brief Probe multiple objects, optionally leasing the last complete
+     * candidate.
      * @param keys Vector of keys to check
-     * @return Vector of existence results: 1 if exists, 0 if not exists, -1
-     * if error
+     * @return Per-key existence results. LastHitOnly leases the last all-1
+     * candidate. Negative values indicate errors.
      */
-    std::vector<int> batchProbeKey(const std::vector<std::string> &keys);
+    std::vector<int> batchProbeKey(const std::vector<std::string> &keys,
+                                   const GrantLeasePolicy &policy = {});
 
     /**
      * @brief Get the size of an object
@@ -794,6 +832,11 @@ class RealClient : public PyClient {
 
     tl::expected<void, ErrorCode> tearDownAll_internal();
 
+    // Idempotently releases this client's NoF registrations for all recorded
+    // user buffers; failures keep their records and latch
+    // nof_buffer_cleanup_failed_.
+    ErrorCode CleanupNofRegisteredBuffers();
+
     tl::expected<bool, ErrorCode> isExist_internal(const std::string &key);
 
     std::vector<tl::expected<bool, ErrorCode>> batchIsExist_internal(
@@ -802,7 +845,7 @@ class RealClient : public PyClient {
     tl::expected<bool, ErrorCode> probeKey_internal(const std::string &key);
 
     std::vector<tl::expected<bool, ErrorCode>> batchProbeKey_internal(
-        const std::vector<std::string> &keys);
+        const std::vector<std::string> &keys, const GrantLeasePolicy &policy);
 
     tl::expected<int64_t, ErrorCode> getSize_internal(const std::string &key);
 
@@ -1042,11 +1085,26 @@ class RealClient : public PyClient {
     };
 #endif
 
+#ifdef USE_MEMFABRIC
+    struct MemFabricSegmentDeleter {
+        std::string protocol = "ascend";
+        void operator()(void *ptr) {
+            if (ptr) {
+                free_memory(protocol.c_str(), ptr);
+            }
+        }
+    };
+#endif
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
+#ifdef USE_MEMFABRIC
+    std::vector<std::unique_ptr<void, MemFabricSegmentDeleter>>
+        memfabric_segment_ptrs_;
+#endif
     std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
 #ifdef USE_VRAM_SEGMENT
     std::vector<std::unique_ptr<void, VRAMSegmentDeleter>> vram_segment_ptrs_;
@@ -1065,6 +1123,11 @@ class RealClient : public PyClient {
     std::unique_ptr<coro_rpc::coro_rpc_server> offload_rpc_server_;
     int offload_rpc_port_ = 0;
     bool use_hugepage_ = false;
+    // NoF runtime (initiator + DMA allocator) created during setup_internal.
+    // Both components are additionally owned by client_ /
+    // client_buffer_allocator_ (in the PyClient base), so member declaration
+    // order is not load-bearing.
+    NofRuntime nof_runtime_{};
 
     struct MappedShm {
         std::string shm_name;
@@ -1105,7 +1168,14 @@ class RealClient : public PyClient {
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
 
     mutable std::shared_mutex registered_buffer_mutex_;
-    std::unordered_map<void *, size_t> registered_buffer_sizes_;
+    struct BufferRegistrationRecord {
+        size_t size;
+    };
+    // A present record means "registered OR cleanup-pending": a record is
+    // retained when NoF/TE cleanup failed, in which case the buffer must
+    // stay mapped until the cleanup retry succeeds (or process exit).
+    std::unordered_map<void *, BufferRegistrationRecord>
+        registered_buffer_sizes_;
     std::optional<WritableBufferRegion> local_buffer_region_;
 
     // KV transfer sessions (process-local; not shared with DummyClient).
@@ -1174,6 +1244,10 @@ class RealClient : public PyClient {
 
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
+
+    // Latched when teardown's NoF buffer cleanup failed: repeat teardown
+    // calls retry the cleanup and keep reporting the failure until it heals.
+    std::atomic<bool> nof_buffer_cleanup_failed_{false};
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
@@ -1319,6 +1393,11 @@ class RealClient : public PyClient {
         bool enable_client_http_server, int client_http_port,
         bool enable_embedded_master);
 
+    friend class DirectGpuReadTest;
+
+    bool can_use_direct_memory_read(const Replica::Descriptor &replica,
+                                    void *buffer, size_t size) const;
+
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
     std::mutex mounted_segment_records_mutex_;
@@ -1344,8 +1423,9 @@ class RealClient : public PyClient {
     std::vector<MappedShm> quarantine_shms_;
 
     // Re-attempt TE + SPDK unregister and munmap of quarantine_shms_. Caller
-    // must hold dummy_client_mutex_. Failures stay quarantined.
-    void RetryQuarantinedShmsLocked();
+    // must hold dummy_client_mutex_. Failures stay quarantined; returns OK
+    // only when nothing remains quarantined.
+    ErrorCode RetryQuarantinedShmsLocked();
 };
 
 }  // namespace mooncake

@@ -45,6 +45,7 @@ struct FilePerKeyEnvironmentVariables {
 };
 
 struct BucketBackendEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE);
@@ -200,6 +201,8 @@ struct OffsetAllocatorBackendEnvironmentVariables {
 };
 
 struct ReplicaSelectionEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MC_STORE_HCA_AFFINITY);
+    MC_DEFINE_ENV_VAR(bool, MC_STORE_HCA_NUMA_SEGMENTS);
     // Only the exact string "1" enables scoring, unlike canonical bool parsing.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_REPLICA_SCORING);
 };

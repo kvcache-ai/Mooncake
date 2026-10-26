@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
@@ -20,6 +21,7 @@
 
 #include "allocator.h"
 #include "client_service.h"
+#include "topology.h"
 #include "real_client.h"
 #include "types.h"
 #include "common/client_buffer_allocation.h"
@@ -61,8 +63,307 @@ UUID ParseClientId(const std::string& client_id_str) {
 
 class ObjectChecksumClient : public Client {
    public:
-    ObjectChecksumClient() : Client("localhost", "", "tcp") {}
+    explicit ObjectChecksumClient(const std::string& protocol = "tcp")
+        : Client("localhost", "", protocol) {}
 };
+
+struct LegacyReplicateConfig {
+    size_t replica_num{1};
+    size_t nof_replica_num{0};
+    size_t dfs_replica_num{0};
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms;
+    bool with_hard_pin{false};
+    std::vector<std::string> preferred_segments;
+    std::string preferred_segment;
+    std::vector<std::string> preferred_nof_segments;
+    bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::string host_id;
+    std::optional<std::vector<std::string>> group_ids;
+};
+
+// Main's session-aware RPC shape, without this PR's affinity extensions.
+struct SessionReplicateConfig {
+    size_t replica_num{1};
+    size_t nof_replica_num{0};
+    size_t dfs_replica_num{0};
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms;
+    bool with_hard_pin{false};
+    std::vector<std::string> preferred_segments;
+    std::string preferred_segment;
+    std::vector<std::string> preferred_nof_segments;
+    bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::string host_id;
+    std::optional<std::vector<std::string>> group_ids;
+    struct_pack::compatible<std::vector<std::string>, 1> session_ids;
+};
+
+TEST(HcaAffinityTest, RequestHintIsWireCompatibleAndSurvivesBatchSplitting) {
+    LegacyReplicateConfig legacy;
+    legacy.preferred_segments = {"receiver"};
+    auto decoded = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(legacy));
+    ASSERT_TRUE(decoded);
+    EXPECT_FALSE(decoded->preferred_hca_names);
+    EXPECT_EQ(decoded->preferred_segments, legacy.preferred_segments);
+    decoded->preferred_hca_names = std::vector<std::string>{"mlx5_0"};
+    decoded->group_ids = std::vector<std::string>{"a", "b"};
+    auto current = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(*decoded));
+    ASSERT_TRUE(current);
+    EXPECT_EQ(current->preferred_hca_names, decoded->preferred_hca_names);
+    EXPECT_EQ(current->ForSingleKey(1).preferred_hca_names,
+              decoded->preferred_hca_names);
+    auto old_reader = struct_pack::deserialize<LegacyReplicateConfig>(
+        struct_pack::serialize(*decoded));
+    ASSERT_TRUE(old_reader);
+    EXPECT_EQ(old_reader->preferred_segments, legacy.preferred_segments);
+}
+
+TEST(HcaAffinityTest, SessionAndAffinityExtensionsRemainWireCompatible) {
+    SessionReplicateConfig session_config;
+    session_config.group_ids = std::vector<std::string>{"g0", "g1"};
+    session_config.session_ids = std::vector<std::string>{"s0", "s1"};
+    EXPECT_EQ(struct_pack::get_type_code<ReplicateConfig>(),
+              struct_pack::get_type_code<SessionReplicateConfig>());
+    auto current = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(session_config));
+    ASSERT_TRUE(current);
+    EXPECT_EQ(current->session_ids, session_config.session_ids);
+    EXPECT_FALSE(current->preferred_hca_names);
+    EXPECT_FALSE(current->per_key_preferred_hca_names);
+
+    current->preferred_hca_names = std::vector<std::string>{"mlx5_0"};
+    current->per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{}, {"mlx5_1"}};
+    auto session_reader = struct_pack::deserialize<SessionReplicateConfig>(
+        struct_pack::serialize(*current));
+    ASSERT_TRUE(session_reader);
+    EXPECT_EQ(session_reader->session_ids, session_config.session_ids);
+    EXPECT_EQ(session_reader->group_ids, session_config.group_ids);
+    auto affinity_reader = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(*current));
+    ASSERT_TRUE(affinity_reader);
+    EXPECT_EQ(affinity_reader->session_ids, session_config.session_ids);
+    EXPECT_EQ(affinity_reader->preferred_hca_names,
+              current->preferred_hca_names);
+    EXPECT_EQ(affinity_reader->per_key_preferred_hca_names,
+              current->per_key_preferred_hca_names);
+}
+
+struct LegacyMemoryDescriptor {
+    AllocatedBuffer::Descriptor buffer_descriptor;
+};
+YLT_REFL(LegacyMemoryDescriptor, buffer_descriptor);
+
+struct LegacyReplicaDescriptor {
+    ReplicaID id{0};
+    std::variant<LegacyMemoryDescriptor, NoFDescriptor, DiskDescriptor,
+                 LocalDiskDescriptor, DistributedFSDescriptor>
+        descriptor_variant;
+    ReplicaStatus status;
+};
+YLT_REFL(LegacyReplicaDescriptor, id, descriptor_variant, status);
+
+TEST(HcaAffinityTest, ReadLocalityIsCompatibleInsideReplicaVariant) {
+    Replica::Descriptor replica;
+    replica.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor memory;
+    memory.buffer_descriptor = {1024, 0x300000000, "rdma", "receiver"};
+    memory.locality = SegmentLocality{7, {"mlx5_0"}};
+    replica.descriptor_variant = memory;
+    auto old_reader = struct_pack::deserialize<LegacyReplicaDescriptor>(
+        struct_pack::serialize(replica));
+    ASSERT_TRUE(old_reader);
+    EXPECT_EQ(std::get<LegacyMemoryDescriptor>(old_reader->descriptor_variant)
+                  .buffer_descriptor.transport_endpoint_,
+              "receiver");
+    auto current = struct_pack::deserialize<Replica::Descriptor>(
+        struct_pack::serialize(replica));
+    ASSERT_TRUE(current);
+    EXPECT_EQ(current->get_memory_descriptor().locality, memory.locality);
+    auto new_reader = struct_pack::deserialize<Replica::Descriptor>(
+        struct_pack::serialize(*old_reader));
+    ASSERT_TRUE(new_reader);
+    EXPECT_FALSE(new_reader->get_memory_descriptor().locality);
+}
+
+struct LegacySegment {
+    UUID id{0, 0};
+    std::string name;
+    uintptr_t base{0};
+    size_t size{0};
+    std::string te_endpoint;
+    std::string protocol;
+    std::string host_id;
+};
+YLT_REFL(LegacySegment, id, name, base, size, te_endpoint, protocol, host_id);
+
+TEST(HcaAffinityTest, SegmentLocalityHasCompatibleWireFields) {
+    LegacySegment old;
+    old.id = generate_uuid();
+    old.name = "receiver";
+    old.base = 0x300000000;
+    old.size = 1024 * 1024;
+    old.te_endpoint = "receiver:1234";
+    old.protocol = "rdma";
+    old.host_id = "receiver";
+    auto decoded =
+        struct_pack::deserialize<Segment>(struct_pack::serialize(old));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->name, old.name);
+    EXPECT_FALSE(decoded->locality);
+    decoded->locality = SegmentLocality{7, {"mlx5_0"}};
+    const auto encoded = struct_pack::serialize(*decoded);
+    auto legacy = struct_pack::deserialize<LegacySegment>(encoded);
+    ASSERT_TRUE(legacy);
+    EXPECT_EQ(legacy->base, old.base);
+    EXPECT_EQ(legacy->host_id, old.host_id);
+    auto current = struct_pack::deserialize<Segment>(encoded);
+    ASSERT_TRUE(current);
+    ASSERT_TRUE(current->locality);
+    EXPECT_EQ(*current->locality, *decoded->locality);
+}
+
+TEST(HcaAffinityTest, ReceiverTopologyDeterminesNuma) {
+    Topology topology;
+    ASSERT_EQ(topology.parse(R"({"cpu:7":[["mlx5_0"],["mlx5_1"]],
+                                 "cpu:0":[["mlx5_1"],["mlx5_0"]]})"),
+              0);
+    auto locality = Client::DiscoverSegmentLocality(topology, "cpu:7");
+    ASSERT_TRUE(locality);
+    EXPECT_EQ(locality->numa_node, 7);
+    EXPECT_EQ(locality->hca_names, (std::vector<std::string>{"mlx5_0"}));
+    EXPECT_EQ(HcaAffinityTier(locality, {"mlx5_0"}), 0);
+    EXPECT_EQ(HcaAffinityTier(locality, {"mlx5_1"}), 2);
+    EXPECT_EQ(HcaAffinityTier(std::nullopt, {"mlx5_0"}), 1);
+    EXPECT_EQ(HcaAffinityTier(locality, {}), 0);
+    EXPECT_EQ(HcaAffinityTier(locality, {"mlx5_0", "mlx5_1"}), 2);
+}
+
+TEST(HcaAffinityTest, CompoundAndUnknownLocalityAreNotAdvertised) {
+    Topology topology;
+    ASSERT_EQ(topology.parse(R"({"cpu:0":[["mlx5_0"],[]]})"), 0);
+    for (const auto* location :
+         {"*", "cuda:0", "cpu:-1", "cpu:0extra", "segments:4096:0,1", "cpu:"}) {
+        EXPECT_FALSE(Client::DiscoverSegmentLocality(topology, location));
+    }
+    auto locality = Client::DiscoverSegmentLocality(topology, "cpu:2");
+    ASSERT_TRUE(locality);
+    EXPECT_EQ(HcaAffinityTier(locality, {"mlx5_0"}), 1);
+}
+
+TEST(HcaAffinityTest, InfersOnlyHomogeneousRegisteredSources) {
+    Topology topology;
+    ASSERT_EQ(topology.parse(R"({"cpu:0":[["mlx5_0","mlx5_2"],[]],
+                                 "cpu:1":[["mlx5_1"],[]],
+                                 "cuda:0":[["mlx5_0","mlx5_2"],[]]})"),
+              0);
+    const std::vector<SegmentBufferInfo> buffers{
+        {0x100000, 8192, "segments:4096:0,1"}, {0x200000, 8192, "cuda:0"}};
+    const std::vector<Slice> homogeneous{
+        {reinterpret_cast<void*>(0x100000), 4096},
+        {reinterpret_cast<void*>(0x200000), 4096}};
+    const auto infer = Client::MakeHcaAffinity(topology, buffers);
+    EXPECT_EQ(infer(homogeneous),
+              (std::vector<std::string>{"mlx5_0", "mlx5_2"}));
+    for (const auto& slice :
+         std::vector<Slice>{{reinterpret_cast<void*>(0x100000), 8192},
+                            {reinterpret_cast<void*>(0x300000), 4096},
+                            {nullptr, 4096}}) {
+        EXPECT_TRUE(infer(std::vector<Slice>{slice}).empty());
+    }
+    const std::vector<Slice> mixed{homogeneous[0],
+                                   {reinterpret_cast<void*>(0x101000), 4096}};
+    EXPECT_TRUE(infer(mixed).empty());
+    const auto& names = infer(homogeneous);
+    topology.clear();
+    EXPECT_TRUE(infer(mixed).empty());
+    EXPECT_EQ(names, (std::vector<std::string>{"mlx5_0", "mlx5_2"}));
+    EXPECT_EQ(infer(homogeneous), names);
+}
+
+TEST(HcaAffinityTest, BatchHintsFollowKeysAndRetrySubsets) {
+    ReplicateConfig config;
+    config.group_ids = std::vector<std::string>{"g0", "g1", "g2"};
+    config.session_ids = std::vector<std::string>{"s0", "s1", "s2"};
+    config.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_0"}, {"mlx5_1"}, {}};
+    EXPECT_TRUE(config.HasValidKeyHints(3));
+    EXPECT_FALSE(config.HasValidKeyHints(2));
+    auto subset = config.ForKeySubset({2, 0});
+    ASSERT_TRUE(subset.HasValidKeyHints(2));
+    EXPECT_EQ(*subset.group_ids, (std::vector<std::string>{"g2", "g0"}));
+    ASSERT_TRUE(subset.ValidSessionIds(2));
+    EXPECT_EQ(*subset.session_ids, (std::vector<std::string>{"s2", "s0"}));
+    EXPECT_EQ(subset.ForSingleKey(0).SessionId(), "s2");
+    EXPECT_TRUE(subset.ForSingleKey(0).preferred_hca_names->empty());
+    EXPECT_EQ(*subset.ForSingleKey(1).preferred_hca_names,
+              (std::vector<std::string>{"mlx5_0"}));
+    EXPECT_FALSE(subset.ForSingleKey(1).per_key_preferred_hca_names);
+    auto key_config = subset;
+    key_config.preferred_segment = "chosen-receiver";
+    for (size_t index : {1, 0, 1}) {
+        key_config.SetKeyIds(subset, index);
+        EXPECT_EQ(key_config.SessionId(), subset.session_ids->at(index));
+        EXPECT_EQ(*key_config.group_ids,
+                  (std::vector<std::string>{subset.group_ids->at(index)}));
+        EXPECT_EQ(*key_config.preferred_hca_names,
+                  subset.per_key_preferred_hca_names->at(index));
+        EXPECT_FALSE(key_config.per_key_preferred_hca_names);
+        EXPECT_EQ(key_config.preferred_segment, "chosen-receiver");
+    }
+    EXPECT_EQ(config.session_ids->size(), 3);
+    auto restored = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(config));
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(restored->per_key_preferred_hca_names,
+              config.per_key_preferred_hca_names);
+    auto legacy = struct_pack::deserialize<LegacyReplicateConfig>(
+        struct_pack::serialize(config));
+    ASSERT_TRUE(legacy);
+    EXPECT_EQ(legacy->group_ids, config.group_ids);
+}
+
+TEST(ReadAffinityTest,
+     SingleCopyKeepsStatusChecksWithoutRegisteredDestinations) {
+    ObjectChecksumClient client("rdma");
+    auto select = client.MakeReadReplicaSelector();
+    Replica::Descriptor copy;
+    copy.descriptor_variant = MemoryDescriptor{};
+    copy.status = ReplicaStatus::COMPLETE;
+    copy.id = 123;
+    copy.get_memory_descriptor().locality = SegmentLocality{7, {"mlx5_0"}};
+    Replica::Descriptor selected;
+    EXPECT_EQ(select({copy}, {}, selected), ErrorCode::OK);
+    EXPECT_EQ(selected.id, copy.id);
+    copy.status = ReplicaStatus::PROCESSING;
+    EXPECT_EQ(select({copy}, {}, selected), ErrorCode::INVALID_REPLICA);
+    EXPECT_EQ(select({}, {}, selected), ErrorCode::INVALID_REPLICA);
+}
+
+TEST(ReadAffinityTest, MissingCompleteSessionCandidateIsAnError) {
+    ObjectChecksumClient client;
+    Replica::Descriptor replica;
+    replica.descriptor_variant = MemoryDescriptor{};
+    replica.get_memory_descriptor().buffer_descriptor.size_ = 1;
+    replica.status = ReplicaStatus::COMPLETE;
+    auto pending = replica;
+    pending.status = ReplicaStatus::PROCESSING;
+    QueryResult query(
+        {pending}, std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    uint8_t destination = 0;
+    const std::vector<const QueryResult*> queries{&query};
+    auto results =
+        client.BatchTransferReadRanges({replica}, {{{&destination, 1}}}, {{0}},
+                                       TransferIntent::kUnspecified, queries);
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_FALSE(results[0]);
+    EXPECT_EQ(results[0].error(), ErrorCode::INVALID_REPLICA);
+}
 
 TEST(ObjectChecksumTest, ClientVerifiesOnlyLogicalObjectBytes) {
     if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
@@ -349,6 +650,55 @@ std::string ClientIntegrationTest::metadata_url_;
 UUID ClientIntegrationTest::test_client_id_{0, 0};
 UUID ClientIntegrationTest::segment_provider_client_id_{0, 0};
 
+namespace {
+
+// Minimal initiator used to observe which initiator Client::Create wires up.
+class WiringProbeInitiator : public NVMeoFInitiator {
+   public:
+    NofSegmentHandle* OpenSegment(const std::string&) override {
+        return nullptr;
+    }
+    bool ProbeSegment(const std::string&, uint32_t, std::string*) override {
+        return false;
+    }
+    uint32_t GetBlockSize(const NofSegmentHandle*) override {
+        return kInvalidBlockSize;
+    }
+    int SubmitIO(NofSegmentHandle*, void*, uint64_t, uint64_t, NofIOOp,
+                 NofIOAdaptor*) override {
+        return -EINVAL;
+    }
+    int64_t PollCompletion(NofSegmentHandle*, uint32_t) override { return 0; }
+    ErrorCode RegisterMemory(void*, size_t) override { return ErrorCode::OK; }
+    ErrorCode UnregisterMemory(void*) override { return ErrorCode::OK; }
+    NofCapabilities GetCapabilities() const override { return {}; }
+};
+
+// Clears the Client default-initiator factory seam even when the test fails.
+struct DefaultInitiatorFactoryGuard {
+    ~DefaultInitiatorFactoryGuard() {
+        Client::SetDefaultNofInitiatorFactoryForTesting(nullptr);
+    }
+};
+
+}  // namespace
+
+// Regression test: callers that pass no initiator (the default argument)
+// must keep getting the process default NoF runtime, not nullptr.
+TEST_F(ClientIntegrationTest, CreateWithoutInitiatorKeepsDefaultNofRuntime) {
+    DefaultInitiatorFactoryGuard guard;
+    auto probe = std::make_shared<WiringProbeInitiator>();
+    Client::SetDefaultNofInitiatorFactoryForTesting([probe] { return probe; });
+
+    auto client_opt = Client::Create("localhost:17941",  // unique hostname
+                                     "P2PHANDSHAKE", FLAGS_protocol,
+                                     std::nullopt, master_address_);
+    ASSERT_TRUE(client_opt.has_value());
+    // The default argument must resolve to the process default runtime
+    // (here: the injected probe), not nullptr.
+    EXPECT_EQ((*client_opt)->GetNofInitiatorForTesting(), probe);
+}
+
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
     const std::string test_data = "Hello, World!";
@@ -471,6 +821,64 @@ TEST_F(ClientIntegrationTest, BatchPutPreservesObjectChecksumPairing) {
                   ComputeCrcChecksum(values[i].data(), values[i].size()));
         client_buffer_allocator_->deallocate(buffers[i], values[i].size());
     }
+}
+
+TEST_F(ClientIntegrationTest, TaggedBatchWritesSkipChecksumFailures) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+    void* buffer = client_buffer_allocator_->allocate(4);
+    ASSERT_NE(buffer, nullptr);
+    std::memcpy(buffer, "data", 4);
+    for (bool upsert : {false, true}) {
+        const std::vector<ObjectKey> keys = {
+            "invalid-slice", upsert ? "tagged-upsert" : "tagged-put"};
+        std::vector<std::vector<Slice>> slices{{Slice{nullptr, 1}},
+                                               {Slice{buffer, 4}}};
+        ReplicateConfig config;
+        config.session_ids = std::vector<std::string>{"invalid", "valid"};
+        config.group_ids =
+            std::vector<std::string>{"invalid-group", "valid-group"};
+        config.per_key_preferred_hca_names =
+            std::vector<std::vector<std::string>>{{"mlx5_0"}, {"mlx5_1"}};
+        auto results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                              : test_client_->BatchPut(keys, slices, config);
+        ASSERT_EQ(results.size(), 2);
+        ASSERT_FALSE(results[0]);
+        EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+        ASSERT_TRUE(results[1]) << toString(results[1].error());
+        auto query = test_client_->Query(keys[1]);
+        ASSERT_TRUE(query);
+        EXPECT_EQ(query->object_checksum, ComputeCrcChecksum("data", 4));
+
+        // A short tag vector must not become valid after filtering a key.
+        config.session_ids = std::vector<std::string>{"wrong"};
+        results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                         : test_client_->BatchPut(keys, slices, config);
+        for (const auto& result : results) {
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        }
+        config.session_ids = std::vector<std::string>{"invalid", "valid"};
+        config.group_ids = std::vector<std::string>{"wrong"};
+        results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                         : test_client_->BatchPut(keys, slices, config);
+        for (const auto& result : results) {
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        }
+        config.group_ids =
+            std::vector<std::string>{"invalid-group", "valid-group"};
+        config.per_key_preferred_hca_names =
+            std::vector<std::vector<std::string>>{{"wrong"}};
+        results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                         : test_client_->BatchPut(keys, slices, config);
+        for (const auto& result : results) {
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        }
+    }
+    client_buffer_allocator_->deallocate(buffer, 4);
 }
 
 // Test Remove operation

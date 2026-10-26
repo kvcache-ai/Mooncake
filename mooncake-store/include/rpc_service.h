@@ -54,7 +54,7 @@ class WrappedMasterService {
         const std::string& tenant_id = "default");
 
     std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
-        const std::vector<std::string>& keys,
+        const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
         const std::string& tenant_id = "default");
 
     tl::expected<
@@ -160,6 +160,10 @@ class WrappedMasterService {
 
     long RemoveAll(bool force = false,
                    const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<void, ErrorCode>> BatchUpdateSoftPin(
+        const std::vector<std::string>& keys, uint64_t ttl_ms,
+        const std::string& tenant_id = "default");
 
     std::vector<tl::expected<void, ErrorCode>> BatchRemove(
         const std::vector<std::string>& keys, bool force = false,
@@ -276,6 +280,41 @@ class WrappedMasterService {
         const UUID& segment_id);
     tl::expected<void, ErrorCode> SetSegmentStatus(
         const std::string& segment_name, SegmentStatus status);
+
+    WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
+        const BeginWeightImportRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(
+        const CommitWeightImportRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> AbortWeightImport(
+        const AbortWeightImportRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionView> GetWeightRevision(
+        const GetWeightRevisionRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<ListWeightRevisionsResponse>
+    ListWeightRevisions(const ListWeightRevisionsRequest& request,
+                        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightResidencyOperation>
+    StartWeightResidencyOperation(
+        const StartWeightResidencyOperationRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightResidencyOperation> QueryWeightOperation(
+        const QueryWeightOperationRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> DeleteWeightRevision(
+        const DeleteWeightRevisionRequest& request,
+        const std::string& tenant_id = "default");
 
     // Internal method called by supervisor during promotion; NOT an RPC
     // endpoint.

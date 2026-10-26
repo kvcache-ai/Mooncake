@@ -1,5 +1,35 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
+  add_executable(adaptive_congestion_control_test
+                 ${WORKSPACE}/adaptive_congestion_control_test.cpp)
+  target_link_libraries(
+    adaptive_congestion_control_test PRIVATE adaptive_congestion_control_core
+                                             gtest gtest_main)
+  add_test(NAME adaptive_congestion_control_test
+           COMMAND adaptive_congestion_control_test)
+
+  add_executable(rdma_error_classifier_test
+                 ${WORKSPACE}/rdma_error_classifier_test.cpp)
+  target_link_libraries(
+    rdma_error_classifier_test PRIVATE adaptive_congestion_control_core gtest
+                                       gtest_main)
+  add_test(NAME rdma_error_classifier_test COMMAND rdma_error_classifier_test)
+
+  add_executable(adaptive_congestion_control_config_test
+                 ${WORKSPACE}/adaptive_congestion_control_config_test.cpp)
+  target_link_libraries(
+    adaptive_congestion_control_config_test
+    PRIVATE adaptive_congestion_control_core gtest gtest_main)
+  add_test(NAME adaptive_congestion_control_config_test
+           COMMAND adaptive_congestion_control_config_test)
+
+  add_executable(adaptive_congestion_control_benchmark
+                 ${WORKSPACE}/adaptive_congestion_control_benchmark.cpp)
+  target_link_libraries(adaptive_congestion_control_benchmark
+                        PRIVATE adaptive_congestion_control_core)
+endif()
+
 if(USE_HIP)
   file(GLOB TEST_SOURCES "*.cpp")
   hipify_files(TEST_SOURCES)
@@ -79,11 +109,13 @@ add_executable(worker_pool_rail_state_test
 target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
                                                          gtest_main)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  # Control GID I/O to exercise recovery while completion failures arrive.
+  # Control GID I/O and port-state queries so event recovery can be exercised
+  # without an RDMA device.
   target_link_options(
     worker_pool_rail_state_test
     PRIVATE
     "-Wl,--wrap=_ZN8mooncake11RdmaContext17refreshCurrentGidEPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_"
+    "-Wl,--wrap=_ZNK8mooncake11RdmaContext14queryPortStateEP14ibv_port_state"
   )
 endif()
 add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)
@@ -316,6 +348,25 @@ if(USE_EFA)
                                                       gtest_main)
   add_test(NAME efa_select_device_test COMMAND efa_select_device_test)
 
+  # Compiles the real EfaEndPoint source against the test-only
+  # RPC/address-vector fakes in efa_endpoint_handshake_fakes/ (shadowed
+  # efa_context.h via -iquote), so the endpoint locking and generation logic
+  # runs without an EFA device. Bounded: a locking regression must fail, not
+  # hang the test runner.
+  add_executable(
+    efa_endpoint_handshake_test
+    ${WORKSPACE}/efa_endpoint_handshake_test.cpp
+    ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/src/transport/efa_transport/efa_endpoint.cpp
+  )
+  target_compile_options(
+    efa_endpoint_handshake_test
+    PRIVATE -iquote${WORKSPACE}/efa_endpoint_handshake_fakes)
+  target_link_libraries(
+    efa_endpoint_handshake_test PUBLIC glog::glog gflags::gflags gtest
+                                       gtest_main pthread)
+  add_test(NAME efa_endpoint_handshake_test COMMAND efa_endpoint_handshake_test)
+  set_tests_properties(efa_endpoint_handshake_test PROPERTIES TIMEOUT 120)
+
   add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
   target_link_libraries(efa_c_api_test PUBLIC transfer_engine gtest gtest_main)
   add_test(NAME efa_c_api_test COMMAND efa_c_api_test)
@@ -499,6 +550,12 @@ add_executable(rdma_context_reprobe_test
 target_link_libraries(rdma_context_reprobe_test PUBLIC transfer_engine gtest
                                                        gtest_main)
 add_test(NAME rdma_context_reprobe_test COMMAND rdma_context_reprobe_test)
+
+add_executable(rdma_unregister_retry_test
+               ${WORKSPACE}/rdma_unregister_retry_test.cpp)
+target_link_libraries(rdma_unregister_retry_test PUBLIC transfer_engine gtest
+                                                        gtest_main)
+add_test(NAME rdma_unregister_retry_test COMMAND rdma_unregister_retry_test)
 
 add_executable(rdma_memory_location_test
                ${WORKSPACE}/rdma_memory_location_test.cpp)

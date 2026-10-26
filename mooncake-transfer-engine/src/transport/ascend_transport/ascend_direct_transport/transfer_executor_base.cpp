@@ -16,6 +16,7 @@
 #include "transport/ascend_transport/ascend_direct_transport/transfer_executor_base.h"
 #include "transport/ascend_transport/ascend_direct_transport/async_transfer_executor.h"
 #include "transport/ascend_transport/ascend_direct_transport/local_copy_engine.h"
+#include "transport/ascend_transport/ascend_direct_transport/shared_host_mapper.h"
 #include "transport/ascend_transport/ascend_direct_transport/sync_transfer_executor.h"
 #include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
@@ -220,6 +221,12 @@ int TransferExecutorBase::initEngines() {
         LOG(ERROR) << "Failed to initialize LocalCopyEngine, ret: " << ret;
         return ret;
     }
+    // Whether a destination can be copied locally is decided per buffer, from
+    // the memfd handle in shm_name. Install the mapper for every non-fabric
+    // engine so that check can run; a buffer without a handle stays on adxl.
+    if (!params_.use_fabric_mem) {
+        shared_host_mapper_ = std::make_unique<SharedHostMapper>();
+    }
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
         LOG(ERROR) << "aclrtGetCurrentContext failed, errmsg: "
@@ -347,6 +354,9 @@ void TransferExecutorBase::finalizeEngines() {
         local_copy_engine_->Finalize();
         local_copy_engine_.reset();
     }
+    // Released after the copy engine, so no copy can still be reading through
+    // one of the imported mappings when it is unmapped.
+    shared_host_mapper_.reset();
 }
 
 int TransferExecutorBase::checkAndConnect(
@@ -646,6 +656,28 @@ std::string TransferExecutorBase::resolveTargetAdxlEngineName(
     return EngineNameForDestAddr(segment_desc->buffers, endpoints, dest_addr);
 }
 
+bool TransferExecutorBase::resolveLocalCopyDestinations(
+    const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
+    const std::vector<Transport::Slice*>& slice_list,
+    std::vector<void*>& dest_addrs) {
+    if (!shared_host_mapper_ || slice_list.empty()) {
+        return false;
+    }
+    dest_addrs.clear();
+    dest_addrs.reserve(slice_list.size());
+    for (auto* slice : slice_list) {
+        void* local_addr = nullptr;
+        if (!shared_host_mapper_->Translate(segment_desc,
+                                            slice->ascend_direct.dest_addr,
+                                            slice->length, &local_addr)) {
+            dest_addrs.clear();
+            return false;
+        }
+        dest_addrs.push_back(local_addr);
+    }
+    return true;
+}
+
 void TransferExecutorBase::processSliceList(
     const std::vector<Transport::Slice*>& slice_list) {
     if (slice_list.empty()) {
@@ -722,11 +754,22 @@ void TransferExecutorBase::processHomogeneousSliceList(
             return;
         }
 
-        auto need_local_copy = !params_.use_fabric_mem &&
-                               (target_adxl_engine_name == local_engine_name);
+        // Two ways a transfer stays on this machine. The engine names matching
+        // means the target is this very process, so its addresses are already
+        // ours. Otherwise the target may still be a peer process here that
+        // shared its host segment, in which case the mapper gives us local
+        // addresses for the same physical pages. Either way we memcpy instead
+        // of going out through adxl.
+        std::vector<void*> local_dest_addrs;
+        bool need_local_copy =
+            !params_.use_fabric_mem &&
+            (target_adxl_engine_name == local_engine_name ||
+             resolveLocalCopyDestinations(target_segment_desc, slice_list,
+                                          local_dest_addrs));
         if (need_local_copy && local_copy_engine_) {
             auto start = std::chrono::steady_clock::now();
-            local_copy_engine_->Copy(slice_list[0]->opcode, slice_list);
+            local_copy_engine_->Copy(slice_list[0]->opcode, slice_list,
+                                     local_dest_addrs);
             VLOG(1) << "Local copy time: "
                     << std::chrono::duration_cast<std::chrono::microseconds>(
                            std::chrono::steady_clock::now() - start)

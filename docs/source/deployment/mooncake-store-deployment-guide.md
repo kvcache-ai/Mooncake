@@ -361,7 +361,7 @@ With `ha_backend_type=etcd`, Mooncake Store supports a Primary-Standby HA model 
 HA leadership and metadata replication are configured separately:
 
 - The HA coordinator elects the active master. Configure it with `--enable_ha`, `--ha_backend_type`, `--ha_backend_connstring`, and `--cluster_id`. For `ha_backend_type=etcd`, legacy `--etcd_endpoints` is used only when `--ha_backend_connstring` is empty.
-- The optional batch-record OpLog records metadata mutations so standby masters can catch up and later be promoted. It is the etcd Primary-Standby path. Enable it explicitly with `--enable_oplog=true`; it is disabled by default. `ha_backend_type=etcd` requires a build with `STORE_USE_ETCD`. On etcd, acknowledged batches form the durable prefix used for promotion. `ha_backend_type=redis` requires a build with `STORE_USE_REDIS` and is an experimental HA log storage method. A successful Redis write only means Redis accepted the record. Do not treat Redis persistence, including AOF `appendfsync everysec`, as a strict durability guarantee. 
+- The optional batch-record OpLog records metadata mutations so standby masters can catch up and later be promoted. It is the etcd Primary-Standby path. Enable it explicitly with `--enable_oplog=true`; it is disabled by default. `ha_backend_type=etcd` requires a build with `STORE_USE_ETCD`. On etcd, acknowledged batches form the durable prefix used for promotion. `ha_backend_type=redis` requires a build with `STORE_USE_REDIS` and is an experimental HA log storage method. A successful Redis write only means Redis accepted the record. Do not treat Redis persistence, including AOF `appendfsync everysec`, as a strict durability guarantee.
 - The optional standby-generated batch OpLog snapshot path is enabled with `--enable_oplog_snapshot=true` together with `--enable_oplog=true`. It uses the batch snapshot provider/coordinator and does not use the legacy catalog snapshot manager. Startup fails when the required etcd, cluster ID, object-store, or chunk configuration is invalid; a temporary upload failure leaves OpLog apply running for a later attempt.
 
 
@@ -720,7 +720,7 @@ mooncake_master \
 |------|---------|-------------|
 | `--default_kv_lease_ttl` | `10000` ms | Lease TTL for KV objects. Supports `5000ms`, `5s`, `30m`, `1h` |
 | `--default_kv_soft_pin_ttl` | `1800000` ms | Soft pin TTL (30 min) |
-| `--max_kv_soft_pin_ttl` | `86400000` ms | Maximum request-level soft pin TTL (24 h) |
+| `--max_kv_soft_pin_ttl` | `604800000` ms | Maximum request-level soft pin TTL (7 days) |
 | `--allow_evict_soft_pinned_objects` | `true` | Allow evicting soft-pinned objects |
 | `--eviction_ratio` | `0.05` | Fraction evicted at high watermark |
 | `--eviction_high_watermark_ratio` | `0.90` | Usage ratio triggering eviction |
@@ -745,6 +745,7 @@ mooncake_master \
 | `--ha_backend_connstring` | empty | HA backend connection string |
 | `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
+| `--ha_leader_lease_ttl_sec` | `5` | Leadership lease TTL in seconds for `ha_backend_type=etcd` (range `2`-`60`; the JSON config key `ha_leader_lease_ttl_sec` is also accepted). Raise it to ride out etcd apply stalls longer than the default. A longer TTL delays failover: a new leader waits one full TTL before serving, and a standby waits for a crashed leader's lease to expire. Ignored by the Redis and k8s backends |
 | `--enable_oplog` | `false` | Enable the batch OpLog writer and reader; requires `enable_ha=true` and `ha_backend_type=etcd` or `redis`. etcd uses it for Primary-Standby promotion. Redis uses it as an experimental HA log store: a successful write only means Redis accepted the record |
 | `--enable_oplog_snapshot` | `false` | Enable standby-generated batch OpLog snapshots; requires batch OpLog, HA/etcd, valid object-store configuration, and persistent local snapshot storage when applicable |
 | `--snapshot_chunk_object_count` | `1000000` | Maximum objects per batch OpLog snapshot chunk; must be positive when the new snapshot path is enabled |
@@ -998,19 +999,21 @@ config.dfs_replica_num = 1
 store.put("key", b"value", config)
 ```
 
-`dfs_replica_num` may currently be `0` or `1`. A DFS replica must be requested
-with at least one memory replica (`replica_num >= 1`), so DFS-only placement is
-not supported.
+`dfs_replica_num` may currently be `0` or `1`. DFS-only placement is supported
+by setting `replica_num = 0` and `nof_replica_num = 0`; the object then has no
+memory replica, and DFS eviction or removal deletes it.
 
 Allocation first tries the key's hash-selected DFS shard, then tries other
 ready shards if that shard has no suitable extent. This lets new shards accept
 writes even when older shards are full. `NO_AVAILABLE_HANDLE` means no ready
 shard could satisfy the allocation. A DFS object is never striped across shards.
-The selected shard must have room for the object rounded
-up to `MOONCAKE_DFS_ALIGNMENT`, plus up to one alignment unit of allocator
-padding (`MOONCAKE_DFS_ALIGNMENT - 1` bytes); usable object capacity is
-therefore lower than the shard file's
-logical size.
+The selected shard must have a contiguous free extent large enough for the
+object rounded up to `MOONCAKE_DFS_ALIGNMENT` (`aligned_size`) and then to the
+allocator's size class. No leading alignment padding is needed: each shard
+allocator starts at offset 0, and size-class rounding, splitting, and coalescing
+preserve alignment. Size-class rounding can still reserve more than
+`aligned_size`, so usable object capacity depends on object sizes and
+fragmentation.
 
 For `Put`, `BatchPut`, `Upsert`, and `BatchUpsert`, the client writes requested
 memory and NoF replicas, stages device buffers to host memory when necessary,
@@ -1022,7 +1025,9 @@ failed key is revoked without downgrading successful keys.
 For a same-size `Upsert`, if either the existing object or the new request has
 a DFS replica, the requested memory, NoF, and DFS replica counts must match the
 existing topology. A different-size update releases the old placement and
-allocates a new topology.
+allocates a new topology. For example, after the memory replica of a
+memory-plus-DFS object is evicted, a same-size `Upsert` must request the
+DFS-only topology.
 
 On reads, the master returns the readable replica list through the normal query
 path, and the client selects the first complete replica. If it selects DFS, any
@@ -1032,14 +1037,13 @@ reads for that descriptor.
 #### Current limitations
 
 - Only the `default` tenant is supported.
-- `dfs_replica_num` must be `0` or `1`, and `replica_num >= 1` is required when
-  it is enabled.
+- `dfs_replica_num` must be `0` or `1`.
 - C and Rust clients cannot currently request or access descriptor-based DFS:
   their replication configuration does not expose `dfs_replica_num`, and their
   setup API cannot initialize the distributed `FileStorage` backend. Use the
   native C++ or Python/RealClient API.
 - A DFS object must fit in a single shard after alignment and allocator
-  padding; objects are not striped across shards.
+  size-class rounding; objects are not striped across shards.
 - DFS allocator state is currently in memory. A master restart or HA leader
   failover does not reconstruct existing DFS allocations, so DFS cannot provide
   continuity across those events.

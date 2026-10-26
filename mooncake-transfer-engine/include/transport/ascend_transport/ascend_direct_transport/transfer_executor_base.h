@@ -33,6 +33,7 @@
 namespace mooncake {
 
 class LocalCopyEngine;
+class SharedHostMapper;
 
 /**
  * TransferExecutorBase: Base class with common ADXL logic shared by
@@ -106,11 +107,23 @@ class TransferExecutorBase {
     std::string resolveTargetAdxlEngineName(
         const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
         uint64_t dest_addr) const;
+    // Fills `dest_addrs` with every slice's destination rebased onto this
+    // process's address space, and returns true when all of them resolved.
+    // On false the caller must use adxl: a partially translated group cannot
+    // be copied, because the untranslated slices point into another process.
+    bool resolveLocalCopyDestinations(
+        const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
+        const std::vector<Transport::Slice*>& slice_list,
+        std::vector<void*>& dest_addrs);
     void processHomogeneousSliceList(
         const std::vector<Transport::Slice*>& slice_list);
 
     InitParams params_;
     std::unique_ptr<LocalCopyEngine> local_copy_engine_;
+    // Imports host segments owned by other processes on this machine.
+    // Installed for non-fabric engines. A transfer uses it only when the
+    // destination buffer advertises a shared memfd handle.
+    std::unique_ptr<SharedHostMapper> shared_host_mapper_;
     std::vector<std::shared_ptr<adxl::AdxlEngine>> adxl_engines_;
     std::vector<aclrtContext> local_engine_contexts_;
     std::mutex mem_handle_mutex_;

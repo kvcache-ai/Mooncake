@@ -216,6 +216,24 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
 tl::expected<DistributedStorageBackend::ShardFile*, ErrorCode>
 DistributedStorageBackend::GetOrOpenShard(
     const DistributedFSDescriptor& descriptor) {
+    if (descriptor.shard_idx < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    ShardFile* shard = nullptr;
+    {
+        std::lock_guard cache_lock(shard_files_mutex_);
+        auto existing = shard_files_.find(descriptor.shard_idx);
+        if (existing != shard_files_.end()) shard = existing->second.get();
+    }
+    if (shard) {
+        std::lock_guard shard_lock(shard->mutex);
+        // Only the exact path validated when this fd was opened can bypass
+        // normalization. Aliases and changed descriptors take the full
+        // validation path below. Cache entries live until backend teardown.
+        if (shard->fd >= 0 && shard->path == descriptor.file_path) return shard;
+    }
+
     const auto path =
         std::filesystem::path(descriptor.file_path).lexically_normal();
     auto root = std::filesystem::path(root_dir_).lexically_normal();
@@ -223,13 +241,11 @@ DistributedStorageBackend::GetOrOpenShard(
     auto parent = path.parent_path();
     if (parent.empty()) parent = ".";
     const auto index = ParseShardFileName(path.filename().string());
-    if (descriptor.shard_idx < 0 || !index || *index != descriptor.shard_idx ||
-        parent != root) {
+    if (!index || *index != descriptor.shard_idx || parent != root) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    ShardFile* shard;
-    {
+    if (!shard) {
         std::lock_guard cache_lock(shard_files_mutex_);
         auto existing = shard_files_.find(descriptor.shard_idx);
         if (existing == shard_files_.end()) {

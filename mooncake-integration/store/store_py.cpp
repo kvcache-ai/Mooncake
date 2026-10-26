@@ -1171,47 +1171,39 @@ class MooncakeStorePyWrapper {
     ReplicateConfig MakeIndexedConfig(
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices) const {
-        if (!config.group_ids.has_value()) {
-            return config;
-        }
-
-        ReplicateConfig indexed_config = config;
-        std::vector<std::string> group_ids;
-        group_ids.reserve(original_indices.size());
-        for (size_t index : original_indices) {
-            group_ids.push_back(config.group_ids->at(index));
-        }
-        indexed_config.group_ids = std::move(group_ids);
-        return indexed_config;
+        return config.ForKeySubset(original_indices);
     }
 
     ReplicateConfig MakeRepeatedIndexedConfig(
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices, int repeat_count) const {
-        if (!config.group_ids.has_value()) {
+        if (!config.group_ids && !config.session_ids &&
+            !config.per_key_preferred_hca_names) {
             return config;
         }
-
-        ReplicateConfig indexed_config = config;
-        std::vector<std::string> group_ids;
-        group_ids.reserve(original_indices.size() *
-                          static_cast<size_t>(repeat_count));
+        std::vector<size_t> shard_indices;
+        shard_indices.reserve(original_indices.size() *
+                              static_cast<size_t>(repeat_count));
         for (size_t index : original_indices) {
             for (int i = 0; i < repeat_count; ++i) {
-                group_ids.push_back(config.group_ids->at(index));
+                shard_indices.push_back(index);
             }
         }
-        indexed_config.group_ids = std::move(group_ids);
-        return indexed_config;
+        return config.ForKeySubset(shard_indices);
     }
 
-    std::vector<int> ValidateGroupIdsForBatchConfig(
-        const ReplicateConfig &config, size_t key_count,
-        const char *operation_name) const {
-        if (config.group_ids.has_value() &&
-            config.group_ids->size() != key_count) {
+    std::vector<int> ValidateBatchKeyHints(const ReplicateConfig &config,
+                                           size_t key_count,
+                                           const char *operation_name) const {
+        if (!config.ValidSessionIds(key_count)) {
+            LOG(ERROR) << operation_name << ": invalid per-key session IDs";
+            return std::vector<int>(key_count,
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        if (!config.HasValidKeyHints(key_count)) {
             LOG(ERROR) << operation_name
-                       << ": group_ids size must match keys size";
+                       << ": group_ids and per-key HCA hint counts must match "
+                          "keys size";
             return std::vector<int>(key_count,
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
@@ -1222,6 +1214,10 @@ class MooncakeStorePyWrapper {
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
+        // Single-tensor TP keeps per-shard group/HCA hints and one source
+        // session ID, which is expanded to all shards below.
+        if (!config.ValidSessionIds(1) || !config.HasValidKeyHints(tp_size))
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
         try {
             std::vector<std::string> tp_keys;
             tp_keys.reserve(tp_size);
@@ -1234,7 +1230,13 @@ class MooncakeStorePyWrapper {
             if (!infos.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            auto results = batch_put_tensor_infos_impl(tp_keys, *infos, config);
+            ReplicateConfig tp_config = config;
+            if (config.session_ids) {
+                tp_config.session_ids =
+                    std::vector<std::string>(tp_size, config.SessionId());
+            }
+            auto results =
+                batch_put_tensor_infos_impl(tp_keys, *infos, tp_config);
             for (int ret : results) {
                 if (ret != 0) return ret;
             }
@@ -1263,6 +1265,8 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const std::vector<PyTensorInfo> &infos,
         const ReplicateConfig &config = ReplicateConfig{}) {
+        auto config_error = ValidateBatchKeyHints(config, keys.size(), "put");
+        if (!config_error.empty()) return config_error;
         if (auto cuda_ipc_results =
                 try_dummy_cuda_ipc_batch_put_tensor_impl(keys, infos, config)) {
             return *cuda_ipc_results;
@@ -1289,6 +1293,9 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const std::vector<PyTensorInfo> &infos,
         const ReplicateConfig &config = ReplicateConfig{}) {
+        auto config_error =
+            ValidateBatchKeyHints(config, keys.size(), "upsert");
+        if (!config_error.empty()) return config_error;
         if (auto cuda_ipc_results = try_dummy_cuda_ipc_batch_upsert_tensor_impl(
                 keys, infos, config)) {
             return *cuda_ipc_results;
@@ -1352,10 +1359,10 @@ class MooncakeStorePyWrapper {
         std::vector<size_t> processed_indices;
         std::vector<int> final_results(base_keys.size(),
                                        to_py_ret(ErrorCode::INVALID_PARAMS));
-        auto group_ids_error = ValidateGroupIdsForBatchConfig(
-            config, base_keys.size(), "batch_put_tensor_with_tp");
-        if (!group_ids_error.empty()) {
-            return group_ids_error;
+        auto config_error = ValidateBatchKeyHints(config, base_keys.size(),
+                                                  "batch_put_tensor_with_tp");
+        if (!config_error.empty()) {
+            return config_error;
         }
         try {
             for (size_t i = 0; i < base_keys.size(); ++i) {
@@ -2155,6 +2162,38 @@ PYBIND11_MODULE(_store, m) {
                        &ReplicateConfig::prefer_alloc_in_same_node)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
+        .def_property(
+            "session_ids",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::string>> {
+                if (!config.session_ids) return std::nullopt;
+                return *config.session_ids;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::string>> ids) {
+                config.session_ids.reset();
+                if (ids) config.session_ids = std::move(*ids);
+            })
+        .def_property(
+            "preferred_hca_names",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::string>> {
+                return config.preferred_hca_names;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::string>> value) {
+                config.preferred_hca_names = std::move(value);
+            })
+        .def_property(
+            "per_key_preferred_hca_names",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::vector<std::string>>> {
+                return config.per_key_preferred_hca_names;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::vector<std::string>>> value) {
+                config.per_key_preferred_hca_names = std::move(value);
+            })
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;
@@ -2625,15 +2664,31 @@ PYBIND11_MODULE(_store, m) {
         .def(
             "batch_probe_key",
             [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
+               const std::vector<std::string> &keys, const std::string &policy,
+               uint64_t candidate_size) {
+                GrantLeasePolicy lease_policy;
+                if (policy == "none") {
+                    lease_policy.lease_mode = ProbeLeaseMode::None;
+                } else if (policy == "LastHitOnly") {
+                    lease_policy.lease_mode = ProbeLeaseMode::LastHitOnly;
+                } else {
+                    throw py::value_error("Unknown batch_probe_key policy: " +
+                                          policy);
+                }
+                lease_policy.candidate_size = candidate_size;
+                if (!self.is_client_initialized()) {
+                    return std::vector<int>(
+                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                }
                 py::gil_scoped_release release;
-                return self.store_->batchProbeKey(keys);
+                return self.store_->batchProbeKey(keys, lease_policy);
             },
-            py::arg("keys"),
-            "Point-in-time existence check for multiple objects that grants "
-            "no read leases. Returns list of results: 1 if existed at the "
-            "time of the call, 0 if not exists, -1 if error. Objects may "
-            "still be evicted before a subsequent get.")
+            py::arg("keys"), py::arg("policy") = "none",
+            py::arg("candidate_size") = 1,
+            "Per-key existence results: 1 if readable, 0 if missing, and "
+            "negative values on error. none grants no leases. LastHitOnly "
+            "leases the last all-1 group of candidate_size results; failed "
+            "candidates may retain partial leases after a concurrent eviction.")
         .def(
             "close",
             [](MooncakeStorePyWrapper &self) {
@@ -2965,7 +3020,10 @@ PYBIND11_MODULE(_store, m) {
             },
             py::arg("buffer_ptr"),
             "Unregister a previously registered memory "
-            "buffer for direct access operations")
+            "buffer for direct access operations. The caller must ensure no "
+            "transfer on this buffer is in flight: deregistration does not "
+            "wait for in-flight RDMA/NoF operations, and freeing or remapping "
+            "the buffer while a transfer is active is unsafe")
         .def(
             "get_into",
             [](MooncakeStorePyWrapper &self, const std::string &key,

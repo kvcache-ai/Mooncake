@@ -2,6 +2,18 @@
 # not add_test targets. tent/benchmark/hip_bandwidth_bench.cpp is a standalone
 # hipcc program.
 
+add_executable(tent_diagnostic_test diagnostic_test.cpp)
+target_link_libraries(tent_diagnostic_test PRIVATE tent_diagnostics gtest
+                                                   gtest_main)
+target_include_directories(tent_diagnostic_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_diagnostic_test COMMAND tent_diagnostic_test)
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME tent_cli_test
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.py
+                 $<TARGET_FILE:tent_cli>)
+
 # TENT Metrics Example
 add_executable(tent_metrics_example tent_metrics_example.cpp)
 # asio_shared must be linked explicitly for executables:
@@ -688,6 +700,11 @@ target_include_directories(tent_local_memory_lifecycle_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_local_memory_lifecycle_test
          COMMAND tent_local_memory_lifecycle_test)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_options(
+    tent_local_memory_lifecycle_test PRIVATE
+    "-Wl,--wrap=_ZN8mooncake4tent14SegmentManager16synchronizeLocalEv")
+endif()
 
 # Causal chain stage decomposition: validates that dispatch_time and post_time
 # timestamps are populated on both queue and direct-commit paths.
@@ -770,6 +787,17 @@ if(USE_XPU)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_xpu_engine_test COMMAND tent_xpu_engine_test)
   set_tests_properties(tent_xpu_engine_test PROPERTIES TIMEOUT 300)
+
+  # Cross-process PCIe P2P over Level Zero IPC: the peer engine is this binary
+  # re-executed in peer mode, so it has its own main() (no gtest_main). Needs a
+  # real Intel GPU and Yama ptrace_scope <= 1 (or CAP_SYS_PTRACE); skips
+  # otherwise.
+  add_executable(tent_xpu_ipc_process_test xpu/xpu_ipc_process_test.cpp)
+  target_link_libraries(tent_xpu_ipc_process_test PRIVATE gtest tent_link_group)
+  target_include_directories(tent_xpu_ipc_process_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_xpu_ipc_process_test COMMAND tent_xpu_ipc_process_test)
+  set_tests_properties(tent_xpu_ipc_process_test PROPERTIES TIMEOUT 300)
 endif()
 
 # NOT registered via add_test: the test needs a real CUDA device (it exports a
@@ -821,6 +849,17 @@ endif()
 target_include_directories(tent_segment_desc_retry_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_segment_desc_retry_test COMMAND tent_segment_desc_retry_test)
+
+if(USE_MEMFABRIC)
+  add_executable(tent_memfabric_transport_test memfabric_transport_test.cpp)
+  target_link_libraries(tent_memfabric_transport_test PRIVATE gtest gtest_main
+                                                              tent_link_group)
+  target_include_directories(
+    tent_memfabric_transport_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+                                          ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
+  add_test(NAME tent_memfabric_transport_test
+           COMMAND tent_memfabric_transport_test)
+endif()
 set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)
 
 # Fabric transport: attribute codec and slicing math, plus end-to-end cases on
@@ -866,4 +905,17 @@ if(USE_MLU)
     add_test(NAME tent_mlu_${suite}_test COMMAND tent_mlu_${suite}_test)
     set_tests_properties(tent_mlu_${suite}_test PROPERTIES TIMEOUT 300)
   endforeach()
+  target_link_options(
+    tent_mlu_transport_test
+    PRIVATE
+    "-Wl,--wrap=cnrtHostMalloc"
+    "-Wl,--wrap=cnrtFreeHost"
+    "-Wl,--wrap=numa_move_pages"
+    "-Wl,--wrap=cnPlaceNotifier"
+    "-Wl,--wrap=cnMemcpyAsync_V3"
+    "-Wl,--wrap=cnMemcpyHtoD"
+    "-Wl,--wrap=cnMemcpyDtoH"
+    "-Wl,--wrap=cnQueueSync"
+    "-Wl,--wrap=cnQueryNotifier"
+    "-Wl,--wrap=cnQueryQueue")
 endif()

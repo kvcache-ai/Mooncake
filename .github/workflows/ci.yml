@@ -131,7 +131,19 @@ jobs:
         python mooncake-wheel/tests/test_cuda_fabric_compat.py -v
       shell: bash
 
-    - name: Run all PG CPU tests with supported PyTorch
+    - name: Run session and HCA write metadata regressions
+      run: |
+        source test_env/bin/activate
+        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+        python -m pip install pyzmq msgpack
+        export MOONCAKE_TEST_MASTER_BINARY="$(command -v mooncake_master)"
+        for affinity in 0 1; do
+          MC_STORE_HCA_AFFINITY="$affinity" \
+            python -m pytest -q mooncake-wheel/tests/test_session_kv_events.py
+        done
+      shell: bash
+
+    - name: Run all PG CPU tests with installed PyTorch
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
         MC_FORCE_TCP: "true"
@@ -139,7 +151,6 @@ jobs:
         TORCH_CUDA_ARCH_LIST: "8.0"
       run: |
         source test_env/bin/activate
-        python -m pip install torch==2.14.0
         export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
         python -m unittest discover -s mooncake-pg/tests -k CPU -v
       shell: bash
@@ -309,14 +320,14 @@ jobs:
         MP: ${{ matrix.mp }}
         MC_METADATA_SERVER: P2PHANDSHAKE
       run: |
-        cmake --build build-metadata --target transfer_metadata_test local_buffer_registrations_test --parallel 2
+        cmake --build build-metadata --target transfer_metadata_test local_buffer_registrations_test rdma_unregister_retry_test --parallel 2
         if [ "$MP" = ON ]; then
           cmake --build build-metadata --target transport_metadata_removal_test --parallel 2
         fi
         mkdir -p "$PWD/build-metadata/results"
         export GTEST_OUTPUT="xml:$PWD/build-metadata/results/"
         ctest --test-dir build-metadata --verbose --no-tests=error \
-          -R '^(transfer_metadata_removal_test|transport_metadata_removal_test|local_buffer_registrations_test)$'
+          -R '^(transfer_metadata_removal_test|transport_metadata_removal_test|local_buffer_registrations_test|rdma_unregister_retry_test)$'
     - name: Check executed test counts
       env:
         MP: ${{ matrix.mp }}
@@ -328,13 +339,15 @@ jobs:
         import xml.etree.ElementTree as ET
         directory = pathlib.Path('build-metadata/results')
         expected = {'transfer_metadata_test.xml': 1,
-                    'local_buffer_registrations_test.xml': 8}
+                    'local_buffer_registrations_test.xml': 8,
+                    'rdma_unregister_retry_test.xml': 6}
         if os.environ['MP'] == 'ON':
             cxl = os.environ['CXL'] == 'ON'
             expected = {
                 'transfer_metadata_test.xml': 6 if cxl else 4,
                 'transport_metadata_removal_test.xml': 5 if cxl else 2,
                 'local_buffer_registrations_test.xml': 8,
+                'rdma_unregister_retry_test.xml': 9,
             }
         for filename, minimum in expected.items():
             cases = ET.parse(directory / filename).getroot().findall('.//testcase')
@@ -722,6 +735,15 @@ jobs:
             cmake_flags: '-DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug'
             need_cuda: false
             metrics_flags: ''
+          # Compile against stub ACL headers and embed host-only ACL stubs in
+          # transfer_engine for Rust checks; no CANN, NPU, or libmf_smem is required.
+          - name: memfabric-mock
+            cmake_flags: >-
+              -DUSE_CUDA=OFF -DUSE_MEMFABRIC=ON
+              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
+              -DCMAKE_BUILD_TYPE=Debug
+            need_cuda: false
+            metrics_flags: ''
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -773,8 +795,12 @@ jobs:
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         fi
         cd build-tent
-        cmake --build .
-        sudo cmake --install .
+        if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
+          cmake --build . --target tent_memfabric_transport_test transfer_engine
+        else
+          cmake --build .
+          sudo cmake --install .
+        fi
       shell: bash
 
     # Check the Transfer Engine Rust crate against the freshly built C++
@@ -822,11 +848,17 @@ jobs:
       id: ctest
       if: '!matrix.need_cuda'
       run: |
+        ctest_args=()
+        if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
+          # Only the MemFabric test executable is built in this test directory.
+          ctest_args=(-R '^tent_memfabric_transport_test$' --no-tests=error --timeout 120)
+        fi
         cd build-tent
         mkdir -p test-results
         ctest --test-dir mooncake-transfer-engine/tent/tests -j \
           --output-on-failure \
-          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml"
+          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml" \
+          "${ctest_args[@]}"
       shell: bash
 
     - name: Preserve TENT CTest diagnostics
