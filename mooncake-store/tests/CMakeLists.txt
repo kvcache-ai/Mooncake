@@ -209,6 +209,13 @@ if(USE_TENT)
   )
   set_tests_properties(transfer_task_tent_completion_test
                        PROPERTIES ENVIRONMENT "MC_USE_TENT=1" TIMEOUT 30)
+  add_test(
+    NAME transfer_task_tent_shared_segment_test
+    COMMAND
+      transfer_task_test
+      --gtest_filter=TransferTaskTest.NativeScatterPreservesSharedRemoteSegment)
+  set_tests_properties(transfer_task_tent_shared_segment_test
+                       PROPERTIES ENVIRONMENT "MC_USE_TENT=1" TIMEOUT 30)
 endif()
 add_store_test(transfer_submitter_config_test
                transfer_submitter_config_test.cpp)
