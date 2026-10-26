@@ -25,9 +25,11 @@ namespace {
 class BlockingOffsetBufferAllocator : public OffsetBufferAllocator {
    public:
     BlockingOffsetBufferAllocator(std::string segment_name, size_t base,
-                                  size_t size, std::string transport_endpoint)
+                                  size_t size, std::string transport_endpoint,
+                                  std::string transport_protocol)
         : OffsetBufferAllocator(std::move(segment_name), base, size,
-                                std::move(transport_endpoint)) {}
+                                std::move(transport_endpoint),
+                                std::move(transport_protocol)) {}
 
     void deallocate(AllocatedBuffer* handle) override {
         entered_.release();
@@ -43,9 +45,11 @@ class BlockingAllocateOffsetBufferAllocator : public OffsetBufferAllocator {
    public:
     BlockingAllocateOffsetBufferAllocator(std::string segment_name, size_t base,
                                           size_t size,
-                                          std::string transport_endpoint)
+                                          std::string transport_endpoint,
+                                          std::string transport_protocol)
         : OffsetBufferAllocator(std::move(segment_name), base, size,
-                                std::move(transport_endpoint)) {}
+                                std::move(transport_endpoint),
+                                std::move(transport_protocol)) {}
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
         entered_.release();
@@ -309,7 +313,8 @@ TEST_F(SegmentTest, AggregateUsageSurvivesConcurrentUnmountAndDeallocate) {
     UUID client_id = generate_uuid();
 
     auto blocking = std::make_shared<BlockingOffsetBufferAllocator>(
-        segment.name, segment.base, segment.size, segment.te_endpoint);
+        segment.name, segment.base, segment.size, segment.te_endpoint,
+        segment.protocol);
     {
         auto segment_access = segment_manager.getSegmentAccess();
         ASSERT_EQ(
@@ -381,7 +386,8 @@ TEST_F(SegmentTest, AggregateMemoryUsageFollowsAllocatorReplacement) {
     ASSERT_NE(old_buffer, nullptr);
 
     auto replacement = std::make_shared<OffsetBufferAllocator>(
-        segment.name, segment.base, segment.size, segment.te_endpoint);
+        segment.name, segment.base, segment.size, segment.te_endpoint,
+        segment.protocol);
     auto restored_buffer = replacement->allocate(kRestoredAllocationSize);
     ASSERT_NE(restored_buffer, nullptr);
     {
@@ -420,7 +426,7 @@ TEST_F(SegmentTest, MemoryUsageSnapshotCountsSharedCxlAllocatorOnce) {
     constexpr size_t kSegmentSize = 16 * 1024 * 1024;
     constexpr size_t kAllocationSize = 4 * 1024 * 1024;
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        "cxl_pool", 0x200000000, kSegmentSize, "cxl_pool");
+        "cxl_pool", 0x200000000, kSegmentSize, "cxl_pool", "cxl");
     InstallSharedCxlAllocatorForTesting(segment_manager, allocator, {});
 
     auto buffer = allocator->allocate(kAllocationSize);
@@ -855,7 +861,8 @@ TEST_F(SegmentTest, DetachedAllocationDoesNotBlockLivenessTransition) {
     const UUID client_id = generate_uuid();
 
     auto blocking = std::make_shared<BlockingAllocateOffsetBufferAllocator>(
-        segment.name, segment.base, segment.size, segment.te_endpoint);
+        segment.name, segment.base, segment.size, segment.te_endpoint,
+        segment.protocol);
     AllocatorManager snapshot;
     {
         auto segment_access = segment_manager.getSegmentAccess();

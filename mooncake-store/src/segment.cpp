@@ -260,9 +260,9 @@ ErrorCode ScopedSegmentAccess::MountSegment(
         return ErrorCode::INVALID_PARAMS;
     }
 
-    auto created =
-        CreateBufferAllocator(segment_manager_->memory_allocator_, segment.name,
-                              buffer, size, segment.te_endpoint);
+    auto created = CreateBufferAllocator(segment_manager_->memory_allocator_,
+                                         segment.name, buffer, size,
+                                         segment.te_endpoint, segment.protocol);
     if (!created) {
         return created.error();
     }
@@ -883,7 +883,7 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
 
     auto created = CreateBufferAllocator(
         nof_segment_manager_->memory_allocator_, segment.name, buffer, size,
-        segment.te_endpoint, ReplicaType::NOF_SSD);
+        segment.te_endpoint, "nvmeof", ReplicaType::NOF_SSD);
     if (!created) {
         return created.error();
     }
@@ -1118,7 +1118,7 @@ ErrorCode SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
 
     auto created =
         CreateBufferAllocator(BufferAllocatorType::CACHELIB, cxl_path,
-                              DEFAULT_CXL_BASE, cxl_size, cxl_path);
+                              DEFAULT_CXL_BASE, cxl_size, cxl_path, "cxl");
     if (!created) {
         return created.error();
     }

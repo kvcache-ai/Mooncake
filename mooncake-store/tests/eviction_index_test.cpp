@@ -93,8 +93,8 @@ class LeaseEvictionIndexTest : public ::testing::Test {
     const Clock::time_point t0_{seconds(1000)};
     // Declared before the namespace, so it outlives the replicas it gave out.
     std::shared_ptr<OffsetBufferAllocator> allocator_ =
-        std::make_shared<OffsetBufferAllocator>("segment", 0x100000000ULL,
-                                                64 * 1024 * 1024, "segment");
+        std::make_shared<OffsetBufferAllocator>(
+            "segment", 0x100000000ULL, 64 * 1024 * 1024, "segment", "tcp");
     metadata::Namespace ns_;
 };
 
