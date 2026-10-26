@@ -205,6 +205,30 @@ class TentMetrics {
     void recordStagingCleanupPending(StagingCleanupKind kind, int64_t delta);
     void recordStagingCleanupTimeout();
 
+    enum class RpcMethod {
+        GetSegmentDesc,
+        BootstrapRdma,
+        SendData,
+        RecvData,
+        Notify,
+        Probe,
+        Delegate,
+        Pin,
+        Unpin,
+        SubscribeSegmentUpdate,
+        NotifySegmentUpdated,
+        BootstrapUb,
+        Unknown,
+    };
+    enum class RpcOutcome { Success, ConnectionError, RpcError };
+
+    // Record physical client RPC attempts at the CoroRpcAgent attempt loop.
+    // One logical call may produce two attempts when its idempotent retry is
+    // enabled; recordRpcRetry counts the second attempt when it is issued.
+    void recordRpcAttempt(RpcMethod method, RpcOutcome outcome,
+                          double latency_us);
+    void recordRpcRetry(RpcMethod method);
+
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
     // sitting in the engine right now — a persistently high or stuck value
@@ -319,6 +343,9 @@ class TentMetrics {
     static inline const std::array<std::string, 1> kWorkerLabel{"worker"};
     static inline const std::array<std::string, 1> kOperationLabel{"operation"};
     static inline const std::array<std::string, 1> kCleanupKindLabel{"kind"};
+    static inline const std::array<std::string, 2> kRpcAttemptLabels{"method",
+                                                                     "outcome"};
+    static inline const std::array<std::string, 1> kRpcMethodLabel{"method"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -331,6 +358,10 @@ class TentMetrics {
     static constexpr size_t kWorkerDomain = 2;
     static constexpr size_t kOperationDomain = 2;
     static constexpr size_t kCleanupKindDomain = 3;
+    static constexpr size_t kRpcMethodDomain = 13;
+    static constexpr size_t kRpcOutcomeDomain = 3;
+    static constexpr size_t kRpcAttemptDomain =
+        kRpcMethodDomain * kRpcOutcomeDomain;
 
     // Stable slot indices into the cached-cell label domain.
     static size_t transportSlot(TransportType tp) {
@@ -344,6 +375,10 @@ class TentMetrics {
     }
     static size_t operationSlot(Request::OpCode operation) {
         return operation == Request::READ ? 0u : 1u;
+    }
+    static size_t rpcAttemptSlot(RpcMethod method, RpcOutcome outcome) {
+        return static_cast<size_t>(method) * kRpcOutcomeDomain +
+               static_cast<size_t>(outcome);
     }
 
     // Per-transport counters (label: transport). Values are int64_t.
@@ -414,6 +449,14 @@ class TentMetrics {
     ylt::metric::counter_t staging_cleanup_timeouts_total_{
         "tent_staging_cleanup_timeouts_total",
         "Staging shutdown drains that reached their configured deadline"};
+    metrics::CachedDynamicCounter<2> rpc_attempts_total_{
+        "tent_rpc_attempts_total",
+        "Physical TENT client RPC attempts by method and transport outcome",
+        kRpcAttemptLabels, kRpcAttemptDomain};
+    metrics::CachedDynamicCounter<1> rpc_retries_total_{
+        "tent_rpc_retries_total",
+        "Physical TENT client RPC retry attempts actually issued",
+        kRpcMethodLabel, kRpcMethodDomain};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_
@@ -499,10 +542,14 @@ class TentMetrics {
         "tent_transport_attempt_latency_us",
         "Observed physical transport attempt latency in microseconds",
         kLatencyBuckets, kAttemptLabels, kAttemptDomain};
+    metrics::CachedDynamicHistogram<2> rpc_attempt_latency_{
+        "tent_rpc_attempt_latency_us",
+        "Physical TENT client RPC attempt latency in microseconds",
+        kLatencyBuckets, kRpcAttemptLabels, kRpcAttemptDomain};
 
     // Per-transport (N=1) histograms for unified serialization; the N=2
-    // transport_attempt_latency_ histogram is serialized separately (see
-    // getPrometheusMetrics / getJsonMetrics) via the same templated helpers.
+    // attempt histograms are serialized separately (see getPrometheusMetrics /
+    // getJsonMetrics) via the same templated helpers.
     std::vector<metrics::CachedDynamicHistogram<1>*> histograms_;
 
     // Serialize a gauge backed by a cached-cell counter: emits the current

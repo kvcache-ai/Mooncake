@@ -248,6 +248,8 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_deadline_infeasible_total` | Counter | `transport` | Transfers whose deadline was already in the past at submit time |
 | `tent_quarantined_batches_total` | Counter | - | Batches abandoned after repeated reclaim failures and retained until engine teardown |
 | `tent_staging_cleanup_timeouts_total` | Counter | - | Staging shutdown drains that reached their configured deadline |
+| `tent_rpc_attempts_total` | Counter | `method`, `outcome` | Physical TENT client RPC attempts, including attempts that fail to connect |
+| `tent_rpc_retries_total` | Counter | `method` | Retry attempts actually issued by an idempotent RPC call |
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
 | `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
 | `tent_worker_last_progress_timestamp_seconds` | Gauge | `worker` | Unix timestamp of the last observed engine-progress or staging-worker progress |
@@ -263,6 +265,7 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_stage_dispatch_us` | Histogram | `transport` | Causal chain: dispatch latency in microseconds |
 | `tent_stage_transport_us` | Histogram | `transport` | Causal chain: transport execution latency in microseconds |
 | `tent_transport_attempt_latency_us` | Histogram | `transport`, `operation` | Observed latency of each physical transport attempt |
+| `tent_rpc_attempt_latency_us` | Histogram | `method`, `outcome` | End-to-end latency of each physical client RPC attempt, including connection setup when needed |
 
 ### Metrics pipeline self-observability
 
@@ -305,9 +308,10 @@ addresses, segment names, or other unbounded values are accepted.
 | `operation` | `read`, `write`; `register`, `unregister` | Attempt or memory lifecycle operation, depending on the metric family |
 | `phase` | `metadata`, `admission`, `selection`, `connect`, `register`, `submit`, `queue`, `post`, `poll`, `completion`, `retry`, `failover`, `notify`, `cleanup`, `shutdown` | Stable phase where a terminal failure originated |
 | `reason` | `submit`, `poll`, `timeout`, `canceled` for `tent_task_failures_total`; `timeout`, `unavailable`, `queue_full`, `resource_exhausted`, `protocol`, `stale_generation`, `wc_error`, `cq_error`, `mr_error`, `peer_closed`, `canceled`, `internal` for `tent_terminal_failures_total` | Bounded failure classification |
-| `outcome` | `success`, `failure` | Memory lifecycle call outcome |
+| `outcome` | `success`, `failure` for memory lifecycle metrics; `success`, `connection_error`, `rpc_error` for RPC metrics | Bounded operation outcome |
 | `worker` | `engine_progress`, `staging` | Worker subsystem reporting forward progress |
 | `kind` | `group`, `batch`, `remote_operation` | Deferred staging cleanup resource kind |
+| `method` | `get_segment_desc`, `bootstrap_rdma`, `bootstrap_ub`, `send_data`, `recv_data`, `notify`, `probe`, `delegate`, `pin`, `unpin`, `subscribe_segment_update`, `notify_segment_updated`, `unknown` | TENT RPC method; `unknown` safely bounds extension methods |
 | `format` | `prometheus`, `json` | Serialization output format |
 | `from` | (same set) | Transport that failed before failover |
 | `to` | (same set) | Transport that the failover switched to |
@@ -329,6 +333,13 @@ each serialization family has exactly two series. Dynamic counters allocate
 only label combinations that actually occur. Build identity labels are
 constant for the life of the process. Total series across all metrics is
 bounded by these closed sets.
+
+Each RPC family is bounded to 13 methods. Attempts and attempt latency have at
+most 13x3 = 39 method/outcome series; retries have at most 13. These are
+client-side physical-attempt metrics: an idempotent logical call retried once
+records two attempts and one retry. A peer response that carries an
+application-level error is still a successful RPC transport attempt; the
+caller-facing failure is classified by the owning subsystem metric or log.
 
 `tent_worker_last_progress_timestamp_seconds` advances when the engine progress
 worker completes a wake cycle and when a staging worker changes a chunk state

@@ -201,6 +201,50 @@ const char* stagingCleanupKindName(TentMetrics::StagingCleanupKind kind) {
     }
     return "unknown";
 }
+
+const char* rpcMethodName(TentMetrics::RpcMethod method) {
+    switch (method) {
+        case TentMetrics::RpcMethod::GetSegmentDesc:
+            return "get_segment_desc";
+        case TentMetrics::RpcMethod::BootstrapRdma:
+            return "bootstrap_rdma";
+        case TentMetrics::RpcMethod::SendData:
+            return "send_data";
+        case TentMetrics::RpcMethod::RecvData:
+            return "recv_data";
+        case TentMetrics::RpcMethod::Notify:
+            return "notify";
+        case TentMetrics::RpcMethod::Probe:
+            return "probe";
+        case TentMetrics::RpcMethod::Delegate:
+            return "delegate";
+        case TentMetrics::RpcMethod::Pin:
+            return "pin";
+        case TentMetrics::RpcMethod::Unpin:
+            return "unpin";
+        case TentMetrics::RpcMethod::SubscribeSegmentUpdate:
+            return "subscribe_segment_update";
+        case TentMetrics::RpcMethod::NotifySegmentUpdated:
+            return "notify_segment_updated";
+        case TentMetrics::RpcMethod::BootstrapUb:
+            return "bootstrap_ub";
+        case TentMetrics::RpcMethod::Unknown:
+            return "unknown";
+    }
+    return "unknown";
+}
+
+const char* rpcOutcomeName(TentMetrics::RpcOutcome outcome) {
+    switch (outcome) {
+        case TentMetrics::RpcOutcome::Success:
+            return "success";
+        case TentMetrics::RpcOutcome::ConnectionError:
+            return "connection_error";
+        case TentMetrics::RpcOutcome::RpcError:
+            return "rpc_error";
+    }
+    return "unknown";
+}
 }  // namespace
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
@@ -396,6 +440,8 @@ void TentMetrics::registerMetrics() {
         &deadline_infeasible_total_,
         &quarantined_batches_total_,
         &staging_cleanup_timeouts_total_,
+        &rpc_attempts_total_,
+        &rpc_retries_total_,
     };
 
     gauges_ = {
@@ -582,6 +628,30 @@ void TentMetrics::recordStagingCleanupTimeout() {
     staging_cleanup_timeouts_total_.inc();
 }
 
+void TentMetrics::recordRpcAttempt(RpcMethod method, RpcOutcome outcome,
+                                   double latency_us) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    const size_t slot = rpcAttemptSlot(method, outcome);
+    auto label = [method, outcome] {
+        return std::array<std::string, 2>{rpcMethodName(method),
+                                          rpcOutcomeName(outcome)};
+    };
+    rpc_attempts_total_.incCached(slot, label);
+    if (latency_us >= 0.0) {
+        rpc_attempt_latency_.observeCached(slot, label,
+                                           static_cast<int64_t>(latency_us));
+    }
+}
+
+void TentMetrics::recordRpcRetry(RpcMethod method) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    rpc_retries_total_.incCached(static_cast<size_t>(method), [method] {
+        return std::array<std::string, 1>{rpcMethodName(method)};
+    });
+}
+
 // Gauge updates below deliberately ignore runtime_enabled_: gauges track
 // engine state through paired add/sub operations (attempt start/finish,
 // register/unregister), and skipping one half of a pair across a
@@ -725,9 +795,10 @@ std::string TentMetrics::getPrometheusMetrics() {
         for (const auto& hist : histograms_) {
             serializeHistogramPrometheus(*hist, result);
         }
-        // N=2 transport-attempt latency histogram (labels: transport,
-        // operation) goes through the same helper, instantiated for N=2.
+        // N=2 attempt histograms go through the same helper, instantiated for
+        // N=2.
         serializeHistogramPrometheus(transport_attempt_latency_, result);
+        serializeHistogramPrometheus(rpc_attempt_latency_, result);
 
         // Gauges: current value per label.
         for (auto* gauge : gauges_) {
@@ -1064,6 +1135,10 @@ std::string TentMetrics::getJsonMetrics() {
             static_cast<int64_t>(quarantined_batches_total_.value());
         root[staging_cleanup_timeouts_total_.str_name()] =
             static_cast<int64_t>(staging_cleanup_timeouts_total_.value());
+        root[rpc_attempts_total_.str_name()] =
+            sumCounterValues(&rpc_attempts_total_);
+        root[rpc_retries_total_.str_name()] =
+            sumCounterValues(&rpc_retries_total_);
 
         // Gauges: aggregate across transport labels (total in-flight attempts
         // / total registered bytes). Per-transport breakdown is via the
@@ -1094,6 +1169,7 @@ std::string TentMetrics::getJsonMetrics() {
         serializeHistogramToJson(root, stage_dispatch_);
         serializeHistogramToJson(root, stage_transport_);
         serializeHistogramToJson(root, transport_attempt_latency_);
+        serializeHistogramToJson(root, rpc_attempt_latency_);
 
         root["tent_metrics_build_info"] = {
             {"version", TENT_BUILD_VERSION},
@@ -1223,6 +1299,8 @@ void TentMetrics::recordStagingTaskStarted(Request::OpCode, size_t) {}
 void TentMetrics::recordStagingTaskFinished(Request::OpCode, size_t) {}
 void TentMetrics::recordStagingCleanupPending(StagingCleanupKind, int64_t) {}
 void TentMetrics::recordStagingCleanupTimeout() {}
+void TentMetrics::recordRpcAttempt(RpcMethod, RpcOutcome, double) {}
+void TentMetrics::recordRpcRetry(RpcMethod) {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}
