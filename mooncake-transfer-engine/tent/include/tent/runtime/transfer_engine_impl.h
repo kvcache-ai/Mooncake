@@ -108,6 +108,12 @@ struct TaskInfo {
     // attempt, so a task that recovers and later fails at poll still
     // attributes its root cause to submit.
     int8_t failure_stage{-1};
+    // Process-local monotonic identifiers for structured logs and traces.
+    // Unlike BatchID, none of these expose a memory address.
+    uint64_t observability_batch_id{0};
+    uint64_t observability_request_id{0};
+    uint64_t observability_task_id{0};
+    uint64_t observability_attempt_id{0};
 
     TaskInfo() = default;
 
@@ -135,7 +141,11 @@ struct TaskInfo {
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
           attempt_active(other.attempt_active),
-          failure_stage(other.failure_stage) {}
+          failure_stage(other.failure_stage),
+          observability_batch_id(other.observability_batch_id),
+          observability_request_id(other.observability_request_id),
+          observability_task_id(other.observability_task_id),
+          observability_attempt_id(other.observability_attempt_id) {}
 
     TaskInfo(TaskInfo&& other) noexcept
         : type(other.type),
@@ -161,7 +171,11 @@ struct TaskInfo {
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
           attempt_active(other.attempt_active),
-          failure_stage(other.failure_stage) {}
+          failure_stage(other.failure_stage),
+          observability_batch_id(other.observability_batch_id),
+          observability_request_id(other.observability_request_id),
+          observability_task_id(other.observability_task_id),
+          observability_attempt_id(other.observability_attempt_id) {}
 
     TaskInfo& operator=(const TaskInfo& other) {
         if (this != &other) {
@@ -191,6 +205,10 @@ struct TaskInfo {
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
             failure_stage = other.failure_stage;
+            observability_batch_id = other.observability_batch_id;
+            observability_request_id = other.observability_request_id;
+            observability_task_id = other.observability_task_id;
+            observability_attempt_id = other.observability_attempt_id;
         }
         return *this;
     }
@@ -223,6 +241,10 @@ struct TaskInfo {
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
             failure_stage = other.failure_stage;
+            observability_batch_id = other.observability_batch_id;
+            observability_request_id = other.observability_request_id;
+            observability_task_id = other.observability_task_id;
+            observability_attempt_id = other.observability_attempt_id;
         }
         return *this;
     }
@@ -578,9 +600,9 @@ class TransferEngineImpl {
                        const std::vector<Request>& request_list,
                        const Notification& notifi);
 
-    void recordTaskCompletionMetrics(TaskInfo& task,
-                                     TransferStatusEnum prev_status,
-                                     TransferStatusEnum new_status);
+    void recordTaskCompletionObservability(TaskInfo& task,
+                                           TransferStatusEnum prev_status,
+                                           TransferStatusEnum new_status);
 
     void startTransportAttempt(TaskInfo& task, TransportType type,
                                std::chrono::steady_clock::time_point post_time);
@@ -658,6 +680,7 @@ class TransferEngineImpl {
     std::shared_ptr<const RuntimeConfigSnapshot> runtime_config_snapshot_;
     bool notify_rpc_fallback_{true};
     bool enable_progress_worker_{false};
+    uint64_t slow_request_threshold_us_{0};
     RuntimeQueueConfig runtime_queue_config_;
     std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;
     std::unordered_map<QueueOwnerId, QueuedOwnerState> queued_owners_;

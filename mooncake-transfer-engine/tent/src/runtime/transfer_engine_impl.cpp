@@ -60,6 +60,51 @@ constexpr uint8_t kRedisDefaultDbIndex = 0;
 // the counter), so only a permanently failing poll or queue retire gets here.
 constexpr size_t kMaxReclaimAttempts = 4096;
 constexpr int kMaxHpTcpMetadataRefreshRetries = 1;
+
+std::atomic<uint64_t> g_next_observability_batch_id{1};
+std::atomic<uint64_t> g_next_observability_request_id{1};
+
+uint64_t nextObservabilityId(std::atomic<uint64_t>& sequence) {
+    uint64_t id = sequence.fetch_add(1, std::memory_order_relaxed);
+    if (id != 0) return id;
+    return sequence.fetch_add(1, std::memory_order_relaxed);
+}
+
+const char* transferStatusName(TransferStatusEnum status) {
+    switch (status) {
+        case INITIAL:
+            return "initial";
+        case PENDING:
+            return "pending";
+        case INVALID:
+            return "invalid";
+        case CANCELED:
+            return "canceled";
+        case COMPLETED:
+            return "completed";
+        case TIMEOUT:
+            return "timeout";
+        case FAILED:
+            return "failed";
+    }
+    return "unknown";
+}
+
+const char* operationName(Request::OpCode operation) {
+    return operation == Request::READ ? "read" : "write";
+}
+
+const char* failurePhaseName(const TaskInfo& task) {
+    if (task.failure_stage == 0) return "submit";
+    if (task.failure_stage == 1) return "poll";
+    return "completion";
+}
+
+const char* failureReasonName(TransferStatusEnum status) {
+    if (status == TIMEOUT) return "timeout";
+    if (status == CANCELED) return "canceled";
+    return "internal";
+}
 }  // namespace
 
 struct Batch {
@@ -70,6 +115,7 @@ struct Batch {
     std::array<Transport::SubBatchRef, kSupportedTransportTypes> sub_batch;
     std::vector<TaskInfo> task_list;
     size_t max_size;
+    uint64_t observability_id{0};
     size_t runtime_refs{0};
     bool free_requested{false};
     uint64_t queue_token{0};
@@ -476,6 +522,8 @@ Status TransferEngineImpl::construct() {
     merge_requests_ = conf_->get("merge_requests", true);
     notify_rpc_fallback_ = conf_->get("notification/rpc_fallback", true);
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
+    slow_request_threshold_us_ =
+        conf_->get("observability/slow_request_threshold_us", 0UL);
     runtime_queue_config_.enabled = conf_->get("enable_runtime_queue", false);
     if (runtime_queue_config_.enabled) enable_progress_worker_ = true;
     runtime_queue_config_.limits.max_outstanding_owners =
@@ -1271,6 +1319,8 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
     Batch* batch = Slab<Batch>::Get().allocate();
     if (!batch) return (BatchID)0;
     batch->max_size = batch_size;
+    batch->observability_id =
+        nextObservabilityId(g_next_observability_batch_id);
     batch->task_list.reserve(batch_size);
     BatchID batch_id = (BatchID)batch;
     // Registry insert under the batch's own shard; no global lock.
@@ -2516,6 +2566,11 @@ Status TransferEngineImpl::commitPreparedSubmit(
             task = merged_task_id_map[merged_task_id];
             task.derived = true;
             task.public_length = task_plan.public_length;
+            task.observability_batch_id = batch->observability_id;
+            task.observability_request_id =
+                nextObservabilityId(g_next_observability_request_id);
+            task.observability_task_id = task_id;
+            task.observability_attempt_id = 0;
             auto owner_it = owner_task_id_by_merged_task.find(merged_task_id);
             if (owner_it != owner_task_id_by_merged_task.end()) {
                 task.physical_owner_task_id = owner_it->second;
@@ -2533,6 +2588,11 @@ Status TransferEngineImpl::commitPreparedSubmit(
         task.status = PENDING;
         task.request = merged_request;
         task.public_length = task_plan.public_length;
+        task.observability_batch_id = batch->observability_id;
+        task.observability_request_id =
+            nextObservabilityId(g_next_observability_request_id);
+        task.observability_task_id = task_id;
+        task.observability_attempt_id = 0;
         task.staging = false;
         task.start_time =
             prepared.submit_time;  // Record start time for latency tracking
@@ -2543,8 +2603,15 @@ Status TransferEngineImpl::commitPreparedSubmit(
         task.physical_owner_task_id = task_id;
         owner_task_id_by_merged_task[merged_task_id] = task_id;
         if (task.type == UNSPEC) {
-            LOG(WARNING) << "Unable to find registered buffer for request: "
-                         << printRequest(merged_request);
+            LOG(WARNING) << "event=tent.transport.selection_failed"
+                         << " request_id=" << task.observability_request_id
+                         << " batch_id=" << task.observability_batch_id
+                         << " task_id=" << task.observability_task_id
+                         << " operation="
+                         << operationName(task.request.opcode)
+                         << " reason=no_transport_available"
+                         << " config_generation="
+                         << task.runtime_policy.config_generation;
             merged_task_id_map[merged_task_id] = task;
             continue;
         }
@@ -2752,6 +2819,11 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         task.status = PENDING;
         task.request = owner.request;
         task.public_length = task_plan.public_length;
+        task.observability_batch_id = batch->observability_id;
+        task.observability_request_id =
+            nextObservabilityId(g_next_observability_request_id);
+        task.observability_task_id = task_plan.task_id;
+        task.observability_attempt_id = 0;
         task.staging = false;
         task.start_time = prepared.submit_time;
         task.type = UNSPEC;
@@ -3027,7 +3099,7 @@ Status TransferEngineImpl::progressRuntimeQueue() {
         CHECK_STATUS(pollTaskStatus(batch, queued.owner_task_id, task_status));
         updateTaskStatusAfterPoll(batch, queued.owner_task_id, task_status,
                                   true);
-        recordTaskCompletionMetrics(task, prev_status, task_status.s);
+        recordTaskCompletionObservability(task, prev_status, task_status.s);
 
         if (task_status.s == PENDING) continue;
 
@@ -3287,11 +3359,18 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         return Status::InvalidEntry("All available transports are failed");
     }
 
-    LOG_EVERY_N(INFO, 1000)
-        << "Transport failover: " << transportTypeName(prev_type) << " -> "
-        << transportTypeName(type) << " (attempt " << task.failover_count << "/"
-        << task.runtime_policy.max_failover_attempts << ", generation "
-        << task.runtime_policy.config_generation << ")";
+    LOG(INFO) << "event=tent.transport.failover"
+              << " request_id=" << task.observability_request_id
+              << " batch_id=" << task.observability_batch_id
+              << " task_id=" << task.observability_task_id
+              << " attempt_id=" << task.observability_attempt_id
+              << " from=" << transportTypeName(prev_type)
+              << " to=" << transportTypeName(type)
+              << " failover_count=" << task.failover_count
+              << " failover_limit="
+              << task.runtime_policy.max_failover_attempts
+              << " config_generation="
+              << task.runtime_policy.config_generation;
     VLOG(1) << "Transport failover: " << transportTypeName(prev_type) << " -> "
             << transportTypeName(type) << " (attempt " << task.failover_count
             << "/" << task.runtime_policy.max_failover_attempts
@@ -3356,7 +3435,7 @@ bool TransferEngineImpl::attemptSubmitStageFailover(Batch* batch,
     // record tasks transitioning out of PENDING, so they would never observe
     // this task's PENDING -> FAILED transition. Record BEFORE resetting
     // task.type so the failure is attributed to the last attempted transport.
-    recordTaskCompletionMetrics(task, PENDING, FAILED);
+    recordTaskCompletionObservability(task, PENDING, FAILED);
     // Reset to UNSPEC so pollTaskStatus()'s UNSPEC short-circuit applies: the
     // last failed submit never created a sub-batch entry for this task, so
     // there is nothing to poll on the transport.
@@ -3704,8 +3783,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     }
 
     // Record metrics when task transitions to terminal state
-    recordTaskCompletionMetrics(batch->task_list[poll_task_id], prev_status,
-                                task_status.s);
+    recordTaskCompletionObservability(batch->task_list[poll_task_id],
+                                      prev_status, task_status.s);
 
     if (task_status.s == COMPLETED) {
         task_status.transferred_bytes =
@@ -3819,8 +3898,8 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
         }
 
         // Record metrics when task transitions to terminal state
-        recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
-                                    task_status.s);
+        recordTaskCompletionObservability(batch->task_list[task_id],
+                                          prev_status, task_status.s);
     }
     // Determine overall status: COMPLETED only when all succeed; FAILED only
     // when all tasks are terminal (no in-flight work) and at least one failed;
@@ -3968,42 +4047,85 @@ Status TransferEngineImpl::unlockStageBuffer(uint64_t addr) {
     return staging_proxy_->unpinStageBuffer(addr);
 }
 
-void TransferEngineImpl::recordTaskCompletionMetrics(
+void TransferEngineImpl::recordTaskCompletionObservability(
     TaskInfo& task, TransferStatusEnum prev_status,
     TransferStatusEnum new_status) {
+    if (prev_status != PENDING || new_status == PENDING || task.derived) return;
+
+    const auto end_time = std::chrono::steady_clock::now();
+    int64_t duration_us = -1;
+    if (task.start_time != std::chrono::steady_clock::time_point{}) {
+        duration_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          end_time - task.start_time)
+                          .count();
+    }
+    const auto attributed_type =
+        task.type != UNSPEC ? task.type : task.attempt_type;
+    if (new_status == FAILED || new_status == TIMEOUT ||
+        new_status == CANCELED) {
+        LOG(ERROR) << "event=tent.request.failed"
+                   << " request_id=" << task.observability_request_id
+                   << " batch_id=" << task.observability_batch_id
+                   << " task_id=" << task.observability_task_id
+                   << " attempt_id=" << task.observability_attempt_id
+                   << " transport=" << transportTypeName(attributed_type)
+                   << " operation=" << operationName(task.request.opcode)
+                   << " phase=" << failurePhaseName(task)
+                   << " reason=" << failureReasonName(new_status)
+                   << " status=" << transferStatusName(new_status)
+                   << " duration_us=" << duration_us
+                   << " failover_count=" << task.failover_count
+                   << " config_generation="
+                   << task.runtime_policy.config_generation;
+    } else if (new_status == COMPLETED && slow_request_threshold_us_ > 0 &&
+               duration_us >= 0 &&
+               static_cast<uint64_t>(duration_us) >=
+                   slow_request_threshold_us_) {
+        LOG(WARNING) << "event=tent.request.slow"
+                     << " request_id=" << task.observability_request_id
+                     << " batch_id=" << task.observability_batch_id
+                     << " task_id=" << task.observability_task_id
+                     << " attempt_id=" << task.observability_attempt_id
+                     << " transport=" << transportTypeName(attributed_type)
+                     << " operation=" << operationName(task.request.opcode)
+                     << " status=completed"
+                     << " duration_us=" << duration_us
+                     << " threshold_us=" << slow_request_threshold_us_
+                     << " failover_count=" << task.failover_count
+                     << " config_generation="
+                     << task.runtime_policy.config_generation;
+    }
 #if TENT_METRICS_ENABLED
-    if (prev_status == PENDING && new_status != PENDING && !task.derived) {
-        auto end_time = std::chrono::steady_clock::now();
-        // Failure reason: task.failure_stage marks where the first failure
-        // originated (0 = submit, 1 = poll), set at the failure site — a
-        // poll-observed failure stays "poll" even when the failover resubmit
-        // is synchronously rejected. TIMEOUT/CANCELED come from the status
-        // itself and were previously not recorded anywhere.
-        if (new_status == FAILED || new_status == TIMEOUT ||
-            new_status == CANCELED) {
-            TentMetrics::TaskFailureReason reason;
-            if (new_status == TIMEOUT) {
-                reason = TentMetrics::TaskFailureReason::Timeout;
-            } else if (new_status == CANCELED) {
-                reason = TentMetrics::TaskFailureReason::Canceled;
-            } else if (task.failure_stage == 0) {
-                reason = TentMetrics::TaskFailureReason::Submit;
-            } else if (task.failure_stage == 1) {
-                reason = TentMetrics::TaskFailureReason::Poll;
-            } else {
-                // Unmarked path: an attempt still in flight means the
-                // failure was observed by polling.
-                reason = task.attempt_active
-                             ? TentMetrics::TaskFailureReason::Poll
-                             : TentMetrics::TaskFailureReason::Submit;
-            }
-            // Prefer the attempt transport: task.type may already be UNSPEC
-            // after a submit-stage failure.
-            TransportType failure_tp =
-                task.attempt_type != UNSPEC ? task.attempt_type : task.type;
-            TentMetrics::instance().recordTaskFailure(failure_tp, reason);
+    // Record the failure classification before finishTransportAttempt clears
+    // attempt_active; the unmarked fallback below uses that bit to distinguish
+    // a poll-observed failure from a synchronous submit rejection.
+    if (new_status == FAILED || new_status == TIMEOUT ||
+        new_status == CANCELED) {
+        TentMetrics::TaskFailureReason reason;
+        if (new_status == TIMEOUT) {
+            reason = TentMetrics::TaskFailureReason::Timeout;
+        } else if (new_status == CANCELED) {
+            reason = TentMetrics::TaskFailureReason::Canceled;
+        } else if (task.failure_stage == 0) {
+            reason = TentMetrics::TaskFailureReason::Submit;
+        } else if (task.failure_stage == 1) {
+            reason = TentMetrics::TaskFailureReason::Poll;
+        } else {
+            reason = task.attempt_active ? TentMetrics::TaskFailureReason::Poll
+                                         : TentMetrics::TaskFailureReason::Submit;
         }
-        finishTransportAttempt(task, new_status, end_time);
+        const TransportType failure_tp = task.attempt_type != UNSPEC
+                                             ? task.attempt_type
+                                             : task.type;
+        TentMetrics::instance().recordTaskFailure(failure_tp, reason);
+    }
+#endif
+
+    // Also closes the structured attempt event when metrics are compiled out.
+    finishTransportAttempt(task, new_status, end_time);
+
+#if TENT_METRICS_ENABLED
+    {
         auto start_time = task.start_time;
         if (start_time.time_since_epoch().count() > 0) {
             double latency_seconds =
@@ -4101,6 +4223,7 @@ void TransferEngineImpl::startTransportAttempt(
     // task.type is overwritten by failover before finishTransportAttempt().
     task.attempt_type = type;
     task.attempt_active = true;
+    ++task.observability_attempt_id;
 #if TENT_METRICS_ENABLED
     TentMetrics::instance().recordTransportAttemptStarted(type,
                                                           task.request.opcode);
@@ -4115,17 +4238,39 @@ void TransferEngineImpl::finishTransportAttempt(
     std::chrono::steady_clock::time_point end_time) {
     if (!task.attempt_active) return;
     task.attempt_active = false;
+    const auto post_time = task.attempt_post_time;
+    int64_t latency_us = -1;
+    if (post_time != std::chrono::steady_clock::time_point{}) {
+        latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                         end_time - post_time)
+                         .count();
+    }
+    if (status == FAILED || status == TIMEOUT || status == CANCELED) {
+        LOG(WARNING) << "event=tent.transport.attempt_failed"
+                     << " request_id=" << task.observability_request_id
+                     << " batch_id=" << task.observability_batch_id
+                     << " task_id=" << task.observability_task_id
+                     << " attempt_id=" << task.observability_attempt_id
+                     << " transport="
+                     << transportTypeName(task.attempt_type)
+                     << " operation=" << operationName(task.request.opcode)
+                     << " phase=" << failurePhaseName(task)
+                     << " reason=" << failureReasonName(status)
+                     << " status=" << transferStatusName(status)
+                     << " duration_us=" << latency_us
+                     << " config_generation="
+                     << task.runtime_policy.config_generation;
+    }
 #if TENT_METRICS_ENABLED
     // Decrement before the early return below so the in-flight gauge stays
     // symmetric with recordInflightAttemptStarted() for every attempt that
     // actually started.
     TentMetrics::instance().recordInflightAttemptFinished(task.attempt_type);
-    auto post_time = task.attempt_post_time;
     if (post_time.time_since_epoch().count() == 0) return;
-    double latency_us =
+    double metric_latency_us =
         std::chrono::duration<double, std::micro>(end_time - post_time).count();
     TentMetrics::instance().recordTransportAttemptFinished(
-        task.attempt_type, task.request.opcode, status, latency_us);
+        task.attempt_type, task.request.opcode, status, metric_latency_us);
 #else
     (void)status;
     (void)end_time;

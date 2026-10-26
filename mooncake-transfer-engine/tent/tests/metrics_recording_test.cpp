@@ -35,6 +35,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -175,6 +177,28 @@ class MetricsSnapshot {
    private:
     nlohmann::json json_;
     std::string prometheus_;
+};
+
+class ObservabilityLogSink : public google::LogSink {
+   public:
+    ObservabilityLogSink() { google::AddLogSink(this); }
+    ~ObservabilityLogSink() override { google::RemoveLogSink(this); }
+
+    void send(google::LogSeverity, const char*, const char*, int,
+              const std::tm*, const char* message, size_t length) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        messages_.append(message, length);
+        messages_.push_back('\n');
+    }
+
+    std::string messages() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return messages_;
+    }
+
+   private:
+    std::mutex mutex_;
+    std::string messages_;
 };
 
 // ---------------------------------------------------------------------------
@@ -1960,6 +1984,77 @@ TEST_F(MetricsRecordingTest, PollFailureRecordsTaskFailureWithPollReason) {
     EXPECT_EQ(after.counter("tent_inflight_attempts") -
                   before.counter("tent_inflight_attempts"),
               0);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
+}
+
+TEST_F(MetricsRecordingTest, FailureLogCarriesStableCorrelationFields) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA, /*force_fail=*/true,
+                                                /*force_submit_fail=*/false);
+    installFakeRdma(engine, fake);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xD1);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kLen).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+
+    ObservabilityLogSink sink;
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch), TransferStatusEnum::FAILED);
+    const std::string logs = sink.messages();
+
+    EXPECT_TRUE(std::regex_search(
+        logs,
+        std::regex("event=tent\\.request\\.failed request_id=[1-9][0-9]* "
+                   "batch_id=[1-9][0-9]* task_id=0 attempt_id=1 ")))
+        << logs;
+    EXPECT_NE(logs.find("transport=rdma operation=write phase=poll "),
+              std::string::npos)
+        << logs;
+    EXPECT_NE(logs.find("event=tent.transport.attempt_failed"),
+              std::string::npos)
+        << logs;
+    EXPECT_EQ(logs.find("source="), std::string::npos) << logs;
+    EXPECT_EQ(logs.find("target_offset="), std::string::npos) << logs;
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
+}
+
+TEST_F(MetricsRecordingTest, SlowLogUsesTheSameCorrelationContract) {
+    auto cfg = makeMetricsTestConfig();
+    cfg->set("observability/slow_request_threshold_us", 1UL);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake);
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xD2);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kLen).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+
+    ObservabilityLogSink sink;
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch), TransferStatusEnum::COMPLETED);
+    const std::string logs = sink.messages();
+    EXPECT_TRUE(std::regex_search(
+        logs,
+        std::regex("event=tent\\.request\\.slow request_id=[1-9][0-9]* "
+                   "batch_id=[1-9][0-9]* task_id=0 attempt_id=1 ")))
+        << logs;
+    EXPECT_NE(logs.find("status=completed duration_us="), std::string::npos)
+        << logs;
+    EXPECT_NE(logs.find("threshold_us=1"), std::string::npos) << logs;
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
