@@ -85,9 +85,7 @@ class StreamGate {
         cudaStreamSynchronize(stream_);
     }
 
-    cudaError_t close() {
-        return cudaLaunchHostFunc(stream_, &wait, this);
-    }
+    cudaError_t close() { return cudaLaunchHostFunc(stream_, &wait, this); }
 
     void release() {
         if (!released_) open_.set_value();
@@ -310,9 +308,10 @@ TEST(TcpCudaStagingTest, SubmissionWaitsForCallerProducerBeforeStaging) {
 
     StreamGate gate(cudaStreamPerThread);
     ASSERT_EQ(gate.close(), cudaSuccess);
-    ASSERT_EQ(cudaMemcpyAsync(device_buffer.get(), pattern.data(), pattern.size(),
-                              cudaMemcpyHostToDevice, cudaStreamPerThread),
-              cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(device_buffer.get(), pattern.data(), pattern.size(),
+                        cudaMemcpyHostToDevice, cudaStreamPerThread),
+        cudaSuccess);
 
     TransferRequest write;
     write.opcode = TransferRequest::WRITE;
