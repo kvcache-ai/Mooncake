@@ -1,4 +1,5 @@
 #include "master_service_test_fixture.h"
+#include "metadata_store.h"
 #include "rpc_service.h"
 
 #include <glog/logging.h>
@@ -11,6 +12,135 @@
 #include <vector>
 
 namespace mooncake::test {
+
+TEST_F(MasterServiceTest, ResidencyAffinitySurvivesPutAndUpsert) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const auto tenant = TenantId::Default();
+    const std::string key = "affinity-upsert";
+    ReplicateConfig config;
+    config.residency_affinity_ids = std::vector<std::string>{"opaque-unit"};
+    config.session_ids = std::vector<std::string>{"write-session"};
+    ASSERT_TRUE(service.PutStart(context.client_id, key, tenant, 1024, config));
+    ASSERT_TRUE(service.PutEnd(context.client_id, ObjectMeta{key, 0x1234},
+                               tenant, ReplicaType::MEMORY));
+    auto check = [&](uint64_t size) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
+        ASSERT_TRUE(accessor.Exists());
+        const auto& metadata = accessor.Get();
+        EXPECT_EQ("opaque-unit", metadata.residency_affinity_id);
+        EXPECT_EQ("write-session", metadata.session_id);
+        for (const auto& encoded :
+             {MasterServiceTestPeer::SerializeMetadataForOpLogForTesting(
+                  service, metadata),
+              MasterServiceTestPeer::
+                  SerializeMetadataForOpLogWithoutMemReplicasForTesting(
+                      service, metadata),
+              MasterServiceTestPeer::
+                  SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
+                      service, metadata, {})}) {
+            auto payload = struct_pack::deserialize<MetadataPayload>(encoded);
+            ASSERT_TRUE(payload);
+            EXPECT_EQ(size, payload->size);
+            EXPECT_EQ("opaque-unit",
+                      payload->residency_affinity_id.value_or(""));
+            EXPECT_EQ("write-session", payload->session_id.value_or(""));
+            EXPECT_EQ(std::optional<uint64_t>(0x1234),
+                      payload->object_checksum);
+        }
+    };
+    check(1024);
+    for (uint64_t size : {1024, 2048}) {
+        auto conflicting = config;
+        conflicting.residency_affinity_ids =
+            std::vector<std::string>{"different-unit"};
+        auto rejected = service.UpsertStart(context.client_id, key, tenant,
+                                            size, conflicting);
+        ASSERT_FALSE(rejected);
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, rejected.error());
+        config.residency_affinity_ids.reset();
+        ASSERT_TRUE(
+            service.UpsertStart(context.client_id, key, tenant, size, config));
+        ASSERT_TRUE(service.UpsertEnd(context.client_id,
+                                      ObjectMeta{key, 0x1234}, tenant,
+                                      ReplicaType::MEMORY));
+        check(size);
+    }
+}
+
+TEST_F(MasterServiceTest, ResidencyAffinitySurvivesPreemptedUpsertRetry) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const auto tenant = TenantId::Default();
+    const std::string key = "affinity-upsert-retry";
+    ReplicateConfig config;
+    config.residency_affinity_ids = std::vector<std::string>{"opaque-unit"};
+    ASSERT_TRUE(service.PutStart(context.client_id, key, tenant, 1024, config));
+    ASSERT_TRUE(
+        service.PutEnd(context.client_id, key, tenant, ReplicaType::MEMORY));
+    config.residency_affinity_ids.reset();
+    ASSERT_TRUE(
+        service.UpsertStart(context.client_id, key, tenant, 1024, config));
+    ASSERT_TRUE(
+        service.UpsertStart(context.client_id, key, tenant, 1024, config));
+    ASSERT_TRUE(
+        service.UpsertEnd(context.client_id, key, tenant, ReplicaType::MEMORY));
+    MasterServiceTestPeer::MetadataAccessorRO accessor(
+        &service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
+    ASSERT_TRUE(accessor.Exists());
+    EXPECT_EQ("opaque-unit", accessor.Get().residency_affinity_id);
+}
+
+TEST_F(MasterServiceTest, ResidencyAffinityBatchOrderAndInvalidCounts) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const auto tenant = TenantId::Default();
+    const std::vector<std::string> keys{"affinity-a", "affinity-b"};
+    ReplicateConfig config;
+    config.residency_affinity_ids = std::vector<std::string>{"unit-a", ""};
+    auto starts = service.BatchUpsertStart(context.client_id, keys, tenant,
+                                           {1024, 1024}, config);
+    ASSERT_EQ(2u, starts.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(starts[i]);
+        ASSERT_TRUE(service.PutEnd(context.client_id, keys[i], tenant,
+                                   ReplicaType::MEMORY));
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant, keys[i]});
+        ASSERT_TRUE(accessor.Exists());
+        EXPECT_EQ(config.residency_affinity_ids->at(i),
+                  accessor.Get().residency_affinity_id);
+    }
+    auto upserts = service.BatchUpsertStart(context.client_id, keys, tenant,
+                                            {2048, 2048}, config);
+    ASSERT_EQ(2u, upserts.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(upserts[i]);
+        ASSERT_TRUE(service.UpsertEnd(context.client_id, keys[i], tenant,
+                                      ReplicaType::MEMORY));
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant, keys[i]});
+        ASSERT_TRUE(accessor.Exists());
+        EXPECT_EQ(config.residency_affinity_ids->at(i),
+                  accessor.Get().residency_affinity_id);
+    }
+    config.residency_affinity_ids = std::vector<std::string>{"one"};
+    for (const auto& result : service.BatchUpsertStart(
+             context.client_id, keys, tenant, {1024, 1024}, config)) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    }
+    config.residency_affinity_ids = std::vector<std::string>{};
+    auto put = service.PutStart(context.client_id, "invalid-affinity", tenant,
+                                1024, config);
+    ASSERT_FALSE(put);
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, put.error());
+    auto upsert =
+        service.UpsertStart(context.client_id, keys[0], tenant, 1024, config);
+    ASSERT_FALSE(upsert);
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, upsert.error());
+}
 
 TEST_F(MasterServiceTest, RemoveAllPreservesManagedGroupImportedDuringScan) {
     MasterService service;
@@ -308,6 +438,8 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     config.replica_num = 1;
     config.group_ids =
         std::vector<std::string>{keys[0] + "_group", "", keys[2] + "_group"};
+    config.residency_affinity_ids =
+        std::vector<std::string>{"unit-a", "", "unit-b"};
 
     auto results = service_.BatchPutStart(client_id, keys, sizes, config);
     ASSERT_EQ(results.size(), keys.size());
@@ -342,6 +474,15 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     ASSERT_EQ(invalid_size_results.size(), keys.size());
     for (const auto& result : invalid_size_results) {
         ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    }
+    invalid_config = config;
+    invalid_config.residency_affinity_ids = std::vector<std::string>{"one"};
+    auto invalid_affinity_results =
+        service_.BatchPutStart(client_id, keys, sizes, invalid_config);
+    ASSERT_EQ(invalid_affinity_results.size(), keys.size());
+    for (const auto& result : invalid_affinity_results) {
+        ASSERT_FALSE(result);
         EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
     }
 }

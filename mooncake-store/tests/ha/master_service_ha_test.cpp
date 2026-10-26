@@ -1354,8 +1354,12 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
     const std::string endpoint = "checksum_restore_segment";
     auto legacy_object = MakeStandbyObject("checksum_legacy_key", endpoint);
     legacy_object.metadata.object_checksum = 0x1234;
+    legacy_object.metadata.session_id = "legacy-session";
+    legacy_object.metadata.residency_affinity_id = "legacy-affinity";
     auto batch_object = MakeStandbyObject("checksum_batch_key", endpoint);
     batch_object.metadata.object_checksum = 0;
+    batch_object.metadata.session_id = "batch-session";
+    batch_object.metadata.residency_affinity_id = "batch-affinity";
 
     MasterService legacy_service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
@@ -1370,6 +1374,8 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
     ASSERT_TRUE(legacy_accessor.Exists());
     EXPECT_EQ(legacy_accessor.Get().GetPart(0).checksum(),
               std::optional<uint64_t>(0x1234));
+    EXPECT_EQ("legacy-session", legacy_accessor.Get().session_id);
+    EXPECT_EQ("legacy-affinity", legacy_accessor.Get().residency_affinity_id);
 
     auto source = std::make_unique<StandbyMetadataStore>();
     ASSERT_TRUE(source->PutMetadata(batch_object.tenant_id, batch_object.key,
@@ -1390,6 +1396,8 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
     ASSERT_TRUE(batch_accessor.Exists());
     EXPECT_EQ(batch_accessor.Get().GetPart(0).checksum(),
               std::optional<uint64_t>(0));
+    EXPECT_EQ("batch-session", batch_accessor.Get().session_id);
+    EXPECT_EQ("batch-affinity", batch_accessor.Get().residency_affinity_id);
 }
 
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesReplicaIds) {
