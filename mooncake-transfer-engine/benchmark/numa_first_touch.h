@@ -26,6 +26,9 @@ namespace tent {
 // Dominant N<id>=<pages> token in a /proc/self/numa_maps line, or -1.
 int parseNumaMapsDominantNode(std::string_view maps_line);
 
+// How many N<id>=<pages> tokens have pages > 0. >1 means a mixed VMA.
+int parseNumaMapsNodeCount(std::string_view maps_line);
+
 #ifdef __linux__
 // Dynamically sized CPU affinity mask. Fixed cpu_set_t is too small when
 // CPU IDs exceed CPU_SETSIZE (1024).

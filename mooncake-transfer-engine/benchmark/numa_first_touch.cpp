@@ -27,20 +27,26 @@
 #ifdef __linux__
 #include <cerrno>
 #include <mutex>
-#include <sched.h>
+#include <numa.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-#include <numa.h>
 #endif
 
 namespace mooncake {
 namespace tent {
 
-int parseNumaMapsDominantNode(std::string_view maps_line) {
-    int best_node = -1;
+namespace {
+
+struct NumaMapsPlacement {
+    int dominant_node = -1;
+    int node_count = 0;
+};
+
+NumaMapsPlacement parseNumaMapsPlacement(std::string_view maps_line) {
+    NumaMapsPlacement out;
     unsigned long best_pages = 0;
-    bool found = false;
     for (size_t i = 0; i < maps_line.size(); ++i) {
         if (maps_line[i] != 'N' || i + 1 >= maps_line.size() ||
             !std::isdigit(static_cast<unsigned char>(maps_line[i + 1]))) {
@@ -69,14 +75,28 @@ int parseNumaMapsDominantNode(std::string_view maps_line) {
             pages = pages * 10 + (maps_line[j] - '0');
             ++j;
         }
-        if (!found || pages > best_pages) {
+        if (pages == 0) {
+            i = j - 1;
+            continue;
+        }
+        ++out.node_count;
+        if (out.dominant_node < 0 || pages > best_pages) {
             best_pages = pages;
-            best_node = node;
-            found = true;
+            out.dominant_node = node;
         }
         i = j - 1;
     }
-    return found ? best_node : -1;
+    return out;
+}
+
+}  // namespace
+
+int parseNumaMapsDominantNode(std::string_view maps_line) {
+    return parseNumaMapsPlacement(maps_line).dominant_node;
+}
+
+int parseNumaMapsNodeCount(std::string_view maps_line) {
+    return parseNumaMapsPlacement(maps_line).node_count;
 }
 
 #ifdef __linux__
@@ -118,7 +138,8 @@ bool CpuAffinityMask::saveCurrent() {
         const int rc =
             pthread_getaffinity_np(pthread_self(), impl_->size, impl_->set);
         if (rc == 0) return true;
-        if (errno != EINVAL) {
+        // pthread_* returns the error number; it does not set errno.
+        if (rc != EINVAL) {
             CPU_FREE(impl_->set);
             impl_->set = nullptr;
             impl_->ncpus = 0;

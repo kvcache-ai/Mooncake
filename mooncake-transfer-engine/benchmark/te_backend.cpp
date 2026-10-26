@@ -229,11 +229,31 @@ static void bindShmBufferToNode(void* addr, size_t size, int node) {
 #endif
 }
 
-// Resolve the node pages actually occupy. Never fall back to `expected_node`
-// when move_pages / numa_maps cannot confirm it — that would register the
+// Resolve the node pages actually occupy from the whole VMA. Never use
+// `expected_node` or the first page alone — a partial spill would pick the
 // wrong NIC topology.
 static std::string cpuLocationFromPages(void* addr, int expected_node) {
     const auto expected = "cpu:" + std::to_string(expected_node);
+#ifdef __linux__
+    const std::string maps = numaMapsLineFor(addr);
+    const int actual = parseNumaMapsDominantNode(maps);
+    if (actual < 0) {
+        LOG(ERROR) << "tebench: cannot resolve NUMA node for DRAM buffer "
+                      "intended for "
+                   << expected << " (" << maps << ")";
+        return {};
+    }
+    auto location = "cpu:" + std::to_string(actual);
+    if (parseNumaMapsNodeCount(maps) > 1) {
+        LOG(WARNING) << "tebench: DRAM buffer intended for " << expected
+                     << " is split across NUMA nodes, registering as "
+                     << location << " (" << maps << ")";
+    } else if (actual != expected_node) {
+        LOG(WARNING) << "tebench: DRAM buffer intended for " << expected
+                     << " is on " << location << " (" << maps << ")";
+    }
+    return location;
+#else
     const auto entries = getMemoryLocation(addr, 1, true);
     if (!entries.empty() && entries[0].location.rfind("cpu:", 0) == 0) {
         if (parseIndex(entries[0].location) != expected_node) {
@@ -242,27 +262,11 @@ static std::string cpuLocationFromPages(void* addr, int expected_node) {
         }
         return entries[0].location;
     }
-#ifdef __linux__
-    const std::string maps = numaMapsLineFor(addr);
-    const int actual = parseNumaMapsDominantNode(maps);
-    if (actual >= 0) {
-        auto location = "cpu:" + std::to_string(actual);
-        if (actual != expected_node) {
-            LOG(WARNING) << "tebench: DRAM buffer intended for " << expected
-                         << " is on " << location << " (" << maps << ")";
-        }
-        return location;
-    }
-    LOG(ERROR) << "tebench: cannot resolve NUMA node for DRAM buffer intended "
-                  "for "
-               << expected << " (" << maps << ")";
-#else
-    (void)addr;
     LOG(ERROR) << "tebench: cannot resolve NUMA node for DRAM buffer intended "
                   "for "
                << expected;
-#endif
     return {};
+#endif
 }
 
 #ifndef MAP_HUGE_2MB
