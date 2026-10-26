@@ -161,7 +161,11 @@ Status MultiTransport::tryFreeBatchID(
     bool busy = false;
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         auto& task = batch_desc.task_list[task_id];
-        if (task.is_finished) {
+        if (__atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE)) {
+            // Event-driven completion can finish a task without a poll
+            // (e.g. mooncake-store waits on completion_cv, then frees the
+            // batch).
+            if (metricsEnabled()) recordFinishedTask(task);
             continue;
         }
         if (task.slice_count == 0) {
@@ -292,8 +296,15 @@ void MultiTransport::recordTaskEnd(Transport::TransferTask& task,
                          ? TransferEngineMetrics::Direction::Read
                          : TransferEngineMetrics::Direction::Write;
     if (status.s == Transport::TransferStatusEnum::COMPLETED) {
-        auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - start);
+        // Prefer the completion callback's stamp over this observation time.
+        using Clock = std::chrono::steady_clock;
+        const int64_t end_ticks =
+            __atomic_load_n(&task.end_ticks, __ATOMIC_RELAXED);
+        const auto end = end_ticks != 0
+                             ? Clock::time_point(Clock::duration(end_ticks))
+                             : Clock::now();
+        auto latency =
+            std::chrono::duration_cast<std::chrono::microseconds>(end - start);
         metrics.recordCompleted(direction, status.transferred_bytes,
                                 static_cast<uint64_t>(latency.count()));
     } else if (status.s == Transport::TransferStatusEnum::TIMEOUT) {
@@ -301,6 +312,31 @@ void MultiTransport::recordTaskEnd(Transport::TransferTask& task,
     } else {
         metrics.recordFailed(direction);
     }
+}
+
+void MultiTransport::recordFinishedTask(Transport::TransferTask& task) {
+    // Usually a poll already recorded this task.
+    if (__atomic_load_n(&task.export_metrics_recorded, __ATOMIC_ACQUIRE))
+        return;
+    TransferStatus status;
+    status.s = static_cast<Transport::TransferStatusEnum>(
+        __atomic_load_n(&task.end_status, __ATOMIC_RELAXED));
+    if (status.s == Transport::TransferStatusEnum::WAITING) {
+        // No completion callback saved the outcome; the slice counters hold
+        // it once they are complete.
+        const uint64_t failed =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        const uint64_t succeeded =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        if (succeeded + failed !=
+            __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE))
+            return;
+        status.s = failed ? Transport::TransferStatusEnum::FAILED
+                          : Transport::TransferStatusEnum::COMPLETED;
+    }
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
+    recordTaskEnd(task, status);
 }
 
 bool MultiTransport::metricsEnabled() {
@@ -314,6 +350,8 @@ void MultiTransport::recordTaskStart(Transport::TransferTask&,
 
 void MultiTransport::recordTaskEnd(Transport::TransferTask&,
                                    const TransferStatus&) {}
+
+void MultiTransport::recordFinishedTask(Transport::TransferTask&) {}
 
 bool MultiTransport::metricsEnabled() { return false; }
 

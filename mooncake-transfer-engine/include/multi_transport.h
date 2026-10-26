@@ -115,10 +115,14 @@ class MultiTransport {
     static void recordTaskStart(Transport::TransferTask &task,
                                 const TransferRequest &request);
 
-    // Record `task` in the metrics once, on the first poll that observes a
-    // terminal `status` (COMPLETED, FAILED, CANCELED or TIMEOUT).
+    // Record `task` in the metrics once, on the first poll or batch free that
+    // observes a terminal `status` (COMPLETED, FAILED, CANCELED or TIMEOUT).
     static void recordTaskEnd(Transport::TransferTask &task,
                               const TransferStatus &status);
+
+    // Record a finished `task` from the outcome the event-driven completion
+    // callback saved, or else from its slice counters.
+    static void recordFinishedTask(Transport::TransferTask &task);
 
     // True while the metrics record tasks.
     static bool metricsEnabled();

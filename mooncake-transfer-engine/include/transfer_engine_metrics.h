@@ -35,8 +35,8 @@ namespace mooncake {
 //
 // An eligible task is recorded once when the shared status-query path first
 // observes a terminal state (see MultiTransport::recordTaskEnd()). Queries may
-// come from the application or internal batch cleanup. Tasks without a terminal
-// observation are not recorded; cleanup skips tasks already marked finished.
+// come from the application or internal batch cleanup. Freeing a batch also
+// records tasks that finished without a query.
 class TransferEngineMetrics {
    public:
     enum class Direction { Read, Write };

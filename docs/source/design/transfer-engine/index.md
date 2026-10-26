@@ -567,22 +567,31 @@ The metrics follow TENT's read/write split, units and buckets, under a
 ### What is recorded
 
 The metrics count engine tasks (one `TransferRequest` or one grouped scatter
-task). An eligible task is recorded once when the shared status-query path
-first observes it `COMPLETED`, `FAILED`, `CANCELED` or `TIMEOUT`.
+task). An eligible task is recorded once when the shared status-query or
+batch-free path first observes it `COMPLETED`, `FAILED`, `CANCELED` or
+`TIMEOUT`.
 Timeouts increment requests and timeouts, but not failures. A later completion
 does not change the recorded outcome or add successful bytes or latency.
 A timeout does not stop in-flight work or make transfer buffers safe to reclaim.
 Queries may come from application task or batch polling,
 `freeBatchID()`, or the deferred batch cleanup worker. Successful-task latency
 runs from submission to that observation, so it includes observation delay,
-potentially including the cleanup worker's 100 ms wait between passes.
+potentially including the cleanup worker's 100 ms wait between passes. With
+`USE_EVENT_DRIVEN_COMPLETION`, the completion callback saves the completion
+timestamp and outcome, and latency ends at that timestamp whenever the
+callback has already stamped the task, whether a poll or a free records it.
+The task is counted once a later status poll, `freeBatchID()` call, or
+cleanup-worker pass observes it finished, not when the callback runs.
+Counting does not require the batch to be freed: a free attempt records the
+finished tasks it walks even if another task or an unwinding callback keeps
+the batch busy.
 
-Not every submitted task is recorded. A task is missed if no status call sees
-it finish, or if the transport refuses it before creating any slice. Cleanup
-may record tasks after the application stops polling, but it skips tasks
-already marked finished and does not guarantee coverage of every abandoned
-task. Failure ratios cover recorded tasks only. Include both failures and
-timeouts when computing the overall unsuccessful-task ratio.
+Not every submitted task is recorded. A task is missed if no status call,
+`freeBatchID()` call, or cleanup pass sees it finish, or if the transport
+refuses it before creating any slice. Cleanup may record tasks after the
+application stops polling, but it does not guarantee coverage of every
+abandoned task. Failure ratios cover recorded tasks only. Include both
+failures and timeouts when computing the overall unsuccessful-task ratio.
 
 ### Caveats
 
