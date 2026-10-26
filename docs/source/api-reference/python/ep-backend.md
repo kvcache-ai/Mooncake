@@ -34,6 +34,22 @@ result locally. The wheel provides the native PG core/device libraries and the
 adapter source bundle; the runtime environment provides PyTorch, a CUDA toolkit
 with `nvcc`, and Ninja.
 
+On Intel XPU, Mooncake EP is built natively with the oneAPI DPC++ compiler
+(TENT and Mooncake PG are not needed). It supports ranks on one node; see
+{ref}`Intel XPU <mooncake-ep-intel-xpu>` in the EP design notes:
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+cmake -S . -B build-xpu -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+  -DUSE_XPU=ON -DWITH_EP=ON -DUSE_CUDA=OFF -DWITH_STORE=OFF \
+  -DWITH_STORE_RUST=OFF
+```
+
+The module runs on PyTorch's SYCL queues and uses the SYCL runtime that
+PyTorch XPU installs, so build it with a oneAPI release that ships the same
+runtime major version (`libsycl.so.N`). For example, PyTorch 2.14+xpu ships
+`libsycl.so.9`, from oneAPI 2026.
+
 PG symbols are exposed through `mooncake.pg`; `mooncake.ep` is the EP entry point
 and no longer re-exports PG symbols. Existing callers should move imports such
 as `MooncakeBackendOptions` and `set_host_ip` from `mooncake.ep` to
@@ -358,6 +374,7 @@ recv_x, recv_count, handle, event, hook = buffer.dispatch(
     use_fp8=True,
     async_finish=False,
     return_recv_hook=False,
+    topk_weights=None,
 )
 ```
 
@@ -378,6 +395,11 @@ Arguments:
   event for stream-lifetime management.
 - `return_recv_hook`: when `True`, call the returned `hook()` to complete receive
   synchronization; otherwise use `event.current_stream_wait()`.
+- `topk_weights`: optional FP32 tensor shaped like `topk_idx`, holding the
+  weights the matching `combine()` will be called with. Every rank must pass it
+  or none. On Intel XPU, combine then sums each token's rows on the expert side
+  with these weights and ignores its own `topk_weights`. Other backends ignore
+  this argument.
 
 Returns:
 
