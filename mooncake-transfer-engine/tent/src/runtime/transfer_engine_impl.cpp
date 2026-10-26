@@ -2610,6 +2610,8 @@ Status TransferEngineImpl::commitPreparedSubmit(
             task.observability_task_id = task_id;
             task.observability_attempt_id = 0;
             task.observability_trace_retained = false;
+            task.logical_observability_active = false;
+            task.terminal_observability_recorded = false;
             auto owner_it = owner_task_id_by_merged_task.find(merged_task_id);
             if (owner_it != owner_task_id_by_merged_task.end()) {
                 task.physical_owner_task_id = owner_it->second;
@@ -2637,6 +2639,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         task.start_time =
             prepared.submit_time;  // Record start time for latency tracking
         task.dispatch_time = prepared.submit_time;  // No queue wait on direct
+        startLogicalRequestObservability(task);
         task.type = owner.route.transport;
         task.device_mask = owner.route.device_mask;
         if (owner.route.qp_pool) task.qp_pool = *owner.route.qp_pool;
@@ -2874,6 +2877,7 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         task.device_mask = owner.route.device_mask;
         if (owner.route.qp_pool) task.qp_pool = *owner.route.qp_pool;
         task.derived = task_plan.task_id != owner.owner_task_id;
+        if (!task.derived) startLogicalRequestObservability(task);
     }
 
     for (size_t i = 0; i < admitted_owner_ids.size(); ++i) {
@@ -2912,6 +2916,11 @@ Status TransferEngineImpl::finishQueuedOwner(
         dispatch_inflight_bytes_ -= queued.byte_charge;
         queued.in_dispatch_window = false;
     }
+    auto& owner_task = queued.batch->task_list[queued.owner_task_id];
+    // updateTaskStatusAfterPoll may already have copied the terminal status
+    // into TaskInfo. The queue settlement itself is still the one terminal
+    // edge, and the idempotence flag prevents a second observation.
+    recordTaskCompletionObservability(owner_task, PENDING, terminal_status);
     for (const auto task_id : queued.public_task_ids) {
         queued.batch->task_list[task_id].status = terminal_status;
     }
@@ -2929,6 +2938,9 @@ Status TransferEngineImpl::cancelQueuedOwner(QueueOwnerId owner_id) {
             "queued owner is already dispatching" LOC_MARK);
     }
     CHECK_STATUS(runtime_queue_->cancel(owner_id));
+    auto& owner_task =
+        queued_it->second.batch->task_list[queued_it->second.owner_task_id];
+    recordTaskCompletionObservability(owner_task, owner_task.status, CANCELED);
     for (const auto task_id : queued_it->second.public_task_ids) {
         auto& task = queued_it->second.batch->task_list[task_id];
         task.cancel_requested = true;
@@ -2950,6 +2962,8 @@ Status TransferEngineImpl::finishDroppedOwner(QueueOwnerId owner_id) {
     }
     // No complete(): the queue turned the owner terminal when it dropped it,
     // and complete() only accepts a dispatching owner.
+    auto& owner_task = queued.batch->task_list[queued.owner_task_id];
+    recordTaskCompletionObservability(owner_task, owner_task.status, CANCELED);
     for (const auto task_id : queued.public_task_ids) {
         queued.batch->task_list[task_id].status = CANCELED;
     }
@@ -3349,6 +3363,7 @@ Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
     }
     if (owner.type == UNSPEC) {
         owner.cancel_requested = true;
+        recordTaskCompletionObservability(owner, owner.status, CANCELED);
         owner.status = CANCELED;
         return Status::OK();
     }
@@ -4094,7 +4109,10 @@ Status TransferEngineImpl::unlockStageBuffer(uint64_t addr) {
 void TransferEngineImpl::recordTaskCompletionObservability(
     TaskInfo& task, TransferStatusEnum prev_status,
     TransferStatusEnum new_status) {
-    if (prev_status != PENDING || new_status == PENDING || task.derived) return;
+    if (prev_status != PENDING || new_status == PENDING || task.derived ||
+        task.terminal_observability_recorded)
+        return;
+    task.terminal_observability_recorded = true;
 
     const auto end_time = std::chrono::steady_clock::now();
     int64_t duration_us = -1;
@@ -4142,6 +4160,12 @@ void TransferEngineImpl::recordTaskCompletionObservability(
                      << task.runtime_policy.config_generation;
     }
 #if TENT_METRICS_ENABLED
+    if (task.logical_observability_active) {
+        TentMetrics::instance().recordLogicalRequestFinished(
+            attributed_type, task.request.opcode, new_status,
+            static_cast<double>(duration_us));
+        task.logical_observability_active = false;
+    }
     // Record the failure classification before finishTransportAttempt clears
     // attempt_active; the unmarked fallback below uses that bit to distinguish
     // a poll-observed failure from a synchronous submit rejection.
@@ -4216,7 +4240,8 @@ void TransferEngineImpl::recordTaskCompletionObservability(
                                                   task.type, transport_us);
                     }
                 }
-            } else if (new_status == FAILED) {
+            } else if (new_status == FAILED || new_status == TIMEOUT ||
+                       new_status == CANCELED) {
                 // A task whose type is UNSPEC (no candidate ever resolved,
                 // or a legacy submit-stage failure clobbered it) has lost its
                 // transport attribution; fall back to the last physical
@@ -4260,6 +4285,14 @@ void TransferEngineImpl::recordTaskCompletionObservability(
         }
     }
 #endif  // TENT_METRICS_ENABLED
+}
+
+void TransferEngineImpl::startLogicalRequestObservability(TaskInfo& task) {
+    if (task.derived || task.logical_observability_active) return;
+#if TENT_METRICS_ENABLED
+    task.logical_observability_active =
+        TentMetrics::instance().recordLogicalRequestStarted(task.request.opcode);
+#endif
 }
 
 void TransferEngineImpl::startTransportAttempt(

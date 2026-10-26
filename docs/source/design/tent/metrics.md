@@ -339,13 +339,16 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 |-------------|------|--------|-------------|
 | `tent_read_bytes_total` | Counter | `transport` | Total bytes read via TENT (success only; failures record no bytes) |
 | `tent_write_bytes_total` | Counter | `transport` | Total bytes written via TENT (success only) |
-| `tent_read_requests_total` | Counter | `transport` | Total read requests via TENT (success + failure) |
-| `tent_write_requests_total` | Counter | `transport` | Total write requests via TENT (success + failure) |
+| `tent_read_requests_total` | Counter | `transport` | Terminal read requests via TENT (success + failed + timeout + canceled) |
+| `tent_write_requests_total` | Counter | `transport` | Terminal write requests via TENT (success + failed + timeout + canceled) |
 | `tent_read_failures_total` | Counter | `transport` | Total read failures via TENT |
 | `tent_write_failures_total` | Counter | `transport` | Total write failures via TENT |
 | `tent_transport_failover_total` | Counter | `from`, `to` | Total cross-transport failover events |
 | `tent_transport_attempts_total` | Counter | `transport`, `operation` | Physical transport attempts submitted for execution |
-| `tent_transport_attempt_failures_total` | Counter | `transport`, `operation` | Physical transport attempts that terminated with `FAILED` |
+| `tent_transport_attempt_failures_total` | Counter | `transport`, `operation` | Physical transport attempts that terminated unsuccessfully |
+| `tent_logical_requests_started_total` | Counter | `operation` | Accepted non-derived logical requests |
+| `tent_logical_request_outcomes_total` | Counter | `transport`, `operation`, `outcome` | Terminal logical outcomes (`success`, `failed`, `timeout`, or `canceled`) |
+| `tent_transport_attempt_outcomes_total` | Counter | `transport`, `operation`, `outcome` | Terminal physical-attempt outcomes |
 | `tent_task_failures_total` | Counter | `transport`, `reason` | Task failures grouped by terminal transport and failure reason |
 | `tent_terminal_failures_total` | Counter | `transport`, `phase`, `reason` | Terminal logical task failures grouped by the bounded public failure taxonomy |
 | `tent_memory_operations_total` | Counter | `transport`, `operation`, `outcome` | Physical backend memory register/unregister calls |
@@ -369,6 +372,7 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_transport_selection_events_total` | Counter | `event`, `transport` | Transport candidate, hint, fallback and exhaustion decisions |
 | `tent_admission_events_total` | Counter | `owner_kind`, `event` | Runtime admission, rejection, dispatch, deadline-drop and cancellation decisions |
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
+| `tent_logical_requests_inflight` | Gauge | `operation` | Accepted logical requests without a terminal outcome |
 | `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
 | `tent_worker_last_progress_timestamp_seconds` | Gauge | `worker` | Unix timestamp of the last observed engine-progress, staging, or RDMA-worker progress |
 | `tent_staging_inflight_tasks` | Gauge | `operation` | Parent staging tasks currently executing in staging workers |
@@ -387,6 +391,8 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_stage_dispatch_us` | Histogram | `transport` | Causal chain: dispatch latency in microseconds |
 | `tent_stage_transport_us` | Histogram | `transport` | Causal chain: transport execution latency in microseconds |
 | `tent_transport_attempt_latency_us` | Histogram | `transport`, `operation` | Observed latency of each physical transport attempt |
+| `tent_logical_request_outcome_latency_us` | Histogram | `transport`, `operation`, `outcome` | End-to-end logical request latency, including unsuccessful outcomes |
+| `tent_transport_attempt_outcome_latency_us` | Histogram | `transport`, `operation`, `outcome` | Physical attempt latency split by terminal outcome |
 | `tent_rpc_attempt_latency_us` | Histogram | `method`, `outcome` | End-to-end latency of each physical client RPC attempt, including connection setup when needed |
 | `tent_rdma_completion_latency_us` | Histogram | `operation`, `outcome` | Post-to-CQ latency of physical RDMA slice completions |
 | `tent_stream_attempt_latency_us` | Histogram | `transport`, `operation`, `outcome` | End-to-end latency of physical TCP or HP-TCP network attempts |
@@ -412,7 +418,9 @@ visible when runtime transfer recording is disabled.
 
 **Notes**:
 - `*_requests_total` counts terminal logical/merged-transfer outcomes. Its `transport` label is the **final transport**: a request recovered by RDMA→TCP failover is counted once under `tcp`.
-- `tent_transport_attempts_total` and `tent_transport_attempt_failures_total` measure physical transport reliability. A recovered RDMA→TCP request contributes one failed RDMA attempt and one successful TCP attempt.
+- `tent_logical_requests_started_total - sum(tent_logical_request_outcomes_total)` is the process-local conservation balance. Compare it with `tent_logical_requests_inflight`; a persistent mismatch means a terminal edge was lost or telemetry was disabled during only one side of the interval.
+- `tent_transport_attempts_total` and `tent_transport_attempt_outcomes_total` provide the equivalent physical-attempt conservation check. A recovered RDMA→TCP request contributes one failed RDMA attempt and one successful TCP attempt.
+- `tent_transport_attempt_failures_total` is a compatibility aggregate of the `failed`, `timeout`, and `canceled` attempt outcomes.
 - Attempt latency currently ends when polling or the progress worker observes the terminal status, so it may include completion-observation delay.
 - `*_failures_total` does not record bytes; failed transfers transfer no bytes.
 - `tent_deadline_infeasible_total` is a dedicated counter (not a histogram sentinel) so infeasible-at-submit cases are distinguishable from genuine high-MLU samples.
@@ -423,7 +431,7 @@ visible when runtime transfer recording is disabled.
 Transfer and attempt metrics carry a `transport` label (the
 `tent_transport_failover_total` counter uses `from` and `to` instead) so they
 can be sliced by transport without grepping logs. Attempt metrics also carry
-an `operation` label. Task failures add a closed-set `reason` label and metrics
+an `operation` label. Outcome metrics add a four-valued `outcome` label. Task failures add a closed-set `reason` label and metrics
 serialization adds a two-valued `format` label. Terminal failures use the
 bounded `phase` and `reason` taxonomy, while memory lifecycle metrics use an
 `outcome` label. Label values come from bounded sets; no request IDs,
@@ -435,7 +443,7 @@ addresses, segment names, or other unbounded values are accepted.
 | `operation` | `read`, `write`; `register`, `unregister` | Attempt or memory lifecycle operation, depending on the metric family |
 | `phase` | `metadata`, `admission`, `selection`, `connect`, `register`, `submit`, `queue`, `post`, `poll`, `completion`, `retry`, `failover`, `notify`, `cleanup`, `shutdown` | Stable phase where a terminal failure originated |
 | `reason` | `submit`, `poll`, `timeout`, `canceled` for `tent_task_failures_total`; `timeout`, `unavailable`, `queue_full`, `resource_exhausted`, `protocol`, `stale_generation`, `wc_error`, `cq_error`, `mr_error`, `peer_closed`, `canceled`, `internal` for `tent_terminal_failures_total` | Bounded failure classification |
-| `outcome` | `success`, `failure` for memory lifecycle metrics; `success`, `connection_error`, `rpc_error` for RPC metrics; `success`, `wc_error`, `flush`, `late` for RDMA completions; `success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error` for stream attempts | Bounded operation outcome |
+| `outcome` | `success`, `failed`, `timeout`, `canceled` for logical/transport outcomes; `success`, `failure` for memory lifecycle metrics; `success`, `connection_error`, `rpc_error` for RPC metrics; `success`, `wc_error`, `flush`, `late` for RDMA completions; `success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error` for stream attempts | Bounded operation outcome |
 | `worker` | `engine_progress`, `staging`, `rdma` | Worker subsystem reporting forward progress |
 | `kind` | `group`, `batch`, `remote_operation` | Deferred staging cleanup resource kind |
 | `owner_kind` | `user`, `staging`, `all` | Runtime admission owner class; `all` is the aggregate capacity domain |

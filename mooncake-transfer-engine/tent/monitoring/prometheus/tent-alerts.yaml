@@ -41,20 +41,20 @@ groups:
         expr: |-
           (
             sum by (job, instance) (
-              rate({__name__=~"tent_(read|write)_failures_total"}[5m])
+              rate(tent_logical_request_outcomes_total{outcome!="success"}[5m])
             )
           )
           /
           clamp_min(
             sum by (job, instance) (
-              rate({__name__=~"tent_(read|write)_requests_total"}[5m])
+              rate(tent_logical_request_outcomes_total[5m])
             ),
             1
           ) > 0.05
           and on (job, instance)
           (
             sum by (job, instance) (
-              rate({__name__=~"tent_(read|write)_requests_total"}[5m])
+              rate(tent_logical_request_outcomes_total[5m])
             )
           ) > 1
         for: 5m
@@ -69,18 +69,18 @@ groups:
       - alert: TentTransportAttemptFailureRateHigh
         expr: |-
           sum by (job, instance, transport) (
-            rate(tent_transport_attempt_failures_total[5m])
+            rate(tent_transport_attempt_outcomes_total{outcome!="success"}[5m])
           )
           /
           clamp_min(
             sum by (job, instance, transport) (
-              rate(tent_transport_attempts_total[5m])
+              rate(tent_transport_attempt_outcomes_total[5m])
             ),
             1
           ) > 0.10
           and on (job, instance, transport)
           sum by (job, instance, transport) (
-            rate(tent_transport_attempts_total[5m])
+            rate(tent_transport_attempt_outcomes_total[5m])
           ) > 1
         for: 5m
         labels:

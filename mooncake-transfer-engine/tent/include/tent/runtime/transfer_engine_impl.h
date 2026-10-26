@@ -115,6 +115,11 @@ struct TaskInfo {
     uint64_t observability_task_id{0};
     uint64_t observability_attempt_id{0};
     bool observability_trace_retained{false};
+    // Logical-request accounting is paired independently of the runtime
+    // sample switch. `logical_observability_active` means the in-flight gauge
+    // was incremented and therefore must be decremented exactly once.
+    bool logical_observability_active{false};
+    bool terminal_observability_recorded{false};
 
     TaskInfo() = default;
 
@@ -147,7 +152,10 @@ struct TaskInfo {
           observability_request_id(other.observability_request_id),
           observability_task_id(other.observability_task_id),
           observability_attempt_id(other.observability_attempt_id),
-          observability_trace_retained(other.observability_trace_retained) {}
+          observability_trace_retained(other.observability_trace_retained),
+          logical_observability_active(other.logical_observability_active),
+          terminal_observability_recorded(
+              other.terminal_observability_recorded) {}
 
     TaskInfo(TaskInfo&& other) noexcept
         : type(other.type),
@@ -178,7 +186,10 @@ struct TaskInfo {
           observability_request_id(other.observability_request_id),
           observability_task_id(other.observability_task_id),
           observability_attempt_id(other.observability_attempt_id),
-          observability_trace_retained(other.observability_trace_retained) {}
+          observability_trace_retained(other.observability_trace_retained),
+          logical_observability_active(other.logical_observability_active),
+          terminal_observability_recorded(
+              other.terminal_observability_recorded) {}
 
     TaskInfo& operator=(const TaskInfo& other) {
         if (this != &other) {
@@ -213,6 +224,9 @@ struct TaskInfo {
             observability_task_id = other.observability_task_id;
             observability_attempt_id = other.observability_attempt_id;
             observability_trace_retained = other.observability_trace_retained;
+            logical_observability_active = other.logical_observability_active;
+            terminal_observability_recorded =
+                other.terminal_observability_recorded;
         }
         return *this;
     }
@@ -250,6 +264,9 @@ struct TaskInfo {
             observability_task_id = other.observability_task_id;
             observability_attempt_id = other.observability_attempt_id;
             observability_trace_retained = other.observability_trace_retained;
+            logical_observability_active = other.logical_observability_active;
+            terminal_observability_recorded =
+                other.terminal_observability_recorded;
         }
         return *this;
     }
@@ -608,6 +625,8 @@ class TransferEngineImpl {
     void recordTaskCompletionObservability(TaskInfo& task,
                                            TransferStatusEnum prev_status,
                                            TransferStatusEnum new_status);
+
+    void startLogicalRequestObservability(TaskInfo& task);
 
     void startTransportAttempt(TaskInfo& task, TransportType type,
                                std::chrono::steady_clock::time_point post_time);
