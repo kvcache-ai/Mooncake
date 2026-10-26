@@ -122,14 +122,13 @@ bool MasterProcessHandler::start() {
         // Execute the master
         std::string rpc_address_arg = "--rpc-address=" + config_.rpc_address;
         std::string rpc_port_arg = "--rpc-port=" + std::to_string(port_);
-        std::vector<std::string> args = {master_path_,
-                                         "--enable-ha=true",
-                                         rpc_address_arg,
-                                         rpc_port_arg,
-                                         "--enable_metric_reporting=false",
-                                         "--metrics_port=0"};
+        std::vector<std::string> args = {master_path_, "--enable-ha=true",
+                                         rpc_address_arg, rpc_port_arg};
 
 #if defined(MOONCAKE_STORE_CLIENT_P2P)
+        args.emplace_back("--enable_metric_reporting=false");
+        args.emplace_back("--metrics_port=0");
+
         if (config_.max_client_per_key.has_value()) {
             args.emplace_back("--max-client-per-key=" +
                               std::to_string(*config_.max_client_per_key));
@@ -169,8 +168,13 @@ bool MasterProcessHandler::start() {
             if (!config_.redis_password.empty()) {
                 args.emplace_back("--redis-password=" + config_.redis_password);
             }
-        } else {
+        } else if (config_.election_backend == "etcd") {
             args.emplace_back("--etcd-endpoints=" + config_.etcd_endpoints);
+        } else {
+            LOG(ERROR) << "[m" << index_
+                       << "] Unsupported master election backend: "
+                       << config_.election_backend;
+            exit(1);
         }
 
 #else
@@ -197,7 +201,7 @@ bool MasterProcessHandler::start() {
         argv.push_back(nullptr);
         execv(master_path_.c_str(), argv.data());
 
-        // If execl returns, it means there was an error
+        // If execv returns, it means there was an error
         LOG(ERROR) << "[m" << index_
                    << "] Master process terminated with error: "
                    << strerror(errno);
