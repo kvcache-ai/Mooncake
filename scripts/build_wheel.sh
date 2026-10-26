@@ -215,6 +215,8 @@ STORE_FACADE_STAGING_DIR="${MIGRATED_PYTHON_STAGING_DIR}/store"
 MIGRATED_PYTHON_INIT_BACKUP=""
 MIGRATED_PYTHON_MODULES=(
     __init__.py
+    py.typed
+    engine.pyi
     structured_object_store.py
     _fast_copy.c
     http_metadata_server.py
@@ -505,7 +507,18 @@ fi
 # libmpcomm.so; and (b) let patchelf rewrite a library carrying CUDA fatbins
 # (MPComm builds TMA kernels with USE_CUDA_KERNELS=ON by default), the same
 # corruption risk the EP/PG extensions are kept away from below.
+#
+# The SYCL, Level Zero and Intel compiler runtimes of an XPU build are
+# excluded too: the XPU EP runs on PyTorch's own sycl::queue, so it must share
+# the one SYCL runtime that PyTorch XPU installs (intel-sycl-rt,
+# intel-cmplr-lib-rt) rather than carry a second copy.
 ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
+    --exclude libsycl.so* \
+    --exclude libze_loader.so* \
+    --exclude libsvml.so* \
+    --exclude libimf.so* \
+    --exclude libirng.so* \
+    --exclude libintlc.so* \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
     --exclude libefa.so* \
