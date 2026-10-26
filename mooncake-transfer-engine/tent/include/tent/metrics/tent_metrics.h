@@ -18,6 +18,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -199,6 +200,8 @@ class TentMetrics {
     std::atomic<uint16_t> bound_http_port_{0};
 
 #if TENT_METRICS_ENABLED
+    friend class TentMetricsTestPeer;
+
     static constexpr size_t kSerializationFormatCount = 2;
     static constexpr size_t kPrometheusFormat = 0;
     static constexpr size_t kJsonFormat = 1;
@@ -225,6 +228,19 @@ class TentMetrics {
     // Register the /metrics, /metrics/summary, /metrics/json and /health
     // endpoints on the current http_server_ instance.
     void registerHttpHandlers();
+
+    // Build an endpoint response and report whether serialization succeeded.
+    // The public string-returning methods retain their existing API, while the
+    // HTTP handlers use the boolean result to return 5xx on failure.
+    bool tryGetPrometheusMetrics(std::string& result);
+    bool tryGetJsonMetrics(std::string& result);
+
+    // Apply common attempt/failure/last-success accounting around both output
+    // formats. Kept off the transfer hot path; this runs only on scrape or
+    // direct serialization requests.
+    bool serializeWithAccounting(
+        size_t format, std::string& result,
+        const std::function<void(std::string&, uint64_t)>& serializer);
 
     // HTTP server for metrics endpoint
     std::unique_ptr<coro_http::coro_http_server> http_server_;

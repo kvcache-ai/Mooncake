@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -52,6 +53,24 @@
 
 namespace mooncake {
 namespace tent {
+
+#if TENT_METRICS_ENABLED
+
+class TentMetricsTestPeer {
+   public:
+    static bool failPrometheusSerialization(TentMetrics& metrics,
+                                            std::string& result) {
+        return metrics.serializeWithAccounting(
+            TentMetrics::kPrometheusFormat, result,
+            [](std::string& output, uint64_t) {
+                output = "partial response";
+                throw std::runtime_error("injected serialization failure");
+            });
+    }
+};
+
+#endif
+
 namespace {
 
 #if TENT_METRICS_ENABLED
@@ -461,7 +480,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     }
     EXPECT_NE(body.find("tent_metrics_build_info{version=\""),
               std::string::npos);
-    EXPECT_NE(body.find("compile_time_enabled=\"true\"} 1"), std::string::npos);
+    EXPECT_EQ(body.find("compile_time_enabled"), std::string::npos);
     EXPECT_NE(body.find("tent_metrics_serialization_attempts_total{format=\""
                         "prometheus\"}"),
               std::string::npos);
@@ -492,6 +511,25 @@ TEST_F(MetricsRecordingTest, SelfMetricsRemainVisibleWhenRuntimeDisabled) {
               0);
 
     TentMetrics::setEnabled(true);
+}
+
+TEST_F(MetricsRecordingTest,
+       FailedSerializationIsVisibleOnTheNextSuccessfulScrape) {
+    auto& metrics = TentMetrics::instance();
+    const auto before = MetricsSnapshot(metrics);
+
+    std::string failed_output;
+    EXPECT_FALSE(TentMetricsTestPeer::failPrometheusSerialization(
+        metrics, failed_output));
+    EXPECT_TRUE(failed_output.empty());
+
+    const auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        after.series("tent_metrics_serialization_failures_total{format=\""
+                     "prometheus\"}") -
+            before.series("tent_metrics_serialization_failures_total{format=\""
+                          "prometheus\"}"),
+        1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,6 +1583,8 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_read_latency_us"));
     EXPECT_TRUE(json.contains("tent_task_failures_total"));
     EXPECT_TRUE(json.contains("tent_metrics_build_info"));
+    EXPECT_FALSE(
+        json["tent_metrics_build_info"].contains("compile_time_enabled"));
     EXPECT_EQ(json["tent_metrics_runtime_enabled"], 1);
     EXPECT_EQ(json["tent_metrics_http_server_up"], 1);
     EXPECT_TRUE(
