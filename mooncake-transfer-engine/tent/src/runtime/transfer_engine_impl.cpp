@@ -284,7 +284,7 @@ TransferEngineImpl::TransferEngineImpl()
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
                    << status.ToString();
     } else {
-        available_ = true;
+        available_.store(true, std::memory_order_release);
     }
 }
 
@@ -306,11 +306,90 @@ TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf,
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
                    << status.ToString();
     } else {
-        available_ = true;
+        available_.store(true, std::memory_order_release);
     }
 }
 
 TransferEngineImpl::~TransferEngineImpl() { deconstruct(); }
+
+EngineDiagnosticsSnapshot TransferEngineImpl::buildDiagnosticsSnapshot() {
+    EngineDiagnosticsSnapshot snapshot;
+    snapshot.engine_available = available();
+
+    // Diagnostics follows the documented progress -> shard lock order. The
+    // provider is cleared before teardown mutates the objects inspected here.
+    std::lock_guard<std::recursive_mutex> progress_lk(progress_mutex_);
+    snapshot.control_plane_available = metadata_ != nullptr;
+    snapshot.progress_worker_enabled = enable_progress_worker_;
+    snapshot.progress_worker_running =
+        progress_worker_ && progress_worker_->running();
+    snapshot.runtime_queue_enabled = runtime_queue_config_.enabled;
+
+    for (size_t type = 0; type < transport_list_.size(); ++type) {
+        if (!transport_list_[type]) continue;
+        ++snapshot.loaded_transport_count;
+        snapshot.loaded_transports.emplace_back(
+            transportTypeName(static_cast<TransportType>(type)));
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& shard : batch_shards_) {
+        std::lock_guard<std::recursive_mutex> shard_lk(shard.mtx);
+        snapshot.alive_batches += shard.alive_batches.size();
+        for (BatchID batch_id : shard.alive_batches) {
+            auto* batch = reinterpret_cast<Batch*>(batch_id);
+            for (const auto& task : batch->task_list) {
+                if (task.derived || task.status != PENDING ||
+                    task.start_time == std::chrono::steady_clock::time_point{})
+                    continue;
+                const auto age = std::chrono::duration_cast<
+                    std::chrono::microseconds>(now - task.start_time);
+                if (age.count() > 0) {
+                    snapshot.oldest_inflight_age_us = std::max<uint64_t>(
+                        snapshot.oldest_inflight_age_us,
+                        static_cast<uint64_t>(age.count()));
+                }
+            }
+        }
+    }
+
+    if (runtime_queue_) {
+        snapshot.outstanding_owners = runtime_queue_->outstandingOwners();
+        snapshot.outstanding_bytes = runtime_queue_->outstandingBytes();
+    }
+    snapshot.dispatch_inflight_owners = dispatch_inflight_owners_;
+    snapshot.dispatch_inflight_bytes = dispatch_inflight_bytes_;
+
+    const uint64_t fallback_us = static_cast<uint64_t>(std::max<int64_t>(
+        0, runtime_queue_config_.progress_fallback_interval.count()));
+    const uint64_t derived_threshold_seconds =
+        (fallback_us * 3 + 999999ULL) / 1000000ULL;
+    snapshot.worker_stall_threshold_seconds =
+        std::max<uint64_t>(5, derived_threshold_seconds);
+    if (progress_worker_) {
+        snapshot.worker_progress_age_seconds =
+            progress_worker_->lastProgressAgeSeconds();
+    }
+
+    if (!snapshot.engine_available)
+        snapshot.readiness_reasons.emplace_back("engine_unavailable");
+    if (!snapshot.control_plane_available)
+        snapshot.readiness_reasons.emplace_back("control_plane_unavailable");
+    if (snapshot.loaded_transport_count == 0)
+        snapshot.readiness_reasons.emplace_back("no_transport_available");
+    if (snapshot.progress_worker_enabled &&
+        !snapshot.progress_worker_running) {
+        snapshot.readiness_reasons.emplace_back(
+            "progress_worker_unavailable");
+    } else if (snapshot.progress_worker_running &&
+               snapshot.oldest_inflight_age_us >=
+                   snapshot.worker_stall_threshold_seconds * 1000000ULL &&
+               snapshot.worker_progress_age_seconds >=
+                   snapshot.worker_stall_threshold_seconds) {
+        snapshot.readiness_reasons.emplace_back("progress_worker_stalled");
+    }
+    return snapshot;
+}
 
 std::string randomSegmentName() {
     std::string name = "segment_noname_";
@@ -567,6 +646,8 @@ Status TransferEngineImpl::construct() {
                 LOG(WARNING) << "Failed to initialize TENT metrics: "
                              << status.ToString();
             } else {
+                TentMetrics::instance().setDiagnosticsProvider(
+                    this, [this]() { return buildDiagnosticsSnapshot(); });
                 LOG(INFO) << "TENT Metrics system initialized";
             }
         }
@@ -592,7 +673,10 @@ Status TransferEngineImpl::construct() {
 }
 
 Status TransferEngineImpl::deconstruct() {
-    // Metrics cleanup is handled automatically by TentMetrics destructor
+    available_.store(false, std::memory_order_release);
+    // Blocks until an in-flight diagnostics callback has returned, then
+    // prevents new callbacks from observing teardown below.
+    TentMetrics::instance().clearDiagnosticsProvider(this);
 
     // Stop the progress worker first so it cannot race with batch teardown
     // below (it dereferences BatchID into Batch* via progressBatch). Keep the

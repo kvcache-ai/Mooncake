@@ -51,6 +51,7 @@ class SegmentTracker;
 class Platform;
 class ProxyManager;
 class ProgressWorker;
+struct EngineDiagnosticsSnapshot;
 
 // How long a poll loop should pause before polling again. Zero means poll
 // immediately.
@@ -245,7 +246,9 @@ class TransferEngineImpl {
     TransferEngineImpl& operator=(const TransferEngineImpl&) = delete;
 
    public:
-    bool available() const { return available_; }
+    bool available() const {
+        return available_.load(std::memory_order_acquire);
+    }
 
     const std::string getSegmentName() const;
 
@@ -404,6 +407,8 @@ class TransferEngineImpl {
     Status construct();
 
     Status deconstruct();
+
+    EngineDiagnosticsSnapshot buildDiagnosticsSnapshot();
 
     Status setupLocalSegment();
 
@@ -629,7 +634,7 @@ class TransferEngineImpl {
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> topology_;
     std::unique_ptr<TransportSelector> transport_selector_;
-    bool available_;
+    std::atomic<bool> available_;
 
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
         transport_list_;
