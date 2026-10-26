@@ -9,6 +9,8 @@
 
 namespace mooncake {
 
+class NVMeoFInitiator;
+
 /**
  * @brief Manages anonymous shared memory segments backed by memfd.
  *
@@ -71,6 +73,11 @@ class ShmHelper {
     static std::mutex shm_mutex_;
     bool use_hugepage_ = false;
     bool register_spdk_ = false;
+    // NoF initiator owning this process's registrations of the ShmHelper
+    // mappings (MC_STORE_REGISTER_SPDK=1). nullptr when NoF is unavailable.
+    // Registrations live in the process-global page registry, so they are
+    // visible to every other initiator instance (e.g. the RealClient's).
+    std::shared_ptr<NVMeoFInitiator> nof_initiator_;
 };
 
 }  // namespace mooncake

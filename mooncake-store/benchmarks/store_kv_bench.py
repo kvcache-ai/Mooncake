@@ -880,8 +880,12 @@ class BenchmarkRunner:
             raise ValueError("replay requires --replay-file")
         if self.args.verify and not self.pattern:
             raise ValueError("verify mode currently requires --pattern")
-        if self.args.memory_replica_num == 0 and self.args.nof_replica_num == 0:
-            raise ValueError("memory_replica_num and nof_replica_num cannot both be 0")
+        if (
+            self.args.memory_replica_num == 0
+            and self.args.nof_replica_num == 0
+            and self.args.dfs_replica_num == 0
+        ):
+            raise ValueError("at least one memory, NoF, or DFS replica is required")
         if self.args.phase_gap_mode == "sleep" and self.args.phase_gap_sec <= 0:
             raise ValueError("phase-gap-sec must be > 0 when phase-gap-mode=sleep")
         if self.args.phase_gap_mode == "file" and not self.args.phase_gap_file:

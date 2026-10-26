@@ -100,9 +100,47 @@ static int cuda_memcpy_sync(void* ctx_, void* dst, void* src, size_t length) {
     int dev = getCudaDeviceForPtr(src);
     if (dev < 0) dev = getCudaDeviceForPtr(dst);
     if (dev < 0) return -1;  // host-to-host; let the caller fall back
-    CHECK_CUDA(cudaSetDevice(dev));
-    CHECK_CUDA(cudaMemcpy(dst, src, length, cudaMemcpyDefault));
-    return 0;
+
+    // Restore the exact caller state, as CudaPlatform::copy() does. An ordinal
+    // cannot distinguish a custom context from its device's primary context,
+    // and a caller that started without a context must remain without one.
+    CUcontext caller_ctx = nullptr;
+    CUresult ctx_result = cuCtxGetCurrent(&caller_ctx);
+    if (ctx_result != CUDA_SUCCESS) {
+        LOG(ERROR) << "CUDA plugin cuCtxGetCurrent: " << ctx_result;
+        return TENT_DEVICE_PLUGIN_ERROR;
+    }
+    int caller_device = -1;
+    // Bare cudaGetDevice() may initialize GPU 0; only query an existing
+    // binding.
+    if (caller_ctx != nullptr && cudaGetDevice(&caller_device) != cudaSuccess) {
+        LOG(ERROR) << "CUDA plugin cudaGetDevice failed before copying";
+        return TENT_DEVICE_PLUGIN_ERROR;
+    }
+
+    cudaError_t err = cudaSetDevice(dev);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(dst, src, length, cudaMemcpyDefault);
+    int result = err == cudaSuccess ? 0 : TENT_DEVICE_PLUGIN_ERROR;
+    if (err != cudaSuccess)
+        LOG(ERROR) << "CUDA plugin copy: " << cudaGetErrorString(err);
+
+    // Do not return early after switching: both restore steps must be attempted
+    // even if the copy or restoring the runtime binding failed.
+    if (caller_device != -1 && caller_device != dev) {
+        err = cudaSetDevice(caller_device);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "CUDA plugin cudaSetDevice(restore): "
+                       << cudaGetErrorString(err);
+            result = TENT_DEVICE_PLUGIN_ERROR;
+        }
+    }
+    ctx_result = cuCtxSetCurrent(caller_ctx);
+    if (ctx_result != CUDA_SUCCESS) {
+        LOG(ERROR) << "CUDA plugin cuCtxSetCurrent(restore): " << ctx_result;
+        result = TENT_DEVICE_PLUGIN_ERROR;
+    }
+    return result;
 }
 
 static int cuda_query_location(void* ctx_, void* addr, size_t size,

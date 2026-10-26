@@ -107,23 +107,77 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     }
 
     // cudaMemcpyAsync() validates the stream against the current device's
-    // context; pin the buffer's device for the copy and restore the caller's
-    // binding only when the thread already had a context.
-    int saved_device = 0;
-    const bool have_saved =
-        cudaHasCurrentContext() && cudaGetDevice(&saved_device) == cudaSuccess;
-    if (!have_saved) (void)cudaGetLastError();
-
-    CHECK_CUDA(cudaSetDevice(device_id));
-    CUDAStreamHandle stream;
-    CHECK_STATUS(getStreamFromPool(stream, device_id));
-    CHECK_CUDA(
-        cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault, stream.get()));
-    CHECK_CUDA(cudaStreamSynchronize(stream.get()));
-    if (have_saved) {
-        CHECK_CUDA(cudaSetDevice(saved_device));
+    // context, so the copy has to run with the buffer's device pinned. A
+    // device ordinal alone cannot restore the caller afterwards: it cannot
+    // tell a custom non-primary CUcontext apart from the primary one, and a
+    // thread that had no current context must not be left holding the one
+    // this copy creates. Save the exact identity through the driver API.
+    CUcontext caller_ctx = nullptr;
+    if (ensureCudaDriverInit() &&
+        cuCtxGetCurrent(&caller_ctx) != CUDA_SUCCESS) {
+        return Status::InternalError(std::string("cuCtxGetCurrent failed") +
+                                     LOC_MARK);
     }
-    return Status::OK();
+    // Bare cudaGetDevice() can implicitly create GPU 0 when this thread has
+    // no current context; only query the runtime binding when one exists.
+    int caller_device = -1;
+    if (caller_ctx != nullptr && cudaGetDevice(&caller_device) != cudaSuccess) {
+        caller_device = -1;
+        (void)cudaGetLastError();
+    }
+
+    Status status;
+    cudaError_t err = cudaSetDevice(device_id);
+    if (err != cudaSuccess) {
+        status = Status::InternalError(std::string("cudaSetDevice: ") +
+                                       cudaGetErrorString(err) + LOC_MARK);
+    } else {
+        // The handle returns the stream to the pool at the end of this scope,
+        // before the caller's state is restored below.
+        CUDAStreamHandle stream;
+        status = getStreamFromPool(stream, device_id);
+        if (status.ok()) {
+            err = cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault,
+                                  stream.get());
+            if (err != cudaSuccess) {
+                status =
+                    Status::InternalError(std::string("cudaMemcpyAsync: ") +
+                                          cudaGetErrorString(err) + LOC_MARK);
+            }
+        }
+        if (status.ok()) {
+            err = cudaStreamSynchronize(stream.get());
+            if (err != cudaSuccess) {
+                status = Status::InternalError(
+                    std::string("cudaStreamSynchronize: ") +
+                    cudaGetErrorString(err) + LOC_MARK);
+            }
+        }
+    }
+
+    // Restore on every exit path, success or failure. cudaSetDevice() first
+    // brings the runtime binding back (and may swap in that device's primary
+    // context), then cuCtxSetCurrent() restores the exact context identity: a
+    // custom CUcontext, or none at all for a caller that started bare.
+    if (caller_device != -1 && caller_device != device_id) {
+        err = cudaSetDevice(caller_device);
+        if (status.ok() && err != cudaSuccess) {
+            status =
+                Status::InternalError(std::string("cudaSetDevice(restore): ") +
+                                      cudaGetErrorString(err) + LOC_MARK);
+        }
+    }
+    const CUresult restore_rc = cuCtxSetCurrent(caller_ctx);
+    if (status.ok() && restore_rc != CUDA_SUCCESS) {
+        status = Status::InternalError(
+            std::string("cuCtxSetCurrent failed to restore the caller "
+                        "context") +
+            LOC_MARK);
+    }
+    if (!status.ok()) {
+        LOG(ERROR) << "CudaPlatform::copy failed: " << status.message();
+    }
+    return status;
 }
 
 Status CudaPlatform::synchronizeDevices(const Topology* topology) {

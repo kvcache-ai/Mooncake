@@ -438,6 +438,11 @@ impl StoreClient {
         policy: Option<&ReplicationPolicy>,
         conflict_policy: BatchPutRouteConflictPolicy,
     ) -> Result<Vec<ObjectRoute>> {
+        for request in requests {
+            self.ensure_control_plane_tenant(
+                request.tenant.unwrap_or(self.default_tenant()),
+            )?;
+        }
         self.ensure_local_memory()?;
         self.flush_due_reclaims()?;
         self.validate_unique_requests(requests)?;

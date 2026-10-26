@@ -66,11 +66,32 @@ struct ObjectRouteTestPeer {
         return route::ObjectRoute::StripeIndex(key);
     }
 
+    // The bucket count of one stripe's map.
+    static size_t StripeBucketCount(const route::ObjectRoute& route,
+                                    size_t stripe_idx) {
+        const route::Stripe& stripe = route.stripes_[stripe_idx];
+        std::shared_lock<std::shared_mutex> lock(stripe.lock);
+        return stripe.slots.bucket_count();
+    }
+
     // A handle on `key`'s slot, empty when the route has none. Holding it
     // keeps an empty slot in the map.
     static route::SlotHandle SlotRef(const route::ObjectRoute& route,
                                      std::string_view key) {
         return route.FindSlot(key);
+    }
+
+    // Whether `key`'s lock could be taken exclusively right now; a key the
+    // route has no slot for is free.
+    static bool KeyLockFree(const route::ObjectRoute& route,
+                            std::string_view key) {
+        const route::SlotHandle slot = route.FindSlot(key);
+        if (!slot) {
+            return true;
+        }
+        std::unique_lock<std::shared_mutex> lock(slot->mutex_,
+                                                 std::try_to_lock);
+        return lock.owns_lock();
     }
 
     // `key`'s stripe locked exclusively, as a release that drops a slot holds

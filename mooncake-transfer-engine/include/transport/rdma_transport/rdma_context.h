@@ -289,6 +289,12 @@ class RdmaContext {
     GidRefreshResult refreshCurrentGid(std::string *previous_gid = nullptr,
                                        std::string *next_gid = nullptr);
 
+    // Read the port's current state from the hardware. The monitor worker
+    // polls this for event-disabled contexts so a link that came back without
+    // a usable IBV_EVENT_PORT_ACTIVE is still noticed. Returns -1 and leaves
+    // *state untouched if no device is open or the query fails.
+    int queryPortState(ibv_port_state *state) const;
+
     ibv_context *context() const { return context_; }
 
     RdmaTransport &engine() const { return engine_; }

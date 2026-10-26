@@ -75,9 +75,140 @@ jobs:
       artifact-prefix: ${{ matrix.artifact-prefix }}
       version-override: ${{ needs.version-stamp.outputs.package_version }}
 
+
+  build-npu:
+    name: Build NPU wheels (${{ matrix.arch }}, py${{ matrix.python-version }})
+    needs: version-stamp
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64, x86_64]
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
+        include:
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            cann_arch: aarch64
+          - arch: x86_64
+            runner: ubuntu-22.04
+            cann_arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    env:
+      NPU_BUILD: "1"
+      WHEEL_VERSION: ${{ needs.version-stamp.outputs.package_version }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set Python bin
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHON_BIN="$(command -v python${{ matrix.python-version }})"
+          "$PYTHON_BIN" --version
+          echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
+
+      - name: Install CANN Toolkit
+        shell: bash
+        run: |
+          set -euo pipefail
+          CANN_BASE_URL="https://ascend.devcloud.huaweicloud.com/cann/run/software"
+          CANN_VERSION=$(curl -s "${CANN_BASE_URL}/" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+(?=/)' | sort -V | tail -1)
+          echo "Latest CANN version: ${CANN_VERSION}"
+          CANN_URL="${CANN_BASE_URL}/${CANN_VERSION}/${{ matrix.cann_arch }}/Ascend-cann-toolkit_${CANN_VERSION}_linux-${{ matrix.cann_arch }}.run"
+          echo "Downloading CANN ${CANN_VERSION} from ${CANN_URL}"
+          wget -q --show-progress -O /tmp/cann_toolkit.run "${CANN_URL}"
+          chmod +x /tmp/cann_toolkit.run
+          sudo /tmp/cann_toolkit.run --install --install-for-all --install-path=/usr/local/Ascend --quiet
+          rm -f /tmp/cann_toolkit.run
+
+      - name: Build and install HIXL
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          sudo ${PYTHON_BIN} -m pip install setuptools
+          cd /tmp
+          git clone https://gitcode.com/cann/hixl.git
+          cd hixl
+          bash build.sh -j$(nproc)
+          sudo ./build_out/cann-hixl_*.run --full --quiet --pylocal --install-path=/usr/local/Ascend
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          sudo bash dependencies.sh -y
+          sudo bash scripts/ascend/dependencies_ascend_installation.sh
+
+      - name: Configure project
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          rm -rf build
+          mkdir build
+          cd build
+          cmake ..             -DUSE_ASCEND_DIRECT=ON             -DUSE_ETCD=ON             -DSTORE_USE_ETCD=ON             -DBUILD_UNIT_TESTS=OFF             -DCMAKE_BUILD_TYPE=Release             -DPython3_EXECUTABLE="${PYTHON_BIN}"             -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF             -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF             -DCMAKE_SKIP_INSTALL_RPATH=ON
+
+      - name: Build project
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          cd build
+          cmake --build . -j"$(nproc)"
+          sudo cmake --install .
+
+      - name: Generate Python version tag
+        id: generate_tag_release
+        shell: bash
+        run: |
+          echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+
+      - name: Patch wheel version in pyproject.toml
+        run: |
+          cd mooncake-wheel
+          sed -i "s/^version = .*/version = \"${WHEEL_VERSION}\"/" pyproject.toml
+          echo "Patched pyproject.toml version to: ${WHEEL_VERSION}"
+
+      - name: Build Python wheel
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          NPU_BUILD=1 PYTHON_VERSION=${{ matrix.python-version }} \
+            OUTPUT_DIR=dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }} \
+            ./scripts/build_wheel.sh
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-wheel-npu-pre-release-${{ matrix.arch }}-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          path: mooncake-wheel/dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
+
   publish-github-release:
     name: Upload wheels to GitHub Pre-release
-    needs: build
+    needs: [build, build-npu]
     runs-on: ubuntu-22.04
     concurrency:
       group: pre-release-github-${{ github.ref_name }}
@@ -103,7 +234,7 @@ jobs:
 
   publish-testpypi:
     name: Validate and publish wheels to TestPyPI
-    needs: [version-stamp, build]
+    needs: [version-stamp, build, build-npu]
     runs-on: ubuntu-22.04
     environment: nightly
     concurrency:

@@ -333,6 +333,17 @@ impl StoreClient {
         &self.default_tenant
     }
 
+    pub(crate) fn ensure_control_plane_tenant(&self, tenant: &str) -> Result<()> {
+        if let Some(bound_tenant) = self.metadata.bound_tenant() {
+            if bound_tenant != tenant {
+                return Err(StoreError::InvalidState(format!(
+                    "StoreClient is bound to tenant {bound_tenant}, but the request targets tenant {tenant}; build a StoreClient for the target tenant"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn build_hot_upgrade_helper_writer(&self) -> Result<Option<StoreClient>> {
         let Some(factory) = self.transport_factory.clone() else {
             return Ok(None);

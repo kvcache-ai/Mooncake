@@ -128,7 +128,8 @@ tl::expected<void, ErrorCode> ShardAllocator::Init(
 
     std::vector<std::string> created_files;
     try {
-        auto ready = std::make_shared<ShardList>();
+        auto ready = std::make_unique<ShardList>();
+        ready->reserve(target_count);
         for (int i = 0; i < target_count; ++i) {
             const auto existing = existing_paths.find(i);
             const std::string path = existing == existing_paths.end()
@@ -142,9 +143,9 @@ tl::expected<void, ErrorCode> ShardAllocator::Init(
             }
             ready->push_back(std::move(*shard));
         }
-        std::atomic_store_explicit(
-            &shards_, std::shared_ptr<const ShardList>(std::move(ready)),
-            std::memory_order_release);
+        published_shards_.push_back(std::move(ready));
+        shards_.store(published_shards_.back().get(),
+                      std::memory_order_release);
     } catch (const std::exception& error) {
         CleanupCreatedFiles(created_files);
         LOG(ERROR) << "Failed to initialize DFS shards: " << error.what();
@@ -155,8 +156,7 @@ tl::expected<void, ErrorCode> ShardAllocator::Init(
 }
 
 int ShardAllocator::GetShardCount() const {
-    const auto shards =
-        std::atomic_load_explicit(&shards_, std::memory_order_acquire);
+    const auto* shards = shards_.load(std::memory_order_acquire);
     return shards ? static_cast<int>(shards->size()) : 0;
 }
 
@@ -165,8 +165,7 @@ tl::expected<int, ErrorCode> ShardAllocator::ExpandShards(int target_count) {
     if (!initialized_.load(std::memory_order_acquire)) {
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
-    const auto current =
-        std::atomic_load_explicit(&shards_, std::memory_order_acquire);
+    const auto* current = shards_.load(std::memory_order_acquire);
     if (target_count <= 0 || target_count < static_cast<int>(current->size()) ||
         shard_capacity_ > std::numeric_limits<uint64_t>::max() /
                               static_cast<uint64_t>(target_count)) {
@@ -176,7 +175,9 @@ tl::expected<int, ErrorCode> ShardAllocator::ExpandShards(int target_count) {
 
     std::vector<std::string> created_files;
     try {
-        auto ready = std::make_shared<ShardList>(*current);
+        auto ready = std::make_unique<ShardList>();
+        ready->reserve(target_count);
+        ready->assign(current->begin(), current->end());
         for (int i = static_cast<int>(current->size()); i < target_count; ++i) {
             const std::string path =
                 mount_path_ + "/dfs_shard_" + FormatShardIdx(i, 0) + ".data";
@@ -190,9 +191,9 @@ tl::expected<int, ErrorCode> ShardAllocator::ExpandShards(int target_count) {
             }
             ready->push_back(std::move(*shard));
         }
-        std::atomic_store_explicit(
-            &shards_, std::shared_ptr<const ShardList>(std::move(ready)),
-            std::memory_order_release);
+        published_shards_.push_back(std::move(ready));
+        shards_.store(published_shards_.back().get(),
+                      std::memory_order_release);
     } catch (const std::exception& error) {
         CleanupCreatedFiles(created_files);
         LOG(ERROR) << "Failed to expand DFS shards: " << error.what();
@@ -271,8 +272,7 @@ tl::expected<DistributedFSDescriptor, ErrorCode> ShardAllocator::Allocate(
     }
 
     auto key_lock = LockKey(key);
-    const auto shards =
-        std::atomic_load_explicit(&shards_, std::memory_order_acquire);
+    const auto* shards = shards_.load(std::memory_order_acquire);
     const size_t preferred = std::hash<std::string>{}(key) % shards->size();
     // A full preferred shard must not hide capacity in newly appended shards.
     // Existing descriptors remain authoritative even when the modulo changes.
@@ -351,8 +351,7 @@ void ShardAllocator::UpdateAccess(const std::string& key,
 
 uint64_t ShardAllocator::GetUsedBytes() const {
     uint64_t used = 0;
-    const auto shards =
-        std::atomic_load_explicit(&shards_, std::memory_order_acquire);
+    const auto* shards = shards_.load(std::memory_order_acquire);
     if (!shards) return 0;
     for (const auto& shard : *shards) {
         if (!shard) continue;
@@ -367,8 +366,7 @@ uint64_t ShardAllocator::GetUsedBytes() const {
 
 uint64_t ShardAllocator::GetTotalCapacity() const {
     uint64_t total = 0;
-    const auto shards =
-        std::atomic_load_explicit(&shards_, std::memory_order_acquire);
+    const auto* shards = shards_.load(std::memory_order_acquire);
     if (!shards) return 0;
     for (const auto& shard : *shards) {
         if (shard) total += shard->capacity;
@@ -383,8 +381,7 @@ uint64_t ShardAllocator::GetFileCount() const {
 void ShardAllocator::Free(uint64_t offset, uint64_t /*aligned_size*/,
                           int shard_idx, const std::string& key) {
     if (!initialized_.load(std::memory_order_acquire)) return;
-    const auto shards =
-        std::atomic_load_explicit(&shards_, std::memory_order_acquire);
+    const auto* shards = shards_.load(std::memory_order_acquire);
     if (shard_idx < 0 || shard_idx >= static_cast<int>(shards->size())) return;
 
     auto& shard = *(*shards)[shard_idx];
@@ -410,8 +407,7 @@ void ShardAllocator::Free(uint64_t offset, uint64_t /*aligned_size*/,
 void ShardAllocator::UpdateAccess(const std::string& key, int shard_idx,
                                   uint64_t offset) {
     if (!initialized_.load(std::memory_order_acquire)) return;
-    const auto shards =
-        std::atomic_load_explicit(&shards_, std::memory_order_acquire);
+    const auto* shards = shards_.load(std::memory_order_acquire);
     if (shard_idx < 0 || shard_idx >= static_cast<int>(shards->size())) return;
 
     auto& shard = *(*shards)[shard_idx];
@@ -440,8 +436,7 @@ ShardAllocator::PendingEviction ShardAllocator::PrepareEviction() {
     PendingEviction pending(this);
     if (!initialized_.load(std::memory_order_acquire)) return pending;
 
-    const auto shards =
-        std::atomic_load_explicit(&shards_, std::memory_order_acquire);
+    const auto* shards = shards_.load(std::memory_order_acquire);
     for (size_t i = 0; i < shards->size(); ++i) {
         auto& shard = *(*shards)[i];
         {
@@ -455,8 +450,7 @@ ShardAllocator::PendingEviction ShardAllocator::PrepareEviction() {
 
 void ShardAllocator::CommitPreparedEviction(PendingEviction&& pending) {
     if (pending.owner_ != this) return;
-    const auto shards =
-        std::atomic_load_explicit(&shards_, std::memory_order_acquire);
+    const auto* shards = shards_.load(std::memory_order_acquire);
 
     const auto free_at =
         std::chrono::steady_clock::now() + deferred_free_duration_;
@@ -482,8 +476,7 @@ void ShardAllocator::CommitPreparedEviction(PendingEviction&& pending) {
 
 void ShardAllocator::RestorePreparedEviction(PendingEviction&& pending) {
     if (pending.owner_ != this) return;
-    const auto shards =
-        std::atomic_load_explicit(&shards_, std::memory_order_acquire);
+    const auto* shards = shards_.load(std::memory_order_acquire);
 
     // Candidates were removed oldest-first. Restore in reverse order so the
     // original relative LRU order is preserved.
@@ -520,8 +513,7 @@ void ShardAllocator::RestorePreparedEviction(PendingEviction&& pending) {
 void ShardAllocator::ResolvePreparedEviction(
     PendingEviction&& pending, const std::vector<bool>& accepted) {
     if (pending.owner_ != this) return;
-    const auto shards =
-        std::atomic_load_explicit(&shards_, std::memory_order_acquire);
+    const auto* shards = shards_.load(std::memory_order_acquire);
     if (accepted.size() != pending.prepared_.size()) {
         LOG(ERROR) << "DFS eviction decision count " << accepted.size()
                    << " does not match prepared candidate count "

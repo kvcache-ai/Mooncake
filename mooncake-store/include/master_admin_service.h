@@ -115,6 +115,9 @@ class MasterAdminServer {
     void HandleRemoveAll(coro_http::coro_http_request& req,
                          coro_http::coro_http_response& resp);
 
+    void HandleSoftPin(coro_http::coro_http_request& req,
+                       coro_http::coro_http_response& resp, bool unpin);
+
     void RegisterHandler();
     void RefreshStorageMetrics() const;
 

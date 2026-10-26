@@ -2141,8 +2141,6 @@ struct MemoryNodeStatusSpec {
 
 MemoryNodeStatusSpec MemoryNodeStatus(std::string node);
 
-std::string GroupOnDifferentShard(std::string_view key);
-
 class MasterScenario {
    public:
     explicit MasterScenario(std::string name);

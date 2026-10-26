@@ -1,3 +1,43 @@
+if(USE_XPU)
+  # Intel XPU: a SYCL implementation of the same _ep module for ranks on one
+  # node (peers over Level Zero IPC; no RDMA path). common.cmake has already
+  # required the DPC++ compiler.
+  set(MOONCAKE_EP_XPU_AOT_DEVICES
+      "bmg"
+      CACHE
+        STRING
+        "Intel GPUs to compile the XPU EP kernels ahead of time for (ocloc -device list, e.g. bmg,pvc); others JIT-compile on first use. Empty: JIT only"
+  )
+  find_library(MOONCAKE_EP_ZE_LOADER ze_loader)
+  if(NOT MOONCAKE_EP_ZE_LOADER)
+    message(FATAL_ERROR "Mooncake EP on XPU needs the Level Zero loader "
+                        "(libze_loader)")
+  endif()
+  pybind11_add_module(
+    _ep MODULE ep_py.cpp xpu/mooncake_ep_xpu_buffer.cpp xpu/xpu_ipc.cpp
+    xpu/xpu_ep_kernels.cpp)
+  target_compile_definitions(_ep PRIVATE MOONCAKE_EP_USE_XPU=1)
+  set(_ep_xpu_sycl_flags -fsycl)
+  if(MOONCAKE_EP_XPU_AOT_DEVICES)
+    list(
+      APPEND
+      _ep_xpu_sycl_flags
+      -fsycl-targets=spir64_gen,spir64
+      "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${MOONCAKE_EP_XPU_AOT_DEVICES}\""
+    )
+  endif()
+  # Correctly rounded division and no contraction: the FP8 scale, 448 / amax,
+  # must round as the CUDA kernel's does. Ahead-of-time device code is generated
+  # at link time, so the link needs these too.
+  list(APPEND _ep_xpu_sycl_flags -fp-model=precise -foffload-fp32-prec-div)
+  target_compile_options(_ep PRIVATE ${_ep_xpu_sycl_flags})
+  target_link_options(_ep PRIVATE ${_ep_xpu_sycl_flags})
+  target_link_libraries(_ep PRIVATE glog::glog ${MOONCAKE_EP_ZE_LOADER})
+  set_target_properties(_ep PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                       INSTALL_RPATH "$ORIGIN")
+  return()
+endif()
+
 set(MOONCAKE_EP_HOST_SOURCES
     ep_py.cpp
     ../benchmarks/legacy_buffer_perf.cpp

@@ -22,6 +22,9 @@ namespace tent {
 
 // Append new memory types to preserve existing numeric values. Add device
 // types to isGpuMemoryType() as well so routing and staging agree.
+// Intel XPU VRAM is NIC-addressable only when exported as a dma-buf and
+// registered with ibv_reg_dmabuf_mr (see Platform::exportDmabuf); otherwise
+// transfers are staged through host DRAM.
 enum MemoryType {
     MTYPE_UNKNOWN,
     MTYPE_CPU,
@@ -37,6 +40,20 @@ inline bool isGpuMemoryType(MemoryType t) {
     return t == MTYPE_CUDA || t == MTYPE_ROCM || t == MTYPE_TPU ||
            t == MTYPE_XPU || t == MTYPE_MLU;
 }
+
+// A device allocation exported as a Linux dma-buf so a NIC can register it
+// with ibv_reg_dmabuf_mr. `fd` is owned by the exporting runtime and stays
+// valid for the lifetime of the allocation; callers must not close it. Level
+// Zero, for instance, caches one descriptor per allocation and returns that
+// same fd on every export, so a caller-side close would leave the driver
+// holding a stale number. The MR keeps its own reference to the dma-buf.
+// `offset` is the position of the requested address within the exported
+// buffer, which covers the whole underlying allocation, not just the
+// requested range.
+struct DmabufExport {
+    int fd = -1;
+    uint64_t offset = 0;
+};
 
 class Platform {
    public:
@@ -67,6 +84,15 @@ class Platform {
     // GPU platforms flush those devices; CPU and others no-op. Failures are
     // logged and still return OK so teardown can continue.
     virtual Status synchronizeDevices(const Topology *topology);
+
+    // Export the device allocation containing [addr, addr+length) as a
+    // dma-buf for direct NIC registration. Returns NotImplemented when the
+    // platform has no dma-buf export path (the default), InvalidArgument when
+    // `addr` is not device memory owned by this platform (register it as host
+    // memory instead), and InternalError when the export itself failed. Only
+    // an OK status populates `out`; per the DmabufExport contract the fd stays
+    // owned by the exporting runtime and the caller must not close it.
+    virtual Status exportDmabuf(void *addr, size_t length, DmabufExport &out);
 
    protected:
     static std::vector<int> topologyDeviceIndices(const Topology *topology,

@@ -67,6 +67,9 @@ class StandbyMetadataStore final : public MetadataStore {
     void Clear();
 
     bool PutWeightMetadata(const WeightRevisionMetadata& metadata) override;
+    bool PutWeightMetadataAndOperation(
+        const WeightRevisionMetadata& metadata,
+        const std::optional<WeightResidencyOperation>& operation) override;
     std::optional<WeightRevisionMetadata> GetWeightMetadata(
         const WeightRevisionIdentity& identity) const override;
     std::optional<uint64_t> GetWeightMetadataTombstoneGeneration(
@@ -81,6 +84,9 @@ class StandbyMetadataStore final : public MetadataStore {
     bool RemoveWeightLease(uint64_t lease_id,
                            const WeightRevisionIdentity& identity,
                            uint64_t fenced_metadata_generation) override;
+    bool PutWeightOperation(const WeightResidencyOperation& operation) override;
+    std::optional<WeightResidencyOperation> GetWeightOperation(
+        uint64_t operation_id) const override;
     bool RestoreWeightMetadata(const WeightMetadataSnapshot& snapshot);
     WeightMetadataSnapshot SnapshotWeightMetadata() const;
 

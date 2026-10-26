@@ -54,7 +54,7 @@ The following environment variables can be configured to control Ascend Direct T
 | `ASCEND_GLOBAL_RESOURCE_CONFIG` | Global resource configuration | - | `ASCEND_GLOBAL_RESOURCE_CONFIG="{\"fabric_memory.max_capacity\":32}"` |
 | `ASCEND_CONNECT_TIMEOUT` | Link establishment timeout in milliseconds | 10000 | `ASCEND_CONNECT_TIMEOUT=5000` |
 | `ASCEND_TRANSFER_TIMEOUT` | Data transfer timeout in milliseconds | 10000 | `ASCEND_TRANSFER_TIMEOUT=10000` |
-| `ASCEND_THREAD_POOL_SIZE` | Number of worker threads in the transfer thread pool | 8 (1 for buffer pool mode) | `ASCEND_THREAD_POOL_SIZE=16` |
+| `ASCEND_THREAD_POOL_SIZE` | Number of worker threads in the transfer thread pool | 16 (1 for buffer pool mode) | `ASCEND_THREAD_POOL_SIZE=32` |
 | `ASCEND_USE_SHORT_CONNECTION` | Enable short connection mode (disconnect after each transfer) | 0 (disabled) | `ASCEND_USE_SHORT_CONNECTION=1` |
 | `ASCEND_BUFFER_POOL` | Buffer pool configuration for intermediate transfer mode (BUFFER_NUM:BUFFER_SIZE_MB) | "0:0" (disabled) | `ASCEND_BUFFER_POOL=4:8` |
 | `ASCEND_BASE_PORT` | Base port for ADXL engine port allocation | 20000 | `ASCEND_BASE_PORT=20000` |

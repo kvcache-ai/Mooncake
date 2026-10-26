@@ -34,7 +34,6 @@ struct ReplicationTask {
     } type;
     ReplicaID source_id;
     std::vector<ReplicaID> replica_ids;
-    uint64_t pending_quota_charge_bytes{0};
     UUID dynamic_replication_lease_id{};
     uint64_t dynamic_replication_version_epoch{0};
     bool durable_cleanup_pending{false};
@@ -89,6 +88,12 @@ struct PromotionCandidate {
     // consumption; reset only when a genuinely new chain starts (fresh
     // insert with 0, e.g. after a give-up or a success).
     uint32_t execution_failures{0};
+    // True when the task was registered by a prefetch caller
+    // (RegisterPrefetchTask) rather than promotion-on-hit admission. Same
+    // execution chain, but failure handling differs: a prefetch failure is
+    // retried by the client-side throttle, not re-recorded as an on-hit
+    // candidate.
+    bool from_prefetch{false};
 };
 
 // NotifyPromotionSuccess should commit, so a concurrent Put on the
@@ -112,7 +117,6 @@ struct PromotionTask {
     ReplicaID source_id;    // the LOCAL_DISK replica being promoted
     ReplicaID alloc_id{0};  // the new MEMORY replica staged by AllocStart
     uint64_t object_size;
-    uint64_t pending_quota_charge_bytes{0};
     std::chrono::system_clock::time_point start_time;
     UUID holder_id;  // owner of source LOCAL_DISK; only Notifier allowed
     // Execution failures so far in this admission chain. Read by
@@ -122,6 +126,9 @@ struct PromotionTask {
     // copies candidate -> task verbatim, failure re-record writes
     // task+1 -> candidate.
     uint32_t execution_failures{0};
+    // SSD prefetch admission. NotifyPromotionSuccess grants a read lease
+    // so the promoted replica survives until the follow-up get.
+    bool from_prefetch{false};
 };
 
 }  // namespace mooncake

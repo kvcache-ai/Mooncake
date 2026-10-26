@@ -35,6 +35,14 @@ class AllocatorManager {
     AllocatorManager() = default;
     ~AllocatorManager() = default;
 
+    // Request-local preference on the existing allocator snapshot.
+    void SetHcaAffinity(std::vector<std::string> names) {
+        preferred_hcas_ = std::move(names);
+    }
+    const std::vector<std::string>& GetHcaAffinity() const {
+        return preferred_hcas_;
+    }
+
     // Copy-construct disallowed.
     AllocatorManager(const AllocatorManager&) = delete;
     AllocatorManager& operator=(const AllocatorManager&) = delete;
@@ -203,8 +211,8 @@ class AllocatorManager {
         std::string, std::vector<std::shared_ptr<SegmentAllocatorRegistration>>>
         allocators_;
     std::unordered_map<std::string, UUID> owner_by_name_;
+    std::vector<std::string> preferred_hcas_;
     friend class ScopedSegmentAccess;
-    friend class SegmentSerializer;
 };
 
 /**
@@ -438,11 +446,21 @@ class RandomAllocationStrategy : public AllocationStrategy {
         // allocations across all segments
         // Select a start segment to place the replica.
         size_t seg_offset = randomIndex(num_segs);
-        for (size_t i = 0; i < num_segs; i++) {  // only allocate one replica
-            const auto& registration =
-                (*allocators)[(i + seg_offset) % num_segs];
-            if (auto buffer = registration->Allocate(slice_length)) {
-                return buffer;
+        const auto& preferred_hca_names = allocator_manager.GetHcaAffinity();
+        const int tiers = preferred_hca_names.empty() ? 1 : 3;
+        for (int tier = 0; tier < tiers; ++tier) {
+            for (size_t i = 0; i < num_segs; ++i) {
+                const auto& registration =
+                    (*allocators)[(i + seg_offset) % num_segs];
+                if (!preferred_hca_names.empty() &&
+                    HcaAffinityTier(
+                        registration->GetAllocator()->GetLocalityHandle().get(),
+                        preferred_hca_names) != tier) {
+                    continue;
+                }
+                if (auto buffer = registration->Allocate(slice_length)) {
+                    return buffer;
+                }
             }
         }
 

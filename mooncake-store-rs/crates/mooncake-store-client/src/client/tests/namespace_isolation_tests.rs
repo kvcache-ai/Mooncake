@@ -6,7 +6,8 @@
 // for `query_route_in_tenant`; this module is intentionally additive and
 // covers everything that was missing:
 //
-//   * Cross-tenant **read** isolation across the full read API surface
+//   * Logical cross-tenant **read** isolation on the compatibility backend
+//     across the full read API surface
 //     (`get`, `batch_get`, `is_exist`, `batch_is_exist`, `query_route_in_scope`,
 //     `list_routes_in_scope`).
 //   * `domain` and `object_set` isolation (the routing tests exercise only
@@ -25,13 +26,98 @@ use mooncake_store_core::{
     MetadataBackend, NamespaceScope, ObjectKey, StoreError, TenantQuotaState,
 };
 
-use crate::{MooncakeCompatibilityFacade, ObjectRef, PutRequest};
+use crate::{
+    MooncakeCompatibilityFacade, MultiBufferPutRequest, ObjectRef, PutFromRequest, PutRequest,
+};
 
 mod harness {
     include!("isolation_test_harness.rs");
 }
 
 use harness::{install_generous_quota_policy, install_tenant_quota_policy, IsolationCluster};
+
+#[test]
+fn hard_isolated_client_rejects_cross_tenant_requests() {
+    use std::sync::Arc;
+
+    use mooncake_store_core::ClientLifecycleState;
+    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
+    use mooncake_store_test_utils::fixtures::test_future_expiry_ms;
+    use mooncake_store_test_utils::transport::TestTransport;
+
+    let metadata = Arc::new(InMemoryMetadataBackend::new_hard_isolated());
+    let tenant_a_metadata = metadata
+        .for_tenant("tenant-a")
+        .expect("hard-isolated metadata should support tenant binding");
+    assert!(matches!(
+        crate::StoreClientBuilder::new(tenant_a_metadata, "mismatched-client")
+            .tenant("tenant-b")
+            .build(test_future_expiry_ms()),
+        Err(StoreError::InvalidState(_))
+    ));
+
+    let transport = Arc::new(TestTransport::new("tenant-bound-segment"));
+    let client = crate::StoreClientBuilder::new(metadata, "tenant-bound-client")
+        .state(ClientLifecycleState::Active)
+        .tenant("tenant-a")
+        .segment_name("tenant-bound-segment")
+        .transport(transport)
+        .local_memory(harness::default_isolation_storage_config())
+        .build(test_future_expiry_ms())
+        .expect("tenant-bound client should build");
+    client
+        .register_local_memory()
+        .expect("tenant-bound local-memory registration should succeed");
+
+    client
+        .put("same-tenant", b"value")
+        .expect("default tenant write should succeed");
+    assert_eq!(
+        client
+            .get_in_tenant("tenant-a", "same-tenant")
+            .expect("matching explicit tenant should read"),
+        b"value"
+    );
+    assert!(matches!(
+        client.get_in_tenant("tenant-b", "same-tenant"),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert!(matches!(
+        client.put_in_tenant("tenant-b", "other", b"value"),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert!(matches!(
+        client.batch_get(&[ObjectRef::new("same-tenant").tenant("tenant-b")]),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert!(matches!(
+        client.batch_put(&[PutRequest::new("other", b"value").tenant("tenant-b")]),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert!(matches!(
+        client.put_from_in_tenant("tenant-b", "other", std::ptr::null(), 0),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert!(matches!(
+        client.batch_put_from(&[
+            PutFromRequest::new("other", std::ptr::null(), 0).tenant("tenant-b")
+        ]),
+        Err(StoreError::InvalidState(_))
+    ));
+    let empty_buffers: [&[u8]; 0] = [];
+    assert!(matches!(
+        client.batch_put_from_multi_buffers(&[
+            MultiBufferPutRequest::new("other", &empty_buffers).tenant("tenant-b")
+        ]),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert!(matches!(
+        unsafe {
+            client.get_into_range("tenant-b", "same-tenant", std::ptr::null_mut(), 0, 0, 0, 0)
+        },
+        Err(StoreError::InvalidState(_))
+    ));
+}
 
 // ===========================================================================
 // 1. Cross-tenant write/read isolation across the full client API

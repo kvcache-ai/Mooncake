@@ -101,6 +101,23 @@ struct GlobalConfig {
     // not-yet-posted slices fail/redispatch instead of hanging. 0 disables.
     // Override via MC_CONN_PAUSE_TTL_MS.
     int conn_pause_ttl_ms = 0;
+    // Tell the EFA provider that every peer runs our platform, build, and
+    // capabilities, which lets it skip the per-peer RDM handshake. That
+    // handshake is what limits the first transfers to a new peer to 16 queued
+    // ops before returning FI_EAGAIN, endpoint-wide rather than per-peer.
+    // Defaults OFF: without the handshake, a passively connected endpoint can
+    // write before the peer has inserted our address, which fails the write
+    // with prov_errno=14 under bilateral first contact. Opt in with
+    // MC_EFA_HOMOGENEOUS_PEERS=1 only for one-directional traffic between
+    // identical hosts. See buildSharedEndpoint() for the full rationale.
+    bool efa_homogeneous_peers = false;
+    // Wall-clock safety net for the WR/CQ credit wait in
+    // EfaContext::submitSlicesOnPeer, in milliseconds.  A credit wait is
+    // ordinary backpressure and resolves on its own; only a wait this long
+    // means completions have genuinely stopped coming back.  Override with
+    // MC_EFA_CQ_DRAIN_TIMEOUT_MS; <= 0 waits forever (the stalled-wave escape
+    // hatch still bounds a provider that refuses every post).
+    int64_t efa_cq_drain_timeout_ms = 1000;
     // Context-level circuit-breaker pause. Repeated local WC failures
     // deactivate the local RNIC context for this many milliseconds. The
     // monitor then reactivates it with a reset failure count. Must be positive

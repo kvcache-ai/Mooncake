@@ -164,11 +164,32 @@ TEST(SessionTagTest, MetadataPayloadCompatibility) {
     EXPECT_FALSE(decoded->session_id);
     EXPECT_EQ(decoded->group_id.value_or(""), "group");
     decoded->session_id = "session";
+    decoded->object_checksum = 0x1234;
     auto old_reader = struct_pack::deserialize<LegacyMetadataPayload>(
         struct_pack::serialize(*decoded));
     ASSERT_TRUE(old_reader);
     EXPECT_TRUE(old_reader->hard_pinned.value_or(false));
     EXPECT_EQ(old_reader->group_id.value_or(""), "group");
+}
+
+TEST(SessionTagTest, MetadataPayloadPreservesChecksumValues) {
+    const std::vector<std::optional<uint64_t>> checksums{std::nullopt, 0,
+                                                         0xfeedfacecafebeefULL};
+    for (const auto& checksum : checksums) {
+        MetadataPayload payload;
+        payload.object_checksum = checksum;
+        auto decoded = struct_pack::deserialize<MetadataPayload>(
+            struct_pack::serialize(payload));
+        ASSERT_TRUE(decoded);
+        EXPECT_EQ(decoded->object_checksum.has_value(), checksum.has_value());
+        EXPECT_EQ(decoded->ToStandbyMetadata().object_checksum.has_value(),
+                  checksum.has_value());
+        if (checksum) {
+            EXPECT_EQ(decoded->object_checksum.value(), *checksum);
+            EXPECT_EQ(decoded->ToStandbyMetadata().object_checksum.value(),
+                      *checksum);
+        }
+    }
 }
 
 TEST_F(MasterServiceTest, SessionTagSurvivesAddingDiskReplica) {

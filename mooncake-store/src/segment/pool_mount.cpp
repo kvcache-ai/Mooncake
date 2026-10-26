@@ -88,6 +88,7 @@ SegmentPool::WriteAccess::PrepareWithLiveAllocations(
     if (!resource) {
         return tl::make_unexpected(resource.error());
     }
+    resource->resource().allocator()->SetLocality(segment.locality);
     resource->resource().allocator()->AttachUsageTracker(
         segment_pool_.usage_tracker_);
     MountedRegion mounted{segment, client_id, SegmentStatus::OK, kind};
@@ -101,20 +102,18 @@ SegmentPool::WriteAccess::PrepareWithLiveAllocations(
 
 tl::expected<RegionMountTxn, ErrorCode> SegmentPool::WriteAccess::PrepareAdopt(
     MountedRegion mounted, std::shared_ptr<BufferAllocatorBase> allocator,
-    bool account_capacity_metrics, AdoptMode mode) {
+    bool account_capacity_metrics) {
     mounted.kind = ClassifyRegion(mounted.segment);
     RegionDriver* driver = segment_pool_.GetDriver(mounted.kind);
     if (!driver) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
-    if (mode == AdoptMode::Insert) {
-        if (catalog_.Find(mounted.segment.id)) {
-            return tl::make_unexpected(ErrorCode::SEGMENT_ALREADY_EXISTS);
-        }
-        auto owner = catalog_.FindOwnerClientId(mounted.segment.name);
-        if (owner && *owner != mounted.client_id) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
+    if (catalog_.Find(mounted.segment.id)) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_ALREADY_EXISTS);
+    }
+    auto owner = catalog_.FindOwnerClientId(mounted.segment.name);
+    if (owner && *owner != mounted.client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto resource = driver->PrepareAdopt(MakeResourceSpec(mounted.segment),
                                          std::move(allocator));

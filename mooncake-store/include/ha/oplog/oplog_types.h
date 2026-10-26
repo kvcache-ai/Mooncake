@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -24,6 +25,15 @@ enum class OpType : uint8_t {
     WEIGHT_LEASE_DELETE = 11,
     OP_TYPE_MAX,
 };
+
+struct WeightMetadataUpsertOp {
+    WeightRevisionMetadata metadata;
+    std::optional<WeightResidencyOperation> operation;
+
+    friend bool operator==(const WeightMetadataUpsertOp&,
+                           const WeightMetadataUpsertOp&) = default;
+};
+YLT_REFL(WeightMetadataUpsertOp, metadata, operation);
 
 struct WeightMetadataDeleteOp {
     WeightRevisionIdentity identity;

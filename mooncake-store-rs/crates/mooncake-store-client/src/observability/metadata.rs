@@ -112,6 +112,10 @@ impl MetadataBackend for ObservedMetadataBackend {
         self.inner.route_namespace()
     }
 
+    fn bound_tenant(&self) -> Option<&str> {
+        self.inner.bound_tenant()
+    }
+
     fn backend_kind(&self) -> &'static str {
         self.backend
     }
@@ -356,6 +360,10 @@ impl MetadataBackend for ObservedMetadataBackend {
         self.observe("get_tenant_policies", || {
             self.inner.get_tenant_policies(scopes)
         })
+    }
+
+    fn list_tenants(&self) -> Result<Vec<String>> {
+        self.observe("list_tenants", || self.inner.list_tenants())
     }
 
     fn list_tenant_policies(&self, tenant: Option<&str>) -> Result<Vec<TenantPolicy>> {

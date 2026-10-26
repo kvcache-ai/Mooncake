@@ -3316,6 +3316,101 @@ TEST_F(StorageBackendTest,
     EXPECT_TRUE(std::filesystem::exists(test_dir + "/f3"));
 }
 
+TEST_F(StorageBackendTest, WatermarkPerFileRetryRollsBackOnTransportFailure) {
+    const auto test_dir = data_path + "/watermark_retry_failure";
+    std::filesystem::create_directories(test_dir);
+    StorageBackend backend(test_dir, "", true);
+    ASSERT_TRUE(backend.Init(4096));
+    const std::string data(1024, 'r');
+    for (const auto& key : {"key_1", "key_2", "key_3"}) {
+        ASSERT_TRUE(backend.StoreObject(test_dir + "/" + key, data, key));
+    }
+
+    auto result = backend.EvictAboveDiskWatermark(
+        0.70, 0.40,
+        [](const std::vector<std::string>& keys)
+            -> tl::expected<void, ErrorCode> {
+            if (keys.size() > 1) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+            if (keys.front() == "key_1") return {};
+            return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        });
+    ASSERT_FALSE(result);
+    EXPECT_EQ(ErrorCode::RPC_FAIL, result.error());
+    for (const auto& key : {"key_1", "key_2", "key_3"}) {
+        EXPECT_TRUE(std::filesystem::exists(test_dir + "/" + key));
+    }
+
+    // The restored queue remains usable after a partially acknowledged RPC.
+    auto retry = backend.EvictAboveDiskWatermark(
+        0.70, 0.40,
+        [](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
+            return {};
+        });
+    ASSERT_TRUE(retry);
+    EXPECT_EQ((std::vector<std::string>{"key_1", "key_2"}), *retry);
+    EXPECT_FALSE(std::filesystem::exists(test_dir + "/key_1"));
+    EXPECT_FALSE(std::filesystem::exists(test_dir + "/key_2"));
+    EXPECT_TRUE(std::filesystem::exists(test_dir + "/key_3"));
+}
+
+TEST_F(StorageBackendTest, WatermarkPerFileRetryRetainsAnonymousFiles) {
+    const auto test_dir = data_path + "/watermark_retry_anonymous";
+    std::filesystem::create_directories(test_dir);
+    StorageBackend backend(test_dir, "", true);
+    ASSERT_TRUE(backend.Init(4096));
+    const std::string data(1024, 'r');
+    ASSERT_TRUE(backend.StoreObject(test_dir + "/anonymous", data, ""));
+    ASSERT_TRUE(backend.StoreObject(test_dir + "/managed", data, "managed"));
+    ASSERT_TRUE(backend.StoreObject(test_dir + "/newest", data, "newest"));
+    auto result = backend.EvictAboveDiskWatermark(
+        0.70, 0.40,
+        [](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        });
+    ASSERT_FALSE(result);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, result.error());
+    for (const auto& key : {"anonymous", "managed", "newest"}) {
+        EXPECT_TRUE(std::filesystem::exists(test_dir + "/" + key));
+    }
+}
+
+TEST_F(StorageBackendTest, WatermarkProtectedPrefixRotatesBehindOrdinaryFiles) {
+    const auto test_dir = data_path + "/watermark_protected_prefix";
+    std::filesystem::create_directories(test_dir);
+    StorageBackend backend(test_dir, "", true);
+    ASSERT_TRUE(backend.Init(4096));
+    const std::string data(1024, 'r');
+    for (const auto& key : {"managed", "ordinary", "newest"}) {
+        ASSERT_TRUE(backend.StoreObject(test_dir + "/" + key, data, key));
+    }
+    auto authorize = [](const std::vector<std::string>& keys)
+        -> tl::expected<void, ErrorCode> {
+        for (const auto& key : keys) {
+            if (key == "managed") {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+        }
+        return {};
+    };
+    auto refused = backend.EvictAboveDiskWatermark(0.70, 0.60, authorize);
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, refused.error());
+    for (const auto& key : {"managed", "ordinary", "newest"}) {
+        EXPECT_TRUE(std::filesystem::exists(test_dir + "/" + key));
+    }
+    auto retry = backend.EvictAboveDiskWatermark(0.70, 0.60, authorize);
+    ASSERT_TRUE(retry);
+    EXPECT_EQ((std::vector<std::string>{"ordinary"}), *retry);
+    EXPECT_TRUE(std::filesystem::exists(test_dir + "/managed"));
+    EXPECT_FALSE(std::filesystem::exists(test_dir + "/ordinary"));
+    EXPECT_TRUE(std::filesystem::exists(test_dir + "/newest"));
+}
+
 TEST_F(StorageBackendTest, StoreObjectRejectsOverwriteDuringFailedEviction) {
     std::string test_dir = data_path + "/eviction_overwrite_race_test";
     std::filesystem::create_directories(test_dir);

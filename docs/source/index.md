@@ -195,6 +195,7 @@ design/transfer-engine/index
 design/tent/overview
 design/store/mooncake-store
 design/store/store-rs/index
+design/store/ssd-prefetch
 design/mooncake-backend-pg
 design/mooncake-ep
 design/conductor/index
@@ -238,4 +239,5 @@ troubleshooting/store-rs-key-access
 :hidden:
 
 community/governance
+community/ecosystem-prs
 :::

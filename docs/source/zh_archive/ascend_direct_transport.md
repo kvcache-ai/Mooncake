@@ -42,7 +42,7 @@ Transfer Engine RPC using <协议> listening on <IP>:<实际端口>，记录目�
 | `ASCEND_GLOBAL_RESOURCE_CONFIG` | 全局资源配置                               | - | `ASCEND_GLOBAL_RESOURCE_CONFIG="{\"fabric_memory.max_capacity\":32}"` |
 | `ASCEND_CONNECT_TIMEOUT` | 链路建链超时时间（毫秒）                         | 3000 | `ASCEND_CONNECT_TIMEOUT=5000`                                         |
 | `ASCEND_TRANSFER_TIMEOUT` | 数据传输超时时间（毫秒）                         | 3000 | `ASCEND_TRANSFER_TIMEOUT=10000`                                       |
-| `ASCEND_THREAD_POOL_SIZE` | 传输线程池的工作线程数                          | 8（缓冲池模式下为1） | `ASCEND_THREAD_POOL_SIZE=16`                                          |
+| `ASCEND_THREAD_POOL_SIZE` | 传输线程池的工作线程数                          | 16（缓冲池模式下为1） | `ASCEND_THREAD_POOL_SIZE=32`                                          |
 | `ASCEND_USE_SHORT_CONNECTION` | 启用短连接模式（每次传输后断开）                     | 0（禁用） | `ASCEND_USE_SHORT_CONNECTION=1`                                       |
 | `ASCEND_BUFFER_POOL` | 中转模式缓冲池配置（BUFFER_NUM:BUFFER_SIZE_MB） | "0:0"（禁用） | `ASCEND_BUFFER_POOL=4:8`                                              |
 | `ASCEND_BASE_PORT` | ADXL引擎端口分配的基础端口                      | 11000 | `ASCEND_BASE_PORT=20000`                                              |
@@ -79,4 +79,3 @@ ASCEND_GLOBAL_RESOURCE_CONFIG：配置Hixl的全局资源，具体查看hixl的�
 10. 可以通过配置`ASCEND_USE_ASYNC_TRANSFER`环境变量来开启异步传输。
 
 11. 在A3上，在获取最新驱动和CANN的前提下，在使用Mooncake store时，可以设置`ASCEND_ENABLE_USE_FABRIC_MEM`环境变量来开启fabric mem传输模式(能直接访问远端的HOST内存)。
-

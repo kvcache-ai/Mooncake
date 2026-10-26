@@ -1022,4 +1022,105 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstVsRandomStrategyPerformance) {
         << "% slower)\n\n";
 }
 
+TEST_P(AllocationStrategyParameterizedTest, HcaNameSelectsReceiverLocalNuma) {
+    auto other = CreateTestAllocator("receiver", 0);
+    auto matching = CreateTestAllocator("receiver", 0x10000000ULL);
+    auto unknown = CreateTestAllocator("receiver", 0x20000000ULL);
+    other->SetLocality(SegmentLocality{0, {"mlx5_1"}});
+    matching->SetLocality(SegmentLocality{7, {"mlx5_0", "mlx5_2"}});
+    AllocatorManager manager;
+    manager.SetHcaAffinity({"mlx5_0"});
+    manager.addAllocator("receiver", other);
+    manager.addAllocator("receiver", unknown);
+    manager.addAllocator("receiver", matching);
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        auto result =
+            strategy_->Allocate(manager, 1024, 1, {}, {}, ReplicaType::MEMORY);
+        ASSERT_TRUE(result);
+        ASSERT_EQ(result->size(), 1);
+        const auto address = (*result)[0]
+                                 .get_descriptor()
+                                 .get_memory_descriptor()
+                                 .buffer_descriptor.buffer_address_;
+        EXPECT_GE(address, matching->base());
+        EXPECT_LT(address, matching->base() + matching->capacity());
+    }
+}
+
+TEST_P(AllocationStrategyParameterizedTest, FullHcaTargetFallsBackToUnknown) {
+    auto matching = CreateTestAllocator("receiver", 0);
+    std::vector<std::unique_ptr<AllocatedBuffer>> occupied;
+    while (auto buffer = matching->allocate(MiB)) {
+        occupied.push_back(std::move(buffer));
+    }
+    ASSERT_FALSE(occupied.empty());
+    auto unknown = CreateTestAllocator("receiver", 0x10000000ULL);
+    auto other = CreateTestAllocator("receiver", 0x20000000ULL);
+    matching->SetLocality(SegmentLocality{7, {"mlx5_0"}});
+    other->SetLocality(SegmentLocality{0, {"mlx5_1"}});
+    AllocatorManager manager;
+    manager.SetHcaAffinity({"mlx5_0"});
+    manager.addAllocator("receiver", other);
+    manager.addAllocator("receiver", matching);
+    const auto unknown_registration = manager.addAllocator("receiver", unknown);
+    auto result =
+        strategy_->Allocate(manager, MiB, 1, {}, {}, ReplicaType::MEMORY);
+    ASSERT_TRUE(result);
+    auto address = (*result)[0]
+                       .get_descriptor()
+                       .get_memory_descriptor()
+                       .buffer_descriptor.buffer_address_;
+    EXPECT_GE(address, unknown->base());
+    EXPECT_LT(address, unknown->base() + unknown->capacity());
+    manager.removeAllocator("receiver", unknown_registration);
+    result = strategy_->Allocate(manager, MiB, 1, {}, {}, ReplicaType::MEMORY);
+    ASSERT_TRUE(result);
+    address = (*result)[0]
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_;
+    EXPECT_GE(address, other->base());
+    EXPECT_LT(address, other->base() + other->capacity());
+}
+
+TEST_P(AllocationStrategyParameterizedTest,
+       HcaAffinityPreservesReplicaDomains) {
+    AllocatorManager manager;
+    manager.SetHcaAffinity({"mlx5_0"});
+    std::unordered_map<std::string, uintptr_t> matching_bases;
+    for (size_t node = 0; node < 2; ++node) {
+        const auto name = "receiver" + std::to_string(node);
+        auto other = CreateTestAllocator(name, node * 0x20000000ULL);
+        auto matching =
+            CreateTestAllocator(name, node * 0x20000000ULL + 0x10000000ULL);
+        other->SetLocality(SegmentLocality{0, {"mlx5_1"}});
+        matching->SetLocality(SegmentLocality{7, {"mlx5_0"}});
+        manager.addAllocator(name, other);
+        manager.addAllocator(name, matching);
+        matching_bases[name] = matching->base();
+    }
+    auto result = strategy_->Allocate(manager, 1024, 2, {"receiver0"}, {},
+                                      ReplicaType::MEMORY);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 2);
+    std::set<std::string> names;
+    for (const auto& replica : *result) {
+        const auto descriptor =
+            replica.get_descriptor().get_memory_descriptor().buffer_descriptor;
+        names.insert(descriptor.transport_endpoint_);
+        const auto base = matching_bases.at(descriptor.transport_endpoint_);
+        EXPECT_GE(descriptor.buffer_address_, base);
+        EXPECT_LT(descriptor.buffer_address_, base + 64 * MiB);
+    }
+    EXPECT_EQ(names.size(), 2);
+    result = strategy_->Allocate(manager, 1024, 1, {"receiver0"}, {"receiver0"},
+                                 ReplicaType::MEMORY);
+    ASSERT_TRUE(result);
+    EXPECT_EQ((*result)[0]
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "receiver1");
+}
+
 }  // namespace mooncake

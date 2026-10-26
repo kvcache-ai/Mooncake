@@ -2,10 +2,11 @@
 
 ## Overview
 
-Mooncake Conductor is the kv-cache indexer used by cache-aware routers. It
-subscribes to KV cache events from inference engines or storage backends,
-normalizes those events, maintains a global prefix cache table, and exposes
-HTTP APIs for dynamic service registration and cache-hit queries.
+Mooncake Conductor is the KV-cache indexer used by cache-aware routers. It
+subscribes to KV cache events from inference engines (vLLM, SGLang) and from
+the Mooncake Store master, recomputes those events into its own prefix hashes,
+maintains a global prefix cache table, and answers cache-hit queries over HTTP
+and RPC.
 
 The design goal is to let routers answer a simple scheduling question:
 for this request prefix, which registered instance has the best reusable KV
@@ -16,116 +17,163 @@ cache locality, and on which cache tiers is that prefix available?
 ```mermaid
 flowchart TD
     subgraph Router["Gateway or router"]
-        HTTPClient["HTTP client"]
+        HTTPClient["HTTP client (msgpack)"]
+        RPCClient["ConductorClient (C++, Python, Rust)"]
     end
 
-    subgraph Conductor["Mooncake Conductor"]
+    subgraph Conductor["mooncake_conductor"]
         EventManager["EventManager"]
-        ZMQClient["ZMQClient"]
+        Service["ConductorService"]
+        ZMQClient["ZMQClient (one per service)"]
         KVEventHandler["KVEventHandler"]
         PrefixCacheTable["PrefixCacheTable"]
     end
 
-    subgraph Publishers["vLLM, SGLang, Mooncake, or cache daemons"]
-        InferenceService["Inference or cache service"]
-        KVEvent["KV event stream"]
+    subgraph Publishers["Event publishers"]
+        Engine["vLLM / SGLang engines"]
+        Master["Mooncake Store master"]
     end
 
+    Engine -->|ZMQ PUB, optional replay ROUTER| ZMQClient
+    Master -->|ZMQ PUB| ZMQClient
     EventManager -->|creates and manages| ZMQClient
-    ZMQClient -->|registers handler| KVEventHandler
-    InferenceService -->|publishes events| KVEvent
-    KVEvent -->|ZMQ SUB or DEALER| ZMQClient
     ZMQClient -->|decoded batches| KVEventHandler
-    KVEventHandler -->|normalizes events| PrefixCacheTable
-    HTTPClient -->|/query, /register, /unregister| EventManager
-    EventManager -->|cache-hit computation| PrefixCacheTable
-    PrefixCacheTable -->|hit result by instance| EventManager
-    EventManager -->|HTTP response| HTTPClient
+    KVEventHandler -->|store / remove / clear| PrefixCacheTable
+    HTTPClient -->|HTTP :13333| EventManager
+    RPCClient -->|coro_rpc :13334| EventManager
+    EventManager --> Service
+    Service -->|query, register, unregister| PrefixCacheTable
 ```
 
 ## Components
 
 | Component | Responsibility |
 |---|---|
-| `EventManager` | Owns the Conductor lifecycle, HTTP server, dynamic registration, active service map, and tenant-to-instance map. |
-| `ZMQClient` | Connects to publisher endpoints, consumes event frames, decodes event batches, tracks sequence numbers, and requests replay after reconnects. |
-| `KVEventHandler` | Adapts decoded engine events into Conductor store/remove events enriched with registration metadata. |
-| `PrefixCacheTable` | Maintains model-context-specific prefix maps, engine-hash to conductor-hash mappings, medium metadata, DP-rank metadata, and query-time hit computation. |
-
+| `EventManager` | Owns the process lifecycle, the HTTP server, the RPC server, and the active service map. Creates one `ZMQClient` and `KVEventHandler` per registered service. |
+| `ConductorService` | Implements `Query`, `Register`, `Unregister`, `GetGlobalView`, and `ListServices`. The HTTP routes and the RPC methods share one instance, so both channels behave the same. |
+| `ZMQClient` | Subscribes to one publisher endpoint, validates frames, tracks sequence numbers, and recovers gaps through the replay endpoint when one is configured. |
+| `KVEventHandler` | Applies decoded vLLM, SGLang, or Mooncake events to the prefix table using the service's registration metadata and hash profile. |
+| `PrefixCacheTable` | Holds per-context prefix entries with per-tier owners, binds each context to one hash profile, and computes query-time hits. |
+| `ConductorClient` | RPC client in C++ (`conductor/client`), with a C ABI used by the Python (`mooncake.conductor`) and Rust bindings. |
 
 ## Data model
 
-The prefix index is scoped by `ModelContext`:
+The prefix index is scoped by a context key:
 
 ```text
-(tenant_id, model_name, lora_name, block_size, additional_salt, instance_id)
+(tenant_id, model_name, lora_name, block_size)
 ```
 
-Within each context, Conductor stores:
+Each context is bound to exactly one hash profile. Registering a service whose
+hash profile conflicts with an existing binding for the same context is
+rejected. Each context records which instances and DP ranks are registered in
+it, and holds at most 200000 prefix entries. When the cap is exceeded, the
+oldest entries are evicted in a batch down to 90% of the cap.
 
-- a mapping from engine-provided block hash to Conductor prefix hash;
-- a prefix hash map that records replica count, medium set, DP-rank set, and
-  per-instance access metadata;
-- a DP-rank set used to report rank-level hit information.
+A prefix entry records owners per storage tier:
 
-The vLLM strategy computes complete-block prefix hashes from token IDs and
-ignores trailing partial blocks during `/query`. The SGLang strategies also hash
-the trailing partial block, so a match that reaches it is reported as the number
-of tokens the request actually carries, never as a whole block.
+| Tier | Owner | Fed by |
+|---|---|---|
+| `device` | engine `(source, instance_id, dp_rank)` | vLLM `gpu` medium; SGLang `gpu`  medium |
+| `cpu_local` | engine | SGLang `cpu` / `cpu_pinned` medium |
+| `cpu_share` | shared store object | Mooncake `cpu` / `cpu_pinned` medium |
+| `disk` | engine or shared store object | Mooncake `disk` |
+
+Mooncake events with a medium other than `cpu`, `cpu_pinned`, or `disk` are ignored.
+
+## Hash profiles
+
+Conductor never trusts a block hash it cannot reproduce. Every service registers
+a `hash_profile` that tells Conductor how the publisher hashes token blocks, and
+`/query` recomputes the same hashes from the request tokens.
+
+| `strategy` | `algorithm` | `index_projection` | Block coverage |
+|---|---|---|---|
+| `vllm_v1` | `sha256` (pickle) or `sha256_cbor` | `low64_be` | Complete blocks only |
+| `sglang` | `sha256_raw` | `first64_be` | Includes the final partial block |
+| `sglang_bigram` | `sha256_raw` | `first64_be` | Includes the final partial block; hashes adjacent token pairs |
+
+`vllm_v1` also requires `python_hash_seed` (decimal `0..4294967295`, or
+`"random"`), from which Conductor derives the chain root `root_digest`.
+SGLang strategies have no seed; their root depends only on the optional
+`cache_salt`.
+
+Engine block hashes are projected to the 64-bit index key with the profile's
+projection. For Mooncake Store events, the key is derived from the object key or
+`connector_block_hash`, not from `seq_hashes`, which the master always leaves
+empty.
 
 ## Event flow
 
 1. A service is registered statically from `conductor_config.json` or
-   dynamically through `POST /register`.
-2. `EventManager` creates one `ZMQClient` per `(instance_id, tenant_id,
-   dp_rank)` service key.
-3. `ZMQClient` subscribes to the publisher endpoint and consumes frames in the
-   form `[topic, sequence, payload]`.
-4. The payload is decoded into a batch of engine events. Today, the implemented
-   parser supports vLLM `BlockStored` and `BlockRemoved` msgpack events.
-5. `KVEventHandler` enriches events with registration metadata such as model,
-   LoRA, tenant, instance, block size, and additional salt.
-6. `PrefixCacheTable` updates the prefix map for stored or removed blocks.
-7. If a reconnect detects missed sequence numbers, the `replay endpoint` can be
-   used to request missed events.
+   dynamically through `POST /register` or the RPC `Register` method. The
+   service key is `instance_id|tenant_id|dp_rank`. Re-registering an identical
+   configuration is a no-op.
+2. `EventManager` starts a `ZMQClient` that connects a `SUB` socket to the
+   publisher endpoint. Each live message must have exactly three frames:
+   `[topic, sequence (u64 big-endian), payload]`.
+3. The payload is a msgpack array `[timestamp, [event_map, ...], dp_rank]`.
+   Events must be maps; array-encoded events are rejected. Decoders exist for:
+   - vLLM: `type` = `BlockStored`, `BlockRemoved`, `AllBlocksCleared`;
+   - SGLang: the same type tags, with signed 64-bit hashes and optional bigram
+     token pairs;
+   - Mooncake Store: `event_type` = `stored`, `removed`, `cleared`
+     (see [subscriber-guide](subscriber-guide.md)).
+4. `KVEventHandler` maps the medium to a tier and applies the event:
+   - vLLM and SGLang events are applied to the registered context and must
+     carry the registered `dp_rank`;
+   - Mooncake events take their context from the event envelope (`tenant_id`,
+     `model_name`, `lora_name`, `block_size`), which must match a context
+     already registered with the same hash profile. The object key is parsed
+     with the vLLM or SGLang key convention selected by the profile.
+5. Clears are scoped to their owner: vLLM `AllBlocksCleared` clears that
+   engine's `device` tier, SGLang `AllBlocksCleared` clears all of that engine's
+   tiers, and Mooncake `cleared` drops every object bound to that
+   `backend_id + tenant_id`.
+
+## Sequence gaps and replay
+
+`ZMQClient` treats a sequence number above `last + 1` as a gap.
+
+- With a `replay_endpoint` (vLLM and SGLang only), the client buffers live
+  messages, sends `["", from_seq]` on a `DEALER` socket, and applies the replayed
+  range in order. The replay stream ends with sequence `UINT64_MAX` and an empty
+  payload. Recovery is bounded to 30 seconds and to a 10000-message / 64 MiB
+  buffer.
+- Without a replay endpoint, and for every Mooncake publisher (the master has
+  no replay service), a gap cannot be recovered.
+
+When recovery is impossible, the source is marked stale: its entries are
+removed from the index and further events from it are dropped until the
+service is unregistered and registered again. On a dropped connection the
+client reconnects after one second and, when replay is enabled, replays from
+the last applied sequence.
 
 ## Query flow
 
 1. A router obtains prompt token IDs, usually from an engine tokenizer endpoint.
-2. The router calls `POST /query` with `model`, `token_ids`, `block_size`, and
-   optional `tenant_id`, `instance_id`, `lora_name`, and `cache_salt`.
-3. Conductor computes complete-block prefix hashes for the request.
-4. The prefix table is scanned in order. The first miss terminates the scan so
-   prefix continuity is preserved.
-5. Conductor returns per-instance `longest_matched`, medium hit counts, and
-   DP-rank hit counts.
+2. The router calls `POST /query` (or RPC `Query`) with `model`, `block_size`,
+   `token_ids`, and optional `tenant_id`, `lora_name`, `cache_salt`, and
+   `instance_id`.
+3. Conductor recomputes the prefix hash chain with the context's hash profile.
+4. For each instance and DP rank, a cursor walks the chain through cumulative
+   tier predicates. The first miss ends each predicate, so prefix continuity is
+   preserved: `device <= cpu_local <= cpu_share <= disk`.
+5. Instance-level tier counts are the maximum over that instance's ranks, and
+   `longest_matched` equals `disk`. Counts are in tokens, clamped to the number
+   of queried tokens (`n - 1` for `sglang_bigram`).
 6. The router selects the best target instance and forwards the request.
 
-## Dynamic registration
+## Configuration
 
-Conductor supports runtime registration so routers or control planes can add
-and remove KV event publishers without restarting the process.
-
-```json
-{
-  "endpoint": "tcp://127.0.0.1:5557",
-  "replay_endpoint": "tcp://127.0.0.1:5558",
-  "type": "vLLM",
-  "modelname": "qwen2.5",
-  "lora_name": "",
-  "tenant_id": "default",
-  "instance_id": "vllm-prefill-node1",
-  "block_size": 128,
-  "dp_rank": 0,
-  "additionalsalt": ""
-}
-```
-
-Static configuration uses the same fields under `kvevent_instance`:
+Static configuration lists services under `kvevent_instance`, using the same
+field names as `POST /register`. When `instance_id` is omitted, the entry key is
+used. Invalid entries are logged and skipped.
 
 ```json
 {
   "http_server_port": 13333,
+  "rpc_server_port": 13334,
   "kvevent_instance": {
     "vllm-prefill-node1": {
       "endpoint": "tcp://127.0.0.1:5557",
@@ -134,51 +182,69 @@ Static configuration uses the same fields under `kvevent_instance`:
       "modelname": "qwen2.5",
       "lora_name": "",
       "tenant_id": "default",
-      "instance_id": "vllm-prefill-node1",
-      "block_size": 128,
+      "block_size": 16,
       "dp_rank": 0,
-      "additionalsalt": ""
+      "hash_profile": {
+        "strategy": "vllm_v1",
+        "algorithm": "sha256_cbor",
+        "python_hash_seed": "0",
+        "index_projection": "low64_be"
+      }
     }
   }
 }
 ```
 
+| Key | Default | Description |
+|---|---|---|
+| `http_server_port` | `13333` without a config file | HTTP port. Set it explicitly. |
+| `rpc_server_port` | `13334` | RPC port. `0` disables the RPC server. |
+| `kvevent_instance` | none | Static services keyed by name. |
+
 ## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `CONDUCTOR_LOG_LEVEL` | `INFO` | Log level: `DEBUG`, `INFO`, `WARN`, or `ERROR`. |
-| `CONDUCTOR_CONFIG_PATH` | `~/.mooncake/conductor_config.json` | Path to the static configuration file. |
-| `CONDUCTOR_SEED` | random | Legacy seed option for hash computation experiments. |
+| `CONDUCTOR_CONFIG_PATH` | `$HOME/.mooncake/conductor_config.json` | Path to the static configuration file. |
+| `CONDUCTOR_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error` (case-insensitive). Logs go to stderr. |
 
 ## Build and run
 
-```bash
-cd mooncake-conductor/conductor-ctrl
-go mod tidy
-go build -o mooncake_conductor .
-```
+Conductor is built as part of the Mooncake CMake project:
 
 ```bash
-export CONDUCTOR_CONFIG_PATH=../example/conductor_config.json
-export CONDUCTOR_LOG_LEVEL=INFO
-./mooncake_conductor
+cmake -S . -B build -DWITH_CONDUCTOR=ON
+cmake --build build --target mooncake_conductor
 ```
+
+`-DWITH_CONDUCTOR_RUST=ON` additionally builds the Rust client. The Python
+client (`mooncake.conductor`) is built with the Mooncake Python package when
+`WITH_CONDUCTOR=ON`.
+
+```bash
+export CONDUCTOR_CONFIG_PATH=conductor_config.json
+export CONDUCTOR_LOG_LEVEL=info
+./build/mooncake-conductor/mooncake_conductor
+```
+
+The process stops on `SIGINT` or `SIGTERM`.
 
 ## Project structure
 
 ```text
 mooncake-conductor/
-+-- conductor-ctrl/
-|   +-- common/        # shared types, helpers, and sync map
-|   +-- kvevent/       # EventManager and KVEventHandler
-|   +-- prefixindex/   # prefix cache table and hit computation
-|   +-- zmq/           # ZMQ client, event decoding, event types
-|   +-- main.go        # process entry point
-+-- example/           # demo config and cache-aware proxy
-+-- build.sh
++-- include/conductor/   # public headers
++-- src/
+|   +-- client/          # ConductorClient and C ABI
+|   +-- common/          # shared types and helpers
+|   +-- kvevent/         # EventManager, KVEventHandler, ConductorService, config
+|   +-- prefixindex/     # PrefixCacheTable and hash strategies
+|   +-- zmq/             # ZMQ client, transport, msgpack decoding
+|   +-- main.cpp         # mooncake_conductor entry point
++-- rust/                # Rust client crate
++-- tests/
 +-- CMakeLists.txt
 ```
 
-See [Indexer API](../../api-reference/http/conductor-indexer.md) for the HTTP API and KV Events wire
-format.
+See [Indexer API](../../api-reference/http/conductor-indexer.md) for the HTTP
+API and [Python API](../../api-reference/python/conductor.md) for the client.

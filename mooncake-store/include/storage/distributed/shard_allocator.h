@@ -177,9 +177,14 @@ class ShardAllocator final : public DfsAllocatorInterface {
     std::string mount_path_;
     uint64_t shard_capacity_ = 0;
     uint64_t alignment_ = 4096;
-    // Readers retain an immutable topology snapshot. Expansion shares existing
+    // Readers use an immutable topology snapshot. Expansion shares existing
     // ShardState objects and publishes the complete new topology in one step.
-    std::shared_ptr<const ShardList> shards_;
+    // Readers keep no reference, so superseded snapshots are never freed:
+    // published_shards_ (guarded by expansion_mutex_) holds every snapshot
+    // until destruction. Only Init and a growing ExpandShards publish, so each
+    // expansion retains 16 bytes (one shared_ptr) per shard.
+    std::atomic<const ShardList*> shards_{nullptr};
+    std::vector<std::unique_ptr<const ShardList>> published_shards_;
     std::mutex expansion_mutex_;
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     bool eviction_enabled_ = true;

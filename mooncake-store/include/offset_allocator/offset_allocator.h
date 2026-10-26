@@ -13,7 +13,6 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "mutex.h"
-#include "serialize/serializer.h"
 
 namespace mooncake::offset_allocator {
 typedef unsigned char uint8;
@@ -24,7 +23,6 @@ using NodeIndex = uint32;
 // Forward declarations
 class OffsetAllocator;
 class __Allocator;
-struct OffsetAllocatorSnapshot;
 
 static constexpr uint32 NUM_TOP_BINS = 32;
 static constexpr uint32 BINS_PER_LEAF = 8;
@@ -48,7 +46,6 @@ struct OffsetAllocation {
     bool isNoSpace() const { return offset == NO_SPACE; }
 
     friend class __Allocator;
-    friend class Serializer<OffsetAllocationHandle>;
     friend class OffsetAllocator;  // for createHandleAtNode during recovery
 };
 
@@ -113,7 +110,6 @@ class OffsetAllocationHandle {
     uint64_t requested_size;
 
     friend class OffsetAllocatorTest;  // for unit tests
-    friend class Serializer<OffsetAllocationHandle>;
 };
 
 struct OffsetAllocatorMetrics {
@@ -195,15 +191,6 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     [[nodiscard]]
     OffsetAllocatorMetrics get_metrics() const;
 
-    // Deep-copy persisted layout without locking. Only for a forked snapshot
-    // child or externally quiesced state; the result owns no live resources.
-    OffsetAllocatorSnapshot CaptureSnapshot() const;
-
-    // Consumes a captured snapshot and rebuilds the allocator from its layout.
-    // Validates before installing any state; returns a diagnostic on failure.
-    static tl::expected<std::shared_ptr<OffsetAllocator>, std::string> Restore(
-        OffsetAllocatorSnapshot snapshot);
-
     // Serialize the allocator with serializer.
     template <typename T>
     void serialize_to(T& serializer) const;
@@ -213,7 +200,6 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
 
    private:
     friend class OffsetAllocationHandle;
-    friend class Serializer<OffsetAllocator>;
 
     // Internal method for Handle to free allocation (thread-safe)
     void freeAllocation(const OffsetAllocation& allocation, uint64_t size);
@@ -241,12 +227,6 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // Private constructor - use create() factory method instead
     OffsetAllocator(uint64_t base, size_t size, uint32 init_capacity,
                     uint32 max_capacity);
-
-    // Private constructor for creating from saved state with pre-constructed
-    // allocator This constructor is used during deserialization when we already
-    // have a reconstructed
-    OffsetAllocator(uint64_t base, size_t size, uint64_t multiplier_bits,
-                    std::unique_ptr<__Allocator> allocator);
 
     // Private constructor - initialize from serialized data
     template <typename T>
@@ -281,9 +261,6 @@ class __Allocator {
     void serialize_to(T& serializer) const;
 
    private:
-    // Detaches the bin/node state for OffsetAllocator::CaptureSnapshot().
-    __Allocator(const __Allocator&) = default;
-
     uint32 insertNodeIntoBin(uint32 size, uint32 dataOffset);
     void removeNodeFromBin(uint32 nodeIndex);
 
@@ -313,57 +290,7 @@ class __Allocator {
     uint32 m_freeOffset;
 
     friend class OffsetAllocatorTest;  // for unit tests
-    friend class mooncake::Serializer<__Allocator>;
-    friend struct OffsetAllocatorSnapshot;
     friend class OffsetAllocator;  // for visit_used_nodes / createHandleAtNode
-};
-
-// Owned allocation metadata. No runtime allocator, handles or mutex are
-// retained. The internal bin/node layout is deeply copied during capture.
-struct OffsetAllocatorSnapshot {
-    uint64_t base;
-    uint64_t multiplier_bits;
-    uint64_t capacity;
-    uint64_t allocated_size;
-    uint64_t allocated_num;
-    std::unique_ptr<__Allocator> layout;
-
-    // The host-memory allocator supports up to 64Mi metadata nodes. This is
-    // independent of the smaller limit used by the storage backend's byte
-    // serializer, and must allow snapshots of large memory segments.
-    static constexpr uint32_t kMaxNodes = 1u << 26;
-
-    // Used by the wire decoder before allocating/decompressing node storage.
-    static tl::expected<void, std::string> ValidateNodeCapacity(
-        uint32_t size, uint32_t current_capacity, uint32_t max_capacity,
-        uint32_t free_offset);
-
-    // Pure validation: no runtime allocator, metrics, logging or mutation.
-    // Checks headers before shifts, then layout topology and usage accounting.
-    // Requested sizes are not persisted per node, so allocated_size must lie
-    // within the range permitted by bin/unit rounding, not equal occupied
-    // bytes.
-    [[nodiscard]] tl::expected<void, std::string> Validate() const;
-
-   private:
-    enum class NodeState : uint8_t { kUnclassified, kUsed, kFree, kSpare };
-    struct LayoutUsage {
-        uint64_t used_nodes = 0;
-        uint64_t min_used_bytes = 0;
-        uint64_t max_used_bytes = 0;
-    };
-
-    tl::expected<void, std::string> ValidateHeader() const;
-    tl::expected<LayoutUsage, std::string> ValidateUsedNodes(
-        std::vector<NodeState>& state) const;
-    tl::expected<uint32_t, std::string> ValidateBins(
-        std::vector<NodeState>& state) const;
-    tl::expected<void, std::string> ValidateFreeStack(
-        std::vector<NodeState>& state, uint32_t live_nodes) const;
-    tl::expected<void, std::string> ValidateNeighborChain(
-        const std::vector<NodeState>& state, uint32_t live_nodes) const;
-    tl::expected<void, std::string> ValidateAccounting(
-        const LayoutUsage& usage) const;
 };
 
 // Template method implementations

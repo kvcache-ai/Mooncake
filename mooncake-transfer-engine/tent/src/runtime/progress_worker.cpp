@@ -15,6 +15,7 @@
 #include "tent/runtime/progress_worker.h"
 
 #include <chrono>
+#include <vector>
 
 #include "tent/common/status.h"
 #include "tent/runtime/transfer_engine_impl.h"
@@ -41,17 +42,20 @@ void ProgressWorker::stop() {
         // user thread's freeBatch path.
         order_.clear();
         queued_.clear();
+        polling_.clear();
         queue_ready_ = false;
     }
     cv_.notify_all();
     if (thread_.joinable()) thread_.join();
 }
 
-void ProgressWorker::notifyBatchMaybeReady(BatchID batch_id) {
+void ProgressWorker::notifyBatchMaybeReady(BatchID batch_id,
+                                           bool poll_until_terminal) {
     if (!batch_id) return;
     if (!running_.load(std::memory_order_acquire)) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        if (poll_until_terminal) polling_.insert(batch_id);
         if (!queued_.insert(batch_id).second) return;
         order_.push_back(batch_id);
     }
@@ -68,19 +72,45 @@ void ProgressWorker::notifyRuntimeQueueReady() {
 }
 
 void ProgressWorker::runner() {
+    // An explicit zero disables runtime-queue scans, but must not strand a
+    // transport that requires polling to produce its only completion wake.
+    const auto interval = fallback_interval_.count() > 0
+                              ? fallback_interval_
+                              : std::chrono::microseconds(50000);
+    auto next_fallback = std::chrono::steady_clock::now() + interval;
+    auto progress = [this](BatchID id) {
+        TransferStatus status{PENDING, 0};
+        auto result = impl_->progressBatch(id, status);
+        bool retired = result.ok() && status.s != PENDING;
+        if (!result.ok()) {
+            // InvalidArgument can also mean a live batch's transport is not
+            // ready yet (for example while appending a new sub-batch). Only
+            // actual removal from the engine retires polling on an error.
+            std::lock_guard<std::recursive_mutex> batch_lk(
+                impl_->progressLockFor(id));
+            retired = !impl_->isBatchAlive(id);
+        }
+        if (retired) {
+            std::lock_guard<std::mutex> lk(mu_);
+            // A concurrent submit can reuse this batch after progressBatch
+            // releases the engine lock. Preserve its newly queued wake.
+            if (!queued_.count(id)) polling_.erase(id);
+        }
+    };
     while (true) {
         BatchID batch_id = 0;
         bool queue_ready = false;
         bool fallback_due = false;
         bool queue_active = impl_->hasActiveRuntimeQueue();
+        std::vector<BatchID> polling_due;
         {
             std::unique_lock<std::mutex> lk(mu_);
-            if (queue_active && fallback_interval_.count() > 0) {
-                const bool woke = cv_.wait_for(lk, fallback_interval_, [&] {
+            if (!polling_.empty() ||
+                (queue_active && fallback_interval_.count() > 0)) {
+                cv_.wait_until(lk, next_fallback, [&] {
                     return !running_.load(std::memory_order_acquire) ||
                            queue_ready_ || !order_.empty();
                 });
-                fallback_due = !woke;
             } else {
                 cv_.wait(lk, [&] {
                     return !running_.load(std::memory_order_acquire) ||
@@ -88,6 +118,12 @@ void ProgressWorker::runner() {
                 });
             }
             if (!running_.load(std::memory_order_acquire)) return;
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= next_fallback) {
+                fallback_due = true;
+                polling_due.assign(polling_.begin(), polling_.end());
+                next_fallback = now + interval;
+            }
             queue_ready = queue_ready_;
             queue_ready_ = false;
             if (!order_.empty()) {
@@ -103,19 +139,25 @@ void ProgressWorker::runner() {
             (void)impl_->progressRuntimeQueue();
             (void)impl_->lazyFreeBatch();
         }
-        // progressBatch acquires the engine's progress_mutex_ and silently
-        // returns InvalidArgument if the batch was freed before we got here.
-        // PENDING means "kick again later"; the next notify wakes us up.
+        // progressBatch checks batch liveness under the engine's progress lock.
+        // Errors alone do not establish that a batch was freed.
+        // Event-driven transports wait for their next notification; polling
+        // transports remain in polling_ until terminal or explicitly freed.
         // Terminal states are observed here; lazyFreeBatch reclaims a batch
         // only if freeBatch has already marked it free_requested.
         if (batch_id) {
-            TransferStatus s;
-            (void)impl_->progressBatch(batch_id, s);
+            progress(batch_id);
             (void)impl_->progressRuntimeQueue();
             (void)impl_->lazyFreeBatch();
         }
-        if (fallback_due && !queue_ready && !batch_id && queue_active) {
-            (void)impl_->progressRuntimeQueue();
+        // Keep an absolute deadline so a stream of wakes for other batches
+        // cannot indefinitely postpone these polls.
+        for (auto id : polling_due) {
+            if (id != batch_id) progress(id);
+        }
+        if (fallback_due) {
+            if (queue_active && fallback_interval_.count() > 0)
+                (void)impl_->progressRuntimeQueue();
             (void)impl_->lazyFreeBatch();
         }
     }

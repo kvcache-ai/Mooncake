@@ -666,7 +666,23 @@ int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
     cudaIpcMemHandle_t handle;
     err = cudaIpcGetMemHandle(&handle, (void *)base_ptr);
     if (err != cudaSuccess) {
-        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaIpcGetMemHandle failed";
+        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaIpcGetMemHandle failed: "
+                   << cudaGetErrorString(err);
+        // Virtual-memory allocations (cuMemCreate) have no legacy IPC handle.
+        // cuMemRetainAllocationHandle only succeeds for those, so use it to
+        // tell the user why registration failed.
+        CUmemGenericAllocationHandle vmm_handle;
+        if (cuMemRetainAllocationHandle(&vmm_handle, (void *)base_ptr) ==
+            CUDA_SUCCESS) {
+            cuMemRelease(vmm_handle);
+            LOG(ERROR)
+                << "IntraNodeNvlinkTransport: buffer " << addr
+                << " is a virtual-memory (cuMemCreate) allocation, which has "
+                   "no cudaIpc handle. This is the case for PyTorch with "
+                   "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True. Register "
+                   "a buffer allocated with cudaMalloc/cuMemAlloc instead, or "
+                   "disable expandable_segments for it.";
+        }
         return -1;
     }
 
@@ -739,6 +755,23 @@ int IntraNodeNvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                         LOG(ERROR) << "IntraNodeNvlinkTransport: "
                                       "cudaIpcOpenMemHandle failed: "
                                    << cudaGetErrorString(err);
+                        // cudaErrorDeviceUninitialized ("invalid device
+                        // context") is what CUDA returns when the handle
+                        // looks like it was exported by this very process:
+                        // the exporter's PID equals ours. Peers in separate
+                        // PID namespaces (e.g. two containers) can get the
+                        // same PID.
+                        if (err == cudaErrorDeviceUninitialized) {
+                            LOG(ERROR)
+                                << "IntraNodeNvlinkTransport: the peer segment "
+                                << target_id
+                                << " may run in a different PID namespace "
+                                   "with the same PID as this process (CUDA "
+                                   "IPC handles carry the exporter's PID). "
+                                   "Run the peers in a shared PID namespace, "
+                                   "e.g. docker run --pid=host, or hostPID / "
+                                   "shareProcessNamespace in Kubernetes.";
+                        }
                         return -1;
                     }
                     OpenedShmEntry shm_entry;

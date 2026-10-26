@@ -50,6 +50,8 @@ class Transport {
         SubBatch() : device_mask(~0ULL) {}
         virtual ~SubBatch() {}
         virtual size_t size() const = 0;
+        // Opt in when completion cannot emit a second progress wake.
+        virtual bool needsProgressPolling() const { return false; }
         void notifyProgress() {
             if (notify_progress) notify_progress(progress_batch_id);
         }

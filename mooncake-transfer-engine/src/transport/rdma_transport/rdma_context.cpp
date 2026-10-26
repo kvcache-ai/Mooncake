@@ -1400,6 +1400,18 @@ GidRefreshResult RdmaContext::refreshCurrentGid(std::string *previous_gid,
     return changed ? GidRefreshResult::CHANGED : GidRefreshResult::UNCHANGED;
 }
 
+int RdmaContext::queryPortState(ibv_port_state *state) const {
+    if (!state || !context_) return -1;
+    ibv_port_attr port_attr;
+    if (ibv_query_port(context_, port_, &port_attr)) {
+        PLOG(WARNING) << "Failed to query state of port "
+                      << static_cast<int>(port_) << " on " << device_name_;
+        return -1;
+    }
+    *state = port_attr.state;
+    return 0;
+}
+
 int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
                                 int gid_index) {
     int num_devices = 0;

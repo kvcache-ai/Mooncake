@@ -218,12 +218,6 @@ std::vector<int> batch_write_tensor_impl(
                                 to_py_ret(ErrorCode::INVALID_PARAMS));
     }
 
-    auto group_ids_error =
-        ValidateGroupIdsForBatchConfig(config, keys.size(), operation_name);
-    if (!group_ids_error.empty()) {
-        return group_ids_error;
-    }
-
     std::vector<int> results(keys.size(), 0);
     {
         py::gil_scoped_release release_gil;

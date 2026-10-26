@@ -7,7 +7,7 @@ hits for request routing. `ConductorClient` connects to the Conductor RPC servic
 cache events arrive separately through the registered ZMQ publishers.
 
 For the HTTP interface and event format, see the
-[Conductor / Global KV Indexer API](../http/conductor-indexer.md).
+[Conductor Indexer API](../http/conductor-indexer.md).
 
 ## Installation
 
@@ -24,7 +24,8 @@ If the native extension is absent, importing `mooncake.conductor` raises an
 package with Conductor support or a rebuild with `WITH_CONDUCTOR=ON`.
 
 The client requires a running `mooncake_conductor` service. Connect to its
-`rpc_server_port`, using `host:port` without an HTTP URL scheme.
+`rpc_server_port` (default `13334`), using `host:port` without an HTTP URL
+scheme.
 
 ## Quick Start
 

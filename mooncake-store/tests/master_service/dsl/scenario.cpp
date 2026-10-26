@@ -244,21 +244,6 @@ MemoryNodeStatusSpec MemoryNodeStatus(std::string node) {
     return {.node = std::move(node)};
 }
 
-std::string GroupOnDifferentShard(std::string_view key) {
-    constexpr size_t kMetadataShardCount = 1024;
-    const size_t key_shard =
-        std::hash<std::string>{}(std::string(key)) % kMetadataShardCount;
-    for (size_t suffix = 0; suffix < 10000; ++suffix) {
-        std::string group =
-            std::string(key) + "_group_" + std::to_string(suffix);
-        if (std::hash<std::string>{}(group) % kMetadataShardCount !=
-            key_shard) {
-            return group;
-        }
-    }
-    return std::string(key) + "_fallback_group";
-}
-
 WaitAction WaitFor(std::chrono::milliseconds duration) { return {duration}; }
 
 WaitForOpLogFailureAction WaitForOpLogFailure() { return {}; }
@@ -1080,34 +1065,16 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
     }
 
     const TenantId tenant(action.tenant);
-    auto update = [&](size_t shard_idx) {
-        MasterServiceTestPeer::MetadataShardAccessorRW shard(service_.get(),
-                                                             shard_idx);
-        auto tenant_it = shard->tenants.find(tenant);
-        if (tenant_it == shard->tenants.end()) {
-            return false;
-        }
-        auto metadata_it = tenant_it->second.metadata.find(action.key);
-        if (metadata_it == tenant_it->second.metadata.end()) {
-            return false;
-        }
-        auto& metadata = metadata_it->second.metadata;
+    // Changed under the key's write lock, so whatever the service files by
+    // lease sees the new deadline once the lock is let go.
+    if (auto hold = MasterServiceTestPeer::WriteObject(
+            *service_,
+            MasterServiceTestPeer::ObjectIdentity{tenant, action.key})) {
+        auto& metadata = hold->metadata();
         SpinLocker locker(&metadata.lock);
         metadata.lease_->SetDeadline(action.lease_timeout);
         metadata.soft_pin_timeout = action.soft_pin_timeout;
-        return true;
-    };
-
-    const size_t routed =
-        MasterServiceTestPeer(*service_).getShardIndex(tenant, action.key);
-    if (update(routed)) {
         return *this;
-    }
-    for (size_t shard_idx = 0; shard_idx < MasterServiceTestPeer::kNumShards;
-         ++shard_idx) {
-        if (shard_idx != routed && update(shard_idx)) {
-            return *this;
-        }
     }
     Fail("ExpireAt(" + action.key + ") could not find object");
     return *this;

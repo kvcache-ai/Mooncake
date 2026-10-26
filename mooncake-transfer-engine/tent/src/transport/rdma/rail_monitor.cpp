@@ -320,6 +320,14 @@ int RailMonitor::findBestRemoteDevice(int local_nic, int remote_numa) {
         else
             return -1;
     }
+    // A wildcard memory location has no remote NUMA preference. In that case,
+    // prefer the direct rail selected by loadDefault()/the configured direct
+    // map instead of whichever NUMA bucket happens to be visited first.
+    auto direct = direct_rails_.find(local_nic);
+    if (direct != direct_rails_.end() && direct->second >= 0 &&
+        isAvailable(local_nic, direct->second))
+        return direct->second;
+
     for (remote_numa = 0; remote_numa < (int)kMaxNuma; ++remote_numa) {
         if (best_mapping_[remote_numa].count(local_nic))
             return best_mapping_[remote_numa][local_nic];

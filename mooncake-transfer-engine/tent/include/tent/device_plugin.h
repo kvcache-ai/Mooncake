@@ -20,6 +20,10 @@
 
 #define LOCATION_LEN 32
 
+// memcpy_sync handled the request but failed. Callers must not retry it as a
+// host memcpy. Other nonzero results retain the legacy "not handled" meaning.
+#define TENT_DEVICE_PLUGIN_ERROR (-3)
+
 #ifdef __cplusplus
 extern "C" {
 #endif  // __cplusplus

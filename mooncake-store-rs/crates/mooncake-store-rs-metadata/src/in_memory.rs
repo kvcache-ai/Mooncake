@@ -33,6 +33,7 @@ struct InMemoryState {
     objects: BTreeMap<String, ObjectRoute>,
     cold_tier_devices: BTreeMap<String, ColdTierDeviceRecord>,
     route_policies: BTreeMap<RoutePolicyDomain, RoutePolicy>,
+    tenant_index: BTreeSet<String>,
     tenant_policies: BTreeMap<TenantPolicyScope, TenantPolicy>,
     tenant_quota_states: BTreeMap<TenantPolicyScope, TenantQuotaState>,
     tenant_object_accounting: BTreeMap<ObjectKey, TenantObjectAccounting>,
@@ -78,6 +79,21 @@ impl InMemoryMetadataBackend {
         } else {
             self.tenant_prefix.as_deref()
         }
+    }
+
+    fn validate_tenant(&self, tenant: &str) -> Result<()> {
+        if let Some(bound_tenant) = self.effective_tenant_prefix() {
+            if bound_tenant != tenant {
+                return Err(StoreError::InvalidState(format!(
+                    "metadata backend is bound to tenant {bound_tenant}, but the operation targets tenant {tenant}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn needs_policy_tenant_binding(&self) -> bool {
+        !self.default_tenant_legacy_mode && self.tenant_prefix.is_none()
     }
 
     fn tenant_storage_prefix(&self) -> Option<String> {
@@ -250,7 +266,17 @@ impl MetadataBackend for InMemoryMetadataBackend {
         }
     }
 
+    fn bound_tenant(&self) -> Option<&str> {
+        self.effective_tenant_prefix()
+    }
+
     fn for_tenant(&self, tenant: &str) -> Option<Arc<dyn MetadataBackend>> {
+        if self
+            .bound_tenant()
+            .is_some_and(|bound_tenant| bound_tenant != tenant)
+        {
+            return None;
+        }
         Some(Arc::new(Self {
             state: self.state.clone(),
             namespace_id: self.namespace_id,
@@ -663,10 +689,36 @@ impl MetadataBackend for InMemoryMetadataBackend {
     }
 
     fn get_tenant_policy(&self, scope: &TenantPolicyScope) -> Result<Option<TenantPolicy>> {
+        if self.needs_policy_tenant_binding() {
+            return self
+                .for_tenant(&scope.tenant)
+                .expect("hard-isolated in-memory metadata supports tenant binding")
+                .get_tenant_policy(scope);
+        }
+        self.validate_tenant(&scope.tenant)?;
         Ok(self.state.read().tenant_policies.get(scope).cloned())
     }
 
+    fn list_tenants(&self) -> Result<Vec<String>> {
+        Ok(self.state.read().tenant_index.iter().cloned().collect())
+    }
+
     fn list_tenant_policies(&self, tenant: Option<&str>) -> Result<Vec<TenantPolicy>> {
+        if self.needs_policy_tenant_binding() {
+            if let Some(tenant) = tenant {
+                return self
+                    .for_tenant(tenant)
+                    .expect("hard-isolated in-memory metadata supports tenant binding")
+                    .list_tenant_policies(Some(tenant));
+            }
+        }
+        let tenant = match (self.bound_tenant(), tenant) {
+            (Some(bound_tenant), None) => Some(bound_tenant),
+            (_, tenant) => tenant,
+        };
+        if let Some(tenant) = tenant {
+            self.validate_tenant(tenant)?;
+        }
         let mut policies = self
             .state
             .read()
@@ -684,6 +736,13 @@ impl MetadataBackend for InMemoryMetadataBackend {
         policy: &TenantPolicy,
         expected_version: Option<u64>,
     ) -> Result<TenantPolicy> {
+        if self.needs_policy_tenant_binding() {
+            return self
+                .for_tenant(&policy.scope.tenant)
+                .expect("hard-isolated in-memory metadata supports tenant binding")
+                .put_tenant_policy(policy, expected_version);
+        }
+        self.validate_tenant(&policy.scope.tenant)?;
         policy.validate()?;
         let mut state = self.state.write();
         let current = state.tenant_policies.get(&policy.scope).cloned();
@@ -709,6 +768,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
                 )))
             }
         }
+        state.tenant_index.insert(policy.scope.tenant.clone());
         state
             .tenant_policies
             .insert(policy.scope.clone(), policy.clone());
@@ -720,6 +780,13 @@ impl MetadataBackend for InMemoryMetadataBackend {
         scope: &TenantPolicyScope,
         expected_version: Option<u64>,
     ) -> Result<bool> {
+        if self.needs_policy_tenant_binding() {
+            return self
+                .for_tenant(&scope.tenant)
+                .expect("hard-isolated in-memory metadata supports tenant binding")
+                .delete_tenant_policy(scope, expected_version);
+        }
+        self.validate_tenant(&scope.tenant)?;
         let mut state = self.state.write();
         let Some(current) = state.tenant_policies.get(scope) else {
             return Ok(false);
@@ -1366,6 +1433,55 @@ mod tests {
             .get_handoff(&ClientStableId::new("writer"))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn hard_isolated_tenant_policy_uses_scope_as_the_tenant_source() {
+        let metadata = InMemoryMetadataBackend::new_hard_isolated();
+        let tenant_a = metadata.for_tenant("tenant-a").expect("tenant view");
+        let scope = TenantPolicyScope::new("tenant-a", None::<String>, None::<String>);
+        let policy = TenantPolicy {
+            scope: scope.clone(),
+            spec: TenantPolicySpec::default(),
+            version: 1,
+            updated_at_ms: now_ms(),
+            updated_by: "test".to_string(),
+        };
+
+        metadata
+            .put_tenant_policy(&policy, None)
+            .expect("root policy write should derive the tenant keyspace");
+        assert_eq!(
+            tenant_a
+                .get_tenant_policy(&scope)
+                .expect("tenant policy lookup should succeed"),
+            Some(policy.clone())
+        );
+        assert_eq!(
+            metadata.list_tenants().expect("tenant index should list"),
+            vec!["tenant-a".to_string()]
+        );
+        assert_eq!(
+            metadata
+                .list_tenant_policies(None)
+                .expect("root policy listing should traverse tenant keyspaces"),
+            vec![policy.clone()]
+        );
+
+        let other_scope = TenantPolicyScope::new("tenant-b", None::<String>, None::<String>);
+        let other_policy = TenantPolicy {
+            scope: other_scope.clone(),
+            ..policy
+        };
+        assert!(matches!(
+            tenant_a.put_tenant_policy(&other_policy, None),
+            Err(StoreError::InvalidState(_))
+        ));
+        assert!(matches!(
+            tenant_a.get_tenant_policy(&other_scope),
+            Err(StoreError::InvalidState(_))
+        ));
+        assert!(tenant_a.for_tenant("tenant-b").is_none());
     }
 
     #[test]

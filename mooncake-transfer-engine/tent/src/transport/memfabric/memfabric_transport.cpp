@@ -500,8 +500,37 @@ Status MemFabricTransport::addMemoryBuffer(BufferDesc& desc,
 
 Status MemFabricTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
                                            const MemoryOptions& options) {
+    (void)options;
+    if (desc_list.empty()) return Status::OK();
+    if (!handle_) {
+        LOG(ERROR) << "addMemoryBuffer called before install";
+        return Status::InternalError("not installed" LOC_MARK);
+    }
+    if (desc_list.size() > std::numeric_limits<uint32_t>::max()) {
+        return Status::InvalidArgument("too many buffers" LOC_MARK);
+    }
+
+    // Let MemFabric align and merge the whole batch so adjacent buffers do not
+    // produce overlapping registrations after alignment to NPU pages.
+    std::vector<void*> addrs;
+    std::vector<size_t> caps;
+    addrs.reserve(desc_list.size());
+    caps.reserve(desc_list.size());
+    for (const auto& desc : desc_list) {
+        addrs.push_back(reinterpret_cast<void*>(desc.addr));
+        caps.push_back(desc.length);
+    }
+    auto ret = MemFabricUnderApi::SmemTransBatchRegisterMem(
+        handle_, addrs.data(), caps.data(), static_cast<uint32_t>(addrs.size()),
+        0);
+    if (ret != 0) {
+        LOG(ERROR) << "smem_trans_batch_register_mem failed, ret=" << ret
+                   << ", count=" << addrs.size();
+        return Status::InternalError("batch register_mem failed" LOC_MARK);
+    }
     for (auto& desc : desc_list) {
-        CHECK_STATUS(addMemoryBuffer(desc, options));
+        desc.transports.push_back(MEMFABRIC);
+        desc.transport_attrs[MEMFABRIC] = "";
     }
     return Status::OK();
 }

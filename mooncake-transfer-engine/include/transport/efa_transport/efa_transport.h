@@ -93,12 +93,20 @@ class EfaTransport : public Transport {
     int warmupSegment(const std::string& segment_name);
 
    private:
-    // Internal version with force_sequential option to avoid nested parallelism
+    // How a THP-backed buffer is planned. kAuto budgets PTEs at 2MB and puts
+    // every chunk on every NIC; when that registration fails, the buffer is
+    // retried (already pre-touched) with kThpPartitioned, which keeps 2MB but
+    // gives each NIC only its share of the buffer, and then with kBasePages,
+    // the 4KB partitioned plan used for non-THP memory.
+    enum class ThpPlan { kAuto, kThpPartitioned, kBasePages };
+
+    // Internal version with force_sequential option to avoid nested
+    // parallelism.
     int registerLocalMemoryInternal(void* addr, size_t length,
                                     const std::string& location,
                                     bool remote_accessible,
-                                    bool update_metadata,
-                                    bool force_sequential);
+                                    bool update_metadata, bool force_sequential,
+                                    ThpPlan thp_plan = ThpPlan::kAuto);
 
     int unregisterLocalMemoryInternal(void* addr, bool update_metadata,
                                       bool force_sequential);

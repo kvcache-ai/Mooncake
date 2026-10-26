@@ -175,6 +175,15 @@ class RdmaTransport : public Transport {
     // start-addresses for cleanup.
     std::mutex chunk_map_mutex_;
     std::unordered_map<uint64_t, std::vector<uint64_t>> chunk_map_;
+
+    // Single-buffer counterpart of chunk_map_'s pending bookkeeping: base
+    // addresses whose metadata was removed but whose MR deregistration has
+    // not completed. Gates the metadata-missing fall-through so only a known
+    // pending cleanup retries the per-context deregistration — an address
+    // that was never a registration base must not reach the containing-range
+    // MR lookup.
+    std::mutex pending_dereg_mutex_;
+    std::unordered_set<uint64_t> pending_dereg_;
 };
 
 using TransferRequest = Transport::TransferRequest;

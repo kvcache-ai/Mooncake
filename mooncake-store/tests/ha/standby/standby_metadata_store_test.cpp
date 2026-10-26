@@ -122,6 +122,8 @@ TEST(StandbyMetadataStoreTest, WeightMetadataSnapshotRoundTripsCompleteState) {
             .fenced_metadata_generation = 4,
             .started_at_ms = 150,
             .updated_at_ms = 200,
+            .processed_members = 0,
+            .total_members = 2,
             .cursor = {},
             .message = {},
         }},
