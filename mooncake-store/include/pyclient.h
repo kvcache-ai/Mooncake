@@ -169,6 +169,41 @@ class ClientRequester {
     void release_offload_buffer(const std::string &client_addr,
                                 uint64_t batch_id);
 
+    /**
+     * @brief Asks a remote holder node to prefetch (promote SSD->DRAM) the
+     * given keys. Used for cross-node SSD prefetch: the holder must register
+     * the promotion task itself (the master validates holder_id ==
+     * client_id), so the requester delegates via this RPC instead of calling
+     * RegisterPrefetchTask locally. Best-effort: errors are logged, not
+     * propagated, and never block the originating exist() call. Old peers
+     * reject the RPC and the keys simply stay SSD-only.
+     * @param client_addr Network address of the holder's offload RPC service.
+     * @param keys SSD-only keys held by the remote node.
+     * @param sizes Object sizes (bytes), index-aligned with keys. Hint only;
+     *        the holder re-reads sizes from its authoritative local metadata.
+     * @param tenant_id The keys' tenant. A shared SSD holder stores objects
+     *        from other tenants, so lookup/registration/promotion must run
+     *        under the object's own tenant, not the holder's.
+     */
+    void prefetch_offload_object(const std::string &client_addr,
+                                 const std::vector<std::string> &keys,
+                                 const std::vector<int64_t> &sizes,
+                                 const std::string &tenant_id);
+
+    /**
+     * @brief Asks a replica owner to verify the backing file of each key and
+     * evict its own replica when the file is proven gone.
+     * @param client_addr Network address of the replica owner's offload RPC
+     * service.
+     * @param request The caller's tenant (offload files are scoped by the
+     * object's recorded tenant) and the object keys to verify.
+     * @return Per-key tri-state in request order (present, evicted,
+     * undetermined), or an error when the owner could not answer at all.
+     */
+    tl::expected<VerifyDiskReplicaResponse, ErrorCode> verify_disk_replica(
+        const std::string &client_addr,
+        const VerifyDiskReplicaRequest &request);
+
    private:
     /**
      * @brief A batch of allocated memory buffers, tracking both handles and
@@ -524,7 +559,67 @@ class PyClient {
     virtual int probeKey(const std::string &key) = 0;
 
     virtual std::vector<int> batchProbeKey(
-        const std::vector<std::string> &keys) = 0;
+        const std::vector<std::string> &keys,
+        const GrantLeasePolicy &policy = {}) = 0;
+    virtual WeightRpcResult<WeightRevisionMetadata> begin_weight_import(
+        const BeginWeightImportRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionMetadata> commit_weight_import(
+        const CommitWeightImportRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionMetadata> abort_weight_import(
+        const AbortWeightImportRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionView> get_weight_revision(
+        const GetWeightRevisionRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<ListWeightRevisionsResponse> list_weight_revisions(
+        const ListWeightRevisionsRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionLease> acquire_weight_revision_lease(
+        const AcquireWeightRevisionLeaseRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionLease> renew_weight_revision_lease(
+        const RenewWeightRevisionLeaseRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<void> release_weight_revision_lease(
+        const ReleaseWeightRevisionLeaseRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightResidencyOperation>
+    start_weight_residency_operation(
+        const StartWeightResidencyOperationRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightResidencyOperation> query_weight_operation(
+        const QueryWeightOperationRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionMetadata> delete_weight_revision(
+        const DeleteWeightRevisionRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // ExistOptions variants. The default implementation ignores the options
+    // (prefetch unsupported); RealClient overrides them when
+    // enable_ssd_prefetch is on. See docs/source/design/store/ssd-prefetch.md.
+    virtual int isExist(const std::string &key, const ExistOptions &options) {
+        (void)options;
+        return isExist(key);
+    }
+
+    virtual std::vector<int> batchIsExist(const std::vector<std::string> &keys,
+                                          const ExistOptions &options) {
+        (void)options;
+        return batchIsExist(keys);
+    }
 
     virtual int64_t getSize(const std::string &key) = 0;
 
@@ -585,11 +680,15 @@ inline CachedQueryResultResponse to_cached_query_result_response(
     if (query_result->IsLeaseExpired(now)) {
         return CachedQueryResultResponse(ErrorCode::OBJECT_NOT_FOUND);
     }
-    return CachedQueryResultResponse(GetReplicaListResponse(
+    GetReplicaListResponse value(
         std::vector<Replica::Descriptor>(query_result->replicas.begin(),
                                          query_result->replicas.end()),
         remaining_lease_ttl_ms(*query_result, now),
-        query_result->object_checksum));
+        query_result->object_checksum);
+    if (query_result->resolved_tenant_id) {
+        value.resolved_tenant_id = *query_result->resolved_tenant_id;
+    }
+    return CachedQueryResultResponse(std::move(value));
 }
 
 inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
@@ -603,7 +702,8 @@ inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
         std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
                                          cached_result.value.replicas.end()),
         now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),
-        cached_result.value.object_checksum);
+        cached_result.value.object_checksum,
+        cached_result.value.resolved_tenant_id);
 }
 
 inline PyClient::QueryResultCache build_query_result_cache_from_cached_results(

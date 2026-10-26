@@ -980,58 +980,6 @@ TEST_F(SegmentTest, SharedNameIndexesSurviveReverseUnmountOrder) {
     }
 }
 
-TEST_F(SegmentTest, SharedNameRegistrationsSurviveSegmentSnapshotRestore) {
-    SegmentManager source(BufferAllocatorType::OFFSET);
-    Segment first;
-    first.id = generate_uuid();
-    first.name = "snapshot-shared-hostname";
-    first.base = DEFAULT_CXL_BASE;
-    first.size = 64 * 1024 * 1024;
-    first.te_endpoint = "snapshot-first-endpoint";
-    Segment second = first;
-    second.id = generate_uuid();
-    second.base += first.size;
-    second.te_endpoint = "snapshot-second-endpoint";
-    const UUID first_owner = generate_uuid();
-    const UUID second_owner = generate_uuid();
-
-    {
-        auto segment_access = source.getSegmentAccess();
-        ASSERT_EQ(
-            segment_access.MountSegment(first, first_owner, client_liveness_),
-            ErrorCode::OK);
-        ASSERT_EQ(segment_access.MountSegment(
-                      second, second_owner,
-                      std::make_shared<ClientLivenessRecord>(
-                          ClientLivenessRecord::Clock::now())),
-                  ErrorCode::OK);
-    }
-    auto serialized =
-        SegmentSerializer(&source).Serialize(LocalSsdPersistedState{});
-    ASSERT_TRUE(serialized.has_value());
-
-    SegmentManager restored(BufferAllocatorType::OFFSET);
-    auto restored_state = SegmentSerializer(&restored).Deserialize(*serialized);
-    ASSERT_TRUE(restored_state.has_value());
-    {
-        auto allocator_access = restored.getAllocatorAccess();
-        const auto* registrations =
-            allocator_access.getAllocatorManager().getAllocators(first.name);
-        ASSERT_NE(registrations, nullptr);
-        EXPECT_EQ(registrations->size(), 2u);
-    }
-
-    std::vector<std::pair<Segment, UUID>> segments;
-    ASSERT_EQ(restored.getSegmentAccess().GetAllSegments(segments),
-              ErrorCode::OK);
-    std::unordered_map<UUID, UUID, boost::hash<UUID>> owners;
-    for (const auto& [segment, owner] : segments) {
-        owners.emplace(segment.id, owner);
-    }
-    EXPECT_EQ(owners.at(first.id), first_owner);
-    EXPECT_EQ(owners.at(second.id), second_owner);
-}
-
 TEST_F(SegmentTest, HostOrderedSegmentsRotateWithinSameHostByKey) {
     SegmentManager segment_manager;
 

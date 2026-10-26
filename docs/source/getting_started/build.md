@@ -57,6 +57,47 @@ make -j
 sudo make install
 ```
 
+(build-with-intel-xpu)=
+### Build with Intel XPU
+
+Intel XPU support requires TENT and a native oneAPI SYCL build with the Intel
+DPC++ compiler (`icpx`), not GCC. Install the common dependencies above and
+the Intel GPU driver, Level Zero runtime, and oneAPI compiler separately.
+From the repository root, use a fresh build directory:
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+cmake -S . -B build-xpu \
+  -DCMAKE_C_COMPILER=icx \
+  -DCMAKE_CXX_COMPILER=icpx \
+  -DUSE_TENT=ON \
+  -DUSE_XPU=ON \
+  -DUSE_CUDA=OFF \
+  -DWITH_STORE_RUST=OFF
+cmake --build build-xpu --parallel "$(nproc)"
+```
+
+For Python bindings, install from the repository root with the same compiler
+and backend settings. This performs a separate native build:
+
+```bash
+python -m pip install . \
+  -Ccmake.define.CMAKE_C_COMPILER=icx \
+  -Ccmake.define.CMAKE_CXX_COMPILER=icpx \
+  -Ccmake.define.USE_TENT=ON \
+  -Ccmake.define.USE_XPU=ON \
+  -Ccmake.define.USE_CUDA=OFF
+```
+
+Keep the matching SYCL/Level Zero runtime available when running Mooncake,
+and use XPU-enabled PyTorch for tensor APIs. The prebuilt wheels do not include
+XPU support. Select TENT at runtime with `MC_USE_TENT=1`. For direct dma-buf
+RDMA requirements, the host-staging fallback, and same-node IPC permissions,
+see the Intel XPU part of the GPU-Direct RDMA note under Hardware Backend Setup
+below;
+see {ref}`Intel XPU Transport <intel-xpu-transport>` for runtime settings and
+current limitations.
+
 ### Build with NVMe-oF SSD Pool
 
 To enable the NVMe-oF SSD pool, install the SPDK dependencies and build
@@ -74,6 +115,75 @@ sudo make install
 
 `-DUSE_NOF=ON` builds the NoF registration APIs and deployment tools. Use
 `-DUSE_NOF=OFF` or omit the option when the NVMe-oF SSD pool is not needed.
+
+Registering client buffers for NoF over RDMA requires SPDK 22.05 or newer
+(`spdk_mem_register`). The build probes for it automatically and continues
+with older SPDK versions, but then logs a CMake warning, and pure-NoF writes
+over RDMA from unregistered user buffers fail at runtime with
+"No translation" errors.
+
+(build-with-store-rs)=
+### Build with Store-RS
+
+Store-RS is an optional Rust-native Mooncake Store. The default CMake build
+leaves it disabled, and the Python Store facade uses the C++ backend. Enable
+it when building a root wheel that should include the Rust backend and its standalone commands.
+
+The build needs a root checkout with submodules, CMake, a C++ toolchain, Rust
+(`cargo` on `PATH`), and Python 3.10 or newer. A multi-client runtime also
+needs Redis or etcd.
+
+```bash
+export MOONCAKE_ROOT_DIR="$PWD"
+export MOONCAKE_STORE_RS_DIR="$MOONCAKE_ROOT_DIR/mooncake-store-rs"
+export MOONCAKE_BUILD_DIR="$MOONCAKE_ROOT_DIR/build/store-rs"
+export MOONCAKE_PYTHON_BIN="$(command -v python3)"
+
+cmake -S "$MOONCAKE_ROOT_DIR" -B "$MOONCAKE_BUILD_DIR" \
+  -DPython3_EXECUTABLE="$MOONCAKE_PYTHON_BIN" \
+  -DWITH_STORE=ON \
+  -DWITH_STORE_RUST=OFF \
+  -DWITH_STORE_RS=ON \
+  -DWITH_TE=ON \
+  -DUSE_TENT=ON \
+  -DBUILD_SHARED_LIBS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build "$MOONCAKE_BUILD_DIR" --target build_store_rs --parallel
+```
+
+This out-of-tree build provides the native artifacts and standalone binaries. For a Python wheel only, skip the separate CMake build command; the wheel builder configures and builds its own CMake tree.
+
+The root wheel owns the mooncake Python package. Build and install one wheel,
+then select its Store backend before importing mooncake.store:
+
+| Setting | Backend |
+|---------|---------|
+| Unset or cpp | C++ Store |
+| rs | Store-RS, included by WITH_STORE_RS=ON |
+
+The facade reads MOONCAKE_STORE_BACKEND when mooncake.store is first imported.
+Use exactly cpp or rs. The setting does not change the standalone command
+names.
+
+```bash
+MOONCAKE_STORE_BACKEND=rs .venv-store-rs/bin/python -c \
+  "from mooncake.store import MooncakeDistributedStore; print(MooncakeDistributedStore)"
+
+.venv-store-rs/bin/mooncake-store-rs-client --help
+.venv-store-rs/bin/mooncake-store-rs-admin --help
+.venv-store-rs/bin/mooncake-store-rs-bench --help
+```
+
+For workspace unit tests and installed-package smoke coverage, run
+`scripts/ci/run_store_rs_smoke.sh` after installing the CMake `python`
+component. The [Store-RS validation guide](../deployment/store-rs/testing.md#local-validation)
+lists the required CMake paths and the direct commands for heavier scenarios.
+
+Configuration, validation, and API details are in the
+[Store-RS deployment guides](../deployment/store-rs/index.md), the
+[Rust API](../api-reference/rust/store-rs.md), the
+[Python API](../api-reference/python/store-rs.md), and the
+[Admin HTTP API](../api-reference/http/store-rs-admin.md).
 
 ### RISC-V Build
 
@@ -122,6 +232,7 @@ environment setup must be prepared separately.
 | Moore Threads MUSA | `-DUSE_MUSA=ON` | Install MUSA SDK and `mthreads-peermem` for GPUDirect RDMA. | Add `/usr/local/musa/lib` to `LIBRARY_PATH` and `LD_LIBRARY_PATH`. |
 | Cambricon MLU | `-DUSE_MLU=ON` | Install Cambricon Neuware SDK. | Set `NEUWARE_HOME`, or pass `-DNEUWARE_ROOT=/path/to/neuware`. Use `-DMLU_INCLUDE_DIR` and `-DMLU_LIB_DIR` for custom layouts. |
 | MetaX MACA | `-DUSE_MACA=ON` | Install MACA SDK. | Set `MACA_HOME`, or pass `-DMACA_ROOT=/path/to/maca`. Use `-DMACA_INCLUDE_DIR`, `-DMACA_LIB_DIR`, and `-DMACA_RUNTIME_LIBS` for custom layouts. |
+| Intel XPU (Arc / Data Center GPU) | `-DUSE_XPU=ON -DUSE_TENT=ON` | Install the oneAPI DPC++ compiler and Level Zero runtime (`libze_loader`), and build with `-DCMAKE_CXX_COMPILER=icpx`. | Source `/opt/intel/oneapi/setvars.sh` before configuring CMake and run with `MC_USE_TENT=1`. VRAM is transferred directly over RDMA when the NIC driver supports dma-buf registration (`ibv_reg_dmabuf_mr`, rdma-core 34+); otherwise it is staged through pinned host memory. |
 | Huawei Ascend Direct | `-DUSE_ASCEND_DIRECT=ON` | Install Ascend CANN Toolkit and ADXL dependencies. | Source `/usr/local/Ascend/cann/set_env.sh` before configuring CMake. This is the recommended Ascend path. |
 | Huawei Ascend UBSHMEM | `-DUSE_UBSHMEM=ON` | Install Ascend CANN Toolkit. Requires CANN >= 9.0.0, driver >= 26.0.0, Lingqu >= 1.5. | Source the CANN `set_env.sh` before configuring CMake. |
 | AMD HIP / ROCm | `-DUSE_HIP=ON` | Install ROCm/HIP SDK. | Ensure HIP compiler, headers, and runtime libraries are visible to CMake. |
@@ -169,6 +280,49 @@ modules with the inbox RDMA stack and no MLNX_OFED), GPU memory registration
 then fails with `Failed to register memory 0x...: Bad address [14]`; set
 `WITH_NVIDIA_PEERMEM=0` there. DMA-BUF needs the NVIDIA open kernel modules and
 Linux 5.12 or later.
+
+Intel XPU builds (`-DUSE_XPU=ON`) use DMA-BUF for direct RDMA: when a USM
+device allocation is registered, TENT asks the Level Zero runtime to export it
+as a dma-buf and registers that with `ibv_reg_dmabuf_mr`, so the NIC reads and
+writes VRAM directly with no host copy. This needs rdma-core 34+ and a NIC
+driver with dma-buf support (for example `mlx5`). The direct path is attempted
+per buffer and is not guaranteed: when the verb or driver support is missing,
+when the export fails for a given allocation (see the pooling caveat below), or
+when `transports/rdma/disable_gpu_direct_rdma` is set to `true` in the TENT
+configuration, transfers touching that buffer fall back to staging through
+pinned host memory.
+
+Both direct RDMA and host-staged transfers involving XPU memory currently
+require an **XPU-platform initiator**, even when its local buffer is DRAM and
+only the remote buffer is XPU memory. Staging also requires the initiator's
+`XpuTransport` to be enabled; without it, XPU memory is not staged and is
+routed only over a transport that copies device memory itself, such as TCP.
+A CPU-platform initiator cannot currently route
+these requests; it does not transparently fall back to staging. A `cpu:0`
+buffer inside an XPU-platform process is not a CPU-platform peer.
+
+The Transfer Engine requests dedicated exportable Level Zero allocations;
+runtime allocation/export failures can still require staging. For device
+memory allocated elsewhere (for example PyTorch XPU tensors), the Intel
+compute runtime can pool small USM allocations into shared buffers whose
+dma-buf cannot be registered per allocation. Foreign or fallback USM is
+eligible for export only when the allocation and dma-buf sizes match exactly.
+Extra backing bytes cannot safely be distinguished from a shared pool, even
+when they match a rounded page size, so padded foreign allocations also stage.
+`NEOReadDebugKeys=1 EnableDeviceUsmAllocationPool=0` disables pooling, but does
+not bypass this conservative size check.
+
+On the same node, registered XPU memory is also shared between processes with
+Level Zero IPC handles, so VRAM-to-VRAM transfers between two local engines
+(for example prefill and decode workers) are local XPU copies rather than
+network transfers. Importing a handle uses `pidfd_getfd(2)` on the exporting
+process and therefore needs ptrace permission over it. The Level Zero runtime
+marks every process that opens a device with `PR_SET_PTRACER_ANY`, so the same
+user in the same pid namespace with Yama `ptrace_scope` 0 or 1 (the default on
+most distributions) is enough; `ptrace_scope` 2 needs `CAP_SYS_PTRACE` (in
+Kubernetes, `securityContext.capabilities.add: [SYS_PTRACE]`) and 3 forbids it.
+Without that permission, or with `transports/xpu/disable_ipc: true` in the
+TENT configuration, those transfers use the RDMA or TCP transport instead.
 ```
 
 ## Use Mooncake in Docker Containers
@@ -248,6 +402,7 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_COREX=ON/OFF` | `OFF` | Enable Iluvatar CoreX GPU support. Uses a CUDA-compatible runtime. |
 | `-DUSE_SUPA=ON/OFF` | `OFF` | Enable Biren GPU support via the SUPA SDK. Uses a CUDA-compatible runtime. Set `BIREN_HOME` to the SDK root. |
 | `-DUSE_MLU=ON/OFF` | `OFF` | Enable Cambricon MLU memory support via Neuware, including memory detection, topology discovery, and RDMA registration. |
+| `-DUSE_XPU=ON/OFF` | `OFF` | Enable Intel XPU memory support in TENT via SYCL/Level Zero: memory detection, host staging, intra-node PCIe P2P copies between XPUs, and dma-buf GPUDirect RDMA registration. Requires `-DUSE_TENT=ON` and the `icpx` compiler. |
 | `-DUSE_RISCV=ON/OFF` | `OFF` | Enable RISC-V build compatibility settings, including disabling full IPO/LTO for Python extensions. |
 | `-DUSE_SHCA=ON/OFF` | `OFF` | Enable ScaleFabric SHCA InfiniBand support for Transfer Engine/TENT RDMA paths only. Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
 | `-DUSE_ASCEND_DIRECT=ON/OFF` | `OFF` | Enable Ascend Direct transport and HCCS support via the ADXL engine. Recommended for Ascend builds. |
@@ -301,7 +456,8 @@ The following options can be passed to `cmake ..`.
 | `-DWITH_P2P_STORE=ON/OFF` | `OFF` | Enable Golang support and build the P2P Store component. Requires Go 1.23+. |
 | `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust library (`transfer_engine_rust`), tests, and sample benchmark. |
 | `-DWITH_STORE_RUST=ON/OFF` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |
-| `-DWITH_EP=ON/OFF` | `OFF` | Build the EP and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.13.0"` to build for specific PyTorch versions, or leave empty to use the currently installed torch. The CUDA version is detected automatically. |
+| `-DWITH_STORE_RS=ON/OFF` | `OFF` | Build the Rust-native Mooncake Store (Store-RS), its Python extension, and the standalone commands. Requires `-DWITH_TE=ON`, `-DUSE_TENT=ON`, and `cargo`. See {ref}`Build with Store-RS <build-with-store-rs>`. |
+| `-DWITH_EP=ON/OFF` | `OFF` | Build Mooncake EP and the native Mooncake PG core/device libraries. The Torch-facing PG adapter is compiled by the installed package at first `import mooncake.pg`. |
 
 ### Build Behavior Options
 

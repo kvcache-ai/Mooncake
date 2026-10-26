@@ -20,6 +20,19 @@ For Transfer Engine metadata, use the `P2PHANDSHAKE` connection string for
 decentralized peer discovery, enable the master's embedded HTTP metadata
 server, or provide an external metadata service.
 
+## Backend Selection
+
+The Python facade in mooncake.store uses the C++ Store when
+MOONCAKE_STORE_BACKEND is unset or set to cpp. A root wheel built with Store-RS
+enabled also supports rs. The setting is read when mooncake.store is first
+imported and accepts cpp or rs.
+
+This page describes the shared facade and the default C++ backend. See the
+[Store-RS Python API](store-rs.md) for backend-specific runtime behavior, API
+coverage, and compatibility notes. The
+{ref}`Build with Store-RS <build-with-store-rs>` section shows how to
+build the root wheel with Store-RS enabled.
+
 ## Quick Start
 
 ### Start Master (with HTTP enabled)
@@ -654,9 +667,10 @@ config.nof_replica_num = 1
 **Default:** `0`
 **Status:** **Work in progress; development and evaluation only.**
 **Description:** Requests an additional replica in the configured shared
-distributed filesystem. The supported values are currently `0` and `1`. When
-set to `1`, `replica_num` must be at least `1`, so DFS-only placement is not
-supported. DFS replicas currently support only the `default` tenant.
+distributed filesystem. The supported values are currently `0` and `1`.
+DFS-only placement (`replica_num = 0` with `dfs_replica_num = 1`) is supported;
+the DFS replica is then the object's only copy, so DFS eviction or removal
+deletes the object. DFS replicas currently support only the `default` tenant.
 
 ```python
 config = ReplicateConfig()
@@ -730,6 +744,40 @@ config.preferred_segment = self.get_hostname()
 config = ReplicateConfig()
 config.prefer_alloc_in_same_node = True
 ```
+
+#### session_ids
+**Type:** `Optional[List[str]]`
+**Default:** `None`
+
+Optional per-key write attribution. Supply one entry for each input key (one
+entry for a single-key write). Each ID must be valid UTF-8 and at most 256 bytes.
+An empty string means no new attribution. The field does not change object identity,
+replication, group membership, leases, or eviction policy.
+
+```python
+config = ReplicateConfig()
+config.session_ids = ["session-a", "session-a", "session-b"]
+store.batch_put_from(keys, buffer_ptrs, buffer_sizes, config)
+```
+
+The tag becomes committed when the first replica of the write becomes readable.
+A skipped duplicate Put leaves the original tag unchanged. Upsert with a
+non-empty ID replaces attribution at commit; an omitted or empty ID preserves
+the previous tag, including when storage is reallocated. Failed/preempted
+writes do not commit their pending tags. Committed tags survive metadata
+OpLog/snapshot recovery and standby promotion; old metadata defaults to no tag.
+
+With KV events enabled, each `stored` / `BlockStored` map carries a single
+`session_id` string, or MessagePack `nil` when untagged. Replica availability
+changes reuse the committed object tag. `removed` and `cleared` keep their
+existing schemas: they retract availability, not a particular session's
+association. This matches SGLang's single-session stored-event attribution;
+it does not enumerate every session that has reused a shared object.
+
+Old RPC readers can ignore the compatible extension, but do not persist or
+publish session tags. Upgrade the Store client and Master to enable attribution.
+A storage node's disk scan alone cannot reconstruct metadata tags after all
+Master metadata is lost; preserve the metadata recovery artifacts as well.
 
 #### group_ids
 **Type:** `List[str] | None`
@@ -1081,6 +1129,63 @@ store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*10
 ```
 
 </details>
+
+The class also accepts a configuration dictionary. For the EGM Provider and
+Consumer examples below, select NVLink explicitly before calling `setup()`:
+
+```bash
+export MC_MS_AUTO_DISC=0
+# MC_FORCE_MNNVL is not needed with manual protocol selection.
+```
+
+```python
+# EGM Provider
+store.setup({
+    "local_hostname": "10.192.8.81:12345",
+    "metadata_server": "http://10.192.8.81:8079/metadata",
+    "master_server_addr": "10.192.8.81:50051",
+    "protocol": "nvlink",
+    "global_segment_size": str(64 * 1024**3),
+    "local_buffer_size": "0",
+    "enable_egm_store_pool": "true",
+    "egm_numa_nodes": "auto",  # or, for example, "0,1"
+})
+```
+
+`enable_egm_store_pool` defaults to `false`; `egm_numa_nodes` defaults to
+`auto`. These controls apply only to this dictionary overload. The EGM pool
+requires a `USE_MNNVL=ON` build, a non-TENT Transfer Engine, and the exact
+`nvlink`/nonzero-global/zero-local combination shown above. With `auto`, nodes
+come from the visible GPUs' CUDA `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID` values.
+
+EGM capacity is rounded down to a multiple of the common alignment: the
+maximum of the Store slab alignment and the selected nodes' CUDA allocation
+granularities. It is then divided across nodes and split into balanced,
+aligned chunks no larger than `max_mr_size`. This capacity planning applies
+only to the EGM pool.
+
+An ordinary Consumer does not enable the EGM pool; it uses `protocol="nvlink"`
+to access the Provider's mounted segments:
+
+```python
+# Consumer accessing the Provider's EGM pool
+consumer.setup({
+    "local_hostname": "10.192.8.58:12400",
+    "metadata_server": "http://10.192.8.81:8079/metadata",
+    "master_server_addr": "10.192.8.81:50051",
+    "protocol": "nvlink",
+    "global_segment_size": "0",
+    "local_buffer_size": "0",
+    "rdma_devices": "",
+    "enable_egm_store_pool": "false",
+})
+```
+
+Manual NVLink selection is supported for both Providers and Consumers.
+If you instead set `MC_MS_AUTO_DISC=1`, EGM setup verifies that the selected
+non-TENT engine actually has the `nvlink` transport installed and fails before
+allocating EGM memory otherwise. Set `MC_FORCE_MNNVL=1` when using discovery on
+hosts with RDMA HCAs to select MNNVL instead of RDMA.
 
 ---
 #### setup_dummy()
@@ -1549,19 +1654,51 @@ else:
 ---
 
 #### batch_probe_key()
-Point-in-time existence check for multiple objects in a single batch
-operation, granting no read leases.
+Probe multiple objects, optionally selecting and leasing the last complete
+candidate. The default `"none"` policy remains a lease-free existence check.
 
 ```python
-def batch_probe_key(self, keys: List[str]) -> List[int]
+def batch_probe_key(
+    self, keys: List[str], policy: str = "none", candidate_size: int = 1
+) -> List[int]
 ```
 
 **Parameters:**
 - `keys` (List[str]): List of object identifiers to check
+- `policy` (str): `"none"` or `"LastHitOnly"`.
+- `candidate_size` (int): Number of consecutive keys forming each candidate.
+  Ignored for `"none"`. For a nonempty `"LastHitOnly"` request, it must be
+  positive and divide the number of keys exactly. Empty input returns `[]`.
 
 **Returns:**
-- `List[int]`: List of existence results (1=existed at probe time,
-0=not exists, -1=error)
+- Both policies return per-key existence results in the same length and order
+  as `keys`: 1=readable when checked, 0=missing or unreadable. Negative values
+  indicate errors, not cache misses.
+- With `"LastHitOnly"`, the last group of `candidate_size` all-1 results is
+  the selected, leased candidate. Earlier complete groups and incomplete
+  groups retain their existence results. If no group is all-1, no complete
+  candidate was selected.
+
+Candidates are ordered by the caller. A candidate is complete when every key
+has a readable replica. Earlier candidates may be missing or incomplete.
+The caller must include all required components,
+cache groups, and rank shards; Store does not infer prefix or model semantics.
+Duplicate key positions are allowed and must not alter the grouping.
+
+The Master first probes without leases, then rechecks and leases complete
+candidates in reverse order using the existing per-shard lookup. Recheck
+results replace that candidate's initial results; a candidate that loses a
+member cannot remain all-1. A failed candidate may retain partial leases
+while selection falls back to an earlier candidate. This is not an atomic
+snapshot of all keys, and unselected existence results are not lease guarantees.
+
+Selected objects receive the Master's default read-lease TTL, protecting them
+from normal eviction while the leases remain valid; soft-pin deadlines are
+unchanged. The policy does not protect against lease expiry, forced removal,
+or replica loss. Existing shared group leases (or a physical key repeated
+outside the selected candidate) may also protect unselected positions. No
+persistent group registration is added. Invalid candidate sizes return
+per-key parameter errors; unknown policy strings raise `ValueError` in Python.
 
 **Example:**
 ```python
@@ -1570,6 +1707,29 @@ results = store.batch_probe_key(keys)
 candidates = [key for key, exists in zip(keys, results) if exists == 1]
 print("Probed candidates (unprotected from eviction):", candidates)
 ```
+
+For checkpoint selection, first use `batch_is_exist()` to protect the required
+KV data and determine its usable boundary. Pass only valid checkpoint
+candidates within that boundary, in increasing resume-position order:
+
+```python
+keys = ["checkpoint128.rank0", "checkpoint128.rank1",
+        "checkpoint256.rank0", "checkpoint256.rank1"]
+results = store.batch_probe_key(keys, policy="LastHitOnly", candidate_size=2)
+if any(result < 0 for result in results):
+    raise RuntimeError("Checkpoint lookup failed")
+selected = next((i for i in reversed(range(len(keys) // 2))
+                 if all(result == 1 for result in results[i * 2:(i + 1) * 2])), None)
+# Both complete: [1, 1, 1, 1] selects 1.
+# Last incomplete: [1, 1, 1, 0] selects 0.
+# Load only the selected checkpoint, with the KV prefix it needs.
+```
+
+**Upgrade note:** the policy changes the `BatchProbeKey` Master RPC and the
+DummyClient-to-RealClient batch-probe RPC signatures. Upgrade the Master,
+client daemon, and clients together; mixed-version batch-probe calls are not
+supported. Default Python arguments preserve the old call syntax, not wire
+compatibility. `is_exist()`, `batch_is_exist()`, and `probe_key()` are unchanged.
 
 ---
 
@@ -2093,18 +2253,37 @@ store.close()
 ---
 
 #### close()
-Clean up all resources and terminate connections.
+Terminate the store and clean up its resources. Before calling `close()`, wait
+for setup and all application and offload calls to finish; do not issue new
+calls concurrently. Close stops local services. For an EGM Provider, close
+also stops `FileStorage` workers before unmounting EGM segments and
+releasing their backing memory.
+
+Close is terminal: both real-client and dummy-client handles are cleared from
+the Python object even when cleanup fails. Further `close()` calls are
+idempotent, not cleanup retries. Repeated `setup()` calls are not a recovery
+mechanism.
+
+If EGM setup fails, Mooncake attempts cleanup even for failed or uncertain
+mounts. When unmount cannot be confirmed, it logs the error and retains the
+affected EGM allocation until process exit. CUDA cleanup failures likewise
+retain any remaining resources. Recreating the store does not reclaim retained
+resources; restart the process to reclaim them.
+A failed mount may leave a remote segment record: close does not guarantee
+synchronous remote cleanup, and there is no background cleanup reaper.
 
 ```python
 def close(self) -> int
 ```
 
 **Returns:**
-- `int`: Status code (0 = success, non-zero = error code)
+- `int`: Status code (0 = success, non-zero = terminal cleanup failure).
 
 **Example:**
 ```python
-store.close()
+if store.close() != 0:
+    # Inspect the cleanup logs; retained EGM memory requires process restart.
+    raise RuntimeError("Store cleanup failed")
 ```
 
 ---

@@ -114,8 +114,9 @@ The EWMA provides:
 
 Each device also keeps a second series, the **transmit estimate**, for the
 deadline predictors (described end to end in
-[Deadline Scheduling](deadline-scheduling.md)): the admission queue's deadline-infeasible drop
-(`runtime_queue/mlu_local_threshold`, reads the sum over devices) and the RDMA
+[Deadline Scheduling](deadline-scheduling.md)): the admission queue's
+deadline-infeasible drop (`runtime_queue/mlu_local_threshold`, reads the
+transmit estimate of the transport that will carry the owner) and the RDMA
 workers' bandwidth arbitration (`transports/rdma/deadline_bw_arbitration`,
 reads the local NIC's value). Both compute the same predicted MLU from it:
 
@@ -124,16 +125,17 @@ predicted_mlu = ((bytes_ahead + length) / transmit_bandwidth) / remaining_window
 ```
 
 `bytes_ahead` is what the request must wait behind before its own bytes move:
-for the admission queue, every drop-eligible owner (RDMA, not staged) already
-dispatched and not yet completed — owners on other transports share the queue
-but not the NIC. For the arbitration it is the NIC's **posted bytes**: what
-has reached the hardware and not yet completed. That is deliberately not the
-selector's `inflight_bytes`, which is charged when a slice is *allocated* and
-so would include the very slices being ordered as well as work still sitting
-in a worker queue. The order is then built one slot at a time — the slice
-that takes a slot joins `bytes_ahead` for the ones still waiting, since the
-QP posts them in that order (exactly for the first 64 slots; the rest are
-ranked once against the bytes those slots accumulated).
+for the admission queue, every drop-eligible owner (RDMA or UB, not staged)
+already dispatched and not yet completed — owners on other transports share the
+queue but not the NIC, and the rate used for the prediction is the one the
+owner's own transport reports. For the arbitration it is the NIC's **posted
+bytes**: what has reached the hardware and not yet completed. That is
+deliberately not the selector's `inflight_bytes`, which is charged when a slice
+is *allocated* and so would include the very slices being ordered as well as
+work still sitting in a worker queue. The order is then built one slot at a
+time — the slice that takes a slot joins `bytes_ahead` for the ones still
+waiting, since the QP posts them in that order (exactly for the first 64 slots;
+the rest are ranked once against the bytes those slots accumulated).
 
 The deadline is absolute, so that wait counts against the window — as an
 additive delay over the wire rate, not as a slower bandwidth (which would

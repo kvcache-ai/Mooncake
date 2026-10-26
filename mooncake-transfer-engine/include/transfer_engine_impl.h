@@ -527,6 +527,17 @@ class TransferEngineImpl {
         return "rdma";
     }
 
+    // True when auto-discovery should set up the EFA transport. Only USE_EFA
+    // builds can construct it; elsewhere protocol=efa keeps the RDMA-style
+    // discovery that excludes EFA NICs.
+    bool autoDiscoverUsesEfa() const {
+#ifdef USE_EFA
+        return autoDiscoverTransport() == "efa";
+#else
+        return false;
+#endif
+    }
+
     // Discover topology and install transports automatically when enabled.
     AutoDiscoverConfig auto_discover_config_;
     std::vector<std::string> filter_;
