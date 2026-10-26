@@ -553,3 +553,7 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+add_store_test(weight_manual_residency_e2e_test
+               weight_manual_residency_e2e_test.cpp)
+set_tests_properties(weight_manual_residency_e2e_test PROPERTIES TIMEOUT 420)

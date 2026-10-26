@@ -13,10 +13,27 @@ independent tensor-level management metadata.
 
 This stage provides Master RPC and C++ client access to revision management,
 managed-group removal protection, lease-fenced deletion, and basic residency
-operation reconciliation with HA recovery. Configurable residency policies,
-automatic migration, and the managed Python `WeightStore` facade remain
-follow-up work. The upload flow below describes the caller's responsibilities;
+operation reconciliation with HA recovery. This stage adds configurable
+HOT/COLD/MIXED policies and explicit affinity-aware migration. MANUAL is the
+default mode; PINNED preserves its requested residency. AUTO is recognized but
+rejected by policy validation until its scheduler is delivered. Automatic
+migration, generation replacement, and the managed Python `WeightStore` facade
+remain follow-up work. The upload flow below describes the caller's responsibilities;
 the Python facade is not required to use the C++ interfaces.
+
+This development-stage change replaces the earlier persistence format directly.
+Weight snapshots use schema 2; earlier snapshots and metadata-only OpLog
+records are rejected. There is no migration or compatibility decoder. New
+operation envelopes and snapshots retain atomic publication and replay.
+
+Imports declare an affinity count and digest. Each payload object carries an
+opaque residency-affinity ID, and all objects with that ID move as one unit.
+The manifest remains in memory. Mixed planning chooses complete affinities;
+it never splits an affinity to reach the requested hot-byte ratio. Observed
+ratios count readable payload bytes, while availability separately reports
+missing members. Background migration spends one work item per complete
+affinity; deletion spends one per object and shares its remaining budget with
+the following reconciliation pass.
 
 ## Authority Model
 
@@ -119,9 +136,9 @@ Availability, physical residency, and an in-progress operation are separate:
 | --- | --- | --- |
 | Availability | `IMPORTING`, `READY`, `DEGRADED`, `DELETING`, `DELETED` | whether the complete revision is safe to discover and load |
 | Residency | `UNKNOWN`, `HOT`, `COLD`, `MIXED`, `ABSENT` | observed placement across required group members |
-| Operation | `NONE`, `EVICTING`, `REHYDRATING`, `REPAIRING` | durable non-terminal group work |
+| Operation | optional operation ID, with `MIGRATING` or `REPAIRING` kind | durable non-terminal group work |
 
-The current operation entry point starts `EVICTING` or `REHYDRATING`.
+The current operation entry point starts `MIGRATING` toward HOT, COLD, or MIXED.
 `REPAIRING` is reserved for a follow-up recovery workflow.
 
 `READY` means the manifest and every required payload object have a readable
@@ -151,6 +168,14 @@ The managed upload sequence is:
 4. `CommitWeightImport` validates exact group membership and the manifest
    reference, then durably publishes `READY`.
 5. `GetWeightRevision` or bounded `ListWeightRevisions` can discover it.
+
+The import's policy overrides the Master's default policy. Commit publishes
+READY with readable HOT payloads; it does not wait for preferred placement.
+For COLD or MIXED preference, that same commit records an initial migration,
+including under MANUAL or PINNED policy. The background worker finishes that
+declared placement asynchronously. MANUAL does not subsequently choose targets
+from memory pressure or access recency; later migrations require explicit
+requests. Policy preference and observed residency are separate query fields.
 
 `READY` is never inferred from key prefixes. An abandoned import is handled by
 the explicit abort/reconciliation policy. `weight_import_idle_timeout_ms`
@@ -186,21 +211,30 @@ leases; those protect different ownership boundaries.
 fenced metadata generation, and progress. Reconciliation then uses existing
 per-object primitives:
 
-- `EVICTING` removes memory replicas only after a readable cold replica exists
+- cold migration removes memory replicas only after a readable cold replica exists
   for each affected member;
-- `REHYDRATING` queues promotion for every group member and waits until all
+- hot migration queues promotion for every payload affinity and waits until all
   required members have readable memory replicas;
 - busy or incomplete members keep the operation in progress;
 - deletion blocks new leases, waits for live leases, removes payload objects,
   removes the manifest last, verifies absence, and retains a tombstone.
 
-An explicit COLD request requires a readable cold copy of every member at
-admission; otherwise it returns `NOT_READY`. An explicit delete may cancel a
+An explicit COLD or MIXED request may queue payload offloads before memory
+eviction. Acceptance records pending work, not completion; missing cold copies
+or offload capacity can leave it pending with observable error state. The
+manifest stays in memory. An explicit delete may cancel a
 pending residency operation, including one stalled by missing replicas or
 promotion capacity. After the ordinary generation and lease checks, cancellation
 and `DELETING` publish together in one durable record, before physical removal.
 Operation queries retain the original target and progress with message
 `cancelled`; they never report cancellation as successful convergence.
+
+Bucket offload batches keep their initial coalescing opportunity. If no new
+tasks arrive, the next heartbeat retries the carried tail and flushes it through
+the existing replay path. This also applies to ordinary KV offloads: a small
+tail no longer waits indefinitely for unrelated traffic. Fresh tasks for a
+carried key take precedence over its old size and task; no new configuration
+flag is required.
 
 Generic `BatchEvict`, quota eviction, explicit remove, and cleanup paths skip
 managed groups. Only the weight lifecycle path may change their aggregate
@@ -208,7 +242,7 @@ residency or availability.
 
 Reconciliation runs on a dedicated Master worker, not the general task-cleanup
 thread, and is not exposed as a client RPC. A background pass shares a bounded
-number of member actions across revisions. This bounds physical action attempts,
+number of affinity migration or member deletion actions across revisions. This bounds physical action attempts,
 not the time required for a durable write or the cost of observing group metadata.
 Clients use operation and revision queries to observe convergence. The operation
 `cursor` reports progress; it is not a client-controlled resume token.
@@ -222,15 +256,11 @@ snapshots capture that namespace with object and segment metadata at the same
 durable replay cursor. Derived group indexes are rebuilt from restored
 metadata records.
 
-OpLog replay accepts both the legacy `WeightRevisionMetadata` payload and the
-metadata-plus-operation envelope, distinguished by their serialized type hashes.
-Legacy records can only describe metadata without an active operation. A valid
-envelope with invalid metadata or operation fields is rejected rather than
-retried as a legacy payload. Deploy new readers before enabling writers that
-publish operation envelopes; compatibility decoding does not make an old reader
-understand a new writer's format.
-The `cancelled` terminal message also requires upgraded readers before writers
-enable cancellation, even though the serialized envelope shape is unchanged.
+OpLog replay accepts the current metadata-plus-operation envelope. Earlier
+metadata-only payloads and invalid envelopes are rejected without advancing the
+replay cursor. This development-stage replacement requires fresh weight state;
+there is no rolling upgrade or old-format migration contract. Cancelled and
+completed operations are terminal, including for late progress and error reports.
 
 Batch-OpLog snapshots containing weight state use a version-2 manifest with a
 checksummed weight-state artifact captured at the same replay cursor as object
