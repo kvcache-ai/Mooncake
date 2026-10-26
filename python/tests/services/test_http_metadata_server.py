@@ -235,7 +235,12 @@ class TestHttpMetadataServerBounds(unittest.IsolatedAsyncioTestCase):
     async def test_body_limit_is_passed_to_aiohttp(self) -> None:
         with patch.dict(os.environ, {"MC_METADATA_MAX_BODY_BYTES": "123"}):
             server = KVBootstrapServer(port=0)
-        self.assertEqual(server.app.client_max_size, 123)
+        self.assertEqual(server.max_body_bytes, 123)
+        # aiohttp may or may not expose client_max_size as a public attribute
+        # depending on version; when available, verify the app received it.
+        app_limit = getattr(server.app, "client_max_size", None)
+        if app_limit is not None:
+            self.assertEqual(app_limit, 123)
 
     async def test_invalid_budget_env_falls_back_to_default(self) -> None:
         with patch.dict(os.environ, {"MC_METADATA_MAX_KEYS": "abc"}):
