@@ -9,7 +9,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
+#include <algorithm>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <random>
@@ -27,6 +29,8 @@
 
 #include "config.h"
 #include "real_client.h"
+#include "nof/dma_buffer_allocator.h"
+#include "nof/nvmeof_initiator.h"
 #include "tenant_id.h"
 #include "test_server_helpers.h"
 
@@ -1029,7 +1033,14 @@ TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
     ASSERT_EQ(queries.size(), 1);
     ASSERT_TRUE(queries[0].has_value());
     PyClient::QueryResultCache snapshot;
-    snapshot.emplace(key, std::move(queries[0]));
+    // Two candidates exercise fragment splitting when affinity is enabled.
+    auto replicas = queries[0]->replicas;
+    auto alias = replicas.front();
+    ++alias.id;
+    replicas.push_back(std::move(alias));
+    snapshot.emplace(key,
+                     QueryResult(std::move(replicas), queries[0]->lease_timeout,
+                                 queries[0]->object_checksum));
     auto destination = py_client_->allocate_client_buffer(original.size());
     ASSERT_TRUE(destination.has_value());
     auto read = [&](size_t offset, size_t size) {
@@ -1042,8 +1053,10 @@ TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
     EXPECT_EQ(read(0, 4),
               (std::vector<std::vector<std::vector<int64_t>>>{{{4}}}));
     ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
-    EXPECT_EQ(read(4, 28),
-              (std::vector<std::vector<std::vector<int64_t>>>{{{28}}}));
+    EXPECT_EQ(py_client_->get_into_ranges_from_snapshot(
+                  {destination->ptr()}, {{key}}, {{{4, 12}}}, {{{4, 12}}},
+                  {{{8, 20}}}, snapshot),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{8, 20}}}));
     EXPECT_EQ(std::string(static_cast<char*>(destination->ptr()), 32),
               original);
     auto current = py_client_->get_buffer(key);
@@ -1611,6 +1624,89 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
         << "Upsert data buffer unregistration should succeed";
 }
 
+// group_by_target reads exact-size memory replicas on one segment in one
+// transfer. A destination larger than its object stays on the per-key path
+// and fails alone.
+TEST_F(RealClientTest, TestBatchMultiBuffersGroupedByTarget) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kKeyCount = 10;
+    constexpr size_t kSlicesPerKey = 10;
+    constexpr size_t kSliceSize = 10;
+    constexpr size_t kKeyBytes = kSlicesPerKey * kSliceSize;
+    std::string src_data(kKeyCount * kKeyBytes, '\0');
+    for (size_t i = 0; i < src_data.size(); ++i) {
+        src_data[i] = static_cast<char>('a' + i % 26);
+    }
+    // One spare slice past the end for the oversized read below.
+    std::string dst_data(kKeyCount * kKeyBytes + kSliceSize, '0');
+    ASSERT_EQ(py_client_->register_buffer(src_data.data(), src_data.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(dst_data.data(), dst_data.size()), 0);
+
+    std::vector<std::string> keys;
+    std::vector<std::vector<void*>> src_ptrs;
+    std::vector<std::vector<void*>> dst_ptrs;
+    std::vector<std::vector<size_t>> sizes;
+    for (size_t i = 0; i < kKeyCount; ++i) {
+        keys.emplace_back("grouped_key_" + std::to_string(i));
+        src_ptrs.emplace_back();
+        dst_ptrs.emplace_back();
+        sizes.emplace_back();
+        for (size_t j = 0; j < kSlicesPerKey; ++j) {
+            const size_t offset = i * kKeyBytes + j * kSliceSize;
+            src_ptrs.back().push_back(src_data.data() + offset);
+            dst_ptrs.back().push_back(dst_data.data() + offset);
+            sizes.back().push_back(kSliceSize);
+        }
+    }
+
+    ReplicateConfig config;
+    auto put_results =
+        py_client_->batch_put_from_multi_buffers(keys, src_ptrs, sizes, config);
+    for (auto result : put_results) {
+        EXPECT_EQ(result, 0) << "Grouped put should succeed";
+    }
+
+    auto get_results =
+        py_client_->batch_get_into_multi_buffers(keys, dst_ptrs, sizes, true);
+    for (auto result : get_results) {
+        EXPECT_EQ(result, static_cast<int>(kKeyBytes))
+            << "Grouped get should succeed";
+    }
+    EXPECT_EQ(dst_data.substr(0, src_data.size()), src_data);
+
+    // A destination larger than its object cannot be read; it must fail on
+    // its own and leave the other keys on the same target intact.
+    std::fill(dst_data.begin(), dst_data.end(), '0');
+    dst_ptrs.back().push_back(dst_data.data() + kKeyCount * kKeyBytes);
+    sizes.back().push_back(kSliceSize);
+    get_results =
+        py_client_->batch_get_into_multi_buffers(keys, dst_ptrs, sizes, true);
+    ASSERT_EQ(get_results.size(), kKeyCount);
+    for (size_t i = 0; i + 1 < kKeyCount; ++i) {
+        EXPECT_EQ(get_results[i], static_cast<int>(kKeyBytes))
+            << "Key " << i << " should not fail with the oversized key";
+    }
+    EXPECT_LT(get_results.back(), 0) << "Oversized key should fail";
+    const size_t intact_bytes = (kKeyCount - 1) * kKeyBytes;
+    EXPECT_EQ(dst_data.substr(0, intact_bytes),
+              src_data.substr(0, intact_bytes));
+
+    ASSERT_EQ(py_client_->unregister_buffer(src_data.data()), 0);
+    ASSERT_EQ(py_client_->unregister_buffer(dst_data.data()), 0);
+}
+
 TEST_F(RealClientTest, TestPutGetSessionRanges) {
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start in-proc master";
@@ -2089,8 +2185,8 @@ TEST_F(RealClientTest, TestPutSessionStartRejectsReliableNofConfig) {
     EXPECT_EQ(rcs[0], kInvalidParams);
 }
 
-// Filtered start_keys must keep group_ids aligned (skip existing sessions).
-TEST_F(RealClientTest, TestPutSessionStartFiltersGroupIds) {
+// Skip existing sessions while keeping every per-key field aligned.
+TEST_F(RealClientTest, TestPutSessionStartFiltersSessionGroupAndHcaHints) {
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start in-proc master";
     master_address_ = master_.master_address();
@@ -2110,17 +2206,24 @@ TEST_F(RealClientTest, TestPutSessionStartFiltersGroupIds) {
 
     ReplicateConfig first_config;
     first_config.group_ids = std::vector<std::string>{"group_a"};
+    first_config.session_ids = std::vector<std::string>{"session_a"};
+    first_config.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_0"}};
     ASSERT_EQ(py_client_->batch_put_session_start({"group_key_a"}, {kSize},
                                                   first_config)[0],
               0);
 
     ReplicateConfig batch_config;
     batch_config.group_ids = std::vector<std::string>{"group_a", "group_b"};
+    batch_config.session_ids =
+        std::vector<std::string>{"session_a", "session_b"};
+    batch_config.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_0"}, {"mlx5_1"}};
     auto rcs = py_client_->batch_put_session_start(
         {"group_key_a", "group_key_b"}, {kSize, kSize}, batch_config);
     ASSERT_EQ(rcs.size(), 2u);
     EXPECT_EQ(rcs[0], kInvalidParams) << "existing session should be skipped";
-    EXPECT_EQ(rcs[1], 0) << "filtered group_ids must match remaining keys";
+    EXPECT_EQ(rcs[1], 0) << "filtered metadata must match remaining keys";
 
     auto revoke_rcs =
         py_client_->batch_put_session_revoke({"group_key_a", "group_key_b"});
@@ -3441,12 +3544,333 @@ TEST_F(RealClientTest, SunriseLinkHostPutGetRemove) {
 }
 #endif
 
+namespace {
+
+// Records RegisterMemory/UnregisterMemory calls so tests can assert on the
+// client-side NoF registration lifecycle without SPDK.
+class RecordingNofInitiator : public NVMeoFInitiator {
+   public:
+    NofSegmentHandle* OpenSegment(const std::string&) override {
+        return nullptr;
+    }
+    bool ProbeSegment(const std::string&, uint32_t, std::string*) override {
+        return false;
+    }
+    uint32_t GetBlockSize(const NofSegmentHandle*) override {
+        return kInvalidBlockSize;
+    }
+    int SubmitIO(NofSegmentHandle*, void*, uint64_t, uint64_t, NofIOOp,
+                 NofIOAdaptor*) override {
+        return -EINVAL;
+    }
+    int64_t PollCompletion(NofSegmentHandle*, uint32_t) override { return 0; }
+
+    ErrorCode RegisterMemory(void* ptr, size_t size) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        ++register_calls_;
+        if (register_result_ != ErrorCode::OK) {
+            return register_result_;
+        }
+        registered_[ptr] = size;
+        return ErrorCode::OK;
+    }
+
+    ErrorCode UnregisterMemory(void* ptr) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        ++unregister_calls_;
+        if (unregister_result_ != ErrorCode::OK) {
+            return unregister_result_;
+        }
+        unregistered_.push_back(ptr);
+        return ErrorCode::OK;
+    }
+
+    NofCapabilities GetCapabilities() const override { return {}; }
+
+    bool WasUnregistered(void* ptr) const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return std::find(unregistered_.begin(), unregistered_.end(), ptr) !=
+               unregistered_.end();
+    }
+
+    mutable std::mutex mu_;
+    int register_calls_ = 0;
+    int unregister_calls_ = 0;
+    ErrorCode register_result_ = ErrorCode::OK;
+    ErrorCode unregister_result_ = ErrorCode::OK;
+    std::map<void*, size_t> registered_;
+    std::vector<void*> unregistered_;
+};
+
+// Clears the NoF runtime factory seam even when the test body fails.
+struct NofFactoryGuard {
+    ~NofFactoryGuard() { RealClient::SetNofRuntimeFactoryForTesting(nullptr); }
+};
+
+// Clears the TE unregister hook even when the test body fails.
+struct TeUnregisterHookGuard {
+    ~TeUnregisterHookGuard() {
+        RealClient::SetTeUnregisterHookForTesting(nullptr);
+    }
+};
+
+}  // namespace
+
+// Regression test: closing a client without manually unregistering every
+// buffer must still release its SPDK registrations (they live in the
+// process-global page registry, so orphaned entries would outlive the client
+// and a reopened client could reuse stale translation state).
+TEST_F(RealClientTest, TearDownWithoutUnregisterReleasesNofRegistrations) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    NofFactoryGuard guard;
+    auto initiator = std::make_shared<RecordingNofInitiator>();
+    RealClient::SetNofRuntimeFactoryForTesting([initiator]() {
+        return NofRuntime{initiator, std::make_shared<SystemDmaAllocator>()};
+    });
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17931", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_),
+              0);
+
+    std::vector<char> buffer(1 << 20);
+    ASSERT_EQ(py_client_->register_buffer(buffer.data(), buffer.size()), 0);
+    EXPECT_EQ(initiator->register_calls_, 1);
+
+    // Close WITHOUT unregister_buffer: teardown must release the
+    // registration anyway.
+    ASSERT_EQ(py_client_->tearDownAll(), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 1);
+    EXPECT_TRUE(initiator->WasUnregistered(buffer.data()));
+
+    // Reopen: a new client with a fresh initiator registers the same buffer
+    // cleanly, with no stale state carried over.
+    auto initiator2 = std::make_shared<RecordingNofInitiator>();
+    RealClient::SetNofRuntimeFactoryForTesting([initiator2]() {
+        return NofRuntime{initiator2, std::make_shared<SystemDmaAllocator>()};
+    });
+    py_client_ = RealClient::create();
+    ASSERT_EQ(py_client_->setup_real("localhost:17932", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_),
+              0);
+    ASSERT_EQ(py_client_->register_buffer(buffer.data(), buffer.size()), 0);
+    EXPECT_EQ(initiator2->register_calls_, 1);
+    EXPECT_EQ(initiator->register_calls_, 1);  // old initiator untouched
+
+    ASSERT_EQ(py_client_->tearDownAll(), 0);
+    EXPECT_TRUE(initiator2->WasUnregistered(buffer.data()));
+}
+
+// Regression test: a failed NoF registration must NOT fail register_buffer
+// as a whole; the buffer remains usable for non-NoF transfers.
+TEST_F(RealClientTest, RegisterBufferSucceedsWhenNofRegistrationFails) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    NofFactoryGuard guard;
+    auto initiator = std::make_shared<RecordingNofInitiator>();
+    initiator->register_result_ = ErrorCode::INTERNAL_ERROR;
+    RealClient::SetNofRuntimeFactoryForTesting([initiator]() {
+        return NofRuntime{initiator, std::make_shared<SystemDmaAllocator>()};
+    });
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17933", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_),
+              0);
+
+    std::vector<char> buffer(1 << 20);
+    // The NoF registration is attempted and fails, but the TE registration —
+    // and therefore register_buffer — succeeds.
+    ASSERT_EQ(py_client_->register_buffer(buffer.data(), buffer.size()), 0);
+    EXPECT_EQ(initiator->register_calls_, 1);
+
+    // unregister_buffer works; the NoF unregister is an idempotent no-op for
+    // a buffer the initiator never registered.
+    ASSERT_EQ(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 1);
+}
+
+// A failed NoF cleanup must not be reported as a successful
+// unregister_buffer: the API propagates the error and keeps the buffer
+// recorded so teardown retries the cleanup after TE is unregistered.
+TEST_F(RealClientTest, UnregisterBufferPropagatesNofCleanupFailure) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    NofFactoryGuard guard;
+    auto initiator = std::make_shared<RecordingNofInitiator>();
+    RealClient::SetNofRuntimeFactoryForTesting([initiator]() {
+        return NofRuntime{initiator, std::make_shared<SystemDmaAllocator>()};
+    });
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17934", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_),
+              0);
+
+    std::vector<char> buffer(1 << 20);
+    ASSERT_EQ(py_client_->register_buffer(buffer.data(), buffer.size()), 0);
+
+    // Backend cleanup fails: unregister_buffer must fail and must NOT drop
+    // the buffer record.
+    initiator->unregister_result_ = ErrorCode::INTERNAL_ERROR;
+    EXPECT_NE(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 1);
+
+    // Backend recovers: teardown retries the pending cleanup even though TE
+    // was already unregistered.
+    initiator->unregister_result_ = ErrorCode::OK;
+    ASSERT_EQ(py_client_->tearDownAll(), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 2);
+    EXPECT_TRUE(initiator->WasUnregistered(buffer.data()));
+}
+
+// A second unregister_buffer must reach the NoF cleanup even after the first
+// attempt already unregistered TE (TE then reports the buffer as
+// unregistered and would otherwise return early).
+TEST_F(RealClientTest, UnregisterBufferRetryReachesNofCleanup) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    NofFactoryGuard guard;
+    auto initiator = std::make_shared<RecordingNofInitiator>();
+    RealClient::SetNofRuntimeFactoryForTesting([initiator]() {
+        return NofRuntime{initiator, std::make_shared<SystemDmaAllocator>()};
+    });
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17935", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_),
+              0);
+
+    std::vector<char> buffer(1 << 20);
+    ASSERT_EQ(py_client_->register_buffer(buffer.data(), buffer.size()), 0);
+
+    initiator->unregister_result_ = ErrorCode::INTERNAL_ERROR;
+    EXPECT_NE(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 1);
+
+    // Without closing the client: the retry reaches the NoF cleanup.
+    initiator->unregister_result_ = ErrorCode::OK;
+    EXPECT_EQ(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 2);
+    EXPECT_TRUE(initiator->WasUnregistered(buffer.data()));
+
+    // Fully unregistered now: a third call has no record left and returns
+    // the TE error without touching the NoF side.
+    EXPECT_NE(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 2);
+
+    ASSERT_EQ(py_client_->tearDownAll(), 0);
+}
+
+// Regression test: teardown must NOT report success when a NoF cleanup
+// fails — caller-owned buffers may still be DMA-translated, so the failure
+// must surface (and the buffer stays recorded). A repeated teardown must
+// keep reporting the failure instead of decaying into success, and must
+// heal once the backend recovers.
+TEST_F(RealClientTest, TearDownReportsNofCleanupFailure) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    NofFactoryGuard guard;
+    auto initiator = std::make_shared<RecordingNofInitiator>();
+    RealClient::SetNofRuntimeFactoryForTesting([initiator]() {
+        return NofRuntime{initiator, std::make_shared<SystemDmaAllocator>()};
+    });
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17943", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_),
+              0);
+
+    std::vector<char> buffer(1 << 20);
+    ASSERT_EQ(py_client_->register_buffer(buffer.data(), buffer.size()), 0);
+
+    initiator->unregister_result_ = ErrorCode::INTERNAL_ERROR;
+    EXPECT_NE(py_client_->tearDownAll(), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 1);
+
+    // The first teardown latched closed_, but the failure is terminal until
+    // the cleanup actually succeeds: a second call retries the cleanup walk
+    // and must still report the failure.
+    EXPECT_NE(py_client_->tearDownAll(), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 2);
+
+    // The backend recovers: the retry heals and teardown reports success.
+    initiator->unregister_result_ = ErrorCode::OK;
+    EXPECT_EQ(py_client_->tearDownAll(), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 3);
+    EXPECT_TRUE(initiator->WasUnregistered(buffer.data()));
+}
+
+// Regression test for a partially failed TE deregistration: the first
+// unregister_buffer attempt fails inside TE (e.g. ibv_dereg_mr), and the
+// retry sees NOT_REGISTERED because TE metadata was already removed. The
+// store must still reach the NoF cleanup on the retry and must not report
+// success before every layer is clean.
+TEST_F(RealClientTest, UnregisterBufferRecoversAfterTePartialFailure) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    NofFactoryGuard guard;
+    auto initiator = std::make_shared<RecordingNofInitiator>();
+    RealClient::SetNofRuntimeFactoryForTesting([initiator]() {
+        return NofRuntime{initiator, std::make_shared<SystemDmaAllocator>()};
+    });
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17944", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_),
+              0);
+
+    std::vector<char> buffer(1 << 20);
+    ASSERT_EQ(py_client_->register_buffer(buffer.data(), buffer.size()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 0);
+
+    // Replay the TE failure sequence: the first call fails as a partial
+    // deregistration, the second reports NOT_REGISTERED (TE metadata was
+    // removed before the MR deregistration failed).
+    TeUnregisterHookGuard hook_guard;
+    int hook_calls = 0;
+    RealClient::SetTeUnregisterHookForTesting(
+        [&hook_calls](void*) -> tl::expected<void, ErrorCode> {
+            ++hook_calls;
+            if (hook_calls == 1) {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            return tl::unexpected(ErrorCode::NOT_REGISTERED);
+        });
+
+    // First attempt: real TE failure propagates, record kept, NoF untouched.
+    EXPECT_NE(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 0);
+
+    // Retry: NOT_REGISTERED is a truthful "TE clean" (the TE side retries a
+    // stuck MR deregistration before reporting it), so the store proceeds to
+    // the NoF cleanup and completes.
+    EXPECT_EQ(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 1);
+    EXPECT_TRUE(initiator->WasUnregistered(buffer.data()));
+
+    // Fully cleaned: a third call has no record and fails without touching
+    // the NoF side.
+    EXPECT_NE(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 1);
+
+    ASSERT_EQ(py_client_->tearDownAll(), 0);
+}
+
 // Regression for the read-side half of the dangling-replica problem: a
-// COMPLETE LOCAL_DISK replica whose backing file physically disappeared used
-// to make every read return empty bytes forever while the master kept
-// advertising the key. The batch get path must now heal it like the Put path
-// does: prove the file gone, evict the replica, and stop advertising the key
-// instead of returning a silent empty value.
+// COMPLETE LOCAL_DISK replica whose backing file physically disappeared
+// used to make every read return empty bytes forever while the master kept
+// advertising the key. The batch get path must now heal it like the Put
+// path does: prove the file gone, evict the replica, and stop advertising
+// the key instead of returning a silent empty value.
 TEST_F(RealClientTest, BatchGetBufferHealsDanglingLocalDiskReplica) {
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
     ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
@@ -3516,8 +3940,8 @@ TEST_F(RealClientTest, BatchGetBufferHealsDanglingLocalDiskReplica) {
     ASSERT_EQ(before.size(), 1u);
     ASSERT_NE(before[0], nullptr);
 
-    // The #3709 shape: the backing files are wiped while the master keeps the
-    // completed replica in metadata.
+    // The #3709 shape: the backing files are wiped while the master keeps
+    // the completed replica in metadata.
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
         std::filesystem::remove_all(entry.path(), ec);
@@ -3527,16 +3951,17 @@ TEST_F(RealClientTest, BatchGetBufferHealsDanglingLocalDiskReplica) {
     auto after = py_client_->batch_get_buffer({key});
     ASSERT_EQ(after.size(), 1u);
     EXPECT_EQ(after[0], nullptr);
-    // The dead replica must be evicted: the master stops advertising the key
-    // instead of letting every later read come back empty.
+    // The dead replica must be evicted: the master stops advertising the
+    // key instead of letting every later read come back empty.
     EXPECT_TRUE(py_client_->get_replica_desc(key).empty());
 }
 
-// fcczzz's race on #3889: a reader fails on replica R1, and before its verify
-// reaches the owner a remove + re-put replaces R1 with a fresh record on the
-// same owner. The conditional eviction must compare the reader's replica id
-// against the master's current record atomically under the shard write lock
-// and refuse when they differ, leaving the replacement untouched.
+// fcczzz's race on #3889: a reader fails on replica R1, and before its
+// verify reaches the owner a remove + re-put replaces R1 with a fresh
+// record on the same owner. The conditional eviction must compare the
+// reader's replica id against the master's current record atomically under
+// the shard write lock and refuse when they differ, leaving the replacement
+// untouched.
 TEST_F(RealClientTest, ConditionalEvictLeavesReplacedReplicaUntouched) {
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
     ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
@@ -3615,9 +4040,9 @@ TEST_F(RealClientTest, ConditionalEvictLeavesReplacedReplicaUntouched) {
     }
 
     // Now the remove + re-put half of the race. The fresh object comes back
-    // memory-only here: the bucket backend dedupes the re-offload against its
-    // persisted entry (a separate quirk, not what this test pins down). The
-    // stale verify carrying R1's id must still be refused and must not
+    // memory-only here: the bucket backend dedupes the re-offload against
+    // its persisted entry (a separate quirk, not what this test pins down).
+    // The stale verify carrying R1's id must still be refused and must not
     // disturb the replacement.
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     const auto remove_deadline =
@@ -3667,8 +4092,8 @@ TEST_F(RealClientTest, ConditionalEvictLeavesReplacedReplicaUntouched) {
 // fcczzz's counterexample on #3889: two disk-only keys in separate bucket
 // files on one owner, only A's file wiped. A failed batch must heal A while
 // leaving the healthy B alone — the probe used to answer "gone" for B too,
-// because it asked the raw object key against tenant-scoped storage keys and
-// never checked the physical file.
+// because it asked the raw object key against tenant-scoped storage keys
+// and never checked the physical file.
 TEST_F(RealClientTest, BatchGetBufferWipedSiblingPreservesHealthyReplica) {
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
     ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
@@ -3760,16 +4185,17 @@ TEST_F(RealClientTest, BatchGetBufferWipedSiblingPreservesHealthyReplica) {
     // surfaces a real miss.
     EXPECT_EQ(after[0], nullptr);
     EXPECT_TRUE(py_client_->get_replica_desc(key_a).empty());
-    // B's file is byte-for-byte intact: no eviction, and the read must still
-    // return its data.
+    // B's file is byte-for-byte intact: no eviction, and the read must
+    // still return its data.
     ASSERT_NE(after[1], nullptr);
     EXPECT_EQ(py_client_->get_replica_desc(key_b).size(), 1u);
 }
 
-// fcczzz's second counterexample on #3889: request {A, B, B} with A's bucket
-// file wiped and B healthy on the same owner. The batch dies wholesale, B's
-// standalone retry succeeds, but the healed status used to stay an error, so
-// the duplicate fan-out skipped the copy and the second B came back null.
+// fcczzz's second counterexample on #3889: request {A, B, B} with A's
+// bucket file wiped and B healthy on the same owner. The batch dies
+// wholesale, B's standalone retry succeeds, but the healed status used to
+// stay an error, so the duplicate fan-out skipped the copy and the second B
+// came back null.
 TEST_F(RealClientTest, BatchGetBufferHealedKeyFeedsDuplicateFanOut) {
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
     ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
@@ -3945,12 +4371,12 @@ TEST_F(RealClientTest, BatchGetBufferTruncatedBucketFileSurfacesMiss) {
     EXPECT_EQ(py_client_->get_replica_desc(key).size(), 1u);
 }
 
-// fcczzz's review on #3889: the heal used to live only in the batch path and
-// refused to act unless every COMPLETE replica was the caller's own
+// fcczzz's review on #3889: the heal used to live only in the batch path
+// and refused to act unless every COMPLETE replica was the caller's own
 // LOCAL_DISK, so a remote reader could never evict the owner's dangling
 // replica. A second client with no SSD of its own reads the owner's wiped
-// replica through the single-key get path: the read misses, and the probe to
-// the owner must still evict the dead replica.
+// replica through the single-key get path: the read misses, and the probe
+// to the owner must still evict the dead replica.
 TEST_F(RealClientTest,
        GetBufferRemoteReaderHealsOwnersDanglingLocalDiskReplica) {
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
@@ -3969,9 +4395,10 @@ TEST_F(RealClientTest,
                                   .set_default_kv_lease_ttl(10)
                                   .build()));
     master_address_ = master_.master_address();
-    // The owner holds the SSD offload; the reader has no disk of its own and
-    // can only reach the replica over the owner's offload RPC. The reader
-    // joins after the offload completes, the way a second node would.
+    // The owner holds the SSD offload; the reader has no disk of its own
+    // and can only reach the replica over the owner's offload RPC. The
+    // reader joins after the offload completes, the way a second node
+    // would.
     ASSERT_EQ(
         py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
                                16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
@@ -4034,9 +4461,9 @@ TEST_F(RealClientTest,
     reader->tearDownAll();
 }
 
-// Same remote-reader shape through the batch path: the reader's failed batch
-// read must find the failed replica by the endpoint it actually read from and
-// have the owner evict it.
+// Same remote-reader shape through the batch path: the reader's failed
+// batch read must find the failed replica by the endpoint it actually read
+// from and have the owner evict it.
 TEST_F(RealClientTest,
        BatchGetBufferRemoteReaderHealsOwnersDanglingLocalDiskReplica) {
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
@@ -4094,7 +4521,8 @@ TEST_F(RealClientTest,
     }
     ASSERT_TRUE(memory_cleared);
 
-    // The reader joins after the offload completed, like a second node would.
+    // The reader joins after the offload completed, like a second node
+    // would.
     auto reader = RealClient::create();
     ASSERT_EQ(
         reader->setup_real("localhost:17814", "P2PHANDSHAKE", 16 * 1024 * 1024,
@@ -4120,13 +4548,13 @@ TEST_F(RealClientTest,
 }
 
 // fcczzz's review on #3889: an SSD owner can hold objects recorded under a
-// different tenant than its own. The verify handler used to probe the scoped
-// file and emit the eviction under the owner's own tenant, so the probe
-// missed the tenant-scoped file and the eviction went to a master record
-// that does not exist (OBJECT_NOT_FOUND, swallowed as success), leaving the
-// dangling replica advertised. The verify request now carries the reader's
-// tenant, which always matches the tenant the write path scoped the file
-// with, and both the probe and the eviction go through it.
+// different tenant than its own. The verify handler used to probe the
+// scoped file and emit the eviction under the owner's own tenant, so the
+// probe missed the tenant-scoped file and the eviction went to a master
+// record that does not exist (OBJECT_NOT_FOUND, swallowed as success),
+// leaving the dangling replica advertised. The verify request now carries
+// the reader's tenant, which always matches the tenant the write path
+// scoped the file with, and both the probe and the eviction go through it.
 //
 // The owner is the cross-tenant side here: it runs on tenant-a while the
 // object and its callers stay on default, which also keeps the memory
@@ -4144,8 +4572,8 @@ TEST_F(RealClientTest, GetBufferHealUsesReaderTenantForCrossTenantReplica) {
     ssd_path_ = created;
 
     // Tenant isolation has to be on for the mismatch to exist: with it off
-    // the master resolves every tenant to default and the owner's tenant can
-    // never differ from the object's.
+    // the master resolves every tenant to default and the owner's tenant
+    // can never differ from the object's.
     char quota_path[] = "/tmp/mooncake_tenant_quota_heal_XXXXXX.yaml";
     const int quota_fd = mkstemps(quota_path, 5);
     ASSERT_NE(quota_fd, -1);
@@ -4165,9 +4593,9 @@ TEST_F(RealClientTest, GetBufferHealUsesReaderTenantForCrossTenantReplica) {
                                   .build()));
     master_address_ = master_.master_address();
     // The SSD owner runs on tenant-a. The object and its caller stay on the
-    // default tenant, so the offload file is written under the default scope
-    // while the owner's own tenant is wrong for both the probe and the
-    // eviction.
+    // default tenant, so the offload file is written under the default
+    // scope while the owner's own tenant is wrong for both the probe and
+    // the eviction.
     ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
                                      16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
                                      "", master_address_, nullptr, "", true,
@@ -4235,11 +4663,11 @@ TEST_F(RealClientTest, GetBufferHealUsesReaderTenantForCrossTenantReplica) {
 // fcczzz's review on #3889 (isolation-off follow-up): with tenant isolation
 // disabled the master resolves every request to "default", so the offload
 // file is written under the default scope no matter what tenant a reader is
-// configured with. A tenant-a reader's verify then probed the tenant-a scope,
-// reported the healthy default-scoped file missing, and the master normalized
-// the follow-up eviction to "default" and deleted that healthy replica. On a
-// scoped miss the handler now also probes the default scope and answers
-// undetermined instead of evicting on the ambiguity.
+// configured with. A tenant-a reader's verify then probed the tenant-a
+// scope, reported the healthy default-scoped file missing, and the master
+// normalized the follow-up eviction to "default" and deleted that healthy
+// replica. On a scoped miss the handler now also probes the default scope
+// and answers undetermined instead of evicting on the ambiguity.
 TEST_F(RealClientTest,
        GetBufferHealDoesNotEvictHealthyReplicaWhenTenancyIsOff) {
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
@@ -4320,14 +4748,14 @@ TEST_F(RealClientTest,
 }
 
 // fcczzz's review on #3889 (second round): with tenant isolation on, a
-// tenant-scoped object whose backing file is gone must still be evicted even
-// when a healthy same-named object sits under the default scope on the same
-// owner. Probing the default scope on a tenant-scoped miss made the healthy
-// default object shield the dangling tenant one: the verify answered
-// undetermined forever and the dangling replica kept being advertised. The
-// master now stamps the query's resolved tenant on GetReplicaListResponse,
-// the reader forwards it in the verify request, and the owner probes and
-// evicts under that exact scope instead of guessing.
+// tenant-scoped object whose backing file is gone must still be evicted
+// even when a healthy same-named object sits under the default scope on the
+// same owner. Probing the default scope on a tenant-scoped miss made the
+// healthy default object shield the dangling tenant one: the verify
+// answered undetermined forever and the dangling replica kept being
+// advertised. The master now stamps the query's resolved tenant on
+// GetReplicaListResponse, the reader forwards it in the verify request, and
+// the owner probes and evicts under that exact scope instead of guessing.
 TEST_F(RealClientTest,
        GetBufferHealEvictsTenantReplicaDespiteHealthyDefaultScope) {
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
@@ -4419,15 +4847,16 @@ TEST_F(RealClientTest,
         ASSERT_FALSE(ec) << ec.message();
     }
 
-    // A healthy same-named object under the default scope on the same owner.
+    // A healthy same-named object under the default scope on the same
+    // owner.
     ASSERT_EQ(default_caller->put(key, source), 0);
     ASSERT_TRUE(wait_disk_ready(default_caller.get()));
     ASSERT_TRUE(clear_memory(default_caller.get()));
 
     // The tenant-a read misses on disk, the verify must probe the tenant-a
-    // scope alone (the master resolved the query to tenant-a), prove the file
-    // gone, and evict the dangling replica. The healthy default-scoped object
-    // must not shield it and must not be touched.
+    // scope alone (the master resolved the query to tenant-a), prove the
+    // file gone, and evict the dangling replica. The healthy default-scoped
+    // object must not shield it and must not be touched.
     EXPECT_EQ(tenant_caller->get_buffer(key), nullptr);
     EXPECT_TRUE(tenant_caller->get_replica_desc(key).empty());
     EXPECT_NE(default_caller->get_buffer(key), nullptr);

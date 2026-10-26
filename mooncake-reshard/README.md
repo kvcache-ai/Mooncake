@@ -80,6 +80,58 @@ turn a compact N-D plan into an unbounded number of operations.
 The logical planner is copy-only. It does not infer model semantics from tensor
 names or transform dtype, quantization, packing, swizzle, or checkpoint format.
 
+## Tiled COO Partial Reads
+
+`TiledCOOLayout` and `plan_tiled_coo_read` provide a CPU-only, two-dimensional
+range planner for sparse coordinate/value streams. Source and target boxes may
+split different dimensions or use different parallel degrees. This planner
+does not gather a full tensor or prepartition the payload for a particular
+target topology.
+
+The producer orders entries by source record, then by row-major tile. Tiles
+are aligned to global tensor coordinates; each source record has its own
+contiguous tile directory even when records share a tensor ID. Coordinates and
+values remain separate flat arrays in the same entry order. A cumulative
+directory of `total_tiles + 1` entry offsets addresses the entire packed stream,
+including empty tiles; offsets do not restart at zero for each record.
+
+```python
+from mooncake.reshard.weight import TiledCOOLayout, plan_tiled_coo_read
+
+layout = TiledCOOLayout.build(
+    names=("weight",),
+    shapes=((512, 4096),),
+    offsets=((0, 0),),
+    tile_shape=(128, 64),
+)
+plan = plan_tiled_coo_read(layout, local_target_fragments)
+```
+
+Reuse `layout` and `plan` while tensor geometry and target placement stay the
+same. For every generation:
+
+1. Read `plan.offset_ranges` into a compact directory buffer. The planner may
+   combine nearby metadata windows, with at most 64 extra directory entries
+   per bridged gap.
+2. Project those windows using `plan.offset_gather_indices` and pass the fresh
+   integer endpoints to `plan.bind_offsets`. Never reuse previous-generation
+   offsets merely because the model structure is unchanged.
+3. Read the returned `payload_ranges` from both coordinate and value arrays,
+   converting entry offsets to bytes for each array's element size. Payload
+   ranges never bridge unrelated entries. `counts` and `compact_entries` map
+   each `plan.tile_runs` item to its compact destination interval, including
+   empty runs.
+4. Filter coordinates against the exact source/target intersection before
+   applying updates: a boundary tile may contain entries outside the target.
+
+Multiple targets may read the same tile into different compact destination
+intervals. This API does not deduplicate replicas, select a source generation,
+choose sparse/dense thresholds, encode values, or define additive versus
+replacement updates. Those decisions belong to the producer/consumer layer.
+The executor owns array-length, address, capacity and native integer-overflow
+checks, transport completion, and buffer lifetime. No Store, CUDA, BufferPool,
+or framework dependency is required to construct or bind this plan.
+
 ## Runtime Binding
 
 `bind_logical_transfer_plan` attaches selected typed
@@ -139,9 +191,29 @@ the compatibility entry point. `max_batch_operations`,
 `max_region_segments`, and `max_total_lowered_segments` bound physical
 expansion before native submission.
 
-This version drains each batch ticket to a known terminal state before it
-submits the next batch or endpoint. Native non-draining submission and a
-bounded multi-ticket window are the next performance phase.
+Set `max_inflight_batches` on the reader or sink to overlap batches across
+selected endpoints. The default, `1`, drains each batch before submitting the
+next. Larger windows require the native `submit_scatter_read/write` methods,
+which return a completion ticket immediately after submission. The executor
+drains the oldest ticket when the window is full and returns receipts in
+submission order. Batch size limits still apply to each submitted batch.
+
+All published tickets are drained before returning a known failure. Unresolved
+tickets share one pending-transfer handle, which retains the active
+registrations and allocation tokens until every ticket reaches a terminal
+state. A native submit exception without a recoverable ticket requires engine
+restart. The resource-neutral API exposes the same window through
+`TransferSubmission.execute_batches(..., max_inflight_batches=N)`.
+
+Each composite pending-ticket drain shares one timeout budget across its
+children. Later children receive the remaining budget, including zero for a
+non-blocking completion check. Backend calls must honor that timeout; status
+queries and scheduling overhead are additional to the wait budget.
+
+`execute_batches` borrows its input iterable and does not call `close()` on
+caller-owned iterators. Keep a resource-owning generator alive on early exit,
+and explicitly close it after outstanding transfers reach a terminal state.
+Its `finally` block must not free buffers still retained by a pending transfer.
 
 Live TE adapters accept runtime-bound source fragments. Store-backed restore
 continues through `WeightStore.load()`, which uses the same target placement and

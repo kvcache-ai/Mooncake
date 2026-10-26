@@ -84,9 +84,16 @@ add_store_test(master_metadata_config_test master_metadata_config_test.cpp)
 add_store_test(dfs_enablement_config_test dfs_enablement_config_test.cpp)
 add_store_test(master_service_weight_management_test
                master_service_weight_management_test.cpp)
+add_store_test(weight_group_lifecycle_test weight_group_lifecycle_test.cpp)
+add_store_test(weight_reconciliation_test weight_reconciliation_test.cpp)
+add_store_test(weight_management_rpc_test weight_management_rpc_test.cpp)
 add_store_test(master_service_group_test master_service_group_test.cpp)
 add_store_test(master_service_object_ref_test
                master_service_object_ref_test.cpp)
+add_store_test(master_service_tenant_iteration_test
+               master_service_tenant_iteration_test.cpp)
+add_store_test(master_service_batch_read_test
+               master_service_batch_read_test.cpp)
 add_ha_test(master_service_evict_scenario_test
             master_service_evict_scenario_test.cpp)
 target_link_libraries(master_service_evict_scenario_test
@@ -148,10 +155,24 @@ add_store_test(dynamic_replication_test dynamic_replication_test.cpp)
 add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
 if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
+  add_store_test(nof_env_reacquire_test nof_env_reacquire_test.cpp)
 endif()
 add_store_test(nof_register_config_test nof_register_config_test.cpp)
 add_store_test(spdk_controller_config_test spdk_controller_config_test.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
+add_test(NAME client_hca_affinity_test
+         COMMAND client_integration_test
+                 --gtest_filter=HcaAffinityTest.*:ReadAffinityTest.*)
+set_tests_properties(client_hca_affinity_test
+                     PROPERTIES ENVIRONMENT "MC_STORE_HCA_AFFINITY=1")
+add_test(
+  NAME master_service_hca_affinity_test
+  COMMAND
+    master_service_test
+    --gtest_filter=MasterServiceTest.MixedGpuBatchUsesEachKeysHcaHint:MasterServiceTest.PutAndBatchUpsertHonorReceiverHcaLocality:MasterServiceTest.HcaHintFallsBackForLargeOffsetObject
+)
+set_tests_properties(master_service_hca_affinity_test
+                     PROPERTIES ENVIRONMENT "MC_STORE_HCA_AFFINITY=1")
 add_store_test(batch_replica_clear_tenant_rpc_test
                batch_replica_clear_tenant_rpc_test.cpp)
 add_store_test(rpc_worker_pool_test rpc_worker_pool_test.cpp)
@@ -175,6 +196,10 @@ add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
+add_store_test(nvmeof_initiator_test nvmeof_initiator_test.cpp)
+add_store_test(nof_page_registry_test nof_page_registry_test.cpp)
+add_store_test(nof_probe_context_pool_test
+               nof_probe_context_pool_test.cpp)
 if(USE_TENT)
   target_compile_definitions(transfer_task_test PRIVATE USE_TENT)
   target_link_libraries(transfer_task_test PRIVATE tent)
@@ -216,7 +241,7 @@ if(USE_TENT)
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_manager_test tenant_quota_manager_test.cpp)
-add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
+add_store_test(tenant_quota_policy_test tenant_quota_policy_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(object_part_test object_part_test.cpp)
 add_store_test(object_route_test object_route_test.cpp)
@@ -228,18 +253,22 @@ add_store_test(promotion_candidate_tracker_test
 add_store_test(dynamic_replication_lease_table_test
                dynamic_replication_lease_table_test.cpp)
 add_store_test(group_index_test group_index_test.cpp)
-add_store_test(metadata_tenant_test metadata_tenant_test.cpp)
-add_store_test(metadata_tenant_registry_test metadata_tenant_registry_test.cpp)
+add_store_test(metadata_namespace_test metadata_namespace_test.cpp)
+add_store_test(metadata_namespace_table_test metadata_namespace_table_test.cpp)
+add_store_test(eviction_index_test eviction_index_test.cpp)
+add_store_test(evictor_test evictor_test.cpp)
+add_store_test(client_readonly_query_test client_readonly_query_test.cpp)
+add_store_test(prefetch_throttle_test prefetch_throttle_test.cpp)
+add_store_test(prefetch_task_master_test prefetch_task_master_test.cpp)
+add_store_test(prefetch_teardown_test prefetch_teardown_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)
 target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(local_ssd_test PRIVATE mooncake_local_ssd gtest
                                              gtest_main)
 add_test(NAME local_ssd_test COMMAND local_ssd_test)
-add_store_test(local_ssd_codec_test ha/snapshot/local_ssd_codec_test.cpp)
-add_store_test(store_resource_snapshot_codec_test
-               ha/snapshot/store_resource_snapshot_codec_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
+add_store_test(crc32c_test crc32c_test.cpp)
 add_store_test(byte_size_test byte_size_test.cpp)
 add_store_test(network_test network_test.cpp)
 add_store_test(hugepage_config_test hugepage_config_test.cpp)
@@ -263,6 +292,7 @@ add_store_test(real_client_hugepage_register_test
                real_client_hugepage_register_test.cpp)
 add_store_test(real_client_regular_page_register_test
                real_client_regular_page_register_test.cpp)
+add_store_test(real_client_uninitialized_test real_client_uninitialized_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(standalone_client_test standalone_client_test.cpp)
@@ -285,8 +315,6 @@ add_store_test(host_port_fix_test host_port_fix_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
 if(USE_NOF)
   add_store_test(nof_metrics_test nof_metrics_test.cpp)
-  target_include_directories(nof_metrics_test PRIVATE ${SPDK_INCLUDE_DIR}
-                                                      ${DPDK_INCLUDE_DIR})
 endif()
 add_store_test(client_host_identity_config_test
                client_host_identity_config_test.cpp)
@@ -300,7 +328,6 @@ set_tests_properties(client_metric_cluster_id_test
                      PROPERTIES ENVIRONMENT "MC_STORE_CLUSTER_ID=test-cluster")
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(allocator_metric_test allocator_metric_test.cpp)
-add_store_test(serializer_test serializer_test.cpp)
 add_store_test(dfs_posix_test dfs_posix_test.cpp)
 add_store_test(dfs_immutable_bucket_allocator_test
                dfs_immutable_bucket_allocator_test.cpp)
