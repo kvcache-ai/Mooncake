@@ -193,7 +193,7 @@ class TentMetrics {
     void recordMemoryOperation(TransportType tp, MemoryOperation operation,
                                OperationOutcome outcome, size_t bytes);
 
-    enum class WorkerKind { EngineProgress, Staging };
+    enum class WorkerKind { EngineProgress, Staging, Rdma };
     enum class StagingCleanupKind { Group, Batch, RemoteOperation };
 
     // Worker timestamps and staging gauges are current state, so updates stay
@@ -228,6 +228,34 @@ class TentMetrics {
     void recordRpcAttempt(RpcMethod method, RpcOutcome outcome,
                           double latency_us);
     void recordRpcRetry(RpcMethod method);
+
+    enum class RdmaSliceEvent {
+        Enqueued,
+        PostAttempt,
+        PathError,
+        PostError,
+        CompletionSuccess,
+        CompletionError,
+        CompletionFlush,
+        LateCompletion,
+        SoftwareTimeout,
+    };
+    enum class RdmaRetryCause { Endpoint, Post, Completion };
+    enum class RdmaCompletionOutcome { Success, WcError, Flush, Late };
+
+    // RDMA data-path metrics count slices, not logical requests. Retry
+    // counters advance only when another worker-queue attempt is actually
+    // issued; retry-exhausted is terminal and does not also count as retry.
+    void recordRdmaSliceEvent(Request::OpCode operation, RdmaSliceEvent event,
+                              int64_t count = 1);
+    void recordRdmaRetry(Request::OpCode operation, RdmaRetryCause cause);
+    void recordRdmaRetryExhausted(Request::OpCode operation,
+                                  RdmaRetryCause cause);
+    void recordRdmaCqPollError();
+    void recordRdmaWorkerInflight(Request::OpCode operation, int64_t delta);
+    void recordRdmaPostedInflight(Request::OpCode operation, int64_t delta);
+    void recordRdmaCompletion(Request::OpCode operation,
+                              RdmaCompletionOutcome outcome, double latency_us);
 
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
@@ -346,6 +374,12 @@ class TentMetrics {
     static inline const std::array<std::string, 2> kRpcAttemptLabels{"method",
                                                                      "outcome"};
     static inline const std::array<std::string, 1> kRpcMethodLabel{"method"};
+    static inline const std::array<std::string, 2> kRdmaEventLabels{"operation",
+                                                                    "event"};
+    static inline const std::array<std::string, 2> kRdmaRetryLabels{"operation",
+                                                                    "cause"};
+    static inline const std::array<std::string, 2> kRdmaCompletionLabels{
+        "operation", "outcome"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -355,13 +389,22 @@ class TentMetrics {
         static_cast<size_t>(kNumTransportTypes);
     static constexpr size_t kAttemptDomain = kTransportDomain * 2;
     static constexpr size_t kTaskFailureDomain = kTransportDomain * 4;
-    static constexpr size_t kWorkerDomain = 2;
+    static constexpr size_t kWorkerDomain = 3;
     static constexpr size_t kOperationDomain = 2;
     static constexpr size_t kCleanupKindDomain = 3;
     static constexpr size_t kRpcMethodDomain = 13;
     static constexpr size_t kRpcOutcomeDomain = 3;
     static constexpr size_t kRpcAttemptDomain =
         kRpcMethodDomain * kRpcOutcomeDomain;
+    static constexpr size_t kRdmaSliceEventDomain = 9;
+    static constexpr size_t kRdmaRetryCauseDomain = 3;
+    static constexpr size_t kRdmaCompletionOutcomeDomain = 4;
+    static constexpr size_t kRdmaEventDomain =
+        kOperationDomain * kRdmaSliceEventDomain;
+    static constexpr size_t kRdmaRetryDomain =
+        kOperationDomain * kRdmaRetryCauseDomain;
+    static constexpr size_t kRdmaCompletionDomain =
+        kOperationDomain * kRdmaCompletionOutcomeDomain;
 
     // Stable slot indices into the cached-cell label domain.
     static size_t transportSlot(TransportType tp) {
@@ -378,6 +421,21 @@ class TentMetrics {
     }
     static size_t rpcAttemptSlot(RpcMethod method, RpcOutcome outcome) {
         return static_cast<size_t>(method) * kRpcOutcomeDomain +
+               static_cast<size_t>(outcome);
+    }
+    static size_t rdmaEventSlot(Request::OpCode operation,
+                                RdmaSliceEvent event) {
+        return operationSlot(operation) * kRdmaSliceEventDomain +
+               static_cast<size_t>(event);
+    }
+    static size_t rdmaRetrySlot(Request::OpCode operation,
+                                RdmaRetryCause cause) {
+        return operationSlot(operation) * kRdmaRetryCauseDomain +
+               static_cast<size_t>(cause);
+    }
+    static size_t rdmaCompletionSlot(Request::OpCode operation,
+                                     RdmaCompletionOutcome outcome) {
+        return operationSlot(operation) * kRdmaCompletionOutcomeDomain +
                static_cast<size_t>(outcome);
     }
 
@@ -457,6 +515,21 @@ class TentMetrics {
         "tent_rpc_retries_total",
         "Physical TENT client RPC retry attempts actually issued",
         kRpcMethodLabel, kRpcMethodDomain};
+    metrics::CachedDynamicCounter<2> rdma_slice_events_total_{
+        "tent_rdma_slice_events_total",
+        "RDMA slice lifecycle events by operation and event", kRdmaEventLabels,
+        kRdmaEventDomain};
+    metrics::CachedDynamicCounter<2> rdma_retries_total_{
+        "tent_rdma_retries_total",
+        "RDMA slice retries actually re-enqueued by cause", kRdmaRetryLabels,
+        kRdmaRetryDomain};
+    metrics::CachedDynamicCounter<2> rdma_retry_exhausted_total_{
+        "tent_rdma_retry_exhausted_total",
+        "RDMA slices terminated after exhausting retries by cause",
+        kRdmaRetryLabels, kRdmaRetryDomain};
+    ylt::metric::counter_t rdma_cq_poll_errors_total_{
+        "tent_rdma_cq_poll_errors_total",
+        "RDMA completion queue poll calls that returned an error"};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_
@@ -484,6 +557,14 @@ class TentMetrics {
         "tent_staging_cleanup_pending",
         "Deferred staging cleanup resources still awaiting safe release",
         kCleanupKindLabel, kCleanupKindDomain};
+    metrics::CachedDynamicCounter<1> rdma_worker_inflight_slices_{
+        "tent_rdma_worker_inflight_slices",
+        "RDMA slices owned by worker queues or completion processing",
+        kOperationLabel, kOperationDomain};
+    metrics::CachedDynamicCounter<1> rdma_posted_inflight_slices_{
+        "tent_rdma_posted_inflight_slices",
+        "RDMA slices reserved for posting or awaiting completion",
+        kOperationLabel, kOperationDomain};
     std::vector<metrics::CachedDynamicCounter<1>*> gauges_;
 
     // Latency histograms use microseconds (us) as unit
@@ -546,6 +627,10 @@ class TentMetrics {
         "tent_rpc_attempt_latency_us",
         "Physical TENT client RPC attempt latency in microseconds",
         kLatencyBuckets, kRpcAttemptLabels, kRpcAttemptDomain};
+    metrics::CachedDynamicHistogram<2> rdma_completion_latency_{
+        "tent_rdma_completion_latency_us",
+        "RDMA posted-slice completion latency in microseconds", kLatencyBuckets,
+        kRdmaCompletionLabels, kRdmaCompletionDomain};
 
     // Per-transport (N=1) histograms for unified serialization; the N=2
     // attempt histograms are serialized separately (see getPrometheusMetrics /

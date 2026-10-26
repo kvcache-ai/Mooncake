@@ -250,12 +250,18 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_staging_cleanup_timeouts_total` | Counter | - | Staging shutdown drains that reached their configured deadline |
 | `tent_rpc_attempts_total` | Counter | `method`, `outcome` | Physical TENT client RPC attempts, including attempts that fail to connect |
 | `tent_rpc_retries_total` | Counter | `method` | Retry attempts actually issued by an idempotent RPC call |
+| `tent_rdma_slice_events_total` | Counter | `operation`, `event` | RDMA slice lifecycle events from initial worker enqueue through post, completion, timeout, or pre-post failure |
+| `tent_rdma_retries_total` | Counter | `operation`, `cause` | RDMA slice retries actually re-enqueued after endpoint, post, or completion failure |
+| `tent_rdma_retry_exhausted_total` | Counter | `operation`, `cause` | RDMA slices terminated after reaching the configured retry limit |
+| `tent_rdma_cq_poll_errors_total` | Counter | - | Completion queue polls that returned an error |
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
 | `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
-| `tent_worker_last_progress_timestamp_seconds` | Gauge | `worker` | Unix timestamp of the last observed engine-progress or staging-worker progress |
+| `tent_worker_last_progress_timestamp_seconds` | Gauge | `worker` | Unix timestamp of the last observed engine-progress, staging, or RDMA-worker progress |
 | `tent_staging_inflight_tasks` | Gauge | `operation` | Parent staging tasks currently executing in staging workers |
 | `tent_staging_inflight_bytes` | Gauge | `operation` | Parent request bytes currently executing in staging workers |
 | `tent_staging_cleanup_pending` | Gauge | `kind` | Deferred cleanup groups, child batches, or remote operations still awaiting safe release |
+| `tent_rdma_worker_inflight_slices` | Gauge | `operation` | RDMA slices owned by worker queues or completion processing |
+| `tent_rdma_posted_inflight_slices` | Gauge | `operation` | RDMA slices reserved for posting or posted and not yet resolved |
 | `tent_read_latency_us` | Histogram | `transport` | Read latency distribution in microseconds |
 | `tent_write_latency_us` | Histogram | `transport` | Write latency distribution in microseconds |
 | `tent_read_size_bytes` | Histogram | `transport` | Read request size distribution in bytes |
@@ -266,6 +272,7 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_stage_transport_us` | Histogram | `transport` | Causal chain: transport execution latency in microseconds |
 | `tent_transport_attempt_latency_us` | Histogram | `transport`, `operation` | Observed latency of each physical transport attempt |
 | `tent_rpc_attempt_latency_us` | Histogram | `method`, `outcome` | End-to-end latency of each physical client RPC attempt, including connection setup when needed |
+| `tent_rdma_completion_latency_us` | Histogram | `operation`, `outcome` | Post-to-CQ latency of physical RDMA slice completions |
 
 ### Metrics pipeline self-observability
 
@@ -308,10 +315,12 @@ addresses, segment names, or other unbounded values are accepted.
 | `operation` | `read`, `write`; `register`, `unregister` | Attempt or memory lifecycle operation, depending on the metric family |
 | `phase` | `metadata`, `admission`, `selection`, `connect`, `register`, `submit`, `queue`, `post`, `poll`, `completion`, `retry`, `failover`, `notify`, `cleanup`, `shutdown` | Stable phase where a terminal failure originated |
 | `reason` | `submit`, `poll`, `timeout`, `canceled` for `tent_task_failures_total`; `timeout`, `unavailable`, `queue_full`, `resource_exhausted`, `protocol`, `stale_generation`, `wc_error`, `cq_error`, `mr_error`, `peer_closed`, `canceled`, `internal` for `tent_terminal_failures_total` | Bounded failure classification |
-| `outcome` | `success`, `failure` for memory lifecycle metrics; `success`, `connection_error`, `rpc_error` for RPC metrics | Bounded operation outcome |
-| `worker` | `engine_progress`, `staging` | Worker subsystem reporting forward progress |
+| `outcome` | `success`, `failure` for memory lifecycle metrics; `success`, `connection_error`, `rpc_error` for RPC metrics; `success`, `wc_error`, `flush`, `late` for RDMA completions | Bounded operation outcome |
+| `worker` | `engine_progress`, `staging`, `rdma` | Worker subsystem reporting forward progress |
 | `kind` | `group`, `batch`, `remote_operation` | Deferred staging cleanup resource kind |
 | `method` | `get_segment_desc`, `bootstrap_rdma`, `bootstrap_ub`, `send_data`, `recv_data`, `notify`, `probe`, `delegate`, `pin`, `unpin`, `subscribe_segment_update`, `notify_segment_updated`, `unknown` | TENT RPC method; `unknown` safely bounds extension methods |
+| `event` | `enqueued`, `post_attempt`, `path_error`, `post_error`, `completion_success`, `completion_error`, `completion_flush`, `late_completion`, `software_timeout` | RDMA slice lifecycle transition observed at its canonical owner |
+| `cause` | `endpoint`, `post`, `completion` | RDMA retry or retry-exhaustion source |
 | `format` | `prometheus`, `json` | Serialization output format |
 | `from` | (same set) | Transport that failed before failover |
 | `to` | (same set) | Transport that the failover switched to |
@@ -327,7 +336,7 @@ Transport label values come from the shared `transportTypeName()` mapping.
 few pairs ever occur), each attempt metric has at most 17x2 = 34
 transport/operation combinations, task failures have at most 17x4 = 68,
 terminal failures have at most 17x15x12 = 3060, each memory lifecycle family
-has at most 17x2x2 = 68, worker progress has two series, each staging in-flight
+has at most 17x2x2 = 68, worker progress has three series, each staging in-flight
 family has two operation series, staging cleanup has three kind series, and
 each serialization family has exactly two series. Dynamic counters allocate
 only label combinations that actually occur. Build identity labels are
@@ -341,12 +350,24 @@ records two attempts and one retry. A peer response that carries an
 application-level error is still a successful RPC transport attempt; the
 caller-facing failure is classified by the owning subsystem metric or log.
 
+RDMA metrics count physical slices, not logical requests. Slice events have at
+most 2x9 = 18 operation/event series. Retry and retry-exhausted counters each
+have at most 2x3 = 6 operation/cause series, completion latency has at most
+2x4 = 8 operation/outcome series, and each RDMA in-flight gauge has two
+operation series. `post_attempt` is recorded immediately before the verbs post
+call; a rejected work request additionally records `post_error` and is removed
+from the posted gauge. `late_completion` is a CQE for a slice already resolved
+by timeout, cancellation, or an adjacent queue-pair sweep. A retry is counted
+only when the slice is actually re-enqueued; an exhausted attempt increments
+only `tent_rdma_retry_exhausted_total`.
+
 `tent_worker_last_progress_timestamp_seconds` advances when the engine progress
-worker completes a wake cycle and when a staging worker changes a chunk state
-or finishes a parent task. An idle worker is expected to retain its previous
-timestamp; alert on its age only when the corresponding in-flight or queue
-signals show outstanding work. The JSON endpoint reports the most recent
-timestamp across workers, while Prometheus preserves the per-worker labels.
+worker completes a wake cycle, when a staging worker changes a chunk state or
+finishes a parent task, and when an RDMA worker completes a post/poll cycle.
+An idle worker is expected to retain its previous timestamp; alert on its age
+only when the corresponding in-flight or queue signals show outstanding work.
+The JSON endpoint reports the most recent timestamp across workers, while
+Prometheus preserves the per-worker labels.
 
 Staging in-flight gauges cover parent tasks after a staging worker dequeues
 them and before it hands any undrained resources to deferred cleanup. Work

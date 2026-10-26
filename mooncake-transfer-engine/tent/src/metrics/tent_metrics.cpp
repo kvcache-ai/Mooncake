@@ -186,6 +186,8 @@ const char* workerKindName(TentMetrics::WorkerKind worker) {
             return "engine_progress";
         case TentMetrics::WorkerKind::Staging:
             return "staging";
+        case TentMetrics::WorkerKind::Rdma:
+            return "rdma";
     }
     return "unknown";
 }
@@ -242,6 +244,57 @@ const char* rpcOutcomeName(TentMetrics::RpcOutcome outcome) {
             return "connection_error";
         case TentMetrics::RpcOutcome::RpcError:
             return "rpc_error";
+    }
+    return "unknown";
+}
+
+const char* rdmaSliceEventName(TentMetrics::RdmaSliceEvent event) {
+    switch (event) {
+        case TentMetrics::RdmaSliceEvent::Enqueued:
+            return "enqueued";
+        case TentMetrics::RdmaSliceEvent::PostAttempt:
+            return "post_attempt";
+        case TentMetrics::RdmaSliceEvent::PathError:
+            return "path_error";
+        case TentMetrics::RdmaSliceEvent::PostError:
+            return "post_error";
+        case TentMetrics::RdmaSliceEvent::CompletionSuccess:
+            return "completion_success";
+        case TentMetrics::RdmaSliceEvent::CompletionError:
+            return "completion_error";
+        case TentMetrics::RdmaSliceEvent::CompletionFlush:
+            return "completion_flush";
+        case TentMetrics::RdmaSliceEvent::LateCompletion:
+            return "late_completion";
+        case TentMetrics::RdmaSliceEvent::SoftwareTimeout:
+            return "software_timeout";
+    }
+    return "unknown";
+}
+
+const char* rdmaRetryCauseName(TentMetrics::RdmaRetryCause cause) {
+    switch (cause) {
+        case TentMetrics::RdmaRetryCause::Endpoint:
+            return "endpoint";
+        case TentMetrics::RdmaRetryCause::Post:
+            return "post";
+        case TentMetrics::RdmaRetryCause::Completion:
+            return "completion";
+    }
+    return "unknown";
+}
+
+const char* rdmaCompletionOutcomeName(
+    TentMetrics::RdmaCompletionOutcome outcome) {
+    switch (outcome) {
+        case TentMetrics::RdmaCompletionOutcome::Success:
+            return "success";
+        case TentMetrics::RdmaCompletionOutcome::WcError:
+            return "wc_error";
+        case TentMetrics::RdmaCompletionOutcome::Flush:
+            return "flush";
+        case TentMetrics::RdmaCompletionOutcome::Late:
+            return "late";
     }
     return "unknown";
 }
@@ -442,6 +495,10 @@ void TentMetrics::registerMetrics() {
         &staging_cleanup_timeouts_total_,
         &rpc_attempts_total_,
         &rpc_retries_total_,
+        &rdma_slice_events_total_,
+        &rdma_retries_total_,
+        &rdma_retry_exhausted_total_,
+        &rdma_cq_poll_errors_total_,
     };
 
     gauges_ = {
@@ -451,6 +508,8 @@ void TentMetrics::registerMetrics() {
         &staging_inflight_tasks_,
         &staging_inflight_bytes_,
         &staging_cleanup_pending_,
+        &rdma_worker_inflight_slices_,
+        &rdma_posted_inflight_slices_,
     };
 
     // Register the N=1 per-transport histograms for unified serialization.
@@ -652,6 +711,101 @@ void TentMetrics::recordRpcRetry(RpcMethod method) {
     });
 }
 
+void TentMetrics::recordRdmaSliceEvent(Request::OpCode operation,
+                                       RdmaSliceEvent event, int64_t count) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed) ||
+        count <= 0)
+        return;
+    rdma_slice_events_total_.incCached(
+        rdmaEventSlot(operation, event),
+        [operation, event] {
+            return std::array<std::string, 2>{operationName(operation),
+                                              rdmaSliceEventName(event)};
+        },
+        count);
+}
+
+void TentMetrics::recordRdmaRetry(Request::OpCode operation,
+                                  RdmaRetryCause cause) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    rdma_retries_total_.incCached(
+        rdmaRetrySlot(operation, cause), [operation, cause] {
+            return std::array<std::string, 2>{operationName(operation),
+                                              rdmaRetryCauseName(cause)};
+        });
+}
+
+void TentMetrics::recordRdmaRetryExhausted(Request::OpCode operation,
+                                           RdmaRetryCause cause) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    rdma_retry_exhausted_total_.incCached(
+        rdmaRetrySlot(operation, cause), [operation, cause] {
+            return std::array<std::string, 2>{operationName(operation),
+                                              rdmaRetryCauseName(cause)};
+        });
+}
+
+void TentMetrics::recordRdmaCqPollError() {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    rdma_cq_poll_errors_total_.inc();
+}
+
+void TentMetrics::recordRdmaWorkerInflight(Request::OpCode operation,
+                                           int64_t delta) {
+    if (!initialized_ || delta == 0) return;
+    rdma_worker_inflight_slices_.incCached(
+        operationSlot(operation),
+        [operation] {
+            return std::array<std::string, 1>{operationName(operation)};
+        },
+        delta);
+}
+
+void TentMetrics::recordRdmaPostedInflight(Request::OpCode operation,
+                                           int64_t delta) {
+    if (!initialized_ || delta == 0) return;
+    rdma_posted_inflight_slices_.incCached(
+        operationSlot(operation),
+        [operation] {
+            return std::array<std::string, 1>{operationName(operation)};
+        },
+        delta);
+}
+
+void TentMetrics::recordRdmaCompletion(Request::OpCode operation,
+                                       RdmaCompletionOutcome outcome,
+                                       double latency_us) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    RdmaSliceEvent event = RdmaSliceEvent::CompletionError;
+    switch (outcome) {
+        case RdmaCompletionOutcome::Success:
+            event = RdmaSliceEvent::CompletionSuccess;
+            break;
+        case RdmaCompletionOutcome::WcError:
+            event = RdmaSliceEvent::CompletionError;
+            break;
+        case RdmaCompletionOutcome::Flush:
+            event = RdmaSliceEvent::CompletionFlush;
+            break;
+        case RdmaCompletionOutcome::Late:
+            event = RdmaSliceEvent::LateCompletion;
+            break;
+    }
+    recordRdmaSliceEvent(operation, event);
+    if (latency_us < 0.0) return;
+    rdma_completion_latency_.observeCached(
+        rdmaCompletionSlot(operation, outcome),
+        [operation, outcome] {
+            return std::array<std::string, 2>{
+                operationName(operation), rdmaCompletionOutcomeName(outcome)};
+        },
+        static_cast<int64_t>(latency_us));
+}
+
 // Gauge updates below deliberately ignore runtime_enabled_: gauges track
 // engine state through paired add/sub operations (attempt start/finish,
 // register/unregister), and skipping one half of a pair across a
@@ -799,6 +953,7 @@ std::string TentMetrics::getPrometheusMetrics() {
         // N=2.
         serializeHistogramPrometheus(transport_attempt_latency_, result);
         serializeHistogramPrometheus(rpc_attempt_latency_, result);
+        serializeHistogramPrometheus(rdma_completion_latency_, result);
 
         // Gauges: current value per label.
         for (auto* gauge : gauges_) {
@@ -1139,6 +1294,14 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&rpc_attempts_total_);
         root[rpc_retries_total_.str_name()] =
             sumCounterValues(&rpc_retries_total_);
+        root[rdma_slice_events_total_.str_name()] =
+            sumCounterValues(&rdma_slice_events_total_);
+        root[rdma_retries_total_.str_name()] =
+            sumCounterValues(&rdma_retries_total_);
+        root[rdma_retry_exhausted_total_.str_name()] =
+            sumCounterValues(&rdma_retry_exhausted_total_);
+        root[rdma_cq_poll_errors_total_.str_name()] =
+            static_cast<int64_t>(rdma_cq_poll_errors_total_.value());
 
         // Gauges: aggregate across transport labels (total in-flight attempts
         // / total registered bytes). Per-transport breakdown is via the
@@ -1155,6 +1318,10 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&staging_inflight_bytes_);
         root[staging_cleanup_pending_.str_name()] =
             sumCounterValues(&staging_cleanup_pending_);
+        root[rdma_worker_inflight_slices_.str_name()] =
+            sumCounterValues(&rdma_worker_inflight_slices_);
+        root[rdma_posted_inflight_slices_.str_name()] =
+            sumCounterValues(&rdma_posted_inflight_slices_);
 
         // Histograms: sum bucket counts across all transport labels. The
         // templated helper also reads back the histogram's sum counter so the
@@ -1170,6 +1337,7 @@ std::string TentMetrics::getJsonMetrics() {
         serializeHistogramToJson(root, stage_transport_);
         serializeHistogramToJson(root, transport_attempt_latency_);
         serializeHistogramToJson(root, rpc_attempt_latency_);
+        serializeHistogramToJson(root, rdma_completion_latency_);
 
         root["tent_metrics_build_info"] = {
             {"version", TENT_BUILD_VERSION},
@@ -1301,6 +1469,15 @@ void TentMetrics::recordStagingCleanupPending(StagingCleanupKind, int64_t) {}
 void TentMetrics::recordStagingCleanupTimeout() {}
 void TentMetrics::recordRpcAttempt(RpcMethod, RpcOutcome, double) {}
 void TentMetrics::recordRpcRetry(RpcMethod) {}
+void TentMetrics::recordRdmaSliceEvent(Request::OpCode, RdmaSliceEvent,
+                                       int64_t) {}
+void TentMetrics::recordRdmaRetry(Request::OpCode, RdmaRetryCause) {}
+void TentMetrics::recordRdmaRetryExhausted(Request::OpCode, RdmaRetryCause) {}
+void TentMetrics::recordRdmaCqPollError() {}
+void TentMetrics::recordRdmaWorkerInflight(Request::OpCode, int64_t) {}
+void TentMetrics::recordRdmaPostedInflight(Request::OpCode, int64_t) {}
+void TentMetrics::recordRdmaCompletion(Request::OpCode, RdmaCompletionOutcome,
+                                       double) {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}

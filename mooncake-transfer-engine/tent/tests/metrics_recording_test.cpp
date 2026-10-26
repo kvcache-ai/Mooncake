@@ -436,6 +436,19 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordRpcAttempt(TentMetrics::RpcMethod::Probe,
                              TentMetrics::RpcOutcome::Success, 25.0);
     metrics.recordRpcRetry(TentMetrics::RpcMethod::GetSegmentDesc);
+    metrics.recordRdmaSliceEvent(Request::READ,
+                                 TentMetrics::RdmaSliceEvent::Enqueued);
+    metrics.recordRdmaRetry(Request::READ,
+                            TentMetrics::RdmaRetryCause::Endpoint);
+    metrics.recordRdmaRetryExhausted(Request::WRITE,
+                                     TentMetrics::RdmaRetryCause::Post);
+    metrics.recordRdmaCqPollError();
+    metrics.recordRdmaWorkerInflight(Request::READ, 1);
+    metrics.recordRdmaWorkerInflight(Request::READ, -1);
+    metrics.recordRdmaPostedInflight(Request::WRITE, 1);
+    metrics.recordRdmaPostedInflight(Request::WRITE, -1);
+    metrics.recordRdmaCompletion(
+        Request::WRITE, TentMetrics::RdmaCompletionOutcome::Success, 35.0);
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -445,7 +458,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 41>
+    const std::array<std::pair<std::string_view, std::string_view>, 48>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -465,12 +478,18 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_staging_cleanup_timeouts_total", "counter"},
             {"tent_rpc_attempts_total", "counter"},
             {"tent_rpc_retries_total", "counter"},
+            {"tent_rdma_slice_events_total", "counter"},
+            {"tent_rdma_retries_total", "counter"},
+            {"tent_rdma_retry_exhausted_total", "counter"},
+            {"tent_rdma_cq_poll_errors_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
             {"tent_worker_last_progress_timestamp_seconds", "gauge"},
             {"tent_staging_inflight_tasks", "gauge"},
             {"tent_staging_inflight_bytes", "gauge"},
             {"tent_staging_cleanup_pending", "gauge"},
+            {"tent_rdma_worker_inflight_slices", "gauge"},
+            {"tent_rdma_posted_inflight_slices", "gauge"},
             {"tent_read_latency_us", "histogram"},
             {"tent_write_latency_us", "histogram"},
             {"tent_read_size_bytes", "histogram"},
@@ -481,6 +500,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_stage_transport_us", "histogram"},
             {"tent_transport_attempt_latency_us", "histogram"},
             {"tent_rpc_attempt_latency_us", "histogram"},
+            {"tent_rdma_completion_latency_us", "histogram"},
             {"tent_metrics_build_info", "gauge"},
             {"tent_metrics_runtime_enabled", "gauge"},
             {"tent_metrics_http_server_up", "gauge"},
@@ -579,6 +599,71 @@ TEST_F(MetricsRecordingTest, RpcRetryRecordsEachConnectionAttempt) {
     EXPECT_EQ(after.histogramCount("tent_rpc_attempt_latency_us") -
                   before.histogramCount("tent_rpc_attempt_latency_us"),
               2);
+}
+
+TEST_F(MetricsRecordingTest, RdmaDataPathSignalsUseBoundedLabels) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordRdmaSliceEvent(Request::READ,
+                                 TentMetrics::RdmaSliceEvent::PostAttempt, 3);
+    metrics.recordRdmaRetry(Request::READ,
+                            TentMetrics::RdmaRetryCause::Completion);
+    metrics.recordRdmaRetryExhausted(Request::WRITE,
+                                     TentMetrics::RdmaRetryCause::Endpoint);
+    metrics.recordRdmaCqPollError();
+    metrics.recordRdmaWorkerInflight(Request::READ, 2);
+    metrics.recordRdmaPostedInflight(Request::WRITE, 1);
+    metrics.recordRdmaCompletion(
+        Request::WRITE, TentMetrics::RdmaCompletionOutcome::WcError, 42.0);
+
+    auto active = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        active.series("tent_rdma_slice_events_total{operation=\"read\","
+                      "event=\"post_attempt\"}") -
+            before.series("tent_rdma_slice_events_total{operation=\"read\","
+                          "event=\"post_attempt\"}"),
+        3);
+    EXPECT_EQ(active.series("tent_rdma_retries_total{operation=\"read\",cause="
+                            "\"completion\"}") -
+                  before.series("tent_rdma_retries_total{operation=\"read\","
+                                "cause=\"completion\"}"),
+              1);
+    EXPECT_EQ(active.series("tent_rdma_retry_exhausted_total{operation="
+                            "\"write\",cause=\"endpoint\"}") -
+                  before.series("tent_rdma_retry_exhausted_total{operation="
+                                "\"write\",cause=\"endpoint\"}"),
+              1);
+    EXPECT_EQ(active.counter("tent_rdma_cq_poll_errors_total") -
+                  before.counter("tent_rdma_cq_poll_errors_total"),
+              1);
+    EXPECT_EQ(active.series("tent_rdma_worker_inflight_slices{operation="
+                            "\"read\"}") -
+                  before.series("tent_rdma_worker_inflight_slices{operation="
+                                "\"read\"}"),
+              2);
+    EXPECT_EQ(active.series("tent_rdma_posted_inflight_slices{operation="
+                            "\"write\"}") -
+                  before.series("tent_rdma_posted_inflight_slices{operation="
+                                "\"write\"}"),
+              1);
+    EXPECT_EQ(active.histogramCount("tent_rdma_completion_latency_us") -
+                  before.histogramCount("tent_rdma_completion_latency_us"),
+              1);
+
+    metrics.recordRdmaWorkerInflight(Request::READ, -2);
+    metrics.recordRdmaPostedInflight(Request::WRITE, -1);
+    auto drained = MetricsSnapshot(metrics);
+    EXPECT_EQ(drained.series("tent_rdma_worker_inflight_slices{operation="
+                             "\"read\"}") -
+                  before.series("tent_rdma_worker_inflight_slices{operation="
+                                "\"read\"}"),
+              0);
+    EXPECT_EQ(drained.series("tent_rdma_posted_inflight_slices{operation="
+                             "\"write\"}") -
+                  before.series("tent_rdma_posted_inflight_slices{operation="
+                                "\"write\"}"),
+              0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1763,6 +1848,13 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_rpc_attempts_total"));
     EXPECT_TRUE(json.contains("tent_rpc_retries_total"));
     EXPECT_TRUE(json.contains("tent_rpc_attempt_latency_us"));
+    EXPECT_TRUE(json.contains("tent_rdma_slice_events_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_retries_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_retry_exhausted_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_cq_poll_errors_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_worker_inflight_slices"));
+    EXPECT_TRUE(json.contains("tent_rdma_posted_inflight_slices"));
+    EXPECT_TRUE(json.contains("tent_rdma_completion_latency_us"));
     EXPECT_TRUE(json.contains("tent_metrics_build_info"));
     EXPECT_EQ(json["tent_metrics_runtime_enabled"], 1);
     EXPECT_EQ(json["tent_metrics_http_server_up"], 1);
