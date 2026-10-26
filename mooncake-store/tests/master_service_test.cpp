@@ -2631,8 +2631,8 @@ TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
     const size_t buckets_after =
         RouteStripeBucketCount(*service_, target_stripe);
     ASSERT_GT(buckets_after, 0u);
-    // Without the post-eviction shrink the bucket array would still sit at
-    // its high-water mark and this assertion would fail.
+    // Without the route shrinking a stripe as its slots go, the bucket array
+    // would still sit at its high-water mark and this assertion would fail.
     EXPECT_LT(buckets_after, buckets_before / 2);
 }
 
@@ -2671,8 +2671,8 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     // ClearInvalidHandles -> ClearStaleHandles can erase tens of millions of
     // keys from a shared tenant; erase() never returns bucket memory, so a
     // tenant that loses most (but not all) of its keys would keep its
-    // high-water bucket array forever and RSS would never drop. The shrink
-    // pass at the end of ClearStaleHandles mirrors the one in BatchEvict.
+    // high-water bucket array forever and RSS would never drop. The route
+    // shrinks a stripe as its slots go, whichever path erases them.
     auto service = std::make_unique<MasterService>();
     PauseReplicaCleanup(*service);
 
@@ -2745,8 +2745,8 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     const size_t buckets_after =
         RouteStripeBucketCount(*service, target_stripe);
     ASSERT_GT(buckets_after, 0u);
-    // Without the post-sweep shrink the bucket array would stay at its
-    // high-water mark and this assertion would fail.
+    // Without the route shrinking a stripe as its slots go, the bucket array
+    // would stay at its high-water mark and this assertion would fail.
     EXPECT_LT(buckets_after, buckets_before / 2);
     // The shrunk map must still be large enough to hold every live key.
     EXPECT_GE(buckets_after, live_keys.size());

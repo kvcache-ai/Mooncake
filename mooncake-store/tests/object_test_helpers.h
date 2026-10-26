@@ -66,7 +66,7 @@ struct ObjectRouteTestPeer {
         return route::ObjectRoute::StripeIndex(key);
     }
 
-    // The bucket count of one stripe's map, which erasing never shrinks.
+    // The bucket count of one stripe's map.
     static size_t StripeBucketCount(const route::ObjectRoute& route,
                                     size_t stripe_idx) {
         const route::Stripe& stripe = route.stripes_[stripe_idx];

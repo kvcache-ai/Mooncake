@@ -2384,7 +2384,6 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                 to_sweep.push_back(object.ref());
             }
         }
-        bool erased_any = false;
         for (const auto& object : to_sweep) {
             // The by-reference accessor skips the invalid-replica cleanup,
             // which would drop the stale replicas before this pass could see
@@ -2435,10 +2434,6 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                 continue;
             }
             accessor.Erase();
-            erased_any = true;
-        }
-        if (erased_any) {
-            ns.objects.ShrinkSparseStripes();
         }
     });
     if (first_persist_error) {

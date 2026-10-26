@@ -253,6 +253,12 @@ inline void SlotHandle::reset() noexcept {
     std::unique_lock<std::shared_mutex> lock(stripe->lock);
     if (slot->state_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         stripe->slots.erase(stripe->slots.find(slot->key()));
+        // erase() never gives bucket memory back, so a stripe that once held
+        // far more slots than it does now would keep its high-water buckets
+        // for good. Rehashing moves no node, so the slots guards point at stay
+        // put; only map iterators, which a cursor holds under the shared
+        // stripe lock, are invalidated.
+        ShrinkBucketsIfSparse(stripe->slots);
     }
 }
 
@@ -463,13 +469,6 @@ class ObjectRoute {
     // registers membership and points every grouped object at its group's
     // shared lease.
     void RebuildGroupState();
-
-    // Rehashes every stripe whose map has grown sparse, since erase() never
-    // gives bucket memory back (see ShrinkBucketsIfSparse): a route that once
-    // held millions of keys would keep its high-water bucket arrays for good.
-    // Takes each stripe lock exclusively in turn, so the caller holds no guard
-    // or cursor on the route.
-    void ShrinkSparseStripes();
 
    private:
     template <LockMode>
@@ -840,17 +839,6 @@ inline ObjectRoute::Cursor<LockMode::kRead> ObjectRoute::ReadCursor() const {
 
 inline ObjectRoute::Cursor<LockMode::kWrite> ObjectRoute::WriteCursor() {
     return Cursor<LockMode::kWrite>(*this);
-}
-
-inline void ObjectRoute::ShrinkSparseStripes() {
-    AssertNotInCursor();
-    // Rehashing moves no node, so the slots and the keys guards point at stay
-    // put; only map iterators, which a cursor holds under the shared stripe
-    // lock, are invalidated.
-    for (Stripe& stripe : stripes_) {
-        std::unique_lock<std::shared_mutex> lock(stripe.lock);
-        ShrinkBucketsIfSparse(stripe.slots);
-    }
 }
 
 inline void ObjectRoute::RebuildGroupState() {
