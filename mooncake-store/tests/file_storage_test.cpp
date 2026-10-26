@@ -2,15 +2,18 @@
 #include <gtest/gtest.h>
 #include <sys/stat.h>
 
+#include <atomic>
+#include <barrier>
 #include <chrono>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <unordered_set>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "allocator.h"
 #include "client_metric.h"
@@ -604,6 +607,42 @@ class FileStorageTest : public ::testing::Test {
                              const std::vector<int64_t>& sizes) {
         return fileStorage.AllocateBatch(keys, sizes,
                                          *fileStorage.client_buffer_allocator_);
+    }
+
+    size_t ClientBufferBatchCount(FileStorage& fileStorage) {
+        size_t total = 0;
+        for (auto& shard : fileStorage.client_buffer_shards_) {
+            MutexLocker locker(&shard.mutex);
+            total += shard.batches.size();
+        }
+        return total;
+    }
+
+    std::shared_ptr<FileStorage::AllocatedBatch> ClientBufferBatch(
+        FileStorage& fileStorage, uint64_t batch_id) {
+        auto& shard = fileStorage.ShardFor(batch_id);
+        MutexLocker locker(&shard.mutex);
+        auto it = shard.batches.find(batch_id);
+        return it == shard.batches.end() ? nullptr : it->second.batch;
+    }
+
+    bool ExpireClientBufferBatch(FileStorage& fileStorage, uint64_t batch_id) {
+        auto& shard = fileStorage.ShardFor(batch_id);
+        MutexLocker locker(&shard.mutex);
+        auto it = shard.batches.find(batch_id);
+        if (it == shard.batches.end()) return false;
+        it->second.lease_timeout = std::chrono::steady_clock::now();
+        return true;
+    }
+
+    size_t ClientBufferShardIndex(uint64_t batch_id) {
+        return batch_id % FileStorage::kClientBufferShards;
+    }
+
+    FileStorage::BatchGetResult FileStorageShareStagingBuffer(
+        FileStorage& fileStorage,
+        const std::shared_ptr<FileStorage::AllocatedBatch>& staging) {
+        return fileStorage.ShareStagingBuffer(staging, staging->pointers);
     }
 
     void SetPinnedRestoreArena(FileStorage& fileStorage, void* address,
@@ -2047,6 +2086,489 @@ TEST_F(FileStorageTest,
 TEST_F(FileStorageTest,
        SessionAndHcaBatchPutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
     RunBatchPutHealWipeScenario(data_path, true);
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_SerializesSameKey) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    const std::string target_key = keys.front();
+    const int64_t target_size = sizes.front();
+    constexpr int kConcurrency = 8;
+
+    std::atomic<int> success_count{0};
+    std::atomic<int> started{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kConcurrency);
+
+    for (int i = 0; i < kConcurrency; ++i) {
+        threads.emplace_back([&] {
+            started.fetch_add(1);
+            while (started.load() < kConcurrency) {
+                std::this_thread::yield();
+            }
+            auto result = fileStorage.BatchGet({target_key}, {target_size});
+            if (result) {
+                fileStorage.ReleaseBuffer(result->batch_id);
+                success_count.fetch_add(1);
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_EQ(success_count.load(), kConcurrency)
+        << "All concurrent BatchGet calls should succeed";
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_DifferentKeysRunConcurrently) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_GE(keys.size(), 2u) << "Need at least 2 keys for this test";
+
+    std::atomic<int> success_count{0};
+    std::vector<std::thread> threads;
+
+    for (size_t i = 0; i < std::min(keys.size(), size_t(4)); ++i) {
+        threads.emplace_back([&, i] {
+            auto result = fileStorage.BatchGet({keys[i]}, {sizes[i]});
+            if (result) {
+                fileStorage.ReleaseBuffer(result->batch_id);
+                success_count.fetch_add(1);
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_EQ(success_count.load(),
+              static_cast<int>(std::min(keys.size(), size_t(4))))
+        << "All different-key BatchGet calls should succeed";
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_MultiKeyBatchSucceeds) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_GE(keys.size(), 2u);
+
+    auto result = fileStorage.BatchGet(keys, sizes);
+    ASSERT_TRUE(result) << "Multi-key BatchGet should succeed";
+    fileStorage.ReleaseBuffer(result->batch_id);
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_SameMultiKeyBatchShared) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_GE(keys.size(), 3u);
+
+    keys.resize(3);
+    sizes.resize(3);
+    constexpr int kConcurrency = 16;
+    std::atomic<int> started{0};
+    std::atomic<int> success_count{0};
+    std::vector<uint64_t> first_key_pointers(kConcurrency, 0);
+    std::vector<std::thread> threads;
+    threads.reserve(kConcurrency);
+
+    for (int reader = 0; reader < kConcurrency; ++reader) {
+        threads.emplace_back([&, reader] {
+            std::vector<std::string> reader_keys;
+            std::vector<int64_t> reader_sizes;
+            for (size_t offset = 0; offset < keys.size(); ++offset) {
+                const size_t index = (reader + offset) % keys.size();
+                reader_keys.push_back(keys[index]);
+                reader_sizes.push_back(sizes[index]);
+            }
+
+            started.fetch_add(1);
+            while (started.load() < kConcurrency) {
+                std::this_thread::yield();
+            }
+            auto result = fileStorage.BatchGet(reader_keys, reader_sizes);
+            if (!result) return;
+            ASSERT_EQ(result->pointers.size(), reader_keys.size());
+            for (size_t i = 0; i < reader_keys.size(); ++i) {
+                const auto* data =
+                    reinterpret_cast<const char*>(result->pointers[i]);
+                EXPECT_EQ(std::string(data, reader_sizes[i]),
+                          batch_data.at(reader_keys[i]));
+                if (reader_keys[i] == keys.front()) {
+                    first_key_pointers[reader] = result->pointers[i];
+                }
+            }
+            fileStorage.ReleaseBuffer(result->batch_id);
+            success_count.fetch_add(1);
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    ASSERT_EQ(success_count.load(), kConcurrency);
+    size_t largest_shared_group = 0;
+    for (int i = 0; i < kConcurrency; ++i) {
+        size_t shared_group = 0;
+        for (int j = 0; j < kConcurrency; ++j) {
+            if (first_key_pointers[j] == first_key_pointers[i]) {
+                ++shared_group;
+            }
+        }
+        largest_shared_group = std::max(largest_shared_group, shared_group);
+    }
+    EXPECT_GT(largest_shared_group, 1u)
+        << "At least 2 reordered readers should share one staging batch";
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_StagingSharingVerification) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    const std::string target_key = keys.front();
+    const int64_t target_size = sizes.front();
+    const std::string& expected_data = batch_data.at(target_key);
+    constexpr int kConcurrency = 16;
+
+    std::atomic<int> success_count{0};
+    std::atomic<int> started{0};
+    std::vector<uint64_t> batch_ids(kConcurrency, 0);
+    std::vector<uint64_t> staging_ptrs(kConcurrency, 0);
+    std::vector<std::thread> threads;
+    threads.reserve(kConcurrency);
+
+    for (int i = 0; i < kConcurrency; ++i) {
+        threads.emplace_back([&, i] {
+            started.fetch_add(1);
+            while (started.load() < kConcurrency) {
+                std::this_thread::yield();
+            }
+            auto result = fileStorage.BatchGet({target_key}, {target_size});
+            if (!result) return;
+            ASSERT_EQ(result->pointers.size(), 1u);
+            batch_ids[i] = result->batch_id;
+            staging_ptrs[i] = result->pointers[0];
+
+            // Verify data correctness: read from staging pointer. The reader
+            // still holds its own batch id here, so the staging buffer cannot
+            // be recycled underneath it even if the other readers are done.
+            auto* data_ptr = reinterpret_cast<const char*>(result->pointers[0]);
+            std::string actual(data_ptr, target_size);
+            EXPECT_EQ(actual, expected_data)
+                << "Data mismatch for batch_id=" << result->batch_id;
+
+            fileStorage.ReleaseBuffer(result->batch_id);
+            success_count.fetch_add(1);
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_EQ(success_count.load(), kConcurrency)
+        << "All concurrent BatchGet calls should succeed";
+
+    // Staging sharing now shows up as several batch ids backed by one staging
+    // buffer: every reader releases its own id, and the memory returns to the
+    // pool when the last id goes away.
+    std::unordered_set<uint64_t> distinct_ids(batch_ids.begin(),
+                                              batch_ids.end());
+    EXPECT_EQ(distinct_ids.size(), static_cast<size_t>(kConcurrency))
+        << "Every reader should get its own batch id";
+
+    size_t largest_group = 0;
+    for (int i = 0; i < kConcurrency; ++i) {
+        size_t group = 0;
+        for (int j = 0; j < kConcurrency; ++j) {
+            if (staging_ptrs[j] == staging_ptrs[i]) group++;
+        }
+        largest_group = std::max(largest_group, group);
+    }
+    LOG(INFO) << "Staging sharing results: " << kConcurrency << " readers used "
+              << distinct_ids.size() << " batch ids, " << largest_group
+              << " of them shared one staging buffer";
+    EXPECT_GT(largest_group, 1u)
+        << "At least 2 readers should share the same staging buffer";
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_LastReleaseFreesSharedStaging) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    const std::string target_key = keys.front();
+    const int64_t target_size = sizes.front();
+    const std::string& expected_data = batch_data.at(target_key);
+    constexpr int kConcurrency = 8;
+
+    std::vector<uint64_t> batch_ids(kConcurrency, 0);
+    std::vector<uint64_t> staging_ptrs(kConcurrency, 0);
+    std::atomic<int> started{0};
+    std::atomic<int> readers{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kConcurrency);
+
+    // Reader 0 is the survivor: it holds its batch id until every other reader
+    // has released, which is exactly when a shared staging buffer must still
+    // be readable.
+    std::barrier sync_point(kConcurrency + 1);  // +1 for main thread
+
+    for (int i = 0; i < kConcurrency; ++i) {
+        threads.emplace_back([&, i] {
+            started.fetch_add(1);
+            while (started.load() < kConcurrency) {
+                std::this_thread::yield();
+            }
+            auto result = fileStorage.BatchGet({target_key}, {target_size});
+            if (result) {
+                batch_ids[i] = result->batch_id;
+                if (result->pointers.size() == 1) {
+                    staging_ptrs[i] = result->pointers[0];
+                }
+                readers.fetch_add(1);
+            }
+            sync_point.arrive_and_wait();  // phase 1: everyone holds an id
+
+            if (i != 0 && batch_ids[i] != 0) {
+                EXPECT_TRUE(fileStorage.ReleaseBuffer(batch_ids[i]));
+            }
+            sync_point.arrive_and_wait();  // phase 2: the aliases are released
+            sync_point.arrive_and_wait();  // phase 3: the survivor may release
+
+            if (i == 0 && batch_ids[0] != 0) {
+                EXPECT_TRUE(fileStorage.ReleaseBuffer(batch_ids[0]));
+            }
+        });
+    }
+
+    sync_point.arrive_and_wait();  // wait for every reader to hold an id
+    EXPECT_EQ(readers.load(), kConcurrency)
+        << "All concurrent BatchGet calls should succeed";
+
+    std::unordered_set<uint64_t> distinct_ids(batch_ids.begin(),
+                                              batch_ids.end());
+    EXPECT_EQ(distinct_ids.size(), static_cast<size_t>(kConcurrency))
+        << "Each reader should own a distinct batch id";
+
+    int sharers = 0;
+    for (int i = 0; i < kConcurrency; ++i) {
+        if (staging_ptrs[i] == staging_ptrs[0]) {
+            sharers++;
+        }
+    }
+    LOG(INFO) << "Shared staging test: " << sharers << "/" << kConcurrency
+              << " readers share the staging buffer of batch_id "
+              << batch_ids[0];
+    EXPECT_GT(sharers, 1)
+        << "Concurrent same-key readers should share one staging buffer";
+
+    sync_point.arrive_and_wait();  // release every id but the survivor's
+
+    // Releasing an alias must not free memory another reader is still using.
+    if (staging_ptrs[0] != 0) {
+        std::string actual(reinterpret_cast<const char*>(staging_ptrs[0]),
+                           target_size);
+        EXPECT_EQ(actual, expected_data)
+            << "Shared staging must stay valid until the last reader releases";
+    }
+
+    sync_point.arrive_and_wait();  // the survivor releases its own id
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_FALSE(fileStorage.ReleaseBuffer(batch_ids[0]))
+        << "The survivor's reader already released that id";
+    EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u)
+        << "The last release should return the staging buffer to the pool";
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_AliasLeasesAreIndependent) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    constexpr int64_t kBufferSize = 1024 * 1024;
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = kBufferSize;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    auto leader = fileStorage.BatchGet({keys.front()}, {sizes.front()});
+    ASSERT_TRUE(leader);
+    auto staging = ClientBufferBatch(fileStorage, leader->batch_id);
+    ASSERT_NE(staging, nullptr);
+
+    auto alias = FileStorageShareStagingBuffer(fileStorage, staging);
+    ASSERT_NE(ClientBufferShardIndex(leader->batch_id),
+              ClientBufferShardIndex(alias.batch_id));
+    ASSERT_EQ(ClientBufferBatchCount(fileStorage), 2u);
+    staging.reset();
+
+    // Expiring the leader must not expire an alias in another shard. The
+    // alias started its own lease window when it joined the shared staging
+    // buffer, and its shard mutex cannot protect a deadline stored on the
+    // shared AllocatedBatch.
+    ASSERT_TRUE(ExpireClientBufferBatch(fileStorage, leader->batch_id));
+    const std::vector<std::string> probe_key = {keys.front()};
+    const std::vector<int64_t> probe_size = {kBufferSize};
+    auto probe = FileStorageAllocateBatch(fileStorage, probe_key, probe_size);
+    ASSERT_FALSE(probe);
+    EXPECT_EQ(probe.error(), ErrorCode::BUFFER_OVERFLOW);
+
+    EXPECT_FALSE(fileStorage.ReleaseBuffer(leader->batch_id))
+        << "The expired leader entry should have been collected";
+    EXPECT_TRUE(fileStorage.ReleaseBuffer(alias.batch_id))
+        << "The alias has an independent, unexpired lease";
+    EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u);
+}
+
+TEST_F(FileStorageTest,
+       BatchGetSingleflight_AbandonedReaderDoesNotLeakStaging) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    constexpr int64_t kBufferSize = 1024 * 1024;
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    // Small pool, so the probe below can exhaust it and drive the eager GC.
+    file_storage_config.local_buffer_size = kBufferSize;
+    file_storage_config.total_keys_limit = 1000;
+    // Short-ish lease so an abandoned batch becomes reclaimable quickly, but
+    // comfortably longer than the concurrent cold reads below take to run.
+    file_storage_config.client_buffer_gc_ttl_ms = 2000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    const std::string target_key = keys.front();
+    const int64_t target_size = sizes.front();
+    constexpr int kConcurrency = 8;
+
+    // Every reader disappears right after its cold read without releasing,
+    // which is the worst case for a shared staging buffer: only the lease can
+    // still get the memory back.
+    std::atomic<int> started{0};
+    std::atomic<int> readers{0};
+    std::vector<uint64_t> staging_ptrs(kConcurrency, 0);
+    std::vector<std::thread> threads;
+    threads.reserve(kConcurrency);
+
+    for (int i = 0; i < kConcurrency; ++i) {
+        threads.emplace_back([&, i] {
+            started.fetch_add(1);
+            while (started.load() < kConcurrency) {
+                std::this_thread::yield();
+            }
+            auto result = fileStorage.BatchGet({target_key}, {target_size});
+            if (!result) return;
+            if (result->pointers.size() == 1) {
+                staging_ptrs[i] = result->pointers[0];
+            }
+            readers.fetch_add(1);
+            // Deliberately no ReleaseBuffer: the client is gone.
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+    ASSERT_EQ(readers.load(), kConcurrency);
+
+    int sharers = 0;
+    for (int i = 0; i < kConcurrency; ++i) {
+        if (staging_ptrs[i] == staging_ptrs[0]) {
+            sharers++;
+        }
+    }
+    EXPECT_GT(sharers, 1)
+        << "Expected the concurrent readers to share one staging buffer";
+    EXPECT_EQ(ClientBufferBatchCount(fileStorage),
+              static_cast<size_t>(kConcurrency))
+        << "Every reader should hold its own batch id";
+
+    // These tests never call Init(), so the background GC thread is not
+    // running; reclamation is driven by the eager GC inside AllocateBatch,
+    // which kicks in when an allocation fails. A whole-pool request cannot be
+    // satisfied while any batch is outstanding, so it always takes that path.
+    const std::vector<std::string> probe_key = {target_key};
+    const std::vector<int64_t> probe_size = {kBufferSize};
+    auto probe = FileStorageAllocateBatch(fileStorage, probe_key, probe_size);
+    ASSERT_FALSE(probe);
+    EXPECT_EQ(probe.error(), ErrorCode::BUFFER_OVERFLOW);
+
+    // The lease is still alive, so the eager GC must leave the abandoned batch
+    // alone: its reader may still be copying out of it.
+    EXPECT_EQ(ClientBufferBatchCount(fileStorage),
+              static_cast<size_t>(kConcurrency))
+        << "An unexpired lease should keep the shared staging buffer reserved";
+
+    // Let the lease expire, then drive the eager GC once more.
+    std::this_thread::sleep_for(std::chrono::milliseconds(
+        file_storage_config.client_buffer_gc_ttl_ms + 100));
+    probe = FileStorageAllocateBatch(fileStorage, probe_key, probe_size);
+    EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u)
+        << "Abandoned shared staging buffers must be reclaimed once their "
+           "lease expires, otherwise the memory leaks for good";
 }
 
 }  // namespace mooncake
