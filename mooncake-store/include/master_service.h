@@ -180,6 +180,18 @@ class MasterService {
         OrderedOpLogWriter::TerminalCallback callback);
     void StopBatchOpLogWriter();
 
+    // Stops and joins every background thread and worker that can change
+    // object metadata, weight metadata, segments, clients or allocators. The
+    // batch OpLog writer is stopped first, so that no worker stays blocked on
+    // an OpLog publication. Idempotent; the destructor calls it too. The RPC
+    // server must be stopped first, otherwise a request could schedule new
+    // work on a stopped worker.
+    // Afterwards no allocation or free happens unless a caller makes one.
+    void QuiesceBackgroundWork();
+    // True once QuiesceBackgroundWork() has run and none of those threads
+    // exists any more.
+    bool BackgroundWorkQuiesced() const;
+
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
      * idempotent.
@@ -2411,6 +2423,13 @@ class MasterService {
     void ClientMonitorFunc();
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};
+    std::atomic<bool> background_quiesced_{false};
+    // Lets the sleeps of the client monitor and job dispatch threads end as
+    // soon as QuiesceBackgroundWork() stops them.
+    std::mutex background_sleep_mutex_;
+    std::condition_variable background_sleep_cv_;
+    void SleepWhileRunning(std::chrono::milliseconds duration,
+                           const std::atomic<bool>& running);
     static constexpr uint64_t kClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
     const int64_t client_active_ttl_sec_;

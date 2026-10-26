@@ -49,6 +49,9 @@ class BackgroundWorker {
         }
     }
 
+    // True while the worker thread exists (started and not yet joined).
+    bool Joinable() const { return thread_.joinable(); }
+
     void Schedule() {
         {
             std::lock_guard<std::mutex> lock(mutex_);

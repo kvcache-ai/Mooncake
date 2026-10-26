@@ -578,7 +578,24 @@ void MasterService::InitDfsAllocatorFromEnvironment(
                       : "");
 }
 
-MasterService::~MasterService() {
+void MasterService::QuiesceBackgroundWork() {
+    // Per-step wall time, logged once: a slow step delays whatever waits for
+    // the quiesce (process exit, a shutdown snapshot).
+    std::ostringstream timings;
+    const auto timed = [&timings](const char* name, auto&& step) {
+        const auto start = std::chrono::steady_clock::now();
+        step();
+        timings << ", " << name << "_ms="
+                << std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count();
+    };
+    const auto join = [](std::thread& thread) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    };
+
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;
@@ -595,45 +612,66 @@ MasterService::~MasterService() {
     // This releases publication waiters; in-flight backend I/O still follows
     // the writer's shutdown contract and is not cancelled by the worker flag.
     if (ordered_oplog_writer_) {
-        ordered_oplog_writer_->Stop();
+        timed("oplog_writer", [&] { ordered_oplog_writer_->Stop(); });
     }
-    graceful_unmount_scheduler_.Stop();
-    replica_cleanup_worker_.Stop();
+    timed("graceful_unmount", [&] { graceful_unmount_scheduler_.Stop(); });
+    timed("replica_cleanup", [&] { replica_cleanup_worker_.Stop(); });
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
 #endif
 
     // Wake sleepers so join() doesn't block for long sleep intervals.
+    {
+        std::lock_guard<std::mutex> lock(background_sleep_mutex_);
+    }
+    background_sleep_cv_.notify_all();
     task_cleanup_cv_.notify_all();
     weight_reconciliation_cv_.notify_all();
     http_metadata_cleanup_cv_.notify_all();
 
-    if (eviction_thread_.joinable()) {
-        eviction_thread_.join();
-    }
-    if (client_monitor_thread_.joinable()) {
-        client_monitor_thread_.join();
-    }
+    timed("eviction", [&] { join(eviction_thread_); });
+    timed("client_monitor", [&] { join(client_monitor_thread_); });
 #ifdef USE_NOF
-    if (nof_heartbeat_thread_.joinable()) {
-        nof_heartbeat_thread_.join();
-    }
+    timed("nof_heartbeat", [&] { join(nof_heartbeat_thread_); });
 #endif
-    if (task_cleanup_thread_.joinable()) {
-        task_cleanup_thread_.join();
-    }
-    if (weight_reconciliation_thread_.joinable()) {
-        weight_reconciliation_thread_.join();
-    }
-    if (http_metadata_cleanup_thread_.joinable()) {
-        http_metadata_cleanup_thread_.join();
-    }
-    if (job_dispatch_thread_.joinable()) {
-        job_dispatch_thread_.join();
-    }
-    dynamic_replication_.Stop();
+    timed("task_cleanup", [&] { join(task_cleanup_thread_); });
+    timed("weight_reconciliation",
+          [&] { join(weight_reconciliation_thread_); });
+    timed("http_metadata_cleanup",
+          [&] { join(http_metadata_cleanup_thread_); });
+    timed("job_dispatch", [&] { join(job_dispatch_thread_); });
+    timed("dynamic_replication", [&] { dynamic_replication_.Stop(); });
 
-    client_offboarding_worker_.Stop();
+    timed("client_offboarding", [&] { client_offboarding_worker_.Stop(); });
+    if (!background_quiesced_.exchange(true, std::memory_order_acq_rel)) {
+        LOG(INFO) << "action=quiesce_background_work" << timings.str();
+    }
+}
+
+bool MasterService::BackgroundWorkQuiesced() const {
+    return background_quiesced_.load(std::memory_order_acquire) &&
+           !eviction_thread_.joinable() && !client_monitor_thread_.joinable() &&
+           !nof_heartbeat_thread_.joinable() &&
+           !task_cleanup_thread_.joinable() &&
+           !weight_reconciliation_thread_.joinable() &&
+           !http_metadata_cleanup_thread_.joinable() &&
+           !job_dispatch_thread_.joinable() &&
+           !dynamic_replication_.Joinable() &&
+           !graceful_unmount_scheduler_.Joinable() &&
+           !replica_cleanup_worker_.Joinable() &&
+           !client_offboarding_worker_.Joinable();
+}
+
+void MasterService::SleepWhileRunning(std::chrono::milliseconds duration,
+                                      const std::atomic<bool>& running) {
+    std::unique_lock<std::mutex> lock(background_sleep_mutex_);
+    background_sleep_cv_.wait_for(lock, duration,
+                                  [&running] { return !running.load(); });
+}
+
+MasterService::~MasterService() {
+    // Also stops the batch OpLog writer, before the workers are joined.
+    QuiesceBackgroundWork();
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
         MasterMetricManager::instance().dec_allocated_mem_size(
             segment, static_cast<int64_t>(bytes));
@@ -11221,8 +11259,16 @@ void MasterService::BatchEvict(double evict_ratio_target,
     constexpr size_t kCensusThreads = 16;
     const int num_threads =
         tenants.empty() ? 0 : static_cast<int>(kCensusThreads);
+    // A full pass takes seconds at tens of millions of objects. Stopping the
+    // eviction thread (QuiesceBackgroundWork) abandons the pass between the
+    // slices it walks: nothing is evicted before Phase 2, and Phase 2 just
+    // evicts less.
+    const auto stopping = [this] {
+        return !eviction_running_.load(std::memory_order_relaxed);
+    };
     // Calls `walk(t, tenant_id, slice)` for every slice of every tenant,
-    // spread over the threads; `t` is the calling thread's index.
+    // spread over the threads; `t` is the calling thread's index. Once the
+    // eviction thread is stopping, no thread starts another slice.
     auto parallel_walk = [&](const auto& walk) {
         const size_t num_units = tenants.size() * kCensusThreads;
         std::atomic<size_t> next_unit{0};
@@ -11230,7 +11276,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         workers.reserve(num_threads);
         for (int t = 0; t < num_threads; t++) {
             workers.emplace_back([&, t] {
-                for (size_t unit = next_unit.fetch_add(1); unit < num_units;
+                for (size_t unit = next_unit.fetch_add(1);
+                     unit < num_units && !stopping();
                      unit = next_unit.fetch_add(1)) {
                     walk(t, tenants[unit / kCensusThreads],
                          CursorSlice{unit % kCensusThreads, kCensusThreads});
@@ -11292,6 +11339,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             }
         }
     });
+    if (stopping()) return;
 
     // Merge per-thread results
     long total_eviction_base = 0;
@@ -11430,6 +11478,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                             /*collect_older_or_equal=*/true);
         }
     }
+    if (stopping()) return;
     // ===== Phase 2: Serial eviction via key lookup =====
     long evicted_count = 0;
     uint64_t total_freed_size = 0;
@@ -11456,7 +11505,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         long evicted_this_pass = 0;
         auto evict_candidate_batch = [&](std::vector<Candidate>& batch) {
             for (auto& c : batch) {
-                if (stop_eviction_scan) break;
+                if (stop_eviction_scan || stopping()) break;
                 // Stop once the target object count is reached. Grouped
                 // eviction is all-or-none, so evicting a group can overshoot
                 // evict_num by at most one group; using evict_num (rather than
@@ -11520,7 +11569,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // Do second pass eviction only if 1). there are candidates that can be
     // evicted AND 2). The evicted number in the first pass is less than
     // evict_ratio_lowerbound.
-    if (!stop_eviction_scan && target_evict_num > 0) {
+    if (!stop_eviction_scan && target_evict_num > 0 && !stopping()) {
         // The second pass judges every tenant afresh: it takes the objects
         // `selected` admits and evicts them until the target is met. The
         // list is rotated to a random start, so that the objects a walk
@@ -11951,8 +12000,8 @@ void MasterService::ClientMonitorFunc() {
             }
         }
 
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kClientMonitorSleepMs));
+        SleepWhileRunning(std::chrono::milliseconds(kClientMonitorSleepMs),
+                          client_monitor_running_);
     }
 }
 
@@ -13029,8 +13078,8 @@ void MasterService::ProcessDrainJobs() {
 void MasterService::JobDispatchThreadFunc() {
     while (job_dispatch_running_) {
         ProcessDrainJobs();
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kJobDispatchThreadSleepMs));
+        SleepWhileRunning(std::chrono::milliseconds(kJobDispatchThreadSleepMs),
+                          job_dispatch_running_);
     }
 }
 
