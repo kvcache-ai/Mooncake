@@ -31,7 +31,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -103,6 +105,64 @@ class LeaseEvictionIndex final : public EvictionIndex {
     using SlotList = route::KeySlot::EvictionList;
     class Buckets;
 
+    // One bucket as a cursor copied it: the keys' bytes back to back, so a
+    // bucket costs a few allocations however many keys it holds, and each
+    // entry as the run of keys it names. Filled under the index lock; the
+    // keys are viewed once it is complete and the bytes stop moving.
+    class Copy {
+       public:
+        void Clear() {
+            bytes_.clear();
+            key_ends_.clear();
+            keys_.clear();
+            entries_.clear();
+        }
+
+        // Starts an entry; the keys added until the next one are its.
+        void StartEntry(Rank rank, uint64_t group) {
+            entries_.push_back(Filed{key_ends_.size(), rank, group});
+        }
+
+        void AddKey(const std::string& key) {
+            bytes_.append(key);
+            key_ends_.push_back(bytes_.size());
+        }
+
+        void Seal() {
+            size_t begin = 0;
+            for (const size_t end : key_ends_) {
+                keys_.emplace_back(bytes_.data() + begin, end - begin);
+                begin = end;
+            }
+        }
+
+        [[nodiscard]] size_t size() const { return entries_.size(); }
+
+        // The `i`th entry, once sealed.
+        [[nodiscard]] Entry operator[](size_t i) const {
+            const Filed& filed = entries_[i];
+            const size_t end = i + 1 < entries_.size()
+                                   ? entries_[i + 1].first_key
+                                   : keys_.size();
+            return Entry{std::span<const std::string_view>(keys_).subspan(
+                             filed.first_key, end - filed.first_key),
+                         filed.rank, filed.group};
+        }
+
+       private:
+        struct Filed {
+            size_t first_key;
+            Rank rank;
+            uint64_t group;
+        };
+
+        std::string bytes_;
+        // Where each key ends in `bytes_`; the next one starts there.
+        std::vector<size_t> key_ends_;
+        std::vector<std::string_view> keys_;
+        std::vector<Filed> entries_;
+    };
+
     // The filed members of one group, filed in `buckets` at the rank the
     // latest member write saw from construction to destruction. Members are
     // linked through the hook a key filed on its own is linked into its
@@ -143,9 +203,9 @@ class LeaseEvictionIndex final : public EvictionIndex {
             return members_.empty();
         }
 
-        void AppendKeys(std::vector<std::string>& out) const {
+        void AppendKeys(Copy& out) const {
             for (const route::KeySlot& slot : members_) {
-                out.push_back(slot.key());
+                out.AddKey(slot.key());
             }
         }
 
@@ -190,18 +250,18 @@ class LeaseEvictionIndex final : public EvictionIndex {
         // Copies the entries of the first bucket in [from, last] into `out`
         // and returns the bucket after it; returns `last + 1` when there is
         // none.
-        Rank Read(Rank from, Rank last, std::vector<Entry>& out) const {
+        Rank Read(Rank from, Rank last, Copy& out) const {
             const auto it = buckets_.lower_bound(from);
             if (it == buckets_.end() || it->first > last) {
                 return last + 1;
             }
             for (const route::KeySlot& slot : it->second.keys) {
-                out.push_back(Entry{{slot.key()}, it->first, 0});
+                out.StartEntry(it->first, 0);
+                out.AddKey(slot.key());
             }
             for (const Group& group : it->second.groups) {
-                Entry& entry =
-                    out.emplace_back(Entry{{}, it->first, group.incarnation()});
-                group.AppendKeys(entry.keys);
+                out.StartEntry(it->first, group.incarnation());
+                group.AppendKeys(out);
             }
             return it->first + 1;
         }
@@ -232,15 +292,14 @@ class LeaseEvictionIndex final : public EvictionIndex {
               total_(index.size_.load(std::memory_order_relaxed)) {}
 
         std::optional<Entry> Next() override {
-            if (pos_ == buffer_.size()) {
-                buffer_.clear();
+            if (pos_ == copy_.size()) {
                 pos_ = 0;
-                next_ = index_.ReadBucket(next_, last_, buffer_);
+                next_ = index_.ReadBucket(next_, last_, copy_);
             }
-            if (pos_ == buffer_.size()) {
+            if (pos_ == copy_.size()) {
                 return std::nullopt;
             }
-            return std::move(buffer_[pos_++]);
+            return copy_[pos_++];
         }
 
         bool StillAt(const route::WriteGuard& guard,
@@ -265,7 +324,8 @@ class LeaseEvictionIndex final : public EvictionIndex {
         const size_t total_;
         // The first bucket the walk has not read yet.
         Rank next_ = std::numeric_limits<Rank>::min();
-        std::vector<Entry> buffer_;
+        // The bucket being walked, and the next of its entries to hand out.
+        Copy copy_;
         size_t pos_ = 0;
     };
 
@@ -284,10 +344,17 @@ class LeaseEvictionIndex final : public EvictionIndex {
         return bucket;
     }
 
-    // Buckets::Read under the index lock.
-    Rank ReadBucket(Rank from, Rank last, std::vector<Entry>& out) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return buckets_.Read(from, last, out);
+    // Buckets::Read under the index lock, into `out` in place of what it
+    // held, sealed once the lock is let go.
+    Rank ReadBucket(Rank from, Rank last, Copy& out) const {
+        out.Clear();
+        Rank next;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            next = buckets_.Read(from, last, out);
+        }
+        out.Seal();
+        return next;
     }
 
     // The group `owner`'s key is filed in, if any.

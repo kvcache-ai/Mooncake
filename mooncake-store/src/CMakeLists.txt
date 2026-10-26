@@ -52,7 +52,6 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     tenant/quota.cpp
     tenant/quota_manager.cpp
     tenant/quota_policy.cpp
-    tenant_quota_ledger.cpp
     tenant/quota_policy_store.cpp
     weight_metadata_store.cpp
     rpc_service.cpp

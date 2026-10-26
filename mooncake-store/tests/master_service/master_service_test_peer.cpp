@@ -66,7 +66,9 @@ size_t MasterServiceTestPeer::HttpMetadataCleanupQueueSizeForTesting() const {
 }
 
 void MasterServiceTestPeer::RunTenantEvictForTesting() {
-    service_.EvictTenantsOverWatermark();
+    // The policy throttles its pass; a test asks for one now.
+    service_.tenant_quota_policy_->next_eviction_check_ = {};
+    service_.tenant_quota_policy_->OnMaintenance();
 }
 
 void MasterServiceTestPeer::SetKvTenantEpochTrackingForTesting(bool enabled) {

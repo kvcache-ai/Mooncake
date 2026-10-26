@@ -1,5 +1,6 @@
 #include "master_service.h"
 #include "master_service/master_service_test_peer.h"
+#include "object_test_helpers.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -13,6 +14,7 @@
 #include <future>
 #include <limits>
 #include <map>
+#include <optional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -711,7 +713,8 @@ class MasterServiceHATest : public ::testing::Test {
     }
 
     static uint64_t TenantUsedBytes(MasterService& service) {
-        auto snapshot = service.GetTenantQuotaSnapshot(kDefaultTenant);
+        auto snapshot =
+            service.tenant_quota_policy()->GetSnapshot(kDefaultTenant);
         EXPECT_TRUE(snapshot.has_value());
         return snapshot ? snapshot->charged_bytes : 0;
     }
@@ -826,37 +829,6 @@ class MasterServiceHATest : public ::testing::Test {
         return segment;
     }
 
-    static std::string FindGroupIdOnDifferentShard(MasterService& service,
-                                                   size_t source_shard,
-                                                   const std::string& prefix) {
-        for (size_t index = 0; index < MasterServiceTestPeer::kNumShards * 2;
-             ++index) {
-            std::string group_id = prefix + std::to_string(index);
-            if (MasterServiceTestPeer(service).getShardIndex(group_id) !=
-                source_shard) {
-                return group_id;
-            }
-        }
-        return {};
-    }
-
-    static std::string FindGroupIdOnDifferentShardFromObject(
-        MasterService& service, const TenantId& tenant_id,
-        const std::string& key, const std::string& prefix) {
-        return FindGroupIdOnDifferentShard(
-            service,
-            MasterServiceTestPeer(service).getShardIndex(tenant_id, key),
-            prefix);
-    }
-
-    static std::string FindGroupIdOnDifferentShardFromGroup(
-        MasterService& service, const std::string& group_id,
-        const std::string& prefix) {
-        return FindGroupIdOnDifferentShard(
-            service, MasterServiceTestPeer(service).getShardIndex(group_id),
-            prefix);
-    }
-
     // Use the test peer to seed an in-flight PromotionTask for a
     // given (tenant, key) so NotifyPromotionSuccess can proceed without
     // going through the on-hit admission gate (which is currently
@@ -865,20 +837,15 @@ class MasterServiceHATest : public ::testing::Test {
     static void SeedPromotionTaskForTesting(
         MasterService* service, const TenantId& tenant, const std::string& key,
         const UUID& holder_id, ReplicaID alloc_id, uint64_t object_size) {
-        const size_t shard_idx =
-            MasterServiceTestPeer(*service).getShardIndex(tenant, key);
-        auto shard_access =
-            MasterServiceTestPeer::MetadataShardAccessorRW(service, shard_idx);
-        auto& tenant_state =
-            MasterServiceTestPeer(*service).GetOrCreateTenantState(
-                shard_access.get(), tenant);
-        tenant_state.metadata.at(key).state.promotion_task =
-            MasterServiceTestPeer::PromotionTask{
-                .source_id = 0,
-                .alloc_id = alloc_id,
-                .object_size = object_size,
-                .start_time = std::chrono::system_clock::now(),
-                .holder_id = holder_id};
+        auto hold = MasterServiceTestPeer::WriteObject(
+            *service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
+        ASSERT_TRUE(hold.has_value());
+        hold->state().promotion_task = MasterServiceTestPeer::PromotionTask{
+            .source_id = 0,
+            .alloc_id = alloc_id,
+            .object_size = object_size,
+            .start_time = std::chrono::system_clock::now(),
+            .holder_id = holder_id};
     }
 
     static bool NeedMemoryEvictionForTesting(const MasterService& service) {
@@ -951,16 +918,6 @@ class MasterServiceHATest : public ::testing::Test {
         return accessor.Exists() ? accessor.Get().CountReplicas() : 0;
     }
 
-    // Objects holding a completed LOCAL_DISK replica, summed over the shards.
-    static long DiskObjectCountForTesting(MasterService& service) {
-        long count = 0;
-        for (size_t i = 0; i < MasterServiceTestPeer::kNumShards; ++i) {
-            MasterServiceTestPeer::MetadataShardAccessorRO shard(&service, i);
-            count += shard->disk_object_count;
-        }
-        return count;
-    }
-
     static bool IsHardPinnedForTesting(MasterService& service,
                                        const TenantId& tenant_id,
                                        const std::string& key) {
@@ -996,13 +953,10 @@ class MasterServiceHATest : public ::testing::Test {
     static bool HasMetadataEntryForTesting(MasterService& service,
                                            const TenantId& tenant_id,
                                            const std::string& key) {
-        const auto shard_idx =
-            MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
-        MasterServiceTestPeer::MetadataShardAccessorRO shard(&service,
-                                                             shard_idx);
-        auto tenant = shard->tenants.find(tenant_id);
-        return tenant != shard->tenants.end() &&
-               tenant->second.metadata.contains(key);
+        return MasterServiceTestPeer::ReadObject(
+                   service,
+                   MasterServiceTestPeer::ObjectIdentity{tenant_id, key})
+            .has_value();
     }
 
     static bool HasInvalidMemoryHandleForTesting(MasterService& service,
@@ -1053,17 +1007,10 @@ class MasterServiceHATest : public ::testing::Test {
     static bool HasCompletedMemoryReplicaForTesting(MasterService& service,
                                                     const TenantId& tenant_id,
                                                     const std::string& key) {
-        const size_t shard_idx =
-            MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
-        MasterServiceTestPeer::MetadataShardAccessorRO shard(&service,
-                                                             shard_idx);
-        const auto tenant = shard->tenants.find(tenant_id);
-        if (tenant == shard->tenants.end()) {
-            return false;
-        }
-        const auto metadata = tenant->second.metadata.find(key);
-        return metadata != tenant->second.metadata.end() &&
-               metadata->second.metadata.HasReplica([](const Replica& replica) {
+        const auto hold = MasterServiceTestPeer::ReadObject(
+            service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        return hold.has_value() &&
+               hold->metadata().HasReplica([](const Replica& replica) {
                    return replica.is_memory_replica() && replica.is_completed();
                });
     }
@@ -1107,11 +1054,11 @@ class MasterServiceHATest : public ::testing::Test {
         return accessor.Get().lease_->ExpiresAt();
     }
 
-    static uint64_t EvictTenantMemoryForQuotaForTesting(
-        MasterService& service, const TenantId& tenant_id,
-        uint64_t target_bytes) {
+    static uint64_t EvictNamespaceMemoryForTesting(MasterService& service,
+                                                   const TenantId& tenant_id,
+                                                   uint64_t target_bytes) {
         return MasterServiceTestPeer(service)
-            .EvictTenantMemoryForQuota(tenant_id, target_bytes)
+            .EvictNamespaceMemory(tenant_id, target_bytes)
             .freed_bytes;
     }
 
@@ -1121,13 +1068,14 @@ class MasterServiceHATest : public ::testing::Test {
             MasterServiceTestPeer::MasterStateMutex(service));
     }
 
-    static std::unique_lock<SharedMutex> LockMetadataShardForTesting(
-        MasterService& service, const TenantId& tenant_id,
-        const std::string& key) {
-        const size_t shard_idx =
-            MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
-        return std::unique_lock<SharedMutex>(
-            MasterServiceTestPeer::MetadataShards(service)[shard_idx].mutex);
+    // Holds `key` exclusively, whether or not it holds an object, the way a
+    // write path holds it.
+    static route::WriteGuard LockKeyForTesting(MasterService& service,
+                                               const TenantId& tenant_id,
+                                               const std::string& key) {
+        return MasterServiceTestPeer(service)
+            .GetOrCreateNamespace(tenant_id)
+            .objects.WriteKey(key);
     }
 
     template <typename CreateTask>
@@ -1146,17 +1094,16 @@ class MasterServiceHATest : public ::testing::Test {
         auto segment_lock = std::make_unique<ScopedSegmentAccess>(
             MasterServiceTestPeer::SegmentManager(service).getSegmentAccess());
         auto task = std::async(std::launch::async, std::move(create_task));
-        auto& metadata_mutex =
-            MasterServiceTestPeer::MetadataShards(
-                service)[MasterServiceTestPeer(service).getShardIndex(tenant_id,
-                                                                      key)]
-                .mutex;
+        const metadata::Namespace* ns =
+            MasterServiceTestPeer::Namespaces(service).Lookup(tenant_id);
+        if (ns == nullptr) {
+            return false;
+        }
         const auto wait_for_metadata = [&](bool available, auto timeout) {
             const auto deadline = std::chrono::steady_clock::now() + timeout;
             while (std::chrono::steady_clock::now() < deadline) {
-                std::unique_lock<SharedMutex> metadata_lock(metadata_mutex,
-                                                            std::try_to_lock);
-                if (metadata_lock.owns_lock() == available) {
+                if (ObjectRouteTestPeer::KeyLockFree(ns->objects, key) ==
+                    available) {
                     return true;
                 }
                 std::this_thread::yield();
@@ -1249,8 +1196,7 @@ class MasterServiceHATest : public ::testing::Test {
         MasterService& service, const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids) {
         MasterServiceTestPeer(service).FinalizeRemovedReplicasAfterDurable(
-            durable_entry, replica_ids,
-            MasterServiceTestPeer::QuotaEraseMode::kFull);
+            durable_entry, replica_ids);
     }
 
     static void SetLocalDiskUsedBytesForTesting(MasterService& service,
@@ -1876,8 +1822,7 @@ TEST_F(MasterServiceHATest, RestoreToleratesBadObjectAlongsideGoodOnes) {
         0);
 }
 
-TEST_F(MasterServiceHATest,
-       RestoreSkipsUngroupedObjectDuplicatedIntoAnotherShard) {
+TEST_F(MasterServiceHATest, RestoreSkipsUngroupedObjectDuplicatedIntoAGroup) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
@@ -1891,9 +1836,7 @@ TEST_F(MasterServiceHATest,
 
     // #3760: the duplicate is skipped and the original entry is kept.
     auto duplicate = MakeStandbyObject(key, endpoint);
-    duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromObject(
-        service, kDefaultTenant, key, "group-");
-    ASSERT_FALSE(duplicate.metadata.group_id.empty());
+    duplicate.metadata.group_id = "duplicate-group";
 
     auto result = service.RestoreFromStandbySnapshot(
         {duplicate}, 8, {MakeStandbyMemorySegment(endpoint)});
@@ -1904,7 +1847,7 @@ TEST_F(MasterServiceHATest,
 }
 
 TEST_F(MasterServiceHATest,
-       RestoreSkipsGroupedObjectDuplicatedIntoAnotherGroupDomain) {
+       RestoreSkipsGroupedObjectDuplicatedIntoAnotherGroup) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
@@ -1919,9 +1862,7 @@ TEST_F(MasterServiceHATest,
 
     // #3760: the duplicate is skipped and the original grouping is kept.
     auto duplicate = MakeStandbyObject(key, endpoint);
-    duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromGroup(
-        service, existing.metadata.group_id, "replacement-group-");
-    ASSERT_FALSE(duplicate.metadata.group_id.empty());
+    duplicate.metadata.group_id = "replacement-group";
 
     auto result = service.RestoreFromStandbySnapshot(
         {duplicate}, 8, {MakeStandbyMemorySegment(endpoint)});
@@ -2066,11 +2007,13 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyRebuildsTenantQuotaAccounting) {
                         {object}, 7, {MakeStandbyMemorySegment(endpoint)})
                     .has_value());
 
-    auto snapshot = service.GetTenantQuotaSnapshot(tenant_id);
+    auto snapshot = service.tenant_quota_policy()->GetSnapshot(tenant_id);
     ASSERT_TRUE(snapshot.has_value());
     EXPECT_EQ(snapshot->charged_bytes, object_size);
     ASSERT_TRUE(service.Remove(key, tenant_id, /*force=*/true).has_value());
-    EXPECT_EQ(service.GetTenantQuotaSnapshot(tenant_id)->charged_bytes, 0);
+    EXPECT_EQ(
+        service.tenant_quota_policy()->GetSnapshot(tenant_id)->charged_bytes,
+        0);
 }
 
 TEST_F(MasterServiceHATest, UnreadableRestoredMemoryReplicaIsNotEvictable) {
@@ -2097,9 +2040,9 @@ TEST_F(MasterServiceHATest, UnreadableRestoredMemoryReplicaIsNotEvictable) {
         /*evict_ratio_target=*/1.0,
         /*evict_ratio_lowerbound=*/1.0);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
-    EXPECT_EQ(EvictTenantMemoryForQuotaForTesting(service, kDefaultTenant,
-                                                  object_size),
-              0);
+    EXPECT_EQ(
+        EvictNamespaceMemoryForTesting(service, kDefaultTenant, object_size),
+        0);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
     EXPECT_FALSE(HasReadableReplicaForTesting(service, kDefaultTenant, key));
     auto get = service.GetReplicaList(key, kDefaultTenant);
@@ -2197,7 +2140,8 @@ TEST_F(MasterServiceHATest,
 
     ReplicateConfig config;
     config.replica_num = 1;
-    auto shard_lock = LockMetadataShardForTesting(service, kDefaultTenant, key);
+    std::optional<route::WriteGuard> key_lock(
+        LockKeyForTesting(service, kDefaultTenant, key));
     auto put = std::async(std::launch::async, [&] {
         return service.PutStart(client_id, key, kDefaultTenant, 1024, config);
     });
@@ -2213,7 +2157,7 @@ TEST_F(MasterServiceHATest,
         std::this_thread::yield();
     }
     if (!reached_snapshot) {
-        shard_lock.unlock();
+        key_lock.reset();
         EXPECT_EQ(put.wait_for(std::chrono::seconds(5)),
                   std::future_status::ready);
         if (put.wait_for(std::chrono::seconds(0)) ==
@@ -2226,7 +2170,7 @@ TEST_F(MasterServiceHATest,
     // ReMountSegment holds client_mutex_ exclusively while waiting for the
     // snapshot barrier. PutStart must not reacquire it inside that barrier.
     auto client_lock = LockClientForTesting(service);
-    shard_lock.unlock();
+    key_lock.reset();
     const bool completed_while_client_locked =
         put.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
     client_lock.unlock();
@@ -2992,7 +2936,6 @@ TEST_F(MasterServiceHATest,
                                      "standby_repair_reject_ld_lost"),
               0);
     EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
-    EXPECT_EQ(DiskObjectCountForTesting(service), 0);
 
     // Retry with the writer accepting: the restore lands, and the disk
     // owner's record is installed for real this time.
@@ -3007,9 +2950,6 @@ TEST_F(MasterServiceHATest,
               0);
     EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).contains(
         disk_owner));
-    // The restored survivor counts as a disk object, like one whose
-    // LOCAL_DISK replica was added through AddReplica.
-    EXPECT_EQ(DiskObjectCountForTesting(service), 1);
 }
 
 TEST_F(MasterServiceHATest, RestoreDiscardRepairTimeoutThenRetrySucceeds) {
@@ -5967,7 +5907,9 @@ TEST_F(MasterServiceHATest,
     }
     auto move_end = move_future.get();
     ASSERT_TRUE(move_end.has_value()) << toString(move_end.error());
-    ASSERT_EQ(service.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes,
+    ASSERT_EQ(service.tenant_quota_policy()
+                  ->GetSnapshot(kDefaultTenant)
+                  ->charged_bytes,
               2 * object_size);
 
     ReplicateConfig config;
@@ -5981,8 +5923,9 @@ TEST_F(MasterServiceHATest,
     ReadBatchEventually(storage, 4, batch);
     uint64_t charged_bytes = 2 * object_size;
     for (int i = 0; i < 50 && charged_bytes == 2 * object_size; ++i) {
-        charged_bytes =
-            service.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes;
+        charged_bytes = service.tenant_quota_policy()
+                            ->GetSnapshot(kDefaultTenant)
+                            ->charged_bytes;
         if (charged_bytes == 2 * object_size) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
@@ -5992,7 +5935,9 @@ TEST_F(MasterServiceHATest,
     auto upsert_end = service.UpsertEnd(source.client_id, key, kDefaultTenant,
                                         ReplicaType::MEMORY);
     ASSERT_TRUE(upsert_end.has_value()) << toString(upsert_end.error());
-    EXPECT_EQ(service.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes,
+    EXPECT_EQ(service.tenant_quota_policy()
+                  ->GetSnapshot(kDefaultTenant)
+                  ->charged_bytes,
               object_size);
 }
 
