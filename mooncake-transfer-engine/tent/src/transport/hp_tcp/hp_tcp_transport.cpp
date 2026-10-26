@@ -115,6 +115,41 @@ HighPerformanceTcpTransport::~HighPerformanceTcpTransport() {
     }
 }
 
+namespace {
+
+// One outstanding operation on a peer's lane. The count is taken when the
+// operation is planned. It is given back as soon as the operation completes or
+// is cancelled, so the next submission already sees the lane as free, and in
+// any case when the last holder lets go: the planned command, the operation
+// queued on its lane and its completion callback all share the slot. A planned
+// command dropped without running (a rejected admission, a later request of
+// the same batch failing to plan, a rejected retry) therefore releases it too,
+// exactly once, and a lane is never avoided because of a leaked count.
+class LaneSlot {
+   public:
+    LaneSlot(std::shared_ptr<std::vector<std::atomic<int32_t>>> load,
+             uint32_t lane)
+        : load_(std::move(load)), lane_(lane) {
+        (*load_)[lane_].fetch_add(1, std::memory_order_relaxed);
+    }
+    ~LaneSlot() { release(); }
+    LaneSlot(const LaneSlot&) = delete;
+    LaneSlot& operator=(const LaneSlot&) = delete;
+
+    void release() noexcept {
+        if (!released_.exchange(true, std::memory_order_relaxed)) {
+            (*load_)[lane_].fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
+   private:
+    std::shared_ptr<std::vector<std::atomic<int32_t>>> load_;
+    uint32_t lane_;
+    std::atomic<bool> released_{false};
+};
+
+}  // namespace
+
 Status HighPerformanceTcpTransport::validateParams() const {
     if (params_.worker_count == 0 || params_.connections_per_peer == 0 ||
         params_.max_outstanding_tasks == 0 ||
@@ -587,6 +622,7 @@ Status HighPerformanceTcpTransport::planTask(
             (slice < request.length % slice_count ? 1 : 0);
         uint32_t lane_id = 0;
         uint32_t endpoint_id = 0;
+        std::shared_ptr<LaneSlot> slot;  // single-slice operations only
         if (slice_count == 1) {
             // Least-loaded lane, ties broken from the round-robin position: a
             // lane that just went idle takes the next operation instead of
@@ -605,7 +641,7 @@ Status HighPerformanceTcpTransport::planTask(
                     lane_id = static_cast<uint32_t>(cand);
                 }
             }
-            (*lane_load)[lane_id].fetch_add(1, std::memory_order_relaxed);
+            slot = std::make_shared<LaneSlot>(lane_load, lane_id);
             endpoint_id = static_cast<uint32_t>(lane_id % endpoint_count);
         } else {
             endpoint_id = static_cast<uint32_t>(slice);
@@ -640,11 +676,10 @@ Status HighPerformanceTcpTransport::planTask(
         operation.request_id = request_id;
         if (slice_count == 1) {
             operation.complete =
-                [task, lane_load, lane_id](
+                [task, slot](
                     TransferStatusEnum terminal, size_t bytes,
                     std::optional<HighPerformanceTcpStatus> remote_status) {
-                    (*lane_load)[lane_id].fetch_sub(1,
-                                                    std::memory_order_relaxed);
+                    slot->release();
                     (void)task->completeOnce(terminal, bytes, remote_status);
                 };
         } else {
@@ -665,14 +700,13 @@ Status HighPerformanceTcpTransport::planTask(
 
         HighPerformanceTcpWorkers::Command command;
         command.worker_id = owner_worker;
-        command.run = [this, task, slice_count, lane_load, lane_id,
+        command.run = [this, task, slice_count, slot,
                        operation =
                            std::move(operation)](size_t worker_id) mutable {
             if (task->cancelRequested() ||
                 stopping_.load(std::memory_order_acquire)) {
                 if (slice_count == 1) {
-                    (*lane_load)[lane_id].fetch_sub(1,
-                                                    std::memory_order_relaxed);
+                    slot->release();
                     (void)task->completeOnce(CANCELED, 0);
                 } else {
                     (void)task->completeSlice(CANCELED);
@@ -681,9 +715,9 @@ Status HighPerformanceTcpTransport::planTask(
             }
             client_->enqueueOnOwner(worker_id, std::move(operation));
         };
-        command.cancel = [task, slice_count, lane_load, lane_id] {
+        command.cancel = [task, slice_count, slot] {
             if (slice_count == 1) {
-                (*lane_load)[lane_id].fetch_sub(1, std::memory_order_relaxed);
+                slot->release();
                 (void)task->completeOnce(CANCELED, 0);
             } else {
                 (void)task->completeSlice(CANCELED);
