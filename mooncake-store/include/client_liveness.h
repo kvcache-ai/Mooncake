@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -98,7 +99,13 @@ class ClientLivenessRecord {
     }
 
     [[nodiscard]] ClientLivenessObservation Observe(TimePoint now) {
-        return ObserveAndRun(now, [] { return true; });
+        // A resource guard prevents retirement, not heartbeat refresh.
+        std::lock_guard<std::mutex> lock(observation_mutex_);
+        const auto current_state = state_.load(std::memory_order_relaxed);
+        if (current_state == ClientLivenessState::OFFLINE) {
+            return ClientLivenessObservation::REJECTED_OFFLINE;
+        }
+        return CommitObservationLocked(now, current_state);
     }
 
     template <typename Operation>
@@ -115,7 +122,11 @@ class ClientLivenessRecord {
             return ClientLivenessObservation::OBSERVATION_WITHHELD;
         }
 
-        return CommitObservationLocked(now, current_state);
+        // Observe may have recovered SUSPECTED while the operation ran.
+        // Re-read the state so recovery is accounted for exactly once.
+        std::lock_guard<std::mutex> observation_lock(observation_mutex_);
+        return CommitObservationLocked(now,
+                                       state_.load(std::memory_order_relaxed));
     }
 
     [[nodiscard]] ClientLivenessTransition Evaluate(
@@ -137,10 +148,19 @@ class ClientLivenessRecord {
     [[nodiscard]] ClientLivenessTransition EvaluateAndRetire(
         TimePoint now, Clock::duration active_ttl,
         Clock::duration suspicion_ttl, ReserveRetirement&& reserve_retirement,
-        RetireOperation&& retire_operation) {
+        RetireOperation&& retire_operation, bool wait_for_guard = true) {
         ClientLivenessTransition transition = ClientLivenessTransition::NONE;
         {
-            std::lock_guard<std::mutex> lock(transition_mutex_);
+            std::unique_lock<std::mutex> lock(transition_mutex_,
+                                              std::defer_lock);
+            if (wait_for_guard) {
+                lock.lock();
+            } else if (!lock.try_lock()) {
+                // The monitor holds the registry lock. Do not pin that lock
+                // while a mount or remount retains the client's resources.
+                return ClientLivenessTransition::NONE;
+            }
+            std::lock_guard<std::mutex> observation_lock(observation_mutex_);
             switch (state_.load(std::memory_order_relaxed)) {
                 case ClientLivenessState::ACTIVE:
                     if (now - last_liveness_at_ >= active_ttl) {
@@ -176,7 +196,8 @@ class ClientLivenessRecord {
    private:
     [[nodiscard]] ClientLivenessObservation CommitObservationLocked(
         TimePoint now, ClientLivenessState current_state) {
-        last_liveness_at_ = now;
+        // An admission may finish after a more recent heartbeat.
+        last_liveness_at_ = std::max(last_liveness_at_, now);
         if (current_state == ClientLivenessState::SUSPECTED) {
             state_.store(ClientLivenessState::ACTIVE,
                          std::memory_order_release);
@@ -186,7 +207,10 @@ class ClientLivenessRecord {
     }
 
     std::atomic<ClientLivenessState> state_{ClientLivenessState::ACTIVE};
+    // Guards pin resources against EvaluateAndRetire. Observations take only
+    // observation_mutex_; paths needing both take transition_mutex_ first.
     std::mutex transition_mutex_;
+    std::mutex observation_mutex_;
     TimePoint last_liveness_at_;
     TimePoint suspected_since_{};
 };

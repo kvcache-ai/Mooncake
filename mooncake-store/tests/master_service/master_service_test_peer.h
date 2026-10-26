@@ -145,6 +145,41 @@ class MasterServiceTestPeer {
         return service.client_liveness_records_;
     }
 
+    void StopClientMonitor() {
+        service_.client_monitor_running_ = false;
+        if (service_.client_monitor_thread_.joinable()) {
+            service_.client_monitor_thread_.join();
+        }
+    }
+
+    void SetStaleHandlesBeforeReadHook(std::function<void()> hook) {
+        service_.stale_handles_before_read_hook_ = std::move(hook);
+    }
+
+    void SetRemountBeforeClientReacquireHook(std::function<void()> hook) {
+        service_.remount_before_client_reacquire_hook_ = std::move(hook);
+    }
+
+    void EvaluateClientLiveness(
+        const UUID& client_id,
+        const std::shared_ptr<ClientLivenessRecord>& record,
+        ClientLivenessRecord::TimePoint now) {
+        service_.EvaluateClientLiveness(client_id, record, now);
+    }
+
+    bool ClientIsOk(const UUID& client_id) const {
+        std::shared_lock lock(service_.client_mutex_);
+        return service_.ok_client_.contains(client_id);
+    }
+
+    bool HasPendingOffboarding() const {
+        return service_.client_offboarding_worker_.HasPending();
+    }
+
+    static auto& RemountMutex(MasterService& service) {
+        return service.remount_mutex_;
+    }
+
     static auto& ClientMutex(MasterService& service) {
         return service.client_mutex_;
     }
