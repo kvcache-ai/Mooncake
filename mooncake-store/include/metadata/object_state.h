@@ -14,10 +14,10 @@ namespace route {
 // metadata.
 //
 // Every object carries one, and almost every object carries neither a task nor
-// a candidate, so each lives on the heap and costs a pointer while absent.
+// a candidate, so each lives on the heap and costs a pointer while absent. A
+// primary write is not recorded here: what a write left behind is its parts'
+// replicas and the attempt that handed them out, which the metadata carries.
 struct ObjectState {
-    // A primary write or a background task is in flight for this key.
-    bool is_processing{false};
     HeapOptional<ReplicationTask> replication_task;
     HeapOptional<OffloadingTask> offloading_task;
     HeapOptional<PromotionTask> promotion_task;
@@ -30,9 +30,10 @@ struct ObjectState {
     // not work in flight: no task holds anything for it.
     HeapOptional<PromotionCandidate> promotion_candidate;
 
+    // A background task is in flight for this key. Whether a primary write is
+    // unfinished is a question about the parts, which the metadata answers.
     bool HasWorkInFlight() const {
-        return is_processing || replication_task || offloading_task ||
-               promotion_task;
+        return replication_task || offloading_task || promotion_task;
     }
 };
 

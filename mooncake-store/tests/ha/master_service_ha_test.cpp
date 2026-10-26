@@ -944,9 +944,9 @@ class MasterServiceHATest : public ::testing::Test {
             return {};
         }
         std::vector<Replica::Descriptor> descriptors;
-        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+        accessor.Get().VisitReplicas([&descriptors](const Replica& replica) {
             descriptors.push_back(replica.get_descriptor());
-        }
+        });
         return descriptors;
     }
 
@@ -967,12 +967,14 @@ class MasterServiceHATest : public ::testing::Test {
         if (!accessor.Exists()) {
             return true;
         }
-        for (const auto& replica : accessor.Get().GetAllReplicas()) {
-            if (replica.has_invalid_mem_handle()) {
-                return true;
-            }
-        }
-        return false;
+        bool has_invalid_handle = false;
+        accessor.Get().VisitReplicas(
+            [&has_invalid_handle](const Replica& replica) {
+                if (replica.has_invalid_mem_handle()) {
+                    has_invalid_handle = true;
+                }
+            });
+        return has_invalid_handle;
     }
 
     static bool HasReadableReplicaForTesting(MasterService& service,
@@ -981,9 +983,8 @@ class MasterServiceHATest : public ::testing::Test {
         MasterServiceTestPeer::MetadataAccessorRO accessor(
             &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         return accessor.Exists() &&
-               accessor.Get().HasReplica([&service](const Replica& replica) {
-                   return MasterServiceTestPeer(service).IsReplicaReadable(
-                       replica);
+               accessor.Get().HasReplica([](const Replica& replica) {
+                   return replica.is_readable();
                });
     }
 
@@ -1368,8 +1369,9 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
         &legacy_service, MasterServiceTestPeer::ObjectIdentity{
                              kDefaultTenant, legacy_object.key});
     ASSERT_TRUE(legacy_accessor.Exists());
-    EXPECT_EQ(legacy_accessor.Get().GetPart(0).checksum(),
-              std::optional<uint64_t>(0x1234));
+    const ObjectPart* legacy_part = legacy_accessor.Get().GetPart(0);
+    ASSERT_NE(legacy_part, nullptr);
+    EXPECT_EQ(legacy_part->checksum(), std::optional<uint64_t>(0x1234));
 
     auto source = std::make_unique<StandbyMetadataStore>();
     ASSERT_TRUE(source->PutMetadata(batch_object.tenant_id, batch_object.key,
@@ -1388,8 +1390,9 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
         &batch_service, MasterServiceTestPeer::ObjectIdentity{
                             kDefaultTenant, batch_object.key});
     ASSERT_TRUE(batch_accessor.Exists());
-    EXPECT_EQ(batch_accessor.Get().GetPart(0).checksum(),
-              std::optional<uint64_t>(0));
+    const ObjectPart* batch_part = batch_accessor.Get().GetPart(0);
+    ASSERT_NE(batch_part, nullptr);
+    EXPECT_EQ(batch_part->checksum(), std::optional<uint64_t>(0));
 }
 
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesReplicaIds) {

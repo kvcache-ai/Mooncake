@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "master_service.h"
+#include "rpc_service.h"
 
 namespace mooncake::test {
 
@@ -60,6 +61,22 @@ class MasterServiceTestPeer {
         MasterService& service, const ObjectMetadata& metadata,
         const std::vector<Replica::Descriptor>& replicas);
 
+    // The writer recorded for part `part_index` of the object under `key`, how
+    // many parts that object has, and whether a reader can see it. An object
+    // that is not published has no writer and no parts: the writer comes back
+    // empty and the part count is 0.
+    static UUID GetLastWriter(MasterService& service, const TenantId& tenant_id,
+                              const std::string& key, size_t part_index);
+    static size_t GetPartCount(MasterService& service,
+                               const TenantId& tenant_id,
+                               const std::string& key);
+    static bool GetReadable(MasterService& service, const TenantId& tenant_id,
+                            const std::string& key);
+
+    // The service inside the RPC wrapper, for a suite that drives the calls
+    // over a real connection and still has to look at what they left behind.
+    static MasterService& ServiceOf(WrappedMasterService& service);
+
     // Drive one eviction cycle synchronously, without the periodic worker.
     void RunBatchEvictForTesting(double evict_ratio_target,
                                  double evict_ratio_lowerbound);
@@ -84,6 +101,12 @@ class MasterServiceTestPeer {
         const std::function<void(const TenantId&, metadata::Namespace&)>& visit)
         const {
         service_.VisitNamespaces(visit);
+    }
+
+    // The keys of `ns` the discard sweep may act on.
+    static std::vector<std::string> DiscardSweepKeys(
+        const metadata::Namespace& ns) {
+        return MasterService::DiscardSweepKeys(ns);
     }
 
     // Enable epoch bookkeeping without starting a live KV event publisher.
@@ -477,10 +500,6 @@ class MasterServiceTestPeer {
     mooncake::TenantQuotaAccount& TenantQuotaAccount(
         const TenantId& tenant_id) {
         return service_.tenant_quota_policy_->manager_.AccountFor(tenant_id);
-    }
-
-    bool IsReplicaReadable(const Replica& replica) const {
-        return service_.IsReplicaReadable(replica);
     }
 
     static std::vector<std::string> KvMediaForMetadata(

@@ -94,14 +94,12 @@ MasterStoreBackend::SnapshotWeightGroup(
             .key = key,
             .size = metadata.TotalLength(),
             .data_type = metadata.data_type,
-            .readable = master_.HasReadableReplica(metadata),
-            .has_memory = metadata.HasReplica([this](const Replica& replica) {
-                return replica.is_memory_replica() &&
-                       master_.IsReplicaReadable(replica);
+            .readable = metadata.IsReadable(),
+            .has_memory = metadata.HasReplica([](const Replica& replica) {
+                return replica.is_memory_replica() && replica.is_readable();
             }),
-            .has_cold = metadata.HasReplica([this](const Replica& replica) {
-                return !replica.is_memory_replica() &&
-                       master_.IsReplicaReadable(replica);
+            .has_cold = metadata.HasReplica([](const Replica& replica) {
+                return !replica.is_memory_replica() && replica.is_readable();
             }),
         });
     }

@@ -297,6 +297,65 @@ TEST_F(MasterServiceSSDTest, RemoveDecrementsCacheTotalMetrics) {
     EXPECT_EQ(stats[CacheHitStat::SSD_TOTAL], base_ssd_total);
 }
 
+// A master with a root file system appends a DISK replica to every allocation
+// without being asked for one, so a parted write is refused for what the
+// allocator produced rather than for what the request named. The refusal leaves
+// no replica and no object behind.
+TEST_F(MasterServiceSSDTest, PartedPutStartRefusesTheDiskReplicaASsdRootAdds) {
+    auto service = CreateMasterServiceWithSSDFeat("/mnt/ssd");
+
+    constexpr size_t kBaseAddr = 0x360000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "ssd_parted_refusal_segment";
+    segment.base = kBaseAddr;
+    segment.size = kSegmentSize;
+    segment.te_endpoint = segment.name;
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+
+    // The request asks for one memory replica and nothing else; the allocator
+    // adds a DISK replica because root_fs_dir is set.
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    const std::string parted_key = "parted_key_refused_on_ssd_root";
+    auto refused = service->PutStart(client_id, parted_key, TenantId::Default(),
+                                     1024, config, /*part_index=*/0,
+                                     /*part_count=*/2);
+    ASSERT_FALSE(refused.has_value()) << "a parted write must not hold a disk "
+                                         "replica";
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, refused.error());
+
+    // Neither the allocation nor the object survived the refusal.
+    EXPECT_EQ(0u, MasterServiceTestPeer::GetPartCount(
+                      *service, TenantId::Default(), parted_key));
+    EXPECT_FALSE(MasterServiceTestPeer::GetReadable(
+        *service, TenantId::Default(), parted_key));
+    auto exists = service->ExistKey(parted_key, TenantId::Default());
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
+    auto listed =
+        service->GetReplicaListForAdmin(parted_key, TenantId::Default());
+    ASSERT_FALSE(listed.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, listed.error());
+
+    // The same allocation backs an object of one part: what was refused is the
+    // parted form, not the media the allocator chose.
+    const std::string single_key = "single_part_key_on_ssd_root";
+    auto started = service->PutStart(client_id, single_key, TenantId::Default(),
+                                     1024, config);
+    ASSERT_TRUE(started.has_value()) << toString(started.error());
+    EXPECT_EQ(started->size(), 2u);  // the memory replica and the disk one
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, ObjectMeta{single_key, std::nullopt},
+                             TenantId::Default(), ReplicaType::ALL)
+                    .has_value());
+    EXPECT_EQ(1u, MasterServiceTestPeer::GetPartCount(
+                      *service, TenantId::Default(), single_key));
+}
+
 // Evicting a LOCAL_DISK replica via EvictDiskReplica must decrement
 // file_cache_nums_ even when the object still has a MEMORY replica (so
 // accessor.Erase() does not run). Without SyncCacheTotalAccounting in the
