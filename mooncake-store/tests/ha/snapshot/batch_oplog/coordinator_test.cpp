@@ -211,6 +211,7 @@ class RecordingObjectStore final : public SnapshotObjectStore {
     tl::expected<void, std::string> UploadBuffer(
         const std::string& key, const std::vector<uint8_t>& buffer) override {
         if (on_upload) on_upload();
+        if (fail_upload) return tl::make_unexpected("upload failed");
         objects_[key] = buffer;
         return {};
     }
@@ -266,6 +267,7 @@ class RecordingObjectStore final : public SnapshotObjectStore {
     }
     std::string GetConnectionInfo() const override { return "recording"; }
     int gc_failure{0};
+    bool fail_upload{false};
     std::function<void()> on_upload;
 
    private:
@@ -476,7 +478,7 @@ TEST(BatchOpLogSnapshotCoordinatorTest,
     backend->grow_backlog = true;
     add_batch(2);
     ASSERT_TRUE(wait_for_batch(2));
-    objects.on_upload = [] { throw std::runtime_error("upload failed"); };
+    objects.fail_upload = true;
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, coordinator.RunOnce());
     ASSERT_EQ(StandbyState::WATCHING, standby.GetState());
     EXPECT_EQ(1u, coordinator.GetStatus().attempts);
@@ -484,7 +486,7 @@ TEST(BatchOpLogSnapshotCoordinatorTest,
     now += std::chrono::seconds(4);
     EXPECT_EQ(ErrorCode::OK, coordinator.RunOnce());
     EXPECT_EQ(1u, coordinator.GetStatus().attempts);
-    objects.on_upload = {};
+    objects.fail_upload = false;
     if (const auto target = coordinator.GetStatus().catch_up_target) {
         ASSERT_TRUE(wait_for_batch(target->batch_id));
     }
