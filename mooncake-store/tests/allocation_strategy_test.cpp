@@ -60,7 +60,7 @@ class AllocationStrategyParameterizedTest
         size_t size = 64 * MiB) {
         const size_t base = 0x100000000ULL + base_offset;  // 4GB + offset
         auto allocator = CreateBufferAllocator(allocator_type_, segment_name,
-                                               base, size, segment_name);
+                                               base, size, segment_name, "tcp");
         if (!allocator) {
             throw std::invalid_argument("Invalid allocator test parameters");
         }
@@ -133,9 +133,9 @@ TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
     auto active = std::make_shared<ClientLivenessRecord>(initial);
 
     auto suspected_allocator = std::make_shared<OffsetBufferAllocator>(
-        "shared", DEFAULT_CXL_BASE, 64 * MiB, "suspected");
+        "shared", DEFAULT_CXL_BASE, 64 * MiB, "suspected", "tcp");
     auto active_allocator = std::make_shared<OffsetBufferAllocator>(
-        "shared", DEFAULT_CXL_BASE + 64 * MiB, 64 * MiB, "active");
+        "shared", DEFAULT_CXL_BASE + 64 * MiB, 64 * MiB, "active", "tcp");
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("shared", suspected_allocator, suspected);
     allocator_manager.addAllocator("shared", active_allocator, active);
@@ -380,7 +380,7 @@ TEST_P(AllocationStrategyParameterizedTest, VeryLargeSizeAllocation) {
 // Test invalid replication count
 TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MiB, "segment1");
+        "segment1", 0x100000000ULL, 64 * MiB, "segment1", "tcp");
 
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator);
@@ -397,9 +397,10 @@ TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
 // count
 TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
     auto allocator1 = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MiB, "segment1");
+        "segment1", 0x100000000ULL, 64 * MiB, "segment1", "tcp");
     auto allocator2 = std::make_shared<OffsetBufferAllocator>(
-        "segment2", 0x100000000ULL + 0x10000000ULL, 64 * MiB, "segment2");
+        "segment2", 0x100000000ULL + 0x10000000ULL, 64 * MiB, "segment2",
+        "tcp");
 
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator1);
@@ -504,7 +505,7 @@ TEST_P(AllocationStrategyParameterizedTest, ExcludedSegmentsAllocation) {
 // Test allocation when all available segments are excluded
 TEST_F(AllocationStrategyTest, AllSegmentsExcluded) {
     auto allocator1 = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MiB, "segment1");
+        "segment1", 0x100000000ULL, 64 * MiB, "segment1", "tcp");
 
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator1);
@@ -701,8 +702,8 @@ TEST_F(AllocationStrategyTest, PerformanceComparison) {
     for (size_t i = 0; i < kNumSegments; i++) {
         const auto name = "segment_" + std::to_string(i);
         allocator_manager.addAllocator(
-            name, std::make_shared<OffsetBufferAllocator>(name, kSegmentBase,
-                                                          kSegmentSize, name));
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, kSegmentBase, kSegmentSize, name, "tcp"));
     }
 
     // Test Random strategy
@@ -764,8 +765,8 @@ TEST_F(AllocationStrategyTest, PerformanceTest) {
     for (size_t i = 0; i < kNumSegments; i++) {
         const auto name = "segment_" + std::to_string(i);
         allocator_manager.addAllocator(
-            name, std::make_shared<OffsetBufferAllocator>(name, kSegmentBase,
-                                                          kSegmentSize, name));
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, kSegmentBase, kSegmentSize, name, "tcp"));
     }
 
     std::vector<std::vector<Replica>> replicas;
@@ -801,7 +802,7 @@ class SsdPlacementTestState {
         allocators.addAllocator(
             name, std::make_shared<OffsetBufferAllocator>(
                       name, 0x100000000ULL + index * segment_size, segment_size,
-                      name));
+                      name, "tcp"));
         const UUID client_id{index + 1, index + 100};
         client_by_name.emplace(name, client_id);
         ASSERT_EQ(local_ssd.RegisterClient(client_id, true), ErrorCode::OK);
@@ -812,8 +813,8 @@ class SsdPlacementTestState {
 
     void AddSegmentWithoutSsd(const std::string& name, size_t segment_size) {
         allocators.addAllocator(
-            name, std::make_shared<OffsetBufferAllocator>(name, 0x100000000ULL,
-                                                          segment_size, name));
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, 0x100000000ULL, segment_size, name, "tcp"));
         client_by_name.emplace(name, UUID{1, 100});
     }
 
