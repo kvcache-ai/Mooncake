@@ -1733,8 +1733,9 @@ int EfaContext::submitSlicesOnPeer(
     // microsecond, so 1024 of them pass in microseconds while the provider is
     // only briefly busy (many submitters sharing the NIC, or the RDM handshake
     // to a new peer still in flight) and completions keep arriving.  Also
-    // require the stall to have lasted efa_stall_min_ms of wall time; that
-    // still fails a dead peer within tens of milliseconds.
+    // require the stall to have lasted efa_stall_min_ms of wall time (1 s by
+    // default); that still fails a dead peer far sooner than the multi-second
+    // timer described above.
     const int kMaxStalledWaves = 1024;
     const int64_t stall_min_ns = globalConfig().efa_stall_min_ms * 1000000;
     int stalled_waves = 0;
