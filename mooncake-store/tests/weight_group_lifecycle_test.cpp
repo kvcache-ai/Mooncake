@@ -284,6 +284,9 @@ TEST_F(WeightGroupLifecycleTest, DeleteCancelsOperationAfterMemberLoss) {
     });
     ASSERT_TRUE(deleted);
     EXPECT_EQ(WeightAvailabilityState::DELETED, deleted->availability);
+    EXPECT_TRUE(
+        GetGroupMemberKeysForTest(service, ready.manifest.payload_group_id)
+            .empty());
     const auto after =
         service.QueryWeightOperation({.operation_id = started->operation_id});
     ASSERT_TRUE(after);

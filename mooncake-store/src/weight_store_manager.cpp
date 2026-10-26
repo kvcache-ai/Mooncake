@@ -994,13 +994,15 @@ WeightStoreManager::DeleteWeightRevision(
         return tl::make_unexpected(deleting.error());
     }
 
-    auto removed = RemoveWeightMembers(*deleting, nullptr);
+    size_t remaining_budget = 64;
+    auto removed = RemoveWeightMembers(*deleting, &remaining_budget);
     if (!removed) {
         return tl::make_unexpected(removed.error());
     }
     group_operation_lock.unlock();
-    return ReconcileWeightRevision(
-        ReconcileWeightRevisionRequest{.identity = request.identity});
+    return ReconcileWeightRevisionBounded(
+        ReconcileWeightRevisionRequest{.identity = request.identity},
+        &remaining_budget);
 }
 
 WeightMetadataStore::Result<WeightResidencyOperation>
@@ -1178,9 +1180,13 @@ size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
     return actions;
 }
 
-
 WeightMetadataStore::Result<WeightRevisionMetadata>
-WeightStoreManager::UpdateWeightPolicy(const UpdateWeightPolicyRequest& request) {
+WeightStoreManager::UpdateWeightPolicy(
+    const UpdateWeightPolicyRequest& request) {
+    if (MakeWeightPayloadGroupId(request.identity).empty()) {
+        return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
+    }
+    auto group_operation_lock = LockGroup(request.identity);
     const auto now_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch())

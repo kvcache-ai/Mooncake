@@ -947,8 +947,8 @@ WeightMetadataStore::PrepareUpdateOperationProgress(
     if (operation_id == 0 || total_units == 0 || total_bytes == 0 ||
         processed_units > total_units || processed_bytes > total_bytes ||
         (!cursor.empty() && !IsValidWeightComponent(cursor)) ||
-        (!message.empty() &&
-         (message == "completed" || !IsValidWeightComponent(message))) ||
+        (!message.empty() && (IsWeightOperationTerminal(message) ||
+                              !IsValidWeightComponent(message))) ||
         (observed_availability != WeightAvailabilityState::READY &&
          observed_availability != WeightAvailabilityState::DEGRADED)) {
         return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
@@ -1053,7 +1053,7 @@ WeightMetadataStore::Result<WeightOperationMutation>
 WeightMetadataStore::PrepareRecordOperationError(uint64_t operation_id,
                                                  std::string message,
                                                  uint64_t now_ms) const {
-    if (operation_id == 0 || message == "completed" ||
+    if (operation_id == 0 || IsWeightOperationTerminal(message) ||
         !IsValidWeightComponent(message)) {
         return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
     }
@@ -1068,7 +1068,7 @@ WeightMetadataStore::PrepareRecordOperationError(uint64_t operation_id,
     }
     if (!revision->second.operation_id.has_value() ||
         *revision->second.operation_id != operation_id ||
-        operation->second.message == "completed") {
+        IsWeightOperationTerminal(operation->second.message)) {
         return tl::make_unexpected(WeightManagementError::CONFLICT);
     }
     if (operation->second.message == message) {
@@ -1517,14 +1517,13 @@ tl::expected<void, WeightManagementError> ValidateWeightMetadataSnapshot(
                    operation.fenced_metadata_generation + 1 &&
                (revision->second->operation_id.has_value() ||
                 revision->second->residency != operation.target_residency)))) ||
-            (cancelled &&
-             (revision->second->metadata_generation <=
-                  operation.fenced_metadata_generation ||
-              (revision->second->availability !=
-                   WeightAvailabilityState::DELETING &&
-               revision->second->availability !=
-                   WeightAvailabilityState::DELETED) ||
-              revision->second->operation_id.has_value())) ||
+            (cancelled && (revision->second->metadata_generation <=
+                               operation.fenced_metadata_generation ||
+                           (revision->second->availability !=
+                                WeightAvailabilityState::DELETING &&
+                            revision->second->availability !=
+                                WeightAvailabilityState::DELETED) ||
+                           revision->second->operation_id.has_value())) ||
             !operations.emplace(operation.operation_id).second) {
             return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
         }

@@ -5,7 +5,6 @@
 #include "master_service.h"
 
 namespace mooncake {
-
 bool MasterStoreBackend::QueueManagedWeightMemberOffload(
     const WeightRevisionMetadata& revision, const std::string& key) {
     return master_.QueueManagedWeightMemberOffload(revision, key);

@@ -1637,6 +1637,14 @@ bool MasterService::QueueManagedWeightMemberOffload(
     }
     auto& offloading_task = accessor.GetState().offloading_task;
     if (offloading_task) {
+        if (offloading_task->weight_operation_id.has_value() &&
+            offloading_task->weight_operation_id != revision.operation_id) {
+            return false;
+        }
+        if (!offloading_task->weight_operation_id.has_value() &&
+            revision.operation_id.has_value()) {
+            offloading_task->weight_operation_id = revision.operation_id;
+        }
         return true;
     }
     std::optional<ReplicaID> source_id;
@@ -5807,7 +5815,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
 
-            // Managed writes must acquire the group lock before the shard
             if (accessor.IsPublished() && config.residency_affinity_ids &&
                 accessor.Get().residency_affinity_id != residency_affinity_id) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -6190,15 +6197,6 @@ MasterService::BatchUpsertStart(const UUID& client_id,
     if (!config.HasValidKeyHints(keys.size())) {
         LOG(ERROR)
             << "BatchUpsertStart: per-key hint count does not match keys";
-        return std::vector<
-            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
-            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-    }
-    if (config.residency_affinity_ids.has_value() &&
-        config.residency_affinity_ids->size() != keys.size()) {
-        LOG(ERROR) << "BatchUpsertStart: residency_affinity_ids.size()="
-                   << config.residency_affinity_ids->size()
-                   << " != keys.size()=" << keys.size();
         return std::vector<
             tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));

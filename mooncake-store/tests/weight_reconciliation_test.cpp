@@ -208,6 +208,7 @@ class WeightReconciliationTest : public MasterServiceTest {
                                1024);
         }
         put_config.data_type = ObjectDataType::METADATA;
+        put_config.residency_affinity_ids.reset();
         PutCompletedObject(service, context.client_id, ManifestKey(identity),
                            put_config, 128);
         const auto ready = service.CommitWeightImport(CommitWeightImportRequest{
