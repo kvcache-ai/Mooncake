@@ -438,6 +438,8 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordTransportFailover(RDMA, TCP);
     metrics.recordTransportAttemptStarted(RDMA, Request::READ);
     metrics.recordTransportAttemptFinished(RDMA, Request::READ, FAILED, 42.0);
+    ASSERT_TRUE(metrics.recordLogicalRequestStarted(Request::READ));
+    metrics.recordLogicalRequestFinished(RDMA, Request::READ, TIMEOUT, 43.0);
     metrics.recordDeadlineMLU(RDMA, 0.8);
     metrics.recordDeadlineInfeasible(TCP);
     metrics.recordBatchQuarantined();
@@ -464,7 +466,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 41>
+    const std::array<std::pair<std::string_view, std::string_view>, 47>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -475,6 +477,9 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_transport_failover_total", "counter"},
             {"tent_transport_attempts_total", "counter"},
             {"tent_transport_attempt_failures_total", "counter"},
+            {"tent_logical_requests_started_total", "counter"},
+            {"tent_logical_request_outcomes_total", "counter"},
+            {"tent_transport_attempt_outcomes_total", "counter"},
             {"tent_task_failures_total", "counter"},
             {"tent_terminal_failures_total", "counter"},
             {"tent_memory_operations_total", "counter"},
@@ -485,6 +490,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_rpc_attempts_total", "counter"},
             {"tent_rpc_retries_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
+            {"tent_logical_requests_inflight", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
             {"tent_worker_last_progress_timestamp_seconds", "gauge"},
             {"tent_staging_inflight_tasks", "gauge"},
@@ -499,6 +505,8 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_stage_dispatch_us", "histogram"},
             {"tent_stage_transport_us", "histogram"},
             {"tent_transport_attempt_latency_us", "histogram"},
+            {"tent_logical_request_outcome_latency_us", "histogram"},
+            {"tent_transport_attempt_outcome_latency_us", "histogram"},
             {"tent_rpc_attempt_latency_us", "histogram"},
             {"tent_metrics_build_info", "gauge"},
             {"tent_metrics_runtime_enabled", "gauge"},
@@ -662,6 +670,19 @@ TEST_F(MetricsRecordingTest, CompletedTransferRecordsBytesAndLatency) {
               1);
     EXPECT_EQ(after.counter("tent_transport_attempt_failures_total") -
                   before.counter("tent_transport_attempt_failures_total"),
+              0);
+    EXPECT_EQ(after.counter("tent_logical_requests_started_total") -
+                  before.counter("tent_logical_requests_started_total"),
+              1);
+    EXPECT_EQ(
+        after.series("tent_logical_request_outcomes_total{transport=\"rdma\","
+                     "operation=\"write\",outcome=\"success\"}") -
+            before.series(
+                "tent_logical_request_outcomes_total{transport=\"rdma\","
+                "operation=\"write\",outcome=\"success\"}"),
+        1);
+    EXPECT_EQ(after.counter("tent_logical_requests_inflight") -
+                  before.counter("tent_logical_requests_inflight"),
               0);
     EXPECT_EQ(after.histogramCount("tent_transport_attempt_latency_us") -
                   before.histogramCount("tent_transport_attempt_latency_us"),
@@ -1050,6 +1071,81 @@ TEST_F(MetricsRecordingTest, FailedTransferCountsFailureNotBytes) {
               0);
     EXPECT_EQ(after.histogramCount("tent_write_size_bytes") -
                   before.histogramCount("tent_write_size_bytes"),
+              0);
+}
+
+TEST_F(MetricsRecordingTest,
+       LogicalAndAttemptOutcomesDistinguishEveryTerminalStatus) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+    const std::array<TransferStatusEnum, 4> statuses{COMPLETED, FAILED, TIMEOUT,
+                                                     CANCELED};
+
+    for (const auto status : statuses) {
+        ASSERT_TRUE(metrics.recordLogicalRequestStarted(Request::READ));
+        metrics.recordLogicalRequestFinished(RDMA, Request::READ, status, 50.0);
+        metrics.recordTransportAttemptStarted(RDMA, Request::READ);
+        metrics.recordTransportAttemptFinished(RDMA, Request::READ, status,
+                                               25.0);
+    }
+    auto after = MetricsSnapshot(metrics);
+
+    EXPECT_EQ(after.counter("tent_logical_requests_started_total") -
+                  before.counter("tent_logical_requests_started_total"),
+              4);
+    EXPECT_EQ(after.counter("tent_logical_request_outcomes_total") -
+                  before.counter("tent_logical_request_outcomes_total"),
+              4);
+    EXPECT_EQ(after.counter("tent_transport_attempt_outcomes_total") -
+                  before.counter("tent_transport_attempt_outcomes_total"),
+              4);
+    EXPECT_EQ(after.counter("tent_transport_attempt_failures_total") -
+                  before.counter("tent_transport_attempt_failures_total"),
+              3);
+    EXPECT_EQ(after.counter("tent_logical_requests_inflight") -
+                  before.counter("tent_logical_requests_inflight"),
+              0);
+    EXPECT_EQ(
+        after.histogramCount("tent_logical_request_outcome_latency_us") -
+            before.histogramCount("tent_logical_request_outcome_latency_us"),
+        4);
+    EXPECT_EQ(
+        after.histogramCount("tent_transport_attempt_outcome_latency_us") -
+            before.histogramCount("tent_transport_attempt_outcome_latency_us"),
+        4);
+
+    for (std::string_view outcome :
+         {"success", "failed", "timeout", "canceled"}) {
+        const std::string logical =
+            "tent_logical_request_outcomes_total{transport=\"rdma\","
+            "operation=\"read\",outcome=\"" +
+            std::string(outcome) + "\"}";
+        const std::string attempt =
+            "tent_transport_attempt_outcomes_total{transport=\"rdma\","
+            "operation=\"read\",outcome=\"" +
+            std::string(outcome) + "\"}";
+        EXPECT_EQ(after.series(logical) - before.series(logical), 1);
+        EXPECT_EQ(after.series(attempt) - before.series(attempt), 1);
+    }
+}
+
+TEST_F(MetricsRecordingTest, LogicalInflightGaugeSurvivesRuntimeDisable) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+    ASSERT_TRUE(metrics.recordLogicalRequestStarted(Request::WRITE));
+    TentMetrics::setEnabled(false);
+    metrics.recordLogicalRequestFinished(TCP, Request::WRITE, CANCELED, 10.0);
+    TentMetrics::setEnabled(true);
+    auto after = MetricsSnapshot(metrics);
+
+    EXPECT_EQ(after.counter("tent_logical_requests_inflight") -
+                  before.counter("tent_logical_requests_inflight"),
+              0);
+    EXPECT_EQ(after.counter("tent_logical_requests_started_total") -
+                  before.counter("tent_logical_requests_started_total"),
+              1);
+    EXPECT_EQ(after.counter("tent_logical_request_outcomes_total") -
+                  before.counter("tent_logical_request_outcomes_total"),
               0);
 }
 
@@ -1791,6 +1887,12 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_read_latency_us"));
     EXPECT_TRUE(json.contains("tent_task_failures_total"));
     EXPECT_TRUE(json.contains("tent_terminal_failures_total"));
+    EXPECT_TRUE(json.contains("tent_logical_requests_started_total"));
+    EXPECT_TRUE(json.contains("tent_logical_request_outcomes_total"));
+    EXPECT_TRUE(json.contains("tent_logical_requests_inflight"));
+    EXPECT_TRUE(json.contains("tent_transport_attempt_outcomes_total"));
+    EXPECT_TRUE(json.contains("tent_logical_request_outcome_latency_us"));
+    EXPECT_TRUE(json.contains("tent_transport_attempt_outcome_latency_us"));
     EXPECT_TRUE(json.contains("tent_memory_operations_total"));
     EXPECT_TRUE(json.contains("tent_memory_operation_bytes_total"));
     EXPECT_TRUE(json.contains("tent_staging_cleanup_timeouts_total"));

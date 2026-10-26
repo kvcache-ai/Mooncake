@@ -251,13 +251,16 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 |-------------|------|--------|-------------|
 | `tent_read_bytes_total` | Counter | `transport` | Total bytes read via TENT (success only; failures record no bytes) |
 | `tent_write_bytes_total` | Counter | `transport` | Total bytes written via TENT (success only) |
-| `tent_read_requests_total` | Counter | `transport` | Total read requests via TENT (success + failure) |
-| `tent_write_requests_total` | Counter | `transport` | Total write requests via TENT (success + failure) |
+| `tent_read_requests_total` | Counter | `transport` | Terminal read requests via TENT (success + failed + timeout + canceled) |
+| `tent_write_requests_total` | Counter | `transport` | Terminal write requests via TENT (success + failed + timeout + canceled) |
 | `tent_read_failures_total` | Counter | `transport` | Total read failures via TENT |
 | `tent_write_failures_total` | Counter | `transport` | Total write failures via TENT |
 | `tent_transport_failover_total` | Counter | `from`, `to` | Total cross-transport failover events |
 | `tent_transport_attempts_total` | Counter | `transport`, `operation` | Physical transport attempts submitted for execution |
-| `tent_transport_attempt_failures_total` | Counter | `transport`, `operation` | Physical transport attempts that terminated with `FAILED` |
+| `tent_transport_attempt_failures_total` | Counter | `transport`, `operation` | Physical transport attempts that terminated unsuccessfully |
+| `tent_logical_requests_started_total` | Counter | `operation` | Accepted non-derived logical requests |
+| `tent_logical_request_outcomes_total` | Counter | `transport`, `operation`, `outcome` | Terminal logical outcomes (`success`, `failed`, `timeout`, or `canceled`) |
+| `tent_transport_attempt_outcomes_total` | Counter | `transport`, `operation`, `outcome` | Terminal physical-attempt outcomes |
 | `tent_task_failures_total` | Counter | `transport`, `reason` | Task failures grouped by terminal transport and failure reason |
 | `tent_terminal_failures_total` | Counter | `transport`, `phase`, `reason` | Terminal logical task failures grouped by the bounded public failure taxonomy |
 | `tent_memory_operations_total` | Counter | `transport`, `operation`, `outcome` | Physical backend memory register/unregister calls |
@@ -268,6 +271,7 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_rpc_attempts_total` | Counter | `method`, `outcome` | Physical TENT client RPC attempts, including attempts that fail to connect |
 | `tent_rpc_retries_total` | Counter | `method` | Retry attempts actually issued by an idempotent RPC call |
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
+| `tent_logical_requests_inflight` | Gauge | `operation` | Accepted logical requests without a terminal outcome |
 | `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
 | `tent_worker_last_progress_timestamp_seconds` | Gauge | `worker` | Unix timestamp of the last observed engine-progress or staging-worker progress |
 | `tent_staging_inflight_tasks` | Gauge | `operation` | Parent staging tasks currently executing in staging workers |
@@ -282,6 +286,8 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_stage_dispatch_us` | Histogram | `transport` | Causal chain: dispatch latency in microseconds |
 | `tent_stage_transport_us` | Histogram | `transport` | Causal chain: transport execution latency in microseconds |
 | `tent_transport_attempt_latency_us` | Histogram | `transport`, `operation` | Observed latency of each physical transport attempt |
+| `tent_logical_request_outcome_latency_us` | Histogram | `transport`, `operation`, `outcome` | End-to-end logical request latency, including unsuccessful outcomes |
+| `tent_transport_attempt_outcome_latency_us` | Histogram | `transport`, `operation`, `outcome` | Physical attempt latency split by terminal outcome |
 | `tent_rpc_attempt_latency_us` | Histogram | `method`, `outcome` | End-to-end latency of each physical client RPC attempt, including connection setup when needed |
 
 ### Metrics pipeline self-observability
@@ -302,7 +308,9 @@ visible when runtime transfer recording is disabled.
 
 **Notes**:
 - `*_requests_total` counts terminal logical/merged-transfer outcomes. Its `transport` label is the **final transport**: a request recovered by RDMA→TCP failover is counted once under `tcp`.
-- `tent_transport_attempts_total` and `tent_transport_attempt_failures_total` measure physical transport reliability. A recovered RDMA→TCP request contributes one failed RDMA attempt and one successful TCP attempt.
+- `tent_logical_requests_started_total - sum(tent_logical_request_outcomes_total)` is the process-local conservation balance. Compare it with `tent_logical_requests_inflight`; a persistent mismatch means a terminal edge was lost or telemetry was disabled during only one side of the interval.
+- `tent_transport_attempts_total` and `tent_transport_attempt_outcomes_total` provide the equivalent physical-attempt conservation check. A recovered RDMA→TCP request contributes one failed RDMA attempt and one successful TCP attempt.
+- `tent_transport_attempt_failures_total` is a compatibility aggregate of the `failed`, `timeout`, and `canceled` attempt outcomes.
 - Attempt latency currently ends when polling or the progress worker observes the terminal status, so it may include completion-observation delay.
 - `*_failures_total` does not record bytes; failed transfers transfer no bytes.
 - `tent_deadline_infeasible_total` is a dedicated counter (not a histogram sentinel) so infeasible-at-submit cases are distinguishable from genuine high-MLU samples.
@@ -314,11 +322,12 @@ visible when runtime transfer recording is disabled.
 Transfer and attempt metrics carry a `transport` label (the
 `tent_transport_failover_total` counter uses `from` and `to` instead) so they
 can be sliced by transport without grepping logs. Attempt metrics also carry
-an `operation` label. Task failures add a closed-set `reason` label and metrics
-serialization adds a two-valued `format` label. Terminal failures use the
-bounded `phase` and `reason` taxonomy, while memory lifecycle metrics use an
-`outcome` label. Label values come from bounded sets; no request IDs,
-addresses, segment names, or other unbounded values are accepted.
+an `operation` label. Outcome metrics add a four-valued `outcome` label. Task
+failures add a closed-set `reason` label and metrics serialization adds a
+two-valued `format` label. Terminal failures use the bounded `phase` and
+`reason` taxonomy, while memory lifecycle metrics use an `outcome` label.
+Label values come from bounded sets; no request IDs, addresses, segment names,
+or other unbounded values are accepted.
 
 | Label | Values | Description |
 |-------|--------|-------------|
@@ -326,7 +335,7 @@ addresses, segment names, or other unbounded values are accepted.
 | `operation` | `read`, `write`; `register`, `unregister` | Attempt or memory lifecycle operation, depending on the metric family |
 | `phase` | `metadata`, `admission`, `selection`, `connect`, `register`, `submit`, `queue`, `post`, `poll`, `completion`, `retry`, `failover`, `notify`, `cleanup`, `shutdown` | Stable phase where a terminal failure originated |
 | `reason` | `submit`, `poll`, `timeout`, `canceled` for `tent_task_failures_total`; `timeout`, `unavailable`, `queue_full`, `resource_exhausted`, `protocol`, `stale_generation`, `wc_error`, `cq_error`, `mr_error`, `peer_closed`, `canceled`, `internal` for `tent_terminal_failures_total` | Bounded failure classification |
-| `outcome` | `success`, `failure` for memory lifecycle metrics; `success`, `connection_error`, `rpc_error` for RPC metrics | Bounded operation outcome |
+| `outcome` | `success`, `failed`, `timeout`, `canceled` for logical/transport outcomes; `success`, `failure` for memory lifecycle metrics; `success`, `connection_error`, `rpc_error` for RPC metrics | Bounded operation outcome |
 | `worker` | `engine_progress`, `staging` | Worker subsystem reporting forward progress |
 | `kind` | `group`, `batch`, `remote_operation` | Deferred staging cleanup resource kind |
 | `method` | `get_segment_desc`, `bootstrap_rdma`, `bootstrap_ub`, `send_data`, `recv_data`, `notify`, `probe`, `delegate`, `pin`, `unpin`, `subscribe_segment_update`, `notify_segment_updated`, `unknown` | TENT RPC method; `unknown` safely bounds extension methods |
@@ -341,16 +350,18 @@ Transport label values come from the shared `transportTypeName()` mapping.
 
 **Cardinality**: the `transport` label has 19 values; the failover
 `from`/`to` pair has at most 19x19 = 361 combinations (in practice only a
-few pairs ever occur), each attempt metric has at most 19x2 = 38
-transport/operation combinations, task failures have at most 19x4 = 76,
-terminal failures have at most 19x15x12 = 3420, each memory lifecycle family
-has at most 19x2x2 = 76, worker progress has two series, each staging in-flight
-family has two operation series, staging cleanup has three kind series, and
-each serialization family has exactly two series. Dynamic counters allocate
-only label combinations that actually occur. Build identity labels are
-constant for the life of the process; a served `tent_metrics_build_info` series
-itself confirms that metrics were compiled in. Total series across all metrics
-is bounded by these closed sets.
+few pairs ever occur), each legacy attempt family has at most 19x2 = 38
+transport/operation combinations, and each logical/physical outcome counter
+or histogram has at most 19x2x4 = 152 combinations. Logical started and
+in-flight families have two operation series each. Task failures have at most
+19x4 = 76 combinations, terminal failures have at most 19x15x12 = 3420, and
+each memory lifecycle family has at most 19x2x2 = 76. Worker progress has two
+series, each staging in-flight family has two operation series, staging cleanup
+has three kind series, and each serialization family has exactly two series.
+Dynamic counters allocate only label combinations that actually occur. Build
+identity labels are constant for the life of the process; a served
+`tent_metrics_build_info` series itself confirms that metrics were compiled
+in. Total series across all metrics is bounded by these closed sets.
 
 Each RPC family is bounded to 13 methods. Attempts and attempt latency have at
 most 13x3 = 39 method/outcome series; retries have at most 13. These are

@@ -100,6 +100,16 @@ class TentMetrics {
                               double latency_seconds = 0.0);
     void recordReadFailed(TransportType tp);
     void recordWriteFailed(TransportType tp);
+
+    // Conservation metrics for accepted logical requests. Started/finished
+    // calls must be paired exactly once per non-derived TaskInfo. The return
+    // value says whether the in-flight gauge was incremented and therefore
+    // needs a matching finish call.
+    bool recordLogicalRequestStarted(Request::OpCode operation);
+    void recordLogicalRequestFinished(TransportType tp,
+                                      Request::OpCode operation,
+                                      TransferStatusEnum status,
+                                      double latency_us);
     // Failover counter is labeled with both the source and destination
     // transport types so failover flows (e.g. rdma->tcp) are queryable.
     void recordTransportFailover(TransportType from, TransportType to);
@@ -107,8 +117,8 @@ class TentMetrics {
     // Record physical transport attempts separately from logical requests.
     // "Started" means the engine is about to call submitTransferTasks (or the
     // staging equivalent). "Finished" records the observed attempt duration
-    // and, for a FAILED status (including synchronous submit failure),
-    // increments the attempt-failure counter.
+    // and records its bounded terminal outcome. Every non-success terminal
+    // outcome also increments the compatibility attempt-failure counter.
     void recordTransportAttemptStarted(TransportType tp,
                                        Request::OpCode operation);
     void recordTransportAttemptFinished(TransportType tp,
@@ -350,6 +360,8 @@ class TentMetrics {
                                                                    "to"};
     static inline const std::array<std::string, 2> kAttemptLabels{"transport",
                                                                   "operation"};
+    static inline const std::array<std::string, 3> kOutcomeLabels{
+        "transport", "operation", "outcome"};
     static inline const std::array<std::string, 2> kTaskFailureLabels{
         "transport", "reason"};
     static inline const std::array<std::string, 3> kTerminalFailureLabels{
@@ -370,6 +382,9 @@ class TentMetrics {
     static constexpr size_t kTransportDomain =
         static_cast<size_t>(kNumTransportTypes);
     static constexpr size_t kAttemptDomain = kTransportDomain * 2;
+    static constexpr size_t kOutcomeValueDomain = 4;
+    static constexpr size_t kOutcomeDomain =
+        kAttemptDomain * kOutcomeValueDomain;
     static constexpr size_t kTaskFailureDomain = kTransportDomain * 4;
     static constexpr size_t kWorkerDomain = 2;
     static constexpr size_t kOperationDomain = 2;
@@ -386,6 +401,8 @@ class TentMetrics {
     static size_t attemptSlot(TransportType tp, Request::OpCode op) {
         return static_cast<size_t>(tp) * 2 + (op == Request::READ ? 0u : 1u);
     }
+    static size_t outcomeSlot(TransportType tp, Request::OpCode op,
+                              TransferStatusEnum status);
     static size_t taskFailureSlot(TransportType tp, TaskFailureReason reason) {
         return static_cast<size_t>(tp) * 4 + static_cast<size_t>(reason);
     }
@@ -427,8 +444,19 @@ class TentMetrics {
         kAttemptLabels, kAttemptDomain};
     metrics::CachedDynamicCounter<2> transport_attempt_failures_total_{
         "tent_transport_attempt_failures_total",
-        "Physical transport attempts that terminated with FAILED",
+        "Physical transport attempts that terminated unsuccessfully",
         kAttemptLabels, kAttemptDomain};
+    metrics::CachedDynamicCounter<1> logical_requests_started_total_{
+        "tent_logical_requests_started_total",
+        "Accepted logical requests by operation", kOperationLabel,
+        kOperationDomain};
+    metrics::CachedDynamicCounter<3> logical_request_outcomes_total_{
+        "tent_logical_request_outcomes_total",
+        "Terminal logical request outcomes", kOutcomeLabels, kOutcomeDomain};
+    metrics::CachedDynamicCounter<3> transport_attempt_outcomes_total_{
+        "tent_transport_attempt_outcomes_total",
+        "Terminal physical transport attempt outcomes", kOutcomeLabels,
+        kOutcomeDomain};
     // Task-level failures with a reason label, so Grafana can alert on the
     // failure signature (submit vs poll vs timeout vs canceled) without log
     // scraping. Additive to the legacy read/write_failures_total counters.
@@ -481,6 +509,10 @@ class TentMetrics {
         "tent_inflight_attempts",
         "In-flight transport attempts (submitted, not yet finished)",
         kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> logical_requests_inflight_{
+        "tent_logical_requests_inflight",
+        "Accepted logical requests without a terminal outcome", kOperationLabel,
+        kOperationDomain};
     metrics::CachedDynamicCounter<1> registered_buffer_bytes_{
         "tent_registered_buffer_bytes", "Registered local buffer bytes",
         kTransportLabel, kTransportDomain};
@@ -558,6 +590,15 @@ class TentMetrics {
         "tent_transport_attempt_latency_us",
         "Observed physical transport attempt latency in microseconds",
         kLatencyBuckets, kAttemptLabels, kAttemptDomain};
+    metrics::CachedDynamicHistogram<3> logical_request_outcome_latency_{
+        "tent_logical_request_outcome_latency_us",
+        "Logical request latency by terminal outcome in microseconds",
+        kLatencyBuckets, kOutcomeLabels, kOutcomeDomain};
+    metrics::CachedDynamicHistogram<3> transport_attempt_outcome_latency_{
+        "tent_transport_attempt_outcome_latency_us",
+        "Physical transport attempt latency by terminal outcome in "
+        "microseconds",
+        kLatencyBuckets, kOutcomeLabels, kOutcomeDomain};
     metrics::CachedDynamicHistogram<2> rpc_attempt_latency_{
         "tent_rpc_attempt_latency_us",
         "Physical TENT client RPC attempt latency in microseconds",

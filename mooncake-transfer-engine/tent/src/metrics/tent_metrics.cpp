@@ -80,6 +80,35 @@ const char* operationName(Request::OpCode operation) {
     return operation == Request::READ ? "read" : "write";
 }
 
+size_t outcomeIndex(TransferStatusEnum status) {
+    switch (status) {
+        case COMPLETED:
+            return 0;
+        case FAILED:
+            return 1;
+        case TIMEOUT:
+            return 2;
+        case CANCELED:
+            return 3;
+        default:
+            return 1;
+    }
+}
+
+const char* outcomeName(TransferStatusEnum status) {
+    switch (outcomeIndex(status)) {
+        case 0:
+            return "success";
+        case 1:
+            return "failed";
+        case 2:
+            return "timeout";
+        case 3:
+            return "canceled";
+    }
+    return "failed";
+}
+
 const char* taskFailureReasonName(TentMetrics::TaskFailureReason reason) {
     switch (reason) {
         case TentMetrics::TaskFailureReason::Submit:
@@ -246,6 +275,11 @@ const char* rpcOutcomeName(TentMetrics::RpcOutcome outcome) {
     return "unknown";
 }
 }  // namespace
+
+size_t TentMetrics::outcomeSlot(TransportType tp, Request::OpCode op,
+                                TransferStatusEnum status) {
+    return attemptSlot(tp, op) * kOutcomeValueDomain + outcomeIndex(status);
+}
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
     // Validate configuration before touching initialized_. An invalid config
@@ -446,6 +480,9 @@ void TentMetrics::registerMetrics() {
         &failover_total_,
         &transport_attempts_total_,
         &transport_attempt_failures_total_,
+        &logical_requests_started_total_,
+        &logical_request_outcomes_total_,
+        &transport_attempt_outcomes_total_,
         &task_failures_total_,
         &terminal_failures_total_,
         &memory_operations_total_,
@@ -458,11 +495,9 @@ void TentMetrics::registerMetrics() {
     };
 
     gauges_ = {
-        &inflight_attempts_,
-        &registered_buffer_bytes_,
-        &worker_last_progress_timestamp_seconds_,
-        &staging_inflight_tasks_,
-        &staging_inflight_bytes_,
+        &inflight_attempts_,       &logical_requests_inflight_,
+        &registered_buffer_bytes_, &worker_last_progress_timestamp_seconds_,
+        &staging_inflight_tasks_,  &staging_inflight_bytes_,
         &staging_cleanup_pending_,
     };
 
@@ -513,6 +548,47 @@ void TentMetrics::recordWriteCompleted(TransportType tp, size_t bytes,
     if (latency_seconds > 0.0) {
         int64_t latency_us = static_cast<int64_t>(latency_seconds * 1000000.0);
         write_latency_.observeCached(slot, label, latency_us);
+    }
+}
+
+bool TentMetrics::recordLogicalRequestStarted(Request::OpCode operation) {
+    if (!initialized_) return false;
+    const size_t slot = operationSlot(operation);
+    auto label = [operation] {
+        return std::array<std::string, 1>{operationName(operation)};
+    };
+    // Current-state accounting must survive runtime sampling transitions.
+    logical_requests_inflight_.incCached(slot, label);
+    if (runtime_enabled_.load(std::memory_order_relaxed)) {
+        logical_requests_started_total_.incCached(slot, label);
+    }
+    return true;
+}
+
+void TentMetrics::recordLogicalRequestFinished(TransportType tp,
+                                               Request::OpCode operation,
+                                               TransferStatusEnum status,
+                                               double latency_us) {
+    if (!initialized_) return;
+    const size_t operation_slot = operationSlot(operation);
+    logical_requests_inflight_.incCached(
+        operation_slot,
+        [operation] {
+            return std::array<std::string, 1>{operationName(operation)};
+        },
+        -1);
+    if (!runtime_enabled_.load(std::memory_order_relaxed)) return;
+
+    const size_t slot = outcomeSlot(tp, operation, status);
+    auto labels = [tp, operation, status] {
+        return std::array<std::string, 3>{transportTypeName(tp),
+                                          operationName(operation),
+                                          outcomeName(status)};
+    };
+    logical_request_outcomes_total_.incCached(slot, labels);
+    if (latency_us >= 0.0) {
+        logical_request_outcome_latency_.observeCached(
+            slot, labels, static_cast<int64_t>(latency_us));
     }
 }
 
@@ -769,12 +845,21 @@ void TentMetrics::recordTransportAttemptFinished(TransportType tp,
         return std::array<std::string, 2>{transportTypeName(tp),
                                           operationName(operation)};
     };
-    if (status == FAILED) {
+    if (status != COMPLETED) {
         transport_attempt_failures_total_.incCached(slot, label);
     }
+    const size_t outcome_slot = outcomeSlot(tp, operation, status);
+    auto outcome_labels = [tp, operation, status] {
+        return std::array<std::string, 3>{transportTypeName(tp),
+                                          operationName(operation),
+                                          outcomeName(status)};
+    };
+    transport_attempt_outcomes_total_.incCached(outcome_slot, outcome_labels);
     if (latency_us >= 0.0) {
         auto latency_val = static_cast<int64_t>(latency_us);
         transport_attempt_latency_.observeCached(slot, label, latency_val);
+        transport_attempt_outcome_latency_.observeCached(
+            outcome_slot, outcome_labels, latency_val);
     }
 }
 
@@ -843,6 +928,10 @@ bool TentMetrics::tryGetPrometheusMetrics(std::string& result) {
             // N=2 transport-attempt latency histogram (labels: transport,
             // operation) goes through the same helper, instantiated for N=2.
             serializeHistogramPrometheus(transport_attempt_latency_, output);
+            serializeHistogramPrometheus(logical_request_outcome_latency_,
+                                         output);
+            serializeHistogramPrometheus(transport_attempt_outcome_latency_,
+                                         output);
             serializeHistogramPrometheus(rpc_attempt_latency_, output);
 
             // Gauges: current value per label.
@@ -1167,6 +1256,12 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&transport_attempts_total_);
             root[transport_attempt_failures_total_.str_name()] =
                 sumCounterValues(&transport_attempt_failures_total_);
+            root[logical_requests_started_total_.str_name()] =
+                sumCounterValues(&logical_requests_started_total_);
+            root[logical_request_outcomes_total_.str_name()] =
+                sumCounterValues(&logical_request_outcomes_total_);
+            root[transport_attempt_outcomes_total_.str_name()] =
+                sumCounterValues(&transport_attempt_outcomes_total_);
             root[task_failures_total_.str_name()] =
                 sumCounterValues(&task_failures_total_);
             root[terminal_failures_total_.str_name()] =
@@ -1191,6 +1286,8 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
             // via the Prometheus endpoint.
             root[inflight_attempts_.str_name()] =
                 sumCounterValues(&inflight_attempts_);
+            root[logical_requests_inflight_.str_name()] =
+                sumCounterValues(&logical_requests_inflight_);
             root[registered_buffer_bytes_.str_name()] =
                 sumCounterValues(&registered_buffer_bytes_);
             root[worker_last_progress_timestamp_seconds_.str_name()] =
@@ -1215,6 +1312,8 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
             serializeHistogramToJson(root, stage_dispatch_);
             serializeHistogramToJson(root, stage_transport_);
             serializeHistogramToJson(root, transport_attempt_latency_);
+            serializeHistogramToJson(root, logical_request_outcome_latency_);
+            serializeHistogramToJson(root, transport_attempt_outcome_latency_);
             serializeHistogramToJson(root, rpc_attempt_latency_);
 
             root["tent_metrics_build_info"] = {
@@ -1332,6 +1431,9 @@ void TentMetrics::recordReadCompleted(TransportType, size_t, double) {}
 void TentMetrics::recordWriteCompleted(TransportType, size_t, double) {}
 void TentMetrics::recordReadFailed(TransportType) {}
 void TentMetrics::recordWriteFailed(TransportType) {}
+bool TentMetrics::recordLogicalRequestStarted(Request::OpCode) { return false; }
+void TentMetrics::recordLogicalRequestFinished(TransportType, Request::OpCode,
+                                               TransferStatusEnum, double) {}
 void TentMetrics::recordTransportFailover(TransportType, TransportType) {}
 void TentMetrics::recordTransportAttemptStarted(TransportType,
                                                 Request::OpCode) {}

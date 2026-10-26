@@ -99,6 +99,13 @@ struct TaskInfo {
     std::chrono::steady_clock::time_point attempt_post_time{};
     TransportType attempt_type{UNSPEC};
     bool attempt_active{false};
+#if TENT_METRICS_ENABLED
+    // Logical-request accounting is paired independently of the runtime
+    // sample switch. `logical_observability_active` means the in-flight gauge
+    // was incremented and therefore must be decremented exactly once.
+    bool logical_observability_active{false};
+    bool terminal_observability_recorded{false};
+#endif
     // Failure attribution for tent_task_failures_total (first failure wins):
     // -1 = none, 0 = submit-stage, 1 = poll-stage. Set where the failure
     // originates and never overwritten, so a poll-observed failure stays
@@ -134,7 +141,13 @@ struct TaskInfo {
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
           attempt_active(other.attempt_active),
-          failure_stage(other.failure_stage) {}
+#if TENT_METRICS_ENABLED
+          logical_observability_active(other.logical_observability_active),
+          terminal_observability_recorded(
+              other.terminal_observability_recorded),
+#endif
+          failure_stage(other.failure_stage) {
+    }
 
     TaskInfo(TaskInfo&& other) noexcept
         : type(other.type),
@@ -160,7 +173,13 @@ struct TaskInfo {
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
           attempt_active(other.attempt_active),
-          failure_stage(other.failure_stage) {}
+#if TENT_METRICS_ENABLED
+          logical_observability_active(other.logical_observability_active),
+          terminal_observability_recorded(
+              other.terminal_observability_recorded),
+#endif
+          failure_stage(other.failure_stage) {
+    }
 
     TaskInfo& operator=(const TaskInfo& other) {
         if (this != &other) {
@@ -189,6 +208,11 @@ struct TaskInfo {
             attempt_post_time = other.attempt_post_time;
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
+#if TENT_METRICS_ENABLED
+            logical_observability_active = other.logical_observability_active;
+            terminal_observability_recorded =
+                other.terminal_observability_recorded;
+#endif
             failure_stage = other.failure_stage;
         }
         return *this;
@@ -221,6 +245,11 @@ struct TaskInfo {
             attempt_post_time = other.attempt_post_time;
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
+#if TENT_METRICS_ENABLED
+            logical_observability_active = other.logical_observability_active;
+            terminal_observability_recorded =
+                other.terminal_observability_recorded;
+#endif
             failure_stage = other.failure_stage;
         }
         return *this;
@@ -576,6 +605,8 @@ class TransferEngineImpl {
     void recordTaskCompletionMetrics(TaskInfo& task,
                                      TransferStatusEnum prev_status,
                                      TransferStatusEnum new_status);
+
+    void startLogicalRequestObservability(TaskInfo& task);
 
     void startTransportAttempt(TaskInfo& task, TransportType type,
                                std::chrono::steady_clock::time_point post_time);
