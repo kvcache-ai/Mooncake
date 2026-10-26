@@ -671,9 +671,11 @@ class Client {
      * the promotion-on-hit admission gate or heartbeat mailbox. This client
      * must hold the key's LOCAL_DISK replica. Best-effort:
      * PROMOTION_ALREADY_EXISTS means skip quietly. The client's tenant
-     * applies.
+     * applies. Returns the task's id: the promotion calls that run the
+     * prefetch (PromotionTaskAllocStart, NotifyPromotionTaskSuccess,
+     * NotifyPromotionTaskFailure) name the task by it.
      */
-    virtual tl::expected<void, ErrorCode> RegisterPrefetchTask(
+    virtual tl::expected<L4TaskId, ErrorCode> RegisterPrefetchPromotionTask(
         const std::string& object_key, const std::string& tenant_id);
 
     /**

@@ -22,15 +22,18 @@ is_exist(..., prefetch_to_memory=true)          # synchronous, no RPC added
     → prefetch thread pool (fixed size 4)
       → 128-key chunks: BatchQueryReadOnly      # no lease, no promotion-on-hit
         → classify: SSD-only (LOCAL_DISK complete, no MEMORY), size > 0
-          → local holder:  RegisterPrefetchTask + FileStorage::PrefetchKeys
+          → local holder:  RegisterPrefetchPromotionTask + FileStorage::PrefetchKeys
           → remote holder: prefetch_offload_object RPC (carries the keys'
             tenant; a shared holder promotes under the object's own tenant)
             → holder promotes locally
 ```
 
 `PrefetchKeys` shares the promotion execution chain with promotion-on-hit
-(`PromoteOneKeyFromLocalDisk`: `PromotionAllocStart` → staging `AllocateBatch`
-→ `BatchLoad` → `PromotionWrite` → `NotifyPromotionSuccess`). It does **not**
+(`PromoteOneKeyFromLocalDisk`: `PromotionTaskAllocStart` → staging
+`AllocateBatch` → `BatchLoad` → `PromotionWrite` →
+`NotifyPromotionTaskSuccess`). Every call of the chain names the task by its
+L4 task id, the id `RegisterPrefetchPromotionTask` returned (see
+[SSD offload](ssd-offload.md) for task ids). It does **not**
 reuse promotion-on-hit admission (frequency sketch, DRAM watermark gate), the
 lease-on-query, or the holder's promotion heartbeat mailbox.
 
@@ -41,8 +44,9 @@ promotion-on-hit, and never counts `valid_get` metrics as a side effect.
 
 ## Master side: RegisterPrefetchTask
 
-New additive RPC (older masters reject it and prefetch degrades to a no-op).
-Semantics differ from promotion-on-hit admission:
+New additive RPC `RegisterPrefetchPromotionTask` (older masters reject it and
+prefetch degrades to a no-op). Semantics differ from promotion-on-hit
+admission:
 
 - tenant-aware: the key is looked up under the caller's tenant;
 - holder-only: `holder_id == client_id`, others get `INVALID_PARAMS`;
@@ -53,9 +57,16 @@ Semantics differ from promotion-on-hit admission:
   already exists, the call fails with `PROMOTION_ALREADY_EXISTS`, which the
   caller treats as "skip quietly", not as an error. Prefetch and
   promotion-on-hit therefore cannot double-promote the same key: both paths
-  allocate from the same per-key `promotion_tasks` entry.
+  allocate from the same per-key `promotion_tasks` entry;
+- the task gets a new L4 task id, like a promotion-on-hit task, and the call
+  returns it. The holder's `PromotionTaskAllocStart`,
+  `NotifyPromotionTaskSuccess` and `NotifyPromotionTaskFailure` carry it, and
+  the master acts only on the key's task with that id: a late success or
+  failure of an earlier prefetch of the key cannot commit or free the buffer
+  of a newer promotion. The key-only `PromotionAllocStart` and
+  `NotifyPromotionSuccess` are refused.
 
-`NotifyPromotionSuccess` with `from_prefetch = true` grants the same read
+`NotifyPromotionTaskSuccess` with `from_prefetch = true` grants the same read
 lease (`default_kv_lease_ttl`) as exist/get, so the promoted DRAM replica
 survives until the follow-up `get()`. If the exist→get gap can exceed the hard
 lease, raise `--default_kv_lease_ttl`; note that larger leases can raise Put
@@ -82,9 +93,9 @@ Per-client `PrefetchThrottle` (sharded, lock-free fast path per shard):
   then runs queued and in-flight jobs to completion and joins the workers,
   because jobs capture `shared_ptr`s locked at submission and must not
   outlive the client/segment teardown beneath them.
-- Every failure past `PromotionAllocStart` releases the master-side staged
-  state eagerly (`NotifyPromotionFailure`, RAII guard) instead of waiting for
-  the reaper TTL.
+- Every failure past `PromotionTaskAllocStart` releases the master-side staged
+  state eagerly (`NotifyPromotionTaskFailure`, RAII guard) instead of waiting
+  for the reaper TTL.
 
 ## get() demand-side kick
 
@@ -131,17 +142,17 @@ classDiagram
         -Shard shards_
     }
     class FileStorage {
-        +PrefetchKeys(keys, sizes, dram_pressure, on_key_done)
+        +PrefetchKeys(keys, sizes, task_ids, dram_pressure, on_key_done)
         +LookupLocalObjectSize(key) size
-        -PromoteOneKeyFromLocalDisk(key, tenant_id, size, dram_pressure)
+        -PromoteOneKeyFromLocalDisk(task_item, dram_pressure)
     }
     class MasterService {
-        +RegisterPrefetchTask(client_id, key, tenant_id)
-        +NotifyPromotionSuccess(client_id, key, tenant_id)
+        +RegisterPrefetchTask(client_id, key, tenant_id) task_id
+        +NotifyPromotionTaskSuccess(client_id, task_item, tenant_id)
         -promotion_tasks
     }
     class Client {
-        +RegisterPrefetchTask(key)
+        +RegisterPrefetchPromotionTask(key) task_id
         +BatchQueryReadOnly(keys)
     }
     SsdPrefetcher --> PrefetchThrottle
@@ -173,10 +184,10 @@ sequenceDiagram
     end
     alt local holder
         P->>H: LookupLocalObjectSize, authoritative
-        H->>M: RegisterPrefetchTask with holder client_id and tenant
-        M-->>H: OK, or PROMOTION_ALREADY_EXISTS meaning skip quietly
+        H->>M: RegisterPrefetchPromotionTask with holder client_id and tenant
+        M-->>H: task id, or PROMOTION_ALREADY_EXISTS meaning skip quietly
         H->>H: PrefetchKeys then PromoteOneKeyFromLocalDisk
-        H->>M: NotifyPromotionSuccess, grant read lease from_prefetch
+        H->>M: NotifyPromotionTaskSuccess with the task id, grant read lease from_prefetch
     else remote holder
         P->>H: prefetch_offload_object RPC, additive, old peers drop
         Note over H: holder runs the same local branch<br/>with its own client_id
@@ -191,10 +202,10 @@ amortized per-shard sweep), so a probe is O(batch) not O(table).
 ```mermaid
 stateDiagram-v2
     [*] --> kTriggered : reserve()
-    kTriggered --> kInFlight : RegisterPrefetchTask OK
+    kTriggered --> kInFlight : RegisterPrefetchPromotionTask OK
     kTriggered --> kAlreadyResident : query shows MEMORY
     kTriggered --> kDelegated : remote holder RPC sent
-    kInFlight --> kCompleted : NotifyPromotionSuccess
+    kInFlight --> kCompleted : NotifyPromotionTaskSuccess
     kInFlight --> kFailed : any step failed
     kFailed --> [*] : cooldown-length backoff, then retryable
     kCompleted --> [*] : dedup TTL, then re-prefetchable
@@ -206,7 +217,7 @@ Dedup windows per state (see `EntryExpired`): healthy states block
 re-triggering for `ssd_prefetch_dedup_ttl_sec` (default 30 s); `kFailed`
 only for `ssd_prefetch_cooldown_sec` (default 5 s) so transient failures
 retry quickly. The memory-pressure cooldown is opened when
-`PromotionAllocStart` returns `NO_AVAILABLE_HANDLE`: while active,
+`PromotionTaskAllocStart` returns `NO_AVAILABLE_HANDLE`: while active,
 TriggerPrefetch is a no-op — prefetch (which adds DRAM) yields to
 eviction/offload (which frees DRAM).
 
@@ -228,14 +239,14 @@ flowchart TD
     G -- no --> X5[INVALID_PARAMS]
     G -- yes --> H{promotion_in_flight<br/>queue limit?}
     H -- full --> X6[KEYS_ULTRA_LIMIT]
-    H -- pass --> I[pin source refcnt<br/>emplace PromotionTask from_prefetch=true]
+    H -- pass --> I[pin source refcnt<br/>emplace PromotionTask from_prefetch=true<br/>with a new task id, return the id]
 ```
 
 The task deliberately skips promotion-on-hit admission (frequency sketch,
 watermark) and the holder's heartbeat mailbox — an explicit probe is the
 hotness signal — but **shares** the `promotion_in_flight_` cap and the
 per-key `promotion_tasks` entry with promotion-on-hit, so the two paths
-cannot double-promote a key. `NotifyPromotionSuccess` on a
+cannot double-promote a key. `NotifyPromotionTaskSuccess` on a
 `from_prefetch` task grants the normal `default_kv_lease_ttl` read lease:
 the DRAM replica survives until the follow-up get.
 
@@ -249,14 +260,14 @@ sequenceDiagram
     participant F as FileStorage
     participant C as Client
     participant M as Master
-    F->>C: PromotionAllocStart(key, tenant, size)
+    F->>C: PromotionTaskAllocStart(task item with its task id)
     alt NO_AVAILABLE_HANDLE
         C-->>F: error, set dram_pressure, throttle enters cooldown
     end
-    Note over F: PromotionStateGuard armed (RAII) —<br/>any later failure triggers NotifyPromotionFailure
+    Note over F: PromotionStateGuard armed (RAII) —<br/>any later failure triggers NotifyPromotionTaskFailure
     F->>F: AllocateBatch staging, then BatchLoad SSD read
     F->>C: PromotionWrite, TE write into staged replica
-    F->>C: NotifyPromotionSuccess
+    F->>C: NotifyPromotionTaskSuccess
     C->>M: replica COMPLETE, lease granted from_prefetch
     Note over F: guard.Dismiss()
 ```

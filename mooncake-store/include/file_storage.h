@@ -110,14 +110,17 @@ class FileStorage {
      * @brief Promote a set of keys from local SSD to DRAM (SSD prefetch).
      *
      * Each key must already have a promotion task registered on the master
-     * (Client::RegisterPrefetchTask) with this client as holder; this method
-     * runs the promotion execution chain (PromotionAllocStart -> staging
-     * AllocateBatch -> BatchLoad -> PromotionWrite -> NotifyPromotionSuccess).
+     * (Client::RegisterPrefetchPromotionTask) with this client as holder;
+     * this method runs the promotion execution chain (PromotionTaskAllocStart
+     * -> staging AllocateBatch -> BatchLoad -> PromotionWrite ->
+     * NotifyPromotionTaskSuccess), naming each key's task by its task id.
      * Failures are reported per-key via on_key_done and do not propagate;
      * this is best-effort.
      *
      * @param keys  Keys to promote
      * @param sizes Corresponding object sizes in bytes
+     * @param task_ids The task id the master returned for each key's
+     *        registration
      * @param dram_pressure Optional out-flag, set to true if any key failed
      *        because the master is out of DRAM (PromotionAllocStart returned
      *        NO_AVAILABLE_HANDLE), so the caller can back off prefetch and let
@@ -131,7 +134,7 @@ class FileStorage {
 
     tl::expected<void, ErrorCode> PrefetchKeys(
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
-        bool* dram_pressure = nullptr,
+        const std::vector<L4TaskId>& task_ids, bool* dram_pressure = nullptr,
         PrefetchKeyCallback on_key_done = nullptr,
         const std::string& tenant_id = "");
 

@@ -847,8 +847,13 @@ class MasterService {
      * admission gates (frequency sketch, DRAM watermark) and without pushing
      * onto the holder client's promotion heartbeat mailbox. The caller (the
      * holder of the LOCAL_DISK replica) is expected to execute the transfer
-     * immediately via PromotionAllocStart + PromotionWrite +
-     * NotifyPromotionSuccess (e.g. FileStorage::PrefetchKeys).
+     * immediately via PromotionTaskAllocStart + PromotionWrite +
+     * NotifyPromotionTaskSuccess (e.g. FileStorage::PrefetchKeys).
+     *
+     * The task gets an L4 task id like a promotion-on-hit task, and the id
+     * is returned: the caller names the task with it in every later call, so
+     * a late call of an earlier prefetch of the key cannot stage, commit or
+     * free a buffer of a newer promotion.
      *
      * Shares the promotion_in_flight_ / promotion_queue_limit_ cap with
      * promotion-on-hit: prefetch and on-hit promotion compete for the same
@@ -862,7 +867,7 @@ class MasterService {
      */
     auto RegisterPrefetchTask(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id)
-        -> tl::expected<void, ErrorCode>;
+        -> tl::expected<L4TaskId, ErrorCode>;
 
     /**
      * @brief Commit a staged MEMORY replica to COMPLETE; decrement source

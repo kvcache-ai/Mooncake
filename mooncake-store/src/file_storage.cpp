@@ -1169,12 +1169,12 @@ tl::expected<void, ErrorCode> FileStorage::PromoteOneKeyFromLocalDisk(
 
 tl::expected<void, ErrorCode> FileStorage::PrefetchKeys(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
-    bool* dram_pressure, PrefetchKeyCallback on_key_done,
-    const std::string& tenant_id) {
+    const std::vector<L4TaskId>& task_ids, bool* dram_pressure,
+    PrefetchKeyCallback on_key_done, const std::string& tenant_id) {
     if (client_ == nullptr) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (keys.size() != sizes.size()) {
+    if (keys.size() != sizes.size() || keys.size() != task_ids.size()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -1186,11 +1186,11 @@ tl::expected<void, ErrorCode> FileStorage::PrefetchKeys(
         const auto& key = keys[i];
         const int64_t size = sizes[i];
         bool key_dram_pressure = false;
-        // A prefetch task carries no task id yet, so the promotion chain
-        // only ends it (see PromoteOneKeyFromLocalDisk).
         auto result = PromoteOneKeyFromLocalDisk(
-            PromotionTaskItem{
-                .tenant_id = effective_tenant, .key = key, .size = size},
+            PromotionTaskItem{.tenant_id = effective_tenant,
+                              .key = key,
+                              .size = size,
+                              .task_id = task_ids[i]},
             &key_dram_pressure);
         if (key_dram_pressure && dram_pressure != nullptr) {
             *dram_pressure = true;

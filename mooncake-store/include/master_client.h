@@ -571,11 +571,12 @@ class MasterClient {
      * key's LOCAL_DISK replica (the master checks holder_id == client_id).
      * Best-effort: PROMOTION_ALREADY_EXISTS means a MEMORY replica or an
      * in-flight promotion already exists and the caller should skip quietly.
-     * The client's own tenant is used.
+     * The client's own tenant is used. Returns the task's id, which the
+     * caller's task-named promotion calls must carry.
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> RegisterPrefetchTask(
-        const UUID& client_id, const std::string& key,
-        const std::string& tenant_id);
+    [[nodiscard]] tl::expected<L4TaskId, ErrorCode>
+    RegisterPrefetchPromotionTask(const UUID& client_id, const std::string& key,
+                                  const std::string& tenant_id);
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during

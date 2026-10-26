@@ -9492,7 +9492,7 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
 auto MasterService::RegisterPrefetchTask(const UUID& client_id,
                                          const std::string& key,
                                          const TenantId& tenant_id)
-    -> tl::expected<void, ErrorCode> {
+    -> tl::expected<L4TaskId, ErrorCode> {
     const auto record = FindClientRecord(client_id);
     auto serving_guard =
         record ? record->TryAcquireServingGuard() : std::nullopt;
@@ -9565,6 +9565,7 @@ auto MasterService::RegisterPrefetchTask(const UUID& client_id,
         source->get_descriptor().get_local_disk_descriptor().object_size;
     const uint32_t execution_failures = promotion_candidates_.ConsumeLocked(
         object_id.tenant_id, object_id.user_key, accessor.GetState());
+    const L4TaskId task_id = NextL4TaskId();
     promotion_task =
         PromotionTask{.source_id = source->id(),
                       .alloc_id = 0,
@@ -9572,12 +9573,13 @@ auto MasterService::RegisterPrefetchTask(const UUID& client_id,
                       .start_time = std::chrono::system_clock::now(),
                       .holder_id = holder_id.value(),
                       .execution_failures = execution_failures,
-                      .from_prefetch = true};
+                      .from_prefetch = true,
+                      .task_id = task_id};
     promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
     MasterMetricManager::instance().inc_promotion_in_flight();
     VLOG(1) << "prefetch_task_registered key=" << object_id.user_key
-            << " size=" << object_size;
-    return {};
+            << " size=" << object_size << " task_id=" << task_id;
+    return task_id;
 }
 
 auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)

@@ -474,14 +474,51 @@ TEST_F(FileStoragePromotionTest, PrefetchKeysForwardsTenantToPromotion) {
     // ("default" here). The alloc fails without a backing file, but the
     // tenant must reach the master-facing call intact.
     bool dram_pressure = false;
-    auto res = file_storage->PrefetchKeys({"tk1"}, {1024}, &dram_pressure,
-                                          nullptr, "tenantA");
+    auto res = file_storage->PrefetchKeys({"tk1"}, {1024}, {L4TaskId{3, 1}},
+                                          &dram_pressure, nullptr, "tenantA");
     EXPECT_EQ(fake->last_alloc_tenant, "tenantA");
 
     // Default (unset) tenant keeps the holder's own tenant.
     dram_pressure = false;
-    res = file_storage->PrefetchKeys({"tk2"}, {1024}, &dram_pressure);
+    res = file_storage->PrefetchKeys({"tk2"}, {1024}, {L4TaskId{3, 2}},
+                                     &dram_pressure);
     EXPECT_EQ(fake->last_alloc_tenant, "default");
+}
+
+// Every promotion call of a prefetch carries the task id its registration
+// returned: the AllocStart of the promotion, and the Failure that ends it.
+TEST_F(FileStoragePromotionTest, PrefetchCallsEchoTheRegisteredTaskId) {
+    // AllocStart succeeds; the local read fails (no SSD file), so the store
+    // reports a failure.
+    bool dram_pressure = false;
+    std::vector<std::pair<std::string, bool>> done;
+    auto res = file_storage->PrefetchKeys(
+        {"pk_id"}, {1024}, {L4TaskId{5, 8}}, &dram_pressure,
+        [&done](const std::string& key, bool success) {
+            done.emplace_back(key, success);
+        });
+    ASSERT_TRUE(res.has_value());
+    EXPECT_FALSE(dram_pressure);
+    ASSERT_EQ(fake->alloc_calls.load(), 1);
+    ASSERT_EQ(fake->notify_failure_calls.load(), 1);
+    EXPECT_EQ(fake->notify_calls.load(), 0);
+    ASSERT_EQ(fake->task_call_ids.size(), 2u);  // AllocStart, Failure
+    for (const auto& id : fake->task_call_ids) {
+        ASSERT_TRUE(id.has_value());
+        EXPECT_EQ(*id, (L4TaskId{5, 8}));
+    }
+    EXPECT_EQ(done,
+              (std::vector<std::pair<std::string, bool>>{{"pk_id", false}}));
+}
+
+// The task ids must be index-aligned with the keys.
+TEST_F(FileStoragePromotionTest, PrefetchKeysRejectsMisalignedTaskIds) {
+    auto res = file_storage->PrefetchKeys({"pk_a", "pk_b"}, {1024, 1024},
+                                          {L4TaskId{5, 9}});
+    ASSERT_FALSE(res.has_value());
+    EXPECT_EQ(res.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(fake->alloc_calls.load(), 0);
+    EXPECT_EQ(fake->notify_failure_calls.load(), 0);
 }
 
 TEST_F(FileStoragePromotionTest, PrefetchKeysStopsBatchOnDramPressure) {
@@ -491,8 +528,9 @@ TEST_F(FileStoragePromotionTest, PrefetchKeysStopsBatchOnDramPressure) {
     bool dram_pressure = false;
     std::vector<std::string> attempted;
     auto res = file_storage->PrefetchKeys(
-        {"pk1", "pk2", "pk3", "pk4"}, {1024, 1024, 1024, 1024}, &dram_pressure,
-        [&attempted](const std::string& key, bool) {
+        {"pk1", "pk2", "pk3", "pk4"}, {1024, 1024, 1024, 1024},
+        {L4TaskId{4, 1}, L4TaskId{4, 2}, L4TaskId{4, 3}, L4TaskId{4, 4}},
+        &dram_pressure, [&attempted](const std::string& key, bool) {
             attempted.push_back(key);
         });
     ASSERT_TRUE(res.has_value());

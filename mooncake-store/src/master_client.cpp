@@ -273,8 +273,8 @@ struct RpcNameTraits<&WrappedMasterService::PromotionAllocStart> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::RegisterPrefetchTask> {
-    static constexpr const char* value = "RegisterPrefetchTask";
+struct RpcNameTraits<&WrappedMasterService::RegisterPrefetchPromotionTask> {
+    static constexpr const char* value = "RegisterPrefetchPromotionTask";
 };
 
 template <>
@@ -1335,13 +1335,14 @@ tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccess(
     return NotifyPromotionSuccess(client_id, key, tenant_id_.value());
 }
 
-tl::expected<void, ErrorCode> MasterClient::RegisterPrefetchTask(
+tl::expected<L4TaskId, ErrorCode> MasterClient::RegisterPrefetchPromotionTask(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
-    ScopedVLogTimer timer(1, "MasterClient::RegisterPrefetchTask");
+    ScopedVLogTimer timer(1, "MasterClient::RegisterPrefetchPromotionTask");
     timer.LogRequest("client_id=", client_id, ", key=", key);
-    auto result = invoke_rpc<&WrappedMasterService::RegisterPrefetchTask, void>(
-        client_id, key, tenant_id);
+    auto result =
+        invoke_rpc<&WrappedMasterService::RegisterPrefetchPromotionTask,
+                   L4TaskId>(client_id, key, tenant_id);
     timer.LogResponseExpected(result);
     return result;
 }

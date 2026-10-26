@@ -4586,11 +4586,11 @@ tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     return {};
 }
 
-tl::expected<void, ErrorCode> Client::RegisterPrefetchTask(
+tl::expected<L4TaskId, ErrorCode> Client::RegisterPrefetchPromotionTask(
     const std::string& object_key, const std::string& tenant_id) {
     // Default (empty) means this client's own tenant; a delegated prefetch
     // carries the requester's tenant explicitly.
-    return master_client_.RegisterPrefetchTask(
+    return master_client_.RegisterPrefetchPromotionTask(
         client_id_, object_key,
         tenant_id.empty() ? master_client_.tenant_id() : tenant_id);
 }

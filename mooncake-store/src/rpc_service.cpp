@@ -1828,10 +1828,11 @@ WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
     return master_service_.PromotionObjectHeartbeat(client_id);
 }
 
-tl::expected<void, ErrorCode> WrappedMasterService::RegisterPrefetchTask(
+tl::expected<L4TaskId, ErrorCode>
+WrappedMasterService::RegisterPrefetchPromotionTask(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
-    ScopedVLogTimer timer(1, "RegisterPrefetchTask");
+    ScopedVLogTimer timer(1, "RegisterPrefetchPromotionTask");
     timer.LogRequest("action=register_prefetch_task");
     auto result = WithRequestTenant(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
@@ -2231,7 +2232,7 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &mooncake::WrappedMasterService::BatchGetReplicaListForAdmin>(
         &wrapped_master_service);
     server.register_handler<
-        &mooncake::WrappedMasterService::RegisterPrefetchTask>(
+        &mooncake::WrappedMasterService::RegisterPrefetchPromotionTask>(
         &wrapped_master_service);
 }
 
