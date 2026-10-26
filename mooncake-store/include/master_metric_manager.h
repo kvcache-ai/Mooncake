@@ -160,6 +160,8 @@ class MasterMetricManager {
     void inc_client_offboarding_retry();
     void inc_client_offboarding_alert();
     void observe_client_offboarding_duration_ms(int64_t duration_ms);
+    void observe_evicted_key_age_seconds(double seconds);
+    void observe_eviction_duration_ms(int64_t duration_ms);
 
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
@@ -757,6 +759,13 @@ class MasterMetricManager {
     ylt::metric::counter_t nof_eviction_attempts_;
     ylt::metric::counter_t nof_evicted_key_count_;
     ylt::metric::counter_t nof_evicted_size_;
+
+    // Eviction distributions: key age at eviction, per-cycle duration.
+    // Age uses the double specialization for sub-second bucket placement;
+    // note ylt's histogram _sum is int64-truncated for both specializations,
+    // and a batch with all observations < 1s is omitted while sum == 0.
+    ylt::metric::basic_static_histogram<double> evicted_key_age_seconds_;
+    ylt::metric::histogram_t eviction_duration_ms_;
 
     // PutStart Discard Metrics
     ylt::metric::counter_t put_start_discard_cnt_;

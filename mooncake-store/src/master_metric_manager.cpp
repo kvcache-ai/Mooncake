@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <glog/logging.h>
+#include <algorithm>
 #include <iomanip>  // For std::fixed, std::setprecision
 #include <limits>   // For std::numeric_limits
 #include <sstream>  // For string building during serialization
@@ -380,6 +381,16 @@ MasterMetricManager::MasterMetricManager()
                              "Total number of keys evicted in nof"),
       nof_evicted_size_("master_evicted_size_bytes_nof",
                         "Total bytes of evicted objects in nof"),
+      evicted_key_age_seconds_(
+          "master_evicted_key_age_seconds",
+          "Age of evicted keys at eviction time (seconds since latest put "
+          "start)",
+          {1, 10, 60, 300, 900, 3600, 21600, 86400}),
+      eviction_duration_ms_(
+          "master_eviction_duration_ms",
+          "Wall-clock duration of one BatchEvict cycle in milliseconds",
+          {1, 5, 10, 50, 100, 250, 500, 1000, 5000, 15000, 30000, 60000, 120000,
+           300000, 600000}),
 
       // Initialize Discarded Replicas Counters
       put_start_discard_cnt_("master_put_start_discard_cnt",
@@ -738,6 +749,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     value_size_distribution_.observe(0);
     client_offboarding_duration_ms_.observe(0);
     nof_heartbeat_probe_latency_ms_.observe(0);
+    evicted_key_age_seconds_.observe(0);
+    eviction_duration_ms_.observe(0);
 
     // Note: dynamic_gauge_1t (mem_allocated_size_per_segment_ and
     // mem_total_capacity_per_segment_) are not initialized here because they
@@ -1082,6 +1095,14 @@ void MasterMetricManager::inc_client_offboarding_alert() {
 void MasterMetricManager::observe_client_offboarding_duration_ms(
     int64_t duration_ms) {
     client_offboarding_duration_ms_.observe(duration_ms);
+}
+
+void MasterMetricManager::observe_evicted_key_age_seconds(double seconds) {
+    evicted_key_age_seconds_.observe(std::max(0.0, seconds));
+}
+
+void MasterMetricManager::observe_eviction_duration_ms(int64_t duration_ms) {
+    eviction_duration_ms_.observe(duration_ms);
 }
 
 // Store-observed cache reuse metrics
@@ -2167,6 +2188,8 @@ std::string MasterMetricManager::serialize_metrics() {
     // Serialize Histogram
     serialize_metric(value_size_distribution_);
     serialize_metric(client_offboarding_duration_ms_);
+    serialize_metric(evicted_key_age_seconds_);
+    serialize_metric(eviction_duration_ms_);
 
     serialize_metric(client_liveness_suspected_transitions_);
     serialize_metric(client_liveness_recoveries_);
