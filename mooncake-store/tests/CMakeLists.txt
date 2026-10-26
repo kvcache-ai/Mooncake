@@ -29,6 +29,7 @@ add_store_test(real_client_deployment_test real_client_deployment_test.cpp)
 target_link_libraries(real_client_deployment_test PRIVATE mooncake_master_core)
 set_tests_properties(real_client_deployment_test
     PROPERTIES LABELS "${MOONCAKE_STORE_CLIENT_ARCH};client;deployment" TIMEOUT 180)
+add_store_test(real_client_remount_test real_client_remount_test.cpp)
 
 if(MOONCAKE_STORE_CLIENT_ARCH STREQUAL "centralized")
     add_store_test(storage_backend_test storage_backend_test.cpp)
@@ -50,7 +51,6 @@ if(MOONCAKE_STORE_CLIENT_ARCH STREQUAL "centralized")
     add_store_test(ipv6_client_test ipv6_client_test.cpp)
     add_store_test(client_metrics_test client_metrics_test.cpp)
     add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
-    add_store_test(real_client_remount_test real_client_remount_test.cpp)
     add_store_test(file_storage_test file_storage_test.cpp)
 
     add_executable(high_availability_test high_availability_test.cpp)
