@@ -82,6 +82,8 @@ class RdmaTransport : public Transport {
     virtual Status getTransferStatus(SubBatchRef batch, int task_id,
                                      TransferStatus& status);
 
+    bool publishesBatchCompletionCounter() const override { return true; }
+
     bool supportsCancellation() const override { return true; }
 
     Status cancelTransferTask(SubBatchRef batch, int task_id) override;
