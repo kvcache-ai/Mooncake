@@ -324,6 +324,10 @@ TEST(DataManagerFactoryConfigTest, TheTierFileSetsTheStopDrainTimeout) {
     config.tier_config = ParseJson(kJson);
     // Local-only: no engine to register pool memory with.
     config.register_tiers_with_transfer_engine = false;
+    // Keep Put deferred until Wait(), so its guard is still held at Stop().
+    config.local_transfer.mode = LocalTransferMode::MEMCPY;
+    config.local_transfer.local_memcpy_async_worker_num = 0;
+    config.local_transfer.te_async_poll_worker_num = 0;
     // Deliberately left unset -- that is what "the file decides" looks like.
     ASSERT_FALSE(config.stop_drain_timeout.has_value());
 
@@ -352,6 +356,10 @@ TEST(DataManagerFactoryConfigTest, TheTierFileSetsTheStopDrainTimeout) {
     EXPECT_LT(elapsed, std::chrono::seconds(2))
         << "Stop waited the built-in default, so the tier file's "
            "stop_drain_timeout_ms was ignored";
+
+    auto cancelled = handle.value()->Wait();
+    ASSERT_FALSE(cancelled.has_value());
+    EXPECT_EQ(cancelled.error(), ErrorCode::SHUTTING_DOWN);
 
     // Ordered so the handle is released before the manager it points into.
     handle.value().reset();

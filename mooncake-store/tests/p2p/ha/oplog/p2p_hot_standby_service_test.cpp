@@ -103,6 +103,31 @@ void InjectNotifierErrors(const std::shared_ptr<ControlledNotifierState>& state,
     state->cv.notify_all();
 }
 
+// Bind once on port 0 and keep the listener alive for the entire test. A
+// PID-derived port can be in use by another test or an outgoing connection.
+class SnapshotServer {
+   public:
+    explicit SnapshotServer(P2PHotStandbyService& source)
+        : service_(&source), server_(1, 0) {
+        server_.register_handler<&P2PStandbySnapshotService::BeginSnapshot,
+                                 &P2PStandbySnapshotService::GetSnapshotChunk,
+                                 &P2PStandbySnapshotService::EndSnapshot>(
+            &service_);
+    }
+
+    ~SnapshotServer() { server_.stop(); }
+
+    bool Start() { return !server_.async_start().hasResult(); }
+    uint16_t Port() const { return server_.port(); }
+    std::string Endpoint() const {
+        return "127.0.0.1:" + std::to_string(Port());
+    }
+
+   private:
+    P2PStandbySnapshotService service_;
+    coro_rpc::coro_rpc_server server_;
+};
+
 class P2PHotStandbyServiceTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -247,17 +272,15 @@ TEST_F(P2PHotStandbyServiceTest, BootstrapsFromStandbySnapshotSource) {
     RegisterClient(master, client_id, MakeSegment(segment_id));
     PublishRoute(master, "snapshot-key", client_id, segment_id, 8192);
 
-    auto source_config = MakeStandbyConfig();
-    source_config.snapshot_service_port =
-        static_cast<uint16_t>(49000 + (::getpid() % 1000));
-    P2PHotStandbyService source(source_config);
+    P2PHotStandbyService source(MakeStandbyConfig());
     ASSERT_EQ(source.Start(), ErrorCode::OK);
     ASSERT_TRUE(
         source.WaitForAppliedSequence(2, std::chrono::milliseconds(2000)));
+    SnapshotServer snapshot(source);
+    ASSERT_TRUE(snapshot.Start());
 
     auto target_config = MakeStandbyConfig();
-    target_config.snapshot_source_endpoints = {
-        "127.0.0.1:" + std::to_string(source_config.snapshot_service_port)};
+    target_config.snapshot_source_endpoints = {snapshot.Endpoint()};
     target_config.snapshot_chunk_size = 1;
     P2PHotStandbyService target(target_config);
     ASSERT_EQ(target.Start(), ErrorCode::OK);
@@ -339,13 +362,13 @@ TEST_F(P2PHotStandbyServiceTest,
 }
 
 TEST_F(P2PHotStandbyServiceTest, SnapshotServerRejectsOccupiedPort) {
-    auto config = MakeStandbyConfig();
-    config.snapshot_service_port =
-        static_cast<uint16_t>(50000 + (::getpid() % 1000));
-
-    P2PHotStandbyService first(config);
+    P2PHotStandbyService first(MakeStandbyConfig());
     ASSERT_EQ(first.Start(), ErrorCode::OK);
+    SnapshotServer snapshot(first);
+    ASSERT_TRUE(snapshot.Start());
 
+    auto config = MakeStandbyConfig();
+    config.snapshot_service_port = snapshot.Port();
     P2PHotStandbyService second(config);
     EXPECT_EQ(second.Start(), ErrorCode::INTERNAL_ERROR);
 
@@ -360,13 +383,12 @@ TEST_F(P2PHotStandbyServiceTest, TrimSignalSwitchesToSnapshotResync) {
     RegisterClient(master, client_id, MakeSegment(segment_id));
     PublishRoute(master, "trim-resync-key", client_id, segment_id, 4096);
 
-    auto source_config = MakeStandbyConfig();
-    source_config.snapshot_service_port =
-        static_cast<uint16_t>(50000 + (::getpid() % 1000));
-    P2PHotStandbyService source(source_config);
+    P2PHotStandbyService source(MakeStandbyConfig());
     ASSERT_EQ(source.Start(), ErrorCode::OK);
     ASSERT_TRUE(
         source.WaitForAppliedSequence(2, std::chrono::milliseconds(2000)));
+    SnapshotServer snapshot(source);
+    ASSERT_TRUE(snapshot.Start());
 
     std::mutex states_mutex;
     std::vector<std::shared_ptr<ControlledNotifierState>> states;
@@ -380,8 +402,7 @@ TEST_F(P2PHotStandbyServiceTest, TrimSignalSwitchesToSnapshotResync) {
     };
 
     auto target_config = MakeStandbyConfig();
-    target_config.snapshot_source_endpoints = {
-        "127.0.0.1:" + std::to_string(source_config.snapshot_service_port)};
+    target_config.snapshot_source_endpoints = {snapshot.Endpoint()};
     P2PHotStandbyService target(target_config, factory);
     ASSERT_EQ(target.Start(), ErrorCode::OK);
 
