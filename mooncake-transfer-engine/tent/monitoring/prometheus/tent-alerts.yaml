@@ -1,0 +1,194 @@
+groups:
+  - name: tent-observability
+    interval: 30s
+    rules:
+      - alert: TentMetricsTargetDown
+        expr: up{job=~"tent.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: TENT metrics target is unreachable
+          description: >-
+            Prometheus has been unable to scrape {{ $labels.instance }} for two
+            minutes. Check the process and /live before diagnosing transfer data.
+
+      - alert: TentMetricsSerializationFailure
+        expr: increase(tent_metrics_serialization_failures_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: TENT metrics serialization failed
+          description: >-
+            The {{ $labels.format }} serializer on {{ $labels.instance }} failed
+            during the last five minutes.
+
+      - alert: TentMetricsSerializationStale
+        expr: >-
+          time() -
+          tent_metrics_last_success_timestamp_seconds{format="prometheus"} > 300
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: TENT metrics serialization is stale
+          description: >-
+            No successful Prometheus/OpenMetrics serialization has been observed
+            on {{ $labels.instance }} for more than five minutes.
+
+      - alert: TentLogicalFailureRateHigh
+        expr: |-
+          (
+            sum by (job, instance) (
+              rate({__name__=~"tent_(read|write)_failures_total"}[5m])
+            )
+          )
+          /
+          clamp_min(
+            sum by (job, instance) (
+              rate({__name__=~"tent_(read|write)_requests_total"}[5m])
+            ),
+            1
+          ) > 0.05
+          and on (job, instance)
+          (
+            sum by (job, instance) (
+              rate({__name__=~"tent_(read|write)_requests_total"}[5m])
+            )
+          ) > 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: TENT logical failure rate is above 5%
+          description: >-
+            Logical transfers on {{ $labels.instance }} are failing above the
+            default threshold while request traffic is non-trivial.
+
+      - alert: TentTransportAttemptFailureRateHigh
+        expr: |-
+          sum by (job, instance, transport) (
+            rate(tent_transport_attempt_failures_total[5m])
+          )
+          /
+          clamp_min(
+            sum by (job, instance, transport) (
+              rate(tent_transport_attempts_total[5m])
+            ),
+            1
+          ) > 0.10
+          and on (job, instance, transport)
+          sum by (job, instance, transport) (
+            rate(tent_transport_attempts_total[5m])
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: TENT physical attempt failure rate is above 10%
+          description: >-
+            {{ $labels.transport }} attempts on {{ $labels.instance }} are
+            failing even if logical requests may be recovering through failover.
+
+      - alert: TentProgressWorkerStalled
+        expr: |-
+          (
+            time() - tent_worker_last_progress_timestamp_seconds{
+              worker="engine_progress"
+            } > 30
+          )
+          and on (job, instance)
+          sum by (job, instance) (tent_inflight_attempts) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: TENT progress worker is stalled with in-flight work
+          description: >-
+            {{ $labels.instance }} has in-flight transport attempts but the
+            engine progress timestamp has not advanced for at least 30 seconds.
+
+      - alert: TentStagingWorkerStalled
+        expr: |-
+          (
+            time() - tent_worker_last_progress_timestamp_seconds{
+              worker="staging"
+            } > 30
+          )
+          and on (job, instance)
+          (
+            sum by (job, instance) (tent_staging_inflight_tasks) > 0
+            or
+            sum by (job, instance) (tent_staging_cleanup_pending) > 0
+          )
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: TENT staging worker is stalled
+          description: >-
+            {{ $labels.instance }} has staging work or deferred cleanup but the
+            staging progress timestamp is stale.
+
+      - alert: TentStagingCleanupTimeout
+        expr: increase(tent_staging_cleanup_timeouts_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: TENT staging cleanup reached its deadline
+          description: >-
+            Deferred staging resources on {{ $labels.instance }} did not drain
+            before shutdown or cleanup timeout.
+
+      - alert: TentRdmaCompletionQueueError
+        expr: increase(tent_rdma_cq_poll_errors_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: TENT RDMA completion queue poll failed
+          description: >-
+            An RDMA CQ poll error occurred on {{ $labels.instance }}. Inspect
+            endpoint, QP transition, notification, and terminal-failure signals.
+
+      - alert: TentRdmaRetryExhausted
+        expr: increase(tent_rdma_retry_exhausted_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: TENT RDMA retry budget was exhausted
+          description: >-
+            {{ $labels.operation }} slices exhausted retries due to
+            {{ $labels.cause }} on {{ $labels.instance }}.
+
+      - alert: TentAdmissionRejecting
+        expr: >-
+          sum by (job, instance, owner_kind, event) (
+            rate(tent_admission_events_total{
+              event=~"rejected_.*|deadline_dropped"
+            }[5m])
+          ) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: TENT admission control is rejecting work
+          description: >-
+            {{ $labels.owner_kind }} owners on {{ $labels.instance }} are seeing
+            {{ $labels.event }} decisions continuously.
+
+      - alert: TentTransportSelectionExhausted
+        expr: >-
+          increase(tent_transport_selection_events_total{event="exhausted"}[5m])
+          > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: TENT exhausted all transport candidates
+          description: >-
+            No eligible transport remained for at least one request on
+            {{ $labels.instance }}.

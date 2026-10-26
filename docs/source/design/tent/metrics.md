@@ -363,6 +363,11 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_rdma_qp_transition_failures_total` | Counter | `qp_type`, `transition` | Failed data or notification QP state transitions |
 | `tent_rdma_notification_events_total` | Counter | `event` | Notification receive posting/delivery, send posting/completion and channel failures |
 | `tent_stream_events_total` | Counter | `transport`, `operation`, `event` | TCP and HP-TCP queue, physical attempt, connection, retry and terminal events |
+| `tent_shm_mapping_events_total` | Counter | `event` | SHM address relocation and backing-object mapping outcomes |
+| `tent_shm_copy_events_total` | Counter | `operation`, `outcome` | Synchronous physical SHM copy attempts |
+| `tent_segment_events_total` | Counter | `event` | Segment snapshot, registry, remote-cache and generation lifecycle events |
+| `tent_transport_selection_events_total` | Counter | `event`, `transport` | Transport candidate, hint, fallback and exhaustion decisions |
+| `tent_admission_events_total` | Counter | `owner_kind`, `event` | Runtime admission, rejection, dispatch, deadline-drop and cancellation decisions |
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
 | `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
 | `tent_worker_last_progress_timestamp_seconds` | Gauge | `worker` | Unix timestamp of the last observed engine-progress, staging, or RDMA-worker progress |
@@ -371,6 +376,8 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_staging_cleanup_pending` | Gauge | `kind` | Deferred cleanup groups, child batches, or remote operations still awaiting safe release |
 | `tent_rdma_worker_inflight_slices` | Gauge | `operation` | RDMA slices owned by worker queues or completion processing |
 | `tent_rdma_posted_inflight_slices` | Gauge | `operation` | RDMA slices reserved for posting or posted and not yet resolved |
+| `tent_admission_queue_owners` | Gauge | `owner_kind` | Owners currently accounted by runtime admission control |
+| `tent_admission_queue_bytes` | Gauge | `owner_kind` | Bytes currently accounted by runtime admission control |
 | `tent_read_latency_us` | Histogram | `transport` | Read latency distribution in microseconds |
 | `tent_write_latency_us` | Histogram | `transport` | Write latency distribution in microseconds |
 | `tent_read_size_bytes` | Histogram | `transport` | Read request size distribution in bytes |
@@ -384,6 +391,8 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_rdma_completion_latency_us` | Histogram | `operation`, `outcome` | Post-to-CQ latency of physical RDMA slice completions |
 | `tent_stream_attempt_latency_us` | Histogram | `transport`, `operation`, `outcome` | End-to-end latency of physical TCP or HP-TCP network attempts |
 | `tent_stream_queue_wait_us` | Histogram | `transport`, `operation` | TCP logical-task and HP-TCP physical-slice queue wait before an attempt starts |
+| `tent_shm_copy_latency_us` | Histogram | `operation`, `outcome` | Synchronous physical SHM copy latency |
+| `tent_admission_wait_us` | Histogram | `owner_kind` | Runtime admission wait before dispatch |
 
 ### Metrics pipeline self-observability
 
@@ -429,8 +438,9 @@ addresses, segment names, or other unbounded values are accepted.
 | `outcome` | `success`, `failure` for memory lifecycle metrics; `success`, `connection_error`, `rpc_error` for RPC metrics; `success`, `wc_error`, `flush`, `late` for RDMA completions; `success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error` for stream attempts | Bounded operation outcome |
 | `worker` | `engine_progress`, `staging`, `rdma` | Worker subsystem reporting forward progress |
 | `kind` | `group`, `batch`, `remote_operation` | Deferred staging cleanup resource kind |
+| `owner_kind` | `user`, `staging`, `all` | Runtime admission owner class; `all` is the aggregate capacity domain |
 | `method` | `get_segment_desc`, `bootstrap_rdma`, `bootstrap_ub`, `send_data`, `recv_data`, `notify`, `probe`, `delegate`, `pin`, `unpin`, `subscribe_segment_update`, `notify_segment_updated`, `unknown` | TENT RPC method; `unknown` safely bounds extension methods |
-| `event` | RDMA slice: `enqueued`, `post_attempt`, `path_error`, `post_error`, `completion_success`, `completion_error`, `completion_flush`, `late_completion`, `software_timeout`; endpoint: `constructed`, `construct_failure`, `ready_active`, `ready_passive`, `retiring`, `destroyed`, `destroy_error`; notification: `recv_posted`, `recv_post_error`, `recv_delivered`, `recv_invalid`, `recv_dropped`, `send_posted`, `send_completed`, `send_unavailable`, `send_encode_error`, `send_post_error`, `completion_error`, `cq_poll_error`, `unknown_qp`, `channel_disabled`; stream: `queued`, `attempt_started`, `attempt_success`, `connect_started`, `connect_success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error`, `retry_issued`, `retry_exhausted` | Family-specific bounded lifecycle event |
+| `event` | RDMA slice: `enqueued`, `post_attempt`, `path_error`, `post_error`, `completion_success`, `completion_error`, `completion_flush`, `late_completion`, `software_timeout`; endpoint: `constructed`, `construct_failure`, `ready_active`, `ready_passive`, `retiring`, `destroyed`, `destroy_error`; notification: `recv_posted`, `recv_post_error`, `recv_delivered`, `recv_invalid`, `recv_dropped`, `send_posted`, `send_completed`, `send_unavailable`, `send_encode_error`, `send_post_error`, `completion_error`, `cq_poll_error`, `unknown_qp`, `channel_disabled`; stream: `queued`, `attempt_started`, `attempt_success`, `connect_started`, `connect_success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error`, `retry_issued`, `retry_exhausted`; selection and admission use the closed decision names documented by their counters | Family-specific bounded lifecycle event or decision |
 | `cause` | `endpoint`, `post`, `completion` | RDMA retry or retry-exhaustion source |
 | `qp_type` | `data`, `notification` | RDMA queue-pair role; QP numbers are never labels |
 | `transition` | `create`, `reset`, `init`, `rtr`, `rts`, `error`, `destroy` | Queue-pair transition that failed |

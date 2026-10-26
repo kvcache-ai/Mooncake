@@ -83,6 +83,7 @@ The design favors predictable behavior and operational simplicity over manual tu
 :maxdepth: 1
 
 metrics
+observability-runbook
 :::
 
 ## TENT Transport Selection
