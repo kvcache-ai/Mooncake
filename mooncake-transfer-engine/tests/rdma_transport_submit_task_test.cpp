@@ -176,6 +176,29 @@ TEST_F(SubmitTransferTaskTest, SubmitRetryDropsNicHint) {
     EXPECT_EQ(selectedLkey(request), lkeyForDevice(local_device_id_));
 }
 
+TEST_F(SubmitTransferTaskTest, SparseLocalRegistrationSkipsUnregisteredHca) {
+    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(desc, nullptr);
+    ASSERT_EQ(
+        desc->topology.parse(R"({"cpu:0": [["mlx5_local"], ["mlx5_global"]],)"
+                             R"("cpu:1": [["mlx5_global"], []]})"),
+        0);
+    desc->buffers[0].lkey[local_device_id_] = 0;
+    desc->buffers[0].rkey[local_device_id_] = 0;
+
+    Transport::TransferRequest request;
+    EXPECT_EQ(selectedLkey(request), lkeyForDevice(global_device_id_));
+}
+
+TEST_F(SubmitTransferTaskTest, LocalOnlyRegistrationUsesLkey) {
+    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(desc, nullptr);
+    desc->buffers[0].rkey.clear();
+
+    Transport::TransferRequest request;
+    EXPECT_EQ(selectedLkey(request), lkeyForDevice(local_device_id_));
+}
+
 TEST_F(SubmitTransferTaskTest, NoDuplicateSlice) {
     Transport::Slice *original = nullptr;
     {

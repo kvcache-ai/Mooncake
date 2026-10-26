@@ -24,7 +24,11 @@
 
 namespace mooncake {
 
-RdmaTwoSidedTransport::RdmaTwoSidedTransport() {
+RdmaTwoSidedTransport::RdmaTwoSidedTransport()
+    : RdmaTwoSidedTransport(globalConfig().rdma_nic_selection) {}
+
+RdmaTwoSidedTransport::RdmaTwoSidedTransport(NicSelection nic_selection)
+    : RdmaTransport(nic_selection) {
     std::random_device rd;
     std::mt19937_64 gen(rd());
     local_ctrl_session_id_ = gen();

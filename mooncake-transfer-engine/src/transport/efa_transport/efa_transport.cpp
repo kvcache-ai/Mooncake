@@ -51,7 +51,10 @@ static size_t getMaxPteEntries() { return kDefaultMaxPteEntries; }
 
 static constexpr size_t kThpPageSize = 2ULL * 1024 * 1024;
 
-EfaTransport::EfaTransport() {
+EfaTransport::EfaTransport() : EfaTransport(globalConfig().efa_nic_selection) {}
+
+EfaTransport::EfaTransport(NicSelection nic_selection)
+    : nic_selection_(nic_selection) {
     LOG(INFO) << "[EFA] AWS Elastic Fabric Adapter transport initialized";
 }
 
@@ -753,25 +756,10 @@ int EfaTransport::allocateLocalSegmentID() {
 std::unordered_map<std::string, std::vector<size_t>>
 EfaTransport::buildLocalNicMap(const TopologyMatrix& matrix,
                                const std::vector<std::string>& device_names) {
-    std::unordered_map<std::string, size_t> name_to_index;
-    for (size_t i = 0; i < device_names.size(); ++i)
-        name_to_index[device_names[i]] = i;
-
-    std::unordered_map<std::string, std::vector<size_t>> local_nic_map;
-    for (const auto& entry : matrix) {
-        std::vector<size_t> indices;
-        for (const auto& hca : entry.second.preferred_hca) {
-            auto it = name_to_index.find(hca);
-            // A preferred HCA can be missing here: non-EFA devices are filtered
-            // out of context_list_, and an EFA device whose construct() failed
-            // was dropped. Skipping it leaves the rest of the set usable.
-            if (it != name_to_index.end()) indices.push_back(it->second);
-        }
-        // No entry at all rather than an empty one, so the caller's lookup miss
-        // falls back to all NICs instead of registering the buffer nowhere.
-        if (!indices.empty()) local_nic_map[entry.first] = std::move(indices);
-    }
-    return local_nic_map;
+    // A preferred HCA can be missing from `device_names`: non-EFA devices are
+    // filtered out of context_list_, and an EFA device whose construct()
+    // failed was dropped.
+    return buildPreferredNicIndexMap(matrix, device_names);
 }
 
 int EfaTransport::registerLocalMemoryBatch(
@@ -1302,7 +1290,7 @@ int EfaTransport::initializeEfaResources() {
         return ERR_DEVICE_NOT_FOUND;
     }
 
-    if (globalConfig().efa_nic_selection == EfaNicSelection::LOCAL) {
+    if (nic_selection_ == NicSelection::LOCAL) {
         std::vector<std::string> context_names;
         context_names.reserve(context_list_.size());
         for (auto& context : context_list_)
@@ -1319,9 +1307,9 @@ int EfaTransport::initializeEfaResources() {
                       << nic_list << "]";
         }
         if (local_nic_map_.empty()) {
-            LOG(WARNING) << "EfaTransport: MC_EFA_NIC_SELECTION=local but the "
-                            "topology reports no per-location preferred NICs; "
-                            "every buffer will use all NICs as before";
+            LOG(WARNING) << "EfaTransport: local NIC selection is enabled but "
+                            "the topology reports no per-location preferred "
+                            "NICs; every buffer will use all NICs as before";
         }
     }
 

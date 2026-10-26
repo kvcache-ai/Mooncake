@@ -71,7 +71,7 @@ TransferOpcode.WRITE  # Write operation
 #### initialize()
 
 ```python
-initialize(local_hostname, metadata_server, protocol, device_name)
+initialize(local_hostname, metadata_server, protocol, device_name, topology_local_registration=None)
 ```
 
 Initializes the transfer engine with basic configuration.
@@ -81,6 +81,7 @@ Initializes the transfer engine with basic configuration.
 - `metadata_server` (str): The metadata server connection string (e.g., "127.0.0.1:2379" or "etcd://127.0.0.1:2379")
 - `protocol` (str): The transport protocol to use ("rdma", "tcp", etc.)
 - `device_name` (str): Comma-separated list of device names to filter, or empty string for all devices
+- `topology_local_registration` (bool, optional): Overrides `MC_RDMA_NIC_SELECTION` and `MC_EFA_NIC_SELECTION` for this engine. `True` enables the backend's topology-local registration, as if the variable were `local`; `False` disables it, as if it were `all`. `None` keeps the environment setting. Each backend keeps the scope described for its variable; EFA, for example, narrows only buffers registered as a single chunk
 
 **Returns:**
 - `int`: 0 on success, negative value on failure
@@ -88,7 +89,7 @@ Initializes the transfer engine with basic configuration.
 #### initialize_ext()
 
 ```python
-initialize_ext(local_hostname, metadata_server, protocol, device_name, metadata_type)
+initialize_ext(local_hostname, metadata_server, protocol, device_name, metadata_type, topology_local_registration=None)
 ```
 
 Initializes the transfer engine with extended configuration including metadata type specification.
@@ -99,10 +100,10 @@ Initializes the transfer engine with extended configuration including metadata t
 - `protocol` (str): The transport protocol to use
 - `device_name` (str): Comma-separated list of device names to filter
 - `metadata_type` (str): The type of metadata server ("etcd", "p2p", etc.)
+- `topology_local_registration` (bool, optional): Same as in `initialize()`
 
 **Returns:**
 - `int`: 0 on success, negative value on failure
-
 ### Engine Information
 
 #### get_engine()

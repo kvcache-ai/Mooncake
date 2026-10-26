@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <thread>
+#include <type_traits>
 
 #include "config.h"
 #include "transport/batch_registration.h"
@@ -477,6 +478,9 @@ TEST(BatchRegistrationTest, AttemptsEveryItemAndReturnsAnError) {
     EXPECT_EQ(completed.load(), 12u);
 }
 
+// The EFA-only name stays a source-compatible alias of NicSelection.
+static_assert(std::is_same_v<EfaNicSelection, NicSelection>);
+
 class EfaNicSelectionEnvTest : public ::testing::Test {
    protected:
     void TearDown() override { ::unsetenv("MC_EFA_NIC_SELECTION"); }
@@ -486,29 +490,29 @@ TEST_F(EfaNicSelectionEnvTest, DefaultsToAll) {
     ::unsetenv("MC_EFA_NIC_SELECTION");
     GlobalConfig config;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+    EXPECT_EQ(config.efa_nic_selection, NicSelection::ALL);
 }
 
 TEST_F(EfaNicSelectionEnvTest, LocalIsApplied) {
     ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "local", 1), 0);
     GlobalConfig config;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
+    EXPECT_EQ(config.efa_nic_selection, NicSelection::LOCAL);
 }
 
 TEST_F(EfaNicSelectionEnvTest, AllIsAcceptedExplicitly) {
     ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "all", 1), 0);
     GlobalConfig config;
-    config.efa_nic_selection = EfaNicSelection::LOCAL;  // must be overwritten
+    config.efa_nic_selection = NicSelection::LOCAL;  // must be overwritten
     loadGlobalConfig(config);
-    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+    EXPECT_EQ(config.efa_nic_selection, NicSelection::ALL);
 }
 
 TEST_F(EfaNicSelectionEnvTest, CaseIsIgnored) {
     ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "LOCAL", 1), 0);
     GlobalConfig config;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
+    EXPECT_EQ(config.efa_nic_selection, NicSelection::LOCAL);
 }
 
 TEST_F(EfaNicSelectionEnvTest, UnknownValueKeepsDefault) {
@@ -516,16 +520,35 @@ TEST_F(EfaNicSelectionEnvTest, UnknownValueKeepsDefault) {
     // NIC set is a correctness-adjacent surprise, not a perf knob.
     ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "topology", 1), 0);
     GlobalConfig config;
-    config.efa_nic_selection = EfaNicSelection::LOCAL;
+    config.efa_nic_selection = NicSelection::LOCAL;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
+    EXPECT_EQ(config.efa_nic_selection, NicSelection::LOCAL);
 }
 
 TEST_F(EfaNicSelectionEnvTest, EmptyStringKeepsDefault) {
     ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "", 1), 0);
     GlobalConfig config;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+    EXPECT_EQ(config.efa_nic_selection, NicSelection::ALL);
+}
+
+class RdmaNicSelectionEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_RDMA_NIC_SELECTION"); }
+};
+
+TEST_F(RdmaNicSelectionEnvTest, DefaultsToAll) {
+    ::unsetenv("MC_RDMA_NIC_SELECTION");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_nic_selection, NicSelection::ALL);
+}
+
+TEST_F(RdmaNicSelectionEnvTest, LocalIsApplied) {
+    ASSERT_EQ(::setenv("MC_RDMA_NIC_SELECTION", "local", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_nic_selection, NicSelection::LOCAL);
 }
 
 // max_wr_from_env distinguishes "the operator asked for this depth" from "this

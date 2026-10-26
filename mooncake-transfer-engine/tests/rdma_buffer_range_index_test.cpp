@@ -24,6 +24,8 @@
 
 #include "buffer_range_index.h"
 #include "common.h"
+#include "config.h"
+#include "cuda_alike.h"
 #include "memory_location.h"
 #include "transfer_metadata.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -260,6 +262,114 @@ TEST(BufferRangeIndex, LastHitReusesHintDevice) {
         0);
     EXPECT_EQ(hinted_buffer, 0);
     EXPECT_EQ(hinted_device, first_device);
+}
+
+// Gives the single buffer of MakeSegment() one key per HCA of `topology`.
+// Devices listed in `unkeyed` get no MR, i.e. a zero lkey and rkey.
+SegmentDesc MakeSparseSegment(const std::string &topology,
+                              const std::vector<std::string> &unkeyed = {},
+                              const std::string &location = "cpu:0") {
+    auto desc = MakeSegment({MakeBuffer(0x1000, 0x1000, 0)});
+    EXPECT_EQ(desc.topology.parse(topology), 0);
+    auto &buffer = desc.buffers[0];
+    buffer.name = location;
+    buffer.lkey.clear();
+    buffer.rkey.clear();
+    for (const auto &hca : desc.topology.getHcaList()) {
+        const bool keyed =
+            std::find(unkeyed.begin(), unkeyed.end(), hca) == unkeyed.end();
+        const auto key = static_cast<BufferDesc::mr_key_t>(
+            keyed ? 100 + buffer.lkey.size() : 0);
+        buffer.lkey.push_back(key);
+        buffer.rkey.push_back(key);
+    }
+    return desc;
+}
+
+int DeviceIndex(const SegmentDesc &desc, const std::string &hca) {
+    return desc.topology.getDeviceIndex(kWildcardLocation, hca);
+}
+
+TEST(BufferRangeIndex, LastHitSkipsDeviceWithoutKey) {
+    auto desc =
+        MakeSparseSegment(R"({"cpu:0":[["mlx5_0","mlx5_1"],[]]})", {"mlx5_0"});
+    const int unkeyed = DeviceIndex(desc, "mlx5_0");
+    int buffer_id = -1, device_id = -1;
+    ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x1080, 16, buffer_id,
+                                          device_id, 0, 0, unkeyed),
+              0);
+    EXPECT_EQ(device_id, DeviceIndex(desc, "mlx5_1"));
+}
+
+// Destination device affinity passes the local NIC name as the hint. When the
+// peer has no MR on that NIC the hint must act like an unknown name.
+TEST(BufferRangeIndex, NamedHintWithoutKeyFallsBackToTopology) {
+    auto desc =
+        MakeSparseSegment(R"({"cpu:0":[["mlx5_0"],["mlx5_1"]]})", {"mlx5_1"});
+    for (int retry : {0, 1, 2, 3}) {
+        int buffer_id = -1, device_id = -1;
+        ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x1080, 16, "mlx5_1",
+                                              buffer_id, device_id, retry),
+                  0);
+        EXPECT_EQ(device_id, DeviceIndex(desc, "mlx5_0")) << retry;
+    }
+}
+
+TEST(BufferRangeIndex, RetriesOnlyReachKeyedDevices) {
+    auto desc = MakeSparseSegment(R"({"cpu:0":[["a","b"],["c"]]})", {"a", "c"});
+    for (int retry = 0; retry < 8; ++retry) {
+        int buffer_id = -1, device_id = -1;
+        ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x1080, 16, buffer_id,
+                                              device_id, retry),
+                  0);
+        EXPECT_EQ(device_id, DeviceIndex(desc, "b")) << retry;
+    }
+}
+
+TEST(BufferRangeIndex, BufferWithoutAnyKeyIsNotSelectable) {
+    auto desc = MakeSparseSegment(R"({"cpu:0":[["a"],["b"]]})", {"a", "b"});
+    for (int retry : {0, 1, 5}) {
+        int buffer_id = -1, device_id = -1;
+        EXPECT_EQ(RdmaTransport::selectDevice(&desc, 0x1080, 16, "a", buffer_id,
+                                              device_id, retry),
+                  ERR_ADDRESS_NOT_REGISTERED);
+    }
+}
+
+// Peer affinity is precomputed when the topology is parsed, so the mapping
+// only needs to be set while building the segment.
+SegmentDesc MakePeerAffinitySegment(const std::vector<std::string> &peers,
+                                    const std::vector<std::string> &unkeyed) {
+    auto &config = globalConfig();
+    const bool previous_enabled = config.enable_hca_peer_affinity;
+    const auto previous_mapping = config.nic_peer_affinity;
+    config.enable_hca_peer_affinity = true;
+    config.nic_peer_affinity = {{"local0", peers}};
+    const std::string gpu = GPU_PREFIX + "0";
+    auto desc = MakeSparseSegment(
+        R"({")" + gpu + R"(":[["nic_a","nic_b","nic_c"],[]]})", unkeyed, gpu);
+    config.enable_hca_peer_affinity = previous_enabled;
+    config.nic_peer_affinity = previous_mapping;
+    return desc;
+}
+
+// HCAs outside the mapping may be unreachable from local0, so selection skips
+// a mapped candidate without a key but never leaves the mapping.
+TEST(BufferRangeIndex, PeerAffinityStaysOnKeyedCandidates) {
+    auto desc = MakePeerAffinitySegment({"nic_a", "nic_c"}, {"nic_a"});
+    auto blocked = MakePeerAffinitySegment({"nic_a"}, {"nic_a"});
+    for (int retry : {0, 1, 2, 3}) {
+        int buffer_id = -1, device_id = -1;
+        ASSERT_EQ(RdmaTransport::selectDeviceByLocalHca(
+                      &desc, 0x1080, 16, "local0", buffer_id, device_id, retry),
+                  0);
+        EXPECT_EQ(device_id, DeviceIndex(desc, "nic_c")) << retry;
+        EXPECT_EQ(
+            RdmaTransport::selectDeviceByLocalHca(
+                &blocked, 0x1080, 16, "local0", buffer_id, device_id, retry),
+            ERR_ADDRESS_NOT_REGISTERED)
+            << retry;
+    }
 }
 
 TEST(BufferRangeIndex, DeviceHintDoesNotFollowBufferJump) {

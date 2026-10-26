@@ -145,6 +145,13 @@ class Topology {
         resolved_hca_peer_affinity_by_local_;
 };
 
+// For each location in `matrix` (e.g. "cuda:3"), the indices into
+// `device_names` of its preferred HCAs. Locations whose preferred set is
+// empty, or whose preferred HCAs are all absent from `device_names`, are
+// omitted rather than mapped to an empty vector.
+std::unordered_map<std::string, std::vector<size_t>> buildPreferredNicIndexMap(
+    const TopologyMatrix &matrix, const std::vector<std::string> &device_names);
+
 }  // namespace mooncake
 
 #endif  // TOPOLOGY_H

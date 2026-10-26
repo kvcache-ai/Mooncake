@@ -19,6 +19,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 
@@ -43,8 +44,12 @@ class MultiTransport {
     using TransferStatusEnum = Transport::TransferStatusEnum;
     using BatchDesc = Transport::BatchDesc;
 
-    MultiTransport(std::shared_ptr<TransferMetadata> metadata,
-                   std::string &local_server_name);
+    // topology_local_registration overrides MC_RDMA_NIC_SELECTION and
+    // MC_EFA_NIC_SELECTION for the transports installed here; unset keeps them.
+    MultiTransport(
+        std::shared_ptr<TransferMetadata> metadata,
+        std::string &local_server_name,
+        std::optional<bool> topology_local_registration = std::nullopt);
 
     ~MultiTransport();
 
@@ -131,6 +136,7 @@ class MultiTransport {
    private:
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
+    const std::optional<bool> topology_local_registration_;
     std::map<std::string, std::shared_ptr<Transport>> transport_map_;
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;

@@ -36,6 +36,7 @@
 #include "buffer_range_index.h"
 #include "common.h"
 #include "config.h"
+#include "cuda_alike.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
@@ -168,7 +169,11 @@ bool has_ibv_reg_mr_iova2(void) {
     return sym != NULL;
 }
 
-RdmaTransport::RdmaTransport() {
+RdmaTransport::RdmaTransport()
+    : RdmaTransport(globalConfig().rdma_nic_selection) {}
+
+RdmaTransport::RdmaTransport(NicSelection nic_selection)
+    : nic_selection_(nic_selection) {
     MCIbRelaxedOrderingMode = getIbRelaxedOrderingMode();
     if (MCIbRelaxedOrderingMode == 0) {
         LOG(INFO) << "[RDMA] Relaxed ordering disabled via "
@@ -351,6 +356,36 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
     std::string resolved_name = name;
 
+    // MC_RDMA_NIC_SELECTION=local: register device memory only on the HCAs
+    // the topology prefers for its GPU; the other HCAs publish zero keys,
+    // which device selection skips. An explicit location is trusted because
+    // peers select HCAs by that name. Host memory keeps every HCA: a "cpu:N"
+    // preferred set is a NUMA node's NICs, not a rail group. local_nics is
+    // indexed by context; empty means the buffer is registered on every HCA.
+    std::vector<bool> local_nics;
+    if (!local_nic_map_.empty()) {
+        std::string location = name;
+        if (name == kWildcardLocation) {
+            const auto entries = getMemoryLocation(addr, length, true);
+            if (!entries.empty()) location = entries[0].location;
+        }
+        auto it = location.rfind(GPU_PREFIX, 0) == 0
+                      ? local_nic_map_.find(location)
+                      : local_nic_map_.end();
+        if (it != local_nic_map_.end()) {
+            local_nics.assign(context_list_.size(), false);
+            for (size_t i : it->second) local_nics[i] = true;
+            if (globalConfig().trace) {
+                LOG(INFO) << "RDMA local NIC selection: " << addr << " ("
+                          << location << ") on " << it->second.size() << "/"
+                          << context_list_.size() << " HCAs";
+            }
+        }
+    }
+    auto uses_hca = [&](size_t i) {
+        return local_nics.empty() || local_nics[i];
+    };
+
     // Export a single dma_buf fd for the whole buffer and import it into every
     // NIC's PD during each chunk's registration below (one dma_buf object
     // shared across NICs keeps a single BAR1 window for the buffer instead of
@@ -505,10 +540,12 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // Pre-touch faults host pages in before the real registration. It gains
     // nothing for device memory registered through DMA-BUF, where each
     // pre-touch thread only adds a DMA-BUF import (and a BAR1 mapping) of its
-    // block, so skip it there.
+    // block, so skip it there. A narrowed buffer is device memory, and its
+    // pre-touch MR on context 0 may be on an excluded HCA.
     const bool do_pre_touch =
         dmabuf_exp.method != DmabufExport::Method::kDmabufReg &&
-        context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
+        context_list_.size() > 0 && local_nics.empty() &&
+        std::thread::hardware_concurrency() >= 4 &&
         length >= (size_t)4 * 1024 * 1024 * 1024;
 
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
@@ -554,6 +591,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             const int ar = access_rights;  // Local copy for lambda capture
 
             for (size_t i = 0; i < context_list_.size(); ++i) {
+                if (!uses_hca(i)) continue;
                 reg_threads.emplace_back([this, &ret_codes, chunk_dmabuf_exp, i,
                                           chunk_addr, chunk_len, ar]() {
                     ret_codes[i] = context_list_[i]->registerMemoryRegion(
@@ -577,6 +615,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             }
         } else {
             for (size_t i = 0; i < context_list_.size(); ++i) {
+                if (!uses_hca(i)) continue;
                 int ret = context_list_[i]->registerMemoryRegion(
                     chunk_addr, chunk_len, access_rights, chunk_dmabuf_exp);
                 if (ret) {
@@ -616,10 +655,26 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
         // Collect per-context keys for THIS chunk (address-range lookup).
         BufferDesc buffer_desc;
-        for (auto &context : context_list_) {
-            buffer_desc.lkey.push_back(context->lkey(chunk_addr));
+        for (size_t i = 0; i < context_list_.size(); ++i) {
+            auto &context = context_list_[i];
+            buffer_desc.lkey.push_back(uses_hca(i) ? context->lkey(chunk_addr)
+                                                   : 0);
             if (remote_accessible)
-                buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+                buffer_desc.rkey.push_back(
+                    uses_hca(i) ? context->rkey(chunk_addr) : 0);
+        }
+        // Placeholder contexts and NICs not Data Direct-paired with the GPU
+        // register without an MR, so a narrowed set can end up with no key.
+        if (!local_nics.empty() &&
+            std::all_of(buffer_desc.lkey.begin(), buffer_desc.lkey.end(),
+                        [](BufferDesc::mr_key_t key) { return key == 0; })) {
+            LOG(ERROR) << "No preferred HCA of " << resolved_name
+                       << " registered memory region " << chunk_addr
+                       << "; disable topology-local registration or fix the "
+                          "topology";
+            unregisterChunkMRs(chunk_addr);
+            rollbackChunks(ci);
+            return ERR_CONTEXT;
         }
         buffer_desc.name = resolved_name;
         buffer_desc.addr = (uint64_t)chunk_addr;
@@ -1463,6 +1518,29 @@ int RdmaTransport::initializeRdmaResources() {
         LOG(ERROR) << "RdmaTransport: No available RNIC";
         return ERR_DEVICE_NOT_FOUND;
     }
+
+    if (nic_selection_ == NicSelection::LOCAL) {
+        std::vector<std::string> context_names;
+        context_names.reserve(context_list_.size());
+        for (auto &context : context_list_)
+            context_names.push_back(context->deviceName());
+        local_nic_map_ = buildPreferredNicIndexMap(local_topology_->getMatrix(),
+                                                   context_names);
+        for (auto &entry : local_nic_map_) {
+            std::string nic_list;
+            for (size_t i = 0; i < entry.second.size(); ++i) {
+                if (i > 0) nic_list += ",";
+                nic_list += context_names[entry.second[i]];
+            }
+            LOG(INFO) << "RdmaTransport: local NICs for " << entry.first
+                      << ": [" << nic_list << "]";
+        }
+        if (local_nic_map_.empty()) {
+            LOG(WARNING) << "RdmaTransport: local NIC selection is enabled but "
+                            "the topology reports no per-location preferred "
+                            "NICs; every buffer will use all NICs as before";
+        }
+    }
     return 0;
 }
 
@@ -1543,6 +1621,22 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
             !bufferCoversRange(buffer.addr, buffer.length, offset, length)) {
             return false;
         }
+        // A buffer may have no MR on some HCAs (e.g. Data Direct pairing
+        // leaves zero keys on non-paired NICs), so a device is usable only if
+        // every key array it has holds a nonzero key for it. A local-only MR
+        // has no rkey array.
+        auto has_key = [&](int id) {
+            if (id < 0 || (!desc->devices.empty() &&
+                           static_cast<size_t>(id) >= desc->devices.size()))
+                return false;
+            for (const auto *keys : {&buffer.lkey, &buffer.rkey}) {
+                if (!keys->empty() &&
+                    (static_cast<size_t>(id) >= keys->size() ||
+                     (*keys)[id] == 0))
+                    return false;
+            }
+            return !buffer.lkey.empty() || !buffer.rkey.empty();
+        };
         int selected = -1;
         // Consecutive hits in the same offset-independent MR (typical GPU
         // "cuda:N" buffers) keep the previous topology pick. retry_count > 0
@@ -1552,8 +1646,7 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
             const size_t nkeys =
                 by_local_hca ? buffer.lkey.size() : buffer.rkey.size();
             if (static_cast<size_t>(hint_device_id) < nkeys &&
-                (desc->devices.empty() ||
-                 static_cast<size_t>(hint_device_id) < desc->devices.size())) {
+                has_key(hint_device_id)) {
                 selected = hint_device_id;
             }
         }
@@ -1561,7 +1654,29 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
             selected = pickTopologyDevice(desc, buffer, offset, hint, local_hca,
                                           retry_count, by_local_hca);
         }
-        if (selected < 0) return false;
+        // A hinted HCA without an MR is treated like an unknown hint name:
+        // fall back to normal topology selection.
+        if (!has_key(selected) && !hint.empty()) {
+            selected = pickTopologyDevice(desc, buffer, offset, {}, local_hca,
+                                          retry_count, by_local_hca);
+        }
+        if (!has_key(selected)) {
+            // Walk the location's preferred and available HCAs once, starting
+            // where this retry would have picked, so the walk stays bounded.
+            // A peer-affinity mapping limits the walk to its candidates, since
+            // other peer HCAs may be unreachable from local_hca.
+            const size_t count = desc->topology.getHcaList().size();
+            const size_t start =
+                static_cast<size_t>(std::max(0, retry_count - 1));
+            selected = -1;
+            for (size_t i = 0; i < count && selected < 0; ++i) {
+                const int attempt = static_cast<int>(1 + (start + i) % count);
+                const int id = pickTopologyDevice(
+                    desc, buffer, offset, {}, local_hca, attempt, by_local_hca);
+                if (has_key(id)) selected = id;
+            }
+            if (selected < 0) return false;
+        }
         buffer_id = candidate;
         device_id = selected;
         return true;

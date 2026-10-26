@@ -224,11 +224,11 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #ifdef USE_ASCEND
     std::string mutable_server_name =
         local_server_name_ + ":npu_" + std::to_string(devicePhyId);
-    multi_transports_ =
-        std::make_shared<MultiTransport>(metadata_, mutable_server_name);
+    multi_transports_ = std::make_shared<MultiTransport>(
+        metadata_, mutable_server_name, topology_local_registration_);
 #else
-    multi_transports_ =
-        std::make_shared<MultiTransport>(metadata_, local_server_name_);
+    multi_transports_ = std::make_shared<MultiTransport>(
+        metadata_, local_server_name_, topology_local_registration_);
 #endif
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;

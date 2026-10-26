@@ -21,6 +21,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <optional>
 #include <stack>
 #include <vector>
 
@@ -58,12 +59,18 @@ class TransferEnginePy {
 
     ~TransferEnginePy();
 
-    int initialize(const char *local_hostname, const char *metadata_server,
-                   const char *protocol, const char *device_name);
+    // topology_local_registration overrides MC_RDMA_NIC_SELECTION and
+    // MC_EFA_NIC_SELECTION for this engine; unset keeps them.
+    int initialize(
+        const char *local_hostname, const char *metadata_server,
+        const char *protocol, const char *device_name,
+        std::optional<bool> topology_local_registration = std::nullopt);
 
-    int initializeExt(const char *local_hostname, const char *metadata_server,
-                      const char *protocol, const char *device_name,
-                      const char *metadata_type);
+    int initializeExt(
+        const char *local_hostname, const char *metadata_server,
+        const char *protocol, const char *device_name,
+        const char *metadata_type,
+        std::optional<bool> topology_local_registration = std::nullopt);
 
     int getRpcPort();
 

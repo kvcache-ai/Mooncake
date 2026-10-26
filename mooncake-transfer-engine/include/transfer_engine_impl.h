@@ -444,6 +444,15 @@ class TransferEngineImpl {
         auto_discover_config_ = config;
     }
 
+    void setTopologyLocalRegistration(bool enabled) {
+        if (multi_transports_) {
+            LOG(WARNING) << "Cannot change topology-local registration after "
+                            "init";
+            return;
+        }
+        topology_local_registration_ = enabled;
+    }
+
     // Optional transport hint carried by the protocol argument of init(). An
     // empty value keeps the config written by setAutoDiscover(), which Store
     // uses to pass the protocol of the client before calling init(). A hint
@@ -540,6 +549,7 @@ class TransferEngineImpl {
 
     // Discover topology and install transports automatically when enabled.
     AutoDiscoverConfig auto_discover_config_;
+    std::optional<bool> topology_local_registration_;
     std::vector<std::string> filter_;
     bool use_barex_ = false;
 

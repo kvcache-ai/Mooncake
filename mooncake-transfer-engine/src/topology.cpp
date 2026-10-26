@@ -1037,4 +1037,27 @@ int Topology::disableDevice(const std::string &device_name) {
     }
     return 0;
 }
+
+std::unordered_map<std::string, std::vector<size_t>> buildPreferredNicIndexMap(
+    const TopologyMatrix &matrix,
+    const std::vector<std::string> &device_names) {
+    std::unordered_map<std::string, size_t> name_to_index;
+    for (size_t i = 0; i < device_names.size(); ++i)
+        name_to_index[device_names[i]] = i;
+
+    std::unordered_map<std::string, std::vector<size_t>> nic_map;
+    for (const auto &entry : matrix) {
+        std::vector<size_t> indices;
+        for (const auto &hca : entry.second.preferred_hca) {
+            auto it = name_to_index.find(hca);
+            // A preferred HCA can be missing when the transport filtered it
+            // out or failed to open it. Skipping it leaves the rest usable.
+            if (it != name_to_index.end()) indices.push_back(it->second);
+        }
+        // No entry at all rather than an empty one, so the caller's lookup miss
+        // falls back to all NICs instead of registering the buffer nowhere.
+        if (!indices.empty()) nic_map[entry.first] = std::move(indices);
+    }
+    return nic_map;
+}
 }  // namespace mooncake

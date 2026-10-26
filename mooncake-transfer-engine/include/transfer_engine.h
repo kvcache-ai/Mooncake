@@ -326,6 +326,13 @@ class TransferEngine {
     void setAutoDiscover(bool auto_discover);
     void setAutoDiscover(const AutoDiscoverConfig& config);
 
+    // Overrides MC_RDMA_NIC_SELECTION and MC_EFA_NIC_SELECTION for this
+    // engine: true enables each backend's topology-local registration, as if
+    // the variable were "local", and false disables it. The backend keeps its
+    // own scope; EFA, for example, narrows only single-chunk buffers. Call
+    // before init(); later calls and TENT mode are ignored with a warning.
+    void setTopologyLocalRegistration(bool enabled);
+
     void* getBaseAddr();
 
     void setWhitelistFilters(std::vector<std::string>&& filters);
