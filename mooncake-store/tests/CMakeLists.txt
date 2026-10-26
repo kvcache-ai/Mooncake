@@ -42,6 +42,7 @@ add_store_test(weight_management_contract_test
                weight_management_contract_test.cpp)
 add_store_test(weight_metadata_store_test weight_metadata_store_test.cpp)
 add_store_test(weight_policy_state_test weight_policy_state_test.cpp)
+add_store_test(weight_residency_planner_test weight_residency_planner_test.cpp)
 add_store_test(weight_revision_lease_test weight_revision_lease_test.cpp)
 add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(replica_allocator_test replica_allocator_test.cpp)

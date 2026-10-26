@@ -806,6 +806,9 @@ WeightMetadataStore::PrepareStartOperation(
         current->second.availability != WeightAvailabilityState::DEGRADED) {
         return tl::make_unexpected(WeightManagementError::NOT_READY);
     }
+    if (current->second.policy.migration_mode == WeightMigrationMode::PINNED) {
+        return tl::make_unexpected(WeightManagementError::POLICY_UNSATISFIABLE);
+    }
     if (!CanAdvanceWeightMetadataGeneration(
             current->second.metadata_generation) ||
         next_operation_id_ == 0 ||

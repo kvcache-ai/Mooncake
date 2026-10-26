@@ -59,6 +59,10 @@ class WeightStoreManager {
     tl::expected<ImportWriteGuard, ErrorCode> TrackImportWrite(
         const TenantId& tenant, const std::string& group);
     void RecordImportWrite(const TenantId& tenant, const std::string& group);
+    bool HasActiveLease(const WeightRevisionIdentity& identity,
+                        uint64_t generation, uint64_t now_ms) const {
+        return weight_metadata_.HasActiveLease(identity, generation, now_ms);
+    }
     size_t ReconcileWeightMetadataStoreOnce(uint64_t now_ms, size_t limit);
     bool IsManagedGroup(const std::string& group) const {
         return weight_metadata_.IsManagedGroup(group);
@@ -109,8 +113,6 @@ class WeightStoreManager {
         const ReconcileWeightRevisionRequest& request, size_t* member_budget);
     WeightMetadataStore::Result<void> RemoveWeightMembers(
         const WeightRevisionMetadata& revision, size_t* member_budget);
-    std::vector<std::string> SelectReconciliationMembers(
-        const WeightRevisionMetadata& revision, size_t* member_budget);
     void ForgetReconciliationCursor(const WeightRevisionIdentity& identity);
     WeightMetadataStore::Result<WeightResidencyOperation>
     PersistAndPublishWeightOperationMutation(
@@ -139,9 +141,9 @@ class WeightStoreManager {
     size_t weight_reconciliation_offset_{0};
     bool expire_leases_on_unit_budget_{true};
     std::mutex reconciliation_mutex_;
-    std::mutex member_cursor_mutex_;
+    std::mutex affinity_cursor_mutex_;
     // Retry offsets are local scheduling hints, not durable progress tokens.
-    std::unordered_map<std::string, size_t> member_cursors_;
+    std::unordered_map<std::string, size_t> affinity_cursors_;
 };
 
 }  // namespace mooncake

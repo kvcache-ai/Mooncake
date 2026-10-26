@@ -58,6 +58,7 @@
 #include "eviction/evictor.h"
 #include "eviction/offloading_reclaimer.h"
 #include "eviction/report_observers.h"
+#include "weight_residency_planner.h"
 
 namespace mooncake {
 
@@ -1615,9 +1616,63 @@ std::vector<std::string> MasterService::GetGroupMemberKeys(
     return ns->objects.GroupMembers(group_id);
 }
 
+void MasterService::QueueManagedWeightMemberOffload(
+    const WeightRevisionMetadata& revision, const std::string& member_key) {
+    const TenantId tenant_id(revision.identity.tenant_id);
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    MetadataAccessorRW accessor(this,
+                                MakeObjectIdentity(member_key, tenant_id));
+    if (!accessor.Exists()) {
+        return;
+    }
+    auto& metadata = accessor.Get();
+    if (metadata.group_id != revision.manifest.payload_group_id ||
+        metadata.data_type != ObjectDataType::WEIGHT ||
+        metadata.HasReplica([this](const Replica& replica) {
+            return !replica.is_memory_replica() && IsReplicaReadable(replica);
+        })) {
+        return;
+    }
+    auto& offloading_task = accessor.GetState().offloading_task;
+    if (offloading_task) {
+        return;
+    }
+    std::optional<ReplicaID> source_id;
+    std::vector<UUID> mirror_clients;
+    metadata.VisitReplicas(
+        [this](const Replica& replica) {
+            return replica.is_memory_replica() && IsReplicaReadable(replica);
+        },
+        [&, this](Replica& replica) {
+            if (source_id.has_value()) {
+                return;
+            }
+            auto queued =
+                PushOffloadingQueue(MakeObjectIdentity(member_key, tenant_id),
+                                    replica, &mirror_clients);
+            if (queued) {
+                replica.inc_refcnt();
+                source_id = replica.id();
+            }
+        });
+    if (source_id.has_value()) {
+        offloading_task =
+            OffloadingTask{*source_id, std::chrono::system_clock::now(),
+                           std::move(mirror_clients)};
+    }
+}
+
 void MasterService::EvictManagedWeightMembersToCold(
     const WeightRevisionMetadata& revision,
     const std::vector<std::string>& member_keys) {
+    const auto now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    if (weight_manager_.HasActiveLease(revision.identity,
+                                      revision.metadata_generation, now_ms)) {
+        return;
+    }
     const TenantId tenant_id(revision.identity.tenant_id);
     metadata::Namespace* ns = namespaces_.Lookup(tenant_id);
     if (ns == nullptr || member_keys.empty()) {
@@ -3465,13 +3520,13 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
             // writer held off, so this is a key the objects name twice.
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
-        const route::Generation generation = accessor.Publish(
-            standby_meta.client_id, now, standby_meta.size,
-            std::move(object.replicas), std::nullopt,
-            standby_meta.hard_pinned.value_or(false), standby_meta.data_type,
-            standby_meta.group_id,
-            standby_meta.residency_affinity_id.value_or(""), object.tenant_id,
-            object.user_key);
+        const route::Generation generation =
+            accessor.Publish(standby_meta.client_id, now, standby_meta.size,
+                             std::move(object.replicas), std::nullopt,
+                             standby_meta.hard_pinned.value_or(false),
+                             standby_meta.data_type, standby_meta.group_id,
+                             standby_meta.residency_affinity_id.value_or(""),
+                             object.tenant_id, object.user_key);
         auto& metadata = accessor.Get();
         metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         metadata.session_id = standby_meta.session_id.value_or("");
@@ -4943,8 +4998,7 @@ auto MasterService::InsertMetadata(
 auto MasterService::AllocateAndInsertMetadata(
     MetadataAccessorRW& accessor, const UUID& client_id, uint64_t value_length,
     const ReplicateConfig& config, const std::string& writer_host_id,
-    const std::string& group_id,
-    const std::string& residency_affinity_id,
+    const std::string& group_id, const std::string& residency_affinity_id,
     const std::chrono::system_clock::time_point& now,
     const ResolvedSoftPinRequest& soft_pin_request,
     std::optional<std::chrono::system_clock::time_point>
@@ -5199,8 +5253,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
         return AllocateAndInsertMetadata(
             accessor, client_id, slice_length, config, plan->writer_host_id,
-            plan->group_id, plan->residency_affinity_id, now, plan->soft_pin_request, std::nullopt,
-            dfs_allocation_failed);
+            plan->group_id, plan->residency_affinity_id, now,
+            plan->soft_pin_request, std::nullopt, dfs_allocation_failed);
     };
 
     // Tenant over-quota remains a background-eviction concern. Bucket-count
@@ -5446,7 +5500,8 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
             client_id, std::chrono::system_clock::now(),
             replica.get_descriptor().get_local_disk_descriptor().object_size,
             std::vector<Replica>{}, std::nullopt, false,
-            ObjectDataType::UNKNOWN, std::string{}, std::string{}, object_id.tenant_id, key);
+            ObjectDataType::UNKNOWN, std::string{}, std::string{},
+            object_id.tenant_id, key);
     }
     auto& metadata = accessor.Get();
     const auto previous_kv_media = KvMediaSnapshot(metadata);
@@ -5866,7 +5921,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
                 auto result = AllocateAndInsertMetadata(
                     accessor, client_id, slice_length, allocation_config,
-                    writer_host_id, allocation_group_id, allocation_residency_affinity_id, now, soft_pin_request,
+                    writer_host_id, allocation_group_id,
+                    allocation_residency_affinity_id, now, soft_pin_request,
                     allocation_committed_soft_pin_timeout,
                     dfs_allocation_failed);
                 if (result) {
@@ -6001,7 +6057,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
                 allocation_group_id = metadata.group_id;
                 allocation_session_id = metadata.session_id;
-                allocation_residency_affinity_id = metadata.residency_affinity_id;
+                allocation_residency_affinity_id =
+                    metadata.residency_affinity_id;
                 const auto previous_kv_media = KvMediaSnapshot(metadata);
                 // A leased memory snapshot still references the old replica
                 // descriptors. Allocate the replacement before removing the
@@ -6056,14 +6113,17 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         replacement_replicas.has_value()
                             ? InsertMetadata(
                                   accessor, client_id, slice_length,
-                                  allocation_config, allocation_group_id, allocation_residency_affinity_id, now,
+                                  allocation_config, allocation_group_id,
+                                  allocation_residency_affinity_id, now,
                                   soft_pin_request,
                                   std::move(*replacement_replicas),
                                   allocation_committed_soft_pin_timeout)
                             : AllocateAndInsertMetadata(
                                   accessor, client_id, slice_length,
                                   allocation_config, writer_host_id,
-                                  allocation_group_id, allocation_residency_affinity_id, now, soft_pin_request,
+                                  allocation_group_id,
+                                  allocation_residency_affinity_id, now,
+                                  soft_pin_request,
                                   allocation_committed_soft_pin_timeout,
                                   dfs_allocation_failed);
                 if (allocate_result && accessor.IsPublished()) {
