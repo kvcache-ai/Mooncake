@@ -49,6 +49,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -423,6 +424,16 @@ class ObjectRoute {
     [[nodiscard]] bool Contains(std::string_view key) const {
         return Read(key).has_value();
     }
+
+    // Calls `visit(i, metadata)` for each `keys[i]` that holds an object, in
+    // request order and under that key's read lock, as a read guard holds it.
+    // The slots are found first, stripe by stripe with each stripe locked once
+    // for all of its keys, and held by handle; each key is then locked and
+    // visited with no stripe lock held. Visiting in request order keeps what
+    // `visit` allocates in the order the caller frees it. A route that reports
+    // reads takes each key through Read() instead.
+    template <typename Visit>
+    void ReadBatch(std::span<const std::string> keys, Visit&& visit) const;
 
     [[nodiscard]] size_t ObjectCount() const {
         return object_count_.load(std::memory_order_relaxed);
@@ -831,6 +842,67 @@ inline void ObjectRoute::TearDownLocked(KeySlot& slot) {
     slot.record_.reset();
     slot.state_.fetch_and(~KeySlot::kOccupied, std::memory_order_relaxed);
     object_count_.fetch_sub(1, std::memory_order_relaxed);
+}
+
+template <typename Visit>
+void ObjectRoute::ReadBatch(std::span<const std::string> keys,
+                            Visit&& visit) const {
+    if (report_reads_) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (auto guard = Read(keys[i])) {
+                visit(i, guard->metadata());
+            }
+        }
+        return;
+    }
+    AssertNotInCursor();
+
+    // A counting sort of the key indexes by stripe.
+    std::vector<uint32_t> starts(kStripeCount + 1, 0);
+    std::vector<uint32_t> stripe_of(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        stripe_of[i] = static_cast<uint32_t>(StripeIndex(keys[i]));
+        ++starts[stripe_of[i] + 1];
+    }
+    for (size_t s = 0; s < kStripeCount; ++s) {
+        starts[s + 1] += starts[s];
+    }
+    std::vector<uint32_t> order(keys.size());
+    std::vector<uint32_t> next(starts.begin(), starts.end() - 1);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        order[next[stripe_of[i]]++] = static_cast<uint32_t>(i);
+    }
+
+    std::vector<std::optional<SlotHandle>> slots(keys.size());
+    for (size_t s = 0; s < kStripeCount; ++s) {
+        if (starts[s] == starts[s + 1]) {
+            continue;
+        }
+        Stripe& stripe = stripes_[s];
+        std::shared_lock<std::shared_mutex> stripe_lock(stripe.lock);
+        for (uint32_t pos = starts[s]; pos < starts[s + 1]; ++pos) {
+            const uint32_t i = order[pos];
+            const auto it = stripe.slots.find(keys[i]);
+            if (it != stripe.slots.end()) {
+                slots[i].emplace(stripe, it->second);
+            }
+        }
+    }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!slots[i].has_value()) {
+            continue;
+        }
+        {
+            const KeySlot& slot = **slots[i];
+            std::shared_lock<std::shared_mutex> lock(slot.mutex_);
+            if (slot.record_.has_value()) {
+                visit(i, slot.record_->metadata);
+            }
+        }
+        // Unlocked first: letting go of the handle may drop the slot.
+        slots[i].reset();
+    }
 }
 
 inline ObjectRoute::Cursor<LockMode::kRead> ObjectRoute::ReadCursor() const {
