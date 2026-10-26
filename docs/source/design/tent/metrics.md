@@ -257,6 +257,7 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_rdma_endpoint_events_total` | Counter | `event` | RDMA endpoint construction, ready, retirement and destruction transitions |
 | `tent_rdma_qp_transition_failures_total` | Counter | `qp_type`, `transition` | Failed data or notification QP state transitions |
 | `tent_rdma_notification_events_total` | Counter | `event` | Notification receive posting/delivery, send posting/completion and channel failures |
+| `tent_stream_events_total` | Counter | `transport`, `operation`, `event` | TCP and HP-TCP queue, physical attempt, connection, retry and terminal events |
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
 | `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
 | `tent_worker_last_progress_timestamp_seconds` | Gauge | `worker` | Unix timestamp of the last observed engine-progress, staging, or RDMA-worker progress |
@@ -276,6 +277,8 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_transport_attempt_latency_us` | Histogram | `transport`, `operation` | Observed latency of each physical transport attempt |
 | `tent_rpc_attempt_latency_us` | Histogram | `method`, `outcome` | End-to-end latency of each physical client RPC attempt, including connection setup when needed |
 | `tent_rdma_completion_latency_us` | Histogram | `operation`, `outcome` | Post-to-CQ latency of physical RDMA slice completions |
+| `tent_stream_attempt_latency_us` | Histogram | `transport`, `operation`, `outcome` | End-to-end latency of physical TCP or HP-TCP network attempts |
+| `tent_stream_queue_wait_us` | Histogram | `transport`, `operation` | TCP logical-task and HP-TCP physical-slice queue wait before an attempt starts |
 
 ### Metrics pipeline self-observability
 
@@ -318,11 +321,11 @@ addresses, segment names, or other unbounded values are accepted.
 | `operation` | `read`, `write`; `register`, `unregister` | Attempt or memory lifecycle operation, depending on the metric family |
 | `phase` | `metadata`, `admission`, `selection`, `connect`, `register`, `submit`, `queue`, `post`, `poll`, `completion`, `retry`, `failover`, `notify`, `cleanup`, `shutdown` | Stable phase where a terminal failure originated |
 | `reason` | `submit`, `poll`, `timeout`, `canceled` for `tent_task_failures_total`; `timeout`, `unavailable`, `queue_full`, `resource_exhausted`, `protocol`, `stale_generation`, `wc_error`, `cq_error`, `mr_error`, `peer_closed`, `canceled`, `internal` for `tent_terminal_failures_total` | Bounded failure classification |
-| `outcome` | `success`, `failure` for memory lifecycle metrics; `success`, `connection_error`, `rpc_error` for RPC metrics; `success`, `wc_error`, `flush`, `late` for RDMA completions | Bounded operation outcome |
+| `outcome` | `success`, `failure` for memory lifecycle metrics; `success`, `connection_error`, `rpc_error` for RPC metrics; `success`, `wc_error`, `flush`, `late` for RDMA completions; `success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error` for stream attempts | Bounded operation outcome |
 | `worker` | `engine_progress`, `staging`, `rdma` | Worker subsystem reporting forward progress |
 | `kind` | `group`, `batch`, `remote_operation` | Deferred staging cleanup resource kind |
 | `method` | `get_segment_desc`, `bootstrap_rdma`, `bootstrap_ub`, `send_data`, `recv_data`, `notify`, `probe`, `delegate`, `pin`, `unpin`, `subscribe_segment_update`, `notify_segment_updated`, `unknown` | TENT RPC method; `unknown` safely bounds extension methods |
-| `event` | RDMA slice: `enqueued`, `post_attempt`, `path_error`, `post_error`, `completion_success`, `completion_error`, `completion_flush`, `late_completion`, `software_timeout`; endpoint: `constructed`, `construct_failure`, `ready_active`, `ready_passive`, `retiring`, `destroyed`, `destroy_error`; notification: `recv_posted`, `recv_post_error`, `recv_delivered`, `recv_invalid`, `recv_dropped`, `send_posted`, `send_completed`, `send_unavailable`, `send_encode_error`, `send_post_error`, `completion_error`, `cq_poll_error`, `unknown_qp`, `channel_disabled` | Family-specific bounded RDMA lifecycle event |
+| `event` | RDMA slice: `enqueued`, `post_attempt`, `path_error`, `post_error`, `completion_success`, `completion_error`, `completion_flush`, `late_completion`, `software_timeout`; endpoint: `constructed`, `construct_failure`, `ready_active`, `ready_passive`, `retiring`, `destroyed`, `destroy_error`; notification: `recv_posted`, `recv_post_error`, `recv_delivered`, `recv_invalid`, `recv_dropped`, `send_posted`, `send_completed`, `send_unavailable`, `send_encode_error`, `send_post_error`, `completion_error`, `cq_poll_error`, `unknown_qp`, `channel_disabled`; stream: `queued`, `attempt_started`, `attempt_success`, `connect_started`, `connect_success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error`, `retry_issued`, `retry_exhausted` | Family-specific bounded lifecycle event |
 | `cause` | `endpoint`, `post`, `completion` | RDMA retry or retry-exhaustion source |
 | `qp_type` | `data`, `notification` | RDMA queue-pair role; QP numbers are never labels |
 | `transition` | `create`, `reset`, `init`, `rtr`, `rts`, `error`, `destroy` | Queue-pair transition that failed |
@@ -372,6 +375,16 @@ have fourteen event series. These metrics identify the failing lifecycle phase
 without exposing endpoint names, peer addresses, connection generations or QP
 numbers. Expected flush completions from an endpoint already retiring are not
 counted as notification completion errors.
+
+Stream metrics are emitted only for `tcp` and `hp_tcp`. Classic TCP queue
+events represent logical tasks; each control-plane data RPC started by its
+retry loop is a physical attempt. HP-TCP queue and attempt events represent
+physical slice operations, while `retry_issued` is counted once when a logical
+task retry is successfully admitted. Queue wait and attempt latency have at
+most 2x2 = 4 transport/operation series before their bounded outcome split;
+the event counter has at most 2x2x13 = 52 series and attempt latency has at
+most 2x2x7 = 28 series. Peer identity, socket address, lane and request ID are
+never metric labels.
 
 `tent_worker_last_progress_timestamp_seconds` advances when the engine progress
 worker completes a wake cycle, when a staging worker changes a chunk state or

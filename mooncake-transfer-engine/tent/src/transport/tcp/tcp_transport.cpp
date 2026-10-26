@@ -27,6 +27,8 @@
 #include <thread>
 
 #include "tent/common/status.h"
+#include "tent/common/utils/os.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/slab.h"
 
@@ -178,8 +180,14 @@ Status TcpTransport::submitTransferTasks(
         task.request = request;
         task.progress_batch_id = batch->progress_batch_id;
         task.notify_progress = batch->notify_progress;
+        task.enqueue_ts_ns = getCurrentTimeInNano();
         task.status_word.store(TransferStatusEnum::PENDING,
                                std::memory_order_release);
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordStreamEvent(
+            TransportType::TCP, request.opcode,
+            TentMetrics::StreamEvent::Queued);
+#endif
     }
 
     for (size_t i = start_idx; i < tcp_batch->task_list.size(); ++i) {
@@ -220,6 +228,13 @@ void TcpTransport::startTransfer(TcpTask *task) {
     auto notify_progress = std::move(task->notify_progress);
     const auto progress_batch_id = task->progress_batch_id;
     bool completed = false;
+#if TENT_METRICS_ENABLED
+    if (task->enqueue_ts_ns != 0) {
+        TentMetrics::instance().recordStreamQueueWait(
+            TransportType::TCP, task->request.opcode,
+            (getCurrentTimeInNano() - task->enqueue_ts_ns) / 1000.0);
+    }
+#endif
     try {
         if (task->request.target_id == LOCAL_SEGMENT_ID &&
             IsLoopbackEndpoint(local_segment_name_)) {
@@ -291,8 +306,19 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
                     std::min(static_cast<uint64_t>(100), delay_ms - i)));
             }
             delay_ms = nextTcpRetryDelay(delay_ms, params_.retry_max_delay_ms);
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordStreamEvent(
+                TransportType::TCP, task->request.opcode,
+                TentMetrics::StreamEvent::RetryIssued);
+#endif
         }
 
+#if TENT_METRICS_ENABLED
+        const uint64_t attempt_start_ns = getCurrentTimeInNano();
+        TentMetrics::instance().recordStreamEvent(
+            TransportType::TCP, task->request.opcode,
+            TentMetrics::StreamEvent::AttemptStarted);
+#endif
         if (task->request.opcode == Request::WRITE) {
             status = ControlClient::sendData(
                 rpc_server_addr, task->request.target_offset,
@@ -303,6 +329,19 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
                 task->request.source, task->request.length);
         }
 
+#if TENT_METRICS_ENABLED
+        TentMetrics::StreamOutcome outcome = TentMetrics::StreamOutcome::IoError;
+        if (status.ok()) {
+            outcome = TentMetrics::StreamOutcome::Success;
+        } else if (status.IsRpcConnectionError()) {
+            outcome = TentMetrics::StreamOutcome::ConnectionError;
+        } else if (status.IsRpcServiceError()) {
+            outcome = TentMetrics::StreamOutcome::RemoteError;
+        }
+        TentMetrics::instance().recordStreamAttempt(
+            TransportType::TCP, task->request.opcode, outcome,
+            (getCurrentTimeInNano() - attempt_start_ns) / 1000.0);
+#endif
         if (status.ok()) return Status::OK();
 
         last_error = status;
@@ -334,6 +373,11 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         }
     }
 
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordStreamEvent(
+        TransportType::TCP, task->request.opcode,
+        TentMetrics::StreamEvent::RetryExhausted);
+#endif
     return last_error;
 }
 

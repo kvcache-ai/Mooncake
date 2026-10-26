@@ -456,6 +456,11 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
         TentMetrics::RdmaQpTransition::Rtr);
     metrics.recordRdmaNotificationEvent(
         TentMetrics::RdmaNotificationEvent::RecvPosted);
+    metrics.recordStreamEvent(TCP, Request::READ,
+                              TentMetrics::StreamEvent::Queued);
+    metrics.recordStreamAttempt(
+        HP_TCP, Request::WRITE, TentMetrics::StreamOutcome::Success, 45.0);
+    metrics.recordStreamQueueWait(TCP, Request::READ, 12.0);
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -465,7 +470,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 51>
+    const std::array<std::pair<std::string_view, std::string_view>, 54>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -492,6 +497,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_rdma_endpoint_events_total", "counter"},
             {"tent_rdma_qp_transition_failures_total", "counter"},
             {"tent_rdma_notification_events_total", "counter"},
+            {"tent_stream_events_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
             {"tent_worker_last_progress_timestamp_seconds", "gauge"},
@@ -511,6 +517,8 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_transport_attempt_latency_us", "histogram"},
             {"tent_rpc_attempt_latency_us", "histogram"},
             {"tent_rdma_completion_latency_us", "histogram"},
+            {"tent_stream_attempt_latency_us", "histogram"},
+            {"tent_stream_queue_wait_us", "histogram"},
             {"tent_metrics_build_info", "gauge"},
             {"tent_metrics_runtime_enabled", "gauge"},
             {"tent_metrics_http_server_up", "gauge"},
@@ -705,6 +713,41 @@ TEST_F(MetricsRecordingTest, RdmaLifecycleSignalsUseBoundedLabels) {
                   before.series("tent_rdma_notification_events_total{event="
                                 "\"recv_post_error\"}"),
               2);
+}
+
+TEST_F(MetricsRecordingTest, StreamSignalsSeparateQueueAndPhysicalAttempts) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordStreamEvent(HP_TCP, Request::READ,
+                              TentMetrics::StreamEvent::Queued, 2);
+    metrics.recordStreamEvent(HP_TCP, Request::READ,
+                              TentMetrics::StreamEvent::AttemptStarted);
+    metrics.recordStreamEvent(HP_TCP, Request::READ,
+                              TentMetrics::StreamEvent::RetryIssued);
+    metrics.recordStreamAttempt(
+        HP_TCP, Request::READ, TentMetrics::StreamOutcome::PeerClosed, 51.0);
+    metrics.recordStreamQueueWait(HP_TCP, Request::READ, 17.0);
+
+    auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(after.series("tent_stream_events_total{transport=\"hp_tcp\","
+                           "operation=\"read\",event=\"queued\"}") -
+                  before.series(
+                      "tent_stream_events_total{transport=\"hp_tcp\","
+                      "operation=\"read\",event=\"queued\"}"),
+              2);
+    EXPECT_EQ(after.series("tent_stream_events_total{transport=\"hp_tcp\","
+                           "operation=\"read\",event=\"peer_closed\"}") -
+                  before.series(
+                      "tent_stream_events_total{transport=\"hp_tcp\","
+                      "operation=\"read\",event=\"peer_closed\"}"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_stream_attempt_latency_us") -
+                  before.histogramCount("tent_stream_attempt_latency_us"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_stream_queue_wait_us") -
+                  before.histogramCount("tent_stream_queue_wait_us"),
+              1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1899,6 +1942,9 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_rdma_endpoint_events_total"));
     EXPECT_TRUE(json.contains("tent_rdma_qp_transition_failures_total"));
     EXPECT_TRUE(json.contains("tent_rdma_notification_events_total"));
+    EXPECT_TRUE(json.contains("tent_stream_events_total"));
+    EXPECT_TRUE(json.contains("tent_stream_attempt_latency_us"));
+    EXPECT_TRUE(json.contains("tent_stream_queue_wait_us"));
     EXPECT_TRUE(json.contains("tent_metrics_build_info"));
     EXPECT_EQ(json["tent_metrics_runtime_enabled"], 1);
     EXPECT_EQ(json["tent_metrics_http_server_up"], 1);

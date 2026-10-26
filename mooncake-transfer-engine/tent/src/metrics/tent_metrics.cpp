@@ -383,6 +383,78 @@ const char* rdmaNotificationEventName(
     }
     return "unknown";
 }
+
+const char* streamEventName(TentMetrics::StreamEvent event) {
+    switch (event) {
+        case TentMetrics::StreamEvent::Queued:
+            return "queued";
+        case TentMetrics::StreamEvent::AttemptStarted:
+            return "attempt_started";
+        case TentMetrics::StreamEvent::AttemptSuccess:
+            return "attempt_success";
+        case TentMetrics::StreamEvent::ConnectStarted:
+            return "connect_started";
+        case TentMetrics::StreamEvent::ConnectSuccess:
+            return "connect_success";
+        case TentMetrics::StreamEvent::ConnectionError:
+            return "connection_error";
+        case TentMetrics::StreamEvent::IoError:
+            return "io_error";
+        case TentMetrics::StreamEvent::Timeout:
+            return "timeout";
+        case TentMetrics::StreamEvent::PeerClosed:
+            return "peer_closed";
+        case TentMetrics::StreamEvent::Canceled:
+            return "canceled";
+        case TentMetrics::StreamEvent::RemoteError:
+            return "remote_error";
+        case TentMetrics::StreamEvent::RetryIssued:
+            return "retry_issued";
+        case TentMetrics::StreamEvent::RetryExhausted:
+            return "retry_exhausted";
+    }
+    return "unknown";
+}
+
+const char* streamOutcomeName(TentMetrics::StreamOutcome outcome) {
+    switch (outcome) {
+        case TentMetrics::StreamOutcome::Success:
+            return "success";
+        case TentMetrics::StreamOutcome::ConnectionError:
+            return "connection_error";
+        case TentMetrics::StreamOutcome::IoError:
+            return "io_error";
+        case TentMetrics::StreamOutcome::Timeout:
+            return "timeout";
+        case TentMetrics::StreamOutcome::PeerClosed:
+            return "peer_closed";
+        case TentMetrics::StreamOutcome::Canceled:
+            return "canceled";
+        case TentMetrics::StreamOutcome::RemoteError:
+            return "remote_error";
+    }
+    return "unknown";
+}
+
+TentMetrics::StreamEvent streamOutcomeEvent(TentMetrics::StreamOutcome outcome) {
+    switch (outcome) {
+        case TentMetrics::StreamOutcome::Success:
+            return TentMetrics::StreamEvent::AttemptSuccess;
+        case TentMetrics::StreamOutcome::ConnectionError:
+            return TentMetrics::StreamEvent::ConnectionError;
+        case TentMetrics::StreamOutcome::IoError:
+            return TentMetrics::StreamEvent::IoError;
+        case TentMetrics::StreamOutcome::Timeout:
+            return TentMetrics::StreamEvent::Timeout;
+        case TentMetrics::StreamOutcome::PeerClosed:
+            return TentMetrics::StreamEvent::PeerClosed;
+        case TentMetrics::StreamOutcome::Canceled:
+            return TentMetrics::StreamEvent::Canceled;
+        case TentMetrics::StreamOutcome::RemoteError:
+            return TentMetrics::StreamEvent::RemoteError;
+    }
+    return TentMetrics::StreamEvent::IoError;
+}
 }  // namespace
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
@@ -587,6 +659,7 @@ void TentMetrics::registerMetrics() {
         &rdma_endpoint_events_total_,
         &rdma_qp_transition_failures_total_,
         &rdma_notification_events_total_,
+        &stream_events_total_,
     };
 
     gauges_ = {
@@ -927,6 +1000,55 @@ void TentMetrics::recordRdmaNotificationEvent(RdmaNotificationEvent event,
         count);
 }
 
+void TentMetrics::recordStreamEvent(TransportType transport,
+                                    Request::OpCode operation,
+                                    StreamEvent event, int64_t count) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed) ||
+        count <= 0)
+        return;
+    stream_events_total_.incCached(
+        streamEventSlot(transport, operation, event),
+        [transport, operation, event] {
+            return std::array<std::string, 3>{
+                transportTypeName(transport), operationName(operation),
+                streamEventName(event)};
+        },
+        count);
+}
+
+void TentMetrics::recordStreamAttempt(TransportType transport,
+                                      Request::OpCode operation,
+                                      StreamOutcome outcome,
+                                      double latency_us) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    recordStreamEvent(transport, operation, streamOutcomeEvent(outcome));
+    if (latency_us < 0.0) return;
+    stream_attempt_latency_.observeCached(
+        streamAttemptSlot(transport, operation, outcome),
+        [transport, operation, outcome] {
+            return std::array<std::string, 3>{
+                transportTypeName(transport), operationName(operation),
+                streamOutcomeName(outcome)};
+        },
+        static_cast<int64_t>(latency_us));
+}
+
+void TentMetrics::recordStreamQueueWait(TransportType transport,
+                                        Request::OpCode operation,
+                                        double latency_us) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed) ||
+        latency_us < 0.0)
+        return;
+    stream_queue_wait_.observeCached(
+        streamOperationSlot(transport, operation),
+        [transport, operation] {
+            return std::array<std::string, 2>{transportTypeName(transport),
+                                              operationName(operation)};
+        },
+        static_cast<int64_t>(latency_us));
+}
+
 // Gauge updates below deliberately ignore runtime_enabled_: gauges track
 // engine state through paired add/sub operations (attempt start/finish,
 // register/unregister), and skipping one half of a pair across a
@@ -1075,6 +1197,8 @@ std::string TentMetrics::getPrometheusMetrics() {
         serializeHistogramPrometheus(transport_attempt_latency_, result);
         serializeHistogramPrometheus(rpc_attempt_latency_, result);
         serializeHistogramPrometheus(rdma_completion_latency_, result);
+        serializeHistogramPrometheus(stream_attempt_latency_, result);
+        serializeHistogramPrometheus(stream_queue_wait_, result);
 
         // Gauges: current value per label.
         for (auto* gauge : gauges_) {
@@ -1429,6 +1553,8 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&rdma_qp_transition_failures_total_);
         root[rdma_notification_events_total_.str_name()] =
             sumCounterValues(&rdma_notification_events_total_);
+        root[stream_events_total_.str_name()] =
+            sumCounterValues(&stream_events_total_);
 
         // Gauges: aggregate across transport labels (total in-flight attempts
         // / total registered bytes). Per-transport breakdown is via the
@@ -1465,6 +1591,8 @@ std::string TentMetrics::getJsonMetrics() {
         serializeHistogramToJson(root, transport_attempt_latency_);
         serializeHistogramToJson(root, rpc_attempt_latency_);
         serializeHistogramToJson(root, rdma_completion_latency_);
+        serializeHistogramToJson(root, stream_attempt_latency_);
+        serializeHistogramToJson(root, stream_queue_wait_);
 
         root["tent_metrics_build_info"] = {
             {"version", TENT_BUILD_VERSION},
@@ -1608,6 +1736,12 @@ void TentMetrics::recordRdmaCompletion(Request::OpCode, RdmaCompletionOutcome,
 void TentMetrics::recordRdmaEndpointEvent(RdmaEndpointEvent) {}
 void TentMetrics::recordRdmaQpTransitionFailure(RdmaQpType, RdmaQpTransition) {}
 void TentMetrics::recordRdmaNotificationEvent(RdmaNotificationEvent, int64_t) {}
+void TentMetrics::recordStreamEvent(TransportType, Request::OpCode, StreamEvent,
+                                    int64_t) {}
+void TentMetrics::recordStreamAttempt(TransportType, Request::OpCode,
+                                      StreamOutcome, double) {}
+void TentMetrics::recordStreamQueueWait(TransportType, Request::OpCode,
+                                        double) {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}

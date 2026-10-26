@@ -297,6 +297,42 @@ class TentMetrics {
     void recordRdmaNotificationEvent(RdmaNotificationEvent event,
                                      int64_t count = 1);
 
+    enum class StreamEvent {
+        Queued,
+        AttemptStarted,
+        AttemptSuccess,
+        ConnectStarted,
+        ConnectSuccess,
+        ConnectionError,
+        IoError,
+        Timeout,
+        PeerClosed,
+        Canceled,
+        RemoteError,
+        RetryIssued,
+        RetryExhausted,
+    };
+    enum class StreamOutcome {
+        Success,
+        ConnectionError,
+        IoError,
+        Timeout,
+        PeerClosed,
+        Canceled,
+        RemoteError,
+    };
+
+    // Stream metrics cover TCP and HP-TCP. A queued event belongs to a
+    // logical task for TCP and a physical slice operation for HP-TCP; attempt
+    // events and latency always describe a physical network attempt.
+    void recordStreamEvent(TransportType transport, Request::OpCode operation,
+                           StreamEvent event, int64_t count = 1);
+    void recordStreamAttempt(TransportType transport,
+                             Request::OpCode operation, StreamOutcome outcome,
+                             double latency_us);
+    void recordStreamQueueWait(TransportType transport,
+                               Request::OpCode operation, double latency_us);
+
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
     // sitting in the engine right now — a persistently high or stuck value
@@ -426,6 +462,10 @@ class TentMetrics {
         "qp_type", "transition"};
     static inline const std::array<std::string, 1> kRdmaNotificationEventLabel{
         "event"};
+    static inline const std::array<std::string, 3> kStreamEventLabels{
+        "transport", "operation", "event"};
+    static inline const std::array<std::string, 3> kStreamAttemptLabels{
+        "transport", "operation", "outcome"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -451,6 +491,13 @@ class TentMetrics {
     static constexpr size_t kRdmaQpFailureDomain =
         kRdmaQpTypeDomain * kRdmaQpTransitionDomain;
     static constexpr size_t kRdmaNotificationEventDomain = 14;
+    static constexpr size_t kStreamEventValueDomain = 13;
+    static constexpr size_t kStreamOutcomeDomain = 7;
+    static constexpr size_t kStreamOperationDomain = kTransportDomain * 2;
+    static constexpr size_t kStreamEventDomain =
+        kStreamOperationDomain * kStreamEventValueDomain;
+    static constexpr size_t kStreamAttemptDomain =
+        kStreamOperationDomain * kStreamOutcomeDomain;
     static constexpr size_t kRdmaEventDomain =
         kOperationDomain * kRdmaSliceEventDomain;
     static constexpr size_t kRdmaRetryDomain =
@@ -494,6 +541,24 @@ class TentMetrics {
                                     RdmaQpTransition transition) {
         return static_cast<size_t>(qp_type) * kRdmaQpTransitionDomain +
                static_cast<size_t>(transition);
+    }
+    static size_t streamOperationSlot(TransportType transport,
+                                      Request::OpCode operation) {
+        return transportSlot(transport) * 2 + operationSlot(operation);
+    }
+    static size_t streamEventSlot(TransportType transport,
+                                  Request::OpCode operation,
+                                  StreamEvent event) {
+        return streamOperationSlot(transport, operation) *
+                   kStreamEventValueDomain +
+               static_cast<size_t>(event);
+    }
+    static size_t streamAttemptSlot(TransportType transport,
+                                    Request::OpCode operation,
+                                    StreamOutcome outcome) {
+        return streamOperationSlot(transport, operation) *
+                   kStreamOutcomeDomain +
+               static_cast<size_t>(outcome);
     }
 
     // Per-transport counters (label: transport). Values are int64_t.
@@ -599,6 +664,10 @@ class TentMetrics {
         "tent_rdma_notification_events_total",
         "RDMA notification channel events", kRdmaNotificationEventLabel,
         kRdmaNotificationEventDomain};
+    metrics::CachedDynamicCounter<3> stream_events_total_{
+        "tent_stream_events_total",
+        "TCP and HP-TCP queue, attempt, connection, retry and terminal events",
+        kStreamEventLabels, kStreamEventDomain};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_
@@ -700,6 +769,14 @@ class TentMetrics {
         "tent_rdma_completion_latency_us",
         "RDMA posted-slice completion latency in microseconds", kLatencyBuckets,
         kRdmaCompletionLabels, kRdmaCompletionDomain};
+    metrics::CachedDynamicHistogram<3> stream_attempt_latency_{
+        "tent_stream_attempt_latency_us",
+        "Physical TCP and HP-TCP attempt latency in microseconds",
+        kLatencyBuckets, kStreamAttemptLabels, kStreamAttemptDomain};
+    metrics::CachedDynamicHistogram<2> stream_queue_wait_{
+        "tent_stream_queue_wait_us",
+        "TCP logical-task and HP-TCP physical-slice queue wait in microseconds",
+        kLatencyBuckets, kAttemptLabels, kStreamOperationDomain};
 
     // Per-transport (N=1) histograms for unified serialization; the N=2
     // attempt histograms are serialized separately (see getPrometheusMetrics /
