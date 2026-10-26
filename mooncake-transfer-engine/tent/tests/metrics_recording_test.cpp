@@ -47,6 +47,7 @@
 #include "tent/common/types.h"
 #include "tent/metrics/config_loader.h"
 #include "tent/metrics/tent_metrics.h"
+#include "tent/rpc/rpc.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
 #include "tent/thirdparty/nlohmann/json.h"
@@ -451,6 +452,9 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStagingCleanupPending(TentMetrics::StagingCleanupKind::Group,
                                         -1);
     metrics.recordStagingCleanupTimeout();
+    metrics.recordRpcAttempt(TentMetrics::RpcMethod::Probe,
+                             TentMetrics::RpcOutcome::Success, 25.0);
+    metrics.recordRpcRetry(TentMetrics::RpcMethod::GetSegmentDesc);
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -460,7 +464,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 38>
+    const std::array<std::pair<std::string_view, std::string_view>, 41>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -478,6 +482,8 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_deadline_infeasible_total", "counter"},
             {"tent_quarantined_batches_total", "counter"},
             {"tent_staging_cleanup_timeouts_total", "counter"},
+            {"tent_rpc_attempts_total", "counter"},
+            {"tent_rpc_retries_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
             {"tent_worker_last_progress_timestamp_seconds", "gauge"},
@@ -493,6 +499,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_stage_dispatch_us", "histogram"},
             {"tent_stage_transport_us", "histogram"},
             {"tent_transport_attempt_latency_us", "histogram"},
+            {"tent_rpc_attempt_latency_us", "histogram"},
             {"tent_metrics_build_info", "gauge"},
             {"tent_metrics_runtime_enabled", "gauge"},
             {"tent_metrics_http_server_up", "gauge"},
@@ -560,6 +567,56 @@ TEST_F(MetricsRecordingTest,
             before.series("tent_metrics_serialization_failures_total{format=\""
                           "prometheus\"}"),
         1);
+}
+
+TEST_F(MetricsRecordingTest, RpcAgentRecordsSuccessfulPhysicalAttempt) {
+    CoroRpcAgent server;
+    ASSERT_TRUE(server
+                    .registerFunction(
+                        Probe, [](const std::string_view&, std::string&) {})
+                    .ok());
+    uint16_t port = 0;
+    ASSERT_TRUE(server.start(port).ok());
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    CoroRpcAgent client;
+    std::string response;
+    ASSERT_TRUE(
+        client.call("127.0.0.1:" + std::to_string(port), Probe, "", response)
+            .ok());
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    const std::string series =
+        "tent_rpc_attempts_total{method=\"probe\",outcome=\"success\"}";
+    EXPECT_EQ(after.series(series) - before.series(series), 1);
+    EXPECT_EQ(after.histogramCount("tent_rpc_attempt_latency_us") -
+                  before.histogramCount("tent_rpc_attempt_latency_us"),
+              1);
+    EXPECT_TRUE(server.stop().ok());
+}
+
+TEST_F(MetricsRecordingTest, RpcRetryRecordsEachConnectionAttempt) {
+    const uint16_t unused_port = getFreeTcpPort();
+    ASSERT_NE(unused_port, 0);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    CoroRpcAgent client;
+    auto [status, response] = async_simple::coro::syncAwait(
+        client.callCoroutine("127.0.0.1:" + std::to_string(unused_port),
+                             GetSegmentDesc, "", true));
+    EXPECT_FALSE(status.ok());
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    const std::string failures =
+        "tent_rpc_attempts_total{method=\"get_segment_desc\",outcome="
+        "\"connection_error\"}";
+    const std::string retries =
+        "tent_rpc_retries_total{method=\"get_segment_desc\"}";
+    EXPECT_EQ(after.series(failures) - before.series(failures), 2);
+    EXPECT_EQ(after.series(retries) - before.series(retries), 1);
+    EXPECT_EQ(after.histogramCount("tent_rpc_attempt_latency_us") -
+                  before.histogramCount("tent_rpc_attempt_latency_us"),
+              2);
 }
 
 // ---------------------------------------------------------------------------
@@ -1741,6 +1798,9 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_staging_inflight_tasks"));
     EXPECT_TRUE(json.contains("tent_staging_inflight_bytes"));
     EXPECT_TRUE(json.contains("tent_staging_cleanup_pending"));
+    EXPECT_TRUE(json.contains("tent_rpc_attempts_total"));
+    EXPECT_TRUE(json.contains("tent_rpc_retries_total"));
+    EXPECT_TRUE(json.contains("tent_rpc_attempt_latency_us"));
     EXPECT_TRUE(json.contains("tent_metrics_build_info"));
     EXPECT_FALSE(
         json["tent_metrics_build_info"].contains("compile_time_enabled"));

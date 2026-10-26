@@ -16,8 +16,10 @@
 #include <glog/logging.h>
 #include <async_simple/executors/SimpleExecutor.h>
 
+#include <chrono>
 #include <stdexcept>
 
+#include "tent/metrics/tent_metrics.h"
 #include "transfer_engine_rpc_client_io_context.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/random.h"
@@ -41,6 +43,49 @@ struct RpcHandlerScope {
     bool& flag_;
     bool prev_;
 };
+
+#if TENT_METRICS_ENABLED
+TentMetrics::RpcMethod rpcMethodForFuncId(int func_id) {
+    switch (func_id) {
+        case GetSegmentDesc:
+            return TentMetrics::RpcMethod::GetSegmentDesc;
+        case BootstrapRdma:
+            return TentMetrics::RpcMethod::BootstrapRdma;
+        case SendData:
+            return TentMetrics::RpcMethod::SendData;
+        case RecvData:
+            return TentMetrics::RpcMethod::RecvData;
+        case Notify:
+            return TentMetrics::RpcMethod::Notify;
+        case Probe:
+            return TentMetrics::RpcMethod::Probe;
+        case Delegate:
+            return TentMetrics::RpcMethod::Delegate;
+        case Pin:
+            return TentMetrics::RpcMethod::Pin;
+        case Unpin:
+            return TentMetrics::RpcMethod::Unpin;
+        case SubscribeSegmentUpdate:
+            return TentMetrics::RpcMethod::SubscribeSegmentUpdate;
+        case NotifySegmentUpdated:
+            return TentMetrics::RpcMethod::NotifySegmentUpdated;
+        case BootstrapUb:
+            return TentMetrics::RpcMethod::BootstrapUb;
+        default:
+            return TentMetrics::RpcMethod::Unknown;
+    }
+}
+
+void recordRpcAttempt(TentMetrics::RpcMethod method,
+                      TentMetrics::RpcOutcome outcome,
+                      std::chrono::steady_clock::time_point attempt_started) {
+    const auto latency_us =
+        std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - attempt_started)
+            .count();
+    TentMetrics::instance().recordRpcAttempt(method, outcome, latency_us);
+}
+#endif
 }  // namespace
 
 class ClientPool {
@@ -252,7 +297,16 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
     }
 
     const int max_attempts = retry_rpc_error_once ? 2 : 1;
+#if TENT_METRICS_ENABLED
+    const auto metric_method = rpcMethodForFuncId(func_id);
+#endif
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
+#if TENT_METRICS_ENABLED
+        if (attempt != 0) {
+            TentMetrics::instance().recordRpcRetry(metric_method);
+        }
+        const auto attempt_started = std::chrono::steady_clock::now();
+#endif
         auto pool = getOrCreatePool(server_addr);
         auto acquired = pool->acquire();
         const uint64_t generation = acquired.generation;
@@ -265,6 +319,11 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
             auto conn_result = co_await lease.client->connect(server_addr);
             if (conn_result.val() != 0) {
                 lease.broken = true;
+#if TENT_METRICS_ENABLED
+                recordRpcAttempt(metric_method,
+                                 TentMetrics::RpcOutcome::ConnectionError,
+                                 attempt_started);
+#endif
                 auto msg =
                     "Failed to connect RPC server. server: " + server_addr +
                     ", func_id: " + std::to_string(func_id) +
@@ -282,6 +341,10 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
 
         if (!call_result.has_value()) {
             lease.broken = true;
+#if TENT_METRICS_ENABLED
+            recordRpcAttempt(metric_method, TentMetrics::RpcOutcome::RpcError,
+                             attempt_started);
+#endif
             // An idle pooled connection only learns that its peer restarted
             // when it is next used. Drop the whole pool so a retry starts
             // from a fresh connection.
@@ -302,6 +365,10 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
         std::string response = lease->release_resp_attachment();
         response.resize(len);
 
+#if TENT_METRICS_ENABLED
+        recordRpcAttempt(metric_method, TentMetrics::RpcOutcome::Success,
+                         attempt_started);
+#endif
         co_return std::make_pair(Status::OK(), std::move(response));
     }
 
