@@ -9,7 +9,7 @@
 // nothing about block contents or locations -- it is handed a dedup identity
 // and a key, and the tests speak the same language.
 
-#include "p2p/client/v2/movement_tracker.h"
+#include "p2p/client/data_manager/v2/movement_tracker.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -25,9 +25,9 @@
 #include <string_view>
 #include <utility>
 
-#include "p2p/client/v2/block.h"
-#include "p2p/client/v2/block_registry.h"
-#include "p2p/client/v2/v2_common.h"
+#include "p2p/client/data_manager/v2/block.h"
+#include "p2p/client/data_manager/v2/block_registry.h"
+#include "p2p/client/data_manager/v2/v2_common.h"
 #include "common_types.h"
 
 namespace mooncake::v2 {

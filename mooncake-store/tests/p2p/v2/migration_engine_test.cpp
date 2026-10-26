@@ -25,12 +25,12 @@
 #include <vector>
 
 #include "p2p/client/data_manager_types.h"
-#include "p2p/client/v2/block_pool.h"
-#include "p2p/client/v2/block_registry.h"
-#include "p2p/client/v2/event_center.h"
-#include "p2p/client/v2/local_copy_engine.h"
-#include "p2p/client/v2/migration_engine.h"
-#include "p2p/client/v2/tiler_manager.h"
+#include "p2p/client/data_manager/v2/block_pool.h"
+#include "p2p/client/data_manager/v2/block_registry.h"
+#include "p2p/client/data_manager/v2/event_center.h"
+#include "p2p/client/data_manager/v2/local_copy_engine.h"
+#include "p2p/client/data_manager/v2/migration_engine.h"
+#include "p2p/client/data_manager/v2/tiler_manager.h"
 #include "p2p/common/p2p_types.h"
 
 namespace mooncake::v2 {

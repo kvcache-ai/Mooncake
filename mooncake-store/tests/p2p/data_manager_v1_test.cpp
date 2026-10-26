@@ -15,7 +15,7 @@
 
 #define private public
 #define protected public
-#include "p2p/client/v1/data_manager_v1.h"
+#include "p2p/client/data_manager/v1/data_manager_v1.h"
 #include "p2p/client/tiered_cache/tiered_backend.h"
 #include "../utils/common.h"
 #include "topology.h"

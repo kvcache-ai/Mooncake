@@ -28,8 +28,8 @@
 #include <utility>
 #include <vector>
 
-#include "p2p/client/v2/block.h"
-#include "p2p/client/v2/block_pool.h"
+#include "p2p/client/data_manager/v2/block.h"
+#include "p2p/client/data_manager/v2/block_pool.h"
 #include "common_types.h"
 
 namespace mooncake::v2 {

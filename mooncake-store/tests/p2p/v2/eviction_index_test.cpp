@@ -11,7 +11,7 @@
 // are weak. A fake handle could never fail to upgrade, and failing to upgrade
 // is exactly what the evict engine has to be able to observe.
 
-#include "p2p/client/v2/eviction_index.h"
+#include "p2p/client/data_manager/v2/eviction_index.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -29,10 +29,10 @@
 #include <unordered_map>
 #include <vector>
 
-#include "p2p/client/v2/block.h"
-#include "p2p/client/v2/block_pool.h"
-#include "p2p/client/v2/evict_engine.h"
-#include "p2p/client/v2/block_registry.h"
+#include "p2p/client/data_manager/v2/block.h"
+#include "p2p/client/data_manager/v2/block_pool.h"
+#include "p2p/client/data_manager/v2/evict_engine.h"
+#include "p2p/client/data_manager/v2/block_registry.h"
 #include "common_types.h"
 
 // ---------------------------------------------------------------------------

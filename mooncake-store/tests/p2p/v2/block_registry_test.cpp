@@ -8,7 +8,7 @@
 // idempotent presence hints, and the pointer-identity check that keeps a late
 // destructor from evicting a re-created registration.
 
-#include "p2p/client/v2/block_registry.h"
+#include "p2p/client/data_manager/v2/block_registry.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>

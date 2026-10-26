@@ -5,7 +5,7 @@
 // each case fixes one of the three permitted outcomes -- fold, lose, or apply
 // on the producer's thread -- and none of them is "wait".
 
-#include "p2p/client/v2/event_center.h"
+#include "p2p/client/data_manager/v2/event_center.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -24,9 +24,9 @@
 #include <utility>
 #include <vector>
 
-#include "p2p/client/v2/block.h"
-#include "p2p/client/v2/block_registry.h"
-#include "p2p/client/v2/movement.h"
+#include "p2p/client/data_manager/v2/block.h"
+#include "p2p/client/data_manager/v2/block_registry.h"
+#include "p2p/client/data_manager/v2/movement.h"
 #include "common_types.h"
 
 namespace mooncake::v2 {

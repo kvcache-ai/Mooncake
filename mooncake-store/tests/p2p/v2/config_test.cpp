@@ -20,9 +20,9 @@
 #include <vector>
 
 #include "p2p/client/data_manager_factory.h"
-#include "p2p/client/v2/block_index.h"
-#include "p2p/client/v2/data_manager_v2.h"
-#include "p2p/client/v2/v2_common.h"
+#include "p2p/client/data_manager/v2/block_index.h"
+#include "p2p/client/data_manager/v2/data_manager_v2.h"
+#include "p2p/client/data_manager/v2/v2_common.h"
 #include "p2p/common/p2p_types.h"
 
 namespace mooncake::v2 {

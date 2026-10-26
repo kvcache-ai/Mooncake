@@ -1,4 +1,4 @@
-#include "p2p/client/v2/block_index.h"
+#include "p2p/client/data_manager/v2/block_index.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -16,9 +16,9 @@
 #include <unordered_set>
 #include <vector>
 
-#include "p2p/client/v2/block.h"
-#include "p2p/client/v2/block_pool.h"
-#include "p2p/client/v2/block_registry.h"
+#include "p2p/client/data_manager/v2/block.h"
+#include "p2p/client/data_manager/v2/block_pool.h"
+#include "p2p/client/data_manager/v2/block_registry.h"
 #include "common_types.h"
 
 namespace mooncake::v2 {

@@ -1,4 +1,4 @@
-#include "p2p/client/v2/eviction_policy.h"
+#include "p2p/client/data_manager/v2/eviction_policy.h"
 
 // Time is injected. Every watermark, half-life and horizon in this file moves
 // because FakeClock was advanced, never because a thread waited: the
@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-#include "p2p/client/v2/v2_common.h"
+#include "p2p/client/data_manager/v2/v2_common.h"
 #include "common_types.h"
 
 namespace mooncake::v2 {

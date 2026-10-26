@@ -15,7 +15,7 @@
 #include <asio.hpp>
 #include <async_simple/coro/SyncAwait.h>
 
-#include "p2p/client/v2/data_manager_v2.h"
+#include "p2p/client/data_manager/v2/data_manager_v2.h"
 #include "utils.h"
 
 namespace mooncake::v2 {

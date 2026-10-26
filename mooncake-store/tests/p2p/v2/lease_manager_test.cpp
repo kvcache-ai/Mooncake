@@ -27,12 +27,12 @@
 #include <vector>
 
 #include "p2p/client/data_manager_types.h"
-#include "p2p/client/v2/block.h"
-#include "p2p/client/v2/block_index.h"
-#include "p2p/client/v2/block_pool.h"
-#include "p2p/client/v2/block_registry.h"
-#include "p2p/client/v2/lease_manager.h"
-#include "p2p/client/v2/v2_common.h"
+#include "p2p/client/data_manager/v2/block.h"
+#include "p2p/client/data_manager/v2/block_index.h"
+#include "p2p/client/data_manager/v2/block_pool.h"
+#include "p2p/client/data_manager/v2/block_registry.h"
+#include "p2p/client/data_manager/v2/lease_manager.h"
+#include "p2p/client/data_manager/v2/v2_common.h"
 #include "transfer_engine.h"
 #include "common_types.h"
 

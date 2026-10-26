@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include "p2p/client/v2/frequency_tracker.h"
+#include "p2p/client/data_manager/v2/frequency_tracker.h"
 
 namespace mooncake::v2 {
 namespace {

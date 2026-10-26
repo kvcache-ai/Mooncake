@@ -6,8 +6,10 @@
 // data plane can be dropped in without touching any of those callers.
 //
 // Two implementations live behind it:
-//   - DataManagerV1 (p2p/client/v1/data_manager_v1.h)  — TieredBackend based
-//   - DataManagerV2 (p2p/client/v2/data_manager_v2.h)  — Tiler/Block based
+//   - DataManagerV1 (p2p/client/data_manager/v1/data_manager_v1.h)  —
+//   TieredBackend based
+//   - DataManagerV2 (p2p/client/data_manager/v2/data_manager_v2.h)  —
+//   Tiler/Block based
 //
 // Deliberately NOT on this interface:
 //   - ReadRemoteData / WriteRemoteData / TransferData: the synchronous
