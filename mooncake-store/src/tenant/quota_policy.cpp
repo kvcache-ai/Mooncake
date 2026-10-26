@@ -133,28 +133,35 @@ uint64_t TenantQuotaPolicy::AllocatableCapacityBytes() const {
 uint64_t TenantQuotaPolicy::MemoryCharge(const ObjectMetadata& metadata) {
     // A replica being written already holds the memory it was allocated, and
     // a removed one keeps its memory until the removal is durable and the
-    // replica is dropped, so both are charged.
-    const auto holding_replicas =
-        metadata.CountReplicas([](const Replica& replica) {
+    // replica is dropped, so both are charged. The replicas of a part carry
+    // that part alone, so each part is charged for its own length.
+    uint64_t charge = 0;
+    metadata.ForEachPart([&charge](size_t, const ObjectPart& part) {
+        uint64_t holding_replicas = 0;
+        for (const auto& replica : part.replicas()) {
             if (!replica.is_memory_replica()) {
-                return false;
+                continue;
             }
             switch (replica.status()) {
                 case ReplicaStatus::INITIALIZED:
                 case ReplicaStatus::PROCESSING:
                 case ReplicaStatus::COMPLETE:
                 case ReplicaStatus::REMOVED:
-                    return true;
+                    ++holding_replicas;
+                    break;
                 default:
-                    return false;
+                    break;
             }
-        });
-    const unsigned __int128 charge =
-        static_cast<unsigned __int128>(metadata.TotalLength()) *
-        holding_replicas;
-    return charge > TenantQuotaAccount::kMaxChargedBytes
-               ? TenantQuotaAccount::kMaxChargedBytes
-               : static_cast<uint64_t>(charge);
+        }
+        const unsigned __int128 part_charge =
+            static_cast<unsigned __int128>(part.length()) * holding_replicas;
+        const uint64_t capped =
+            part_charge > TenantQuotaAccount::kMaxChargedBytes
+                ? TenantQuotaAccount::kMaxChargedBytes
+                : static_cast<uint64_t>(part_charge);
+        charge = SaturatingAdd(charge, capped);
+    });
+    return charge;
 }
 
 TenantQuotaAccount& TenantQuotaPolicy::AccountOf(const PolicyContext& ctx) {

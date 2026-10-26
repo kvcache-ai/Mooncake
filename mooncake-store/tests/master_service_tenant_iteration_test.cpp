@@ -202,7 +202,7 @@ TEST_F(TenantIterationTest, RemoveAllLeavesLeasedObjectsUnlessForced) {
     EXPECT_EQ(service.RemoveAll(kTenantA, /*force=*/true), 4);
 }
 
-TEST_F(TenantIterationTest, InFlightKeysNameOnlyKeysWithWorkInFlight) {
+TEST_F(TenantIterationTest, TheDiscardSweepListsTheKeysItMayActOn) {
     MasterService service(MultiTenantConfig());
     const auto context = PrepareSimpleSegment(service);
     PutKeys(service, context.client_id, kTenantA, "done_", 3);
@@ -215,19 +215,25 @@ TEST_F(TenantIterationTest, InFlightKeysNameOnlyKeysWithWorkInFlight) {
     }
 
     MasterServiceTestPeer peer(service);
-    EXPECT_EQ(InFlightKeysOf(service, kTenantA),
+    // The keys of one tenant the sweep may act on.
+    const auto discard_sweep_keys = [&](const TenantId& tenant_id) {
+        const metadata::Namespace* ns = NamespaceOf(service, tenant_id);
+        return ns == nullptr ? std::vector<std::string>{}
+                             : MasterServiceTestPeer::DiscardSweepKeys(*ns);
+    };
+    EXPECT_EQ(discard_sweep_keys(kTenantA),
               std::vector<std::string>{"pending_a"});
-    EXPECT_EQ(InFlightKeysOf(service, kTenantB),
+    EXPECT_EQ(discard_sweep_keys(kTenantB),
               std::vector<std::string>{"pending_b"});
-    EXPECT_TRUE(InFlightKeysOf(service, kTenantC).empty());
+    EXPECT_TRUE(discard_sweep_keys(kTenantC).empty());
 
     // The expiry sweep of one tenant leaves the others' writes alone.
     peer.DiscardExpiredProcessingReplicas(
         kTenantA, std::chrono::system_clock::time_point::max());
-    EXPECT_TRUE(InFlightKeysOf(service, kTenantA).empty());
+    EXPECT_TRUE(discard_sweep_keys(kTenantA).empty());
     EXPECT_EQ(KeysOf(service, kTenantA),
               (std::set<std::string>{"done_0", "done_1", "done_2"}));
-    EXPECT_EQ(InFlightKeysOf(service, kTenantB),
+    EXPECT_EQ(discard_sweep_keys(kTenantB),
               std::vector<std::string>{"pending_b"});
 }
 

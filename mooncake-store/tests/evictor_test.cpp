@@ -47,12 +47,12 @@ class FakePolicy final : public eviction::EvictionPolicy {
                                            : SkipReason::kSoftPinned);
         }
         eviction::Plan plan;
-        for (const Replica& replica : candidate.metadata.GetAllReplicas()) {
+        candidate.metadata.VisitReplicas([&plan](const Replica& replica) {
             if (replica.is_memory_replica() && replica.is_completed() &&
                 replica.get_refcnt() == 0) {
                 plan.release.push_back(replica.id());
             }
-        }
+        });
         if (plan.release.empty()) {
             return tl::make_unexpected(SkipReason::kNothingToRelease);
         }
@@ -137,9 +137,13 @@ class EvictorTest : public ::testing::Test {
             list.emplace_back(allocator_->allocate(128),
                               ReplicaStatus::COMPLETE);
         }
-        (void)guard.Publish(
-            UUID{1, 2}, Clock::time_point{}, 128, std::move(list), std::nullopt,
-            false, ObjectDataType::UNKNOWN, group_id, TenantId(tenant), key);
+        (void)guard.Publish(/*part_count=*/1, TenantId(tenant), key, group_id,
+                            ObjectDataType::UNKNOWN, /*hard_pinned=*/false,
+                            std::nullopt);
+        auto begin_write = guard.metadata().BeginWrite(
+            /*index=*/0, /*length=*/128, std::move(list), UUID{1, 2},
+            /*session_id=*/"", Clock::time_point{});
+        ASSERT_TRUE(begin_write.has_value());
         SetDeadline(guard.metadata(), Clock::now() - age);
     }
 
@@ -387,10 +391,14 @@ TEST_F(EvictorTest, AReplacedDeferredObjectIsLeftAlone) {
         hold->TearDown();
         std::vector<Replica> list;
         list.emplace_back(allocator_->allocate(128), ReplicaStatus::COMPLETE);
-        (void)hold->Publish(UUID{1, 2}, Clock::time_point{}, 128,
-                            std::move(list), std::nullopt, false,
-                            ObjectDataType::UNKNOWN, std::string(),
-                            TenantId("a"), "pinned");
+        (void)hold->Publish(/*part_count=*/1, TenantId("a"), "pinned",
+                            std::string(), ObjectDataType::UNKNOWN,
+                            /*hard_pinned=*/false, std::nullopt);
+        ASSERT_TRUE(hold->metadata()
+                        .BeginWrite(/*index=*/0, /*length=*/128,
+                                    std::move(list), UUID{1, 2},
+                                    /*session_id=*/"", Clock::time_point{})
+                        .has_value());
     };
 
     Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
@@ -448,10 +456,14 @@ TEST_F(EvictorTest, AMemberReplacedBeforeItsTurnIsLeftAlone) {
         hold->TearDown();
         std::vector<Replica> list;
         list.emplace_back(allocator_->allocate(128), ReplicaStatus::COMPLETE);
-        (void)hold->Publish(UUID{1, 2}, Clock::time_point{}, 128,
-                            std::move(list), std::nullopt, false,
-                            ObjectDataType::UNKNOWN, std::string(),
-                            TenantId("a"), replaced);
+        (void)hold->Publish(/*part_count=*/1, TenantId("a"), replaced,
+                            std::string(), ObjectDataType::UNKNOWN,
+                            /*hard_pinned=*/false, std::nullopt);
+        ASSERT_TRUE(hold->metadata()
+                        .BeginWrite(/*index=*/0, /*length=*/128,
+                                    std::move(list), UUID{1, 2},
+                                    /*session_id=*/"", Clock::time_point{})
+                        .has_value());
         SetDeadline(hold->metadata(), Clock::now() + std::chrono::hours(1));
     };
 

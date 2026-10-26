@@ -50,9 +50,13 @@ class LeaseEvictionIndexTest : public ::testing::Test {
                    bool hard_pinned = false) {
         std::vector<Replica> replicas;
         replicas.emplace_back(allocator_->allocate(128), status);
-        (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
-                            std::move(replicas), std::nullopt, hard_pinned,
-                            ObjectDataType::UNKNOWN, group_id, TenantId(), key);
+        (void)guard.Publish(/*part_count=*/1, TenantId(), key, group_id,
+                            ObjectDataType::UNKNOWN, hard_pinned, std::nullopt);
+        // The part keeps the status the caller asked for.
+        auto begin_write = guard.metadata().BeginWrite(
+            /*index=*/0, /*length=*/128, std::move(replicas), UUID{1, 2},
+            /*session_id=*/"", Clock::time_point{});
+        ASSERT_TRUE(begin_write.has_value());
     }
 
     static void SetDeadline(const ObjectMetadata& metadata,

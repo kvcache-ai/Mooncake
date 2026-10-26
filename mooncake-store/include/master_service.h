@@ -394,10 +394,13 @@ class MasterService {
     /**
      * @brief Get list of replicas for an object
      * @param[out] replica_list Vector to store replica information
+     * @param part_index Which part the reader wants. Empty when it named none,
+     * which a reader of an object of several parts cannot do.
      * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if not
      * ready
      */
-    auto GetReplicaList(const std::string& key, const TenantId& tenant_id)
+    auto GetReplicaList(const std::string& key, const TenantId& tenant_id,
+                        std::optional<uint32_t> part_index = std::nullopt)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
@@ -411,10 +414,17 @@ class MasterService {
 
     /**
      * @brief Get replica lists for a batch of objects.
+     * @param part_indices Which part of each key the reader wants, one entry
+     * per key. Empty means every reader named none.
+     *
+     * Keys are grouped by the metadata shard they route to, so the parts of one
+     * object are served in a single visit to that shard. Results follow the
+     * input order.
      */
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys,
-                        const TenantId& tenant_id);
+    BatchGetReplicaList(
+        const std::vector<std::string>& keys, const TenantId& tenant_id,
+        const std::vector<std::optional<uint32_t>>& part_indices = {});
 
     /**
      * @brief Read-only batch replica list query for admin use.
@@ -429,28 +439,40 @@ class MasterService {
      * @brief Start a put operation for an object
      * @param[out] replica_list Vector to store replica information for the
      * slice
+     * @param part_index Which part of the object this write produces.
+     * @param part_count How many parts the object has, fixed by the first
+     * write of it.
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if exists,
      *         ErrorCode::NO_AVAILABLE_HANDLE if allocation fails,
      *         ErrorCode::INVALID_PARAMS if slice size is invalid
      */
     auto PutStart(const UUID& client_id, const std::string& key,
                   const TenantId& tenant_id, const uint64_t slice_length,
-                  const ReplicateConfig& config)
+                  const ReplicateConfig& config, uint32_t part_index = 0,
+                  uint32_t part_count = 1)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
      * @brief Complete a put operation, replica_type indicates the type of
      * replica to complete (memory or disk)
+     * @param part_index Which part this End completes.
+     * @param replica_ids Which of that part's replicas the caller wrote. Empty
+     * means every replica of the part, which is what a caller that does not
+     * speak parts asks for.
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
-                const TenantId& tenant_id, ReplicaType replica_type)
-        -> tl::expected<void, ErrorCode>;
+                const TenantId& tenant_id, ReplicaType replica_type,
+                uint32_t part_index = 0,
+                std::optional<std::vector<ReplicaID>> replica_ids =
+                    std::nullopt) -> tl::expected<void, ErrorCode>;
 
     auto PutEnd(const UUID& client_id, const std::string& key,
-                const TenantId& tenant_id, ReplicaType replica_type)
-        -> tl::expected<void, ErrorCode>;
+                const TenantId& tenant_id, ReplicaType replica_type,
+                uint32_t part_index = 0,
+                std::optional<std::vector<ReplicaID>> replica_ids =
+                    std::nullopt) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Adds a replica instance associated with the given client and key.
@@ -466,8 +488,10 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutRevoke(const UUID& client_id, const std::string& key,
-                   const TenantId& tenant_id, ReplicaType replica_type)
-        -> tl::expected<void, ErrorCode>;
+                   const TenantId& tenant_id, ReplicaType replica_type,
+                   uint32_t part_index = 0,
+                   std::optional<std::vector<ReplicaID>> replica_ids =
+                       std::nullopt) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Complete a batch of put operations
@@ -476,7 +500,10 @@ class MasterService {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
-        const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL);
+        const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL,
+        std::optional<std::vector<uint32_t>> part_indices = std::nullopt,
+        std::optional<std::vector<std::vector<ReplicaID>>> replica_ids =
+            std::nullopt);
 
     /**
      * @brief Revoke a batch of put operations
@@ -485,7 +512,10 @@ class MasterService {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
-        const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL);
+        const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL,
+        std::optional<std::vector<uint32_t>> part_indices = std::nullopt,
+        std::optional<std::vector<std::vector<ReplicaID>>> replica_ids =
+            std::nullopt);
 
     /**
      * @brief Start an upsert operation. If the key does not exist, behaves
@@ -1299,6 +1329,12 @@ class MasterService {
         std::vector<Replica::Descriptor> remaining;
         bool would_invalidate{false};
     };
+    // Whether a replica's handle is dead, or the client that owns its local
+    // disk entry no longer holds it. A dropped handle is not stale: the segment
+    // is only waiting for its owner to come back.
+    static bool IsStaleReplicaHandle(
+        const Replica& replica,
+        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
         const ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
@@ -1391,7 +1427,8 @@ class MasterService {
                         const ResolvedSoftPinRequest& soft_pin_request,
                         std::vector<Replica>&& replicas,
                         std::optional<std::chrono::system_clock::time_point>
-                            committed_soft_pin_timeout = std::nullopt)
+                            committed_soft_pin_timeout = std::nullopt,
+                        size_t part_count = 1, size_t part_index = 0)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     // Helper: allocate replicas, publish the object under the key `accessor`
@@ -1405,7 +1442,8 @@ class MasterService {
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
             committed_soft_pin_timeout = std::nullopt,
-        bool* dfs_allocation_failed = nullptr)
+        bool* dfs_allocation_failed = nullptr, size_t part_count = 1,
+        size_t part_index = 0)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     // What PutStart and UpsertStart settle before they take the key.
@@ -1415,6 +1453,82 @@ class MasterService {
         std::string writer_host_id;
         std::string group_id;
     };
+
+    // One part's write, with the key held and the tenant admitted. The batch
+    // call cleans the key's stale handles once and reaches this for every part
+    // of it, so many parts of one object cost one visit to its shard.
+    auto PutStartLocked(
+        MetadataAccessorRW& accessor, const WriteStartPlan& plan,
+        const UUID& client_id, const std::string& key, uint64_t slice_length,
+        const ReplicateConfig& config, uint32_t part_index, uint32_t part_count,
+        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients,
+        std::chrono::system_clock::time_point now, bool& dfs_allocation_failed)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
+    // One part's End, with the key held: that part's replicas become complete
+    // and its write closes.
+    auto PutEndPartLocked(MetadataAccessorRW& accessor, const UUID& client_id,
+                          const ObjectMeta& object_meta,
+                          ReplicaType replica_type, uint32_t part_index,
+                          std::optional<std::vector<ReplicaID>> replica_ids)
+        -> tl::expected<void, ErrorCode>;
+
+    // What the object as a whole owes the Ends just run, asked once per object:
+    // the tenant settlement, the cache totals, the offload queue, the
+    // readability transition and the durable record. `readable_before` and the
+    // medium snapshot are what the object said before them.
+    auto PutEndObjectLocked(MetadataAccessorRW& accessor,
+                            ReplicaType replica_type, bool readable_before,
+                            const std::vector<std::string>& previous_kv_media)
+        -> tl::expected<void, ErrorCode>;
+
+    // One part's Revoke, with the key held: the replicas that part's write
+    // handed out go. The answer says whether the object-level step is still
+    // owed, which the durable path settles in its finalize callback.
+    auto PutRevokePartLocked(MetadataAccessorRW& accessor,
+                             const UUID& client_id, const std::string& key,
+                             ReplicaType replica_type, uint32_t part_index,
+                             std::optional<std::vector<ReplicaID>> replica_ids)
+        -> tl::expected<bool, ErrorCode>;
+
+    // What the object as a whole owes the Revokes just run: it goes when they
+    // were its last usable replicas; otherwise the medium change follows what
+    // is left.
+    auto PutRevokeObjectLocked(
+        MetadataAccessorRW& accessor,
+        const std::vector<std::string>& previous_kv_media)
+        -> tl::expected<void, ErrorCode>;
+
+    // A batch indexes every per-item list by the item, so a list of another
+    // length is refused outright rather than read as a default for the items it
+    // does not cover, and a list the call does not carry has no length to
+    // answer for. `call` names the caller in the log.
+    bool BatchListsDifferInLength(
+        const char* call, size_t count,
+        std::initializer_list<std::pair<const char*, std::optional<size_t>>>
+            lists) const;
+
+    // Hand part `part_index` the content produced by one write: take the
+    // replicas the caller allocated and record the soft-pin action it asked
+    // for. The replicas are freed here when the write cannot be opened.
+    auto OpenPartWrite(
+        MetadataAccessorRW& accessor, const UUID& client_id, uint64_t length,
+        size_t part_index, const std::string& session_id,
+        const ResolvedSoftPinRequest& soft_pin_request,
+        std::vector<Replica>&& replicas,
+        const std::optional<std::chrono::system_clock::time_point>&
+            committed_soft_pin_timeout,
+        std::chrono::system_clock::time_point now)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
+    // Empty a part whose write went silent: what that write handed out goes to
+    // the quarantine for one release timeout, in case the writer that received
+    // it still streams into it, and the object's durable record is brought up
+    // to date with the part emptied.
+    tl::expected<void, ErrorCode> DiscardStalePartWrite(
+        MetadataAccessorRW& accessor, size_t part_index,
+        std::chrono::system_clock::time_point release_deadline);
+
     // The checks and setup PutStart and UpsertStart share before they take the
     // key: validates `config` for a write of `slice_length` bytes, records the
     // client's host, resolves the soft pin, the writer's host and the group,
@@ -1423,7 +1537,8 @@ class MasterService {
     auto PrepareWriteStart(const UUID& client_id, const std::string& key,
                            const TenantId& tenant_id, uint64_t slice_length,
                            const ReplicateConfig& config,
-                           std::string_view action)
+                           std::string_view action, uint32_t part_index = 0,
+                           uint32_t part_count = 1)
         -> tl::expected<WriteStartPlan, ErrorCode>;
     // A write's first step under the key: drops the held object's stale
     // replica handles and, without the oplog, the object itself when none is
@@ -1445,10 +1560,6 @@ class MasterService {
             tl::expected<std::vector<Replica::Descriptor>, ErrorCode>(
                 bool* dfs_allocation_failed)>& admit)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
-    // The first step of an accessor that holds a key by name: drops the held
-    // object's memory replicas whose segment is gone, and the object with them
-    // when none is left valid.
-    void CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor);
 
     // Discards the namespace's expired processing replicas and expired tasks.
     void DiscardExpiredProcessingReplicas(
@@ -1596,11 +1707,12 @@ class MasterService {
     class MetadataAccessorRW {
        public:
         struct AsIs {};
-        // Holds the key only while it holds an object, and leaves that object
-        // as it is, without the invalid-replica cleanup: for a pass that acts
-        // on what the object's own state says, such as an expiry sweep.
+        // Holds the key only while it holds an object, leaving it as the store
+        // holds it: dead replica handles are swept by the cleanup worker, not
+        // here, because the sweep needs the shard's generation to advance for
+        // every writer that lost one.
         MetadataAccessorRW(MasterService* service, ObjectIdentity object_id,
-                           AsIs)
+                           AsIs = {})
             : service_(service),
               object_id_(std::move(object_id)),
               ns_(service_->namespaces_.Lookup(object_id_.tenant_id)),
@@ -1608,17 +1720,9 @@ class MasterService {
                                     : ns_->objects.Write(object_id_.user_key)) {
         }
 
-        // Holds the key only while it holds an object.
-        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id,
-                           bool cleanup_invalid = true)
-            : MetadataAccessorRW(service, std::move(object_id), AsIs{}) {
-            // Invalid memory replicas go first, which may tear the object down.
-            if (cleanup_invalid && IsPublished()) {
-                service_->CleanupInvalidMemoryReplicas(*this);
-            }
-        }
-
         struct CreateKey {
+            // Sweep the dead replica handles of an object already published
+            // before the caller judges it.
             bool cleanup_invalid = true;
         };
         // Holds the key whether or not it holds an object, creating the
@@ -1636,10 +1740,6 @@ class MasterService {
 
         // Holds the key only while `ref` is still its current publication: a
         // key republished since `ref` was taken, or emptied, is not held.
-        // The held object is left as it is, without the invalid-replica
-        // cleanup: the caller comes back to act on what it judged, and the
-        // cleanup's KV sync would bump the tenant epoch a RemoveAll compares
-        // its `cleared` against.
         MetadataAccessorRW(MasterService* service, const TenantId& tenant_id,
                            const route::ObjectRef& ref)
             : service_(service),
@@ -1661,8 +1761,10 @@ class MasterService {
             return guard_.has_value() && guard_->has_object();
         }
 
+        // Whether a write of this object is still unfinished: a part it
+        // opened still holds a replica its writer has not ended.
         bool InProcessing() const {
-            return IsPublished() && guard_->state().is_processing;
+            return IsPublished() && guard_->metadata().HasWriteInFlight();
         }
 
         bool HasReplicationTask() const {
@@ -1721,12 +1823,6 @@ class MasterService {
                                     previous_media_hint);
         }
 
-        void EraseFromProcessing() {
-            if (IsPublished()) {
-                guard_->state().is_processing = false;
-            }
-        }
-
         void EraseReplicationTask() {
             if (IsPublished()) {
                 guard_->state().replication_task.reset();
@@ -1763,8 +1859,10 @@ class MasterService {
         // Holds an object, whether or not a replica is still valid.
         bool IsPublished() const { return guard_.has_value(); }
 
+        // Whether a write of this object is still unfinished: a part it
+        // opened still holds a replica its writer has not ended.
         bool InProcessing() const {
-            return IsPublished() && guard_->state().is_processing;
+            return IsPublished() && guard_->metadata().HasWriteInFlight();
         }
 
         // Get metadata (only call when Exists() is true)
@@ -1789,6 +1887,10 @@ class MasterService {
     friend class MetadataAccessorRW;
     friend class MetadataAccessorRO;
 
+    // Erases the replicas of the held object whose handles died with their
+    // allocator, then the object when none is left.
+    void CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor);
+
     // Calls `visit` with each namespace that holds an object when the walk
     // starts, holding no lock, so `visit` may reach any key. A namespace that
     // gains its first object meanwhile may or may not be visited. Its objects
@@ -1802,6 +1904,12 @@ class MasterService {
     void VisitNamespaces(
         const std::function<void(const TenantId&, metadata::Namespace&)>& visit)
         const;
+
+    // The keys of `ns` whose object may carry something the discard sweep
+    // reclaims: work in flight, a write no part has ended, or an object that
+    // never became whole. A snapshot, resolved again under each key's lock.
+    [[nodiscard]] static std::vector<std::string> DiscardSweepKeys(
+        const metadata::Namespace& ns);
 
     // The work client reads leave for when they hold no lock on any key:
     // queueing a promotion for each read served only from LOCAL_DISK, and
@@ -1828,12 +1936,14 @@ class MasterService {
     // What ExistKey answers for an object: whether it has a replica to read,
     // granting it a read lease if it does and `grant_lease` is set.
     bool ReadExistence(const ObjectMetadata& metadata, bool grant_lease) const;
-    // A client read of an object: its readable replicas, after the read's
-    // effects on it (the read lease, the DFS LRU, hit metrics). What is left
-    // for when no key is held goes to `follow_ups`.
+    // A client read of one part of an object: the part's readable replicas,
+    // after the read's effects on it (the read lease, the DFS LRU, hit
+    // metrics). What is left for when no key is held goes to `follow_ups`.
     auto ReadReplicaList(const TenantId& tenant_id, const std::string& key,
                          const ObjectMetadata& metadata,
-                         ReadFollowUps& follow_ups)
+                         ReadFollowUps& follow_ups,
+                         std::optional<uint32_t> part_index,
+                         std::optional<bool> object_readable = std::nullopt)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
     // An admin read of an object, which leaves it as it is.
     auto ReadReplicaListForAdmin(const ObjectMetadata& metadata) const
@@ -2226,6 +2336,12 @@ class MasterService {
     BatchOpLogWriterFactory batch_oplog_writer_factory_;
 
     // OpLog publishing helpers
+    // The retained form of one object. An object of one part is described
+    // exactly as it always was, so its payload stays byte for byte what it was;
+    // an object of several parts carries them one by one.
+    MetadataPayload BuildMetadataPayload(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& keep) const;
     std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
     std::string SerializeMetadataForOpLogWithoutMemReplicas(
         const ObjectMetadata& metadata) const;
@@ -2253,8 +2369,11 @@ class MasterService {
         const std::string& payload, DurableFinalizeCallback callback);
 
     // Standby-restored memory endpoints remain unreadable until the owning
-    // Client has successfully remounted them.
-    std::unordered_set<std::string> invalid_replica_endpoints_;
+    // Client has successfully remounted them. The lifetime is what carries
+    // that: the buffers restored onto the segment are bound to it, so
+    // Replica::is_readable answers false until the segment is mounted again.
+    std::unordered_map<std::string, SegmentLifetime>
+        remount_awaiting_lifetimes_;
 
     // Keep DummyBufferAllocator alive after standby restore.
     // Key: transport_endpoint, Value: allocator.
@@ -2265,16 +2384,38 @@ class MasterService {
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
-    // True while the replica sits on an endpoint in
-    // invalid_replica_endpoints_. The read path asks only this, never the set.
-    bool IsAwaitingRemount(const Replica& replica) const;
     bool TryGetReadableReplicaDescriptor(const Replica& replica,
                                          Replica::Descriptor& descriptor) const;
     std::vector<Replica::Descriptor> GetReadableReplicaDescriptors(
         const ObjectMetadata& metadata) const;
-    bool IsReplicaReadable(const Replica& replica) const;
-    bool HasReadableReplica(const ObjectMetadata& metadata) const;
+    // What a read of one part resolves to, and the only place that decides
+    // whether a reader names a part it may read. The length comes back beside
+    // the response because the cache-hit byte counters are bumped with it.
+    struct PartReadOutcome {
+        uint32_t part_count{1};
+        size_t part_length{0};
+        std::vector<Replica::Descriptor> replicas;
+        std::optional<uint64_t> checksum;
+    };
+    // `object_readable` is the caller's whole-object answer when it already has
+    // one: a batch naming several parts of one key asks it once.
+    tl::expected<PartReadOutcome, ErrorCode> ReadPart(
+        const ObjectMetadata& metadata, std::optional<uint32_t> part_index,
+        std::optional<bool> object_readable = std::nullopt) const;
+    // The answer to a read: the replicas it hands out, the checksum of that
+    // content, and the count the object declares.
+    GetReplicaListResponse MakeReadResponse(
+        std::vector<Replica::Descriptor>&& replicas,
+        std::optional<uint64_t> checksum, uint32_t part_count) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
+
+    // The error a surface that addresses one replica set of a whole object
+    // answers for an object of several parts, or nullopt for an ordinary one.
+    // `action` names the surface in the log line; a caller that drops the key
+    // asks this too and keeps its own answer.
+    [[nodiscard]] std::optional<ErrorCode> RefusesPartedObject(
+        const char* action, const std::string& key,
+        const ObjectMetadata& metadata) const;
 
     /**
      * Segment lifecycle persist helper. Tries to durably persist the

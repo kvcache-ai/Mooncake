@@ -529,8 +529,7 @@ TEST_F(MasterServiceTest,
             MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
                 "shared-key", TenantId("pin-a")));
         EXPECT_TRUE(accessor.Get().IsHardPinned());
-        EXPECT_EQ(accessor.Get().session_id,
-                  std::optional<std::string>("writing-session"));
+        EXPECT_EQ(accessor.Get().WriteSessionId(), "writing-session");
         return accessor.Get().EvictionDeadline();
     };
     const auto lease = read_deadline();
