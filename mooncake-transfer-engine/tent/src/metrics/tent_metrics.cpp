@@ -16,9 +16,21 @@
 
 #include <glog/logging.h>
 #include <tent/thirdparty/nlohmann/json.h>
+
+#include <array>
+#include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <string_view>
 #include <unordered_set>
+
+#ifndef TENT_BUILD_VERSION
+#define TENT_BUILD_VERSION "unknown"
+#endif
+
+#ifndef TENT_GIT_COMMIT
+#define TENT_GIT_COMMIT "unknown"
+#endif
 
 namespace mooncake::tent {
 
@@ -32,6 +44,38 @@ TentMetrics::~TentMetrics() { shutdown(); }
 #if TENT_METRICS_ENABLED
 
 namespace {
+constexpr std::array<std::string_view, 2> kSerializationFormatNames{
+    "prometheus", "json"};
+
+uint64_t unixTimestampSeconds() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
+
+std::string escapePrometheusLabelValue(std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char c : value) {
+        switch (c) {
+            case '\\':
+                escaped.append("\\\\");
+                break;
+            case '"':
+                escaped.append("\\\"");
+                break;
+            case '\n':
+                escaped.append("\\n");
+                break;
+            default:
+                escaped.push_back(c);
+                break;
+        }
+    }
+    return escaped;
+}
+
 const char* operationName(Request::OpCode operation) {
     return operation == Request::READ ? "read" : "write";
 }
@@ -85,6 +129,7 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
     Status http_status = initHttpServer();
     const bool http_ok = http_status.ok();
     if (!http_ok) {
+        http_start_failures_.fetch_add(1, std::memory_order_relaxed);
         LOG(WARNING) << "TENT metrics HTTP endpoint unavailable on "
                      << config_.http_host << ":" << config_.http_port << " ("
                      << http_status.ToString()
@@ -448,6 +493,8 @@ void TentMetrics::recordTransportAttemptFinished(TransportType tp,
 std::string TentMetrics::getPrometheusMetrics() {
     if (!initialized_) return "";
 
+    serialization_attempts_[kPrometheusFormat].fetch_add(
+        1, std::memory_order_relaxed);
     try {
         std::string result;
         result.reserve(kPrometheusBufferSize);
@@ -482,8 +529,14 @@ std::string TentMetrics::getPrometheusMetrics() {
             serializeGaugePrometheus(*gauge, result);
         }
 
+        const uint64_t success_timestamp = unixTimestampSeconds();
+        appendSelfMetricsPrometheus(result, success_timestamp);
+        last_serialization_success_timestamp_seconds_[kPrometheusFormat].store(
+            success_timestamp, std::memory_order_relaxed);
         return result;
     } catch (const std::exception& e) {
+        serialization_failures_[kPrometheusFormat].fetch_add(
+            1, std::memory_order_relaxed);
         LOG(ERROR) << "Failed to serialize Prometheus metrics: " << e.what();
         return "";
     }
@@ -673,9 +726,93 @@ void TentMetrics::serializeGaugePrometheus(
     }
 }
 
+void TentMetrics::appendSelfMetricsPrometheus(
+    std::string& out, uint64_t prometheus_success_timestamp) const {
+    const auto append_scalar = [&out](std::string_view name,
+                                      std::string_view help,
+                                      std::string_view type, uint64_t value) {
+        out.append("# HELP ")
+            .append(name)
+            .append(" ")
+            .append(help)
+            .append("\n# TYPE ")
+            .append(name)
+            .append(" ")
+            .append(type)
+            .append("\n")
+            .append(name)
+            .append(" ")
+            .append(std::to_string(value))
+            .append("\n");
+    };
+
+    out.append(
+           "# HELP tent_metrics_build_info TENT metrics build information\n")
+        .append("# TYPE tent_metrics_build_info gauge\n")
+        .append("tent_metrics_build_info{version=\"")
+        .append(escapePrometheusLabelValue(TENT_BUILD_VERSION))
+        .append("\",commit=\"")
+        .append(escapePrometheusLabelValue(TENT_GIT_COMMIT))
+        .append("\",compile_time_enabled=\"true\"} 1\n");
+
+    append_scalar("tent_metrics_runtime_enabled",
+                  "Whether runtime transfer metric recording is enabled",
+                  "gauge", isEnabled() ? 1 : 0);
+    append_scalar(
+        "tent_metrics_http_server_up",
+        "Whether the TENT metrics HTTP server is listening", "gauge",
+        bound_http_port_.load(std::memory_order_relaxed) != 0 ? 1 : 0);
+    append_scalar("tent_metrics_http_start_failures_total",
+                  "Total failed TENT metrics HTTP server start attempts",
+                  "counter",
+                  http_start_failures_.load(std::memory_order_relaxed));
+
+    const auto append_by_format =
+        [&out, prometheus_success_timestamp](
+            std::string_view name, std::string_view help, std::string_view type,
+            const std::array<std::atomic<uint64_t>, kSerializationFormatCount>&
+                values,
+            bool include_current_prometheus_success) {
+            out.append("# HELP ")
+                .append(name)
+                .append(" ")
+                .append(help)
+                .append("\n# TYPE ")
+                .append(name)
+                .append(" ")
+                .append(type)
+                .append("\n");
+            for (size_t i = 0; i < kSerializationFormatCount; ++i) {
+                const uint64_t value =
+                    i == kPrometheusFormat && include_current_prometheus_success
+                        ? prometheus_success_timestamp
+                        : values[i].load(std::memory_order_relaxed);
+                out.append(name)
+                    .append("{format=\"")
+                    .append(kSerializationFormatNames[i])
+                    .append("\"} ")
+                    .append(std::to_string(value))
+                    .append("\n");
+            }
+        };
+
+    append_by_format("tent_metrics_serialization_attempts_total",
+                     "Total TENT metrics serialization attempts by format",
+                     "counter", serialization_attempts_, false);
+    append_by_format("tent_metrics_serialization_failures_total",
+                     "Total failed TENT metrics serializations by format",
+                     "counter", serialization_failures_, false);
+    append_by_format(
+        "tent_metrics_last_success_timestamp_seconds",
+        "Unix timestamp of the last successful TENT metrics serialization",
+        "gauge", last_serialization_success_timestamp_seconds_, true);
+}
+
 std::string TentMetrics::getJsonMetrics() {
     if (!initialized_) return "{}";
 
+    serialization_attempts_[kJsonFormat].fetch_add(1,
+                                                   std::memory_order_relaxed);
     try {
         nlohmann::json root;
 
@@ -699,6 +836,8 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&transport_attempts_total_);
         root[transport_attempt_failures_total_.str_name()] =
             sumCounterValues(&transport_attempt_failures_total_);
+        root[task_failures_total_.str_name()] =
+            sumCounterValues(&task_failures_total_);
         root[deadline_infeasible_total_.str_name()] =
             sumCounterValues(&deadline_infeasible_total_);
         root[quarantined_batches_total_.str_name()] =
@@ -726,8 +865,47 @@ std::string TentMetrics::getJsonMetrics() {
         serializeHistogramToJson(root, stage_transport_);
         serializeHistogramToJson(root, transport_attempt_latency_);
 
-        return root.dump(2);  // Pretty print with 2-space indent
+        root["tent_metrics_build_info"] = {
+            {"version", TENT_BUILD_VERSION},
+            {"commit", TENT_GIT_COMMIT},
+            {"compile_time_enabled", true},
+        };
+        root["tent_metrics_runtime_enabled"] = isEnabled() ? 1 : 0;
+        root["tent_metrics_http_server_up"] =
+            bound_http_port_.load(std::memory_order_relaxed) != 0 ? 1 : 0;
+        root["tent_metrics_http_start_failures_total"] =
+            http_start_failures_.load(std::memory_order_relaxed);
+
+        nlohmann::json serialization_attempts;
+        nlohmann::json serialization_failures;
+        nlohmann::json last_success;
+        const uint64_t success_timestamp = unixTimestampSeconds();
+        for (size_t i = 0; i < kSerializationFormatCount; ++i) {
+            const auto format = std::string(kSerializationFormatNames[i]);
+            serialization_attempts[format] =
+                serialization_attempts_[i].load(std::memory_order_relaxed);
+            serialization_failures[format] =
+                serialization_failures_[i].load(std::memory_order_relaxed);
+            last_success[format] =
+                i == kJsonFormat
+                    ? success_timestamp
+                    : last_serialization_success_timestamp_seconds_[i].load(
+                          std::memory_order_relaxed);
+        }
+        root["tent_metrics_serialization_attempts_total"] =
+            std::move(serialization_attempts);
+        root["tent_metrics_serialization_failures_total"] =
+            std::move(serialization_failures);
+        root["tent_metrics_last_success_timestamp_seconds"] =
+            std::move(last_success);
+
+        std::string result = root.dump(2);  // Pretty print with 2-space indent
+        last_serialization_success_timestamp_seconds_[kJsonFormat].store(
+            success_timestamp, std::memory_order_relaxed);
+        return result;
     } catch (const std::exception& e) {
+        serialization_failures_[kJsonFormat].fetch_add(
+            1, std::memory_order_relaxed);
         LOG(ERROR) << "Failed to serialize JSON metrics: " << e.what();
         return R"({"error": "Failed to serialize metrics"})";
     }
