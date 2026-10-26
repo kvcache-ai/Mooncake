@@ -1,5 +1,5 @@
 // Unit tests for FileStorage::ProcessPromotionTasks. Uses a stub Client
-// that overrides the 4 promotion-RPC entry points so we can drive the
+// that overrides the promotion-RPC entry points so we can drive the
 // orchestration loop deterministically without standing up a master.
 
 #include <glog/logging.h>
@@ -29,8 +29,12 @@ class FakeClient : public Client {
                  /*protocol=*/"tcp",
                  /*labels=*/{}) {}
 
-    // Drives the queue returned to the heartbeat caller.
+    // Drives the queue returned to the heartbeat caller. Items without a
+    // task id get one when handed out (as from a master with task ids),
+    // unless assign_task_ids is false (a master that predates them).
     std::vector<PromotionTaskItem> heartbeat_queue;
+    bool assign_task_ids = true;
+    uint64_t next_task_seq = 1;
     tl::expected<void, ErrorCode> heartbeat_result =
         tl::expected<void, ErrorCode>{};
 
@@ -50,8 +54,12 @@ class FakeClient : public Client {
         promotion_objects.clear();
         while (promotion_objects.size() < kMaxPerHeartbeat &&
                !heartbeat_queue.empty()) {
-            promotion_objects.push_back(std::move(heartbeat_queue.back()));
+            auto item = std::move(heartbeat_queue.back());
             heartbeat_queue.pop_back();
+            if (assign_task_ids && !item.task_id.has_value()) {
+                item.task_id = L4TaskId{0x42, next_task_seq++};
+            }
+            promotion_objects.push_back(std::move(item));
         }
         return {};
     }
@@ -138,6 +146,33 @@ class FakeClient : public Client {
         notify_failure_calls.fetch_add(1);
         notify_failure_keys.push_back(key);
         return {};
+    }
+
+    // The calls that name the task by the drained item (what the store uses
+    // for items with a task id). They count as the calls above, and record
+    // the task id they carried.
+    std::vector<std::optional<L4TaskId>> task_call_ids;
+
+    tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionTaskAllocStart(
+        const PromotionTaskItem& item,
+        const std::vector<std::string>& preferred_segments) override {
+        task_call_ids.push_back(item.task_id);
+        return PromotionAllocStart(item.key, item.tenant_id,
+                                   static_cast<uint64_t>(item.size),
+                                   preferred_segments);
+    }
+
+    tl::expected<void, ErrorCode> NotifyPromotionTaskSuccess(
+        const PromotionTaskItem& item) override {
+        task_call_ids.push_back(item.task_id);
+        return NotifyPromotionSuccess(item.key, item.tenant_id);
+    }
+
+    tl::expected<void, ErrorCode> NotifyPromotionTaskFailure(
+        const PromotionTaskItem& item) override {
+        task_call_ids.push_back(item.task_id);
+        return NotifyPromotionFailure(item.key, item.tenant_id);
     }
 
     std::atomic<int> heartbeat_calls{0};
@@ -233,6 +268,43 @@ TEST_F(FileStoragePromotionTest, EmptyQueueIsNoOp) {
     EXPECT_EQ(fake->alloc_calls.load(), 0);
     EXPECT_EQ(fake->write_calls.load(), 0);
     EXPECT_EQ(fake->notify_calls.load(), 0);
+}
+
+// An item without a task id comes from a master that matches promotion
+// calls by key alone: the store stages nothing for it and only ends its task
+// with the key-only failure call (safe: no buffer is staged).
+TEST_F(FileStoragePromotionTest, ItemsWithoutTaskIdAreReleasedNotPromoted) {
+    fake->assign_task_ids = false;
+    fake->heartbeat_queue = {
+        {.tenant_id = "default", .key = "k_old", .size = 1024}};
+    auto res = CallProcessPromotionTasks();
+    EXPECT_TRUE(res.has_value());
+    EXPECT_EQ(fake->alloc_calls.load(), 0);
+    EXPECT_EQ(fake->write_calls.load(), 0);
+    EXPECT_EQ(fake->notify_calls.load(), 0);
+    EXPECT_EQ(fake->notify_failure_calls.load(), 1);
+    EXPECT_EQ(fake->notify_failure_keys, std::vector<std::string>{"k_old"});
+    EXPECT_TRUE(fake->task_call_ids.empty());
+}
+
+// Every promotion call for a drained item carries that item's task id: the
+// AllocStart and Success of a promotion, and the Failure of a failed one.
+TEST_F(FileStoragePromotionTest, PromotionCallsEchoTheDrainedTaskId) {
+    PromotionTaskItem item{.tenant_id = "default",
+                           .key = "k_fail",
+                           .size = 1024,
+                           .task_id = L4TaskId{7, 9}};
+    // AllocStart succeeds; the local read fails (no SSD file), so the store
+    // reports a failure.
+    fake->heartbeat_queue = {item};
+    ASSERT_TRUE(CallProcessPromotionTasks().has_value());
+    ASSERT_EQ(fake->alloc_calls.load(), 1);
+    ASSERT_EQ(fake->notify_failure_calls.load(), 1);
+    ASSERT_EQ(fake->task_call_ids.size(), 2u);  // AllocStart, Failure
+    for (const auto& id : fake->task_call_ids) {
+        ASSERT_TRUE(id.has_value());
+        EXPECT_EQ(*id, (L4TaskId{7, 9}));
+    }
 }
 
 // Heartbeat returns SEGMENT_NOT_FOUND (transient post-restart):

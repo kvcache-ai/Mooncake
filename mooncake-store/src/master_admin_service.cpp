@@ -24,6 +24,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"
+#include "handoff/handoff_runtime.h"
 #include "ha_metric_manager.h"
 #include "master_metric_manager.h"
 #include "rpc_service.h"
@@ -392,6 +393,11 @@ std::string MasterAdminServer::BuildMetricsText() const {
     std::string metrics = AppendMetricSections(
         MasterMetricManager::instance().serialize_metrics(),
         HAMetricManager::instance().serialize_metrics());
+    auto handoff_metrics = handoff::HandoffMetrics::Instance().Serialize();
+    if (!handoff_metrics.empty()) {
+        metrics = AppendMetricSections(std::move(metrics),
+                                       std::move(handoff_metrics));
+    }
     auto tenant_metrics = BuildTenantQuotaMetricsText();
     if (tenant_metrics.empty()) {
         return metrics;

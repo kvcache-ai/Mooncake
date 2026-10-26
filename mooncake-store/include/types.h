@@ -248,29 +248,56 @@ constexpr const char* DEFAULT_PROTOCOL = "tcp";
 constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
 static constexpr int DEFAULT_CLIENT_HTTP_PORT = 9300;
 
+// Identity of one L4 (LocalSSD) offload or promotion task. epoch is drawn
+// from OS randomness once per MasterService instance (never 0) and seq counts
+// the tasks of that instance from 1, so a report that echoes the id of the
+// item it was given can only ever match the task that item was made for.
+struct L4TaskId {
+    uint64_t epoch{0};
+    uint64_t seq{0};
+
+    bool operator==(const L4TaskId& other) const = default;
+};
+YLT_REFL(L4TaskId, epoch, seq);
+
+inline std::ostream& operator<<(std::ostream& os, const L4TaskId& id) noexcept {
+    os << std::hex << id.epoch << std::dec << ":" << id.seq;
+    return os;
+}
+
 struct OffloadTaskItem {
     std::string tenant_id;
     std::string key;
     int64_t size;
+    // Set by the master on every item it queues; empty from a master that
+    // predates task ids. The store echoes the item, id included, in its
+    // completion or NACK. A compatible field: it is not part of the
+    // struct_pack type hash, and either side skips or leaves it empty when
+    // the peer does not know it.
+    struct_pack::compatible<L4TaskId, 1> task_id;
 
+    // Compares the object fields only, not task_id.
     bool operator==(const OffloadTaskItem& other) const {
         return tenant_id == other.tenant_id && key == other.key &&
                size == other.size;
     }
 };
-YLT_REFL(OffloadTaskItem, tenant_id, key, size);
+YLT_REFL(OffloadTaskItem, tenant_id, key, size, task_id);
 
 struct PromotionTaskItem {
     std::string tenant_id;
     std::string key;
     int64_t size;
+    // Same contract as OffloadTaskItem::task_id.
+    struct_pack::compatible<L4TaskId, 1> task_id;
 
+    // Compares the object fields only, not task_id.
     bool operator==(const PromotionTaskItem& other) const {
         return tenant_id == other.tenant_id && key == other.key &&
                size == other.size;
     }
 };
-YLT_REFL(PromotionTaskItem, tenant_id, key, size);
+YLT_REFL(PromotionTaskItem, tenant_id, key, size, task_id);
 
 // Store client configuration validation limits
 static constexpr size_t MIN_SEGMENT_SIZE = 1024;                          // 1KB

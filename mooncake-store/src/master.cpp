@@ -1,12 +1,22 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
+
+// The shutdown handoff's trim step calls glibc's malloc_trim(); jemalloc
+// implements none and another libc may not have it.
+#if !defined(STORE_USE_JEMALLOC) && defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
 #include <csignal>
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
-#include <memory>   // For std::unique_ptr
+#include <functional>
+#include <memory>  // For std::unique_ptr
 #include <optional>
 #include <string>
 #include <thread>  // For std::thread
@@ -16,6 +26,7 @@
 
 #include "allocator_status.h"
 #include "config/metrics_bootstrap_config_loader.h"
+#include "config/dfs_enablement_config.h"
 #include "config/rpc_protocol_config.h"
 #include "default_config.h"
 #include "duration_utils.h"
@@ -23,6 +34,10 @@
 #include "ha/leadership/master_service_supervisor.h"
 #include "ha/snapshot/batch_oplog/config.h"
 
+#include "handoff/handoff_admission.h"
+#include "handoff/handoff_lifecycle.h"
+#include "handoff/handoff_runtime.h"
+#include "handoff/handoff_writer.h"
 #include "http_metadata_server.h"
 #include "master_admin_service.h"
 #include "rpc_worker_pool.h"
@@ -418,6 +433,55 @@ DEFINE_bool(
     "when client heartbeat times out. Works in two modes: (1) co-located "
     "(enable_http_metadata_server=true) via in-process removal, or "
     "(2) separately-deployed metadata server via async HTTP DELETE.");
+
+// Shutdown handoff (standalone master only; see handoff/handoff_lifecycle.h).
+DEFINE_string(handoff_dir, "",
+              "Node-local directory for the shutdown handoff snapshot. Empty "
+              "disables the handoff. Must outlive the master process "
+              "(e.g. a hostPath or local PV), and cannot be combined with "
+              "enable_ha");
+DEFINE_bool(handoff_restore, true,
+            "Restore a READY handoff snapshot at startup (it is always "
+            "claimed and removed, restored or not)");
+DEFINE_bool(handoff_snapshot, true,
+            "Write a handoff snapshot on SIGTERM/SIGINT");
+DEFINE_int32(handoff_shutdown_deadline_sec, 45,
+             "Watchdog from SIGTERM: abandon the snapshot (no READY) and exit "
+             "after this many seconds. Keep it below the grace period of the "
+             "process manager (e.g. terminationGracePeriodSeconds)");
+DEFINE_int32(handoff_restore_deadline_sec, 180,
+             "Watchdog for the startup restore: exit after this many seconds; "
+             "the next start finds CLAIMED and starts cold");
+DEFINE_int32(handoff_max_workers, 8,
+             "Upper bound of snapshot writer threads (admission may pick "
+             "fewer)");
+DEFINE_int32(handoff_restore_workers, 0,
+             "Restore threads; 0 = available CPUs, at most 16");
+DEFINE_int32(handoff_max_age_sec, 120,
+             "Do not restore snapshots older than this; an older snapshot "
+             "starts cold. Keep it small: it bounds how long a snapshot "
+             "survives next to a master that does not know the handoff "
+             "(rollback)");
+DEFINE_uint64(handoff_restore_bytes_per_object, 1144,
+              "Restore admission: peak RSS per object that has a memory "
+              "replica (measured, before the margin)");
+DEFINE_uint64(handoff_restore_bytes_per_disk_replica, 184,
+              "Restore admission: peak RSS per LOCAL_DISK (L4) replica of an "
+              "object that also has a memory replica (measured, before the "
+              "margin)");
+DEFINE_uint64(handoff_restore_bytes_per_disk_only_object, 904,
+              "Restore admission: peak RSS per object whose only replica is "
+              "a LOCAL_DISK (L4) replica (measured, before the margin)");
+DEFINE_uint32(handoff_restore_margin_percent, 15,
+              "Restore admission: safety margin added to the predicted "
+              "restore memory, in percent of the prediction");
+DEFINE_bool(handoff_malloc_trim, true,
+            "malloc_trim(0) and re-check when the shutdown admission check "
+            "gives fewer writer threads than wanted");
+DEFINE_int32(handoff_lock_wait_sec, 10,
+             "How long to wait for the handoff directory lock at startup");
+DEFINE_string(handoff_cgroup_root, "/sys/fs/cgroup",
+              "cgroup directory read by the handoff admission control");
 
 DEFINE_string(pod_name, "",
               "Pod name for K8s label-based routing (default: $POD_NAME)");
@@ -1409,6 +1473,233 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
     }
 }
 
+namespace {
+
+// ---- Shutdown handoff glue ----
+struct HandoffContext {
+    bool enabled{false};
+    // False if the startup step decided this master must not serve.
+    bool serve{true};
+    std::string root;
+    mooncake::handoff::HandoffDirLock lock;
+    mooncake::handoff::CgroupPaths cgroup;
+    size_t cpus{1};
+};
+
+mooncake::handoff::RestoreCostModel HandoffRestoreCostModel() {
+    mooncake::handoff::RestoreCostModel model;
+    model.bytes_per_memory_object = FLAGS_handoff_restore_bytes_per_object;
+    model.bytes_per_extra_disk_replica =
+        FLAGS_handoff_restore_bytes_per_disk_replica;
+    model.bytes_per_disk_only_object =
+        FLAGS_handoff_restore_bytes_per_disk_only_object;
+    model.margin_percent = FLAGS_handoff_restore_margin_percent;
+    return model;
+}
+
+void FlushLogsForExit() {
+    google::FlushLogFiles(google::GLOG_INFO);
+    std::fflush(stdout);
+    std::fflush(stderr);
+}
+
+// A watchdog that fires does a little I/O (logs, last_shutdown) before
+// _exit(). If that I/O blocks (hung disk, a log lock held by a stuck
+// thread), the default action of SIGALRM still ends the process.
+void ArmWatchdogBackstop() {
+    constexpr unsigned kBackstopSec = 5;
+    std::signal(SIGALRM, SIG_DFL);
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGALRM);
+    pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
+    alarm(kBackstopSec);
+}
+
+// Runs before the RPC server and the admin delegate exist: claims a READY
+// snapshot and restores it, or leaves an empty master (cold start). A failed
+// restore replaces `wrapped` by a new, empty service from `make_service`.
+void RunHandoffAtStartup(
+    HandoffContext& ctx,
+    std::shared_ptr<mooncake::WrappedMasterService>& wrapped,
+    const std::function<std::shared_ptr<mooncake::WrappedMasterService>()>&
+        make_service,
+    const std::atomic<bool>& shutdown_requested) {
+    namespace h = mooncake::handoff;
+    if (FLAGS_handoff_dir.empty()) return;
+    ctx.enabled = true;
+    ctx.root = FLAGS_handoff_dir;
+    ctx.cgroup = h::CgroupPaths::Under(FLAGS_handoff_cgroup_root);
+    ctx.cpus = h::AvailableCpus(ctx.cgroup);
+    std::string error;
+    const bool owner = ctx.lock.Acquire(
+        ctx.root, int64_t{FLAGS_handoff_lock_wait_sec} * 1000, &error);
+    if (!owner) {
+        LOG(ERROR) << "handoff: " << error
+                   << "; this master will neither restore nor write a "
+                      "snapshot";
+    }
+    if (owner) {
+        const std::string last = h::ReadLastShutdown(ctx.root);
+        if (!last.empty()) {
+            LOG(INFO) << "handoff_last_shutdown=" << last;
+            h::HandoffMetrics::Instance().SetLastShutdownJson(last);
+        }
+    }
+    h::StartupSteps steps;
+    steps.read_memory = [&ctx]() { return h::ReadMemorySnapshot(ctx.cgroup); };
+    steps.restore =
+        [&wrapped, &make_service](
+            const std::string& dir,
+            size_t workers) -> tl::expected<h::RestoreSummary, std::string> {
+        // The watchdog covers the restore only, not the claim retries
+        // before it (those end on their own, see RunHandoffStartup).
+        std::unique_ptr<h::Watchdog> watchdog;
+        if (FLAGS_handoff_restore_deadline_sec > 0) {
+            watchdog = std::make_unique<h::Watchdog>(
+                std::chrono::seconds(FLAGS_handoff_restore_deadline_sec), []() {
+                    ArmWatchdogBackstop();
+                    // CLAIMED stays behind, so the next start is a cold
+                    // start.
+                    LOG(ERROR) << "handoff_startup=deadline, action=exit";
+                    FlushLogsForExit();
+                    _exit(1);
+                });
+        }
+        auto restored =
+            wrapped->GetMasterServiceForHandoff().RestoreFromHandoff(dir,
+                                                                     {workers});
+        if (!restored) {
+            // A failed restore leaves part of the snapshot behind: serve
+            // from a new, empty service instead (cold start).
+            wrapped.reset();
+            wrapped = make_service();
+            return tl::make_unexpected(restored.error());
+        }
+        return h::RestoreSummary{restored->objects, restored->segments,
+                                 restored->local_disk_replicas,
+                                 restored->ToJson()};
+    };
+    // Retries of a claim or POISON write that failed on I/O: wait with
+    // backoff, give up (and never serve) only when asked to shut down.
+    steps.wait_retry = [&shutdown_requested](int attempt) {
+        const auto until =
+            std::chrono::steady_clock::now() + h::RetryBackoff(attempt);
+        while (std::chrono::steady_clock::now() < until) {
+            if (shutdown_requested.load()) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return !shutdown_requested.load();
+    };
+    h::StartupOptions options;
+    options.root = ctx.root;
+    options.owner = owner;
+    options.restore_enabled = FLAGS_handoff_restore;
+    options.max_age_ms = int64_t{FLAGS_handoff_max_age_sec} * 1000;
+    options.restore_cost = HandoffRestoreCostModel();
+    options.workers = FLAGS_handoff_restore_workers > 0
+                          ? static_cast<size_t>(FLAGS_handoff_restore_workers)
+                          : std::min<size_t>(ctx.cpus, 16);
+    const h::StartupReport report = h::RunHandoffStartup(steps, options);
+    ctx.serve = report.serve;
+    h::HandoffMetrics::Instance().SetStartup(report);
+    // The service is final now (a failed restore replaced it above).
+    auto* service = &wrapped->GetMasterServiceForHandoff();
+    h::HandoffMetrics::Instance().SetSegmentCounters(
+        [service](uint64_t* pending, uint64_t* confirmed, uint64_t* dropped) {
+            *pending = service->HandoffPendingSegmentCount();
+            *confirmed = service->HandoffSegmentsConfirmed();
+            *dropped = service->HandoffSegmentsDropped();
+        });
+    h::HandoffMetrics::Instance().SetLocalDiskCounters(
+        [service](uint64_t* pending) {
+            *pending = service->HandoffDiskClientsPending();
+        });
+}
+
+// SIGTERM path: stop serving, quiesce, write the snapshot under a watchdog,
+// then _exit without running the destructors of a large index.
+[[noreturn]] void RunHandoffShutdownAndExit(
+    HandoffContext& ctx, const std::function<void()>& stop_serving,
+    mooncake::WrappedMasterService& wrapped) {
+    namespace h = mooncake::handoff;
+    std::atomic<bool> published{false};
+    LOG(INFO) << "handoff_shutdown=start, deadline_sec="
+              << FLAGS_handoff_shutdown_deadline_sec;
+    h::Watchdog watchdog(
+        std::chrono::seconds(FLAGS_handoff_shutdown_deadline_sec),
+        [&ctx, &published]() {
+            ArmWatchdogBackstop();
+            if (published.load()) {
+                FlushLogsForExit();
+                _exit(0);
+            }
+            // No READY was written; the tmp directory is removed by the
+            // next master.
+            h::ShutdownReport report;
+            report.result = "deadline";
+            report.detail = "watchdog fired before the snapshot was published";
+            report.finished_at_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count();
+            if (ctx.lock.held())
+                h::WriteLastShutdown(ctx.root, report.ToJson());
+            LOG(ERROR) << "handoff_shutdown=deadline, action=exit";
+            FlushLogsForExit();
+            _exit(1);
+        });
+    auto& service = wrapped.GetMasterServiceForHandoff();
+    h::ShutdownSteps steps;
+    steps.stop_serving = stop_serving;
+    steps.quiesce = [&service]() { service.QuiesceBackgroundWork(); };
+    if (FLAGS_handoff_malloc_trim) {
+#if !defined(STORE_USE_JEMALLOC) && defined(__GLIBC__)
+        steps.trim = []() { malloc_trim(0); };
+#else
+        LOG(WARNING) << "handoff_malloc_trim ignored: this build has no "
+                        "glibc malloc_trim() (jemalloc or another libc)";
+#endif
+    }
+    steps.read_memory = [&ctx]() { return h::ReadMemorySnapshot(ctx.cgroup); };
+    steps.object_count = [&service]() { return service.HandoffObjectCount(); };
+    steps.local_disk_count = [&service]() {
+        return service.HandoffLocalDiskObjectCount();
+    };
+    steps.disk_free = [](const std::string& path) {
+        return h::FreeDiskBytes(path);
+    };
+    steps.write = [&service](const std::string& dir, size_t workers)
+        -> tl::expected<h::ShutdownWriteResult, std::string> {
+        if (!service.BackgroundWorkQuiesced()) {
+            return tl::make_unexpected("background work is still running");
+        }
+        mooncake::HandoffWriteOptions options;
+        options.dir = dir;
+        options.workers = workers;
+        options.durable = true;
+        auto written = mooncake::WriteHandoffSnapshot(service, options);
+        if (!written) return tl::make_unexpected(written.error());
+        return h::ShutdownWriteResult{
+            written->stats.objects, written->stats.total_bytes,
+            written->stats.local_disk_replicas,
+            written->stats.disk_only_objects, written->ToJson()};
+    };
+    h::ShutdownOptions options;
+    options.root = ctx.root;
+    options.owner = ctx.lock.held();
+    options.max_workers =
+        static_cast<size_t>(std::max(1, FLAGS_handoff_max_workers));
+    options.cpus = ctx.cpus;
+    options.restore_cost = HandoffRestoreCostModel();
+    const h::ShutdownReport report =
+        h::RunHandoffShutdown(steps, options, &published);
+    FlushLogsForExit();
+    _exit(report.result == "error" ? 1 : 0);
+}
+
+}  // namespace
+
 int main(int argc, char* argv[]) {
     mooncake::init_ylt_log_level();
     // Initialize gflags
@@ -1501,6 +1792,15 @@ int main(int argc, char* argv[]) {
     if (auto error = ValidateBatchOpLogSnapshotConfig(master_config)) {
         LOG(FATAL) << *error;
         return 1;
+    }
+    if (!FLAGS_handoff_dir.empty()) {
+        if (auto error = mooncake::handoff::ValidateHandoffConfig(
+                master_config.enable_ha,
+                mooncake::DfsEnablementConfig::FromEnvironment().enabled,
+                master_config.memory_allocator)) {
+            LOG(FATAL) << "--handoff_dir: " << *error;
+            return 1;
+        }
     }
     if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||
                                      !master_config.etcd_endpoints.empty())) {
@@ -1717,10 +2017,34 @@ int main(int argc, char* argv[]) {
                 << "RDMA RPC is disabled at compile time; using TCP RPC";
 #endif
         }
-        auto wrapped_master_service =
-            std::make_shared<mooncake::WrappedMasterService>(
+        const auto make_service = [&]() {
+            return std::make_shared<mooncake::WrappedMasterService>(
                 mooncake::WrappedMasterServiceConfig(master_config, version),
                 metadata_server_ptr, http_metadata_remote_url);
+        };
+        auto wrapped_master_service = make_service();
+        // Installed before the handoff restore, so a SIGTERM that arrives
+        // during the restore is handled once it is done (snapshot again)
+        // instead of killing the process.
+        static std::atomic<bool> shutdown_requested{false};
+        auto signal_handler = [](int /* signum */) {
+            shutdown_requested.store(true);
+        };
+        std::signal(SIGINT, signal_handler);
+        std::signal(SIGTERM, signal_handler);
+
+        // Handoff restore: before the admin delegate and the RPC server
+        // exist, so nothing else touches the master meanwhile.
+        HandoffContext handoff;
+        RunHandoffAtStartup(handoff, wrapped_master_service, make_service,
+                            shutdown_requested);
+        if (!handoff.serve) {
+            // Asked to stop while serving would have been unsafe (a READY
+            // that could not be removed, or POISON that could not be
+            // written). Nothing was restored and nothing was served.
+            LOG(ERROR) << "handoff: stopping without serving";
+            return 0;
+        }
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics.port),
             master_config.metrics.enabled, master_config.metrics.host);
@@ -1734,18 +2058,21 @@ int main(int argc, char* argv[]) {
         admin_server.SetServiceAvailable(true);
 
         // Declared after the service so that it drains before the service
-        // is destroyed.
-        mooncake::RpcWorkerPool worker_pool(
+        // is destroyed. Held by pointer so the handoff shutdown can drain it
+        // before it quiesces the service.
+        auto worker_pool = std::make_unique<mooncake::RpcWorkerPool>(
             master_config.handler_worker_thread_num);
         mooncake::RegisterRpcService(server, *wrapped_master_service,
-                                     &worker_pool);
+                                     worker_pool.get());
 
-        static std::atomic<bool> shutdown_requested{false};
-        auto signal_handler = [](int /* signum */) {
-            shutdown_requested.store(true);
-        };
-        std::signal(SIGINT, signal_handler);
-        std::signal(SIGTERM, signal_handler);
+        const bool handoff_on_shutdown =
+            handoff.enabled && FLAGS_handoff_snapshot;
+        if (shutdown_requested.load() && handoff_on_shutdown) {
+            // SIGTERM arrived during the restore: never start serving.
+            RunHandoffShutdownAndExit(
+                handoff, [&]() { admin_server.Stop(); },
+                *wrapped_master_service);
+        }
 
         int server_result = 0;
         std::atomic<bool> server_done{false};
@@ -1756,6 +2083,21 @@ int main(int argc, char* argv[]) {
 
         while (!shutdown_requested.load() && !server_done.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (shutdown_requested.load() && handoff_on_shutdown) {
+            // Does not return. No RPC handler, queued or running, outlives
+            // the stop step, so none can change the index while the snapshot
+            // is written. MasterAdminServer::Stop() does the same for the
+            // admin HTTP server.
+            RunHandoffShutdownAndExit(
+                handoff,
+                [&]() {
+                    mooncake::StopRpcServerAndDrainHandlers(
+                        server, server_thread, server_done, worker_pool);
+                    admin_server.Stop();
+                },
+                *wrapped_master_service);
         }
 
         server.stop();

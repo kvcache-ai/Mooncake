@@ -52,6 +52,9 @@ class DeadlineScheduler {
         timer_cv_.notify_one();
     }
 
+    // True while the timer thread exists (not yet joined).
+    bool Joinable() const { return timer_thread_.joinable(); }
+
     void Stop() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
