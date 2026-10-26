@@ -101,10 +101,10 @@ class BlockingBatchHaKvBackend : public FakeBatchHaKvBackend {
         txn_entered_ = false;
     }
 
-    bool WaitForBlockedTxn() {
+    bool WaitForBlockedTxn(
+        std::chrono::seconds timeout = std::chrono::seconds(2)) {
         std::unique_lock<std::mutex> lock(mutex_);
-        return cv_.wait_for(lock, std::chrono::seconds(2),
-                            [&] { return txn_entered_; });
+        return cv_.wait_for(lock, timeout, [&] { return txn_entered_; });
     }
 
     void AllowTxn() {
@@ -178,7 +178,7 @@ class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
     tl::expected<PendingHandle, ErrorCode> Commit(
         Reservation&& reservation, OpLogEntry entry,
         DurableCallback callback) override {
-        return OrderedOpLogWriter::Commit(
+        auto result = OrderedOpLogWriter::Commit(
             std::move(reservation), std::move(entry),
             [this, callback = std::move(callback)](const OpLogEntry& durable) {
                 {
@@ -197,6 +197,19 @@ class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
                 }
                 cv_.notify_all();
             });
+        if (result) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++submitted_count_;
+            cv_.notify_all();
+        }
+        return result;
+    }
+
+    bool WaitForSubmittedCount(size_t count,
+                               std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout,
+                            [&] { return submitted_count_ >= count; });
     }
 
     tl::expected<std::vector<PendingHandle>, ErrorCode> CommitBatch(
@@ -269,6 +282,7 @@ class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
     std::condition_variable cv_;
     uint64_t released_through_{UINT64_MAX};
     uint64_t completed_through_{0};
+    size_t submitted_count_{0};
     bool stopping_{false};
 };
 
@@ -356,9 +370,122 @@ class MasterServiceHATest : public ::testing::Test {
         MasterServiceTestPeer::EnableDfs(service) = true;
     }
 
-    static WeightMetadataSnapshot ExportWeightMetadataStore(
+    static WeightMetadataSnapshot ExportWeightMetadata(
         const MasterService& service) {
         return MasterServiceTestPeer::WeightMetadata(service).ExportSnapshot();
+    }
+
+    void CheckConcurrentWeightReplay(bool abandoned_import) {
+        const std::string cluster_id = abandoned_import
+                                           ? "weight_abandon_replay"
+                                           : "weight_reconcile_replay";
+        auto backend = std::make_shared<FakeBatchHaKvBackend>();
+        auto config =
+            MasterServiceConfig::builder()
+                .set_enable_ha(true)
+                .set_enable_oplog(true)
+                .set_weight_management_oplog_capability_confirmed(true)
+                .set_cluster_id(cluster_id)
+                .set_oplog_batch_max_entries(1)
+                .build();
+        MasterService service(config);
+        const WeightRevisionIdentity identity{
+            .tenant_id = "default",
+            .name_space = "production",
+            .resource_id = "replay",
+            .revision = "step-100",
+            .weight_generation = 7,
+        };
+        const WeightMetadataSnapshot baseline{
+            .metadata = {WeightRevisionMetadata{
+                .identity = identity,
+                .manifest =
+                    {
+                        .manifest_key = abandoned_import
+                                            ? ""
+                                            : MakeWeightManifestKey(identity),
+                        .manifest_sha256 =
+                            abandoned_import ? "" : std::string(64, 'a'),
+                        .payload_group_id = MakeWeightPayloadGroupId(identity),
+                        .payload_keys_sha256 =
+                            abandoned_import ? "" : std::string(64, 'b'),
+                        .payload_count = 1,
+                        .logical_bytes = 1024,
+                    },
+                .availability = abandoned_import
+                                    ? WeightAvailabilityState::IMPORTING
+                                    : WeightAvailabilityState::READY,
+                .residency = abandoned_import ? WeightResidencyState::UNKNOWN
+                                              : WeightResidencyState::HOT,
+                .operation = WeightOperationState::NONE,
+                .metadata_generation = abandoned_import ? 1u : 2u,
+                .created_at_ms = 100,
+                .updated_at_ms = 200,
+            }},
+            .leases = {},
+            .operations = {},
+            .next_lease_id = 1,
+            .next_operation_id = 1,
+        };
+        ASSERT_TRUE(service.RestoreFromStandbySnapshot({}, 0, {}, baseline));
+        auto* writer = InstallGatedWriter(service, backend);
+        ASSERT_TRUE(writer->PauseCallbacksAfter(0));
+        std::future<WeightMetadataStore::Result<WeightRevisionMetadata>> first;
+        std::future<void> second;
+        struct ResumeOnExit {
+            GatedOrderedOpLogWriter* writer;
+            ~ResumeOnExit() { writer->ResumeCallbacks(); }
+        } resume{writer};
+        first = std::async(std::launch::async, [&] {
+            return abandoned_import ? service.AbortWeightImport({
+                                          .identity = identity,
+                                          .expected_metadata_generation = 1,
+                                      })
+                                    : service.ReconcileWeightRevision(
+                                          {.identity = identity});
+        });
+        ASSERT_TRUE(writer->WaitForSubmittedCount(1, std::chrono::seconds(2)));
+        const auto now_ms = [] {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count());
+        };
+        const auto first_submitted_at = now_ms();
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        // Distinct timestamps make conflicting same-generation records visible.
+        while (now_ms() <= first_submitted_at &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        ASSERT_GT(now_ms(), first_submitted_at);
+        second = std::async(std::launch::async, [&] {
+            if (abandoned_import) {
+                MasterServiceTestPeer(service)
+                    .RunWeightReconciliationForTesting(now_ms(), 1);
+            } else {
+                (void)service.ReconcileWeightRevision({.identity = identity});
+            }
+        });
+        // A serialized caller cannot submit while the first callback is gated.
+        writer->WaitForSubmittedCount(2, std::chrono::milliseconds(150));
+        writer->ResumeCallbacks();
+        EXPECT_TRUE(first.get());
+        second.get();
+        service.StopBatchOpLogWriter();
+
+        StandbyMetadataStore standby;
+        ASSERT_TRUE(standby.RestoreWeightMetadata(baseline));
+        OpLogApplier applier(&standby, cluster_id);
+        OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+        const auto replayed = reader.PollOnce();
+        EXPECT_EQ(ErrorCode::OK, replayed.error);
+        ASSERT_TRUE(replayed.durable_prefix_present);
+        EXPECT_EQ(replayed.durable_prefix.last_seq + 1,
+                  applier.GetExpectedSequenceId());
+        EXPECT_EQ(ExportWeightMetadata(service),
+                  standby.SnapshotWeightMetadata());
     }
 
     static void SetUpTestSuite() {
@@ -824,6 +951,16 @@ class MasterServiceHATest : public ::testing::Test {
         return accessor.Exists() ? accessor.Get().CountReplicas() : 0;
     }
 
+    // Objects holding a completed LOCAL_DISK replica, summed over the shards.
+    static long DiskObjectCountForTesting(MasterService& service) {
+        long count = 0;
+        for (size_t i = 0; i < MasterServiceTestPeer::kNumShards; ++i) {
+            MasterServiceTestPeer::MetadataShardAccessorRO shard(&service, i);
+            count += shard->disk_object_count;
+        }
+        return count;
+    }
+
     static bool IsHardPinnedForTesting(MasterService& service,
                                        const TenantId& tenant_id,
                                        const std::string& key) {
@@ -1037,19 +1174,12 @@ class MasterServiceHATest : public ::testing::Test {
         return task.get().has_value() && reached_discovery && metadata_released;
     }
 
+    // PutStart is the only caller in these tests that holds the snapshot
+    // barrier shared, so a barrier that cannot be taken exclusively while the
+    // client lock is free means PutStart reached it and let the client lock
+    // go.
     static bool PutStartHoldsSnapshotAfterClientReleaseForTesting(
-        MasterService& service, const TenantId& tenant_id,
-        const std::string& key) {
-        const auto scoped_key = tenant_id.MakeScopedKey(key);
-        const size_t stripe_idx =
-            std::hash<std::string>{}(scoped_key) %
-            MasterServiceTestPeer::kObjectOperationLockStripes;
-        std::unique_lock<std::mutex> object_lock(
-            MasterServiceTestPeer::ObjectOperationLocks(service)[stripe_idx],
-            std::try_to_lock);
-        if (object_lock.owns_lock()) {
-            return false;
-        }
+        MasterService& service) {
         std::unique_lock<std::shared_mutex> client_lock(
             MasterServiceTestPeer::ClientMutex(service), std::try_to_lock);
         if (!client_lock.owns_lock()) {
@@ -1272,6 +1402,48 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     EXPECT_EQ(restored.buffer_address_, address);
     EXPECT_EQ(restored.protocol_, "tcp");
     EXPECT_EQ(restored.transport_endpoint_, endpoint);
+}
+
+TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
+    const std::string endpoint = "checksum_restore_segment";
+    auto legacy_object = MakeStandbyObject("checksum_legacy_key", endpoint);
+    legacy_object.metadata.object_checksum = 0x1234;
+    auto batch_object = MakeStandbyObject("checksum_batch_key", endpoint);
+    batch_object.metadata.object_checksum = 0;
+
+    MasterService legacy_service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    ASSERT_TRUE(
+        legacy_service
+            .RestoreFromStandbySnapshot({legacy_object}, 7,
+                                        {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
+    MasterServiceTestPeer::MetadataAccessorRO legacy_accessor(
+        &legacy_service, MasterServiceTestPeer::ObjectIdentity{
+                             kDefaultTenant, legacy_object.key});
+    ASSERT_TRUE(legacy_accessor.Exists());
+    EXPECT_EQ(legacy_accessor.Get().GetPart(0).checksum(),
+              std::optional<uint64_t>(0x1234));
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(source->PutMetadata(batch_object.tenant_id, batch_object.key,
+                                    batch_object.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = batch_object.metadata.replicas.front().id;
+
+    MasterService batch_service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    ASSERT_TRUE(
+        batch_service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
+    MasterServiceTestPeer::MetadataAccessorRO batch_accessor(
+        &batch_service, MasterServiceTestPeer::ObjectIdentity{
+                            kDefaultTenant, batch_object.key});
+    ASSERT_TRUE(batch_accessor.Exists());
+    EXPECT_EQ(batch_accessor.Get().GetPart(0).checksum(),
+              std::optional<uint64_t>(0));
 }
 
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesReplicaIds) {
@@ -2034,8 +2206,7 @@ TEST_F(MasterServiceHATest,
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
     bool reached_snapshot = false;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(
-                service, kDefaultTenant, key)) {
+        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(service)) {
             reached_snapshot = true;
             break;
         }
@@ -2371,6 +2542,48 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
               3072);
+}
+
+TEST_F(MasterServiceHATest, RemountMatchesSharedEndpointRangesByAddress) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "shared_endpoint_numa_ranges";
+    const size_t range_size = 4096;
+    const size_t second_range_base = kDefaultSegmentBase + range_size;
+    auto first_object = MakeStandbyObject("shared_range_first", endpoint);
+    first_object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 128;
+    auto second_object = MakeStandbyObject("shared_range_second", endpoint);
+    second_object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = second_range_base + 128;
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {first_object, second_object}, 7,
+                        {MakeStandbyMemorySegment(endpoint, range_size)})
+                    .has_value());
+
+    Segment first_segment =
+        MakeSegment(endpoint, kDefaultSegmentBase, range_size);
+    Segment second_segment =
+        MakeSegment(endpoint, second_range_base, range_size);
+    ASSERT_TRUE(
+        service.ReMountSegment({first_segment, second_segment}, generate_uuid())
+            .has_value());
+
+    for (const auto& [key, expected_address] :
+         std::vector<std::pair<std::string, uintptr_t>>{
+             {"shared_range_first", kDefaultSegmentBase + 128},
+             {"shared_range_second", second_range_base + 128}}) {
+        auto replicas = service.GetReplicaList(key, kDefaultTenant);
+        ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+        ASSERT_EQ(replicas->replicas.size(), 1);
+        EXPECT_EQ(replicas->replicas.front()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.buffer_address_,
+                  expected_address);
+    }
 }
 
 TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
@@ -2779,6 +2992,7 @@ TEST_F(MasterServiceHATest,
                                      "standby_repair_reject_ld_lost"),
               0);
     EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+    EXPECT_EQ(DiskObjectCountForTesting(service), 0);
 
     // Retry with the writer accepting: the restore lands, and the disk
     // owner's record is installed for real this time.
@@ -2793,6 +3007,9 @@ TEST_F(MasterServiceHATest,
               0);
     EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).contains(
         disk_owner));
+    // The restored survivor counts as a disk object, like one whose
+    // LOCAL_DISK replica was added through AddReplica.
+    EXPECT_EQ(DiskObjectCountForTesting(service), 1);
 }
 
 TEST_F(MasterServiceHATest, RestoreDiscardRepairTimeoutThenRetrySucceeds) {
@@ -3652,7 +3869,7 @@ TEST_F(MasterServiceHATest,
         GetWeightRevisionRequest{.identity = identity});
     ASSERT_TRUE(restored.has_value());
     EXPECT_EQ(snapshot.metadata.front(), restored->metadata);
-    const auto after = ExportWeightMetadataStore(service);
+    const auto after = ExportWeightMetadata(service);
     EXPECT_EQ(snapshot.metadata, after.metadata);
     EXPECT_TRUE(after.leases.empty());
     EXPECT_TRUE(after.operations.empty());
@@ -3718,6 +3935,84 @@ TEST_F(MasterServiceHATest,
     EXPECT_EQ(*result, visible->metadata);
 }
 
+TEST_F(MasterServiceHATest,
+       ImportingReconcileDoesNotAppendUnpublishableWeightMutation) {
+    const std::string cluster_id = "weight_importing_reconcile_rejected";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    ASSERT_TRUE(service.BeginWeightImport(BeginWeightImportRequest{
+        .identity = identity,
+        .payload_group_id = {},
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    }));
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    auto reconciled = service.ReconcileWeightRevision(
+        ReconcileWeightRevisionRequest{.identity = identity});
+    EXPECT_FALSE(reconciled.has_value());
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(2, batch));
+}
+
+TEST_F(MasterServiceHATest,
+       WeightMutationRequiresConfirmedStandbyOpLogCapability) {
+    const std::string cluster_id = "weight_metadata_capability_gate";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id(cluster_id)
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    auto rejected = service.BeginWeightImport(BeginWeightImportRequest{
+        .identity = identity,
+        .payload_group_id = {},
+        .expected_payload_count = 2,
+        .expected_logical_bytes = 2048,
+    });
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(WeightManagementError::DURABILITY_FAILED, rejected.error());
+    EXPECT_FALSE(
+        service
+            .GetWeightRevision(GetWeightRevisionRequest{.identity = identity})
+            .has_value());
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(1, batch));
+}
+
 TEST_F(MasterServiceHATest, WeightMetadataRejectsOpLogSubmissionFailure) {
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto config = MasterServiceConfig::builder()
@@ -3773,6 +4068,7 @@ TEST_F(MasterServiceHATest,
         .revision = "step-100",
         .weight_generation = 7,
     };
+    ::testing::internal::CaptureStderr();
     auto importing = std::async(std::launch::async, [&] {
         return service.BeginWeightImport(BeginWeightImportRequest{
             .identity = identity,
@@ -3786,6 +4082,11 @@ TEST_F(MasterServiceHATest,
     // fails.
     MasterServiceTestPeer::OrderedOplogWriter(service)->Stop();
     const auto result = importing.get();
+    const auto failure_log = ::testing::internal::GetCapturedStderr();
+    EXPECT_NE(std::string::npos,
+              failure_log.find("Failed to durably persist weight metadata"));
+    EXPECT_NE(std::string::npos,
+              failure_log.find(MakeWeightRevisionMetadataKey(identity)));
     EXPECT_TRUE(attempted);
     EXPECT_EQ(std::future_status::ready, completed);
     ASSERT_FALSE(result.has_value());
@@ -3794,6 +4095,68 @@ TEST_F(MasterServiceHATest,
         service
             .GetWeightRevision(GetWeightRevisionRequest{.identity = identity})
             .has_value());
+}
+
+TEST_F(MasterServiceHATest, WeightDurabilityWaitDoesNotBlockTaskCleanup) {
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id("weight_cleanup_isolation")
+                      .set_weight_import_idle_timeout_ms(1)
+                      .set_pending_task_timeout_sec(1)
+                      .set_max_retry_attempts(0)
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "cleanup",
+        .revision = "abandoned",
+        .weight_generation = 1,
+    };
+    ASSERT_TRUE(service.BeginWeightImport({
+        .identity = identity,
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    }));
+    backend->BlockTxn();
+    struct ReleaseOnExit {
+        BlockingBatchHaKvBackend& backend;
+        ~ReleaseOnExit() { backend.AllowTxn(); }
+    } release{*backend};
+    // Let the real background worker enter the abandoned-import durable wait.
+    ASSERT_TRUE(backend->WaitForBlockedTxn(std::chrono::seconds(35)));
+    UUID task_id;
+    {
+        auto tasks =
+            MasterServiceTestPeer::TaskManager(service).get_write_access();
+        auto submitted = tasks.submit_task_typed<TaskType::REPLICA_COPY>(
+            generate_uuid(), ReplicaCopyPayload{});
+        ASSERT_TRUE(submitted.has_value());
+        task_id = *submitted;
+    }
+    const auto pending = service.QueryTask(task_id);
+    ASSERT_TRUE(pending.has_value());
+    ASSERT_EQ(TaskStatus::PENDING, pending->status);
+    // Let the real pending timeout expire while weight reconciliation blocks.
+    bool cleaned = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(35);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto task = service.QueryTask(task_id);
+        if (task && task->status == TaskStatus::FAILED) {
+            cleaned = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    backend->AllowTxn();
+    EXPECT_TRUE(cleaned);
 }
 
 TEST_F(MasterServiceHATest,
@@ -4035,6 +4398,8 @@ TEST_F(MasterServiceHATest,
             .fenced_metadata_generation = 4,
             .started_at_ms = 150,
             .updated_at_ms = 200,
+            .processed_members = 0,
+            .total_members = 2,
             .cursor = {},
             .message = {},
         }},
@@ -4044,10 +4409,10 @@ TEST_F(MasterServiceHATest,
 
     MasterService service;
     ASSERT_TRUE(service.RestoreFromStandbySnapshot({}, 7, {}, snapshot));
-    EXPECT_EQ(snapshot, ExportWeightMetadataStore(service));
+    EXPECT_EQ(snapshot, ExportWeightMetadata(service));
 }
 
-TEST_F(MasterServiceHATest, OldStandbyPromotionClearsWeightMetadataStore) {
+TEST_F(MasterServiceHATest, OldStandbyPromotionClearsWeightMetadata) {
     MasterService service;
     const WeightRevisionIdentity identity{
         .tenant_id = "default",
@@ -4766,6 +5131,8 @@ TEST_F(MasterServiceBatchRecordE2ETest,
             .set_cluster_id(cluster_id)
             .set_oplog_batch_max_entries(1)
             .set_enable_multi_tenants(true)
+            // Keep quota release under the durable callback's control.
+            .set_tenant_eviction_high_watermark_ratio(0.0)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
                 WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
@@ -4824,6 +5191,8 @@ TEST_F(MasterServiceBatchRecordE2ETest,
             .set_cluster_id(cluster_id)
             .set_oplog_batch_max_entries(1)
             .set_enable_multi_tenants(true)
+            // Keep quota release under the durable callback's control.
+            .set_tenant_eviction_high_watermark_ratio(0.0)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
                 WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
@@ -4961,6 +5330,8 @@ TEST_F(MasterServiceBatchRecordE2ETest,
             .set_cluster_id(cluster_id)
             .set_oplog_batch_max_entries(1)
             .set_enable_multi_tenants(true)
+            // Keep quota release under the durable callback's control.
+            .set_tenant_eviction_high_watermark_ratio(0.0)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
                 WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
@@ -7161,6 +7532,150 @@ TEST_F(MasterServiceHATest, WeightLeaseRenewalRechecksExpiryAfterGroupWait) {
     EXPECT_TRUE(blocker.has_value());
     ASSERT_FALSE(renewed.has_value());
     EXPECT_EQ(WeightManagementError::LEASE_EXPIRED, renewed.error());
+}
+
+TEST_F(MasterServiceHATest, ConcurrentWeightReconciliationPreservesReplay) {
+    CheckConcurrentWeightReplay(false);
+}
+
+TEST_F(MasterServiceHATest, AbandonedWeightImportSweepPreservesReplay) {
+    CheckConcurrentWeightReplay(true);
+}
+
+TEST_F(MasterServiceHATest,
+       WeightOperationReplayRestoresActiveAndCompletedState) {
+    const std::string cluster_id = "weight_operation_replay_restore";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    auto* writer = InstallGatedWriter(service, backend);
+    ASSERT_NE(nullptr, writer);
+    const auto segment = PrepareSimpleSegment(service);
+    ASSERT_TRUE(writer->RunCallbacksThrough(1));
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "replay",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    const auto importing = service.BeginWeightImport({
+        .identity = identity,
+        .payload_group_id = {},
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    });
+    ASSERT_TRUE(importing);
+    const std::string payload_key = "operation-replay-payload";
+    const auto manifest_key = MakeWeightManifestKey(identity);
+    ReplicateConfig replicate;
+    replicate.replica_num = 1;
+    replicate.with_hard_pin = true;
+    replicate.group_ids =
+        std::vector<std::string>{importing->manifest.payload_group_id};
+    uint64_t put_sequence = 3;
+    for (const auto& key : {payload_key, manifest_key}) {
+        replicate.data_type = key == payload_key ? ObjectDataType::WEIGHT
+                                                 : ObjectDataType::METADATA;
+        ASSERT_TRUE(service.PutStart(segment.client_id, key, kDefaultTenant,
+                                     key == payload_key ? 1024 : 128,
+                                     replicate));
+        ASSERT_TRUE(service.PutEnd(segment.client_id, key, kDefaultTenant,
+                                   ReplicaType::MEMORY));
+        // PutEnd returns before durability; drain the single-entry writer.
+        ASSERT_TRUE(writer->RunCallbacksThrough(put_sequence++));
+    }
+    const auto ready = service.CommitWeightImport({
+        .identity = identity,
+        .expected_metadata_generation = importing->metadata_generation,
+        .manifest =
+            {
+                .manifest_key = manifest_key,
+                .manifest_sha256 = std::string(64, 'a'),
+                .payload_group_id = importing->manifest.payload_group_id,
+                .payload_keys_sha256 =
+                    ComputeWeightPayloadKeysSha256({payload_key}),
+                .payload_count = 1,
+                .logical_bytes = 1024,
+            },
+    });
+    ASSERT_TRUE(ready);
+    const auto active = service.StartWeightResidencyOperation({
+        .identity = identity,
+        .expected_metadata_generation = ready->metadata_generation,
+        .target_residency = WeightResidencyState::HOT,
+    });
+    ASSERT_TRUE(active);
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+    const auto verify_restored =
+        [&](const WeightResidencyOperation& operation) {
+            const auto replayed = reader.PollOnce();
+            ASSERT_EQ(ErrorCode::OK, replayed.error);
+            ASSERT_TRUE(replayed.durable_prefix_present);
+            EXPECT_EQ(replayed.durable_prefix.last_seq + 1,
+                      applier.GetExpectedSequenceId());
+            const auto snapshot = standby.SnapshotWeightMetadata();
+            EXPECT_EQ(ExportWeightMetadata(service), snapshot);
+            MasterService restored;
+            ASSERT_TRUE(restored.RestoreFromStandbySnapshot(
+                {}, replayed.durable_prefix.last_seq, {}, snapshot));
+            EXPECT_EQ(snapshot, ExportWeightMetadata(restored));
+            const auto queried = restored.QueryWeightOperation({
+                .operation_id = operation.operation_id,
+            });
+            ASSERT_TRUE(queried);
+            EXPECT_EQ(operation, *queried);
+        };
+    verify_restored(*active);
+    const auto finished =
+        service.ReconcileWeightRevision({.identity = identity});
+    ASSERT_TRUE(finished);
+    ASSERT_EQ(WeightOperationState::NONE, finished->operation);
+    const auto completed = service.QueryWeightOperation({
+        .operation_id = active->operation_id,
+    });
+    ASSERT_TRUE(completed);
+    ASSERT_EQ("completed", completed->message);
+    verify_restored(*completed);
+
+    const auto rehydrating = service.StartWeightResidencyOperation({
+        .identity = identity,
+        .expected_metadata_generation = finished->metadata_generation,
+        .target_residency = WeightResidencyState::HOT,
+    });
+    ASSERT_TRUE(rehydrating);
+    ASSERT_TRUE(service.UnmountSegment(segment.segment_id, segment.client_id));
+    for (const auto& key : {payload_key, manifest_key}) {
+        const auto readable = service.ExistKey(key, kDefaultTenant);
+        ASSERT_TRUE(readable);
+        ASSERT_FALSE(*readable);
+    }
+    const auto degraded =
+        service.ReconcileWeightRevision({.identity = identity});
+    ASSERT_TRUE(degraded);
+    EXPECT_EQ(WeightAvailabilityState::DEGRADED, degraded->availability);
+    EXPECT_EQ(WeightResidencyState::ABSENT, degraded->residency);
+    EXPECT_EQ(WeightOperationState::REHYDRATING, degraded->operation);
+    EXPECT_EQ(rehydrating->operation_id, degraded->operation_id);
+    EXPECT_EQ(rehydrating->fenced_metadata_generation + 1,
+              degraded->metadata_generation);
+    const auto pending = service.QueryWeightOperation({
+        .operation_id = rehydrating->operation_id,
+    });
+    ASSERT_TRUE(pending);
+    EXPECT_EQ(degraded->metadata_generation,
+              pending->fenced_metadata_generation);
+    EXPECT_NE("completed", pending->message);
+    service.StopBatchOpLogWriter();
+    verify_restored(*pending);
 }
 
 }  // namespace mooncake::test

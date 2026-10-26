@@ -17,7 +17,7 @@ on:
         default: x86_64
       python-versions:
         type: string
-        default: '["3.10", "3.11", "3.12", "3.13"]'
+        default: '["3.10", "3.11", "3.12", "3.13", "3.14"]'
       artifact-prefix:
         type: string
         required: true
@@ -289,6 +289,8 @@ jobs:
           fi
           "$smoke_venv/bin/python" -c \
             'from mooncake import engine; assert engine.SUPPORT_EFA, "EFA support missing"'
+
+          bash scripts/ci/check_wheel_typing.sh "$smoke_venv/bin/python"
 
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4

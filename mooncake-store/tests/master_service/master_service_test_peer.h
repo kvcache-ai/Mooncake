@@ -15,6 +15,19 @@ class MasterServiceTestPeer {
     explicit MasterServiceTestPeer(MasterService& service)
         : service_(service) {}
 
+    size_t RunWeightReconciliationForTesting(uint64_t now_ms,
+                                             size_t limit = 32) {
+        return service_.weight_manager_.ReconcileWeightMetadataStoreOnce(now_ms,
+                                                                         limit);
+    }
+
+    bool DropWeightGroupMemberForTesting(const WeightRevisionIdentity& identity,
+                                         const std::string& key) {
+        return service_
+            .RemoveObject(key, TenantId(identity.tenant_id), true, true)
+            .has_value();
+    }
+
     using GroupDomainAccessorRO = MasterService::GroupDomainAccessorRO;
     using GroupDomainAccessorRW = MasterService::GroupDomainAccessorRW;
     using MetadataAccessorRO = MasterService::MetadataAccessorRO;
@@ -35,8 +48,6 @@ class MasterServiceTestPeer {
     static constexpr auto kMaxPromotionExecutionFailures =
         MasterService::kMaxPromotionExecutionFailures;
     static constexpr auto kNumShards = MasterService::kNumShards;
-    static constexpr auto kObjectOperationLockStripes =
-        MasterService::kObjectOperationLockStripes;
     static constexpr auto kPromotionCandidateMaxRetries =
         PromotionCandidateTracker::kMaxRetries;
 
@@ -50,6 +61,12 @@ class MasterServiceTestPeer {
     // the fields that payload carries.
     static std::string SerializeMetadataForOpLogForTesting(
         MasterService& service, const ObjectMetadata& metadata);
+    static std::string SerializeMetadataForOpLogWithoutMemReplicasForTesting(
+        MasterService& service, const ObjectMetadata& metadata);
+    static std::string
+    SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
+        MasterService& service, const ObjectMetadata& metadata,
+        const std::vector<Replica::Descriptor>& replicas);
 
     // Drive one eviction cycle synchronously, without the periodic worker.
     void RunBatchEvictForTesting(double evict_ratio_target,
@@ -63,12 +80,31 @@ class MasterServiceTestPeer {
     // Drive one tenant watermark eviction pass without the periodic worker.
     void RunTenantEvictForTesting();
 
+    // The service's walks over tenants and over one tenant's objects.
+    auto ReadCursor(const TenantId& tenant_id) const {
+        return service_.ReadCursor(tenant_id);
+    }
+    using CursorSlice = MasterService::CursorSlice;
+    auto ReadCursor(const TenantId& tenant_id, CursorSlice slice) const {
+        return service_.ReadCursor(tenant_id, slice);
+    }
+    auto WriteCursor(const TenantId& tenant_id) {
+        return service_.WriteCursor(tenant_id);
+    }
+    void VisitTenants(const std::function<void(const TenantId&)>& visit) const {
+        service_.VisitTenants(visit);
+    }
+    std::vector<std::string> InFlightKeys(const TenantId& tenant_id) const {
+        return service_.InFlightKeys(tenant_id);
+    }
+
     // Enable epoch bookkeeping without starting a live KV event publisher.
     void SetKvTenantEpochTrackingForTesting(bool enabled);
 
-    // Called after each shard lock is released during RemoveAll. Tests can
-    // commit into an already-scanned shard to pin the interleaving.
-    void SetRemoveAllShardHookForTesting(std::function<void(size_t)> hook);
+    // Called once per tenant RemoveAll has finished removing. Tests can commit
+    // into a tenant the walk already passed to pin the interleaving.
+    void SetRemoveAllTenantHookForTesting(
+        std::function<void(const TenantId&)> hook);
 
     // Counts of published clears and clears suppressed by a concurrent commit.
     uint64_t GetKvClearedPublishedForTesting() const;
@@ -201,13 +237,6 @@ class MasterServiceTestPeer {
         return service.nof_segment_manager_;
     }
 
-    static auto& ObjectOperationLocks(MasterService& service) {
-        return service.object_operation_locks_;
-    }
-    static const auto& ObjectOperationLocks(const MasterService& service) {
-        return service.object_operation_locks_;
-    }
-
     static auto& OrderedOplogWriter(MasterService& service) {
         return service.ordered_oplog_writer_;
     }
@@ -310,6 +339,9 @@ class MasterServiceTestPeer {
     static auto& WeightMetadata(MasterService& service) {
         return service.weight_manager_.weight_metadata_;
     }
+    static auto& WeightManager(MasterService& service) {
+        return service.weight_manager_;
+    }
     static const auto& WeightMetadata(const MasterService& service) {
         return service.weight_manager_.weight_metadata_;
     }
@@ -373,9 +405,9 @@ class MasterServiceTestPeer {
     }
 
     void DiscardExpiredProcessingReplicas(
-        MetadataShardAccessorRW& shard,
+        const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) {
-        service_.DiscardExpiredProcessingReplicas(shard, now);
+        service_.DiscardExpiredProcessingReplicas(tenant_id, now);
     }
 
     uint32_t DynamicReplicationAdmissionMinHits() const {
@@ -405,10 +437,16 @@ class MasterServiceTestPeer {
     }
 
     void FinalizeExpiredProcessingReplicasAfterDurable(
-        const OpLogEntry& durable_entry,
+        route::ObjectRef object, const OpLogEntry& durable_entry,
         const std::chrono::system_clock::time_point& ttl) {
-        service_.FinalizeExpiredProcessingReplicasAfterDurable(durable_entry,
-                                                               ttl);
+        service_.FinalizeExpiredProcessingReplicasAfterDurable(
+            std::move(object), durable_entry, ttl);
+    }
+
+    void FinalizeMetadataEraseAfterDurable(route::ObjectRef object,
+                                           const TenantId& tenant_id) {
+        service_.FinalizeMetadataEraseAfterDurable(std::move(object), tenant_id,
+                                                   QuotaEraseMode::kFull);
     }
 
     void FinalizeRemovedReplicasAfterDurable(
@@ -471,12 +509,6 @@ class MasterServiceTestPeer {
         std::vector<UUID>* mirror_clients = nullptr) {
         return service_.PushOffloadingQueue(object_id, replica, mirror_clients);
     }
-
-    void ReRouteRestoredObjectsByKey() {
-        service_.ReRouteRestoredObjectsByKey();
-    }
-
-    void RebuildGroupState() { service_.RebuildGroupState(); }
 
     void RebuildTenantQuotaUsageFromMetadata() {
         service_.RebuildTenantQuotaUsageFromMetadata();

@@ -181,12 +181,8 @@ class ScopedTaskWriteAccess {
     ErrorCode complete_task(const UUID& client_id, const UUID& task_id,
                             TaskStatus status, const std::string& message);
 
-    void restore_task(Task&& task);
-
     ErrorCode fail_task_if_pending(const UUID& task_id,
                                    const std::string& message);
-
-    void clear_all();
 
     void prune_finished_tasks();
 
@@ -259,22 +255,4 @@ class ClientTaskManager {
     std::deque<UUID> finished_task_history_ GUARDED_BY(mutex_);
 };
 
-class TaskManagerSerializer {
-    static constexpr size_t kTaskSerializedFields = 8;
-    static constexpr size_t kMaxDecompressedSize = 1024 * 1024 * 1024;  // 1 GB
-
-   public:
-    explicit TaskManagerSerializer(ClientTaskManager* task_manager)
-        : task_manager_(task_manager) {}
-
-    tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
-
-    tl::expected<void, SerializationError> Deserialize(
-        const std::vector<uint8_t>& data);
-
-    void Reset();
-
-   private:
-    ClientTaskManager* task_manager_;
-};
 }  // namespace mooncake

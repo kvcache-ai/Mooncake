@@ -5,10 +5,6 @@
 #include <limits>
 #include <mutex>
 
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
-#endif
-
 namespace mooncake::test {
 
 ErrorCode MasterServiceTestPeer::SetBatchOpLogBackendForTesting(
@@ -29,6 +25,20 @@ void MasterServiceTestPeer::SetBatchOpLogWriterFactoryForTesting(
 std::string MasterServiceTestPeer::SerializeMetadataForOpLogForTesting(
     MasterService& service, const ObjectMetadata& metadata) {
     return service.SerializeMetadataForOpLog(metadata);
+}
+
+std::string
+MasterServiceTestPeer::SerializeMetadataForOpLogWithoutMemReplicasForTesting(
+    MasterService& service, const ObjectMetadata& metadata) {
+    return service.SerializeMetadataForOpLogWithoutMemReplicas(metadata);
+}
+
+std::string MasterServiceTestPeer::
+    SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
+        MasterService& service, const ObjectMetadata& metadata,
+        const std::vector<Replica::Descriptor>& replicas) {
+    return service.SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                   replicas);
 }
 
 void MasterServiceTestPeer::RunBatchEvictForTesting(
@@ -53,9 +63,9 @@ void MasterServiceTestPeer::SetKvTenantEpochTrackingForTesting(bool enabled) {
     service_.kv_track_tenant_epochs_ = enabled;
 }
 
-void MasterServiceTestPeer::SetRemoveAllShardHookForTesting(
-    std::function<void(size_t)> hook) {
-    service_.kv_remove_all_shard_hook_ = std::move(hook);
+void MasterServiceTestPeer::SetRemoveAllTenantHookForTesting(
+    std::function<void(const TenantId&)> hook) {
+    service_.kv_remove_all_tenant_hook_ = std::move(hook);
 }
 
 uint64_t MasterServiceTestPeer::GetKvClearedPublishedForTesting() const {
@@ -75,12 +85,7 @@ void MasterServiceTestPeer::SetNoFProbeFnForTesting(
         service_.nof_probe_fn_ = std::move(fn);
         return;
     }
-    service_.nof_probe_fn_ = [](const std::string& te_endpoint,
-                                uint32_t timeout_ms,
-                                std::string* error_reason) {
-        return SpdkWrapper::GetInstance().ProbeNofSegment(
-            te_endpoint, timeout_ms, error_reason);
-    };
+    service_.nof_probe_fn_ = &MasterService::DefaultProbeNofSegment;
 #else
     (void)fn;
 #endif

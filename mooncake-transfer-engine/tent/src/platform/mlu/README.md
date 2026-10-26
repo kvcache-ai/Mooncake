@@ -57,16 +57,42 @@ supported, since the network stage registers its own host buffers.
 Staging admission and retry follow TENT's existing policy. A full staging pool
 can fail a request; applications decide whether and when to resubmit. A failed
 transfer may have completed some chunks, so callers must account for partial
-writes and keep buffers alive while any physical operations remain in flight.
+writes. A staging task remains pending until its accepted child operations have
+finished, even if another child fails. Keep both allocations alive and source
+contents unchanged until the transfer reaches a terminal state; a polling error
+alone does not permit reuse.
 
-Device copies are synchronous in this version. There is no MLU peer-to-peer,
-MLU IPC, direct device RDMA, or copy/network overlap implementation here. The
-existing host staging planner can also select HP TCP. An invalid allocation
+Pinned D2H copies and pinned H2D copies larger than 64 KiB use per-context,
+per-direction device queues and report completion through notifiers. MLU staging
+explicitly selects the MLU allocator, which tries `cnrtHostMalloc`; ordinary
+internal CPU allocations retain the engine's normal allocator selection. Explicit
+host allocations through the MLU transport use the same allocator. If a pinned
+allocation does not satisfy a requested `cpu:N` location, it falls back to the
+normal NUMA allocator. Pageable host buffers use synchronous copies.
+
+Host-to-MLU copies of at most 64 KiB run synchronously when their context's H2D
+queue is absent or idle, avoiding queue overhead. With earlier H2D work pending,
+pinned copies join the same queue; pageable copies wait for that queue to drain
+before copying synchronously. Submission is serialized through the idle check
+and inline copy, preserving H2D copy order within each context. Dependencies
+across directions or contexts still require waiting for the preceding transfer
+to complete. The staging pipeline waits for each chunk's dependent steps while
+allowing independent chunks to overlap device copies with TCP or HP TCP transfers.
+
+Freeing a sub-batch or unregistering a buffer waits for its in-flight copies;
+transport shutdown drains all copy queues. If a copy may have been submitted but
+its completion cannot be tracked, it remains pending until the queue drains.
+Drain failures are reported and resources are retained for retry. External pinned
+allocations remain owned by the caller.
+
+There is no MLU peer-to-peer, MLU IPC, or direct device RDMA. An invalid allocation
 range, missing local copy transport, or missing staging location fails instead
 of submitting device pointers to the host network path.
 
 The tests cover real SDK allocations, fresh worker threads, interior pointers,
 out-of-bounds rejection, transport routing, and READ/WRITE payload equality.
+Transport tests hold real device queues to check pending status and resource
+lifetimes, and inject notifier-record failure after a copy is submitted.
 The engine suite covers TCP/HP TCP, legacy/policy selection, and runtime queues.
 The process suite starts a second executable with independent allocations and
 passes payloads through loopback TCP/HP TCP; test pipes carry only commands

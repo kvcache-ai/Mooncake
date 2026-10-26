@@ -6,6 +6,9 @@
 #include <numaif.h>
 #include <sys/mman.h>
 
+#include <cstdint>
+#include <cstring>
+
 TEST(MemoryLocationTest, MallocSimpleNode0) {
     int size = 4096 * 10;
     void *addr = numa_alloc_onnode(size, 0);
@@ -128,4 +131,82 @@ TEST(MemoryLocationTest, MallocMultipleNodes) {
     }
 
     numa_free(addr, size);
+}
+
+namespace {
+
+constexpr size_t kHugePage = 2 * 1024 * 1024;
+
+// Maps `size` bytes aligned to 2MB so that THP can back them.
+void *mapAligned(size_t size, void **raw, size_t *raw_size) {
+    *raw_size = size + kHugePage;
+    *raw = mmap(nullptr, *raw_size, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (*raw == MAP_FAILED) return nullptr;
+    uintptr_t p = reinterpret_cast<uintptr_t>(*raw);
+    return reinterpret_cast<void *>((p + kHugePage - 1) & ~(kHugePage - 1));
+}
+
+}  // namespace
+
+TEST(MemoryLocationTest, ThpDetectionNoHugepage) {
+    void *raw;
+    size_t raw_size;
+    const size_t size = 2 * kHugePage;
+    void *addr = mapAligned(size, &raw, &raw_size);
+    ASSERT_NE(addr, nullptr);
+    ASSERT_EQ(madvise(addr, size, MADV_NOHUGEPAGE), 0);
+
+    EXPECT_FALSE(mooncake::hasHugepageAdvice(addr));
+    memset(addr, 1, size);
+    EXPECT_FALSE(mooncake::isThpBacked(addr, size));
+
+    munmap(raw, raw_size);
+}
+
+TEST(MemoryLocationTest, ThpDetectionNotFaultedIn) {
+    void *raw;
+    size_t raw_size;
+    const size_t size = 2 * kHugePage;
+    void *addr = mapAligned(size, &raw, &raw_size);
+    ASSERT_NE(addr, nullptr);
+    if (madvise(addr, size, MADV_HUGEPAGE) != 0) {
+        munmap(raw, raw_size);
+        GTEST_SKIP() << "MADV_HUGEPAGE not supported";
+    }
+
+    EXPECT_TRUE(mooncake::hasHugepageAdvice(addr));
+    // Nothing resident yet, so it is not THP-backed.
+    EXPECT_FALSE(mooncake::isThpBacked(addr, size));
+
+    munmap(raw, raw_size);
+}
+
+TEST(MemoryLocationTest, ThpDetectionFullAndPartial) {
+    void *raw;
+    size_t raw_size;
+    const size_t size = 4 * kHugePage;
+    char *addr = static_cast<char *>(mapAligned(size, &raw, &raw_size));
+    ASSERT_NE(addr, nullptr);
+    // First half THP, second half 4KB pages: two VMAs.
+    const size_t half = size / 2;
+    if (madvise(addr, half, MADV_HUGEPAGE) != 0) {
+        munmap(raw, raw_size);
+        GTEST_SKIP() << "MADV_HUGEPAGE not supported";
+    }
+    ASSERT_EQ(madvise(addr + half, half, MADV_NOHUGEPAGE), 0);
+    memset(addr, 1, size);
+
+    EXPECT_TRUE(mooncake::hasHugepageAdvice(addr));
+    EXPECT_FALSE(mooncake::hasHugepageAdvice(addr + half));
+    if (!mooncake::isThpBacked(addr, half)) {
+        munmap(raw, raw_size);
+        GTEST_SKIP() << "THP did not back the MADV_HUGEPAGE range (THP "
+                        "disabled or no free huge pages)";
+    }
+    EXPECT_TRUE(mooncake::isThpBacked(addr, kHugePage));
+    EXPECT_FALSE(mooncake::isThpBacked(addr + half, half));
+    EXPECT_FALSE(mooncake::isThpBacked(addr, size));
+
+    munmap(raw, raw_size);
 }

@@ -429,6 +429,11 @@ impl StoreClient {
         let tracker = OperationTracker::new("batch_is_readable")
             .attribute_u64("mooncake.item_count", objects.len() as u64);
         let result: Result<Vec<bool>> = (|| {
+            for object in objects {
+                self.ensure_control_plane_tenant(
+                    object.tenant.unwrap_or(self.default_tenant()),
+                )?;
+            }
             let keys = objects
                 .iter()
                 .map(|object| {
@@ -663,6 +668,11 @@ impl StoreClient {
         let use_batch_put_from = shared_put_from_policy.is_some();
 
         for (index, request) in requests.iter().enumerate() {
+            let tenant = request.tenant.unwrap_or(self.default_tenant());
+            if let Err(error) = self.ensure_control_plane_tenant(tenant) {
+                statuses[index] = Some(Err(error));
+                continue;
+            }
             if request.buffer.is_null() {
                 statuses[index] = Some(Err(StoreError::Allocator(
                     "put_from buffer must not be null".to_string(),
@@ -672,7 +682,6 @@ impl StoreClient {
             {
                 let state = self.state.lock();
                 if !state.buffer_is_registered(request.buffer.cast_mut(), request.size) {
-                    let tenant = request.tenant.unwrap_or(self.default_tenant());
                     statuses[index] = Some(Err(StoreError::Allocator(format!(
                         "put_from buffer is not registered for tenant={tenant} key={}",
                         request.key
@@ -1078,12 +1087,15 @@ impl MooncakeCompatibilityFacade for StoreClient {
         scope: &NamespaceScope,
         logical_key: &str,
     ) -> Result<Option<ObjectRoute>> {
+        self.ensure_control_plane_tenant(&scope.tenant)?;
         self.query_route_by_object_id(&LogicalObjectId::new(scope.clone(), logical_key))
     }
 
     fn query_route_by_object_id(&self, object_id: &LogicalObjectId) -> Result<Option<ObjectRoute>> {
         let tracker = OperationTracker::new("query_route");
-        let result = self.query_route_by_object_id_inner(object_id);
+        let result = self
+            .ensure_control_plane_tenant(&object_id.scope.tenant)
+            .and_then(|()| self.query_route_by_object_id_inner(object_id));
         tracker.finish(&result, result.as_ref().map(|route| route.is_some() as u64).unwrap_or(0));
         result
     }
@@ -1097,6 +1109,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .scope("route_lookup")
             .attribute_u64("mooncake.item_count", keys.len() as u64);
         let result = (|| {
+            self.ensure_control_plane_tenant(tenant)?;
             let object_keys = keys
                 .iter()
                 .map(|key| {
@@ -1119,10 +1132,12 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {
+        self.ensure_control_plane_tenant(&scope.tenant)?;
         self.route_ops().list_routes_in_scope(scope)
     }
 
     fn list_reuse_candidates(&self, reuse: &mooncake_store_core::ReuseIdentity) -> Result<Vec<ObjectRoute>> {
+        self.ensure_control_plane_tenant(&reuse.tenant)?;
         self.route_ops().list_reuse_candidates(reuse)
     }
 
@@ -1142,6 +1157,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         expected: Option<RouteVersion>,
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult> {
+        self.ensure_control_plane_tenant(tenant)?;
         let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
         let object_key = mooncake_store_core::ObjectKey::from_logical_id(&object_id);
         self.route_ops()
@@ -1208,6 +1224,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
     fn get_size_in_tenant(&self, tenant: &str, key: &str) -> Result<usize> {
         let tracker = OperationTracker::new("get_size");
         let result = (|| {
+            self.ensure_control_plane_tenant(tenant)?;
             let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
             let Some(route) = self.query_route_by_object_id_inner(&object_id)? else {
                 return Ok(0);
@@ -1234,6 +1251,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn is_exist_in_tenant(&self, tenant: &str, key: &str) -> Result<bool> {
+        self.ensure_control_plane_tenant(tenant)?;
         let scope = NamespaceScope::with_defaults(Some(tenant), None, None);
         let object_key = ObjectKey::from_scope(&scope, key);
         self.route_ops().contains_active_route(&object_key)
@@ -1244,13 +1262,14 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .attribute_u64("mooncake.item_count", objects.len() as u64);
         let keys = objects
             .iter()
-            .map(|object| {
+            .map(|object| -> Result<ObjectKey> {
                 let tenant = object.tenant.unwrap_or(self.default_tenant());
+                self.ensure_control_plane_tenant(tenant)?;
                 let scope =
                     NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set);
-                ObjectKey::from_scope(&scope, object.key)
+                Ok(ObjectKey::from_scope(&scope, object.key))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let result = self.route_ops().contains_active_routes_bounded(&keys);
         tracker.finish(&result, result.as_ref().map(|items| items.len()).unwrap_or(0) as u64);
         result
@@ -1270,6 +1289,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("remove");
+        self.ensure_control_plane_tenant(tenant)?;
         let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
         let object_key = mooncake_store_core::ObjectKey::from_logical_id(&object_id);
         let result = self.remove_object_route_with_retry(&object_id, &object_key, force);
@@ -1289,6 +1309,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let tracker = OperationTracker::new("batch_remove");
         for object in objects {
             let tenant = object.tenant.unwrap_or(self.default_tenant());
+            self.ensure_control_plane_tenant(tenant)?;
             let object_id = LogicalObjectId::new(
                 NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
                 object.key,
@@ -1384,6 +1405,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .attribute_str("mooncake.tenant", tenant)
             .attribute_u64("mooncake.item_count", 1)
             .input_bytes(size as u64);
+        self.ensure_control_plane_tenant(tenant)?;
         if buffer.is_null() {
             let result = Err(StoreError::Allocator(
                 "put_from buffer must not be null".to_string(),
@@ -1441,6 +1463,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .attribute_str("mooncake.tenant", tenant)
             .attribute_u64("mooncake.item_count", 1)
             .input_bytes(size as u64);
+        self.ensure_control_plane_tenant(tenant)?;
         if buffer.is_null() {
             let result = Err(StoreError::Allocator(
                 "put_from buffer must not be null".to_string(),
@@ -1538,6 +1561,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .input_bytes(bytes_in);
         let mut routes = Vec::with_capacity(requests.len());
         for request in requests {
+            self.ensure_control_plane_tenant(
+                request.tenant.unwrap_or(self.default_tenant()),
+            )?;
             let payload = flatten_slices(request.buffers);
             let mut object = ObjectRef::new(request.key);
             if let Some(tenant) = request.tenant {
@@ -1786,6 +1812,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .attribute_str("mooncake.tenant", tenant)
             .attribute_u64("mooncake.src_offset", src_offset as u64)
             .attribute_u64("mooncake.size", size as u64);
+        self.ensure_control_plane_tenant(tenant)?;
         if buffer.is_null() {
             let result: Result<usize> = Err(StoreError::InvalidState(
                 "buffer pointer is null".to_string(),
@@ -1875,6 +1902,23 @@ impl MooncakeCompatibilityFacade for StoreClient {
             buffers = buffer_count,
         )
         .entered();
+
+        if self.ensure_control_plane_tenant(tenant).is_err() {
+            return (0..buffer_count)
+                .map(|i| {
+                    let key_count = all_keys.get(i).map_or(1, |keys| keys.len().max(1));
+                    (0..key_count)
+                        .map(|j| {
+                            let fragment_count = all_dst_offsets
+                                .get(i)
+                                .and_then(|keys| keys.get(j))
+                                .map_or(1, |fragments| fragments.len().max(1));
+                            vec![RANGE_READ_ERROR; fragment_count]
+                        })
+                        .collect()
+                })
+                .collect();
+        }
 
         let mut metadata_cache: HashMap<&str, Result<ResolvedObject>> = HashMap::new();
         let local_segments = self.local_storage_segments();
