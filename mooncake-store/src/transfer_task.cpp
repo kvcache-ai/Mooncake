@@ -1271,7 +1271,10 @@ class StoreScatterTransferOperation::Impl {
             return;
         }
 #ifdef USE_TENT
-        if (completed_) return;
+        if (completed_) {
+            retryCloseSegments();
+            return;
+        }
         // Destructor path: use a shorter timeout than wait() to avoid
         // blocking too long when the caller didn't explicitly wait.
         const auto deadline = std::chrono::steady_clock::now() +
@@ -1353,7 +1356,26 @@ class StoreScatterTransferOperation::Impl {
         }
     }
 
-    void finish() { completed_ = true; }
+    void retryCloseSegments() {
+        for (int attempt = 0; attempt < 3 && !segments_.empty(); ++attempt) {
+            for (auto it = segments_.begin(); it != segments_.end();) {
+                auto status = tent_engine_->closeSegment(it->second);
+                if (status.ok()) {
+                    it = segments_.erase(it);
+                } else {
+                    remember(Status::Context(status.ToString()));
+                    ++it;
+                }
+            }
+            if (!segments_.empty())
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    void finish() {
+        retryCloseSegments();
+        completed_ = true;
+    }
 
     void failPending(const Status& status) {
         for (size_t i = 0; i < done_.size(); ++i) complete(i, status);
@@ -1425,10 +1447,7 @@ class StoreScatterTransferOperation::Impl {
                 }
                 segment_it =
                     segment_ids.emplace(range.remote_segment, segment_id).first;
-                // openSegment is idempotent, not a reference-counted lease.
-                // Other Store operations can be using this same handle. Keep
-                // it cached in the engine, as the ordinary transfer paths do;
-                // closing it here would invalidate concurrent reads/writes.
+                segments_.emplace_back(range.remote_segment, segment_id);
             }
             for (size_t fragment = 0; fragment < count; ++fragment) {
                 const size_t length = range.lengths[fragment];
@@ -1565,6 +1584,7 @@ class StoreScatterTransferOperation::Impl {
     std::vector<std::pair<size_t, size_t>> request_fragments_;
     std::vector<std::function<void(size_t, const Status&)>> callbacks_;
     std::vector<uint8_t> done_;
+    std::vector<std::pair<std::string, tent::SegmentID>> segments_;
     BatchID batch_id_ = 0;
     size_t remaining_ = 0;
     bool abort_requested_ = false;
