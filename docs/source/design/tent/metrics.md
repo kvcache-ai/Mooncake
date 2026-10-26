@@ -170,6 +170,38 @@ The HTTP server provides multiple endpoints:
 - **`/metrics/summary`**: Human-readable summary
 - **`/metrics/json`**: JSON format
 - **`/health`**: Metrics HTTP process liveness (`200 OK` while the endpoint is serving). It does not report TransferEngine readiness or transport health.
+- **`/live`**: Versioned JSON process liveness. This remains `200` while the
+  metrics HTTP event loop can serve requests, even when the engine is not
+  ready.
+- **`/ready`**: Versioned JSON engine readiness. It returns `200` only when an
+  engine diagnostics provider is registered and all mandatory checks pass;
+  otherwise it returns `503` with stable reason identifiers.
+- **`/diagnostics`**: The same versioned, redacted engine snapshot as
+  `/ready`, always returned with `200` so it can be collected during an
+  incident.
+
+`/health` is kept for compatibility. New probes should use `/live` for process
+liveness and `/ready` for traffic readiness.
+
+The readiness reasons are a closed set:
+
+- `engine_diagnostics_unavailable`
+- `engine_unavailable`
+- `control_plane_unavailable`
+- `no_transport_available`
+- `progress_worker_unavailable`
+- `progress_worker_stalled`
+
+The progress-worker stall check requires both old in-flight work and a stale
+worker progress timestamp. A legitimately long transfer therefore does not
+make the engine unready while the worker continues to make progress.
+
+The diagnostics schema is currently version `1`. It contains build identity,
+loaded transport types, aggregate batch/queue/window counts, oldest in-flight
+age, and progress-worker state. It deliberately omits peer and request
+identifiers, segment names, network addresses, memory addresses, keys,
+credentials, and payload data. Transport names are bounded enum values rather
+than runtime-provided strings.
 
 ### Example Responses
 
@@ -226,6 +258,40 @@ tent_read_latency_us_bucket{transport="rdma",le="500"} 50
 **Summary Format (`/metrics/summary`)**:
 ```
 Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
+```
+
+**Readiness (`/ready`)**:
+
+```json
+{
+  "schema_version": 1,
+  "ready": true,
+  "provider_available": true,
+  "readiness_reasons": [],
+  "engine": {
+    "available": true,
+    "control_plane_available": true,
+    "loaded_transport_count": 2,
+    "loaded_transports": ["rdma", "tcp"]
+  },
+  "progress_worker": {
+    "enabled": true,
+    "running": true,
+    "last_progress_age_seconds": 0,
+    "stall_threshold_seconds": 5
+  },
+  "runtime_queue": {
+    "enabled": false,
+    "outstanding_owners": 0,
+    "outstanding_bytes": 0,
+    "dispatch_inflight_owners": 0,
+    "dispatch_inflight_bytes": 0
+  },
+  "work": {
+    "alive_batches": 0,
+    "oldest_inflight_age_us": 0
+  }
+}
 ```
 
 ## Available Metrics
