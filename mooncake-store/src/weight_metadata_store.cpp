@@ -142,6 +142,11 @@ WeightMetadataStore::PrepareBeginImport(const BeginWeightImportRequest& request,
         !ValidateWeightAffinitySummary(request.affinity_summary).ok()) {
         return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
     }
+    if (request.policy.value_or(WeightStoragePolicy{}).preferred_residency ==
+            WeightResidencyState::MIXED &&
+        request.affinity_summary.affinity_count < 2) {
+        return tl::make_unexpected(WeightManagementError::POLICY_UNSATISFIABLE);
+    }
 
     std::lock_guard lock(mutex_);
     const auto group = group_index_.find(request.payload_group_id);
@@ -345,6 +350,15 @@ WeightMetadataStore::Result<WeightRevisionMetadata>
 WeightMetadataStore::Publish(const WeightMetadataMutation& mutation) {
     std::lock_guard lock(mutex_);
     const auto current = revisions_.find(mutation.identity);
+    if (current != revisions_.end() && mutation.next.has_value() &&
+        current->second.availability != WeightAvailabilityState::DELETING &&
+        mutation.next->availability == WeightAvailabilityState::DELETING) {
+        std::optional<uint64_t> nearest;
+        if (CountActiveLeasesLocked(
+                current->second, mutation.next->updated_at_ms, &nearest) != 0) {
+            return tl::make_unexpected(WeightManagementError::BUSY);
+        }
+    }
     if (mutation.previous.has_value()) {
         if (current == revisions_.end() ||
             current->second != *mutation.previous) {
@@ -371,15 +385,6 @@ WeightMetadataStore::Publish(const WeightMetadataMutation& mutation) {
     const auto& next = *mutation.next;
     if (!ValidateWeightRevisionMetadata(next).ok()) {
         return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
-    }
-    if (current != revisions_.end() &&
-        current->second.availability != WeightAvailabilityState::DELETING &&
-        next.availability == WeightAvailabilityState::DELETING) {
-        std::optional<uint64_t> nearest;
-        if (CountActiveLeasesLocked(current->second, next.updated_at_ms,
-                                    &nearest) != 0) {
-            return tl::make_unexpected(WeightManagementError::BUSY);
-        }
     }
     const auto group = group_index_.find(next.manifest.payload_group_id);
     if (group != group_index_.end() && group->second != next.identity) {

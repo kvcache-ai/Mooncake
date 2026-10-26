@@ -942,11 +942,16 @@ TEST_F(WeightReconciliationTest, ExpiresLeasesAndAbortsAbandonedImports) {
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
-        .policy = std::nullopt,
-        .affinity_summary = WeightAffinitySummary{
-            .affinity_count = 1,
-            .affinity_digest = std::string(64, 'c'),
-        },
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'c'),
+            },
     });
     ASSERT_TRUE(importing.has_value());
     const uint64_t now_ms = std::max(
@@ -980,22 +985,32 @@ TEST_F(WeightReconciliationTest, WorkLimitBoundsAbandonedImportTransitions) {
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
-        .policy = std::nullopt,
-        .affinity_summary = WeightAffinitySummary{
-            .affinity_count = 1,
-            .affinity_digest = std::string(64, 'c'),
-        },
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'c'),
+            },
     });
     auto second = service.BeginWeightImport(BeginWeightImportRequest{
         .identity = Identity("step-b"),
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
-        .policy = std::nullopt,
-        .affinity_summary = WeightAffinitySummary{
-            .affinity_count = 1,
-            .affinity_digest = std::string(64, 'c'),
-        },
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'c'),
+            },
     });
     ASSERT_TRUE(first.has_value());
     ASSERT_TRUE(second.has_value());

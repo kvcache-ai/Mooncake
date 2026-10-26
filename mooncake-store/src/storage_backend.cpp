@@ -2371,6 +2371,23 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     }
     auto& ungrouped_offloading_objects = ungrouped_offloading_objects_;
     auto carryover_objects = std::move(ungrouped_offloading_objects);
+    const bool replaying_complete_carryover =
+        !carryover_objects.empty() &&
+        offloading_objects.size() == carryover_objects.size() &&
+        std::all_of(offloading_objects.begin(), offloading_objects.end(),
+                    [&carryover_objects](const auto& item) {
+                        return carryover_objects.contains(item.first);
+                    });
+    if (replaying_complete_carryover) {
+        std::vector<std::string> replayed_keys;
+        replayed_keys.reserve(carryover_objects.size());
+        for (const auto& [key, size] : carryover_objects) {
+            static_cast<void>(size);
+            replayed_keys.push_back(key);
+        }
+        buckets_keys.push_back(std::move(replayed_keys));
+        return {};
+    }
     bool carryover_loaded = false;
     auto it = offloading_objects.cbegin();
     int64_t residue_count = static_cast<int64_t>(offloading_objects.size() +

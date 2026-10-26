@@ -586,17 +586,6 @@ inline WeightValidationResult ValidateWeightRevisionMetadata(
         return WeightValidationResult::Failure(
             "observed residency and hot ratio disagree");
     }
-    if (metadata.operation_id.has_value() &&
-        metadata.availability != WeightAvailabilityState::READY &&
-        metadata.availability != WeightAvailabilityState::DEGRADED) {
-        return WeightValidationResult::Failure(
-            "active operation requires a published revision");
-    }
-    if (metadata.availability == WeightAvailabilityState::IMPORTING &&
-        metadata.residency != WeightResidencyState::UNKNOWN) {
-        return WeightValidationResult::Failure(
-            "importing revision must have unknown residency");
-    }
     if (metadata.availability == WeightAvailabilityState::READY ||
         metadata.availability == WeightAvailabilityState::DEGRADED) {
         auto manifest_result =
