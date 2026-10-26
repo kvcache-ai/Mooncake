@@ -3667,7 +3667,8 @@ class RdmaWorkersDeadlineTest : public RdmaWorkersSharedQpTest {
         ASSERT_TRUE(rail.load(topo, topo, "", &conf).ok());
         ASSERT_TRUE(rail.admit(kDev, 0));
         rail.markFailed(kDev, 0);
-        ASSERT_TRUE(rail.admit(kDev, 0));
+        ASSERT_TRUE(rail.admit(kDev, 0, slice->rail_admission));
+        ASSERT_NE(slice->rail_admission, 0u);
         slice->rail_monitor = &rail;
     }
 
@@ -3718,6 +3719,81 @@ TEST_F(RdmaWorkersDeadlineTest, ExpiredAdmittedRequestDoesNotBootstrap) {
     RdmaTransportTestPeer::postPending(*workers_);
     EXPECT_EQ(calls_.load(), 0);
     expectUnposted(slice, TIMEOUT);
+}
+
+TEST_F(RdmaWorkersDeadlineTest, ExpiredProbeReleasesAdmission) {
+    auto* slice = admitForBootstrap();
+    RailMonitor rail;
+    armProbe(rail, slice);
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 0);
+    serveBootstrap();
+    RdmaTransportTestPeer::postPending(*workers_);
+    EXPECT_EQ(calls_.load(), 0);
+    expectUnposted(slice, TIMEOUT);
+    uint64_t replacement = 0;
+    EXPECT_TRUE(rail.admit(kDev, 0, replacement));
+    EXPECT_NE(replacement, slice->rail_admission);
+    rail.cancelProbe(kDev, 0, replacement);
+}
+
+TEST_F(RdmaWorkersDeadlineTest, ExpiredOrdinaryRequestPreservesNewerProbe) {
+    serveBootstrap();
+    ASSERT_NE(connect(), nullptr);
+    auto* slice = admitForBootstrap();
+    RailMonitor rail;
+    auto topo = topologyWithRdmaNics(2);
+    Config conf;
+    conf.set(RailMonitor::kCfgErrorThreshold, 1);
+    conf.set(RailMonitor::kCfgProbeIntervalSecs, 0);
+    ASSERT_TRUE(rail.load(topo, topo, "", &conf).ok());
+    ASSERT_TRUE(rail.admit(kDev, 0, slice->rail_admission));
+    ASSERT_EQ(slice->rail_admission, 0u);  // Healthy rail, no probe to own.
+    slice->rail_monitor = &rail;
+
+    params_->endpoint.max_qp_wr = 0;
+    RdmaTransportTestPeer::postPending(*workers_);
+    ASSERT_EQ(slice->word, PENDING);
+    ASSERT_TRUE(post_order.empty());
+
+    // Another transfer fails while this request waits for QP space. A new
+    // request then owns the rail's only recovery probe.
+    rail.markFailed(kDev, 0);
+    ASSERT_TRUE(rail.admit(kDev, 0));
+    ASSERT_FALSE(rail.admit(kDev, 0));
+
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 0);
+    RdmaTransportTestPeer::postPending(*workers_);
+    EXPECT_EQ(calls_.load(), 1);
+    expectUnposted(slice, TIMEOUT);
+    // Expiring the older request must not admit a second recovery probe.
+    EXPECT_FALSE(rail.admit(kDev, 0));
+    rail.cancelProbe(kDev, 0);
+}
+
+TEST_F(RdmaWorkersDeadlineTest, ExpiredStaleProbePreservesReplacement) {
+    serveBootstrap();
+    ASSERT_NE(connect(), nullptr);
+    auto* slice = admitForBootstrap();
+    RailMonitor rail;
+    armProbe(rail, slice);
+
+    params_->endpoint.max_qp_wr = 0;
+    RdmaTransportTestPeer::postPending(*workers_);
+    ASSERT_EQ(slice->word, PENDING);
+    ASSERT_TRUE(post_order.empty());
+
+    rail.cancelProbe(kDev, 0, slice->rail_admission);
+    uint64_t replacement = 0;
+    ASSERT_TRUE(rail.admit(kDev, 0, replacement));
+    ASSERT_NE(replacement, slice->rail_admission);
+    ASSERT_FALSE(rail.admit(kDev, 0));
+
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 0);
+    RdmaTransportTestPeer::postPending(*workers_);
+    EXPECT_EQ(calls_.load(), 1);
+    expectUnposted(slice, TIMEOUT);
+    EXPECT_FALSE(rail.admit(kDev, 0));
+    rail.cancelProbe(kDev, 0, replacement);
 }
 
 TEST_F(RdmaWorkersDeadlineTest, QpCapacityWaitKeepsOriginalDeadline) {
@@ -3969,6 +4045,43 @@ TEST_F(RdmaWorkersSharedQpTest, SliceResolvedWhileQueuedIsDroppedNotPosted) {
     EXPECT_TRUE(
         RdmaTransportTestPeer::dropUnpostableSlice(*workers_, lane0, slice));
     EXPECT_EQ(lane0.inflight_slices.load(), 0);
+}
+
+TEST_F(RdmaWorkersSharedQpTest, ExpiredTerminalSliceDoesNotReadRetiredTask) {
+    auto task = std::make_unique<RdmaTask>();
+    task->num_slices = 1;
+    task->status_word = PENDING;
+    task->ref();  // batch
+    task->ref();  // slice
+
+    RdmaSlice slice;
+    slice.task = task.get();
+    slice.word = PENDING;
+    slice.length = kLen;
+    slice.enqueue_ts = 0;
+    updateSliceStatus(&slice, TIMEOUT);
+    EXPECT_EQ(task->ref_count.load(), 1);
+    // A freed batch destroys its task while the orphan list keeps the
+    // terminal slice alive. Heap storage lets AddressSanitizer detect a
+    // stale task read when this regression runs in a sanitizer build.
+    task.reset();
+
+    auto& lane0 = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    slice.owner_worker = 0;
+    slice.counted_lane = 0;
+    RdmaTransportTestPeer::rechargeSlice(*workers_, &slice, kDev);
+    lane0.inflight_slices.store(1);
+    RdmaSliceList queued{&slice, 1};
+    lane0.queues[PRIO_HIGH].push(queued);
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 0);
+    RdmaTransportTestPeer::postPending(*workers_);
+    slice.task = nullptr;
+
+    EXPECT_EQ(slice.word, TIMEOUT);
+    EXPECT_EQ(slice.charged_dev.load(), -1);
+    EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+    EXPECT_EQ(lane0.inflight_slices.load(), 0);
+    EXPECT_TRUE(post_order.empty());
 }
 
 // A qp_pools layout with fewer queue pairs than lanes has two lanes posting

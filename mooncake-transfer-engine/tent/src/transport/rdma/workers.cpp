@@ -504,14 +504,17 @@ bool Workers::dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice) {
 
 bool Workers::expireUnpostedSlice(WorkerContext& worker, RdmaSlice* slice,
                                   uint64_t now_ns, bool admitted) {
-    if (!slice || !slice->task || now_ns <= slice->enqueue_ts ||
+    // A terminal orphan can outlive its task while a CQE is still owed.
+    // Leave it to the existing terminal cleanup without reading the task.
+    if (!slice || slice->word != PENDING || !slice->task ||
+        now_ns <= slice->enqueue_ts ||
         now_ns - slice->enqueue_ts <= slice_timeout_ns_)
         return false;
     const bool canceled =
         slice->task->cancel_requested.load(std::memory_order_acquire);
     if (admitted && slice->rail_monitor)
-        slice->rail_monitor->cancelProbe(slice->source_dev_id,
-                                         slice->target_dev_id);
+        slice->rail_monitor->cancelProbe(
+            slice->source_dev_id, slice->target_dev_id, slice->rail_admission);
     retireSweptSlice(worker, slice, now_ns, nullptr);
     updateSliceStatus(slice, canceled ? CANCELED : TIMEOUT);
     return true;
@@ -1721,8 +1724,8 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
                                        slice->target_dev_id, src_gpu, dst_gpu);
     }
 
-    if (gdr_excluded ||
-        !rail.admit(slice->source_dev_id, slice->target_dev_id)) {
+    if (gdr_excluded || !rail.admit(slice->source_dev_id, slice->target_dev_id,
+                                    slice->rail_admission)) {
         VLOG(1) << "Optimal device pair not available: source_dev_id "
                 << slice->source_dev_id << ", target_dev_id "
                 << slice->target_dev_id;
@@ -1837,8 +1840,9 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
         if (!same_machine && gdr_learned &&
             gdrPairExcluded(source, target, sdev, tdev, src_gpu, dst_gpu))
             continue;
-        bool reachable = same_machine ? (sdev == tdev)  // loopback is safe
-                                      : rail_mon->admit(sdev, tdev);
+        bool reachable =
+            same_machine ? (sdev == tdev)  // loopback is safe
+                         : rail_mon->admit(sdev, tdev, slice->rail_admission);
 
         if (reachable) {
             // A retry gets here after the failure path returned the slice's
@@ -1859,6 +1863,7 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
 }
 
 Status Workers::generatePostPath(RdmaSlice* slice) {
+    slice->rail_admission = 0;
     RouteHint source, target;
     CHECK_STATUS(getRouteHint(source, LOCAL_SEGMENT_ID,
                               (uint64_t)slice->source_addr, slice->length));

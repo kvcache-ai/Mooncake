@@ -91,11 +91,17 @@ class RailMonitor {
     // two workers arm a probe on the same rail.
     bool admit(int local_nic, int remote_nic);
 
+    // Ordinary traffic receives zero; a probe receives an ownership token.
+    bool admit(int local_nic, int remote_nic, uint64_t &admission);
+
     void markFailed(int local_nic, int remote_nic);
 
     void markRecovered(int local_nic, int remote_nic);
 
     void cancelProbe(int local_nic, int remote_nic);
+
+    // Cancel only the probe owned by this admission, if it is still current.
+    void cancelProbe(int local_nic, int remote_nic, uint64_t admission);
 
     int findBestRemoteDevice(int local_nic, int remote_numa);
 
@@ -130,6 +136,7 @@ class RailMonitor {
         std::chrono::steady_clock::time_point last_probe_time{};
         bool half_open = false;
         bool probe_in_flight = false;
+        uint64_t generation = 0;
 
         bool paused() const {
             return resume_time != std::chrono::steady_clock::time_point{};
@@ -139,6 +146,9 @@ class RailMonitor {
     std::unordered_map<std::pair<int, int>, RailState, PairHash> rail_states_;
     std::unordered_map<int, int> direct_rails_;  // keep static after loaded
     std::unordered_map<int, int> best_mapping_[kMaxNuma];
+
+    // Keep tokens distinct even when a topology reload rebuilds rail_states_.
+    uint64_t next_generation_ = 0;
 
     int error_threshold_ = 3;
     std::chrono::seconds error_window_{10};

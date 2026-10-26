@@ -462,6 +462,31 @@ TEST(RailMonitorLoadTest, DifferentLayoutRebuildsMapping) {
         << "A real topology change must rebuild rails from a clean state";
 }
 
+TEST(RailMonitorLoadTest, DifferentLayoutDoesNotReuseProbeAdmission) {
+    auto local = makeSingleNicTopology("mlx5_0");
+    auto remote_old = makeSingleNicTopology("mlx5_1");
+    auto remote_new = makeSingleNicTopology("mlx5_2");
+    Config cfg;
+    cfg.set(RailMonitor::kCfgErrorThreshold, 1);
+    cfg.set(RailMonitor::kCfgProbeIntervalSecs, 0);
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote_old, "", &cfg).ok());
+    rail.markFailed(0, 0);
+    uint64_t old_admission = 0;
+    ASSERT_TRUE(rail.admit(0, 0, old_admission));
+    ASSERT_NE(old_admission, 0u);
+
+    ASSERT_TRUE(rail.load(local, remote_new, "", &cfg).ok());
+    rail.markFailed(0, 0);
+    uint64_t new_admission = 0;
+    ASSERT_TRUE(rail.admit(0, 0, new_admission));
+    ASSERT_NE(new_admission, old_admission);
+    rail.cancelProbe(0, 0, old_admission);
+    EXPECT_FALSE(rail.admit(0, 0));
+    rail.cancelProbe(0, 0, new_admission);
+    EXPECT_TRUE(rail.admit(0, 0));
+}
+
 TEST(RailMonitorRecoverTest, CooldownDoesNotCarryOverAfterRecovery) {
     auto local = makeSingleNicTopology("mlx5_0");
     auto remote = makeSingleNicTopology("mlx5_1");
@@ -693,6 +718,30 @@ TEST(RailMonitorProbeTest, InFlightProbeBlocksSecondAdmit) {
     EXPECT_TRUE(rail.admit(0, 0))
         << "After completion clears the flag, a new probe must arm";
     EXPECT_FALSE(rail.admit(0, 0)) << "Again blocked while in flight";
+}
+
+TEST(RailMonitorProbeTest, OrdinaryAndRejectedAdmissionsClearToken) {
+    auto local = makeSingleNicTopology("mlx5_0");
+    auto remote = makeSingleNicTopology("mlx5_1");
+    Config cfg;
+    cfg.set(RailMonitor::kCfgErrorThreshold, 1);
+    cfg.set(RailMonitor::kCfgProbeIntervalSecs, 0);
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote, "", &cfg).ok());
+
+    uint64_t admission = 42;
+    ASSERT_TRUE(rail.admit(0, 0, admission));
+    EXPECT_EQ(admission, 0u);
+    rail.markFailed(0, 0);
+    ASSERT_TRUE(rail.admit(0, 0, admission));
+    ASSERT_NE(admission, 0u);
+    const auto probe = admission;
+    rail.cancelProbe(0, 0, 0);
+    ASSERT_FALSE(rail.admit(0, 0, admission));
+    EXPECT_EQ(admission, 0u);
+    rail.cancelProbe(0, 0, probe);
+    EXPECT_TRUE(rail.admit(0, 0, admission));
+    EXPECT_NE(admission, probe);
 }
 
 // ---------------------------------------------------------------------------
