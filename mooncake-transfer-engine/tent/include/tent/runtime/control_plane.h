@@ -53,10 +53,31 @@ struct BootstrapDesc {
     std::string reply_msg;       // on error
     uint32_t notify_qp_num = 0;  // Notification QP number (0 = not supported)
 
-   public:
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(BootstrapDesc, local_nic_path, peer_nic_path,
-                                   qp_num, local_lid, local_gid, reply_msg,
-                                   notify_qp_num);
+    // Identifies this endpoint incarnation even if the provider reuses QPNs.
+    // Zero denotes a peer using the legacy QPN-only handshake.
+    uint64_t endpoint_generation = 0;
+
+    friend void to_json(nlohmann::json& j, const BootstrapDesc& desc) {
+        j = nlohmann::json{{"local_nic_path", desc.local_nic_path},
+                           {"peer_nic_path", desc.peer_nic_path},
+                           {"qp_num", desc.qp_num},
+                           {"local_lid", desc.local_lid},
+                           {"local_gid", desc.local_gid},
+                           {"reply_msg", desc.reply_msg},
+                           {"notify_qp_num", desc.notify_qp_num},
+                           {"endpoint_generation", desc.endpoint_generation}};
+    }
+
+    friend void from_json(const nlohmann::json& j, BootstrapDesc& desc) {
+        j.at("local_nic_path").get_to(desc.local_nic_path);
+        j.at("peer_nic_path").get_to(desc.peer_nic_path);
+        j.at("qp_num").get_to(desc.qp_num);
+        j.at("local_lid").get_to(desc.local_lid);
+        j.at("local_gid").get_to(desc.local_gid);
+        j.at("reply_msg").get_to(desc.reply_msg);
+        j.at("notify_qp_num").get_to(desc.notify_qp_num);
+        desc.endpoint_generation = j.value("endpoint_generation", uint64_t{0});
+    }
 };
 
 // UB/URMA has Jetty, JFC and EID concepts that are not wire-compatible with

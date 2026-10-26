@@ -205,10 +205,12 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // queue pair another lane can poll a completion before this call
     // returns, so whatever the poller must find in place (the posted
     // device, the set entry) has to be written first. Slices the hardware
-    // rejects come back with `failed` set; the caller undoes what it did for
-    // them.
+    // rejects come back with `failed` set and are appended to `rejected`.
+    // Only those pointers remain safe for the caller to inspect: successful
+    // slices may already have completed and been freed by another CQ poller.
     int submitSlices(std::vector<RdmaSlice*>& slice_list, int qp_index,
-                     const std::function<void(RdmaSlice*)>& on_post = {});
+                     const std::function<void(RdmaSlice*)>& on_post = {},
+                     std::vector<RdmaSlice*>* rejected = nullptr);
 
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
 
@@ -295,6 +297,8 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     std::string peer_server_name_;
     std::string peer_nic_name_;
     std::vector<uint32_t> peer_qp_num_list_;
+    const uint64_t generation_;
+    uint64_t peer_generation_ = 0;
     // Notification QP (one per endpoint for control plane operations)
     ibv_qp* notify_qp_ = nullptr;
 

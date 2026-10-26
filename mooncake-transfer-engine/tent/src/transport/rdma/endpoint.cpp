@@ -77,6 +77,14 @@ static bool isStaleEndpointBootstrapError(const Status& status) {
                std::string_view::npos;
 }
 
+// Monotonic within a process; the time seed also separates peer restarts
+// that reuse the same listening address and provider QP numbers.
+static uint64_t nextEndpointGeneration() {
+    static std::atomic<uint64_t> next{
+        static_cast<uint64_t>(getCurrentTimeInNano())};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
 RdmaEndPoint::RdmaEndPoint()
     : status_(EP_UNINIT),
       context_(nullptr),
@@ -84,7 +92,8 @@ RdmaEndPoint::RdmaEndPoint()
       queue_lock_list_(nullptr),
       wr_depth_list_(nullptr),
       inflight_slices_(0),
-      destroy_start_time_(0) {}
+      destroy_start_time_(0),
+      generation_(nextEndpointGeneration()) {}
 
 RdmaEndPoint::~RdmaEndPoint() { deconstruct(); }
 
@@ -448,6 +457,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         local_desc.peer_nic_path = MakeNicPath(peer_server_name, peer_nic_name);
         qp_num = qpNum();
         local_desc.qp_num = qp_num;
+        local_desc.endpoint_generation = generation_;
         local_desc.notify_qp_num = notifyQpNum();
         local_desc.local_lid = local_address.lid;
         local_desc.local_gid = local_address.gid;
@@ -574,6 +584,8 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
                 "Failed to configure RDMA endpoint" LOC_MARK);
         }
         peer_qp_num_list_ = qp_num;
+        peer_generation_ =
+            same_nic ? generation_ : peer_desc.endpoint_generation;
 
         // Setup notification QP connection if peer supports it
         if (peer_desc.notify_qp_num != 0 && notify_qp_) {
@@ -605,18 +617,19 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     RWSpinlock::WriteGuard guard(lock_);
     if (status_.load(std::memory_order_relaxed) == EP_READY) {
         // Idempotency check: if the incoming bootstrap is from the same peer
-        // and carries the same peer QP list as the established connection,
-        // this is a duplicate request (e.g. from a concurrent connect() on
-        // the initiator that released its lock during Phase 2). Re-using the
-        // existing connection is safe and avoids resetting QPs that may
-        // already have in-flight RDMA operations.
+        // and carries the same generation and QP list as the established
+        // connection, this is a duplicate request (e.g. from a concurrent
+        // connect() on the initiator that released its lock during Phase 2).
+        // Re-using the existing connection is safe and avoids resetting QPs
+        // that may already have in-flight RDMA operations.
         auto incoming_peer_server =
             getServerNameFromNicPath(peer_desc.local_nic_path);
         auto incoming_peer_nic =
             getNicNameFromNicPath(peer_desc.local_nic_path);
         if (incoming_peer_server == peer_server_name_ &&
             incoming_peer_nic == peer_nic_name_ &&
-            peer_desc.qp_num == peer_qp_num_list_) {
+            peer_desc.qp_num == peer_qp_num_list_ &&
+            peer_desc.endpoint_generation == peer_generation_) {
             LOG(INFO) << "Endpoint already established with " << peer_nic_name_
                       << " of " << peer_server_name_
                       << " (duplicate bootstrap, reusing connection)";
@@ -625,6 +638,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
                 MakeNicPath(transport.rdma_server_name_, context_->name());
             local_desc.peer_nic_path = peer_desc.local_nic_path;
             local_desc.qp_num = qpNum();
+            local_desc.endpoint_generation = generation_;
             local_desc.local_lid = local_address_.lid;
             local_desc.local_gid = local_address_.gid;
             local_desc.notify_qp_num = notifyQpNum();
@@ -632,7 +646,8 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
         }
         // The bootstrap does not match the established connection: the peer
         // discarded its endpoint (eviction or failure) and came back with new
-        // QPs, so the local QPs now point at QPs that no longer exist.
+        // QPs. Their numbers may have been recycled, but their packet sequence
+        // state is new, so the established local QPs must not be reused.
         // Endpoints have unidirectional lifecycle and are never reset, so
         // retire this one. The caller drops retiring endpoints from the store,
         // and the peer's next bootstrap gets a newly created endpoint.
@@ -661,6 +676,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
         MakeNicPath(transport.rdma_server_name_, context_->name());
     local_desc.peer_nic_path = peer_nic_path;
     local_desc.qp_num = qpNum();
+    local_desc.endpoint_generation = generation_;
     local_desc.local_lid = local_address_.lid;
     local_desc.local_gid = local_address_.gid;
     local_desc.notify_qp_num = notifyQpNum();  // Pass notification QP number
@@ -678,6 +694,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
             "Failed to configure RDMA endpoint" LOC_MARK);
     }
     peer_qp_num_list_ = peer_desc.qp_num;
+    peer_generation_ = peer_desc.endpoint_generation;
 
     // Setup notification QP connection if peer supports it
     if (peer_desc.notify_qp_num != 0 && notify_qp_) {
@@ -773,7 +790,8 @@ static ibv_wr_opcode getOpCode(RdmaSlice* slice) {
 
 int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
                                int qp_index,
-                               const std::function<void(RdmaSlice*)>& on_post) {
+                               const std::function<void(RdmaSlice*)>& on_post,
+                               std::vector<RdmaSlice*>* rejected) {
     const static int kSgeEntries = 1;
     RWSpinlock::ReadGuard guard(lock_);
     if (qp_list_.empty()) return 0;
@@ -844,7 +862,9 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
         rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
         if (rc) {
             while (bad_wr) {
-                slice_list[bad_wr - wr_list.data()]->failed = true;
+                auto* slice = slice_list[bad_wr - wr_list.data()];
+                slice->failed = true;
+                if (rejected) rejected->push_back(slice);
                 cancelQuota(qp_index, 1);
                 bad_wr = bad_wr->next;
             }

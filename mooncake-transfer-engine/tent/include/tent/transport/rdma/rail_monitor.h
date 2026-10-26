@@ -15,16 +15,17 @@
 #ifndef TENT_RAIL_MONITOR_H
 #define TENT_RAIL_MONITOR_H
 
+#include <mutex>
+
 #include "tent/common/config.h"
 #include "tent/common/status.h"
 #include "tent/runtime/topology.h"
 
 namespace mooncake {
 namespace tent {
-// Not thread-safe. Each RDMA worker owns its own RailMonitor via
-// WorkerContext::rails, so markFailed / markRecovered / available / load
-// all execute on a single worker thread. Do not share across threads
-// without adding external synchronization.
+// Each worker owns a monitor, but a shared CQ can deliver its completions
+// on another worker. Protect admission, completion updates and the derived
+// mappings together; topology snapshot refresh remains owner-driven.
 class RailMonitor {
     const static size_t kMaxNuma = 16;
 
@@ -67,7 +68,10 @@ class RailMonitor {
                 const std::string &rail_topo_json = "",
                 const Config *conf = nullptr);
 
-    bool ready() { return ready_; }
+    bool ready() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return ready_;
+    }
 
     bool isAvailable(int local_nic, int remote_nic) const;
 
@@ -84,18 +88,28 @@ class RailMonitor {
     // cannot race the first while it is on the wire. Callers that select a rail
     // but fail to post must call cancelProbe() to clear the flag.
     //
-    // The check-then-set on probe_in_flight is not atomic, but each RailMonitor
-    // is owned by exactly one worker thread (WorkerContext::rails[machine_id]
-    // is per-worker, never shared -- see the class comment), so admit() and
-    // the completion-path mutators all run single-threaded on that worker; no
-    // two workers arm a probe on the same rail.
-    bool admit(int local_nic, int remote_nic);
+    // Admission and cross-worker completion updates share mutex_. The returned
+    // generation must accompany completion/cancellation: an older request
+    // cannot resolve a newer recovery probe or a rebuilt topology. Failed
+    // admission returns zero and conveys no ownership.
+    // A denied admission reports probe_pending for an outstanding probe or
+    // work queued before the last probe/pause. This keeps late-scheduled work
+    // in the same recovery attempt. probe_delayed reports the interval alone;
+    // callers decide whether a retried request should wait for it. All are
+    // sampled under the same state lock; an unset queued_at opts out.
+    bool admit(int local_nic, int remote_nic, uint64_t &admission,
+               bool *probe_pending = nullptr, bool *probe_delayed = nullptr,
+               std::chrono::steady_clock::time_point queued_at = {});
 
-    void markFailed(int local_nic, int remote_nic);
+    // A rejected admission can wait for an already admitted recovery probe.
+    // This query neither admits another probe nor cancels the existing one.
+    bool probeInFlight(int local_nic, int remote_nic) const;
 
-    void markRecovered(int local_nic, int remote_nic);
+    void markFailed(int local_nic, int remote_nic, uint64_t admission);
 
-    void cancelProbe(int local_nic, int remote_nic);
+    void markRecovered(int local_nic, int remote_nic, uint64_t admission);
+
+    void cancelProbe(int local_nic, int remote_nic, uint64_t admission);
 
     int findBestRemoteDevice(int local_nic, int remote_numa);
 
@@ -104,6 +118,8 @@ class RailMonitor {
     const Topology *remote() const { return remote_.get(); }
 
    private:
+    bool isAvailableUnlocked(int local_nic, int remote_nic) const;
+
     Status loadFromJson(const std::string &rail_topo_json);
 
     Status loadDefault();
@@ -111,6 +127,7 @@ class RailMonitor {
     void updateBestMapping();
 
    private:
+    mutable std::mutex mutex_;
     bool ready_{false};
     std::shared_ptr<const Topology> local_;
     std::shared_ptr<const Topology> remote_;
@@ -123,6 +140,7 @@ class RailMonitor {
     };
 
     struct RailState {
+        uint64_t generation = 0;
         int error_count = 0;
         std::chrono::seconds cooldown{0};
         std::chrono::steady_clock::time_point last_error{};
@@ -140,6 +158,8 @@ class RailMonitor {
     std::unordered_map<int, int> direct_rails_;  // keep static after loaded
     std::unordered_map<int, int> best_mapping_[kMaxNuma];
 
+    // Never reset on topology reload; NIC IDs may be reused.
+    uint64_t next_generation_ = 0;
     int error_threshold_ = 3;
     std::chrono::seconds error_window_{10};
     std::chrono::seconds cooldown_{30};
