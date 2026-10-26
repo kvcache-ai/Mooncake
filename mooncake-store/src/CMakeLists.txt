@@ -525,7 +525,7 @@ string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
 if(USE_CUDA)
   find_package(CUDAToolkit REQUIRED)
   enable_language(CUDA)
-  add_library(mooncake_gpu_read_scatter STATIC gpu_read_staging_kernel.cu)
+  add_library(mooncake_gpu_read_scatter OBJECT gpu_read_staging_kernel.cu)
   set_target_properties(
     mooncake_gpu_read_scatter PROPERTIES POSITION_INDEPENDENT_CODE ON
                                          CUDA_STANDARD 17)
@@ -741,8 +741,10 @@ if(TARGET Mooncake::liburing)
   target_link_libraries(mooncake_store PUBLIC Mooncake::liburing)
 endif()
 if(USE_CUDA)
-  target_link_libraries(mooncake_store PRIVATE CUDA::cudart
-                                               mooncake_gpu_read_scatter)
+  # Cargo links the Store archive directly, without CMake's transitive deps.
+  target_sources(mooncake_store
+                 PRIVATE $<TARGET_OBJECTS:mooncake_gpu_read_scatter>)
+  target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
 elseif(USE_HIP)
   target_link_libraries(mooncake_store PRIVATE hip::host)
 endif()
