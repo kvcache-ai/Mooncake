@@ -2012,7 +2012,8 @@ TEST_F(MetricsRecordingTest, FailureLogCarriesStableCorrelationFields) {
 
     EXPECT_TRUE(std::regex_search(
         logs,
-        std::regex("event=tent\\.request\\.failed request_id=[1-9][0-9]* "
+        std::regex("event=tent\\.request\\.failed trace_id=[0-9a-f]{32} "
+                   "request_id=[1-9][0-9]* "
                    "batch_id=[1-9][0-9]* task_id=0 attempt_id=1 ")))
         << logs;
     EXPECT_NE(logs.find("transport=rdma operation=write phase=poll "),
@@ -2049,12 +2050,59 @@ TEST_F(MetricsRecordingTest, SlowLogUsesTheSameCorrelationContract) {
     const std::string logs = sink.messages();
     EXPECT_TRUE(std::regex_search(
         logs,
-        std::regex("event=tent\\.request\\.slow request_id=[1-9][0-9]* "
+        std::regex("event=tent\\.request\\.slow trace_id=[0-9a-f]{32} "
+                   "request_id=[1-9][0-9]* "
                    "batch_id=[1-9][0-9]* task_id=0 attempt_id=1 ")))
         << logs;
     EXPECT_NE(logs.find("status=completed duration_us="), std::string::npos)
         << logs;
     EXPECT_NE(logs.find("threshold_us=1"), std::string::npos) << logs;
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
+}
+
+TEST_F(MetricsRecordingTest, RetainedTraceLinksLogsAndOpenMetricsExemplar) {
+    auto cfg = makeMetricsTestConfig();
+    cfg->set("log_level", "info");
+    cfg->set("observability/tracing_enabled", true);
+    cfg->set("observability/trace_sample_rate_ppm", 1000000UL);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake);
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xD3);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kLen).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+
+    ObservabilityLogSink sink;
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch), TransferStatusEnum::COMPLETED);
+    const std::string logs = sink.messages();
+
+    std::smatch match;
+    const std::regex attempt_span(
+        "event=tent\\.trace\\.span trace_id=([0-9a-f]{32}).*"
+        "span_name=tent\\.transport_attempt");
+    ASSERT_TRUE(std::regex_search(logs, match, attempt_span)) << logs;
+    const std::string retained_trace_id = match[1].str();
+    EXPECT_NE(logs.find("span_name=tent.logical_transfer"), std::string::npos)
+        << logs;
+    EXPECT_NE(logs.find("retention=head_sampled"), std::string::npos) << logs;
+
+    const std::string prometheus =
+        TentMetrics::instance().getPrometheusMetrics();
+    const std::string openmetrics = TentMetrics::instance().getOpenMetrics();
+    EXPECT_EQ(prometheus.find("# {trace_id="), std::string::npos);
+    EXPECT_NE(openmetrics.find("# {trace_id=\"" + retained_trace_id +
+                               "\"}"),
+              std::string::npos)
+        << openmetrics;
+    EXPECT_TRUE(openmetrics.ends_with("# EOF\n"));
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
@@ -2192,6 +2240,28 @@ TEST_F(MetricsHttpTest, PrometheusEndpointExposesAllCounters) {
               std::string::npos);
     EXPECT_NE(resp.body.find("tent_write_latency_us_bucket"),
               std::string::npos);
+}
+
+TEST_F(MetricsHttpTest, OpenMetricsEndpointAddsExemplarWithoutChangingLegacy) {
+    auto& metrics = TentMetrics::instance();
+    metrics.recordTransportAttemptStarted(RDMA, Request::WRITE);
+    metrics.recordTransportAttemptFinished(RDMA, Request::WRITE, COMPLETED,
+                                           42.0);
+    metrics.recordTransportAttemptExemplar(RDMA, Request::WRITE,
+                                           0x1122334455667788ULL,
+                                           0x99aabbccddeeff00ULL, 42.0);
+
+    const auto prometheus = retryGet("/metrics");
+    const auto openmetrics = retryGet("/metrics/openmetrics");
+    ASSERT_EQ(prometheus.http_status, 200);
+    ASSERT_EQ(openmetrics.http_status, 200);
+    EXPECT_EQ(prometheus.body.find("# {trace_id="), std::string::npos);
+    EXPECT_EQ(prometheus.body.find("# EOF"), std::string::npos);
+    EXPECT_NE(openmetrics.body.find(
+                  "# {trace_id=\"112233445566778899aabbccddeeff00\"} 42"),
+              std::string::npos)
+        << openmetrics.body;
+    EXPECT_TRUE(openmetrics.body.ends_with("# EOF\n"));
 }
 
 TEST_F(MetricsHttpTest, PrometheusLabelsDistinguishTransports) {

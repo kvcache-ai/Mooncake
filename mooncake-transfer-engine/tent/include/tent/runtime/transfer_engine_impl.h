@@ -114,6 +114,7 @@ struct TaskInfo {
     uint64_t observability_request_id{0};
     uint64_t observability_task_id{0};
     uint64_t observability_attempt_id{0};
+    bool observability_trace_retained{false};
 
     TaskInfo() = default;
 
@@ -145,7 +146,8 @@ struct TaskInfo {
           observability_batch_id(other.observability_batch_id),
           observability_request_id(other.observability_request_id),
           observability_task_id(other.observability_task_id),
-          observability_attempt_id(other.observability_attempt_id) {}
+          observability_attempt_id(other.observability_attempt_id),
+          observability_trace_retained(other.observability_trace_retained) {}
 
     TaskInfo(TaskInfo&& other) noexcept
         : type(other.type),
@@ -175,7 +177,8 @@ struct TaskInfo {
           observability_batch_id(other.observability_batch_id),
           observability_request_id(other.observability_request_id),
           observability_task_id(other.observability_task_id),
-          observability_attempt_id(other.observability_attempt_id) {}
+          observability_attempt_id(other.observability_attempt_id),
+          observability_trace_retained(other.observability_trace_retained) {}
 
     TaskInfo& operator=(const TaskInfo& other) {
         if (this != &other) {
@@ -209,6 +212,7 @@ struct TaskInfo {
             observability_request_id = other.observability_request_id;
             observability_task_id = other.observability_task_id;
             observability_attempt_id = other.observability_attempt_id;
+            observability_trace_retained = other.observability_trace_retained;
         }
         return *this;
     }
@@ -245,6 +249,7 @@ struct TaskInfo {
             observability_request_id = other.observability_request_id;
             observability_task_id = other.observability_task_id;
             observability_attempt_id = other.observability_attempt_id;
+            observability_trace_retained = other.observability_trace_retained;
         }
         return *this;
     }
@@ -610,6 +615,13 @@ class TransferEngineImpl {
     void finishTransportAttempt(TaskInfo& task, TransferStatusEnum status,
                                 std::chrono::steady_clock::time_point end_time);
 
+    const char* traceRetentionReason(const TaskInfo& task,
+                                     TransferStatusEnum status,
+                                     int64_t duration_us) const;
+    void emitTraceSpan(const TaskInfo& task, bool transport_attempt,
+                       TransferStatusEnum status, int64_t duration_us,
+                       const char* retention_reason) const;
+
    private:
     struct AllocatedMemory {
         void* addr;
@@ -681,6 +693,9 @@ class TransferEngineImpl {
     bool notify_rpc_fallback_{true};
     bool enable_progress_worker_{false};
     uint64_t slow_request_threshold_us_{0};
+    bool tracing_enabled_{false};
+    uint64_t trace_sample_rate_ppm_{0};
+    uint64_t trace_slow_threshold_us_{0};
     RuntimeQueueConfig runtime_queue_config_;
     std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;
     std::unordered_map<QueueOwnerId, QueuedOwnerState> queued_owners_;

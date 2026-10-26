@@ -65,6 +65,12 @@ TENT metrics configuration is integrated into the main `transfer-engine.json` co
   "metadata_type": "p2p",
   "metadata_servers": "127.0.0.1:2379",
   "log_level": "warning",
+  "observability": {
+    "slow_request_threshold_us": 0,
+    "tracing_enabled": false,
+    "trace_sample_rate_ppm": 0,
+    "trace_slow_threshold_us": 0
+  },
   "metrics": {
     "enabled": true,
     "http_port": 9100,
@@ -81,6 +87,12 @@ TENT metrics configuration is integrated into the main `transfer-engine.json` co
 **Note**:
 - `report_interval_seconds`: Set to 0 to disable periodic logging
 - Histogram buckets are fixed at compile time (see `kLatencyBuckets` / `kSizeBuckets` in `tent_metrics.h`) for reproducible observability across deployments.
+- Retained trace spans are structured `INFO` logs. Set `log_level` to `info`
+  when `observability/tracing_enabled` is true.
+- `trace_sample_rate_ppm` is deterministic head sampling in parts per million
+  and is capped at `1000000`. Errors, timeouts, cancellations, and requests
+  slower than `trace_slow_threshold_us` are retained independently of head
+  sampling. A zero slow threshold disables slow-trace retention.
 
 ### Environment Variables
 
@@ -167,6 +179,10 @@ tent_metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 130.0);
 The HTTP server provides multiple endpoints:
 
 - **`/metrics`**: Prometheus format
+- **`/metrics/openmetrics`**: OpenMetrics 1.0 format. The latest retained trace
+  for each transport/operation attempt series may be attached to the `+Inf`
+  latency bucket as an exemplar. Use this endpoint when the collector supports
+  exemplars; `/metrics` remains Prometheus 0.0.4 compatible.
 - **`/metrics/summary`**: Human-readable summary
 - **`/metrics/json`**: JSON format
 - **`/health`**: Metrics HTTP process liveness (`200 OK` while the endpoint is serving). It does not report TransferEngine readiness or transport health.
@@ -202,6 +218,29 @@ age, and progress-worker state. It deliberately omits peer and request
 identifiers, segment names, network addresses, memory addresses, keys,
 credentials, and payload data. Transport names are bounded enum values rather
 than runtime-provided strings.
+
+### Correlated logs and retained traces
+
+Terminal failures, configured slow requests, transport-attempt failures,
+failover, and selection failures are emitted as stable `key=value` events.
+They carry process-local monotonic `request_id`, `batch_id`, `task_id`, and
+`attempt_id` fields plus a 128-bit `trace_id`. They never include payloads,
+memory addresses, target offsets, credentials, or peer-provided strings.
+
+When tracing is enabled, TENT emits completed logical-request and physical-
+attempt spans as `event=tent.trace.span`. Each record contains `trace_id`,
+`span_id`, `parent_span_id`, `span_name`, `status`, `duration_us`, and one of
+the bounded retention reasons `head_sampled`, `slow`, `error`, `timeout`, or
+`linked_child`. Failed and slow attempts are retained even when the head
+sample does not select the request, and retaining a child also retains its
+logical parent. This first trace slice is process-local and does not change
+the TENT wire protocol; cross-process context propagation can be added later
+through a compatible carrier.
+
+The same retained trace ID is published as an OpenMetrics exemplar on
+`tent_transport_attempt_latency_us`. Exemplars are deliberately absent from
+the legacy `/metrics` response, so existing Prometheus 0.0.4 scrapers keep the
+same wire contract.
 
 ### Example Responses
 

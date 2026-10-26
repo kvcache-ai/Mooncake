@@ -19,10 +19,12 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
@@ -63,11 +65,42 @@ constexpr int kMaxHpTcpMetadataRefreshRetries = 1;
 
 std::atomic<uint64_t> g_next_observability_batch_id{1};
 std::atomic<uint64_t> g_next_observability_request_id{1};
+const uint64_t g_trace_id_high = [] {
+    const uint64_t wall = static_cast<uint64_t>(
+        std::chrono::system_clock::now().time_since_epoch().count());
+    const uint64_t monotonic = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const uint64_t value = wall ^ (monotonic + 0x9e3779b97f4a7c15ULL);
+    return value == 0 ? 1ULL : value;
+}();
 
 uint64_t nextObservabilityId(std::atomic<uint64_t>& sequence) {
     uint64_t id = sequence.fetch_add(1, std::memory_order_relaxed);
     if (id != 0) return id;
     return sequence.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t mixTraceValue(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31U);
+}
+
+std::string traceId(uint64_t request_id) {
+    std::ostringstream out;
+    out << std::hex << std::setfill('0') << std::setw(16) << g_trace_id_high
+        << std::setw(16) << request_id;
+    return out.str();
+}
+
+std::string spanId(uint64_t request_id, uint64_t attempt_id) {
+    const uint64_t mixed =
+        mixTraceValue(request_id ^ (attempt_id * 0x9e3779b97f4a7c15ULL));
+    std::ostringstream out;
+    out << std::hex << std::setfill('0') << std::setw(16)
+        << (mixed == 0 ? 1ULL : mixed);
+    return out.str();
 }
 
 const char* transferStatusName(TransferStatusEnum status) {
@@ -524,6 +557,11 @@ Status TransferEngineImpl::construct() {
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
     slow_request_threshold_us_ =
         conf_->get("observability/slow_request_threshold_us", 0UL);
+    tracing_enabled_ = conf_->get("observability/tracing_enabled", false);
+    trace_sample_rate_ppm_ = std::min<uint64_t>(
+        1000000, conf_->get("observability/trace_sample_rate_ppm", 0UL));
+    trace_slow_threshold_us_ = conf_->get(
+        "observability/trace_slow_threshold_us", slow_request_threshold_us_);
     runtime_queue_config_.enabled = conf_->get("enable_runtime_queue", false);
     if (runtime_queue_config_.enabled) enable_progress_worker_ = true;
     runtime_queue_config_.limits.max_outstanding_owners =
@@ -2571,6 +2609,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
                 nextObservabilityId(g_next_observability_request_id);
             task.observability_task_id = task_id;
             task.observability_attempt_id = 0;
+            task.observability_trace_retained = false;
             auto owner_it = owner_task_id_by_merged_task.find(merged_task_id);
             if (owner_it != owner_task_id_by_merged_task.end()) {
                 task.physical_owner_task_id = owner_it->second;
@@ -2593,6 +2632,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
             nextObservabilityId(g_next_observability_request_id);
         task.observability_task_id = task_id;
         task.observability_attempt_id = 0;
+        task.observability_trace_retained = false;
         task.staging = false;
         task.start_time =
             prepared.submit_time;  // Record start time for latency tracking
@@ -2604,6 +2644,8 @@ Status TransferEngineImpl::commitPreparedSubmit(
         owner_task_id_by_merged_task[merged_task_id] = task_id;
         if (task.type == UNSPEC) {
             LOG(WARNING) << "event=tent.transport.selection_failed"
+                         << " trace_id="
+                         << traceId(task.observability_request_id)
                          << " request_id=" << task.observability_request_id
                          << " batch_id=" << task.observability_batch_id
                          << " task_id=" << task.observability_task_id
@@ -2824,6 +2866,7 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
             nextObservabilityId(g_next_observability_request_id);
         task.observability_task_id = task_plan.task_id;
         task.observability_attempt_id = 0;
+        task.observability_trace_retained = false;
         task.staging = false;
         task.start_time = prepared.submit_time;
         task.type = UNSPEC;
@@ -3360,6 +3403,7 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     }
 
     LOG(INFO) << "event=tent.transport.failover"
+              << " trace_id=" << traceId(task.observability_request_id)
               << " request_id=" << task.observability_request_id
               << " batch_id=" << task.observability_batch_id
               << " task_id=" << task.observability_task_id
@@ -4064,6 +4108,7 @@ void TransferEngineImpl::recordTaskCompletionObservability(
     if (new_status == FAILED || new_status == TIMEOUT ||
         new_status == CANCELED) {
         LOG(ERROR) << "event=tent.request.failed"
+                   << " trace_id=" << traceId(task.observability_request_id)
                    << " request_id=" << task.observability_request_id
                    << " batch_id=" << task.observability_batch_id
                    << " task_id=" << task.observability_task_id
@@ -4082,6 +4127,7 @@ void TransferEngineImpl::recordTaskCompletionObservability(
                static_cast<uint64_t>(duration_us) >=
                    slow_request_threshold_us_) {
         LOG(WARNING) << "event=tent.request.slow"
+                     << " trace_id=" << traceId(task.observability_request_id)
                      << " request_id=" << task.observability_request_id
                      << " batch_id=" << task.observability_batch_id
                      << " task_id=" << task.observability_task_id
@@ -4123,6 +4169,11 @@ void TransferEngineImpl::recordTaskCompletionObservability(
 
     // Also closes the structured attempt event when metrics are compiled out.
     finishTransportAttempt(task, new_status, end_time);
+
+    if (const char* retention =
+            traceRetentionReason(task, new_status, duration_us)) {
+        emitTraceSpan(task, false, new_status, duration_us, retention);
+    }
 
 #if TENT_METRICS_ENABLED
     {
@@ -4247,6 +4298,7 @@ void TransferEngineImpl::finishTransportAttempt(
     }
     if (status == FAILED || status == TIMEOUT || status == CANCELED) {
         LOG(WARNING) << "event=tent.transport.attempt_failed"
+                     << " trace_id=" << traceId(task.observability_request_id)
                      << " request_id=" << task.observability_request_id
                      << " batch_id=" << task.observability_batch_id
                      << " task_id=" << task.observability_task_id
@@ -4261,6 +4313,12 @@ void TransferEngineImpl::finishTransportAttempt(
                      << " config_generation="
                      << task.runtime_policy.config_generation;
     }
+    const char* trace_retention =
+        traceRetentionReason(task, status, latency_us);
+    if (trace_retention != nullptr) {
+        emitTraceSpan(task, true, status, latency_us, trace_retention);
+        task.observability_trace_retained = true;
+    }
 #if TENT_METRICS_ENABLED
     // Decrement before the early return below so the in-flight gauge stays
     // symmetric with recordInflightAttemptStarted() for every attempt that
@@ -4271,10 +4329,69 @@ void TransferEngineImpl::finishTransportAttempt(
         std::chrono::duration<double, std::micro>(end_time - post_time).count();
     TentMetrics::instance().recordTransportAttemptFinished(
         task.attempt_type, task.request.opcode, status, metric_latency_us);
+    if (trace_retention != nullptr) {
+        // Publish the exemplar only after the matching histogram observation,
+        // so a concurrent OpenMetrics scrape cannot see a trace link before
+        // the sample it explains.
+        TentMetrics::instance().recordTransportAttemptExemplar(
+            task.attempt_type, task.request.opcode, g_trace_id_high,
+            task.observability_request_id, metric_latency_us);
+    }
 #else
     (void)status;
     (void)end_time;
 #endif
+}
+
+const char* TransferEngineImpl::traceRetentionReason(
+    const TaskInfo& task, TransferStatusEnum status, int64_t duration_us) const {
+    if (!tracing_enabled_) return nullptr;
+    if (status == TIMEOUT) return "timeout";
+    if (status == FAILED || status == CANCELED) return "error";
+    if (task.observability_trace_retained) return "linked_child";
+    if (trace_slow_threshold_us_ > 0 && duration_us >= 0 &&
+        static_cast<uint64_t>(duration_us) >= trace_slow_threshold_us_)
+        return "slow";
+    if (trace_sample_rate_ppm_ > 0 &&
+        mixTraceValue(task.observability_request_id) % 1000000ULL <
+            trace_sample_rate_ppm_)
+        return "head_sampled";
+    return nullptr;
+}
+
+void TransferEngineImpl::emitTraceSpan(const TaskInfo& task,
+                                       bool transport_attempt,
+                                       TransferStatusEnum status,
+                                       int64_t duration_us,
+                                       const char* retention_reason) const {
+    const std::string root_span = spanId(task.observability_request_id, 0);
+    const std::string current_span =
+        transport_attempt
+            ? spanId(task.observability_request_id,
+                     task.observability_attempt_id)
+            : root_span;
+    LOG(INFO) << "event=tent.trace.span"
+              << " trace_id=" << traceId(task.observability_request_id)
+              << " span_id=" << current_span
+              << " parent_span_id="
+              << (transport_attempt ? root_span : "0000000000000000")
+              << " span_name="
+              << (transport_attempt ? "tent.transport_attempt"
+                                    : "tent.logical_transfer")
+              << " retention=" << retention_reason
+              << " request_id=" << task.observability_request_id
+              << " batch_id=" << task.observability_batch_id
+              << " task_id=" << task.observability_task_id
+              << " attempt_id=" << task.observability_attempt_id
+              << " transport="
+              << transportTypeName(transport_attempt ? task.attempt_type
+                                                      : task.type)
+              << " operation=" << operationName(task.request.opcode)
+              << " status=" << transferStatusName(status)
+              << " duration_us=" << duration_us
+              << " failover_count=" << task.failover_count
+              << " config_generation="
+              << task.runtime_policy.config_generation;
 }
 
 }  // namespace tent

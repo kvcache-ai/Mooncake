@@ -766,6 +766,19 @@ void TentMetrics::registerHttpHandlers() {
             resp.set_status_and_content(status_type::ok, std::move(metrics));
         });
 
+    // OpenMetrics is opt-in so the existing Prometheus 0.0.4 response remains
+    // byte-compatible. Retained transport-attempt traces may appear here as
+    // exemplars on the matching histogram's +Inf bucket.
+    http_server_->set_http_handler<GET>(
+        "/metrics/openmetrics",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            std::string metrics = getOpenMetrics();
+            resp.add_header(
+                "Content-Type",
+                "application/openmetrics-text; version=1.0.0; charset=utf-8");
+            resp.set_status_and_content(status_type::ok, std::move(metrics));
+        });
+
     // Register /metrics/summary endpoint for human-readable summary
     http_server_->set_http_handler<GET>(
         "/metrics/summary",
@@ -1487,7 +1500,41 @@ void TentMetrics::recordTransportAttemptFinished(TransportType tp,
     }
 }
 
+void TentMetrics::recordTransportAttemptExemplar(
+    TransportType tp, Request::OpCode operation, uint64_t trace_id_high,
+    uint64_t trace_id_low, double latency_us) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed) ||
+        trace_id_low == 0 || latency_us < 0.0 || tp < 0 ||
+        tp >= kNumTransportTypes)
+        return;
+    auto& exemplar = attempt_exemplars_[attemptSlot(tp, operation)];
+    uint64_t sequence = exemplar.sequence.load(std::memory_order_acquire);
+    while (true) {
+        if (sequence & 1U) {
+            sequence = exemplar.sequence.load(std::memory_order_acquire);
+            continue;
+        }
+        if (exemplar.sequence.compare_exchange_weak(
+                sequence, sequence + 1, std::memory_order_acq_rel,
+                std::memory_order_acquire))
+            break;
+    }
+    exemplar.trace_id_high.store(trace_id_high, std::memory_order_relaxed);
+    exemplar.trace_id_low.store(trace_id_low, std::memory_order_relaxed);
+    exemplar.value_us.store(static_cast<int64_t>(latency_us),
+                            std::memory_order_relaxed);
+    exemplar.sequence.store(sequence + 2, std::memory_order_release);
+}
+
 std::string TentMetrics::getPrometheusMetrics() {
+    return serializePrometheusMetrics(false);
+}
+
+std::string TentMetrics::getOpenMetrics() {
+    return serializePrometheusMetrics(true);
+}
+
+std::string TentMetrics::serializePrometheusMetrics(bool open_metrics) {
     if (!initialized_) return "";
 
     serialization_attempts_[kPrometheusFormat].fetch_add(
@@ -1519,7 +1566,8 @@ std::string TentMetrics::getPrometheusMetrics() {
         }
         // N=2 attempt histograms go through the same helper, instantiated for
         // N=2.
-        serializeHistogramPrometheus(transport_attempt_latency_, result);
+        serializeHistogramPrometheus(transport_attempt_latency_, result,
+                                     open_metrics);
         serializeHistogramPrometheus(rpc_attempt_latency_, result);
         serializeHistogramPrometheus(rdma_completion_latency_, result);
         serializeHistogramPrometheus(stream_attempt_latency_, result);
@@ -1533,6 +1581,7 @@ std::string TentMetrics::getPrometheusMetrics() {
 
         const uint64_t success_timestamp = unixTimestampSeconds();
         appendSelfMetricsPrometheus(result, success_timestamp);
+        if (open_metrics) result.append("# EOF\n");
         last_serialization_success_timestamp_seconds_[kPrometheusFormat].store(
             success_timestamp, std::memory_order_relaxed);
         return result;
@@ -1596,7 +1645,8 @@ void serializeHistogramToJson(nlohmann::json& root,
 
 template <uint8_t N>
 void TentMetrics::serializeHistogramPrometheus(
-    metrics::CachedDynamicHistogram<N>& hist, std::string& out) const {
+    metrics::CachedDynamicHistogram<N>& hist, std::string& out,
+    bool include_exemplars) const {
     // Walk the same bucket-counter / sum-counter data the JSON path uses, so
     // the two endpoints cannot drift. Unlike ylt's serialize() this never
     // silently drops a histogram that has observed >=1 sample: ylt clears its
@@ -1693,7 +1743,50 @@ void TentMetrics::serializeHistogramPrometheus(
             } else {
                 out.append("le=\"+Inf\"} ");
             }
-            out.append(std::to_string(cumulative)).append("\n");
+            out.append(std::to_string(cumulative));
+            if constexpr (N == 2) {
+                if (include_exemplars && i + 1 == bucket_counters.size() &&
+                    name == "tent_transport_attempt_latency_us") {
+                    const TransportType transport =
+                        parseTransportType((*labels_value)[0]);
+                    const Request::OpCode operation =
+                        (*labels_value)[1] == "read" ? Request::READ
+                                                        : Request::WRITE;
+                    if (transport >= 0 && transport < kNumTransportTypes) {
+                        const auto& exemplar =
+                            attempt_exemplars_[attemptSlot(transport,
+                                                            operation)];
+                        for (int attempt = 0; attempt < 3; ++attempt) {
+                            const uint64_t before = exemplar.sequence.load(
+                                std::memory_order_acquire);
+                            if (before & 1U) continue;
+                            const uint64_t trace_high =
+                                exemplar.trace_id_high.load(
+                                    std::memory_order_relaxed);
+                            const uint64_t trace_low =
+                                exemplar.trace_id_low.load(
+                                    std::memory_order_relaxed);
+                            const int64_t value = exemplar.value_us.load(
+                                std::memory_order_relaxed);
+                            const uint64_t after = exemplar.sequence.load(
+                                std::memory_order_acquire);
+                            if (before != after || (after & 1U)) continue;
+                            if (trace_low != 0) {
+                                std::ostringstream trace;
+                                trace << std::hex << std::setfill('0')
+                                      << std::setw(16) << trace_high
+                                      << std::setw(16) << trace_low;
+                                out.append(" # {trace_id=\"")
+                                    .append(trace.str())
+                                    .append("\"} ")
+                                    .append(std::to_string(value));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            out.append("\n");
         }
 
         // _sum: read from the sum counter maintained by each observe() call.
@@ -2051,6 +2144,8 @@ void TentMetrics::recordTransportAttemptStarted(TransportType,
                                                 Request::OpCode) {}
 void TentMetrics::recordTransportAttemptFinished(TransportType, Request::OpCode,
                                                  TransferStatusEnum, double) {}
+void TentMetrics::recordTransportAttemptExemplar(
+    TransportType, Request::OpCode, uint64_t, uint64_t, double) {}
 void TentMetrics::recordDeadlineMLU(TransportType, double) {}
 void TentMetrics::recordDeadlineInfeasible(TransportType) {}
 void TentMetrics::recordBatchQuarantined() {}
@@ -2099,6 +2194,10 @@ void TentMetrics::recordStageLatency(Stage, TransportType, double) {}
 
 std::string TentMetrics::getPrometheusMetrics() {
     return "# TENT metrics disabled at compile time\n";
+}
+
+std::string TentMetrics::getOpenMetrics() {
+    return "# TENT metrics disabled at compile time\n# EOF\n";
 }
 
 std::string TentMetrics::getJsonMetrics() {

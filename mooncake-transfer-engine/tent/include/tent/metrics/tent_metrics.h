@@ -140,6 +140,14 @@ class TentMetrics {
                                         Request::OpCode operation,
                                         TransferStatusEnum status,
                                         double latency_us);
+    // Latest retained trace for a transport-attempt histogram series. This is
+    // rendered only by /metrics/openmetrics; the legacy /metrics response
+    // remains Prometheus 0.0.4 and never receives exemplar syntax.
+    void recordTransportAttemptExemplar(TransportType tp,
+                                        Request::OpCode operation,
+                                        uint64_t trace_id_high,
+                                        uint64_t trace_id_low,
+                                        double latency_us);
 
     // Record the deadline feasibility ratio (MLU) for a completed transfer
     // that carried a deadline. mlu = actual_transfer_seconds / window_seconds,
@@ -465,6 +473,7 @@ class TentMetrics {
 
     // Get metrics for HTTP server
     std::string getPrometheusMetrics();
+    std::string getOpenMetrics();
     std::string getJsonMetrics();
     std::string getSummaryString();
 
@@ -523,6 +532,15 @@ class TentMetrics {
         serialization_failures_{{0, 0}};
     std::array<std::atomic<uint64_t>, kSerializationFormatCount>
         last_serialization_success_timestamp_seconds_{{0, 0}};
+
+    struct AttemptExemplar {
+        // Even sequence values are stable; odd values mean a writer is
+        // publishing the remaining fields.
+        std::atomic<uint64_t> sequence{0};
+        std::atomic<uint64_t> trace_id_high{0};
+        std::atomic<uint64_t> trace_id_low{0};
+        std::atomic<int64_t> value_us{0};
+    };
 
     // Initialize and start the HTTP server on the configured port. Port
     // assignment is deterministic: co-located ranks are expected to be given
@@ -604,6 +622,7 @@ class TentMetrics {
     static constexpr size_t kTransportDomain =
         static_cast<size_t>(kNumTransportTypes);
     static constexpr size_t kAttemptDomain = kTransportDomain * 2;
+    std::array<AttemptExemplar, kAttemptDomain> attempt_exemplars_{};
     static constexpr size_t kTaskFailureDomain = kTransportDomain * 4;
     static constexpr size_t kWorkerDomain = 3;
     static constexpr size_t kOperationDomain = 2;
@@ -1004,7 +1023,10 @@ class TentMetrics {
     // and the transport-attempt (N=2) histogram share one implementation.
     template <uint8_t N>
     void serializeHistogramPrometheus(metrics::CachedDynamicHistogram<N>& hist,
-                                      std::string& out) const;
+                                      std::string& out,
+                                      bool include_exemplars = false) const;
+
+    std::string serializePrometheusMetrics(bool open_metrics);
 #endif  // TENT_METRICS_ENABLED
 };
 
