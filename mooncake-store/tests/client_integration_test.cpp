@@ -107,14 +107,17 @@ TEST(HcaAffinityTest, RequestHintIsWireCompatibleAndSurvivesBatchSplitting) {
     auto decoded = struct_pack::deserialize<ReplicateConfig>(
         struct_pack::serialize(legacy));
     ASSERT_TRUE(decoded);
+    EXPECT_FALSE(decoded->residency_affinity_ids);
     EXPECT_FALSE(decoded->preferred_hca_names);
     EXPECT_EQ(decoded->preferred_segments, legacy.preferred_segments);
     decoded->preferred_hca_names = std::vector<std::string>{"mlx5_0"};
     decoded->group_ids = std::vector<std::string>{"a", "b"};
+    decoded->residency_affinity_ids = std::vector<std::string>{"u0", "u1"};
     auto current = struct_pack::deserialize<ReplicateConfig>(
         struct_pack::serialize(*decoded));
     ASSERT_TRUE(current);
     EXPECT_EQ(current->preferred_hca_names, decoded->preferred_hca_names);
+    EXPECT_EQ(current->residency_affinity_ids, decoded->residency_affinity_ids);
     EXPECT_EQ(current->ForSingleKey(1).preferred_hca_names,
               decoded->preferred_hca_names);
     auto old_reader = struct_pack::deserialize<LegacyReplicateConfig>(
@@ -133,12 +136,14 @@ TEST(HcaAffinityTest, SessionAndAffinityExtensionsRemainWireCompatible) {
         struct_pack::serialize(session_config));
     ASSERT_TRUE(current);
     EXPECT_EQ(current->session_ids, session_config.session_ids);
+    EXPECT_FALSE(current->residency_affinity_ids);
     EXPECT_FALSE(current->preferred_hca_names);
     EXPECT_FALSE(current->per_key_preferred_hca_names);
 
     current->preferred_hca_names = std::vector<std::string>{"mlx5_0"};
     current->per_key_preferred_hca_names =
         std::vector<std::vector<std::string>>{{}, {"mlx5_1"}};
+    current->residency_affinity_ids = std::vector<std::string>{"u0", "u1"};
     auto session_reader = struct_pack::deserialize<SessionReplicateConfig>(
         struct_pack::serialize(*current));
     ASSERT_TRUE(session_reader);
@@ -148,6 +153,8 @@ TEST(HcaAffinityTest, SessionAndAffinityExtensionsRemainWireCompatible) {
         struct_pack::serialize(*current));
     ASSERT_TRUE(affinity_reader);
     EXPECT_EQ(affinity_reader->session_ids, session_config.session_ids);
+    EXPECT_EQ(affinity_reader->residency_affinity_ids,
+              current->residency_affinity_ids);
     EXPECT_EQ(affinity_reader->preferred_hca_names,
               current->preferred_hca_names);
     EXPECT_EQ(affinity_reader->per_key_preferred_hca_names,
@@ -290,6 +297,7 @@ TEST(HcaAffinityTest, BatchHintsFollowKeysAndRetrySubsets) {
     ReplicateConfig config;
     config.group_ids = std::vector<std::string>{"g0", "g1", "g2"};
     config.session_ids = std::vector<std::string>{"s0", "s1", "s2"};
+    config.residency_affinity_ids = std::vector<std::string>{"u0", "u1", "u2"};
     config.per_key_preferred_hca_names =
         std::vector<std::vector<std::string>>{{"mlx5_0"}, {"mlx5_1"}, {}};
     EXPECT_TRUE(config.HasValidKeyHints(3));
@@ -299,6 +307,10 @@ TEST(HcaAffinityTest, BatchHintsFollowKeysAndRetrySubsets) {
     EXPECT_EQ(*subset.group_ids, (std::vector<std::string>{"g2", "g0"}));
     ASSERT_TRUE(subset.ValidSessionIds(2));
     EXPECT_EQ(*subset.session_ids, (std::vector<std::string>{"s2", "s0"}));
+    EXPECT_EQ(*subset.residency_affinity_ids,
+              (std::vector<std::string>{"u2", "u0"}));
+    EXPECT_EQ(*subset.ForSingleKey(0).residency_affinity_ids,
+              (std::vector<std::string>{"u2"}));
     EXPECT_EQ(subset.ForSingleKey(0).SessionId(), "s2");
     EXPECT_TRUE(subset.ForSingleKey(0).preferred_hca_names->empty());
     EXPECT_EQ(*subset.ForSingleKey(1).preferred_hca_names,
@@ -309,6 +321,9 @@ TEST(HcaAffinityTest, BatchHintsFollowKeysAndRetrySubsets) {
     for (size_t index : {1, 0, 1}) {
         key_config.SetKeyIds(subset, index);
         EXPECT_EQ(key_config.SessionId(), subset.session_ids->at(index));
+        EXPECT_EQ(*key_config.residency_affinity_ids,
+                  (std::vector<std::string>{
+                      subset.residency_affinity_ids->at(index)}));
         EXPECT_EQ(*key_config.group_ids,
                   (std::vector<std::string>{subset.group_ids->at(index)}));
         EXPECT_EQ(*key_config.preferred_hca_names,
@@ -322,10 +337,32 @@ TEST(HcaAffinityTest, BatchHintsFollowKeysAndRetrySubsets) {
     ASSERT_TRUE(restored);
     EXPECT_EQ(restored->per_key_preferred_hca_names,
               config.per_key_preferred_hca_names);
+    EXPECT_EQ(restored->residency_affinity_ids, config.residency_affinity_ids);
     auto legacy = struct_pack::deserialize<LegacyReplicateConfig>(
         struct_pack::serialize(config));
     ASSERT_TRUE(legacy);
     EXPECT_EQ(legacy->group_ids, config.group_ids);
+}
+
+TEST(HcaAffinityTest, ResidencyAffinityPreservesEmptyAndAbsentValues) {
+    ReplicateConfig config;
+    EXPECT_FALSE(config.residency_affinity_ids);
+    EXPECT_TRUE(config.HasValidKeyHints(1));
+    EXPECT_FALSE(config.ForSingleKey(0).residency_affinity_ids);
+    config.residency_affinity_ids = std::vector<std::string>{};
+    EXPECT_TRUE(config.HasValidKeyHints(0));
+    EXPECT_FALSE(config.HasValidKeyHints(1));
+    auto empty = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(config));
+    ASSERT_TRUE(empty);
+    ASSERT_TRUE(empty->residency_affinity_ids);
+    EXPECT_TRUE(empty->residency_affinity_ids->empty());
+    EXPECT_TRUE(empty->ForKeySubset({}).residency_affinity_ids.has_value());
+    config.residency_affinity_ids.reset();
+    auto absent = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(config));
+    ASSERT_TRUE(absent);
+    EXPECT_FALSE(absent->residency_affinity_ids);
 }
 
 TEST(ReadAffinityTest,
