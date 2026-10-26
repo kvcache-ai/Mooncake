@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -66,6 +67,13 @@ constexpr size_t kPrometheusBufferSize = 4096;
 class TentMetrics {
    public:
     static TentMetrics& instance();
+
+    // Build-time capability query for embedders and diagnostics. A build with
+    // metrics compiled out has no HTTP endpoint, so this must remain available
+    // in both the enabled implementation and the no-op stub.
+    static constexpr bool isCompiledIn() noexcept {
+        return TENT_METRICS_ENABLED != 0;
+    }
 
     // Initialize with configuration and start HTTP server
     Status initialize(const MetricsConfig& config);
@@ -191,6 +199,22 @@ class TentMetrics {
     std::atomic<uint16_t> bound_http_port_{0};
 
 #if TENT_METRICS_ENABLED
+    static constexpr size_t kSerializationFormatCount = 2;
+    static constexpr size_t kPrometheusFormat = 0;
+    static constexpr size_t kJsonFormat = 1;
+
+    // Metrics about the metrics pipeline itself. They deliberately live in
+    // plain atomics instead of the ylt registry so they are always emitted,
+    // including while runtime recording is disabled or before any transfer
+    // metric has received a sample.
+    std::atomic<uint64_t> http_start_failures_{0};
+    std::array<std::atomic<uint64_t>, kSerializationFormatCount>
+        serialization_attempts_{{0, 0}};
+    std::array<std::atomic<uint64_t>, kSerializationFormatCount>
+        serialization_failures_{{0, 0}};
+    std::array<std::atomic<uint64_t>, kSerializationFormatCount>
+        last_serialization_success_timestamp_seconds_{{0, 0}};
+
     // Initialize and start the HTTP server on the configured port. Port
     // assignment is deterministic: co-located ranks are expected to be given
     // distinct ports explicitly (e.g. base_port + local_rank) rather than
@@ -375,6 +399,13 @@ class TentMetrics {
     // value per label with # TYPE ... gauge.
     void serializeGaugePrometheus(metrics::CachedDynamicCounter<1>& gauge,
                                   std::string& out) const;
+
+    // Append the fixed single-series metrics-pipeline state plus the
+    // two-valued serialization format series. `prometheus_success_timestamp`
+    // is the timestamp for the scrape currently being built, so the response
+    // reports its own successful serialization rather than lagging one scrape.
+    void appendSelfMetricsPrometheus(
+        std::string& out, uint64_t prometheus_success_timestamp) const;
 
     // Helper to register all metrics to the vectors
     void registerMetrics();
