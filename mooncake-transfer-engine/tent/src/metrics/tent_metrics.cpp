@@ -217,6 +217,18 @@ const char* taskFailureReasonName(TentMetrics::TaskFailureReason reason) {
     return "unknown";
 }
 
+const char* stuckPhaseName(TentMetrics::StuckPhase phase) {
+    switch (phase) {
+        case TentMetrics::StuckPhase::Queue:
+            return "queue";
+        case TentMetrics::StuckPhase::Dispatch:
+            return "dispatch";
+        case TentMetrics::StuckPhase::Transport:
+            return "transport";
+    }
+    return "dispatch";
+}
+
 const char* failurePhaseName(TentMetrics::FailurePhase phase) {
     switch (phase) {
         case TentMetrics::FailurePhase::Metadata:
@@ -1008,6 +1020,7 @@ void TentMetrics::registerMetrics() {
         &logical_request_outcomes_total_,
         &transport_attempt_outcomes_total_,
         &task_failures_total_,
+        &request_stuck_events_total_,
         &terminal_failures_total_,
         &memory_operations_total_,
         &memory_operation_bytes_total_,
@@ -1190,6 +1203,19 @@ void TentMetrics::recordTaskFailure(TransportType tp,
                                   FailureReason::Canceled);
             break;
     }
+}
+
+void TentMetrics::recordRequestStuck(StuckPhase phase, TransportType transport,
+                                     Request::OpCode operation) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    request_stuck_events_total_.incCached(
+        requestStuckSlot(phase, transport, operation),
+        [phase, transport, operation] {
+            return std::array<std::string, 3>{stuckPhaseName(phase),
+                                              transportTypeName(transport),
+                                              operationName(operation)};
+        });
 }
 
 void TentMetrics::recordTerminalFailure(TransportType tp, FailurePhase phase,
@@ -2254,6 +2280,8 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&transport_attempt_outcomes_total_);
         root[task_failures_total_.str_name()] =
             sumCounterValues(&task_failures_total_);
+        root[request_stuck_events_total_.str_name()] =
+            sumCounterValues(&request_stuck_events_total_);
         root[terminal_failures_total_.str_name()] =
             sumCounterValues(&terminal_failures_total_);
         root[memory_operations_total_.str_name()] =
@@ -2508,6 +2536,8 @@ void TentMetrics::recordDeadlineMLU(TransportType, double) {}
 void TentMetrics::recordDeadlineInfeasible(TransportType) {}
 void TentMetrics::recordBatchQuarantined() {}
 void TentMetrics::recordTaskFailure(TransportType, TaskFailureReason) {}
+void TentMetrics::recordRequestStuck(StuckPhase, TransportType,
+                                     Request::OpCode) {}
 void TentMetrics::recordTerminalFailure(TransportType, FailurePhase,
                                         FailureReason) {}
 void TentMetrics::recordMemoryOperation(TransportType, MemoryOperation,

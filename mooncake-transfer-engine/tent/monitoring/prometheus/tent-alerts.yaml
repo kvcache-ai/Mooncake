@@ -134,6 +134,19 @@ groups:
             {{ $labels.instance }} has in-flight transport attempts but the
             engine progress timestamp has not advanced for at least 30 seconds.
 
+      - alert: TentRequestStuckThresholdCrossed
+        expr: increase(tent_request_stuck_events_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: A TENT request crossed the configured stuck threshold
+          description: >-
+            A {{ $labels.operation }} request on {{ $labels.instance }} crossed
+            its stuck threshold in phase {{ $labels.phase }} on transport
+            {{ $labels.transport }}. Correlate the tent.request.stuck log by
+            trace_id; the event is diagnostic and does not cancel the request.
+
       - alert: TentStagingWorkerStalled
         expr: |-
           (

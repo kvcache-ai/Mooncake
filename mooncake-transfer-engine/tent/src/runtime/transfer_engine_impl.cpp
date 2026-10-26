@@ -618,6 +618,8 @@ Status TransferEngineImpl::construct() {
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
     slow_request_threshold_us_ =
         conf_->get("observability/slow_request_threshold_us", 0UL);
+    stuck_request_threshold_us_ =
+        conf_->get("observability/stuck_request_threshold_us", 0UL);
     tracing_enabled_ = conf_->get("observability/tracing_enabled", false);
     trace_sample_rate_ppm_ = std::min<uint64_t>(
         1000000, conf_->get("observability/trace_sample_rate_ppm", 0UL));
@@ -3853,7 +3855,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     const size_t public_task_id = task_id;
     size_t poll_task_id = task_id;
-    const auto& public_task = batch->task_list[public_task_id];
+    auto& public_task = batch->task_list[public_task_id];
     bool queued_owner_resolved = false;
     CHECK_STATUS(refillDispatchWindow());
     if (runtime_queue_config_.enabled && batch->queue_token != 0) {
@@ -3868,6 +3870,9 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
             if (public_status != PENDING ||
                 (queued_it != queued_owners_.end() &&
                  !queued_it->second.in_dispatch_window)) {
+                if (public_status == PENDING) {
+                    recordTaskStuckObservability(public_task);
+                }
                 task_status.s = public_status;
                 task_status.transferred_bytes =
                     public_status == COMPLETED
@@ -3894,6 +3899,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     CHECK_STATUS(pollTaskStatus(batch, poll_task_id, task_status));
     updateTaskStatusAfterPoll(batch, poll_task_id, task_status,
                               task.runtime_policy.enable_auto_failover_on_poll);
+    recordTaskStuckObservability(task);
     if (runtime_queue_config_.enabled && batch->queue_token != 0 &&
         task_status.s != PENDING) {
         QueueOwnerId owner_id = 0;
@@ -3967,6 +3973,7 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
                 if (public_status == PENDING) {
                     if (queued_it != queued_owners_.end() &&
                         !queued_it->second.in_dispatch_window) {
+                        recordTaskStuckObservability(task);
                         continue;
                     }
                 }
@@ -4000,6 +4007,7 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
         updateTaskStatusAfterPoll(
             batch, task_id, task_status,
             force_failover || task.runtime_policy.enable_auto_failover_on_poll);
+        recordTaskStuckObservability(task);
         if (runtime_queue_config_.enabled && batch->queue_token != 0 &&
             task_status.s != PENDING) {
             QueueOwnerId owner_id = 0;
@@ -4360,6 +4368,54 @@ void TransferEngineImpl::recordTaskCompletionObservability(
         }
     }
 #endif  // TENT_METRICS_ENABLED
+}
+
+void TransferEngineImpl::recordTaskStuckObservability(TaskInfo& task) {
+    if (stuck_request_threshold_us_ == 0 || task.derived ||
+        task.status != PENDING || task.stuck_observability_recorded ||
+        task.start_time == std::chrono::steady_clock::time_point{}) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const int64_t duration_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(now -
+                                                              task.start_time)
+            .count();
+    if (duration_us < 0 ||
+        static_cast<uint64_t>(duration_us) < stuck_request_threshold_us_) {
+        return;
+    }
+
+    task.stuck_observability_recorded = true;
+    const auto transport =
+        task.attempt_type != UNSPEC ? task.attempt_type : task.type;
+    TentMetrics::StuckPhase phase = TentMetrics::StuckPhase::Dispatch;
+    const char* phase_name = "dispatch";
+    if (task.dispatch_time == std::chrono::steady_clock::time_point{}) {
+        phase = TentMetrics::StuckPhase::Queue;
+        phase_name = "queue";
+    } else if (task.attempt_active) {
+        phase = TentMetrics::StuckPhase::Transport;
+        phase_name = "transport";
+    }
+
+    LOG(WARNING) << "event=tent.request.stuck"
+                 << " trace_id=" << traceId(task.observability_request_id)
+                 << " request_id=" << task.observability_request_id
+                 << " batch_id=" << task.observability_batch_id
+                 << " task_id=" << task.observability_task_id
+                 << " attempt_id=" << task.observability_attempt_id
+                 << " transport=" << transportTypeName(transport)
+                 << " operation=" << operationName(task.request.opcode)
+                 << " phase=" << phase_name << " status=pending"
+                 << " duration_us=" << duration_us
+                 << " threshold_us=" << stuck_request_threshold_us_
+                 << " failover_count=" << task.failover_count
+                 << " config_generation="
+                 << task.runtime_policy.config_generation;
+    TentMetrics::instance().recordRequestStuck(phase, transport,
+                                               task.request.opcode);
 }
 
 void TransferEngineImpl::startLogicalRequestObservability(TaskInfo& task) {

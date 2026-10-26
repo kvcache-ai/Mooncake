@@ -187,6 +187,14 @@ class TentMetrics {
     // the only failure metric that records TIMEOUT/CANCELED outcomes.
     void recordTaskFailure(TransportType tp, TaskFailureReason reason);
 
+    enum class StuckPhase { Queue, Dispatch, Transport };
+
+    // Counts the first configured stuck-threshold crossing for a logical
+    // request. The caller guarantees at-most-once recording per request;
+    // labels deliberately remain within bounded engine enums.
+    void recordRequestStuck(StuckPhase phase, TransportType transport,
+                            Request::OpCode operation);
+
     // Stable public failure taxonomy. Native transport details (errno, WC
     // status, peer identity, etc.) belong in logs/traces; metric labels stay
     // within these bounded enums.
@@ -634,6 +642,8 @@ class TentMetrics {
         "transport", "operation", "outcome"};
     static inline const std::array<std::string, 2> kTaskFailureLabels{
         "transport", "reason"};
+    static inline const std::array<std::string, 3> kRequestStuckLabels{
+        "phase", "transport", "operation"};
     static inline const std::array<std::string, 3> kTerminalFailureLabels{
         "transport", "phase", "reason"};
     static inline const std::array<std::string, 3> kMemoryOperationLabels{
@@ -690,6 +700,9 @@ class TentMetrics {
         kAttemptDomain * kOutcomeValueDomain;
     std::array<AttemptExemplar, kAttemptDomain> attempt_exemplars_{};
     static constexpr size_t kTaskFailureDomain = kTransportDomain * 4;
+    static constexpr size_t kStuckPhaseDomain = 3;
+    static constexpr size_t kRequestStuckDomain =
+        kStuckPhaseDomain * kTransportDomain * 2;
     static constexpr size_t kWorkerDomain = 3;
     static constexpr size_t kOperationDomain = 2;
     static constexpr size_t kCleanupKindDomain = 3;
@@ -750,6 +763,13 @@ class TentMetrics {
                               TransferStatusEnum status);
     static size_t taskFailureSlot(TransportType tp, TaskFailureReason reason) {
         return static_cast<size_t>(tp) * 4 + static_cast<size_t>(reason);
+    }
+    static size_t requestStuckSlot(StuckPhase phase, TransportType transport,
+                                   Request::OpCode operation) {
+        return (static_cast<size_t>(phase) * kTransportDomain +
+                transportSlot(transport)) *
+                   2 +
+               operationSlot(operation);
     }
     static size_t operationSlot(Request::OpCode operation) {
         return operation == Request::READ ? 0u : 1u;
@@ -871,6 +891,10 @@ class TentMetrics {
         "tent_task_failures_total",
         "Task-level failures by terminal transport and failure reason",
         kTaskFailureLabels, kTaskFailureDomain};
+    metrics::CachedDynamicCounter<3> request_stuck_events_total_{
+        "tent_request_stuck_events_total",
+        "Logical requests crossing the configured stuck threshold once",
+        kRequestStuckLabels, kRequestStuckDomain};
     // Terminal failures and memory lifecycle operations are rare control-path
     // events, so they use the plain dynamic counter instead of reserving the
     // full bounded-label cross product in cached cells.

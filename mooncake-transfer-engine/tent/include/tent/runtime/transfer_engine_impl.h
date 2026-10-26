@@ -121,6 +121,7 @@ struct TaskInfo {
     bool logical_observability_active{false};
     bool logical_request_active{false};
     bool terminal_observability_recorded{false};
+    bool stuck_observability_recorded{false};
 
     TaskInfo() = default;
 
@@ -157,7 +158,8 @@ struct TaskInfo {
           logical_observability_active(other.logical_observability_active),
           logical_request_active(other.logical_request_active),
           terminal_observability_recorded(
-              other.terminal_observability_recorded) {}
+              other.terminal_observability_recorded),
+          stuck_observability_recorded(other.stuck_observability_recorded) {}
 
     TaskInfo(TaskInfo&& other) noexcept
         : type(other.type),
@@ -192,7 +194,8 @@ struct TaskInfo {
           logical_observability_active(other.logical_observability_active),
           logical_request_active(other.logical_request_active),
           terminal_observability_recorded(
-              other.terminal_observability_recorded) {}
+              other.terminal_observability_recorded),
+          stuck_observability_recorded(other.stuck_observability_recorded) {}
 
     TaskInfo& operator=(const TaskInfo& other) {
         if (this != &other) {
@@ -231,6 +234,7 @@ struct TaskInfo {
             logical_request_active = other.logical_request_active;
             terminal_observability_recorded =
                 other.terminal_observability_recorded;
+            stuck_observability_recorded = other.stuck_observability_recorded;
         }
         return *this;
     }
@@ -272,6 +276,7 @@ struct TaskInfo {
             logical_request_active = other.logical_request_active;
             terminal_observability_recorded =
                 other.terminal_observability_recorded;
+            stuck_observability_recorded = other.stuck_observability_recorded;
         }
         return *this;
     }
@@ -632,6 +637,8 @@ class TransferEngineImpl {
                                            TransferStatusEnum prev_status,
                                            TransferStatusEnum new_status);
 
+    void recordTaskStuckObservability(TaskInfo& task);
+
     void startLogicalRequestObservability(TaskInfo& task);
 
     void startTransportAttempt(TaskInfo& task, TransportType type,
@@ -718,6 +725,7 @@ class TransferEngineImpl {
     bool notify_rpc_fallback_{true};
     bool enable_progress_worker_{false};
     uint64_t slow_request_threshold_us_{0};
+    uint64_t stuck_request_threshold_us_{0};
     bool tracing_enabled_{false};
     uint64_t trace_sample_rate_ppm_{0};
     uint64_t trace_slow_threshold_us_{0};

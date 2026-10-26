@@ -67,6 +67,7 @@ TENT metrics configuration is integrated into the main `transfer-engine.json` co
   "log_level": "warning",
   "observability": {
     "slow_request_threshold_us": 0,
+    "stuck_request_threshold_us": 0,
     "tracing_enabled": false,
     "trace_sample_rate_ppm": 0,
     "trace_slow_threshold_us": 0
@@ -93,6 +94,10 @@ TENT metrics configuration is integrated into the main `transfer-engine.json` co
   and is capped at `1000000`. Errors, timeouts, cancellations, and requests
   slower than `trace_slow_threshold_us` are retained independently of head
   sampling. A zero slow threshold disables slow-trace retention.
+- `stuck_request_threshold_us` emits one correlated `tent.request.stuck`
+  warning and increments one counter when a still-pending logical request first
+  crosses the threshold. It does not cancel the request. Zero disables the
+  event; choose a value above the deployment's expected maximum transfer time.
 
 ### Environment Variables
 
@@ -352,6 +357,7 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_logical_request_outcomes_total` | Counter | `transport`, `operation`, `outcome` | Terminal logical outcomes (`success`, `failed`, `timeout`, or `canceled`) |
 | `tent_transport_attempt_outcomes_total` | Counter | `transport`, `operation`, `outcome` | Terminal physical-attempt outcomes |
 | `tent_task_failures_total` | Counter | `transport`, `reason` | Task failures grouped by terminal transport and failure reason |
+| `tent_request_stuck_events_total` | Counter | `phase`, `transport`, `operation` | Logical requests that crossed the configured stuck threshold once while still pending |
 | `tent_terminal_failures_total` | Counter | `transport`, `phase`, `reason` | Terminal logical task failures grouped by the bounded public failure taxonomy |
 | `tent_memory_operations_total` | Counter | `transport`, `operation`, `outcome` | Physical backend memory register/unregister calls |
 | `tent_memory_operation_bytes_total` | Counter | `transport`, `operation`, `outcome` | Bytes covered by physical backend memory register/unregister calls |
@@ -435,6 +441,12 @@ visible when runtime transfer recording is disabled.
 - State gauges ignore the runtime sampling switch. Every queue, worker,
   admission, and connection increment is paired with a decrement on success,
   cancellation, timeout, dispatch failure, and shutdown paths.
+- A stuck event is a threshold crossing, not a terminal outcome. It is emitted
+  at most once per logical request and carries the same `trace_id`,
+  `request_id`, `batch_id`, `task_id`, and `attempt_id` contract as failure and
+  slow-request logs. The bounded `phase` label distinguishes admission queue
+  wait, dispatch, and an active transport attempt; use the correlated log for
+  the exact request identity.
 - TENT software retries, kernel TCP retransmissions, and RDMA hardware retry
   exhaustion are different signals. `tent_rdma_retries_total` counts software
   re-enqueue, `tent_tcp_retransmissions_total` comes from TCP_INFO, and
@@ -518,6 +530,10 @@ from the posted gauge. `late_completion` is a CQE for a slice already resolved
 by timeout, cancellation, or an adjacent queue-pair sweep. A retry is counted
 only when the slice is actually re-enqueued; an exhausted attempt increments
 only `tent_rdma_retry_exhausted_total`.
+
+Stuck-event labels are bounded to three phases, the `TransportType` enum, and
+two operations. Request, batch, peer, address, and attempt identifiers remain
+in structured logs and are never Prometheus labels.
 
 Endpoint lifecycle metrics have seven event series. QP transition failures
 have at most 2x7 = 14 QP-type/transition series, and notification diagnostics

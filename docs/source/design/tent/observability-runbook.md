@@ -113,7 +113,7 @@ Interpret the combinations as follows:
 | Request errors | logical failure ratio | terminal `phase`/`reason`, task failure reason, correlated failure log |
 | Latency regression | read/write and attempt p99 | queue-wait, dispatch, transport stage histograms; admission wait; stream queue wait |
 | Throughput drop | read/write byte rates | request rate, in-flight work, attempt errors, failover, admission rejection |
-| Engine stall | worker progress age plus in-flight attempts | oldest in-flight age, RDMA posted/worker gauges, stream/staging state |
+| Engine stall | worker progress age plus in-flight attempts | stuck threshold events, oldest in-flight age, RDMA posted/worker gauges, stream/staging state |
 | RDMA degradation | retry exhausted, CQ poll errors | slice events, completion outcomes, endpoint events, QP transition failures, notification events |
 | TCP or HP-TCP degradation | stream terminal events | queue depth, busy workers, admitted tasks/bytes, open connections, connection/IO/timeout outcome, retry exhaustion, attempt and queue latency |
 | Admission pressure | rejected admission events | queue owners/bytes, admission wait, deadline drops, owner kind |
@@ -154,6 +154,16 @@ If the engine worker is stale, compare `tent_inflight_attempts` with
 `tent_rdma_worker_inflight_slices` and `tent_rdma_posted_inflight_slices`.
 Growth only in posted RDMA work points toward completion processing. Growth
 before posting points toward endpoint selection, queueing, or post failures.
+
+If `observability/stuck_request_threshold_us` is enabled,
+`tent_request_stuck_events_total` marks the first threshold crossing for each
+still-pending logical request. Split it by `phase`: `queue` means admission has
+not dispatched the request, `dispatch` means no physical attempt is active,
+and `transport` means the current attempt has not completed. Find the matching
+`event=tent.request.stuck` log by time and labels, then pivot on its `trace_id`
+to the attempt and terminal events. The event is diagnostic only: it neither
+cancels the request nor proves a deadlock, so set the threshold above the
+largest expected transfer time.
 
 ## Transport-specific checks
 
