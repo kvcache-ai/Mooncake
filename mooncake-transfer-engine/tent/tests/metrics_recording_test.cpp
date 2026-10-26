@@ -464,6 +464,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordShmMappingEvent(TentMetrics::ShmMappingEvent::CacheHit);
     metrics.recordShmCopy(Request::WRITE,
                           TentMetrics::ShmCopyOutcome::Success, 18.0);
+    metrics.recordSegmentEvent(TentMetrics::SegmentEvent::CacheHit);
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -473,7 +474,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 57>
+    const std::array<std::pair<std::string_view, std::string_view>, 58>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -503,6 +504,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_stream_events_total", "counter"},
             {"tent_shm_mapping_events_total", "counter"},
             {"tent_shm_copy_events_total", "counter"},
+            {"tent_segment_events_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
             {"tent_worker_last_progress_timestamp_seconds", "gauge"},
@@ -791,6 +793,23 @@ TEST_F(MetricsRecordingTest, ShmSignalsUseBoundedOperationAndEventLabels) {
     EXPECT_EQ(after.histogramCount("tent_shm_copy_latency_us") -
                   before.histogramCount("tent_shm_copy_latency_us"),
               2);
+}
+
+TEST_F(MetricsRecordingTest, SegmentSignalsUseBoundedLifecycleEvents) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordSegmentEvent(TentMetrics::SegmentEvent::CacheMiss);
+    metrics.recordSegmentEvent(TentMetrics::SegmentEvent::FetchError);
+    metrics.recordSegmentEvent(TentMetrics::SegmentEvent::GenerationAdvanced);
+
+    auto after = MetricsSnapshot(metrics);
+    for (std::string_view event : {"cache_miss", "fetch_error",
+                                   "generation_advanced"}) {
+        const std::string series =
+            "tent_segment_events_total{event=\"" + std::string(event) + "\"}";
+        EXPECT_EQ(after.series(series) - before.series(series), 1) << event;
+    }
 }
 
 // ---------------------------------------------------------------------------

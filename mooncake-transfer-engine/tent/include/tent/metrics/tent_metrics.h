@@ -352,6 +352,27 @@ class TentMetrics {
     void recordShmCopy(Request::OpCode operation, ShmCopyOutcome outcome,
                        double latency_us);
 
+    enum class SegmentEvent {
+        SnapshotPublished,
+        MutationError,
+        RegistryPublishSuccess,
+        RegistryPublishError,
+        RegistryDeleteSuccess,
+        RegistryDeleteError,
+        CacheHit,
+        CacheMiss,
+        CacheReset,
+        FetchSuccess,
+        FetchError,
+        EntryInvalidated,
+        GenerationAdvanced,
+    };
+
+    // Segment metadata events are recorded at SegmentManager, the owner of
+    // local snapshot publication, registry I/O and remote cache generations.
+    // Segment names and handles are intentionally excluded from labels.
+    void recordSegmentEvent(SegmentEvent event);
+
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
     // sitting in the engine right now — a persistently high or stuck value
@@ -489,6 +510,7 @@ class TentMetrics {
         "event"};
     static inline const std::array<std::string, 2> kShmCopyLabels{"operation",
                                                                  "outcome"};
+    static inline const std::array<std::string, 1> kSegmentEventLabel{"event"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -525,6 +547,7 @@ class TentMetrics {
     static constexpr size_t kShmCopyOutcomeDomain = 2;
     static constexpr size_t kShmCopyDomain =
         kOperationDomain * kShmCopyOutcomeDomain;
+    static constexpr size_t kSegmentEventDomain = 13;
     static constexpr size_t kRdmaEventDomain =
         kOperationDomain * kRdmaSliceEventDomain;
     static constexpr size_t kRdmaRetryDomain =
@@ -708,6 +731,10 @@ class TentMetrics {
         "tent_shm_copy_events_total",
         "Synchronous physical SHM copy attempts by operation and outcome",
         kShmCopyLabels, kShmCopyDomain};
+    metrics::CachedDynamicCounter<1> segment_events_total_{
+        "tent_segment_events_total",
+        "Segment snapshot, registry and remote-cache lifecycle events",
+        kSegmentEventLabel, kSegmentEventDomain};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_
