@@ -7139,6 +7139,64 @@ TEST_F(MasterServiceHATest, BatchEvictCommitFailureRestoresRemovedReplicas) {
     EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, full.error());
 }
 
+TEST_F(MasterServiceHATest, OffloadOnEvictOffloadsBeforeEvictingThroughOpLog) {
+    const std::string cluster_id = "test_offload_on_evict_ha_cluster";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .set_enable_offload(true)
+                              .build();
+    service_config.offload_on_evict = true;
+    MasterService service(service_config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const std::string segment_name = "offload_on_evict_ha_segment";
+    auto mounted = PrepareSimpleSegment(service, segment_name);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(mounted.client_id,
+                                           /*enable_offloading=*/true)
+                    .has_value());
+    const std::string key = "offload_on_evict_ha_key";
+    PutObjectOnSegment(service, mounted.client_id, key, segment_name);
+
+    // The only memory replica stays until its offload lands.
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    auto evicted = MasterServiceTestPeer(service).EvictNamespaceMemory(
+        kDefaultTenant, 1024);
+    EXPECT_EQ(0u, evicted.freed_bytes);
+    auto queued = service.OffloadObjectHeartbeat(mounted.client_id, true);
+    ASSERT_TRUE(queued.has_value()) << toString(queued.error());
+    ASSERT_EQ(1u, queued->size());
+    EXPECT_EQ(key, queued->front().key);
+    auto before_offload = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(before_offload.has_value());
+    ASSERT_EQ(1u, before_offload->replicas.size());
+    EXPECT_TRUE(before_offload->replicas.front().is_memory_replica());
+
+    // With the offload landed, the next round takes the memory replica off
+    // through the OpLog.
+    StorageObjectMetadata offloaded;
+    offloaded.data_size = 1024;
+    offloaded.transport_endpoint = "offload_on_evict_ha_disk";
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(mounted.client_id, *queued, {offloaded})
+            .has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    evicted = MasterServiceTestPeer(service).EvictNamespaceMemory(
+        kDefaultTenant, 1024);
+    EXPECT_EQ(1024u, evicted.freed_bytes);
+    auto after_evict = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(after_evict.has_value());
+    ASSERT_EQ(1u, after_evict->replicas.size());
+    EXPECT_TRUE(after_evict->replicas.front().is_local_disk_replica());
+}
+
 TEST_F(MasterServiceHATest, PutStartExpiredOverwriteWritesBatchRecordOpLog) {
     const std::string cluster_id =
         "test_batch_record_put_start_cleanup_cluster";
