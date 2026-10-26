@@ -190,38 +190,57 @@ static std::atomic<KfdPinAnchorState> &kfdPinAnchorState() {
     return state;
 }
 
-// A smaller allocation moves KFD free VRAM too little to tell a double charge
-// from concurrent allocations, so the probe waits for a larger one.
-static constexpr size_t kKfdPinProbeMinBytes = 64ull << 20;
+static constexpr size_t kKfdPinProbeBytes = 64ull << 20;
 
-// Pins the allocation through a dma-buf MR over the buffer's first page. KFD
-// free VRAM dropping by the allocation size means the driver charges dma-buf
-// pins twice; not moving means it does not. Anything else means other
-// allocations interfered, and a later registration probes again.
-static KfdPinAnchorState probeKfdPin(ibv_pd *pd, void *addr, size_t length,
-                                     const DmabufExport &exp) {
-    HipDeviceGuard device(exp.device);
-    size_t before = 0, after = 0, total = 0;
-    if (!device.set_ok() || hipMemGetInfo(&before, &total) != hipSuccess)
+// Pins one page of a private, never-pinned allocation through dma-buf: a fixed
+// driver keeps KFD free VRAM flat, one that charges dma-buf pins twice drops it
+// by the whole allocation. A caller's buffer cannot serve, as it may already
+// be pinned or exceed the free VRAM that hipMemGetInfo clamps at 0. Anything
+// else, e.g. a concurrent allocation, leaves the decision to the next
+// registration.
+static KfdPinAnchorState probeKfdPin(ibv_pd *pd, int device) {
+    HipDeviceGuard guard(device);
+    void *buf = nullptr;
+    if (!guard.set_ok() || hipMalloc(&buf, kKfdPinProbeBytes) != hipSuccess) {
+        (void)hipGetLastError();
+        LOG(WARNING) << "KFD pin probe: cannot allocate its "
+                     << (kKfdPinProbeBytes >> 20) << " MiB on GPU " << device
+                     << "; probing again at the next registration";
         return kKfdPinUnprobed;
-    ibv_mr *mr = ibv_reg_dmabuf_mr(
-        pd, exp.offset, std::min<size_t>(length, getpagesize()),
-        reinterpret_cast<uintptr_t>(addr), exp.fd, IBV_ACCESS_LOCAL_WRITE);
-    if (!mr) return kKfdPinUnprobed;
-    const bool measured = hipMemGetInfo(&after, &total) == hipSuccess;
-    if (int ret = ibv_dereg_mr(mr))
-        LOG(WARNING) << "Failed to deregister KFD pin probe MR: "
-                     << strerror(ret);
-    if (!measured) return kKfdPinUnprobed;
-
-    const int64_t drop = (int64_t)before - (int64_t)after;
-    const int64_t size = (int64_t)exp.alloc_size;
+    }
+    DmabufExport exp;
+    const int64_t size = kKfdPinProbeBytes;
+    int64_t drop = 0;
     KfdPinAnchorState result = kKfdPinUnprobed;
-    if (std::llabs(drop) < size / 4)
-        result = kKfdPinNoAnchor;
-    else if (std::llabs(drop - size) < size / 4)
-        result = kKfdPinAnchor;
-    LOG(INFO) << "KFD pin probe: a dma-buf MR of a " << (size >> 20)
+    if (RdmaContext::exportDmabuf(buf, kKfdPinProbeBytes, exp) == 0 &&
+        exp.method == DmabufExport::Method::kDmabufReg) {
+        for (int attempt = 0; attempt < 3 && result == kKfdPinUnprobed;
+             ++attempt) {
+            size_t before = 0, after = 0, total = 0;
+            if (hipMemGetInfo(&before, &total) != hipSuccess ||
+                before < kKfdPinProbeBytes)
+                break;
+            ibv_mr *mr = ibv_reg_dmabuf_mr(pd, exp.offset, getpagesize(),
+                                           reinterpret_cast<uintptr_t>(buf),
+                                           exp.fd, IBV_ACCESS_LOCAL_WRITE);
+            if (!mr) break;
+            const bool measured = hipMemGetInfo(&after, &total) == hipSuccess;
+            if (int ret = ibv_dereg_mr(mr)) {
+                LOG(WARNING) << "Failed to deregister KFD pin probe MR: "
+                             << strerror(ret);
+                break;
+            }
+            if (!measured) break;
+            drop = (int64_t)before - (int64_t)after;
+            if (std::llabs(drop) < size / 4)
+                result = kKfdPinNoAnchor;
+            else if (std::llabs(drop - size) < size / 4)
+                result = kKfdPinAnchor;
+        }
+    }
+    RdmaContext::closeDmabufExport(exp);
+    (void)hipFree(buf);
+    LOG(INFO) << "KFD pin probe: a dma-buf pin of a private " << (size >> 20)
               << " MiB allocation lowered KFD free VRAM by " << drop / (1 << 20)
               << " MiB; "
               << (result == kKfdPinAnchor ? "holding one peer-memory pin per "
@@ -447,7 +466,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         ~KfdPinAnchorGuard() {
             if (held) transport->releaseKfdPinAnchor(addr);
         }
-    } kfd_pin_anchor{this, addr, acquireKfdPinAnchor(addr, length, dmabuf_exp)};
+    } kfd_pin_anchor{this, addr, acquireKfdPinAnchor(addr, dmabuf_exp)};
 
     // Mooncake#2017: ibv_reg_mr silently truncates a registration to the device
     // max_mr_size, but the metadata would still advertise the full BufferDesc
@@ -922,8 +941,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
     return 0;
 }
 
-bool RdmaTransport::acquireKfdPinAnchor(void *addr, size_t length,
-                                        const DmabufExport &exp) {
+bool RdmaTransport::acquireKfdPinAnchor(void *addr, const DmabufExport &exp) {
 #ifdef USE_HIP_DMABUF
     auto &state = kfdPinAnchorState();
     if (!exp.alloc_base || state.load() == kKfdPinNoAnchor) return false;
@@ -931,11 +949,12 @@ bool RdmaTransport::acquireKfdPinAnchor(void *addr, size_t length,
         ibv_pd *pd = nullptr;
         for (auto &context : context_list_)
             if ((pd = context->pd())) break;
-        if (!pd || exp.alloc_size < kKfdPinProbeMinBytes) return false;
+        if (!pd) return false;
+        // HIP registrations wait here instead of pinning during the probe.
         static std::mutex probe_mutex;
         std::lock_guard<std::mutex> lock(probe_mutex);
         if (state.load() == kKfdPinUnprobed)
-            state.store(probeKfdPin(pd, addr, length, exp));
+            state.store(probeKfdPin(pd, exp.device));
         if (state.load() != kKfdPinAnchor) return false;
     }
 

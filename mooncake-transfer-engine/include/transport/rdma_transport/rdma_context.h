@@ -121,7 +121,6 @@ struct DmabufExport {
     std::string pci_root;
     // HIP: the exported allocation and the GPU that owns it.
     void *alloc_base = nullptr;
-    size_t alloc_size = 0;
     int device = -1;
 };
 

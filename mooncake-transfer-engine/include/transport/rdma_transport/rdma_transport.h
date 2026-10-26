@@ -101,8 +101,7 @@ class RdmaTransport : public Transport {
     // hipMemGetInfo and later device allocations exact while the data MRs stay
     // on dma-buf. MC_HIP_KFD_PIN_FIX and a probe at the first registration
     // decide whether the driver needs it.
-    bool acquireKfdPinAnchor(void *addr, size_t length,
-                             const DmabufExport &exp);
+    bool acquireKfdPinAnchor(void *addr, const DmabufExport &exp);
     void releaseKfdPinAnchor(void *addr);
 
    public:
