@@ -26,6 +26,7 @@
 #include "pyclient.h"
 #include "nof/nof_runtime.h"
 #include "rpc_types.h"
+#include "ssd_prefetcher.h"
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
 #endif
@@ -37,6 +38,10 @@
 namespace mooncake {
 
 class RealClient;
+
+namespace test {
+class PrefetchTeardownTest;
+}  // namespace test
 class NvlinkHostNumaAllocation;
 struct EgmStorePoolConfig;
 class RegisteredPinnedRegion;
@@ -181,6 +186,9 @@ class RealClient : public PyClient {
      * @param all_buffers Vector of vectors of pointers to the pre-allocated
      * buffers
      * @param all_sizes Vector of vectors of sizes of the buffers
+     * @param prefer_alloc_in_same_node Group exact-size memory replicas on
+     * one segment into one transfer. A size mismatch stays on the per-key
+     * path. Ascend and ascend_direct group even when this flag is false.
      * @return Vector of integers, where each element is the number of bytes
      * read on success, or a negative value on error
      * @note The buffer addresses must resolve to Store-managed registered
@@ -191,7 +199,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool prefer_alloc_in_same_node);
 
     /**
      * @brief Put object data directly from a pre-allocated buffer
@@ -433,6 +441,17 @@ class RealClient : public PyClient {
      */
     std::vector<int> batchProbeKey(const std::vector<std::string> &keys,
                                    const GrantLeasePolicy &policy = {});
+
+    /**
+     * @brief isExist / batchIsExist with options. With
+     * ExistOptions.prefetch_to_memory and enable_ssd_prefetch configured,
+     * existing keys that turn out SSD-only get a best-effort asynchronous
+     * SSD->DRAM promotion so a later get() can hit DRAM. The synchronous
+     * path does no extra RPC (a throttle dedup plus a thread-pool enqueue).
+     */
+    int isExist(const std::string &key, const ExistOptions &options) override;
+    std::vector<int> batchIsExist(const std::vector<std::string> &keys,
+                                  const ExistOptions &options) override;
 
     /**
      * @brief Get the size of an object
@@ -751,7 +770,18 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool prefer_alloc_in_same_node);
+
+    // Demand-side kick, shared by all get paths: a get headed for LOCAL_DISK
+    // fires one promotion attempt for those keys (best-effort, non-blocking,
+    // one dedup lookup + one pool enqueue; no RPC on the caller's thread).
+    // ignore_cooldown bypasses only this client's throttle backoff — never a
+    // master-side gate (the in-flight cap, holder check, and dedup TTL still
+    // apply). No-op unless enable_ssd_prefetch_ and the prefetcher is set up.
+    void KickPrefetchForDiskHeadedKeys(
+        const std::vector<std::string> &keys,
+        const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
+        const std::unordered_set<std::string> &local_endpoints);
 
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,
@@ -905,6 +935,16 @@ class RealClient : public PyClient {
      * @return true if batch was found and released, false otherwise
      */
     bool release_offload_buffer(uint64_t batch_id);
+
+    /**
+     * @brief RPC handler: a remote requester asks this node (the LOCAL_DISK
+     * holder) to prefetch-promote the given keys into DRAM. Best-effort and
+     * asynchronous; returns false when prefetch is disabled or SSD offload
+     * is not set up here.
+     */
+    bool prefetch_offload_object(const std::vector<std::string> &keys,
+                                 const std::vector<int64_t> &sizes,
+                                 const std::string &tenant_id);
 
     /**
      * @brief Verifies each key's backing offload file on this (the replica
@@ -1122,6 +1162,15 @@ class RealClient : public PyClient {
     std::string local_rpc_addr;
     std::unique_ptr<coro_rpc::coro_rpc_server> offload_rpc_server_;
     int offload_rpc_port_ = 0;
+
+    // SSD prefetch (best-effort SSD->DRAM promotion on exist probes). Off
+    // unless enable_ssd_prefetch is set in the config; knobs are read from
+    // the config dict in setup_internal. See
+    // docs/source/design/store/ssd-prefetch.md.
+    std::unique_ptr<SsdPrefetcher> prefetcher_;
+    bool enable_ssd_prefetch_ = false;
+    int64_t ssd_prefetch_cooldown_sec_ = DEFAULT_SSD_PREFETCH_COOLDOWN_SEC;
+    int64_t ssd_prefetch_dedup_ttl_sec_ = DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC;
     bool use_hugepage_ = false;
     // NoF runtime (initiator + DMA allocator) created during setup_internal.
     // Both components are additionally owned by client_ /
@@ -1394,6 +1443,7 @@ class RealClient : public PyClient {
         bool enable_embedded_master);
 
     friend class DirectGpuReadTest;
+    friend class test::PrefetchTeardownTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,
                                     void *buffer, size_t size) const;
