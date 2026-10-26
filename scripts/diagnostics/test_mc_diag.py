@@ -727,7 +727,7 @@ class IncidentTest(unittest.TestCase):
 
     def test_directory_rejected_instead_of_collecting_private_map(self):
         with tempfile.TemporaryDirectory() as temp:
-            with self.assertRaisesRegex(SystemExit, "explicit log file"):
+            with self.assertRaisesRegex(SystemExit, "explicit input file"):
                 m.main(
                     ["bundle", "--prefill-log", temp, "-o", str(Path(temp) / "out.zip")]
                 )
@@ -746,6 +746,292 @@ ret=-1
         self.assertNotIn("CANARY", redacted)
         self.assertIn("Stopped P", redacted)
         self.assertIn("ret=-1", redacted)
+
+
+class FieldIterationTest(unittest.TestCase):
+    def test_bom_log_headers_and_record_request_fields_are_preserved_safely(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log, record, out = (
+                Path(temp) / "p.log",
+                Path(temp) / "record.txt",
+                Path(temp) / "out.zip",
+            )
+            log.write_text(
+                vlog("ERROR", "peer failed ret=-1") + "\n", encoding="utf-8-sig"
+            )
+            record.write_text(
+                "prompt: BOM_PROMPT_CANARY\n## Checks\nP stayed alive\n",
+                encoding="utf-8-sig",
+            )
+            m.main(
+                [
+                    "bundle",
+                    "--prefill-log",
+                    str(log),
+                    "--record",
+                    str(record),
+                    "-o",
+                    str(out),
+                ]
+            )
+            with zipfile.ZipFile(out) as archive:
+                blob = "\n".join(archive.read(n).decode() for n in archive.namelist())
+                self.assertNotIn("BOM_PROMPT_CANARY", blob)
+                self.assertIn("P stayed alive", blob)
+                self.assertIn(
+                    "logs/prefill/0-p.log:L1",
+                    archive.read("mooncake-incident/AI_CONTEXT.md").decode(),
+                )
+
+    def test_utf16_and_invalid_text_rejected_before_redaction_or_publish(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "p.log"
+            log.write_text("ready\n", encoding="utf-8")
+            text = Path(temp) / "export.txt"
+            invalid = [
+                "prompt: ENCODING_CANARY\n".encode("utf-16"),
+                b"\xfe\xff" + "prompt: ENCODING_CANARY\n".encode("utf-16-be"),
+                b"password=\xffCANARY\n",
+                b"prompt:\x00NULL_CANARY\n",
+            ]
+            for flag in ["--log", "--record"]:
+                for i, raw in enumerate(invalid):
+                    text.write_bytes(raw)
+                    out = Path(temp) / f"bad-{i}.zip"
+                    with self.subTest(flag=flag, raw=raw), self.assertRaisesRegex(
+                        SystemExit, "UTF-8 text.*export.txt"
+                    ):
+                        m.main(
+                            [
+                                "bundle",
+                                "--prefill-log",
+                                str(log),
+                                flag,
+                                str(text),
+                                "-o",
+                                str(out),
+                            ]
+                        )
+                    self.assertFalse(out.exists())
+                    self.assertFalse(out.with_suffix(".map.json").exists())
+
+    def test_corrupt_or_incomplete_gzip_never_publishes_and_names_input(self):
+        good = gzip.compress(b"ready\nret=-1\n")
+        corrupt = bytearray(good)
+        corrupt[-8] ^= 1
+        with tempfile.TemporaryDirectory() as temp:
+            path, out = Path(temp) / "prefill.log.GZ", Path(temp) / "out.zip"
+            for raw in [b"incomplete-copy", good[:-4], bytes(corrupt)]:
+                path.write_bytes(raw)
+                with self.subTest(raw=raw), self.assertRaisesRegex(
+                    SystemExit, "cannot read input.*prefill.log.GZ"
+                ):
+                    m.main(["bundle", "--prefill-log", str(path), "-o", str(out)])
+                self.assertFalse(out.exists())
+                self.assertFalse(out.with_suffix(".map.json").exists())
+            path.write_bytes(good)
+            m.main(["bundle", "--prefill-log", str(path), "-o", str(out)])
+            with zipfile.ZipFile(out) as archive:
+                log = next(n for n in archive.namelist() if "/logs/" in n)
+                self.assertFalse(log.lower().endswith(".gz"))
+                self.assertEqual(archive.read(log), b"1\tready\n2\tret=-1\n")
+
+    def test_json_prompt_continuations_are_not_log_headers(self):
+        payload = '{"message":"JSON_PROMPT_CANARY"}'
+        diagnostic = '{"level":"error","message":"transport failed ret=-1"}'
+        with tempfile.TemporaryDirectory() as temp:
+            data = bundle(
+                temp,
+                p=[
+                    vlog(
+                        "DEBUG", "Request cmpl-a JSON body: {", file="request_logger.py"
+                    ),
+                    payload,
+                    "AFTER_JSON_CANARY",
+                    diagnostic,
+                ],
+                case="prompt: first paragraph\n"
+                + payload
+                + "\nAFTER_JSON_CANARY\n"
+                + diagnostic,
+                record="prompt: first paragraph\n"
+                + payload
+                + "\nAFTER_JSON_CANARY\n"
+                + diagnostic,
+            )
+            blob = "\n".join(data.values())
+            self.assertNotIn("CANARY", blob)
+            for path in [
+                "logs/prefill/0-prefill.log",
+                "case.md",
+                "records/0-record.txt",
+            ]:
+                self.assertIn("transport failed ret=-1", data[path])
+            self.assertEqual(m.parse_line(payload).source, "raw")
+            self.assertEqual(m.parse_line(diagnostic).level, "ERROR")
+
+    def test_network_identities_next_to_filename_separators(self):
+        identities = [
+            "10.20.30.40",
+            "2001:db8::7",
+            "0c:42:a1:00:11:22",
+            "00:00:00:00:00:00:00:00:00:00:ff:ff:0a:01:02:03",
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "prefill_10.20.30.40_peer.log"
+            line = " ".join("prefix_" + value + "_suffix" for value in identities)
+            path.write_text(vlog("ERROR", line) + "\n", encoding="utf-8")
+            out = Path(temp) / "incident.zip"
+            m.main(["bundle", "--prefill-log", str(path), "-o", str(out)])
+            with zipfile.ZipFile(out) as archive:
+                blob = (
+                    "\n".join(archive.namelist())
+                    + "\n"
+                    + "\n".join(archive.read(n).decode() for n in archive.namelist())
+                )
+            for value in identities:
+                self.assertNotIn(value, blob)
+            self.assertIn("prefill_ip-1_peer.log", blob)
+            self.assertIn("prefix_ip-1_suffix", blob)
+            self.assertIn("gid-1", blob)
+            self.assertIn("mac-1", blob)
+            self.assertEqual(
+                m.Redactor().text("v10.20.30.40 12:00:00.123456"),
+                "v10.20.30.40 12:00:00.123456",
+            )
+
+    def test_hostname_case_variants_share_one_alias(self):
+        with tempfile.TemporaryDirectory() as temp:
+            data = bundle(
+                temp,
+                [vlog("INFO", "peer=OPS-NODE-1.EXAMPLE")],
+                [vlog("INFO", "peer=ops-node-1")],
+                snapshot={
+                    "host": {"hostname": "ops-node-1", "fqdn": "Ops-Node-1.Example"}
+                },
+            )
+            blob = "\n".join(data.values()).lower()
+            self.assertNotIn("ops-node-1", blob)
+            self.assertIn("peer=host-1", data["logs/prefill/0-prefill.log"])
+            self.assertIn("peer=host-1", data["logs/decode/1-decode.log"])
+            mapping = json.loads((Path(temp) / "incident.map.json").read_text())
+            self.assertEqual([k for k in mapping if k.startswith("host-")], ["host-1"])
+
+    def test_prefill_error_noise_cannot_hide_decode_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            p = [
+                glog("E", f"startup error {i}", file="workers.cpp", line=i)
+                for i in range(20)
+            ]
+            data = bundle(temp, p, [vlog("ERROR", "decode connection failed (ret=-1)")])
+            entry = data["AI_CONTEXT.md"]
+            self.assertIn("decode connection failed (ret=-1)", entry)
+            self.assertIn("logs/decode/1-decode.log:L1", entry)
+            self.assertIn("ID/error summary is limited", entry)
+            self.assertEqual(len(data["logs/prefill/0-prefill.log"].splitlines()), 20)
+
+    def test_private_maps_rejected_as_every_input_kind(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "p.log"
+            path.write_text("ready\n", encoding="utf-8")
+            mapping = Path(temp) / "previous.MAP.JSON"
+            mapping.write_text('{"host-1":"PRIVATE_HOST_CANARY"}', encoding="utf-8")
+            out = Path(temp) / "out.zip"
+            for flag in [
+                "--prefill-log",
+                "--decode-log",
+                "--log",
+                "--record",
+                "--snapshot",
+                "--case",
+            ]:
+                with self.subTest(flag=flag), self.assertRaisesRegex(
+                    SystemExit, "private identity maps"
+                ):
+                    m.main(
+                        [
+                            "bundle",
+                            "--prefill-log",
+                            str(path),
+                            flag,
+                            str(mapping),
+                            "-o",
+                            str(out),
+                        ]
+                    )
+                self.assertFalse(out.exists())
+                self.assertFalse(out.with_suffix(".map.json").exists())
+            if os.name == "posix":
+                disguised = Path(temp) / "record.txt"
+                disguised.symlink_to(mapping)
+                with self.assertRaisesRegex(SystemExit, "private identity maps"):
+                    m.main(
+                        [
+                            "bundle",
+                            "--prefill-log",
+                            str(path),
+                            "--record",
+                            str(disguised),
+                            "-o",
+                            str(out),
+                        ]
+                    )
+            self.assertIn("PRIVATE_HOST_CANARY", mapping.read_text())
+
+    def test_bom_snapshot_accepted_and_malformed_shapes_are_actionable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log, snapshot, out = (
+                Path(temp) / "p.log",
+                Path(temp) / "snapshot.json",
+                Path(temp) / "out.zip",
+            )
+            log.write_text("ready\n", encoding="utf-8")
+            snapshot.write_text('{"role":"prefill","host":{}}', encoding="utf-8-sig")
+            m.main(
+                [
+                    "bundle",
+                    "--prefill-log",
+                    str(log),
+                    "--snapshot",
+                    str(snapshot),
+                    "-o",
+                    str(out),
+                ]
+            )
+            with zipfile.ZipFile(out) as archive:
+                self.assertEqual(
+                    json.loads(archive.read("mooncake-incident/env.json"))[0]["role"],
+                    "prefill",
+                )
+            invalid = [
+                "{partial",
+                "[]",
+                "{}",
+                '{"host":null}',
+                '{"host":{"user":123}}',
+                '{"host":{},"env":null}',
+                '{"host":{},"env":{"vars":[]}}',
+                '{"host":{},"env":{"tent_conf":"file"}}',
+            ]
+            for i, text in enumerate(invalid):
+                snapshot.write_text(text, encoding="utf-8")
+                target = Path(temp) / f"bad-{i}.zip"
+                with self.subTest(text=text), self.assertRaisesRegex(
+                    SystemExit, "snapshot"
+                ):
+                    m.main(
+                        [
+                            "bundle",
+                            "--prefill-log",
+                            str(log),
+                            "--snapshot",
+                            str(snapshot),
+                            "-o",
+                            str(target),
+                        ]
+                    )
+                self.assertFalse(target.exists())
+                self.assertFalse(target.with_suffix(".map.json").exists())
 
 
 if __name__ == "__main__":

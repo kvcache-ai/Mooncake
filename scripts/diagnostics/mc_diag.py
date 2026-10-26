@@ -33,6 +33,8 @@ import zipfile
 
 import tempfile
 
+import zlib
+
 from collections import defaultdict
 
 from dataclasses import dataclass
@@ -40,7 +42,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
-TOOL_VERSION = "0.3.1"
+TOOL_VERSION = "0.3.2"
 
 
 ROLES = ("prefill", "decode", "unknown")
@@ -100,13 +102,10 @@ def parse_line(text: str) -> Parsed:
     if s.startswith("{") and '"message"' in s:
         try:
             obj = json.loads(s)
-            return Parsed(
-                "json",
-                str(obj.get("levelname") or obj.get("level") or "") or None,
-                None,
-                None,
-                str(obj.get("message", "")),
-            )
+            level = str(obj.get("levelname") or obj.get("level") or "").upper()
+            # JSON embedded in a multiline prompt is not a new diagnostic header.
+            if level in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "FATAL"):
+                return Parsed("json", level, None, None, str(obj.get("message", "")))
         except ValueError:
             pass
     return Parsed("raw", None, None, None, text)
@@ -134,18 +133,24 @@ TOKEN_LIKE_RE = re.compile(
 
 
 URL_CRED_RE = re.compile(r"\b([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s?#]*@")
-GID_RE = re.compile(r"(?i)(?<![\w:])(?:[0-9a-f]{2}:){15}[0-9a-f]{2}(?![\w:])")
-
-
-MAC_RE = re.compile(r"(?i)(?<![\w:])(?:[0-9a-f]{2}:){5}[0-9a-f]{2}(?![\w:])")
-
-
-IPV6_RE = re.compile(
-    r"(?i)(?<![\w:.])(?:[0-9a-f]{0,4}:){2,}[0-9a-f:.]*(?:%[\w.-]+)?(?![\w:])"
+GID_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9:])(?:[0-9a-f]{2}:){15}[0-9a-f]{2}(?![A-Za-z0-9:])"
 )
 
 
-IPV4_RE = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?!\w)(?!\.\d)")
+MAC_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9:])(?:[0-9a-f]{2}:){5}[0-9a-f]{2}(?![A-Za-z0-9:])"
+)
+
+
+IPV6_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9:.])(?:[0-9a-f]{0,4}:){2,}[0-9a-f:.]*(?:%[\w.-]+)?(?![A-Za-z0-9:])"
+)
+
+
+IPV4_RE = re.compile(
+    r"(?<![A-Za-z0-9.])(\d{1,3}(?:\.\d{1,3}){3})(?![A-Za-z0-9])(?!\.\d)"
+)
 
 
 HOME_RE = re.compile(r"(/home/|/Users/)([^/\s:'\"]+)")
@@ -309,7 +314,11 @@ class Redactor:
         )
 
     def add_host(self, name: Optional[str]) -> None:
-        if not name or name.lower() in SKIP_HOSTS or name in self._hosts:
+        if (
+            not name
+            or name.lower() in SKIP_HOSTS
+            or name.lower() in self._host_identity
+        ):
             return
         try:
             ipaddress.ip_address(name)
@@ -322,14 +331,15 @@ class Redactor:
         for n in names:
             if n and n.lower() not in SKIP_HOSTS and n not in self._hosts:
                 self._hosts.append(n)
-                self._host_identity[n] = self._host_identity.get(
-                    name.split(".")[0], name
+                self._host_identity[n.lower()] = self._host_identity.get(
+                    name.split(".")[0].lower(), name
                 )
         self._hosts.sort(key=len, reverse=True)
         self._host_re = re.compile(
             r"(?<![A-Za-z0-9])("
             + "|".join(re.escape(h) for h in self._hosts)
-            + r")(?![A-Za-z0-9])"
+            + r")(?![A-Za-z0-9])",
+            re.IGNORECASE | re.ASCII,
         )
 
     def alias(self, kind: str, value: str) -> str:
@@ -376,7 +386,7 @@ class Redactor:
         """按文件重置状态；请求内容的无日志头续行也要去掉。"""
         p = parse_line(s)
         if self._secret_continuation is not None:
-            if p.source not in ("glog", "vllm"):
+            if p.source == "raw":
                 state = self._secret_continuation
                 first = s.lstrip()[:1]
                 if state["waiting"] and first not in ("", '"', "'", "[", "{", "("):
@@ -427,7 +437,7 @@ class Redactor:
             s = redact_secret_values(s)
         if self._host_re is not None:
             s = self._host_re.sub(
-                lambda m: self.alias("host", self._host_identity[m.group(1)]), s
+                lambda m: self.alias("host", self._host_identity[m.group(1).lower()]), s
             )
         if self._user_re is not None:
             s = self._user_re.sub(lambda m: self.alias("user", m.group(1)), s)
@@ -1023,10 +1033,29 @@ def snapshot_hosts(snap: dict) -> List[str]:
 
 
 def _load_json(path: str) -> dict:
-    with open(path, encoding="utf-8") as f:
-        snap = json.load(f)
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            snap = json.load(f)
+    except ValueError:
+        raise SystemExit(f"mc_diag: invalid snapshot JSON: {path}") from None
+    if not isinstance(snap, dict) or not isinstance(snap.get("host"), dict):
+        raise SystemExit(f"mc_diag: expected a snapshot with a host object: {path}")
+    host = snap["host"]
+    if any(
+        host.get(key) is not None and not isinstance(host[key], str)
+        for key in ("hostname", "fqdn", "user")
+    ):
+        raise SystemExit(f"mc_diag: snapshot host identities must be strings: {path}")
     # 兼容旧版快照：不要信任它已经脱敏，更不能读取其中声明的本机路径。
     env = snap.get("env", {})
+    if (
+        not isinstance(env, dict)
+        or not isinstance(env.get("vars", {}), dict)
+        or not isinstance(env.get("tent_conf", {}), dict)
+    ):
+        raise SystemExit(
+            f"mc_diag: snapshot env/vars/tent_conf must be objects: {path}"
+        )
     variables = env.get("vars", {})
     if "MC_TENT_CONF" in variables:
         value = variables["MC_TENT_CONF"]
@@ -1196,11 +1225,22 @@ def cmd_snapshot(args) -> int:
 
 def input_lines(path):
     """Read every source LF line; never create an unknown continuation after a gap."""
-    opener = gzip.open if str(path).endswith(".gz") else open
-    with opener(path, "rb") as stream:
-        for number, raw in enumerate(stream, 1):
-            text = raw.decode("utf-8", "replace").rstrip("\r\n").replace("\r", "\\r")
-            yield number, strip_ansi(text)
+    opener = gzip.open if str(path).lower().endswith(".gz") else open
+    try:
+        with opener(path, "rb") as stream:
+            for number, raw in enumerate(stream, 1):
+                if b"\0" in raw:
+                    raise UnicodeError("binary or UTF-16 input")
+                text = (
+                    raw.decode("utf-8-sig" if number == 1 else "utf-8")
+                    .rstrip("\r\n")
+                    .replace("\r", "\\r")
+                )
+                yield number, strip_ansi(text)
+    except UnicodeError:
+        raise SystemExit(f"mc_diag: input must be UTF-8 text: {path}") from None
+    except (OSError, EOFError, zlib.error) as error:
+        raise SystemExit(f"mc_diag: cannot read input {path}: {error}") from None
 
 
 def context_rows(root, logs):
@@ -1248,15 +1288,19 @@ def context_rows(root, logs):
 def collect_context(root, logs):
     """Keep literal ID evidence; explicit pairs never merge different request IDs."""
     limit = 128
-    priority, errors = set(), {}
+    priority, errors = set(), defaultdict(dict)
+    errors_limited = False
     for parsed, ref, ids in context_rows(root, logs):
         if ref["error"]:
             for identity in sorted(ids):
                 if len(priority) < limit:
                     priority.add(identity)
             site = (ref["file"], parsed.file, parsed.line)
-            if len(errors) < 12:
-                errors.setdefault(site, ref)
+            role_errors = errors[ref["role"]]
+            if len(role_errors) < 6:
+                role_errors.setdefault(site, ref)
+            elif site not in role_errors:
+                errors_limited = True
     # Error IDs may have been mapped before the failure, in the other input file.
     error_ids = set(priority)
     for parsed, _, ids in context_rows(root, logs):
@@ -1296,8 +1340,8 @@ def collect_context(root, logs):
     return {
         "groups": [(identity, groups[identity]) for identity in ordered[:12]],
         "links": links,
-        "errors": list(errors.values()),
-        "limited": omitted > 0 or len(groups) > 12,
+        "errors": [ref for role in ROLES for ref in errors[role].values()],
+        "limited": omitted > 0 or len(groups) > 12 or errors_limited,
     }
 
 
@@ -1377,7 +1421,7 @@ def render_context(logs, snapshots, records, case, context):
         )
     if context["limited"]:
         out.append(
-            "The ID summary is limited. Full logs remain in this ZIP; search them for the failure window."
+            "The ID/error summary is limited. Full logs remain in this ZIP; search them for the failure window."
         )
     out += [
         "\n## Sharing",
@@ -1389,7 +1433,7 @@ def render_context(logs, snapshots, records, case, context):
 def safe_name(path, red):
     # A numeric prefix at each call site also avoids duplicate and DOS-reserved basenames.
     name = red.text(os.path.basename(path))
-    if name.endswith(".gz"):
+    if name.lower().endswith(".gz"):
         name = name[:-3]
     return re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", name) or "log"
 
@@ -1428,9 +1472,18 @@ def cmd_bundle(args):
     )
     if not logs:
         raise SystemExit("mc_diag bundle: provide --prefill-log, --decode-log or --log")
-    for _, path in logs:
+    paths = [path for _, path in logs] + args.snapshot + args.record
+    if args.case:
+        paths.append(args.case)
+    for path in paths:
+        if path.lower().endswith(".map.json") or os.path.realpath(
+            path
+        ).lower().endswith(".map.json"):
+            raise SystemExit(
+                f"mc_diag: private identity maps cannot be incident inputs: {path}"
+            )
         if not os.path.isfile(path):
-            raise SystemExit(f"mc_diag: expected an explicit log file: {path}")
+            raise SystemExit(f"mc_diag: expected an explicit input file: {path}")
     snapshots = [_load_json(path) for path in args.snapshot]
     red = Redactor(
         hosts=args.host + [h for s in snapshots for h in snapshot_hosts(s)],
@@ -1536,7 +1589,7 @@ def main(argv=None):
     except UnicodeError:
         raise SystemExit("mc_diag: incident description must be UTF-8") from None
     except OSError as error:
-        raise SystemExit(f"mc_diag: {error.strerror}: {error.filename}") from None
+        raise SystemExit(f"mc_diag: {error}") from None
 
 
 if __name__ == "__main__":

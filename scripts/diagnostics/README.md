@@ -33,7 +33,8 @@ Snapshots collect package/build metadata, process environment, RDMA port state,
 GPU topology, and peer-memory module state. They do not start transfers. Package
 metadata follows the selected interpreter and is not proof of modules already
 imported in a modified running process. TENT build capability is not proof of the
-runtime backend. Raw snapshots stay private.
+runtime backend. Raw snapshots stay private. UTF-8 BOM snapshots are accepted;
+malformed snapshots are rejected with a file-specific error.
 
 ## Make the ZIP
 
@@ -48,7 +49,8 @@ python3 scripts/diagnostics/mc_diag.py bundle \
 ```
 
 Use explicit files, not directories; options may be repeated. `.gz` logs/records
-are decompressed. Add `--record PATH` for saved troubleshooting results or `--log
+are decompressed and checked for incomplete/corrupt data before a ZIP is published.
+Add `--record PATH` for saved troubleshooting results or `--log
 PATH` for a log with no known P/D role. Omit unavailable material; the context
 will report the gap. `bundle` never collects the packaging machine's environment.
 
@@ -56,13 +58,17 @@ The ZIP contains one reading entry, `AI_CONTEXT.md`, plus `env.json`,
 `manifest.json`, redacted `logs/`, optional `case.md`, and optional `records/`.
 Logs/records retain original LF line numbers as `number<TAB>text`; JSON records
 are numbered text. Input files are read completely, so select the relevant
-incident window before running. Text should be UTF-8.
+incident window before running. Text must be UTF-8 (an initial BOM is accepted).
+UTF-16/binary or invalid UTF-8 exports are rejected rather than shared after
+unreliable redaction; resave them as UTF-8 first.
 
 The context lists explicit request/transfer pairs and literal P/D ID references.
 It does not merge different requests, classify stages, infer a root cause, or
 claim recovery. Reused IDs may span attempts. INFO logs can lack DEBUG mappings;
 do not restart a production service just to obtain them. A small ID/error summary
 can be limited; the complete supplied logs remain in the ZIP.
+Error samples are retained per input role so prefill noise cannot exclude decode
+errors. These remain samples, not a complete failure timeline.
 
 ## Review and share
 
@@ -71,7 +77,8 @@ issue](https://github.com/kvcache-ai/Mooncake/issues/new/choose) or consulting A
 Nothing is uploaded automatically. Review the contents first: redaction cannot
 recognize every business-specific secret. The adjacent `.map.json` contains
 original identities and stays local with the raw inputs. Only share the reviewed
-ZIP. Existing output files are never overwritten.
+ZIP. Private `.map.json` files are rejected as inputs, including named symlink
+targets. Existing output files are never overwritten.
 
 Ask AI to start with `AI_CONTEXT.md`, verify cited lines, distinguish operator
 statements from evidence and guesses, and suggest the smallest useful next
