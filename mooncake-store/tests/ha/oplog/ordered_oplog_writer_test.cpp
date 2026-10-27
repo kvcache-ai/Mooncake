@@ -1853,4 +1853,98 @@ TEST(OrderedOpLogWriterAdmissionTest, CommitBatchRejectsSlotMismatch) {
     writer.Abort(std::move(*next));
 }
 
+
+// Reserving for a known entry is what lets a caller check a record before it
+// changes anything: everything Commit would refuse about the entry itself is
+// refused here, so a commit that follows can only fail for a writer that
+// stopped taking work.
+namespace {
+
+std::unique_ptr<OrderedOpLogWriter> MakeReserveForWriter(
+    FakeBatchWriter& storage, OrderedOpLogWriterConfig config = {}) {
+    return std::make_unique<OrderedOpLogWriter>(
+        config,
+        [&storage](const OpLogBatchRecord& batch, const DurablePrefix& prefix) {
+            return storage.Write(batch, prefix);
+        });
+}
+
+std::string KeyOfSize(size_t size) { return std::string(size, 'k'); }
+
+}  // namespace
+
+TEST(OrderedOpLogWriterReserveForTest, AnEntryCommitWouldRefuseTakesNoSlot) {
+    FakeBatchWriter storage;
+    auto writer = MakeReserveForWriter(
+        storage, OrderedOpLogWriterConfig{.max_entries_per_batch = 1});
+
+    // One byte past the limit the writer enforces on the key.
+    auto oversized_key =
+        writer->ReserveFor(MakeEntry(KeyOfSize(kMaxOpLogObjectKeySize + 1)));
+    ASSERT_FALSE(oversized_key.has_value());
+    EXPECT_EQ(oversized_key.error(), ErrorCode::INVALID_PARAMS);
+
+    // The refusal left no slot behind: the only slot this writer admits is
+    // still free.
+    auto admitted = writer->Reserve();
+    ASSERT_TRUE(admitted.has_value());
+    writer->Abort(std::move(*admitted));
+}
+
+TEST(OrderedOpLogWriterReserveForTest, TheSizeLimitsAreInclusive) {
+    FakeBatchWriter storage;
+    auto writer = MakeReserveForWriter(storage);
+
+    auto largest_key = writer->ReserveFor(MakeEntry(KeyOfSize(kMaxOpLogObjectKeySize)));
+    ASSERT_TRUE(largest_key.has_value());
+    writer->Abort(std::move(*largest_key));
+
+    auto largest_payload = writer->ReserveFor(
+        MakeEntry("key", std::string(kMaxOpLogPayloadSize, 'p')));
+    ASSERT_TRUE(largest_payload.has_value());
+    writer->Abort(std::move(*largest_payload));
+
+    auto over_payload = writer->ReserveFor(
+        MakeEntry("key", std::string(kMaxOpLogPayloadSize + 1, 'p')));
+    ASSERT_FALSE(over_payload.has_value());
+    EXPECT_EQ(over_payload.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST(OrderedOpLogWriterReserveForTest, AnUnknownOperationIsRefusedUpFront) {
+    FakeBatchWriter storage;
+    auto writer = MakeReserveForWriter(storage);
+    auto entry = MakeEntry();
+    entry.op_type = OpType::OP_TYPE_MAX;
+
+    auto refused = writer->ReserveFor(entry);
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST(OrderedOpLogWriterReserveForTest, AValidatedEntryCommitsAsItIs) {
+    FakeBatchWriter storage;
+    auto writer = MakeReserveForWriter(storage);
+    writer->Start();
+
+    const auto entry = MakeEntry("key", "payload");
+    auto reservation = writer->ReserveFor(entry);
+    ASSERT_TRUE(reservation.has_value());
+    // The same entry, so the commit has nothing left to refuse it for.
+    auto committed = writer->Commit(std::move(*reservation), entry, nullptr);
+    ASSERT_TRUE(committed.has_value());
+    EXPECT_TRUE(storage.WaitForWrites(1));
+    writer->Stop();
+}
+
+TEST(OrderedOpLogWriterReserveForTest, AStoppedWriterTakesNoReservation) {
+    FakeBatchWriter storage;
+    auto writer = MakeReserveForWriter(storage);
+    writer->Start();
+    writer->Stop();
+
+    auto refused = writer->ReserveFor(MakeEntry());
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
 }  // namespace mooncake::test
