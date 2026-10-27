@@ -1,0 +1,55 @@
+# Securing the etcd Metadata Service (RBAC + TLS)
+
+Mooncake's Go etcd client (`libetcd_wrapper.so`) can authenticate against an
+etcd cluster with RBAC and/or encrypt the connection with one-way TLS. Both
+are configured purely with environment variables on the Mooncake node; no
+code or endpoint string changes are needed.
+
+## Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `MC_ETCD_CONF_FILE` | Path to a file with `username=...` and `password=...` lines (one per line, `#` lines and empty lines ignored) |
+| `MC_ETCD_TLS_CA_CERT` | Path to the CA certificate used to verify the etcd server (one-way TLS) |
+| `MC_ETCD_TLS_SERVER_NAME` | Optional: override the server name used for TLS SNI / certificate hostname verification (e.g. connecting via IP). Requires TLS to be enabled (either `MC_ETCD_TLS_CA_CERT` or `MC_ETCD_TLS_INSECURE_SKIP_VERIFY="true"`). |
+| `MC_ETCD_TLS_INSECURE_SKIP_VERIFY` | Set to `"true"` to skip certificate verification (testing only, never in production). If set to `"true"` without `MC_ETCD_TLS_CA_CERT`, the client uses an insecure TLS connection. |
+
+All variables are optional. When none are set, the client behaves exactly as
+before (plaintext, no authentication). Invalid or incomplete TLS combinations
+are rejected during client initialization; the wrapper does not silently fall
+back to plaintext when TLS-related variables are partially configured.
+
+## Notes and limitations
+
+### Process-wide configuration
+
+The wrapper loads `MC_ETCD_*` variables once and caches them for the lifetime
+of the process (via `sync.Once`). The same cached credentials and TLS settings
+are applied to all etcd clients created by the process (Store / Transfer Engine
+metadata / snapshot clients). One process cannot connect to different etcd
+clusters with different security settings.
+
+### RBAC token expiry
+
+If your etcd cluster issues RBAC authentication tokens with a finite TTL, long-lived
+watch streams and lease keepalives may stop working after the token expires.
+This PR focuses on RBAC/TLS configuration and validation and does not implement
+token refresh or automatic re-authentication. For secured HA deployments, ensure
+that the token TTL is compatible with your availability requirements or plan to
+add an explicit token-refresh mechanism.
+
+## Example
+
+```bash
+# credentials file /etc/mooncake/etcd/credentials:
+#   username=mooncake
+#   password=<secret>
+
+export MC_ETCD_CONF_FILE=/etc/mooncake/etcd/credentials
+export MC_ETCD_TLS_CA_CERT=/etc/mooncake/etcd/ca.crt
+```
+
+The endpoint string keeps its usual form (`etcd://host:port` or bare
+`host:port`; the C++ callers already strip the scheme before the Go client
+sees it). When TLS is enabled the client upgrades automatically to an
+encrypted connection.
