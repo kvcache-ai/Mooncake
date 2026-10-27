@@ -1,0 +1,31 @@
+name: PR Tidy
+
+on:
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  tidy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clean PR description
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr.body) return;
+
+            // Remove HTML comment blocks (template instructions)
+            let body = pr.body.replace(/<!--[\s\S]*?-->/g, '').trim();
+
+            if (body !== pr.body) {
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                body: body
+              });
+            }

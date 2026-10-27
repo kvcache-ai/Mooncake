@@ -1,0 +1,141 @@
+if(USE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  add_definitions(-DUSE_CUDA)
+  include_directories(${CUDAToolkit_INCLUDE_DIRS})
+  message(STATUS "CUDA: Enabled")
+else()
+  message(STATUS "CUDA: Disabled")
+endif()
+
+if(USE_HIP)
+  list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
+  find_package(HIP REQUIRED)
+  add_definitions(-DUSE_HIP -D__HIP_PLATFORM_AMD__)
+  message(STATUS "ROCm/HIP: Enabled")
+else()
+  message(STATUS "ROCm/HIP: Disabled")
+endif()
+
+if(USE_SUNRISE)
+  add_definitions(-DUSE_SUNRISE)
+  include_directories(${MC_TANGRT_ROOT}/include)
+  link_directories(${MC_TANGRT_ROOT}/lib)
+  message(STATUS "Sunrise/Tang: Enabled")
+else()
+  message(STATUS "Sunrise/Tang: Disabled")
+endif()
+
+file(GLOB TEBENCH_SOURCES CONFIGURE_DEPENDS "*.cpp")
+# The TENT backend is only available when USE_TENT is enabled; drop its
+# translation unit (which pulls in tent/ headers) from non-TENT builds.
+if(NOT USE_TENT)
+  list(REMOVE_ITEM TEBENCH_SOURCES
+       "${CMAKE_CURRENT_SOURCE_DIR}/tent_backend.cpp")
+  list(APPEND TEBENCH_SOURCES
+       "${CMAKE_CURRENT_SOURCE_DIR}/../tent/src/common/qos_metrics.cpp")
+endif()
+add_executable(tebench ${TEBENCH_SOURCES})
+target_link_libraries(tebench PUBLIC transfer_engine)
+if(USE_TENT)
+  target_compile_definitions(tebench PRIVATE USE_TENT)
+  # tent_link_group's interface brings in the tent/ header search path.
+  target_link_libraries(tebench PUBLIC tent_link_group)
+else()
+  # The classic backend still uses a couple of header-only helpers that live
+  # under tent/include (SimpleRandom in utils.h, bindToSocket in
+  # te_backend.cpp). Expose just the header path so tebench builds without the
+  # TENT library.
+  target_include_directories(
+    tebench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+endif()
+if(USE_CUDA)
+  target_link_libraries(tebench PUBLIC CUDA::cudart)
+endif()
+if(USE_HIP)
+  target_link_libraries(tebench PUBLIC hip::host)
+endif()
+if(USE_SUNRISE)
+  target_link_libraries(tebench PUBLIC tangrt_shared)
+endif()
+
+# Set RPATH for finding libasio.so at runtime
+if(USE_SUNRISE AND MC_TANGRT_ROOT)
+  set(TANGRT_RPATH ":${MC_TANGRT_ROOT}/lib")
+else()
+  set(TANGRT_RPATH "")
+endif()
+set_target_properties(
+  tebench
+  PROPERTIES INSTALL_RPATH
+             "$ORIGIN/../lib:$ORIGIN/../../mooncake-common${TANGRT_RPATH}")
+
+if(BUILD_UNIT_TESTS)
+  if(USE_TENT)
+    add_executable(
+      tebench_tent_config_test tests/tent_config_test.cpp tent_backend.cpp
+                               split_output.cpp utils.cpp)
+    target_link_libraries(
+      tebench_tent_config_test PRIVATE transfer_engine tent_link_group gtest
+                                       gtest_main)
+    target_include_directories(tebench_tent_config_test
+                               PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tebench_tent_config_test COMMAND tebench_tent_config_test)
+  endif()
+
+  if(USE_MLU)
+    add_executable(tebench_mlu_data_test tests/mlu_data_test.cpp utils.cpp)
+    target_link_libraries(tebench_mlu_data_test PRIVATE transfer_engine gtest
+                                                        gtest_main)
+    target_include_directories(
+      tebench_mlu_data_test
+      PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+    add_test(NAME tebench_mlu_data_test COMMAND tebench_mlu_data_test)
+  endif()
+
+  add_test(NAME tebench_build_tree_help
+           COMMAND ${CMAKE_COMMAND} -E env --unset=LD_LIBRARY_PATH
+                   $<TARGET_FILE:tebench> --help)
+  set_tests_properties(
+    tebench_build_tree_help
+    PROPERTIES PASS_REGULAR_EXPRESSION
+               "Mooncake Transfer Engine Benchmarking Tool" TIMEOUT 10)
+
+  add_executable(
+    tebench_qos_metrics_test tests/qos_metrics_test.cpp qos_metrics_adapter.cpp
+                             workload_config.cpp utils.cpp)
+  if(NOT USE_TENT)
+    target_sources(tebench_qos_metrics_test
+                   PRIVATE ../tent/src/common/qos_metrics.cpp)
+  endif()
+  target_link_libraries(tebench_qos_metrics_test PRIVATE transfer_engine gtest
+                                                         gtest_main)
+  if(USE_TENT)
+    target_link_libraries(tebench_qos_metrics_test PRIVATE tent_common)
+  endif()
+  target_include_directories(
+    tebench_qos_metrics_test
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+  add_test(NAME tebench_qos_metrics_test COMMAND tebench_qos_metrics_test)
+
+  add_executable(tebench_target_metrics_test tests/target_metrics_test.cpp
+                                             target_metrics.cpp utils.cpp)
+  target_link_libraries(tebench_target_metrics_test PRIVATE transfer_engine
+                                                            gtest gtest_main)
+  if(USE_TENT)
+    target_link_libraries(tebench_target_metrics_test PRIVATE tent_common)
+  endif()
+  target_include_directories(
+    tebench_target_metrics_test
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+  add_test(NAME tebench_target_metrics_test COMMAND tebench_target_metrics_test)
+
+  add_executable(tebench_split_output_test tests/split_output_test.cpp
+                                           split_output.cpp)
+  target_link_libraries(tebench_split_output_test PRIVATE gtest gtest_main)
+  target_include_directories(tebench_split_output_test
+                             PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  add_test(NAME tebench_split_output_test COMMAND tebench_split_output_test)
+endif()

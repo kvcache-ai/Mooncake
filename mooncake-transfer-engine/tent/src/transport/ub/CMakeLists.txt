@@ -1,0 +1,8 @@
+if(USE_UB)
+  file(GLOB TENT_UB_SOURCES CONFIGURE_DEPENDS "*.cpp")
+  add_library(tent_xport_ub STATIC ${TENT_UB_SOURCES})
+  target_link_libraries(tent_xport_ub PUBLIC tent_common Urma::urma)
+  if(URMA_LIBRARY)
+    target_compile_definitions(tent_xport_ub PRIVATE TENT_HAS_REAL_URMA=1)
+  endif()
+endif()

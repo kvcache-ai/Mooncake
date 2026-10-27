@@ -1,0 +1,347 @@
+#include <gflags/gflags.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <future>
+#include <memory>
+#include <optional>
+#include <string>
+#include <thread>
+
+#ifdef STORE_USE_K8S_LEASE
+#include "k8s_lease_helper.h"
+#endif
+#include "ha/leadership/leader_coordinator_factory.h"
+#include "ha/leadership/high_availability_test_fixture.h"
+#include "types.h"
+
+namespace mooncake {
+namespace testing {
+
+DEFINE_string(k8s_namespace, "default",
+              "K8s namespace for HA integration tests");
+DEFINE_string(k8s_lease_name, "mooncake-ha-test",
+              "K8s Lease name for HA integration tests");
+
+namespace {
+
+std::optional<std::string> GetK8sSkipReason() {
+#ifdef STORE_USE_K8S_LEASE
+    // Probe: try to init K8s client and read a lease.
+    auto err = K8sLeaseHelper::Init();
+    if (err != ErrorCode::OK) {
+        return "K8s API not reachable (Init failed)";
+    }
+    std::string holder;
+    int64_t transitions = 0;
+    err = K8sLeaseHelper::GetHolder(FLAGS_k8s_namespace, FLAGS_k8s_lease_name,
+                                    holder, transitions);
+    if (err != ErrorCode::OK && err != ErrorCode::K8S_LEASE_NOT_FOUND) {
+        return "K8s API not reachable (GetHolder probe failed)";
+    }
+    return std::nullopt;
+#else
+    return "K8s Lease HA backend is not enabled in this build";
+#endif
+}
+
+ha::HABackendSpec MakeK8sBackendSpec(const std::string& ns,
+                                     const std::string& lease_name) {
+    return ha::HABackendSpec{
+        .type = ha::HABackendType::K8S,
+        .connstring = ns + "/" + lease_name,
+        .cluster_namespace = "",
+    };
+}
+
+std::unique_ptr<ha::LeaderCoordinator> CreateK8sCoordinatorOrNull(
+    const std::string& ns, const std::string& lease_name) {
+    auto coordinator =
+        ha::CreateLeaderCoordinator(MakeK8sBackendSpec(ns, lease_name));
+    if (!coordinator) {
+        return nullptr;
+    }
+    return std::move(coordinator.value());
+}
+
+std::string MakeK8sTestLeaseName(const std::string& suffix) {
+    return FLAGS_k8s_lease_name + "-" + suffix;
+}
+
+}  // namespace
+
+TEST_F(HighAvailabilityTest, K8sBasicMasterViewOperations) {
+    if (auto skip_reason = GetK8sSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const auto lease_name = MakeK8sTestLeaseName("basic");
+    auto coordinator =
+        CreateK8sCoordinatorOrNull(FLAGS_k8s_namespace, lease_name);
+    ASSERT_NE(coordinator, nullptr);
+
+    // Initially, the master view should be empty (no leader)
+    auto initial_view = coordinator->ReadCurrentView();
+    ASSERT_TRUE(initial_view.has_value());
+    // Note: may or may not have value depending on prior test state
+
+    // Acquire leadership
+    auto acquire = coordinator->TryAcquireLeadership("127.0.0.1:8899");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+
+    // Read current view — should show our address
+    auto current_view = coordinator->ReadCurrentView();
+    ASSERT_TRUE(current_view.has_value());
+    ASSERT_TRUE(current_view->has_value());
+    EXPECT_EQ("127.0.0.1:8899", current_view->value().leader_address);
+
+    // Renew
+    auto renewed = coordinator->RenewLeadership(*acquire->session);
+    ASSERT_TRUE(renewed.has_value());
+    EXPECT_TRUE(renewed.value());
+
+    // WaitForViewChange — should time out since nothing changed
+    auto no_change = coordinator->WaitForViewChange(
+        acquire->session->view.view_version, std::chrono::milliseconds(200));
+    ASSERT_TRUE(no_change.has_value());
+    ASSERT_FALSE(no_change->changed);
+    ASSERT_TRUE(no_change->timed_out);
+
+    // Release
+    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(*acquire->session));
+
+    // After release, view should eventually show no leader or a different
+    // transitions count
+    auto released = coordinator->WaitForViewChange(
+        acquire->session->view.view_version, std::chrono::seconds(10));
+    ASSERT_TRUE(released.has_value());
+    ASSERT_TRUE(released->changed);
+}
+
+TEST_F(HighAvailabilityTest, K8sLeadershipMonitorIgnoresExplicitRelease) {
+    if (auto skip_reason = GetK8sSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const auto lease_name = MakeK8sTestLeaseName("monitor-release");
+    auto coordinator =
+        CreateK8sCoordinatorOrNull(FLAGS_k8s_namespace, lease_name);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("127.0.0.1:9922");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto renew = coordinator->RenewLeadership(session);
+    ASSERT_TRUE(renew.has_value());
+    ASSERT_TRUE(renew.value());
+
+    auto callback_fired = std::make_shared<std::atomic<bool>>(false);
+    auto monitor = coordinator->StartLeadershipMonitor(
+        session, [callback_fired](ha::LeadershipLossReason) {
+            callback_fired->store(true);
+        });
+    ASSERT_TRUE(monitor.has_value());
+
+    // Explicit release should NOT fire the monitor callback
+    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    EXPECT_FALSE(callback_fired->load());
+}
+
+TEST_F(HighAvailabilityTest, K8sLeadershipMonitorReportsElectionCancellation) {
+    if (auto skip_reason = GetK8sSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const auto lease_name = MakeK8sTestLeaseName("monitor-loss");
+    auto coordinator =
+        CreateK8sCoordinatorOrNull(FLAGS_k8s_namespace, lease_name);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("127.0.0.1:9955");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto renew = coordinator->RenewLeadership(session);
+    ASSERT_TRUE(renew.has_value());
+    ASSERT_TRUE(renew.value());
+
+    auto callback_fired = std::make_shared<std::atomic<bool>>(false);
+    auto monitor = coordinator->StartLeadershipMonitor(
+        session, [callback_fired](ha::LeadershipLossReason) {
+            callback_fired->store(true);
+        });
+    ASSERT_TRUE(monitor.has_value());
+
+    // Cancel the election goroutine directly, bypassing ReleaseLeadership.
+    // This simulates leadership loss: WaitLost returns while
+    // election_shutdown_requested_ is still false, so the monitor fires.
+    K8sLeaseHelper::CancelElection(FLAGS_k8s_namespace, lease_name);
+
+    // Wait for the monitor thread to detect the loss and fire the callback
+    for (int i = 0; i < 50 && !callback_fired->load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    EXPECT_TRUE(callback_fired->load());
+}
+
+TEST_F(HighAvailabilityTest, K8sCanReacquireAfterRelease) {
+    if (auto skip_reason = GetK8sSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const auto lease_name = MakeK8sTestLeaseName("reacquire");
+    auto coordinator =
+        CreateK8sCoordinatorOrNull(FLAGS_k8s_namespace, lease_name);
+    ASSERT_NE(coordinator, nullptr);
+
+    // First acquisition
+    auto first_acquire = coordinator->TryAcquireLeadership("127.0.0.1:9933");
+    ASSERT_TRUE(first_acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, first_acquire->status);
+    ASSERT_TRUE(first_acquire->session.has_value());
+
+    auto first_renew = coordinator->RenewLeadership(*first_acquire->session);
+    ASSERT_TRUE(first_renew.has_value());
+    ASSERT_TRUE(first_renew.value());
+
+    ASSERT_EQ(ErrorCode::OK,
+              coordinator->ReleaseLeadership(*first_acquire->session));
+
+    // Wait for lease to expire
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    // Second acquisition
+    auto second_acquire = coordinator->TryAcquireLeadership("127.0.0.1:9944");
+    ASSERT_TRUE(second_acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, second_acquire->status);
+    ASSERT_TRUE(second_acquire->session.has_value());
+
+    auto second_renew = coordinator->RenewLeadership(*second_acquire->session);
+    ASSERT_TRUE(second_renew.has_value());
+    ASSERT_TRUE(second_renew.value());
+
+    ASSERT_EQ(ErrorCode::OK,
+              coordinator->ReleaseLeadership(*second_acquire->session));
+}
+
+TEST_F(HighAvailabilityTest, K8sContendedLeadershipAndHandover) {
+    if (auto skip_reason = GetK8sSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const auto lease_name = MakeK8sTestLeaseName("contention");
+
+    // Coordinator A acquires leadership
+    auto coord_a = CreateK8sCoordinatorOrNull(FLAGS_k8s_namespace, lease_name);
+    ASSERT_NE(coord_a, nullptr);
+
+    auto acquire_a = coord_a->TryAcquireLeadership("127.0.0.1:7701");
+    ASSERT_TRUE(acquire_a.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire_a->status);
+    ASSERT_TRUE(acquire_a->session.has_value());
+
+    auto renew_a = coord_a->RenewLeadership(*acquire_a->session);
+    ASSERT_TRUE(renew_a.has_value());
+    ASSERT_TRUE(renew_a.value());
+
+    // Coordinator B attempts acquisition on the same lease — should be
+    // contended
+    auto coord_b = CreateK8sCoordinatorOrNull(FLAGS_k8s_namespace, lease_name);
+    ASSERT_NE(coord_b, nullptr);
+
+    auto acquire_b = coord_b->TryAcquireLeadership("127.0.0.1:7702");
+    ASSERT_TRUE(acquire_b.has_value());
+    EXPECT_EQ(ha::AcquireLeadershipStatus::CONTENDED, acquire_b->status);
+    ASSERT_TRUE(acquire_b->observed_view.has_value());
+    EXPECT_EQ(acquire_a->session->view.view_version,
+              acquire_b->observed_view->view_version);
+
+    // A releases leadership
+    ASSERT_EQ(ErrorCode::OK, coord_a->ReleaseLeadership(*acquire_a->session));
+
+    // Wait for lease to expire so B can take over
+    auto view_changed = coord_b->WaitForViewChange(
+        acquire_a->session->view.view_version, std::chrono::seconds(10));
+    ASSERT_TRUE(view_changed.has_value());
+    ASSERT_TRUE(view_changed->changed);
+
+    // B acquires leadership
+    auto acquire_b2 = coord_b->TryAcquireLeadership("127.0.0.1:7702");
+    ASSERT_TRUE(acquire_b2.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire_b2->status);
+    ASSERT_TRUE(acquire_b2->session.has_value());
+
+    ASSERT_EQ(ErrorCode::OK, coord_b->ReleaseLeadership(*acquire_b2->session));
+}
+
+// --- Connstring validation ---
+
+TEST_F(HighAvailabilityTest, K8sConnstringEmptyIsRejected) {
+    auto coordinator = CreateK8sCoordinatorOrNull("", "");
+    ASSERT_EQ(coordinator, nullptr);
+}
+
+TEST_F(HighAvailabilityTest, K8sConnstringEmptyNamespaceIsRejected) {
+    auto spec = ha::HABackendSpec{
+        .type = ha::HABackendType::K8S,
+        .connstring = "/lease-name",
+    };
+    auto coordinator = ha::CreateLeaderCoordinator(spec);
+    ASSERT_FALSE(coordinator.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, coordinator.error());
+}
+
+TEST_F(HighAvailabilityTest, K8sConnstringEmptyLeaseNameIsRejected) {
+    auto spec = ha::HABackendSpec{
+        .type = ha::HABackendType::K8S,
+        .connstring = "default/",
+    };
+    auto coordinator = ha::CreateLeaderCoordinator(spec);
+    ASSERT_FALSE(coordinator.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, coordinator.error());
+}
+
+TEST_F(HighAvailabilityTest, K8sConnstringMultipleSlashesIsRejected) {
+    auto spec = ha::HABackendSpec{
+        .type = ha::HABackendType::K8S,
+        .connstring = "a/b/c",
+    };
+    auto coordinator = ha::CreateLeaderCoordinator(spec);
+    ASSERT_FALSE(coordinator.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, coordinator.error());
+}
+
+TEST_F(HighAvailabilityTest, K8sConnstringValidFormatPassesParsing) {
+    if (auto skip_reason = GetK8sSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    auto coordinator =
+        CreateK8sCoordinatorOrNull(FLAGS_k8s_namespace, "parse-valid");
+    ASSERT_NE(coordinator, nullptr);
+}
+
+TEST_F(HighAvailabilityTest, K8sConnstringNoSlashDefaultsNamespace) {
+    if (auto skip_reason = GetK8sSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    auto spec = ha::HABackendSpec{
+        .type = ha::HABackendType::K8S,
+        .connstring = FLAGS_k8s_lease_name + "-parse-noslash",
+    };
+    auto coordinator = ha::CreateLeaderCoordinator(spec);
+    ASSERT_TRUE(coordinator.has_value());
+}
+
+}  // namespace testing
+}  // namespace mooncake

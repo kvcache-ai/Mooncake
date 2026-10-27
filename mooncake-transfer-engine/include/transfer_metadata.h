@@ -1,0 +1,382 @@
+// Copyright 2024 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef TRANSFER_METADATA
+#define TRANSFER_METADATA
+
+#include <glog/logging.h>
+#if __has_include(<jsoncpp/json/json.h>)
+#include <jsoncpp/json/json.h>  // Ubuntu
+#else
+#include <json/json.h>  // CentOS
+#endif
+#include <netdb.h>
+
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+
+#include "buffer_range_index.h"
+#include "common.h"
+#include "topology.h"
+
+namespace mooncake {
+struct MetadataStoragePlugin;
+struct HandShakePlugin;
+
+// Result of a metadata-backend lookup, distinguishing an authoritative
+// key absence (kNotFound — the master removed the segment key on peer
+// unmount/expiry) from a transient backend failure (kUnavailable — curl
+// timeout, etcd blip, connection drop). syncSegmentCache() advances its
+// invalidation streak only for kNotFound so a metadata-service outage
+// cannot purge the live cache.
+enum class GetResult {
+    kFound,
+    kNotFound,
+    kUnavailable,
+};
+
+#define P2PHANDSHAKE "P2PHANDSHAKE"
+
+class TransferMetadata {
+   public:
+    struct DeviceDesc {
+        std::string name;
+        uint32_t lid;
+        std::string gid;
+        std::string eid;  // for ub
+
+        bool operator==(const DeviceDesc &other) const = default;
+    };
+
+    struct BufferDesc {
+        std::string name;
+        uint64_t addr;
+        uint64_t length;
+        int32_t device_id = -1;  // CUDA device (NCCL) or Ascend engine index
+#ifdef ENABLE_MULTI_PROTOCOL
+        std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
+#endif
+        // EFA/CXI's libfabric provider returns 64-bit MR keys (fi_mr_key()), so
+        // these must be 64-bit wide to avoid truncation. RDMA verbs keys are
+        // 32-bit and the non-EFA/CXI path keeps them as such.
+#if defined(USE_EFA) || defined(USE_CXI)
+        using mr_key_t = uint64_t;
+#else
+        using mr_key_t = uint32_t;
+#endif
+        std::vector<mr_key_t> lkey;  // for rdma/efa
+        std::vector<mr_key_t> rkey;  // for rdma/efa
+        std::string shm_name;  // nvlink/hip IPC blob, or POSIX shm object name
+        uint64_t offset;       // for cxl
+        std::vector<std::string> tseg;      // for ub/urma
+        std::vector<uint32_t> l_seg_index;  // for ub/urma
+
+        bool operator==(const BufferDesc &other) const = default;
+    };
+
+    struct NVMeoFBufferDesc {
+        std::string file_path;
+        uint64_t length;
+        std::unordered_map<std::string, std::string> local_path_map;
+
+        bool operator==(const NVMeoFBufferDesc &other) const = default;
+    };
+
+    struct RankInfoDesc {
+        uint64_t rankId = 0xFFFFFFFF;  // rank id, user rank
+        std::string hostIp;
+        uint64_t hostPort;
+        uint64_t deviceLogicId;
+        uint64_t devicePhyId;
+        uint64_t deviceType = 5;  // default
+        std::string deviceIp;
+        uint64_t devicePort;
+        uint64_t pid;
+        std::vector<std::string> endpoints;
+
+        bool operator==(const RankInfoDesc &other) const = default;
+    };
+
+    using SegmentID = uint64_t;
+
+    struct SegmentDesc {
+        std::string name;
+        std::string protocol;
+        uint64_t metadata_version{0};
+        // this is for rdma/shm/urma
+        std::vector<DeviceDesc> devices;
+        Topology topology;
+        std::vector<BufferDesc> buffers;
+        // Derived from `buffers`. Rebuild after every mutation of that
+        // vector, before the descriptor is published through a shared_ptr.
+        // Copying a SegmentDesc copies this snapshot; a subsequent
+        // push_back/erase must call rebuildBufferRangeIndex() again.
+        BufferRangeIndex buffer_range_index;
+        // Derived from `name`/`rdma_server_name` + `devices`. Rebuild after
+        // every mutation of those fields, before the descriptor is published
+        // (addLocalSegment / decodeSegmentDesc). Not tied to
+        // rebuildBufferRangeIndex(); that snapshot depends only on `buffers`.
+        // Entries point into a process-lifetime intern pool (never erased;
+        // cardinality is historical peer endpoints × NICs). After publish,
+        // devices / name / rdma_server_name are frozen. internedNicPath()
+        // falls back to the intern pool without mutating this snapshot if
+        // interned_nic_paths.size() != devices.size().
+        std::vector<const std::string *> interned_nic_paths;
+        void rebuildInternedNicPaths();
+        const std::string &internedNicPath(size_t device_id) const;
+        void rebuildBufferRangeIndex() { buffer_range_index.rebuild(buffers); }
+        // this is for nvmeof.
+        std::vector<NVMeoFBufferDesc> nvmeof_buffers;
+        // this is for cxl.
+        std::string cxl_name;
+        uint64_t cxl_base_addr;
+        // TODO : make these two a union or a std::variant
+        std::string timestamp;
+        // this is for ascend
+        RankInfoDesc rank_info;
+
+        // TCP data-plane endpoint. Keeping the routable host beside the port
+        // makes one SegmentDesc an immutable endpoint snapshot for clients.
+        // Older descriptors may omit tcp_data_host; getSegmentDesc() fills it
+        // once from legacy RPC metadata before caching the descriptor.
+        std::string tcp_data_host;
+        int tcp_data_port{0};
+        // TCP data-plane protocol version advertised by this segment's
+        // server. v2 adds acknowledged WRITE framing and status-prefixed
+        // READ responses (#2086); absent/1 = legacy unacknowledged framing.
+        int tcp_proto_version{1};
+
+        // In dual-NIC setups (MC_RDMA_BIND_ADDRESS), the RDMA-reachable
+        // address may differ from the TCP-routable segment name.  When
+        // non-empty, NIC paths are constructed using this value instead
+        // of `name`.
+        std::string rdma_server_name;
+
+        // Returns the server name to use for NIC path construction.
+        // Uses rdma_server_name when available, otherwise falls back
+        // to name.
+        const std::string &nicPathServerName() const {
+            return rdma_server_name.empty() ? name : rdma_server_name;
+        }
+
+        bool operator==(const SegmentDesc &other) const;
+        bool operator!=(const SegmentDesc &other) const {
+            return !(*this == other);
+        }
+        void dump() const;
+    };
+
+    struct RpcMetaDesc {
+        std::string ip_or_host_name;
+        uint16_t rpc_port;
+        uint64_t metadata_version{0};
+#ifdef USE_BAREX
+        uint16_t barex_port;
+#endif
+        int sockfd;  // local cache
+    };
+
+    struct HandShakeDesc {
+        std::string payload;  // opaque transport-specific handshake data
+        std::string local_nic_path;
+        uint32_t local_lid = 0;
+        std::string local_gid;
+        std::string peer_nic_path;
+#ifdef USE_UB
+        std::vector<uint32_t> jetty_num;  // for ub/urma
+#endif
+#ifdef USE_BAREX
+        uint16_t barex_port;
+#endif
+        std::vector<uint32_t> qp_num;
+        bool ready_ack = false;
+        // Capability marker. Encoded only by transports that opt into
+        // ready_ack; decoded from field presence to detect peer support.
+        bool ready_ack_supported = false;
+        // Optional classic-RDMA advisory. Older peers omit this field.
+        std::string auto_gid_reprobe_from;
+        // Per-peer RDMA CtrlChannel (notify QP). 0 = not supported / unused.
+        // When ctrl_channel is true, this handshake only sets up the control
+        // path (qp_num may be empty).
+        uint32_t notify_qp_num = 0;
+        uint16_t notify_rq_depth = 0;
+        bool ctrl_channel = false;
+        std::string reply_msg;  // on error
+#ifdef USE_EFA
+        std::string efa_addr;  // EFA endpoint address (hex encoded)
+#endif
+#ifdef USE_CXI
+        std::string cxi_addr;
+#endif
+    };
+
+    struct NotifyDesc {
+        std::string name;
+        std::string notify_msg;
+    };
+
+   public:
+    TransferMetadata(const std::string &conn_string);
+
+    ~TransferMetadata();
+
+   protected:
+    // Test-only seam: inject a storage plugin directly, bypassing the
+    // conn-string plugin factory (which LOG(FATAL)s without a real
+    // etcd/redis/http backend) and the P2P handshake daemon. Derived
+    // hardware-free unit tests substitute an in-memory
+    // MetadataStoragePlugin to exercise syncSegmentCache without RDMA/CUDA.
+    explicit TransferMetadata(
+        std::shared_ptr<MetadataStoragePlugin> storage_plugin);
+
+   public:
+    std::shared_ptr<SegmentDesc> getSegmentDescByName(
+        const std::string &segment_name, bool force_update = false);
+
+    std::shared_ptr<SegmentDesc> getSegmentDescByID(SegmentID segment_id,
+                                                    bool force_update = false);
+
+    int updateLocalSegmentDesc(SegmentID segment_id = LOCAL_SEGMENT_ID);
+
+    int updateSegmentDesc(const std::string &segment_name,
+                          const SegmentDesc &desc);
+
+    // Fetch a segment descriptor from the metadata backend. When |status|
+    // is non-null it receives the GetResult so the caller (syncSegmentCache)
+    // can distinguish an authoritative key removal from a transient outage.
+    std::shared_ptr<SegmentDesc> getSegmentDesc(const std::string &segment_name,
+                                                GetResult *status = nullptr);
+
+    SegmentID getSegmentID(const std::string &segment_name);
+
+    int syncSegmentCache(const std::string &segment_name);
+
+    int removeSegmentDesc(const std::string &segment_name);
+
+    int addLocalMemoryBuffer(const BufferDesc &buffer_desc,
+                             bool update_metadata);
+
+    // Removes the local descriptor entry before optional metadata publication.
+    // If publication fails, the local removal remains committed; a retry must
+    // publish the updated descriptor rather than remove the entry again.
+    // ERR_ADDRESS_NOT_REGISTERED means no matching local entry was present.
+    int removeLocalMemoryBuffer(void *addr, bool update_metadata);
+
+    // Rebuilds interned NIC paths on `desc` before insert. The caller must
+    // exclusively own `desc`; do not pass a live descriptor from the metadata
+    // map (copy first, as refreshLocalDeviceDesc does).
+    int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
+                        std::shared_ptr<SegmentDesc> &&desc);
+
+    int removeLocalSegment(const std::string &segment_name);
+
+    int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
+
+    int removeRpcMetaEntry(const std::string &server_name);
+
+    // Re-publish the local RPC meta entry to the HTTP metadata server.
+    int rePublishRpcMetaEntry(const std::string &server_name);
+
+    int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
+    int getNotifies(std::vector<NotifyDesc> &notifies);
+    // Push a notify received from an alternate path (e.g. RDMA CtrlChannel).
+    void pushNotify(const NotifyDesc &notify);
+
+    const RpcMetaDesc &localRpcMeta() const { return local_rpc_meta_; }
+
+    using OnReceiveHandShake = std::function<int(const HandShakeDesc &peer_desc,
+                                                 HandShakeDesc &local_desc)>;
+    int startHandshakeDaemon(OnReceiveHandShake on_receive_handshake,
+                             uint16_t listen_port, int sockfd);
+
+    int sendHandshake(const std::string &peer_server_name,
+                      const HandShakeDesc &local_desc,
+                      HandShakeDesc &peer_desc);
+
+    int sendNotify(const std::string &peer_server_name,
+                   const NotifyDesc &local_desc, NotifyDesc &peer_desc);
+    int sendProbe(const std::string &peer_server_name);
+
+    // Record a failed peer buffer/device selection.  Runs on the transfer
+    // worker (CQ polling) thread, so the record is fixed-size and capped
+    // process-wide: one line per throttle window plus a suppressed-event
+    // count.  Uses the descriptor the caller already holds — the exact
+    // version the failed selection matched against — instead of
+    // re-looking-up the cache, and takes no metadata locks.
+    void dumpMetadataContent(const std::shared_ptr<const SegmentDesc> &desc,
+                             uint64_t offset, uint64_t length);
+
+    void dumpMetadataContentUnlocked();
+
+   private:
+    std::shared_ptr<SegmentDesc> getSegmentDescInternal(
+        const std::string &segment_name, bool force_rpc_update,
+        GetResult *status = nullptr);
+    int getRpcMetaEntryInternal(const std::string &server_name,
+                                RpcMetaDesc &desc, bool force_update);
+    int publishSegmentDesc(const std::string &segment_name,
+                           const SegmentDesc &desc);
+    int encodeSegmentDesc(const SegmentDesc &desc, Json::Value &segmentJSON);
+    std::shared_ptr<TransferMetadata::SegmentDesc> decodeSegmentDesc(
+        Json::Value &segmentJSON, const std::string &segment_name);
+    int receivePeerMetadata(const Json::Value &peer_json,
+                            Json::Value &local_json);
+    int receivePeerNotify(const Json::Value &peer_json,
+                          Json::Value &local_json);
+    int receivePeerProbe(const Json::Value &peer_json, Json::Value &local_json);
+    std::string getFullMetadataKey(const std::string &segment_name) const;
+    void startMetadataRefreshPollingIfNeeded();
+    void stopMetadataRefreshPollingThread();
+    void metadataRefreshPollingLoop(uint64_t refresh_interval_seconds);
+
+    bool p2p_handshake_mode_{false};
+    std::string common_key_prefix_;
+    std::string rpc_meta_prefix_;
+    // local cache
+    RWSpinlock segment_lock_;
+    std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>
+        segment_id_to_desc_map_;
+    std::unordered_map<std::string, uint64_t> segment_name_to_id_map_;
+    // Per-REMOTE-segment consecutive fetch-failure streak, guarded by
+    // segment_lock_. Bumped in syncSegmentCache's apply phase when a cached
+    // segment's backend fetch fails; reset to 0 on a successful fetch. Once it
+    // reaches kStaleSegmentFailureThreshold the cached entry is invalidated.
+    std::unordered_map<std::string, int> segment_failure_counts_;
+
+    RWSpinlock notify_lock_;
+    std::vector<NotifyDesc> notifys;
+    RWSpinlock rpc_meta_lock_;
+    std::unordered_map<std::string, RpcMetaDesc> rpc_meta_map_;
+    RpcMetaDesc local_rpc_meta_;
+
+    std::atomic<SegmentID> next_segment_id_;
+
+    std::shared_ptr<HandShakePlugin> handshake_plugin_;
+    std::shared_ptr<MetadataStoragePlugin> storage_plugin_;
+    std::mutex metadata_refresh_mutex_;
+    std::condition_variable metadata_refresh_cv_;
+    std::atomic<bool> should_stop_metadata_refresh_thread_{false};
+    std::thread metadata_refresh_thread_;
+};
+
+}  // namespace mooncake
+
+#endif  // TRANSFER_METADATA

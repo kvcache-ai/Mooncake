@@ -1,0 +1,634 @@
+// Copyright 2025 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "tent/runtime/transport_selector.h"
+#include "tent/runtime/transport.h"
+#include "tent/runtime/platform.h"
+#include "tent/runtime/topology.h"
+#include "tent/thirdparty/nlohmann/json.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <glog/logging.h>
+
+namespace mooncake {
+namespace tent {
+
+// Memory type name mapping for pattern matching
+static const std::string kMemoryTypeCpu = "cpu";
+static const std::string kMemoryTypeCuda = "cuda";
+static const std::string kMemoryTypeNpu = "npu";
+static const std::string kMemoryTypeWildcard = "*";
+
+static const std::unordered_map<std::string, IntentType> kIntentTypeNameMap = {
+    {"intent_unspec", IntentType::INTENT_UNSPEC},
+    {"unspec", IntentType::INTENT_UNSPEC},
+    {"foreground_get", IntentType::FOREGROUND_GET},
+    {"background_prefetch", IntentType::BACKGROUND_PREFETCH},
+    {"migration", IntentType::MIGRATION},
+    {"checkpoint", IntentType::CHECKPOINT},
+    {"weight_loading", IntentType::WEIGHT_LOADING},
+    {"staging_internal", IntentType::STAGING_INTERNAL},
+};
+
+static std::string joinNames(const std::vector<std::string>& names) {
+    std::string out;
+    for (const auto& name : names) {
+        if (!out.empty()) out += ", ";
+        out += name;
+    }
+    return out;
+}
+
+static std::optional<IntentType> parseIntentType(const json& value) {
+    if (value.is_string()) {
+        auto name = value.get<std::string>();
+        std::transform(name.begin(), name.end(), name.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        auto it = kIntentTypeNameMap.find(name);
+        if (it != kIntentTypeNameMap.end()) return it->second;
+        return std::nullopt;
+    }
+
+    if (value.is_number_unsigned()) {
+        const auto raw = value.get<uint64_t>();
+        if (raw <= static_cast<uint64_t>(IntentType::STAGING_INTERNAL)) {
+            return static_cast<IntentType>(raw);
+        }
+        return std::nullopt;
+    }
+
+    if (value.is_number_integer()) {
+        const auto raw = value.get<int64_t>();
+        if (raw >= static_cast<int64_t>(IntentType::INTENT_UNSPEC) &&
+            raw <= static_cast<int64_t>(IntentType::STAGING_INTERNAL)) {
+            return static_cast<IntentType>(raw);
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::vector<SelectionPolicy> TransportSelector::getDefaultPolicies() {
+    // Default policies that match the original hardcoded behavior
+    return {
+        {
+            "file_storage",
+            SegmentType::File,
+            std::nullopt,    // same_machine doesn't matter for file
+            std::nullopt,    // local_memory_pattern
+            std::nullopt,    // remote_memory_pattern
+            std::nullopt,    // min_size
+            std::nullopt,    // max_size
+            std::nullopt,    // priority
+            {},              // devices (empty = all devices)
+            {GDS, IOURING},  // File priority (original: GDS -> IOURING)
+            std::nullopt,    // service_level
+            std::nullopt,    // traffic_class
+            std::nullopt,    // qp_pool
+            std::nullopt     // intent_type
+        },
+        {
+            "memory_default",
+            SegmentType::Memory,
+            std::nullopt,  // any machine
+            std::nullopt,  // any local memory
+            std::nullopt,  // any remote memory
+            std::nullopt,  // min_size
+            std::nullopt,  // max_size
+            std::nullopt,  // priority
+            {},            // devices (empty = all devices)
+            {},            // Empty = use buffer_transports order
+            std::nullopt,  // service_level
+            std::nullopt,  // traffic_class
+            std::nullopt,  // qp_pool
+            std::nullopt   // intent_type
+        },
+    };
+}
+
+void TransportSelector::loadPolicies() {
+    policies_.clear();
+
+    // Try to load from configuration - read from "policy" subtree
+    auto policies_array = config_->getArray<json>("policy");
+
+    if (policies_array.empty()) {
+        LOG(INFO)
+            << "No 'policy' configured, using default transport selection";
+        policies_ = getDefaultPolicies();
+        return;
+    }
+
+    LOG(INFO) << "Loading transport selection policies from config";
+
+    for (const auto& policy_json : policies_array) {
+        if (!policy_json.is_object()) continue;
+
+        SelectionPolicy policy;
+        policy.name = policy_json.value("name", "unnamed");
+
+        // Parse segment_type
+        std::string segment_type_str = policy_json.value("segment_type", "");
+        if (segment_type_str == "file") {
+            policy.segment_type = SegmentType::File;
+        } else if (segment_type_str == "memory") {
+            policy.segment_type = SegmentType::Memory;
+        } else {
+            LOG(WARNING) << "Invalid segment_type in policy " << policy.name;
+            continue;
+        }
+
+        // Parse same_machine (optional)
+        if (policy_json.contains("same_machine")) {
+            policy.same_machine = policy_json["same_machine"].get<bool>();
+        } else {
+            policy.same_machine = std::nullopt;
+        }
+
+        // Parse memory patterns (optional)
+        if (policy_json.contains("local_memory")) {
+            policy.local_memory_pattern =
+                policy_json["local_memory"].get<std::string>();
+        }
+        if (policy_json.contains("remote_memory")) {
+            policy.remote_memory_pattern =
+                policy_json["remote_memory"].get<std::string>();
+        }
+
+        // Parse size filters (optional)
+        if (policy_json.contains("min_size")) {
+            policy.min_size = policy_json["min_size"].get<uint64_t>();
+        }
+        if (policy_json.contains("max_size")) {
+            policy.max_size = policy_json["max_size"].get<uint64_t>();
+        }
+
+        // Parse priority filter (optional)
+        if (policy_json.contains("priority")) {
+            if (policy_json["priority"].is_string()) {
+                // Parse string: "high", "medium", "low"
+                std::string prio_str =
+                    policy_json["priority"].get<std::string>();
+                // Convert to lowercase for case-insensitive matching
+                std::transform(prio_str.begin(), prio_str.end(),
+                               prio_str.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                if (prio_str == "high" || prio_str == "0") {
+                    policy.priority = PRIO_HIGH;
+                } else if (prio_str == "medium" || prio_str == "1") {
+                    policy.priority = PRIO_MEDIUM;
+                } else if (prio_str == "low" || prio_str == "2") {
+                    policy.priority = PRIO_LOW;
+                } else {
+                    LOG(WARNING) << "Invalid priority string: " << prio_str
+                                 << ", using PRIO_LOW";
+                    policy.priority = PRIO_LOW;
+                }
+            } else {
+                // Parse integer for backward compatibility
+                policy.priority = policy_json["priority"].get<int>();
+            }
+        } else {
+            policy.priority = std::nullopt;
+        }
+
+        // Parse the optional business-intent filter. An invalid value skips the
+        // entire policy instead of turning it into a catch-all rule, which
+        // would silently broaden its authorization scope.
+        if (policy_json.contains("intent_type")) {
+            auto intent = parseIntentType(policy_json["intent_type"]);
+            if (!intent.has_value()) {
+                LOG(WARNING)
+                    << "Skip policy " << policy.name << ": invalid intent_type";
+                continue;
+            }
+            policy.intent_type = *intent;
+        }
+
+        // Parse devices (optional)
+        if (policy_json.contains("devices")) {
+            for (const auto& device_name : policy_json["devices"]) {
+                if (device_name.is_string()) {
+                    policy.devices.push_back(device_name.get<std::string>());
+                }
+            }
+        }
+
+        // Parse transports list
+        policy.transports.clear();
+        if (policy_json.contains("transports")) {
+            for (const auto& transport_str : policy_json["transports"]) {
+                if (!transport_str.is_string()) continue;
+                const auto name = transport_str.get<std::string>();
+                TransportType type = parseTransportType(name);
+                if (type == UNSPEC && name != "unspec") {
+                    LOG(WARNING) << "Unknown transport type: " << name;
+                }
+                if (type != UNSPEC) {
+                    policy.transports.push_back(type);
+                }
+            }
+        }
+
+        // Parse link-layer QoS attributes (RFC #2519 / #2568, step 1: stored
+        // only, not yet applied to QPs). Out-of-range values are ignored so a
+        // bad config never breaks selection.
+        if (policy_json.contains("service_level")) {
+            int sl = policy_json.value("service_level", -1);
+            if (sl >= 0 && sl <= 15) {
+                policy.service_level = sl;
+            } else {
+                LOG(WARNING) << "Ignore service_level in policy " << policy.name
+                             << ", value " << sl << " out of range (0-15)";
+            }
+        }
+        if (policy_json.contains("traffic_class")) {
+            int tc = policy_json.value("traffic_class", -1);
+            if (tc >= 0 && tc <= 255) {
+                policy.traffic_class = tc;
+            } else {
+                LOG(WARNING) << "Ignore traffic_class in policy " << policy.name
+                             << ", value " << tc << " out of range (0-255)";
+            }
+        }
+        // Reserved for step 2 (per-class QP pools); parsed for forward schema
+        // compatibility, no effect yet.
+        if (policy_json.contains("qp_pool")) {
+            auto& qp = policy_json["qp_pool"];
+            if (!qp.is_string()) {
+                LOG(WARNING) << "Ignore qp_pool in policy " << policy.name
+                             << ", expected a string";
+            } else {
+                auto value = qp.get<std::string>();
+                // Treat an empty string the same as unset (use default pool)
+                // so a blank config value doesn't look like an explicit pool.
+                if (!value.empty()) policy.qp_pool = std::move(value);
+            }
+        }
+
+        // Link-layer QoS is defined on the QP pool, not on the policy: a QP
+        // carries the SL/TC of the pool it was created in, and a policy only
+        // selects a pool by name. These fields are a superseded duplicate that
+        // nothing reads, so say where the values actually belong.
+        if (policy.service_level || policy.traffic_class) {
+            LOG(WARNING)
+                << "Transport policy " << policy.name
+                << " sets service_level/traffic_class, which have NO effect "
+                   "here. Link-layer QoS belongs to the QP pool: define it in "
+                   "transports/rdma/endpoint/qp_pools and point this policy at "
+                   "it with \"qp_pool\": \"<name>\". Otherwise its traffic "
+                   "runs with the global transports/rdma SL/TC.";
+        }
+
+        LOG(INFO) << "Loaded transport policy: " << policy.name
+                  << " (segment_type=" << segment_type_str
+                  << ", transports_count=" << policy.transports.size() << ")";
+        policies_.push_back(std::move(policy));
+    }
+}
+
+TransportSelector::TransportSelector(std::shared_ptr<Config> config)
+    : config_(config), force_tcp_(config_->get("transports/force_tcp", false)) {
+    loadPolicies();
+}
+
+void TransportSelector::resolveDeviceMasks() {
+    for (auto& policy : policies_) {
+        // Unconditional: a mask resolved against a topology we no longer hold
+        // would keep naming NIC ids that now mean something else.
+        if (!topology_ || policy.devices.empty()) {
+            policy.resolved_device_mask = ~0ULL;
+            continue;
+        }
+        uint64_t mask = 0;
+        std::vector<std::string> unresolved;
+        for (const auto& name : policy.devices) {
+            int dev_id = topology_->getNicId(name);
+            if (dev_id < 0) {
+                unresolved.push_back(name + " (no such device)");
+            } else if (dev_id >= kDeviceMaskBits) {
+                // The NIC exists but sits past the mask width, so no policy
+                // can ever name it. Say so explicitly: "not found" would send
+                // the operator looking for a typo that is not there.
+                unresolved.push_back(
+                    name + " (index " + std::to_string(dev_id) +
+                    " >= " + std::to_string(kDeviceMaskBits) + ")");
+            } else {
+                mask |= (1ULL << dev_id);
+            }
+        }
+
+        if (mask == 0) {
+            // Fail open, as before — a typo must not stop transfers. But an
+            // ignored device filter is the opposite of what it was written
+            // for, so it is an error, reported once with every name that
+            // failed rather than once per request.
+            policy.resolved_device_mask = ~0ULL;
+            LOG(ERROR) << "Transport policy " << policy.name
+                       << ": no device in its list resolved, so the device "
+                          "restriction is IGNORED and all devices are allowed. "
+                          "Unresolved: "
+                       << joinNames(unresolved);
+            continue;
+        }
+
+        policy.resolved_device_mask = mask;
+        if (!unresolved.empty()) {
+            LOG(WARNING) << "Transport policy " << policy.name
+                         << ": ignoring unresolved devices: "
+                         << joinNames(unresolved);
+        }
+    }
+}
+
+void TransportSelector::setTopology(std::shared_ptr<Topology> topology) {
+    topology_ = std::move(topology);
+    resolveDeviceMasks();
+}
+
+bool TransportSelector::matchesMemoryPattern(const std::string& pattern,
+                                             MemoryType type) const {
+    if (pattern == kMemoryTypeWildcard) {
+        return true;
+    }
+
+    // Convert MemoryType to string for comparison
+    std::string type_str;
+    switch (type) {
+        case MTYPE_CPU:
+            type_str = kMemoryTypeCpu;
+            break;
+        case MTYPE_CUDA:
+            type_str = kMemoryTypeCuda;
+            break;
+        case MTYPE_ROCM:
+            return isAmdGpuLocationType(pattern);
+        case MTYPE_TPU:
+            type_str = "tpu";
+            break;
+        case MTYPE_MLU:
+            type_str = "mlu";
+            break;
+        case MTYPE_XPU:
+            type_str = "xpu";
+            break;
+        default:
+            type_str = "unknown";
+            break;
+    }
+
+    return pattern == type_str;
+}
+
+bool TransportSelector::matchesPolicy(const SelectionPolicy& policy,
+                                      const SelectionContext& context) const {
+    // If context specifies a policy_name, only match that exact policy with
+    // matching segment type
+    if (context.policy_name.has_value()) {
+        return context.policy_name.value() == policy.name &&
+               policy.segment_type == context.segment_type;
+    }
+
+    // Check segment type
+    if (policy.segment_type != context.segment_type) {
+        return false;
+    }
+
+    // Check same_machine constraint
+    if (policy.same_machine.has_value()) {
+        if (policy.same_machine.value() != context.same_machine) {
+            return false;
+        }
+    }
+
+    // Check local memory pattern
+    if (policy.local_memory_pattern.has_value()) {
+        if (!matchesMemoryPattern(policy.local_memory_pattern.value(),
+                                  context.local_memory_type)) {
+            return false;
+        }
+    }
+
+    // Check remote memory pattern
+    if (policy.remote_memory_pattern.has_value()) {
+        if (!matchesMemoryPattern(policy.remote_memory_pattern.value(),
+                                  context.remote_memory_type)) {
+            return false;
+        }
+    }
+
+    // Check size constraints
+    if (policy.min_size.has_value()) {
+        if (context.transfer_size < policy.min_size.value()) {
+            return false;
+        }
+    }
+    if (policy.max_size.has_value()) {
+        if (context.transfer_size > policy.max_size.value()) {
+            return false;
+        }
+    }
+
+    // Check priority constraint: exact match required
+    if (policy.priority.has_value()) {
+        if (context.priority_level != policy.priority.value()) {
+            return false;
+        }
+    }
+
+    // Policies without an intent filter retain the historical catch-all
+    // behavior. Intent-specific policies require an exact match.
+    if (policy.intent_type.has_value() &&
+        context.intent_type != policy.intent_type.value()) {
+        return false;
+    }
+
+    return true;
+}
+
+bool TransportSelector::isTransportAvailable(
+    TransportType type, const SelectionContext& context,
+    const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
+        available_transports) const {
+    // Check if transport type is valid
+    if (type < 0 || type >= kSupportedTransportTypes) {
+        return false;
+    }
+
+    // Check if transport exists
+    const auto& transport = available_transports[type];
+    if (!transport) {
+        return false;
+    }
+
+    // MLU requires process-local addresses. XPU also supports a same-host
+    // peer's buffer mapped into this process over IPC.
+    if (type == MLU && !context.local_segment) return false;
+    const bool xpu_ipc =
+        type == XPU && !context.local_segment && context.xpu_ipc;
+    if (type == XPU && !context.local_segment &&
+        !(context.xpu_ipc && context.same_machine))
+        return false;
+    if (context.xpu_ipc_only && type != XPU) return false;
+    if ((type == NVLINK || type == SHM || type == TPU) &&
+        !context.same_machine) {
+        return false;
+    }
+
+    const auto& caps = transport->capabilities();
+    // The IPC route copies the original buffers; only the network leg of a
+    // staged request runs on host stage buffers.
+    if (context.host_staging && !xpu_ipc) {
+        return (type == RDMA || type == FABRIC || type == TCP ||
+                type == HP_TCP) &&
+               caps.dram_to_dram;
+    }
+
+    // Helper to check if memory type is a device (GPU/NPU/TPU/XPU). Delegates
+    // to the single isGpuMemoryType() in platform.h so this routing predicate
+    // and the staging capability checks share one device-type list and cannot
+    // disagree. TPU and Intel XPU are included so their device<->host staging
+    // hop routes to the matching staging transport (gpu_to_dram / dram_to_gpu).
+    // XPU also satisfies gpu_to_gpu, but only for the local segment (checked
+    // above), so cross-node device traffic without GPUDirect RDMA is always
+    // staged through host DRAM.
+    auto is_gpu = [](MemoryType t) { return isGpuMemoryType(t); };
+
+    // For file segments, check file-specific capabilities (original logic)
+    if (context.segment_type == SegmentType::File) {
+        if (context.local_memory_type == MTYPE_CPU) return caps.dram_to_file;
+        if (is_gpu(context.local_memory_type)) return caps.gpu_to_file;
+        return false;
+    }
+
+    // Check transport capabilities for the memory type combination
+    MemoryType remote_mtype = context.remote_memory_type;
+
+    // CPU to CPU
+    if (context.local_memory_type == MTYPE_CPU && remote_mtype == MTYPE_CPU)
+        return caps.dram_to_dram;
+
+    // GPU/NPU to GPU/NPU (same type)
+    if (is_gpu(context.local_memory_type) && is_gpu(remote_mtype))
+        return caps.gpu_to_gpu;
+
+    // CPU to GPU/NPU
+    if (context.local_memory_type == MTYPE_CPU && is_gpu(remote_mtype))
+        return caps.dram_to_gpu;
+
+    // GPU/NPU to CPU
+    if (is_gpu(context.local_memory_type) && remote_mtype == MTYPE_CPU)
+        return caps.gpu_to_dram;
+
+    return false;
+}
+
+SelectionResult TransportSelector::select(
+    const SelectionContext& context,
+    const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
+        available_transports,
+    int transport_index, TransportType hint) {
+    SelectionResult result;
+
+    // Find the first matching policy (JSON order wins)
+    const SelectionPolicy* matching_policy = nullptr;
+    for (const auto& policy : policies_) {
+        if (matchesPolicy(policy, context)) {
+            matching_policy = &policy;
+            break;  // First match wins
+        }
+    }
+
+    if (!matching_policy) {
+        LOG(WARNING) << "No matching transport policy for segment_type="
+                     << (context.segment_type == SegmentType::File ? "file"
+                                                                   : "memory")
+                     << ", size=" << context.transfer_size
+                     << ", priority_level=" << context.priority_level;
+        return result;  // UNSPEC, all devices
+    }
+
+    // qp_pool is what actually routes: it picks the QP pool, and the pool's
+    // own SL/TC were applied when those QPs were set up. The two SL/TC fields
+    // below are carried for diagnostics only (see SelectionPolicy).
+    result.service_level = matching_policy->service_level;
+    result.traffic_class = matching_policy->traffic_class;
+    result.qp_pool = matching_policy->qp_pool;
+
+    // Resolved once by setTopology(), not per request: the names and the
+    // topology are both fixed by then, and repeating the lookup here also
+    // repeated its diagnostics on every single select().
+    result.device_mask = matching_policy->resolved_device_mask;
+
+    // The "raw" candidate set is whatever the matching policy authorizes:
+    // the policy's explicit transports list, or the buffer's registered
+    // transports as a fallback.
+    static const std::vector<TransportType> kEmpty;
+    static const std::vector<TransportType> kTcpOnly{TCP};
+    const auto& raw =
+        force_tcp_ && context.segment_type == SegmentType::Memory ? kTcpOnly
+        : !matching_policy->transports.empty() ? matching_policy->transports
+        : context.buffer_transports            ? *context.buffer_transports
+                                               : kEmpty;
+
+    if (transport_index < 0) return result;
+    const int original_index = transport_index;
+
+    auto candidates = reorderWithHint(raw, hint);
+    if (!candidates) return result;  // UNSPEC -> task FAILED downstream
+
+    const bool has_hint = (hint != UNSPEC);
+    for (size_t i = 0; i < candidates->size(); ++i) {
+        TransportType type = (*candidates)[i];
+        if (!isTransportAvailable(type, context, available_transports)) {
+            // The pinned hint at slot 0 must be available; if it isn't,
+            // reject the request rather than falling through to another
+            // transport the caller did not ask for.
+            if (has_hint && i == 0) return result;
+            continue;
+        }
+        if (transport_index == 0) {
+            result.transport = type;
+            break;
+        }
+        --transport_index;
+    }
+    if (result.transport == UNSPEC) return result;
+    VLOG(1) << "Selected transport " << transportTypeName(result.transport)
+            << " for policy " << matching_policy->name << " at index "
+            << original_index << " (hint=" << transportTypeName(hint)
+            << "), device_mask=0x" << std::hex << result.device_mask
+            << std::dec;
+    return result;
+}
+
+std::optional<std::vector<TransportType>> TransportSelector::reorderWithHint(
+    const std::vector<TransportType>& raw, TransportType hint) {
+    if (hint == UNSPEC) return raw;
+    if (std::find(raw.begin(), raw.end(), hint) == raw.end()) {
+        return std::nullopt;
+    }
+    std::vector<TransportType> out;
+    out.reserve(raw.size());
+    out.push_back(hint);
+    for (TransportType t : raw) {
+        if (t != hint) out.push_back(t);
+    }
+    return out;
+}
+
+}  // namespace tent
+}  // namespace mooncake

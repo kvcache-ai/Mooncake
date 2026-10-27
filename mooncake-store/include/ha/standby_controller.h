@@ -1,0 +1,85 @@
+#pragma once
+
+#include <functional>
+#include <memory>
+#include <optional>
+#include <vector>
+
+#include <ylt/util/tl/expected.hpp>
+
+#include "ha/ha_types.h"
+#include "ha/snapshot/batch_oplog/promotion.h"
+#include "master_config.h"
+#include "metadata_store.h"
+#include "types.h"
+
+namespace mooncake {
+namespace ha {
+
+/**
+ * Context exported from standby at promotion time.
+ * Contains everything needed to restore primary's state.
+ */
+struct PromotionContext {
+    PromotionContext() = default;
+    PromotionContext(PromotionContext&&) = default;
+    PromotionContext& operator=(PromotionContext&&) = default;
+    PromotionContext(const PromotionContext&) = delete;
+    PromotionContext& operator=(const PromotionContext&) = delete;
+
+    uint64_t applied_seq_id{0};
+    std::vector<StandbyObjectEntry> objects;
+    std::vector<StandbySegmentInfo> segments;
+    WeightMetadataSnapshot weight_metadata;
+    std::unique_ptr<StandbyMetadataStore> metadata_store;
+    DurablePrefix applied_cursor;
+    ViewVersionId producer_view_version{0};
+    ReplicaID max_replica_id{0};
+};
+
+class StandbyController {
+   public:
+    using RuntimeStateCallback = std::function<void(MasterRuntimeState)>;
+    // Test-only seam for exercising controller error propagation without
+    // relying on an asynchronous HA backend connection failure.
+    using StartErrorInjector = std::function<ErrorCode()>;
+
+    virtual ~StandbyController() = default;
+
+    virtual ErrorCode StartStandby(
+        const std::optional<MasterView>& observed_leader) = 0;
+
+    virtual void StopStandby() = 0;
+
+    virtual ErrorCode PromoteStandby() = 0;
+
+    /**
+     * Promote standby and export complete context for new primary.
+     * This replaces the old PromoteStandby() for HA scenarios.
+     *
+     * @return PromotionContext on success, error code on failure
+     */
+    virtual tl::expected<PromotionContext, ErrorCode>
+    PromoteStandbyAndExport() = 0;
+
+    virtual void UpdateObservedLeader(
+        const std::optional<MasterView>& observed_leader) = 0;
+
+    virtual MasterRuntimeState GetStandbyRuntimeState() const = 0;
+
+    virtual void SetStandbyRuntimeStateCallback(
+        RuntimeStateCallback callback) = 0;
+
+    // Put a detached promotion handoff back onto the standby so the next
+    // StartStandby resumes from that cursor instead of an older snapshot.
+    virtual ErrorCode RestorePromotionBaseline(PromotionContext) {
+        return ErrorCode::OK;
+    }
+};
+
+std::unique_ptr<StandbyController> CreateStandbyController(
+    const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
+    StandbyController::StartErrorInjector start_error_injector = {});
+
+}  // namespace ha
+}  // namespace mooncake

@@ -1,0 +1,380 @@
+#pragma once
+
+#include <functional>
+#include <optional>
+#include <unordered_set>
+
+#include "client_service.h"
+#include "client_buffer.h"
+#include "storage_backend.h"
+#include "pinned_buffer_pool.h"
+
+namespace mooncake {
+
+struct SsdMetric;
+
+class FileStorage {
+   public:
+    FileStorage(const FileStorageConfig& config, std::shared_ptr<Client> client,
+                const std::string& local_rpc_addr,
+                SsdMetric* ssd_metric = nullptr);
+    ~FileStorage();
+
+    tl::expected<void, ErrorCode> Init();
+
+    void RemoveAll();
+
+    /**
+     * @brief Deregisters this store's disk tier from the master, then waits out
+     * a grace period so offload reads already in flight can finish.
+     *
+     * Meant for a shutdown hook that runs before the process is signalled. Once
+     * this returns, the master no longer names this store as the owner of any
+     * offloaded key, so a reader gets a clean miss instead of a peer that is
+     * about to disappear. Unlike a memory replica, which the NIC serves without
+     * the process, a disk replica is read and pushed by this process -- hence
+     * the grace period rather than an immediate exit.
+     *
+     * Latches offloading off first: the heartbeat re-mounts the segment
+     * whenever the master answers SEGMENT_NOT_FOUND, which would otherwise
+     * undo this within one heartbeat interval. The latch and the
+     * deregistration happen under offloading_mutex_, the lock the heartbeat
+     * holds across its master RPCs, so a tick that read the latch before it
+     * was set cannot resume after the deregistration and re-mount: it either
+     * finished before the drain latched, or it re-checks the latch when it
+     * acquires the lock. The latch is not reversible on success; the process
+     * is expected to exit.
+     */
+    tl::expected<void, ErrorCode> DrainLocalDiskSegment(
+        uint64_t grace_period_ms);
+
+    /**
+     * @brief Result of BatchGet operation containing batch_id and buffer
+     * pointers.
+     */
+    struct BatchGetResult {
+        uint64_t batch_id;
+        std::vector<uint64_t> pointers;
+    };
+
+    struct LocalBatchResult {
+        std::vector<uint64_t> pointers;
+
+       private:
+        friend class FileStorage;
+        std::shared_ptr<void> owner;
+    };
+
+    /**
+     * @brief Reads multiple key-value (KV) entries from local storage and
+     * forwards them to a remote node.
+     * @param keys                 List of keys to read from the local KV store
+     * @param sizes                Expected size in bytes for each value
+     * @return tl::expected<BatchGetResult, ErrorCode> containing batch_id and
+     * buffer pointers.
+     */
+    tl::expected<BatchGetResult, ErrorCode> BatchGet(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes);
+
+    tl::expected<LocalBatchResult, ErrorCode> BatchGetLocal(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes);
+
+    [[nodiscard]] bool HasPinnedRestoreArena() const {
+        return pinned_restore_arena_allocator_ != nullptr;
+    }
+
+    // Allocate request-scoped staging from the fixed-capacity accelerator-
+    // pinned restore arena. The returned handle releases its sub-allocation
+    // back to the arena; FileStorage retains ownership of the backing memory.
+    [[nodiscard]] std::optional<BufferHandle> AllocatePinnedStagingBuffer(
+        size_t size) {
+        if (!pinned_restore_arena_allocator_) return std::nullopt;
+        return pinned_restore_arena_allocator_->allocate(size);
+    }
+
+    /**
+     * @brief Reports whether the backend still holds an entry for the key.
+     *
+     * Answers existence only, without allocating read buffers. After a
+     * physical wipe the per-key backend's filesystem lookup and the bucket
+     * backend's in-memory index both report false, which is exactly the
+     * divergence a dangling-replica probe needs to detect.
+     */
+    tl::expected<bool, ErrorCode> Exists(const std::string& key);
+
+    FileStorageConfig config_;
+
+    /**
+     * @brief Promote a set of keys from local SSD to DRAM (SSD prefetch).
+     *
+     * Each key must already have a promotion task registered on the master
+     * (Client::RegisterPrefetchTask) with this client as holder; this method
+     * runs the promotion execution chain (PromotionAllocStart -> staging
+     * AllocateBatch -> BatchLoad -> PromotionWrite -> NotifyPromotionSuccess).
+     * Failures are reported per-key via on_key_done and do not propagate;
+     * this is best-effort.
+     *
+     * @param keys  Keys to promote
+     * @param sizes Corresponding object sizes in bytes
+     * @param dram_pressure Optional out-flag, set to true if any key failed
+     *        because the master is out of DRAM (PromotionAllocStart returned
+     *        NO_AVAILABLE_HANDLE), so the caller can back off prefetch and let
+     *        eviction/offload reclaim memory. Never reset to false here;
+     *        the caller initializes it.
+     * @param on_key_done Optional per-key completion callback.
+     * @return void on success, ErrorCode on critical (pre-loop) failure
+     */
+    using PrefetchKeyCallback =
+        std::function<void(const std::string& key, bool success)>;
+
+    tl::expected<void, ErrorCode> PrefetchKeys(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        bool* dram_pressure = nullptr,
+        PrefetchKeyCallback on_key_done = nullptr,
+        const std::string& tenant_id = "");
+
+    /**
+     * @brief Local SSD object size from the storage backend's authoritative
+     * metadata (with tenant-scoped key fallback). Remote callers' size hints
+     * must not be trusted for allocation sizing.
+     */
+    std::optional<int64_t> LookupLocalObjectSize(
+        const std::string& key, const std::string& tenant_id = "") const;
+
+    /**
+     * @brief Releases buffer associated with a specific batch_id.
+     * Called by remote client after transfer completion.
+     * @param batch_id The unique identifier of the batch to release
+     * @return true if batch was found and released, false otherwise
+     */
+    bool ReleaseBuffer(uint64_t batch_id);
+
+   private:
+    friend class FileStorageTest;
+    friend class FileStoragePromotionTest;
+    // TEST_F bodies are generated subclasses and do not inherit the fixture's
+    // friendship, so the dangling-replica tests are friended by their
+    // generated class names (plain friend, no gtest include in a production
+    // header).
+    friend class
+        FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplica_Test;
+    friend class
+        FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket_Test;
+    struct AllocatedBatch {
+        uint64_t batch_id;
+        std::vector<BufferHandle> handles;
+        std::unordered_map<std::string, Slice> slices;
+        std::chrono::steady_clock::time_point lease_timeout;
+        std::vector<uint64_t> pointers;
+        uint64_t total_size;
+
+        AllocatedBatch() : batch_id(0), total_size(0) {}
+        AllocatedBatch(AllocatedBatch&&) = default;
+        AllocatedBatch& operator=(AllocatedBatch&&) = default;
+
+        AllocatedBatch(const AllocatedBatch&) = delete;
+        AllocatedBatch& operator=(const AllocatedBatch&) = delete;
+
+        ~AllocatedBatch() = default;
+    };
+
+    /**
+     * @brief Offload object data and metadata.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> OffloadObjects(
+        const std::vector<OffloadTaskItem>& offloading_objects);
+
+    /**
+     * @brief Classifies a BatchOffload error as affecting only the current
+     * bucket rather than the whole offload cycle.
+     *
+     * Such an error means the bucket's keys simply cannot be persisted this
+     * round; OffloadObjects reports them back to the master as failed (so their
+     * offloading tasks and source-replica refcounts are released) and continues
+     * with the remaining buckets, instead of aborting the entire cycle.
+     *
+     *   - INVALID_READ: source data for these keys could not be read/staged.
+     *   - OBJECT_ALREADY_EXISTS: the key(s) were already offloaded, or are
+     *     being offloaded concurrently. The bucket backend rejects the whole
+     *     bucket atomically by design (see BucketStorageBackend::BatchOffload
+     *     and its PrepareEviction duplicate guard). Treating this as fatal
+     *     aborted the cycle, leaked offloading tasks, and left master/SSD
+     *     metadata inconsistent, which surfaced as spurious INVALID_KEY on the
+     *     read path (issue #2827).
+     */
+    static bool IsPerBucketSoftOffloadError(ErrorCode error);
+
+    /**
+     * @brief Performs a heartbeat operation for the FileStorage component.
+     * 1. Sends object status (e.g., access frequency, size) to the master via
+     * client.
+     * 2. Receives feedback on which objects should be offloaded.
+     * 3. Triggers asynchronous offloading of pending objects.
+     * 4. If offload work was returned, pulls and processes any pending L2->L1
+     *    promotion tasks queued by the master (mirror of step 1+2 in the
+     *    reverse direction).
+     * 5. Runs proactive local-disk watermark eviction.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> Heartbeat();
+
+    /**
+     * @brief Drives the L2->L1 promotion pipeline for one heartbeat tick.
+     * Pulls promotion work from the master, stages a MEMORY replica for each
+     * key, copies the bytes from local SSD into that replica, and notifies the
+     * master on success. A failure on any single key is logged and skipped;
+     * the master-side reaper decrements the source replica's refcnt and
+     * erases the task entry on TTL expiry, and any orphaned PROCESSING
+     * MEMORY replica is reaped via the standard discarded-replicas path.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> ProcessPromotionTasks();
+
+    /**
+     * @brief Execute the promotion chain for one key whose LOCAL_DISK replica
+     * lives on this node: PromotionAllocStart -> staging AllocateBatch ->
+     * BatchLoad -> PromotionWrite -> NotifyPromotionSuccess, with eager
+     * NotifyPromotionFailure on every failure path (RAII guard).
+     *
+     * Shared by the heartbeat-driven promotion-on-hit path
+     * (ProcessPromotionTasks) and the prefetch path (PrefetchKeys).
+     * @param dram_pressure Optional out-flag set when PromotionAllocStart
+     *        failed with NO_AVAILABLE_HANDLE (master out of DRAM).
+     */
+    tl::expected<void, ErrorCode> PromoteOneKeyFromLocalDisk(
+        const std::string& key, const std::string& tenant_id, int64_t size,
+        bool* dram_pressure);
+
+    tl::expected<bool, ErrorCode> IsEnableOffloading();
+
+    tl::expected<void, ErrorCode> RunDiskWatermarkEviction();
+
+    tl::expected<void, ErrorCode> NotifyEvictedDiskReplicas(
+        const std::vector<std::string>& evicted_keys);
+
+    tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>& batch_object);
+
+    tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
+        const std::vector<std::string>& keys, const std::string& tenant_id,
+        std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
+
+    tl::expected<void, ErrorCode> RegisterLocalMemory();
+
+    tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> AllocateBatch(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        ClientBufferAllocator& allocator);
+
+    tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadBatch(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        bool prefer_pinned);
+
+    void ClientBufferGCThreadFunc();
+
+    /**
+     * @brief Re-registers all offloaded objects with the master.
+     * Called after master restart recovery to sync SSD object metadata.
+     * This is the same logic as the ScanMeta step in Init().
+     */
+    tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
+
+    std::shared_ptr<Client> client_;
+    SsdMetric* ssd_metric_{nullptr};
+    std::string local_rpc_addr_;
+    // Pinned memory for GPU staging and SSD-to-GPU restores.
+    std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
+    PinnedBufferPool::Buffer pinned_restore_arena_;
+    std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
+    std::shared_ptr<StorageBackendInterface> storage_backend_;
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
+    mutable Mutex client_buffer_mutex_;
+    std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
+        client_buffer_mutex_) client_buffer_allocated_batches_;
+    std::atomic<uint64_t> next_batch_id_{1};
+
+    /**
+     * @brief Partition drained-but-unbucketed offload tasks into NACKs vs
+     * carries (pure function; extracted for direct unit testing).
+     *
+     * A key absent from all_bucket_keys was either deliberately skipped by
+     * the backend (size over bucket limit / already on disk) — those must be
+     * NACKed so the master releases the task and source-replica refcount — or
+     * DEFERRED to the backend's ungrouped pool to be written as part of a
+     * full bucket next cycle. Deferred keys must NOT be NACKed: the backend
+     * carries only key+size across the deferral, so their tasks must be
+     * carried here or the re-emitted keys arrive task-less and are silently
+     * dropped (upstream #3006 — measured as ~12% of pool entries never
+     * reaching the SSD tier).
+     *
+     * Previously carried keys must also be RETAINED while un-emitted: the
+     * backend's pool only moves on a call with non-empty input, so a cycle
+     * can pass without the pooled keys being either emitted or re-reported
+     * (empty effective input after the carry merge). Rebuilding the carry
+     * from deferred_keys alone would NACK such keys while the pool still
+     * holds them — re-introducing the task-less drop.
+     *
+     * Retention is void for a key re-drained this cycle (redrained_carried_
+     * keys): the collision handling in OffloadObjects dropped its pooled copy,
+     * so it is no longer waiting and the stale carried task must not be
+     * retained. Without the exclusion, a re-drained key the backend then
+     * skipped (e.g. re-PUT at a size over the bucket limit) is neither
+     * bucketed nor deferred, so the stale task would be retained forever as a
+     * zombie AND its presence in carried_tasks would suppress the NACK for the
+     * fresh task — losing the fresh task and leaking its source refcount.
+     * Note the exclusion cannot be expressed as "absent from
+     * task_by_storage_key": the carry merge inserts every non-collision
+     * carried task into that map, so such a test would void retention
+     * entirely.
+     *
+     * @param task_by_storage_key All tasks known this cycle (drained +
+     * carried).
+     * @param all_bucket_keys Storage keys emitted in a bucket this cycle.
+     * @param deferred_keys Storage keys the backend deferred this cycle.
+     * @param previously_carried Carry map from the previous cycle; entries
+     * not emitted this cycle are retained in carried_tasks.
+     * @param redrained_carried_keys Carried keys re-drained this cycle, whose
+     * pooled copies the caller already removed; excluded from retention.
+     * @param failed_tasks Output: tasks to NACK (appended).
+     * @param carried_tasks Output: tasks to carry to the next cycle.
+     */
+    static void PartitionUnbucketedTasks(
+        const std::unordered_map<std::string, OffloadTaskItem>&
+            task_by_storage_key,
+        const std::unordered_set<std::string>& all_bucket_keys,
+        const std::vector<std::string>& deferred_keys,
+        const std::unordered_map<std::string, OffloadTaskItem>&
+            previously_carried,
+        const std::unordered_set<std::string>& redrained_carried_keys,
+        std::vector<OffloadTaskItem>& failed_tasks,
+        std::unordered_map<std::string, OffloadTaskItem>& carried_tasks);
+
+    // Tasks for keys the bucket backend deferred to its ungrouped pool, keyed
+    // by tenant-scoped storage key. Consumed (merged into task_by_storage_key)
+    // on the next OffloadObjects call, when the backend re-emits those keys in
+    // a bucket. Only touched from the offload worker path (single-threaded);
+    // lost on restart together with the backend's in-memory ungrouped pool,
+    // in which case the master's TTL reaper reclaims the orphaned tasks.
+    std::unordered_map<std::string, OffloadTaskItem>
+        deferred_task_by_storage_key_;
+
+    mutable Mutex offloading_mutex_;
+    bool GUARDED_BY(offloading_mutex_) enable_offloading_;
+    std::atomic<bool> heartbeat_running_;
+    std::thread heartbeat_thread_;
+    std::atomic<bool> client_buffer_gc_running_;
+    std::thread client_buffer_gc_thread_;
+    std::future<void> rescan_future_;
+    std::atomic<bool> metadata_resync_pending_{false};
+    // Set by DrainLocalDiskSegment under offloading_mutex_. Stops the
+    // heartbeat -- which would otherwise re-mount the segment the drain just
+    // deregistered -- and aborts an in-flight metadata rescan. Checked at
+    // Heartbeat entry (fast path, also guards the rescan-retry block) and
+    // again under offloading_mutex_ before the heartbeat RPC, because a tick
+    // parked on that lock passed the entry check before the drain latched.
+    std::atomic<bool> draining_{false};
+};
+
+}  // namespace mooncake

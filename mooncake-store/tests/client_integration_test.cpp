@@ -1,0 +1,2648 @@
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include <array>
+#include <cerrno>
+#include <cstdlib>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <regex>
+#include <unordered_set>
+#include <unordered_map>
+#include <thread>
+#include <chrono>
+
+#include "allocator.h"
+#include "client_service.h"
+#include "topology.h"
+#include "real_client.h"
+#include "types.h"
+#include "common/client_buffer_allocation.h"
+#include "test_server_helpers.h"
+#include "default_config.h"
+#include "crc_checksum.h"
+#include "../src/config/client_object_checksum_config.h"
+
+DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
+DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
+DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
+              "Default lease time for kv objects, must be set to the "
+              "same as the master's default_kv_lease_ttl");
+
+namespace mooncake {
+namespace testing {
+
+// Helper functions for client_id parsing
+std::string FormatClientId(const UUID& client_id) {
+    return std::to_string(client_id.first) + "-" +
+           std::to_string(client_id.second);
+}
+
+UUID ParseClientId(const std::string& client_id_str) {
+    UUID client_id{0, 0};
+    size_t dash_pos = client_id_str.find('-');
+    if (dash_pos != std::string::npos) {
+        try {
+            client_id.first = std::stoull(client_id_str.substr(0, dash_pos));
+            client_id.second = std::stoull(client_id_str.substr(dash_pos + 1));
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to parse client_id: " << e.what();
+        }
+    } else {
+        LOG(ERROR) << "Invalid client_id format. Expected format: first-second";
+    }
+    return client_id;
+}
+
+class ObjectChecksumClient : public Client {
+   public:
+    explicit ObjectChecksumClient(const std::string& protocol = "tcp")
+        : Client("localhost", "", protocol) {}
+};
+
+struct LegacyReplicateConfig {
+    size_t replica_num{1};
+    size_t nof_replica_num{0};
+    size_t dfs_replica_num{0};
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms;
+    bool with_hard_pin{false};
+    std::vector<std::string> preferred_segments;
+    std::string preferred_segment;
+    std::vector<std::string> preferred_nof_segments;
+    bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::string host_id;
+    std::optional<std::vector<std::string>> group_ids;
+};
+
+// Main's session-aware RPC shape, without this PR's affinity extensions.
+struct SessionReplicateConfig {
+    size_t replica_num{1};
+    size_t nof_replica_num{0};
+    size_t dfs_replica_num{0};
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms;
+    bool with_hard_pin{false};
+    std::vector<std::string> preferred_segments;
+    std::string preferred_segment;
+    std::vector<std::string> preferred_nof_segments;
+    bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::string host_id;
+    std::optional<std::vector<std::string>> group_ids;
+    struct_pack::compatible<std::vector<std::string>, 1> session_ids;
+};
+
+TEST(HcaAffinityTest, RequestHintIsWireCompatibleAndSurvivesBatchSplitting) {
+    LegacyReplicateConfig legacy;
+    legacy.preferred_segments = {"receiver"};
+    auto decoded = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(legacy));
+    ASSERT_TRUE(decoded);
+    EXPECT_FALSE(decoded->preferred_hca_names);
+    EXPECT_EQ(decoded->preferred_segments, legacy.preferred_segments);
+    decoded->preferred_hca_names = std::vector<std::string>{"mlx5_0"};
+    decoded->group_ids = std::vector<std::string>{"a", "b"};
+    auto current = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(*decoded));
+    ASSERT_TRUE(current);
+    EXPECT_EQ(current->preferred_hca_names, decoded->preferred_hca_names);
+    EXPECT_EQ(current->ForSingleKey(1).preferred_hca_names,
+              decoded->preferred_hca_names);
+    auto old_reader = struct_pack::deserialize<LegacyReplicateConfig>(
+        struct_pack::serialize(*decoded));
+    ASSERT_TRUE(old_reader);
+    EXPECT_EQ(old_reader->preferred_segments, legacy.preferred_segments);
+}
+
+TEST(HcaAffinityTest, SessionAndAffinityExtensionsRemainWireCompatible) {
+    SessionReplicateConfig session_config;
+    session_config.group_ids = std::vector<std::string>{"g0", "g1"};
+    session_config.session_ids = std::vector<std::string>{"s0", "s1"};
+    EXPECT_EQ(struct_pack::get_type_code<ReplicateConfig>(),
+              struct_pack::get_type_code<SessionReplicateConfig>());
+    auto current = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(session_config));
+    ASSERT_TRUE(current);
+    EXPECT_EQ(current->session_ids, session_config.session_ids);
+    EXPECT_FALSE(current->preferred_hca_names);
+    EXPECT_FALSE(current->per_key_preferred_hca_names);
+
+    current->preferred_hca_names = std::vector<std::string>{"mlx5_0"};
+    current->per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{}, {"mlx5_1"}};
+    auto session_reader = struct_pack::deserialize<SessionReplicateConfig>(
+        struct_pack::serialize(*current));
+    ASSERT_TRUE(session_reader);
+    EXPECT_EQ(session_reader->session_ids, session_config.session_ids);
+    EXPECT_EQ(session_reader->group_ids, session_config.group_ids);
+    auto affinity_reader = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(*current));
+    ASSERT_TRUE(affinity_reader);
+    EXPECT_EQ(affinity_reader->session_ids, session_config.session_ids);
+    EXPECT_EQ(affinity_reader->preferred_hca_names,
+              current->preferred_hca_names);
+    EXPECT_EQ(affinity_reader->per_key_preferred_hca_names,
+              current->per_key_preferred_hca_names);
+}
+
+struct LegacyMemoryDescriptor {
+    AllocatedBuffer::Descriptor buffer_descriptor;
+};
+YLT_REFL(LegacyMemoryDescriptor, buffer_descriptor);
+
+struct LegacyReplicaDescriptor {
+    ReplicaID id{0};
+    std::variant<LegacyMemoryDescriptor, NoFDescriptor, DiskDescriptor,
+                 LocalDiskDescriptor, DistributedFSDescriptor>
+        descriptor_variant;
+    ReplicaStatus status;
+};
+YLT_REFL(LegacyReplicaDescriptor, id, descriptor_variant, status);
+
+TEST(HcaAffinityTest, ReadLocalityIsCompatibleInsideReplicaVariant) {
+    Replica::Descriptor replica;
+    replica.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor memory;
+    memory.buffer_descriptor = {1024, 0x300000000, "rdma", "receiver"};
+    memory.locality = SegmentLocality{7, {"mlx5_0"}};
+    replica.descriptor_variant = memory;
+    auto old_reader = struct_pack::deserialize<LegacyReplicaDescriptor>(
+        struct_pack::serialize(replica));
+    ASSERT_TRUE(old_reader);
+    EXPECT_EQ(std::get<LegacyMemoryDescriptor>(old_reader->descriptor_variant)
+                  .buffer_descriptor.transport_endpoint_,
+              "receiver");
+    auto current = struct_pack::deserialize<Replica::Descriptor>(
+        struct_pack::serialize(replica));
+    ASSERT_TRUE(current);
+    EXPECT_EQ(current->get_memory_descriptor().locality, memory.locality);
+    auto new_reader = struct_pack::deserialize<Replica::Descriptor>(
+        struct_pack::serialize(*old_reader));
+    ASSERT_TRUE(new_reader);
+    EXPECT_FALSE(new_reader->get_memory_descriptor().locality);
+}
+
+struct LegacySegment {
+    UUID id{0, 0};
+    std::string name;
+    uintptr_t base{0};
+    size_t size{0};
+    std::string te_endpoint;
+    std::string protocol;
+    std::string host_id;
+};
+YLT_REFL(LegacySegment, id, name, base, size, te_endpoint, protocol, host_id);
+
+TEST(HcaAffinityTest, SegmentLocalityHasCompatibleWireFields) {
+    LegacySegment old;
+    old.id = generate_uuid();
+    old.name = "receiver";
+    old.base = 0x300000000;
+    old.size = 1024 * 1024;
+    old.te_endpoint = "receiver:1234";
+    old.protocol = "rdma";
+    old.host_id = "receiver";
+    auto decoded =
+        struct_pack::deserialize<Segment>(struct_pack::serialize(old));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->name, old.name);
+    EXPECT_FALSE(decoded->locality);
+    decoded->locality = SegmentLocality{7, {"mlx5_0"}};
+    const auto encoded = struct_pack::serialize(*decoded);
+    auto legacy = struct_pack::deserialize<LegacySegment>(encoded);
+    ASSERT_TRUE(legacy);
+    EXPECT_EQ(legacy->base, old.base);
+    EXPECT_EQ(legacy->host_id, old.host_id);
+    auto current = struct_pack::deserialize<Segment>(encoded);
+    ASSERT_TRUE(current);
+    ASSERT_TRUE(current->locality);
+    EXPECT_EQ(*current->locality, *decoded->locality);
+}
+
+TEST(HcaAffinityTest, ReceiverTopologyDeterminesNuma) {
+    Topology topology;
+    ASSERT_EQ(topology.parse(R"({"cpu:7":[["mlx5_0"],["mlx5_1"]],
+                                 "cpu:0":[["mlx5_1"],["mlx5_0"]]})"),
+              0);
+    auto locality = Client::DiscoverSegmentLocality(topology, "cpu:7");
+    ASSERT_TRUE(locality);
+    EXPECT_EQ(locality->numa_node, 7);
+    EXPECT_EQ(locality->hca_names, (std::vector<std::string>{"mlx5_0"}));
+    EXPECT_EQ(HcaAffinityTier(locality, {"mlx5_0"}), 0);
+    EXPECT_EQ(HcaAffinityTier(locality, {"mlx5_1"}), 2);
+    EXPECT_EQ(HcaAffinityTier(std::nullopt, {"mlx5_0"}), 1);
+    EXPECT_EQ(HcaAffinityTier(locality, {}), 0);
+    EXPECT_EQ(HcaAffinityTier(locality, {"mlx5_0", "mlx5_1"}), 2);
+}
+
+TEST(HcaAffinityTest, CompoundAndUnknownLocalityAreNotAdvertised) {
+    Topology topology;
+    ASSERT_EQ(topology.parse(R"({"cpu:0":[["mlx5_0"],[]]})"), 0);
+    for (const auto* location :
+         {"*", "cuda:0", "cpu:-1", "cpu:0extra", "segments:4096:0,1", "cpu:"}) {
+        EXPECT_FALSE(Client::DiscoverSegmentLocality(topology, location));
+    }
+    auto locality = Client::DiscoverSegmentLocality(topology, "cpu:2");
+    ASSERT_TRUE(locality);
+    EXPECT_EQ(HcaAffinityTier(locality, {"mlx5_0"}), 1);
+}
+
+TEST(HcaAffinityTest, InfersOnlyHomogeneousRegisteredSources) {
+    Topology topology;
+    ASSERT_EQ(topology.parse(R"({"cpu:0":[["mlx5_0","mlx5_2"],[]],
+                                 "cpu:1":[["mlx5_1"],[]],
+                                 "cuda:0":[["mlx5_0","mlx5_2"],[]]})"),
+              0);
+    const std::vector<SegmentBufferInfo> buffers{
+        {0x100000, 8192, "segments:4096:0,1"}, {0x200000, 8192, "cuda:0"}};
+    const std::vector<Slice> homogeneous{
+        {reinterpret_cast<void*>(0x100000), 4096},
+        {reinterpret_cast<void*>(0x200000), 4096}};
+    const auto infer = Client::MakeHcaAffinity(topology, buffers);
+    EXPECT_EQ(infer(homogeneous),
+              (std::vector<std::string>{"mlx5_0", "mlx5_2"}));
+    for (const auto& slice :
+         std::vector<Slice>{{reinterpret_cast<void*>(0x100000), 8192},
+                            {reinterpret_cast<void*>(0x300000), 4096},
+                            {nullptr, 4096}}) {
+        EXPECT_TRUE(infer(std::vector<Slice>{slice}).empty());
+    }
+    const std::vector<Slice> mixed{homogeneous[0],
+                                   {reinterpret_cast<void*>(0x101000), 4096}};
+    EXPECT_TRUE(infer(mixed).empty());
+    const auto& names = infer(homogeneous);
+    topology.clear();
+    EXPECT_TRUE(infer(mixed).empty());
+    EXPECT_EQ(names, (std::vector<std::string>{"mlx5_0", "mlx5_2"}));
+    EXPECT_EQ(infer(homogeneous), names);
+}
+
+TEST(HcaAffinityTest, BatchHintsFollowKeysAndRetrySubsets) {
+    ReplicateConfig config;
+    config.group_ids = std::vector<std::string>{"g0", "g1", "g2"};
+    config.session_ids = std::vector<std::string>{"s0", "s1", "s2"};
+    config.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_0"}, {"mlx5_1"}, {}};
+    EXPECT_TRUE(config.HasValidKeyHints(3));
+    EXPECT_FALSE(config.HasValidKeyHints(2));
+    auto subset = config.ForKeySubset({2, 0});
+    ASSERT_TRUE(subset.HasValidKeyHints(2));
+    EXPECT_EQ(*subset.group_ids, (std::vector<std::string>{"g2", "g0"}));
+    ASSERT_TRUE(subset.ValidSessionIds(2));
+    EXPECT_EQ(*subset.session_ids, (std::vector<std::string>{"s2", "s0"}));
+    EXPECT_EQ(subset.ForSingleKey(0).SessionId(), "s2");
+    EXPECT_TRUE(subset.ForSingleKey(0).preferred_hca_names->empty());
+    EXPECT_EQ(*subset.ForSingleKey(1).preferred_hca_names,
+              (std::vector<std::string>{"mlx5_0"}));
+    EXPECT_FALSE(subset.ForSingleKey(1).per_key_preferred_hca_names);
+    auto key_config = subset;
+    key_config.preferred_segment = "chosen-receiver";
+    for (size_t index : {1, 0, 1}) {
+        key_config.SetKeyIds(subset, index);
+        EXPECT_EQ(key_config.SessionId(), subset.session_ids->at(index));
+        EXPECT_EQ(*key_config.group_ids,
+                  (std::vector<std::string>{subset.group_ids->at(index)}));
+        EXPECT_EQ(*key_config.preferred_hca_names,
+                  subset.per_key_preferred_hca_names->at(index));
+        EXPECT_FALSE(key_config.per_key_preferred_hca_names);
+        EXPECT_EQ(key_config.preferred_segment, "chosen-receiver");
+    }
+    EXPECT_EQ(config.session_ids->size(), 3);
+    auto restored = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(config));
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(restored->per_key_preferred_hca_names,
+              config.per_key_preferred_hca_names);
+    auto legacy = struct_pack::deserialize<LegacyReplicateConfig>(
+        struct_pack::serialize(config));
+    ASSERT_TRUE(legacy);
+    EXPECT_EQ(legacy->group_ids, config.group_ids);
+}
+
+TEST(ReadAffinityTest,
+     SingleCopyKeepsStatusChecksWithoutRegisteredDestinations) {
+    ObjectChecksumClient client("rdma");
+    auto select = client.MakeReadReplicaSelector();
+    Replica::Descriptor copy;
+    copy.descriptor_variant = MemoryDescriptor{};
+    copy.status = ReplicaStatus::COMPLETE;
+    copy.id = 123;
+    copy.get_memory_descriptor().locality = SegmentLocality{7, {"mlx5_0"}};
+    Replica::Descriptor selected;
+    EXPECT_EQ(select({copy}, {}, selected), ErrorCode::OK);
+    EXPECT_EQ(selected.id, copy.id);
+    copy.status = ReplicaStatus::PROCESSING;
+    EXPECT_EQ(select({copy}, {}, selected), ErrorCode::INVALID_REPLICA);
+    EXPECT_EQ(select({}, {}, selected), ErrorCode::INVALID_REPLICA);
+}
+
+TEST(ReadAffinityTest, MissingCompleteSessionCandidateIsAnError) {
+    ObjectChecksumClient client;
+    Replica::Descriptor replica;
+    replica.descriptor_variant = MemoryDescriptor{};
+    replica.get_memory_descriptor().buffer_descriptor.size_ = 1;
+    replica.status = ReplicaStatus::COMPLETE;
+    auto pending = replica;
+    pending.status = ReplicaStatus::PROCESSING;
+    QueryResult query(
+        {pending}, std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    uint8_t destination = 0;
+    const std::vector<const QueryResult*> queries{&query};
+    auto results =
+        client.BatchTransferReadRanges({replica}, {{{&destination, 1}}}, {{0}},
+                                       TransferIntent::kUnspecified, queries);
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_FALSE(results[0]);
+    EXPECT_EQ(results[0].error(), ErrorCode::INVALID_REPLICA);
+}
+
+TEST(ObjectChecksumTest, ClientVerifiesOnlyLogicalObjectBytes) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+
+    ObjectChecksumClient client;
+    std::array<uint8_t, 20> value = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+                                     0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+                                     0x0E, 0x0F, 0xAA, 0xBB, 0xCC, 0xDD};
+    constexpr size_t object_size = 16;
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    const uint64_t checksum = ComputeCrcChecksum(value.data(), object_size);
+
+    EXPECT_TRUE(
+        client.VerifyObjectChecksum("key", slices, object_size, checksum)
+            .has_value());
+    value[16] ^= 0xFF;
+    EXPECT_TRUE(
+        client.VerifyObjectChecksum("key", slices, object_size, checksum)
+            .has_value());
+    value[0] ^= 0xFF;
+    auto mismatch =
+        client.VerifyObjectChecksum("key", slices, object_size, checksum);
+    ASSERT_FALSE(mismatch.has_value());
+    EXPECT_EQ(mismatch.error(), ErrorCode::CHECKSUM_MISMATCH);
+}
+
+TEST(ObjectChecksumTest, BatchPutStopsAfterChecksumPrecomputeFailure) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+
+    ObjectChecksumClient client;
+    const std::vector<ObjectKey> keys{"invalid-slice"};
+    std::vector<std::vector<Slice>> slices{{Slice{nullptr, 1}}};
+
+    auto results = client.BatchPut(keys, slices, ReplicateConfig{});
+
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+}
+
+class ClientIdCaptureSink : public google::LogSink {
+   public:
+    std::string captured_client_id;
+
+    void send(google::LogSeverity severity, const char* full_filename,
+              const char* base_filename, int line, const struct ::tm* tm_time,
+              const char* message, size_t message_len) override {
+        (void)severity;
+        (void)full_filename;
+        (void)base_filename;
+        (void)line;
+        (void)tm_time;
+
+        std::string msg(message, message_len);
+
+        size_t pos = msg.find("client_id=");
+        if (pos != std::string::npos) {
+            std::string client_id_str = msg.substr(pos + 10);
+            client_id_str.erase(0, client_id_str.find_first_not_of(" \t\n\r"));
+            client_id_str.erase(client_id_str.find_last_not_of(" \t\n\r") + 1);
+
+            std::regex uuid_pattern(R"((\d+)-(\d+))");
+            std::smatch match;
+            if (std::regex_search(client_id_str, match, uuid_pattern)) {
+                captured_client_id = match[0].str();
+            }
+        }
+    }
+};
+
+class ClientIntegrationTest : public ::testing::Test {
+   protected:
+    static std::shared_ptr<Client> CreateClient(const std::string& host_name) {
+        auto client_opt =
+            Client::Create(host_name,       // Local hostname
+                           "P2PHANDSHAKE",  // Metadata connection string
+                           FLAGS_protocol,  // Transfer protocol
+                           std::nullopt,  // RDMA device names (auto-discovery)
+                           master_address_  // Master server address (non-HA)
+            );
+
+        EXPECT_TRUE(client_opt.has_value())
+            << "Failed to create client with host_name: " << host_name;
+        if (!client_opt.has_value()) {
+            return nullptr;
+        }
+        return client_opt.value();
+    }
+
+    static void SetUpTestSuite() {
+        // Initialize glog
+        google::InitGoogleLogging("ClientIntegrationTest");
+
+        FLAGS_logtostderr = 1;
+
+        // Override flags from environment variables if present
+        if (getenv("PROTOCOL")) FLAGS_protocol = getenv("PROTOCOL");
+        if (getenv("DEVICE_NAME")) FLAGS_device_name = getenv("DEVICE_NAME");
+
+        LOG(INFO) << "Protocol: " << FLAGS_protocol
+                  << ", Device name: " << FLAGS_device_name;
+
+        if (getenv("DEFAULT_KV_LEASE_TTL")) {
+            default_kv_lease_ttl_ = std::stoul(getenv("DEFAULT_KV_LEASE_TTL"));
+        } else {
+            default_kv_lease_ttl_ = FLAGS_default_kv_lease_ttl;
+        }
+        LOG(INFO) << "Default KV lease TTL: " << default_kv_lease_ttl_;
+
+        // Start an in-process non-HA master without HTTP metadata server
+        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+        master_address_ = master_.master_address();
+        metadata_url_ = master_.metadata_url();
+        LOG(INFO) << "Started in-proc master at " << master_address_
+                  << ", metadata=P2PHANDSHAKE";
+
+        InitializeClients();
+        InitializeSegment();
+    }
+
+    static void TearDownTestSuite() {
+        CleanupSegment();
+        CleanupClients();
+        master_.Stop();
+        google::ShutdownGoogleLogging();
+    }
+
+    static void InitializeSegment() {
+        ram_buffer_size_ = 512 * 1024 * 1024;  // 512 MB
+        segment_ptr_ = allocate_buffer_allocator_memory(ram_buffer_size_);
+        LOG_ASSERT(segment_ptr_);
+        auto mount_result = segment_provider_client_->MountSegment(
+            segment_ptr_, ram_buffer_size_, FLAGS_protocol);
+        if (!mount_result.has_value()) {
+            LOG(ERROR) << "Failed to mount segment: "
+                       << toString(mount_result.error());
+        }
+        LOG(INFO) << "Segment mounted successfully";
+    }
+
+    static void InitializeClients() {
+        // This client is used for testing purposes.
+        // Capture test_client_ client_id from logs
+        ClientIdCaptureSink* test_client_sink = new ClientIdCaptureSink();
+        google::AddLogSink(test_client_sink);
+
+        test_client_ = CreateClient("localhost:17813");
+        ASSERT_TRUE(test_client_ != nullptr);
+
+        // Wait for logs to flush
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        google::RemoveLogSink(test_client_sink);
+
+        if (!test_client_sink->captured_client_id.empty()) {
+            UUID extracted_id =
+                ParseClientId(test_client_sink->captured_client_id);
+            if (extracted_id.first != 0 || extracted_id.second != 0) {
+                test_client_id_ = extracted_id;
+                LOG(INFO) << "Captured test_client_id: "
+                          << FormatClientId(test_client_id_);
+            }
+        }
+        delete test_client_sink;
+
+        // This client is used to provide segments.
+        // Capture segment_provider_client_ client_id from logs
+        ClientIdCaptureSink* provider_client_sink = new ClientIdCaptureSink();
+        google::AddLogSink(provider_client_sink);
+
+        segment_provider_client_ = CreateClient("localhost:17812");
+        ASSERT_TRUE(segment_provider_client_ != nullptr);
+
+        // Wait for logs to flush
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        google::RemoveLogSink(provider_client_sink);
+
+        if (!provider_client_sink->captured_client_id.empty()) {
+            UUID extracted_id =
+                ParseClientId(provider_client_sink->captured_client_id);
+            if (extracted_id.first != 0 || extracted_id.second != 0) {
+                segment_provider_client_id_ = extracted_id;
+                LOG(INFO) << "Captured segment_provider_client_id: "
+                          << FormatClientId(segment_provider_client_id_);
+            }
+        }
+        delete provider_client_sink;
+
+        client_buffer_allocator_ =
+            std::make_unique<SimpleAllocator>(128 * 1024 * 1024);
+        auto register_result = test_client_->RegisterLocalMemory(
+            client_buffer_allocator_->getBase(), 128 * 1024 * 1024, "cpu:0",
+            false, false);
+        if (!register_result.has_value()) {
+            LOG(ERROR) << "Failed to register local memory: "
+                       << toString(register_result.error());
+        }
+
+        // Mount segment for test_client_ as well
+        test_client_ram_buffer_size_ = 512 * 1024 * 1024;  // 512 MB
+        test_client_segment_ptr_ =
+            allocate_buffer_allocator_memory(test_client_ram_buffer_size_);
+        LOG_ASSERT(test_client_segment_ptr_);
+        auto test_client_mount_result = test_client_->MountSegment(
+            test_client_segment_ptr_, test_client_ram_buffer_size_,
+            FLAGS_protocol);
+        if (!test_client_mount_result.has_value()) {
+            LOG(ERROR) << "Failed to mount segment for test_client_: "
+                       << toString(test_client_mount_result.error());
+        }
+        LOG(INFO) << "Test client segment mounted successfully";
+    }
+
+    static void CleanupClients() {
+        // Unmount test client segment first
+        if (test_client_ && test_client_segment_ptr_) {
+            if (!test_client_
+                     ->UnmountSegment(test_client_segment_ptr_,
+                                      test_client_ram_buffer_size_)
+                     .has_value()) {
+                LOG(ERROR) << "Failed to unmount test client segment";
+            }
+        }
+
+        if (test_client_) {
+            test_client_.reset();
+        }
+        if (segment_provider_client_) {
+            segment_provider_client_.reset();
+        }
+
+        // Free segment memory
+        if (test_client_segment_ptr_) {
+            free(test_client_segment_ptr_);
+        }
+        if (segment_ptr_) {
+            free(segment_ptr_);
+        }
+    }
+
+    static void CleanupSegment() {
+        if (!segment_provider_client_
+                 ->UnmountSegment(segment_ptr_, ram_buffer_size_)
+                 .has_value()) {
+            LOG(ERROR) << "Failed to unmount segment";
+        }
+    }
+
+    static std::shared_ptr<Client> test_client_;
+    static std::shared_ptr<Client> segment_provider_client_;
+    // Here we use a simple allocator for the client buffer. In a real
+    // application, user should manage the memory allocation and deallocation
+    // themselves.
+    static std::unique_ptr<SimpleAllocator> client_buffer_allocator_;
+    static void* segment_ptr_;
+    static size_t ram_buffer_size_;
+    static void* test_client_segment_ptr_;
+    static size_t test_client_ram_buffer_size_;
+    static uint64_t default_kv_lease_ttl_;
+    static InProcMaster master_;
+    static std::string master_address_;
+    static std::string metadata_url_;
+    static UUID test_client_id_;
+    static UUID segment_provider_client_id_;
+};
+
+// Static members initialization
+std::shared_ptr<Client> ClientIntegrationTest::test_client_ = nullptr;
+std::shared_ptr<Client> ClientIntegrationTest::segment_provider_client_ =
+    nullptr;
+void* ClientIntegrationTest::segment_ptr_ = nullptr;
+void* ClientIntegrationTest::test_client_segment_ptr_ = nullptr;
+std::unique_ptr<SimpleAllocator>
+    ClientIntegrationTest::client_buffer_allocator_ = nullptr;
+size_t ClientIntegrationTest::ram_buffer_size_ = 0;
+size_t ClientIntegrationTest::test_client_ram_buffer_size_ = 0;
+uint64_t ClientIntegrationTest::default_kv_lease_ttl_ = 0;
+InProcMaster ClientIntegrationTest::master_;
+std::string ClientIntegrationTest::master_address_;
+std::string ClientIntegrationTest::metadata_url_;
+UUID ClientIntegrationTest::test_client_id_{0, 0};
+UUID ClientIntegrationTest::segment_provider_client_id_{0, 0};
+
+namespace {
+
+// Minimal initiator used to observe which initiator Client::Create wires up.
+class WiringProbeInitiator : public NVMeoFInitiator {
+   public:
+    NofSegmentHandle* OpenSegment(const std::string&) override {
+        return nullptr;
+    }
+    bool ProbeSegment(const std::string&, uint32_t, std::string*) override {
+        return false;
+    }
+    uint32_t GetBlockSize(const NofSegmentHandle*) override {
+        return kInvalidBlockSize;
+    }
+    int SubmitIO(NofSegmentHandle*, void*, uint64_t, uint64_t, NofIOOp,
+                 NofIOAdaptor*) override {
+        return -EINVAL;
+    }
+    int64_t PollCompletion(NofSegmentHandle*, uint32_t) override { return 0; }
+    ErrorCode RegisterMemory(void*, size_t) override { return ErrorCode::OK; }
+    ErrorCode UnregisterMemory(void*) override { return ErrorCode::OK; }
+    NofCapabilities GetCapabilities() const override { return {}; }
+};
+
+// Clears the Client default-initiator factory seam even when the test fails.
+struct DefaultInitiatorFactoryGuard {
+    ~DefaultInitiatorFactoryGuard() {
+        Client::SetDefaultNofInitiatorFactoryForTesting(nullptr);
+    }
+};
+
+}  // namespace
+
+// Regression test: callers that pass no initiator (the default argument)
+// must keep getting the process default NoF runtime, not nullptr.
+TEST_F(ClientIntegrationTest, CreateWithoutInitiatorKeepsDefaultNofRuntime) {
+    DefaultInitiatorFactoryGuard guard;
+    auto probe = std::make_shared<WiringProbeInitiator>();
+    Client::SetDefaultNofInitiatorFactoryForTesting([probe] { return probe; });
+
+    auto client_opt = Client::Create("localhost:17941",  // unique hostname
+                                     "P2PHANDSHAKE", FLAGS_protocol,
+                                     std::nullopt, master_address_);
+    ASSERT_TRUE(client_opt.has_value());
+    // The default argument must resolve to the process default runtime
+    // (here: the injected probe), not nullptr.
+    EXPECT_EQ((*client_opt)->GetNofInitiatorForTesting(), probe);
+}
+
+// Test basic Put/Get operations through the client
+TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
+    const std::string test_data = "Hello, World!";
+    const std::string key = "test_key";
+    void* buffer = client_buffer_allocator_->allocate(test_data.size());
+
+    // write
+    memcpy(buffer, test_data.data(), test_data.size());
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, test_data.size()});
+
+    // Test Put operation
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Put operation failed: " << toString(put_result.error());
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+
+    buffer = client_buffer_allocator_->allocate(1 * 1024 * 1024);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, test_data.size()});
+    // Verify data through Get operation
+    auto get_result = test_client_->Get(key, slices);
+    ASSERT_TRUE(get_result.has_value())
+        << "Get operation failed: " << toString(get_result.error());
+    ASSERT_EQ(slices.size(), 1);
+    ASSERT_EQ(slices[0].size, test_data.size());
+    ASSERT_EQ(slices[0].ptr, buffer);
+    ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+
+    // Put again with the same key, should succeed
+    buffer = client_buffer_allocator_->allocate(test_data.size());
+    memcpy(buffer, test_data.data(), test_data.size());
+    slices.clear();
+    slices.emplace_back(Slice{buffer, test_data.size()});
+    auto put_result2 = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result2.has_value())
+        << "Second Put operation failed: " << toString(put_result2.error());
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    auto remove_result = test_client_->Remove(key);
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove operation failed: " << toString(remove_result.error());
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+}
+
+TEST_F(ClientIntegrationTest, ObjectChecksumRejectsCorruptedObject) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+
+    const std::string key = "checksum_corruption_key";
+    const std::string test_data = "0123456789abcdef";
+    void* source = client_buffer_allocator_->allocate(test_data.size());
+    memcpy(source, test_data.data(), test_data.size());
+    std::vector<Slice> slices{{source, test_data.size()}};
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value()) << toString(put_result.error());
+    client_buffer_allocator_->deallocate(source, test_data.size());
+
+    auto query_result = test_client_->Query(key);
+    ASSERT_TRUE(query_result.has_value()) << toString(query_result.error());
+    ASSERT_TRUE(query_result->object_checksum.has_value());
+    ASSERT_EQ(query_result->replicas.size(), 1);
+    ASSERT_TRUE(query_result->replicas[0].is_memory_replica());
+
+    auto& descriptor =
+        query_result->replicas[0].get_memory_descriptor().buffer_descriptor;
+    auto* stored_data = reinterpret_cast<char*>(descriptor.buffer_address_);
+    stored_data[0] ^= 0x01;
+
+    void* target = client_buffer_allocator_->allocate(test_data.size());
+    slices = {{target, test_data.size()}};
+    auto get_result = test_client_->Get(key, query_result.value(), slices);
+    ASSERT_FALSE(get_result.has_value());
+    EXPECT_EQ(get_result.error(), ErrorCode::CHECKSUM_MISMATCH);
+
+    stored_data[0] ^= 0x01;
+    client_buffer_allocator_->deallocate(target, test_data.size());
+}
+
+TEST_F(ClientIntegrationTest, BatchPutPreservesObjectChecksumPairing) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+
+    const std::vector<ObjectKey> keys = {"checksum_batch_a",
+                                         "checksum_batch_b"};
+    const std::vector<std::string> values = {"first-object",
+                                             "different-second-object"};
+    std::vector<std::vector<Slice>> batched_slices;
+    std::vector<void*> buffers;
+    batched_slices.reserve(values.size());
+    buffers.reserve(values.size());
+    for (const auto& value : values) {
+        void* buffer = client_buffer_allocator_->allocate(value.size());
+        memcpy(buffer, value.data(), value.size());
+        buffers.emplace_back(buffer);
+        batched_slices.push_back({Slice{buffer, value.size()}});
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto results = test_client_->BatchPut(keys, batched_slices, config);
+    ASSERT_EQ(results.size(), keys.size());
+    for (const auto& result : results) {
+        ASSERT_TRUE(result.has_value()) << toString(result.error());
+    }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto query_result = test_client_->Query(keys[i]);
+        ASSERT_TRUE(query_result.has_value()) << toString(query_result.error());
+        ASSERT_TRUE(query_result->object_checksum.has_value());
+        EXPECT_EQ(*query_result->object_checksum,
+                  ComputeCrcChecksum(values[i].data(), values[i].size()));
+        client_buffer_allocator_->deallocate(buffers[i], values[i].size());
+    }
+}
+
+TEST_F(ClientIntegrationTest, TaggedBatchWritesSkipChecksumFailures) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+    void* buffer = client_buffer_allocator_->allocate(4);
+    ASSERT_NE(buffer, nullptr);
+    std::memcpy(buffer, "data", 4);
+    for (bool upsert : {false, true}) {
+        const std::vector<ObjectKey> keys = {
+            "invalid-slice", upsert ? "tagged-upsert" : "tagged-put"};
+        std::vector<std::vector<Slice>> slices{{Slice{nullptr, 1}},
+                                               {Slice{buffer, 4}}};
+        ReplicateConfig config;
+        config.session_ids = std::vector<std::string>{"invalid", "valid"};
+        config.group_ids =
+            std::vector<std::string>{"invalid-group", "valid-group"};
+        config.per_key_preferred_hca_names =
+            std::vector<std::vector<std::string>>{{"mlx5_0"}, {"mlx5_1"}};
+        auto results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                              : test_client_->BatchPut(keys, slices, config);
+        ASSERT_EQ(results.size(), 2);
+        ASSERT_FALSE(results[0]);
+        EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+        ASSERT_TRUE(results[1]) << toString(results[1].error());
+        auto query = test_client_->Query(keys[1]);
+        ASSERT_TRUE(query);
+        EXPECT_EQ(query->object_checksum, ComputeCrcChecksum("data", 4));
+
+        // A short tag vector must not become valid after filtering a key.
+        config.session_ids = std::vector<std::string>{"wrong"};
+        results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                         : test_client_->BatchPut(keys, slices, config);
+        for (const auto& result : results) {
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        }
+        config.session_ids = std::vector<std::string>{"invalid", "valid"};
+        config.group_ids = std::vector<std::string>{"wrong"};
+        results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                         : test_client_->BatchPut(keys, slices, config);
+        for (const auto& result : results) {
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        }
+        config.group_ids =
+            std::vector<std::string>{"invalid-group", "valid-group"};
+        config.per_key_preferred_hca_names =
+            std::vector<std::vector<std::string>>{{"wrong"}};
+        results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                         : test_client_->BatchPut(keys, slices, config);
+        for (const auto& result : results) {
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        }
+    }
+    client_buffer_allocator_->deallocate(buffer, 4);
+}
+
+// Test Remove operation
+TEST_F(ClientIntegrationTest, RemoveOperation) {
+    const std::string test_data = "Test data for removal";
+    const std::string key = "remove_test_key";
+    void* buffer = client_buffer_allocator_->allocate(test_data.size());
+
+    // Put data first
+    memcpy(buffer, test_data.data(), test_data.size());
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, test_data.size()});
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Put operation failed: " << toString(put_result.error());
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+
+    // Remove the data
+    auto remove_result = test_client_->Remove(key);
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove operation failed: " << toString(remove_result.error());
+
+    // Verify that the data is removed using Query operation
+    auto query_result = test_client_->Query(key);
+    ASSERT_FALSE(query_result.has_value())
+        << "Query should not find the removed key: " << key;
+
+    // Check if the key exists using IsExist
+    auto exist_result = test_client_->IsExist(key);
+    ASSERT_TRUE(exist_result.has_value());
+    ASSERT_FALSE(exist_result.value())
+        << "IsExist should return false for removed key: " << key;
+
+    // Try to get the removed data - should fail
+    buffer = client_buffer_allocator_->allocate(test_data.size());
+    slices.clear();
+    slices.emplace_back(Slice{buffer, test_data.size()});
+    auto get_result = test_client_->Get(key, slices);
+    ASSERT_FALSE(get_result.has_value()) << "Get should fail for removed key";
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+}
+
+// Test local preferred allocation strategy
+TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
+    const std::string test_data = "Test data for local preferred allocation";
+    const std::string key = "local_preferred_test_key";
+    void* buffer = client_buffer_allocator_->allocate(test_data.size());
+
+    // Put data with preferred segment set to local hostname
+    memcpy(buffer, test_data.data(), test_data.size());
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, test_data.size()});
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    // Although there is only one segment now, in order to test the preferred
+    // allocation logic, we still set it. This will prevent potential
+    // compatibility issues in the future.
+    config.preferred_segment = "localhost:17812";  // Local segment
+
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Put operation failed: " << toString(put_result.error());
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+
+    // Verify data through Get operation
+    buffer = client_buffer_allocator_->allocate(test_data.size());
+    slices.clear();
+    slices.emplace_back(Slice{buffer, test_data.size()});
+
+    auto query_result = test_client_->Query(key);
+    ASSERT_TRUE(query_result.has_value())
+        << "Query operation failed: " << toString(query_result.error());
+    auto replica_list = query_result.value().replicas;
+    ASSERT_EQ(replica_list.size(), 1);
+    ASSERT_EQ(replica_list[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              segment_provider_client_->GetTransportEndpoint());
+
+    auto get_result = test_client_->Get(key, query_result.value(), slices);
+    ASSERT_TRUE(get_result.has_value())
+        << "Get operation failed: " << toString(get_result.error());
+    ASSERT_EQ(slices.size(), 1);
+    ASSERT_EQ(slices[0].size, test_data.size());
+    ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+
+    // Clean up
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    auto remove_result2 = test_client_->Remove(key);
+    ASSERT_TRUE(remove_result2.has_value())
+        << "Remove operation failed: " << toString(remove_result2.error());
+}
+
+TEST_F(ClientIntegrationTest, BatchWriteStagesActualNonLocalAllocation) {
+    size_t stage_calls = 0;
+    std::vector<std::pair<void*, size_t>> staged_allocations;
+    Client::WriteBufferStager stager = [&](const std::vector<Slice>& slices)
+        -> tl::expected<std::vector<Slice>, ErrorCode> {
+        size_t total_size = 0;
+        for (const auto& slice : slices) total_size += slice.size;
+        void* buffer = client_buffer_allocator_->allocate(total_size);
+        if (!buffer) return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+
+        std::vector<Slice> staged_slices;
+        size_t offset = 0;
+        for (const auto& slice : slices) {
+            std::memcpy(static_cast<char*>(buffer) + offset, slice.ptr,
+                        slice.size);
+            staged_slices.emplace_back(static_cast<char*>(buffer) + offset,
+                                       slice.size);
+            offset += slice.size;
+        }
+        staged_allocations.emplace_back(buffer, total_size);
+        ++stage_calls;
+        return staged_slices;
+    };
+    auto write = [&](const std::string& key, std::string& value,
+                     const ReplicateConfig& config, bool upsert) {
+        std::vector<std::string> keys{key};
+        std::vector<std::vector<Slice>> slices{{{value.data(), value.size()}}};
+        return upsert ? test_client_->BatchUpsert(keys, slices, config, stager)
+                      : test_client_->BatchPut(keys, slices, config, stager);
+    };
+
+    ReplicateConfig config;
+    config.preferred_segment = "localhost:17813";
+    size_t expected_stage_calls =
+        test_client_->CanUseLocalMemcpy(test_client_->GetTransportEndpoint())
+            ? 0
+            : 1;
+    std::string local_value = "local direct write";
+    auto local_result =
+        write("batch_write_actual_local", local_value, config, false);
+    ASSERT_TRUE(local_result[0]);
+    EXPECT_EQ(stage_calls, expected_stage_calls);
+
+    config.prefer_alloc_in_same_node = true;
+    config.preferred_segment = "localhost:17812";
+    std::string remote_value = "remote staged write";
+    auto remote_result =
+        write("batch_write_actual_remote", remote_value, config, false);
+    ASSERT_TRUE(remote_result[0]);
+    ++expected_stage_calls;
+    EXPECT_EQ(stage_calls, expected_stage_calls);
+    auto query = test_client_->Query("batch_write_actual_remote");
+    ASSERT_TRUE(query);
+    EXPECT_EQ(query->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              segment_provider_client_->GetTransportEndpoint());
+
+    remote_value = "remote staged upsert";
+    auto upsert_result =
+        write("batch_write_actual_remote", remote_value, config, true);
+    ASSERT_TRUE(upsert_result[0]);
+    ++expected_stage_calls;
+    EXPECT_EQ(stage_calls, expected_stage_calls);
+
+    EXPECT_TRUE(test_client_->Remove("batch_write_actual_local", true));
+    EXPECT_TRUE(test_client_->Remove("batch_write_actual_remote", true));
+    for (const auto& [ptr, size] : staged_allocations) {
+        client_buffer_allocator_->deallocate(ptr, size);
+    }
+}
+
+// Test heavy workload operations
+TEST_F(ClientIntegrationTest, DISABLED_AllocateTest) {
+    const size_t data_size = 1 * 1024 * 1024;  // 1MB
+    std::string large_data(data_size, 'A');    // Fill with 'A's
+    const int num_operations = 13;
+
+    // Configure with 1 replicas for high availability
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Perform multiple Put/Get operations
+    for (int i = 0; i < num_operations; i++) {
+        std::string key = "heavy_test_key_" + std::to_string(i);
+        void* buffer = client_buffer_allocator_->allocate(data_size);
+        ASSERT_TRUE(buffer);
+
+        // Put operation with large data
+        memcpy(buffer, large_data.data(), data_size);
+        std::vector<Slice> put_slices;
+        put_slices.emplace_back(Slice{buffer, data_size});
+        auto put_result = test_client_->Put(key, put_slices, config);
+        if (!put_result.has_value()) break;
+        client_buffer_allocator_->deallocate(buffer, data_size);
+        // Get and verify data
+        buffer = client_buffer_allocator_->allocate(data_size);
+        std::vector<Slice> get_slices;
+        get_slices.emplace_back(Slice{buffer, data_size});
+        auto get_result = test_client_->Get(key, get_slices);
+        ASSERT_TRUE(get_result.has_value())
+            << "Get operation failed: " << toString(get_result.error());
+        ASSERT_EQ(get_slices[0].size, data_size);
+
+        std::string retrieved_data(static_cast<const char*>(get_slices[0].ptr),
+                                   get_slices[0].size);
+        EXPECT_EQ(retrieved_data, large_data);
+        client_buffer_allocator_->deallocate(buffer, data_size);
+    }
+
+    std::string allocate_failed_key = "heavy_test_failed_key";
+    void* failed_buffer = client_buffer_allocator_->allocate(data_size);
+    std::vector<Slice> failed_slices;
+    failed_slices.emplace_back(Slice{failed_buffer, data_size});
+    memcpy(failed_buffer, large_data.data(), data_size);
+    auto failed_put_result =
+        test_client_->Put(allocate_failed_key, failed_slices, config);
+    ASSERT_FALSE(failed_put_result.has_value())
+        << "Put operation should have failed";
+    client_buffer_allocator_->deallocate(failed_buffer, data_size);
+
+    // sleep for 2 seconds to ensure the object is marked for GC
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    // After removing all keys, we should be able to allocate the failed key
+    void* success_buffer = client_buffer_allocator_->allocate(data_size);
+    std::vector<Slice> success_slices;
+    success_slices.emplace_back(Slice{success_buffer, data_size});
+    memcpy(success_buffer, large_data.data(), data_size);
+    auto success_put_result =
+        test_client_->Put(allocate_failed_key, success_slices, config);
+    ASSERT_TRUE(success_put_result.has_value())
+        << "Put operation failed: " << toString(success_put_result.error());
+    client_buffer_allocator_->deallocate(success_buffer, data_size);
+    auto success_remove_result = test_client_->Remove(allocate_failed_key);
+    ASSERT_TRUE(success_remove_result.has_value())
+        << "Remove operation failed: "
+        << toString(success_remove_result.error());
+}
+
+// Test large allocation operations
+TEST_F(ClientIntegrationTest, LargeAllocateTest) {
+    const size_t data_size = 1 * 1024 * 1024;  // 1MB
+    const uint64_t kNumBuffers = 5;
+    const std::string key = "large_test_key";
+
+    // Configure with 1 replicas for high availability
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Allocate buffers and fill with data
+    std::vector<void*> buffers(kNumBuffers);
+    for (size_t i = 0; i < kNumBuffers; ++i) {
+        buffers[i] = client_buffer_allocator_->allocate(data_size);
+        ASSERT_NE(buffers[i], nullptr);
+        std::string large_data(data_size, 'A' + i);
+        memcpy(buffers[i], large_data.data(), data_size);
+    }
+
+    // Create slices from buffers
+    std::vector<Slice> slices;
+    for (size_t i = 0; i < kNumBuffers; ++i) {
+        slices.emplace_back(Slice{buffers[i], data_size});
+    }
+
+    // Put operation
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Put operation failed: " << toString(put_result.error());
+
+    // Clear buffers before Get
+    for (size_t i = 0; i < kNumBuffers; ++i) {
+        memset(buffers[i], 0, data_size);
+    }
+
+    // Get operation
+    auto get_result = test_client_->Get(key, slices);
+    ASSERT_TRUE(get_result.has_value())
+        << "Get operation failed: " << toString(get_result.error());
+
+    // Verify data and deallocate buffers
+    for (size_t i = 0; i < kNumBuffers; ++i) {
+        ASSERT_EQ(slices[i].size, data_size);
+        std::string retrieved_data(static_cast<const char*>(slices[i].ptr),
+                                   slices[i].size);
+        std::string expected_data(data_size, 'A' + i);
+        EXPECT_EQ(
+            memcmp(retrieved_data.data(), expected_data.data(), data_size), 0);
+        client_buffer_allocator_->deallocate(buffers[i], data_size);
+    }
+
+    // Remove the key
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    auto remove_result = test_client_->Remove(key);
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove operation failed: " << toString(remove_result.error());
+}
+
+// Test batch Put/Get operations through the client
+TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
+    int batch_sz = 100;
+    std::vector<std::string> keys;
+    std::vector<std::string> test_data_list;
+    std::vector<std::vector<Slice>> batched_slices;
+    for (int i = 0; i < batch_sz; i++) {
+        keys.push_back("test_key_batch_put_" + std::to_string(i));
+        test_data_list.push_back("test_data_" + std::to_string(i));
+    }
+    void* buffer = nullptr;
+    void* target_buffer = nullptr;
+    batched_slices.reserve(batch_sz);
+    for (int i = 0; i < batch_sz; i++) {
+        std::vector<Slice> slices;
+        buffer = client_buffer_allocator_->allocate(test_data_list[i].size());
+        memcpy(buffer, test_data_list[i].data(), test_data_list[i].size());
+        slices.emplace_back(Slice{buffer, test_data_list[i].size()});
+        batched_slices.push_back(std::move(slices));
+    }
+    // Test Batch Put operation
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto start = std::chrono::high_resolution_clock::now();
+    auto batch_put_results =
+        test_client_->BatchPut(keys, batched_slices, config);
+    // Check that all operations succeeded
+    for (const auto& result : batch_put_results) {
+        ASSERT_TRUE(result.has_value()) << "BatchPut operation failed";
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    LOG(INFO) << "Time taken for BatchPut: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                       start)
+                     .count()
+              << "us";
+
+    start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < batch_sz; i++) {
+        std::vector<Slice> slices;
+        target_buffer =
+            client_buffer_allocator_->allocate(test_data_list[i].size());
+        slices.emplace_back(Slice{target_buffer, test_data_list[i].size()});
+        auto get_result = test_client_->Get(keys[i], slices);
+        ASSERT_TRUE(get_result.has_value())
+            << "Get operation failed: " << toString(get_result.error());
+        client_buffer_allocator_->deallocate(target_buffer,
+                                             test_data_list[i].size());
+    }
+    end = std::chrono::high_resolution_clock::now();
+    LOG(INFO) << "Time taken for single Get: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                       start)
+                     .count()
+              << "us";
+
+    start = std::chrono::high_resolution_clock::now();
+    std::unordered_map<std::string, std::vector<Slice>> target_batched_slices;
+    for (int i = 0; i < batch_sz; i++) {
+        std::vector<Slice> target_slices;
+        target_buffer =
+            client_buffer_allocator_->allocate(test_data_list[i].size());
+        target_slices.emplace_back(
+            Slice{target_buffer, test_data_list[i].size()});
+        target_batched_slices.emplace(keys[i], target_slices);
+    }
+    auto batch_get_results =
+        test_client_->BatchGet(keys, target_batched_slices);
+    for (const auto& result : batch_get_results) {
+        ASSERT_TRUE(result.has_value()) << "BatchGet operation failed";
+    }
+    end = std::chrono::high_resolution_clock::now();
+    LOG(INFO) << "Time taken for BatchGet: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                       start)
+                     .count()
+              << "us";
+
+    for (int i = 0; i < batch_sz; i++) {
+        ASSERT_EQ(target_batched_slices[keys[i]][0].size,
+                  test_data_list[i].size());
+        ASSERT_EQ(memcmp(target_batched_slices[keys[i]][0].ptr,
+                         test_data_list[i].data(), test_data_list[i].size()),
+                  0);
+        client_buffer_allocator_->deallocate(
+            target_batched_slices[keys[i]][0].ptr, test_data_list[i].size());
+    }
+}
+
+TEST_F(ClientIntegrationTest, BatchGetChecksLeasesWithPreferredNode) {
+    const std::vector<std::string> keys = {"batch_lease_expired",
+                                           "batch_lease_live",
+                                           "batch_lease_missing_slices"};
+    const std::string value = "batch read lease regression";
+    const size_t buffer_size = value.size() * 3;
+    void* buffer = client_buffer_allocator_->allocate(buffer_size);
+    ASSERT_NE(buffer, nullptr);
+    auto release_buffer = [buffer_size](void* ptr) {
+        client_buffer_allocator_->deallocate(ptr, buffer_size);
+    };
+    std::unique_ptr<void, decltype(release_buffer)> buffer_owner(
+        buffer, release_buffer);
+    memcpy(buffer, value.data(), value.size());
+    std::vector<Slice> source{{buffer, value.size()}};
+    ReplicateConfig config;
+    config.replica_num = 1;
+    // Keep both readable keys in the same transfer batch.
+    config.preferred_segment = "localhost:17812";
+    for (const auto& key : keys) {
+        ASSERT_TRUE(test_client_->Put(key, source, config).has_value());
+    }
+
+    const auto queries = test_client_->BatchQuery(keys);
+    ASSERT_EQ(queries.size(), keys.size());
+    std::vector<QueryResult> query_results;
+    const auto now = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < queries.size(); ++i) {
+        ASSERT_TRUE(queries[i].has_value());
+        ASSERT_EQ(queries[i]->replicas.size(), 1);
+        ASSERT_TRUE(queries[i]->replicas[0].is_memory_replica());
+        auto replicas = queries[i]->replicas;
+        // Use an explicit expired deadline instead of relying on a slow
+        // transfer or sleeping until the master's lease expires.
+        query_results.emplace_back(std::move(replicas),
+                                   i == 1 ? now + std::chrono::minutes(1)
+                                          : now - std::chrono::seconds(1),
+                                   queries[i]->object_checksum);
+    }
+    EXPECT_EQ(queries[0]
+                  ->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              queries[1]
+                  ->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_);
+    auto* expired_dst = static_cast<char*>(buffer) + value.size();
+    auto* live_dst = expired_dst + value.size();
+    std::unordered_map<std::string, std::vector<Slice>> destinations{
+        {keys[0], {{expired_dst, value.size()}}},
+        {keys[1], {{live_dst, value.size()}}}};
+
+    // Both public BatchGet modes must apply the same per-key lease contract.
+    for (bool group_by_target : {false, true}) {
+        SCOPED_TRACE(group_by_target);
+        memset(expired_dst, 0, value.size() * 2);
+        const auto results = test_client_->BatchGet(
+            keys, query_results, destinations, group_by_target);
+        ASSERT_EQ(results.size(), keys.size());
+        ASSERT_FALSE(results[0].has_value());
+        EXPECT_EQ(results[0].error(), ErrorCode::LEASE_EXPIRED);
+        EXPECT_TRUE(results[1].has_value());
+        ASSERT_FALSE(results[2].has_value());
+        EXPECT_EQ(results[2].error(), ErrorCode::INVALID_PARAMS);
+        // The expired item completed its transfer too; it must still not be
+        // reported as a successful read once its lease has expired.
+        EXPECT_EQ(memcmp(expired_dst, value.data(), value.size()), 0);
+        EXPECT_EQ(memcmp(live_dst, value.data(), value.size()), 0);
+    }
+}
+
+TEST_F(ClientIntegrationTest, BatchGetPreservesTransferErrorWithExpiredLease) {
+    const std::string key = "batch_lease_transfer_failure";
+    const std::string value = "batch read transfer error";
+    void* buffer = client_buffer_allocator_->allocate(value.size());
+    ASSERT_NE(buffer, nullptr);
+    auto release_buffer = [&value](void* ptr) {
+        client_buffer_allocator_->deallocate(ptr, value.size());
+    };
+    std::unique_ptr<void, decltype(release_buffer)> buffer_owner(
+        buffer, release_buffer);
+    memcpy(buffer, value.data(), value.size());
+    std::vector<Slice> source{{buffer, value.size()}};
+    ASSERT_TRUE(test_client_->Put(key, source, ReplicateConfig{}).has_value());
+    const auto query = test_client_->Query(key);
+    ASSERT_TRUE(query.has_value());
+    auto replicas = query->replicas;
+    const std::vector<QueryResult> query_results{
+        QueryResult(std::move(replicas),
+                    std::chrono::steady_clock::now() - std::chrono::seconds(1),
+                    query->object_checksum)};
+    // Invalid transfer length fails submission before any bytes are copied.
+    std::unordered_map<std::string, std::vector<Slice>> destinations{
+        {key, {{buffer, value.size() - 1}}}};
+    for (bool group_by_target : {false, true}) {
+        SCOPED_TRACE(group_by_target);
+        const auto results = test_client_->BatchGet(
+            {key}, query_results, destinations, group_by_target);
+        ASSERT_EQ(results.size(), 1);
+        ASSERT_FALSE(results[0].has_value());
+        EXPECT_EQ(results[0].error(), ErrorCode::TRANSFER_FAIL);
+    }
+}
+
+TEST_F(ClientIntegrationTest, BatchPutMixedGroupIdsThroughClient) {
+    auto find_group_id_on_different_shard = [](const std::string& key) {
+        static constexpr size_t kMetadataShardCountForTest = 1024;
+        const size_t key_shard =
+            std::hash<std::string>{}(key) % kMetadataShardCountForTest;
+        for (int i = 0; i < 10000; ++i) {
+            std::string group_id = key + "_group_" + std::to_string(i);
+            if (std::hash<std::string>{}(group_id) %
+                    kMetadataShardCountForTest !=
+                key_shard) {
+                return group_id;
+            }
+        }
+        return key + "_fallback_group";
+    };
+
+    const std::vector<std::string> keys = {
+        "client_batch_grouped_a",
+        "client_batch_ungrouped",
+        "client_batch_grouped_b",
+    };
+    const std::vector<std::string> values = {
+        "grouped-value-a",
+        "ungrouped-value",
+        "grouped-value-b",
+    };
+
+    std::vector<void*> source_buffers;
+    std::vector<std::vector<Slice>> batched_slices;
+    source_buffers.reserve(values.size());
+    batched_slices.reserve(values.size());
+    for (const auto& value : values) {
+        void* buffer = client_buffer_allocator_->allocate(value.size());
+        memcpy(buffer, value.data(), value.size());
+        source_buffers.push_back(buffer);
+        batched_slices.push_back({Slice{buffer, value.size()}});
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids =
+        std::vector<std::string>{find_group_id_on_different_shard(keys[0]), "",
+                                 find_group_id_on_different_shard(keys[2])};
+
+    auto put_results = test_client_->BatchPut(keys, batched_slices, config);
+    ASSERT_EQ(put_results.size(), keys.size());
+    for (const auto& result : put_results) {
+        ASSERT_TRUE(result.has_value())
+            << "BatchPut failed: " << toString(result.error());
+    }
+
+    for (size_t i = 0; i < values.size(); ++i) {
+        client_buffer_allocator_->deallocate(source_buffers[i],
+                                             values[i].size());
+    }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        void* target_buffer =
+            client_buffer_allocator_->allocate(values[i].size());
+        std::vector<Slice> slices{Slice{target_buffer, values[i].size()}};
+        auto get_result = test_client_->Get(keys[i], slices);
+        ASSERT_TRUE(get_result.has_value())
+            << "Get failed: " << toString(get_result.error());
+        EXPECT_EQ(slices[0].size, values[i].size());
+        EXPECT_EQ(memcmp(slices[0].ptr, values[i].data(), values[i].size()), 0);
+        client_buffer_allocator_->deallocate(target_buffer, values[i].size());
+    }
+
+    auto remove_results = test_client_->BatchRemove(keys, /*force=*/true);
+    ASSERT_EQ(remove_results.size(), keys.size());
+    for (const auto& result : remove_results) {
+        ASSERT_TRUE(result.has_value())
+            << "BatchRemove failed: " << toString(result.error());
+    }
+}
+
+// Test batch IsExist operations through the client
+TEST_F(ClientIntegrationTest, BatchIsExistOperations) {
+    int batch_size = 50;
+    std::vector<std::string> keys;
+    std::vector<std::string> test_data_list;
+    std::vector<std::vector<Slice>> batched_slices;
+
+    // Create test keys and data
+    for (int i = 0; i < batch_size; i++) {
+        keys.push_back("test_key_batch_exist_" + std::to_string(i));
+        test_data_list.push_back("test_data_" + std::to_string(i));
+    }
+
+    // Put only the first half of the keys
+    void* buffer = nullptr;
+    batched_slices.reserve(batch_size / 2);
+    for (int i = 0; i < batch_size / 2; i++) {
+        std::vector<Slice> slices;
+        buffer = client_buffer_allocator_->allocate(test_data_list[i].size());
+        memcpy(buffer, test_data_list[i].data(), test_data_list[i].size());
+        slices.emplace_back(Slice{buffer, test_data_list[i].size()});
+        batched_slices.push_back(std::move(slices));
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Put the first half of keys
+    std::vector<std::string> existing_keys(keys.begin(),
+                                           keys.begin() + batch_size / 2);
+    auto batch_put_results =
+        test_client_->BatchPut(existing_keys, batched_slices, config);
+    // Check that all operations succeeded
+    for (const auto& result : batch_put_results) {
+        ASSERT_TRUE(result.has_value()) << "BatchPut operation failed";
+    }
+
+    // Test BatchIsExist with mixed existing and non-existing keys
+    auto exist_results = test_client_->BatchIsExist(keys);
+
+    // Verify results
+    ASSERT_EQ(keys.size(), exist_results.size());
+
+    // First half should exist
+    for (int i = 0; i < batch_size / 2; i++) {
+        ASSERT_TRUE(exist_results[i].has_value())
+            << "BatchIsExist failed for key " << keys[i];
+        ASSERT_TRUE(exist_results[i].value())
+            << "Key " << keys[i] << " should exist";
+    }
+
+    // Second half should not exist
+    for (int i = batch_size / 2; i < batch_size; i++) {
+        ASSERT_TRUE(exist_results[i].has_value())
+            << "BatchIsExist failed for key " << keys[i];
+        ASSERT_FALSE(exist_results[i].value())
+            << "Key " << keys[i] << " should not exist";
+    }
+
+    // Test with empty keys vector
+    std::vector<std::string> empty_keys;
+    auto empty_results = test_client_->BatchIsExist(empty_keys);
+    ASSERT_EQ(empty_results.size(), 0);
+
+    // Clean up
+    for (int i = 0; i < batch_size / 2; i++) {
+        client_buffer_allocator_->deallocate(batched_slices[i][0].ptr,
+                                             test_data_list[i].size());
+    }
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    for (int i = 0; i < batch_size / 2; i++) {
+        auto remove_result = test_client_->Remove(keys[i]);
+        ASSERT_TRUE(remove_result.has_value())
+            << "Remove operation failed: " << toString(remove_result.error());
+    }
+}
+
+// Test batch QueryIp operations through the client
+TEST_F(ClientIntegrationTest, BatchQueryIpOperations) {
+    // Skip test if we couldn't capture client_ids
+    if ((test_client_id_.first == 0 && test_client_id_.second == 0) ||
+        (segment_provider_client_id_.first == 0 &&
+         segment_provider_client_id_.second == 0)) {
+        GTEST_SKIP()
+            << "Could not capture client_ids, skipping BatchQueryIp test";
+    }
+
+    // Test 1: Query IP for test_client_
+    std::vector<UUID> client_ids = {test_client_id_};
+    auto result = test_client_->BatchQueryIp(client_ids);
+
+    ASSERT_TRUE(result.has_value())
+        << "BatchQueryIp failed: " << toString(result.error());
+
+    const auto& results = result.value();
+    ASSERT_FALSE(results.empty()) << "BatchQueryIp returned empty results";
+
+    auto it = results.find(test_client_id_);
+    ASSERT_NE(it, results.end()) << "test_client_id not found in results";
+
+    const auto& ip_addresses = it->second;
+    ASSERT_FALSE(ip_addresses.empty())
+        << "test_client_ should have at least one IP address";
+
+    LOG(INFO) << "test_client_ IP addresses (" << ip_addresses.size() << "):";
+    for (size_t i = 0; i < ip_addresses.size(); ++i) {
+        LOG(INFO) << "  [" << (i + 1) << "] " << ip_addresses[i];
+    }
+
+    // Verify IP addresses are valid (should contain "127.0.0.1" or "localhost")
+    bool has_valid_ip = false;
+    for (const auto& ip : ip_addresses) {
+        if (ip == "127.0.0.1" || ip.find("127.0.0.1") != std::string::npos ||
+            ip == "localhost" || ip.find("localhost") != std::string::npos) {
+            has_valid_ip = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_valid_ip) << "Expected at least one valid IP address";
+
+    // Test 2: Query IP for multiple client_ids
+    std::vector<UUID> multiple_ids = {test_client_id_,
+                                      segment_provider_client_id_};
+    auto multi_result = test_client_->BatchQueryIp(multiple_ids);
+
+    ASSERT_TRUE(multi_result.has_value())
+        << "BatchQueryIp failed for multiple client_ids: "
+        << toString(multi_result.error());
+
+    const auto& multi_results = multi_result.value();
+
+    // Verify test_client_id_ is in results
+    auto test_it = multi_results.find(test_client_id_);
+    if (test_it != multi_results.end()) {
+        EXPECT_FALSE(test_it->second.empty())
+            << "test_client_ should have IP addresses";
+    }
+
+    // Verify segment_provider_client_id_ is in results
+    auto provider_it = multi_results.find(segment_provider_client_id_);
+    if (provider_it != multi_results.end()) {
+        EXPECT_FALSE(provider_it->second.empty())
+            << "segment_provider_client_ should have IP addresses";
+        LOG(INFO) << "segment_provider_client_ IP addresses ("
+                  << provider_it->second.size() << "):";
+        for (size_t i = 0; i < provider_it->second.size(); ++i) {
+            LOG(INFO) << "  [" << (i + 1) << "] " << provider_it->second[i];
+        }
+    }
+
+    // Test 3: Query with empty client_ids list
+    std::vector<UUID> empty_client_ids;
+    auto empty_result = test_client_->BatchQueryIp(empty_client_ids);
+
+    ASSERT_TRUE(empty_result.has_value());
+    EXPECT_TRUE(empty_result.value().empty())
+        << "Empty client_ids should return empty results";
+
+    // Test 4: Query with non-existent client_id (should be silently skipped)
+    UUID non_existent_client_id = generate_uuid();
+    std::vector<UUID> non_existent_ids = {non_existent_client_id};
+    auto non_existent_result = test_client_->BatchQueryIp(non_existent_ids);
+
+    ASSERT_TRUE(non_existent_result.has_value());
+    // Non-existent client_id should not be in results (silently skipped)
+    EXPECT_TRUE(non_existent_result.value().empty() ||
+                non_existent_result.value().find(non_existent_client_id) ==
+                    non_existent_result.value().end())
+        << "Non-existent client_id should not be in results";
+}
+
+// Test batch put with duplicate keys
+TEST_F(ClientIntegrationTest, BatchPutDuplicateKeys) {
+    const std::string test_data = "test_data_duplicate";
+    const std::string key = "duplicate_key";
+
+    // Create two identical keys
+    std::vector<std::string> keys = {key, key};
+    std::vector<std::vector<Slice>> batched_slices;
+
+    // Prepare data for both keys
+    for (int i = 0; i < 2; i++) {
+        std::vector<Slice> slices;
+        void* buffer = client_buffer_allocator_->allocate(test_data.size());
+        memcpy(buffer, test_data.data(), test_data.size());
+        slices.emplace_back(Slice{buffer, test_data.size()});
+        batched_slices.push_back(std::move(slices));
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Test batch put with duplicate keys
+    auto batch_put_results =
+        test_client_->BatchPut(keys, batched_slices, config);
+
+    // Check that we got results for both operations
+    ASSERT_EQ(batch_put_results.size(), 2);
+
+    // Both of them should success
+    // Because we currently consider `OBJECT_ALREADY_EXISTS` as success
+
+    for (const auto& result : batch_put_results) {
+        ASSERT_TRUE(result.has_value())
+            << "BatchPut operation failed: " << toString(result.error());
+    }
+
+    // Clean up allocated memory
+    for (const auto& slices : batched_slices) {
+        for (const auto& slice : slices) {
+            client_buffer_allocator_->deallocate(slice.ptr, slice.size);
+        }
+    }
+
+    // Clean up the key that was successfully put
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    auto remove_result = test_client_->Remove(key);
+    // Remove might fail if the key wasn't actually put, which is fine
+    ASSERT_TRUE(remove_result);
+}
+
+// Regression test for duplicate keys in a batch read (#3876): the
+// destinations used to collapse onto one buffer, returning the first
+// occurrence's unwritten memory as success. Every duplicate must come back
+// with a copy of the object bytes.
+TEST_F(ClientIntegrationTest, BatchGetDuplicateKeysFanOut) {
+    auto real_client = RealClient::create();
+    const std::string rdma_devices =
+        (FLAGS_protocol == "rdma") ? FLAGS_device_name : "";
+    ASSERT_EQ(real_client->setup_real("localhost:17913", "P2PHANDSHAKE", 0,
+                                      64 * 1024 * 1024, FLAGS_protocol,
+                                      rdma_devices, master_address_),
+              0);
+
+    const std::string key = "test_key_batch_get_duplicate_keys";
+    const size_t obj_size = 4096;
+    std::string test_data(obj_size, '\0');
+    for (size_t i = 0; i < obj_size; ++i) {
+        test_data[i] = static_cast<char>(((i * 131 + 7) & 0x7f) | 0x01);
+    }
+
+    void* put_buffer = client_buffer_allocator_->allocate(obj_size);
+    memcpy(put_buffer, test_data.data(), obj_size);
+    std::vector<Slice> put_slices{Slice{put_buffer, obj_size}};
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_result = test_client_->Put(key, put_slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Put failed: " << toString(put_result.error());
+    client_buffer_allocator_->deallocate(put_buffer, obj_size);
+
+    const std::vector<std::string> dup_keys = {key, key};
+
+    // Caller-buffer variant (batch_get_into): poison the first destination;
+    // it must still come back with the object bytes.
+    void* first = malloc(obj_size);
+    void* second = malloc(obj_size);
+    ASSERT_TRUE(first != nullptr && second != nullptr);
+    ASSERT_EQ(real_client->register_buffer(first, obj_size), 0);
+    ASSERT_EQ(real_client->register_buffer(second, obj_size), 0);
+    memset(first, 0xAA, obj_size);
+    memset(second, 0xBB, obj_size);
+    std::vector<void*> dst_buffers = {first, second};
+    std::vector<size_t> dst_sizes = {obj_size, obj_size};
+    auto into_results =
+        real_client->batch_get_into(dup_keys, dst_buffers, dst_sizes);
+    ASSERT_EQ(into_results.size(), 2);
+    EXPECT_EQ(into_results[0], static_cast<int64_t>(obj_size));
+    EXPECT_EQ(into_results[1], static_cast<int64_t>(obj_size));
+    EXPECT_EQ(memcmp(first, test_data.data(), obj_size), 0)
+        << "first duplicate buffer was left unwritten";
+    EXPECT_EQ(memcmp(second, test_data.data(), obj_size), 0)
+        << "second duplicate buffer was left unwritten";
+    real_client->unregister_buffer(first);
+    real_client->unregister_buffer(second);
+    free(first);
+    free(second);
+
+    // Allocated-buffer variant (batch_get_buffer, the Python get_batch
+    // entry): both handles must carry the object bytes.
+    auto handles = real_client->batch_get_buffer(dup_keys);
+    ASSERT_EQ(handles.size(), 2);
+    ASSERT_NE(handles[0], nullptr);
+    ASSERT_NE(handles[1], nullptr);
+    EXPECT_EQ(handles[0]->size(), obj_size);
+    EXPECT_EQ(handles[1]->size(), obj_size);
+    EXPECT_EQ(memcmp(handles[0]->ptr(), test_data.data(), obj_size), 0)
+        << "first duplicate handle was left unwritten";
+    EXPECT_EQ(memcmp(handles[1]->ptr(), test_data.data(), obj_size), 0)
+        << "second duplicate handle was left unwritten";
+}
+
+// Test BatchReplicaClear operations through the client
+TEST_F(ClientIntegrationTest, BatchReplicaClearOperations) {
+    // Skip test if we couldn't capture client_id
+    if (test_client_id_.first == 0 && test_client_id_.second == 0) {
+        GTEST_SKIP() << "Could not capture test_client_id, skipping "
+                        "BatchReplicaClear test";
+    }
+
+    const std::string test_data = "Test data for BatchReplicaClear";
+    std::vector<std::string> keys = {"batch_clear_key1", "batch_clear_key2",
+                                     "batch_clear_key3"};
+
+    // Test 1: Clear a single key (all segments)
+    std::string key1 = keys[0];
+    void* buffer = client_buffer_allocator_->allocate(test_data.size());
+    memcpy(buffer, test_data.data(), test_data.size());
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, test_data.size()});
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_result = test_client_->Put(key1, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Put operation failed: " << toString(put_result.error());
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+
+    // Wait for lease to expire (PutEnd sets lease_timeout to now, but
+    // if IsExist was called, it would grant a new lease)
+    // Wait for the full lease TTL to ensure any lease granted by PutEnd or
+    // other operations has expired
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_ + 100));
+    const auto timeout = std::chrono::seconds(5);
+    const auto start_time = std::chrono::steady_clock::now();
+    bool cleared = false;
+    std::vector<std::string> single_key = {key1};
+
+    while (std::chrono::steady_clock::now() - start_time < timeout) {
+        auto clear_result = test_client_->BatchReplicaClear(
+            single_key, test_client_id_,
+            "");  // Empty segment_name clears all segments
+        ASSERT_TRUE(clear_result.has_value())
+            << "BatchReplicaClear failed: " << toString(clear_result.error());
+
+        if (clear_result.value().size() == 1) {
+            cleared = true;
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    ASSERT_TRUE(cleared) << "Failed to clear key within timeout period";
+
+    // Verify the key is removed
+    auto exist_result2 = test_client_->IsExist(key1);
+    ASSERT_TRUE(exist_result2.has_value());
+    ASSERT_FALSE(exist_result2.value())
+        << "Key should be removed after BatchReplicaClear";
+
+    // Test 2: Clear multiple keys
+    std::vector<std::string> multiple_keys = {keys[1], keys[2]};
+    for (const auto& key : multiple_keys) {
+        buffer = client_buffer_allocator_->allocate(test_data.size());
+        memcpy(buffer, test_data.data(), test_data.size());
+        slices.clear();
+        slices.emplace_back(Slice{buffer, test_data.size()});
+        auto put_result2 = test_client_->Put(key, slices, config);
+        ASSERT_TRUE(put_result2.has_value())
+            << "Put operation failed for key: " << key
+            << ", error: " << toString(put_result2.error());
+        client_buffer_allocator_->deallocate(buffer, test_data.size());
+    }
+
+    // Wait for lease to expire and clear
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_ + 100));
+    const auto start_time2 = std::chrono::steady_clock::now();
+    bool all_cleared = false;
+
+    while (std::chrono::steady_clock::now() - start_time2 < timeout) {
+        auto clear_result = test_client_->BatchReplicaClear(
+            multiple_keys, test_client_id_, "");  // Clear all segments
+        ASSERT_TRUE(clear_result.has_value())
+            << "BatchReplicaClear failed: " << toString(clear_result.error());
+
+        if (clear_result.value().size() == multiple_keys.size()) {
+            all_cleared = true;
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    ASSERT_TRUE(all_cleared)
+        << "Failed to clear all keys within timeout period";
+
+    // Verify all keys are removed
+    for (const auto& key : multiple_keys) {
+        auto exist_result3 = test_client_->IsExist(key);
+        ASSERT_TRUE(exist_result3.has_value());
+        ASSERT_FALSE(exist_result3.value()) << "Key should be removed: " << key;
+    }
+
+    // Test 3: Clear with empty keys list
+    std::vector<std::string> empty_keys;
+    auto empty_result =
+        test_client_->BatchReplicaClear(empty_keys, test_client_id_, "");
+    ASSERT_TRUE(empty_result.has_value());
+    EXPECT_TRUE(empty_result.value().empty())
+        << "Empty keys should return empty results";
+
+    // Test 4: Clear with non-existent keys (should be silently skipped)
+    std::vector<std::string> non_existent_keys = {"non_existent_key1",
+                                                  "non_existent_key2"};
+    auto non_existent_result =
+        test_client_->BatchReplicaClear(non_existent_keys, test_client_id_, "");
+    ASSERT_TRUE(non_existent_result.has_value());
+    // Non-existent keys should not be in results (silently skipped)
+    EXPECT_TRUE(non_existent_result.value().empty())
+        << "Non-existent keys should return empty results";
+}
+
+// Helper: extract transport endpoints from Query() result
+static std::unordered_set<std::string> ExtractReplicaEndpoints(
+    const decltype(std::declval<Client>()
+                       .Query(std::declval<std::string>())
+                       .value())& q) {
+    std::unordered_set<std::string> endpoints;
+    for (const auto& r : q.replicas) {
+        // Memory replicas carry buffer_descriptor.transport_endpoint_
+        endpoints.insert(
+            r.get_memory_descriptor().buffer_descriptor.transport_endpoint_);
+    }
+    return endpoints;
+}
+
+// Helper: fill a target segment by placing many objects there until Put fails.
+// Returns keys that were successfully placed on target.
+static std::vector<std::string> FillSegmentUntilFull(
+    const std::shared_ptr<Client>& writer_client, SimpleAllocator* writer_alloc,
+    const std::string& target_segment_name, size_t value_size, int num_keys) {
+    std::vector<std::string> keys;
+    keys.reserve(num_keys);
+
+    std::string payload(value_size, 'X');
+
+    ReplicateConfig cfg;
+    cfg.replica_num = 1;
+    cfg.preferred_segment = target_segment_name;
+
+    for (int i = 0; i < num_keys; ++i) {
+        std::string key =
+            "fill_" + target_segment_name + "_" + std::to_string(i);
+
+        void* buf = writer_alloc->allocate(payload.size());
+        if (!buf) {
+            EXPECT_NE(buf, nullptr);
+            return keys;
+        }
+        std::memcpy(buf, payload.data(), payload.size());
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{buf, payload.size()});
+
+        writer_client->Put(key, slices, cfg);
+        writer_alloc->deallocate(buf, payload.size());
+
+        keys.push_back(std::move(key));
+    }
+    return keys;
+}
+
+// Helper: poll QueryTask until SUCCESS/FAILED or timeout.
+static TaskStatus WaitTaskTerminalStatus(const std::shared_ptr<Client>& client,
+                                         const UUID& task_id,
+                                         std::chrono::milliseconds timeout,
+                                         std::chrono::milliseconds interval) {
+    const auto start = std::chrono::steady_clock::now();
+    TaskStatus last = TaskStatus::PROCESSING;
+
+    while (std::chrono::steady_clock::now() - start < timeout) {
+        auto q = client->QueryTask(task_id);
+        EXPECT_TRUE(q.has_value())
+            << "QueryTask failed: " << toString(q.error());
+        last = q.value().status;
+
+        if (last == TaskStatus::SUCCESS || last == TaskStatus::FAILED)
+            return last;
+        std::this_thread::sleep_for(interval);
+    }
+    return last;
+}
+
+TEST_F(ClientIntegrationTest, ReplicaCopyAndMoveOperations) {
+    // Create two extra clients:
+    // - target_small: small segment to force allocation failure
+    // - target_big: normal segment for copy/move verification
+    const std::string target_small_name = "localhost:17814";
+    const std::string target_big_name = "localhost:17815";
+
+    auto target_small = CreateClient(target_small_name);
+    ASSERT_TRUE(target_small != nullptr);
+
+    auto target_big = CreateClient(target_big_name);
+    ASSERT_TRUE(target_big != nullptr);
+
+    // Mount segments for the extra clients
+    constexpr size_t kSegAlign = 16 * 1024 * 1024;  // 16MB alignment
+    const size_t kSmallSeg = kSegAlign;             // 16MB
+    const size_t kBigSeg = 8 * kSegAlign;           // 128MB
+
+    void* small_seg_ptr = allocate_buffer_allocator_memory(kSmallSeg);
+    ASSERT_NE(small_seg_ptr, nullptr);
+    auto m1 = target_small->MountSegment(small_seg_ptr, kSmallSeg);
+    ASSERT_TRUE(m1.has_value())
+        << "MountSegment(small) failed: " << toString(m1.error());
+
+    void* big_seg_ptr = allocate_buffer_allocator_memory(kBigSeg);
+    ASSERT_NE(big_seg_ptr, nullptr);
+    auto m2 = target_big->MountSegment(big_seg_ptr, kBigSeg);
+    ASSERT_TRUE(m2.has_value())
+        << "MountSegment(big) failed: " << toString(m2.error());
+
+    // --- Phase A: Fill small target (segment full) ---
+    const size_t kFillValueSize = 512 * 1024;  // 512KB
+    auto fill_keys = FillSegmentUntilFull(
+        test_client_, client_buffer_allocator_.get(), target_small_name,
+        kFillValueSize, /*num_keys=*/50);
+
+    ASSERT_FALSE(fill_keys.empty())
+        << "Failed to fill anything into target_small; test setup invalid";
+
+    // --- Phase B: COPY retry should succeed after freeing space ---
+    {
+        const std::string source_key = "retry_key_success_cpp";
+        std::string payload(kFillValueSize, 'A');
+
+        // Put source object onto the source segment (test_client_ segment).
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        cfg.preferred_segment = "localhost:17813";  // test_client_ name
+
+        void* buf = client_buffer_allocator_->allocate(payload.size());
+        ASSERT_NE(buf, nullptr);
+        std::memcpy(buf, payload.data(), payload.size());
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{buf, payload.size()});
+        auto put_res = test_client_->Put(source_key, slices, cfg);
+        client_buffer_allocator_->deallocate(buf, payload.size());
+        ASSERT_TRUE(put_res.has_value())
+            << "Put(source) failed: " << toString(put_res.error());
+
+        // Start COPY task to the full small target.
+        auto copy_task =
+            test_client_->CreateCopyTask(source_key, {target_small_name});
+        ASSERT_TRUE(copy_task.has_value())
+            << "CreateCopyTask failed: " << toString(copy_task.error());
+        const auto copy_task_id = copy_task.value();
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+            500));  // Give some time for initial attempt
+
+        // Free space by removing one of the fill keys.
+        test_client_->Remove(fill_keys.front());
+
+        // Poll task: should succeed after space is freed.
+        auto status =
+            WaitTaskTerminalStatus(test_client_, copy_task_id,
+                                   /*timeout=*/std::chrono::seconds(30),
+                                   /*interval=*/std::chrono::milliseconds(200));
+
+        ASSERT_EQ(status, TaskStatus::SUCCESS)
+            << "COPY task did not succeed after freeing space";
+
+        // Verify replica now exists on target_small (by endpoint)
+        auto q = test_client_->Query(source_key);
+        ASSERT_TRUE(q.has_value()) << "Query failed: " << toString(q.error());
+
+        auto endpoints = ExtractReplicaEndpoints(q.value());
+        EXPECT_TRUE(endpoints.contains(target_small->GetTransportEndpoint()))
+            << "Expected a replica on target_small endpoint";
+    }
+
+    // --- Phase C: COPY retry should fail if we do NOT free space ---
+    {
+        const std::string source_key = "retry_key_fail_cpp";
+        std::string payload(kFillValueSize, 'B');
+
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        cfg.preferred_segment = "localhost:17813";
+
+        void* buf = client_buffer_allocator_->allocate(payload.size());
+        ASSERT_NE(buf, nullptr);
+        std::memcpy(buf, payload.data(), payload.size());
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{buf, payload.size()});
+        auto put_res = test_client_->Put(source_key, slices, cfg);
+        client_buffer_allocator_->deallocate(buf, payload.size());
+        ASSERT_TRUE(put_res.has_value())
+            << "Put(source) failed: " << toString(put_res.error());
+
+        auto copy_task =
+            test_client_->CreateCopyTask(source_key, {target_small_name});
+        ASSERT_TRUE(copy_task.has_value())
+            << "CreateCopyTask failed: " << toString(copy_task.error());
+        const auto copy_task_id = copy_task.value();
+
+        // Do NOT free space; wait for retries to exhaust.
+        auto status =
+            WaitTaskTerminalStatus(test_client_, copy_task_id,
+                                   /*timeout=*/std::chrono::seconds(60),
+                                   /*interval=*/std::chrono::milliseconds(300));
+
+        ASSERT_EQ(status, TaskStatus::FAILED)
+            << "COPY task unexpectedly succeeded or did not fail in time";
+    }
+
+    // --- Phase D: Basic multi-client COPY and MOVE---
+    {
+        const int kNumKeys = 10;
+        std::vector<std::string> keys;
+        keys.reserve(kNumKeys);
+
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        cfg.preferred_segment = "localhost:17813";
+
+        // Put keys on source segment
+        for (int i = 0; i < kNumKeys; ++i) {
+            std::string key = "cm_key_" + std::to_string(i);
+            std::string payload(4 * 1024, static_cast<char>('a' + (i % 26)));
+
+            void* buf = client_buffer_allocator_->allocate(payload.size());
+            ASSERT_NE(buf, nullptr);
+            std::memcpy(buf, payload.data(), payload.size());
+            std::vector<Slice> slices;
+            slices.emplace_back(Slice{buf, payload.size()});
+
+            auto r = test_client_->Put(key, slices, cfg);
+            client_buffer_allocator_->deallocate(buf, payload.size());
+            ASSERT_TRUE(r.has_value()) << "Put failed: " << toString(r.error());
+
+            keys.push_back(std::move(key));
+        }
+
+        // COPY all keys to target_big
+        std::vector<UUID> copy_task_ids;
+
+        copy_task_ids.reserve(keys.size());
+        for (const auto& key : keys) {
+            auto t = test_client_->CreateCopyTask(key, {target_big_name});
+            ASSERT_TRUE(t.has_value())
+                << "CreateCopyTask failed: " << toString(t.error());
+            copy_task_ids.push_back(t.value());
+        }
+
+        for (const auto& tid : copy_task_ids) {
+            auto status = WaitTaskTerminalStatus(
+                test_client_, tid,
+                /*timeout=*/std::chrono::seconds(30),
+                /*interval=*/std::chrono::milliseconds(200));
+            ASSERT_EQ(status, TaskStatus::SUCCESS) << "COPY did not succeed";
+        }
+
+        // MOVE first 5 keys from source -> target_big
+        std::vector<UUID> move_task_ids;
+
+        for (int i = 0; i < 5; ++i) {
+            auto t = test_client_->CreateMoveTask(keys[i], "localhost:17813",
+                                                  target_big_name);
+            ASSERT_TRUE(t.has_value())
+                << "CreateMoveTask failed: " << toString(t.error());
+            move_task_ids.push_back(t.value());
+        }
+
+        for (const auto& tid : move_task_ids) {
+            auto status = WaitTaskTerminalStatus(
+                test_client_, tid,
+                /*timeout=*/std::chrono::seconds(30),
+                /*interval=*/std::chrono::milliseconds(200));
+            ASSERT_EQ(status, TaskStatus::SUCCESS) << "MOVE did not succeed";
+        }
+
+        // Verify moved keys are on target_big and (ideally) not on source
+        // endpoint
+        const auto source_ep = test_client_->GetTransportEndpoint();
+        const auto target_ep = target_big->GetTransportEndpoint();
+
+        for (int i = 0; i < 5; ++i) {
+            auto q = test_client_->Query(keys[i]);
+            ASSERT_TRUE(q.has_value())
+                << "Query failed: " << toString(q.error());
+            auto eps = ExtractReplicaEndpoints(q.value());
+
+            EXPECT_TRUE(eps.contains(target_ep))
+                << "Moved key missing on target_big";
+            EXPECT_FALSE(eps.contains(source_ep))
+                << "Moved key still present on source";
+        }
+    }
+
+    // Unmount and free extra segments
+    auto u1 = target_small->UnmountSegment(small_seg_ptr, kSmallSeg);
+    EXPECT_TRUE(u1.has_value()) << "UnmountSegment(small) failed";
+    auto u2 = target_big->UnmountSegment(big_seg_ptr, kBigSeg);
+    EXPECT_TRUE(u2.has_value()) << "UnmountSegment(big) failed";
+
+    std::free(small_seg_ptr);
+    std::free(big_seg_ptr);
+}
+
+// ---------------------------------------------------------------------------
+// Eviction notification integration test
+// Uses a separate InProcMaster with root_fs_dir and small quota_bytes so that
+// StorageBackend triggers FIFO eviction after a few Puts. Verifies that the
+// evicted key's DISK replica is removed from master metadata.
+// ---------------------------------------------------------------------------
+class EvictionNotificationTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        // Create a temporary directory for storage
+        tmp_dir_ = std::filesystem::temp_directory_path() /
+                   ("mc_evict_test_" + std::to_string(::getpid()));
+        std::filesystem::create_directories(tmp_dir_);
+
+        // Start master with root_fs_dir pointing to our temp dir and small
+        // quota. The client will discover fsdir = root_fs_dir/cluster_id and
+        // initialise a StorageBackend with the given quota.
+        auto config = InProcMasterConfigBuilder()
+                          .set_root_fs_dir(tmp_dir_.string())
+                          .set_enable_disk_eviction(true)
+                          .set_quota_bytes(kQuotaBytes)
+                          .build();
+        ASSERT_TRUE(master_.Start(config));
+        master_address_ = master_.master_address();
+    }
+
+    void TearDown() override {
+        client_.reset();
+        master_.Stop();
+        std::error_code ec;
+        std::filesystem::remove_all(tmp_dir_, ec);
+    }
+
+    void CreateClientAndMount() {
+        auto client_opt = Client::Create("localhost:17820",  // unique hostname
+                                         "P2PHANDSHAKE", FLAGS_protocol,
+                                         std::nullopt, master_address_);
+        ASSERT_TRUE(client_opt.has_value()) << "Failed to create client";
+        client_ = client_opt.value();
+
+        // Mount segment so that PutStart can allocate memory replicas
+        constexpr size_t kSegSize = 64 * 1024 * 1024;  // 64MB
+        seg_ptr_ = allocate_buffer_allocator_memory(kSegSize);
+        ASSERT_NE(seg_ptr_, nullptr);
+        seg_size_ = kSegSize;
+        auto mount = client_->MountSegment(seg_ptr_, seg_size_, FLAGS_protocol);
+        ASSERT_TRUE(mount.has_value())
+            << "MountSegment failed: " << toString(mount.error());
+
+        // Register local memory for client-side buffers
+        alloc_ = std::make_unique<SimpleAllocator>(16 * 1024 * 1024);
+        auto reg = client_->RegisterLocalMemory(
+            alloc_->getBase(), 16 * 1024 * 1024, "cpu:0", false, false);
+        ASSERT_TRUE(reg.has_value())
+            << "RegisterLocalMemory failed: " << toString(reg.error());
+    }
+
+    // Helper: check if a key has a DISK replica in master
+    bool HasDiskReplica(const std::string& key) {
+        auto q = client_->Query(key);
+        if (!q.has_value()) return false;
+        for (const auto& r : q.value().replicas) {
+            if (r.is_disk_replica()) return true;
+        }
+        return false;
+    }
+
+    // Helper: wait until a key has a DISK replica (async PutToLocalFile)
+    bool WaitForDiskReplica(const std::string& key,
+                            std::chrono::milliseconds timeout) {
+        auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < timeout) {
+            if (HasDiskReplica(key)) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return false;
+    }
+
+    // Helper: wait until a key no longer has a DISK replica
+    bool WaitForNoDiskReplica(const std::string& key,
+                              std::chrono::milliseconds timeout) {
+        auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < timeout) {
+            if (!HasDiskReplica(key)) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return false;
+    }
+
+    // Quota: 3KB so that 3 × 1KB objects fit, and the 4th triggers eviction
+    static constexpr uint64_t kQuotaBytes = 3 * 1024;
+    static constexpr size_t kValueSize = 1024;
+
+    InProcMaster master_;
+    std::string master_address_;
+    std::filesystem::path tmp_dir_;
+    std::shared_ptr<Client> client_;
+    std::unique_ptr<SimpleAllocator> alloc_;
+    void* seg_ptr_ = nullptr;
+    size_t seg_size_ = 0;
+};
+
+TEST_F(EvictionNotificationTest, DiskReplicaRemovedAfterEviction) {
+    CreateClientAndMount();
+
+    // Put 3 keys — should all fit within quota.
+    // Wait for each DISK replica before putting the next key so that the
+    // FIFO write-queue order is deterministic (write_thread_pool_ has >1
+    // thread, so concurrent writes can reorder).
+    std::vector<std::string> keys;
+    for (int i = 0; i < 3; ++i) {
+        std::string key = "evict_test_key_" + std::to_string(i);
+        std::string payload(kValueSize, 'A' + i);
+
+        void* buf = alloc_->allocate(payload.size());
+        ASSERT_NE(buf, nullptr);
+        std::memcpy(buf, payload.data(), payload.size());
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{buf, payload.size()});
+
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        auto put = client_->Put(key, slices, cfg);
+        ASSERT_TRUE(put.has_value())
+            << "Put(" << key << ") failed: " << toString(put.error());
+        alloc_->deallocate(buf, payload.size());
+        keys.push_back(key);
+
+        // Wait for this key's DISK replica before proceeding to the next
+        // Put, ensuring deterministic FIFO order in the eviction queue.
+        ASSERT_TRUE(WaitForDiskReplica(key, std::chrono::seconds(10)))
+            << "DISK replica did not appear for key: " << key;
+    }
+
+    // Put a 4th key — triggers eviction of the oldest (key 0) due to FIFO
+    {
+        std::string key = "evict_test_key_3";
+        std::string payload(kValueSize, 'D');
+
+        void* buf = alloc_->allocate(payload.size());
+        ASSERT_NE(buf, nullptr);
+        std::memcpy(buf, payload.data(), payload.size());
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{buf, payload.size()});
+
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        auto put = client_->Put(key, slices, cfg);
+        ASSERT_TRUE(put.has_value())
+            << "Put(" << key << ") failed: " << toString(put.error());
+        alloc_->deallocate(buf, payload.size());
+        keys.push_back(key);
+    }
+
+    // Wait for the 4th key's DISK replica to appear
+    ASSERT_TRUE(WaitForDiskReplica(keys[3], std::chrono::seconds(10)))
+        << "DISK replica did not appear for eviction-trigger key";
+
+    // The oldest key (key 0) should have had its DISK replica evicted
+    EXPECT_TRUE(WaitForNoDiskReplica(keys[0], std::chrono::seconds(10)))
+        << "Evicted key's DISK replica was not removed from master";
+
+    // Keys 1..3 should still have DISK replicas
+    for (int i = 1; i <= 3; ++i) {
+        EXPECT_TRUE(HasDiskReplica(keys[i]))
+            << "Key " << keys[i] << " should still have a DISK replica";
+    }
+
+    // Clean up: unmount segment
+    auto unmount = client_->UnmountSegment(seg_ptr_, seg_size_);
+    EXPECT_TRUE(unmount.has_value()) << "UnmountSegment failed";
+    std::free(seg_ptr_);
+    seg_ptr_ = nullptr;
+}
+
+// Test Upsert Case A: key does not exist — equivalent to Put
+TEST_F(ClientIntegrationTest, UpsertNewKey) {
+    const std::string test_data = "upsert_new_key_data";
+    const std::string key = "upsert_case_a_key";
+    void* buffer = client_buffer_allocator_->allocate(test_data.size());
+    ASSERT_NE(buffer, nullptr);
+
+    memcpy(buffer, test_data.data(), test_data.size());
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, test_data.size()});
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Upsert on a non-existent key should succeed (Case A)
+    auto upsert_result = test_client_->Upsert(key, slices, config);
+    ASSERT_TRUE(upsert_result.has_value())
+        << "Upsert (Case A) failed: " << toString(upsert_result.error());
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+
+    // Verify data through Get
+    buffer = client_buffer_allocator_->allocate(test_data.size());
+    slices.clear();
+    slices.emplace_back(Slice{buffer, test_data.size()});
+    auto get_result = test_client_->Get(key, slices);
+    ASSERT_TRUE(get_result.has_value())
+        << "Get after Upsert failed: " << toString(get_result.error());
+    ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+
+    // Clean up
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    auto remove_result = test_client_->Remove(key);
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove failed: " << toString(remove_result.error());
+}
+
+// Test Upsert Case B: key exists, same size — in-place update
+TEST_F(ClientIntegrationTest, UpsertSameSize) {
+    const std::string key = "upsert_case_b_key";
+    const size_t data_size = 64;
+
+    // Initial data: all 'A'
+    std::string initial_data(data_size, 'A');
+    void* buffer = client_buffer_allocator_->allocate(data_size);
+    ASSERT_NE(buffer, nullptr);
+    memcpy(buffer, initial_data.data(), data_size);
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, data_size});
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // First Put to create the key
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Initial Put failed: " << toString(put_result.error());
+    client_buffer_allocator_->deallocate(buffer, data_size);
+
+    // Wait for lease to expire so refcnt drops to 0
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+
+    // Upsert with same size but different content: all 'B'
+    std::string updated_data(data_size, 'B');
+    buffer = client_buffer_allocator_->allocate(data_size);
+    ASSERT_NE(buffer, nullptr);
+    memcpy(buffer, updated_data.data(), data_size);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, data_size});
+
+    auto upsert_result = test_client_->Upsert(key, slices, config);
+    ASSERT_TRUE(upsert_result.has_value())
+        << "Upsert (Case B) failed: " << toString(upsert_result.error());
+    client_buffer_allocator_->deallocate(buffer, data_size);
+
+    // Verify the data was updated
+    buffer = client_buffer_allocator_->allocate(data_size);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, data_size});
+    auto get_result = test_client_->Get(key, slices);
+    ASSERT_TRUE(get_result.has_value())
+        << "Get after Upsert failed: " << toString(get_result.error());
+    ASSERT_EQ(memcmp(slices[0].ptr, updated_data.data(), data_size), 0)
+        << "Data should be updated to 'B's after in-place upsert";
+    client_buffer_allocator_->deallocate(buffer, data_size);
+
+    // Clean up
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    auto remove_result = test_client_->Remove(key);
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove failed: " << toString(remove_result.error());
+}
+
+// Test Upsert Case C: key exists, different size — delete and reallocate
+TEST_F(ClientIntegrationTest, UpsertDifferentSize) {
+    const std::string key = "upsert_case_c_key";
+    const size_t initial_size = 64;
+    const size_t updated_size = 128;
+
+    // Initial data: 64 bytes of 'X'
+    std::string initial_data(initial_size, 'X');
+    void* buffer = client_buffer_allocator_->allocate(initial_size);
+    ASSERT_NE(buffer, nullptr);
+    memcpy(buffer, initial_data.data(), initial_size);
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, initial_size});
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Initial Put failed: " << toString(put_result.error());
+    client_buffer_allocator_->deallocate(buffer, initial_size);
+
+    // Wait for lease to expire so refcnt drops to 0
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+
+    // Upsert with different (larger) size: 128 bytes of 'Y'
+    std::string updated_data(updated_size, 'Y');
+    buffer = client_buffer_allocator_->allocate(updated_size);
+    ASSERT_NE(buffer, nullptr);
+    memcpy(buffer, updated_data.data(), updated_size);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, updated_size});
+
+    auto upsert_result = test_client_->Upsert(key, slices, config);
+    ASSERT_TRUE(upsert_result.has_value())
+        << "Upsert (Case C) failed: " << toString(upsert_result.error());
+    client_buffer_allocator_->deallocate(buffer, updated_size);
+
+    // Verify the data was updated with new size
+    buffer = client_buffer_allocator_->allocate(updated_size);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, updated_size});
+    auto get_result = test_client_->Get(key, slices);
+    ASSERT_TRUE(get_result.has_value())
+        << "Get after Upsert failed: " << toString(get_result.error());
+    ASSERT_EQ(slices[0].size, updated_size);
+    ASSERT_EQ(memcmp(slices[0].ptr, updated_data.data(), updated_size), 0)
+        << "Data should be updated to 'Y's with new size";
+    client_buffer_allocator_->deallocate(buffer, updated_size);
+
+    // Clean up
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    auto remove_result = test_client_->Remove(key);
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove failed: " << toString(remove_result.error());
+}
+
+// Test BatchUpsert with mixed cases (A + B + C)
+TEST_F(ClientIntegrationTest, BatchUpsertMixed) {
+    const size_t data_size = 64;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Pre-create key_b (for Case B: same size) and key_c (for Case C: diff
+    // size)
+    std::string key_b = "batch_upsert_case_b";
+    std::string key_c = "batch_upsert_case_c";
+
+    // Put key_b: 64 bytes of 'M'
+    {
+        std::string data(data_size, 'M');
+        void* buf = client_buffer_allocator_->allocate(data_size);
+        memcpy(buf, data.data(), data_size);
+        std::vector<Slice> sl;
+        sl.emplace_back(Slice{buf, data_size});
+        auto r = test_client_->Put(key_b, sl, config);
+        ASSERT_TRUE(r.has_value())
+            << "Put key_b failed: " << toString(r.error());
+        client_buffer_allocator_->deallocate(buf, data_size);
+    }
+
+    // Put key_c: 64 bytes of 'N'
+    {
+        std::string data(data_size, 'N');
+        void* buf = client_buffer_allocator_->allocate(data_size);
+        memcpy(buf, data.data(), data_size);
+        std::vector<Slice> sl;
+        sl.emplace_back(Slice{buf, data_size});
+        auto r = test_client_->Put(key_c, sl, config);
+        ASSERT_TRUE(r.has_value())
+            << "Put key_c failed: " << toString(r.error());
+        client_buffer_allocator_->deallocate(buf, data_size);
+    }
+
+    // Wait for lease to expire
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+
+    // Now BatchUpsert:
+    //   key_a (new)            → Case A, 64 bytes of 'P'
+    //   key_b (exists, same)   → Case B, 64 bytes of 'Q'
+    //   key_c (exists, larger) → Case C, 128 bytes of 'R'
+    std::string key_a = "batch_upsert_case_a";
+    std::vector<std::string> keys = {key_a, key_b, key_c};
+
+    const size_t size_a = data_size;
+    const size_t size_b = data_size;
+    const size_t size_c = data_size * 2;
+    std::string data_a(size_a, 'P');
+    std::string data_b(size_b, 'Q');
+    std::string data_c(size_c, 'R');
+
+    std::vector<std::vector<Slice>> batched_slices;
+    std::vector<void*> alloc_ptrs;  // track for cleanup
+
+    auto alloc_and_fill = [&](const std::string& data, size_t sz) {
+        void* buf = client_buffer_allocator_->allocate(sz);
+        EXPECT_NE(buf, nullptr);
+        memcpy(buf, data.data(), sz);
+        alloc_ptrs.push_back(buf);
+        std::vector<Slice> sl;
+        sl.emplace_back(Slice{buf, sz});
+        batched_slices.push_back(std::move(sl));
+    };
+
+    alloc_and_fill(data_a, size_a);
+    alloc_and_fill(data_b, size_b);
+    alloc_and_fill(data_c, size_c);
+
+    auto batch_results =
+        test_client_->BatchUpsert(keys, batched_slices, config);
+    ASSERT_EQ(batch_results.size(), 3);
+    for (size_t i = 0; i < batch_results.size(); ++i) {
+        ASSERT_TRUE(batch_results[i].has_value())
+            << "BatchUpsert failed for key " << keys[i] << ": "
+            << toString(batch_results[i].error());
+    }
+
+    // Free write buffers
+    client_buffer_allocator_->deallocate(alloc_ptrs[0], size_a);
+    client_buffer_allocator_->deallocate(alloc_ptrs[1], size_b);
+    client_buffer_allocator_->deallocate(alloc_ptrs[2], size_c);
+
+    // Verify each key's data
+    auto verify = [&](const std::string& key, const std::string& expected,
+                      size_t sz) {
+        void* buf = client_buffer_allocator_->allocate(sz);
+        std::vector<Slice> sl;
+        sl.emplace_back(Slice{buf, sz});
+        auto get_result = test_client_->Get(key, sl);
+        EXPECT_TRUE(get_result.has_value())
+            << "Get failed for " << key << ": " << toString(get_result.error());
+        if (get_result.has_value()) {
+            EXPECT_EQ(sl[0].size, sz);
+            EXPECT_EQ(memcmp(sl[0].ptr, expected.data(), sz), 0)
+                << "Data mismatch for " << key;
+        }
+        client_buffer_allocator_->deallocate(buf, sz);
+    };
+
+    verify(key_a, data_a, size_a);
+    verify(key_b, data_b, size_b);
+    verify(key_c, data_c, size_c);
+
+    // Clean up
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    for (const auto& key : keys) {
+        auto r = test_client_->Remove(key);
+        EXPECT_TRUE(r.has_value())
+            << "Remove failed for " << key << ": " << toString(r.error());
+    }
+}
+
+TEST_F(ClientIntegrationTest, MountSegmentAndGetIdAndUnmountSegmentById) {
+    // Allocate a small buffer for this test
+    size_t test_size = 16 * 1024 * 1024;  // 16 MB
+    void* test_buffer = allocate_buffer_allocator_memory(test_size);
+    ASSERT_NE(test_buffer, nullptr);
+
+    // Test MountSegmentAndGetId returns a valid UUID
+    auto mount_result = test_client_->MountSegmentAndGetId(
+        test_buffer, test_size, FLAGS_protocol);
+    ASSERT_TRUE(mount_result.has_value())
+        << "MountSegmentAndGetId failed: " << toString(mount_result.error());
+    UUID segment_id = mount_result.value();
+    EXPECT_NE(segment_id.first, 0u);
+    EXPECT_NE(segment_id.second, 0u);
+
+    // Test UnmountSegmentById succeeds
+    auto unmount_result = test_client_->UnmountSegmentById(segment_id);
+    EXPECT_TRUE(unmount_result.has_value())
+        << "UnmountSegmentById failed: " << toString(unmount_result.error());
+
+    // Test MountSegment delegates to MountSegmentAndGetId (equivalent behavior)
+    auto mount2 =
+        test_client_->MountSegment(test_buffer, test_size, FLAGS_protocol);
+    EXPECT_TRUE(mount2.has_value())
+        << "MountSegment failed: " << toString(mount2.error());
+
+    // Test UnmountSegment delegates to UnmountSegmentImpl (equivalent behavior)
+    auto unmount2 = test_client_->UnmountSegment(test_buffer, test_size);
+    EXPECT_TRUE(unmount2.has_value())
+        << "UnmountSegment failed: " << toString(unmount2.error());
+
+    free(test_buffer);
+}
+
+}  // namespace testing
+
+}  // namespace mooncake
+
+int main(int argc, char** argv) {
+    // Initialize Google Test
+    ::testing::InitGoogleTest(&argc, argv);
+
+    // Initialize Google's flags library
+    gflags::ParseCommandLineFlags(&argc, &argv, false);
+    mooncake::init_ylt_log_level();
+    // Run all tests
+    return RUN_ALL_TESTS();
+}

@@ -1,0 +1,2032 @@
+// Copyright 2024 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "transfer_engine_py.h"
+
+#include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <limits>
+#include <mutex>
+#include <numeric>
+
+#include <pybind11/stl.h>
+
+#include <algorithm>
+#include <cstring>
+#include "shared_segment_py.h"
+#include "transport/rpc_communicator/rpc_interface.h"
+
+#ifdef USE_TENT
+#include "tent/common/config.h"
+#include "tent/common/types.h"
+#include "tent/transfer_engine.h"
+#endif
+
+#ifdef USE_EFA
+#include "transport/efa_transport/efa_transport.h"
+#endif
+
+#ifdef USE_HIP
+#include "transport/hip_transport/hip_transport.h"
+#endif
+
+#ifdef USE_MNNVL
+#include "transport/nvlink_transport/nvlink_transport.h"
+#endif
+
+#ifdef USE_MUSA
+#include "transport/musa_transport/musa_transport.h"
+#endif
+
+#ifdef USE_INTRA_NVLINK
+#include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
+#endif
+
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
+static void* (*allocateMemory)(size_t) = nullptr;
+static void (*freeMemory)(void*) = nullptr;
+static std::string g_protocol;
+
+enum class ScatterTransferCompletionStatus : int {
+    COMPLETED = 0,
+    FAILED_DRAINED = -1,
+    COMPLETION_UNKNOWN = -2,
+};
+
+class ScatterTransferTicket {
+   public:
+    explicit ScatterTransferTicket(
+        std::shared_ptr<TransferEngine::ScatterTransferOperation> operation)
+        : operation_(std::move(operation)) {}
+
+    static std::shared_ptr<ScatterTransferTicket> terminal(
+        ScatterTransferCompletionStatus status) {
+        auto ticket = std::shared_ptr<ScatterTransferTicket>(
+            new ScatterTransferTicket(nullptr));
+        ticket->status_ = status;
+        ticket->drained_ = true;
+        return ticket;
+    }
+
+    ScatterTransferCompletionStatus status() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return status_;
+    }
+
+    bool drained() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return drained_;
+    }
+
+    ScatterTransferCompletionStatus drain(uint64_t timeout_ms) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (drained_) return status_;
+        if (!operation_) {
+            status_ = ScatterTransferCompletionStatus::FAILED_DRAINED;
+            drained_ = true;
+            return status_;
+        }
+
+        constexpr uint64_t kNanosPerMillis = 1000 * 1000;
+        const auto max_milliseconds =
+            static_cast<uint64_t>(std::chrono::nanoseconds::max().count()) /
+            kNanosPerMillis;
+        const auto bounded_timeout = std::chrono::milliseconds(
+            timeout_ms > max_milliseconds ? max_milliseconds : timeout_ms);
+        Status result = operation_->waitFor(bounded_timeout);
+        if (result.IsClock()) {
+            return ScatterTransferCompletionStatus::COMPLETION_UNKNOWN;
+        }
+
+        status_ = result.ok() ? ScatterTransferCompletionStatus::COMPLETED
+                              : ScatterTransferCompletionStatus::FAILED_DRAINED;
+        drained_ = true;
+        operation_.reset();
+        return status_;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::shared_ptr<TransferEngine::ScatterTransferOperation> operation_;
+    ScatterTransferCompletionStatus status_ =
+        ScatterTransferCompletionStatus::COMPLETION_UNKNOWN;
+    bool drained_ = false;
+};
+
+namespace {
+
+struct ScatterTransferSubmission {
+    std::shared_ptr<ScatterTransferTicket> ticket;
+    uint64_t total_length;
+};
+
+uint64_t nanosToCeilingMillis(uint64_t timeout_ns) {
+    constexpr uint64_t kNanosPerMillis = 1000 * 1000;
+    if (timeout_ns >
+        std::numeric_limits<uint64_t>::max() - (kNanosPerMillis - 1)) {
+        return std::numeric_limits<uint64_t>::max() / kNanosPerMillis;
+    }
+    return (timeout_ns + kNanosPerMillis - 1) / kNanosPerMillis;
+}
+
+ScatterTransferSubmission submitScatterWithTicket(
+    const std::shared_ptr<TransferEngine>& engine, const std::string& endpoint,
+    const std::vector<uintptr_t>& local_base_addresses,
+    const std::vector<size_t>& local_capacities,
+    const std::vector<uint64_t>& remote_base_addresses,
+    const std::vector<size_t>& remote_capacities,
+    const std::vector<std::vector<size_t>>& local_offsets,
+    const std::vector<std::vector<size_t>>& remote_offsets,
+    const std::vector<std::vector<size_t>>& lengths,
+    TransferEnginePy::TransferOpcode opcode) {
+    const size_t range_count = local_base_addresses.size();
+    if (local_capacities.size() != range_count ||
+        remote_base_addresses.size() != range_count ||
+        remote_capacities.size() != range_count ||
+        local_offsets.size() != range_count ||
+        remote_offsets.size() != range_count || lengths.size() != range_count) {
+        LOG(ERROR) << "Scatter transfer range arrays have different sizes";
+        return {ScatterTransferTicket::terminal(
+                    ScatterTransferCompletionStatus::FAILED_DRAINED),
+                0};
+    }
+
+    std::vector<TransferEngine::ScatterTransferRange> ranges;
+    ranges.reserve(range_count);
+    uint64_t total_length = 0;
+    for (size_t i = 0; i < range_count; ++i) {
+        constexpr auto kMaxLocalAddress = std::numeric_limits<uintptr_t>::max();
+        if (local_capacities[i] > kMaxLocalAddress ||
+            local_base_addresses[i] >
+                kMaxLocalAddress -
+                    static_cast<uintptr_t>(local_capacities[i])) {
+            LOG(ERROR) << "Scatter transfer local allocation range overflows "
+                          "the address space at range "
+                       << i;
+            return {ScatterTransferTicket::terminal(
+                        ScatterTransferCompletionStatus::FAILED_DRAINED),
+                    0};
+        }
+        const size_t fragment_count = local_offsets[i].size();
+        if (remote_offsets[i].size() != fragment_count ||
+            lengths[i].size() != fragment_count) {
+            LOG(ERROR) << "Scatter transfer fragment arrays have different "
+                          "sizes at range "
+                       << i;
+            return {ScatterTransferTicket::terminal(
+                        ScatterTransferCompletionStatus::FAILED_DRAINED),
+                    0};
+        }
+
+        TransferEngine::ScatterTransferRange range;
+        range.opcode = opcode == TransferEnginePy::TransferOpcode::WRITE
+                           ? TransferRequest::WRITE
+                           : TransferRequest::READ;
+        range.remote_segment = endpoint;
+        range.remote_base_offset = remote_base_addresses[i];
+        range.remote_size = remote_capacities[i];
+        range.local_buffer = reinterpret_cast<void*>(local_base_addresses[i]);
+        range.local_capacity = local_capacities[i];
+        range.local_offsets = local_offsets[i];
+        range.remote_offsets = remote_offsets[i];
+        range.lengths = lengths[i];
+        ranges.push_back(std::move(range));
+
+        for (size_t length : lengths[i]) {
+            if (length > std::numeric_limits<uint64_t>::max() - total_length) {
+                total_length = std::numeric_limits<uint64_t>::max();
+                break;
+            }
+            total_length += length;
+        }
+    }
+
+    auto operation = std::make_shared<TransferEngine::ScatterTransferOperation>(
+        engine->submitScatter(ranges));
+    return {std::make_shared<ScatterTransferTicket>(operation), total_length};
+}
+
+}  // namespace
+
+//  Handle allocateMemory function pointer based on protocol
+static bool initMemoryAllocator(const char* protocol) {
+    if (allocateMemory != nullptr) {
+        LOG(WARNING) << "Memory allocator already initialized with: "
+                     << g_protocol;
+        return true;
+    }
+    if (protocol == nullptr) protocol = "";
+    if (strcmp(protocol, "nvlink") == 0) {
+#ifdef USE_MNNVL
+        allocateMemory = [](size_t s) -> void* {
+            return mooncake::NvlinkTransport::allocatePinnedLocalMemory(s);
+        };
+        freeMemory = [](void* p) {
+            mooncake::NvlinkTransport::freePinnedLocalMemory(p);
+        };
+        LOG(INFO) << "Selected MNNVL (NVLink) memory allocator";
+#else
+        LOG(ERROR) << "Protocol 'nvlink' requires -DUSE_MNNVL=ON";
+        return false;
+#endif
+    } else if (strcmp(protocol, "musa") == 0) {
+#ifdef USE_MUSA
+        allocateMemory = [](size_t s) -> void* {
+            return mooncake::MusaTransport::allocatePinnedLocalMemory(s);
+        };
+        freeMemory = [](void* p) {
+            mooncake::MusaTransport::freePinnedLocalMemory(p);
+        };
+        LOG(INFO) << "Selected MUSA memory allocator";
+#else
+        LOG(ERROR) << "Protocol 'musa' requires -DUSE_MUSA=ON";
+#endif
+    } else if (strcmp(protocol, "hip") == 0) {
+#ifdef USE_HIP
+        allocateMemory = [](size_t s) -> void* {
+            return mooncake::HipTransport::allocatePinnedLocalMemory(s);
+        };
+        freeMemory = [](void* p) {
+            mooncake::HipTransport::freePinnedLocalMemory(p);
+        };
+        LOG(INFO) << "Selected HIP memory allocator";
+#else
+        LOG(ERROR) << "Protocol 'hip' requires -DUSE_HIP=ON";
+        return false;
+#endif
+    } else if (strcmp(protocol, "nvlink_intra") == 0) {
+#ifdef USE_INTRA_NVLINK
+        allocateMemory = [](size_t s) -> void* {
+            return mooncake::IntraNodeNvlinkTransport::
+                allocatePinnedLocalMemory(s);
+        };
+        freeMemory = [](void* p) {
+            mooncake::IntraNodeNvlinkTransport::freePinnedLocalMemory(p);
+        };
+        LOG(INFO) << "Selected Intra-NVLink memory allocator";
+#else
+        LOG(ERROR) << "Protocol 'nvlink_intra' requires -DUSE_INTRA_NVLINK=ON";
+        return false;
+#endif
+    } else {
+        // Ascend SVM (_devmm_mem_remote_map) requires a 64KB page-aligned
+        // src_va. Fallback protocols (rdma/tcp/ascend) use posix_memalign to
+        // guarantee 64KB alignment, otherwise aclrtHostRegister fails with
+        // EINVAL on a misaligned address.
+        allocateMemory = [](size_t s) -> void* {
+            void* p = nullptr;
+            if (posix_memalign(&p, 64 * 1024, s) != 0) {
+                return nullptr;
+            }
+            return p;
+        };
+        freeMemory = free;
+        LOG(WARNING) << "Using 64KB-aligned malloc/free for protocol: "
+                     << protocol;
+    }
+    g_protocol = protocol;
+    return true;
+}
+
+TransferEnginePy::TransferEnginePy() {
+    const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
+    if (getenv("MC_TRANSFER_TIMEOUT")) {
+        int timeout_sec = std::max(5, atoi(getenv("MC_TRANSFER_TIMEOUT")));
+        transfer_timeout_nsec_ = timeout_sec * kNanosPerSecond;
+    } else {
+        transfer_timeout_nsec_ = 30 * kNanosPerSecond;
+    }
+}
+
+TransferEnginePy::~TransferEnginePy() {
+    for (auto& handle : handle_map_) engine_->closeSegment(handle.second);
+    handle_map_.clear();
+    engine_.reset();
+    for (auto& buffer : buffer_list_) freeMemory(buffer);
+    buffer_list_.clear();
+    for (auto& buffer : large_buffer_list_) freeMemory(buffer);
+    large_buffer_list_.clear();
+}
+
+std::vector<std::string> buildDeviceFilter(const std::string& device_names) {
+    std::stringstream ss(device_names);
+    std::string item;
+    std::vector<std::string> tokens;
+    while (getline(ss, item, ',')) {
+        tokens.push_back(item);
+    }
+    return tokens;
+}
+
+std::pair<std::string, std::string> parseConnectionString(
+    const std::string& conn_string) {
+    std::pair<std::string, std::string> result;
+    std::string proto = "etcd";
+    std::string domain;
+    std::size_t pos = conn_string.find("://");
+
+    if (pos != std::string::npos) {
+        proto = conn_string.substr(0, pos);
+        domain = conn_string.substr(pos + 3);
+    } else if (conn_string == P2PHANDSHAKE) {
+        proto = "";
+        domain = P2PHANDSHAKE;
+    } else {
+        domain = conn_string;
+    }
+
+    result.first = proto;
+    result.second = domain;
+    return result;
+}
+
+std::string buildConnString(const std::string& metadata_type,
+                            const std::string& metadata_server) {
+    if (metadata_server == P2PHANDSHAKE) {
+        return P2PHANDSHAKE;
+    }
+
+    std::string conn_string = metadata_server;
+    if (conn_string.find("://") == std::string::npos)
+        conn_string = metadata_type + "://" + metadata_server;
+    return conn_string;
+}
+
+int TransferEnginePy::initialize(const char* local_hostname,
+                                 const char* metadata_server,
+                                 const char* protocol,
+                                 const char* device_name) {
+    auto conn_string = parseConnectionString(metadata_server);
+    return initializeExt(local_hostname, conn_string.second.c_str(), protocol,
+                         device_name, conn_string.first.c_str());
+}
+
+int TransferEnginePy::initializeExt(const char* local_hostname,
+                                    const char* metadata_server,
+                                    const char* protocol,
+                                    const char* device_name,
+                                    const char* metadata_type) {
+    if (protocol != nullptr && strcmp(protocol, "xgmi") == 0) {
+        LOG(ERROR) << "Protocol 'xgmi' is not exposed in the Python API. "
+                   << "Use 'hip' instead.";
+        return -1;
+    }
+    if (!initMemoryAllocator(protocol)) return -1;
+
+    std::string proto = protocol ? std::string(protocol) : "";
+    std::string conn_string = buildConnString(metadata_type, metadata_server);
+
+    auto device_name_safe = device_name ? std::string(device_name) : "";
+    auto device_filter = buildDeviceFilter(device_name_safe);
+    bool use_flagcx = (proto == "flagcx");
+
+#ifdef USE_EFA
+    // Only protocol=efa is set up by hand. Every other protocol goes through
+    // the same auto-discovery as non-EFA builds, which keeps EFA NICs out of
+    // the RDMA transport, so the EFA wheel behaves like the default wheel on
+    // IB/RoCE hosts.
+    bool use_efa = (proto == "efa");
+    engine_ = std::make_unique<TransferEngine>(!use_efa && !use_flagcx,
+                                               device_filter);
+    if (use_efa) {
+        engine_->getLocalTopology()->discover(device_filter);
+        LOG(INFO) << "Topology discovery complete for EFA. Found "
+                  << engine_->getLocalTopology()->getHcaList().size()
+                  << " devices.";
+    }
+#elif defined(USE_CXI)
+
+    bool use_cxi = (proto == "cxi");
+    engine_ = std::make_unique<TransferEngine>(false, device_filter);
+    if (use_cxi) {
+        engine_->getLocalTopology()->discover(device_filter);
+        LOG(INFO) << "Topology discovery complete for CXI. Found "
+                  << engine_->getLocalTopology()->getHcaList().size()
+                  << " devices.";
+    }
+#else
+    engine_ = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
+#endif
+
+    if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
+        auto hostname_port = parseHostNameWithPort(local_hostname);
+        int ret = engine_->init(conn_string, local_hostname,
+                                hostname_port.first.c_str(),
+                                hostname_port.second, proto);
+        if (ret) return -1;
+    } else {
+        // the last two params are unused
+        int ret = engine_->init(conn_string, local_hostname, "", 0, proto);
+        if (ret) return -1;
+    }
+
+#ifdef USE_EFA
+    // Install EFA transport when protocol is "efa"
+    if (use_efa) {
+        LOG(INFO)
+            << "Installing EFA transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("efa", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install EFA transport";
+            return -1;
+        }
+        LOG(INFO) << "EFA transport installed successfully";
+    } else if (use_flagcx) {
+        LOG(INFO)
+            << "Installing FlagCX transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("flagcx", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install FlagCX transport";
+            return -1;
+        }
+        LOG(INFO) << "FlagCX transport installed successfully";
+    }
+#elif defined(USE_CXI)
+    if (use_cxi) {
+        LOG(INFO)
+            << "Installing CXI transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("cxi", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install CXI transport";
+            return -1;
+        }
+        LOG(INFO) << "CXI transport installed successfully";
+    } else if (use_flagcx) {
+        LOG(INFO)
+            << "Installing FlagCX transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("flagcx", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install FlagCX transport";
+            return -1;
+        }
+        LOG(INFO) << "FlagCX transport installed successfully";
+    } else {
+        // For non-EFA protocols (e.g. TCP), manually install TCP transport
+        // since auto_discover is disabled to prevent RDMA installation
+        // (RDMA QP creation fails on EFA devices).
+        LOG(INFO)
+            << "Installing TCP transport (auto_discover disabled in CXI build)";
+        auto transport = engine_->installTransport("tcp", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install TCP transport";
+            return -1;
+        }
+        LOG(INFO) << "TCP transport installed successfully";
+    }
+#else
+    if (use_flagcx) {
+        LOG(INFO)
+            << "Installing FlagCX transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("flagcx", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install FlagCX transport";
+            return -1;
+        }
+        LOG(INFO) << "FlagCX transport installed successfully";
+    }
+#endif
+
+    free_list_.resize(kSlabSizeKBTabLen);
+    return 0;
+}
+
+int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
+
+char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
+    if (allocateMemory == nullptr || freeMemory == nullptr) {
+        LOG(ERROR) << "Memory allocator is not initialized";
+        return nullptr;
+    }
+    auto buffer = allocateMemory(capacity);
+    if (!buffer) return nullptr;
+    int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
+    if (ret) {
+        freeMemory(buffer);
+        return nullptr;
+    }
+    return (char*)buffer;
+}
+
+int TransferEnginePy::findClassId(size_t size) {
+    if (size > 1024ull * kSlabSizeKB[kMaxClassId]) return -1;
+    for (int i = kMaxClassId - 1; i >= 0; --i)
+        if (size > 1024ull * kSlabSizeKB[i]) return i + 1;
+    return 0;
+}
+
+int TransferEnginePy::doBuddyAllocate(int class_id) {
+    if (class_id == kMaxClassId) {
+        auto buffer = allocateRawBuffer(kDefaultBufferCapacity);
+        if (!buffer) return -1;
+        buffer_list_.push_back(buffer);
+        for (size_t offset = 0; offset < kDefaultBufferCapacity;
+             offset += 1024ull * kSlabSizeKB[kMaxClassId])
+            free_list_[kMaxClassId].push(buffer + offset);
+        return 0;
+    }
+    if (free_list_[class_id + 1].empty()) {
+        int ret = doBuddyAllocate(class_id + 1);
+        if (ret) return ret;
+    }
+    assert(!free_list_[class_id + 1].empty());
+    char* buffer = free_list_[class_id + 1].top();
+    free_list_[class_id + 1].pop();
+    free_list_[class_id].push(buffer);
+    free_list_[class_id].push(buffer + kSlabSizeKB[class_id] * 1024);
+    return 0;
+}
+
+uintptr_t TransferEnginePy::allocateManagedBuffer(size_t length) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    int class_id = findClassId(length);
+    if (class_id < 0) {
+        char* buffer = allocateRawBuffer(length);
+        if (buffer) large_buffer_list_.insert(buffer);
+        return (uintptr_t)buffer;
+    }
+    if (free_list_[class_id].empty())
+        if (doBuddyAllocate(class_id)) return 0;
+    assert(!free_list_[class_id].empty());
+    char* buffer = free_list_[class_id].top();
+    free_list_[class_id].pop();
+    return (uintptr_t)buffer;
+}
+
+int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto buffer = (char*)buffer_addr;
+    int class_id = findClassId(length);
+    if (class_id < 0) {
+        large_buffer_list_.erase(buffer);
+        engine_->unregisterLocalMemory(buffer);
+        freeMemory(buffer);
+        return 0;
+    }
+    free_list_[class_id].push(buffer);
+    return 0;
+}
+
+static int parseTransportHint(const std::string& name) {
+#ifdef USE_TENT
+    if (name.empty()) return mooncake::tent::UNSPEC;
+    auto type = mooncake::tent::parseTransportType(name);
+    if (type == mooncake::tent::UNSPEC && name != "unspec") {
+        throw std::invalid_argument(
+            "Unknown transport_hint '" + name +
+            "' (valid: rdma, mnnvl, shm, nvlink, gds, io_uring, tcp, "
+            "ascend, sunrise_link, unspec, or empty string for no hint)");
+    }
+    return type;
+#else
+    return 0;
+#endif
+}
+
+int TransferEnginePy::resolveNicHint(const std::string& name) const {
+    if (name.empty() || !engine_ || engine_->isUsingTent()) return -1;
+    auto topology = engine_->getLocalTopology();
+    if (!topology) return -1;
+    const auto& hca_list = topology->getHcaList();
+    const auto it = std::find(hca_list.begin(), hca_list.end(), name);
+    return it == hca_list.end()
+               ? -1
+               : static_cast<int>(std::distance(hca_list.begin(), it));
+}
+
+int TransferEnginePy::transferSyncWrite(const char* target_hostname,
+                                        uintptr_t buffer,
+                                        uintptr_t peer_buffer_address,
+                                        size_t length,
+                                        const std::string& transport_hint,
+                                        const std::string& nic_hint) {
+    return transferSync(target_hostname, buffer, peer_buffer_address, length,
+                        TransferOpcode::WRITE, nullptr, transport_hint,
+                        nic_hint);
+}
+
+int TransferEnginePy::transferSyncRead(const char* target_hostname,
+                                       uintptr_t buffer,
+                                       uintptr_t peer_buffer_address,
+                                       size_t length,
+                                       const std::string& transport_hint,
+                                       const std::string& nic_hint) {
+    return transferSync(target_hostname, buffer, peer_buffer_address, length,
+                        TransferOpcode::READ, nullptr, transport_hint,
+                        nic_hint);
+}
+
+int TransferEnginePy::batchTransferSyncWrite(
+    const char* target_hostname, std::vector<uintptr_t> buffers,
+    std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
+    const std::string& transport_hint, const std::string& nic_hint) {
+    return batchTransferSync(target_hostname, buffers, peer_buffer_addresses,
+                             lengths, TransferOpcode::WRITE, nullptr,
+                             transport_hint, nic_hint);
+}
+
+int TransferEnginePy::batchTransferSyncRead(
+    const char* target_hostname, std::vector<uintptr_t> buffers,
+    std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
+    const std::string& transport_hint, const std::string& nic_hint) {
+    return batchTransferSync(target_hostname, buffers, peer_buffer_addresses,
+                             lengths, TransferOpcode::READ, nullptr,
+                             transport_hint, nic_hint);
+}
+
+std::shared_ptr<ScatterTransferTicket>
+TransferEnginePy::scatterTransferSyncWriteWithTicket(
+    const std::string& endpoint,
+    const std::vector<uintptr_t>& local_base_addresses,
+    const std::vector<size_t>& local_capacities,
+    const std::vector<uint64_t>& remote_base_addresses,
+    const std::vector<size_t>& remote_capacities,
+    const std::vector<std::vector<size_t>>& local_offsets,
+    const std::vector<std::vector<size_t>>& remote_offsets,
+    const std::vector<std::vector<size_t>>& lengths) {
+    return scatterTransferSyncWithTicket(
+        endpoint, local_base_addresses, local_capacities, remote_base_addresses,
+        remote_capacities, local_offsets, remote_offsets, lengths,
+        TransferOpcode::WRITE);
+}
+
+std::shared_ptr<ScatterTransferTicket>
+TransferEnginePy::scatterTransferSyncReadWithTicket(
+    const std::string& endpoint,
+    const std::vector<uintptr_t>& local_base_addresses,
+    const std::vector<size_t>& local_capacities,
+    const std::vector<uint64_t>& remote_base_addresses,
+    const std::vector<size_t>& remote_capacities,
+    const std::vector<std::vector<size_t>>& local_offsets,
+    const std::vector<std::vector<size_t>>& remote_offsets,
+    const std::vector<std::vector<size_t>>& lengths) {
+    return scatterTransferSyncWithTicket(
+        endpoint, local_base_addresses, local_capacities, remote_base_addresses,
+        remote_capacities, local_offsets, remote_offsets, lengths,
+        TransferOpcode::READ);
+}
+
+std::shared_ptr<ScatterTransferTicket>
+TransferEnginePy::scatterTransferSyncWithTicket(
+    const std::string& endpoint,
+    const std::vector<uintptr_t>& local_base_addresses,
+    const std::vector<size_t>& local_capacities,
+    const std::vector<uint64_t>& remote_base_addresses,
+    const std::vector<size_t>& remote_capacities,
+    const std::vector<std::vector<size_t>>& local_offsets,
+    const std::vector<std::vector<size_t>>& remote_offsets,
+    const std::vector<std::vector<size_t>>& lengths, TransferOpcode opcode) {
+    pybind11::gil_scoped_release release;
+    auto submission = submitScatterWithTicket(
+        engine_, endpoint, local_base_addresses, local_capacities,
+        remote_base_addresses, remote_capacities, local_offsets, remote_offsets,
+        lengths, opcode);
+    const uint64_t timeout_ns =
+        submission.total_length >
+                std::numeric_limits<uint64_t>::max() - transfer_timeout_nsec_
+            ? std::numeric_limits<uint64_t>::max()
+            : transfer_timeout_nsec_ + submission.total_length;
+    submission.ticket->drain(nanosToCeilingMillis(timeout_ns));
+    return submission.ticket;
+}
+
+batch_id_t TransferEnginePy::batchTransferAsyncWrite(
+    const char* target_hostname, const std::vector<uintptr_t>& buffers,
+    const std::vector<uintptr_t>& peer_buffer_addresses,
+    const std::vector<size_t>& lengths, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    return batchTransferAsync(target_hostname, buffers, peer_buffer_addresses,
+                              lengths, TransferOpcode::WRITE, transport_hint,
+                              nic_hint);
+}
+
+batch_id_t TransferEnginePy::batchTransferAsyncRead(
+    const char* target_hostname, const std::vector<uintptr_t>& buffers,
+    const std::vector<uintptr_t>& peer_buffer_addresses,
+    const std::vector<size_t>& lengths, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    return batchTransferAsync(target_hostname, buffers, peer_buffer_addresses,
+                              lengths, TransferOpcode::READ, transport_hint,
+                              nic_hint);
+}
+
+namespace {
+
+// Copy a contiguous 1-D array of 8-byte integers out of a buffer-protocol
+// object. Raises TypeError/ValueError like pybind11's own casters would.
+template <typename T>
+std::vector<T> vectorFromIntegerBuffer(const pybind11::buffer& source,
+                                       const char* name) {
+    pybind11::buffer_info info = source.request();
+    if (info.ndim != 1) {
+        throw pybind11::type_error(std::string(name) +
+                                   " must be a one-dimensional array");
+    }
+    if (info.itemsize != sizeof(T) ||
+        info.format.find_first_of("QLqlNn") == std::string::npos ||
+        info.format.size() > 2) {
+        throw pybind11::type_error(std::string(name) +
+                                   " must hold 8-byte integers (uint64/int64)");
+    }
+    const auto count = static_cast<size_t>(info.shape[0]);
+    if (count && info.strides[0] != static_cast<pybind11::ssize_t>(sizeof(T))) {
+        throw pybind11::type_error(std::string(name) + " must be contiguous");
+    }
+    const bool is_signed =
+        info.format.find_first_of("qln") != std::string::npos;
+    std::vector<T> values(count);
+    if (count) {
+        std::memcpy(values.data(), info.ptr, count * sizeof(T));
+        if (is_signed) {
+            const auto* signed_values = static_cast<const int64_t*>(info.ptr);
+            for (size_t i = 0; i < count; ++i) {
+                if (signed_values[i] < 0) {
+                    throw pybind11::value_error(
+                        std::string(name) +
+                        " must not contain negative values");
+                }
+            }
+        }
+    }
+    return values;
+}
+
+struct BatchArrays {
+    std::vector<uintptr_t> buffers;
+    std::vector<uintptr_t> peer_buffer_addresses;
+    std::vector<size_t> lengths;
+};
+
+BatchArrays batchArraysFromBuffers(
+    const pybind11::buffer& buffers,
+    const pybind11::buffer& peer_buffer_addresses,
+    const pybind11::buffer& lengths) {
+    BatchArrays arrays{
+        vectorFromIntegerBuffer<uintptr_t>(buffers, "buffers"),
+        vectorFromIntegerBuffer<uintptr_t>(peer_buffer_addresses,
+                                           "peer_buffer_addresses"),
+        vectorFromIntegerBuffer<size_t>(lengths, "lengths"),
+    };
+    if (arrays.buffers.size() != arrays.peer_buffer_addresses.size() ||
+        arrays.buffers.size() != arrays.lengths.size()) {
+        throw pybind11::value_error(
+            "buffers, peer_buffer_addresses and lengths must have the same "
+            "length");
+    }
+    return arrays;
+}
+
+// Read a C-contiguous [rows, columns] array of 8-byte integers.
+std::vector<int64_t> matrixFromIntegerBuffer(const pybind11::buffer& source,
+                                             size_t columns, const char* name) {
+    pybind11::buffer_info info = source.request();
+    if (info.ndim != 2 || static_cast<size_t>(info.shape[1]) != columns) {
+        throw pybind11::type_error(std::string(name) + " must be a [rows, " +
+                                   std::to_string(columns) + "] array");
+    }
+    if (info.itemsize != sizeof(int64_t) ||
+        info.format.find_first_of("QLqlNn") == std::string::npos ||
+        info.format.size() > 2) {
+        throw pybind11::type_error(std::string(name) +
+                                   " must hold 8-byte integers (uint64/int64)");
+    }
+    const auto rows = static_cast<size_t>(info.shape[0]);
+    if (rows &&
+        (info.strides[1] != static_cast<pybind11::ssize_t>(sizeof(int64_t)) ||
+         info.strides[0] !=
+             static_cast<pybind11::ssize_t>(sizeof(int64_t) * columns))) {
+        throw pybind11::type_error(std::string(name) + " must be C-contiguous");
+    }
+    std::vector<int64_t> values(rows * columns);
+    if (!values.empty()) {
+        std::memcpy(values.data(), info.ptr, values.size() * sizeof(int64_t));
+    }
+    return values;
+}
+
+// Expand (fields x pages) into flat descriptor columns, field-major.
+BatchArrays batchArraysFromPages(const pybind11::buffer& src_pages,
+                                 const pybind11::buffer& dst_pages,
+                                 const pybind11::buffer& fields) {
+    const std::vector<int64_t> src =
+        vectorFromIntegerBuffer<int64_t>(src_pages, "src_pages");
+    const std::vector<int64_t> dst =
+        vectorFromIntegerBuffer<int64_t>(dst_pages, "dst_pages");
+    if (src.size() != dst.size()) {
+        throw pybind11::value_error(
+            "src_pages and dst_pages must have the same length");
+    }
+    constexpr size_t kColumns = 5;
+    const std::vector<int64_t> table =
+        matrixFromIntegerBuffer(fields, kColumns, "fields");
+    const size_t num_fields = table.size() / kColumns;
+    const size_t num_pages = src.size();
+    BatchArrays arrays;
+    arrays.buffers.reserve(num_fields * num_pages);
+    arrays.peer_buffer_addresses.reserve(num_fields * num_pages);
+    arrays.lengths.reserve(num_fields * num_pages);
+    for (size_t f = 0; f < num_fields; ++f) {
+        const int64_t src_base = table[f * kColumns + 0];
+        const int64_t src_stride = table[f * kColumns + 1];
+        const int64_t dst_base = table[f * kColumns + 2];
+        const int64_t dst_stride = table[f * kColumns + 3];
+        const int64_t length = table[f * kColumns + 4];
+        if (length <= 0 || src_stride < 0 || dst_stride < 0) {
+            throw pybind11::value_error(
+                "fields rows need a positive length and non-negative strides");
+        }
+        for (size_t i = 0; i < num_pages; ++i) {
+            arrays.buffers.push_back(
+                static_cast<uintptr_t>(src_base + src[i] * src_stride));
+            arrays.peer_buffer_addresses.push_back(
+                static_cast<uintptr_t>(dst_base + dst[i] * dst_stride));
+            arrays.lengths.push_back(static_cast<size_t>(length));
+        }
+    }
+    return arrays;
+}
+
+}  // namespace
+
+int TransferEnginePy::batchTransferSyncWritePages(
+    const char* target_hostname, const pybind11::buffer& src_pages,
+    const pybind11::buffer& dst_pages, const pybind11::buffer& fields,
+    size_t max_batch_size, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    return batchTransferSyncPages(target_hostname, src_pages, dst_pages, fields,
+                                  max_batch_size, TransferOpcode::WRITE,
+                                  transport_hint, nic_hint);
+}
+
+int TransferEnginePy::batchTransferSyncReadPages(
+    const char* target_hostname, const pybind11::buffer& src_pages,
+    const pybind11::buffer& dst_pages, const pybind11::buffer& fields,
+    size_t max_batch_size, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    return batchTransferSyncPages(target_hostname, src_pages, dst_pages, fields,
+                                  max_batch_size, TransferOpcode::READ,
+                                  transport_hint, nic_hint);
+}
+
+int TransferEnginePy::batchTransferSyncPages(
+    const char* target_hostname, const pybind11::buffer& src_pages,
+    const pybind11::buffer& dst_pages, const pybind11::buffer& fields,
+    size_t max_batch_size, TransferOpcode opcode,
+    const std::string& transport_hint, const std::string& nic_hint) {
+    BatchArrays arrays = batchArraysFromPages(src_pages, dst_pages, fields);
+    const size_t total = arrays.buffers.size();
+    if (total == 0) return 0;
+    const size_t step = max_batch_size == 0 ? total : max_batch_size;
+    for (size_t start = 0; start < total; start += step) {
+        const size_t stop = std::min(total, start + step);
+        int ret = batchTransferSync(
+            target_hostname,
+            std::vector<uintptr_t>(arrays.buffers.begin() + start,
+                                   arrays.buffers.begin() + stop),
+            std::vector<uintptr_t>(arrays.peer_buffer_addresses.begin() + start,
+                                   arrays.peer_buffer_addresses.begin() + stop),
+            std::vector<size_t>(arrays.lengths.begin() + start,
+                                arrays.lengths.begin() + stop),
+            opcode, nullptr, transport_hint, nic_hint);
+        if (ret != 0) return ret;
+    }
+    return 0;
+}
+
+int TransferEnginePy::batchTransferSyncWriteArrays(
+    const char* target_hostname, const pybind11::buffer& buffers,
+    const pybind11::buffer& peer_buffer_addresses,
+    const pybind11::buffer& lengths, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    BatchArrays arrays =
+        batchArraysFromBuffers(buffers, peer_buffer_addresses, lengths);
+    return batchTransferSync(target_hostname, std::move(arrays.buffers),
+                             std::move(arrays.peer_buffer_addresses),
+                             std::move(arrays.lengths), TransferOpcode::WRITE,
+                             nullptr, transport_hint, nic_hint);
+}
+
+int TransferEnginePy::batchTransferSyncReadArrays(
+    const char* target_hostname, const pybind11::buffer& buffers,
+    const pybind11::buffer& peer_buffer_addresses,
+    const pybind11::buffer& lengths, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    BatchArrays arrays =
+        batchArraysFromBuffers(buffers, peer_buffer_addresses, lengths);
+    return batchTransferSync(target_hostname, std::move(arrays.buffers),
+                             std::move(arrays.peer_buffer_addresses),
+                             std::move(arrays.lengths), TransferOpcode::READ,
+                             nullptr, transport_hint, nic_hint);
+}
+
+batch_id_t TransferEnginePy::batchTransferAsyncWriteArrays(
+    const char* target_hostname, const pybind11::buffer& buffers,
+    const pybind11::buffer& peer_buffer_addresses,
+    const pybind11::buffer& lengths, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    BatchArrays arrays =
+        batchArraysFromBuffers(buffers, peer_buffer_addresses, lengths);
+    return batchTransferAsync(target_hostname, arrays.buffers,
+                              arrays.peer_buffer_addresses, arrays.lengths,
+                              TransferOpcode::WRITE, transport_hint, nic_hint);
+}
+
+batch_id_t TransferEnginePy::batchTransferAsyncReadArrays(
+    const char* target_hostname, const pybind11::buffer& buffers,
+    const pybind11::buffer& peer_buffer_addresses,
+    const pybind11::buffer& lengths, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    BatchArrays arrays =
+        batchArraysFromBuffers(buffers, peer_buffer_addresses, lengths);
+    return batchTransferAsync(target_hostname, arrays.buffers,
+                              arrays.peer_buffer_addresses, arrays.lengths,
+                              TransferOpcode::READ, transport_hint, nic_hint);
+}
+
+int TransferEnginePy::transferSync(const char* target_hostname,
+                                   uintptr_t buffer,
+                                   uintptr_t peer_buffer_address, size_t length,
+                                   TransferOpcode opcode,
+                                   TransferNotify* notify,
+                                   const std::string& transport_hint,
+                                   const std::string& nic_hint) {
+    pybind11::gil_scoped_release release;
+    Transport::SegmentHandle handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            LOG(INFO)
+                << "transferSync, cache not found, openSegment with target "
+                << target_hostname;
+            handle = engine_->openSegment(target_hostname);
+            if (handle == (Transport::SegmentHandle)-1) return -1;
+            handle_map_[target_hostname] = handle;
+        }
+    }
+
+    // TODO this is just a workaround
+    // When transfer engine submits one task, it will be dispatch to a worker
+    // associated with one local RNIC. If the local RNIC fails to connect to any
+    // remote RNIC, it will eventually fail. This allows selecting multiple
+    // local RNIC in one transferSync call. Will be fixed in the next revision.
+    const int max_retry =
+        engine_->numContexts() + 1;  // Iter all possible local contexts
+    auto start_ts = getCurrentTimeInNano();
+    const int nic_hint_id = resolveNicHint(nic_hint);
+    for (int retry = 0; retry < max_retry; ++retry) {
+        auto batch_id = engine_->allocateBatchID(1);
+        TransferRequest entry;
+        if (opcode == TransferOpcode::WRITE) {
+            entry.opcode = TransferRequest::WRITE;
+        } else {
+            entry.opcode = TransferRequest::READ;
+        }
+        entry.length = length;
+        entry.source = (void*)buffer;
+        entry.target_id = handle;
+        entry.target_offset = peer_buffer_address;
+        entry.advise_retry_cnt = retry;
+        entry.transport_hint = parseTransportHint(transport_hint);
+        entry.nic_hint = nic_hint_id;
+
+        Status s =
+            notify
+                ? engine_->submitTransferWithNotify(
+                      batch_id, {entry},
+                      TransferMetadata::NotifyDesc{notify->name, notify->msg})
+                : engine_->submitTransfer(batch_id, {entry});
+        if (!s.ok()) {
+            engine_->freeBatchID(batch_id);
+            Status segment_status = engine_->CheckSegmentStatus(handle);
+            if (!segment_status.ok()) {
+                LOG(WARNING)
+                    << "submitTransfer failed with target " << target_hostname
+                    << ", CheckSegmentStatus not ok, ready to closeSegment";
+                std::lock_guard<std::mutex> guard(mutex_);
+                engine_->closeSegment(handle);
+                // Under MC_USE_TENT there is no classic metadata object
+                // (getMetadata() returns nullptr); TENT invalidates its own
+                // segment cache inside closeSegment(). Guard the classic-only
+                // cleanup so evicting a dead peer's handle cannot dereference
+                // a null metadata pointer. Refs #3995 (P0-stale-handle).
+                if (auto metadata = engine_->getMetadata())
+                    metadata->removeSegmentDesc(target_hostname);
+                handle_map_.erase(target_hostname);
+            }
+            return -1;
+        }
+
+        bool completed = false;
+        bool release_scheduled = false;
+        TransferStatus status;
+        while (!completed) {
+            Status s = engine_->getTransferStatus(batch_id, 0, status);
+            LOG_ASSERT(s.ok());
+            if (status.s == TransferStatusEnum::COMPLETED) {
+                engine_->freeBatchID(batch_id);
+                return 0;
+            } else if (status.s == TransferStatusEnum::FAILED) {
+                engine_->freeBatchID(batch_id);
+                release_scheduled = true;
+                completed = true;
+            } else if (status.s == TransferStatusEnum::TIMEOUT) {
+                LOG(INFO) << "Sync data transfer timeout";
+                engine_->freeBatchID(batch_id);
+                release_scheduled = true;
+                completed = true;
+            }
+            if (completed) break;
+            auto current_ts = getCurrentTimeInNano();
+            const int64_t timeout =
+                transfer_timeout_nsec_ + length;  // 1GiB per second
+            if (current_ts - start_ts > timeout) {
+                LOG(INFO) << "Sync data transfer timeout after "
+                          << current_ts - start_ts << "ns, local buffer "
+                          << (void*)buffer << " remote buffer "
+                          << (void*)peer_buffer_address << " length " << length;
+                if (!release_scheduled) {
+                    engine_->freeBatchID(batch_id);
+                }
+                return -1;
+            }
+        }
+    }
+    return -1;
+}
+
+int TransferEnginePy::batchTransferSync(
+    const char* target_hostname, std::vector<uintptr_t> buffers,
+    std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
+    TransferOpcode opcode, TransferNotify* notify,
+    const std::string& transport_hint, const std::string& nic_hint) {
+    pybind11::gil_scoped_release release;
+    Transport::SegmentHandle handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            if (handle == (Transport::SegmentHandle)-1) {
+                LOG(ERROR) << "batchTransferSync: openSegment failed for "
+                           << target_hostname;
+                return -1;
+            }
+            handle_map_[target_hostname] = handle;
+        }
+    }
+
+    if (buffers.size() != peer_buffer_addresses.size() ||
+        buffers.size() != lengths.size()) {
+        LOG(ERROR)
+            << "buffers, peer_buffer_addresses and lengths have different size";
+        return -1;
+    }
+
+    const int max_retry = engine_->numContexts() + 1;
+    auto start_ts = getCurrentTimeInNano();
+    auto total_length = std::accumulate(lengths.begin(), lengths.end(), 0ull);
+    auto batch_size = buffers.size();
+    const int nic_hint_id = resolveNicHint(nic_hint);
+    std::vector<TransferRequest> entries;
+    for (size_t i = 0; i < batch_size; ++i) {
+        TransferRequest entry;
+        if (opcode == TransferOpcode::WRITE) {
+            entry.opcode = TransferRequest::WRITE;
+        } else {
+            entry.opcode = TransferRequest::READ;
+        }
+        entry.length = lengths[i];
+        entry.source = (void*)buffers[i];
+        entry.target_id = handle;
+        entry.target_offset = peer_buffer_addresses[i];
+        entry.advise_retry_cnt = 0;
+        entry.transport_hint = parseTransportHint(transport_hint);
+        entry.nic_hint = nic_hint_id;
+        entries.push_back(entry);
+    }
+
+    for (int retry = 0; retry < max_retry; ++retry) {
+        // Preserve the historical empty-hint retry policy. Only stop pinning a
+        // named RNIC after the first submit-level attempt fails.
+        if (retry > 0) {
+            for (auto& entry : entries) entry.nic_hint = -1;
+        }
+        auto batch_id = engine_->allocateBatchID(batch_size);
+        Status s =
+            notify
+                ? engine_->submitTransferWithNotify(
+                      batch_id, entries,
+                      TransferMetadata::NotifyDesc{notify->name, notify->msg})
+                : engine_->submitTransfer(batch_id, entries);
+        if (!s.ok()) {
+            LOG(ERROR) << "batchTransferSync: submitTransfer failed for "
+                       << target_hostname << " (batch of " << batch_size
+                       << " requests, " << total_length
+                       << " bytes): " << s.ToString();
+            engine_->freeBatchID(batch_id);
+            Status segment_status = engine_->CheckSegmentStatus(handle);
+            if (!segment_status.ok()) {
+                LOG(WARNING)
+                    << "submitTransfer failed with target " << target_hostname
+                    << ", CheckSegmentStatus not ok, ready to closeSegment";
+                std::lock_guard<std::mutex> guard(mutex_);
+                engine_->closeSegment(handle);
+                // Under MC_USE_TENT there is no classic metadata object
+                // (getMetadata() returns nullptr); TENT invalidates its own
+                // segment cache inside closeSegment(). Guard the classic-only
+                // cleanup so evicting a dead peer's handle cannot dereference
+                // a null metadata pointer. Refs #3995 (P0-stale-handle).
+                if (auto metadata = engine_->getMetadata())
+                    metadata->removeSegmentDesc(target_hostname);
+                handle_map_.erase(target_hostname);
+            }
+            return -1;
+        }
+
+        bool completed = false;
+        bool release_scheduled = false;
+        TransferStatus status;
+        while (!completed) {
+            Status s = engine_->getBatchTransferStatus(batch_id, status);
+            LOG_ASSERT(s.ok());
+            if (status.s == TransferStatusEnum::COMPLETED) {
+                engine_->freeBatchID(batch_id);
+                return 0;
+            } else if (status.s == TransferStatusEnum::FAILED) {
+                LOG(ERROR) << "batchTransferSync: transfer FAILED for "
+                           << target_hostname << " (batch of " << batch_size
+                           << " requests, " << total_length
+                           << " bytes) on retry " << retry << "/" << max_retry;
+                engine_->freeBatchID(batch_id);
+                completed = true;
+            } else if (status.s == TransferStatusEnum::TIMEOUT) {
+                LOG(INFO) << "Sync data transfer timeout";
+                engine_->freeBatchID(batch_id);
+                release_scheduled = true;
+                completed = true;
+            }
+            if (completed) break;
+            auto current_ts = getCurrentTimeInNano();
+            const int64_t timeout =
+                transfer_timeout_nsec_ + total_length;  // 1GiB per second
+            if (current_ts - start_ts > timeout) {
+                LOG(INFO) << "Sync batch data transfer timeout after "
+                          << current_ts - start_ts << "ns";
+                if (!release_scheduled) {
+                    engine_->freeBatchID(batch_id);
+                }
+                return -1;
+            }
+        }
+    }
+    LOG(ERROR) << "batchTransferSync: all " << max_retry
+               << " retries exhausted for " << target_hostname << " (batch of "
+               << batch_size << " requests, " << total_length << " bytes)";
+    return -1;
+}
+
+batch_id_t TransferEnginePy::batchTransferAsync(
+    const char* target_hostname, const std::vector<uintptr_t>& buffers,
+    const std::vector<uintptr_t>& peer_buffer_addresses,
+    const std::vector<size_t>& lengths, TransferOpcode opcode,
+    const std::string& transport_hint, const std::string& nic_hint) {
+    pybind11::gil_scoped_release release;
+    Transport::SegmentHandle handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            // batch_id_t is unsigned; 0 is the documented failure sentinel
+            // (-1 would surface as 2^64 - 1 in Python).
+            if (handle == (Transport::SegmentHandle)-1) return 0;
+            handle_map_[target_hostname] = handle;
+        }
+    }
+
+    if (buffers.size() != peer_buffer_addresses.size() ||
+        buffers.size() != lengths.size()) {
+        LOG(ERROR)
+            << "buffers, peer_buffer_addresses and lengths have different size";
+        return 0;
+    }
+
+    const int max_retry = engine_->numContexts() + 1;
+    auto batch_size = buffers.size();
+    const int nic_hint_id = resolveNicHint(nic_hint);
+    std::vector<TransferRequest> entries;
+    batch_id_t batch_id = 0;
+    for (size_t i = 0; i < batch_size; ++i) {
+        TransferRequest entry;
+        if (opcode == TransferOpcode::WRITE) {
+            entry.opcode = TransferRequest::WRITE;
+        } else {
+            entry.opcode = TransferRequest::READ;
+        }
+        entry.length = lengths[i];
+        entry.source = (void*)buffers[i];
+        entry.target_id = handle;
+        entry.target_offset = peer_buffer_addresses[i];
+        entry.advise_retry_cnt = 0;
+        entry.transport_hint = parseTransportHint(transport_hint);
+        entry.nic_hint = nic_hint_id;
+        entries.push_back(entry);
+    }
+
+    for (int retry = 0; retry < max_retry; ++retry) {
+        batch_id = engine_->allocateBatchID(batch_size);
+        auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
+
+        auto start_ts = getCurrentTimeInNano();
+        batch_desc->start_timestamp = start_ts;
+
+        Status s = engine_->submitTransfer(batch_id, entries);
+        if (!s.ok()) {
+            engine_->freeBatchID(batch_id);
+            return 0;
+        } else {
+            break;
+        }
+    }
+
+    return batch_id;
+}
+
+int TransferEnginePy::getBatchTransferStatus(
+    const std::vector<batch_id_t>& batch_ids) {
+    pybind11::gil_scoped_release release;
+    TransferStatus status;
+    std::unordered_map<batch_id_t, int64_t> timeout_table{};
+    for (auto& batch_id : batch_ids) {
+        int64_t total_length = 0;
+        auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
+        const size_t task_count = batch_desc->task_list.size();
+
+        for (size_t task_id = 0; task_id < task_count; task_id++) {
+            auto& task = batch_desc->task_list[task_id];
+            for (auto& slice : task.slice_list) {
+                total_length += slice->length;
+            }
+        }
+
+        timeout_table[batch_id] = total_length + transfer_timeout_nsec_;
+    }
+
+    bool failed_or_timeout = false;
+    std::unordered_set<batch_id_t> remove_ids{};
+    while (!timeout_table.empty() && !failed_or_timeout) {
+        for (auto& entry : timeout_table) {
+            auto batch_desc = reinterpret_cast<BatchDesc*>(entry.first);
+            auto start_timestamp = batch_desc->start_timestamp;
+            Status s = engine_->getBatchTransferStatus(entry.first, status);
+            LOG_ASSERT(s.ok());
+            if (status.s == TransferStatusEnum::COMPLETED) {
+                engine_->freeBatchID(entry.first);
+                LOG(INFO) << "Batch Transfer completed!";
+                remove_ids.insert(entry.first);
+            } else if (status.s == TransferStatusEnum::FAILED) {
+                failed_or_timeout = true;
+            } else if (status.s == TransferStatusEnum::TIMEOUT) {
+                LOG(INFO) << "Sync data transfer timeout";
+            }
+            auto current_ts = getCurrentTimeInNano();
+            if (current_ts - start_timestamp > entry.second) {
+                LOG(INFO) << "Sync batch data transfer timeout after "
+                          << current_ts - start_timestamp << "ns";
+                failed_or_timeout = true;
+            }
+        }
+
+        for (auto& remove_id : remove_ids) {
+            timeout_table.erase(remove_id);
+        }
+
+        remove_ids.clear();
+    }
+
+    if (failed_or_timeout) {
+        for (auto& entry : timeout_table) {
+            engine_->freeBatchID(entry.first);
+        }
+    }
+
+    return failed_or_timeout ? -1 : 0;
+}
+
+batch_id_t TransferEnginePy::transferSubmitWrite(
+    const char* target_hostname, uintptr_t buffer,
+    uintptr_t peer_buffer_address, size_t length,
+    const std::string& transport_hint, const std::string& nic_hint) {
+    pybind11::gil_scoped_release release;
+    Transport::SegmentHandle handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            // batch_id_t is unsigned; 0 is the documented failure sentinel
+            // (-1 would surface as 2^64 - 1 in Python).
+            if (handle == (Transport::SegmentHandle)-1) return 0;
+            handle_map_[target_hostname] = handle;
+        }
+    }
+
+    auto batch_id = engine_->allocateBatchID(1);
+    TransferRequest entry;
+    entry.opcode = TransferRequest::WRITE;
+    entry.length = length;
+    entry.source = (void*)buffer;
+    entry.target_id = handle;
+    entry.target_offset = peer_buffer_address;
+    entry.transport_hint = parseTransportHint(transport_hint);
+    entry.nic_hint = resolveNicHint(nic_hint);
+
+    Status s = engine_->submitTransfer(batch_id, {entry});
+    if (!s.ok()) {
+        engine_->freeBatchID(batch_id);
+        return 0;
+    }
+
+    return batch_id;
+}
+
+int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
+    pybind11::gil_scoped_release release;
+    TransferStatus status;
+    Status s = engine_->getTransferStatus(batch_id, 0, status);
+    LOG_ASSERT(s.ok());
+    if (status.s == TransferStatusEnum::COMPLETED) {
+        engine_->freeBatchID(batch_id);
+        return 1;
+    } else if (status.s == TransferStatusEnum::FAILED) {
+        engine_->freeBatchID(batch_id);
+        return -1;
+    } else if (status.s == TransferStatusEnum::TIMEOUT) {
+        engine_->freeBatchID(batch_id);
+        return -2;
+    } else {
+        return 0;
+    }
+}
+
+int TransferEnginePy::batchRegisterMemory(
+    std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities,
+    const std::string& location) {
+    pybind11::gil_scoped_release release;
+    auto batch_size = buffer_addresses.size();
+    std::vector<BufferEntry> buffers;
+    for (size_t i = 0; i < batch_size; i++) {
+        buffers.push_back(
+            BufferEntry{(void*)buffer_addresses[i], capacities[i]});
+    }
+    return engine_->registerLocalMemoryBatch(buffers, location);
+}
+
+int TransferEnginePy::batchUnregisterMemory(
+    std::vector<uintptr_t> buffer_addresses) {
+    pybind11::gil_scoped_release release;
+    auto batch_size = buffer_addresses.size();
+    std::vector<void*> buffers;
+    for (size_t i = 0; i < batch_size; i++) {
+        buffers.push_back(reinterpret_cast<char*>(buffer_addresses[i]));
+    }
+    return engine_->unregisterLocalMemoryBatch(buffers);
+}
+
+int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity,
+                                     const std::string& location,
+                                     bool remote_accessible) {
+    char* buffer = reinterpret_cast<char*>(buffer_addr);
+    return engine_->registerLocalMemory(buffer, capacity, location,
+                                        remote_accessible);
+}
+
+int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
+    char* buffer = reinterpret_cast<char*>(buffer_addr);
+    return engine_->unregisterLocalMemory(buffer);
+}
+
+#ifdef USE_CUDA
+
+/**
+ * @brief Context structure for CUDA-stream-synchronized transfers.
+ *
+ * This structure holds all necessary data to execute a Mooncake transfer
+ * from within a CUDA host callback.
+ */
+struct TransferOnCudaContext {
+    std::shared_ptr<TransferEngine> engine;
+    Transport::BatchID batch_id;
+    std::vector<Transport::TransferRequest> requests;
+    uint64_t total_bytes;
+};
+
+/**
+ * @brief CUDA Host Callback function for triggered transfers.
+ *
+ * This function is called by the CUDA driver when all preceding operations
+ * in the associated stream have completed. It submits the transfer requests
+ * and waits synchronously for their completion.
+ *
+ * @param data Pointer to a TransferOnCudaContext object.
+ */
+void CUDART_CB transfer_on_cuda_callback(void* data) {
+    auto* ctx = reinterpret_cast<TransferOnCudaContext*>(data);
+
+    auto status = ctx->engine->submitTransfer(ctx->batch_id, ctx->requests);
+    if (!status.ok()) {
+        LOG(ERROR) << "[Mooncake Cuda] Submit failed: " << status.ToString()
+                   << " | BatchID: " << ctx->batch_id;
+        goto error_exit;
+    }
+
+    Transport::TransferStatus t_status;
+    while (true) {
+        auto ret = ctx->engine->getBatchTransferStatus(ctx->batch_id, t_status);
+        if (!ret.ok()) {
+            LOG(ERROR) << "[Mooncake Cuda] Failed to get status for BatchID: "
+                       << ctx->batch_id;
+            goto error_exit;
+        }
+
+        if (t_status.s == Transport::TransferStatusEnum::COMPLETED) {
+            break;
+        } else if (t_status.s == Transport::TransferStatusEnum::FAILED) {
+            LOG(ERROR) << "[Mooncake Cuda] Transfer failed | BatchID: "
+                       << ctx->batch_id << " | Bytes: " << ctx->total_bytes;
+            goto error_exit;
+        } else if (t_status.s == Transport::TransferStatusEnum::TIMEOUT) {
+            LOG(ERROR) << "[Mooncake Cuda] Transfer timeout | BatchID: "
+                       << ctx->batch_id;
+            goto error_exit;
+        }
+    }
+
+    ctx->engine->freeBatchID(ctx->batch_id);
+    delete ctx;
+    return;
+
+error_exit:
+    // Since this is a CUDA host callback running in a driver thread,
+    // we cannot propagate exceptions or error codes back to the main
+    // application. A failure here implies the data transfer required for
+    // subsequent stream operations has failed, leaving the system in an
+    // inconsistent state. We use _exit(1) to terminate the process
+    // immediately and avoid undefined behavior.
+    _exit(1);
+}
+
+/**
+ * @brief Submits a batch of transfer requests synchronized with a CUDA stream.
+ *
+ * This method schedules a host callback on the provided CUDA stream. The
+ * Mooncake transfer will only start after all previous kernels/memcpys on
+ * the stream have finished.
+ *
+ * @param target_hostname Remote host to transfer to/from.
+ * @param buffers Local buffer addresses.
+ * @param peer_buffer_addresses Remote buffer addresses.
+ * @param lengths Length of each transfer in bytes.
+ * @param opcode READ or WRITE operation.
+ * @param stream_ptr Handle to a CUDA stream (cudaStream_t as uintptr_t).
+ */
+void TransferEnginePy::batchTransferOnCuda(
+    const char* target_hostname, const std::vector<uintptr_t>& buffers,
+    const std::vector<uintptr_t>& peer_buffer_addresses,
+    const std::vector<size_t>& lengths, TransferOpcode opcode,
+    uintptr_t stream_ptr, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    pybind11::gil_scoped_release release;
+    Transport::SegmentHandle handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            if (handle == (Transport::SegmentHandle)-1)
+                throw std::runtime_error("Failed to open segment");
+            handle_map_[target_hostname] = handle;
+        }
+    }
+
+    if (buffers.size() != peer_buffer_addresses.size() ||
+        buffers.size() != lengths.size()) {
+        LOG(ERROR)
+            << "buffers, peer_buffer_addresses and lengths have different size";
+        throw std::runtime_error(
+            "buffers, peer_buffer_addresses and lengths have different size");
+    }
+
+    size_t batch_size = buffers.size();
+    const int nic_hint_id = resolveNicHint(nic_hint);
+    std::vector<TransferRequest> entries;
+    uint64_t total_bytes = 0;
+    for (size_t i = 0; i < batch_size; ++i) {
+        TransferRequest entry;
+        entry.opcode = (opcode == TransferOpcode::WRITE)
+                           ? TransferRequest::WRITE
+                           : TransferRequest::READ;
+        entry.length = lengths[i];
+        entry.source = (void*)buffers[i];
+        entry.target_id = handle;
+        entry.target_offset = peer_buffer_addresses[i];
+        entry.transport_hint = parseTransportHint(transport_hint);
+        entry.nic_hint = nic_hint_id;
+        entries.push_back(entry);
+        total_bytes += lengths[i];
+    }
+
+    auto batch_id = engine_->allocateBatchID(batch_size);
+    auto* ctx = new TransferOnCudaContext{engine_, batch_id, std::move(entries),
+                                          total_bytes};
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    cudaError_t err =
+        cudaLaunchHostFunc(stream, transfer_on_cuda_callback, ctx);
+    if (err != cudaSuccess) {
+        delete ctx;
+        engine_->freeBatchID(batch_id);
+        throw std::runtime_error(std::string("cudaLaunchHostFunc failed: ") +
+                                 cudaGetErrorString(err));
+    }
+}
+
+/**
+ * @brief Async WRITE transfer triggered by a CUDA stream.
+ */
+void TransferEnginePy::transferWriteOnCuda(const char* target_hostname,
+                                           uintptr_t buffer,
+                                           uintptr_t peer_buffer_address,
+                                           size_t length, uintptr_t stream_ptr,
+                                           const std::string& transport_hint,
+                                           const std::string& nic_hint) {
+    batchTransferOnCuda(target_hostname, {buffer}, {peer_buffer_address},
+                        {length}, TransferOpcode::WRITE, stream_ptr,
+                        transport_hint, nic_hint);
+}
+
+/**
+ * @brief Async READ transfer triggered by a CUDA stream.
+ */
+void TransferEnginePy::transferReadOnCuda(const char* target_hostname,
+                                          uintptr_t buffer,
+                                          uintptr_t peer_buffer_address,
+                                          size_t length, uintptr_t stream_ptr,
+                                          const std::string& transport_hint,
+                                          const std::string& nic_hint) {
+    batchTransferOnCuda(target_hostname, {buffer}, {peer_buffer_address},
+                        {length}, TransferOpcode::READ, stream_ptr,
+                        transport_hint, nic_hint);
+}
+
+/**
+ * @brief Batch async WRITE transfer triggered by a CUDA stream.
+ */
+void TransferEnginePy::batchTransferWriteOnCuda(
+    const char* target_hostname, const std::vector<uintptr_t>& buffers,
+    const std::vector<uintptr_t>& peer_buffer_addresses,
+    const std::vector<size_t>& lengths, uintptr_t stream_ptr,
+    const std::string& transport_hint, const std::string& nic_hint) {
+    batchTransferOnCuda(target_hostname, buffers, peer_buffer_addresses,
+                        lengths, TransferOpcode::WRITE, stream_ptr,
+                        transport_hint, nic_hint);
+}
+
+/**
+ * @brief Batch async READ transfer triggered by a CUDA stream.
+ */
+void TransferEnginePy::batchTransferReadOnCuda(
+    const char* target_hostname, const std::vector<uintptr_t>& buffers,
+    const std::vector<uintptr_t>& peer_buffer_addresses,
+    const std::vector<size_t>& lengths, uintptr_t stream_ptr,
+    const std::string& transport_hint, const std::string& nic_hint) {
+    batchTransferOnCuda(target_hostname, buffers, peer_buffer_addresses,
+                        lengths, TransferOpcode::READ, stream_ptr,
+                        transport_hint, nic_hint);
+}
+#endif
+
+int TransferEnginePy::warmupEfaSegment(const std::string& segment_name) {
+#ifdef USE_EFA
+    pybind11::gil_scoped_release release;
+    auto* t = engine_->getTransport("efa");
+    if (!t) return 0;  // EFA transport not installed; nothing to do.
+    auto* efa = dynamic_cast<EfaTransport*>(t);
+    if (!efa) return 0;
+    return efa->warmupSegment(segment_name);
+#else
+    (void)segment_name;
+    return 0;
+#endif
+}
+
+uintptr_t TransferEnginePy::getFirstBufferAddress(
+    const std::string& segment_name) {
+    pybind11::gil_scoped_release release;
+    Transport::SegmentHandle segment_id =
+        engine_->openSegment(segment_name.c_str());
+    if (segment_id ==
+        static_cast<Transport::SegmentHandle>(ERR_INVALID_ARGUMENT))
+        return 0;
+    std::vector<SegmentBufferInfo> buffers;
+    if (engine_->getSegmentBuffers(segment_id, buffers) != 0 || buffers.empty())
+        return 0;
+    return buffers.front().addr;
+}
+
+std::string TransferEnginePy::getLocalTopology(const char* device_name) {
+    pybind11::gil_scoped_release release;
+    auto device_name_safe = device_name ? std::string(device_name) : "";
+
+    const bool use_tent =
+        getenv("MC_USE_TENT") != nullptr || getenv("MC_USE_TEV1") != nullptr;
+#ifdef USE_TENT
+    if (use_tent) {
+        // This helper only needs topology, so use the native TENT Config path
+        // directly instead of constructing the classic compatibility shim.
+        // Keep the filter per-instance and avoid the process-global
+        // MC_TE_FILTERS environment variable, which is unsafe for concurrent
+        // callers. Explicit Config values take precedence over environment
+        // defaults inside TransferEngineImpl.
+        auto conf = std::make_shared<mooncake::tent::Config>();
+        conf->set("metadata_type", "p2p");
+        if (!device_name_safe.empty()) {
+            conf->set("topology/rdma_whitelist",
+                      std::vector<std::string>{device_name_safe});
+        }
+        mooncake::tent::TransferEngine tent_engine(conf);
+        return tent_engine.available() ? tent_engine.getLocalTopologyString()
+                                       : "{}";
+    }
+#else
+    (void)use_tent;
+#endif
+
+    // Classic path: device_filter is honored by classic TransferEngineImpl.
+    auto device_filter = buildDeviceFilter(device_name_safe);
+    std::shared_ptr<TransferEngine> tmp_engine =
+        std::make_shared<TransferEngine>(true, device_filter);
+    std::string metadata_conn_string{"P2PHANDSHAKE"}, local_server_name{};
+    tmp_engine->init(metadata_conn_string, local_server_name);
+    return tmp_engine->getLocalTopologyString();
+}
+
+std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
+    std::vector<TransferMetadata::NotifyDesc> notifies;
+    std::vector<TransferNotify> result;
+
+    int ret = engine_->getNotifies(notifies);
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to get notifies: " << ret;
+        return result;
+    }
+
+    for (const auto& notify : notifies) {
+        result.emplace_back(
+            TransferEnginePy::TransferNotify{notify.name, notify.notify_msg});
+    }
+
+    return result;
+}
+
+int TransferEnginePy::sendProbe(const std::string& peer_server_name) {
+    if (!engine_) return -1;
+    pybind11::gil_scoped_release release;
+
+    if (engine_->isUsingTent()) {
+        auto handle = engine_->openSegment(peer_server_name);
+        if (handle == static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT))
+            return -1;
+        auto liveness = engine_->probePeerAliveByID(handle);
+        return static_cast<int>(liveness);
+    }
+
+    return engine_->getMetadata()->sendProbe(peer_server_name);
+}
+
+namespace py = pybind11;
+
+// Implementation of coro_rpc_interface binding function
+void bind_coro_rpc_interface(py::module_& m) {
+    // Note: RpcInterface, ReceivedData and ReceivedTensor are already
+    // registered by bind_rpc_interface() so we don't register them again here
+    // to avoid duplicate type registration errors. The factory functions are
+    // also registered by bind_rpc_interface(), so we don't need to register
+    // them again.
+
+    // Add CoroRPCInterface as an alias to RpcInterface
+    m.attr("CoroRPCInterface") = m.attr("RpcInterface");
+}
+
+PYBIND11_MODULE(engine, m) {
+#ifdef USE_EFA
+    m.attr("SUPPORT_EFA") = true;
+#else
+    m.attr("SUPPORT_EFA") = false;
+#endif
+
+#ifdef USE_HIP
+    m.attr("SUPPORT_HIP") = true;
+#else
+    m.attr("SUPPORT_HIP") = false;
+#endif
+
+#ifdef USE_MNNVL
+    m.attr("SUPPORT_MNNVL") = true;
+#else
+    m.attr("SUPPORT_MNNVL") = false;
+#endif
+
+#ifdef USE_MUSA
+    m.attr("SUPPORT_MUSA") = true;
+#else
+    m.attr("SUPPORT_MUSA") = false;
+#endif
+
+#ifdef USE_INTRA_NVLINK
+    m.attr("SUPPORT_INTRA_NVLINK") = true;
+#else
+    m.attr("SUPPORT_INTRA_NVLINK") = false;
+#endif
+
+#ifdef USE_CUDA
+    m.attr("SUPPORT_CUDA") = true;
+#else
+    m.attr("SUPPORT_CUDA") = false;
+#endif
+
+#ifdef ENABLE_MULTI_PROTOCOL
+    m.attr("SUPPORT_MULTI_PROTOCOL") = true;
+#else
+    m.attr("SUPPORT_MULTI_PROTOCOL") = false;
+#endif
+
+    py::enum_<TransferEnginePy::TransferOpcode> transfer_opcode(
+        m, "TransferOpcode", py::arithmetic());
+    transfer_opcode.value("Read", TransferEnginePy::TransferOpcode::READ)
+        .value("Write", TransferEnginePy::TransferOpcode::WRITE)
+        .export_values();
+
+    py::enum_<ScatterTransferCompletionStatus>(
+        m, "ScatterTransferCompletionStatus")
+        .value("COMPLETED", ScatterTransferCompletionStatus::COMPLETED)
+        .value("FAILED_DRAINED",
+               ScatterTransferCompletionStatus::FAILED_DRAINED)
+        .value("COMPLETION_UNKNOWN",
+               ScatterTransferCompletionStatus::COMPLETION_UNKNOWN);
+
+    py::class_<ScatterTransferTicket, std::shared_ptr<ScatterTransferTicket>>(
+        m, "ScatterTransferTicket",
+        "Keeps a scatter operation alive until native DMA is drained.")
+        .def_property_readonly("status",
+                               [](const ScatterTransferTicket& ticket) {
+                                   py::gil_scoped_release release;
+                                   return ticket.status();
+                               })
+        .def_property_readonly("drained",
+                               [](const ScatterTransferTicket& ticket) {
+                                   py::gil_scoped_release release;
+                                   return ticket.drained();
+                               })
+        .def("drain", [](ScatterTransferTicket& ticket, uint64_t timeout_ms) {
+            py::gil_scoped_release release;
+            return ticket.drain(timeout_ms);
+        });
+
+    py::class_<TransferEnginePy::TransferNotify>(m, "TransferNotify")
+        .def(py::init<>())
+        .def(py::init<const std::string&, const std::string&>(),
+             py::arg("name"), py::arg("msg"))
+        .def_readwrite("name", &TransferEnginePy::TransferNotify::name)
+        .def_readwrite("msg", &TransferEnginePy::TransferNotify::msg);
+
+    auto submit_scatter = [](TransferEnginePy::TransferOpcode opcode) {
+        return [opcode](TransferEnginePy& adaptor, const std::string& endpoint,
+                        const std::vector<uintptr_t>& local_base_addresses,
+                        const std::vector<size_t>& local_capacities,
+                        const std::vector<uint64_t>& remote_base_addresses,
+                        const std::vector<size_t>& remote_capacities,
+                        const std::vector<std::vector<size_t>>& local_offsets,
+                        const std::vector<std::vector<size_t>>& remote_offsets,
+                        const std::vector<std::vector<size_t>>& lengths) {
+            py::gil_scoped_release release;
+            return submitScatterWithTicket(
+                       adaptor.getEngine(), endpoint, local_base_addresses,
+                       local_capacities, remote_base_addresses,
+                       remote_capacities, local_offsets, remote_offsets,
+                       lengths, opcode)
+                .ticket;
+        };
+    };
+
+    auto adaptor_cls =
+        py::class_<TransferEnginePy>(m, "TransferEngine")
+            .def(py::init<>())
+            .def("initialize", &TransferEnginePy::initialize)
+            .def("initialize_ext", &TransferEnginePy::initializeExt)
+            .def("get_rpc_port", &TransferEnginePy::getRpcPort)
+            .def("allocate_managed_buffer",
+                 &TransferEnginePy::allocateManagedBuffer)
+            .def("free_managed_buffer", &TransferEnginePy::freeManagedBuffer)
+            .def("transfer_sync_write", &TransferEnginePy::transferSyncWrite,
+                 py::arg("target_hostname"), py::arg("buffer"),
+                 py::arg("peer_buffer_address"), py::arg("length"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("transfer_sync_read", &TransferEnginePy::transferSyncRead,
+                 py::arg("target_hostname"), py::arg("buffer"),
+                 py::arg("peer_buffer_address"), py::arg("length"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_sync_write",
+                 &TransferEnginePy::batchTransferSyncWrite,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_sync_read",
+                 &TransferEnginePy::batchTransferSyncRead,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("submit_scatter_write",
+                 submit_scatter(TransferEnginePy::TransferOpcode::WRITE),
+                 py::arg("endpoint"), py::arg("local_base_addresses"),
+                 py::arg("local_capacities"), py::arg("remote_base_addresses"),
+                 py::arg("remote_capacities"), py::arg("local_offsets"),
+                 py::arg("remote_offsets"), py::arg("lengths"),
+                 py::keep_alive<0, 1>())
+            .def("submit_scatter_read",
+                 submit_scatter(TransferEnginePy::TransferOpcode::READ),
+                 py::arg("endpoint"), py::arg("local_base_addresses"),
+                 py::arg("local_capacities"), py::arg("remote_base_addresses"),
+                 py::arg("remote_capacities"), py::arg("local_offsets"),
+                 py::arg("remote_offsets"), py::arg("lengths"),
+                 py::keep_alive<0, 1>())
+            .def("scatter_transfer_sync_write_with_ticket",
+                 &TransferEnginePy::scatterTransferSyncWriteWithTicket,
+                 py::arg("endpoint"), py::arg("local_base_addresses"),
+                 py::arg("local_capacities"), py::arg("remote_base_addresses"),
+                 py::arg("remote_capacities"), py::arg("local_offsets"),
+                 py::arg("remote_offsets"), py::arg("lengths"),
+                 py::keep_alive<0, 1>())
+            .def("scatter_transfer_sync_read_with_ticket",
+                 &TransferEnginePy::scatterTransferSyncReadWithTicket,
+                 py::arg("endpoint"), py::arg("local_base_addresses"),
+                 py::arg("local_capacities"), py::arg("remote_base_addresses"),
+                 py::arg("remote_capacities"), py::arg("local_offsets"),
+                 py::arg("remote_offsets"), py::arg("lengths"),
+                 py::keep_alive<0, 1>())
+            .def("batch_transfer_async_write",
+                 &TransferEnginePy::batchTransferAsyncWrite,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_async_read",
+                 &TransferEnginePy::batchTransferAsyncRead,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_sync_write_arrays",
+                 &TransferEnginePy::batchTransferSyncWriteArrays,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_sync_read_arrays",
+                 &TransferEnginePy::batchTransferSyncReadArrays,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_async_write_arrays",
+                 &TransferEnginePy::batchTransferAsyncWriteArrays,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_async_read_arrays",
+                 &TransferEnginePy::batchTransferAsyncReadArrays,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_sync_write_pages",
+                 &TransferEnginePy::batchTransferSyncWritePages,
+                 py::arg("target_hostname"), py::arg("src_pages"),
+                 py::arg("dst_pages"), py::arg("fields"),
+                 py::arg("max_batch_size") = 0, py::arg("transport_hint") = "",
+                 py::arg("nic_hint") = "")
+            .def("batch_transfer_sync_read_pages",
+                 &TransferEnginePy::batchTransferSyncReadPages,
+                 py::arg("target_hostname"), py::arg("src_pages"),
+                 py::arg("dst_pages"), py::arg("fields"),
+                 py::arg("max_batch_size") = 0, py::arg("transport_hint") = "",
+                 py::arg("nic_hint") = "")
+            .def("transfer_sync", &TransferEnginePy::transferSync,
+                 py::arg("target_hostname"), py::arg("buffer"),
+                 py::arg("peer_buffer_address"), py::arg("length"),
+                 py::arg("opcode"), py::arg("notify") = nullptr,
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_sync", &TransferEnginePy::batchTransferSync,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("opcode"), py::arg("notify") = nullptr,
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_async", &TransferEnginePy::batchTransferAsync,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("opcode"), py::arg("transport_hint") = "",
+                 py::arg("nic_hint") = "")
+#ifdef USE_CUDA
+            .def("transfer_write_on_cuda",
+                 &TransferEnginePy::transferWriteOnCuda,
+                 py::arg("target_hostname"), py::arg("buffer"),
+                 py::arg("peer_buffer_address"), py::arg("length"),
+                 py::arg("stream_ptr") = 0, py::arg("transport_hint") = "",
+                 py::arg("nic_hint") = "")
+            .def("transfer_read_on_cuda", &TransferEnginePy::transferReadOnCuda,
+                 py::arg("target_hostname"), py::arg("buffer"),
+                 py::arg("peer_buffer_address"), py::arg("length"),
+                 py::arg("stream_ptr") = 0, py::arg("transport_hint") = "",
+                 py::arg("nic_hint") = "")
+            .def("batch_transfer_write_on_cuda",
+                 &TransferEnginePy::batchTransferWriteOnCuda,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("stream_ptr") = 0, py::arg("transport_hint") = "",
+                 py::arg("nic_hint") = "")
+            .def("batch_transfer_read_on_cuda",
+                 &TransferEnginePy::batchTransferReadOnCuda,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("stream_ptr") = 0, py::arg("transport_hint") = "",
+                 py::arg("nic_hint") = "")
+#endif
+            .def("get_batch_transfer_status",
+                 &TransferEnginePy::getBatchTransferStatus)
+            .def("transfer_submit_write",
+                 &TransferEnginePy::transferSubmitWrite,
+                 py::arg("target_hostname"), py::arg("buffer"),
+                 py::arg("peer_buffer_address"), py::arg("length"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("transfer_check_status",
+                 &TransferEnginePy::transferCheckStatus)
+            .def("write_bytes_to_buffer", &TransferEnginePy::writeBytesToBuffer)
+            .def("read_bytes_from_buffer",
+                 &TransferEnginePy::readBytesFromBuffer)
+            .def("register_memory", &TransferEnginePy::registerMemory,
+                 py::arg("buffer_addr"), py::arg("capacity"),
+                 py::arg("location") = kWildcardLocation,
+                 py::arg("remote_accessible") = true)
+            .def("unregister_memory", &TransferEnginePy::unregisterMemory)
+            .def("batch_register_memory",
+                 &TransferEnginePy::batchRegisterMemory,
+                 py::arg("buffer_addresses"), py::arg("capacities"),
+                 py::arg("location") = kWildcardLocation)
+            .def("batch_unregister_memory",
+                 &TransferEnginePy::batchUnregisterMemory)
+            .def("get_local_topology", &TransferEnginePy::getLocalTopology,
+                 py::arg("device_name") = nullptr)
+            .def("get_first_buffer_address",
+                 &TransferEnginePy::getFirstBufferAddress)
+            .def("warmup_efa_segment", &TransferEnginePy::warmupEfaSegment,
+                 py::arg("segment_name"))
+            .def("get_notifies", &TransferEnginePy::getNotifies)
+            .def("send_probe", &TransferEnginePy::sendProbe,
+                 py::arg("peer_server_name"),
+                 "Send a JSON-RPC probe to peer to verify reachability. "
+                 "Returns 0 on success, non-zero on failure. Used by "
+                 "SGLang's failed-session blacklist recovery.")
+            .def("get_engine", &TransferEnginePy::getEngine)
+            .def("get_engine_ptr", &TransferEnginePy::getEnginePtr);
+
+    adaptor_cls.attr("TransferOpcode") = transfer_opcode;
+
+    py::class_<TransferEngine, std::shared_ptr<TransferEngine>>(
+        m, "InnerTransferEngine");
+
+    mooncake::bind_shared_segment(m);
+
+    // Bind RpcInterface (this also registers ReceivedData, ReceivedTensor, and
+    // factory functions)
+    mooncake::bind_rpc_interface(m);
+
+    // Add CoroRPCInterface as an alias to RpcInterface if needed
+    bind_coro_rpc_interface(m);
+}

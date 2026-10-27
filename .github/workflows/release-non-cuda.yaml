@@ -1,0 +1,37 @@
+name: Release Non-CUDA
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # manylinux2_28 for the toolchain only (USE_CUDA=OFF); keeps the glibc floor
+  # aligned with the CUDA wheels.
+  build:
+    if: ${{ !contains(github.ref_name, '-') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            artifact-prefix: mooncake-wheel-non-cuda
+          - architecture: arm64
+            artifact-prefix: mooncake-wheel-non-cuda-arm64
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: non-cuda
+      architecture: ${{ matrix.architecture }}
+      artifact-prefix: ${{ matrix.artifact-prefix }}
+
+  publish-release:
+    if: ${{ !contains(github.ref_name, '-') }}
+    needs: build
+    permissions:
+      contents: write
+      id-token: write
+    uses: ./.github/workflows/_publish-wheel.yaml
+    with:
+      artifact-pattern: 'mooncake-wheel-non-cuda-*'
+    secrets:
+      pypi-token: ${{ secrets.PYPI_API_TOKEN }}

@@ -1,0 +1,531 @@
+import unittest
+import os
+import ctypes
+from mooncake.engine import TransferEngine
+
+
+class TestVLLMAdaptorTransfer(unittest.TestCase):
+    DEFAULT_BUFFER_CAPACITY = 64 * 1024 * 1024
+
+    @classmethod
+    def setUpClass(cls):
+        cls.target_server_name = os.getenv("TARGET_SERVER_NAME", "127.0.0.1:12345")
+        cls.initiator_server_name = os.getenv(
+            "INITIATOR_SERVER_NAME", "127.0.0.1:12347"
+        )
+        cls.metadata_server = os.getenv("MC_METADATA_SERVER", "127.0.0.1:2379")
+        cls.protocol = os.getenv("PROTOCOL", "tcp")  # "rdma" or "tcp"
+        cls.circle = int(os.getenv("CIRCLE", 1000))
+
+        cls.adaptor = TransferEngine()
+        ret = cls.adaptor.initialize(
+            cls.initiator_server_name, cls.metadata_server, cls.protocol, ""
+        )
+        if ret != 0:
+            raise RuntimeError(f"Initialization failed with code {ret}")
+
+        if cls.metadata_server == "P2PHANDSHAKE":
+            cls.initiator_server_name = (
+                cls.initiator_server_name.rpartition(":")[0]
+                + ":"
+                + str(cls.adaptor.get_rpc_port())
+            )
+
+        cls._fallback_buffer_addr = None
+
+    @classmethod
+    def _ensure_buffer_available(cls):
+        src_addr = cls.adaptor.get_first_buffer_address(cls.initiator_server_name)
+        if src_addr == 0:
+            cls._fallback_buffer_addr = cls.adaptor.allocate_managed_buffer(
+                cls.DEFAULT_BUFFER_CAPACITY
+            )
+            if cls._fallback_buffer_addr == 0:
+                raise RuntimeError("Failed to allocate fallback buffer")
+            src_addr = cls._fallback_buffer_addr
+        return src_addr
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._fallback_buffer_addr is not None:
+            cls.adaptor.free_managed_buffer(
+                cls._fallback_buffer_addr, cls.DEFAULT_BUFFER_CAPACITY
+            )
+            cls._fallback_buffer_addr = None
+
+    def test_random_write_circle_times(self):
+        """Test circle times of random string write/read via buffer transfer."""
+        import random
+        import string
+
+        def generate_random_string(length):
+            chars = string.ascii_letters + string.digits + string.punctuation
+            return "".join(random.choices(chars, k=length))
+
+        adaptor = self.adaptor
+        circles = self.circle
+
+        src_addr = self._ensure_buffer_available()
+        dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(dst_addr, 0, "Target server has no registered buffers")
+
+        for i in range(circles):
+            str_len = random.randint(16, 256)
+            src_data = generate_random_string(str_len).encode("utf-8")
+            data_len = len(src_data)
+
+            # Write to local buffer
+            result = adaptor.write_bytes_to_buffer(src_addr, src_data, data_len)
+            self.assertEqual(result, 0, f"[{i}] writeBytesToBuffer failed")
+
+            # Write to the remote end
+            result = adaptor.transfer_sync_write(
+                self.target_server_name, src_addr, dst_addr, data_len
+            )
+            self.assertEqual(result, 0, f"[{i}] WRITE transferSyncExt failed")
+
+            # Clear the local buffer
+            clear_data = bytes([0] * data_len)
+            result = adaptor.write_bytes_to_buffer(src_addr, clear_data, data_len)
+            self.assertEqual(result, 0, f"[{i}] Clear buffer failed")
+
+            # Read it back from the remote end
+            result = adaptor.transfer_sync_read(
+                self.target_server_name, src_addr, dst_addr, data_len
+            )
+            self.assertEqual(result, 0, f"[{i}] READ transferSyncExt failed")
+
+            # Verify data consistency
+            read_back = adaptor.read_bytes_from_buffer(src_addr, data_len)
+            self.assertEqual(read_back, src_data, f"[{i}] Data mismatch")
+
+        print(f"[✓] {circles} iterations of random write-read passed successfully.")
+
+    def test_batch_write_read(self):
+        """Test batch_transfer_sync_write and batch_transfer_sync_read for batch write/read consistency."""
+        import random
+        import string
+
+        def generate_random_string(length):
+            chars = string.ascii_letters + string.digits + string.punctuation
+            return "".join(random.choices(chars, k=length))
+
+        adaptor = self.adaptor
+        batch_size = 100  # Adjust batch size if needed
+        circles = max(2, self.circle // 100)  # Number of batch test rounds
+
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        src_addr_list = []
+        dst_addr_list = []
+        offset_size = 1024  # 1KB offset between each buffer
+
+        for i in range(batch_size):
+            src_addr_list.append(base_src_addr + i * offset_size)
+            dst_addr_list.append(base_dst_addr + i * offset_size)
+
+        for i in range(circles):
+            # Generate multiple groups of random data
+            data_list = []
+            data_len_list = []
+            for _ in range(batch_size):
+                str_len = random.randint(32, min(128, offset_size))
+                src_data = generate_random_string(str_len).encode("utf-8")
+                data_list.append(src_data)
+                data_len_list.append(len(src_data))
+
+            # Write to local buffers in batch
+            for j in range(batch_size):
+                result = adaptor.write_bytes_to_buffer(
+                    src_addr_list[j], data_list[j], data_len_list[j]
+                )
+                self.assertEqual(result, 0, f"[{i}-{j}] writeBytesToBuffer failed")
+
+            # Batch write to remote
+            result = adaptor.batch_transfer_sync_write(
+                self.target_server_name, src_addr_list, dst_addr_list, data_len_list
+            )
+            self.assertEqual(result, 0, f"[{i}] batch_transfer_sync_write failed")
+
+            # Clear local buffers
+            for j in range(batch_size):
+                clear_data = bytes([0] * data_len_list[j])
+                result = adaptor.write_bytes_to_buffer(
+                    src_addr_list[j], clear_data, data_len_list[j]
+                )
+                self.assertEqual(result, 0, f"[{i}-{j}] Clear buffer failed")
+
+            # Batch read back from remote
+            result = adaptor.batch_transfer_sync_read(
+                self.target_server_name, src_addr_list, dst_addr_list, data_len_list
+            )
+            self.assertEqual(result, 0, f"[{i}] batch_transfer_sync_read failed")
+
+            # Verify data consistency
+            for j in range(batch_size):
+                read_back = adaptor.read_bytes_from_buffer(
+                    src_addr_list[j], data_len_list[j]
+                )
+                self.assertEqual(
+                    read_back, data_list[j], f"[{i}-{j}] Data mismatch in batch read"
+                )
+
+        print(
+            f"[✓] {circles} rounds of batch_write_read passed, batch size {batch_size}."
+        )
+
+    def test_scatter_write_read(self):
+        """Transfer allocation-bounded offset vectors through one operation."""
+
+        adaptor = self.adaptor
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        payloads = (b"scatter-range-a", b"scatter-range-b", b"scatter-range-c")
+        write_local_offsets = ((0, 128), (1024,))
+        remote_offsets = ((256, 512), (1536,))
+        lengths = ((len(payloads[0]), len(payloads[1])), (len(payloads[2]),))
+        for address, payload in zip(
+            (
+                base_src_addr + write_local_offsets[0][0],
+                base_src_addr + write_local_offsets[0][1],
+                base_src_addr + write_local_offsets[1][0],
+            ),
+            payloads,
+            strict=True,
+        ):
+            self.assertEqual(
+                adaptor.write_bytes_to_buffer(address, payload, len(payload)),
+                0,
+            )
+
+        write_ticket = adaptor.scatter_transfer_sync_write_with_ticket(
+            self.target_server_name,
+            [base_src_addr, base_src_addr],
+            [4096, 4096],
+            [base_dst_addr, base_dst_addr],
+            [4096, 4096],
+            [list(offsets) for offsets in write_local_offsets],
+            [list(offsets) for offsets in remote_offsets],
+            [list(sizes) for sizes in lengths],
+        )
+        self.assertTrue(write_ticket.drained)
+        self.assertIn("COMPLETED", str(write_ticket.status))
+
+        read_local_offsets = ((2048, 2304), (3072,))
+        read_ticket = adaptor.scatter_transfer_sync_read_with_ticket(
+            self.target_server_name,
+            [base_src_addr, base_src_addr],
+            [4096, 4096],
+            [base_dst_addr, base_dst_addr],
+            [4096, 4096],
+            [list(offsets) for offsets in read_local_offsets],
+            [list(offsets) for offsets in remote_offsets],
+            [list(sizes) for sizes in lengths],
+        )
+        self.assertTrue(read_ticket.drained)
+        self.assertIn("COMPLETED", str(read_ticket.status))
+
+        for address, payload in zip(
+            (
+                base_src_addr + read_local_offsets[0][0],
+                base_src_addr + read_local_offsets[0][1],
+                base_src_addr + read_local_offsets[1][0],
+            ),
+            payloads,
+            strict=True,
+        ):
+            self.assertEqual(
+                adaptor.read_bytes_from_buffer(address, len(payload)),
+                payload,
+            )
+
+    def test_scatter_submit_write_read(self):
+        """Submit scatter transfers without draining them in the binding."""
+
+        adaptor = self.adaptor
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        payload = b"scatter-submit"
+        self.assertEqual(
+            adaptor.write_bytes_to_buffer(base_src_addr, payload, len(payload)),
+            0,
+        )
+
+        write_ticket = adaptor.submit_scatter_write(
+            self.target_server_name,
+            [base_src_addr],
+            [4096],
+            [base_dst_addr],
+            [4096],
+            [[0]],
+            [[256]],
+            [[len(payload)]],
+        )
+        self.assertFalse(write_ticket.drained)
+        self.assertIn("COMPLETED", str(write_ticket.drain(30_000)))
+        self.assertTrue(write_ticket.drained)
+
+        self.assertEqual(
+            adaptor.write_bytes_to_buffer(
+                base_src_addr + 512, bytes(len(payload)), len(payload)
+            ),
+            0,
+        )
+        read_ticket = adaptor.submit_scatter_read(
+            self.target_server_name,
+            [base_src_addr],
+            [4096],
+            [base_dst_addr],
+            [4096],
+            [[512]],
+            [[256]],
+            [[len(payload)]],
+        )
+        self.assertFalse(read_ticket.drained)
+        self.assertIn("COMPLETED", str(read_ticket.drain(30_000)))
+        self.assertTrue(read_ticket.drained)
+        self.assertEqual(
+            adaptor.read_bytes_from_buffer(base_src_addr + 512, len(payload)),
+            payload,
+        )
+
+    def test_scatter_rejects_mismatched_fragment_vectors(self):
+        adaptor = self.adaptor
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        ticket = adaptor.scatter_transfer_sync_write_with_ticket(
+            self.target_server_name,
+            [base_src_addr],
+            [4096],
+            [base_dst_addr],
+            [4096],
+            [[0, 128]],
+            [[256]],
+            [[16, 16]],
+        )
+        self.assertTrue(ticket.drained)
+        self.assertIn("FAILED_DRAINED", str(ticket.status))
+
+    def test_scatter_rejects_fragment_outside_allocation(self):
+        adaptor = self.adaptor
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        ticket = adaptor.scatter_transfer_sync_write_with_ticket(
+            self.target_server_name,
+            [base_src_addr],
+            [4096],
+            [base_dst_addr],
+            [4096],
+            [[4088]],
+            [[0]],
+            [[16]],
+        )
+        self.assertTrue(ticket.drained)
+        self.assertIn("FAILED_DRAINED", str(ticket.status))
+
+    def test_scatter_rejects_local_allocation_address_overflow(self):
+        adaptor = self.adaptor
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+        max_address = (1 << 64) - 1
+        stderr_read, stderr_write = os.pipe()
+        saved_stderr = os.dup(2)
+        try:
+            os.dup2(stderr_write, 2)
+            for transfer in (
+                adaptor.scatter_transfer_sync_write_with_ticket,
+                adaptor.scatter_transfer_sync_read_with_ticket,
+            ):
+                ticket = transfer(
+                    self.target_server_name,
+                    [max_address],
+                    [1],
+                    [base_dst_addr],
+                    [1],
+                    [[0]],
+                    [[0]],
+                    [[1]],
+                )
+                self.assertTrue(ticket.drained)
+                self.assertIn("FAILED_DRAINED", str(ticket.status))
+        finally:
+            os.dup2(saved_stderr, 2)
+            os.close(saved_stderr)
+            os.close(stderr_write)
+        native_stderr = os.read(stderr_read, 64 * 1024)
+        os.close(stderr_read)
+        self.assertNotIn(hex(max_address).encode(), native_stderr)
+
+    def test_scatter_rejects_local_address_range_overflow(self):
+        max_local_address = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
+
+        for direction in ("write", "read"):
+            with self.subTest(direction=direction):
+                transfer = getattr(
+                    self.adaptor,
+                    f"scatter_transfer_sync_{direction}_with_ticket",
+                )
+                ticket = transfer(
+                    self.target_server_name,
+                    [max_local_address],
+                    [2],
+                    [0],
+                    [0],
+                    [[0]],
+                    [[0]],
+                    [[0]],
+                )
+                self.assertTrue(ticket.drained)
+                self.assertIn("FAILED_DRAINED", str(ticket.status))
+
+    def test_async_batch_write_read(self):
+        """Test batch_transfer_async_write and batch_transfer_async_read for batch write/read consistency."""
+        import random
+        import string
+
+        def generate_random_string(length):
+            chars = string.ascii_letters + string.digits + string.punctuation
+            return "".join(random.choices(chars, k=length))
+
+        adaptor = self.adaptor
+        batch_size = 100  # Adjust batch size if needed
+        circles = max(2, self.circle // 100)  # Number of batch test rounds
+
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        src_addr_list = []
+        dst_addr_list = []
+        offset_size = 1024  # 1KB offset between each buffer
+
+        for i in range(batch_size):
+            src_addr_list.append(base_src_addr + i * offset_size)
+            dst_addr_list.append(base_dst_addr + i * offset_size)
+
+        for i in range(circles):
+            # Generate multiple groups of random data
+            data_list = []
+            data_len_list = []
+            for _ in range(batch_size):
+                str_len = random.randint(32, min(128, offset_size))
+                src_data = generate_random_string(str_len).encode("utf-8")
+                data_list.append(src_data)
+                data_len_list.append(len(src_data))
+
+            # Write to local buffers in batch
+            for j in range(batch_size):
+                result = adaptor.write_bytes_to_buffer(
+                    src_addr_list[j], data_list[j], data_len_list[j]
+                )
+                self.assertEqual(result, 0, f"[{i}-{j}] writeBytesToBuffer failed")
+
+            # Batch write to remote
+            batch_id = adaptor.batch_transfer_async_write(
+                self.target_server_name, src_addr_list, dst_addr_list, data_len_list
+            )
+            self.assertNotEqual(
+                batch_id,
+                0,
+                f"[{i}] batch_transfer_async_write {batch_id} failed in submitting task(s)",
+            )
+
+            result = adaptor.get_batch_transfer_status([batch_id])
+            self.assertEqual(
+                result, 0, f"[{i}] batch {batch_id} failed during transferring"
+            )
+
+            # Clear local buffers
+            for j in range(batch_size):
+                clear_data = bytes([0] * data_len_list[j])
+                result = adaptor.write_bytes_to_buffer(
+                    src_addr_list[j], clear_data, data_len_list[j]
+                )
+                self.assertEqual(result, 0, f"[{i}-{j}] Clear buffer failed")
+
+            # Batch read back from remote
+            batch_id = adaptor.batch_transfer_async_read(
+                self.target_server_name, src_addr_list, dst_addr_list, data_len_list
+            )
+            self.assertNotEqual(
+                batch_id,
+                0,
+                f"[{i}] batch_transfer_async_read {batch_id} failed in submitting task(s)",
+            )
+
+            result = adaptor.get_batch_transfer_status([batch_id])
+            self.assertEqual(
+                result, 0, f"[{i}] batch {batch_id} failed during transferring"
+            )
+
+            # Verify data consistency
+            for j in range(batch_size):
+                read_back = adaptor.read_bytes_from_buffer(
+                    src_addr_list[j], data_len_list[j]
+                )
+                self.assertEqual(
+                    read_back, data_list[j], f"[{i}-{j}] Data mismatch in batch read"
+                )
+
+        print(
+            f"[✓] {circles} rounds of batch_write_async_read passed, batch size {batch_size}."
+        )
+
+    def test_async_submit_to_unknown_peer_returns_zero(self):
+        """Async submit APIs return the documented failure sentinel 0.
+
+        openSegment failure used to surface as -1 cast through the unsigned
+        batch_id_t, i.e. 2**64 - 1, which passes the documented
+        `batch_id != 0` failure check and crashes get_batch_transfer_status.
+        """
+        # "unreachable_peer:9" is not registered with the metadata server, so
+        # openSegment fails before any buffer address is dereferenced.
+        batch_id = self.adaptor.batch_transfer_async_write(
+            "unreachable_peer:9", [0], [0], [16]
+        )
+        self.assertEqual(
+            batch_id,
+            0,
+            f"batch_transfer_async_write to unknown peer returned {batch_id}",
+        )
+
+        batch_id = self.adaptor.transfer_submit_write("unreachable_peer:9", 0, 0, 16)
+        self.assertEqual(
+            batch_id,
+            0,
+            f"transfer_submit_write to unknown peer returned {batch_id}",
+        )
+
+    def test_send_probe_reachable_peer(self):
+        """send_probe against a registered, reachable peer returns 0."""
+        rc = self.adaptor.send_probe(self.target_server_name)
+        self.assertEqual(
+            rc,
+            0,
+            f"send_probe to reachable peer {self.target_server_name} returned {rc}",
+        )
+
+    def test_send_probe_unknown_peer(self):
+        """send_probe against an unknown peer returns non-zero (does not crash)."""
+        # "unreachable_peer:9" is not registered with the metadata server, so the
+        # metadata lookup itself should fail and sendProbe returns ERR_METADATA.
+        rc = self.adaptor.send_probe("unreachable_peer:9")
+        self.assertNotEqual(
+            rc,
+            0,
+            "send_probe to unknown peer unexpectedly succeeded",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

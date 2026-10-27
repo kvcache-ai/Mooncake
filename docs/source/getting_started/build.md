@@ -1,0 +1,473 @@
+# Build Guide
+
+This document describes how to build Mooncake.
+
+## Build From Source
+
+### Recommended Version
+- OS: Ubuntu 22.04 LTS+
+- cmake: 3.20.x
+- gcc: 9.4+
+
+### Default Build
+
+Install common build dependencies first. A stable Internet connection is
+required because the script installs system packages, initializes submodules,
+and installs Go.
+
+```bash
+sudo bash dependencies.sh
+```
+
+Then build and install Mooncake:
+
+```bash
+mkdir build
+cd build
+cmake ..
+make -j
+sudo make install
+```
+
+### Build with VRAM Segment
+
+To enable VRAM Segment, install CUDA toolkit and build Mooncake with
+`USE_VRAM_SEGMENT` enabled:
+
+```bash
+sudo bash dependencies.sh
+
+mkdir build
+cd build
+cmake .. -DUSE_VRAM_SEGMENT=ON
+make -j
+sudo make install
+```
+
+If NVLink is available in your environment, you can also enable it
+with `-DUSE_INTRA_NVLINK=ON`:
+
+```bash
+sudo bash dependencies.sh
+
+mkdir build
+cd build
+cmake .. -DUSE_VRAM_SEGMENT=ON -DUSE_INTRA_NVLINK=ON
+make -j
+sudo make install
+```
+
+(build-with-intel-xpu)=
+### Build with Intel XPU
+
+Intel XPU support requires TENT and a native oneAPI SYCL build with the Intel
+DPC++ compiler (`icpx`), not GCC. A Mooncake EP-only build on XPU
+(`-DWITH_EP=ON -DWITH_STORE=OFF`) does not need TENT; see the EP build notes in
+[Mooncake EP & Mooncake PG](../api-reference/python/ep-backend.md). Install the
+common dependencies above and the Intel GPU driver, Level Zero runtime, and
+oneAPI compiler separately.
+From the repository root, use a fresh build directory:
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+cmake -S . -B build-xpu \
+  -DCMAKE_C_COMPILER=icx \
+  -DCMAKE_CXX_COMPILER=icpx \
+  -DUSE_TENT=ON \
+  -DUSE_XPU=ON \
+  -DUSE_CUDA=OFF \
+  -DWITH_STORE_RUST=OFF
+cmake --build build-xpu --parallel "$(nproc)"
+```
+
+For Python bindings, install from the repository root with the same compiler
+and backend settings. This performs a separate native build:
+
+```bash
+python -m pip install . \
+  -Ccmake.define.CMAKE_C_COMPILER=icx \
+  -Ccmake.define.CMAKE_CXX_COMPILER=icpx \
+  -Ccmake.define.USE_TENT=ON \
+  -Ccmake.define.USE_XPU=ON \
+  -Ccmake.define.USE_CUDA=OFF
+```
+
+Keep the matching SYCL/Level Zero runtime available when running Mooncake,
+and use XPU-enabled PyTorch for tensor APIs. The prebuilt wheels do not include
+XPU support. Select TENT at runtime with `MC_USE_TENT=1`. For direct dma-buf
+RDMA requirements, the host-staging fallback, and same-node IPC permissions,
+see the Intel XPU part of the GPU-Direct RDMA note under Hardware Backend Setup
+below;
+see {ref}`Intel XPU Transport <intel-xpu-transport>` for runtime settings and
+current limitations.
+
+### Build with NVMe-oF SSD Pool
+
+To enable the NVMe-oF SSD pool, install the SPDK dependencies and build
+Mooncake with `USE_NOF` enabled:
+
+```bash
+sudo bash dependencies.sh --with-spdk
+
+mkdir build
+cd build
+cmake .. -DUSE_NOF=ON
+make -j
+sudo make install
+```
+
+`-DUSE_NOF=ON` builds the NoF registration APIs and deployment tools. Use
+`-DUSE_NOF=OFF` or omit the option when the NVMe-oF SSD pool is not needed.
+
+Registering client buffers for NoF over RDMA requires SPDK 22.05 or newer
+(`spdk_mem_register`). The build probes for it automatically and continues
+with older SPDK versions, but then logs a CMake warning, and pure-NoF writes
+over RDMA from unregistered user buffers fail at runtime with
+"No translation" errors.
+
+(build-with-store-rs)=
+### Build with Store-RS
+
+Store-RS is an optional Rust-native Mooncake Store. The default CMake build
+leaves it disabled, and the Python Store facade uses the C++ backend. Enable
+it when building a root wheel that should include the Rust backend and its standalone commands.
+
+The build needs a root checkout with submodules, CMake, a C++ toolchain, Rust
+(`cargo` on `PATH`), and Python 3.10 or newer. A multi-client runtime also
+needs Redis or etcd.
+
+```bash
+export MOONCAKE_ROOT_DIR="$PWD"
+export MOONCAKE_STORE_RS_DIR="$MOONCAKE_ROOT_DIR/mooncake-store-rs"
+export MOONCAKE_BUILD_DIR="$MOONCAKE_ROOT_DIR/build/store-rs"
+export MOONCAKE_PYTHON_BIN="$(command -v python3)"
+
+cmake -S "$MOONCAKE_ROOT_DIR" -B "$MOONCAKE_BUILD_DIR" \
+  -DPython3_EXECUTABLE="$MOONCAKE_PYTHON_BIN" \
+  -DWITH_STORE=ON \
+  -DWITH_STORE_RUST=OFF \
+  -DWITH_STORE_RS=ON \
+  -DWITH_TE=ON \
+  -DUSE_TENT=ON \
+  -DBUILD_SHARED_LIBS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build "$MOONCAKE_BUILD_DIR" --target build_store_rs --parallel
+```
+
+This out-of-tree build provides the native artifacts and standalone binaries. For a Python wheel only, skip the separate CMake build command; the wheel builder configures and builds its own CMake tree.
+
+The root wheel owns the mooncake Python package. Build and install one wheel,
+then select its Store backend before importing mooncake.store:
+
+| Setting | Backend |
+|---------|---------|
+| Unset or cpp | C++ Store |
+| rs | Store-RS, included by WITH_STORE_RS=ON |
+
+The facade reads MOONCAKE_STORE_BACKEND when mooncake.store is first imported.
+Use exactly cpp or rs. The setting does not change the standalone command
+names.
+
+```bash
+MOONCAKE_STORE_BACKEND=rs .venv-store-rs/bin/python -c \
+  "from mooncake.store import MooncakeDistributedStore; print(MooncakeDistributedStore)"
+
+.venv-store-rs/bin/mooncake-store-rs-client --help
+.venv-store-rs/bin/mooncake-store-rs-admin --help
+.venv-store-rs/bin/mooncake-store-rs-bench --help
+```
+
+For workspace unit tests and installed-package smoke coverage, run
+`scripts/ci/run_store_rs_smoke.sh` after installing the CMake `python`
+component. The [Store-RS validation guide](../deployment/store-rs/testing.md#local-validation)
+lists the required CMake paths and the direct commands for heavier scenarios.
+
+Configuration, validation, and API details are in the
+[Store-RS deployment guides](../deployment/store-rs/index.md), the
+[Rust API](../api-reference/rust/store-rs.md), the
+[Python API](../api-reference/python/store-rs.md), and the
+[Admin HTTP API](../api-reference/http/store-rs-admin.md).
+
+### RISC-V Build
+
+Mooncake supports native 64-bit RISC-V Linux builds with `USE_RISCV` enabled.
+The option keeps regular Release optimizations but disables interprocedural
+optimization for the Python extensions, avoiding the excessive memory use of
+full GNU LTO on RISC-V build hosts. The build also detects whether 16-byte
+atomic operations require `libatomic` and links it automatically.
+
+The following configuration builds the C++, Python, and Rust components while
+disabling every component that requires Go:
+
+```bash
+mkdir build-riscv
+cd build-riscv
+cmake -G Ninja .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DUSE_RISCV=ON \
+  -DWITH_STORE_GO=OFF \
+  -DWITH_P2P_STORE=OFF \
+  -DUSE_ETCD=OFF \
+  -DSTORE_USE_ETCD=OFF \
+  -DSTORE_USE_K8S_LEASE=OFF \
+  -DBUILD_UNIT_TESTS=OFF \
+  -DBUILD_EXAMPLES=OFF \
+  -DBUILD_BENCHMARK=OFF
+cmake --build . --parallel 4
+```
+
+Adjust the parallel job count for the available memory. The example uses four
+jobs because optimized C++ and Python binding translation units can each need
+several gigabytes of memory on RISC-V.
+
+### Hardware Backend Setup
+
+Run `sudo bash dependencies.sh` before using any of these backend-specific build
+options. The script handles common dependencies; vendor SDKs and runtime
+environment setup must be prepared separately.
+
+| Hardware / backend | Build option | External SDK / setup | Environment and notes |
+| --- | --- | --- | --- |
+| NVIDIA CUDA / GPUDirect | `-DUSE_CUDA=ON` | Install CUDA 12.1+ and enable `nvidia-fs` for cuFile builds. | Add CUDA libraries to `LIBRARY_PATH` and `LD_LIBRARY_PATH`, for example `/usr/local/cuda/lib64`. |
+| NVIDIA NCCL DeviceTransport | `-DUSE_NCCL_DEVICE=ON` | Install NCCL 2.30.4+ with `nccl_device.h`. Requires CUDA. | Disabled by default. Enabling it directly links NCCL into the EP extensions, so importing `mooncake.ep` requires a matching runtime `libnccl` even when the NCCL transport is not selected. Set `NCCL_ROOT` when NCCL is outside the standard search paths. |
+| NVIDIA NCCL host RMA (WRITE only) | `-DUSE_NCCL_HOST=ON` | Install NCCL 2.30.4+. Requires CUDA. | Set `NCCL_ROOT` when NCCL is outside the standard search paths. Install NCCL as the only transport in a `TransferEngine(false)` instance before registering buffers. Peers must register matching buffer sizes in the same order. It has no multi-transport fallback and supports WRITE requests only because NCCL 2.30 has no public host Get operation. |
+| NVIDIA Multi-Node NVLink | `-DUSE_MNNVL=ON` | Requires CUDA. | Also set `-DUSE_CUDA=ON`. Not used with MUSA, HIP, or MACA builds. |
+| Moore Threads MUSA | `-DUSE_MUSA=ON` | Install MUSA SDK and `mthreads-peermem` for GPUDirect RDMA. | Add `/usr/local/musa/lib` to `LIBRARY_PATH` and `LD_LIBRARY_PATH`. |
+| Cambricon MLU | `-DUSE_MLU=ON` | Install Cambricon Neuware SDK. | Set `NEUWARE_HOME`, or pass `-DNEUWARE_ROOT=/path/to/neuware`. Use `-DMLU_INCLUDE_DIR` and `-DMLU_LIB_DIR` for custom layouts. |
+| MetaX MACA | `-DUSE_MACA=ON` | Install MACA SDK. | Set `MACA_HOME`, or pass `-DMACA_ROOT=/path/to/maca`. Use `-DMACA_INCLUDE_DIR`, `-DMACA_LIB_DIR`, and `-DMACA_RUNTIME_LIBS` for custom layouts. |
+| Intel XPU (Arc / Data Center GPU) | `-DUSE_XPU=ON -DUSE_TENT=ON` | Install the oneAPI DPC++ compiler and Level Zero runtime (`libze_loader`), and build with `-DCMAKE_CXX_COMPILER=icpx`. | Source `/opt/intel/oneapi/setvars.sh` before configuring CMake and run with `MC_USE_TENT=1`. VRAM is transferred directly over RDMA when the NIC driver supports dma-buf registration (`ibv_reg_dmabuf_mr`, rdma-core 34+); otherwise it is staged through pinned host memory. |
+| Huawei Ascend Direct | `-DUSE_ASCEND_DIRECT=ON` | Install Ascend CANN Toolkit and ADXL dependencies. | Source `/usr/local/Ascend/cann/set_env.sh` before configuring CMake. This is the recommended Ascend path. |
+| Huawei Ascend UBSHMEM | `-DUSE_UBSHMEM=ON` | Install Ascend CANN Toolkit. Requires CANN >= 9.0.0, driver >= 26.0.0, Lingqu >= 1.5. | Source the CANN `set_env.sh` before configuring CMake. |
+| AMD HIP / ROCm | `-DUSE_HIP=ON` | Install ROCm/HIP SDK. | Ensure HIP compiler, headers, and runtime libraries are visible to CMake. |
+| Hygon DCU | `-DUSE_HYGON=ON` | Install DTK SDK. | Set `DTK_HOME`, or pass `-DDTK_ROOT=/path/to/dtk`. Use `-DDTK_INCLUDE_DIR` and `-DDTK_LIB_DIR` for custom layouts. |
+| ScaleFabric SHCA | `-DUSE_SHCA=ON` | Install `shca-tools`. | Supports Transfer Engine/TENT RDMA paths only; Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
+| Iluvatar CoreX | `-DUSE_COREX=ON` | Install CoreX SDK. | Set `COREX_HOME`, or pass `-DCOREX_ROOT=/path/to/corex`. Use `-DCOREX_INCLUDE_DIR` and `-DCOREX_LIB_DIR` for custom layouts. |
+| Biren GPU | `-DUSE_SUPA=ON` | Install Biren SUPA SDK. | Set `BIREN_HOME` to the SDK root containing `supa/include` and `supa/lib`, or pass `-DBIREN_HOME=/path/to/biren-sdk`. Uses a CUDA-compatible runtime. |
+
+```{admonition} NCCL host RMA constraints
+:class: important
+The first valid NCCL host WRITE freezes the ordered CUDA-buffer catalog before
+bootstrap. Registration and unregistration are not allowed afterward, even if
+bootstrap fails. Session initialization is attempted once for each
+endpoint/device pair. If the session reaches a terminal failure, it retains the
+error and subsequent transfers fail without retrying bootstrap. Recovery
+requires destroying and recreating the NCCL-only `TransferEngine` on both
+peers, then registering the buffers again. A one-sided restart is unsupported.
+Same-engine targets remain unsupported and should use
+the intra-node NVLink/P2P transport.
+```
+
+```{admonition} NCCL DeviceTransport version contract
+:class: important
+Mooncake currently requires NCCL Device API device code, whether AOT-compiled
+or JIT-compiled, to use NCCL headers that exactly match the loaded runtime
+`libnccl.so`. `NcclTransport::initialize()` rejects a mismatch. After upgrading
+NCCL, rebuild Mooncake and every AOT CUDA kernel that includes
+`transport/device/nccl_device.cuh`. Invalidate and regenerate any cached NCCL
+Device API JIT kernels before running. This is required for the current GIN
+device-code model, which is not cross-version compatible.
+```
+
+```{admonition} GPU-Direct RDMA
+:class: note
+Mooncake can use the DMA-BUF path for GPU-Direct RDMA, which does **not**
+require the `nvidia-peermem` kernel module. Set `WITH_NVIDIA_PEERMEM=0` before
+starting Mooncake to use DMA-BUF. Set `WITH_NVIDIA_PEERMEM=1` to use the legacy
+`ibv_reg_mr` path, which requires `nvidia-peermem`. See Section 3.7 of
+https://docs.nvidia.com/cuda/gpudirect-rdma/ for `nvidia-peermem` installation
+instructions.
+
+When `WITH_NVIDIA_PEERMEM` is **unset**, Mooncake uses the legacy `ibv_reg_mr`
+path. On hosts without `nvidia-peermem` (for example the NVIDIA open kernel
+modules with the inbox RDMA stack and no MLNX_OFED), GPU memory registration
+then fails with `Failed to register memory 0x...: Bad address [14]`; set
+`WITH_NVIDIA_PEERMEM=0` there. DMA-BUF needs the NVIDIA open kernel modules and
+Linux 5.12 or later.
+
+Intel XPU builds (`-DUSE_XPU=ON`) use DMA-BUF for direct RDMA: when a USM
+device allocation is registered, TENT asks the Level Zero runtime to export it
+as a dma-buf and registers that with `ibv_reg_dmabuf_mr`, so the NIC reads and
+writes VRAM directly with no host copy. This needs rdma-core 34+ and a NIC
+driver with dma-buf support (for example `mlx5`). The direct path is attempted
+per buffer and is not guaranteed: when the verb or driver support is missing,
+when the export fails for a given allocation (see the pooling caveat below), or
+when `transports/rdma/disable_gpu_direct_rdma` is set to `true` in the TENT
+configuration, transfers touching that buffer fall back to staging through
+pinned host memory.
+
+Both direct RDMA and host-staged transfers involving XPU memory currently
+require an **XPU-platform initiator**, even when its local buffer is DRAM and
+only the remote buffer is XPU memory. Staging also requires the initiator's
+`XpuTransport` to be enabled; without it, XPU memory is not staged and is
+routed only over a transport that copies device memory itself, such as TCP.
+A CPU-platform initiator cannot currently route
+these requests; it does not transparently fall back to staging. A `cpu:0`
+buffer inside an XPU-platform process is not a CPU-platform peer.
+
+The Transfer Engine requests dedicated exportable Level Zero allocations;
+runtime allocation/export failures can still require staging. For device
+memory allocated elsewhere (for example PyTorch XPU tensors), the Intel
+compute runtime can pool small USM allocations into shared buffers whose
+dma-buf cannot be registered per allocation. Foreign or fallback USM is
+eligible for export only when the allocation and dma-buf sizes match exactly.
+Extra backing bytes cannot safely be distinguished from a shared pool, even
+when they match a rounded page size, so padded foreign allocations also stage.
+`NEOReadDebugKeys=1 EnableDeviceUsmAllocationPool=0` disables pooling, but does
+not bypass this conservative size check.
+
+On the same node, registered XPU memory is also shared between processes with
+Level Zero IPC handles, so VRAM-to-VRAM transfers between two local engines
+(for example prefill and decode workers) are local XPU copies rather than
+network transfers. Importing a handle uses `pidfd_getfd(2)` on the exporting
+process and therefore needs ptrace permission over it. The Level Zero runtime
+marks every process that opens a device with `PR_SET_PTRACER_ANY`, so the same
+user in the same pid namespace with Yama `ptrace_scope` 0 or 1 (the default on
+most distributions) is enough; `ptrace_scope` 2 needs `CAP_SYS_PTRACE` (in
+Kubernetes, `securityContext.capabilities.add: [SYS_PTRACE]`) and 3 forbids it.
+Without that permission, or with `transports/xpu/disable_ipc: true` in the
+TENT configuration, those transfers use the RDMA or TCP transport instead.
+```
+
+## Use Mooncake in Docker Containers
+Mooncake supports Docker-based deployment. You can either build the image from
+this repository with `docker/mooncake.Dockerfile` or substitute a published
+tag that matches the release you want to run.
+For the container to use the host's network resources, you need to add the `--device` option when starting the container. The following is an example.
+
+```
+# In host
+sudo docker build -f docker/mooncake.Dockerfile -t mooncake:from-source .
+sudo docker run --net=host --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/rdma_cm --ulimit memlock=-1 -t -i mooncake:from-source /bin/bash
+# Run transfer engine in container
+cd /Mooncake-main/build/mooncake-transfer-engine/example
+./transfer_engine_bench --device_name=ibp6s0 --metadata_server=10.1.101.3:2379 --mode=target --local_server_name=10.1.100.3
+```
+
+For SGLang HiCache deployments inside Docker, reserve HugeTLB pages on the host before starting the container and pass the allocator settings through the container environment:
+
+```bash
+python3 scripts/check_hicache_hugepage_requirements.py \
+  --tp-size 4 \
+  --hicache-size 64gb \
+  --global-segment-size 8gb \
+  --arena-pool-size 56gb \
+  --available-hugetlb 512gb
+
+sudo sysctl -w vm.nr_hugepages=262144
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+
+sudo docker run --gpus all \
+  --net=host \
+  --ipc=host \
+  --ulimit memlock=-1 \
+  --shm-size=128g \
+  --device=/dev/infiniband/uverbs0 \
+  --device=/dev/infiniband/rdma_cm \
+  -e MC_STORE_USE_HUGEPAGE=1 \
+  -e MC_STORE_HUGEPAGE_SIZE=2MB \
+  -e MOONCAKE_GLOBAL_SEGMENT_SIZE=8gb \
+  -e MC_MMAP_ARENA_POOL_SIZE=56gb \
+  -t -i mooncake:from-source /bin/bash
+```
+
+The `64gb` / `56gb` values above are tuned examples for large HiCache deployments, not defaults. The arena remains disabled unless you explicitly enable it, and if you enable it via gflag without an env override the default pool size is `8gb`. On smaller hosts, start with `8gb` or `16gb` and size upward with the helper. When you want the baseline direct-`mmap()` path instead of the arena, set `MC_DISABLE_MMAP_ARENA=1` (also accepts `true`, `yes`, or `on`) and omit `MC_MMAP_ARENA_POOL_SIZE`. Set it before the first Mooncake mmap-buffer allocation in the process. If you build the image from source with `docker/mooncake.Dockerfile`, that source-built image also installs the helper as `mooncake-hicache-sizing`.
+Without `MC_STORE_USE_HUGEPAGE=1`, the arena may opportunistically try hugepages and then retry on regular pages if HugeTLB is unavailable. When `MC_STORE_USE_HUGEPAGE=1` is set, both the arena path and the direct-`mmap()` fallback path require HugeTLB pages. Mooncake will not silently degrade that explicit hugepage request to regular pages.
+
+For RDMA Store segments backed by HugeTLB, page population is automatically
+deferred until immediately before transfer-engine registration and
+parallelized across CPU threads:
+
+```bash
+export MC_STORE_USE_HUGEPAGE=1
+export MC_STORE_HUGEPAGE_SIZE=2MB
+```
+
+Direct mappings use a generic worker pool. NUMA-segmented mappings bind each
+worker to the node associated with its memory region. The mmap arena keeps its
+eager population behavior; set `MC_DISABLE_MMAP_ARENA=1` if an arena was
+otherwise enabled and deferred direct-mmap population is desired.
+
+## Advanced Compile Options
+The following options can be passed to `cmake ..`.
+
+### Accelerator and Hardware Options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `-DUSE_CUDA=ON/OFF` | `OFF` | Enable GPU memory support, including GPUDirect RDMA, NVMe-oF, and GPU-aware TCP transport. Required when transferring GPU memory, even when using TCP. |
+| `-DUSE_NCCL_DEVICE=ON/OFF` | `OFF` | Enable the NCCL DeviceTransport backend. Requires CUDA and NCCL 2.30.4+ with `nccl_device.h`. NCCL-enabled EP extensions require a matching runtime `libnccl` at import time, and AOT- and JIT-compiled NCCL device code must use headers that exactly match that runtime. |
+| `-DUSE_NCCL_HOST=ON/OFF` | `OFF` | Enable the experimental, WRITE-only NCCL host RMA transport. Requires CUDA and NCCL 2.30.4+, must be installed before its buffers are registered, and must be the engine's only installed transport. |
+| `-DUSE_MNNVL=ON/OFF` | `OFF` | Enable Multi-Node NVLink transport. Requires `-DUSE_CUDA=ON`; not used with MUSA, HIP, or MACA builds. |
+| `-DUSE_MUSA=ON/OFF` | `OFF` | Enable Moore Threads GPU support via MUSA. |
+| `-DUSE_MACA=ON/OFF` | `OFF` | Enable MetaX (Muxi) GPU support via MACA. |
+| `-DUSE_HIP=ON/OFF` | `OFF` | Enable AMD GPU support via HIP/ROCm. |
+| `-DUSE_HYGON=ON/OFF` | `OFF` | Enable Hygon DCU support via DTK SDK. Uses a CUDA-compatible runtime. |
+| `-DUSE_COREX=ON/OFF` | `OFF` | Enable Iluvatar CoreX GPU support. Uses a CUDA-compatible runtime. |
+| `-DUSE_SUPA=ON/OFF` | `OFF` | Enable Biren GPU support via the SUPA SDK. Uses a CUDA-compatible runtime. Set `BIREN_HOME` to the SDK root. |
+| `-DUSE_MLU=ON/OFF` | `OFF` | Enable Cambricon MLU memory support via Neuware, including memory detection, topology discovery, and RDMA registration. |
+| `-DUSE_XPU=ON/OFF` | `OFF` | Enable Intel XPU memory support in TENT via SYCL/Level Zero: memory detection, host staging, intra-node PCIe P2P copies between XPUs, and dma-buf GPUDirect RDMA registration. Requires `-DUSE_TENT=ON` and the `icpx` compiler. |
+| `-DUSE_XPU_GDS=ON/OFF` | `OFF` | Enable the TENT GDS transport for Intel XPU memory through a cuFile-compatible library (for example Intel xFile) that provides `cufile.h` and `libcufile.so`. Requires `-DUSE_XPU=ON`; cannot be combined with `-DUSE_CUDA=ON`. Pass `-DCUFILE_INCLUDE=<dir>` and `-DCUFILE_LIB=<path>` when they are outside the default search paths. Enable at runtime with `transports/gds/enable`. Only XPU-to-file transfers use GDS; DRAM-to-file transfers use io_uring. |
+| `-DUSE_RISCV=ON/OFF` | `OFF` | Enable RISC-V build compatibility settings, including disabling full IPO/LTO for Python extensions. |
+| `-DUSE_SHCA=ON/OFF` | `OFF` | Enable ScaleFabric SHCA InfiniBand support for Transfer Engine/TENT RDMA paths only. Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
+| `-DUSE_ASCEND_DIRECT=ON/OFF` | `OFF` | Enable Ascend Direct transport and HCCS support via the ADXL engine. Recommended for Ascend builds. |
+| `-DUSE_UBSHMEM=ON/OFF` | `OFF` | Enable Huawei Ascend NPU shared memory transport via CANN VMM APIs. |
+| `-DUSE_INTRA_NVLINK=ON/OFF` | `OFF` | Enable intranode NVLink transport. |
+| `-DUSE_VRAM_SEGMENT=ON/OFF` | `OFF` | Enable create VRAM Segment instead of (default) DRAM Segment. |
+| `-DUSE_CXL=ON/OFF` | `OFF` | Enable CXL support. |
+| `-DUSE_MPCOMM=ON/OFF` | `OFF` | Enable the MPComm transport in TENT (multi-NIC memory pooling over RDMA). Requires `-DUSE_TENT=ON` and `-DMPCOMM_ROOT=<prefix>`. See [MPComm Transport](../design/transfer-engine/transport/mpcomm_transport.md). |
+
+### Vendor SDK Path Overrides
+
+| Option | Applies when | Description |
+| --- | --- | --- |
+| `-DMACA_ROOT=/path/to/maca` | `-DUSE_MACA=ON` | Override the MACA SDK root. `MACA_HOME` is also honored; default is `/opt/maca`. |
+| `-DMACA_INCLUDE_DIR=/path/to/include` | `-DUSE_MACA=ON` | Override the MACA include directory. |
+| `-DMACA_LIB_DIR=/path/to/lib64` | `-DUSE_MACA=ON` | Override the MACA library directory. |
+| `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"` | `-DUSE_MACA=ON` | Override MACA runtime libraries linked by `transfer_engine`. |
+| `-DDTK_ROOT=/path/to/dtk` | `-DUSE_HYGON=ON` | Override the DTK SDK root. `DTK_HOME` is also honored; default is `/opt/dtk`. |
+| `-DDTK_INCLUDE_DIR=/path/to/include` | `-DUSE_HYGON=ON` | Override the DTK include directory. |
+| `-DDTK_LIB_DIR=/path/to/lib64` | `-DUSE_HYGON=ON` | Override the DTK library directory. |
+| `-DCOREX_ROOT=/path/to/corex` | `-DUSE_COREX=ON` | Override the CoreX SDK root. `COREX_HOME` is also honored; default is `/usr/local/corex`. |
+| `-DCOREX_INCLUDE_DIR=/path/to/include` | `-DUSE_COREX=ON` | Override the CoreX include directory. |
+| `-DCOREX_LIB_DIR=/path/to/lib` | `-DUSE_COREX=ON` | Override the CoreX library directory. |
+| `-DBIREN_HOME=/path/to/biren-sdk` | `-DUSE_SUPA=ON` | Override the Biren SUPA SDK root. `BIREN_HOME` is also honored; default is `/usr/local/birensupa/all/latest`. The root must contain `supa/include` and `supa/lib`. |
+| `-DNEUWARE_ROOT=/path/to/neuware` | `-DUSE_MLU=ON` | Override the Neuware SDK root. `NEUWARE_HOME` is also honored; default is `/usr/local/neuware`. |
+| `-DMLU_INCLUDE_DIR=/path/to/include` | `-DUSE_MLU=ON` | Override the Neuware include directory. |
+| `-DMLU_LIB_DIR=/path/to/lib64` | `-DUSE_MLU=ON` | Override the Neuware library directory. |
+| `-DMPCOMM_ROOT=/path/to/mpcomm` | `-DUSE_MPCOMM=ON` | **Required.** MPComm install prefix; must contain `include/mpcomm.h` and `lib/libmpcomm.so`. Configuration fails if unset or if either file is missing. |
+
+### Transport and Metadata Options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `-DUSE_EFA=ON/OFF` | `OFF` | Enable AWS Elastic Fabric Adapter transport via libfabric. See [EFA Transport](../design/transfer-engine/transport/efa_transport.md). |
+| `-DUSE_NOF=ON/OFF` | `OFF` | Build Mooncake Store with NVMe-oF SSD pool support. Use `sudo bash dependencies.sh --with-spdk` before enabling it. |
+| `-DUSE_REDIS=ON/OFF` | `OFF` | Enable Redis-based metadata service for Transfer Engine. Requires hiredis. |
+| `-DUSE_HTTP=ON/OFF` | `ON` | Enable HTTP-based metadata service. |
+| `-DUSE_ETCD=ON/OFF` | `OFF` | Enable etcd-based metadata service. Requires Go 1.23+. |
+| `-DSTORE_USE_ETCD=ON/OFF` | `OFF` | Enable etcd-based failover for Mooncake Store. Independent from `-DUSE_ETCD`. Requires Go 1.23+. |
+| `-DSTORE_USE_REDIS=ON/OFF` | `OFF` | Enable Redis-based failover for Mooncake Store. Independent from `-DUSE_REDIS`. Requires hiredis. |
+| `-DSTORE_USE_K8S_LEASE=ON/OFF` | `OFF` | Enable Kubernetes Lease-based failover for Mooncake Store. Cannot be enabled with `-DSTORE_USE_ETCD=ON` or non-legacy `-DUSE_ETCD=ON`. |
+
+### Component Options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `-DWITH_TE=ON/OFF` | `ON` | Build the Mooncake Transfer Engine component and sample code. |
+| `-DWITH_STORE=ON/OFF` | `ON` | Build the Mooncake Store component. |
+| `-DWITH_STORE_GO=ON/OFF` | `OFF` | Build Go bindings for Mooncake Store when `-DWITH_STORE=ON`. |
+| `-DWITH_CONDUCTOR=ON/OFF` | `OFF` | Build the Mooncake Conductor service. |
+| `-DWITH_P2P_STORE=ON/OFF` | `OFF` | Enable Golang support and build the P2P Store component. Requires Go 1.23+. |
+| `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust library (`transfer_engine_rust`), tests, and sample benchmark. |
+| `-DWITH_STORE_RUST=ON/OFF` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |
+| `-DWITH_STORE_RS=ON/OFF` | `OFF` | Build the Rust-native Mooncake Store (Store-RS), its Python extension, and the standalone commands. Requires `-DWITH_TE=ON`, `-DUSE_TENT=ON`, and `cargo`. See {ref}`Build with Store-RS <build-with-store-rs>`. |
+| `-DWITH_EP=ON/OFF` | `OFF` | Build Mooncake EP and the native Mooncake PG core/device libraries. The Torch-facing PG adapter is compiled by the installed package at first `import mooncake.pg`. |
+
+### Build Behavior Options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `-DBUILD_SHARED_LIBS=ON/OFF` | `OFF` | Build Transfer Engine as a shared library. |
+| `-DBUILD_UNIT_TESTS=ON/OFF` | `ON` | Build unit tests. |
+| `-DBUILD_EXAMPLES=ON/OFF` | `ON` | Build examples. |
+| `-DSTORE_USE_JEMALLOC=ON/OFF` | `OFF` | Use jemalloc in the Mooncake Store master. |

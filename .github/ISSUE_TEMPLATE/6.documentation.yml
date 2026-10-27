@@ -1,0 +1,20 @@
+name: "📚 Documentation"
+description: "Report issues or suggest improvements for Mooncake's documentation"
+title: "[Documentation]: "
+labels: ["documentation"]
+body:
+- type: textarea
+  attributes:
+    label: Documentation Feedback
+    description: >
+      Please provide any specific errors or unclear descriptions you have encountered in the documentation, along with any proposed changes to improve it based on your experience.
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉!
+- type: checkboxes
+  id: before_submit
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues and read the [documentation](https://kvcache-ai.github.io/Mooncake/)

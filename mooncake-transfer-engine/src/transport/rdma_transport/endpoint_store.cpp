@@ -1,0 +1,415 @@
+// Copyright 2024 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "transport/rdma_transport/endpoint_store.h"
+
+#include <glog/logging.h>
+
+#include <atomic>
+#include <cassert>
+#include <cstddef>
+#include <memory>
+#include <utility>
+
+#include "config.h"
+#include "transport/rdma_transport/rdma_context.h"
+#include "transport/rdma_transport/rdma_endpoint.h"
+
+namespace mooncake {
+std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::getEndpoint(
+    const std::string &peer_nic_path) {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    auto iter = endpoint_map_.find(peer_nic_path);
+    if (iter != endpoint_map_.end()) return iter->second;
+    return nullptr;
+}
+
+std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::getEndpointByPtr(
+    const RdmaEndPoint *endpoint_ptr) {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    for (auto &kv : endpoint_map_) {
+        if (kv.second.get() == endpoint_ptr) return kv.second;
+    }
+    for (auto &endpoint : waiting_list_)
+        if (endpoint.get() == endpoint_ptr) return endpoint;
+    return nullptr;
+}
+
+std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
+    const std::string &peer_nic_path, RdmaContext *context, ibv_cq *cq) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    if (endpoint_map_.find(peer_nic_path) != endpoint_map_.end()) {
+        LOG(INFO) << "Endpoint " << peer_nic_path
+                  << " already exists in FIFOEndpointStore";
+        return endpoint_map_[peer_nic_path];
+    }
+    if (!cq) {
+        LOG(ERROR) << "Cannot insert endpoint " << peer_nic_path
+                   << ": completion queue is null";
+        return nullptr;
+    }
+    auto endpoint = std::make_shared<RdmaEndPoint>(*context);
+    if (!endpoint) {
+        LOG(ERROR) << "Failed to allocate memory for RdmaEndPoint";
+        return nullptr;
+    }
+    auto &config = globalConfig();
+    int ret = endpoint->construct(cq, config.num_qp_per_ep, config.max_sge,
+                                  config.max_wr, config.max_inline);
+    if (ret) return nullptr;
+
+    while (this->getSize() >= max_size_) evictEndpoint();
+
+    endpoint->setPeerNicPath(peer_nic_path);
+    endpoint_map_[peer_nic_path] = endpoint;
+    fifo_list_.push_back(peer_nic_path);
+    auto it = fifo_list_.end();
+    fifo_map_[peer_nic_path] = --it;
+    return endpoint;
+}
+
+int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    auto iter = endpoint_map_.find(peer_nic_path);
+    // Begin two-phase destruction: mark endpoint as destroying and move QPs
+    // to ERR state so inflight WRs are flushed to CQ. The endpoint is moved
+    // to waiting_list_ and will be fully destroyed by reclaimEndpoint() only
+    // after all outstanding WRs have been drained. Timed-out endpoints remain
+    // retired in waiting_list_ rather than being force-freed.
+    if (iter != endpoint_map_.end()) {
+        waiting_list_len_++;
+        iter->second->beginDestroy();
+        waiting_list_.insert(iter->second);
+        endpoint_map_.erase(iter);
+        auto fifo_iter = fifo_map_[peer_nic_path];
+        fifo_list_.erase(fifo_iter);
+        fifo_map_.erase(peer_nic_path);
+    }
+    return 0;
+}
+
+int FIFOEndpointStore::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr,
+                                           std::string *deleted_peer_nic_path) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    // Find endpoint by pointer
+    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
+         ++iter) {
+        if (iter->second.get() == endpoint_ptr) {
+            std::string peer_nic_path = iter->first;
+            if (deleted_peer_nic_path) *deleted_peer_nic_path = peer_nic_path;
+            waiting_list_len_++;
+            iter->second->beginDestroy();
+            waiting_list_.insert(iter->second);
+            endpoint_map_.erase(iter);
+            auto fifo_iter = fifo_map_[peer_nic_path];
+            fifo_list_.erase(fifo_iter);
+            fifo_map_.erase(peer_nic_path);
+            return 0;
+        }
+    }
+    return -1;  // Not found
+}
+
+void FIFOEndpointStore::evictEndpoint() {
+    if (fifo_list_.empty()) return;
+    std::string victim = fifo_list_.front();
+    fifo_list_.pop_front();
+    fifo_map_.erase(victim);
+    LOG(INFO) << victim << " evicted";
+    waiting_list_len_++;
+    auto victim_endpoint = endpoint_map_[victim];
+    victim_endpoint->beginDestroy();
+    waiting_list_.insert(victim_endpoint);
+    endpoint_map_.erase(victim);
+    return;
+}
+
+void FIFOEndpointStore::reclaimEndpoint() {
+    if (waiting_list_len_.load(std::memory_order_relaxed) == 0) return;
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
+    for (auto &endpoint : waiting_list_) {
+        if (endpoint->finishDestroy()) to_delete.push_back(endpoint);
+    }
+    for (auto &endpoint : to_delete) waiting_list_.erase(endpoint);
+    waiting_list_len_ -= to_delete.size();
+}
+
+size_t FIFOEndpointStore::getSize() { return endpoint_map_.size(); }
+
+int FIFOEndpointStore::destroyQPs() {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    int ret = 0;
+
+    // Always transition QPs to ERR before destroy to flush inflight WRs.
+    for (auto &endpoint : waiting_list_) {
+        endpoint->beginDestroy();
+    }
+    for (auto &kv : endpoint_map_) {
+        kv.second->beginDestroy();
+    }
+
+    for (auto &endpoint : waiting_list_) {
+        if (endpoint->destroyQP()) ret = -1;
+    }
+    for (auto &kv : endpoint_map_) {
+        if (kv.second->destroyQP()) ret = -1;
+    }
+    return ret;
+}
+
+int FIFOEndpointStore::disconnectQPs() {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    for (auto &kv : endpoint_map_) {
+        kv.second->beginDestroy();
+        waiting_list_.insert(kv.second);
+    }
+    waiting_list_len_ += endpoint_map_.size();
+    endpoint_map_.clear();
+    fifo_list_.clear();
+    fifo_map_.clear();
+    return 0;
+}
+
+size_t FIFOEndpointStore::getTotalQPNumber() {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    size_t total_qps = 0;
+    for (const auto &kv : endpoint_map_) {
+        total_qps += kv.second->getQPNumber();
+    }
+    return total_qps;
+}
+
+void FIFOEndpointStore::testOnlyInsertWaiting(
+    std::shared_ptr<RdmaEndPoint> ep) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    waiting_list_.insert(ep);
+    waiting_list_len_++;
+}
+
+std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpoint(
+    const std::string &peer_nic_path) {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    auto iter = endpoint_map_.find(peer_nic_path);
+    if (iter != endpoint_map_.end()) {
+        iter->second.second.store(
+            true, std::memory_order_relaxed);  // This is safe within read lock
+                                               // because of idempotence
+        return iter->second.first;
+    }
+    // LOG(INFO) << "Endpoint " << peer_nic_path << " not found in
+    // SIEVEEndpointStore";
+    return nullptr;
+}
+
+std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpointByPtr(
+    const RdmaEndPoint *endpoint_ptr) {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    for (auto &kv : endpoint_map_) {
+        if (kv.second.first.get() == endpoint_ptr) return kv.second.first;
+    }
+    for (auto &endpoint : waiting_list_)
+        if (endpoint.get() == endpoint_ptr) return endpoint;
+    return nullptr;
+}
+
+std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
+    const std::string &peer_nic_path, RdmaContext *context, ibv_cq *cq) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    if (endpoint_map_.find(peer_nic_path) != endpoint_map_.end()) {
+        LOG(INFO) << "Endpoint " << peer_nic_path
+                  << " already exists in SIEVEEndpointStore";
+        return endpoint_map_[peer_nic_path].first;
+    }
+    if (!cq) {
+        LOG(ERROR) << "Cannot insert endpoint " << peer_nic_path
+                   << ": completion queue is null";
+        return nullptr;
+    }
+    auto endpoint = std::make_shared<RdmaEndPoint>(*context);
+    if (!endpoint) {
+        LOG(ERROR) << "Failed to allocate memory for RdmaEndPoint";
+        return nullptr;
+    }
+    auto &config = globalConfig();
+    int ret = endpoint->construct(cq, config.num_qp_per_ep, config.max_sge,
+                                  config.max_wr, config.max_inline);
+    if (ret) return nullptr;
+
+    while (this->getSize() >= max_size_) evictEndpoint();
+
+    endpoint->setPeerNicPath(peer_nic_path);
+    endpoint_map_[peer_nic_path] = std::make_pair(endpoint, true);
+    fifo_list_.push_front(peer_nic_path);
+    fifo_map_[peer_nic_path] = fifo_list_.begin();
+    return endpoint;
+}
+
+int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    auto iter = endpoint_map_.find(peer_nic_path);
+    // Begin two-phase destruction: mark endpoint as destroying and move QPs
+    // to ERR state so inflight WRs are flushed to CQ. The endpoint is moved
+    // to waiting_list_ and will be fully destroyed by reclaimEndpoint() only
+    // after all outstanding WRs have been drained. Timed-out endpoints remain
+    // retired in waiting_list_ rather than being force-freed.
+    if (iter != endpoint_map_.end()) {
+        iter->second.first->beginDestroy();
+        waiting_list_len_++;
+        waiting_list_.insert(iter->second.first);
+        endpoint_map_.erase(iter);
+        auto fifo_iter = fifo_map_[peer_nic_path];
+        if (hand_.has_value() && hand_.value() == fifo_iter) {
+            fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
+                                            : hand_ = std::prev(fifo_iter);
+        }
+        fifo_list_.erase(fifo_iter);
+        fifo_map_.erase(peer_nic_path);
+    }
+    return 0;
+}
+
+int SIEVEEndpointStore::deleteEndpointByPtr(
+    const RdmaEndPoint *endpoint_ptr, std::string *deleted_peer_nic_path) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    // Find endpoint by pointer
+    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
+         ++iter) {
+        if (iter->second.first.get() == endpoint_ptr) {
+            std::string peer_nic_path = iter->first;
+            if (deleted_peer_nic_path) *deleted_peer_nic_path = peer_nic_path;
+            iter->second.first->beginDestroy();
+            waiting_list_len_++;
+            waiting_list_.insert(iter->second.first);
+            auto fifo_iter = fifo_map_[peer_nic_path];
+            if (hand_.has_value() && hand_.value() == fifo_iter) {
+                fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
+                                                : hand_ = std::prev(fifo_iter);
+            }
+            fifo_list_.erase(fifo_iter);
+            fifo_map_.erase(peer_nic_path);
+            endpoint_map_.erase(iter);
+            return 0;
+        }
+    }
+    return -1;  // Not found
+}
+
+void SIEVEEndpointStore::evictEndpoint() {
+    if (fifo_list_.empty()) {
+        return;
+    }
+    auto o = hand_.has_value() ? hand_.value() : --fifo_list_.end();
+    std::string victim;
+    while (true) {
+        victim = *o;
+        if (endpoint_map_[victim].second.load(std::memory_order_relaxed)) {
+            endpoint_map_[victim].second.store(false,
+                                               std::memory_order_relaxed);
+            o = (o == fifo_list_.begin() ? --fifo_list_.end() : std::prev(o));
+        } else {
+            break;
+        }
+    }
+    o == fifo_list_.begin() ? hand_ = std::nullopt : hand_ = std::prev(o);
+    fifo_list_.erase(o);
+    fifo_map_.erase(victim);
+    LOG(INFO) << victim << " evicted";
+    auto victim_instance = endpoint_map_[victim].first;
+    victim_instance->beginDestroy();
+    waiting_list_len_++;
+    waiting_list_.insert(victim_instance);
+    endpoint_map_.erase(victim);
+    return;
+}
+
+void SIEVEEndpointStore::reclaimEndpoint() {
+    if (waiting_list_len_.load(std::memory_order_relaxed) == 0) return;
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
+    for (auto &endpoint : waiting_list_) {
+        if (endpoint->finishDestroy()) to_delete.push_back(endpoint);
+    }
+    for (auto &endpoint : to_delete) waiting_list_.erase(endpoint);
+    waiting_list_len_ -= to_delete.size();
+}
+
+int SIEVEEndpointStore::destroyQPs() {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    int ret = 0;
+
+    // Always transition QPs to ERR before destroy to flush inflight WRs.
+    for (auto &endpoint : waiting_list_) {
+        endpoint->beginDestroy();
+    }
+    for (auto &kv : endpoint_map_) {
+        kv.second.first->beginDestroy();
+    }
+
+    for (auto &endpoint : waiting_list_)
+        if (endpoint->destroyQP()) ret = -1;
+    for (auto &kv : endpoint_map_)
+        if (kv.second.first->destroyQP()) ret = -1;
+    return ret;
+}
+
+int SIEVEEndpointStore::disconnectQPs() {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    for (auto &kv : endpoint_map_) {
+        kv.second.first->beginDestroy();
+        waiting_list_.insert(kv.second.first);
+    }
+    waiting_list_len_ += endpoint_map_.size();
+    endpoint_map_.clear();
+    fifo_list_.clear();
+    fifo_map_.clear();
+    hand_ = std::nullopt;
+    return 0;
+}
+
+size_t SIEVEEndpointStore::getSize() { return endpoint_map_.size(); }
+
+void SIEVEEndpointStore::testOnlyInsertWaiting(
+    std::shared_ptr<RdmaEndPoint> ep) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    waiting_list_.insert(ep);
+    waiting_list_len_++;
+}
+
+void SIEVEEndpointStore::testOnlyInsertEndpoint(
+    const std::string &peer_nic_path, std::shared_ptr<RdmaEndPoint> ep) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    endpoint_map_[peer_nic_path] = std::make_pair(ep, true);
+    fifo_list_.push_front(peer_nic_path);
+    fifo_map_[peer_nic_path] = fifo_list_.begin();
+}
+
+size_t SIEVEEndpointStore::getTotalQPNumber() {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    size_t total_qps = 0;
+
+    // Count QPs in active endpoints
+    for (const auto &kv : endpoint_map_) {
+        total_qps += kv.second.first->getQPNumber();
+    }
+
+    // Count QPs in waiting list
+    for (const auto &endpoint : waiting_list_) {
+        total_qps += endpoint->getQPNumber();
+    }
+
+    return total_qps;
+}
+
+}  // namespace mooncake

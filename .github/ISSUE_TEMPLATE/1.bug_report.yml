@@ -1,0 +1,21 @@
+name: "🐞 Bug Report"
+description: "Report a bug to help us improve"
+title: "[Bug]: "
+labels: ["bug"]
+
+body:
+- type: textarea
+  attributes:
+    label: Bug Report
+    description: "Include your environment, a clear description of the bug, and steps to reproduce."
+  validations:
+    required: true
+- type: markdown
+  attributes:
+    value: "Thanks for your contribution! 🎉"
+- type: checkboxes
+  id: before_submit
+  attributes:
+    label: Before submitting...
+    options:
+      - label: "Ensure you searched for relevant issues and read the [documentation]"

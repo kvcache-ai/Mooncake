@@ -1,0 +1,202 @@
+// Copyright 2024 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef TRANSPORT_V1_H_
+#define TRANSPORT_V1_H_
+
+#include <bits/stdint-uintn.h>
+#include <errno.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <queue>
+#include <string>
+
+#include "tent/common/status.h"
+#include "tent/common/types.h"
+#include "tent/runtime/platform.h"
+#include "tent/runtime/control_plane.h"
+
+namespace mooncake {
+namespace tent {
+struct Capabilities {
+    bool dram_to_dram = false;
+    bool dram_to_gpu = false;  // dram as local side, gpu as peer side
+    bool gpu_to_dram = false;  // gpu as local side, dram as peer side
+    bool gpu_to_gpu = false;
+    bool dram_to_file = false;
+    bool gpu_to_file = false;
+};
+
+class Transport {
+   public:
+    struct SubBatch {
+        SubBatch() : device_mask(~0ULL) {}
+        virtual ~SubBatch() {}
+        virtual size_t size() const = 0;
+        // Opt in when completion cannot emit a second progress wake.
+        virtual bool needsProgressPolling() const { return false; }
+        void notifyProgress() {
+            if (notify_progress) notify_progress(progress_batch_id);
+        }
+
+        uint64_t device_mask;  // Device mask for transport selection
+        // Named QP pool for this batch's transfers (RFC #2568 step 3). Empty =
+        // no pool (default spray). Carried like device_mask, from the matched
+        // SelectionPolicy down to each RdmaTask.
+        std::string qp_pool;
+        BatchID progress_batch_id{0};
+        std::function<void(BatchID)> notify_progress;
+    };
+
+    using SubBatchRef = SubBatch*;
+
+   public:
+    Transport() = default;
+
+    virtual ~Transport() = default;
+
+    virtual Status install(std::string& local_segment_name,
+                           std::shared_ptr<ControlService> metadata,
+                           std::shared_ptr<Topology> local_topology,
+                           std::shared_ptr<Config> conf = nullptr) {
+        return Status::OK();
+    }
+
+    virtual Status uninstall() { return Status::OK(); }
+
+    // Called before registered ranges and sub-batches are reclaimed.  Most
+    // transports have no background work; transports with async I/O use this
+    // barrier to settle work while their buffer registry is still alive.
+    virtual Status quiesce() { return Status::OK(); }
+
+    virtual const Capabilities capabilities() const { return caps; }
+
+    virtual Status allocateSubBatch(SubBatchRef& batch, size_t max_size) {
+        return Status::NotImplemented(
+            "allocateSubBatch not implemented" LOC_MARK);
+    }
+
+    virtual Status freeSubBatch(SubBatchRef& batch) {
+        return Status::NotImplemented("freeSubBatch not implemented" LOC_MARK);
+    }
+
+    // Submission contract (all-or-nothing): on an error return, no request
+    // from request_list may have been dispatched and the sub-batch must be
+    // left exactly as it was before the call (no tasks appended, no work
+    // queued). A transport that starts accepting requests and then hits an
+    // error must roll back its partial state before returning. This lets the
+    // engine fail the whole submission over to another transport without
+    // double-executing an accepted prefix or losing track of the original
+    // sub-batch. Transports that validate requests incrementally must
+    // validate every request before dispatching any of them.
+    virtual Status submitTransferTasks(
+        SubBatchRef batch, const std::vector<Request>& request_list) {
+        return Status::NotImplemented(
+            "submitTransferTasks not implemented" LOC_MARK);
+    }
+
+    virtual Status getTransferStatus(SubBatchRef batch, int task_id,
+                                     TransferStatus& status) {
+        return Status::NotImplemented(
+            "getTransferStatus not implemented" LOC_MARK);
+    }
+
+    virtual Status retryTransferTask(SubBatchRef batch, int task_id,
+                                     const Request& request) {
+        return Status::NotImplemented(
+            "retryTransferTask not implemented" LOC_MARK);
+    }
+
+    // Cancellation is best effort: implementations must prevent work that has
+    // not reached the device from being submitted, but work already posted to
+    // a device may still complete. Callers must continue polling until the
+    // task reaches a terminal state.
+    virtual bool supportsCancellation() const { return false; }
+
+    virtual Status cancelTransferTask(SubBatchRef batch, int task_id) {
+        return Status::NotImplemented(
+            "cancelTransferTask not implemented" LOC_MARK);
+    }
+
+    virtual Status allocateLocalMemory(void** addr, size_t size,
+                                       MemoryOptions& options) {
+        return Platform::getLoader().allocate(addr, size, options);
+    }
+
+    virtual Status freeLocalMemory(void* addr, size_t size) {
+        return Platform::getLoader().free(addr, size);
+    }
+
+    // Pre-registration warm-up that pins pages before NUMA probing.
+    // Returns true if pages were successfully pinned (caller may skip
+    // prefault). Default: no-op, returns false.
+    virtual bool warmupMemory(void* addr, size_t length) { return false; }
+
+    virtual Status addMemoryBuffer(BufferDesc& desc,
+                                   const MemoryOptions& options) {
+        return Status::NotImplemented(
+            "addMemoryBuffer not implemented" LOC_MARK);
+    }
+
+    virtual Status addMemoryBuffer(std::vector<BufferDesc>& desc_list,
+                                   const MemoryOptions& options) {
+        for (auto& desc : desc_list) {
+            CHECK_STATUS(addMemoryBuffer(desc, options));
+        }
+        return Status::OK();
+    }
+
+    virtual Status removeMemoryBuffer(BufferDesc& desc) {
+        return Status::NotImplemented(
+            "removeMemoryBuffer not implemented" LOC_MARK);
+    }
+
+    // Some transports keep private local-only registrations that must not be
+    // advertised through BufferDesc::transports.
+    virtual bool tracksLocalBuffer(const BufferDesc&) const { return false; }
+
+    virtual bool supportNotification() const { return false; }
+
+    virtual Status sendNotification(SegmentID target_id,
+                                    const Notification& notify) {
+        return Status::NotImplemented(
+            "sendNotification not implemented" LOC_MARK);
+    }
+
+    virtual Status receiveNotification(std::vector<Notification>& notify_list) {
+        return Status::NotImplemented(
+            "receiveNotification not implemented" LOC_MARK);
+    }
+
+    virtual const char* getName() const { return "<generic>"; }
+
+    virtual double getEstimatedBandwidth() const { return -1.0; }
+
+    virtual Status getNicLoadStats(std::vector<NicLoadStats>&) const {
+        return Status::OK();
+    }
+
+   protected:
+    Capabilities caps;
+};
+}  // namespace tent
+}  // namespace mooncake
+
+#endif  // TRANSPORT_V1_H_

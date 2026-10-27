@@ -1,0 +1,348 @@
+#include <array>
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+#include "tent/common/types.h"
+
+namespace mooncake {
+namespace tent {
+
+// Mirror the internal merge declarations from transfer_engine_impl.cpp
+// without exporting them in a public header.
+struct BufferKey {
+    uint64_t addr{0};
+    uint64_t length{0};
+
+    bool operator==(const BufferKey&) const = default;
+};
+
+struct RequestBoundaryInfo {
+    std::optional<BufferKey> source_key;
+    std::optional<BufferKey> target_key;
+    uint64_t max_merge_bytes{std::numeric_limits<uint64_t>::max()};
+};
+
+struct MergeResult {
+    std::vector<Request> request_list;
+    std::vector<size_t> task_lookup;
+};
+
+MergeResult mergeRequests(const std::vector<Request>& requests,
+                          const std::vector<RequestBoundaryInfo>& boundaries,
+                          bool do_merge);
+
+namespace {
+
+Request makeWriteRequest(char* base, size_t source_offset,
+                         uint64_t target_offset, size_t length) {
+    return Request{
+        Request::WRITE, base + source_offset, 7, target_offset, length,
+    };
+}
+
+BufferKey makeBufferKey(uint64_t addr, uint64_t length) {
+    return BufferKey{addr, length};
+}
+
+TEST(RequestMergeTest, KeepsRequestsSplitAcrossRegisteredBufferBoundaries) {
+    std::array<char, 2048> source{};
+    const auto source_addr =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source.data()));
+
+    std::vector<Request> requests = {
+        makeWriteRequest(source.data(), 0, 0, 1024),
+        makeWriteRequest(source.data(), 1024, 1024, 1024),
+    };
+    std::vector<RequestBoundaryInfo> boundaries = {
+        {makeBufferKey(source_addr, 1024), makeBufferKey(0, 1024)},
+        {makeBufferKey(source_addr + 1024, 1024), makeBufferKey(1024, 1024)},
+    };
+
+    auto merged = mergeRequests(requests, boundaries, true);
+
+    ASSERT_EQ(merged.request_list.size(), 2u);
+    EXPECT_EQ(merged.request_list[0].length, 1024u);
+    EXPECT_EQ(merged.request_list[1].length, 1024u);
+    EXPECT_EQ(merged.task_lookup.at(0), 0u);
+    EXPECT_EQ(merged.task_lookup.at(1), 1u);
+}
+
+TEST(RequestMergeTest, MergesAdjacentRequestsInsideSameRegisteredBuffers) {
+    std::array<char, 2048> source{};
+    const auto source_addr =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source.data()));
+
+    std::vector<Request> requests = {
+        makeWriteRequest(source.data(), 0, 4096, 1024),
+        makeWriteRequest(source.data(), 1024, 5120, 1024),
+    };
+    std::vector<RequestBoundaryInfo> boundaries = {
+        {makeBufferKey(source_addr, 2048), makeBufferKey(4096, 2048)},
+        {makeBufferKey(source_addr, 2048), makeBufferKey(4096, 2048)},
+    };
+
+    auto merged = mergeRequests(requests, boundaries, true);
+
+    ASSERT_EQ(merged.request_list.size(), 1u);
+    EXPECT_EQ(merged.request_list[0].length, 2048u);
+    EXPECT_EQ(merged.task_lookup.at(0), 0u);
+    EXPECT_EQ(merged.task_lookup.at(1), 0u);
+    for (uint64_t limit : {1024, 2048}) {
+        for (auto& boundary : boundaries) boundary.max_merge_bytes = limit;
+        EXPECT_EQ(mergeRequests(requests, boundaries, true).request_list.size(),
+                  limit == 1024 ? 2u : 1u);
+    }
+}
+
+TEST(RequestMergeTest, KeepsNonContiguousRequestsSplit) {
+    std::array<char, 3072> source{};
+    const auto source_addr =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source.data()));
+
+    std::vector<Request> requests = {
+        makeWriteRequest(source.data(), 0, 8192, 1024),
+        makeWriteRequest(source.data(), 1536, 9728, 1024),
+    };
+    std::vector<RequestBoundaryInfo> boundaries = {
+        {makeBufferKey(source_addr, 3072), makeBufferKey(8192, 3072)},
+        {makeBufferKey(source_addr, 3072), makeBufferKey(8192, 3072)},
+    };
+
+    auto merged = mergeRequests(requests, boundaries, true);
+
+    ASSERT_EQ(merged.request_list.size(), 2u);
+    EXPECT_EQ(merged.task_lookup.at(0), 0u);
+    EXPECT_EQ(merged.task_lookup.at(1), 1u);
+}
+
+TEST(RequestMergeTest, DoesNotMergeAcrossDifferentTransportHint) {
+    std::array<char, 2048> source{};
+    const auto source_addr =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source.data()));
+
+    std::vector<Request> requests = {
+        makeWriteRequest(source.data(), 0, 4096, 1024),
+        makeWriteRequest(source.data(), 1024, 5120, 1024),
+    };
+    requests[0].transport_hint = TransportType::RDMA;
+    requests[1].transport_hint = TransportType::TCP;
+
+    std::vector<RequestBoundaryInfo> boundaries = {
+        {makeBufferKey(source_addr, 2048), makeBufferKey(4096, 2048)},
+        {makeBufferKey(source_addr, 2048), makeBufferKey(4096, 2048)},
+    };
+
+    auto merged = mergeRequests(requests, boundaries, true);
+
+    // Mixed hints across an otherwise-contiguous run must stay split,
+    // otherwise the merged request would carry only one hint and the
+    // other half's pinning would silently disappear.
+    ASSERT_EQ(merged.request_list.size(), 2u);
+    EXPECT_EQ(merged.request_list[0].length, 1024u);
+    EXPECT_EQ(merged.request_list[1].length, 1024u);
+    EXPECT_NE(merged.request_list[0].transport_hint,
+              merged.request_list[1].transport_hint);
+}
+
+TEST(RequestMergeTest, MergesAdjacentRequestsWithSameTransportHint) {
+    std::array<char, 2048> source{};
+    const auto source_addr =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source.data()));
+
+    std::vector<Request> requests = {
+        makeWriteRequest(source.data(), 0, 4096, 1024),
+        makeWriteRequest(source.data(), 1024, 5120, 1024),
+    };
+    requests[0].transport_hint = TransportType::TCP;
+    requests[1].transport_hint = TransportType::TCP;
+
+    std::vector<RequestBoundaryInfo> boundaries = {
+        {makeBufferKey(source_addr, 2048), makeBufferKey(4096, 2048)},
+        {makeBufferKey(source_addr, 2048), makeBufferKey(4096, 2048)},
+    };
+
+    auto merged = mergeRequests(requests, boundaries, true);
+
+    // Regression guard: adding transport_hint must not break merging
+    // when the hint is the same on both sides.
+    ASSERT_EQ(merged.request_list.size(), 1u);
+    EXPECT_EQ(merged.request_list[0].length, 2048u);
+    EXPECT_EQ(merged.request_list[0].transport_hint, TransportType::TCP);
+    EXPECT_EQ(merged.task_lookup.at(0), 0u);
+    EXPECT_EQ(merged.task_lookup.at(1), 0u);
+}
+
+TEST(RequestMergeTest, KeepsDifferentSelectionAttributesSplit) {
+    std::array<char, 8192> source{};
+    const auto source_addr =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source.data()));
+
+    struct AttributeCase {
+        const char* name;
+        void (*set_different)(Request&, Request&);
+    };
+    const std::array<AttributeCase, 3> cases = {{
+        {"priority",
+         [](Request& first, Request& second) {
+             first.priority = PRIO_HIGH;
+             second.priority = PRIO_LOW;
+         }},
+        {"policy_name",
+         [](Request& first, Request& second) {
+             first.policy_name = "foreground";
+             second.policy_name = "background";
+         }},
+        {"intent_type",
+         [](Request& first, Request& second) {
+             first.intent_type = IntentType::FOREGROUND_GET;
+             second.intent_type = IntentType::MIGRATION;
+         }},
+    }};
+
+    for (const auto& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        std::vector<Request> requests = {
+            makeWriteRequest(source.data(), 0, 4096, 1024),
+            makeWriteRequest(source.data(), 1024, 5120, 1024),
+        };
+        test_case.set_different(requests[0], requests[1]);
+        std::vector<RequestBoundaryInfo> boundaries = {
+            {makeBufferKey(source_addr, source.size()),
+             makeBufferKey(4096, 2048)},
+            {makeBufferKey(source_addr, source.size()),
+             makeBufferKey(4096, 2048)},
+        };
+
+        auto merged = mergeRequests(requests, boundaries, true);
+
+        ASSERT_EQ(merged.request_list.size(), 2u);
+        EXPECT_NE(merged.task_lookup.at(0), merged.task_lookup.at(1));
+    }
+}
+
+TEST(RequestMergeTest, MergesMatchingSelectionAttributes) {
+    std::array<char, 2048> source{};
+    const auto source_addr =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source.data()));
+    std::vector<Request> requests = {
+        makeWriteRequest(source.data(), 0, 4096, 1024),
+        makeWriteRequest(source.data(), 1024, 5120, 1024),
+    };
+    for (auto& request : requests) {
+        request.priority = PRIO_LOW;
+        request.policy_name = "background";
+        request.intent_type = IntentType::MIGRATION;
+    }
+    std::vector<RequestBoundaryInfo> boundaries = {
+        {makeBufferKey(source_addr, source.size()), makeBufferKey(4096, 2048)},
+        {makeBufferKey(source_addr, source.size()), makeBufferKey(4096, 2048)},
+    };
+
+    auto merged = mergeRequests(requests, boundaries, true);
+
+    ASSERT_EQ(merged.request_list.size(), 1u);
+    EXPECT_EQ(merged.request_list[0].length, 2048u);
+    EXPECT_EQ(merged.task_lookup.at(0), merged.task_lookup.at(1));
+}
+
+TEST(RequestMergeTest, MixedHintBatchStillMergesPerHint) {
+    std::array<char, 4096> source{};
+    const auto source_addr =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source.data()));
+
+    // Four requests interleave RDMA / TCP in submission order, but within
+    // each hint group both source and target are contiguous. After the
+    // hint-aware sort, the two RDMA requests fold into one, and the two
+    // TCP requests fold into the other.
+    //
+    // RDMA source pair: bytes [0, 2048) -> target [4096, 6144)
+    // TCP  source pair: bytes [2048, 4096) -> target [8192, 10240)
+    std::vector<Request> requests = {
+        makeWriteRequest(source.data(), 0, 4096, 1024),     // RDMA
+        makeWriteRequest(source.data(), 2048, 8192, 1024),  // TCP
+        makeWriteRequest(source.data(), 1024, 5120, 1024),  // RDMA (contig)
+        makeWriteRequest(source.data(), 3072, 9216, 1024),  // TCP  (contig)
+    };
+    requests[0].transport_hint = TransportType::RDMA;
+    requests[1].transport_hint = TransportType::TCP;
+    requests[2].transport_hint = TransportType::RDMA;
+    requests[3].transport_hint = TransportType::TCP;
+
+    std::vector<RequestBoundaryInfo> boundaries = {
+        {makeBufferKey(source_addr, 4096), makeBufferKey(4096, 6144)},
+        {makeBufferKey(source_addr, 4096), makeBufferKey(8192, 2048)},
+        {makeBufferKey(source_addr, 4096), makeBufferKey(4096, 6144)},
+        {makeBufferKey(source_addr, 4096), makeBufferKey(8192, 2048)},
+    };
+
+    auto merged = mergeRequests(requests, boundaries, true);
+
+    ASSERT_EQ(merged.request_list.size(), 2u);
+    // 0,2 (RDMA, contiguous on src+target) → one merged request, len 2048.
+    // 1,3 (TCP, contiguous on src+target)  → one merged request, len 2048.
+    EXPECT_EQ(merged.request_list[0].length, 2048u);
+    EXPECT_EQ(merged.request_list[1].length, 2048u);
+    EXPECT_EQ(merged.task_lookup.at(0), merged.task_lookup.at(2));
+    EXPECT_EQ(merged.task_lookup.at(1), merged.task_lookup.at(3));
+    EXPECT_NE(merged.task_lookup.at(0), merged.task_lookup.at(1));
+}
+
+TEST(RequestMergeTest, EmptyInputHasNoTaskMapping) {
+    for (bool merge : {false, true}) {
+        auto result = mergeRequests({}, {}, merge);
+        EXPECT_TRUE(result.request_list.empty());
+        EXPECT_TRUE(result.task_lookup.empty());
+    }
+}
+
+TEST(RequestMergeTest, PassThroughKeepsOriginalOrder) {
+    std::array<char, 1024> source{};
+    std::vector<Request> requests = {
+        makeWriteRequest(source.data(), 512, 8192, 32),
+        makeWriteRequest(source.data(), 0, 4096, 16),
+        makeWriteRequest(source.data(), 16, 4112, 48),
+    };
+    // Both explicitly disabled merging and missing boundaries take the
+    // pass-through path, even when some requests could otherwise merge.
+    for (bool merge : {false, true}) {
+        auto result = mergeRequests(requests, {}, merge);
+        ASSERT_EQ(result.task_lookup.size(), requests.size());
+        ASSERT_EQ(result.request_list.size(), requests.size());
+        for (size_t i = 0; i < requests.size(); ++i) {
+            EXPECT_EQ(result.task_lookup.at(i), i);
+            EXPECT_EQ(result.request_list[i].source, requests[i].source);
+            EXPECT_EQ(result.request_list[i].length, requests[i].length);
+        }
+    }
+}
+
+TEST(RequestMergeTest, ShuffledRequestsMapBackToOriginalIndices) {
+    std::array<char, 1024> source{};
+    std::vector<Request> requests = {
+        makeWriteRequest(source.data(), 160, 4256, 16),
+        makeWriteRequest(source.data(), 0, 4096, 16),
+        makeWriteRequest(source.data(), 128, 4224, 32),
+        makeWriteRequest(source.data(), 16, 4112, 48),
+    };
+    std::vector<RequestBoundaryInfo> boundaries(
+        requests.size(),
+        {makeBufferKey(reinterpret_cast<uintptr_t>(source.data()),
+                       source.size()),
+         makeBufferKey(4096, source.size())});
+    auto result = mergeRequests(requests, boundaries, true);
+    ASSERT_EQ(result.request_list.size(), 2u);
+    EXPECT_EQ(result.request_list[0].length, 64u);
+    EXPECT_EQ(result.request_list[1].length, 48u);
+    ASSERT_EQ(result.task_lookup.size(), requests.size());
+    const std::array<size_t, 4> owners{1, 0, 1, 0};
+    for (size_t i = 0; i < owners.size(); ++i)
+        EXPECT_EQ(result.task_lookup.at(i), owners[i]);
+}
+
+}  // namespace
+}  // namespace tent
+}  // namespace mooncake

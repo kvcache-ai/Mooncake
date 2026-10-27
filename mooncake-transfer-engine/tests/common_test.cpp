@@ -1,0 +1,424 @@
+#include <gtest/gtest.h>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "common.h"
+
+namespace {
+
+using namespace mooncake;
+using namespace std::chrono_literals;
+
+const uint16_t kDefaultPort = getDefaultHandshakePort();
+
+//------------------------------------------------------------------------------
+// RWSpinlock
+//------------------------------------------------------------------------------
+
+TEST(RWSpinlockTest, AggressiveWriteLockProgressesAcrossTicketWraparound) {
+    RWSpinlock lock;
+    int protected_value = 0;
+
+    constexpr int kIterations = 65536 + 3;
+    for (int i = 0; i < kIterations; ++i) {
+        lock.writeLockAggressive();
+        ++protected_value;
+        lock.unlock();
+    }
+
+    RWSpinlock::ReadGuard guard(lock);
+    EXPECT_EQ(protected_value, kIterations);
+}
+
+TEST(RWSpinlockTest, DowngradePublishesToReadersAndBlocksWriters) {
+    RWSpinlock lock;
+    int protected_value = 0;
+    std::atomic<bool> writer_started{false};
+    std::atomic<bool> writer_entered{false};
+    std::atomic<bool> reader_observed{false};
+
+    lock.writeLockAggressive();
+    protected_value = 42;
+    lock.unlockAndLockShared();
+
+    std::thread reader([&] {
+        RWSpinlock::ReadGuard guard(lock);
+        reader_observed.store(protected_value == 42, std::memory_order_release);
+    });
+
+    reader.join();
+    EXPECT_TRUE(reader_observed.load(std::memory_order_acquire));
+
+    std::thread writer([&] {
+        writer_started.store(true, std::memory_order_release);
+        lock.writeLockAggressive();
+        writer_entered.store(true, std::memory_order_release);
+        protected_value = 99;
+        lock.unlock();
+    });
+
+    while (!writer_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    std::this_thread::sleep_for(10ms);
+    EXPECT_FALSE(writer_entered.load(std::memory_order_acquire));
+
+    lock.unlockShared();
+    writer.join();
+
+    RWSpinlock::ReadGuard guard(lock);
+    EXPECT_TRUE(writer_entered.load(std::memory_order_acquire));
+    EXPECT_EQ(protected_value, 99);
+}
+
+//------------------------------------------------------------------------------
+// writeFullySocket
+//------------------------------------------------------------------------------
+
+TEST(WriteFullySocketTest, DeliversBytesIntactOnHealthySocket) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    const char payload[] = "handshake-reply-bytes";
+
+    ssize_t rc = writeFullySocket(fds[0], payload, sizeof(payload));
+    ASSERT_EQ(rc, (ssize_t)sizeof(payload));
+
+    char buf[sizeof(payload)] = {0};
+    ASSERT_EQ(read(fds[1], buf, sizeof(buf)), (ssize_t)sizeof(buf));
+    EXPECT_STREQ(buf, payload);
+    close(fds[0]);
+    close(fds[1]);
+}
+
+TEST(WriteFullySocketTest, PeerResetYieldsEpipeInsteadOfSigpipe) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    const char payload[] = "handshake-reply-bytes";
+    // Peer goes away before the answer is written. The first write may still
+    // succeed (the close has not been noticed yet), but a later write must
+    // report EPIPE. Without SIGPIPE suppression the process dies right here,
+    // which is exactly the handshake-daemon kill from #4454.
+    close(fds[1]);
+
+    ssize_t rc = 0;
+    for (int attempt = 0; attempt < 4 && rc != -1; ++attempt) {
+        rc = writeFullySocket(fds[0], payload, sizeof(payload));
+    }
+    ASSERT_EQ(rc, -1);
+    EXPECT_EQ(errno, EPIPE);
+    close(fds[0]);
+}
+
+//------------------------------------------------------------------------------
+// parseFromString<T>
+//------------------------------------------------------------------------------
+
+TEST(ParseFromString, ValidUint16) {
+    auto result = parseFromString<uint16_t>("42");
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 42);
+}
+
+TEST(ParseFromString, InvalidAlpha) {
+    auto result = parseFromString<uint16_t>("forty-two");
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST(ParseFromString, ValueOutOfRange) {
+    // 70000 exceeds std::numeric_limits<uint16_t>::max() (65 535)
+    auto result = parseFromString<uint16_t>("70000");
+    EXPECT_FALSE(result.has_value());
+}
+
+//------------------------------------------------------------------------------
+// getPortFromString
+//------------------------------------------------------------------------------
+
+TEST(GetPortFromString, ReturnsParsedPort) {
+    EXPECT_EQ(getPortFromString("8080", kDefaultPort), 8080);
+}
+
+TEST(GetPortFromString, FallsBackToDefaultOnInvalid) {
+    EXPECT_EQ(getPortFromString("not-a-number", kDefaultPort), kDefaultPort);
+}
+
+//------------------------------------------------------------------------------
+// IPv6 helpers
+//------------------------------------------------------------------------------
+
+TEST(IsValidIpV6, RecognisesValidAddress) {
+    EXPECT_TRUE(isValidIpV6("2001:0db8:85a3:0000:0000:8a2e:0370:7334"));
+}
+
+TEST(IsValidIpV6, RejectsInvalidAddress) {
+    EXPECT_FALSE(isValidIpV6("not::an::ip"));
+}
+
+TEST(MaybeWrapIpV6, WrapsValidIp) {
+    const std::string addr = "2001:db8::1";
+    EXPECT_EQ(maybeWrapIpV6(addr), "[" + addr + "]");
+}
+
+TEST(MaybeWrapIpV6, LeavesInvalidUntouched) {
+    const std::string addr = "example.com";
+    EXPECT_EQ(maybeWrapIpV6(addr), addr);
+}
+
+//------------------------------------------------------------------------------
+// parseHostNameWithPort
+//------------------------------------------------------------------------------
+
+TEST(ParseHostNameWithPort, BracketedIpv6WithPort) {
+    auto [host, port] = parseHostNameWithPort("[2001:db8::1]:1234");
+    EXPECT_EQ(host, "2001:db8::1");
+    EXPECT_EQ(port, 1234);
+}
+
+TEST(ParseHostNameWithPort, BracketedIpv6NoPort) {
+    auto [host, port] = parseHostNameWithPort("[2001:db8::1]");
+    EXPECT_EQ(host, "2001:db8::1");
+    EXPECT_EQ(port, kDefaultPort);
+}
+
+TEST(ParseHostNameWithPort, RawIpv6) {
+    auto [host, port] = parseHostNameWithPort("2001:db8::1");
+    EXPECT_EQ(host, "2001:db8::1");
+    EXPECT_EQ(port, kDefaultPort);
+}
+
+TEST(ParseHostNameWithPort, Ipv4WithPort) {
+    auto [host, port] = parseHostNameWithPort("8.8.8.8:4321");
+    EXPECT_EQ(host, "8.8.8.8");
+    EXPECT_EQ(port, 4321);
+}
+
+TEST(ParseHostNameWithPort, Ipv4WithoutPort) {
+    auto [host, port] = parseHostNameWithPort("8.8.8.8");
+    EXPECT_EQ(host, "8.8.8.8");
+    EXPECT_EQ(port, kDefaultPort);
+}
+
+TEST(ParseHostNameWithPort, HostWithPort) {
+    auto [host, port] = parseHostNameWithPort("example.com:4321");
+    EXPECT_EQ(host, "example.com");
+    EXPECT_EQ(port, 4321);
+}
+
+TEST(ParseHostNameWithPort, HostWithoutPort) {
+    auto [host, port] = parseHostNameWithPort("example.com");
+    EXPECT_EQ(host, "example.com");
+    EXPECT_EQ(port, kDefaultPort);
+}
+
+TEST(HostPortHelpers, DetectsExplicitPort) {
+    EXPECT_TRUE(hasExplicitPort("8.8.8.8:4321"));
+    EXPECT_TRUE(hasExplicitPort("example.com:4321"));
+    EXPECT_TRUE(hasExplicitPort("[2001:db8::1]:4321"));
+    EXPECT_FALSE(hasExplicitPort("2001:db8::1"));
+    EXPECT_FALSE(hasExplicitPort("[2001:db8::1]"));
+}
+
+TEST(HostPortHelpers, ExtractsHostWithoutPort) {
+    EXPECT_EQ(getHostNameWithoutPort("8.8.8.8:4321"), "8.8.8.8");
+    EXPECT_EQ(getHostNameWithoutPort("example.com:4321"), "example.com");
+    EXPECT_EQ(getHostNameWithoutPort("[2001:db8::1]:4321"), "2001:db8::1");
+    EXPECT_EQ(getHostNameWithoutPort("[2001:db8::1]"), "2001:db8::1");
+    EXPECT_EQ(getHostNameWithoutPort("2001:db8::1"), "2001:db8::1");
+}
+
+TEST(HostPortHelpers, BuildsBracketedIpv6Endpoint) {
+    EXPECT_EQ(buildHostNameWithPort("2001:db8::1", 4321), "[2001:db8::1]:4321");
+    EXPECT_EQ(buildHostNameWithPort("8.8.8.8", 4321), "8.8.8.8:4321");
+}
+
+//------------------------------------------------------------------------------
+// parsePortAndDevice
+//------------------------------------------------------------------------------
+
+TEST(ParsePortAndDevice, PortOnly) {
+    int dev = -1;
+    EXPECT_EQ(parsePortAndDevice("8080", kDefaultPort, &dev), 8080);
+    EXPECT_EQ(dev, -1);
+}
+
+TEST(ParsePortAndDevice, PortAndDevice) {
+    int dev = -1;
+    EXPECT_EQ(parsePortAndDevice("9000:npu_2", kDefaultPort, &dev), 9000);
+    EXPECT_EQ(dev, 2);
+}
+
+TEST(ParsePortAndDevice, InvalidDeviceFormatKeepsDefault) {
+    int dev = -1;
+    EXPECT_EQ(parsePortAndDevice("9000:npu2", kDefaultPort, &dev), 9000);
+    EXPECT_EQ(dev, -1);
+
+    EXPECT_EQ(parsePortAndDevice("9000:_2", kDefaultPort, &dev), 9000);
+    EXPECT_EQ(dev, -1);
+}
+
+TEST(ParsePortAndDevice, InvalidDeviceIdSetsToZero) {
+    int dev = -1;
+    EXPECT_EQ(parsePortAndDevice("9000:npu_x", kDefaultPort, &dev), 9000);
+    EXPECT_EQ(dev, 0);
+}
+
+//------------------------------------------------------------------------------
+// parseHostNameWithPortAscend
+//------------------------------------------------------------------------------
+
+TEST(ParseHostNameWithPortAscend, BracketedIpv6WithPort) {
+    int dev = -1;
+    auto [host, port] = parseHostNameWithPortAscend("[2001:db8::1]:1234", &dev);
+    EXPECT_EQ(host, "2001:db8::1");
+    EXPECT_EQ(port, 1234);
+    EXPECT_EQ(dev, -1);
+}
+
+TEST(ParseHostNameWithPortAscend, BracketedIpv6NoPort) {
+    int dev = -1;
+    auto [host, port] = parseHostNameWithPortAscend("[2001:db8::1]", &dev);
+    EXPECT_EQ(host, "2001:db8::1");
+    EXPECT_EQ(port, kDefaultPort);
+    EXPECT_EQ(dev, -1);
+}
+
+TEST(ParseHostNameWithPortAscend, RawIpv6) {
+    int dev = -1;
+    auto [host, port] = parseHostNameWithPortAscend("2001:db8::1", &dev);
+    EXPECT_EQ(host, "2001:db8::1");
+    EXPECT_EQ(port, kDefaultPort);
+    EXPECT_EQ(dev, -1);
+}
+
+TEST(ParseHostNameWithPortAscend, Ipv4WithPort) {
+    int dev = -1;
+    auto [host, port] = parseHostNameWithPortAscend("8.8.8.8:4321", &dev);
+    EXPECT_EQ(host, "8.8.8.8");
+    EXPECT_EQ(port, 4321);
+    EXPECT_EQ(dev, -1);
+}
+
+TEST(ParseHostNameWithPortAscend, Ipv4WithoutPort) {
+    int dev = -1;
+    auto [host, port] = parseHostNameWithPortAscend("8.8.8.8", &dev);
+    EXPECT_EQ(host, "8.8.8.8");
+    EXPECT_EQ(port, kDefaultPort);
+    EXPECT_EQ(dev, -1);
+}
+
+TEST(ParseHostNameWithPortAscend, HostWithPort) {
+    int dev = -1;
+    auto [host, port] = parseHostNameWithPortAscend("example.com:4321", &dev);
+    EXPECT_EQ(host, "example.com");
+    EXPECT_EQ(port, 4321);
+    EXPECT_EQ(dev, -1);
+}
+
+TEST(ParseHostNameWithPortAscend, HostWithoutPort) {
+    int dev = -1;
+    auto [host, port] = parseHostNameWithPortAscend("example.com", &dev);
+    EXPECT_EQ(host, "example.com");
+    EXPECT_EQ(port, kDefaultPort);
+    EXPECT_EQ(dev, -1);
+}
+
+TEST(ParseHostNameWithPortAscend, BracketedIpv6PortDevice) {
+    int dev = -1;
+    auto [host, port] =
+        parseHostNameWithPortAscend("[2001:db8::1]:8080:npu_3", &dev);
+    EXPECT_EQ(host, "2001:db8::1");
+    EXPECT_EQ(port, 8080);
+    EXPECT_EQ(dev, 3);
+}
+
+TEST(ParseHostNameWithPortAscend, Ipv4PortDevice) {
+    int dev = -1;
+    auto [host, port] = parseHostNameWithPortAscend("8.8.8.8:8080:npu_1", &dev);
+    EXPECT_EQ(host, "8.8.8.8");
+    EXPECT_EQ(port, 8080);
+    EXPECT_EQ(dev, 1);
+}
+
+TEST(ParseHostNameWithPortAscend, Ipv4PortInvalidDevice) {
+    int dev = -1;
+    auto [host, port] = parseHostNameWithPortAscend("8.8.8.8:8080:npu1", &dev);
+    EXPECT_EQ(host, "8.8.8.8");
+    EXPECT_EQ(port, 8080);
+    EXPECT_EQ(dev, -1);
+}
+
+TEST(ParseHostNameWithPortAscend, HostPortDevice) {
+    int dev = -1;
+    auto [host, port] =
+        parseHostNameWithPortAscend("example.com:8080:npu_1", &dev);
+    EXPECT_EQ(host, "example.com");
+    EXPECT_EQ(port, 8080);
+    EXPECT_EQ(dev, 1);
+}
+
+//------------------------------------------------------------------------------
+// getHandshakeMaxLength
+//------------------------------------------------------------------------------
+
+// Note: Since getHandshakeMaxLength() uses static initialization that happens
+// once per process, we only test that it returns a valid value (>= 1MB).
+// Environment variable tests would require separate test processes.
+
+TEST(GetHandshakeMaxLengthTest, ReturnsValidValue) {
+    size_t max_length = getHandshakeMaxLength();
+    // Should be at least the default/minimum (1MB) and at most the maximum
+    // (128MB)
+    EXPECT_GE(max_length, kDefaultHandshakeMaxLength);
+    EXPECT_LE(max_length, kMaxHandshakeMaxLength);
+}
+
+TEST(GetHandshakeMaxLengthTest, ReturnsSameValueOnMultipleCalls) {
+    // Static initialization ensures consistent value
+    size_t first_call = getHandshakeMaxLength();
+    size_t second_call = getHandshakeMaxLength();
+    EXPECT_EQ(first_call, second_call);
+}
+
+//------------------------------------------------------------------------------
+// bindToSocket
+//------------------------------------------------------------------------------
+
+// Worker pools bind every thread they spawn, so bindToSocket() races inside
+// libnuma's unlocked lazy cache fill and orphans an allocation. The leak is
+// what this guards, so it only fails under ASAN/LSAN; the barrier is what makes
+// it reliable there.
+TEST(BindToSocketTest, ConcurrentCallsDoNotLeakNumaState) {
+    if (numa_available() < 0) GTEST_SKIP() << "platform does not support NUMA";
+
+    constexpr int kThreads = 32;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::vector<std::thread> threads;
+    std::vector<int> results(kThreads, -1);
+
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            // Every thread races on the same node, maximizing the window.
+            results[i] = bindToSocket(0);
+        });
+    }
+    while (ready.load(std::memory_order_acquire) < kThreads)
+        std::this_thread::yield();
+    go.store(true, std::memory_order_release);
+    for (auto &thread : threads) thread.join();
+
+    // Serializing the cache fill must not change what callers observe.
+    for (int i = 0; i < kThreads; ++i)
+        EXPECT_EQ(results[i], 0) << "thread " << i << " failed to bind";
+}
+
+}  // namespace

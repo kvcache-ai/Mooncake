@@ -1,0 +1,135 @@
+# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2024 KVCache.AI
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http:#www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# If git clone fails, you can place dependencies and the script in a directory for compilation and installation.
+# Define a function to handle the git clone operation
+
+#!/bin/bash
+
+# Try git clone with GitHub mirror fallback via https://ghfast.top/
+git_with_github_mirror_fallback() {
+    local repo_dir="$1"
+    local repo_url="$2"
+    shift 2
+
+    if git clone "$repo_url" "$repo_dir" "$@"; then
+        return 0
+    fi
+
+    echo "Direct clone failed, retrying with mirror https://ghfast.top/"
+    rm -rf "$repo_dir"
+    local mirror_url="https://ghfast.top/${repo_url}"
+    git clone "$mirror_url" "$repo_dir" "$@"
+}
+
+clone_repo_if_not_exists() {
+    local repo_dir="$1"
+    local repo_url="$2"
+    shift 2
+
+    if [ ! -d "$repo_dir" ]; then
+        git_with_github_mirror_fallback "$repo_dir" "$repo_url" "$@"
+    else
+        echo "Directory $repo_dir already exists, skipping clone."
+    fi
+}
+
+# Function to check command success
+check_success() {
+    if [ $? -ne 0 ]; then
+        print_error "$1"
+    fi
+}
+
+set +e
+
+# System detection and dependency installation
+if command -v apt-get &> /dev/null; then
+    echo "Detected apt-get. Using Debian-based package manager."
+    apt-get update
+    apt-get install -y build-essential \
+            cmake \
+            git \
+            wget \
+            libibverbs-dev \
+            libgoogle-glog-dev \
+            libjsoncpp-dev \
+            libunwind-dev \
+            libnuma-dev \
+            libpython3-dev \
+            libboost-dev \
+            libssl-dev \
+            libgrpc-dev \
+            libgrpc++-dev \
+            libprotobuf-dev \
+            libyaml-cpp-dev \
+            protobuf-compiler-grpc \
+            libcurl4-openssl-dev \
+            libhiredis-dev \
+            pkg-config \
+            patchelf \
+            mpich \
+            libmpich-dev \
+            libzstd-dev \
+            libxxhash-dev \
+            libmsgpack-dev
+    apt purge -y openmpi-bin libopenmpi-dev || true
+elif command -v yum &> /dev/null; then
+    echo "Detected yum. Using Red Hat-based package manager."
+    yum makecache
+    yum install -y cmake \
+            gflags-devel \
+            glog-devel \
+            libibverbs-devel \
+            numactl-devel \
+            boost-devel \
+            openssl-devel \
+            hiredis-devel \
+            libcurl-devel \
+            jsoncpp-devel \
+            mpich \
+            mpich-devel \
+            zstd-devel \
+            xxhash-devel
+    # Install yaml-cpp
+    cd "$TARGET_DIR"
+    clone_repo_if_not_exists "yaml-cpp" https://github.com/jbeder/yaml-cpp.git
+    cd yaml-cpp || exit
+    rm -rf build
+    mkdir -p build && cd build
+    cmake ..
+    make -j$(nproc)
+    make install
+    cd ../..
+
+    # Install msgpack-c
+    clone_repo_if_not_exists "msgpack-c" "https://github.com/msgpack/msgpack-c.git"
+    cd msgpack-c || exit
+    git checkout cpp-7.0.0
+    rm -rf build
+    mkdir -p build && cd build
+    cmake ..
+    make -j
+    make install
+    cd ../..
+else
+    echo "Unsupported package manager. Please install the dependencies manually."
+    exit 1
+fi
+
+check_success "Failed to install system packages"
+echo -e "system packages installed successfully."
+
+export CPLUS_INCLUDE_PATH=$(echo $CPLUS_INCLUDE_PATH | tr ':' '\n' | grep -v "/usr/local/Ascend" | paste -sd: -)

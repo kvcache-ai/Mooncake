@@ -1,0 +1,867 @@
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CUDA_STANDARD 20)
+
+option(ENABLE_DEBUG_SYMBOLS "Include debug symbols (-g) in compilation" ON)
+
+set(CMAKE_CXX_FLAGS
+    "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-unused-parameter -fPIC")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-parameter -fPIC")
+
+if(ENABLE_DEBUG_SYMBOLS)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g")
+endif()
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcoroutines")
+  set(CMAKE_CXX_FLAGS_RELEASE
+      "${CMAKE_CXX_FLAGS_RELEASE} -fno-tree-slp-vectorize")
+endif()
+
+set(CMAKE_C_FLAGS_RELEASE "-O3")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+
+set(CMAKE_C_FLAGS_DEBUG "-O0")
+set(CMAKE_CXX_FLAGS_DEBUG "-O0")
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror=thread-safety")
+endif()
+
+option(ENABLE_ASAN "enable address sanitizer" OFF)
+
+if(ENABLE_ASAN)
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=leak")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=leak")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
+endif()
+
+# keep debuginfo by default
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE "RelWithDebInfo")
+endif()
+
+message(CMAKE_BUILD_TYPE ": ${CMAKE_BUILD_TYPE}")
+
+# Necessary if you are using Alibaba Cloud eRDMA
+add_definitions(-DCONFIG_ERDMA)
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Memory-aware build parallelism (compile vs. link job pools)
+include(${CMAKE_CURRENT_LIST_DIR}/limit_jobs.cmake)
+
+option(ENABLE_SCCACHE "Whether to open sccache" OFF)
+if(ENABLE_SCCACHE)
+  find_program(SCCACHE sccache)
+  if(NOT SCCACHE)
+    message(FATAL_ERROR "sccache executable not found")
+  endif()
+endif()
+if(SCCACHE AND ENABLE_SCCACHE)
+  message(STATUS "Building with SCCACHE enabled")
+  set(CMAKE_C_COMPILER_LAUNCHER ${SCCACHE})
+  set(CMAKE_CXX_COMPILER_LAUNCHER ${SCCACHE})
+endif()
+
+add_compile_definitions(GLOG_USE_GLOG_EXPORT)
+add_compile_options(-fno-tree-slp-vectorize)
+
+option(BUILD_EXAMPLES "Build examples" ON)
+
+option(BUILD_UNIT_TESTS "Build unit tests" ON)
+if(BUILD_UNIT_TESTS)
+  include(${CMAKE_CURRENT_LIST_DIR}/FindGTest.cmake)
+endif()
+option(BUILD_BENCHMARK "Build benchmarks" ON)
+option(USE_CUDA "option for enabling gpu features for NVIDIA GPU" OFF)
+option(USE_NCCL_DEVICE "option for enabling the NCCL DeviceTransport backend"
+       OFF)
+option(USE_NCCL_HOST "option for enabling the NCCL host RMA transport" OFF)
+option(USE_MLU "option for enabling Cambricon MLU features" OFF)
+option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
+option(USE_MACA "option for enabling gpu features for MUXI GPU with MACA" OFF)
+option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
+option(USE_HYGON "option for enabling gpu features for Hygon DCU with DTK" OFF)
+option(USE_COREX "option for enabling gpu features for Iluvatar CoreX" OFF)
+option(USE_SUPA "option for enabling gpu features for Biren GPU with SUPA" OFF)
+option(USE_RISCV "Enable RISC-V build compatibility settings" OFF)
+if(USE_RISCV)
+  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
+    message(
+      WARNING
+        "USE_RISCV is enabled, but CMAKE_SYSTEM_PROCESSOR is '${CMAKE_SYSTEM_PROCESSOR}'"
+    )
+  endif()
+  # Define this before any pybind11 module is created. Otherwise pybind11 adds
+  # its default full-LTO target, which is prohibitively resource-intensive on
+  # RISC-V build hosts.
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+  message(STATUS "RISC-V: IPO disabled for Mooncake Python extensions")
+endif()
+option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
+option(USE_TCP "option for using TCP transport" ON)
+option(USE_BAREX "option for using accl-barex transport" OFF)
+option(USE_ASCEND "option for using npu with HCCL" OFF)
+option(USE_ASCEND_DIRECT "option for using ascend npu with adxl engine" OFF)
+option(USE_UBSHMEM "option for using ascend npu with shmem" OFF)
+option(USE_ASCEND_HETEROGENEOUS
+       "option for transferring between ascend npu and gpu" OFF)
+option(USE_MNNVL "option for using Multi-Node NVLink transport" OFF)
+option(USE_CXL "option for using CXL protocol" OFF)
+option(USE_EFA "option for using AWS EFA transport" OFF)
+option(USE_UB "option for using UB protocol transport" OFF)
+option(USE_SUNRISE
+       "option for enabling gpu features for Sunrise GPU with Tang runtime" OFF)
+option(
+  USE_TPU
+  "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
+  OFF)
+option(
+  USE_XPU
+  "option for enabling Intel XPU (oneAPI SYCL) staging support in TENT; this is a direct-link (native) build that requires USE_TENT and the Intel DPC++ compiler (icpx / IntelLLVM) at build time -- there is no dlopen shim"
+  OFF)
+option(
+  USE_XPU_GDS
+  "GDS on Intel XPU through a cuFile-compatible library (cufile.h + libcufile.so)"
+  OFF)
+option(USE_VRAM_SEGMENT "option for vram segment" OFF)
+option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
+option(USE_FABRIC
+       "option for the libfabric transport in TENT (implied by USE_EFA/USE_CXI)"
+       OFF)
+option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
+option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
+option(USE_MEMFABRIC "option for using memfabric transport" OFF)
+
+if(USE_UB)
+  add_compile_definitions(USE_UB)
+  message(STATUS "ub transport is enabled")
+  include(${CMAKE_CURRENT_LIST_DIR}/FindUrma.cmake)
+endif()
+
+if(USE_EFA)
+  # The EFA transport dlopens libfabric at runtime, so only the headers are
+  # needed here; default to the AWS EFA installer path.
+  find_path(
+    LIBFABRIC_INCLUDE_DIR rdma/fabric.h
+    HINTS /opt/amazon/efa/include
+    PATH_SUFFIXES include)
+
+  if(NOT LIBFABRIC_INCLUDE_DIR)
+    message(
+      FATAL_ERROR
+        "libfabric headers not found. Install libfabric-dev or AWS EFA, or set LIBFABRIC_INCLUDE_DIR."
+    )
+  endif()
+
+  include_directories(${LIBFABRIC_INCLUDE_DIR})
+  add_compile_definitions(USE_EFA)
+
+  # AWS Neuron device memory needs both the FI_HMEM_NEURON enumerator and
+  # fi_mr_attr::device.neuron, which arrive together and are absent from older
+  # libfabric -- including distro packages such as Ubuntu 22.04's libfabric-dev.
+  # Probed rather than gated on a version so that a build against any libfabric
+  # keeps working; when it is missing, efa_neuron.cpp reports Neuron as
+  # unsupported instead of registering its HBM as host memory.
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES ${LIBFABRIC_INCLUDE_DIR})
+  check_cxx_source_compiles(
+    "
+    #include <rdma/fabric.h>
+    #include <rdma/fi_domain.h>
+    int main() {
+      struct fi_mr_attr attr = {};
+      attr.iface = FI_HMEM_NEURON;
+      attr.device.neuron = 0;
+      return 0;
+    }
+    "
+    MOONCAKE_HAVE_FI_HMEM_NEURON)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  if(MOONCAKE_HAVE_FI_HMEM_NEURON)
+    add_compile_definitions(MOONCAKE_HAVE_FI_HMEM_NEURON)
+  endif()
+
+  message(STATUS "AWS EFA (libfabric) transport is enabled")
+  message(STATUS "  libfabric include: ${LIBFABRIC_INCLUDE_DIR}")
+  message(STATUS "  libfabric is loaded at runtime (dlopen)")
+  message(STATUS "  Neuron (FI_HMEM_NEURON): ${MOONCAKE_HAVE_FI_HMEM_NEURON}")
+endif()
+if(USE_CXI)
+  # Find libfabric headers and library; default to AWS EFA installer path
+  find_path(LIBFABRIC_INCLUDE_DIR rdma/fabric.h PATH_SUFFIXES include)
+  find_library(LIBFABRIC_LIBRARY fabric PATH_SUFFIXES lib lib64)
+
+  if(NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
+    message(
+      FATAL_ERROR
+        "libfabric not found. Install AWS EFA or set LIBFABRIC_INCLUDE_DIR/LIBFABRIC_LIBRARY."
+    )
+  endif()
+
+  get_filename_component(LIBFABRIC_LIB_DIR ${LIBFABRIC_LIBRARY} DIRECTORY)
+  include_directories(${LIBFABRIC_INCLUDE_DIR})
+  link_directories(${LIBFABRIC_LIB_DIR})
+  add_compile_definitions(USE_CXI)
+  message(STATUS "HPE CXI (libfabric) transport is enabled")
+  message(STATUS "  libfabric include: ${LIBFABRIC_INCLUDE_DIR}")
+  message(STATUS "  libfabric library: ${LIBFABRIC_LIBRARY}")
+endif()
+option(USE_ETCD "option for enable etcd as metadata server" OFF)
+option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
+option(USE_REDIS "option for enable redis as metadata server" OFF)
+option(USE_HTTP "option for enable http as metadata server" ON)
+option(WITH_RUST_EXAMPLE
+       "build the Transfer Engine Rust library and sample code" OFF)
+option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
+option(USE_3FS "option for using 3FS storage backend" OFF)
+option(USE_EVENT_DRIVEN_COMPLETION
+       "option for using event-driven completion (store & transfer engine)" OFF)
+
+option(USE_TENT "option for building Mooncake TENT" OFF)
+option(ENABLE_MULTI_PROTOCOL
+       "option for enabling multi-protocol support in transfer engine" OFF)
+if(ENABLE_MULTI_PROTOCOL)
+  add_compile_definitions(ENABLE_MULTI_PROTOCOL)
+  message(STATUS "Multi-protocol support is enabled")
+endif()
+option(USE_LRU_MASTER "option for using LRU in master service" OFF)
+option(USE_INTRA_NVLINK "option for using IntraNode nvlink transport" OFF)
+option(USE_MLX5DV
+       "enable mlx5 direct verbs (libmlx5) for QP UDP source port override" OFF)
+set(LRU_MAX_CAPACITY 1000)
+
+if(USE_LRU_MASTER)
+  add_compile_definitions(USE_LRU_MASTER)
+  add_compile_definitions(LRU_MAX_CAPACITY)
+endif()
+
+if(USE_EVENT_DRIVEN_COMPLETION)
+  add_compile_definitions(USE_EVENT_DRIVEN_COMPLETION)
+  message(STATUS "Event-driven completion is enabled")
+else()
+  message(STATUS "Event-driven completion is disabled")
+endif()
+
+if(USE_NVMEOF)
+  set(USE_CUDA ON)
+  add_compile_definitions(USE_NVMEOF)
+  message(STATUS "NVMe-oF support is enabled")
+endif()
+
+if(USE_MNNVL)
+  if(NOT USE_HIP
+     AND NOT USE_MUSA
+     AND NOT USE_MACA
+     AND NOT USE_SUPA)
+    set(USE_CUDA ON)
+  endif()
+  add_compile_definitions(USE_MNNVL)
+  message(STATUS "Multi-Node NVLink support is enabled")
+endif()
+
+if(USE_VRAM_SEGMENT)
+  set(USE_CUDA ON)
+  add_compile_definitions(USE_VRAM_SEGMENT)
+  message(STATUS "VRAM SEGMENT is ON")
+endif()
+
+if(USE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  add_compile_definitions(USE_CUDA)
+  message(STATUS "CUDA support is enabled")
+  include_directories(${CUDAToolkit_INCLUDE_DIRS})
+  # Include stubs directory so the linker can find libcuda.so on machines that
+  # have the CUDA toolkit but not a GPU driver (e.g. CI builders).  On
+  # production systems with a driver the real libcuda.so in the system library
+  # path takes precedence at both link and runtime.
+  link_directories(${CUDAToolkit_LIBRARY_DIR} ${CUDAToolkit_LIBRARY_DIR}/stubs)
+endif()
+
+if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
+  if(NOT USE_CUDA)
+    message(FATAL_ERROR "USE_NCCL_DEVICE and USE_NCCL_HOST require USE_CUDA=ON")
+  endif()
+  list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR})
+  find_package(NCCLDevice 2.30.4 REQUIRED MODULE)
+endif()
+
+if(USE_NCCL_DEVICE)
+  add_compile_definitions(USE_NCCL_DEVICE)
+  message(
+    STATUS
+      "NCCL DeviceTransport support is enabled (NCCL ${NCCLDevice_VERSION})")
+endif()
+
+if(USE_NCCL_HOST)
+  add_compile_definitions(USE_NCCL_HOST)
+  message(
+    STATUS "NCCL host RMA transport is enabled (NCCL ${NCCLDevice_VERSION})")
+endif()
+
+if(USE_SUPA)
+  add_compile_definitions(USE_SUPA)
+  message(STATUS "SUPA support is enabled")
+  if(NOT DEFINED BIREN_HOME OR BIREN_HOME STREQUAL "")
+    if(DEFINED ENV{BIREN_HOME} AND NOT "$ENV{BIREN_HOME}" STREQUAL "")
+      set(BIREN_HOME
+          "$ENV{BIREN_HOME}"
+          CACHE PATH "Biren SUPA SDK root")
+    else()
+      set(BIREN_HOME
+          "/usr/local/birensupa/all/latest"
+          CACHE PATH "Biren SUPA SDK root")
+    endif()
+  endif()
+  message(STATUS "  BIREN_HOME: ${BIREN_HOME}")
+  # The SUPA SDK ships generic header names (e.g. version.h) that must not
+  # shadow Mooncake's own headers, so expose it as a system include directory.
+  include_directories(SYSTEM ${BIREN_HOME}/supa/include)
+  link_directories(${BIREN_HOME}/supa/lib ${BIREN_HOME}/brumd/lib)
+  # Resolve the runtime library by name: older SUPA SDKs ship libsupa.so with a
+  # separate libsupart.so, while newer SDKs ship a single libsupa-runtime.so.
+  find_library(
+    SUPA_RUNTIME_LIBRARY
+    NAMES supa supa-runtime
+    PATHS ${BIREN_HOME}/supa/lib)
+  find_library(
+    SUPA_PART_LIBRARY
+    NAMES supart
+    PATHS ${BIREN_HOME}/supa/lib)
+  if(NOT SUPA_RUNTIME_LIBRARY)
+    message(
+      FATAL_ERROR
+        "SUPA runtime library not found under ${BIREN_HOME}/supa/lib (expected libsupa.so, libsupa-runtime.so, or libsupart.so)"
+    )
+  endif()
+  set(SUPA_LIBRARIES ${SUPA_RUNTIME_LIBRARY})
+  if(SUPA_PART_LIBRARY)
+    list(APPEND SUPA_LIBRARIES ${SUPA_PART_LIBRARY})
+  endif()
+endif()
+
+if(USE_TPU)
+  # Every TPU source file lives under mooncake-transfer-engine/tent, which is
+  # only added when USE_TENT is ON. Without this guard -DUSE_TPU=ON configures
+  # and builds cleanly while compiling no TPU code at all.
+  if(NOT USE_TENT)
+    message(
+      FATAL_ERROR
+        "USE_TPU=ON requires USE_TENT=ON: all TPU support lives in TENT. Re-run cmake with -DUSE_TENT=ON."
+    )
+  endif()
+  add_compile_definitions(USE_TPU)
+  message(STATUS "TPU (PJRT) staging support is enabled")
+endif()
+
+if(USE_XPU)
+  # XPU sources live under mooncake-transfer-engine/tent and mooncake-ep, which
+  # are only added when USE_TENT or WITH_EP is ON. Without this guard
+  # -DUSE_XPU=ON configures and builds cleanly while compiling no XPU code. An
+  # EP build without TENT must also leave out the Store; the top-level
+  # CMakeLists.txt checks that once WITH_STORE is defined.
+  if(NOT USE_TENT AND NOT WITH_EP)
+    message(
+      FATAL_ERROR
+        "USE_XPU=ON requires USE_TENT=ON (Transfer Engine) or WITH_EP=ON (Mooncake EP). Re-run cmake with either."
+    )
+  endif()
+  # The XPU platform links oneAPI SYCL directly (native / direct-link): its
+  # translation units include <sycl/sycl.hpp> and are compiled with -fsycl, so
+  # the whole build must use the Intel DPC++ compiler. Configure with icpx, e.g.
+  # CXX=icpx cmake -DUSE_TENT=ON -DUSE_XPU=ON ... (from an intel/oneapi-basekit
+  # or intel/pytorch:xpu image, or after `source /opt/intel/oneapi/setvars.sh`).
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM" AND NOT CMAKE_CXX_COMPILER
+                                                       MATCHES "icpx|icx|dpcpp")
+    message(
+      FATAL_ERROR
+        "USE_XPU=ON requires the Intel DPC++ compiler (icpx): the XPU platform "
+        "links SYCL directly. Re-run cmake with CXX=icpx (detected "
+        "'${CMAKE_CXX_COMPILER_ID}' at ${CMAKE_CXX_COMPILER}).")
+  endif()
+  add_compile_definitions(USE_XPU)
+  message(
+    STATUS "Intel XPU (oneAPI SYCL, direct-link) staging support is enabled")
+endif()
+
+if(USE_XPU_GDS)
+  # The GDS transport links libcufile.so; with USE_XPU_GDS it must come from a
+  # cuFile-compatible library for Intel XPU (for example Intel xFile) instead of
+  # NVIDIA GDS. A process can load only one libcufile.so, so the two GDS
+  # flavours are mutually exclusive.
+  if(NOT USE_XPU)
+    message(
+      FATAL_ERROR
+        "USE_XPU_GDS=ON requires USE_XPU=ON (and therefore USE_TENT=ON).")
+  endif()
+  if(USE_CUDA)
+    message(
+      FATAL_ERROR
+        "USE_XPU_GDS=ON cannot be combined with USE_CUDA=ON: both resolve "
+        "libcufile.so, and a process can load only one of them.")
+  endif()
+  add_compile_definitions(USE_XPU_GDS)
+  message(STATUS "Intel XPU GDS (cuFile-compatible library) is enabled")
+endif()
+
+if(NOT DEFINED NEUWARE_ROOT OR NEUWARE_ROOT STREQUAL "")
+  if(DEFINED ENV{NEUWARE_HOME} AND NOT "$ENV{NEUWARE_HOME}" STREQUAL "")
+    set(NEUWARE_ROOT
+        "$ENV{NEUWARE_HOME}"
+        CACHE PATH "Path to Cambricon Neuware SDK" FORCE)
+  else()
+    set(NEUWARE_ROOT
+        "/usr/local/neuware"
+        CACHE PATH "Path to Cambricon Neuware SDK" FORCE)
+  endif()
+endif()
+
+if(NOT DEFINED MLU_INCLUDE_DIR OR MLU_INCLUDE_DIR STREQUAL "")
+  set(MLU_INCLUDE_DIR "${NEUWARE_ROOT}/include")
+endif()
+
+if(NOT DEFINED MLU_LIB_DIR OR MLU_LIB_DIR STREQUAL "")
+  set(MLU_LIB_DIR "${NEUWARE_ROOT}/lib64")
+endif()
+
+if(NOT DEFINED MACA_ROOT OR MACA_ROOT STREQUAL "")
+  if(DEFINED ENV{MACA_HOME} AND NOT "$ENV{MACA_HOME}" STREQUAL "")
+    set(MACA_ROOT
+        "$ENV{MACA_HOME}"
+        CACHE PATH "Path to MACA SDK" FORCE)
+  else()
+    set(MACA_ROOT
+        "/opt/maca"
+        CACHE PATH "Path to MACA SDK" FORCE)
+  endif()
+endif()
+
+if(NOT DEFINED MACA_INCLUDE_DIR OR MACA_INCLUDE_DIR STREQUAL "")
+  set(MACA_INCLUDE_DIR "${MACA_ROOT}/include")
+endif()
+
+if(NOT DEFINED MACA_LIB_DIR OR MACA_LIB_DIR STREQUAL "")
+  if(EXISTS "${MACA_ROOT}/lib64")
+    set(MACA_LIB_DIR "${MACA_ROOT}/lib64")
+  else()
+    set(MACA_LIB_DIR "${MACA_ROOT}/lib")
+  endif()
+endif()
+
+if(USE_MLU)
+  add_compile_definitions(USE_MLU)
+  message(STATUS "MLU support is enabled")
+  include_directories(${MLU_INCLUDE_DIR})
+  if(EXISTS "${MLU_LIB_DIR}")
+    link_directories(${MLU_LIB_DIR})
+  endif()
+endif()
+
+if(USE_MACA)
+  add_compile_definitions(USE_MACA)
+  message(STATUS "MACA support is enabled")
+  include_directories(${MACA_INCLUDE_DIR})
+  if(EXISTS "${MACA_LIB_DIR}")
+    link_directories(${MACA_LIB_DIR})
+  endif()
+endif()
+
+if(NOT DEFINED MC_TANGRT_ROOT OR MC_TANGRT_ROOT STREQUAL "")
+  if(DEFINED ENV{MC_TANGRT_ROOT} AND NOT "$ENV{MC_TANGRT_ROOT}" STREQUAL "")
+    set(MC_TANGRT_ROOT
+        "$ENV{MC_TANGRT_ROOT}"
+        CACHE PATH "Path to Tang runtime root" FORCE)
+  else()
+    set(MC_TANGRT_ROOT
+        "/usr/local/tangrt"
+        CACHE PATH "Path to Tang runtime root" FORCE)
+  endif()
+endif()
+
+if(USE_SUNRISE)
+  add_compile_definitions(USE_SUNRISE)
+  message(STATUS "Sunrise (Tang runtime) support is enabled")
+  include_directories(${MC_TANGRT_ROOT}/include)
+endif()
+
+if(USE_MUSA)
+  add_compile_definitions(USE_MUSA)
+  message(STATUS "MUSA support is enabled")
+  include_directories(/usr/local/musa/include)
+  link_directories(/usr/local/musa/lib)
+endif()
+
+if(USE_HYGON)
+  if(NOT DEFINED DTK_ROOT OR DTK_ROOT STREQUAL "")
+    if(DEFINED ENV{DTK_HOME} AND NOT "$ENV{DTK_HOME}" STREQUAL "")
+      set(DTK_ROOT
+          "$ENV{DTK_HOME}"
+          CACHE PATH "Path to Hygon DTK SDK" FORCE)
+    else()
+      set(DTK_ROOT
+          "/opt/dtk"
+          CACHE PATH "Path to Hygon DTK SDK" FORCE)
+    endif()
+  endif()
+
+  if(NOT DEFINED DTK_INCLUDE_DIR OR DTK_INCLUDE_DIR STREQUAL "")
+    set(DTK_INCLUDE_DIR "${DTK_ROOT}/cuda/cuda-11/include")
+  endif()
+
+  if(NOT DEFINED DTK_LIB_DIR OR DTK_LIB_DIR STREQUAL "")
+    set(DTK_LIB_DIR "${DTK_ROOT}/cuda/cuda-11/lib64")
+  endif()
+
+  add_compile_definitions(USE_HYGON)
+  message(STATUS "Hygon DCU/DTK support is enabled")
+  include_directories(${DTK_INCLUDE_DIR})
+  if(EXISTS "${DTK_LIB_DIR}")
+    link_directories(${DTK_LIB_DIR})
+  endif()
+endif()
+
+if(USE_COREX)
+  if(NOT DEFINED COREX_ROOT OR COREX_ROOT STREQUAL "")
+    if(DEFINED ENV{COREX_HOME} AND NOT "$ENV{COREX_HOME}" STREQUAL "")
+      set(COREX_ROOT
+          "$ENV{COREX_HOME}"
+          CACHE PATH "Path to Iluvatar CoreX SDK" FORCE)
+    else()
+      set(COREX_ROOT
+          "/usr/local/corex"
+          CACHE PATH "Path to Iluvatar CoreX SDK" FORCE)
+    endif()
+  endif()
+
+  if(NOT DEFINED COREX_INCLUDE_DIR OR COREX_INCLUDE_DIR STREQUAL "")
+    set(COREX_INCLUDE_DIR "${COREX_ROOT}/include")
+  endif()
+
+  if(NOT DEFINED COREX_LIB_DIR OR COREX_LIB_DIR STREQUAL "")
+    set(COREX_LIB_DIR "${COREX_ROOT}/lib")
+  endif()
+
+  add_compile_definitions(USE_COREX)
+  message(STATUS "Iluvatar CoreX support is enabled")
+  include_directories(${COREX_INCLUDE_DIR})
+  if(EXISTS "${COREX_LIB_DIR}")
+    link_directories(${COREX_LIB_DIR})
+  endif()
+endif()
+
+# Hylink builds on the HIP runtime; enable it automatically.
+if(USE_HYLINK AND NOT USE_HIP)
+  set(USE_HIP ON)
+endif()
+
+if(USE_HIP)
+  list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
+  find_package(HIP REQUIRED)
+  include_directories(${HIP_INCLUDE_DIRS})
+  add_compile_definitions(USE_HIP __HIP_PLATFORM_AMD__)
+  message(STATUS "HIP support is enabled")
+
+  find_program(HIPIFY_PERL_EXECUTABLE hipify-perl)
+  if(NOT HIPIFY_PERL_EXECUTABLE)
+    message(
+      FATAL_ERROR
+        "hipify-perl not found.\n"
+        "Please ensure the ROCm or HIP SDK is installed and in your PATH.")
+  endif()
+endif()
+
+# This function converts given CUDA source files into HIP-compatible files using
+# hipify-perl, placing the outputs in the build directory for use in project
+# compilation. The file path changes to a new location after hipify.
+function(hipify_files input_var_name)
+  set(result_files)
+
+  foreach(input_file IN LISTS ${input_var_name})
+    file(RELATIVE_PATH rel_path ${CMAKE_SOURCE_DIR} ${input_file})
+    set(output_file "${CMAKE_BINARY_DIR}/${rel_path}")
+
+    get_filename_component(output_dir ${output_file} DIRECTORY)
+    file(MAKE_DIRECTORY ${output_dir})
+
+    add_custom_command(
+      OUTPUT ${output_file}
+      COMMAND ${HIPIFY_PERL_EXECUTABLE} ${input_file} > ${output_file}
+      DEPENDS ${input_file}
+      COMMENT "HIPifying ${input_file} → ${output_file}")
+
+    list(APPEND result_files ${output_file})
+  endforeach()
+
+  set(${input_var_name}
+      ${result_files}
+      PARENT_SCOPE)
+endfunction()
+
+if(USE_CXL)
+  add_compile_definitions(USE_CXL)
+  message(STATUS "CXL support is enabled")
+endif()
+
+if(USE_MPCOMM)
+  if(NOT DEFINED MPCOMM_ROOT)
+    message(
+      FATAL_ERROR
+        "USE_MPCOMM=ON requires MPCOMM_ROOT to point at the MPComm install prefix, e.g. -DMPCOMM_ROOT=/opt/mpcomm"
+    )
+  endif()
+
+  # Oldest MPComm whose ABI this transport is written against, and the major it
+  # is written for - MPComm's own package config declares SameMajorVersion
+  # compatibility, so a different major is an ABI break by its own definition. A
+  # bare find_library() can express neither, since it accepts whatever
+  # libmpcomm.so happens to be on the prefix.
+  #
+  # Queried without a version so that an install that is present but too old is
+  # reported as such, rather than looking the same as no package config at all.
+  #
+  # find_package() also consults an upper-case <PACKAGENAME>_ROOT variable, and
+  # for this package that name is exactly our own MPCOMM_ROOT, which makes CMake
+  # 3.27+ emit a CMP0144 developer warning. Opting into the new behaviour is
+  # what we want anyway - the prefix really is where the package lives - and the
+  # setting is scoped so that no other find_package() is affected.
+  set(MPCOMM_MINIMUM_VERSION 1.4)
+  set(MPCOMM_SUPPORTED_MAJOR 1)
+  if(POLICY CMP0144)
+    cmake_policy(PUSH)
+    cmake_policy(SET CMP0144 NEW)
+  endif()
+  find_package(mpcomm CONFIG QUIET HINTS ${MPCOMM_ROOT})
+  if(POLICY CMP0144)
+    cmake_policy(POP)
+  endif()
+  if(mpcomm_FOUND)
+    if(mpcomm_VERSION VERSION_LESS MPCOMM_MINIMUM_VERSION)
+      message(
+        FATAL_ERROR
+          "MPComm ${mpcomm_VERSION} found under MPCOMM_ROOT=${MPCOMM_ROOT} is too old; this transport requires >= ${MPCOMM_MINIMUM_VERSION}"
+      )
+    endif()
+    if(NOT mpcomm_VERSION_MAJOR EQUAL MPCOMM_SUPPORTED_MAJOR)
+      message(
+        FATAL_ERROR
+          "MPComm ${mpcomm_VERSION} has major ${mpcomm_VERSION_MAJOR}, but this transport is written against major ${MPCOMM_SUPPORTED_MAJOR}; MPComm declares SameMajorVersion compatibility, so this is an ABI break"
+      )
+    endif()
+  endif()
+
+  find_path(MPCOMM_INCLUDE_DIR mpcomm.h HINTS ${MPCOMM_ROOT}/include)
+  # Resolve to an absolute library path instead of relying on -L/-l. Link
+  # directories are usage requirements and get stripped when a dependency is
+  # consumed through $<LINK_ONLY:...> (mooncake_store links transfer_engine
+  # PRIVATE, so mooncake_master would otherwise see -lmpcomm without the
+  # matching -L). An absolute path survives that stripping.
+  find_library(MPCOMM_LIBRARY mpcomm HINTS ${MPCOMM_ROOT}/lib
+                                           ${MPCOMM_ROOT}/lib64)
+  if(NOT MPCOMM_INCLUDE_DIR OR NOT MPCOMM_LIBRARY)
+    message(
+      FATAL_ERROR
+        "MPComm not found under MPCOMM_ROOT=${MPCOMM_ROOT} (expected ${MPCOMM_ROOT}/include/mpcomm.h and ${MPCOMM_ROOT}/lib/libmpcomm.so)"
+    )
+  endif()
+  add_compile_definitions(USE_MPCOMM)
+  message(STATUS "MPComm transport is enabled")
+  message(STATUS "  MPComm include: ${MPCOMM_INCLUDE_DIR}")
+  message(STATUS "  MPComm library: ${MPCOMM_LIBRARY}")
+  if(mpcomm_FOUND)
+    message(STATUS "  MPComm version: ${mpcomm_VERSION}")
+  else()
+    # No package config under the prefix - for example a tree where only the
+    # headers and the library were copied into place. Say so rather than imply
+    # the version was verified: the transport still builds, but an ABI mismatch
+    # would then only surface at run time.
+    message(
+      STATUS
+        "  MPComm version: unknown (no CMake package config under ${MPCOMM_ROOT}; requires >= ${MPCOMM_MINIMUM_VERSION})"
+    )
+  endif()
+endif()
+
+if(USE_TCP)
+  add_compile_definitions(USE_TCP)
+endif()
+
+if(USE_MEMFABRIC)
+  add_compile_definitions(USE_MEMFABRIC)
+  message(STATUS "memfabric transport is enabled")
+endif()
+
+if(USE_BAREX)
+  add_compile_definitions(USE_BAREX)
+endif()
+
+if(USE_ASCEND
+   OR USE_ASCEND_DIRECT
+   OR USE_UBSHMEM
+   OR USE_MEMFABRIC)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DOPEN_BUILD_PROJECT ")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DOPEN_BUILD_PROJECT ")
+  string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" CURRENT_CPU)
+  set(CPU_ARCH "unknown")
+  if(CURRENT_CPU MATCHES "^(aarch64|arm64)$")
+    set(CPU_ARCH "aarch64")
+  elseif(CURRENT_CPU MATCHES "^(x86_64|amd64)$")
+    set(CPU_ARCH "x86_64")
+  else()
+    message(WARNING "Unsupported cpu arch.")
+  endif()
+  if(DEFINED ENV{ASCEND_HOME_PATH})
+    message(STATUS "Use env ASCEND_HOME_PATH")
+    file(GLOB ASCEND_TOOLKIT_ROOT "$ENV{ASCEND_HOME_PATH}/${CPU_ARCH}-linux")
+  else()
+    file(GLOB ASCEND_TOOLKIT_ROOT
+         "/usr/local/Ascend/ascend-toolkit/latest/${CPU_ARCH}-linux")
+  endif()
+  set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
+  set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
+  add_compile_options(-Wno-ignored-qualifiers)
+  include_directories(/usr/local/include /usr/include ${ASCEND_INCLUDE_DIR})
+  link_directories(${ASCEND_LIB_DIR})
+endif()
+
+if(USE_ASCEND)
+  set(ASCEND_DEVLIB_DIR "${ASCEND_TOOLKIT_ROOT}/devlib")
+  link_directories(${ASCEND_DEVLIB_DIR})
+  add_compile_definitions(USE_ASCEND)
+endif()
+
+if(USE_ASCEND_DIRECT)
+  set(BUILD_SHARED_LIBS ON)
+  add_compile_definitions(USE_ASCEND_DIRECT)
+endif()
+
+if(USE_UBSHMEM)
+  set(BUILD_SHARED_LIBS ON)
+  add_compile_definitions(USE_UBSHMEM)
+endif()
+
+if(USE_ASCEND_HETEROGENEOUS)
+  file(GLOB ASCEND_TOOLKIT_ROOT
+       "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+  set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
+  set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
+  add_compile_definitions(USE_ASCEND_HETEROGENEOUS)
+  include_directories(/usr/local/include /usr/include ${ASCEND_INCLUDE_DIR})
+  link_directories(${ASCEND_LIB_DIR})
+endif()
+
+if(USE_REDIS)
+  add_compile_definitions(USE_REDIS)
+  message(STATUS "Redis as metadata server support is enabled")
+endif()
+
+if(USE_HTTP)
+  add_compile_definitions(USE_HTTP)
+  message(STATUS "Http as metadata server support is enabled")
+endif()
+
+if(NOT USE_ETCD
+   AND NOT USE_REDIS
+   AND NOT USE_HTTP)
+  message(
+    STATUS
+      "None of USE_ETCD, USE_REDIS, USE_HTTP is selected, only \"P2PHANDSHAKE\" is supported as metadata server"
+  )
+endif()
+
+if(WITH_METRICS)
+  add_compile_definitions(WITH_METRICS)
+  message(STATUS "metrics is enabled")
+endif()
+
+if(USE_3FS)
+  add_compile_definitions(USE_3FS)
+  message(STATUS "3FS storage backend is enabled")
+endif()
+
+if(EXISTS "/usr/include/boost1.78")
+  include_directories(SYSTEM "/usr/include/boost1.78")
+  link_directories("/usr/lib64/boost1.78")
+endif()
+
+set(GFLAGS_USE_TARGET_NAMESPACE "true")
+find_package(yaml-cpp REQUIRED)
+find_package(gflags REQUIRED)
+if(NOT TARGET gflags::gflags)
+  foreach(_gflags_target gflags-shared gflags_shared gflags)
+    if(TARGET ${_gflags_target})
+      add_library(gflags::gflags INTERFACE IMPORTED)
+      set_target_properties(gflags::gflags PROPERTIES INTERFACE_LINK_LIBRARIES
+                                                      ${_gflags_target})
+      break()
+    endif()
+  endforeach()
+endif()
+
+set(GH_MIRROR "")
+if(DEFINED ENV{ASCEND_GITHUB_MIRROR_URLS})
+  set(GH_MIRROR $ENV{ASCEND_GITHUB_MIRROR_URLS})
+endif()
+if(GH_MIRROR)
+  message(STATUS "Using Github mirror: ${GH_MIRROR}")
+endif()
+
+include(${CMAKE_CURRENT_LIST_DIR}/FindYLT.cmake)
+
+option(USE_FLAGCX "option for using FlagCX-backed transport (cross-vendor CCL)"
+       OFF)
+if(USE_FLAGCX)
+  if(NOT FLAGCX_HOME)
+    if(DEFINED ENV{FLAGCX_HOME})
+      set(FLAGCX_HOME $ENV{FLAGCX_HOME})
+    else()
+      set(FLAGCX_HOME "$ENV{HOME}/FlagCX/build")
+    endif()
+  endif()
+  find_path(
+    FLAGCX_INCLUDE_DIR
+    NAMES flagcx_p2p.h
+    HINTS "${FLAGCX_HOME}/include")
+  find_library(
+    FLAGCX_LIBRARY
+    NAMES flagcx
+    HINTS "${FLAGCX_HOME}/lib" "${FLAGCX_HOME}/lib64")
+  if(NOT FLAGCX_INCLUDE_DIR)
+    message(
+      FATAL_ERROR
+        "USE_FLAGCX=ON but flagcx_p2p.h was not found (set -DFLAGCX_HOME=...)")
+  endif()
+  if(NOT FLAGCX_LIBRARY)
+    message(
+      FATAL_ERROR
+        "USE_FLAGCX=ON but the FlagCX library was not found (set -DFLAGCX_HOME=...)"
+    )
+  endif()
+  if(NOT TARGET FlagCX::flagcx)
+    add_library(FlagCX::flagcx UNKNOWN IMPORTED)
+    set_target_properties(
+      FlagCX::flagcx
+      PROPERTIES IMPORTED_LOCATION "${FLAGCX_LIBRARY}"
+                 INTERFACE_INCLUDE_DIRECTORIES "${FLAGCX_INCLUDE_DIR}")
+  endif()
+  include_directories(${FLAGCX_INCLUDE_DIR})
+  add_compile_definitions(USE_FLAGCX)
+  message(
+    STATUS
+      "FlagCX transport enabled, include=${FLAGCX_INCLUDE_DIR}, library=${FLAGCX_LIBRARY}"
+  )
+endif()
+
+if(USE_SHCA)
+  add_compile_definitions(USE_SHCA)
+elseif(YLT_ENABLE_IBV)
+  # YLT_ENABLE_IBV is set in FindYLT.cmake (OFF on macOS).
+  add_compile_definitions(YLT_ENABLE_IBV)
+endif()
+
+if(USE_HYLINK)
+  add_compile_definitions(USE_HYLINK)
+  message(STATUS "Hylink transport is enabled")
+endif()

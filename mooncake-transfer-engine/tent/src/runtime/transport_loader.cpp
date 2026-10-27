@@ -1,0 +1,181 @@
+// Copyright 2024 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "tent/runtime/transfer_engine_impl.h"
+#include "tent/transport/shm/shm_transport.h"
+#include "tent/transport/tcp/tcp_transport.h"
+#include "tent/transport/hp_tcp/hp_tcp_transport.h"
+
+#ifdef USE_RDMA
+#include "tent/transport/rdma/rdma_transport.h"
+#endif
+
+#ifdef USE_UB
+#include "tent/transport/ub/ub_transport.h"
+#endif
+
+#ifdef USE_CUDA
+#include "tent/transport/nvlink/nvlink_transport.h"
+#include "tent/transport/mnnvl/mnnvl_transport.h"
+#endif
+
+#ifdef USE_GDS
+#include "tent/transport/gds/gds_transport.h"
+#endif
+
+#ifdef USE_URING
+#include "tent/transport/io_uring/io_uring_transport.h"
+#endif
+
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#include "tent/transport/ascend/ascend_direct_transport.h"
+#endif
+
+#ifdef USE_SUNRISE
+#include "tent/transport/sunrise_link/sunrise_link_transport.h"
+#endif
+
+#ifdef USE_TPU
+#include "tent/transport/tpu/tpu_transport.h"
+#endif
+
+#ifdef USE_MLU
+#include "tent/transport/mlu/mlu_transport.h"
+#endif
+
+#ifdef USE_XPU
+#include "tent/transport/xpu/xpu_transport.h"
+#endif
+
+#ifdef USE_MPCOMM
+#include "tent/transport/mpcomm/mpcomm_transport.h"
+#endif
+
+#ifdef USE_HYLINK
+#include "tent/transport/hylink/hylink_transport.h"
+#endif
+
+#ifdef USE_FABRIC
+#include "tent/transport/fabric/fabric_transport.h"
+#endif
+
+#ifdef USE_MEMFABRIC
+#include "tent/transport/memfabric/memfabric_transport.h"
+#endif
+
+namespace mooncake {
+namespace tent {
+
+Status TransferEngineImpl::loadTransports() {
+    if (conf_->get("transports/tcp/enable", true))
+        transport_list_[TCP] = std::make_shared<TcpTransport>();
+
+    if (hp_tcp_transport_config_.enabled)
+        transport_list_[HP_TCP] = std::make_shared<HighPerformanceTcpTransport>(
+            hp_tcp_transport_config_.params);
+
+    // SHM is opt-in: default false because the current path is not NUMA-aware
+    // (see tent/config/transfer-engine.json for an example that enables it).
+    if (conf_->get("transports/shm/enable", false))
+        transport_list_[SHM] = std::make_shared<ShmTransport>();
+
+#ifdef USE_RDMA
+    if (conf_->get("transports/rdma/enable", true) &&
+        topology_->getNicCount(Topology::NIC_RDMA)) {
+        transport_list_[RDMA] = std::make_shared<RdmaTransport>();
+    }
+#endif
+
+#ifdef USE_UB
+    if (conf_->get("transports/ub/enable", false) &&
+        topology_->getNicCount(Topology::NIC_UB)) {
+        transport_list_[UB] = std::make_shared<UbTransport>();
+    }
+#endif
+
+#ifdef USE_URING
+    if (conf_->get("transports/io_uring/enable", true))
+        transport_list_[IOURING] = std::make_shared<IOUringTransport>();
+#endif
+
+#ifdef USE_CUDA
+    bool enable_mnnvl = getenv("MC_ENABLE_MNNVL") != nullptr;
+    if (enable_mnnvl) {
+        if (conf_->get("transports/mnnvl/enable", true))
+            transport_list_[MNNVL] = std::make_shared<MnnvlTransport>();
+    } else {
+        if (conf_->get("transports/nvlink/enable", true))
+            transport_list_[NVLINK] = std::make_shared<NVLinkTransport>();
+    }
+#endif
+
+#ifdef USE_GDS
+    if (conf_->get("transports/gds/enable", false))
+        transport_list_[GDS] = std::make_shared<GdsTransport>();
+#endif
+
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+    if (conf_->get("transports/ascend_direct/enable", true)) {
+        transport_list_[AscendDirect] =
+            std::make_shared<AscendDirectTransport>();
+    }
+#endif
+
+#ifdef USE_SUNRISE
+    if (conf_->get("transports/sunrise_link/enable", true)) {
+        transport_list_[SUNRISE_LINK] =
+            std::make_shared<SunriseLinkTransport>();
+    }
+#endif
+
+#ifdef USE_TPU
+    if (conf_->get("transports/tpu/enable", true))
+        transport_list_[TPU] = std::make_shared<TpuTransport>();
+#endif
+
+#ifdef USE_MLU
+    if (conf_->get("transports/mlu/enable", true))
+        transport_list_[MLU] = std::make_shared<MluTransport>();
+#endif
+
+#ifdef USE_XPU
+    if (conf_->get("transports/xpu/enable", true))
+        transport_list_[XPU] = std::make_shared<XpuTransport>();
+#endif
+
+#ifdef USE_MPCOMM
+    if (conf_->get("transports/mpcomm/enable", true))
+        transport_list_[MPCOMM] = std::make_shared<MpcommTransport>();
+#endif
+
+#ifdef USE_HYLINK
+    if (conf_->get("transports/hylink/enable", false))
+        transport_list_[HYLINK] = std::make_shared<HylinkTransport>();
+#endif
+
+#ifdef USE_FABRIC
+    if (conf_->get("transports/fabric/enable", true))
+        transport_list_[FABRIC] = std::make_shared<FabricTransport>();
+#endif
+
+#ifdef USE_MEMFABRIC
+    if (conf_->get("transports/memfabric/enable", false))
+        transport_list_[MEMFABRIC] = std::make_shared<MemFabricTransport>();
+#endif
+
+    return Status::OK();
+}
+
+}  // namespace tent
+}  // namespace mooncake

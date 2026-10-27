@@ -1,0 +1,308 @@
+# Troubleshooting
+
+This document lists common errors that may occur when using Mooncake Store and provides troubleshooting and resolution measures.
+
+> **CheckList**
+> - [ ] `connectable_name` is not the local machine's LAN/WAN address, such as the loopback address (`127.0.0.1`/`localhost`) and address of other machines.
+> - [ ] Incorrect MTU and GID configurations. Use the environment variables MC_MTU and MC_GID_INDEX.
+> - [ ] Incorrect RDMA device name and connection status is not active.
+> - [ ] etcd is not started normally and it is not bind with `0.0.0.0`.
+
+## TENT Configuration Load Failures
+
+`MC_TENT_CONF` accepts inline JSON or a configuration file path. Malformed JSON,
+an unreadable file, or a missing path prevents TENT from starting, including
+when vLLM's `MooncakeConnector` enables TENT through `MC_USE_TENT`.
+The log reports `Failed to construct Transfer Engine instance` with the
+configuration loading error. Check the JSON syntax and ensure the file exists
+and is readable in the worker's environment before retrying startup.
+
+The native `TransferEngine(config_path)` constructor also rejects missing or
+malformed files: `available()` stays false and no RPC server is started. Valid
+environment defaults do not rescue a failed explicit file load.
+
+## Corrupted Data or Garbled Output
+
+Use object-level checksum diagnostics when a full-object Mooncake Store read returns corrupted data or the application produces garbled output that may originate from stored data. Deploy checksum-capable Mooncake Store client, primary master, and standby master binaries from the same version, then set `MOONCAKE_STORE_CHECKSUM=1` before starting every writer and reader client process:
+
+```bash
+export MOONCAKE_STORE_CHECKSUM=1
+```
+
+Reproduce the issue with full-object `put`/`upsert` and `get` operations. The writer computes a CRC-64 checksum over the source object before transfer, and the reader verifies the logical `object_size` bytes returned by `get`. Range reads, including `get_into_ranges`, are not verified.
+
+`CHECKSUM_MISMATCH` (-801) proves that the bytes returned by the covered `get` differ from the bytes checksummed before the corresponding write. Treat the read as failed and do not use the destination buffer. It does not identify whether the corruption occurred during transfer, storage, or another covered Store stage.
+
+An enabled reader skips verification when the object's metadata has no checksum, such as an object written by a client with the switch disabled or restored from an older snapshot. This case is logged as `object_checksum_absent` at VLOG(1). A successful read without a mismatch therefore does not prove that checksum verification occurred, and a verified Store read does not rule out corruption introduced elsewhere in the application.
+
+Checksum diagnostics add a full data scan to writes and reads, perform device-to-host staging for GPU buffers, and disable the local hot cache. Disable the switch after diagnosis. See the [Mooncake Store Deployment and Tuning Guide](../deployment/mooncake-store-deployment-guide.md) for deployment and snapshot compatibility details.
+
+## Metadata and Out-of-Band Communication
+
+### TENT Configuration Parse Diagnostics
+
+JSON parse errors report a parser code and byte position without echoing the
+configuration's input tokens. Check the original `MC_TENT_CONF` value or file
+privately at that position. Errors from probing an inline configuration as a
+filename report the filesystem error without printing the configuration.
+Numeric parsing failures also omit the input literal. Review other log fields
+and attachments for sensitive data before sharing them.
+
+1. At startup, a `TransferMetadata` object is constructed according to the incoming `metadata_server` parameter. During program execution, this object is used to communicate with the etcd server to maintain internal data required for connection.
+2. At startup, the current node is registered with the cluster according to the incoming `connectable_name` parameter and `rpc_port` parameter, and the TCP port specified by the `rpc_port` parameter is listened. Before other nodes send the first read/write request to the current node, they will use the above information, resolve DNS, and initiate a connection through socket's `connect()` method.
+
+Errors in this part usually indicate that the error occurred within the `mooncake-transfer-engine/src/transfer_metadata.cpp` file.
+
+### Recommended Troubleshooting Directions
+1. The incoming `metadata_server` parameter is not a valid and reachable etcd server address (or a group of addresses). In this case, an `Error from etcd client` error will be displayed. It is recommended to investigate from the following aspects:
+    - After installing the etcd service, the default listening IP is 127.0.0.1, which other nodes cannot use. Therefore, the actual listening IP should be determined in conjunction with the network environment. In the experimental environment, 0.0.0.0 can be used. For example, the following command line can be used to start the required service:
+      ```bash
+      # This is 10.0.0.1
+      etcd --listen-client-urls http://0.0.0.0:2379  --advertise-client-urls http://10.0.0.1:2379
+      ```
+      You can verify this on other nodes using `curl <metadata_server>`.
+    - HTTP proxies need to be disabled before starting the program.
+      ```bash
+      unset http_proxy
+      unset https_proxy
+      ```
+
+2. Other nodes cannot establish a socket out-of-band communication with the current node through the incoming `connectable_name` parameter and `rpc_port` parameter to implement connection establishment operations. The types of errors in this case may include:
+    - A `bind address already in use` error is displayed when starting the process, usually because the port number corresponding to the `rpc_port` parameter is occupied. Try using another port number.
+    - Another node displays a `connection refused` type of error when initiating a Batch Transfer to the current node, which requires a focus on checking the correctness of these two parameters when the current node is created.
+      - `connectable_name` must be a non-Loopback IP address of the current node or a valid Hostname (with records in DNS or `/etc/hosts`), and other nodes in the cluster can use `connectable_name` and `rpc_port` parameters to connect to the current node.
+      - There may be firewall mechanisms in some networks that need to be added to the whitelist in advance.
+    - If the correspondence between `local_server_name` and `connectable_name`/`rpc_port` parameters changes and various errors occur, you can try clearing the etcd database and restarting the cluster.
+
+## RDMA Resource Initialization
+
+1. At startup, all RDMA network cards corresponding to the incoming `nic_priority_matrix` parameter are initialized, including device contexts and other internal objects.
+2. Before other nodes send the first read/write request to the current node, they will exchange GID, LID, QP Num, etc., through out-of-band communication mechanisms and complete the establishment of RDMA reliable connection paths.
+
+Errors in this part usually indicate that the error occurred within the `mooncake-transfer-engine/src/transport/rdma_transport/rdma_*.cpp` files.
+
+### Recommended Troubleshooting Directions
+1. If the error `No matched device found` is displayed, check if there are any network card names in the `nic_priority_matrix` parameter that do not exist on the machine. You can use the `ibv_devinfo` command to view the list of installed network cards on the machine.
+2. If the error `Device XXX port not active` is displayed, it indicates that the default RDMA Port of the corresponding device (RDMA device port, to be distinguished from the `rpc_port` TCP port) is not in the ACTIVE state. This is usually due to RDMA cables not being installed properly or the driver not being configured correctly. You can use the `MC_IB_PORT` environment variable to change the default RDMA Port used.
+3. If both the error `Worker: Cannot make connection for endpoint` and `Failed to exchange handshake description` are displayed, it indicates that the two parties cannot establish a reliable RDMA connection path. In most cases, it is usually due to incorrect configuration on one side or the inability of both parties to reach each other. First, use tools like `ib_send_bw` to confirm the reachability of the two nodes and pay attention to the output of GID, LID, MTU, and other parameter information. Then, analyze the possible error points based on the error message:
+    1. After starting, the log output usually includes several lines of log information like `RDMA device: XXX, LID: XXX, GID: (X) XX:XX:XX:...`. If the displayed GID address is all 0 (the bracket indicates GID Index), you need to choose the correct GID Index according to the network environment and specify it at startup using the `MC_GID_INDEX` environment variable.
+    2. If the error `Failed to modify QP to RTR, check mtu, gid, peer lid, peer qp num` is displayed, first determine which party the error occurred on. If there is no prefix `Handshake request rejected by peer endpoint: `, it indicates that the problem comes from the party displaying the error. According to the error message, you need to check the MTU length configuration (adjust using the `MC_MTU` environment variable), whether your own and the other party's GID addresses are valid, etc. At the same time, if the two nodes cannot achieve physical connection, it may also be hang/interrupted at this step, please pay attention.
+
+4. If you encounter an error like `Failed to register memory 0x7efb94000000: Input/output error [5]`, this may indicate that RDMA memory registration has failed. This is usually caused by device limitations where some machines can only register a maximum of 64GB of memory. When the registration exceeds this limit, it will fail.
+
+   **Diagnostic Commands:**
+   - Use `ulimit -a` to check system limits, particularly the `max locked memory` value
+   - Use `ibv_devinfo -v` to check RDMA device capabilities, especially the `max_mr_size` field
+   - Use `dmesg -T` to view detailed failure logs, which may show messages like:
+     ```
+     [Wed Jul 30 11:49:18 2025] infiniband erdma_0: ERROR: Out of mr size: 0, max 68719476736
+     ```
+
+   **Solution:**
+   Ensure that the total memory registration does not exceed the device's upper limit. You may need to reduce the amount of memory being registered or split large memory regions into smaller chunks that fit within the device's `max_mr_size` limit.
+
+5. If you encounter `Failed to register memory 0x...: Resource temporarily unavailable [11]` and kernel logs show `CREATE_MKEY failed, status no resources(0xf)`, this indicates that the RDMA NIC has exhausted its internal Memory Key (MKEY) resources, even though `ulimit -l` and `vm.max_map_count` may appear sufficient.
+
+   This typically happens when:
+   - Applications that use RDMA (e.g., SGLang with HiCache + Mooncake) have crashed or been killed multiple times without cleanly releasing RDMA resources.
+   - The leaked MKEY entries accumulate in the NIC firmware and are not reclaimed by the kernel, eventually hitting the hardware limit.
+   - Large memory regions (e.g., NSA indexer buffers at ~4.68 GB each across multiple TP ranks) amplify the problem since each registration consumes more internal NIC resources.
+
+   **Diagnostic Commands:**
+   ```bash
+   # Check current RDMA resource usage per device
+   rdma resource show
+
+   # Check kernel logs for CREATE_MKEY failures
+   dmesg | grep -i "CREATE_MKEY\|no resources\|mlx5_cmd_out_err"
+   # Example output:
+   # mlx5_core 0000:65:01.0: mlx5_cmd_out_err:829:(pid 3958462): CREATE_MKEY(0x200) op_mod(0x0) failed, status no resources(0xf), syndrome (0x2aac7c), err(-11)
+
+   # Ensure vm.max_map_count is large enough (default 65530 may be too small)
+   sysctl vm.max_map_count
+   ```
+
+   **Solutions:**
+   - **Reboot the node** to fully reset NIC firmware state and reclaim all leaked MKEY resources. This is the most reliable fix.
+   - Increase `vm.max_map_count` if it is at the default value: `sysctl -w vm.max_map_count=16777216`
+   - Ensure applications shut down cleanly (avoid `kill -9` when possible) so RDMA resources are properly deregistered.
+   - If rebooting is not feasible, try unloading and reloading the mlx5 kernel modules (may disrupt other services):
+     ```bash
+     modprobe -r mlx5_ib mlx5_core && modprobe mlx5_core mlx5_ib
+     ```
+
+6. If you encounter errors indicating inability to allocate memory space when requesting large memory regions, this may be due to ulimit restrictions. When the total memory requirement (number of registered RDMA devices × requested space) exceeds the ulimit, the system will display errors about failing to allocate space.
+
+   **Diagnostic Commands:**
+   - Use `ulimit -a` to check current limits, particularly the `max locked memory` value
+   - Calculate total memory requirement: number of RDMA devices × requested space per device
+   - Verify if the total requirement exceeds the ulimit
+
+   **Solutions:**
+   - Switch to a higher privilege level (root) to bypass ulimit restrictions
+   - Modify ulimit settings: use `ulimit -l unlimited` to remove locked memory limits (may require root privileges)
+   - Start multiple store instances with smaller memory allocations that stay within ulimit constraints
+   - Add permanent ulimit configuration in `/etc/security/limits.conf`:
+     ```
+     *    soft    memlock    unlimited
+     *    hard    memlock    unlimited
+     ```
+
+7. If the error `Failed to create QP: Cannot allocate memory` is displayed, it is typically caused by too many QP have been created, reaching the driver limit. You can use `rdma resource` to trace how many QP is created. Possible ways to resolve this issue:
+   - Update Mooncake to version v0.3.5 or later
+   - Set the environment variable `MC_ENABLE_DEST_DEVICE_AFFINITY=1` before starting the application
+   - If the leak persists under sustained peer failures (many `endpoint evicted` log lines accompanying the QP growth), update to a version that includes the fix for [issue #1845](https://github.com/kvcache-ai/Mooncake/issues/1845). Prior to that fix, the endpoint store's `waiting_list_` only drained when new endpoints were inserted, so evictions under failure load accumulated QPs until the driver limit was hit. The fix adds a periodic reclaim tick to `monitorWorker`.
+
+8. If you encounter `Failed to register memory 0x...: Bad address [14]` when registering **GPU** memory (for example a vLLM or SGLang KV cache), usually followed by `Memory region not registered by any active device(s)` and `AddressNotRegistered` on every transfer, Mooncake is registering GPU memory with the legacy `ibv_reg_mr` path, which needs the `nvidia-peermem` kernel module. This is the default while `WITH_NVIDIA_PEERMEM` is unset.
+
+   **Diagnostic Commands:**
+   ```bash
+   # Is nvidia-peermem loaded? (no output: it is not)
+   lsmod | grep nvidia_peermem
+
+   # Open kernel modules? DMA-BUF needs them (and Linux >= 5.12)
+   cat /proc/driver/nvidia/version    # "Open Kernel Module" in the first line
+   ```
+
+   **Solutions:**
+   - Set `WITH_NVIDIA_PEERMEM=0` before starting Mooncake to register GPU memory through DMA-BUF (`cuMemGetHandleForAddressRange` + `ibv_reg_dmabuf_mr`), which does not need `nvidia-peermem`. This also works on MIG GPU instances.
+   - Or install and load `nvidia-peermem` (it requires MLNX_OFED or DOCA-OFED) and keep the legacy path.
+
+## RDMA Transfer Period
+### Recommended Troubleshooting Directions
+
+If the network state is unstable, some requests may not be delivered, displaying errors like `Worker: Process failed for slice`. Transfer Engine can avoid problems by reselecting paths, etc. In some complex cases, if a large number of such errors are output continuously, it is recommended to search for the cause of the problem according to the string prompt of the last field.
+
+Note: In most cases, the errors output, except for the first occurrence, are `work request flushed error`. This is because when the first error occurs, the RDMA driver sets the connection to an unavailable state, so tasks in the submission queue are blocked from execution and subsequent errors are reported. Therefore, it is recommended to locate the first occurrence of the error and check it.
+
+In addition, if the error `Failed to get description of XXX` is displayed, it indicates that the Segment name input by the user when calling the `openSegment` interface cannot be found in the etcd database. For memory read/write scenarios, the Segment name needs to strictly match the `local_hostname` field filled in by the other node during initialization.
+
+## TCP Transport
+### Recommended Troubleshooting Directions
+
+1. If sustained, high-concurrency TCP traffic (for example, PD-disaggregated KV transfers over the TCP transport) fails with `connect: Cannot assign requested address`, the initiator side has exhausted its ephemeral port range. Each transfer opens a fresh short-lived socket, and ports held in `TIME_WAIT` accumulate faster than the kernel can reclaim them.
+
+   **Diagnostic Commands:**
+   ```bash
+   # Confirm large numbers of TIME_WAIT sockets to the peer
+   ss -tan state time-wait | wc -l
+
+   # Check the local ephemeral port range
+   sysctl net.ipv4.ip_local_port_range
+   ```
+
+   **Solutions:**
+   - Keep the TCP connection pool enabled so that long-lived sockets are reused across transfers instead of being opened per transfer. The pool is on by default in current builds; if it was explicitly disabled, re-enable it by removing the opt-out:
+     ```bash
+     unset MC_TCP_ENABLE_CONNECTION_POOL   # or stop setting it to 0
+     ```
+     On older builds where the pool is still opt-in, enable it with `export MC_TCP_ENABLE_CONNECTION_POOL=1`.
+   - Widen the ephemeral port range if the workload genuinely needs many distinct connections:
+     ```bash
+     sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+     ```
+   - As a last resort, enable `TIME_WAIT` reuse on the initiator. `tcp_tw_reuse` only affects outbound connections and requires TCP timestamps to be enabled on both sides:
+     ```bash
+     sysctl -w net.ipv4.tcp_tw_reuse=1
+     ```
+
+2. The TCP connection pool is enabled by default (`MC_TCP_ENABLE_CONNECTION_POOL=0` opts out). The current lane-based implementation has none of the failure modes the old dynamic pool had here before; its actual operational caveats are:
+
+   * **Lane sockets are kept open for the life of the process.** There is no idle reaping, so a long-lived initiator holds up to `MC_TCP_LANES_PER_PEER` (default 4) sockets per peer. That is bounded per peer, but the total grows with the number of distinct peers the process talks to.
+
+     **Diagnostic Commands:**
+     ```bash
+     # Watch open socket count from the process
+     ls /proc/$PID/fd | wc -l
+     ss -tan | awk '$1=="ESTAB"' | wc -l
+     ```
+
+   * **Reused sockets are not probed before a transfer.** A connection that a middlebox silently dropped while idle surfaces as a stall on the next transfer (TCP retransmission timeout) rather than a fast reconnect. Same-datacenter peers are unaffected in practice; if your initiators reach peers across a NAT or firewall with aggressive idle expiry, keep the pool opted out or shorten the idle gap below the middlebox timeout.
+   * A connection whose protocol stream went dirty is closed instead of reused, and a failed lane is retried on a cooldown, so a restarted peer costs at most the transfer that was in flight.
+
+## Intel XPU Transfers
+
+- **No Intel GPU is visible:** In the same shell or container as the client,
+  run `source /opt/intel/oneapi/setvars.sh`, then check that `sycl-ls` lists a
+  Level Zero GPU. An OpenCL CPU device alone does not provide GPU support.
+- **XPU buffers are not handled:** Use an {ref}`XPU-enabled build
+  <build-with-intel-xpu>`; the default wheels do not include XPU support. Set
+  `MC_USE_TENT=1` before constructing the engine or store.
+- **Choosing a protocol:** `xpu` is a local transport (host staging and
+  same-node XPU copies), not a network protocol. Pass `tcp` or `rdma` to Store
+  setup; see {ref}`Intel XPU Transport <intel-xpu-transport>`.
+- **Same-node transfers still use the network:** Check that both processes
+  are in the same PID namespace, that the copying device has peer access to
+  the device holding the buffer, and that `/proc/sys/kernel/yama/ptrace_scope`
+  is 0 or 1 (`CAP_SYS_PTRACE` covers scope 2 only; scope 3 always falls back).
+  Also check that `transports/xpu/disable_ipc` is not `true`, and that any
+  selector policy with a `transports` list includes `"xpu"` ahead of `"rdma"`.
+
+## Memory Allocator
+
+Mooncake Store's mmap arena is opt-in for mmap buffer allocations. Setting `MC_MMAP_ARENA_POOL_SIZE` explicitly enables it and pre-allocates a hugepage-backed pool; if it is enabled via gflag instead, the default pool size is `8gb`. If the arena cannot allocate hugepages, it falls back to regular pages automatically.
+
+If you encounter memory allocation issues related to the arena:
+
+- **HugeTLB pool is too small for the launch:** Run `python3 scripts/check_hicache_hugepage_requirements.py ...` from a source checkout, or `mooncake-hicache-sizing ...` inside the Docker image, using your `--hicache-size`, `MOONCAKE_GLOBAL_SEGMENT_SIZE`, and `MC_MMAP_ARENA_POOL_SIZE` values. If it reports `insufficient_for_baseline`, increase `vm.nr_hugepages`, reduce `--hicache-size`, or shrink `MOONCAKE_GLOBAL_SEGMENT_SIZE`.
+- **Arena pool too large for available hugepages:** Reduce the pool size with `MC_MMAP_ARENA_POOL_SIZE="8gb"` to fit within your hugepage budget, or leave `MC_MMAP_ARENA_POOL_SIZE` unset to stay on the baseline direct-`mmap()` path.
+- **Arena only partially fits:** If the helper reports `baseline_fits_arena_may_fallback`, the baseline should start but some arena allocations may spill onto regular pages. Either increase `vm.nr_hugepages` or reduce `MC_MMAP_ARENA_POOL_SIZE`.
+- **Need to disable the arena entirely:** Set `MC_DISABLE_MMAP_ARENA=1` (also accepts `true`, `yes`, or `on`) before the first Mooncake mmap-buffer allocation to fall back to per-call `mmap()`.
+- **Arena init failed once and the process stayed on the baseline path:** Arena initialization is lazy and one-shot per process. After a failed first attempt, Mooncake keeps using direct `mmap()` until the process restarts. Fix the env / hugepage budget, then restart the process before retrying.
+- **Arena OOM during serving:** The arena logs a warning and falls back to direct `mmap()` for that allocation. If this happens frequently, increase `MC_MMAP_ARENA_POOL_SIZE`.
+- **Direct hugepage mmap fails immediately:** Verify the host really has hugepages reserved with `grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo`. When `MC_STORE_USE_HUGEPAGE=1` is set, direct `mmap()` allocations depend on the OS HugeTLB pool.
+
+To provision `2 MiB` hugepages on Linux:
+
+```bash
+sudo sysctl -w vm.nr_hugepages=49152
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+printf 'vm.nr_hugepages=49152\n' | sudo tee /etc/sysctl.d/90-mooncake-hugepages.conf
+sudo sysctl --system
+```
+
+`49152` pages equals `96 GiB`; for `512 GiB` use `262144` pages.
+
+## SGLang Common Questions
+
+### Do I need RDMA to run SGLang and Mooncake?
+
+When using Mooncake for KV cache transfer in SGLang PD disaggregation deployments, GPUDirect RDMA (GDR) is required.
+
+When using Mooncake as a KV cache storage backend in SGLang HiCache, RDMA is recommended for better performance.
+However, if RDMA NICs are not available, the TCP protocol is also supported.
+
+### How to make sure GPUDirect RDMA (GDR) is supported
+
+1. Verify the presence of an RDMA-capable NIC (e.g., Mellanox, ERDMA) and drivers.
+```
+ibv_devices
+lspci | grep rdma
+lsmod | grep -E 'ib_core|mlx4_core|mlx5_core|nvidia_peer_mem'
+```
+If no RDMA devices appear: (1) Confirm physical NIC presence via lspci
+(2) Install vendor-specific drivers (e.g., Mellanox MLNX_OFED)
+
+2. check GDR driver is ready. With the legacy `ibv_reg_mr` path (the default while `WITH_NVIDIA_PEERMEM` is unset), the peer_memory module (part of MLNX_OFED) should be installed. Without it, set `WITH_NVIDIA_PEERMEM=0` to use the DMA-BUF path instead, which needs the NVIDIA open kernel modules and Linux 5.12 or later (see item 8 under RDMA Resource Initialization)
+```
+# Check peer_memory module (from MLNX_OFED)
+lsmod | grep peer_mem
+
+# Verify NVIDIA peer memory module
+lsmod | grep nvidia_peer_mem
+```
+
+3. If you use container to run SGLang, please make sure RDMA and GDR driver are installed in the container and run container in privileged mode. Requirements: (1) privileged mode must be enabled. (2) RDMA devices/NVIDIA devices mounted into container
+
+4. Check the connectivity
+Benchmark end-to-end performance using ib_write_bw.
+```
+apt install perftest
+# server side
+ib_write_bw -d [rdma_device] -R -x gdr
+# client side
+ib_write_bw -d [rdma_device] -R -x gdr [server_ip]
+```
+Expected Output:
+Successful bidirectional transfer with "BW peak" reported
+Errors with -x gdr indicate GDR setup failures

@@ -1,0 +1,18 @@
+# Test case for HA mode
+# master cmd:  ./mooncake-store/src/mooncake_master --enable-ha=true --rpc-address=0.0.0.0 --etcd-endpoints=0.0.0.0:2379 --client-ttl=3
+# clientctl cmd: ./mooncake-store/tests/e2e/clientctl --master_server_entry=etcd://0.0.0.0:2379
+create c1 9888
+mount c1 s1 1073741824
+put c1 key1 val1
+create c2 9889
+mount c2 s2 1073741824
+put c1 key2 val2
+get c2 key1
+get c1 key2
+# For quick test, the master should set client ttl to 3 sec
+sleep 10
+# The client should not expired after the sleep
+get c1 key1
+get c2 key2
+terminate
+# The client should expired and segments are auto-unmounted

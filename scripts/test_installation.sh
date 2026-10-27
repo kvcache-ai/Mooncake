@@ -1,0 +1,92 @@
+#!/bin/bash
+# Script to test the installation of the mooncake wheel package
+# Usage: ./scripts/test_installation.sh
+
+set -e  # Exit immediately if a command exits with a non-zero status
+
+# Ensure LD_LIBRARY_PATH includes /usr/local/lib
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+
+echo "Creating a clean Python environment for testing..."
+python -m venv test_env
+source test_env/bin/activate
+
+echo "Verifying that import fails before installation..."
+# Verify that importing mooncake.engine fails before installation
+python -c "import mooncake.engine" 2>/dev/null && { echo "ERROR: Import succeeded when it should have failed!"; exit 1; } || echo "Good: Import failed as expected before installation"
+
+echo "Installing the wheel package..."
+# Install the wheel package
+pip install mooncake-wheel/dist/*.whl
+
+# install dependencies
+SYSTEM_PACKAGES="build-essential \
+                  cmake \
+                  libibverbs-dev \
+                  libnuma-dev \
+                  libssl-dev \
+                  libcurl4-openssl-dev"
+
+sudo apt-get install -y $SYSTEM_PACKAGES
+
+
+echo "Verifying that import succeeds after installation..."
+python -c "import mooncake.engine" && echo "Success: Import succeeded after installation" || { echo "ERROR: Import failed after installation!"; exit 1; }
+python -c "import mooncake.reshard.weight" && echo "Success: Reshard import succeeded after installation" || { echo "ERROR: Reshard import failed after installation!"; exit 1; }
+python -c "import mooncake.cli, mooncake.cli_bench, mooncake.cli_client, mooncake.transfer_engine_topology_dump" && echo "Success: CLI imports succeeded after installation" || { echo "ERROR: CLI imports failed after installation!"; exit 1; }
+
+echo "Running import structure test..."
+# Run the import structure test
+cp -r mooncake-wheel/tests test_env/
+cp -r python/tests/services test_env/service_tests
+cp -r python/tests/unit test_env/unit_tests
+cp -r mooncake-reshard/tests test_env/reshard_tests
+cp python/tests/store/test_fast_copy.py test_env/tests/
+cp -r python/tests/ssd test_env/ssd_tests
+cd test_env
+pip install torch numpy
+python -c "import mooncake._fast_copy"
+python -c "import mooncake.structured_object_store"
+python tests/test_fast_copy.py
+python tests/test_import_structure.py
+
+echo "Running HTTP metadata server test..."
+python -m unittest service_tests/test_http_metadata_server.py
+
+echo "Running mooncake config test..."
+python unit_tests/test_mooncake_config.py
+
+echo "Running reshard contract tests..."
+python -m pip install pytest hypothesis==6.141.0 paramiko
+python -m pytest reshard_tests ssd_tests -q
+
+echo "Verifying mooncake_master entry point..."
+# Check if the mooncake_master entry point is installed and executable
+which mooncake_master || { echo "ERROR: mooncake_master entry point not found!"; exit 1; }
+mooncake_master --version
+echo "Success: mooncake_master entry point found"
+
+# Check if the mooncake_client entry point is installed and executable
+which mooncake_client || { echo "ERROR: mooncake_client entry point not found!"; exit 1; }
+echo "Success: mooncake_client entry point found"
+
+echo "Verifying transfer_engine_bench entry point..."
+# Check if the transfer_engine_bench entry point is installed and executable
+which transfer_engine_bench || { echo "ERROR: transfer_engine_bench entry point not found!"; exit 1; }
+echo "Success: transfer_engine_bench entry point found"
+
+echo "Verifying mooncake_http_metadata_server entry point..."
+which mooncake_http_metadata_server || { echo "ERROR: mooncake_http_metadata_server entry point not found!"; exit 1; }
+mooncake_http_metadata_server --help >/dev/null
+echo "Success: mooncake_http_metadata_server entry point found"
+echo "Verifying transfer_engine_topology_dump entry point..."
+transfer_engine_topology_dump --help >/dev/null
+python -m mooncake.transfer_engine_topology_dump --help >/dev/null
+echo "Success: transfer_engine_topology_dump entry point and module execution work"
+
+cd ..
+
+echo "Installation test completed successfully!"
+
+# Note: We don't deactivate the virtual environment here
+# so that subsequent scripts can use it

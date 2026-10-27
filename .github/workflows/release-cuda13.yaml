@@ -1,0 +1,35 @@
+name: Release CUDA 13
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    if: ${{ !contains(github.ref_name, '-') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            artifact-prefix: mooncake-wheel-cuda13
+          - architecture: arm64
+            artifact-prefix: mooncake-wheel-cuda13-arm64
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      architecture: ${{ matrix.architecture }}
+      artifact-prefix: ${{ matrix.artifact-prefix }}
+
+  publish-release:
+    if: ${{ !contains(github.ref_name, '-') }}
+    needs: build
+    permissions:
+      contents: write
+      id-token: write
+    uses: ./.github/workflows/_publish-wheel.yaml
+    with:
+      artifact-pattern: 'mooncake-wheel-cuda13*'
+    secrets:
+      pypi-token: ${{ secrets.PYPI_CU13_API_TOKEN }}

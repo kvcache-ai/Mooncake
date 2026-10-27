@@ -1,0 +1,25 @@
+name: "🔧 Usage"
+description: "Questions about Mooncake's usage or best practices"
+title: "[Usage]: "
+labels: ["usage"]
+body:
+- type: textarea
+  attributes:
+    label: Describe your usage question
+    description: >
+      A clear and concise description of your question about using the repo.
+  validations:
+    required: true
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉!
+- type: checkboxes
+  id: before_submit
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues and read the [documentation](https://kvcache-ai.github.io/Mooncake/)
+
+
+    

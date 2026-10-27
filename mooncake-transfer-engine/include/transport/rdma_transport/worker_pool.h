@@ -1,0 +1,197 @@
+// Copyright 2024 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef WORKER_H
+#define WORKER_H
+
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include "config.h"
+#include "rdma_context.h"
+
+namespace mooncake {
+class WorkerPoolTestPeer;
+class WorkerPool {
+    friend class WorkerPoolTestPeer;
+
+   public:
+    WorkerPool(RdmaContext &context, int numa_socket_id = 0);
+
+    ~WorkerPool();
+
+    // Add slices to queue, called by Transport
+    int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
+
+    void trackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
+                           size_t first, size_t count);
+    void untrackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
+                             size_t first, size_t count);
+
+   private:
+    using SliceList = std::vector<Transport::Slice *>;
+
+    // Enqueue slices that were prepared by another WorkerPool. Used for
+    // local-NIC failure handoff: the original worker keeps the remote path
+    // fixed, updates the local lkey, and pushes the slice to this context's
+    // worker queue.
+    int submitPreparedPostSend(
+        const std::vector<Transport::Slice *> &slice_list);
+    void enqueuePreparedSlices(const SliceList &slice_list,
+                               uint64_t submitted_slice_count);
+    void enqueueSliceToOwner(Transport::Slice *slice);
+    void enqueueSlicesToOwner(int owner_thread, const SliceList &slices);
+    int postingThreadForPeer(const std::string &peer_nic_path) const;
+    int cqIndexForPostingThread(int thread_id) const;
+
+    void performPostSend(int thread_id);
+
+    int performPollCq(int thread_id, bool defer_local_redispatch = false);
+    void processCompletions(int thread_id, const std::vector<ibv_wc> &wc_list,
+                            bool defer_local_redispatch = false);
+
+    void redispatch(std::vector<Transport::Slice *> &slice_list, int thread_id,
+                    bool handoff_to_local_worker = false,
+                    bool defer_local_redispatch = false);
+
+    void transferWorker(int thread_id);
+
+    bool hasOutstandingCq(int thread_id);
+
+    void monitorWorker();
+
+    int doProcessContextEvents();
+    void processContextEventForTest(ibv_event_type event_type);
+
+    // Simplified rail monitor: pause problematic paths for a cooldown period
+    struct RailState {
+        int error_count = 0;
+        uint64_t pause_until_ns = 0;  // Timestamp (ns) when pause expires
+        uint64_t last_error_ns = 0;   // Timestamp (ns) of the last error
+    };
+
+    void markRailFailed(const std::string &peer_nic_path,
+                        bool immediate_pause = false);
+    bool isRailAvailable(const std::string &peer_nic_path);
+
+    // Retry helper: increment retry count and return whether retry is allowed
+    static bool shouldRetrySlice(Transport::Slice *slice);
+
+    void refreshPublishedLocalTopology();
+    GidRefreshResult refreshPublishedLocalGid();
+    bool handleContextEvent(ibv_event_type event_type, bool injected_for_test,
+                            struct ibv_async_event *event = nullptr);
+    void scheduleContextRecovery(uint64_t delay_ns = kContextRecoveryDelayNs,
+                                 bool override_breaker = true);
+    void maybeActivateRecoveredContext();
+    // Safety net for a PORT_ERR whose PORT_ACTIVE never arrived. At most the
+    // 1 Hz monitor tick calls this, and only when context_disabling_event_
+    // is IBV_EVENT_PORT_ERR. On IBV_PORT_ACTIVE it arms the same delayed GID
+    // probe as the event path. DEVICE_FATAL, CQ_ERR, WQ_FATAL and LID_CHANGE
+    // stay inactive: the probe does not rebuild a failed CQ or device.
+    // Breaker-owned pauses are left alone so TTL reactivation still owns
+    // local-WC downtime.
+    void resumePausedContext();
+    bool hasAvailablePeerRailAlternative(Transport::Slice *slice,
+                                         const std::string &failed_peer_path);
+    bool recordAutoGidDataPathFailure(Transport::Slice *slice);
+    void recordAutoGidDataPathSuccess(Transport::Slice *slice);
+
+    static bool isLocalWcFailure(const ibv_wc &wc);
+
+    // Local-side failure handler: degrade current context so retries are
+    // handed off to another local context's worker pool.
+    void handleLocalFailure(const std::string &peer_nic_path,
+                            RdmaEndPoint *endpoint = nullptr);
+
+    bool tryHandoffToAnotherLocalWorker(Transport::Slice *slice);
+
+    // Only direct local completion errors charge the context breaker.
+    // Submit-side all-rails-unavailable failures remain peer/rail scoped.
+    bool markLocalContextFailure();
+    void markContextSuccess();
+    bool tryReactivateContext(uint64_t now_ns);
+    void maybeReactivateContext();
+    // Serialize breaker transitions with physical-event recovery so a late
+    // completion cannot arm TTL recovery after a fatal event.
+    void resetContextBreaker(bool context_active);
+
+   private:
+    RdmaContext &context_;
+    const int numa_socket_id_;
+    const int worker_count_;
+
+    std::vector<std::thread> worker_thread_;
+    std::atomic<bool> workers_running_;
+
+    std::atomic<int> parked_worker_count_;
+
+    // The poll worker updates these on every poll pass. The monitor worker
+    // reads them when CQ entries stay outstanding, so a transfer timeout can
+    // be distinguished from a stalled poller.
+    std::atomic<uint64_t> last_poll_ts_ns_{0};
+    std::atomic<uint64_t> last_poll_interval_ns_{0};
+    std::atomic<uint64_t> max_poll_interval_ns_{0};
+
+    std::mutex posted_slices_mutex_;
+    std::unordered_set<Transport::Slice *> posted_slices_;
+
+    std::atomic<int> redispatch_counter_;
+
+    std::mutex cond_mutex_;
+    std::condition_variable cond_var_;
+
+    std::vector<std::unordered_map<std::string, SliceList>>
+        collective_slice_queue_;
+    std::vector<std::unordered_map<std::string, SliceList>> worker_slice_queue_;
+    std::vector<std::mutex> worker_slice_queue_lock_;
+
+    std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
+    std::atomic<uint64_t> recovery_activate_after_ns_{0};
+    // Fatal async event that owns the inactive context, or -1 when none does.
+    // The 1 Hz port poll resumes only IBV_EVENT_PORT_ERR.
+    std::atomic<int> context_disabling_event_{-1};
+
+    // Rail state management: peer_nic_path -> RailState
+    std::unordered_map<std::string, RailState> rail_states_;
+    std::mutex rail_state_lock_;
+    // Number of rails with pause_until_ns in the future. The submit hot path
+    // skips rail_state_lock_ while this is zero. Expired pauses are cleared on
+    // the next locked isRailAvailable() for any path, not only the expired one.
+    std::atomic<int> paused_rail_count_{0};
+
+    // Rail monitor configuration
+    const static int kRailErrorThreshold = 5;  // Errors before pause
+    // Errors further apart than this are not consecutive, so error_count is
+    // restarted. Without it a long-lived process accumulates isolated failures
+    // until an otherwise healthy rail is paused.
+    const static uint64_t kRailErrorWindowNs = 5000000000ull;  // 5 seconds
+    const static uint64_t kContextRecoveryDelayNs =
+        30000000000ull;  // 30 seconds before a recovered local RNIC is reused
+
+    // Local-completion context breaker. Protected by context_state_lock_ so
+    // fatal events, GID recovery and TTL recovery have one state owner.
+    std::mutex context_state_lock_;
+    std::atomic<int> context_failure_count_{0};
+    uint64_t breaker_reactivate_after_ns_{0};
+    static constexpr int kLocalCompletionFailureThreshold = 32;
+};
+}  // namespace mooncake
+
+#endif  // WORKER_H

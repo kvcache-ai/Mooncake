@@ -1,0 +1,527 @@
+# TENT Slice Spraying
+
+## Overview
+
+This document describes TENT's Slice Spraying mechanism, which enables efficient data movement in multi-rail RDMA environments through intelligent device selection and adaptive load balancing.
+
+## Background
+
+In multi-rail RDMA environments, naive round-robin striping leads to suboptimal performance because:
+
+1. **NUMA Effects**: Cross-NUMA access incurs additional latency and reduces effective bandwidth
+2. **Load Imbalance**: Static striping cannot adapt to dynamic load conditions
+3. **Heterogeneous Link Quality**: Different rails may have different effective bandwidth due to congestion or hardware characteristics
+
+TENT addresses these issues through:
+- **NUMA-aware device selection** with configurable penalties
+- **EWMA-based bandwidth estimation** for adaptive load balancing
+- **Dynamic multi-path allocation** for large transfers
+
+## Architecture
+
+### Device Selector
+
+The `DeviceSelector` component is responsible for choosing which RDMA device(s) to use for each transfer request. It operates in two modes:
+
+#### Baseline Mode (Round-Robin)
+
+When `enable_smart_scheduling = false`, the selector uses simple round-robin within the highest-priority device tier (typically local NUMA devices):
+
+```
+For each request:
+  1. Find first non-empty device tier (local NUMA preferred)
+  2. Select devices round-robin within that tier
+  3. Ignore lower-priority tiers
+```
+
+**Characteristics**:
+- Deterministic behavior
+- No runtime overhead for tracking
+- Consistent with original TE behavior
+- Does not adapt to load conditions
+
+#### Smart Mode (EWMA-Based Selection)
+
+When `enable_smart_scheduling = true`, the selector uses an EWMA-based algorithm:
+
+```
+For each request:
+  1. Calculate predicted completion time for each device:
+     predicted_time = (inflight_bytes + slice_bytes) / ewma_bandwidth
+
+  2. Apply NUMA penalty based on tier:
+     score = predicted_time × numa_tier_weights[tier]
+
+  3. Select device(s) with minimum score:
+     - Single slice: best device only
+     - Multiple slices: weighted distribution across devices
+
+  4. Update EWMA bandwidth on completion:
+     ewma_bandwidth = α × ewma_bandwidth + (1 - α) × observed_bandwidth
+     where α = bandwidth_learning_rate
+```
+
+**Characteristics**:
+- Adapts to changing load conditions
+- Prefers local NUMA devices
+- Spreads load across multiple rails
+- Higher runtime overhead
+
+### NUMA-Aware Selection
+
+Devices are organized into tiers based on NUMA distance:
+
+| Tier | Description | Default Penalty |
+|------|-------------|-----------------|
+| Rank 0 | Local NUMA | 1.0 (baseline) |
+| Rank 1 | Remote NUMA (tier 1) | 5.0 |
+| Rank 2 | Remote NUMA (tier 2) | 10.0 |
+
+The penalty is applied as a multiplier to predicted completion time, making remote devices less attractive unless local devices are heavily loaded.
+
+### EWMA Bandwidth Estimation
+
+Each device maintains a **selection EWMA** (Exponentially Weighted Moving Average) of its effective bandwidth, the series that device selection scores with:
+
+```
+initial_value = theoretical_bandwidth
+
+on_transfer_complete:
+  observed_bandwidth = transfer_size / transfer_time
+  ewma_bandwidth = α × ewma_bandwidth + (1 - α) × observed_bandwidth
+  ewma_bandwidth = clamp(ewma_bandwidth,
+                        0.1 × theoretical,
+                        10.0 × theoretical)
+```
+
+where `α = bandwidth_learning_rate`.
+
+**Note on terminology**: The EWMA formula uses α as the coefficient for the old value. Therefore:
+- **Lower α** (closer to 0) → more weight on new observations → **faster adaptation**
+- **Higher α** (closer to 1) → more weight on old value → **slower adaptation**
+
+Examples:
+- α = 0: `ewma_bandwidth = observed_bandwidth` (full adaptation, always use new value)
+- α = 1: `ewma_bandwidth = ewma_bandwidth` (no learning, never update)
+- α = 0.01: `ewma_bandwidth = 0.01 × old + 0.99 × new` (default, gradual adaptation)
+
+The EWMA provides:
+- **Memory**: Recent observations have more influence than old ones
+- **Stability**: Smooths out transient fluctuations
+- **Adaptability**: Tracks gradual changes in link quality
+
+#### Transmit Estimate
+
+Each device also keeps a second series, the **transmit estimate**, for the
+deadline predictors (described end to end in
+[Deadline Scheduling](deadline-scheduling.md)): the admission queue's
+deadline-infeasible drop (`runtime_queue/mlu_local_threshold`, reads the
+transmit estimate of the transport that will carry the owner) and the RDMA
+workers' bandwidth arbitration (`transports/rdma/deadline_bw_arbitration`,
+reads the local NIC's value). Both compute the same predicted MLU from it:
+
+```
+predicted_mlu = ((bytes_ahead + length) / transmit_bandwidth) / remaining_window
+```
+
+`bytes_ahead` is what the request must wait behind before its own bytes move:
+for the admission queue, every drop-eligible owner (RDMA or UB, not staged)
+already dispatched and not yet completed — owners on other transports share the
+queue but not the NIC, and the rate used for the prediction is the one the
+owner's own transport reports. For the arbitration it is the NIC's **posted
+bytes**: what has reached the hardware and not yet completed. That is
+deliberately not the selector's `inflight_bytes`, which is charged when a slice
+is *allocated* and so would include the very slices being ordered as well as
+work still sitting in a worker queue. The order is then built one slot at a
+time — the slice that takes a slot joins `bytes_ahead` for the ones still
+waiting, since the QP posts them in that order (exactly for the first 64 slots;
+the rest are ranked once against the bytes those slots accumulated).
+
+The deadline is absolute, so that wait counts against the window — as an
+additive delay over the wire rate, not as a slower bandwidth (which would
+multiply the wait by the request's slice count).
+
+It uses the same update rule and clamp as the selection EWMA, but it is fed
+from a different measurement because it answers a different question:
+
+| | Selection EWMA | Transmit estimate |
+|---|---|---|
+| Question | Which NIC should the next slice go to? | How fast does this NIC move bytes? |
+| Sample | one successful completion: bytes / (post → completion), so the NIC's own queueing behind earlier work requests is included and a backed-up NIC scores worse | one meter interval: bytes completed / time the NIC spent with work posted |
+| α | `bandwidth_learning_rate` = 0.01 (~99% latest sample) | `transmit_bandwidth_learning_rate` = 0.9 (~10 intervals, ≈100 ms, to follow a change) |
+
+Per-completion timing cannot answer the second question. Up to `max_qp_wr`
+work requests are posted in one call with timestamps that are effectively
+one, and a poll pass timestamps every completion it collects alike, so a
+slice's own "post → completion" grows with the depth of the batch it
+travelled in — deep enough and the estimate would sit on its lower clamp on
+a healthy link. Bytes over the NIC's busy time does not care how the work was
+batched.
+
+Busy time is the time the device has had at least one work request posted:
+a stretch opens when its posted bytes go from zero to non-zero and closes
+when they return to zero, so the gaps of a workload that bursts and waits are
+not charged to the link. A sample is offered only at the last completion of a
+poll pass (every completion in a pass carries the same timestamp), and one
+that spans more than `transmit_meter_max_interval_ns` of wall clock is
+dropped rather than learned from: it describes a link too far in the past. A
+posted slice that ends without moving its bytes — failed, flushed, timed
+out — makes its stretch unusable, so the meter starts its next interval
+fresh. With no usable interval the estimate keeps its last value, or the
+link-speed seed — the optimistic direction, which cannot cause a false drop.
+
+With queueing carried by `bytes_ahead`, the rate itself must exclude
+queueing or the wait would be counted twice.
+
+### Multi-Path Allocation
+
+For large transfers, TENT distributes slices across multiple devices:
+
+**Single Path** (small requests):
+- All slices go to the single best device
+- Minimizes coordination overhead
+
+**Multi Path** (large requests):
+- **Normal mode** (99% of calls): Slices distributed proportionally to device capacity
+  - Each device gets: `(device_weight / total_weight) × num_slices`
+  - Remaining slices assigned to best device
+- **Probe mode** (1% of calls, every 100th call): Slices distributed round-robin
+  - Purpose: Ensure all devices are continuously sampled for EWMA updates
+  - Prevents EWMA starvation for less-used devices
+
+### Request Flow
+
+```
+┌──────────────┐
+│ Application  │
+└──────┬───────┘
+       │ submitTransfer()
+       ▼
+┌──────────────────────────────────────┐
+│  RdmaTransport::submitTransferTasks  │
+│  - Split large requests into slices   │
+│  - Call DeviceSelector for allocation │
+│  - Only if num_slices >= max_slice_count/2 │
+└──────┬───────────────────────────────┘
+       │
+       ▼
+┌──────────────────────────────────────┐
+│     DeviceSelector::allocate         │
+│  ┌────────────────────────────────┐  │
+│  │ smart_selection_enabled?       │  │
+│  └────┬──────────────────────┬────┘  │
+│       │ Yes                  │ No     │
+│       ▼                     ▼        │
+│  ┌─────────┐          ┌─────────┐   │
+│  │  Smart  │          │ Baseline│   │
+│  │  Mode   │          │   Mode  │   │
+│  └────┬────┘          └────┬────┘   │
+│       │                    │         │
+│       └────────┬───────────┘         │
+│                ▼                     │
+│  ┌────────────────────────────────┐  │
+│  │  Return slice_dev_ids          │  │
+│  └────────────────────────────────┘  │
+└──────────────────────────────────────┘
+```
+
+## Configuration
+
+All slice spraying parameters are configurable via the configuration file:
+
+### Core Scheduling
+
+```json
+{
+  "transports": {
+    "rdma": {
+      "enable_smart_scheduling": true
+    }
+  }
+}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enable_smart_scheduling` | bool | `true` | Enable EWMA-based selection (false = round-robin) |
+
+### NUMA Penalties
+
+```json
+{
+  "transports": {
+    "rdma": {
+      "numa_penalties": [1.0, 5.0, 10.0],
+      "strict_local_numa": false
+    }
+  }
+}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `numa_penalties` | array[float] | `[1.0, 5.0, 10.0]` | Penalty multipliers for each NUMA tier |
+| `strict_local_numa` | bool | `false` | Never select a cross-NUMA NIC instead of penalizing it |
+
+**Guidelines**:
+- Higher values = stronger preference for local devices
+- Set all to `1.0` to disable NUMA awareness
+- Increase remote penalties if cross-NUMA latency is high
+
+### Strict Local NUMA
+
+`numa_penalties` makes a remote NIC expensive but still selectable, so a busy
+local NIC eventually loses to a cross-NUMA one. Set `strict_local_numa` (or the
+`MC_STRICT_LOCAL_NUMA` environment variable, which accepts `1`/`0` and
+`true`/`false`) to remove those NICs from selection entirely.
+
+A NIC is only excluded when the memory location and the NIC **both** report a
+NUMA node and the nodes differ. If either side is unknown the NIC keeps its
+`numa_penalties` weight, because discovery reports `-1` in cases where excluding
+everything would break otherwise working hosts:
+
+- virtual machines and some GPUs, where sysfs exposes no `numa_node`
+- bonded NICs such as `mlx5_bond_0`
+- classic priority-matrix topologies (`MC_CUSTOM_TOPO_JSON`,
+  `topology/priority_matrix`), which carry no NUMA information at all
+
+On those hosts the flag has no effect; a warning is logged at startup so this is
+visible rather than silent. A second warning names any location left without a
+same-NUMA NIC, since transfers from it will fail with `DeviceNotFound`.
+
+**Trade-off**: strict mode converts a performance problem into an availability
+one. Without a local NIC an allocation fails instead of degrading, so enable it
+only where every memory location provably has a same-NUMA rail.
+
+**Scope**: the exclusion is enforced on the local NIC for both the first
+selection and the retry path. For the remote NIC it is only a preference — the
+peer publishes its own topology and may not run this policy, so failing a slice
+because another host has no local rail would turn a local setting into a
+cross-node outage.
+
+### Bandwidth Estimation
+
+```json
+{
+  "transports": {
+    "rdma": {
+      "bandwidth_learning_rate": 0.01,
+      "transmit_bandwidth_learning_rate": 0.9,
+      "transmit_meter_interval_ns": 10000000,
+      "transmit_meter_max_interval_ns": 50000000,
+      "ewma_min_bandwidth_multiplier": 0.1,
+      "ewma_max_bandwidth_multiplier": 10.0
+    }
+  }
+}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `bandwidth_learning_rate` | float | `0.01` | Selection EWMA learning rate (0.0 = full adaptation, 1.0 = no learning) |
+| `transmit_bandwidth_learning_rate` | float | `0.9` | Transmit estimate learning rate, same convention; read by the deadline predictors |
+| `transmit_meter_interval_ns` | uint | `10000000` | How often a device's throughput is sampled (10 ms) |
+| `transmit_meter_max_interval_ns` | uint | `50000000` | An interval longer than this is re-baselined instead of learned from |
+| `ewma_min_bandwidth_multiplier` | float | `0.1` | Minimum bandwidth as fraction of theoretical |
+| `ewma_max_bandwidth_multiplier` | float | `10.0` | Maximum bandwidth as fraction of theoretical |
+
+**Guidelines**:
+- Lower α (e.g., 0.001) → faster adaptation, more volatile → responds quickly to changes
+- Higher α (e.g., 0.1) → slower adaptation, more stable → smooths out transient fluctuations
+- Default α = 0.01 provides balanced adaptation for device selection
+- Keep `transmit_bandwidth_learning_rate` high: it backs an irreversible
+  drop decision, so it should follow sustained change, not single samples
+- Multipliers constrain both series to [0.1×, 10.0×] of theoretical bandwidth
+
+### Device Selection Scoring
+
+```json
+{
+  "transports": {
+    "rdma": {
+      "score_jitter_range": 1e-9,
+      "score_epsilon": 1e-12
+    }
+  }
+}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `score_jitter_range` | float | `1e-9` | Random jitter range to avoid deterministic selection |
+| `score_epsilon` | float | `1e-12` | Small value to prevent division by zero |
+
+### Bandwidth Constants
+
+```json
+{
+  "transports": {
+    "rdma": {
+      "default_bandwidth_gbps": 400.0,
+      "min_bandwidth_gbps": 10.0,
+      "max_bandwidth_gbps": 800.0
+    }
+  }
+}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `default_bandwidth_gbps` | float | `400.0` | NIC bandwidth assumed when the port speed is unknown or out of range |
+| `min_bandwidth_gbps` | float | `10.0` | Minimum valid NIC bandwidth (Gbps) |
+| `max_bandwidth_gbps` | float | `800.0` | Maximum valid NIC bandwidth (Gbps) |
+
+**Notes**:
+- Each device's bandwidth is read from the speed and width its port
+  negotiated (`ibv_query_port`), so a 100G and a 400G NIC in the same host
+  start from different theoretical rates. Where libibverbs provides
+  `ibv_query_port_speed()` (rdma-core >= 62) the *effective* speed it
+  reports is preferred: for a VF over LAG that is the bandwidth left after
+  a PF drops out of the bond, which the encoded link rate cannot express.
+  The verb is resolved as an optional symbol, so older libraries keep
+  working on the encoded rate. A query *error* keeps the last known
+  effective speed (falling back would briefly restore the higher encoded
+  rate on a degraded LAG); failures are counted per device and logged once
+  per episode
+- The theoretical rate seeds the EWMA and bounds it to
+  `[ewma_min_multiplier, ewma_max_multiplier]` times that rate
+- If a device's port speed cannot be read or is outside [min, max],
+  `default_bandwidth_gbps` is used and a warning is logged
+- A NIC that cannot carry traffic -- its context was never constructed,
+  `construct()` failed, or its port is down -- is marked unavailable: it is
+  excluded from device selection and from the aggregate bandwidth the
+  admission queue's deadline predictor reads. The default speed applies
+  only to a usable NIC whose speed could not be determined. `PORT_ERR`
+  marks a device unavailable and `PORT_ACTIVE` restores it; both are
+  matched against the port the context opened, since a device's async
+  events cover every port of that device
+- The link speed is re-read on `IBV_EVENT_PORT_ACTIVE`, and on
+  `IBV_EVENT_DEVICE_SPEED_CHANGE` where rdma-core (>= 62) provides it. If
+  the speed changed -- a 400G link returning at 100G, or a VF over LAG
+  losing a PF -- the device's EWMA is re-seeded and its clamp re-derived; a
+  link that returns at the same speed keeps its learned estimate
+
+## Usage Examples
+
+### Example 1: Latency-Sensitive Workload
+
+For latency-sensitive queries where local NUMA access is critical:
+
+```json
+{
+  "transports": {
+    "rdma": {
+      "enable_smart_scheduling": true,
+      "numa_penalties": [1.0, 100.0, 1000.0],
+      "bandwidth_learning_rate": 0.001
+    }
+  }
+}
+```
+
+**Effect**: Strongly prefers local devices, slow adaptation for stability.
+
+### Example 2: Bulk Data Transfer
+
+For bulk transfers where throughput is more important than latency:
+
+```json
+{
+  "transports": {
+    "rdma": {
+      "enable_smart_scheduling": true,
+      "numa_penalties": [1.0, 2.0, 3.0],
+      "bandwidth_learning_rate": 0.1
+    }
+  }
+}
+```
+
+**Effect**: Allows cross-NUMA transfers, fast adaptation to load.
+
+### Example 3: Baseline Mode
+
+For deterministic performance matching original TE:
+
+```json
+{
+  "transports": {
+    "rdma": {
+      "enable_smart_scheduling": false
+    }
+  }
+}
+```
+
+**Effect**: Round-robin within local NUMA tier, no adaptation, minimal overhead.
+
+## Performance Considerations
+
+### Overhead Comparison
+
+| Mode | CPU Overhead | Adaptability | NUMA Awareness |
+|------|--------------|--------------|----------------|
+| Baseline | Minimal | None | Tier-based (static) |
+| Smart | Moderate | EWMA-based | Dynamic + penalty |
+
+### When to Use Each Mode
+
+**Use Baseline Mode when**:
+- Workload is uniform and predictable
+- Deterministic performance is required
+- CPU overhead must be minimized
+- All devices are in same NUMA node
+
+**Use Smart Mode when**:
+- Workload is heterogeneous
+- Link quality varies over time
+- NUMA effects are significant
+- Maximum throughput is desired
+
+### Tuning Guidelines
+
+1. **Start with baseline mode** to establish performance baseline
+2. **Enable smart mode** with conservative parameters:
+   - `numa_penalties = [1.0, 2.0, 5.0]`
+   - `bandwidth_learning_rate = 0.01`
+3. **Monitor performance** and adjust based on observations:
+   - If cross-NUMA transfers are too frequent: increase remote penalties
+   - If adaptation is too slow (EWMA not keeping up with load changes): decrease α
+   - If performance is unstable (too much fluctuation): increase α
+
+## Troubleshooting
+
+### Problem: All requests go to cross-NUMA devices
+
+**Symptoms**: Poor performance, high latency
+
+**Diagnosis**:
+```cpp
+device_selector_->printTrafficStats();
+```
+
+**Solution**: Check `numa_penalties` configuration. Ensure local devices have lowest penalty (1.0).
+
+### Problem: Performance worse than baseline
+
+**Symptoms**: Smart mode slower than baseline mode
+
+**Possible causes**:
+1. Learning rate too high (volatile decisions)
+2. NUMA penalties too low (not preferring local)
+3. Score jitter too large (too much randomness)
+
+**Solution**: Use more conservative:
+```json
+{
+  "bandwidth_learning_rate": 0.001,
+  "numa_penalties": [1.0, 10.0, 100.0],
+  "score_jitter_range": 1e-12
+}
+```
+
+## References
+
+- [TENT Overview](overview.md)
+- [TENT QoS](qos.md)
+- [TENT C++ API](../../api-reference/cpp/tent.md)

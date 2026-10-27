@@ -1,0 +1,437 @@
+#include "ha_metric_manager.h"
+#include "standby_state_machine.h"
+
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include <atomic>
+#include <chrono>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+
+namespace mooncake::test {
+
+namespace {
+
+std::optional<int64_t> FindSerializedMetricValue(
+    const std::string& metrics, const std::string& metric_name) {
+    std::istringstream lines(metrics);
+    std::string line;
+    const std::string prefix = metric_name + " ";
+    while (std::getline(lines, line)) {
+        if (line.rfind(prefix, 0) != 0) {
+            continue;
+        }
+
+        std::istringstream value_stream(line.substr(prefix.size()));
+        int64_t value = 0;
+        if (!(value_stream >> value)) {
+            return std::nullopt;
+        }
+        value_stream >> std::ws;
+        return value_stream.eof() ? std::optional<int64_t>(value)
+                                  : std::nullopt;
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
+class HAMetricManagerTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        google::InitGoogleLogging("HAMetricManagerTest");
+        FLAGS_logtostderr = 1;
+    }
+
+    void TearDown() override { google::ShutdownGoogleLogging(); }
+
+    HAMetricManager& M() { return HAMetricManager::instance(); }
+};
+
+TEST_F(HAMetricManagerTest,
+       SnapshotActivityFollowsStandbyLifecycleWithoutDroppingCounters) {
+    M().reset_snapshot_runtime(true);
+    using Operation = HAMetricManager::SnapshotOperation;
+    for (const auto state :
+         {StandbyState::CONNECTING, StandbyState::WATCHING,
+          StandbyState::PROMOTING, StandbyState::PROMOTED, StandbyState::FAILED,
+          StandbyState::STOPPED, StandbyState::CONNECTING}) {
+        M().set_standby_state(static_cast<int64_t>(state));
+        const bool active = state == StandbyState::CONNECTING ||
+                            state == StandbyState::WATCHING;
+        EXPECT_EQ(active ? 1 : 0,
+                  FindSerializedMetricValue(M().serialize_metrics(),
+                                            "ha_snapshot_active"));
+        const auto before =
+            M().get_snapshot_operation(Operation::Publish).total;
+        M().record_snapshot_operation(Operation::Publish, 0,
+                                      std::chrono::steady_clock::now());
+        EXPECT_EQ(before + 1,
+                  M().get_snapshot_operation(Operation::Publish).total);
+    }
+    M().reset_snapshot_runtime(false);
+    EXPECT_EQ(0, FindSerializedMetricValue(M().serialize_metrics(),
+                                           "ha_snapshot_active"));
+    M().set_standby_state(static_cast<int64_t>(StandbyState::STOPPED));
+}
+
+TEST_F(HAMetricManagerTest, SnapshotMetricsResetGaugesAndKeepCounters) {
+    using Operation = HAMetricManager::SnapshotOperation;
+    using Skip = HAMetricManager::SnapshotSkipReason;
+    M().reset_snapshot_runtime(true);
+    const auto before = M().get_snapshot_operation(Operation::Publish);
+    M().update_snapshot_runtime([](auto& metrics) {
+        metrics.latest_created_at_ms = 0;  // Epoch zero is a valid timestamp.
+        metrics.fallback_created_at_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count() +
+            60000;
+        metrics.durable_batch = 7;
+        metrics.compaction_floor = 3;
+    });
+    M().record_snapshot_skip(Skip::LeaseBusy);
+    {
+        HAMetricManager::SnapshotOperationTimer timer(Operation::Publish);
+        timer.Success(0);
+    }
+    try {
+        HAMetricManager::SnapshotOperationTimer timer(Operation::Publish);
+        throw 1;
+    } catch (int) {
+    }
+    const auto after = M().get_snapshot_operation(Operation::Publish);
+    EXPECT_EQ(before.total + 2, after.total);
+    EXPECT_EQ(before.errors + 1, after.errors);
+    const auto upload_before = M().get_snapshot_operation(Operation::Upload);
+    M().record_snapshot_operation(
+        Operation::Upload, 0,
+        std::chrono::steady_clock::now() - std::chrono::seconds(2));
+    EXPECT_GE(M().get_snapshot_operation(Operation::Upload).elapsed_us -
+                  upload_before.elapsed_us,
+              2000000u);
+    auto text = M().serialize_metrics();
+    EXPECT_EQ(2, FindSerializedMetricValue(text, "ha_snapshot_count"));
+    EXPECT_EQ(1, FindSerializedMetricValue(text, "ha_snapshot_latest_present"));
+    EXPECT_GT(
+        *FindSerializedMetricValue(text, "ha_snapshot_latest_age_seconds"), 0);
+    EXPECT_EQ(
+        0, FindSerializedMetricValue(text, "ha_snapshot_fallback_age_seconds"));
+    EXPECT_EQ(
+        4, FindSerializedMetricValue(text, "ha_snapshot_uncompacted_batches"));
+    EXPECT_EQ(1, FindSerializedMetricValue(
+                     text, "ha_snapshot_skip_reason{reason=\"lease_busy\"}"));
+    M().reset_snapshot_runtime(false);
+    M().update_snapshot_runtime(
+        [](auto& metrics) { metrics.snapshot_bytes = 100; });
+    M().record_snapshot_operation(Operation::Publish, 0,
+                                  std::chrono::steady_clock::now());
+    EXPECT_EQ(after.total,
+              M().get_snapshot_operation(Operation::Publish).total);
+    text = M().serialize_metrics();
+    EXPECT_EQ(0, FindSerializedMetricValue(text, "ha_snapshot_enabled"));
+    EXPECT_EQ(0, FindSerializedMetricValue(text, "ha_snapshot_bytes"));
+    EXPECT_EQ(0, FindSerializedMetricValue(text, "ha_snapshot_count"));
+    EXPECT_EQ(1, FindSerializedMetricValue(
+                     text, "ha_snapshot_skip_reason{reason=\"disabled\"}"));
+    M().reset_snapshot_runtime(true);
+    M().update_snapshot_runtime(
+        [](auto& metrics) { metrics.compaction_floor = 100; });
+    EXPECT_EQ(0, FindSerializedMetricValue(M().serialize_metrics(),
+                                           "ha_snapshot_uncompacted_batches"));
+}
+
+// ========== 7.1.1 Metric update tests ==========
+
+TEST_F(HAMetricManagerTest, TestSetOpLogLastSequenceId) {
+    M().set_oplog_last_sequence_id(123);
+    EXPECT_EQ(123, M().get_oplog_last_sequence_id());
+}
+
+TEST_F(HAMetricManagerTest, TestSetOpLogAppliedSequenceId) {
+    M().set_oplog_applied_sequence_id(456);
+    EXPECT_EQ(456, M().get_oplog_applied_sequence_id());
+}
+
+TEST_F(HAMetricManagerTest, TestSetOpLogStandbyLag) {
+    M().set_oplog_standby_lag(10);
+    EXPECT_EQ(10, M().get_oplog_standby_lag());
+}
+
+TEST_F(HAMetricManagerTest, TestSetOpLogPendingEntries) {
+    M().set_oplog_pending_entries(7);
+    EXPECT_EQ(7, M().get_oplog_pending_entries());
+}
+
+TEST_F(HAMetricManagerTest, TestSetPendingMutationQueueSize) {
+    M().set_pending_mutation_queue_size(5);
+    EXPECT_EQ(5, M().get_pending_mutation_queue_size());
+}
+
+TEST_F(HAMetricManagerTest, TestIncOpLogSkippedEntries) {
+    auto before = M().get_oplog_skipped_entries_total();
+    M().inc_oplog_skipped_entries();
+    EXPECT_EQ(before + 1, M().get_oplog_skipped_entries_total());
+}
+
+TEST_F(HAMetricManagerTest, TestIncOpLogChecksumFailures) {
+    auto before = M().get_oplog_checksum_failures_total();
+    M().inc_oplog_checksum_failures(2);
+    EXPECT_EQ(before + 2, M().get_oplog_checksum_failures_total());
+}
+
+TEST_F(HAMetricManagerTest, TestIncGapResolveCounters) {
+    auto before_attempts = M().get_oplog_gap_resolve_attempts_total();
+    auto before_success = M().get_oplog_gap_resolve_success_total();
+
+    M().inc_oplog_gap_resolve_attempts(3);
+    M().inc_oplog_gap_resolve_success(1);
+
+    EXPECT_EQ(before_attempts + 3, M().get_oplog_gap_resolve_attempts_total());
+    EXPECT_EQ(before_success + 1, M().get_oplog_gap_resolve_success_total());
+}
+
+TEST_F(HAMetricManagerTest, TestIncOpLogEtcdWriteFailuresAndRetries) {
+    auto before_failures = M().get_oplog_etcd_write_failures_total();
+    auto before_retries = M().get_oplog_etcd_write_retries_total();
+
+    M().inc_oplog_etcd_write_failures(4);
+    M().inc_oplog_etcd_write_retries(5);
+
+    EXPECT_EQ(before_failures + 4, M().get_oplog_etcd_write_failures_total());
+    EXPECT_EQ(before_retries + 5, M().get_oplog_etcd_write_retries_total());
+}
+
+TEST_F(HAMetricManagerTest, TestIncWatchDisconnectionsAndAppliedEntries) {
+    auto before_disc = M().get_oplog_watch_disconnections_total();
+    auto before_applied = M().get_oplog_applied_entries_total();
+
+    M().inc_oplog_watch_disconnections(2);
+    M().inc_oplog_applied_entries(10);
+
+    EXPECT_EQ(before_disc + 2, M().get_oplog_watch_disconnections_total());
+    EXPECT_EQ(before_applied + 10, M().get_oplog_applied_entries_total());
+}
+
+TEST_F(HAMetricManagerTest, TestRecordOpLogEtcdWriteLatency) {
+    const std::string count_name = "ha_oplog_etcd_write_latency_us_count";
+    const std::string sum_name = "ha_oplog_etcd_write_latency_us_sum";
+    const std::string before_metrics = M().serialize_metrics();
+    const int64_t count_before =
+        FindSerializedMetricValue(before_metrics, count_name).value_or(0);
+    const int64_t sum_before =
+        FindSerializedMetricValue(before_metrics, sum_name).value_or(0);
+
+    M().observe_oplog_etcd_write_latency_us(100);
+    M().observe_oplog_etcd_write_latency_us(5000);
+
+    const std::string after_metrics = M().serialize_metrics();
+    const auto count_after =
+        FindSerializedMetricValue(after_metrics, count_name);
+    const auto sum_after = FindSerializedMetricValue(after_metrics, sum_name);
+    ASSERT_TRUE(count_after.has_value());
+    ASSERT_TRUE(sum_after.has_value());
+    EXPECT_EQ(count_before + 2, *count_after);
+    EXPECT_EQ(sum_before + 5100, *sum_after);
+}
+
+TEST_F(HAMetricManagerTest, TestRecordOpLogApplyLatency) {
+    const std::string count_name = "ha_oplog_apply_latency_us_count";
+    const std::string sum_name = "ha_oplog_apply_latency_us_sum";
+    const std::string before_metrics = M().serialize_metrics();
+    const int64_t count_before =
+        FindSerializedMetricValue(before_metrics, count_name).value_or(0);
+    const int64_t sum_before =
+        FindSerializedMetricValue(before_metrics, sum_name).value_or(0);
+
+    M().observe_oplog_apply_latency_us(50);
+    M().observe_oplog_apply_latency_us(1000);
+
+    const std::string after_metrics = M().serialize_metrics();
+    const auto count_after =
+        FindSerializedMetricValue(after_metrics, count_name);
+    const auto sum_after = FindSerializedMetricValue(after_metrics, sum_name);
+    ASSERT_TRUE(count_after.has_value());
+    ASSERT_TRUE(sum_after.has_value());
+    EXPECT_EQ(count_before + 2, *count_after);
+    EXPECT_EQ(sum_before + 1050, *sum_after);
+}
+
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+TEST_F(HAMetricManagerTest, TestBatchRecordMetrics) {
+    const auto batches_before = M().get_batch_record_durable_batches_total();
+    const auto entries_before = M().get_batch_record_durable_entries_total();
+    const auto retries_before = M().get_batch_record_retries_total();
+
+    M().inc_batch_record_durable_batches();
+    M().inc_batch_record_durable_entries(8);
+    M().inc_batch_record_retries();
+    M().set_batch_record_committed_queue_depth(3);
+    M().set_batch_record_callback_queue_depth(2);
+    M().set_batch_record_last_batch_id(9);
+    M().set_batch_record_durable_sequence(72);
+    M().observe_batch_record_batch_entries(8);
+    M().observe_batch_record_batch_bytes(1024);
+    M().observe_batch_record_txn_latency_us(500);
+    M().observe_batch_record_commit_to_durable_us(700);
+    M().observe_batch_record_callback_latency_us(20);
+
+    EXPECT_EQ(batches_before + 1, M().get_batch_record_durable_batches_total());
+    EXPECT_EQ(entries_before + 8, M().get_batch_record_durable_entries_total());
+    EXPECT_EQ(retries_before + 1, M().get_batch_record_retries_total());
+    EXPECT_EQ(3, M().get_batch_record_committed_queue_depth());
+    EXPECT_EQ(2, M().get_batch_record_callback_queue_depth());
+    EXPECT_EQ(9, M().get_batch_record_last_batch_id());
+    EXPECT_EQ(72, M().get_batch_record_durable_sequence());
+
+    const std::string text = M().serialize_metrics();
+    for (const char* name : {
+             "ha_batch_record_durable_batches_total",
+             "ha_batch_record_durable_entries_total",
+             "ha_batch_record_retry_total",
+             "ha_batch_record_committed_queue_depth",
+             "ha_batch_record_callback_queue_depth",
+             "ha_batch_record_last_batch_id",
+             "ha_batch_record_durable_sequence",
+             "ha_batch_record_batch_entries",
+             "ha_batch_record_batch_bytes",
+             "ha_batch_record_txn_latency_us",
+             "ha_batch_record_commit_to_durable_us",
+             "ha_batch_record_callback_latency_us",
+         }) {
+        EXPECT_NE(std::string::npos, text.find(name)) << name;
+    }
+}
+#else
+TEST_F(HAMetricManagerTest, BatchRecordMetricsAreAbsentWhenDisabled) {
+    EXPECT_EQ(std::string::npos,
+              M().serialize_metrics().find("ha_batch_record_"));
+}
+#endif
+
+// ========== 7.1.2 Metric serialization tests ==========
+
+TEST_F(HAMetricManagerTest, TestSerializeMetrics) {
+    M().set_oplog_last_sequence_id(1);
+    M().set_oplog_applied_sequence_id(1);
+    M().set_oplog_standby_lag(0);
+
+    std::string text = M().serialize_metrics();
+    EXPECT_FALSE(text.empty());
+
+    // Basic fields should appear in the Prometheus text output
+    EXPECT_NE(std::string::npos, text.find("ha_oplog_last_sequence_id"));
+    EXPECT_NE(std::string::npos, text.find("ha_oplog_applied_sequence_id"));
+    EXPECT_NE(std::string::npos, text.find("ha_oplog_standby_lag"));
+}
+
+TEST_F(HAMetricManagerTest, TestGetSummaryString) {
+    M().set_oplog_last_sequence_id(100);
+    M().set_oplog_applied_sequence_id(95);
+    M().set_oplog_standby_lag(5);
+
+    std::string summary = M().get_summary_string();
+    EXPECT_FALSE(summary.empty());
+    // Summary string should contain key fields
+    EXPECT_NE(std::string::npos, summary.find("last_seq"));
+    EXPECT_NE(std::string::npos, summary.find("applied_seq"));
+}
+
+// ========== 7.1.3 Singleton tests ==========
+
+TEST_F(HAMetricManagerTest, TestSingletonInstance) {
+    HAMetricManager& a = HAMetricManager::instance();
+    HAMetricManager& b = HAMetricManager::instance();
+
+    EXPECT_EQ(&a, &b);
+
+    a.set_oplog_last_sequence_id(1234);
+    EXPECT_EQ(1234, b.get_oplog_last_sequence_id());
+}
+
+TEST_F(HAMetricManagerTest, TestConcurrentAccess) {
+    constexpr int kThreads = 8;
+    constexpr int kIncrementsPerThread = 1000;
+
+    auto& mgr = HAMetricManager::instance();
+    auto before = mgr.get_oplog_applied_entries_total();
+
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&mgr]() {
+            for (int j = 0; j < kIncrementsPerThread; ++j) {
+                mgr.inc_oplog_applied_entries();
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    auto after = mgr.get_oplog_applied_entries_total();
+    EXPECT_EQ(before + kThreads * kIncrementsPerThread, after);
+}
+
+TEST_F(HAMetricManagerTest, WriterOwnershipAndRangeSerialization) {
+    auto& mgr = HAMetricManager::instance();
+    const auto before = mgr.get_writer_runtime().retry_count;
+    HAMetricManager::WriterRuntimeSnapshot first;
+    first.accepting = true;
+    const auto old_owner = mgr.activate_writer_runtime(first);
+    auto serialized = mgr.serialize_metrics();
+    EXPECT_EQ(
+        FindSerializedMetricValue(serialized, "ha_writer_stuck_first_sequence"),
+        0);
+    EXPECT_EQ(
+        FindSerializedMetricValue(serialized, "ha_writer_stuck_last_sequence"),
+        0);
+
+    first.retry_count = 2;
+    first.stuck_range = std::make_pair(11, 15);
+    mgr.update_writer_runtime(old_owner, first);
+    serialized = mgr.serialize_metrics();
+    EXPECT_EQ(
+        FindSerializedMetricValue(serialized, "ha_writer_stuck_first_sequence"),
+        11);
+    EXPECT_EQ(
+        FindSerializedMetricValue(serialized, "ha_writer_stuck_last_sequence"),
+        15);
+    EXPECT_EQ(mgr.get_writer_runtime().retry_count, before + 2);
+
+    first.stuck_range.reset();
+    mgr.update_writer_runtime(old_owner, first);
+    serialized = mgr.serialize_metrics();
+    EXPECT_EQ(
+        FindSerializedMetricValue(serialized, "ha_writer_stuck_first_sequence"),
+        0);
+    EXPECT_EQ(
+        FindSerializedMetricValue(serialized, "ha_writer_stuck_last_sequence"),
+        0);
+
+    HAMetricManager::WriterRuntimeSnapshot second;
+    second.accepting = true;
+    second.durable_sequence = 20;
+    const auto new_owner = mgr.activate_writer_runtime(second);
+    first.accepting = false;
+    first.terminal_reason = "fenced";
+    mgr.update_writer_runtime(old_owner, first);
+    EXPECT_TRUE(mgr.get_writer_runtime().accepting);
+    EXPECT_EQ(mgr.get_writer_runtime().durable_sequence, 20);
+    EXPECT_TRUE(mgr.get_writer_runtime().terminal_reason.empty());
+    second.retry_count = 1;
+    mgr.update_writer_runtime(new_owner, second);
+    EXPECT_EQ(mgr.get_writer_runtime().retry_count, before + 3);
+}
+
+}  // namespace mooncake::test
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}

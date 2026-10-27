@@ -1,0 +1,6 @@
+if (USE_HIP)
+    find_package(HIP REQUIRED)
+    file(GLOB TENT_PLATFORM_ROCM_SOURCES "*.cpp")
+    add_library(platform_rocm STATIC ${TENT_PLATFORM_ROCM_SOURCES})
+    target_link_libraries(platform_rocm PUBLIC tent_common hip::host)
+endif()

@@ -1,0 +1,346 @@
+// mooncake_worker_host.cpp — Host-side code for PG collectives.
+// Compiled by g++ for both CUDA and MUSA builds. Uses kernel launch wrappers
+// from mooncake_worker_kernels.cuh instead of <<<>>> syntax.
+
+#include <memory>
+#include <thread>
+#include <utility>
+
+#include <mooncake_worker.cuh>
+#include <mooncake_worker_kernels.cuh>
+
+#include "error_types.h"
+
+namespace mooncake {
+
+void launchReduceKernel(void* dst, DataType dataType, size_t pos,
+                        size_t realSize, void* src, size_t numRanks,
+                        ReduceOp op, bool* activeRanks, cudaStream_t stream) {
+    PG_ASSERT(op == ReduceOp::Sum || op == ReduceOp::Min ||
+                  op == ReduceOp::Max || op == ReduceOp::Product,
+              "Only support SUM/MIN/MAX/PRODUCT for reduction.");
+    auto ptr = (char*)dst + pos;
+    size_t num = realSize / elementSize(dataType);
+
+    switch (dataType) {
+        case DataType::Uint8:
+            launchReduceKernel_uint8((uint8_t*)ptr, (uint8_t*)src, num,
+                                     numRanks, (int)op, activeRanks, stream);
+            break;
+        case DataType::Int8:
+            launchReduceKernel_int8((int8_t*)ptr, (int8_t*)src, num, numRanks,
+                                    (int)op, activeRanks, stream);
+            break;
+        case DataType::Int16:
+            launchReduceKernel_int16((int16_t*)ptr, (int16_t*)src, num,
+                                     numRanks, (int)op, activeRanks, stream);
+            break;
+        case DataType::Int32:
+            launchReduceKernel_int32((int*)ptr, (int*)src, num, numRanks,
+                                     (int)op, activeRanks, stream);
+            break;
+        case DataType::Int64:
+            launchReduceKernel_int64((int64_t*)ptr, (int64_t*)src, num,
+                                     numRanks, (int)op, activeRanks, stream);
+            break;
+        case DataType::Float32:
+            launchReduceKernel_float((float*)ptr, (float*)src, num, numRanks,
+                                     (int)op, activeRanks, stream);
+            break;
+        case DataType::Float64:
+            launchReduceKernel_double((double*)ptr, (double*)src, num, numRanks,
+                                      (int)op, activeRanks, stream);
+            break;
+        case DataType::Bool:
+            launchReduceKernel_bool((bool*)ptr, (bool*)src, num, numRanks,
+                                    (int)op, activeRanks, stream);
+            break;
+        case DataType::Bfloat16:
+            launchReduceKernel_bf16(ptr, src, num, numRanks, (int)op,
+                                    activeRanks, stream);
+            break;
+        default:
+            PG_ASSERT(false, "Unsupported reduce dtype: ", (int)dataType);
+    }
+}
+
+template <typename T>
+T applyReduceOp(const T& a, const T& b, ReduceOp op) {
+    switch (op) {
+        case ReduceOp::Sum:
+            return a + b;
+        case ReduceOp::Product:
+            return a * b;
+        case ReduceOp::Min:
+            return std::min(a, b);
+        case ReduceOp::Max:
+            return std::max(a, b);
+        default:
+            PG_ASSERT(false, "Unsupported reduce op: ", (int)op);
+    }
+}
+
+template <typename T>
+void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
+               ReduceOp op, bool* activeRanks) {
+    for (size_t i = 0; i < numElements; ++i) {
+        bool valid = false;
+        T acc{};
+        for (size_t rank = 0; rank < numRanks; ++rank) {
+            if (activeRanks[rank]) {
+                if (!valid) {
+                    acc = src[i + rank * numElements];
+                    valid = true;
+                } else {
+                    acc = applyReduceOp(acc, src[i + rank * numElements], op);
+                }
+            }
+        }
+        dst[i] = acc;
+    }
+}
+
+void launchReduceCpu(void* dst, DataType dataType, size_t pos, size_t realSize,
+                     void* src, size_t numRanks, ReduceOp op,
+                     bool* activeRanks) {
+    auto ptr = (char*)dst + pos;
+    size_t num = realSize / elementSize(dataType);
+
+    switch (dataType) {
+        case DataType::Uint8:
+            reduceCpu((uint8_t*)ptr, (uint8_t*)src, num, numRanks, op,
+                      activeRanks);
+            break;
+        case DataType::Int8:
+            reduceCpu((int8_t*)ptr, (int8_t*)src, num, numRanks, op,
+                      activeRanks);
+            break;
+        case DataType::Int16:
+            reduceCpu((int16_t*)ptr, (int16_t*)src, num, numRanks, op,
+                      activeRanks);
+            break;
+        case DataType::Int32:
+            reduceCpu((int*)ptr, (int*)src, num, numRanks, op, activeRanks);
+            break;
+        case DataType::Int64:
+            reduceCpu((int64_t*)ptr, (int64_t*)src, num, numRanks, op,
+                      activeRanks);
+            break;
+        case DataType::Float32:
+            reduceCpu((float*)ptr, (float*)src, num, numRanks, op, activeRanks);
+            break;
+        case DataType::Float64:
+            reduceCpu((double*)ptr, (double*)src, num, numRanks, op,
+                      activeRanks);
+            break;
+        case DataType::Bool:
+            reduceCpu((bool*)ptr, (bool*)src, num, numRanks, op, activeRanks);
+            break;
+        default:
+            PG_ASSERT(false, "Unsupported reduce dtype: ", (int)dataType);
+    }
+}
+
+MooncakeWorker::MooncakeWorker(int cuda_device_index)
+    : cuda_device_index_(cuda_device_index) {
+    int deviceCount = 0;
+    cudaError_t err = cudaGetDeviceCount(&deviceCount);
+    if (!err && deviceCount > 0) {
+        cudaHostAlloc(&tasks_, kNumTasks_ * sizeof(Task), cudaHostAllocMapped);
+        cudaHostGetDevicePointer(&tasks_device_, tasks_, 0);
+    } else {
+        tasks_ = new Task[kNumTasks_];
+    }
+
+    if (cuda_device_index_ >= 0) {
+        for (auto& enqueue_stream : enqueue_streams_) {
+            auto stream_result =
+                GpuStream::createNonBlocking(cuda_device_index_);
+            PG_ASSERT(stream_result.has_value(),
+                      "create CUDA worker enqueue stream failed: ",
+                      stream_result.error().message);
+            enqueue_stream.emplace(std::move(stream_result).value());
+        }
+    }
+
+    for (size_t i = 0; i < kNumTasks_; ++i) {
+        tasks_[i].active = false;
+        tasks_[i].activeRanksMirrorRequestGeneration = 0;
+        tasks_[i].activeRanksMirrorAppliedGeneration = 0;
+        tasks_[i].submitSequence = 0;
+        tasks_[i].failedRanksHint = nullptr;
+        tasks_[i].resetFailedRanksHint = false;
+        submitted_task_sequence_[i].store(0, std::memory_order_relaxed);
+    }
+}
+
+MooncakeWorker::~MooncakeWorker() {
+    running_ = false;
+    if (worker_thread_.joinable()) {
+        worker_thread_.join();
+    }
+}
+
+std::unique_ptr<WorkCompletion> MooncakeWorker::putTaskCpu(
+    OpType opType, size_t tensorSize, int64_t broadcastRoot,
+    const std::shared_ptr<TransferGroupMeta>& meta, int32_t* failed_ranks_hint,
+    const std::function<void(void* dst, size_t pos, size_t realSize)>&
+        copyToSendBuffer,
+    const std::function<void(void* src, size_t pos, size_t realSize)>&
+        copyFromRecvBuffer) {
+    PG_ASSERT(failed_ranks_hint, "failed-ranks hint is null");
+    size_t chunkSize = ((kBufferSize - 1) / meta->maxGroupSize) & ~(size_t)7;
+    auto completion = std::make_shared<std::promise<void>>();
+    auto future = completion->get_future().share();
+    auto result = std::make_unique<WorkCompletion>(std::move(future));
+
+    struct IterState {
+        size_t currentPos = 0;
+    };
+    auto state = std::make_shared<IterState>();
+
+    auto processNextChunk = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weakProcessNextChunk =
+        processNextChunk;
+
+    *processNextChunk = [this, weakProcessNextChunk, state, opType, tensorSize,
+                         chunkSize, broadcastRoot, meta, copyToSendBuffer,
+                         copyFromRecvBuffer, completion, failed_ranks_hint]() {
+        auto processNextChunk = weakProcessNextChunk.lock();
+
+        if (state->currentPos >= tensorSize) {
+            completion->set_value();
+            return;
+        }
+
+        int taskId = cpuTaskCount % 2;
+        PG_ASSERT(!tasks_[taskId].active,
+                  "collective CPU task slot is still active");
+        size_t realSize = std::min(chunkSize, tensorSize - state->currentPos);
+        int bufferOffset = meta->taskCount % 2;
+        tasks_[taskId].opType = (int)opType;
+        tasks_[taskId].dataSize = realSize;
+        tasks_[taskId].broadcastRoot = broadcastRoot;
+        tasks_[taskId].bufferOffset = bufferOffset;
+        tasks_[taskId].submitSequence = 0;
+        tasks_[taskId].failedRanksHint = failed_ranks_hint;
+        tasks_[taskId].resetFailedRanksHint = state->currentPos == 0;
+        tasks_[taskId].transferGroupMeta = meta.get();
+        copyToSendBuffer(
+            (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
+            state->currentPos, realSize);
+
+        hasCallback_[taskId] = true;
+
+        callbacks_[taskId] = [processNextChunk, state, meta, copyFromRecvBuffer,
+                              bufferOffset, realSize, completion]() {
+            copyFromRecvBuffer(
+                (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
+                state->currentPos, realSize);
+
+            state->currentPos += realSize;
+
+            (*processNextChunk)();
+        };
+
+        tasks_[taskId].active = true;
+        ++cpuTaskCount;
+        ++meta->taskCount;
+    };
+
+    (*processNextChunk)();
+
+    return result;
+}
+
+void MooncakeWorker::putTaskCuda(
+    OpType opType, size_t tensorSize, int64_t broadcastRoot,
+    const std::shared_ptr<TransferGroupMeta>& meta, cudaStream_t issueStream,
+    int32_t* failed_ranks_hint,
+    const std::function<void(void* dst, size_t pos, size_t realSize,
+                             cudaStream_t)>& copyToSendBuffer,
+    const std::function<void(void* src, size_t pos, size_t realSize,
+                             cudaStream_t)>& copyFromRecvBuffer) {
+    size_t chunkSize = ((kBufferSize - 1) / meta->maxGroupSize) & ~(size_t)7;
+
+    auto guard_result = GpuDeviceGuard::create(cuda_device_index_);
+    PG_ASSERT(guard_result.has_value(), "select CUDA worker device failed: ",
+              guard_result.error().message);
+    auto device_guard = std::move(guard_result).value();
+    const auto issue_stream =
+        GpuStream::borrow(issueStream, cuda_device_index_);
+    const size_t cudaTaskSlot = cudaOpCount % kNumCudaTasks_;
+    const size_t taskId = kCudaTaskOffset_ + cudaTaskSlot;
+    const auto& enq_stream = enqueue_streams_[cudaTaskSlot].value();
+    ++cudaOpCount;
+
+    const auto issue_capture = issue_stream.captureStatus();
+    PG_ASSERT(issue_capture.has_value(),
+              "query CUDA worker issue stream capture status failed: ",
+              issue_capture.error().message);
+    const auto enq_capture = enq_stream.captureStatus();
+    PG_ASSERT(enq_capture.has_value(),
+              "query CUDA worker enqueue stream capture status failed: ",
+              enq_capture.error().message);
+    const bool is_capturing =
+        issue_capture.value() != cudaStreamCaptureStatusNone ||
+        enq_capture.value() != cudaStreamCaptureStatusNone;
+    auto event_start_result = GpuEvent::create(issue_stream.deviceIndex());
+    PG_ASSERT(event_start_result.has_value(),
+              "create CUDA worker entry event failed: ",
+              event_start_result.error().message);
+    auto event_start = std::move(event_start_result).value();
+    PG_ASSERT_OK(event_start.record(issue_stream));
+    PG_ASSERT_OK(enq_stream.waitEvent(event_start));
+
+    std::vector<CudaTaskSubmissionToken> submitted_tasks;
+    submitted_tasks.reserve((tensorSize + chunkSize - 1) / chunkSize);
+
+    // Keep every chunk of one collective on the same task slot and enqueue
+    // stream. The next collective rotates to the other CUDA task slot.
+    for (size_t pos = 0; pos < tensorSize; pos += chunkSize) {
+        size_t realSize = std::min(tensorSize, pos + chunkSize) - pos;
+        int bufferOffset = meta->taskCount % 2;
+
+        const uint64_t taskSequence =
+            next_cuda_task_sequence_.fetch_add(1, std::memory_order_relaxed);
+        submitted_tasks.push_back(
+            {.task_id = taskId, .sequence = taskSequence});
+        copyToSendBuffer(
+            (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
+            pos, realSize, enq_stream.get());
+
+        hasCallback_[taskId] = false;
+
+        launchEnqueueTaskKernel(
+            (int)opType, realSize, broadcastRoot, bufferOffset, taskSequence,
+            failed_ranks_hint, pos == 0, meta.get(), meta->activeRanksDevice,
+            meta->activeRanksMirrorDevice, meta->maxGroupSize, tasks_device_,
+            taskId, enq_stream.get());
+        copyFromRecvBuffer(
+            (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
+            pos, realSize, enq_stream.get());
+
+        ++meta->taskCount;
+    }
+
+    // Each CUDA task slot is paired with a dedicated enqueue stream. All chunks
+    // of one collective stay on that pair, and reusing the same slot is
+    // serialized by the stream. In eager mode, finish each chunk's host-worker
+    // submission step before installing the completion wait on issue_stream
+    // below. Captured enqueue kernels have not run yet, so capture skips this
+    // gate.
+    if (!is_capturing) {
+        waitUntilTasksSubmitted(submitted_tasks);
+    }
+
+    auto event_end_result = GpuEvent::create(enq_stream.deviceIndex());
+    PG_ASSERT(event_end_result.has_value(),
+              "create CUDA worker return event failed: ",
+              event_end_result.error().message);
+    auto event_end = std::move(event_end_result).value();
+    PG_ASSERT_OK(event_end.record(enq_stream));
+    PG_ASSERT_OK(issue_stream.waitEvent(event_end));
+}
+
+}  // namespace mooncake

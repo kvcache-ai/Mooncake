@@ -1,0 +1,210 @@
+// Copyright 2024 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "tent/runtime/segment_tracker.h"
+
+#include <cassert>
+#include <filesystem>
+#include <set>
+
+#include "tent/common/status.h"
+#include "tent/runtime/platform.h"
+#include "tent/runtime/control_plane.h"
+#include "tent/runtime/segment_registry.h"
+
+namespace mooncake {
+namespace tent {
+namespace {
+void sortBuffers(std::vector<BufferDesc>& buffers) {
+    std::sort(buffers.begin(), buffers.end(),
+              [](const BufferDesc& lhs, const BufferDesc& rhs) -> bool {
+                  if (lhs.addr < rhs.addr) return true;
+                  if (lhs.addr > rhs.addr) return false;
+                  return lhs.length > rhs.length;  // prefer large interval
+              });
+}
+
+bool containsBuffer(const SegmentDesc& desc, uint64_t base, size_t length) {
+    auto& detail = std::get<MemorySegmentDesc>(desc.detail);
+    for (auto& buf : detail.buffers) {
+        if (buf.addr == base && buf.length == length) return true;
+    }
+    return false;
+}
+}  // namespace
+
+Status SegmentTracker::add(uint64_t base, size_t length,
+                           std::function<Status(BufferDesc&)> callback) {
+    std::lock_guard<std::recursive_mutex> guard(mutex_);
+    // Skip the ref-count publication when the current snapshot has no match.
+    // The tracker mutex serializes registration and removal across callbacks.
+    if (containsBuffer(*manager_.getLocal(), base, length)) {
+        bool found = false;
+        CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) -> Status {
+            assert(desc.type == SegmentType::Memory);
+            auto& detail = std::get<MemorySegmentDesc>(desc.detail);
+            for (auto& buf : detail.buffers) {
+                if (buf.addr == base && buf.length == length) {
+                    buf.ref_count++;
+                    found = true;
+                    break;
+                }
+            }
+            return Status::OK();
+        }));
+        if (found) return Status::OK();
+    }
+    BufferDesc new_desc;
+    new_desc.addr = base;
+    new_desc.length = length;
+    auto entries = Platform::getLoader().getLocation((void*)base, length);
+    if (entries.size() == 1)
+        new_desc.location = entries[0].location;
+    else {
+        new_desc.location = entries[0].location;
+        new_desc.regions = coalesceRegions(entries);
+    }
+    new_desc.ref_count = 1;
+    auto status = callback(new_desc);
+    if (!status.ok()) return status;
+    return manager_.updateLocal([&](SegmentDesc& desc) -> Status {
+        assert(desc.type == SegmentType::Memory);
+        auto& detail = std::get<MemorySegmentDesc>(desc.detail);
+        detail.buffers.push_back(std::move(new_desc));
+        sortBuffers(detail.buffers);
+        return Status::OK();
+    });
+}
+
+Status SegmentTracker::addInBatch(
+    std::vector<BufferDesc>& desc_list,
+    std::function<Status(std::vector<BufferDesc>&)> callback,
+    std::function<Status(BufferDesc&)> on_removed) {
+    std::lock_guard<std::recursive_mutex> guard(mutex_);
+    std::vector<BufferDesc> new_desc_list;
+    // Read-only pre-scan (see add()): skip the ref-count publication when no
+    // entry duplicates an already-registered range.
+    bool any_dup = false;
+    {
+        auto snapshot = manager_.getLocal();
+        for (auto& entry : desc_list) {
+            if (containsBuffer(*snapshot, entry.addr, entry.length)) {
+                any_dup = true;
+                break;
+            }
+        }
+    }
+    // Record added references so a failed callback can roll them back.
+    // Publish them before the callback, which may reenter the tracker.
+    std::vector<std::pair<uint64_t, uint64_t>> bumped;
+    if (any_dup) {
+        CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) -> Status {
+            assert(desc.type == SegmentType::Memory);
+            auto& detail = std::get<MemorySegmentDesc>(desc.detail);
+            for (auto& entry : desc_list) {
+                bool found = false;
+                for (auto& buf : detail.buffers) {
+                    if (buf.addr == entry.addr && buf.length == entry.length) {
+                        buf.ref_count++;
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) {
+                    bumped.emplace_back(entry.addr, entry.length);
+                } else {
+                    new_desc_list.push_back(std::move(entry));
+                }
+            }
+            return Status::OK();
+        }));
+    } else {
+        new_desc_list = std::move(desc_list);
+    }
+    auto status = callback(new_desc_list);
+    if (!status.ok()) {
+        // Roll back the duplicate ref-counts so a failed registration does
+        // not leave buffers pinned forever.
+        for (const auto& range : bumped) {
+            auto rollback =
+                remove(range.first, range.second, [&](BufferDesc& desc) {
+                    return on_removed ? on_removed(desc) : Status::OK();
+                });
+            if (!rollback.ok()) LOG(WARNING) << rollback.ToString();
+        }
+        return status;
+    }
+    return manager_.updateLocal([&](SegmentDesc& desc) -> Status {
+        assert(desc.type == SegmentType::Memory);
+        auto& detail = std::get<MemorySegmentDesc>(desc.detail);
+        for (auto& new_desc : new_desc_list) {
+            detail.buffers.push_back(new_desc);
+        }
+        sortBuffers(detail.buffers);
+        return Status::OK();
+    });
+}
+
+Status SegmentTracker::remove(uint64_t base, size_t length,
+                              std::function<Status(BufferDesc&)> callback) {
+    std::lock_guard<std::recursive_mutex> guard(mutex_);
+    bool removed = false;
+    BufferDesc removed_desc;
+    CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) -> Status {
+        assert(desc.type == SegmentType::Memory);
+        auto& detail = std::get<MemorySegmentDesc>(desc.detail);
+        for (auto it = detail.buffers.begin(); it != detail.buffers.end();
+             ++it) {
+            if (it->addr == base && (!length || it->length == length)) {
+                it->ref_count--;
+                if (it->ref_count == 0) {
+                    removed_desc = *it;
+                    detail.buffers.erase(it);
+                    removed = true;
+                }
+                break;
+            }
+        }
+        return Status::OK();
+    }));
+    if (!removed) return Status::OK();
+    auto status = callback(removed_desc);
+    if (!status.ok()) {
+        // Successful transport removals may have scrubbed their keys. Keep
+        // the remaining registrations and one reference for a safe retry.
+        removed_desc.ref_count = 1;
+        CHECK_STATUS(manager_.updateLocal([&](SegmentDesc& desc) {
+            auto& buffers = std::get<MemorySegmentDesc>(desc.detail).buffers;
+            buffers.push_back(std::move(removed_desc));
+            sortBuffers(buffers);
+            return Status::OK();
+        }));
+    }
+    return status;
+}
+
+Status SegmentTracker::forEach(
+    std::function<Status(const BufferDesc&)> callback) {
+    auto snapshot = manager_.getLocal();
+    assert(snapshot->type == SegmentType::Memory);
+    for (const auto& buf :
+         std::get<MemorySegmentDesc>(snapshot->detail).buffers) {
+        auto status = callback(buf);
+        if (!status.ok()) return status;
+    }
+    return Status::OK();
+}
+
+}  // namespace tent
+}  // namespace mooncake

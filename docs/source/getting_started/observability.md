@@ -1,0 +1,325 @@
+# Observability
+
+This document describes how to monitor and observe a running Mooncake Store deployment.
+
+## Master Metrics Log
+
+When started, the Mooncake master periodically prints a metrics summary log every 10 seconds (configurable via `kMetricReportIntervalSeconds`). This log provides a comprehensive snapshot of the master's runtime state.
+
+### Log Format
+
+```
+I0512 15:03:30.321475 239489 rpc_service.cpp:269] Master Admin Metrics: role=leader, state=serving, service_ready=true, master={...}, ha={...}, leader=127.0.0.1:50051, view_version=1
+```
+
+Each log line contains:
+- **GLog header**: timestamp, thread ID, source file and line number
+- **role**: HA role — `leader` or `standby`
+- **state**: HA runtime state — `serving`, `starting`, `stopping`, etc.
+- **service_ready**: whether the gRPC service is accepting requests
+- **master**: master metrics block (see below)
+- **ha**: HA metrics block
+- **leader**: (only when available) the current leader address and view version
+
+### Master Metrics Block
+
+A typical `master={...}` block looks like this:
+
+```
+Mem Storage: 94.09 MB / 100.00 MB (94.1%) | SSD Storage: 0 B / 0 B | Keys: 16058 (soft-pinned: 0) | Clients: 1 | Requests (Success/Total per sec): PutStart=0.00/0.00, PutEnd=0.00/0.00, PutRevoke=0.00/0.00, Get=0.00/0.00, Exist=0.00/0.00, Del=0.00/0.00, DelAll=0.00/0.00, Ping=1.00/1.00, CopyStart=0.00/0.00, CopyEnd=0.00/0.00, CopyRevoke=0.00/0.00, MoveStart=0.00/0.00, MoveEnd=0.00/0.00, MoveRevoke=0.00/0.00, EvictDiskReplica=0.00/0.00 | Batch Requests (per sec, Req=Success/PartialSuccess/Total, Item=Success/Total): PutStart:(Req=0.00/0.00/0.00, Item=0.00/0.00), PutEnd:(Req=0.00/0.00/0.00, Item=0.00/0.00), PutRevoke:(Req=0.00/0.00/0.00, Item=0.00/0.00), Get:(Req=0.00/0.00/0.00, Item=0.00/0.00), ExistKey:(Req=0.00/0.00/0.00, Item=0.00/0.00), QueryIp:(Req=0.00/0.00/0.00, Item=0.00/0.00), Clear:(Req=0.00/0.00/0.00, Item=0.00/0.00), CreateMoveTask:(Req=0.00/0.00), CreateCopyTask:(Req=0.00/0.00), QueryTask:(Req=0.00/0.00), FetchTasks:(Req=0.00/0.00), MarkTaskToComplete:(Req=0.00/0.00) | Eviction: Success/Attempts=0/0, AllocFail=0, keys=0, size=0 B | Discard: Released/Total=0/0, StagingSize=0 B | Snapshots: Success=0, Fail=0
+```
+
+Request counters are reported as **rates per second** over the time window between two consecutive log outputs (10 seconds by default). Real-time state values (storage, key count, client count, discard staging size) are not rate-limited and reflect the current value at log time.
+
+The metrics block consists of the following sections:
+
+#### Storage
+
+| Field | Description |
+|-------|-------------|
+| `Mem Storage` | Current memory usage / total memory capacity, with percentage |
+| `SSD Storage` | Current SSD-backed storage usage / total SSD capacity |
+
+#### Keys and Clients
+
+| Field | Description |
+|-------|-------------|
+| `Keys` | Total number of keys managed by the master |
+| `soft-pinned` | Number of keys with active soft-pin leases (protected from eviction) |
+| `Clients` | Number of currently connected clients |
+
+#### Requests (Success/Total per sec)
+
+Rate counters for individual (non-batch) RPC requests over the last time window. Each shows `<success_rate>/<total_rate>` in requests per second:
+
+| Counter | Description |
+|---------|-------------|
+| `PutStart` | Put object allocation requests |
+| `PutEnd` | Put object commit requests |
+| `PutRevoke` | Put object cancellation requests |
+| `Get` | Get replica list requests |
+| `Exist` | Key existence check requests |
+| `Del` | Single key deletion requests |
+| `DelAll` | Delete-all objects requests |
+| `Ping` | Client heartbeat/ping requests |
+| `CopyStart` | Copy object allocation requests |
+| `CopyEnd` | Copy object commit requests |
+| `CopyRevoke` | Copy object cancellation requests |
+| `MoveStart` | Move object allocation requests |
+| `MoveEnd` | Move object commit requests |
+| `MoveRevoke` | Move object cancellation requests |
+| `EvictDiskReplica` | Evict disk replica requests |
+
+#### Batch Requests (per sec)
+
+Batch operations aggregate multiple items into a single RPC. Rates are per second over the last time window. Format: `Req=<success>/<partial_success>/<total>`, `Item=<success_items>/<total_items>`:
+
+| Counter | Description |
+|---------|-------------|
+| `PutStart` | Batch put object allocation requests |
+| `PutEnd` | Batch put object commit requests |
+| `PutRevoke` | Batch put object cancellation requests |
+| `Get` | Batch get replica list requests |
+| `ExistKey` | Batch key existence check requests |
+| `QueryIp` | Batch query IP requests |
+| `Clear` | Batch replica clear requests |
+
+A request is considered "partial success" when it succeeds for some items but not all.
+
+#### Task Operations
+
+| Counter | Description |
+|---------|-------------|
+| `CreateMoveTask` | Move task creation requests |
+| `CreateCopyTask` | Copy task creation requests |
+| `QueryTask` | Task status query requests |
+| `FetchTasks` | Pending task fetch requests (polled by store clients) |
+| `MarkTaskToComplete` | Task completion acknowledgement requests |
+
+#### Eviction & Discard
+
+Eviction counters are **deltas** between two consecutive log outputs — they show what happened in the time window, not cumulative totals.
+
+| Field | Description |
+|-------|-------------|
+| `Eviction: Success/Attempts` | Eviction rounds that succeeded at least partially vs. total attempts in this window |
+| `AllocFail` | Number of PutStart/UpsertStart failures caused by replica allocation failure (triggers eviction) in this window |
+| `keys` | Number of keys evicted in this window |
+| `size` | Total size of evicted data in this window |
+| `Discard: Released/Total` | Released (cleaned up) vs. total discarded PutStart staging replicas (live values) |
+| `StagingSize` | Current size of discarded but not-yet-released staging buffers (live value) |
+
+## Prometheus Metrics Endpoint
+
+Mooncake master exposes Prometheus-format metrics at the HTTP admin endpoint. This allows integration with Prometheus, Grafana, or any Prometheus-compatible monitoring stack.
+
+### Endpoints
+
+The admin HTTP server runs on `metrics_port` (default: **9003**) and exposes the following endpoints:
+
+| Endpoint | Content-Type | Description |
+|----------|-------------|-------------|
+| `GET /metrics` | `text/plain; version=0.0.4` | All metrics in Prometheus exposition format |
+| `GET /metrics/summary` | `text/plain; version=0.0.4` | Human-readable summary (same content as the periodic log) |
+| `GET /health` | `application/json` | Health check with role, HA state, and service readiness |
+| `GET /version` | `application/json` | Master version (`version` for RPC compatibility, `display_version` for release + git hash) |
+| `GET /role` | `text/plain` | Current HA role (`leader` / `standby`) |
+| `GET /ha_status` | `text/plain` | Current HA runtime state (`serving` / `starting` / etc.) |
+
+### Usage
+
+**Scrape the /metrics endpoint with Prometheus:**
+
+Add a scrape config to your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: 'mooncake-master'
+    static_configs:
+      - targets: ['<master-host>:9003']
+    metrics_path: '/metrics'
+```
+
+**Quick check with curl:**
+
+```bash
+# Get Prometheus metrics
+curl http://<master-host>:9003/metrics
+
+# Get human-readable summary
+curl http://<master-host>:9003/metrics/summary
+
+# Check health
+curl http://<master-host>:9003/health
+
+# Check version
+curl http://<master-host>:9003/version
+```
+
+### Configuration
+
+The admin HTTP server is configured in the master config file (`master.json` or `master.yaml`):
+
+```text
+{
+  "enable_metric_reporting": true,
+  "metrics_port": 9003,
+  ...
+}
+```
+
+Set `enable_metric_reporting` to `false` to disable the periodic metrics log. HTTP endpoints (`/metrics`, `/health`, etc.) remain available regardless of this setting.
+
+### Process and Allocator Memory Metrics
+
+Both `/metrics` endpoints export the resident set size of the serving process,
+so memory growth can be read from Mooncake itself rather than correlated
+against a container-level metric.
+
+| Metric | Type | Source |
+|--------|------|--------|
+| `mooncake_process_rss_bytes` | gauge | `VmRSS` |
+| `mooncake_process_rss_peak_bytes` | gauge | `VmHWM`, the high-water mark an OOM kill is decided on |
+| `mooncake_process_rss_anon_bytes` / `..._rss_file_bytes` / `..._rss_shmem_bytes` | gauge | `RssAnon` / `RssFile` / `RssShmem` |
+| `mooncake_process_vsize_bytes` | gauge | `VmSize` |
+| `mooncake_process_swap_bytes` | gauge | `VmSwap` |
+
+These come from `/proc/self/status` and are exported whichever allocator the
+binary is linked against, so they stay comparable across an allocator change.
+
+When the binary is built with `-DSTORE_USE_JEMALLOC=ON` (see below),
+`mooncake_jemalloc_enabled` reports `1` and the allocator's own accounting is
+exported alongside: `allocated` / `active` / `metadata` / `resident` /
+`retained` / `mapped` / `dirty` / `muzzy` bytes, arena and background-thread
+counts, the `opt.dirty_decay_ms` and `opt.muzzy_decay_ms` settings, and
+cumulative purge counters (`mooncake_jemalloc_dirty_purge_runs_total`,
+`..._dirty_madvises_total`, and the `muzzy` equivalents). Dirty and muzzy are
+reported separately because jemalloc decays them on separate paths.
+
+`mooncake_jemalloc_resident_bytes / mooncake_jemalloc_allocated_bytes` is the
+ratio to watch: it is how much memory the allocator holds beyond what the
+application asked for. To attribute that ratio to a specific allocation size,
+`mooncake_jemalloc_bin_regs`, `..._bin_slabs`, `..._bin_used_bytes` and
+`..._bin_slab_bytes` break it down per small size class, labelled by
+`size_class`. A slab is returned to the OS only once every region in it is
+free, so a class with low `bin_used_bytes / bin_slab_bytes` occupancy is
+holding pages it cannot release.
+
+Note that `mooncake_jemalloc_resident_bytes` is the allocator's own upper
+estimate over the extents it maps and can exceed `mooncake_process_rss_bytes`;
+compare the two for divergence rather than subtracting them.
+
+When the binary is not built with jemalloc, `mooncake_jemalloc_enabled` reports
+`0`, no `mooncake_jemalloc_*` values or per-size-class series are emitted, and
+the process series above still export.
+
+#### Building with jemalloc
+
+`STORE_USE_JEMALLOC` is **off by default**. It links jemalloc into the
+`mooncake_master` and `mooncake_client` executables only, never into
+`libmooncake_store`, so the Python extension keeps its host process's
+allocator:
+
+```bash
+cmake .. -DSTORE_USE_JEMALLOC=ON
+```
+
+Both executables are stripped at link time, so each logs the jemalloc version,
+`background_thread` state and both decay settings at startup. That line is the
+way to confirm on a release binary that the allocator was actually replaced.
+
+## Client Metrics Endpoint
+
+Mooncake clients can also expose a client-local HTTP endpoint for health checks
+and client metrics. This is separate from the master admin endpoint above and is
+disabled by default for Python/programmatic clients.
+
+Enable it through the Python setup arguments:
+
+```python
+store.setup(
+    local_hostname,
+    metadata_server,
+    global_segment_size,
+    local_buffer_size,
+    protocol,
+    rdma_devices,
+    master_server_addr,
+    enable_client_http_server=True,
+    client_http_port=9300,
+)
+```
+
+For `mooncake.mooncake_store_service`, set
+`MOONCAKE_ENABLE_CLIENT_HTTP_SERVER=true` and optionally
+`MOONCAKE_CLIENT_HTTP_PORT=<port>`. For the standalone `mooncake_client`, use
+`--enable_http_server=true --http_port=<port>`.
+
+| Endpoint | Content-Type | Description |
+|----------|--------------|-------------|
+| `GET /health` | `application/json` | Client health check |
+| `GET /metrics` | `text/plain; version=0.0.4` | Prometheus-format client metrics |
+| `GET /metrics/summary` | `text/plain` | Human-readable client metrics summary |
+| `GET /version` | `application/json` | Client version (`version` for RPC compatibility, `display_version` for release + git hash) |
+
+```bash
+curl http://<client-host>:9300/health
+curl http://<client-host>:9300/metrics
+curl http://<client-host>:9300/metrics/summary
+curl http://<client-host>:9300/version
+```
+
+```json
+{"version":"2.0.0","display_version":"0.3.12.post1 (git: f9e8311f)"}
+```
+
+`/version` does not depend on client metric collection or on a fully
+initialized client, so it stays available whenever the client HTTP server is
+running.
+
+Set `MC_STORE_CLIENT_METRIC=0` to disable client metric collection. If the
+client HTTP server remains enabled while metrics are disabled, `/metrics` and
+`/metrics/summary` return HTTP 503 with `metrics not available`.
+
+
+### Master heartbeat observations
+
+Clients running the storage heartbeat expose two gauges through `/metrics`:
+
+| Metric | Meaning |
+|--------|---------|
+| `mooncake_client_master_heartbeat_status_ok` | Last observed Ping status: `1` for `OK`, `0` for `NEED_REMOUNT`. |
+| `mooncake_client_master_heartbeat_observation_timestamp_seconds` | Client-side Unix receive time, in seconds, of the same observation. |
+
+Both samples carry the existing client labels. They are absent before the first
+valid heartbeat, after a failed heartbeat or an unsupported status, and while
+reconnecting. Late responses from an older connection cannot restore the
+observation. A successful remount alone does not set the status to `1`; a later
+Ping must return `OK`.
+
+A client without storage may never start this heartbeat. Memory or LocalDisk
+mounts and DFS backend activation start the storage control plane; creating a
+request-only client does not. Missing samples mean **unknown or inapplicable**,
+not `NEED_REMOUNT`. Disabling client metrics also disables these observations.
+
+The timestamp is an observation value, not a Prometheus sample timestamp. An
+in-flight Ping can leave the previous observation visible until it completes,
+so check its age as well as its status. For example, for targets expected to
+run a storage heartbeat, this query selects a recent `NEED_REMOUNT` observation
+using an illustrative 10-second freshness limit:
+
+```promql
+(mooncake_client_master_heartbeat_status_ok == 0)
+and
+((time() - mooncake_client_master_heartbeat_observation_timestamp_seconds) < 10)
+```
+
+Choose the freshness limit for the heartbeat/RPC timeouts and scrape interval
+in your deployment, and account for clock skew. Do not replace missing status
+samples with zero. Prometheus `up` describes the HTTP scrape, not Master Ping
+success; missing or stale observations need separate handling.
+
+This is a sampled control-plane response. `OK` does not prove that every
+segment is mounted, that transfer metadata or SSD recovery is complete, or
+that data RPCs and RDMA transfers are healthy. The existing `/health` check
+can remain healthy when a successful Ping returns `NEED_REMOUNT`.

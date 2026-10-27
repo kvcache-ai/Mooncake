@@ -1,0 +1,330 @@
+// Copyright 2024 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef TENT_ENDPOINT_H
+#define TENT_ENDPOINT_H
+
+#include <atomic>
+#include <functional>
+#include <memory>
+#include <queue>
+#include <unordered_set>
+#include <vector>
+
+#include "context.h"
+#include "tent/common/concurrent/ticket_lock.h"
+
+namespace mooncake {
+namespace tent {
+class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
+    struct WrDepthBlock {
+        std::atomic<int> value;
+        uint64_t padding[7];
+    };
+
+    // Not synchronized: every access goes through queue_lock_list_[qp_index]
+    // (submitSlices / acknowledge) or the endpoint write lock (teardown).
+    struct BoundedSliceQueue {
+        size_t head, tail, capacity, count;
+        std::vector<RdmaSlice*> entries;
+        std::unordered_set<RdmaSlice*> slice_set;
+
+        BoundedSliceQueue(size_t num_wr)
+            : head(0),
+              tail(0),
+              capacity(num_wr * 2),
+              count(0),
+              entries(capacity) {
+            assert(capacity > 0);
+        }
+
+        ~BoundedSliceQueue() {}
+
+        bool empty() const { return count == 0; }
+
+        bool full() const { return count == capacity; }
+
+        void push(RdmaSlice* slice) {
+            if (count == capacity) throw std::runtime_error("queue overflow");
+            entries[tail] = slice;
+            tail = (tail + 1) % capacity;
+            slice_set.insert(slice);
+            count++;
+        }
+
+        RdmaSlice* peek() {
+            if (count == 0) return nullptr;
+            return entries[head];
+        }
+
+        RdmaSlice* pop() {
+            if (count == 0) return nullptr;
+            RdmaSlice* cur = entries[head];
+            head = (head + 1) % capacity;
+            slice_set.erase(cur);
+            count--;
+            return cur;
+        }
+
+        bool contains(RdmaSlice* slice) { return slice_set.count(slice); }
+    };
+
+   public:
+    RdmaEndPoint();
+
+    ~RdmaEndPoint();
+
+   public:
+    // Endpoint lifecycle is unidirectional: once created, endpoints move
+    // forward through states and never return. Failed or discarded endpoints
+    // enter EP_DESTROYING and are reclaimed - they are never reset or reused.
+    enum EndPointStatus {
+        EP_UNINIT,       // Initial state, not yet constructed
+        EP_HANDSHAKING,  // Connection in progress
+        EP_READY,        // Connected and operational
+        EP_DESTROYING,   // Being destroyed (failed or discarded)
+        EP_DESTROYED,    // Fully destroyed
+    };
+
+    int construct(RdmaContext* context, EndPointParams* params,
+                  const std::string& endpoint_name);
+
+    int deconstruct();
+
+    int resetConnection(const std::string& reason);
+
+    // Two-phase QP destruction to avoid use-after-free in concurrent
+    // submitPostSend. Phase 1 (beginDestroy): sets status_=EP_DESTROYING,
+    // transitions QPs to ERR state so hardware flushes inflight WRs to CQ.
+    // Does not block. Phase 2 (finishDestroy): called after all outstanding
+    // WRs have been drained, actually destroys QPs and frees resources.
+    // Returns true if destruction is complete, false if outstanding WRs remain.
+    void beginDestroy();
+    bool finishDestroy();
+
+    Status connect(const std::string& peer_server_name,
+                   const std::string& peer_nic_name,
+                   const std::string& peer_rpc_server_addr = "");
+
+    Status accept(const BootstrapDesc& peer_desc, BootstrapDesc& local_desc);
+
+    EndPointStatus status() const {
+        return status_.load(std::memory_order_relaxed);
+    }
+
+    std::vector<uint32_t> qpNum();
+
+    int getInflightSlices() const;
+
+    RdmaContext& context() const { return *context_; }
+
+    std::string name() const { return endpoint_name_; }
+
+    // Notification QP operations
+    uint32_t notifyQpNum() const { return notify_qp_ ? notify_qp_->qp_num : 0; }
+
+    bool sendNotification(const std::string& name, const std::string& msg);
+
+    // Whether the notify QP is connected and not disabled after a fault.
+    bool notifyConnected() const {
+        return notify_connected_.load(std::memory_order_acquire);
+    }
+
+    // One notification WR (send or receive) left the CQ. Called by the
+    // transport for every completion of this endpoint's notify QP.
+    void noteNotifyCompletion() {
+        uint32_t inflight = notify_inflight_.load(std::memory_order_relaxed);
+        while (inflight > 0 &&
+               !notify_inflight_.compare_exchange_weak(
+                   inflight, inflight - 1, std::memory_order_acq_rel,
+                   std::memory_order_relaxed)) {
+        }
+    }
+
+    uint32_t notifyInflight() const {
+        return notify_inflight_.load(std::memory_order_acquire);
+    }
+
+    // Whether a consumed notify RECV slot is posted again. Only while the
+    // endpoint is ready and its notify QP connected: a retiring endpoint's
+    // QP is in ERR, and so is the QP of an endpoint whose notifications were
+    // disabled, because the local completion error that disables them has
+    // already moved the RC QP to ERR. A post on either is wasted work - this
+    // provider accepts it and flushes it straight back, one that checks the
+    // state rejects it and logs - and the initial posting in connect() /
+    // accept() does not go through here.
+    static bool shouldRearmNotifyRecv(EndPointStatus status,
+                                      bool notify_connected) {
+        return status == EP_READY && notify_connected;
+    }
+
+    // Turns notifications off after a fault confined to the notify QP,
+    // leaving the data QPs and the endpoint lifecycle untouched.
+    // Notifications stay off for the remaining lifetime of the endpoint. The
+    // QP itself stays published until deconstruct(), so completions already
+    // in the CQ are still delivered.
+    void disableNotification(const std::string& reason);
+
+    // Process RECV completion: parse message and add to transport queue
+    // directly
+    bool handleNotifyRecv(size_t buffer_idx, size_t byte_len);
+
+    // Process SEND completion: cleanup pending send
+    void handleNotifySendComplete(uint64_t wr_id);
+
+   public:
+    struct Request {
+        struct SglEntry {
+            uint32_t length;
+            uint64_t addr;
+            uint32_t lkey;
+        };
+        ibv_wr_opcode opcode;
+        std::vector<SglEntry> local;
+        uint64_t remote_addr;
+        uint32_t remote_key;
+        uint32_t imm_data;
+        void* user_context;
+        bool failed;
+    };
+
+    // Post as many of `slice_list` as the queue pair's budget allows and
+    // return how many were taken (posted or marked `failed`). `on_post`,
+    // when given, runs for each of those before ibv_post_send: on a shared
+    // queue pair another lane can poll a completion before this call
+    // returns, so whatever the poller must find in place (the posted
+    // device, the set entry) has to be written first. Slices the hardware
+    // rejects come back with `failed` set; the caller undoes what it did for
+    // them.
+    int submitSlices(std::vector<RdmaSlice*>& slice_list, int qp_index,
+                     const std::function<void(RdmaSlice*)>& on_post = {});
+
+    int submitRecvImmDataRequest(int qp_index, uint64_t id);
+
+    // Pop `slice` and every slice queued before it on the same QP, giving
+    // them `status`. `on_each` is invoked for every popped slice so the
+    // caller can return per-slice accounting (the worker's selector charge)
+    // for slices it never sees otherwise.
+    size_t acknowledge(RdmaSlice* slice, TransferStatusEnum status,
+                       const std::function<void(RdmaSlice*)>& on_each = {});
+
+    std::atomic<int>* getQuotaCounter(int qp_index) const {
+        return &wr_depth_list_[qp_index].value;
+    }
+
+   private:
+    int setupAllQPs(const std::string& peer_gid, uint32_t peer_lid,
+                    std::vector<uint32_t> peer_qp_num_list, int local_gid_index,
+                    std::string* reply_msg = nullptr);
+
+    int setupOneQP(int qp_index, const std::string& peer_gid, uint32_t peer_lid,
+                   uint32_t peer_qp_num, int local_gid_index,
+                   std::string* reply_msg = nullptr);
+
+    // Returns the pool segment owning qp_index, or nullptr when no pools are
+    // configured (the default single-pool case). Read-only after construct().
+    const QpPoolSegment* poolForQp(int qp_index) const;
+
+    bool reserveQuota(int qp_index, int num_entries);
+
+    void cancelQuota(int qp_index, int num_entries);
+
+   private:
+    // Caller must hold lock_ in write mode.
+    void beginDestroyNoLock();
+    int deconstructUnlocked();
+
+    void resetInflightSlices();
+
+    void postNotifyRecv(size_t idx);
+    // postNotifyRecv() for a slot that has just been consumed, subject to
+    // shouldRearmNotifyRecv().
+    void rearmNotifyRecv(size_t idx);
+    void repostAllNotifyRecvs();
+
+    static char* notifySlotPtr(char* base, size_t idx);
+    static bool encodeNotifyPayload(char* slot, const std::string& name,
+                                    const std::string& msg, uint32_t* out_len);
+    static bool decodeNotifyPayload(const char* data, size_t byte_len,
+                                    std::string* name, std::string* msg);
+
+   private:
+    friend class EndpointTestAccess;
+    friend class RdmaEndPointTestPeer;
+
+    std::atomic<EndPointStatus> status_;
+    RdmaContext* context_;
+    EndPointParams* params_;
+    std::string endpoint_name_;
+    // Immutable address generation used to create this endpoint's QPs and
+    // bootstrap descriptors. A context refresh evicts the whole endpoint.
+    RdmaAddressSnapshot local_address_;
+
+    std::vector<ibv_qp*> qp_list_;
+    // Per-pool QP layout, resolved once in construct() from params_->qp_pools.
+    // Empty = default single pool spanning all of qp_list_. Each segment's
+    // [begin, begin+num_qp) indexes into qp_list_. Read-only after construct().
+    std::vector<QpPoolSegment> qp_pool_segments_;
+    // One queue per data QP, in posting order, so acknowledge() can retire
+    // everything up to a completed slice. A qp_pools layout with fewer QPs
+    // than lanes lets several lanes reach one queue under the shared read
+    // guard; queue_lock_list_[i] serializes posting and acknowledging on
+    // QP i, and is uncontended in the default one-lane-per-QP layout.
+    // reset/deconstruct are synchronized by the endpoint lifecycle lock.
+    std::vector<BoundedSliceQueue> slice_queue_;
+    TicketLock* queue_lock_list_;
+    WrDepthBlock* wr_depth_list_;
+    std::atomic<int> inflight_slices_;
+    uint32_t padding_[7];
+    RWSpinlock lock_;
+
+    // Two-phase destruction: timestamp when EP entered EP_DESTROYING
+    std::atomic<uint64_t> destroy_start_time_;
+
+    std::string peer_server_name_;
+    std::string peer_nic_name_;
+    std::vector<uint32_t> peer_qp_num_list_;
+    // Notification QP (one per endpoint for control plane operations)
+    ibv_qp* notify_qp_ = nullptr;
+
+    // Notification buffers. Send and recv each use one contiguous host buffer
+    // split into kNotifyMaxPendingSends slots, registered with a single MR.
+    static constexpr size_t kNotifyBufferSize = 65536;  // 64 KB
+    static constexpr size_t kNotifyMaxPendingSends = 256;
+    std::vector<char> notify_recv_buffer_;
+    ibv_mr* notify_recv_mr_ = nullptr;
+    std::vector<char> notify_send_buffer_;
+    ibv_mr* notify_send_mr_ = nullptr;
+    // Serializes notification buffer/QP access against deconstruction.
+    std::mutex notify_resource_mutex_;
+    std::mutex notify_send_mutex_;
+    std::condition_variable notify_send_cv_;
+    size_t notify_pending_count_ = 0;  // Number of pending sends
+    uint64_t notify_send_wr_id_ = 0;   // Circular counter for wr_id
+    std::atomic<bool> notify_connected_{false};
+    // Notification WRs posted on the notify QP whose completion has not been
+    // polled yet. finishDestroy() waits for it: the QP must not be destroyed
+    // while completions the peer already saw acknowledged are still in the CQ,
+    // because the provider drops them with the QP.
+    std::atomic<uint32_t> notify_inflight_{0};
+
+    // Two-phase destruction constants (matching TE)
+    static constexpr double kFinishDestroyTimeoutSec = 30.0;
+    static constexpr int kMaxDestroyErrorLogs = 3;
+    int destroy_error_count_ = 0;
+};
+}  // namespace tent
+}  // namespace mooncake
+
+#endif  // TENT_ENDPOINT_H

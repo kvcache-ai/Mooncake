@@ -1,0 +1,246 @@
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+add_library(tent_interface INTERFACE)
+target_include_directories(
+  tent_interface
+  INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+            $<INSTALL_INTERFACE:include>)
+target_compile_features(tent_interface INTERFACE cxx_std_20)
+
+if(TARGET asio_shared)
+  target_link_libraries(tent_interface INTERFACE asio_shared)
+endif()
+
+# CUDA
+if(USE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  message(STATUS "CUDA: Enabled")
+  target_compile_definitions(tent_interface INTERFACE USE_CUDA)
+  target_include_directories(tent_interface
+                             INTERFACE ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(tent_interface INTERFACE CUDA::cudart)
+else()
+  message(STATUS "CUDA: Disabled")
+endif()
+
+# ROCm / HIP
+if(USE_HIP)
+  list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
+  find_package(HIP REQUIRED)
+  message(STATUS "ROCm/HIP: Enabled")
+  target_compile_definitions(tent_interface INTERFACE USE_HIP
+                                                      __HIP_PLATFORM_AMD__)
+  target_include_directories(tent_interface INTERFACE ${HIP_INCLUDE_DIRS})
+  target_link_libraries(tent_interface INTERFACE hip::host)
+else()
+  message(STATUS "ROCm/HIP: Disabled")
+endif()
+
+# TENT hylink on Hygon DTK, built on the HIP runtime (requires USE_HIP).
+if(USE_HYLINK)
+  message(STATUS "TENT hylink (DTK): Enabled")
+  target_compile_definitions(tent_interface INTERFACE USE_HYLINK)
+endif()
+
+# GDS. With USE_XPU_GDS, cufile.h and libcufile.so come from a cuFile-compatible
+# library for Intel XPU; pass -DCUFILE_INCLUDE=<dir> and -DCUFILE_LIB=<path>
+# when they are outside the default search paths.
+find_library(CUFILE_LIB cufile HINTS ${CUDAToolkit_LIBRARY_DIR})
+find_path(CUFILE_INCLUDE cufile.h HINTS ${CUDAToolkit_INCLUDE_DIRS})
+if(USE_XPU_GDS AND NOT (CUFILE_LIB AND CUFILE_INCLUDE))
+  message(
+    FATAL_ERROR
+      "USE_XPU_GDS=ON requires cufile.h and libcufile.so from a "
+      "cuFile-compatible library (found CUFILE_INCLUDE='${CUFILE_INCLUDE}', "
+      "CUFILE_LIB='${CUFILE_LIB}'). Pass -DCUFILE_INCLUDE=<dir> and "
+      "-DCUFILE_LIB=<path/to/libcufile.so>.")
+endif()
+if(CUFILE_LIB
+   AND CUFILE_INCLUDE
+   AND ((USE_CUDA AND CUDAToolkit_FOUND) OR USE_XPU_GDS))
+  message(STATUS "GDS: Enabled")
+  target_compile_definitions(tent_interface INTERFACE USE_GDS)
+  target_include_directories(tent_interface INTERFACE ${CUFILE_INCLUDE})
+  target_link_libraries(tent_interface INTERFACE ${CUFILE_LIB})
+else()
+  message(STATUS "GDS: Disabled")
+endif()
+
+# RDMA (ibverbs)
+find_library(IBVERBS_LIB ibverbs PATHS /usr/lib /usr/lib64 /usr/local/lib
+                                       /usr/local/lib64)
+find_path(IBVERBS_INCLUDE infiniband/verbs.h PATHS /usr/include
+                                                   /usr/local/include)
+if(IBVERBS_LIB AND IBVERBS_INCLUDE)
+  message(STATUS "RDMA: Enabled")
+  target_compile_definitions(tent_interface INTERFACE USE_RDMA)
+  target_include_directories(tent_interface INTERFACE ${IBVERBS_INCLUDE})
+  target_link_libraries(tent_interface INTERFACE ${IBVERBS_LIB})
+  set(TENT_FEATURE_RDMA ON)
+  # ibv_port_attr::active_speed is a uint8_t and reads 0 for XDR (encoding 256);
+  # newer rdma-core adds active_speed_ex to carry it.
+  include(CheckStructHasMember)
+  set(CMAKE_REQUIRED_INCLUDES ${IBVERBS_INCLUDE})
+  check_struct_has_member(
+    "struct ibv_port_attr" active_speed_ex infiniband/verbs.h
+    HAVE_IBV_ACTIVE_SPEED_EX LANGUAGE CXX)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  if(HAVE_IBV_ACTIVE_SPEED_EX)
+    target_compile_definitions(tent_interface
+                               INTERFACE HAVE_IBV_ACTIVE_SPEED_EX)
+  endif()
+  # IBV_EVENT_DEVICE_SPEED_CHANGE (rdma-core >= 62) reports a port speed change
+  # without a link flap. It is an enumerator, so probe by compiling.
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES ${IBVERBS_INCLUDE})
+  check_cxx_source_compiles(
+    "#include <infiniband/verbs.h>
+     int main() { return IBV_EVENT_DEVICE_SPEED_CHANGE == IBV_EVENT_PORT_ACTIVE; }"
+    HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  if(HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE)
+    target_compile_definitions(tent_interface
+                               INTERFACE HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE)
+  endif()
+else()
+  message(STATUS "RDMA: Disabled")
+endif()
+
+# libfabric (EFA, and tcp;ofi_rxm for tests). USE_EFA/USE_CXI already
+# resolve libfabric in mooncake-common/common.cmake.
+if(USE_FABRIC
+   OR USE_EFA
+   OR USE_CXI)
+  if(NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
+    find_path(
+      LIBFABRIC_INCLUDE_DIR rdma/fabric.h
+      HINTS /opt/amazon/efa/include
+      PATH_SUFFIXES include)
+    find_library(
+      LIBFABRIC_LIBRARY fabric
+      HINTS /opt/amazon/efa/lib
+      PATH_SUFFIXES lib lib64)
+  endif()
+  if(NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
+    message(
+      FATAL_ERROR
+        "TENT fabric transport needs libfabric. Set LIBFABRIC_INCLUDE_DIR and LIBFABRIC_LIBRARY."
+    )
+  endif()
+  set(TENT_WITH_FABRIC
+      ON
+      CACHE INTERNAL "")
+  message(STATUS "Fabric (libfabric): Enabled, ${LIBFABRIC_LIBRARY}")
+  target_compile_definitions(tent_interface INTERFACE USE_FABRIC)
+  target_include_directories(tent_interface INTERFACE ${LIBFABRIC_INCLUDE_DIR})
+  target_link_libraries(tent_interface INTERFACE ${LIBFABRIC_LIBRARY})
+else()
+  set(TENT_WITH_FABRIC
+      OFF
+      CACHE INTERNAL "")
+  message(STATUS "Fabric (libfabric): Disabled")
+endif()
+
+# io_uring
+if(TARGET Mooncake::liburing)
+  message(STATUS "Uring: Enabled")
+  target_compile_definitions(tent_interface INTERFACE USE_URING)
+  target_link_libraries(tent_interface INTERFACE Mooncake::liburing)
+  set(TENT_FEATURE_URING ON)
+else()
+  message(STATUS "Uring: Disabled")
+endif()
+
+# Configure diagnostics only after optional local capabilities have been
+# detected. The resulting library is deliberately independent of tent_interface
+# so the CLI cannot initialize transports or device runtimes.
+add_subdirectory(diagnostics)
+
+if(USE_SUNRISE)
+  target_compile_definitions(tent_interface INTERFACE USE_SUNRISE)
+  target_include_directories(tent_interface INTERFACE ${MC_TANGRT_ROOT}/include)
+  target_link_directories(
+    tent_interface INTERFACE ${MC_TANGRT_ROOT}/lib/linux-x86_64
+    ${MC_TANGRT_ROOT}/lib)
+  target_link_libraries(tent_interface INTERFACE tangrt_shared ptml_shared dl)
+endif()
+
+add_subdirectory(common)
+add_subdirectory(rpc)
+add_subdirectory(metastore)
+add_subdirectory(runtime)
+add_subdirectory(platform)
+add_subdirectory(transport)
+add_subdirectory(metrics)
+if(NOT TARGET pybind11::module)
+  find_package(pybind11 QUIET)
+endif()
+if(TARGET pybind11::module)
+  add_subdirectory(python)
+else()
+  message(STATUS "pybind11 not found, skipping Tent Python bindings")
+endif()
+
+file(GLOB TENT_ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+
+add_library(tent STATIC ${TENT_ENGINE_SOURCES})
+target_link_libraries(tent PUBLIC tent_runtime tent_interface)
+
+add_library(tent_shared SHARED ${TENT_ENGINE_SOURCES})
+target_link_libraries(tent_shared PUBLIC tent_runtime tent_interface)
+set_target_properties(tent_shared PROPERTIES INSTALL_RPATH "$ORIGIN")
+
+add_library(tent_link_group INTERFACE)
+target_link_libraries(tent_link_group INTERFACE "-Wl,--start-group" tent)
+foreach(
+  tgt
+  metastore_redis
+  metastore_http
+  metastore_etcd
+  tent_platform_all
+  platform_cuda
+  platform_rocm
+  platform_ascend
+  platform_sunrise
+  platform_tpu
+  platform_xpu
+  platform_mlu
+  tent_xport_gds
+  tent_xport_uring
+  tent_xport_bufio
+  tent_xport_mnnvl
+  tent_xport_nvlink
+  tent_xport_rdma
+  tent_xport_shm
+  tent_xport_tcp
+  tent_xport_hp_tcp
+  tent_xport_hp_tcp_core
+  tent_xport_ub
+  tent_xport_ascend_direct
+  tent_xport_sunrise_link
+  tent_xport_tpu
+  tent_xport_xpu
+  tent_xport_mlu
+  tent_xport_mpcomm
+  tent_xport_hylink
+  tent_xport_fabric
+  tent_xport_memfabric
+  tent_metrics)
+  if(TARGET ${tgt})
+    target_link_libraries(tent_link_group INTERFACE ${tgt})
+  endif()
+endforeach()
+if(TARGET mooncake_common)
+  # Use the archive path so CMake does not de-duplicate mooncake_common against
+  # an earlier transitive occurrence. TENT RPC objects reference the Transfer
+  # Engine client I/O pool accessor and need the archive inside this rescan
+  # group when all components are linked statically.
+  target_link_libraries(tent_link_group
+                        INTERFACE "$<TARGET_FILE:mooncake_common>")
+endif()
+target_link_libraries(tent_link_group INTERFACE "-Wl,--end-group")
+install(
+  TARGETS tent_shared
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin)

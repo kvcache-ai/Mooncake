@@ -1,0 +1,22 @@
+name: "🚀 Feature Request"
+description: "Suggest a new feature or improvement for Mooncake"
+title: "[Feature Request]: "
+labels: ["feature-request"]
+body:
+- type: textarea
+  attributes:
+    label: Describe your feature request
+    description: >
+      A clear and concise description of the feature you'd like to see.
+  validations:
+    required: true
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉!
+- type: checkboxes
+  id: before_submit
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues and read the [documentation](https://kvcache-ai.github.io/Mooncake/)

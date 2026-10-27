@@ -1,0 +1,97 @@
+#!/bin/bash
+
+CONTAINER_NAME=${CONTAINER_NAME:-"mooncake-ci-test"}
+MODEL_CACHE=${MODEL_CACHE:-"/root/.cache"}
+MOONCAKE_RUNTIME_CACHE=${MOONCAKE_RUNTIME_CACHE:-}
+HF_TOKEN_FILE=${HF_TOKEN_FILE:-"/etc/mooncake-ci/huggingface.token"}
+CI_ACCELERATOR=cuda
+REGISTRY_ADDR_SGLANG=${REGISTRY_ADDR_SGLANG:-"lmsysorg/sglang:latest"}
+REGISTRY_ADDR_VLLM=${REGISTRY_ADDR_VLLM:-"vllm/vllm-openai:latest"}
+MOONCAKE_SGLANG_BASE_GPU_ID=${MOONCAKE_SGLANG_BASE_GPU_ID:-6}
+MOONCAKE_EPD_ENCODER_GPU_ID=${MOONCAKE_EPD_ENCODER_GPU_ID:-0}
+MOONCAKE_EPD_PREFILL_GPU_ID=${MOONCAKE_EPD_PREFILL_GPU_ID:-4}
+MOONCAKE_EPD_DECODE_GPU_ID=${MOONCAKE_EPD_DECODE_GPU_ID:-6}
+MOONCAKE_VLLM_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-6,7}
+MOONCAKE_SGLANG_MEM_FRACTION_STATIC=${MOONCAKE_SGLANG_MEM_FRACTION_STATIC:-}
+MOONCAKE_CI_TIER=${MOONCAKE_CI_TIER:-"full"}
+MOONCAKE_RDMA_DEVICES=${MOONCAKE_RDMA_DEVICES:-}
+MOONCAKE_RDMA_NETDEVS=${MOONCAKE_RDMA_NETDEVS:-}
+MOONCAKE_TRANSFER_DEVICE=${MOONCAKE_TRANSFER_DEVICE:-}
+MOONCAKE_GID_INDEX=${MOONCAKE_GID_INDEX:-}
+USE_HUGGINGFACE_MIRROR=${USE_HUGGINGFACE_MIRROR:-true}
+MOONCAKE_RENDER_DEVICES=${MOONCAKE_RENDER_DEVICES:-}
+MOONCAKE_GPU_INDICES=${MOONCAKE_GPU_INDICES:-}
+MOONCAKE_CPUSET_CPUS=${MOONCAKE_CPUSET_CPUS:-}
+MOONCAKE_CPUSET_MEMS=${MOONCAKE_CPUSET_MEMS:-}
+AINIC_VERSION=${AINIC_VERSION:-}
+HUGGINGFACE_MIRROR=${HUGGINGFACE_MIRROR:-"https://hf-mirror.com"}
+USE_MODELSCOPE=${USE_MODELSCOPE:-false}
+REMOTE_TEST_DIR=${REMOTE_TEST_DIR:-"/tmp/Mooncake_tone/mooncake_ci_test"}
+LOCAL_IP=${LOCAL_IP}
+REMOTE_IP=${REMOTE_IP}
+ARTIFACT_ID=${ARTIFACT_ID:-}
+ARTIFACT_ID_SGLANG=${ARTIFACT_ID_SGLANG:-$ARTIFACT_ID}
+ARTIFACT_ID_VLLM=${ARTIFACT_ID_VLLM:-$ARTIFACT_ID}
+WHEEL_DIR=${WHEEL_DIR:-}
+WHEEL_DIR_SGLANG=${WHEEL_DIR_SGLANG:-$WHEEL_DIR}
+WHEEL_DIR_VLLM=${WHEEL_DIR_VLLM:-$WHEEL_DIR}
+GIT_REPO=${GIT_REPO:-}
+MOONCAKE_ENV_UNHEALTHY=false
+
+[ "$MOONCAKE_CI_TIER" = "full" ] || {
+    echo "ERROR: this suite requires MOONCAKE_CI_TIER=full" >&2
+    return 2 2>/dev/null || exit 2
+}
+All_TEST_SCRIPTS_SGLANG=(
+    "test_hicache_storage_mooncake_backend.sh"
+    "test_disaggregation_different_tp.sh"
+    "test_1p1d_erdma.sh"
+    "test_epd_sglang.sh"
+    "test_moe_mooncake.sh"
+)
+
+All_TEST_SCRIPTS_VLLM=(
+    "test_vllm_1p1d_erdma.sh"
+)
+
+list_tests() {
+    case "${1:-default}" in
+        default)
+            printf '%s\n' "${All_TEST_SCRIPTS_SGLANG[@]}" "${All_TEST_SCRIPTS_VLLM[@]}"
+            ;;
+        SGLANG)
+            printf '%s\n' "${All_TEST_SCRIPTS_SGLANG[@]}"
+            ;;
+        VLLM)
+            printf '%s\n' "${All_TEST_SCRIPTS_VLLM[@]}"
+            ;;
+        *)
+            echo "ERROR: Unknown framework '$1'. Use SGLANG or VLLM." >&2
+            return 1
+            ;;
+    esac
+}
+
+if [ "${1:-}" = "list-tests" ]; then
+    list_tests "${2:-default}"
+    exit $?
+fi
+
+REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-"$REMOTE_IP"}
+SSH_CMD=${SSH_CMD:-"ssh -o StrictHostKeyChecking=no"}
+RSYNC_RSH=${RSYNC_RSH:-"ssh -o StrictHostKeyChecking=no"}
+SCP_CMD=${SCP_CMD:-"scp -o StrictHostKeyChecking=no"}
+export REMOTE_SSH_TARGET SSH_CMD RSYNC_RSH SCP_CMD
+
+SUITE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)
+RUN_DIR="$SUITE_DIR/run"
+E2E_DIR=$(cd "$SUITE_DIR/../e2e" && pwd)
+
+. $SUITE_DIR/scripts/common.sh
+
+REMOTE_WORK_ROOT=/tmp/Mooncake_tone/mooncake_ci_test
+source "$E2E_DIR/scripts/controller.sh"
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

@@ -1,0 +1,1988 @@
+// Copyright 2026 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Tests the ProgressWorker skeleton (issue #2116, follow-up to PR #2160).
+// Goals:
+//   * default-off behavior is byte-identical to the pre-worker world;
+//   * with the worker enabled and enable_auto_failover_on_poll=false, a
+//     caller that only submits + observes status (never calls
+//     progressBatch / waitTransferCompletion) still sees its batch
+//     progress through failover;
+//   * one notify advances the engine by exactly one progress step;
+//   * freeBatch racing the worker, including cross-thread free, is safe;
+//   * worker shuts down cleanly on engine destruction.
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <functional>
+#include <future>
+#include <memory>
+#include <optional>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include "tent/common/config.h"
+#include "tent/common/types.h"
+#include "tent/rpc/rpc.h"
+#include "tent/runtime/segment.h"
+#include "tent/runtime/proxy_manager.h"
+#include "tent/runtime/transfer_engine_impl.h"
+#include "tent/runtime/transport.h"
+#include "tent/transport/fault_proxy/fault_proxy_transport.h"
+#include "remote_stage_operation.h"
+
+namespace mooncake {
+namespace tent {
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// FakeTransport — same minimal shape used by engine_failover_e2e_test.cpp.
+// Kept local to avoid cross-test linkage; sources of truth diverging is OK
+// because we only exercise the "completes / status-can-be-overridden" surface.
+// ---------------------------------------------------------------------------
+
+class FakeSubBatch : public Transport::SubBatch {
+   public:
+    size_t size() const override { return task_count; }
+    size_t task_count = 0;
+    std::vector<Request> requests;
+    std::vector<TransferStatus> statuses;
+    std::vector<int> poll_counts;
+};
+
+class FakeTransport : public Transport {
+   public:
+    using StatusFactory = std::function<TransferStatus(const Request&)>;
+    using PollStatusFactory =
+        std::function<TransferStatus(const Request&, int)>;
+
+    explicit FakeTransport(TransportType self_type,
+                           StatusFactory status_factory = {},
+                           PollStatusFactory poll_status_factory = {})
+        : self_type_(self_type),
+          status_factory_(std::move(status_factory)),
+          poll_status_factory_(std::move(poll_status_factory)) {
+        caps.dram_to_dram = true;
+    }
+
+    std::atomic<int> install_calls{0};
+    std::atomic<int> submit_calls{0};
+    std::atomic<int> status_calls{0};
+    std::atomic<int> add_mem_calls{0};
+    std::atomic<int> remove_mem_calls{0};
+
+    Status install(std::string& /*local_segment_name*/,
+                   std::shared_ptr<ControlService> /*metadata*/,
+                   std::shared_ptr<Topology> /*local_topology*/,
+                   std::shared_ptr<Config> /*conf*/ = nullptr) override {
+        ++install_calls;
+        return Status::OK();
+    }
+
+    Status allocateSubBatch(SubBatchRef& batch, size_t /*max_size*/) override {
+        batch = new FakeSubBatch();
+        return Status::OK();
+    }
+
+    Status freeSubBatch(SubBatchRef& batch) override {
+        delete batch;
+        batch = nullptr;
+        return Status::OK();
+    }
+
+    Status submitTransferTasks(
+        SubBatchRef batch, const std::vector<Request>& request_list) override {
+        ++submit_calls;
+        auto* fb = static_cast<FakeSubBatch*>(batch);
+        for (const auto& req : request_list) {
+            if (status_factory_) {
+                fb->statuses.push_back(status_factory_(req));
+            } else {
+                fb->statuses.push_back(
+                    {TransferStatusEnum::COMPLETED, req.length});
+            }
+            fb->requests.push_back(req);
+            fb->poll_counts.push_back(0);
+            fb->task_count++;
+        }
+        return Status::OK();
+    }
+
+    Status getTransferStatus(SubBatchRef batch, int task_id,
+                             TransferStatus& status) override {
+        ++status_calls;
+        auto* fb = static_cast<FakeSubBatch*>(batch);
+        if (task_id < 0 || task_id >= (int)fb->statuses.size()) {
+            return Status::InvalidArgument("bad task_id" LOC_MARK);
+        }
+        ++fb->poll_counts[task_id];
+        if (poll_status_factory_) {
+            status = poll_status_factory_(fb->requests[task_id],
+                                          fb->poll_counts[task_id]);
+        } else {
+            status = fb->statuses[task_id];
+        }
+        return Status::OK();
+    }
+
+    Status addMemoryBuffer(BufferDesc& desc,
+                           const MemoryOptions& /*options*/) override {
+        ++add_mem_calls;
+        desc.transports.push_back(self_type_);
+        return Status::OK();
+    }
+
+    Status addMemoryBuffer(std::vector<BufferDesc>& desc_list,
+                           const MemoryOptions& options) override {
+        for (auto& d : desc_list) {
+            auto s = addMemoryBuffer(d, options);
+            if (!s.ok()) return s;
+        }
+        return Status::OK();
+    }
+
+    Status removeMemoryBuffer(BufferDesc& desc) override {
+        ++remove_mem_calls;
+        desc.transports.erase(std::remove(desc.transports.begin(),
+                                          desc.transports.end(), self_type_),
+                              desc.transports.end());
+        return Status::OK();
+    }
+
+    Status allocateLocalMemory(void** addr, size_t size,
+                               MemoryOptions& /*options*/) override {
+        *addr = std::malloc(size);
+        if (!*addr) return Status::InternalError("malloc failed" LOC_MARK);
+        return Status::OK();
+    }
+
+    Status freeLocalMemory(void* addr, size_t /*size*/) override {
+        std::free(addr);
+        return Status::OK();
+    }
+
+    bool warmupMemory(void* /*addr*/, size_t /*length*/) override {
+        return false;
+    }
+
+    const char* getName() const override {
+        return self_type_ == RDMA ? "<fake-rdma>" : "<fake-tcp>";
+    }
+
+   private:
+    TransportType self_type_;
+    StatusFactory status_factory_;
+    PollStatusFactory poll_status_factory_;
+};
+
+class DeferredCleanupProbeTransport : public FakeTransport {
+   public:
+    DeferredCleanupProbeTransport() : FakeTransport(TCP) {}
+
+    Status submitTransferTasks(
+        SubBatchRef batch, const std::vector<Request>& request_list) override {
+        const int attempt =
+            submit_attempts.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (attempt == 2) {
+            return Status::InternalError(
+                "injected second staging submission failure" LOC_MARK);
+        }
+        return FakeTransport::submitTransferTasks(batch, request_list);
+    }
+
+    Status getTransferStatus(SubBatchRef batch, int task_id,
+                             TransferStatus& status) override {
+        poll_attempts.fetch_add(1, std::memory_order_relaxed);
+        if (fail_polling.load(std::memory_order_acquire)) {
+            return Status::InternalError(
+                "injected deferred cleanup poll failure" LOC_MARK);
+        }
+
+        auto* fake_batch = static_cast<FakeSubBatch*>(batch);
+        if (task_id < 0 || task_id >= (int)fake_batch->requests.size()) {
+            return Status::InvalidArgument("bad task_id" LOC_MARK);
+        }
+        if (stay_pending.load(std::memory_order_acquire)) {
+            status.s = TransferStatusEnum::PENDING;
+            status.transferred_bytes = 0;
+        } else {
+            status.s = TransferStatusEnum::COMPLETED;
+            status.transferred_bytes = fake_batch->requests[task_id].length;
+        }
+        return Status::OK();
+    }
+
+    Status freeLocalMemory(void* addr, size_t size) override {
+        free_local_memory_calls.fetch_add(1, std::memory_order_relaxed);
+        if (stay_pending.load(std::memory_order_acquire)) {
+            free_local_memory_while_pending.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        return FakeTransport::freeLocalMemory(addr, size);
+    }
+
+    std::atomic<int> submit_attempts{0};
+    std::atomic<int> poll_attempts{0};
+    std::atomic<int> free_local_memory_calls{0};
+    std::atomic<int> free_local_memory_while_pending{0};
+    std::atomic<bool> stay_pending{true};
+    std::atomic<bool> fail_polling{false};
+};
+
+TransferStatus waitForStagingTerminal(ProxyManager& manager, TaskInfo& task) {
+    TransferStatus status;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto poll_status = manager.getStatus(&task, status);
+        if (!poll_status.ok()) {
+            ADD_FAILURE() << "getStatus failed: " << poll_status.ToString();
+            status.s = INVALID;
+            return status;
+        }
+        if (status.s != PENDING) return status;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return status;
+}
+
+std::shared_ptr<Config> makeMinimalP2PConfig() {
+    auto cfg = std::make_shared<Config>();
+    cfg->set("metadata_type", "p2p");
+    cfg->set("metadata_servers", "");
+    cfg->set("rpc_server_hostname", "127.0.0.1");
+    cfg->set("rpc_server_port", "0");
+    cfg->set("log_level", "warning");
+    cfg->set("merge_requests", false);
+
+    cfg->set("transports/tcp/enable", false);
+    cfg->set("transports/shm/enable", false);
+    cfg->set("transports/rdma/enable", false);
+    cfg->set("transports/io_uring/enable", false);
+    cfg->set("transports/nvlink/enable", false);
+    cfg->set("transports/mlu/enable", false);
+    cfg->set("transports/mnnvl/enable", false);
+    cfg->set("transports/gds/enable", false);
+    cfg->set("transports/ascend_direct/enable", false);
+
+    cfg->set("max_failover_attempts", 3);
+    return cfg;
+}
+
+// Pause at transport boundaries without adding a production test hook.
+class PublicationProbeTransport : public FakeTransport {
+   public:
+    PublicationProbeTransport() : FakeTransport(TCP) {}
+    std::function<void()> before_allocate;
+    std::function<void()> after_submit;
+
+    Status allocateSubBatch(SubBatchRef& batch, size_t max_size) override {
+        if (before_allocate) before_allocate();
+        return FakeTransport::allocateSubBatch(batch, max_size);
+    }
+    Status submitTransferTasks(SubBatchRef batch,
+                               const std::vector<Request>& requests) override {
+        CHECK_STATUS(FakeTransport::submitTransferTasks(batch, requests));
+        batch->notifyProgress();
+        if (after_submit) after_submit();
+        return Status::OK();
+    }
+};
+
+class SubmitPublication : public ::testing::TestWithParam<bool> {};
+
+TEST_P(SubmitPublication, PollCannotFailAnUnpublishedTask) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_progress_worker", true);
+    cfg->set("enable_runtime_queue", GetParam());
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto tcp = std::make_shared<PublicationProbeTransport>();
+    engine.swapTransportForTest(TCP, tcp);
+    std::vector<uint8_t> bytes(4096, 0x7A);
+    ASSERT_TRUE(engine.registerLocalMemory(bytes.data(), bytes.size()).ok());
+    auto batch = engine.allocateBatch(2);
+    Request first{};
+    first.opcode = Request::WRITE;
+    first.source = bytes.data();
+    first.target_id = LOCAL_SEGMENT_ID;
+    first.target_offset = reinterpret_cast<uint64_t>(bytes.data() + 1024);
+    first.length = 64;
+    first.transport_hint = TCP;
+    auto second = first;
+    second.source = bytes.data() + 128;
+    second.target_offset += 128;
+
+    std::promise<void> entered, release;
+    auto entered_future = entered.get_future();
+    auto released = release.get_future().share();
+    tcp->before_allocate = [&] {
+        entered.set_value();
+        EXPECT_EQ(released.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+    };
+    auto submit = std::async(std::launch::async, [&] {
+        return engine.submitTransfer(batch, {first, second});
+    });
+    EXPECT_EQ(entered_future.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    std::promise<void> polling;
+    auto polling_future = polling.get_future();
+    auto poll = std::async(std::launch::async, [&] {
+        polling.set_value();
+        TransferStatus status{PENDING, 0};
+        auto result = engine.getTransferStatus(batch, 1, status);
+        return std::make_pair(result, status);
+    });
+    polling_future.wait();
+    // Direct mode used to expose the second task with its default UNSPEC
+    // route while allocation for the first task was still in progress.
+    const bool returned_early = poll.wait_for(std::chrono::milliseconds(100)) ==
+                                std::future_status::ready;
+    std::optional<std::pair<Status, TransferStatus>> early;
+    if (returned_early) early = poll.get();
+    release.set_value();
+    EXPECT_TRUE(submit.get().ok());
+    if (early) {
+        EXPECT_TRUE(early->first.ok());
+        EXPECT_EQ(early->second.s, PENDING)
+            << "an unpublished task must not acquire a terminal status";
+    } else {
+        auto result = poll.get();
+        EXPECT_TRUE(result.first.ok());
+        EXPECT_EQ(result.second.s, COMPLETED);
+    }
+    EXPECT_TRUE(engine.waitTransferCompletion(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(bytes.data()).ok());
+}
+
+TEST_P(SubmitPublication, CompletionWakeCannotPrecedeSubmitHook) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_progress_worker", true);
+    cfg->set("enable_runtime_queue", GetParam());
+    // Exercise the event-only contract: no periodic runtime queue fallback.
+    cfg->set("runtime_queue/progress_fallback_interval_us", 0UL);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto tcp = std::make_shared<PublicationProbeTransport>();
+    engine.swapTransportForTest(TCP, tcp);
+    std::vector<uint8_t> bytes(4096, 0x42);
+    ASSERT_TRUE(engine.registerLocalMemory(bytes.data(), bytes.size()).ok());
+    auto batch = engine.allocateBatch(1);
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = bytes.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(bytes.data());
+    request.length = bytes.size();
+    request.transport_hint = TCP;
+    Notification notification;
+    notification.msg = "published-hook";
+
+    tcp->after_submit = [&] {
+        // The transport has completed and emitted its only wake, but the
+        // engine has not installed this submit's notification hook yet.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    };
+    ASSERT_TRUE(engine.submitTransfer(batch, {request}, notification).ok());
+    std::vector<Notification> received;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (received.empty() && std::chrono::steady_clock::now() < deadline) {
+        (void)engine.receiveNotification(received);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(received.size(), 1u);
+    if (!received.empty()) {
+        EXPECT_EQ(received.front().msg, notification.msg);
+    }
+    // Only poll manually after checking background notification delivery.
+    EXPECT_TRUE(engine.waitTransferCompletion(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(bytes.data()).ok());
+}
+
+INSTANTIATE_TEST_SUITE_P(DirectAndRuntimeQueue, SubmitPublication,
+                         ::testing::Bool());
+
+// ---------------------------------------------------------------------------
+// 1. Default config: worker is not constructed, notifyBatchMaybeReady is a
+// no-op, and behavior matches PR #2160 exactly.
+// ---------------------------------------------------------------------------
+
+TEST(ProgressWorker, DisabledByDefaultLeavesBehaviorUnchanged) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0x10);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, (BatchID)0);
+
+    Request req;
+    req.opcode = Request::WRITE;
+    req.source = buf.data();
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+    req.length = kBufLen;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
+
+    // No-op when the worker isn't constructed.
+    engine.notifyBatchMaybeReady(batch_id);
+    engine.notifyBatchMaybeReady((BatchID)0);
+
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(fake_tcp->submit_calls.load(), 0);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+TEST(ProgressWorker, MemoryUnregisterSurvivesBackendMetadataMutation) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string segment = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(segment, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(segment, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 4096;
+    std::vector<uint8_t> buffer(kBufferLength);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    ASSERT_EQ(fake_rdma->add_mem_calls.load(), 1);
+    ASSERT_EQ(fake_tcp->add_mem_calls.load(), 1);
+
+    ASSERT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    EXPECT_EQ(fake_rdma->remove_mem_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->remove_mem_calls.load(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 2. Worker drives failover when the caller does not poll with
+// allow_failover. This is the integration shape mooncake-pg needs.
+// ---------------------------------------------------------------------------
+
+TEST(ProgressWorker, ProgressesWithoutPollAutoFailover) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_auto_failover_on_poll", false);
+    cfg->set("enable_progress_worker", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+
+    FaultPolicy rdma_policy;
+    rdma_policy.status_corrupt_rate = 1.0;
+    auto proxied_rdma =
+        std::make_shared<FaultProxyTransport>(fake_rdma, rdma_policy);
+
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(proxied_rdma->install(seg, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, proxied_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0xC1);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, (BatchID)0);
+
+    Request req;
+    req.opcode = Request::WRITE;
+    req.source = buf.data();
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+    req.length = kBufLen;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
+
+    // Drive the worker until terminal. We deliberately never call
+    // progressBatch / waitTransferCompletion here — only
+    // notifyBatchMaybeReady + observation-only getTransferStatus
+    // (which, with auto-failover-on-poll disabled, will not advance failover
+    // by itself).
+    TransferStatus status{};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+    while (std::chrono::steady_clock::now() < deadline) {
+        engine.notifyBatchMaybeReady(batch_id);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (fake_tcp->submit_calls.load() == 0) continue;
+        status = {};
+        ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+        if (status.s == TransferStatusEnum::COMPLETED) break;
+    }
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED)
+        << "progress worker must drive failover when caller never calls "
+           "progressBatch";
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_GE(fake_tcp->submit_calls.load(), 1);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+// ---------------------------------------------------------------------------
+// 3. One notify == one progress step. The worker must not loop internally
+// until completion; the next step requires another notify.
+// ---------------------------------------------------------------------------
+
+TEST(ProgressWorker, SingleNotifyOnlyRepollsOptedInBatches) {
+    for (bool poll_until_terminal : {false, true}) {
+        SCOPED_TRACE(poll_until_terminal);
+        auto cfg = makeMinimalP2PConfig();
+        cfg->set("enable_auto_failover_on_poll", false);
+        cfg->set("enable_progress_worker", true);
+        cfg->set("runtime_queue/progress_fallback_interval_us", 10000UL);
+        TransferEngineImpl engine(cfg);
+        ASSERT_TRUE(engine.available());
+
+        auto fake_rdma = std::make_shared<FakeTransport>(
+            RDMA, FakeTransport::StatusFactory{},
+            [](const Request& req, int poll_count) {
+                if (poll_count < 3) {
+                    return TransferStatus{TransferStatusEnum::PENDING, 0};
+                }
+                return TransferStatus{TransferStatusEnum::COMPLETED,
+                                      req.length};
+            });
+        auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+
+        std::string seg = engine.getSegmentName();
+        ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+        ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+        engine.swapTransportForTest(RDMA, fake_rdma);
+        engine.swapTransportForTest(TCP, fake_tcp);
+
+        constexpr size_t kBufLen = 4096;
+        std::vector<uint8_t> buf(kBufLen, 0xC2);
+        ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+        BatchID batch_id = engine.allocateBatch(1);
+        ASSERT_NE(batch_id, (BatchID)0);
+
+        Request req;
+        req.opcode = Request::WRITE;
+        req.source = buf.data();
+        req.target_id = LOCAL_SEGMENT_ID;
+        req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+        req.length = kBufLen;
+        ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
+
+        // Initial state: nothing polled yet.
+        EXPECT_EQ(fake_rdma->status_calls.load(), 0);
+
+        // Event-driven transports still advance once per wake. Only an opted-in
+        // batch keeps polling, and polling must stop when it becomes terminal.
+        engine.notifyBatchMaybeReady(batch_id, poll_until_terminal);
+        const int expected_polls = poll_until_terminal ? 3 : 1;
+        const auto step_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (std::chrono::steady_clock::now() < step_deadline &&
+               fake_rdma->status_calls.load() < expected_polls)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        EXPECT_EQ(fake_rdma->status_calls.load(), expected_polls);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        EXPECT_EQ(fake_rdma->status_calls.load(), expected_polls);
+
+        EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+        EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. freeBatch races with worker notifications. With ASAN/UBSAN this
+// catches missing alive_batches_ / progress_mutex_ coverage.
+// ---------------------------------------------------------------------------
+
+TEST(ProgressWorker, FreeBatchRacesWithWorker) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_auto_failover_on_poll", false);
+    cfg->set("enable_progress_worker", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0xC3);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    // Concurrently spam stale notifications from a second thread while the
+    // main thread submits, frees, and re-allocates batches.
+    std::atomic<bool> stop{false};
+    std::atomic<BatchID> latest{0};
+    std::thread spammer([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            BatchID bid = latest.load(std::memory_order_acquire);
+            engine.notifyBatchMaybeReady(bid, true);
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    });
+
+    constexpr int kRounds = 100;
+    for (int i = 0; i < kRounds; ++i) {
+        BatchID batch_id = engine.allocateBatch(1);
+        ASSERT_NE(batch_id, (BatchID)0);
+
+        Request req;
+        req.opcode = Request::WRITE;
+        req.source = buf.data();
+        req.target_id = LOCAL_SEGMENT_ID;
+        req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+        req.length = kBufLen;
+        ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
+
+        latest.store(batch_id, std::memory_order_release);
+        engine.notifyBatchMaybeReady(batch_id, i % 2 == 0);
+
+        // Free immediately; the worker may pick the notification up after
+        // free. The progress_mutex_ + alive_batches_ guard must keep this
+        // safe.
+        EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    }
+
+    stop.store(true, std::memory_order_release);
+    spammer.join();
+
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+TEST(ProgressWorker, BatchMayBeFreedFromDifferentThread) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0xC4);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    BatchID batch_id = 0;
+    std::thread allocator([&] { batch_id = engine.allocateBatch(1); });
+    allocator.join();
+    ASSERT_NE(batch_id, (BatchID)0);
+
+    Request req;
+    req.opcode = Request::WRITE;
+    req.source = buf.data();
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+    req.length = kBufLen;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
+
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+
+    std::atomic<bool> free_ok{false};
+    std::thread freer([&] { free_ok.store(engine.freeBatch(batch_id).ok()); });
+    freer.join();
+    EXPECT_TRUE(free_ok.load());
+    EXPECT_TRUE(engine.getTransferStatus(batch_id, status).IsInvalidArgument());
+
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+// ---------------------------------------------------------------------------
+// 5. Engine teardown joins the worker cleanly even with pending notifies.
+// ---------------------------------------------------------------------------
+
+TEST(ProgressWorker, EngineDestructorJoinsWorker) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_auto_failover_on_poll", false);
+    cfg->set("enable_progress_worker", true);
+    {
+        TransferEngineImpl engine(cfg);
+        ASSERT_TRUE(engine.available());
+
+        auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+        auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+        std::string seg = engine.getSegmentName();
+        ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+        ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+        engine.swapTransportForTest(RDMA, fake_rdma);
+        engine.swapTransportForTest(TCP, fake_tcp);
+
+        // Push some notifies for non-existent batches; worker must reject
+        // them via alive_batches_ check and stay alive.
+        for (int i = 0; i < 8; ++i) {
+            engine.notifyBatchMaybeReady((BatchID)(uintptr_t)0xdeadbeef);
+        }
+    }
+    // If teardown hangs or crashes here, gtest fails this test on timeout
+    // / signal — no further assert needed.
+    SUCCEED();
+}
+
+TEST(ProxyManager, ConcurrentFirstAllocationIsBounded) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    ProxyManager manager(&engine, 4096, 4);
+    constexpr int kCallers = 8;
+    std::atomic<int> ready{0};
+    std::atomic<int> attempted{0};
+    std::atomic<int> successful{0};
+    std::atomic<int> exhausted{0};
+    std::atomic<int> unpin_failures{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> callers;
+    callers.reserve(kCallers);
+
+    for (int i = 0; i < kCallers; ++i) {
+        callers.emplace_back([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire))
+                std::this_thread::yield();
+
+            uint64_t addr = 0;
+            auto status = manager.pinStageBuffer(kWildcardLocation, addr);
+            if (status.ok()) {
+                successful.fetch_add(1, std::memory_order_relaxed);
+            } else if (status.IsTooManyRequests()) {
+                exhausted.fetch_add(1, std::memory_order_relaxed);
+            }
+            attempted.fetch_add(1, std::memory_order_release);
+            while (attempted.load(std::memory_order_acquire) != kCallers)
+                std::this_thread::yield();
+            if (status.ok() && !manager.unpinStageBuffer(addr).ok())
+                unpin_failures.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) != kCallers)
+        std::this_thread::yield();
+    start.store(true, std::memory_order_release);
+    for (auto& caller : callers) caller.join();
+
+    EXPECT_EQ(successful.load(), 4);
+    EXPECT_EQ(exhausted.load(), 4);
+    EXPECT_EQ(unpin_failures.load(), 0);
+}
+
+TEST(ProxyManager, ReclaimsStageBuffersBetweenWorkerTasks) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 128;
+    std::vector<uint8_t> source(kBufferLength, 0x21);
+    std::vector<uint8_t> target(kBufferLength, 0x00);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(target.data(), target.size()).ok());
+
+    {
+        ProxyManager manager(&engine, 64, 2);
+        Request request;
+        request.opcode = Request::WRITE;
+        request.source = source.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        request.length = kBufferLength;
+        const std::vector<std::string> params = {"", kWildcardLocation, ""};
+
+        for (int i = 0; i < 8; ++i) {
+            TaskInfo task;
+            task.request = request;
+            task.staging = true;
+            Status submit_status;
+            std::thread submitter(
+                [&] { submit_status = manager.submit(&task, 0, params); });
+            submitter.join();
+            ASSERT_TRUE(submit_status.ok());
+
+            TransferStatus status;
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (std::chrono::steady_clock::now() < deadline) {
+                ASSERT_TRUE(manager.getStatus(&task, status).ok());
+                if (status.s != PENDING) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            ASSERT_TRUE(manager.getStatus(&task, status).ok());
+            EXPECT_EQ(status.s, COMPLETED);
+        }
+    }
+
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(target.data(), target.size()).ok());
+}
+
+TEST(ProxyManager, DrainsInflightBatchesAfterProgressError) {
+    class FailOncePollTransport : public FakeTransport {
+       public:
+        explicit FailOncePollTransport(TransportType type)
+            : FakeTransport(type) {}
+
+        Status getTransferStatus(SubBatchRef batch, int task_id,
+                                 TransferStatus& status) override {
+            const int attempt =
+                poll_attempts.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (attempt == 1) {
+                return Status::InternalError("injected poll failure" LOC_MARK);
+            }
+            return FakeTransport::getTransferStatus(batch, task_id, status);
+        }
+
+        std::atomic<int> poll_attempts{0};
+    };
+
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<FailOncePollTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 128;
+    std::vector<uint8_t> source(kBufferLength, 0x31);
+    std::vector<uint8_t> target(kBufferLength, 0x00);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(target.data(), target.size()).ok());
+
+    {
+        ProxyManager manager(&engine, 64, 2);
+        Request request;
+        request.opcode = Request::WRITE;
+        request.source = source.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        request.length = kBufferLength;
+        const std::vector<std::string> params = {"", kWildcardLocation, ""};
+
+        TaskInfo task;
+        task.request = request;
+        task.staging = true;
+        ASSERT_TRUE(manager.submit(&task, 0, params).ok());
+
+        TransferStatus status;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            ASSERT_TRUE(manager.getStatus(&task, status).ok());
+            if (status.s != PENDING) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_TRUE(manager.getStatus(&task, status).ok());
+        EXPECT_EQ(status.s, FAILED);
+        EXPECT_GE(fake_tcp->poll_attempts.load(), 3);
+
+        uint64_t first = 0;
+        uint64_t second = 0;
+        uint64_t exhausted = 0;
+        ASSERT_TRUE(manager.pinStageBuffer(kWildcardLocation, first).ok());
+        ASSERT_TRUE(manager.pinStageBuffer(kWildcardLocation, second).ok());
+        EXPECT_TRUE(manager.pinStageBuffer(kWildcardLocation, exhausted)
+                        .IsTooManyRequests());
+        EXPECT_TRUE(manager.unpinStageBuffer(first).ok());
+        EXPECT_TRUE(manager.unpinStageBuffer(second).ok());
+    }
+
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(target.data(), target.size()).ok());
+}
+
+TEST(TransferEngineImpl, DirectSubmitRejectsBatchCapacityOverflow) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 128;
+    std::vector<uint8_t> buffer(kBufferLength, 0x41);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+    Request request;
+    request.opcode = Request::WRITE;
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+
+    ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
+    EXPECT_TRUE(engine.submitTransfer(batch, {request}).IsTooManyRequests());
+
+    EXPECT_TRUE(engine.waitTransferCompletion(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(ProxyManager, ReusesStageBuffersAfterFailedTaskDrains) {
+    class ControlledTransport : public FakeTransport {
+       public:
+        explicit ControlledTransport(TransportType type)
+            : FakeTransport(type) {}
+
+        Status submitTransferTasks(
+            SubBatchRef batch,
+            const std::vector<Request>& request_list) override {
+            int count =
+                submit_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count == 2) {
+                return Status::InternalError(
+                    "injected submit failure" LOC_MARK);
+            }
+            return FakeTransport::submitTransferTasks(batch, request_list);
+        }
+
+        Status getTransferStatus(SubBatchRef batch, int task_id,
+                                 TransferStatus& status) override {
+            if (stay_pending.load(std::memory_order_relaxed)) {
+                status.s = TransferStatusEnum::PENDING;
+                return Status::OK();
+            }
+            status.s = TransferStatusEnum::COMPLETED;
+            return Status::OK();
+        }
+
+        std::atomic<int> submit_count{0};
+        std::atomic<bool> stay_pending{true};
+    };
+
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<ControlledTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 128;
+    std::vector<uint8_t> source(kBufferLength, 0x51);
+    std::vector<uint8_t> target(kBufferLength, 0x00);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(target.data(), target.size()).ok());
+
+    {
+        ProxyManager manager(&engine, 64, 2);
+        Request request;
+        request.opcode = Request::WRITE;
+        request.source = source.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        request.length = kBufferLength;
+        const std::vector<std::string> params = {"", kWildcardLocation, ""};
+
+        TaskInfo task1;
+        task1.request = request;
+        task1.staging = true;
+        ASSERT_TRUE(manager.submit(&task1, 0, params).ok());
+
+        TransferStatus status;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline &&
+               fake_tcp->submit_count.load() < 2) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_TRUE(manager.getStatus(&task1, status).ok());
+        EXPECT_GE(fake_tcp->submit_count.load(), 2);
+        EXPECT_EQ(status.s, PENDING);
+
+        // While task1's batch is still PENDING, its stage buffer stays
+        // reserved.
+        uint64_t addr = 0;
+        EXPECT_TRUE(manager.pinStageBuffer(kWildcardLocation, addr)
+                        .IsTooManyRequests());
+
+        // Allow in-flight batches to complete.
+        fake_tcp->stay_pending.store(false, std::memory_order_relaxed);
+        EXPECT_EQ(waitForStagingTerminal(manager, task1).s, FAILED);
+
+        // A subsequent task can reuse the drained staging pool.
+        TaskInfo task2;
+        task2.request = request;
+        task2.request.length =
+            64;  // 1 chunk so submitSubBatch count 3 succeeds
+        task2.staging = true;
+        ASSERT_TRUE(manager.submit(&task2, 0, params).ok());
+
+        const auto deadline2 =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline2) {
+            ASSERT_TRUE(manager.getStatus(&task2, status).ok());
+            if (status.s != PENDING) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_TRUE(manager.getStatus(&task2, status).ok());
+
+        // The completed drain makes task1's stage buffers available again.
+        ASSERT_TRUE(manager.pinStageBuffer(kWildcardLocation, addr).ok());
+        EXPECT_TRUE(manager.unpinStageBuffer(addr).ok());
+    }
+
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(target.data(), target.size()).ok());
+}
+
+TEST(ProxyManager, RetainsBatchToPreventSlabReuseLeak) {
+    class ControlledTransport : public FakeTransport {
+       public:
+        explicit ControlledTransport(TransportType type)
+            : FakeTransport(type) {}
+
+        Status submitTransferTasks(
+            SubBatchRef batch,
+            const std::vector<Request>& request_list) override {
+            int count =
+                submit_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count == 2) {
+                return Status::InternalError(
+                    "injected submit failure" LOC_MARK);
+            }
+            return FakeTransport::submitTransferTasks(batch, request_list);
+        }
+
+        Status getTransferStatus(SubBatchRef batch, int task_id,
+                                 TransferStatus& status) override {
+            if (stay_pending.load(std::memory_order_relaxed)) {
+                status.s = TransferStatusEnum::PENDING;
+                return Status::OK();
+            }
+            status.s = TransferStatusEnum::COMPLETED;
+            return Status::OK();
+        }
+
+        std::atomic<int> submit_count{0};
+        std::atomic<bool> stay_pending{true};
+    };
+
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<ControlledTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 128;
+    std::vector<uint8_t> source(kBufferLength, 0x61);
+    std::vector<uint8_t> target(kBufferLength, 0x00);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(target.data(), target.size()).ok());
+
+    {
+        ProxyManager manager(&engine, 64, 2);
+        Request request;
+        request.opcode = Request::WRITE;
+        request.source = source.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        request.length = kBufferLength;
+        const std::vector<std::string> params = {"", kWildcardLocation, ""};
+
+        TaskInfo task1;
+        task1.request = request;
+        task1.staging = true;
+        ASSERT_TRUE(manager.submit(&task1, 0, params).ok());
+
+        TransferStatus status;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline &&
+               fake_tcp->submit_count.load() < 2) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_TRUE(manager.getStatus(&task1, status).ok());
+        EXPECT_GE(fake_tcp->submit_count.load(), 2);
+        EXPECT_EQ(status.s, PENDING);
+
+        // Allow task1 in-flight batch to finish on transport
+        fake_tcp->stay_pending.store(false, std::memory_order_relaxed);
+        EXPECT_EQ(waitForStagingTerminal(manager, task1).s, FAILED);
+
+        // Attempting to allocate a new batch should not collide with retained
+        // batch
+        BatchID new_batch = engine.allocateBatch(1);
+        ASSERT_NE(new_batch, (BatchID)0);
+
+        // Submit another task after the failed parent has drained.
+        TaskInfo task2;
+        task2.request = request;
+        task2.request.length = 64;
+        task2.staging = true;
+        ASSERT_TRUE(manager.submit(&task2, 0, params).ok());
+
+        const auto deadline2 =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline2) {
+            ASSERT_TRUE(manager.getStatus(&task2, status).ok());
+            if (status.s != PENDING) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        // Verify task1 stage buffers were successfully reclaimed after retained
+        // batch completed
+        uint64_t addr = 0;
+        ASSERT_TRUE(manager.pinStageBuffer(kWildcardLocation, addr).ok());
+        EXPECT_TRUE(manager.unpinStageBuffer(addr).ok());
+
+        engine.freeBatch(new_batch);
+    }
+
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(target.data(), target.size()).ok());
+}
+
+TEST(ProxyManager, PollErrorKeepsInflightStageBuffersReserved) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<DeferredCleanupProbeTransport>();
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 128;
+    std::vector<uint8_t> source(kBufferLength, 0x71);
+    std::vector<uint8_t> target(kBufferLength, 0x00);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(target.data(), target.size()).ok());
+
+    {
+        ProxyManager manager(&engine, 64, 2);
+        Request request;
+        request.opcode = Request::WRITE;
+        request.source = source.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        request.length = kBufferLength;
+        const std::vector<std::string> params = {"", kWildcardLocation, ""};
+
+        TaskInfo task;
+        task.request = request;
+        task.staging = true;
+        ASSERT_TRUE(manager.submit(&task, 0, params).ok());
+        const auto submission_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (fake_tcp->submit_attempts.load() < 2 &&
+               std::chrono::steady_clock::now() < submission_deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        EXPECT_GE(fake_tcp->submit_attempts.load(), 2);
+        TransferStatus pending{};
+        EXPECT_TRUE(manager.getStatus(&task, pending).ok());
+        EXPECT_EQ(pending.s, PENDING);
+
+        fake_tcp->fail_polling.store(true, std::memory_order_release);
+        uint64_t addr = 0;
+        auto pin_status = manager.pinStageBuffer(kWildcardLocation, addr);
+        EXPECT_TRUE(pin_status.IsTooManyRequests())
+            << "a polling error must not release an in-flight stage buffer: "
+            << pin_status.ToString();
+        if (pin_status.ok()) {
+            EXPECT_TRUE(manager.unpinStageBuffer(addr).ok());
+        }
+
+        fake_tcp->fail_polling.store(false, std::memory_order_release);
+        fake_tcp->stay_pending.store(false, std::memory_order_release);
+        EXPECT_EQ(waitForStagingTerminal(manager, task).s, FAILED);
+        ASSERT_TRUE(manager.pinStageBuffer(kWildcardLocation, addr).ok());
+        EXPECT_TRUE(manager.unpinStageBuffer(addr).ok());
+    }
+
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(target.data(), target.size()).ok());
+}
+
+TEST(ProxyManager, RemoteCleanupProbeDoesNotBlockOnPendingOperation) {
+    auto operation = std::make_shared<internal::RemoteStageOperation>();
+    std::vector<internal::RemoteStageOperationPtr> remote_operations = {
+        operation};
+
+    EXPECT_FALSE(internal::pollRemoteOperations(remote_operations));
+    ASSERT_EQ(remote_operations.size(), 1);
+
+    operation->complete(Status::OK(), true);
+    EXPECT_TRUE(internal::pollRemoteOperations(remote_operations));
+    EXPECT_TRUE(remote_operations.empty());
+}
+
+TEST(ProxyManager, UnconfirmedRemoteCompletionKeepsAbandonedBufferPinned) {
+    auto cleanup_calls = std::make_shared<std::atomic<int>>(0);
+    auto callback_done = std::make_shared<std::atomic<bool>>(false);
+    constexpr uint64_t kRemoteBuffer = 0x1234;
+
+    CoroRpcAgent stopped_server;
+    uint16_t port = 0;
+    ASSERT_TRUE(stopped_server.start(port).ok());
+    ASSERT_TRUE(stopped_server.stop().ok());
+    const std::string server_addr =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+
+    auto operation = std::make_shared<internal::RemoteStageOperation>(
+        server_addr, kRemoteBuffer, [cleanup_calls] {
+            cleanup_calls->fetch_add(1, std::memory_order_relaxed);
+        });
+    operation->abandonForCleanup();
+
+    Request request;
+    request.opcode = Request::WRITE;
+    request.source = reinterpret_cast<void*>(kRemoteBuffer);
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = kRemoteBuffer;
+    request.length = 1;
+    ControlClient::delegateAsync(
+        server_addr, request,
+        [operation, callback_done](Status status, auto... completion_info) {
+            operation->complete(std::move(status), completion_info...);
+            callback_done->store(true, std::memory_order_release);
+        });
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!callback_done->load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(callback_done->load(std::memory_order_acquire));
+    EXPECT_EQ(cleanup_calls->load(std::memory_order_acquire), 0);
+
+    std::vector<internal::RemoteStageOperationPtr> remote_operations = {
+        operation};
+    EXPECT_FALSE(internal::pollRemoteOperations(remote_operations));
+    EXPECT_EQ(remote_operations.size(), 1);
+}
+
+TEST(ProxyManager, LateRemoteCompletionReleasesAbandonedStageBuffer) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 64;
+    std::vector<uint8_t> source(kBufferLength, 0x91);
+    std::vector<uint8_t> remote_stage(kBufferLength, 0x00);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(
+        engine.registerLocalMemory(remote_stage.data(), remote_stage.size())
+            .ok());
+
+    CoroRpcAgent remote_server;
+    std::atomic<bool> buffer_pinned{false};
+    std::atomic<bool> delegate_started{false};
+    std::atomic<bool> release_delegate{false};
+    std::atomic<int> unpin_calls{0};
+    const auto remote_stage_addr =
+        reinterpret_cast<uint64_t>(remote_stage.data());
+
+    ASSERT_TRUE(remote_server
+                    .registerFunction(
+                        Pin,
+                        [&](const std::string_view&, std::string& response) {
+                            bool expected = false;
+                            response = buffer_pinned.compare_exchange_strong(
+                                           expected, true)
+                                           ? std::to_string(remote_stage_addr)
+                                           : "0";
+                        })
+                    .ok());
+    ASSERT_TRUE(remote_server
+                    .registerFunction(
+                        Unpin,
+                        [&](const std::string_view&, std::string&) {
+                            buffer_pinned.store(false,
+                                                std::memory_order_release);
+                            unpin_calls.fetch_add(1, std::memory_order_relaxed);
+                        })
+                    .ok());
+    ASSERT_TRUE(
+        remote_server
+            .registerFunction(
+                Delegate,
+                [&](const std::string_view&, std::string&) {
+                    delegate_started.store(true, std::memory_order_release);
+                    while (!release_delegate.load(std::memory_order_acquire)) {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(1));
+                    }
+                },
+                /*offload=*/true)
+            .ok());
+
+    uint16_t port = 0;
+    ASSERT_TRUE(remote_server.start(port).ok());
+    const std::string server_addr =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+
+    auto manager = std::make_unique<ProxyManager>(&engine, kBufferLength, 1);
+    Request request;
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = remote_stage_addr;
+    request.length = kBufferLength;
+    const std::vector<std::string> params = {server_addr, "", "remote"};
+
+    TaskInfo task;
+    task.request = request;
+    task.staging = true;
+    ASSERT_TRUE(manager->submit(&task, 0, params).ok());
+
+    const auto start_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!delegate_started.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < start_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!delegate_started.load(std::memory_order_acquire)) {
+        release_delegate.store(true, std::memory_order_release);
+        manager.reset();
+        FAIL() << "remote Delegate never started";
+        return;
+    }
+
+    manager.reset();
+    release_delegate.store(true, std::memory_order_release);
+
+    const auto cleanup_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (unpin_calls.load(std::memory_order_acquire) == 0 &&
+           std::chrono::steady_clock::now() < cleanup_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(unpin_calls.load(std::memory_order_acquire), 1);
+
+    uint64_t repinned_addr = 0;
+    ASSERT_TRUE(
+        ControlClient::pinStageBuffer(server_addr, "remote", repinned_addr)
+            .ok());
+    EXPECT_EQ(repinned_addr, remote_stage_addr);
+    if (repinned_addr != 0) {
+        EXPECT_TRUE(
+            ControlClient::unpinStageBuffer(server_addr, repinned_addr).ok());
+    }
+
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(remote_stage.data(), remote_stage.size())
+            .ok());
+}
+
+TEST(ProxyManager, DestructorWaitsForDeferredBatchBeforeFreeingStageMemory) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<DeferredCleanupProbeTransport>();
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 128;
+    std::vector<uint8_t> source(kBufferLength, 0x81);
+    std::vector<uint8_t> target(kBufferLength, 0x00);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(target.data(), target.size()).ok());
+
+    auto manager = std::make_unique<ProxyManager>(&engine, 64, 2);
+    Request request;
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = kBufferLength;
+    const std::vector<std::string> params = {"", kWildcardLocation, ""};
+
+    TaskInfo task;
+    task.request = request;
+    task.staging = true;
+    ASSERT_TRUE(manager->submit(&task, 0, params).ok());
+    const auto submission_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (fake_tcp->submit_attempts.load() < 2 &&
+           std::chrono::steady_clock::now() < submission_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_GE(fake_tcp->submit_attempts.load(), 2);
+    TransferStatus pending{};
+    EXPECT_TRUE(manager->getStatus(&task, pending).ok());
+    EXPECT_EQ(pending.s, PENDING);
+
+    std::atomic<bool> destroyed{false};
+    std::thread destroyer([&] {
+        manager.reset();
+        destroyed.store(true, std::memory_order_release);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(destroyed.load(std::memory_order_acquire));
+    EXPECT_EQ(fake_tcp->free_local_memory_calls.load(std::memory_order_acquire),
+              0);
+    EXPECT_EQ(fake_tcp->free_local_memory_while_pending.load(
+                  std::memory_order_acquire),
+              0);
+
+    fake_tcp->stay_pending.store(false, std::memory_order_release);
+    destroyer.join();
+    EXPECT_TRUE(destroyed.load(std::memory_order_acquire));
+    EXPECT_GT(fake_tcp->free_local_memory_calls.load(std::memory_order_acquire),
+              0);
+    EXPECT_EQ(fake_tcp->free_local_memory_while_pending.load(
+                  std::memory_order_acquire),
+              0);
+
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(target.data(), target.size()).ok());
+}
+
+// ---------------------------------------------------------------------------
+// lazyFreeBatch head-of-line blocking. freelist is insertion-ordered; a batch
+// whose poll fails permanently must not stop every batch behind it from being
+// reclaimed.
+// ---------------------------------------------------------------------------
+
+// Polls succeed except for requests whose source is `poison_source`, which
+// fail permanently. Also counts freeSubBatch so a test can see reclamation.
+class PoisonedPollTransport : public FakeTransport {
+   public:
+    explicit PoisonedPollTransport(TransportType type) : FakeTransport(type) {}
+
+    Status getTransferStatus(SubBatchRef batch, int task_id,
+                             TransferStatus& status) override {
+        auto* fb = static_cast<FakeSubBatch*>(batch);
+        if (task_id >= 0 && task_id < (int)fb->requests.size() &&
+            fb->requests[task_id].source ==
+                poison_source.load(std::memory_order_acquire)) {
+            poisoned_polls.fetch_add(1, std::memory_order_relaxed);
+            return Status::InternalError(
+                "injected permanent poll failure" LOC_MARK);
+        }
+        return FakeTransport::getTransferStatus(batch, task_id, status);
+    }
+
+    Status freeSubBatch(SubBatchRef& batch) override {
+        free_sub_batch_calls.fetch_add(1, std::memory_order_relaxed);
+        return FakeTransport::freeSubBatch(batch);
+    }
+
+    std::atomic<const void*> poison_source{nullptr};
+    std::atomic<int> free_sub_batch_calls{0};
+    std::atomic<int> poisoned_polls{0};
+};
+
+TEST(BatchLifecycle, FreeListSweepSkipsAStuckBatchInsteadOfStopping) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<PoisonedPollTransport>(RDMA);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> stuck_buf(kBufLen, 0xA1);
+    std::vector<uint8_t> healthy_buf(kBufLen, 0xB2);
+    ASSERT_TRUE(engine.registerLocalMemory(stuck_buf.data(), kBufLen).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(healthy_buf.data(), kBufLen).ok());
+
+    auto make_request = [&](std::vector<uint8_t>& buf) {
+        Request req;
+        req.opcode = Request::WRITE;
+        req.source = buf.data();
+        req.target_id = LOCAL_SEGMENT_ID;
+        req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+        req.length = kBufLen;
+        return req;
+    };
+
+    // Batch A polls with a permanent error, so lazyFreeBatch can neither
+    // reclaim it nor decide it is still pending.
+    BatchID stuck = engine.allocateBatch(1);
+    ASSERT_NE(stuck, (BatchID)0);
+    ASSERT_TRUE(engine.submitTransfer(stuck, {make_request(stuck_buf)}).ok());
+    fake_rdma->poison_source.store(stuck_buf.data(), std::memory_order_release);
+
+    // Batch B completes normally.
+    BatchID healthy = engine.allocateBatch(1);
+    ASSERT_NE(healthy, (BatchID)0);
+    ASSERT_TRUE(
+        engine.submitTransfer(healthy, {make_request(healthy_buf)}).ok());
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(healthy, status).ok());
+    ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+
+    // A enters the freelist first and stays there; B lands behind it.
+    EXPECT_TRUE(engine.freeBatch(stuck).ok());
+    EXPECT_TRUE(engine.freeBatch(healthy).ok());
+
+    // B must be reclaimed even though A, ahead of it, cannot be: its SubBatch
+    // is returned to the transport and its handle is no longer alive.
+    EXPECT_EQ(fake_rdma->free_sub_batch_calls.load(std::memory_order_acquire),
+              1)
+        << "the healthy batch behind the stuck one was never reclaimed";
+    TransferStatus after_free{};
+    EXPECT_FALSE(engine.getTransferStatus(healthy, after_free).ok())
+        << "a reclaimed batch handle must not stay alive";
+
+    // Unpoison so the stuck batch drains at teardown.
+    fake_rdma->poison_source.store(nullptr, std::memory_order_release);
+    EXPECT_TRUE(engine.unregisterLocalMemory(stuck_buf.data(), kBufLen).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(healthy_buf.data(), kBufLen).ok());
+}
+
+// A batch whose reclaim fails on every pass must eventually be parked: after
+// kMaxReclaimAttempts (4096) consecutive failures the sweep stops polling and
+// warning about it, later frees are unaffected, and engine teardown still
+// reclaims it unconditionally.
+TEST(BatchLifecycle, PermanentlyStuckBatchIsQuarantinedNotRetriedForever) {
+    constexpr size_t kMaxReclaimAttempts = 4096;  // mirrors the impl constant
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> stuck_buf(kBufLen, 0xA1);
+    std::vector<uint8_t> late_buf(kBufLen, 0xB2);
+    auto fake_rdma = std::make_shared<PoisonedPollTransport>(RDMA);
+
+    {
+        auto cfg = makeMinimalP2PConfig();
+        TransferEngineImpl engine(cfg);
+        ASSERT_TRUE(engine.available());
+        std::string seg = engine.getSegmentName();
+        ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+        engine.swapTransportForTest(RDMA, fake_rdma);
+        ASSERT_TRUE(engine.registerLocalMemory(stuck_buf.data(), kBufLen).ok());
+        ASSERT_TRUE(engine.registerLocalMemory(late_buf.data(), kBufLen).ok());
+
+        auto make_request = [&](std::vector<uint8_t>& buf) {
+            Request req;
+            req.opcode = Request::WRITE;
+            req.source = buf.data();
+            req.target_id = LOCAL_SEGMENT_ID;
+            req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+            req.length = kBufLen;
+            return req;
+        };
+
+        BatchID stuck = engine.allocateBatch(1);
+        ASSERT_NE(stuck, (BatchID)0);
+        ASSERT_TRUE(
+            engine.submitTransfer(stuck, {make_request(stuck_buf)}).ok());
+        fake_rdma->poison_source.store(stuck_buf.data(),
+                                       std::memory_order_release);
+        ASSERT_TRUE(engine.freeBatch(stuck).ok());
+
+        // Drive sweeps past the quarantine threshold. Re-freeing an already
+        // free-requested batch runs one sweep per call and returns the sweep
+        // error while the batch is still being retried.
+        bool saw_error = false;
+        for (size_t i = 0; i + 1 < kMaxReclaimAttempts; ++i) {
+            saw_error |= !engine.freeBatch(stuck).ok();
+        }
+        EXPECT_TRUE(saw_error);
+
+        // Quarantined: further sweeps neither poll the batch nor report its
+        // error.
+        const int polls_at_quarantine =
+            fake_rdma->poisoned_polls.load(std::memory_order_acquire);
+        for (int i = 0; i < 100; ++i) {
+            EXPECT_TRUE(engine.freeBatch(stuck).ok());
+        }
+        EXPECT_EQ(fake_rdma->poisoned_polls.load(std::memory_order_acquire),
+                  polls_at_quarantine)
+            << "a quarantined batch must not be re-polled";
+
+        // Healthy batches are still reclaimed normally alongside it.
+        BatchID late = engine.allocateBatch(1);
+        ASSERT_NE(late, (BatchID)0);
+        ASSERT_TRUE(engine.submitTransfer(late, {make_request(late_buf)}).ok());
+        TransferStatus status{};
+        ASSERT_TRUE(engine.getTransferStatus(late, status).ok());
+        ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+        EXPECT_TRUE(engine.freeBatch(late).ok());
+        EXPECT_EQ(
+            fake_rdma->free_sub_batch_calls.load(std::memory_order_acquire), 1)
+            << "batches behind a quarantined one must still be reclaimed";
+    }  // engine teardown reclaims the quarantined batch unconditionally
+
+    EXPECT_EQ(fake_rdma->free_sub_batch_calls.load(std::memory_order_acquire),
+              2)
+        << "teardown must reclaim the quarantined batch";
+}
+
+void installFakeRdmaAndTcp(TransferEngineImpl& engine,
+                           const std::shared_ptr<FakeTransport>& fake_rdma,
+                           const std::shared_ptr<FakeTransport>& fake_tcp) {
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+}
+
+Request makeLocalWriteReq(uint8_t* ptr, size_t length) {
+    Request req;
+    req.opcode = Request::WRITE;
+    req.source = ptr;
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(ptr);
+    req.length = length;
+    return req;
+}
+
+template <typename Fn>
+void runOrAbortOnTimeout(Fn&& fn, std::chrono::milliseconds timeout,
+                         const char* what) {
+    std::promise<void> done;
+    auto fut = done.get_future();
+    std::thread worker([&] {
+        fn();
+        done.set_value();
+    });
+    if (fut.wait_for(timeout) != std::future_status::ready) {
+        worker.detach();
+        ADD_FAILURE() << what << " timed out (likely deadlock)";
+        std::_Exit(1);
+    }
+    worker.join();
+}
+
+// ---------------------------------------------------------------------------
+// Lock-sharding: independent batches poll concurrently; poll vs free of the
+// same batch is well-defined; runtime-queue path must not invert lock order.
+// ---------------------------------------------------------------------------
+
+TEST(ProgressLockShard, ConcurrentIndependentBatchPolls) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    constexpr int kThreads = 8;
+    constexpr int kIters = 50;
+    std::vector<uint8_t> buf(kBufLen * kThreads, 0x5A);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    std::atomic<int> failures{0};
+    runOrAbortOnTimeout(
+        [&] {
+            std::vector<std::thread> threads;
+            threads.reserve(kThreads);
+            for (int t = 0; t < kThreads; ++t) {
+                threads.emplace_back([&, t] {
+                    uint8_t* ptr = buf.data() + t * kBufLen;
+                    for (int i = 0; i < kIters; ++i) {
+                        BatchID batch_id = engine.allocateBatch(1);
+                        if (!batch_id) {
+                            ++failures;
+                            return;
+                        }
+                        if (!engine
+                                 .submitTransfer(batch_id, {makeLocalWriteReq(
+                                                               ptr, kBufLen)})
+                                 .ok()) {
+                            ++failures;
+                            (void)engine.freeBatch(batch_id);
+                            return;
+                        }
+                        TransferStatus status{};
+                        if (!engine.getTransferStatus(batch_id, status).ok() ||
+                            status.s != TransferStatusEnum::COMPLETED) {
+                            ++failures;
+                            (void)engine.freeBatch(batch_id);
+                            return;
+                        }
+                        if (!engine.freeBatch(batch_id).ok()) ++failures;
+                    }
+                });
+            }
+            for (auto& th : threads) th.join();
+        },
+        std::chrono::seconds(10), "ConcurrentIndependentBatchPolls");
+
+    EXPECT_EQ(failures.load(), 0);
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+TEST(ProgressLockShard, PollRacesWithFreeSameBatch) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0x11);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, (BatchID)0);
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch_id, {makeLocalWriteReq(buf.data(), kBufLen)})
+            .ok());
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> invalid_after_free{0};
+    std::atomic<int> unexpected{0};
+    runOrAbortOnTimeout(
+        [&] {
+            std::thread poller([&] {
+                TransferStatus status{};
+                while (!stop.load(std::memory_order_acquire)) {
+                    auto st = engine.getTransferStatus(batch_id, status);
+                    if (st.ok()) continue;
+                    if (st.IsInvalidArgument()) {
+                        ++invalid_after_free;
+                        return;
+                    }
+                    ++unexpected;
+                    return;
+                }
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+            stop.store(true, std::memory_order_release);
+            poller.join();
+        },
+        std::chrono::seconds(10), "PollRacesWithFreeSameBatch");
+
+    EXPECT_EQ(unexpected.load(), 0);
+    TransferStatus status{};
+    EXPECT_TRUE(engine.getTransferStatus(batch_id, status).IsInvalidArgument());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+TEST(ProgressLockShard, DeferredFreeRegistryReadRacesWithAllocation) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_runtime_queue", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    std::atomic<bool> complete{false};
+    auto pending_poll = [&complete](const Request& request, int) {
+        if (complete.load(std::memory_order_acquire)) {
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        }
+        return TransferStatus{TransferStatusEnum::PENDING, 0};
+    };
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, FakeTransport::StatusFactory{}, pending_poll);
+    auto fake_tcp = std::make_shared<FakeTransport>(
+        TCP, FakeTransport::StatusFactory{}, pending_poll);
+    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    constexpr int kPendingBatches = 8;
+    constexpr int kRounds = 512;
+    constexpr int kAllocatorThreads = 4;
+    std::vector<uint8_t> buf(kBufLen, 0x33);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    std::vector<BatchID> pending_batches;
+    pending_batches.reserve(kPendingBatches);
+    for (int i = 0; i < kPendingBatches; ++i) {
+        BatchID batch_id = engine.allocateBatch(1);
+        ASSERT_NE(batch_id, (BatchID)0);
+        ASSERT_TRUE(engine
+                        .submitTransfer(
+                            batch_id, {makeLocalWriteReq(buf.data(), kBufLen)})
+                        .ok());
+        pending_batches.push_back(batch_id);
+    }
+
+    std::atomic<bool> start{false};
+    std::atomic<bool> stop{false};
+    std::atomic<int> allocator_failures{0};
+    std::vector<std::thread> allocators;
+    allocators.reserve(kAllocatorThreads);
+    for (int i = 0; i < kAllocatorThreads; ++i) {
+        allocators.emplace_back([&] {
+            while (!start.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            while (!stop.load(std::memory_order_acquire)) {
+                // Empty batches complete immediately, so this thread mutates
+                // the shard registry without growing the deferred freelist.
+                BatchID batch_id = engine.allocateBatch(0);
+                if (!batch_id) {
+                    ++allocator_failures;
+                    return;
+                }
+                if (!engine.freeBatch(batch_id).ok()) ++allocator_failures;
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+
+    int free_failures = 0;
+    for (int round = 0; round < kRounds; ++round) {
+        for (BatchID batch_id : pending_batches) {
+            if (!engine.freeBatch(batch_id).ok()) ++free_failures;
+        }
+    }
+
+    stop.store(true, std::memory_order_release);
+    for (auto& allocator : allocators) allocator.join();
+
+    EXPECT_EQ(free_failures, 0);
+    EXPECT_EQ(allocator_failures.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(engine.aliveBatchCountForTest(), kPendingBatches);
+
+    // Let the deferred batches drain before the engine and registered memory
+    // are torn down.
+    complete.store(true, std::memory_order_release);
+    EXPECT_TRUE(engine.freeBatch(pending_batches.front()).ok());
+    EXPECT_EQ(engine.aliveBatchCountForTest(), 0);
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+TEST(ProgressLockShard, RuntimeQueuePollAndFreeDoesNotDeadlock) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_runtime_queue", true);
+    cfg->set("runtime_queue/max_outstanding_owners", 16UL);
+    cfg->set("runtime_queue/max_outstanding_bytes", 1UL << 20);
+    cfg->set("runtime_queue/max_dispatch_owners", 4UL);
+    cfg->set("runtime_queue/max_dispatch_bytes", 1UL << 20);
+    cfg->set("runtime_queue/staging_owner_reserve", 0UL);
+    cfg->set("runtime_queue/staging_byte_reserve", 0UL);
+    cfg->set("runtime_queue/progress_fallback_interval_us", 50000UL);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto pending_poll = [](const Request&, int) {
+        return TransferStatus{TransferStatusEnum::PENDING, 0};
+    };
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, FakeTransport::StatusFactory{}, pending_poll);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    constexpr int kBatches = 8;
+    std::vector<uint8_t> buf(kBufLen * kBatches, 0x22);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    std::vector<BatchID> batches;
+    batches.reserve(kBatches);
+    for (int i = 0; i < kBatches; ++i) {
+        BatchID batch_id = engine.allocateBatch(1);
+        ASSERT_NE(batch_id, (BatchID)0);
+        ASSERT_TRUE(engine
+                        .submitTransfer(batch_id,
+                                        {makeLocalWriteReq(
+                                            buf.data() + i * kBufLen, kBufLen)})
+                        .ok());
+        batches.push_back(batch_id);
+    }
+
+    runOrAbortOnTimeout(
+        [&] {
+            std::atomic<bool> stop{false};
+            std::vector<std::thread> pollers;
+            pollers.reserve(kBatches);
+            for (int i = 0; i < kBatches; ++i) {
+                pollers.emplace_back([&, i] {
+                    TransferStatus status{};
+                    while (!stop.load(std::memory_order_acquire)) {
+                        (void)engine.getTransferStatus(batches[i], status);
+                    }
+                });
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            for (auto batch_id : batches) {
+                EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+            }
+            stop.store(true, std::memory_order_release);
+            for (auto& th : pollers) th.join();
+        },
+        std::chrono::seconds(10), "RuntimeQueuePollAndFreeDoesNotDeadlock");
+
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+}  // namespace
+}  // namespace tent
+}  // namespace mooncake

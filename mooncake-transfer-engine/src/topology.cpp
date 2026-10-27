@@ -1,0 +1,1121 @@
+// Copyright 2024 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <glog/logging.h>
+
+#include <algorithm>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <set>
+#include <string>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+#include <dirent.h>
+#include <infiniband/verbs.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+
+#include "cuda_alike.h"
+#include "config.h"
+#include "memory_location.h"
+#if defined(USE_CUDA) && !defined(USE_CXI)
+#include "transport/rdma_transport/data_direct_topology.h"
+#endif
+#include "topology.h"
+#include "char_util.h"
+#ifdef USE_EFA
+#include "transport/efa_transport/efa_discovery.h"
+#include "transport/efa_transport/efa_neuron.h"
+#endif
+#ifdef USE_UB
+#include <libgen.h>
+#include <urma_api.h>
+#endif
+
+namespace mooncake {
+
+static bool isIbDeviceAccessible(struct ibv_device *device) {
+    char device_path[PATH_MAX];
+    struct stat st;
+
+    snprintf(device_path, sizeof(device_path), "/dev/infiniband/%s",
+             device->dev_name);
+
+    if (stat(device_path, &st) != 0) {
+        LOG(WARNING) << "Device " << ibv_get_device_name(device) << " path "
+                     << device_path << " does not exist";
+        return false;
+    }
+
+    if (!S_ISCHR(st.st_mode)) {
+        LOG(WARNING) << "Device path " << device_path
+                     << " is not a character device (mode: " << std::oct
+                     << st.st_mode << std::dec << ")";
+        return false;
+    }
+
+    if (access(device_path, R_OK | W_OK) != 0) {
+        LOG(WARNING) << "Device " << device_path
+                     << " is not accessible for read/write";
+        return false;
+    }
+
+    return true;
+}
+
+static bool checkIbDevicePort(struct ibv_context *context,
+                              const std::string &device_name,
+                              uint8_t port_num) {
+    struct ibv_port_attr port_attr;
+
+    if (ibv_query_port(context, port_num, &port_attr) != 0) {
+        PLOG(WARNING) << "Failed to query port " << static_cast<int>(port_num)
+                      << " on " << device_name;
+        return false;
+    }
+
+    if (port_attr.gid_tbl_len == 0) {
+        LOG(WARNING) << device_name << ":" << static_cast<int>(port_num)
+                     << " has no GID table entries";
+        return false;
+    }
+
+    if (port_attr.state != IBV_PORT_ACTIVE) {
+        LOG(INFO) << device_name << ":" << static_cast<int>(port_num)
+                  << " is not active (state: "
+                  << static_cast<int>(port_attr.state) << ")";
+        return false;
+    }
+
+    return true;
+}
+
+static bool isIbDeviceAvailable(struct ibv_device *device) {
+    const char *device_name = ibv_get_device_name(device);
+
+    if (!isIbDeviceAccessible(device)) {
+        return false;
+    }
+
+    struct ibv_context *context = ibv_open_device(device);
+    if (!context) {
+        PLOG(WARNING) << "Failed to open device " << device_name;
+        return false;
+    }
+
+    struct ibv_device_attr device_attr;
+    if (ibv_query_device(context, &device_attr) != 0) {
+        PLOG(WARNING) << "Failed to query device attributes for "
+                      << device_name;
+        ibv_close_device(context);
+        return false;
+    }
+
+    bool has_active_port = false;
+    for (uint8_t port = 1; port <= device_attr.phys_port_cnt; ++port) {
+        if (checkIbDevicePort(context, device_name, port)) {
+            has_active_port = true;
+            LOG(INFO) << "Device " << device_name << " port "
+                      << static_cast<int>(port) << " is available";
+        }
+    }
+
+    ibv_close_device(context);
+
+    if (!has_active_port) {
+        LOG(WARNING) << "Device " << device_name
+                     << " has no active ports, skipping";
+    }
+
+    return has_active_port;
+}
+
+struct InfinibandDevice {
+    std::string name;
+    std::string pci_bus_id;
+    int numa_node;
+};
+
+static inline void ltrim(std::string &s) {
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
+                return !std::isspace(ch);
+            }));
+}
+
+static inline void rtrim(std::string &s) {
+    s.erase(std::find_if(s.rbegin(), s.rend(),
+                         [](unsigned char ch) { return !std::isspace(ch); })
+                .base(),
+            s.end());
+}
+
+static std::set<std::string> getIbvDeviceWhitelist() {
+    std::set<std::string> whitelist;
+    const char *env = std::getenv("MC_TE_FILTERS");
+    if (!env || !*env) {
+        return whitelist;
+    }
+
+    LOG(INFO) << "IB device whitelist: " << env;
+    std::string env_str(env);
+    size_t start = 0;
+    size_t pos = 0;
+    while ((pos = env_str.find(',', start)) != std::string::npos) {
+        std::string token = env_str.substr(start, pos - start);
+        ltrim(token);
+        rtrim(token);
+        if (!token.empty()) {
+            whitelist.insert(std::move(token));
+        }
+        start = pos + 1;
+    }
+    if (start < env_str.length()) {
+        std::string token = env_str.substr(start);
+        ltrim(token);
+        rtrim(token);
+        if (!token.empty()) {
+            whitelist.insert(std::move(token));
+        }
+    }
+    return whitelist;
+}
+
+#ifndef USE_CXI
+static bool isEfaDevice(const std::string &device_name) {
+    char path[PATH_MAX + 64];
+    char resolved_path[PATH_MAX];
+    snprintf(path, sizeof(path), "/sys/class/infiniband/%s/device/driver",
+             device_name.c_str());
+    if (realpath(path, resolved_path) == NULL) return false;
+    return strcmp(basename(resolved_path), "efa") == 0;
+}
+#endif
+
+static std::vector<InfinibandDevice> listInfiniBandDevices(
+    const std::vector<std::string> &filter, bool exclude_efa) {
+#ifndef USE_CXI
+    int num_devices = 0;
+    std::vector<InfinibandDevice> devices;
+    const auto whitelist = getIbvDeviceWhitelist();
+
+    struct ibv_device **device_list = ibv_get_device_list(&num_devices);
+    if (!device_list) {
+        LOG(WARNING) << "No RDMA devices found, check your device installation";
+        return {};
+    }
+    if (device_list && num_devices <= 0) {
+        LOG(WARNING) << "No RDMA devices found, check your device installation";
+        ibv_free_device_list(device_list);
+        return {};
+    }
+
+    for (int i = 0; i < num_devices; ++i) {
+        std::string device_name = ibv_get_device_name(device_list[i]);
+        if (!filter.empty() && std::find(filter.begin(), filter.end(),
+                                         device_name) == filter.end())
+            continue;
+
+        if (!whitelist.empty() &&
+            whitelist.find(device_name) == whitelist.end()) {
+            LOG(INFO) << "Skipping device: " << device_name;
+            continue;
+        }
+
+        if (exclude_efa && isEfaDevice(device_name)) {
+            LOG(INFO) << "Skipping EFA device for RDMA: " << device_name
+                      << " (use protocol=efa for EFA)";
+            continue;
+        }
+
+        // Check device availability before adding to the list
+        if (!isIbDeviceAvailable(device_list[i])) {
+            LOG(WARNING) << "Skipping unavailable device: " << device_name;
+            continue;
+        }
+
+        char path[PATH_MAX + 32];
+        char resolved_path[PATH_MAX];
+        // Get the PCI bus id for the infiniband device. Note that
+        // "/sys/class/infiniband/mlx5_X/" is a symlink to
+        // "/sys/devices/pciXXXX:XX/XXXX:XX:XX.X/infiniband/mlx5_X/".
+        snprintf(path, sizeof(path), "/sys/class/infiniband/%s/../..",
+                 device_name.c_str());
+        if (realpath(path, resolved_path) == NULL) {
+            PLOG(ERROR) << "listInfiniBandDevices: realpath " << path
+                        << " failed";
+            continue;
+        }
+        std::string pci_bus_id = basename(resolved_path);
+
+        int numa_node = -1;
+        snprintf(path, sizeof(path), "%s/numa_node", resolved_path);
+        std::ifstream(path) >> numa_node;
+
+        devices.push_back(InfinibandDevice{.name = std::move(device_name),
+                                           .pci_bus_id = std::move(pci_bus_id),
+                                           .numa_node = numa_node});
+    }
+    ibv_free_device_list(device_list);
+    return devices;
+#else
+    (void)exclude_efa;  // CXI builds have no EFA NICs
+    // assume devices available and working, later use libcxi to check if they
+    // actually work
+    std::vector<std::string> device_names;
+    std::vector<InfinibandDevice> devices;
+    const char *nic_path = "/sys/class/cxi";
+
+    DIR *dir = opendir(nic_path);
+    if (!dir) {
+        perror("opendir");
+        LOG(WARNING) << "No CXI devices were found, check you system";
+        return {};
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_type == DT_LNK && std::string(entry->d_name) != "." &&
+            std::string(entry->d_name) != "..") {
+            device_names.emplace_back(entry->d_name);
+        }
+    }
+    closedir(dir);
+
+    for (auto &dv_name : device_names) {
+        if (!filter.empty() &&
+            std::find(filter.begin(), filter.end(), dv_name) == filter.end())
+            continue;
+
+        char path[PATH_MAX + 32];
+        char resolved_path[PATH_MAX];
+
+        snprintf(path, sizeof(path), "/sys/class/cxi/%s/device",
+                 dv_name.c_str());
+        if (realpath(path, resolved_path) == NULL) {
+            PLOG(ERROR) << "Can't resolve CXI device path for " << path;
+            continue;
+        }
+        std::string pci_bus_id = basename(resolved_path);
+
+        int numa_node = -1;
+
+        snprintf(path, sizeof(path), "%s/numa_node", resolved_path);
+        std::ifstream(path) >> numa_node;
+
+        devices.push_back(InfinibandDevice{.name = std::move(dv_name),
+                                           .pci_bus_id = std::move(pci_bus_id),
+                                           .numa_node = numa_node});
+    }
+    return devices;
+#endif
+}
+
+#if defined(USE_EFA) && !defined(USE_CXI)
+// Replaces the EFA NICs in `devices` with the ones libfabric reports. Those
+// are exactly the devices the EFA transport can open (EfaContext uses the same
+// fi_getinfo() hints), so EFA discovery does not depend on how a device looks
+// through libibverbs and sysfs. Existing entries keep their position, which
+// keeps NIC indices unchanged; NICs only libfabric reports are appended.
+//
+// Hosts whose verbs devices are all non-EFA (e.g. Mellanox) are left alone,
+// so RDMA-only processes never initialize libfabric.
+static void useLibfabricEfaNics(std::vector<InfinibandDevice> &devices,
+                                const std::vector<std::string> &filter) {
+    bool verbs_has_efa = false;
+    for (const auto &device : devices) {
+        if (isEfaDevice(device.name)) {
+            verbs_has_efa = true;
+            break;
+        }
+    }
+    if (!devices.empty() && !verbs_has_efa) return;
+
+    std::vector<EfaNic> nics;
+    std::string error;
+    if (!listEfaNics(nics, &error)) {
+        if (verbs_has_efa) {
+            LOG(INFO) << "Using the EFA devices found through libibverbs: "
+                         "cannot list them through libfabric ("
+                      << error << ")";
+        }
+        return;
+    }
+
+    const auto whitelist = getIbvDeviceWhitelist();
+    std::map<std::string, const EfaNic *> wanted;
+    for (const auto &nic : nics) {
+        if (!filter.empty() &&
+            std::find(filter.begin(), filter.end(), nic.name) == filter.end())
+            continue;
+        if (!whitelist.empty() && !whitelist.count(nic.name)) continue;
+        wanted[nic.name] = &nic;
+    }
+
+    auto to_device = [](const EfaNic &nic, const InfinibandDevice *verbs) {
+        InfinibandDevice device{.name = nic.name,
+                                .pci_bus_id = nic.pci_bus_id,
+                                .numa_node = nic.numa_node};
+        if (device.pci_bus_id.empty() && verbs) {
+            device.pci_bus_id = verbs->pci_bus_id;
+            device.numa_node = verbs->numa_node;
+        }
+        return device;
+    };
+
+    std::vector<InfinibandDevice> merged;
+    std::set<std::string> placed;
+    for (const auto &device : devices) {
+        if (!isEfaDevice(device.name)) {
+            merged.push_back(device);
+            continue;
+        }
+        auto it = wanted.find(device.name);
+        if (it == wanted.end()) {
+            LOG(INFO) << "Skipping EFA device " << device.name
+                      << ": libfabric does not offer it";
+            continue;
+        }
+        merged.push_back(to_device(*it->second, &device));
+        placed.insert(device.name);
+    }
+    for (const auto &entry : wanted) {
+        if (placed.count(entry.first)) continue;
+        merged.push_back(to_device(*entry.second, nullptr));
+        LOG(INFO) << "EFA device " << entry.first << " found through libfabric";
+    }
+    devices = std::move(merged);
+}
+#endif
+
+static void precomputeResolvedHcaPeerAffinity(
+    const TopologyMatrix &matrix, const std::map<std::string, int> &hca_id_map,
+    std::unordered_map<std::string,
+                       std::unordered_map<std::string, std::vector<int>>>
+        &affinity_by_local) {
+    affinity_by_local.clear();
+    const auto &config = globalConfig();
+    if (!config.enable_hca_peer_affinity) return;
+    if (config.nic_peer_affinity.empty()) {
+        LOG(WARNING) << "MC_ENABLE_HCA_PEER_AFFINITY is set, but "
+                        "MC_NIC_PEER_AFFINITY has no valid mappings.";
+        return;
+    }
+
+    for (const auto &entry : matrix) {
+        // Match the vendor-specific GPU location prefix (cuda:/hip:/...).
+        // Hardcoding "cuda:" silently disables HCA peer affinity under USE_HIP.
+        if (entry.first.rfind(GPU_PREFIX, 0) != 0) continue;
+
+        std::unordered_set<std::string> preferred_set(
+            entry.second.preferred_hca.begin(),
+            entry.second.preferred_hca.end());
+
+        for (const auto &mapping : config.nic_peer_affinity) {
+            const auto &local_hca = mapping.first;
+            const auto &peer_hcas = mapping.second;
+
+            std::vector<int> peer_preferred_hca;
+            std::unordered_set<std::string> peer_preferred_set;
+            for (const auto &peer_hca : peer_hcas) {
+                if (!preferred_set.count(peer_hca)) continue;
+                auto hca_id_it = hca_id_map.find(peer_hca);
+                if (hca_id_it == hca_id_map.end()) continue;
+                if (peer_preferred_set.insert(peer_hca).second) {
+                    peer_preferred_hca.push_back(hca_id_it->second);
+                }
+            }
+
+            if (peer_preferred_hca.empty()) continue;
+            affinity_by_local[local_hca][entry.first] =
+                std::move(peer_preferred_hca);
+        }
+    }
+}
+
+#ifdef USE_UB
+struct UBDevice {
+    std::string name;
+    std::string pci_bus_id;
+    int numa_node;
+};
+
+static std::vector<UBDevice> listUBDevices(
+    const std::vector<std::string> &filter) {
+    int num_devices = 0;
+    std::vector<UBDevice> devices;
+
+    urma_init_attr_t init_attr = {};
+    if (urma_init(&init_attr) != URMA_SUCCESS) {
+        LOG(WARNING) << "Failed to urma init";
+        return {};
+    }
+    LOG(INFO) << "URMA module init success";
+    urma_device_t **device_list = urma_get_device_list(&num_devices);
+    if (!device_list) {
+        LOG(WARNING) << "No UB devices found, check your device installation";
+        urma_uninit();
+        return {};
+    }
+    if (device_list && num_devices <= 0) {
+        LOG(WARNING) << "No UB devices found, check your device installation";
+        urma_free_device_list(device_list);
+        return {};
+    }
+
+    for (int i = 0; i < num_devices; ++i) {
+        std::string device_name = device_list[i]->name;
+        if (!filter.empty() && std::find(filter.begin(), filter.end(),
+                                         device_name) == filter.end())
+            continue;
+        char path[PATH_MAX + 32];
+        char resolved_path[PATH_MAX];
+        // Get the PCI bus id for the infiniband device. Note that
+        snprintf(path, sizeof(path), "/sys/class/ubcore/%s",
+                 device_list[i]->name);
+        LOG(INFO) << "listUBDevices: path " << path;
+        if (realpath(path, resolved_path) == NULL) {
+            LOG(ERROR) << "listUBDevices: realpath " << resolved_path
+                       << " failed";
+            continue;
+        }
+        LOG(INFO) << "listUBDevices: realpath " << resolved_path;
+        std::string pci_bus_id = basename(resolved_path);
+
+        int numa_node = -1;
+        snprintf(path, sizeof(path), "%s/numa",
+                 dirname(dirname(resolved_path)));
+        LOG(INFO) << "listUBDevices: numanodepath " << path;
+        std::ifstream(path) >> numa_node;
+        LOG(INFO) << "UBDevices : performation node ----"
+                  << device_list[i]->name << " : " << numa_node;
+
+        devices.push_back(UBDevice{.name = std::move(device_name),
+                                   .pci_bus_id = std::move(pci_bus_id),
+                                   .numa_node = numa_node});
+    }
+    urma_free_device_list(device_list);
+    urma_uninit();
+    return devices;
+}
+
+static std::vector<TopologyEntry> discoverCpuTopology(
+    const std::vector<UBDevice> &all_hca) {
+    DIR *dir = opendir("/sys/devices/system/node");
+    struct dirent *entry;
+    std::vector<TopologyEntry> topology;
+
+    if (dir == NULL) {
+        PLOG(WARNING)
+            << "discoverCpuTopology: open /sys/devices/system/node failed";
+        return {};
+    }
+    while ((entry = readdir(dir))) {
+        const char *prefix = "node";
+        if (entry->d_type != DT_DIR ||
+            strncmp(entry->d_name, prefix, strlen(prefix)) != 0) {
+            continue;
+        }
+        int node_id = atoi(entry->d_name + strlen(prefix));
+        std::vector<std::string> preferred_hca;
+        std::vector<std::string> avail_hca;
+        // an HCA connected to the same cpu NUMA node is preferred
+        for (const auto &hca : all_hca) {
+            if (hca.numa_node == node_id) {
+                preferred_hca.push_back(hca.name);
+            } else {
+                avail_hca.push_back(hca.name);
+            }
+        }
+        topology.push_back(
+            TopologyEntry{.name = "cpu:" + std::to_string(node_id),
+                          .preferred_hca = std::move(preferred_hca),
+                          .avail_hca = std::move(avail_hca)});
+    }
+    (void)closedir(dir);
+    return topology;
+}
+#endif
+
+static std::vector<TopologyEntry> discoverCpuTopology(
+    const std::vector<InfinibandDevice> &all_hca) {
+    DIR *dir = opendir("/sys/devices/system/node");
+    struct dirent *entry;
+    std::vector<TopologyEntry> topology;
+
+    if (dir == NULL) {
+        PLOG(WARNING)
+            << "discoverCpuTopology: open /sys/devices/system/node failed";
+        return {};
+    }
+    while ((entry = readdir(dir))) {
+        const char *prefix = "node";
+        if (entry->d_type != DT_DIR ||
+            strncmp(entry->d_name, prefix, strlen(prefix)) != 0) {
+            continue;
+        }
+        int node_id = atoi(entry->d_name + strlen(prefix));
+        std::vector<std::string> preferred_hca;
+        std::vector<std::string> avail_hca;
+        // an HCA connected to the same cpu NUMA node is preferred
+        for (const auto &hca : all_hca) {
+            if (hca.numa_node == node_id) {
+                preferred_hca.push_back(hca.name);
+            } else {
+                avail_hca.push_back(hca.name);
+            }
+        }
+        topology.push_back(
+            TopologyEntry{.name = "cpu:" + std::to_string(node_id),
+                          .preferred_hca = std::move(preferred_hca),
+                          .avail_hca = std::move(avail_hca)});
+    }
+    (void)closedir(dir);
+    return topology;
+}
+
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX) || defined(USE_SUPA)
+
+static int getPciDistance(const char *bus1, const char *bus2) {
+    char buf[PATH_MAX];
+    char path1[PATH_MAX];
+    char path2[PATH_MAX];
+    snprintf(buf, sizeof(buf), "/sys/bus/pci/devices/%s", bus1);
+    if (realpath(buf, path1) == NULL) {
+        return -1;
+    }
+    snprintf(buf, sizeof(buf), "/sys/bus/pci/devices/%s", bus2);
+    if (realpath(buf, path2) == NULL) {
+        return -1;
+    }
+
+    char *ptr1 = path1;
+    char *ptr2 = path2;
+    while (*ptr1 && *ptr1 == *ptr2) {
+        ptr1++;
+        ptr2++;
+    }
+    int distance = 0;
+    for (; *ptr1; ptr1++) {
+        distance += (*ptr1 == '/');
+    }
+    for (; *ptr2; ptr2++) {
+        distance += (*ptr2 == '/');
+    }
+
+    return distance;
+}
+
+static bool isSameNumaNode(const char *bus1, const char *bus2) {
+    char path[PATH_MAX];
+    int numa1 = -1;
+    int numa2 = -1;
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", bus1);
+    std::ifstream(path) >> numa1;
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", bus2);
+    std::ifstream(path) >> numa2;
+    return (numa1 != -1 && numa1 == numa2);
+}
+
+static std::vector<TopologyEntry> discoverCudaTopology(
+    const std::vector<InfinibandDevice> &all_hca, int *rc) {
+    std::vector<TopologyEntry> topology;
+    int device_count;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess) {
+        device_count = 0;
+    }
+#if defined(USE_CUDA) && !defined(USE_CXI)
+    // With MC_RDMA_DATA_DIRECT_PAIRING a GPU's memory is registered (and so
+    // transferred) only through the NICs whose Data Direct function sits on
+    // the GPU's PCI root; PCIe distance cannot see that pairing inside a VM
+    // where every device is its own segment. The mapping is fail-closed: a
+    // NIC without a Data Direct function or a GPU without a paired NIC
+    // rejects discovery rather than falling back to PCIe distance, which
+    // could select a NIC that cannot register the memory (lkey/rkey 0).
+    const bool pair_data_direct = globalConfig().rdma_data_direct &&
+                                  globalConfig().rdma_data_direct_pairing;
+    std::map<std::string, std::string> data_direct_roots;
+    if (pair_data_direct) {
+        std::vector<std::string> names;
+        for (const auto &hca : all_hca) names.push_back(hca.name);
+        data_direct_roots = dataDirectRootsByDevice(names);
+        for (const auto &hca : all_hca) {
+            if (!data_direct_roots.count(hca.name)) {
+                LOG(ERROR) << "MC_RDMA_DATA_DIRECT_PAIRING: " << hca.name
+                           << " reports no Data Direct function; every NIC "
+                              "must satisfy the pairing rule";
+                if (rc) *rc = ERR_DEVICE_NOT_FOUND;
+                return {};
+            }
+        }
+    }
+#endif
+    for (int i = 0; i < device_count; i++) {
+        char pci_bus_id[20];
+        if (cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), i) !=
+            cudaSuccess) {
+            continue;
+        }
+        for (char *ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
+
+        std::vector<std::string> preferred_hca;
+        std::vector<std::string> avail_hca;
+
+#if defined(USE_CUDA) && !defined(USE_CXI)
+        if (pair_data_direct) {
+            const std::string gpu_root = pciSysfsRoot(pci_bus_id);
+            for (const auto &hca : all_hca) {
+                auto it = data_direct_roots.find(hca.name);
+                if (!gpu_root.empty() && it != data_direct_roots.end() &&
+                    it->second == gpu_root)
+                    preferred_hca.push_back(hca.name);
+            }
+            if (preferred_hca.empty()) {
+                LOG(ERROR) << "MC_RDMA_DATA_DIRECT_PAIRING: " << GPU_PREFIX << i
+                           << " (" << pci_bus_id << ", root \"" << gpu_root
+                           << "\") has no Data Direct NIC on its PCI root; "
+                              "rejecting discovery instead of falling back to "
+                              "PCIe distance";
+                if (rc) *rc = ERR_DEVICE_NOT_FOUND;
+                return {};
+            }
+            std::string list;
+            for (const auto &name : preferred_hca)
+                list += (list.empty() ? "" : ",") + name;
+            LOG(INFO) << GPU_PREFIX << i << " (" << pci_bus_id << ", root "
+                      << gpu_root << "): Data Direct NICs " << list
+                      << "; other NICs excluded";
+            topology.push_back(
+                TopologyEntry{.name = GPU_PREFIX + std::to_string(i),
+                              .preferred_hca = std::move(preferred_hca),
+                              .avail_hca = {}});
+            continue;
+        }
+#endif
+
+        // Find HCAs with minimum distance in one pass.
+        int min_distance = INT_MAX;
+        std::vector<std::string> min_distance_hcas;
+
+        std::vector<InfinibandDevice> same_numa_hca;
+        for (const auto &hca : all_hca) {
+            if (isSameNumaNode(hca.pci_bus_id.c_str(), pci_bus_id)) {
+                same_numa_hca.push_back(hca);
+            }
+        }
+        const auto &candidate_preferred_hca =
+            same_numa_hca.empty() ? all_hca : same_numa_hca;
+
+        for (const auto &hca : candidate_preferred_hca) {
+            int distance = getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id);
+            if (distance >= 0) {
+                if (distance < min_distance) {
+                    min_distance = distance;
+                    min_distance_hcas.clear();
+                    min_distance_hcas.push_back(hca.name);
+                } else if (distance == min_distance) {
+                    min_distance_hcas.push_back(hca.name);
+                }
+            }
+        }
+
+        // Add HCAs with minimum distance to preferred_hca, others to avail_hca
+        for (const auto &hca : all_hca) {
+            if (std::find(min_distance_hcas.begin(), min_distance_hcas.end(),
+                          hca.name) != min_distance_hcas.end()) {
+                preferred_hca.push_back(hca.name);
+            } else {
+                avail_hca.push_back(hca.name);
+            }
+        }
+        topology.push_back(
+            TopologyEntry{.name = GPU_PREFIX + std::to_string(i),
+                          .preferred_hca = std::move(preferred_hca),
+                          .avail_hca = std::move(avail_hca)});
+    }
+    return topology;
+}
+#endif
+
+#ifdef USE_EFA
+// Neuron (Trainium / Inferentia) devices cannot go through the PCI-distance
+// heuristic above: the driver presents them as *virtual* class devices with no
+// link back to their PCI function, so /sys offers nothing to measure.  The
+// runtime does know the mapping, and neuronNicAffinity() asks it -- see
+// efa_neuron.h for why that is safe to do this early.
+//
+// The distinction matters more here than it does for GPUs.  On trn2.48xlarge a
+// NIC one switch away from the device it is serving measured 2.5 GB/s against
+// 19.2 GB/s for a switch-local one, so getting this wrong does not shave a few
+// percent, it costs 7.7x and lands below plain host DRAM.
+static std::vector<TopologyEntry> discoverNeuronTopology(
+    const std::vector<InfinibandDevice> &all_hca) {
+    std::vector<TopologyEntry> topology;
+    for (const auto &entry : neuronNicAffinity()) {
+        std::vector<std::string> preferred_hca;
+        std::vector<std::string> avail_hca;
+        // Filtered against all_hca rather than trusted directly, so that a NIC
+        // the caller excluded stays excluded.  Everything else becomes
+        // avail_hca: a distant NIC is slow, not unusable, and it is the only
+        // thing left if the switch-local ones are down.
+        for (const auto &hca : all_hca) {
+            if (std::find(entry.second.begin(), entry.second.end(), hca.name) !=
+                entry.second.end()) {
+                preferred_hca.push_back(hca.name);
+            } else {
+                avail_hca.push_back(hca.name);
+            }
+        }
+        if (preferred_hca.empty()) continue;
+        topology.push_back(
+            TopologyEntry{.name = neuronLocationName(entry.first),
+                          .preferred_hca = std::move(preferred_hca),
+                          .avail_hca = std::move(avail_hca)});
+    }
+    return topology;
+}
+#endif
+
+Topology::Topology() {
+    auto str = getenv("MC_PATH_ROUNDROBIN");
+    if (str && (strcmp(str, "1") == 0 || strcasecmp(str, "true") == 0)) {
+        use_round_robin_ = true;
+    } else {
+        use_round_robin_ = false;
+    }
+}
+
+Topology::~Topology() {}
+
+bool Topology::empty() const {
+    for (const auto &entry : resolved_matrix_) {
+        if (!entry.second.preferred_hca.empty() ||
+            !entry.second.avail_hca.empty()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void Topology::clear() {
+    matrix_.clear();
+    hca_list_.clear();
+    resolved_matrix_.clear();
+    resolved_hca_peer_affinity_by_local_.clear();
+}
+
+int Topology::discover(const std::vector<std::string> &filter,
+                       bool exclude_efa) {
+    matrix_.clear();
+    resolved_hca_peer_affinity_by_local_.clear();
+    auto all_hca = listInfiniBandDevices(filter, exclude_efa);
+#if defined(USE_EFA) && !defined(USE_CXI)
+    if (!exclude_efa) useLibfabricEfaNics(all_hca, filter);
+#endif
+    for (auto &ent : discoverCpuTopology(all_hca)) {
+        matrix_[ent.name] = ent;
+    }
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX) || defined(USE_SUPA)
+    int cuda_rc = 0;
+    for (auto &ent : discoverCudaTopology(all_hca, &cuda_rc)) {
+        matrix_[ent.name] = ent;
+    }
+    if (cuda_rc) return cuda_rc;
+#endif
+#ifdef USE_EFA
+    for (auto &ent : discoverNeuronTopology(all_hca)) {
+        matrix_[ent.name] = ent;
+    }
+#endif
+#ifdef USE_UB
+    auto ub_all_hca = listUBDevices(filter);
+    for (auto &ent : discoverCpuTopology(ub_all_hca)) {
+        matrix_[ent.name] = ent;
+    }
+#endif
+    return resolve();
+}
+
+int Topology::parse(const std::string &topology_json) {
+    std::set<std::string> rnic_set;
+    Json::Value root;
+
+    if (topology_json.empty()) {
+        return ERR_MALFORMED_JSON;
+    }
+
+    // Use thread-safe CharReaderBuilder instead of deprecated Reader
+    Json::CharReaderBuilder builder;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    std::string errs;
+
+    if (!reader->parse(topology_json.data(),
+                       topology_json.data() + topology_json.size(), &root,
+                       &errs)) {
+        LOG(ERROR) << "Topology::parse: JSON parse error: " << errs;
+        return ERR_MALFORMED_JSON;
+    }
+
+    matrix_.clear();
+    resolved_hca_peer_affinity_by_local_.clear();
+    for (const auto &key : root.getMemberNames()) {
+        const Json::Value &value = root[key];
+        if (value.isArray() && value.size() == 2) {
+            TopologyEntry topo_entry;
+            topo_entry.name = key;
+            for (const auto &array : value[0]) {
+                auto device_name = array.asString();
+                topo_entry.preferred_hca.push_back(device_name);
+            }
+            for (const auto &array : value[1]) {
+                auto device_name = array.asString();
+                topo_entry.avail_hca.push_back(device_name);
+            }
+            matrix_[key] = topo_entry;
+        } else {
+            return ERR_MALFORMED_JSON;
+        }
+    }
+
+    return resolve();
+}
+
+std::string Topology::toString() const {
+    Json::Value value(Json::objectValue);
+    for (auto &entry : matrix_) {
+        value[entry.first] = entry.second.toJson();
+    }
+    return value.toStyledString();
+}
+
+bool Topology::operator==(const Topology &other) const {
+    return matrix_ == other.matrix_ && hca_list_ == other.hca_list_;
+}
+
+Json::Value Topology::toJson() const {
+    Json::Value root;
+    for (const auto &pair : matrix_) {
+        root[pair.first] = pair.second.toJson();
+    }
+    return root;
+}
+
+int Topology::getDeviceIndex(const std::string &storage_type,
+                             std::string_view device_name) const {
+    const auto it = resolved_matrix_.find(storage_type);
+    if (it == resolved_matrix_.end() || device_name.empty()) {
+        return ERR_DEVICE_NOT_FOUND;
+    }
+    const int hca_idx = it->second.getHcaIndex(std::string(device_name));
+    return hca_idx >= 0 ? hca_idx : ERR_DEVICE_NOT_FOUND;
+}
+
+int Topology::selectDevice(const std::string storage_type,
+                           std::string_view hint, int retry_count) {
+    const auto it = resolved_matrix_.find(std::string(storage_type));
+    if (it == resolved_matrix_.end()) {
+        return ERR_DEVICE_NOT_FOUND;
+    }
+
+    const auto &entry = it->second;
+
+    if (!hint.empty()) {
+        auto hca_idx = entry.getHcaIndex(std::string(hint));
+        if (hca_idx != -1) {
+            return hca_idx;
+        }
+    }
+
+    return selectDevice(storage_type, retry_count);
+}
+
+int Topology::selectDeviceByLocalHca(const std::string storage_type,
+                                     std::string_view local_hca,
+                                     int retry_count) {
+    if (!local_hca.empty()) {
+        auto local_it =
+            resolved_hca_peer_affinity_by_local_.find(std::string(local_hca));
+        if (local_it != resolved_hca_peer_affinity_by_local_.end()) {
+            auto hints_it = local_it->second.find(std::string(storage_type));
+            if (hints_it != local_it->second.end() &&
+                !hints_it->second.empty()) {
+                const auto &candidates = hints_it->second;
+                if (retry_count == 0) {
+                    int rand_value;
+                    if (use_round_robin_) {
+                        thread_local int tl_counter = 0;
+                        rand_value = tl_counter;
+                        tl_counter = (tl_counter + 1) % 10000;
+                    } else {
+                        rand_value = SimpleRandom::Get().next();
+                    }
+                    return candidates[rand_value % candidates.size()];
+                }
+                return candidates[(retry_count - 1) % candidates.size()];
+            }
+        }
+    }
+
+    return selectDevice(storage_type, retry_count);
+}
+
+int Topology::selectDevice(const std::string storage_type, int retry_count) {
+    if (resolved_matrix_.count(storage_type) == 0) return ERR_DEVICE_NOT_FOUND;
+
+    auto &entry = resolved_matrix_[storage_type];
+    if (entry.preferred_hca.empty() && entry.avail_hca.empty()) {
+        return ERR_DEVICE_NOT_FOUND;
+    }
+
+    if (retry_count == 0) {
+        int rand_value;
+        if (use_round_robin_) {
+            thread_local int tl_counter = 0;
+            rand_value = tl_counter;
+            tl_counter = (tl_counter + 1) % 10000;
+        } else
+            rand_value = SimpleRandom::Get().next();
+        if (!entry.preferred_hca.empty())
+            return entry.preferred_hca[rand_value % entry.preferred_hca.size()];
+        else
+            return entry.avail_hca[rand_value % entry.avail_hca.size()];
+    } else {
+        size_t index = (retry_count - 1) %
+                       (entry.preferred_hca.size() + entry.avail_hca.size());
+        if (index < entry.preferred_hca.size())
+            return entry.preferred_hca[index];
+        else {
+            index -= entry.preferred_hca.size();
+            return entry.avail_hca[index];
+        }
+    }
+    return ERR_DEVICE_NOT_FOUND;
+}
+
+int Topology::resolve() {
+    resolved_matrix_.clear();
+    resolved_hca_peer_affinity_by_local_.clear();
+    hca_list_.clear();
+    std::map<std::string, int> hca_id_map;
+    int next_hca_map_index = 0;
+
+    // Sorted, not matrix_ order.  A device index is not private to this object:
+    // a peer rebuilds our matrix with parse() and then indexes the device and
+    // rkey arrays we published with the numbers *its* resolve() produced.
+    // matrix_ is an unordered_map, so its iteration order depends on insertion
+    // order, and the peer inserts in a different one (JSON member order, not
+    // discovery order) -- which silently hands transfers to a NIC other than
+    // the preferred one.  Sorting by storage type makes the numbering a
+    // function of the matrix contents alone, so both ends agree.
+    std::vector<std::string> storage_types;
+    storage_types.reserve(matrix_.size());
+    for (const auto &entry : matrix_) storage_types.push_back(entry.first);
+    std::sort(storage_types.begin(), storage_types.end());
+
+    for (const auto &storage_type : storage_types) {
+        const auto &topo_entry = matrix_[storage_type];
+        for (auto &hca : topo_entry.preferred_hca) {
+            if (!hca_id_map.count(hca)) {
+                hca_list_.push_back(hca);
+                hca_id_map[hca] = next_hca_map_index++;
+
+                resolved_matrix_[kWildcardLocation].preferred_hca.push_back(
+                    hca_id_map[hca]);
+                resolved_matrix_[kWildcardLocation]
+                    .preferred_hca_name_to_index_map_[hca] = hca_id_map[hca];
+            }
+            resolved_matrix_[storage_type].preferred_hca.push_back(
+                hca_id_map[hca]);
+            resolved_matrix_[storage_type]
+                .preferred_hca_name_to_index_map_[hca] = hca_id_map[hca];
+        }
+        for (auto &hca : topo_entry.avail_hca) {
+            if (!hca_id_map.count(hca)) {
+                hca_list_.push_back(hca);
+                hca_id_map[hca] = next_hca_map_index++;
+
+                resolved_matrix_[kWildcardLocation].preferred_hca.push_back(
+                    hca_id_map[hca]);
+                resolved_matrix_[kWildcardLocation]
+                    .preferred_hca_name_to_index_map_[hca] = hca_id_map[hca];
+            }
+            resolved_matrix_[storage_type].avail_hca.push_back(hca_id_map[hca]);
+            resolved_matrix_[storage_type].avail_hca_name_to_index_map_[hca] =
+                hca_id_map[hca];
+        }
+    }
+    precomputeResolvedHcaPeerAffinity(matrix_, hca_id_map,
+                                      resolved_hca_peer_affinity_by_local_);
+    return 0;
+}
+
+int Topology::disableDevice(const std::string &device_name) {
+    int disabled_hca_index = -1;
+    auto hca_iter = std::find(hca_list_.begin(), hca_list_.end(), device_name);
+    if (hca_iter != hca_list_.end()) {
+        disabled_hca_index =
+            static_cast<int>(std::distance(hca_list_.begin(), hca_iter));
+    }
+
+    for (auto &record : matrix_) {
+        auto &preferred_hca = record.second.preferred_hca;
+        auto preferred_hca_iter =
+            std::find(preferred_hca.begin(), preferred_hca.end(), device_name);
+        if (preferred_hca_iter != preferred_hca.end())
+            preferred_hca.erase(preferred_hca_iter);
+        auto &avail_hca = record.second.avail_hca;
+        auto avail_hca_iter =
+            std::find(avail_hca.begin(), avail_hca.end(), device_name);
+        if (avail_hca_iter != avail_hca.end()) avail_hca.erase(avail_hca_iter);
+    }
+
+    if (disabled_hca_index < 0) return 0;
+
+    // Keep existing HCA indexes stable. RDMA transport stores lkey/rkey and
+    // context arrays by the resolved HCA index, so re-running resolve() here
+    // could compact indexes after a disabled device and make those arrays point
+    // at the wrong RNIC.
+    for (auto &record : resolved_matrix_) {
+        auto &preferred_hca = record.second.preferred_hca;
+        preferred_hca.erase(
+            std::remove(preferred_hca.begin(), preferred_hca.end(),
+                        disabled_hca_index),
+            preferred_hca.end());
+        record.second.preferred_hca_name_to_index_map_.erase(device_name);
+
+        auto &avail_hca = record.second.avail_hca;
+        avail_hca.erase(
+            std::remove(avail_hca.begin(), avail_hca.end(), disabled_hca_index),
+            avail_hca.end());
+        record.second.avail_hca_name_to_index_map_.erase(device_name);
+    }
+    for (auto &local_entry : resolved_hca_peer_affinity_by_local_) {
+        for (auto &storage_entry : local_entry.second) {
+            auto &candidates = storage_entry.second;
+            candidates.erase(std::remove(candidates.begin(), candidates.end(),
+                                         disabled_hca_index),
+                             candidates.end());
+        }
+    }
+    return 0;
+}
+}  // namespace mooncake

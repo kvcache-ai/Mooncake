@@ -1,0 +1,169 @@
+name: Cancel Queued and Running CI
+
+# Manually cancel every unfinished (queued / running / waiting / pending)
+# workflow run in the repo. Useful for draining runners after a bad push,
+# a runaway matrix, or before urgent maintenance.
+#
+# Unlike the per-workflow `concurrency: cancel-in-progress` settings (which
+# only cancel a run superseded by a newer run on the same ref), this cancels
+# runs across all workflows and refs in one shot.
+#
+# Adapted from sglang's cancel-pr-workflows-on-close.yml cancellation logic:
+# fetch recent runs, keep the non-terminal ones, force-cancel runs stuck
+# behind approval gates, and run a second pass to catch runs still
+# materializing during the first.
+#
+# Listing note: query params (branch, per_page, page) are placed directly in
+# the API path rather than via `gh api -f key=value`. `gh api` treats -f/-F
+# fields as a request *body* and, unless the method is pinned, flips GET to
+# POST -- either way the value never reaches the query string, so a status/
+# branch filter silently matches nothing. Status is filtered client-side in
+# jq to avoid that class of bug entirely.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Only cancel runs on this branch (leave empty to cancel across all branches)'
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: 'List what would be cancelled without cancelling'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  actions: write   # Needed to cancel runs
+  contents: read   # Needed to read repo info
+
+# Do not let two drain operations fight each other.
+concurrency:
+  group: cancel-ci
+  cancel-in-progress: false
+
+jobs:
+  cancel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel unfinished runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.inputs.branch }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Non-terminal run statuses. GitHub reports in-flight runs as one of
+          # these; everything else (completed) is terminal.
+          UNFINISHED_RE='^(queued|in_progress|waiting|pending|requested|action_required)$'
+
+          echo "=================================================="
+          echo " Cancel Queued and Running CI"
+          echo "=================================================="
+          echo "Repo:   $REPO"
+          if [ -n "$BRANCH" ]; then
+            echo "Scope:  branch '$BRANCH' only"
+          else
+            echo "Scope:  ALL branches"
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            echo ""
+            echo "  ⚠️  DRY RUN — runs will be LISTED but NOT cancelled."
+            echo "  ⚠️  Re-run with dry_run unchecked to actually cancel."
+          fi
+          echo "=================================================="
+          echo ""
+
+          FAILURES=0
+
+          # List unfinished runs. Params go in the path (see header note); status
+          # is filtered client-side. Only the most-recent pages can hold in-flight
+          # runs, so a few pages by created-desc order is plenty and stays bounded.
+          list_unfinished() {
+            local ids="" page batch
+            for page in 1 2 3 4 5; do
+              local path="repos/$REPO/actions/runs?per_page=100&page=$page"
+              if [ -n "$BRANCH" ]; then
+                path="$path&branch=$BRANCH"
+              fi
+              batch=""
+              for attempt in 1 2 3; do
+                if batch=$(gh api -X GET "$path" \
+                  --jq ".workflow_runs[]
+                        | select(.id != $GITHUB_RUN_ID)
+                        | select(.status | test(\"$UNFINISHED_RE\"))
+                        | \"\(.id)\t\(.status)\t\(.name)\""); then
+                  break
+                fi
+                batch=""
+                # Runs in a $(...) subshell, so an error annotation is the only
+                # signal that survives; the retries make a hard failure rare.
+                if [ "$attempt" -eq 3 ]; then
+                  echo "::error::Listing runs (page $page) failed after 3 attempts" >&2
+                else
+                  sleep 5
+                fi
+              done
+              ids="$ids"$'\n'"$batch"
+            done
+            echo "$ids" | sed '/^$/d' | sort -u
+          }
+
+          # Pass 2 catches runs still materializing during pass 1.
+          for pass in 1 2; do
+            rows=$(list_unfinished)
+
+            if [ -z "$rows" ]; then
+              echo "Pass $pass: no unfinished runs found"
+              break
+            fi
+            echo "Pass $pass: found $(echo "$rows" | wc -l | tr -d ' ') unfinished run(s):"
+            echo "$rows" | while IFS=$'\t' read -r rid rstatus rname; do
+              echo "  • $rid  [$rstatus]  $rname"
+            done
+            echo ""
+
+            run_ids=$(echo "$rows" | cut -f1)
+            for run_id in $run_ids; do
+              run_url="https://github.com/$REPO/actions/runs/$run_id"
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "  [dry-run] would cancel $run_url"
+                continue
+              fi
+              echo "Cancelling $run_url"
+              if gh run cancel "$run_id" --repo "$REPO" 2>/dev/null; then
+                continue
+              fi
+              # Plain cancel fails for runs stuck behind approval /
+              # deployment protection rules; force-cancel handles those.
+              if gh api -X POST "repos/$REPO/actions/runs/$run_id/force-cancel" >/dev/null 2>&1; then
+                echo "  force-cancelled"
+                continue
+              fi
+              # Finished between listing and cancelling is fine.
+              state=$(gh api "repos/$REPO/actions/runs/$run_id" --jq '.status' 2>/dev/null || echo "unknown")
+              if [ "$state" = "completed" ]; then
+                echo "  already finished, nothing to cancel"
+              else
+                echo "::error::Failed to cancel run $run_id (status: $state)"
+                FAILURES=1
+              fi
+            done
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "Pass $pass: dry run, skipping second pass"
+              break
+            fi
+
+            if [ "$pass" -eq 1 ]; then
+              sleep 20
+            fi
+          done
+
+          echo ""
+          echo "✅ Done"
+          exit "$FAILURES"

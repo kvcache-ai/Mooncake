@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "mooncake",
+  "owner": {
+    "name": "Mooncake Team"
+  },
+  "metadata": {
+    "description": "Built-in Claude Code skills for working with Mooncake: deployment troubleshooting, local CI validation, and the Python API."
+  },
+  "plugins": [
+    {
+      "name": "mooncake-troubleshoot",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/kvcache-ai/Mooncake.git",
+        "path": ".claude/skills/mooncake-troubleshoot"
+      },
+      "description": "Systematically diagnose Mooncake deployment and runtime issues (services, RDMA, env vars, connectivity, logs) and propose fixes.",
+      "homepage": "https://kvcache-ai.github.io/Mooncake/skills/mooncake-troubleshoot.html"
+    },
+    {
+      "name": "mooncake-ci-local",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/kvcache-ai/Mooncake.git",
+        "path": ".claude/skills/mooncake-ci-local"
+      },
+      "description": "Run Mooncake pre-PR local validation via scripts/run_ci_test.sh, reproducing the reproducible parts of GitHub Actions.",
+      "homepage": "https://kvcache-ai.github.io/Mooncake/skills/mooncake-ci-local.html"
+    },
+    {
+      "name": "mooncake-api",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/kvcache-ai/Mooncake.git",
+        "path": ".claude/skills/mooncake-api"
+      },
+      "description": "Work with the Mooncake Store, Transfer Engine, and EP/Backend Python APIs.",
+      "homepage": "https://kvcache-ai.github.io/Mooncake/skills/mooncake-api.html"
+    }
+  ]
+}

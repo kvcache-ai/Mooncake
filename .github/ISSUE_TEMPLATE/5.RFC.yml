@@ -1,0 +1,21 @@
+name: "💬 RFC"
+description: "Request for Comments"
+title: "[RFC]: "
+labels: ["RFC"]
+
+body:
+- type: textarea
+  attributes:
+    label: Changes proposed
+    description: >
+      A clear and concise description of the motivation and changes proposed in this RFC.
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉!
+- type: checkboxes
+  id: before_submit
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues and read the [documentation](https://kvcache-ai.github.io/Mooncake/)
