@@ -1033,7 +1033,14 @@ TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
     ASSERT_EQ(queries.size(), 1);
     ASSERT_TRUE(queries[0].has_value());
     PyClient::QueryResultCache snapshot;
-    snapshot.emplace(key, std::move(queries[0]));
+    // Two candidates exercise fragment splitting when affinity is enabled.
+    auto replicas = queries[0]->replicas;
+    auto alias = replicas.front();
+    ++alias.id;
+    replicas.push_back(std::move(alias));
+    snapshot.emplace(key,
+                     QueryResult(std::move(replicas), queries[0]->lease_timeout,
+                                 queries[0]->object_checksum));
     auto destination = py_client_->allocate_client_buffer(original.size());
     ASSERT_TRUE(destination.has_value());
     auto read = [&](size_t offset, size_t size) {
@@ -1046,8 +1053,10 @@ TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
     EXPECT_EQ(read(0, 4),
               (std::vector<std::vector<std::vector<int64_t>>>{{{4}}}));
     ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
-    EXPECT_EQ(read(4, 28),
-              (std::vector<std::vector<std::vector<int64_t>>>{{{28}}}));
+    EXPECT_EQ(py_client_->get_into_ranges_from_snapshot(
+                  {destination->ptr()}, {{key}}, {{{4, 12}}}, {{{4, 12}}},
+                  {{{8, 20}}}, snapshot),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{8, 20}}}));
     EXPECT_EQ(std::string(static_cast<char*>(destination->ptr()), 32),
               original);
     auto current = py_client_->get_buffer(key);
@@ -1615,6 +1624,89 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
         << "Upsert data buffer unregistration should succeed";
 }
 
+// group_by_target reads exact-size memory replicas on one segment in one
+// transfer. A destination larger than its object stays on the per-key path
+// and fails alone.
+TEST_F(RealClientTest, TestBatchMultiBuffersGroupedByTarget) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kKeyCount = 10;
+    constexpr size_t kSlicesPerKey = 10;
+    constexpr size_t kSliceSize = 10;
+    constexpr size_t kKeyBytes = kSlicesPerKey * kSliceSize;
+    std::string src_data(kKeyCount * kKeyBytes, '\0');
+    for (size_t i = 0; i < src_data.size(); ++i) {
+        src_data[i] = static_cast<char>('a' + i % 26);
+    }
+    // One spare slice past the end for the oversized read below.
+    std::string dst_data(kKeyCount * kKeyBytes + kSliceSize, '0');
+    ASSERT_EQ(py_client_->register_buffer(src_data.data(), src_data.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(dst_data.data(), dst_data.size()), 0);
+
+    std::vector<std::string> keys;
+    std::vector<std::vector<void*>> src_ptrs;
+    std::vector<std::vector<void*>> dst_ptrs;
+    std::vector<std::vector<size_t>> sizes;
+    for (size_t i = 0; i < kKeyCount; ++i) {
+        keys.emplace_back("grouped_key_" + std::to_string(i));
+        src_ptrs.emplace_back();
+        dst_ptrs.emplace_back();
+        sizes.emplace_back();
+        for (size_t j = 0; j < kSlicesPerKey; ++j) {
+            const size_t offset = i * kKeyBytes + j * kSliceSize;
+            src_ptrs.back().push_back(src_data.data() + offset);
+            dst_ptrs.back().push_back(dst_data.data() + offset);
+            sizes.back().push_back(kSliceSize);
+        }
+    }
+
+    ReplicateConfig config;
+    auto put_results =
+        py_client_->batch_put_from_multi_buffers(keys, src_ptrs, sizes, config);
+    for (auto result : put_results) {
+        EXPECT_EQ(result, 0) << "Grouped put should succeed";
+    }
+
+    auto get_results =
+        py_client_->batch_get_into_multi_buffers(keys, dst_ptrs, sizes, true);
+    for (auto result : get_results) {
+        EXPECT_EQ(result, static_cast<int>(kKeyBytes))
+            << "Grouped get should succeed";
+    }
+    EXPECT_EQ(dst_data.substr(0, src_data.size()), src_data);
+
+    // A destination larger than its object cannot be read; it must fail on
+    // its own and leave the other keys on the same target intact.
+    std::fill(dst_data.begin(), dst_data.end(), '0');
+    dst_ptrs.back().push_back(dst_data.data() + kKeyCount * kKeyBytes);
+    sizes.back().push_back(kSliceSize);
+    get_results =
+        py_client_->batch_get_into_multi_buffers(keys, dst_ptrs, sizes, true);
+    ASSERT_EQ(get_results.size(), kKeyCount);
+    for (size_t i = 0; i + 1 < kKeyCount; ++i) {
+        EXPECT_EQ(get_results[i], static_cast<int>(kKeyBytes))
+            << "Key " << i << " should not fail with the oversized key";
+    }
+    EXPECT_LT(get_results.back(), 0) << "Oversized key should fail";
+    const size_t intact_bytes = (kKeyCount - 1) * kKeyBytes;
+    EXPECT_EQ(dst_data.substr(0, intact_bytes),
+              src_data.substr(0, intact_bytes));
+
+    ASSERT_EQ(py_client_->unregister_buffer(src_data.data()), 0);
+    ASSERT_EQ(py_client_->unregister_buffer(dst_data.data()), 0);
+}
+
 TEST_F(RealClientTest, TestPutGetSessionRanges) {
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start in-proc master";
@@ -2093,8 +2185,8 @@ TEST_F(RealClientTest, TestPutSessionStartRejectsReliableNofConfig) {
     EXPECT_EQ(rcs[0], kInvalidParams);
 }
 
-// Filtered start_keys must keep group_ids aligned (skip existing sessions).
-TEST_F(RealClientTest, TestPutSessionStartFiltersGroupIds) {
+// Skip existing sessions while keeping every per-key field aligned.
+TEST_F(RealClientTest, TestPutSessionStartFiltersSessionGroupAndHcaHints) {
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start in-proc master";
     master_address_ = master_.master_address();
@@ -2114,17 +2206,24 @@ TEST_F(RealClientTest, TestPutSessionStartFiltersGroupIds) {
 
     ReplicateConfig first_config;
     first_config.group_ids = std::vector<std::string>{"group_a"};
+    first_config.session_ids = std::vector<std::string>{"session_a"};
+    first_config.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_0"}};
     ASSERT_EQ(py_client_->batch_put_session_start({"group_key_a"}, {kSize},
                                                   first_config)[0],
               0);
 
     ReplicateConfig batch_config;
     batch_config.group_ids = std::vector<std::string>{"group_a", "group_b"};
+    batch_config.session_ids =
+        std::vector<std::string>{"session_a", "session_b"};
+    batch_config.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_0"}, {"mlx5_1"}};
     auto rcs = py_client_->batch_put_session_start(
         {"group_key_a", "group_key_b"}, {kSize, kSize}, batch_config);
     ASSERT_EQ(rcs.size(), 2u);
     EXPECT_EQ(rcs[0], kInvalidParams) << "existing session should be skipped";
-    EXPECT_EQ(rcs[1], 0) << "filtered group_ids must match remaining keys";
+    EXPECT_EQ(rcs[1], 0) << "filtered metadata must match remaining keys";
 
     auto revoke_rcs =
         py_client_->batch_put_session_revoke({"group_key_a", "group_key_b"});

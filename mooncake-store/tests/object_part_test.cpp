@@ -203,26 +203,37 @@ TEST(EnvelopePartTest, ValidityFollowsThePartsLengthAndReplicas) {
     EXPECT_FALSE(without_content->IsValid());
 }
 
-// The OpLog payload carries the envelope's own fields and no checksum, so this
-// case pins the length the part holds and the fields beside it.
-TEST_F(OplogPayloadTest, TheOplogPayloadCarriesTheEnvelopeFields) {
+// The OpLog payload must carry the part checksum along with the envelope's
+// other fields.
+TEST_F(OplogPayloadTest, EveryOplogMetadataSerializerCarriesTheChecksum) {
     MasterService service{MasterServiceConfig{}};
     auto metadata = MakeEnvelope(kObjectLength, {});
+    metadata->MutablePart(0).SetChecksum(kChecksum);
 
-    const std::string bytes =
+    const auto& object_metadata = *metadata;
+    const std::vector<std::string> serialized_payloads{
         test::MasterServiceTestPeer::SerializeMetadataForOpLogForTesting(
-            service, *metadata);
+            service, object_metadata),
+        test::MasterServiceTestPeer::
+            SerializeMetadataForOpLogWithoutMemReplicasForTesting(
+                service, object_metadata),
+        test::MasterServiceTestPeer::
+            SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
+                service, object_metadata, {})};
 
-    MetadataPayload payload;
-    ASSERT_EQ(struct_pack::deserialize_to(payload, bytes),
-              struct_pack::errc::ok);
-    EXPECT_EQ(payload.client_id, (UUID{1, 2}));
-    EXPECT_EQ(payload.size, metadata->TotalLength());
-    EXPECT_TRUE(payload.replicas.empty());
-    EXPECT_EQ(payload.group_id.value_or(""), kGroupId);
-    EXPECT_EQ(payload.data_type.value_or(ObjectDataType::UNKNOWN),
-              ObjectDataType::UNKNOWN);
-    EXPECT_FALSE(payload.hard_pinned.value_or(true));
+    for (const auto& bytes : serialized_payloads) {
+        MetadataPayload payload;
+        ASSERT_EQ(struct_pack::deserialize_to(payload, bytes),
+                  struct_pack::errc::ok);
+        EXPECT_EQ(payload.client_id, (UUID{1, 2}));
+        EXPECT_EQ(payload.size, metadata->TotalLength());
+        EXPECT_EQ(payload.group_id.value_or(""), kGroupId);
+        EXPECT_EQ(payload.data_type.value_or(ObjectDataType::UNKNOWN),
+                  ObjectDataType::UNKNOWN);
+        EXPECT_FALSE(payload.hard_pinned.value_or(true));
+        ASSERT_TRUE(payload.object_checksum.has_value());
+        EXPECT_EQ(payload.object_checksum.value(), kChecksum);
+    }
 }
 
 }  // namespace mooncake

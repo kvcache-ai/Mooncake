@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -237,6 +238,20 @@ constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
 constexpr const char* CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER =
     "enable_client_http_server";
 constexpr const char* CONFIG_KEY_CLIENT_HTTP_PORT = "client_http_port";
+// Master switch for best-effort SSD prefetch (SSD->DRAM promotion triggered
+// by exist probes). Off by default; when off, the exist/get paths behave
+// exactly as before.
+constexpr const char* CONFIG_KEY_ENABLE_SSD_PREFETCH = "enable_ssd_prefetch";
+// Backoff window (seconds) for best-effort SSD prefetch after DRAM is
+// saturated: while active, prefetch is skipped so eviction/offload can
+// reclaim memory instead of competing with promotion. 0 disables the backoff.
+constexpr const char* CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC =
+    "ssd_prefetch_cooldown_sec";
+// De-duplication / rate-limit TTL (seconds): the same key is prefetched at
+// most once per this period, suppressing duplicate triggers from concurrent
+// probes. 0 disables dedup.
+constexpr const char* CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC =
+    "ssd_prefetch_dedup_ttl_sec";
 constexpr const char* CONFIG_KEY_ENABLE_EMBEDDED_MASTER =
     "enable_embedded_master";
 
@@ -246,6 +261,8 @@ static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
 constexpr const char* DEFAULT_PROTOCOL = "tcp";
 constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
 static constexpr int DEFAULT_CLIENT_HTTP_PORT = 9300;
+static constexpr size_t DEFAULT_SSD_PREFETCH_COOLDOWN_SEC = 5;
+static constexpr size_t DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC = 30;
 
 struct OffloadTaskItem {
     std::string tenant_id;
@@ -359,6 +376,9 @@ enum class ErrorCode : int32_t {
     REPLICA_NOT_IN_LOCAL_MEMORY =
         -713,  ///< Replica does not reside in current node memory.
     OBJECT_REPLICA_BUSY = -714,  ///< Object replicas have non-zero refcnt.
+    PROMOTION_ALREADY_EXISTS =
+        -715,  ///< A MEMORY replica or an in-flight promotion already exists
+               ///< for the key; not an error for best-effort prefetch.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
@@ -448,6 +468,37 @@ const static uint64_t kMinSliceSize = facebook::cachelib::Slab::kMinAllocSize;
 const static uint64_t kMaxSliceSize =
     facebook::cachelib::Slab::kSize - 16;  // should be lower than limit
 
+// The entire allocation range belongs to this NUMA node. hca_names contains
+// only RDMA devices local to that node, as discovered on the storage host.
+struct SegmentLocality {
+    int32_t numa_node{-1};
+    std::vector<std::string> hca_names;
+
+    bool operator==(const SegmentLocality&) const = default;
+};
+YLT_REFL(SegmentLocality, numa_node, hca_names);
+
+// Match HCA names on the receiver; unknown locality precedes a known mismatch.
+inline int HcaAffinityTier(const SegmentLocality* locality,
+                           const std::vector<std::string>& hcas) {
+    if (hcas.empty()) return 0;
+    if (!locality || locality->numa_node < 0 || locality->hca_names.empty())
+        return 1;
+    return std::all_of(hcas.begin(), hcas.end(),
+                       [&](const auto& hca) {
+                           return std::find(locality->hca_names.begin(),
+                                            locality->hca_names.end(),
+                                            hca) != locality->hca_names.end();
+                       })
+               ? 0
+               : 2;
+}
+
+inline int HcaAffinityTier(const std::optional<SegmentLocality>& locality,
+                           const std::vector<std::string>& hcas) {
+    return HcaAffinityTier(locality ? &*locality : nullptr, hcas);
+}
+
 /**
  * @brief Represents a contiguous memory region
  */
@@ -460,10 +511,12 @@ struct Segment {
     std::string te_endpoint{};
     std::string protocol;
     std::string host_id{};
+    struct_pack::compatible<SegmentLocality, 1> locality;
     Segment() = default;
     bool operator==(const Segment&) const = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id,
+         locality);
 
 /**
  * @brief Allocation strategy type for segment allocation

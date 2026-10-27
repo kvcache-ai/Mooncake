@@ -164,6 +164,10 @@ class RdmaTransportTestPeer {
         return workers;
     }
 
+    static void setRailTopology(Workers& workers, const std::string& rails) {
+        workers.rail_topo_json_ = rails;
+    }
+
     static Workers& prepareMetadataLifetime(RdmaTransport& transport) {
         transport.params_->workers.num_workers = 1;
         transport.params_->workers.block_size = kMetadataLifetimeBlockSize;
@@ -970,6 +974,49 @@ TEST_P(RdmaPeerRailAllocationTest, UnknownRegionKeepsWildcardTopologyFallback) {
             EXPECT_TRUE(
                 RdmaTransportTestPeer::selectInitial(*workers_, *slice).ok());
             EXPECT_EQ(slice->source_dev_id, 1);
+        }
+    }
+}
+
+TEST_P(RdmaPeerRailAllocationTest,
+       UnknownTargetLocationHonorsTierTwoRailMapping) {
+    // An unknown target location resolves to the wildcard memory entry. The
+    // selected local NIC is mlx5_1 and its configured peer is mlx5_1, which is
+    // listed only in Tier 2. Initial selection must preserve that rail pair
+    // rather than randomly choosing mlx5_0 from Tier 1.
+    ASSERT_TRUE(
+        peer_->segmentManager()
+            .updateLocal([](SegmentDesc& segment) {
+                auto& memory = std::get<MemorySegmentDesc>(segment.detail);
+                auto wildcard_id = memory.topology.getMemId(kWildcardLocation);
+                if (wildcard_id < 0)
+                    return Status::DeviceNotFound(
+                        "wildcard topology entry missing" LOC_MARK);
+                auto& wildcard = memory.topology.mem_list_[wildcard_id];
+                wildcard.device_list[0] = {0};
+                wildcard.device_list[1].clear();
+                wildcard.device_list[Topology::DevicePriorityRanks - 1] = {1};
+                for (auto& buffer : memory.buffers)
+                    buffer.location = kWildcardLocation;
+                return Status::OK();
+            })
+            .ok());
+    metadata_->segmentManager().invalidateRemote(request_.target_id);
+
+    RdmaTransportTestPeer::setRailTopology(
+        *workers_,
+        R"({"all":[{"local":"mlx5_1","remote":"mlx5_0"},
+                    {"local":"mlx5_1","remote":"mlx5_1"}],
+            "direct":[{"local":"mlx5_1","remote":"mlx5_1"}]})");
+
+    request_.length = 4096;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    for (auto* first : static_cast<RdmaSubBatch*>(batch_)->slice_chain) {
+        for (auto* slice = first; slice; slice = slice->next) {
+            ASSERT_TRUE(
+                RdmaTransportTestPeer::selectInitial(*workers_, *slice).ok());
+            EXPECT_EQ(slice->source_dev_id, 1);
+            EXPECT_EQ(slice->target_dev_id, 1);
         }
     }
 }

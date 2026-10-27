@@ -93,11 +93,13 @@ bool AllocatedBuffer::copyTransferProtocolFrom(const AllocatedBuffer& source) {
     return true;
 }
 
-std::string AllocatedBuffer::getTransportEndpoint() const {
+std::string AllocatedBuffer::getTransportEndpoint(
+    std::optional<SegmentLocality>* locality) const {
     auto alloc = allocator_.lock();
     std::string endpoint;
     if (alloc) {
         endpoint = alloc->getTransportEndpoint();
+        if (locality) *locality = alloc->GetLocality();
     } else {
         LOG(ERROR) << "allocator=expired_or_null in getTransportEndpoint";
     }
@@ -109,10 +111,11 @@ std::string AllocatedBuffer::getTransportEndpoint() const {
 }
 
 // Implementation of get_descriptor
-AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
+AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor(
+    std::optional<SegmentLocality>* locality) const {
     return {static_cast<uint64_t>(size()),
             reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol,
-            getTransportEndpoint()};
+            getTransportEndpoint(locality)};
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {

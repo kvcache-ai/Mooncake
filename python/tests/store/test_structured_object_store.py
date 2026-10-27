@@ -5197,13 +5197,29 @@ def test_session_config_expands_with_physical_keys_without_mutating_input():
     from types import SimpleNamespace
     from mooncake.structured_object_store import _config_for_grouped_keys
 
-    config = SimpleNamespace(group_ids=["group"], session_ids=["session"])
+    config = SimpleNamespace(
+        group_ids=["group"],
+        session_ids=["session"],
+        preferred_hca_names=["mlx5_0"],
+        per_key_preferred_hca_names=[["mlx5_1"]],
+    )
     expanded = _config_for_grouped_keys(config, 3)
     assert expanded.group_ids == ["group"] * 3
     assert expanded.session_ids == ["session"] * 3
+    assert expanded.preferred_hca_names == ["mlx5_0"]
+    assert expanded.per_key_preferred_hca_names == [["mlx5_1"]] * 3
+    expanded.per_key_preferred_hca_names[0].append("mlx5_2")
+    assert expanded.per_key_preferred_hca_names[1:] == [["mlx5_1"]] * 2
     assert config.group_ids == ["group"]
     assert config.session_ids == ["session"]
+    assert config.per_key_preferred_hca_names == [["mlx5_1"]]
     session_only = SimpleNamespace(session_ids=["session"])
     assert _config_for_grouped_keys(session_only, 2).session_ids == ["session"] * 2
     with pytest.raises(ValueError, match="session_ids"):
         _config_for_grouped_keys(SimpleNamespace(session_ids=["a", "b"]), 2)
+    hca_only = SimpleNamespace(per_key_preferred_hca_names=[[]])
+    assert _config_for_grouped_keys(hca_only, 2).per_key_preferred_hca_names == [[], []]
+    with pytest.raises(ValueError, match="per_key_preferred_hca_names"):
+        _config_for_grouped_keys(
+            SimpleNamespace(per_key_preferred_hca_names=[["mlx5_0"], []]), 2
+        )

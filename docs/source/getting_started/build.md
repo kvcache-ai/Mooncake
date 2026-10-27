@@ -57,6 +57,50 @@ make -j
 sudo make install
 ```
 
+(build-with-intel-xpu)=
+### Build with Intel XPU
+
+Intel XPU support requires TENT and a native oneAPI SYCL build with the Intel
+DPC++ compiler (`icpx`), not GCC. A Mooncake EP-only build on XPU
+(`-DWITH_EP=ON -DWITH_STORE=OFF`) does not need TENT; see the EP build notes in
+[Mooncake EP & Mooncake PG](../api-reference/python/ep-backend.md). Install the
+common dependencies above and the Intel GPU driver, Level Zero runtime, and
+oneAPI compiler separately.
+From the repository root, use a fresh build directory:
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+cmake -S . -B build-xpu \
+  -DCMAKE_C_COMPILER=icx \
+  -DCMAKE_CXX_COMPILER=icpx \
+  -DUSE_TENT=ON \
+  -DUSE_XPU=ON \
+  -DUSE_CUDA=OFF \
+  -DWITH_STORE_RUST=OFF
+cmake --build build-xpu --parallel "$(nproc)"
+```
+
+For Python bindings, install from the repository root with the same compiler
+and backend settings. This performs a separate native build:
+
+```bash
+python -m pip install . \
+  -Ccmake.define.CMAKE_C_COMPILER=icx \
+  -Ccmake.define.CMAKE_CXX_COMPILER=icpx \
+  -Ccmake.define.USE_TENT=ON \
+  -Ccmake.define.USE_XPU=ON \
+  -Ccmake.define.USE_CUDA=OFF
+```
+
+Keep the matching SYCL/Level Zero runtime available when running Mooncake,
+and use XPU-enabled PyTorch for tensor APIs. The prebuilt wheels do not include
+XPU support. Select TENT at runtime with `MC_USE_TENT=1`. For direct dma-buf
+RDMA requirements, the host-staging fallback, and same-node IPC permissions,
+see the Intel XPU part of the GPU-Direct RDMA note under Hardware Backend Setup
+below;
+see {ref}`Intel XPU Transport <intel-xpu-transport>` for runtime settings and
+current limitations.
+
 ### Build with NVMe-oF SSD Pool
 
 To enable the NVMe-oF SSD pool, install the SPDK dependencies and build
