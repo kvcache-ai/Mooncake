@@ -9,7 +9,16 @@ CLASSIC_SHIM=${MOONCAKE_CLASSIC_SHIM_LIB_PATH:?MOONCAKE_CLASSIC_SHIM_LIB_PATH mu
 TENT_SHIM=${MOONCAKE_TENT_SHIM_LIB_PATH:?MOONCAKE_TENT_SHIM_LIB_PATH must name the CMake-built TENT shim}
 BUILD_PYTHON_BIN=${MOONCAKE_PYTHON_BIN:-python3}
 TRANSPORT_BACKEND_LIST=${MC_STORE_RS_TRANSPORT_BACKENDS:-${MC_STORE_RS_TRANSPORT_BACKEND:-classic-te}}
+CHECK_CPP_FACADE=${MC_STORE_RS_CHECK_CPP_FACADE:-true}
 read -r -a TRANSPORT_BACKENDS <<< "${TRANSPORT_BACKEND_LIST}"
+
+case "${CHECK_CPP_FACADE}" in
+  true | false) ;;
+  *)
+    echo "MC_STORE_RS_CHECK_CPP_FACADE must be true or false" >&2
+    exit 1
+    ;;
+esac
 
 [[ "${#TRANSPORT_BACKENDS[@]}" -gt 0 ]] || {
   echo "at least one Store-RS transport backend is required" >&2
@@ -64,16 +73,18 @@ done
 }
 
 shopt -s nullglob
-CPP_EXTENSIONS=("${PACKAGE_DIR}"/_store.cpython-*.so)
 RS_EXTENSIONS=("${PACKAGE_DIR}"/_store_rs.*.so)
-[[ "${#CPP_EXTENSIONS[@]}" -eq 1 ]] || {
-  echo "expected one installed C++ Store extension, found ${#CPP_EXTENSIONS[@]}" >&2
-  exit 1
-}
 [[ "${#RS_EXTENSIONS[@]}" -eq 1 ]] || {
   echo "expected one installed Store-RS extension, found ${#RS_EXTENSIONS[@]}" >&2
   exit 1
 }
+if [[ "${CHECK_CPP_FACADE}" == "true" ]]; then
+  CPP_EXTENSIONS=("${PACKAGE_DIR}"/_store.cpython-*.so)
+  [[ "${#CPP_EXTENSIONS[@]}" -eq 1 ]] || {
+    echo "expected one installed C++ Store extension, found ${#CPP_EXTENSIONS[@]}" >&2
+    exit 1
+  }
+fi
 
 echo "==> Store-RS Rust unit tests"
 (
@@ -115,7 +126,8 @@ unset MOONCAKE_ROOT_DIR MOONCAKE_STORE_RS_DIR
 export PYTHONNOUSERSITE=1
 export PATH="${VENV_DIR}/bin:${PATH}"
 
-env -u MOONCAKE_STORE_BACKEND "${PYTHON_BIN}" -I - <<'PY'
+if [[ "${CHECK_CPP_FACADE}" == "true" ]]; then
+  env -u MOONCAKE_STORE_BACKEND "${PYTHON_BIN}" -I - <<'PY'
 from pathlib import Path
 import sys
 
@@ -128,6 +140,9 @@ assert store._BACKEND == "cpp"
 assert store.MooncakeDistributedStore is native.MooncakeDistributedStore
 print("default facade selects the installed C++ Store extension")
 PY
+else
+  echo "==> Skipping C++ Store facade check; this build contains Store-RS only"
+fi
 
 MOONCAKE_STORE_BACKEND=rs "${PYTHON_BIN}" -I - <<'PY'
 import mooncake.store as store

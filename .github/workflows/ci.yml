@@ -829,6 +829,7 @@ jobs:
       MOONCAKE_CLASSIC_SHIM_LIB_PATH: ${{ github.workspace }}/build/store-rs-ci/mooncake-store-rs/native-shims/libmooncake_classic_shim.so
       MOONCAKE_TENT_SHIM_LIB_PATH: ${{ github.workspace }}/build/store-rs-ci/mooncake-store-rs/native-shims/libmooncake_tent_shim.so
       MOONCAKE_PYTHON_BIN: python3
+      MC_STORE_RS_CHECK_CPP_FACADE: "false"
 
     steps:
     - uses: actions/checkout@v4
@@ -855,6 +856,14 @@ jobs:
     - name: Check Store-RS Rust formatting
       run: cargo fmt --all --manifest-path mooncake-store-rs/Cargo.toml -- --check
 
+    - name: Cache Store-RS Cargo artifacts
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: |
+          mooncake-store-rs -> ../build/store-rs-ci/mooncake-store-rs/cargo-cli
+          mooncake-store-rs -> ../build/store-rs-ci/mooncake-store-rs/cargo-python
+          mooncake-store-rs -> ../build/store-rs-ci/mooncake-store-rs/cargo-tests
+
     - name: Free up disk space
       uses: ./.github/actions/free-disk-space
 
@@ -877,7 +886,7 @@ jobs:
           -DSKBUILD=ON \
           -DPython3_EXECUTABLE="$(command -v python3)" \
           -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
-          -DWITH_STORE=ON \
+          -DWITH_STORE=OFF \
           -DWITH_STORE_RUST=OFF \
           -DWITH_STORE_RS=ON \
           -DWITH_TE=ON \
@@ -894,8 +903,7 @@ jobs:
     - name: Build Store-RS and native shims
       run: |
         cmake --build "$MOONCAKE_BUILD_DIR" \
-          --target _fast_copy engine store transfer_engine mooncake_store \
-            mooncake_master mooncake_client build_store_rs \
+          --target _fast_copy engine build_store_rs \
           --parallel "$(nproc)"
       shell: bash
 
@@ -908,7 +916,7 @@ jobs:
         mc_scripts_setup_upstream_runtime_env none
         cargo clippy \
           --manifest-path "$MOONCAKE_STORE_RS_DIR/Cargo.toml" \
-          --workspace --lib --bins -- -D warnings
+          --workspace --lib --bins --release -- -D warnings
       shell: bash
 
     - name: Install Store-RS Python component
