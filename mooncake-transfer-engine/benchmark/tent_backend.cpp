@@ -284,10 +284,11 @@ int TENTBenchRunner::allocateBuffers() {
                 // runs (e.g. SHM sets shm_path, NVLink sets up GPU memory
                 // handle). registerLocalMemory below then resets options.type
                 // to UNSPEC so the buffer registers to ALL enabled transports,
-                // not just this one.
-                options.type = (seg_type == "vram")
-                                   ? (device_prefix == "mlu" ? UNSPEC : NVLINK)
-                                   : SHM;
+                // not just this one. MLU and XPU have no NVLink transport.
+                const bool no_nvlink =
+                    device_prefix == "mlu" || device_prefix == "xpu";
+                options.type =
+                    (seg_type == "vram") ? (no_nvlink ? UNSPEC : NVLINK) : SHM;
             }
             // else: single-seg_type fallback (--seg_type without
             // --seg_type_mix, no --xport_type). Leave options.type as UNSPEC
