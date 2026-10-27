@@ -35,6 +35,22 @@ when they better match the change scope: ``[Bug fix]``, ``[Build]``, ``[CI]``,
 ``[Docs]``, ``[EP]``, ``[Feature]``, ``[MUSA]``, ``[PG]``, ``[TE]``,
 ``[TENT]``, and ``[Wheel]``.
 
+### Automatic PR Size Labels
+
+PRs receive one size label based on GitHub's total added and deleted lines:
+
+| Label | Changed lines (additions + deletions) |
+|-------|-------------------------------------|
+| `size/S` | 0–99 |
+| `size/M` | 100–1,000 |
+| `size/L` | More than 1,000 |
+
+The label is recalculated when a PR is opened, updated with new commits,
+reopened, or edited (including a base-branch change). The workflow creates
+missing size labels and replaces outdated size labels while preserving other
+labels. All files count toward this size, including tests, documentation, and
+generated files; the label is a review aid, not an RFC requirement.
+
 ### Notes for Large Changes
 
 Please keep changes as concise as possible. For major architectural changes

@@ -131,6 +131,18 @@ jobs:
         python mooncake-wheel/tests/test_cuda_fabric_compat.py -v
       shell: bash
 
+    - name: Run session and HCA write metadata regressions
+      run: |
+        source test_env/bin/activate
+        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+        python -m pip install pyzmq msgpack
+        export MOONCAKE_TEST_MASTER_BINARY="$(command -v mooncake_master)"
+        for affinity in 0 1; do
+          MC_STORE_HCA_AFFINITY="$affinity" \
+            python -m pytest -q mooncake-wheel/tests/test_session_kv_events.py
+        done
+      shell: bash
+
     - name: Run all PG CPU tests with installed PyTorch
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
@@ -589,6 +601,11 @@ jobs:
       python-versions: '["3.12"]'
       artifact-prefix: mooncake-wheel-cu130
       version-override: 0.0.0.dev0
+      # This artifact feeds the T-One e2e pipeline (integration-test.yml picks
+      # the py312/cu130 wheel), which exercises the TENT runtime. Default
+      # engine behavior stays classic; TENT activates via MC_USE_TENT=1 set
+      # by tone_tests/scripts/common.sh.
+      use-tent: true
 
   # arm64 default wheels use a different transport set (USE_MNNVL) than
   # x86_64 (USE_INTRA_NVLINK), so build one here instead of only at release.
@@ -743,6 +760,13 @@ jobs:
       run: |
         ctest --test-dir build-tent --output-on-failure --no-tests=error \
           -R '^tent_compat_notify_test$'
+      shell: bash
+
+    - name: Test Store scatter shared-segment ownership with TENT
+      if: matrix.name == 'cuda-off'
+      run: |
+        ctest --test-dir build-tent --output-on-failure --no-tests=error \
+          -R '^transfer_task_tent_shared_segment_test$'
       shell: bash
 
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;

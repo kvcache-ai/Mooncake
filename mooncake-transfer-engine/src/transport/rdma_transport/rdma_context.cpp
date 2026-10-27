@@ -742,6 +742,8 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         // Offset within the dmabuf-backed region: distance from the
         // allocation base, plus any offset hsa returned for the export.
         out.offset = (uintptr_t)addr - (uintptr_t)allocBase + hsa_dmabuf_offset;
+        out.alloc_base = allocBase;
+        out.device = hipAttr.device;
     }
 #else
     out.method = DmabufExport::Method::kHostReg;
@@ -1398,6 +1400,18 @@ GidRefreshResult RdmaContext::refreshCurrentGid(std::string *previous_gid,
             deleteEndpoint(peer);
     }
     return changed ? GidRefreshResult::CHANGED : GidRefreshResult::UNCHANGED;
+}
+
+int RdmaContext::queryPortState(ibv_port_state *state) const {
+    if (!state || !context_) return -1;
+    ibv_port_attr port_attr;
+    if (ibv_query_port(context_, port_, &port_attr)) {
+        PLOG(WARNING) << "Failed to query state of port "
+                      << static_cast<int>(port_) << " on " << device_name_;
+        return -1;
+    }
+    *state = port_attr.state;
+    return 0;
 }
 
 int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,

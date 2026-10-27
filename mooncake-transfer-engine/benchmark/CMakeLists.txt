@@ -25,7 +25,7 @@ else()
   message(STATUS "Sunrise/Tang: Disabled")
 endif()
 
-file(GLOB TEBENCH_SOURCES "*.cpp")
+file(GLOB TEBENCH_SOURCES CONFIGURE_DEPENDS "*.cpp")
 # The TENT backend is only available when USE_TENT is enabled; drop its
 # translation unit (which pulls in tent/ headers) from non-TENT builds.
 if(NOT USE_TENT)

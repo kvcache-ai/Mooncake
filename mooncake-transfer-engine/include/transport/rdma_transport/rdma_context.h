@@ -119,6 +119,9 @@ struct DmabufExport {
     // unknown. Data Direct registration is only possible on NICs whose Data
     // Direct function sits under the same root.
     std::string pci_root;
+    // HIP: the exported allocation and the GPU that owns it.
+    void *alloc_base = nullptr;
+    int device = -1;
 };
 
 // RdmaContext represents the set of resources controlled by each local NIC,
@@ -288,6 +291,12 @@ class RdmaContext {
     // MC_GID_INDEX keeps the configured index and refreshes only its value.
     GidRefreshResult refreshCurrentGid(std::string *previous_gid = nullptr,
                                        std::string *next_gid = nullptr);
+
+    // Read the port's current state from the hardware. The monitor worker
+    // polls this for event-disabled contexts so a link that came back without
+    // a usable IBV_EVENT_PORT_ACTIVE is still noticed. Returns -1 and leaves
+    // *state untouched if no device is open or the query fails.
+    int queryPortState(ibv_port_state *state) const;
 
     ibv_context *context() const { return context_; }
 

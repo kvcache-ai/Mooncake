@@ -164,6 +164,10 @@ class RdmaTransportTestPeer {
         return workers;
     }
 
+    static void setRailTopology(Workers& workers, const std::string& rails) {
+        workers.rail_topo_json_ = rails;
+    }
+
     static Workers& prepareMetadataLifetime(RdmaTransport& transport) {
         transport.params_->workers.num_workers = 1;
         transport.params_->workers.block_size = kMetadataLifetimeBlockSize;
@@ -248,6 +252,14 @@ class RdmaTransportTestPeer {
     }
     static WorkerContext& workerContext(Workers& workers, size_t i) {
         return workers.worker_context_[i];
+    }
+
+    static const Topology* railLocalTopology(Workers& workers,
+                                             const std::string& machine_id) {
+        auto it = workers.worker_context_[0].rails.find(machine_id);
+        return it == workers.worker_context_[0].rails.end()
+                   ? nullptr
+                   : it->second->local();
     }
     static void retireSweptSlice(Workers& workers, WorkerContext& self,
                                  RdmaSlice* slice, uint64_t now_ns,
@@ -408,6 +420,14 @@ class RdmaEndPointTestPeer {
     static TicketLock& qpLock(const std::shared_ptr<RdmaEndPoint>& endpoint,
                               int qp_index) {
         return endpoint->queue_lock_list_[qp_index];
+    }
+    static void markNotifyConnected(
+        const std::shared_ptr<RdmaEndPoint>& endpoint) {
+        endpoint->notify_connected_.store(true);
+    }
+    static uint64_t notifySendWrId(
+        const std::shared_ptr<RdmaEndPoint>& endpoint) {
+        return endpoint->notify_send_wr_id_;
     }
 };
 
@@ -661,6 +681,81 @@ TEST_F(RdmaSliceMetadataLifetimeTest,
     EXPECT_TRUE(gdr.localReachable(expected_nic_name, source_gpu));
     EXPECT_TRUE(gdr.remoteReachable(expected_machine_id, expected_nic_name,
                                     target_gpu));
+}
+
+TEST_F(RdmaSliceMetadataLifetimeTest,
+       RefreshesRailMappingAfterLocalTopologySnapshotUpdate) {
+    batch_->device_mask = 1ULL << 1;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    auto* first = static_cast<RdmaSubBatch*>(batch_)->slice_chain[0];
+    ASSERT_NE(first, nullptr);
+    ASSERT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, first).ok());
+
+    SegmentDescRef remote;
+    ASSERT_TRUE(metadata_->segmentManager()
+                    .getRemoteCached(remote, request_.target_id)
+                    .ok());
+    const auto machine_id = remote->machine_id;
+    const auto* old_local =
+        RdmaTransportTestPeer::railLocalTopology(*workers_, machine_id);
+    ASSERT_NE(old_local, nullptr);
+
+    ASSERT_TRUE(
+        metadata_->segmentManager()
+            .updateLocal([](SegmentDesc& segment) {
+                auto& topology =
+                    std::get<MemorySegmentDesc>(segment.detail).topology;
+                topology.nic_list_[0].numa_node = 1;
+                return Status::OK();
+            })
+            .ok());
+
+    RdmaTask task;
+    task.request = request_;
+    RdmaSlice second;
+    second.task = &task;
+    second.source_addr = request_.source;
+    second.target_addr = request_.target_offset;
+    second.length = request_.length;
+    ASSERT_TRUE(
+        RdmaTransportTestPeer::generatePostPath(*workers_, &second).ok());
+
+    const auto current_local =
+        &std::get<MemorySegmentDesc>(
+             metadata_->segmentManager().getLocal()->detail)
+             .topology;
+    EXPECT_NE(RdmaTransportTestPeer::railLocalTopology(*workers_, machine_id),
+              old_local);
+    EXPECT_EQ(RdmaTransportTestPeer::railLocalTopology(*workers_, machine_id),
+              current_local);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, &second, 0, 0);
+
+    ASSERT_TRUE(
+        metadata_->segmentManager()
+            .updateLocal([](SegmentDesc& segment) {
+                auto& topology =
+                    std::get<MemorySegmentDesc>(segment.detail).topology;
+                topology.nic_list_[0].numa_node = 0;
+                return Status::OK();
+            })
+            .ok());
+    const auto fallback_local =
+        &std::get<MemorySegmentDesc>(
+             metadata_->segmentManager().getLocal()->detail)
+             .topology;
+    ASSERT_NE(fallback_local, current_local);
+
+    RdmaSlice fallback;
+    fallback.task = &task;
+    fallback.source_addr = request_.source;
+    fallback.target_addr = request_.target_offset;
+    fallback.length = request_.length;
+    fallback.retry_count = 1;
+    ASSERT_TRUE(
+        RdmaTransportTestPeer::generatePostPath(*workers_, &fallback).ok());
+    EXPECT_EQ(RdmaTransportTestPeer::railLocalTopology(*workers_, machine_id),
+              fallback_local);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, &fallback, 0, 0);
 }
 
 bool waitBatchDone(TransferEngine& engine, BatchID batch) {
@@ -962,6 +1057,49 @@ TEST_P(RdmaPeerRailAllocationTest, UnknownRegionKeepsWildcardTopologyFallback) {
             EXPECT_TRUE(
                 RdmaTransportTestPeer::selectInitial(*workers_, *slice).ok());
             EXPECT_EQ(slice->source_dev_id, 1);
+        }
+    }
+}
+
+TEST_P(RdmaPeerRailAllocationTest,
+       UnknownTargetLocationHonorsTierTwoRailMapping) {
+    // An unknown target location resolves to the wildcard memory entry. The
+    // selected local NIC is mlx5_1 and its configured peer is mlx5_1, which is
+    // listed only in Tier 2. Initial selection must preserve that rail pair
+    // rather than randomly choosing mlx5_0 from Tier 1.
+    ASSERT_TRUE(
+        peer_->segmentManager()
+            .updateLocal([](SegmentDesc& segment) {
+                auto& memory = std::get<MemorySegmentDesc>(segment.detail);
+                auto wildcard_id = memory.topology.getMemId(kWildcardLocation);
+                if (wildcard_id < 0)
+                    return Status::DeviceNotFound(
+                        "wildcard topology entry missing" LOC_MARK);
+                auto& wildcard = memory.topology.mem_list_[wildcard_id];
+                wildcard.device_list[0] = {0};
+                wildcard.device_list[1].clear();
+                wildcard.device_list[Topology::DevicePriorityRanks - 1] = {1};
+                for (auto& buffer : memory.buffers)
+                    buffer.location = kWildcardLocation;
+                return Status::OK();
+            })
+            .ok());
+    metadata_->segmentManager().invalidateRemote(request_.target_id);
+
+    RdmaTransportTestPeer::setRailTopology(
+        *workers_,
+        R"({"all":[{"local":"mlx5_1","remote":"mlx5_0"},
+                    {"local":"mlx5_1","remote":"mlx5_1"}],
+            "direct":[{"local":"mlx5_1","remote":"mlx5_1"}]})");
+
+    request_.length = 4096;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    for (auto* first : static_cast<RdmaSubBatch*>(batch_)->slice_chain) {
+        for (auto* slice = first; slice; slice = slice->next) {
+            ASSERT_TRUE(
+                RdmaTransportTestPeer::selectInitial(*workers_, *slice).ok());
+            EXPECT_EQ(slice->source_dev_id, 1);
+            EXPECT_EQ(slice->target_dev_id, 1);
         }
     }
 }
@@ -3948,6 +4086,41 @@ TEST_F(RdmaSliceOrphanTest, ALingeringOrphanIsReportedOnceAndStillHeld) {
     completeWith(slice, IBV_WC_SUCCESS);
     RdmaTransportTestPeer::reapOrphanSlices(transport_);
     EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// A notification picks its send slot from its wr_id, and the slot is only
+// free while every lower wr_id was posted. The fixture is borrowed for its
+// fake verbs; its post_send is swapped for one that can refuse a post.
+class RdmaNotifySendSlotTest : public RdmaWorkersSharedQpTest {
+   protected:
+    static std::vector<uint64_t> posted;
+    static bool refuse;
+    static int postNotify(ibv_qp*, ibv_send_wr* wr, ibv_send_wr** bad_wr) {
+        posted.push_back(wr->wr_id);
+        *bad_wr = refuse ? wr : nullptr;
+        return refuse ? EINVAL : 0;
+    }
+    void SetUp() override {
+        RdmaWorkersSharedQpTest::SetUp();
+        posted.clear();
+        refuse = false;
+        fake.native.ops.post_send = postNotify;
+    }
+};
+std::vector<uint64_t> RdmaNotifySendSlotTest::posted;
+bool RdmaNotifySendSlotTest::refuse = false;
+
+TEST_F(RdmaNotifySendSlotTest, AFailedPostDoesNotTakeASendSlot) {
+    RdmaEndPointTestPeer::markNotifyConnected(endpoint_);
+    for (int i = 0; i < 255; ++i)  // wr_id 0..254, none completed
+        ASSERT_TRUE(endpoint_->sendNotification("n", "m"));
+    refuse = true;
+    EXPECT_FALSE(endpoint_->sendNotification("n", "m"));
+    EXPECT_EQ(RdmaEndPointTestPeer::notifySendWrId(endpoint_), 255u);
+    refuse = false;
+    ASSERT_TRUE(endpoint_->sendNotification("n", "m"));
+    // 256 would reuse slot 0, whose wr_id 0 is still in flight.
+    EXPECT_EQ(posted.back(), 255u);
 }
 
 // The handler reads the slice well past acknowledge(), which is what
