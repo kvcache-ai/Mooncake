@@ -110,6 +110,43 @@ class TestHttpMetadataServerPut(unittest.IsolatedAsyncioTestCase):
         resp = await self.server._handle_put(key, _request(b"v2"))
         self.assertEqual(resp.status, 200)
 
+    async def test_version_bump_is_accepted_as_legitimate_republish(self) -> None:
+        """C++ TransferMetadata::rePublishRpcMetaEntry always increments
+        metadata_version on republish; the HTTP server must treat that as
+        a legal update, not as a conflicting duplicate key."""
+        v1 = b'{"ip_or_host_name":"10.0.0.1","rpc_port":12384,"metadata_version":1}'
+        v2 = b'{"ip_or_host_name":"10.0.0.1","rpc_port":12384,"metadata_version":2}'
+        await self.server._handle_put(RPC_META_KEY, _request(v1))
+        resp = await self.server._handle_put(RPC_META_KEY, _request(v2))
+        self.assertEqual(resp.status, 200)
+        self.assertIn(b"republished", resp.body)
+
+    async def test_substring_key_misclassified_as_rpc_meta_can_be_overwritten(self) -> None:
+        """A key that merely CONTAINS the substring 'rpc_meta' but does
+        not have it as a literal path segment must not be routed through
+        the idempotency gate."""
+        key = "mooncake/segment_rpc_meta_cache/stash"
+        await self.server._handle_put(key, _request(b"v1"))
+        resp = await self.server._handle_put(key, _request(b"v2"))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.server.store[key], b"v2")
+
+    async def test_metadata_version_rollback_is_rejected(self) -> None:
+        v1 = b'{"ip_or_host_name":"10.0.0.1","rpc_port":12384,"metadata_version":5}'
+        v2 = b'{"ip_or_host_name":"10.0.0.1","rpc_port":12384,"metadata_version":3}'
+        await self.server._handle_put(RPC_META_KEY, _request(v1))
+        resp = await self.server._handle_put(RPC_META_KEY, _request(v2))
+        self.assertEqual(resp.status, 400)
+        self.assertIn(b"metadata_version-rollback", resp.body)
+
+    async def test_identity_change_is_rejected(self) -> None:
+        v1 = b'{"ip_or_host_name":"10.0.0.1","rpc_port":12384,"metadata_version":1}'
+        v2 = b'{"ip_or_host_name":"10.0.0.2","rpc_port":12384,"metadata_version":2}'
+        await self.server._handle_put(RPC_META_KEY, _request(v1))
+        resp = await self.server._handle_put(RPC_META_KEY, _request(v2))
+        self.assertEqual(resp.status, 400)
+        self.assertIn(b"identity-conflict", resp.body)
+
 
 if __name__ == "__main__":
     unittest.main()
