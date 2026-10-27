@@ -3917,7 +3917,7 @@ class _StructuredObjectLayer:
         )
         if read_plan.byte_length == 0:
             return target
-        destination_view = target.view(np.uint8).reshape(-1)
+        destination_view = target.reshape(-1).view(np.uint8)
         if read_plan.step == 1:
             self._bundle_store.read_payload_range_into_destination(
                 payload_spec,
@@ -5935,7 +5935,7 @@ def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
         return {
             "encoding": "ndarray",
             "dtype": array.dtype.str,
-            "shape": list(array.shape),
+            "shape": list(value.shape),
         }, array.view(np.uint8).reshape(-1)
     return {"encoding": "bytes"}, value
 

@@ -1505,6 +1505,45 @@ def test_append_rejects_conflicting_group_before_write() -> None:
     assert len(store.put_configs) == before_puts
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_put_object_preserves_zero_dimensional_ndarray(wrapped) -> None:
+    _store, transfer = make_transfer()
+    array = np.array(1.5, dtype=np.float32)
+    value = array if wrapped else {"value": array}
+
+    result = transfer.get_object(transfer.put_object(value))
+    result = result if wrapped else result["value"]
+
+    assert result.shape == ()
+    assert result.dtype == array.dtype
+    np.testing.assert_array_equal(result, array)
+
+
+@pytest.mark.parametrize("use_pool", [False, True])
+@pytest.mark.parametrize(
+    "array",
+    [
+        pytest.param(np.array(1.5, dtype=np.float32), id="scalar-float"),
+        pytest.param(np.array(7, dtype=np.int64), id="scalar-int"),
+        pytest.param(np.array(True), id="scalar-bool"),
+    ],
+)
+def test_structured_object_preserves_zero_dimensional_ndarray(array, use_pool) -> None:
+    _store, transfer = make_transfer(buffer_pool=FakeBufferPool() if use_pool else None)
+    ref = transfer.put_structured_object(structured_payload(value=array), chunk_bytes=3)
+    spec = transfer.read_spec(ref)
+
+    result = transfer.materialize(spec).objects["value"]
+    assert result.shape == array.shape
+    assert result.dtype == array.dtype
+    np.testing.assert_array_equal(result, array)
+
+    destination = np.empty_like(array, order="C")
+    result = transfer.materialize_into(spec, {"value": destination}).objects["value"]
+    assert result is destination
+    np.testing.assert_array_equal(destination, array)
+
+
 def test_put_object_roundtrips_numpy_and_torch_tensor_fields() -> None:
     torch = pytest.importorskip("torch")
     store, transfer = make_transfer()

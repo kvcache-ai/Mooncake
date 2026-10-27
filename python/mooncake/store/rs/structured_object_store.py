@@ -338,7 +338,7 @@ class _StructuredObjectLayer:
         target = _resolve_ndarray_destination(
             name, destination, read_plan.dtype, read_plan.output_shape
         )
-        destination_view = target.view(np.uint8).reshape(-1)
+        destination_view = target.reshape(-1).view(np.uint8)
         if read_plan.byte_length == 0:
             return target
         if read_plan.step == 1:
@@ -1223,7 +1223,7 @@ def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
         return {
             "encoding": "ndarray",
             "dtype": array.dtype.str,
-            "shape": list(array.shape),
+            "shape": list(value.shape),
         }, array.view(np.uint8).reshape(-1)
     return {"encoding": "bytes"}, value
 

@@ -377,6 +377,30 @@ def test_structured_object_roundtrip() -> None:
     assert result.objects["tokens"] == b"abc"
 
 
+@pytest.mark.parametrize(
+    "array",
+    [
+        pytest.param(np.array(1.5, dtype=np.float32), id="scalar-float"),
+        pytest.param(np.array(7, dtype=np.int64), id="scalar-int"),
+        pytest.param(np.array(True), id="scalar-bool"),
+    ],
+)
+def test_structured_object_preserves_zero_dimensional_ndarray(array) -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_structured_object(structured_payload(value=array), chunk_bytes=3)
+    spec = transfer.read_spec(ref)
+
+    result = transfer.materialize(spec).objects["value"]
+    assert result.shape == array.shape
+    assert result.dtype == array.dtype
+    np.testing.assert_array_equal(result, array)
+
+    destination = np.empty_like(array, order="C")
+    result = transfer.materialize_into(spec, {"value": destination}).objects["value"]
+    assert result is destination
+    np.testing.assert_array_equal(destination, array)
+
+
 def test_structured_object_read_spec_select_members() -> None:
     store, transfer = make_transfer()
     array = np.arange(10, dtype=np.float32).reshape(2, 5)
