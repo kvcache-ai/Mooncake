@@ -310,7 +310,7 @@ accepted.
 
 | Label | Values | Description |
 |-------|--------|-------------|
-| `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu`, `ub`, `mpcomm`, `hp_tcp`, `xpu`, `hylink`, `fabric` | The transport that handled the transfer |
+| `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu`, `ub`, `mpcomm`, `hp_tcp`, `xpu`, `hylink`, `fabric`, `mlu`, `memfabric` | The transport that handled the transfer |
 | `operation` | `read`, `write` | Attempt operation |
 | `reason` | `submit`, `poll`, `timeout`, `canceled` | Task failure classification |
 | `format` | `prometheus`, `json` | Serialization output format |
@@ -322,10 +322,10 @@ accepted.
 Transport label values come from the shared `transportTypeName()` mapping.
 `unspec` covers transfers that failed before a transport was selected.
 
-**Cardinality**: the `transport` label has 17 values; the failover
-`from`/`to` pair has at most 17x17 = 289 combinations (in practice only a
-few pairs ever occur), each attempt metric has at most 17x2 = 34
-transport/operation combinations, task failures have at most 17x4 = 68, and
+**Cardinality**: the `transport` label has 19 values; the failover
+`from`/`to` pair has at most 19x19 = 361 combinations (in practice only a
+few pairs ever occur), each attempt metric has at most 19x2 = 38
+transport/operation combinations, task failures have at most 19x4 = 76, and
 each serialization family has exactly two series. Build identity labels are
 constant for the life of the process; a served `tent_metrics_build_info` series
 itself confirms that metrics were compiled in. Total series across all metrics
