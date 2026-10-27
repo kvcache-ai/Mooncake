@@ -287,6 +287,18 @@ TEST_P(XpuEngineTest, DefaultRegistrationSelectsLocalXpuCopy) {
     EXPECT_TRUE(route.staging_params.empty());
 }
 
+// The allocator chosen for an unspecified XPU allocation does not limit its
+// registration: the buffer still carries XpuTransport for copies and staging.
+TEST_P(XpuEngineTest, DefaultAllocationRegistersEveryTransport) {
+    MemoryOptions opts;
+    opts.location = "xpu:0";
+    void* device = nullptr;
+    ASSERT_TRUE(a_->allocateLocalMemory(&device, kLength, opts).ok());
+    EXPECT_EQ(opts.type, UNSPEC);
+    ASSERT_TRUE(a_->registerLocalMemory({device}, {kLength}, opts).ok());
+    EXPECT_TRUE(TransferEngineImplTestPeer::hasXpuTag(*a_, device));
+}
+
 // A process-local VRAM->VRAM request routes to XpuTransport (gpu_to_gpu) with
 // no staging and lands the bytes: same device, and PCIe P2P across two XPUs
 // when the host has them.
