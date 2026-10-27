@@ -1736,7 +1736,15 @@ int EfaContext::submitSlicesOnPeer(
     // require the stall to have lasted efa_stall_min_ms of wall time (1 s by
     // default); that still fails a dead peer far sooner than the multi-second
     // timer described above.
+    //
+    // Past the wave count, posting faster does not finish a handshake sooner:
+    // every further fi_write just bounces, while this thread holds the
+    // endpoint read lock that later peers of the same submitTransfer and
+    // disconnect() wait on.  So from there on wake about once per
+    // kStallBackoff and post one more wave, instead of spinning through the
+    // floor.  A peer that recovers is noticed at most one interval late.
     const int kMaxStalledWaves = 1024;
+    constexpr auto kStallBackoff = std::chrono::milliseconds(1);
     const int64_t stall_min_ns = globalConfig().efa_stall_min_ms * 1000000;
     int stalled_waves = 0;
     uint64_t stall_start_ns = 0;
@@ -1795,7 +1803,10 @@ int EfaContext::submitSlicesOnPeer(
             std::copy(retry_slices.begin(), retry_slices.end(),
                       slice_list.begin() + cursor);
             retry_slices.clear();
-            std::this_thread::yield();
+            if (stalled_waves > kMaxStalledWaves)
+                std::this_thread::sleep_for(kStallBackoff);
+            else
+                std::this_thread::yield();
         }
 
         const size_t remaining = slice_list.size() - cursor;
@@ -1836,6 +1847,14 @@ int EfaContext::submitSlicesOnPeer(
                 wr_prev = cur_wr;
             }
         };
+        // Once a stall is past its wave count, this wait shares the stall's
+        // deadline, so a peer that stops completing fails at about
+        // efa_stall_min_ms rather than that plus a whole drain timeout.
+        const bool capped_by_stall =
+            stall_min_ns > 0 && stalled_waves > kMaxStalledWaves;
+        const uint64_t stall_deadline_ns =
+            stall_start_ns + static_cast<uint64_t>(stall_min_ns);
+        bool hit_stall_deadline = false;
         // Counts the yield and reports whether the deadline has passed.  Must
         // be called after note_starved(), which arms wait_t0 on the first call.
         // The clock is read once per 1024 yields: at ~0.2 us per yield that
@@ -1843,8 +1862,13 @@ int EfaContext::submitSlicesOnPeer(
         // clock_gettime off the hot path.
         auto drain_deadline_hit = [&]() -> bool {
             ++backoff;
-            if (drain_timeout_ms <= 0.0) return false;
+            if (drain_timeout_ms <= 0.0 && !capped_by_stall) return false;
             if ((backoff & 1023) != 0) return false;
+            if (capped_by_stall && monotonicNowNs() >= stall_deadline_ns) {
+                hit_stall_deadline = true;
+                return true;
+            }
+            if (drain_timeout_ms <= 0.0) return false;
             return std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - wait_t0)
                        .count() > drain_timeout_ms;
@@ -1916,7 +1940,11 @@ int EfaContext::submitSlicesOnPeer(
                 << " (fi_addr=" << peer_fi_addr
                 << "): starved_on=" << starved_on << ", waited=" << waited_ms
                 << "ms over " << backoff << " yields (deadline "
-                << drain_timeout_ms << "ms, MC_EFA_CQ_DRAIN_TIMEOUT_MS)"
+                << (hit_stall_deadline ? globalConfig().efa_stall_min_ms
+                                       : static_cast<int64_t>(drain_timeout_ms))
+                << (hit_stall_deadline
+                        ? "ms of FI_EAGAIN waves, MC_EFA_STALL_MIN_MS)"
+                        : "ms, MC_EFA_CQ_DRAIN_TIMEOUT_MS)")
                 << "; wr_depth=" << wr_depth_.load(std::memory_order_relaxed)
                 << "/" << max_wr_depth_ << " (at first backoff " << wr_first
                 << ", observed min=" << wr_min << " max=" << wr_max
