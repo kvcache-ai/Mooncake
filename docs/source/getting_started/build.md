@@ -271,18 +271,16 @@ device-code model, which is not cross-version compatible.
 ```{admonition} GPU-Direct RDMA
 :class: note
 Mooncake can use the DMA-BUF path for GPU-Direct RDMA, which does **not**
-require the `nvidia-peermem` kernel module. Set `WITH_NVIDIA_PEERMEM=0` before
-starting Mooncake to use DMA-BUF. Set `WITH_NVIDIA_PEERMEM=1` to use the legacy
-`ibv_reg_mr` path, which requires `nvidia-peermem`. See Section 3.7 of
-https://docs.nvidia.com/cuda/gpudirect-rdma/ for `nvidia-peermem` installation
-instructions.
-
-When `WITH_NVIDIA_PEERMEM` is **unset**, Mooncake uses the legacy `ibv_reg_mr`
-path. On hosts without `nvidia-peermem` (for example the NVIDIA open kernel
-modules with the inbox RDMA stack and no MLNX_OFED), GPU memory registration
-then fails with `Failed to register memory 0x...: Bad address [14]`; set
-`WITH_NVIDIA_PEERMEM=0` there. DMA-BUF needs the NVIDIA open kernel modules and
-Linux 5.12 or later.
+require the `nvidia-peermem` kernel module. When `WITH_NVIDIA_PEERMEM` is
+**unset**, Mooncake uses the legacy `ibv_reg_mr` path if a peer-memory module
+(`nvidia-peermem`, or `nv_peer_mem` from MLNX_OFED) is loaded and DMA-BUF
+otherwise (for example the NVIDIA open kernel modules with the inbox RDMA stack
+and no MLNX_OFED, where `ibv_reg_mr` on GPU memory would fail with
+`Failed to register memory 0x...: Bad address [14]`). Set
+`WITH_NVIDIA_PEERMEM=0` to force DMA-BUF, or `WITH_NVIDIA_PEERMEM=1` to force
+`ibv_reg_mr`. DMA-BUF needs the NVIDIA open kernel modules and Linux 5.12 or
+later; see Section 3.7 of https://docs.nvidia.com/cuda/gpudirect-rdma/ for
+`nvidia-peermem` installation instructions.
 
 Intel XPU builds (`-DUSE_XPU=ON`) use DMA-BUF for direct RDMA: when a USM
 device allocation is registered, TENT asks the Level Zero runtime to export it
