@@ -137,9 +137,9 @@ class EvictorTest : public ::testing::Test {
             list.emplace_back(allocator_->allocate(128),
                               ReplicaStatus::COMPLETE);
         }
-        (void)guard.Publish(
-            UUID{1, 2}, Clock::time_point{}, 128, std::move(list), std::nullopt,
-            false, ObjectDataType::UNKNOWN, group_id);
+        (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
+                            std::move(list), std::nullopt, false,
+                            ObjectDataType::UNKNOWN, group_id);
         SetDeadline(guard.metadata(), Clock::now() - age);
     }
 

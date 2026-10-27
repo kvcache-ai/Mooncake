@@ -162,9 +162,8 @@ struct MasterService::MemoryEviction {
                 return tl::make_unexpected(
                     eviction::SkipReason::kExternalEvict);
             }
-            if (service_.IsSoftPinActive(
-                    candidate.metadata, candidate.key, candidate.tenant_id,
-                    candidate.now)) {
+            if (service_.IsSoftPinActive(candidate.metadata, candidate.key,
+                                         candidate.tenant_id, candidate.now)) {
                 if (!allow_soft_pinned_) {
                     return tl::make_unexpected(
                         eviction::SkipReason::kSoftPinned);
@@ -1803,9 +1802,9 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     dynamic_replication_.RecordReplicaRemoval(metadata, erased_replica_ids);
     ReleaseLocalDiskUsage(erased_replicas);
     FreeDfsReplicas(durable_entry.object_key, erased_replicas);
-    CancelPromotionTaskForRemovedReplicas(
-        metadata, durable_entry.object_key, tenant_id, accessor.GetState(),
-        erased_replica_ids);
+    CancelPromotionTaskForRemovedReplicas(metadata, durable_entry.object_key,
+                                          tenant_id, accessor.GetState(),
+                                          erased_replica_ids);
     if (!metadata.IsValid()) {
         accessor.Erase(previous_media);
     } else {
@@ -3463,11 +3462,11 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
             // writer held off, so this is a key the objects name twice.
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
-        const route::Generation generation = accessor.Publish(
-            standby_meta.client_id, now, standby_meta.size,
-            std::move(object.replicas), std::nullopt,
-            standby_meta.hard_pinned.value_or(false), standby_meta.data_type,
-            standby_meta.group_id);
+        const route::Generation generation =
+            accessor.Publish(standby_meta.client_id, now, standby_meta.size,
+                             std::move(object.replicas), std::nullopt,
+                             standby_meta.hard_pinned.value_or(false),
+                             standby_meta.data_type, standby_meta.group_id);
         auto& metadata = accessor.Get();
         metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         metadata.session_id = standby_meta.session_id.value_or("");
@@ -4495,8 +4494,8 @@ auto MasterService::BatchReplicaClear(
                 }
             }
 
-            EraseReplicasWithCacheTotalAccounting(
-                metadata, key, match_replica_on_segment);
+            EraseReplicasWithCacheTotalAccounting(metadata, key,
+                                                  match_replica_on_segment);
 
             // If no valid replicas remain, erase the entire metadata
             if (!metadata.IsValid()) {
@@ -7410,28 +7409,28 @@ long MasterService::RemoveAll(bool force) {
     std::unordered_set<std::string> tenants_with_remaining_objects;
 
     // Remove per object so managed weights and concurrent imports survive.
-    VisitNamespaces([&](const TenantId& tenant_id,
-                        metadata::Namespace& /*ns*/) {
-        const RemoveResult result =
-            RemoveTenantObjects(tenant_id, force, now, nullptr);
-        removed_count += result.removed_count;
-        total_freed_size += result.freed_bytes;
-        // Record the tenant only once the walk actually reached an object. A
-        // tenant row can outlive its objects, and recording it unconditionally
-        // made every empty-but-present tenant look like a fresh wipe and emit
-        // a spurious `cleared`. Under HA+oplog the erase is deferred to the
-        // durable callback, so only a skipped object means the tenant is not
-        // empty.
-        if (track_cleared_tenants && result.saw_object) {
-            tenants_seen.insert(tenant_id.value());
-            if (result.skipped_object) {
-                tenants_with_remaining_objects.insert(tenant_id.value());
+    VisitNamespaces(
+        [&](const TenantId& tenant_id, metadata::Namespace& /*ns*/) {
+            const RemoveResult result =
+                RemoveTenantObjects(tenant_id, force, now, nullptr);
+            removed_count += result.removed_count;
+            total_freed_size += result.freed_bytes;
+            // Record the tenant only once the walk actually reached an object.
+            // A tenant row can outlive its objects, and recording it
+            // unconditionally made every empty-but-present tenant look like a
+            // fresh wipe and emit a spurious `cleared`. Under HA+oplog the
+            // erase is deferred to the durable callback, so only a skipped
+            // object means the tenant is not empty.
+            if (track_cleared_tenants && result.saw_object) {
+                tenants_seen.insert(tenant_id.value());
+                if (result.skipped_object) {
+                    tenants_with_remaining_objects.insert(tenant_id.value());
+                }
             }
-        }
-        if (kv_remove_all_tenant_hook_) {
-            kv_remove_all_tenant_hook_(tenant_id);
-        }
-    });
+            if (kv_remove_all_tenant_hook_) {
+                kv_remove_all_tenant_hook_(tenant_id);
+            }
+        });
 
     // tenants_seen holds only tenants that actually held an object, so this
     // difference is "held objects and lost all of them" — a real wipe. Both
@@ -7568,8 +7567,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 }
 
 void MasterService::CancelPromotionTaskForRemovedReplicas(
-    ObjectMetadata& metadata, const std::string& key,
-    const TenantId& tenant_id, route::ObjectState& state,
+    ObjectMetadata& metadata, const std::string& key, const TenantId& tenant_id,
+    route::ObjectState& state,
     const std::vector<ReplicaID>& removed_replica_ids) {
     if (removed_replica_ids.empty()) {
         return;
