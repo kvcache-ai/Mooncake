@@ -90,6 +90,13 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         if (config_.enable_dfs && client_) {
             client_->SetDfsStorageBackend(distributed_backend);
         }
+        // Offload sources (mounted segments) and load buffers are registered
+        // with the client's Transfer Engine; an adapter may let the storage
+        // service reach them directly.
+        if (!config_.enable_dfs && client_) {
+            distributed_backend->BindTransferEndpoint(
+                client_->GetSegmentEndpoint());
+        }
     }
 
     // Register the client buffer with the process-wide io_uring fixed-buffer

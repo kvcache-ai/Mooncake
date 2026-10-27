@@ -4,6 +4,12 @@
 //
 //   valkey-server --port 6390 --loadmodule libvalkey_large_object.so
 //   MOONCAKE_VALKEY_ADDR=127.0.0.1:6390 ./valkey_adapter_live_test
+//
+// The RDMA cases also need the module's Transfer Engine backend on the
+// server (fabric-provider MooncakeTe) and, for this process, the Transfer
+// Engine transport and an address the server can reach:
+//
+//   MOONCAKE_VALKEY_RDMA_PROTOCOL=efa MOONCAKE_VALKEY_RDMA_LOCAL_IP=10.0.0.5
 
 #include "storage/distributed/valkey_adapter.h"
 
@@ -12,6 +18,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -20,6 +27,7 @@
 #include <vector>
 
 #include "storage/distributed/distributed_storage_backend.h"
+#include "transfer_engine.h"
 
 namespace mooncake {
 namespace {
@@ -243,6 +251,143 @@ TEST_F(ValkeyAdapterLiveTest, DistributedBackendOffloadAndLoad) {
     ValkeyObjectStorageAdapter cleaner(distributed_config.fsdir);
     ASSERT_TRUE(cleaner.Init());
     for (const auto& key : {"kv/first", "kv/second"}) (void)cleaner.Delete(key);
+}
+
+// ─── RDMA transport ──────────────────────────────────────────────────────────
+
+const char* RdmaProtocol() {
+    return std::getenv("MOONCAKE_VALKEY_RDMA_PROTOCOL");
+}
+const char* RdmaLocalIp() {
+    return std::getenv("MOONCAKE_VALKEY_RDMA_LOCAL_IP");
+}
+
+class ValkeyAdapterRdmaLiveTest : public ::testing::Test {
+   protected:
+    static constexpr size_t kBufferSize = 256ull << 20;
+
+    void SetUp() override {
+        if (!LiveEnabled() || !RdmaProtocol() || !RdmaLocalIp()) {
+            GTEST_SKIP() << "Set MOONCAKE_VALKEY_ADDR, "
+                            "MOONCAKE_VALKEY_RDMA_PROTOCOL and "
+                            "MOONCAKE_VALKEY_RDMA_LOCAL_IP";
+        }
+        engine_ = std::make_unique<TransferEngine>(false);
+        engine_->getLocalTopology()->discover({});
+        const std::string ip = RdmaLocalIp();
+        ASSERT_EQ(
+            engine_->init("P2PHANDSHAKE", ip + ":13360", ip.c_str(), 13360), 0);
+        ASSERT_NE(engine_->installTransport(RdmaProtocol(), nullptr), nullptr);
+        buffer_ = static_cast<char*>(std::aligned_alloc(4096, kBufferSize));
+        ASSERT_NE(buffer_, nullptr);
+        ASSERT_EQ(engine_->registerLocalMemory(buffer_, kBufferSize, "cpu:0"),
+                  0);
+
+        setenv("MOONCAKE_VALKEY_TRANSPORT", "rdma", 1);
+        prefix_ =
+            "/mooncake-valkey-rdma-test-" + std::to_string(getpid()) + "-" +
+            ::testing::UnitTest::GetInstance()->current_test_info()->name();
+        adapter_ = std::make_unique<ValkeyObjectStorageAdapter>(prefix_);
+        adapter_->BindTransferEndpoint(engine_->getLocalIpAndPort());
+        ASSERT_TRUE(adapter_->Init());
+    }
+
+    void TearDown() override {
+        unsetenv("MOONCAKE_VALKEY_TRANSPORT");
+        if (adapter_) {
+            auto keys = adapter_->ListKeys();
+            if (keys) {
+                for (const auto& key : *keys) {
+                    (void)adapter_->Delete(key.logical_key);
+                }
+            }
+            adapter_.reset();
+        }
+        if (engine_ && buffer_) engine_->unregisterLocalMemory(buffer_);
+        std::free(buffer_);
+    }
+
+    char* Region(size_t offset) { return buffer_ + offset; }
+
+    std::unique_ptr<TransferEngine> engine_;
+    char* buffer_ = nullptr;
+    std::string prefix_;
+    std::unique_ptr<ValkeyObjectStorageAdapter> adapter_;
+};
+
+TEST_F(ValkeyAdapterRdmaLiveTest, MultiRegionPutAndGetUseRdma) {
+    const std::string a = Pattern(8 << 20, 'a'), b = Pattern(12345, 'k');
+    std::memcpy(Region(0), a.data(), a.size());
+    std::memcpy(Region(64 << 20), b.data(), b.size());
+    iovec iov[2] = {{Region(0), a.size()}, {Region(64 << 20), b.size()}};
+    ASSERT_TRUE(adapter_->PutV("multi", iov, 2));
+
+    char* out = Region(128 << 20);
+    std::memset(out, 0, a.size() + b.size());
+    auto got = adapter_->Get("multi", out, a.size() + b.size());
+    ASSERT_TRUE(got);
+    EXPECT_EQ(std::string(out, a.size() + b.size()), a + b);
+
+    const auto stats = adapter_->GetTransportStats();
+    EXPECT_EQ(stats.rdma_requests, 2u);
+    EXPECT_EQ(stats.rdma_fallbacks, 0u);
+    EXPECT_EQ(stats.tcp_requests, 0u);
+}
+
+TEST_F(ValkeyAdapterRdmaLiveTest, BatchesUseRdma) {
+    constexpr int kCount = 32;
+    constexpr size_t kSize = 1 << 20;
+    std::vector<iovec> iovs(kCount);
+    std::vector<ObjectPutRequest> puts;
+    std::vector<ObjectGetRequest> gets;
+    for (int i = 0; i < kCount; ++i) {
+        const std::string data = Pattern(kSize, 'a' + i % 26);
+        std::memcpy(Region(i * kSize), data.data(), kSize);
+        iovs[i] = {Region(i * kSize), kSize};
+        puts.push_back({"batch/" + std::to_string(i), &iovs[i], 1});
+        gets.push_back({"batch/" + std::to_string(i),
+                        Region((64 << 20) + i * kSize), kSize});
+    }
+    for (const auto& result : adapter_->PutBatch(puts)) ASSERT_TRUE(result);
+    gets.push_back({"batch/missing", Region(200 << 20), 16});
+    auto results = adapter_->GetBatch(gets);
+    for (int i = 0; i < kCount; ++i) {
+        ASSERT_TRUE(results[i]) << i;
+        EXPECT_EQ(0, std::memcmp(Region(i * kSize),
+                                 Region((64 << 20) + i * kSize), kSize))
+            << i;
+    }
+    ASSERT_FALSE(results.back());
+    EXPECT_EQ(results.back().error(), ErrorCode::FILE_NOT_FOUND);
+    const auto stats = adapter_->GetTransportStats();
+    EXPECT_EQ(stats.rdma_requests, 2u * kCount + 1);
+    EXPECT_EQ(stats.rdma_fallbacks, 0u);
+}
+
+// A buffer outside the registered memory is not reachable by the server, so
+// the request is redone over TCP and still succeeds.
+TEST_F(ValkeyAdapterRdmaLiveTest, UnregisteredBuffersFallBackToTcp) {
+    const std::string data = Pattern(2 << 20, 'u');
+    ASSERT_TRUE(adapter_->Put("heap", {data.data(), data.size()}));
+    std::string out(data.size(), '\0');
+    ASSERT_TRUE(adapter_->Get("heap", out.data(), out.size()));
+    EXPECT_EQ(out, data);
+    const auto stats = adapter_->GetTransportStats();
+    EXPECT_EQ(stats.rdma_requests, 0u);
+    EXPECT_EQ(stats.rdma_fallbacks, 2u);
+    EXPECT_EQ(stats.tcp_requests, 2u);
+}
+
+// A read shorter than the object cannot be served by BLOB.RDMA_GET, which
+// writes the whole object; it is redone over TCP.
+TEST_F(ValkeyAdapterRdmaLiveTest, PrefixReadFallsBackToTcp) {
+    const std::string data = Pattern(1 << 20, 'p');
+    std::memcpy(Region(0), data.data(), data.size());
+    ASSERT_TRUE(adapter_->Put("prefix", {Region(0), data.size()}));
+    auto got = adapter_->Get("prefix", Region(64 << 20), 4096);
+    ASSERT_TRUE(got);
+    EXPECT_EQ(std::string(Region(64 << 20), 4096), data.substr(0, 4096));
+    EXPECT_EQ(adapter_->GetTransportStats().rdma_fallbacks, 1u);
 }
 
 }  // namespace

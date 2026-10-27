@@ -201,6 +201,27 @@ export MOONCAKE_VALKEY_ADDR=valkey-host:6379
 | `MOONCAKE_VALKEY_PASSWORD` | Empty | Password; `AUTH` is skipped when empty. |
 | `MOONCAKE_VALKEY_POOL_SIZE` | `8` | Connections per adapter. Batch requests are spread across them and pipelined per connection. |
 | `MOONCAKE_VALKEY_TIMEOUT_MS` | `30000` | Connect and per-command timeout. |
+| `MOONCAKE_VALKEY_TRANSPORT` | `tcp` | `tcp`, or `rdma` to let the server move object bytes with RDMA (see below). |
+
+With `MOONCAKE_VALKEY_TRANSPORT=rdma`, the Valkey server reads offloaded
+objects straight out of the owner's mounted segment, and writes loaded objects
+into FileStorage's registered buffers, with one-sided RDMA (`BLOB.RDMA_SET`,
+`BLOB.RDMA_GET`). The owner sends its Transfer Engine segment name in
+`BLOB.RDMA_HELLO`, once per connection. This path requires:
+
+- the module's Transfer Engine backend on the server
+  (`fabric-provider MooncakeTe`), which is not in a valkey-large-object release
+  yet;
+- a Transfer Engine transport on the owner, such as `efa` or `rdma`, the same
+  one the server uses;
+- that the server can open the owner's segment: `P2PHANDSHAKE` on both sides,
+  or the same metadata service.
+
+A request the server cannot carry over RDMA, for example one whose buffer is
+not registered with the owner's Transfer Engine, is redone over TCP. On hosts
+with several NICs, Transfer Engine sends a host buffer's traffic over the NICs
+local to its NUMA node, so spread the server's pool across nodes (the module's
+`te-locations`) to use every NIC.
 
 Initialization fails if the server does not have `BLOB.TCP_SET`. The module
 rejects empty objects and objects larger than its `max-object-size` (512 MiB by

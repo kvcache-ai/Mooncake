@@ -100,6 +100,11 @@ class ObjectStorageAdapter {
     virtual tl::expected<void, ErrorCode> CheckHealth() {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
+    // The Transfer Engine segment that this process's buffers are registered
+    // under, for adapters that let the storage service move data with RDMA.
+    // Called before Init(). Optional; the default ignores it.
+    virtual void BindTransferEndpoint(const std::string& /*segment_name*/) {}
+
     virtual const char* GetName() const = 0;
 };
 

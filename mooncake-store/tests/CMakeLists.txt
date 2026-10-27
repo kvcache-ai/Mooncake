@@ -565,3 +565,8 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+if(STORE_USE_REDIS)
+  # file_storage_test's Valkey cases read the server's INFO counters.
+  target_link_libraries(file_storage_test PRIVATE Mooncake::hiredis)
+endif()

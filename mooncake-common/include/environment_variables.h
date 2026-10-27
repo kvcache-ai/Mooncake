@@ -175,6 +175,7 @@ struct ValkeyAdapterEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_VALKEY_PASSWORD);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_VALKEY_POOL_SIZE);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_VALKEY_TIMEOUT_MS);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_VALKEY_TRANSPORT);
 };
 
 struct S3AdapterEnvironmentVariables {
