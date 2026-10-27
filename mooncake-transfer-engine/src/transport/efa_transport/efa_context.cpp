@@ -809,7 +809,6 @@ static int getCudaDeviceForPointer(const void* ptr, cudaError_t& status) {
 int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
                                              int access,
                                              EfaMemoryRegionMeta& mrMeta) {
-    (void)access;
     if (length > (size_t)globalConfig().max_mr_size) {
         LOG(ERROR) << "Buffer length " << length
                    << " exceeds device max_mr_size "
@@ -822,8 +821,11 @@ int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
     mrMeta.addr = addr;
     mrMeta.length = length;
 
-    // For EFA, we need local read/write and remote read/write
-    uint64_t fi_access = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+    // Local read/write always; remote rights only when the caller asked for
+    // them (IBV_ACCESS_REMOTE_* derived from remote_accessible).
+    uint64_t fi_access = FI_READ | FI_WRITE;
+    if (access & IBV_ACCESS_REMOTE_READ) fi_access |= FI_REMOTE_READ;
+    if (access & IBV_ACCESS_REMOTE_WRITE) fi_access |= FI_REMOTE_WRITE;
 
     // Detect memory type and use fi_mr_regattr() for GPU memory.
     // The EFA provider's fi_mr_reg() hardcodes iface=FI_HMEM_SYSTEM,
