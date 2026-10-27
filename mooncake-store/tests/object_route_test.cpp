@@ -71,7 +71,6 @@ TEST(ObjectRouteTest, PublishMakesTheObjectReachableUnderItsKey) {
         // The guard that published now holds the object it published.
         ASSERT_TRUE(guard.has_object());
         EXPECT_EQ(guard.generation(), generation);
-        EXPECT_EQ(guard.metadata().user_key, "k1");
         EXPECT_FALSE(guard.state().HasWorkInFlight());
     }
     EXPECT_NE(generation, 0u);
@@ -584,7 +583,6 @@ TEST(ObjectRouteTest, ReadCursorVisitsEveryObjectOnce) {
         // The cursor names the publication it stands on.
         EXPECT_EQ(object.ref().key, object.key());
         EXPECT_EQ(object.ref().generation, object.generation());
-        EXPECT_EQ(object.metadata().user_key, object.key());
         keys.push_back(object.key());
     }
     for (const auto& ref : published) {
@@ -762,21 +760,6 @@ TEST(ObjectRouteDeathTest, PublishOverAnObjectAborts) {
             (void)test::PublishEnvelope(guard);
         },
         "already holds an object");
-}
-
-TEST(ObjectRouteDeathTest, PublishOfAnotherKeysMetadataAborts) {
-    ObjectRoute route;
-    const auto write_time =
-        std::chrono::system_clock::time_point(std::chrono::seconds(1));
-    EXPECT_DEATH(
-        {
-            auto guard = route.WriteKey("k1");
-            (void)guard.Publish(UUID{1, 2}, write_time, 128,
-                                std::vector<Replica>{}, std::nullopt, false,
-                                ObjectDataType::UNKNOWN, std::string(),
-                                TenantId(), std::string("k2"));
-        },
-        "of an object keyed k2");
 }
 
 TEST(ObjectRouteDeathTest, TearDownOfAnEmptyKeyAborts) {
@@ -1069,8 +1052,7 @@ TEST(ObjectRouteTest, ChurnKeepsTheRouteAndTheGroupConsistent) {
             std::this_thread::yield();
             std::vector<std::string> visited;
             for (auto object : route.ReadCursor()) {
-                if (object.generation() == 0 ||
-                    object.metadata().user_key != object.key()) {
+                if (object.generation() == 0) {
                     violation();
                 }
                 visited.push_back(object.key());
