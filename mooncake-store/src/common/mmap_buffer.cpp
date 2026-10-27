@@ -296,6 +296,47 @@ void free_buffer_mmap_memory(void *ptr, size_t total_size) {
     }
 }
 
+int bind_buffer_numa_segments(void *ptr, size_t total_size,
+                              const std::vector<int> &numa_nodes,
+                              size_t page_size) {
+    if (!ptr || total_size == 0 || numa_nodes.empty()) {
+        LOG(ERROR) << "Invalid params: ptr=" << ptr
+                   << " total_size=" << total_size
+                   << " numa_nodes.size=" << numa_nodes.size();
+        return -1;
+    }
+
+    if (page_size == 0) page_size = getpagesize();
+    const size_t n = numa_nodes.size();
+    if (total_size % n != 0) {
+        LOG(ERROR) << "total_size=" << total_size
+                   << " is not divisible by numa node count=" << n;
+        return -1;
+    }
+    const size_t region_size = total_size / n;
+    if (region_size == 0 || region_size % page_size != 0) {
+        LOG(ERROR) << "region_size=" << region_size
+                   << " is not aligned to page_size=" << page_size;
+        return -1;
+    }
+
+    int max_node = numa_num_possible_nodes();
+    for (size_t i = 0; i < n; ++i) {
+        struct bitmask *mask = numa_bitmask_alloc(max_node);
+        numa_bitmask_setbit(mask, numa_nodes[i]);
+        char *region = static_cast<char *>(ptr) + i * region_size;
+        long rc =
+            mbind(region, region_size, MPOL_BIND, mask->maskp, mask->size, 0);
+        numa_bitmask_free(mask);
+        if (rc != 0) {
+            LOG(ERROR) << "mbind failed for NUMA " << numa_nodes[i]
+                       << ", errno=" << errno << " (" << strerror(errno) << ")";
+            return -1;
+        }
+    }
+    return 0;
+}
+
 // NUMA-segmented buffer allocation
 void *allocate_buffer_numa_segments(size_t total_size,
                                     const std::vector<int> &numa_nodes,
@@ -331,21 +372,9 @@ void *allocate_buffer_numa_segments(size_t total_size,
         return nullptr;
     }
 
-    // bind each region to its NUMA node
-    int max_node = numa_num_possible_nodes();
-    for (size_t i = 0; i < n; ++i) {
-        struct bitmask *mask = numa_bitmask_alloc(max_node);
-        numa_bitmask_setbit(mask, numa_nodes[i]);
-        char *region = static_cast<char *>(ptr) + i * region_size;
-        long rc =
-            mbind(region, region_size, MPOL_BIND, mask->maskp, mask->size, 0);
-        numa_bitmask_free(mask);
-        if (rc != 0) {
-            LOG(ERROR) << "mbind failed for NUMA " << numa_nodes[i]
-                       << ", errno=" << errno << " (" << strerror(errno) << ")";
-            munmap(ptr, map_size);
-            return nullptr;
-        }
+    if (bind_buffer_numa_segments(ptr, map_size, numa_nodes, page_size) != 0) {
+        munmap(ptr, map_size);
+        return nullptr;
     }
 
     // Leave the mapping lazy. The caller may explicitly populate it with
