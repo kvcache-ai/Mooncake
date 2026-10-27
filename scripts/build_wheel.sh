@@ -197,6 +197,7 @@ MIGRATED_PYTHON_MODULES=(
     py.typed
     engine.pyi
     structured_object_store.py
+    _structured_ranges.py
     _fast_copy.c
     http_metadata_server.py
     _launcher.py
