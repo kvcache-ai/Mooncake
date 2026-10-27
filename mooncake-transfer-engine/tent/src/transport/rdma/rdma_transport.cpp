@@ -263,11 +263,13 @@ static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
     if (disable_gpu_direct) {
         return false;
     }
-    // Intel XPU: no peer-memory kernel module; device buffers are exported as
+    // XPU and MLU use dma-buf registration here, without a peer-memory
+    // module requirement. Device buffers are exported as
     // dma-bufs and registered with ibv_reg_dmabuf_mr, so the presence of that
     // verb is the capability signal. Buffers that fail to export at
     // registration time are simply not offered on RDMA and get staged.
-    if (Platform::getLoader().type() == "xpu") {
+    if (Platform::getLoader().type() == "xpu" ||
+        Platform::getLoader().type() == "mlu") {
         auto& loader = IbvLoader::Instance();
         return loader.available() && loader.sym().ibv_reg_dmabuf_mr != nullptr;
     }
@@ -711,10 +713,11 @@ Status RdmaTransport::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
 
 bool RdmaTransport::warmupMemory(void* addr, size_t length) {
     if (length < kMrWarmupMinBytes) return false;
-    // Warm-up is a plain ibv_reg_mr. Intel XPU VRAM has no host pages behind
+    // Warm-up is a plain ibv_reg_mr. XPU/MLU VRAM has no host pages behind
     // it and is registered through dma-buf export instead, so the temporary
     // ibv_reg_mr would only EFAULT.
-    if (Platform::getLoader().getMemoryType(addr) == MTYPE_XPU) return false;
+    const auto type = Platform::getLoader().getMemoryType(addr);
+    if (type == MTYPE_XPU || type == MTYPE_MLU) return false;
     unsigned hwc = std::thread::hardware_concurrency();
     if (hwc < 4) return false;
     RdmaContext* warmup_ctx = nullptr;

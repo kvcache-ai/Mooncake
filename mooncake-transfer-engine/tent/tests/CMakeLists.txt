@@ -405,7 +405,14 @@ target_link_libraries(tent_rdma_transport_test PRIVATE gtest gtest_main
                                                        tent_link_group ibverbs)
 target_include_directories(tent_rdma_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-add_test(NAME tent_rdma_transport_test COMMAND tent_rdma_transport_test)
+# The fork-based case needs a fresh process: earlier cases initialize device
+# runtimes and RDMA state that must not be inherited by the child.
+add_test(NAME tent_rdma_transport_test
+         COMMAND tent_rdma_transport_test
+                 --gtest_filter=-RdmaTransportIntegrationTest.*)
+add_test(NAME tent_rdma_process_test
+         COMMAND tent_rdma_transport_test
+                 --gtest_filter=RdmaTransportIntegrationTest.*)
 
 # Regression test for the edge-triggered async event fd: one epoll wakeup must
 # drain the whole queue. Wraps ibv_get_async_event to script the event source,
@@ -909,8 +916,15 @@ if(TARGET tent_xport_fabric)
   endforeach()
 endif()
 
+add_executable(tent_mlu_topology_test mlu/mlu_topology_test.cpp)
+target_link_libraries(tent_mlu_topology_test PRIVATE gtest gtest_main
+                                                     tent_link_group)
+target_include_directories(tent_mlu_topology_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_mlu_topology_test COMMAND tent_mlu_topology_test)
+
 if(USE_MLU)
-  foreach(suite platform transport engine process)
+  foreach(suite platform transport engine process rdma)
     add_executable(tent_mlu_${suite}_test mlu/mlu_${suite}_test.cpp)
     target_link_libraries(tent_mlu_${suite}_test PRIVATE gtest gtest_main
                                                          tent_link_group)

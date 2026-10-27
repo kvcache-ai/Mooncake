@@ -14,6 +14,8 @@
 
 #include "tent/runtime/platform.h"
 
+#include <unistd.h>
+
 #include <mutex>
 #include <unordered_set>
 #include <vector>
@@ -64,6 +66,17 @@ Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
 #endif
     });
     return *g_instance;
+}
+
+DmabufExport DmabufExport::owned(int fd, uint64_t offset) {
+    DmabufExport result;
+    result.fd = fd;
+    result.offset = offset;
+    result.owner_ = std::shared_ptr<int>(new int(fd), [](int* value) {
+        if (*value >= 0) close(*value);
+        delete value;
+    });
+    return result;
 }
 
 Status Platform::synchronizeDevices(const Topology* topology) {

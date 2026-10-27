@@ -13,9 +13,13 @@
 // limitations under the License.
 
 #include "tent/platform/mlu.h"
+#include "tent/platform/mlu_topology.h"
 
 #include <cnrt.h>
 #include <cn_api.h>
+
+#include <dlfcn.h>
+#include <unistd.h>
 
 #include <charconv>
 #include <fstream>
@@ -100,17 +104,11 @@ Status MluPlatform::probe(std::vector<Topology::NicEntry>& nics,
         entry.numa_node = -1;
         char pci[32] = {};
         CHECK_STATUS(checked(cnrtDeviceGetPCIBusId(pci, sizeof(pci), device)));
-        entry.pci_bus_id = pci;
-        std::ifstream numa_file(std::string("/sys/bus/pci/devices/") + pci +
-                                "/numa_node");
-        numa_file >> entry.numa_node;
-        for (size_t nic = 0; nic < nics.size(); ++nic) {
-            auto rank =
-                entry.numa_node >= 0 && entry.numa_node == nics[nic].numa_node
-                    ? 0
-                    : 2;
-            entry.device_list[rank].push_back(nic);
-        }
+        entry.pci_bus_id = mlu_detail::normalizePciBusId(pci);
+        std::ifstream numa_file(std::string("/sys/bus/pci/devices/") +
+                                entry.pci_bus_id + "/numa_node");
+        if (!(numa_file >> entry.numa_node)) entry.numa_node = -1;
+        mlu_detail::rankNics(entry, nics);
         mems.push_back(std::move(entry));
     }
     return Status::OK();
@@ -211,6 +209,66 @@ const std::vector<RangeLocation> MluPlatform::getLocation(void* start,
     }
     if (!hostMemory(attr)) return {};
     return CpuPlatform::getLocation(start, len, skip_prefault);
+}
+
+Status MluPlatform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
+    out = DmabufExport{};
+    ContextGuard guard;
+    CHECK_STATUS(guard.status());
+    cnrtPointerAttributes_t attr{};
+    CHECK_STATUS(attributes(addr, attr));
+    if (hostMemory(attr))
+        return Status::InvalidArgument("Not an MLU device allocation");
+    if (attr.type != cnrtMemTypeDevice)
+        return Status::InternalError("Unknown MLU memory type");
+    CHECK_STATUS(guard.use(addr));
+    CHECK_STATUS(deviceRange(addr, length));
+    if (!length) return Status::InvalidArgument("Empty MLU dma-buf range");
+#ifdef TENT_MLU_HAS_DMABUF
+    // Resolve dynamically so a binary built with a newer SDK still supports
+    // host staging when an older runtime lacks the export entry point.
+    static const auto export_range =
+        reinterpret_cast<decltype(&cnMemGetHandleForAddressRange)>(
+            dlsym(RTLD_DEFAULT, "cnMemGetHandleForAddressRange"));
+    if (!export_range)
+        return Status::NotImplemented("CNDRV dma-buf export unavailable");
+    CNdev device;
+    CHECK_STATUS(checkedDriver(cnDeviceGet(&device, attr.device)));
+    int supported = 0;
+    CHECK_STATUS(checkedDriver(cnDeviceGetAttribute(
+        &supported, CN_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, device)));
+    if (!supported)
+        return Status::NotImplemented("MLU device does not support dma-buf");
+
+    CNaddr base = 0;
+    cn_uint64_t size = 0;
+    const auto address = reinterpret_cast<CNaddr>(addr);
+    CHECK_STATUS(checkedDriver(cnMemGetAddressRange(&base, &size, address)));
+    const auto page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return Status::InternalError("Cannot determine page size");
+    const auto start = address - address % page;
+    // deviceRange validated the requested span. Check rounding separately:
+    // export only the pages needed by this MR, without crossing allocation
+    // boundaries or overflowing an address near the end of the address space.
+    if (length > std::numeric_limits<CNaddr>::max() - address)
+        return Status::InvalidArgument("MLU dma-buf address overflow");
+    const auto end = address + length;
+    const auto padding = (page - end % page) % page;
+    if (start < base || end < base || end - base > size ||
+        padding > size - (end - base) ||
+        padding > std::numeric_limits<CNaddr>::max() - end)
+        return Status::NotImplemented(
+            "MLU allocation cannot cover a page-aligned dma-buf range");
+    int fd = -1;
+    CHECK_STATUS(
+        checkedDriver(export_range(&fd, start, end + padding - start,
+                                   CN_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0)));
+    if (fd < 0) return Status::InternalError("CNDRV exported an invalid fd");
+    out = DmabufExport::owned(fd, address - start);
+    return Status::OK();
+#else
+    return Status::NotImplemented("Neuware SDK has no dma-buf export API");
+#endif
 }
 
 Status MluPlatform::synchronizeDevices(const Topology* topology) {
