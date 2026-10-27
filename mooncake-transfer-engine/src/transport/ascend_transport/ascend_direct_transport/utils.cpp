@@ -373,28 +373,29 @@ bool ReadFirstLine(const std::string& path, std::string* line) {
 
 // numa_out is the node id. The returned CPUs are that node's cpulist,
 // intersected with this process's cpuset. Empty means do not bind.
-// DSMI uses the device id visible to this process. Inside an Ascend container
-// that id is renumbered, even though ACL can still report the physical id.
-std::vector<int> CpusForLogicDevice(DsmiInfoFn info, int32_t logic_id,
-                                    int* numa_out) {
+// ACL callers provide a user device ID. DSMI expects the driver logical ID;
+// ASCEND_RT_VISIBLE_DEVICES may make these differ even inside a container.
+std::vector<int> CpusForUserDevice(DsmiInfoFn info, int32_t user_id,
+                                   int* numa_out) {
     *numa_out = -1;
-    int32_t user_id = -1;
-    const aclError user_ret =
-        aclrtGetUserDevIdByLogicDevId(logic_id, &user_id);
-    if (user_ret != ACL_ERROR_NONE || user_id < 0) {
-        LOG(WARNING) << "[affinity] cannot resolve user id for ACL logic device "
-                     << logic_id << ", ret=" << user_ret;
+    int32_t logic_id = -1;
+    const aclError logic_ret =
+        aclrtGetLogicDevIdByUserDevId(user_id, &logic_id);
+    if (logic_ret != ACL_ERROR_NONE || logic_id < 0) {
+        LOG(WARNING) << "[affinity] cannot resolve logic id for user device "
+                     << user_id << ", ret=" << logic_ret;
         return {};
     }
 
     char name[kUrmaNameCap];
     std::memset(name, 0, sizeof(name));
     unsigned int size = sizeof(name);
-    const int ret = info(static_cast<unsigned int>(user_id), kDsmiMainCmdUb,
+    const int ret = info(static_cast<unsigned int>(logic_id), kDsmiMainCmdUb,
                          kDsmiUbSubUrmaName, name, &size);
     if (ret != 0 || name[0] == '\0') {
-        LOG(WARNING) << "[affinity] DSMI URMA name unavailable for user device "
-                     << user_id << ", ret=" << ret;
+        LOG(WARNING)
+            << "[affinity] DSMI URMA name unavailable for logic device "
+            << logic_id << ", ret=" << ret;
         return {};
     }
 
@@ -436,9 +437,10 @@ AscendAffinityPlan BuildAscendAffinityPlan(
         same = false;
     }
     for (size_t i = 0; info != nullptr && i < logic_device_ids.size(); ++i) {
-        const int32_t logic_id = logic_device_ids[i];
+        // Historical parameter name; these values originate from ACL user IDs.
+        const int32_t user_id = logic_device_ids[i];
         int numa = -1;
-        plan.per_device_cpus[i] = CpusForLogicDevice(info, logic_id, &numa);
+        plan.per_device_cpus[i] = CpusForUserDevice(info, user_id, &numa);
         if (plan.per_device_cpus[i].empty()) {
             same = false;
             continue;
