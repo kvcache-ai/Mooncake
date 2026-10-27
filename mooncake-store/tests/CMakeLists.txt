@@ -46,6 +46,15 @@ add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(replica_allocator_test replica_allocator_test.cpp)
 add_store_test(segment_pool_test segment_pool_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
+if(USE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  add_executable(cuda_ipc_buffer_test cuda_ipc_buffer_test.cpp)
+  target_link_libraries(cuda_ipc_buffer_test
+                        PRIVATE mooncake_store CUDA::cuda_driver CUDA::cudart)
+  add_test(NAME cuda_ipc_buffer_test COMMAND cuda_ipc_buffer_test)
+  set_tests_properties(cuda_ipc_buffer_test PROPERTIES SKIP_RETURN_CODE 77
+                                                       TIMEOUT 60)
+endif()
 if(USE_MLU)
   foreach(mlu_test mlu_accelerator_test mlu_store_test)
     # These tests do not use master_service_test_peer, which would pull the
@@ -60,6 +69,7 @@ if(USE_MLU)
 endif()
 add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
 add_store_test(real_client_direct_read_test real_client_direct_read_test.cpp)
+add_store_test(local_shm_conflict_test local_shm_conflict_test.cpp)
 add_store_test(ranged_disk_lease_test ranged_disk_lease_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
@@ -213,8 +223,7 @@ add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 add_store_test(nvmeof_initiator_test nvmeof_initiator_test.cpp)
 add_store_test(nof_page_registry_test nof_page_registry_test.cpp)
-add_store_test(nof_probe_context_pool_test
-               nof_probe_context_pool_test.cpp)
+add_store_test(nof_probe_context_pool_test nof_probe_context_pool_test.cpp)
 if(USE_TENT)
   target_compile_definitions(transfer_task_test PRIVATE USE_TENT)
   target_link_libraries(transfer_task_test PRIVATE tent)
@@ -263,10 +272,9 @@ if(USE_TENT)
     NAME transfer_submitter_scatter_tent_test
     COMMAND
       transfer_task_test
-      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath
-  )
-  set_tests_properties(transfer_submitter_scatter_tent_test PROPERTIES
-                       ENVIRONMENT "MC_USE_TENT=1")
+      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath)
+  set_tests_properties(transfer_submitter_scatter_tent_test
+                       PROPERTIES ENVIRONMENT "MC_USE_TENT=1")
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_manager_test tenant_quota_manager_test.cpp)
@@ -318,9 +326,12 @@ add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(local_hot_cache_concurrency_test
                local_hot_cache_concurrency_test.cpp)
-add_store_test(real_client_hugepage_register_test real_client_hugepage_register_test.cpp)
-add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
-add_store_test(real_client_uninitialized_test real_client_uninitialized_test.cpp)
+add_store_test(real_client_hugepage_register_test
+               real_client_hugepage_register_test.cpp)
+add_store_test(real_client_regular_page_register_test
+               real_client_regular_page_register_test.cpp)
+add_store_test(real_client_uninitialized_test
+               real_client_uninitialized_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(standalone_client_test standalone_client_test.cpp)
@@ -418,7 +429,10 @@ add_store_test(bucket_direct_write_test bucket_direct_write_test.cpp)
 if(TARGET Mooncake::liburing)
   target_compile_definitions(bucket_direct_write_test PRIVATE USE_URING)
 endif()
+add_store_test(batch_io_scheduler_test batch_io_scheduler_test.cpp)
 add_store_test(bucket_backend_config_test bucket_backend_config_test.cpp)
+add_store_test(bucket_disk_usage_scanner_test
+               bucket_disk_usage_scanner_test.cpp)
 add_store_test(file_per_key_config_test file_per_key_config_test.cpp)
 add_store_test(offset_allocator_backend_config_test
                offset_allocator_backend_config_test.cpp)
@@ -475,6 +489,7 @@ add_store_test(http_metadata_server_test http_metadata_server_test.cpp)
 add_store_test(mmap_arena_test mmap_arena_test.cpp)
 add_store_test(mmap_arena_config_test mmap_arena_config_test.cpp)
 add_store_test(mmap_arena_fallback_test mmap_arena_fallback_test.cpp)
+add_store_test(numa_segment_layout_test numa_segment_layout_test.cpp)
 add_store_test(object_data_type_test object_data_type_test.cpp)
 add_subdirectory(e2e)
 

@@ -235,10 +235,20 @@ class FileStorageTest : public ::testing::Test {
                                               .resource_id = "ssd-weight",
                                               .revision = "v1",
                                               .weight_generation = 1};
-        auto begin = client->BeginWeightImport({.identity = identity,
-                                                .payload_group_id = {},
-                                                .expected_payload_count = 1,
-                                                .expected_logical_bytes = 128});
+        auto begin = client->BeginWeightImport({
+            .identity = identity,
+            .payload_group_id = {},
+            .expected_payload_count = 1,
+            .expected_logical_bytes = 128,
+            .policy =
+                WeightStoragePolicy{
+                    .preferred_residency = WeightResidencyState::HOT,
+                    .migration_mode = WeightMigrationMode::MANUAL},
+            .affinity_summary =
+                {.affinity_count = 1,
+                 .affinity_digest = ComputeWeightAffinityMappingSha256(
+                     {{"managed-payload", 128, "payload"}})},
+        });
         ASSERT_TRUE(begin && *begin);
         const auto manifest_key = MakeWeightManifestKey(identity);
         const std::vector<std::string> keys{"ordinary-ssd", "managed-payload",
@@ -256,6 +266,10 @@ class FileStorageTest : public ::testing::Test {
                 config.group_ids = {(*begin)->manifest.payload_group_id};
                 config.data_type =
                     i == 1 ? ObjectDataType::WEIGHT : ObjectDataType::METADATA;
+                if (i == 1) {
+                    config.residency_affinity_ids =
+                        std::vector<std::string>{"payload"};
+                }
             }
             std::vector<Slice> slices{{buffer, values[i].size()}};
             ASSERT_TRUE(client->Put(keys[i], slices, config));
@@ -545,7 +559,8 @@ class FileStorageTest : public ::testing::Test {
 
     void RunSkippedOffloadScenario(
         size_t duplicate_count, bool fail_write,
-        StorageBackendType backend_type = StorageBackendType::kBucket) {
+        StorageBackendType backend_type = StorageBackendType::kBucket,
+        int64_t write_workers = 0) {
         testing::InProcMaster master;
         ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
                                      .set_enable_offload(true)
@@ -568,9 +583,15 @@ class FileStorageTest : public ::testing::Test {
             allocator.getBase(), kSegmentSize, "cpu:0", false, false));
         ASSERT_TRUE(client->MountLocalDiskSegment(true));
 
-        const std::vector<std::string> keys = {"duplicate_key", "other_key"};
+        std::vector<std::string> keys = {"duplicate_key", "other_key"};
         std::vector<std::string> values = {std::string(128, 'a'),
                                            std::string(128, 'b')};
+        if (write_workers > 0) {
+            for (size_t i = 2; i < 24; ++i) {
+                keys.push_back("parallel_key_" + std::to_string(i));
+                values.emplace_back(128 + i, static_cast<char>('a' + i % 26));
+            }
+        }
         ReplicateConfig replicate;
         replicate.replica_num = 1;
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -584,6 +605,11 @@ class FileStorageTest : public ::testing::Test {
         std::vector<OffloadTaskItem> tasks;
         ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
         ASSERT_EQ(tasks.size(), keys.size());
+        if (write_workers > 0) {
+            // A missing source must not fail the other keys in its bucket.
+            tasks.push_back(
+                {TenantId::Default().value(), "missing_source", 128});
+        }
         void* overwrite_buffer = allocator.allocate(values.front().size());
         ASSERT_NE(overwrite_buffer, nullptr);
         std::memset(overwrite_buffer, 'c', values.front().size());
@@ -601,7 +627,9 @@ class FileStorageTest : public ::testing::Test {
         fs::create_directories(config.storage_filepath);
         FileStorage file_storage(config, client, endpoint);
         BucketBackendConfig bucket_config;
-        bucket_config.bucket_keys_limit = keys.size();
+        bucket_config.write_io_workers = write_workers;
+        bucket_config.bucket_keys_limit = write_workers > 0 ? 12 : keys.size();
+        bucket_config.write_sub_batch_max_iovecs = 4;
         std::unordered_set<std::string> duplicates;
         for (size_t i = 0; i < duplicate_count; ++i) {
             duplicates.insert(TenantId::Default().MakeScopedKey(keys[i]));
@@ -1747,6 +1775,10 @@ TEST_F(FileStorageTest,
 
 TEST_F(FileStorageTest, EmptyHeartbeatFlushesDeferredTail) {
     RunDeferredHeartbeatTailScenario();
+}
+
+TEST_F(FileStorageTest, OffloadObjects_parallel_bucket_plans) {
+    RunSkippedOffloadScenario(0, false, StorageBackendType::kBucket, 3);
 }
 
 TEST_F(FileStorageTest, OffloadObjects_capacity_limit_releases_deferred_tasks) {

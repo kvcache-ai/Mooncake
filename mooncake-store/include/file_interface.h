@@ -165,7 +165,9 @@ class StorageFile {
     bool delete_on_write_fail_ = true;
     std::string filename_;
     int fd_;
-    ErrorCode error_code_{ErrorCode::OK};
+    // Atomic so parallel offload writers (PR #5020) can publish status read
+    // from other threads.
+    std::atomic<ErrorCode> error_code_{ErrorCode::OK};
     int sys_errno_ = 0;
     std::atomic<bool> is_locked_{false};
 };

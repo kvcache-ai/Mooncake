@@ -155,6 +155,9 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 
 | Environment Variable | Default | Description |
 |---|---|---|
+| `MOONCAKE_OFFLOAD_WRITE_IO_WORKERS` | `0` (disabled) | Shared writer count across buckets and their sub batches. `0` retains sequential offload; positive values enable parallel offload through `BatchIoScheduler`. |
+| `MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS` | `128` | Logical source Slices per write sub batch; minimum `4` when writers are enabled. Small tails up to one quarter join the preceding group within the same bucket. |
+| `MOONCAKE_OFFLOAD_WRITE_IO_BACKOFF_MS` | `300` | Positive delay in milliseconds before writers recheck pending or in-flight reads. |
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | `268435456` (256 MB) | Max size per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE` | `0` | Write mode: `0`/`false` keeps buffered writes; `packed` enables packed O_DIRECT/io_uring writes (`true`/`1` are aliases). Packed writes require a build with io_uring support and `MOONCAKE_OFFLOAD_USE_URING=true`; otherwise writes remain buffered. `aligned` enables aligned O_DIRECT writes, which do not need io_uring (see below). Unknown values fail backend initialization. `.meta` writes stay buffered with their exact protobuf length. |
@@ -163,7 +166,22 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST` | empty | Per-disk eviction thresholds as a comma-separated list, positionally aligned with the paths in `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; when set, it needs exactly one entry per path. Empty applies `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` to every disk. See {ref}`Multiple disks <ssd-offload-multiple-disks>` |
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`, applied **per disk** when several are configured. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
-| `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
+| `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | Directory-scan cadence: bounds the sync per-disk cache TTL, and sets the delay between completed background scans — the `mc-ssd-scan` thread traverses outside metadata locks while I/O workers read a cached estimate that also budgets writes admitted since the scan began. `<= 0` scans on every check. |
+
+### Optional parallel Bucket offload writes
+
+Set the write controls in the **Real Client** environment before starting the embedded Real Client:
+
+```bash
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
+export MOONCAKE_OFFLOAD_WRITE_IO_WORKERS=8
+export MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS=128
+export MOONCAKE_OFFLOAD_WRITE_IO_BACKOFF_MS=300
+```
+
+Leave the worker count unset or set it to `0` to retain sequential offload. Positive values enable a shared write worker pool across buckets. Benchmark throughput, tail latency, and CPU usage on the target volume to select a worker count. Parallel offload prepares all bucket plans in memory, publishes their sub batches together, and commits each bucket independently after its data writes and sync complete. Writers defer new sub batches while reads are active; this setting does not change master-side DRAM eviction policy. Reads retain the existing synchronous path. `MOONCAKE_OFFLOAD_USE_URING` selects the file I/O implementation separately.
+
+Write sub batches are formed within each bucket file. A final group of at most `floor(sub_batch_size / 4)` Slices joins the previous group: with the default `128`, `160` Slices form one group, while `161` form groups of `128` and `33`. Different bucket files' tails are never merged. Invalid write controls fail backend initialization.
 
 For `packed` direct bucket writes, each writing thread retains a 4096-byte-aligned buffer
 that grows to fit its largest bucket and is released when the thread exits.
