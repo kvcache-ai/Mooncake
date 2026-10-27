@@ -7717,7 +7717,12 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                         return matches_candidate(replica, candidate) &&
                                replica.is_processing();
                     });
-                if (processing || accessor.InProcessing() ||
+                // A managed weight leaves DFS only through its manager; a
+                // cold one may have no other copy.
+                const bool managed_weight =
+                    metadata.IsGrouped() &&
+                    weight_manager_.IsManagedGroup(metadata.group_id);
+                if (managed_weight || processing || accessor.InProcessing() ||
                     metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
                     (IsSoftPinActive(metadata, now) &&
                      !allow_evict_soft_pinned_objects_)) {

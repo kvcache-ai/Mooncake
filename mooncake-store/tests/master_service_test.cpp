@@ -3,6 +3,7 @@
 #include "config/replica_selection_config.h"
 #include "master_service/master_service_test_peer.h"
 #include "rpc_service.h"
+#include "weight_management.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -1223,6 +1224,91 @@ TEST_F(MasterServiceTest, DfsBucketEvictionKeepsBucketWithLeasedMember) {
         MasterServiceTestPeer(service).RunDfsEvictionForTesting();
 
         for (const std::string key : {"leased_member", "bucket_0_peer"}) {
+            auto replicas = service.GetReplicaList(key, TenantId::Default());
+            ASSERT_TRUE(replicas.has_value()) << key;
+            EXPECT_EQ(std::count_if(replicas->replicas.begin(),
+                                    replicas->replicas.end(),
+                                    [](const Replica::Descriptor& descriptor) {
+                                        return descriptor.is_dfs_replica();
+                                    }),
+                      1)
+                << key;
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsBucketEvictionKeepsBucketWithManagedWeight) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_bucket_managed_weight_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "8192");
+    ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "2");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "1");
+    ScopedEnvVar high_watermark("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.7");
+    ScopedEnvVar low_watermark("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.5");
+    ScopedEnvVar eviction_interval("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL",
+                                   "60");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        // The group is managed from the start of its import.
+        auto importing = service.BeginWeightImport(BeginWeightImportRequest{
+            .identity =
+                WeightRevisionIdentity{
+                    .tenant_id = "default",
+                    .name_space = "production",
+                    .resource_id = "llama-70b",
+                    .revision = "step-100",
+                    .weight_generation = 7,
+                },
+            .payload_group_id = {},
+            .expected_payload_count = 1,
+            .expected_logical_bytes = 4096,
+        });
+        ASSERT_TRUE(importing.has_value());
+
+        // Not hard-pinned and never read, so only its manager protects it.
+        ReplicateConfig weight_config;
+        weight_config.replica_num = 1;
+        weight_config.dfs_replica_num = 1;
+        weight_config.data_type = ObjectDataType::WEIGHT;
+        weight_config.group_ids =
+            std::vector<std::string>{importing->manifest.payload_group_id};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        // The first two keys fill the first bucket, the third starts another.
+        for (const auto& [key, key_config] :
+             std::vector<std::pair<std::string, ReplicateConfig>>{
+                 {"weight_member", weight_config},
+                 {"bucket_0_peer", config},
+                 {"bucket_1_peer", config}}) {
+            auto start = service.PutStart(
+                context.client_id, key, TenantId::Default(), 4096, key_config);
+            ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, key, TenantId::Default(),
+                                    ReplicaType::ALL)
+                            .has_value());
+        }
+
+        MasterServiceTestPeer(service).RunDfsEvictionForTesting();
+
+        for (const std::string key : {"weight_member", "bucket_0_peer"}) {
             auto replicas = service.GetReplicaList(key, TenantId::Default());
             ASSERT_TRUE(replicas.has_value()) << key;
             EXPECT_EQ(std::count_if(replicas->replicas.begin(),
