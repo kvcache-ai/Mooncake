@@ -1233,6 +1233,11 @@ ErrorCode P2PClientService::HandleStopEvent() {
     if (client_rpc_server_) {
         client_rpc_server_->stop();
     }
+    // Cancel recovery and drain RPCs first. Then join the periodic tier reader
+    // before Stop/Destroy can release the data plane; metrics_ outlives it.
+    if (metrics_) {
+        metrics_->StopMetricReporting();
+    }
     if (data_manager_) {
         data_manager_->Stop();
     }

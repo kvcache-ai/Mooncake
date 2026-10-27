@@ -1865,6 +1865,69 @@ TEST_F(HAIntegrationTest, StopWaitsForCallsBeforeSequentialDestroy) {
     client->Destroy();
 }
 
+TEST_F(HAIntegrationTest, StopJoinsMetricReaderBeforeDestroy) {
+    auto config = LifecycleConfig();
+    config.start_local_only = true;
+    config.metric_report_interval_seconds = 0;
+    auto created = P2PClientService::Create(config);
+    ASSERT_TRUE(created.has_value());
+    auto client = *created;
+    StopHeartbeatForManualEvents(client);
+    // Retain metrics so its destructor cannot supply the missing Stop join.
+    auto metrics = client->metrics_;
+    ASSERT_NE(metrics, nullptr);
+
+    struct Gate {
+        std::promise<void> entered;
+        std::promise<void> release;
+        std::shared_future<void> released = release.get_future().share();
+        std::atomic<bool> armed{false};
+        std::atomic<bool> signaled{false};
+    };
+    auto gate = std::make_shared<Gate>();
+    auto entered = gate->entered.get_future();
+    // RegisterTier polls once during initialization. Block only the subsequent
+    // read from the real reporting thread, with no sleeps used to create
+    // overlap.
+    metrics->tier_metric->RegisterTier(
+        UUID{0xdeadbeef, 0xbeefdead}, "shutdown_gate", MemoryType::DRAM, 0, 1,
+        [gate] {
+            if (gate->armed.load()) {
+                if (!gate->signaled.exchange(true)) gate->entered.set_value();
+                gate->released.wait();
+            }
+            return size_t{0};
+        });
+    gate->armed = true;
+    metrics->StartMetricReporting(1);
+    if (entered.wait_for(std::chrono::seconds(3)) !=
+        std::future_status::ready) {
+        gate->release.set_value();
+        metrics->StopMetricReporting();
+        FAIL() << "Metrics reporter did not enter the usage callback";
+    }
+
+    auto stopped = std::async(std::launch::async, [client] { client->Stop(); });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (client->GetServiceState() == P2PClientServiceState::LOCAL_ONLY &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(client->GetServiceState(), P2PClientServiceState::STOPPING);
+    EXPECT_EQ(stopped.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    gate->release.set_value();
+    stopped.get();
+    EXPECT_EQ(metrics->GetReportingInterval(), 0u);
+    EXPECT_EQ(client->GetServiceState(), P2PClientServiceState::STOPPED);
+
+    // Also clean up safely when exercising the pre-fix implementation.
+    metrics->StopMetricReporting();
+    client->Destroy();
+    EXPECT_EQ(client->data_manager_, nullptr);
+}
+
 TEST_F(HAIntegrationTest, RejectsOccupiedPeerPortBeforeRegistration) {
     coro_rpc::coro_rpc_server occupied(1, 0);
     auto started = occupied.async_start();
