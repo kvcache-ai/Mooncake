@@ -656,18 +656,24 @@ TEST(BufferProtocolTest, DescriptorProtocolsRoundTrip) {
     EXPECT_EQ(unknown.transport_endpoint_, "endpoint");
 }
 
-// Replacing a buffer's storage keeps a plain protocol and refuses a CXL one.
+// Replacing a buffer's storage hands the stored protocol to the new buffer and
+// refuses CXL on either side.
 TEST(BufferProtocolTest, ReplacementKeepsTcpAndRejectsCxl) {
-    auto allocator =
-        std::make_shared<test::TestBufferAllocator>("seg", "endpoint", 1 << 20);
-    Replica replica(allocator->allocate(1024), ReplicaStatus::COMPLETE);
+    auto allocator = std::make_shared<test::TestBufferAllocator>(
+        "seg", "endpoint", 1 << 20, DEFAULT_CXL_BASE);
+    auto protocol_of = [](const Replica& replica) {
+        return replica.get_descriptor()
+            .get_memory_descriptor()
+            .buffer_descriptor.protocol_;
+    };
 
-    ASSERT_TRUE(replica.replace_memory_buffer(allocator->allocate(1024)));
-    EXPECT_EQ(replica.get_descriptor()
-                  .get_memory_descriptor()
-                  .buffer_descriptor.protocol_,
-              "tcp");
+    // An ordinary memory replica keeps plain TCP across a replacement.
+    Replica tcp_replica(allocator->allocate(1024), ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(tcp_replica.replace_memory_buffer(allocator->allocate(1024)));
+    EXPECT_EQ(protocol_of(tcp_replica), "tcp");
 
+    // A descriptor with an unknown protocol keeps it: the imported buffer
+    // adopts what the replica advertised before the remount.
     auto unknown_allocator =
         std::make_shared<DummyBufferAllocator>("seg", "endpoint");
     AllocatedBuffer::Descriptor unknown{};
@@ -675,17 +681,24 @@ TEST(BufferProtocolTest, ReplacementKeepsTcpAndRejectsCxl) {
     unknown.buffer_address_ = 0x1000;
     unknown.protocol_ = "nvmeof";
     unknown.transport_endpoint_ = "endpoint";
-    ASSERT_TRUE(replica.replace_memory_buffer(
-        std::make_unique<AllocatedBuffer>(unknown_allocator, unknown)));
-    EXPECT_EQ(replica.get_descriptor()
-                  .get_memory_descriptor()
-                  .buffer_descriptor.protocol_,
-              "nvmeof");
+    Replica unknown_replica(
+        std::make_unique<AllocatedBuffer>(unknown_allocator, unknown),
+        ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(
+        unknown_replica.replace_memory_buffer(allocator->allocate(1024)));
+    EXPECT_EQ(protocol_of(unknown_replica), "nvmeof");
 
-    auto cxl = allocator->allocate(1024);
-    ASSERT_NE(cxl, nullptr);
-    cxl->change_to_cxl("client-binding");
-    EXPECT_FALSE(replica.replace_memory_buffer(std::move(cxl)));
+    // CXL is refused whether it is the stored protocol or the new buffer's.
+    auto new_cxl = allocator->allocate(1024);
+    ASSERT_NE(new_cxl, nullptr);
+    new_cxl->change_to_cxl("client-binding");
+    EXPECT_FALSE(tcp_replica.replace_memory_buffer(std::move(new_cxl)));
+
+    auto stored_cxl = allocator->allocate(1024);
+    ASSERT_NE(stored_cxl, nullptr);
+    stored_cxl->change_to_cxl("client-binding");
+    Replica cxl_replica(std::move(stored_cxl), ReplicaStatus::COMPLETE);
+    EXPECT_FALSE(cxl_replica.replace_memory_buffer(allocator->allocate(1024)));
 }
 
 }  // namespace mooncake
