@@ -99,6 +99,8 @@ DEFINE_bool(deadline_bw_arbitration, false,
 DEFINE_int32(local_gpu_id, 0,
              "Local device ordinal for VRAM, -1 for all visible devices. "
              "Selects an MLU device with --backend=tent in USE_MLU builds.");
+DEFINE_int32(dram_numa_node, -1,
+             "TENT DRAM NUMA node, -1 allocates on all configured nodes");
 DEFINE_int32(target_gpu_id, 0,
              "Offset for round-robin assignment across target buffers; "
              "-1 uses 0.");
@@ -182,6 +184,7 @@ std::string XferBenchConfig::tent_transport_hint;
 std::string XferBenchConfig::tent_intent_type;
 
 int XferBenchConfig::local_gpu_id = 0;
+int XferBenchConfig::dram_numa_node = -1;
 int XferBenchConfig::target_gpu_id = 0;
 
 namespace {
@@ -274,6 +277,7 @@ void XferBenchConfig::loadFromFlags() {
     tent_intent_type = FLAGS_tent_intent_type;
 
     local_gpu_id = FLAGS_local_gpu_id;
+    dram_numa_node = FLAGS_dram_numa_node;
     target_gpu_id = FLAGS_target_gpu_id;
 }
 

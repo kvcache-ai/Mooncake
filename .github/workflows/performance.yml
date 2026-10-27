@@ -1,0 +1,151 @@
+name: Performance regression
+
+on:
+  pull_request:
+    branches: [main, 'release/**']
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Baseline commit or ref (use the candidate SHA for an A/A calibration)
+        required: true
+        default: main
+      candidate_ref:
+        description: Candidate commit or ref (empty uses the selected workflow ref)
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Performance gate tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s scripts/ci/tests -p 'test_*perf*.py' -v
+
+  performance:
+    name: Performance Gate
+    needs: tests
+    if: ${{ always() }}
+    # Fork code always runs on a disposable hosted VM. A repository-owned PR
+    # can use the optional dedicated Linux runner label after A/A calibration.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-22.04' || vars.PERF_RUNNER || 'ubuntu-22.04' }}
+    timeout-minutes: 75
+    env:
+      PERF_ROOT: ${{ github.workspace }}/performance-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Initialize run directory
+        run: mkdir -p "$PERF_ROOT/results"
+
+      - name: Require harness tests
+        env:
+          TEST_RESULT: ${{ needs.tests.result }}
+        run: test "$TEST_RESULT" = success
+
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_ref || github.sha }}
+          path: candidate
+          fetch-depth: 2
+          submodules: true
+          persist-credentials: false
+
+      - name: Checkout baseline
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.baseline_ref || github.event.pull_request.base.sha }}
+          path: baseline
+          submodules: true
+          persist-credentials: false
+
+      - name: Freeze the benchmark and policy
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          baseline_sha=$(git -C baseline rev-parse HEAD)
+          candidate_sha=$(git -C candidate rev-parse HEAD)
+          if [ "$EVENT_NAME" = pull_request ]; then
+            test "$(git -C candidate rev-parse HEAD^1)" = "$baseline_sha"
+          fi
+          harness_source=baseline
+          if [ ! -f baseline/scripts/ci/performance/perf_gate.py ]; then
+            harness_source=candidate
+            echo '::warning::Bootstrapping the performance harness from the candidate; review the new policy before merging.'
+          fi
+          mkdir -p "$PERF_ROOT/harness"
+          cp -R "$harness_source/scripts/ci/performance/." "$PERF_ROOT/harness/"
+          cp baseline/mooncake-store/benchmarks/offset_allocator_concurrency_bench.cpp \
+            candidate/mooncake-store/benchmarks/offset_allocator_concurrency_bench.cpp
+          python3 "$PERF_ROOT/harness/freeze_build.py" \
+            --baseline baseline --candidate candidate \
+            --manifest "$PERF_ROOT/results/build-config.json"
+          echo "BASELINE_SHA=$baseline_sha" >> "$GITHUB_ENV"
+          echo "CANDIDATE_SHA=$candidate_sha" >> "$GITHUB_ENV"
+          echo "PERF_HARNESS_SHA=$(git -C "$harness_source" rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install hosted runner dependencies
+        if: runner.environment == 'github-hosted'
+        timeout-minutes: 10
+        working-directory: baseline
+        run: sudo bash dependencies.sh -y
+
+      - name: Build both revisions with the same Release configuration
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          for revision in baseline candidate; do
+            cmake -S "$revision" -B "$revision/build-perf" -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=c++ \
+              -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=ON \
+              -DWITH_STORE_RUST=OFF -DUSE_CUDA=OFF -DUSE_ETCD=OFF \
+              -DSTORE_USE_ETCD=OFF -DENABLE_DEBUG_SYMBOLS=OFF \
+              2>&1 | tee "$PERF_ROOT/results/$revision-configure.log"
+            cmake --build "$revision/build-perf" --parallel 2 \
+              --target offset_allocator_concurrency_bench \
+              2>&1 | tee "$PERF_ROOT/results/$revision-build.log"
+          done
+
+      - name: Collect alternating baseline and candidate samples
+        timeout-minutes: 16
+        run: |
+          python3 "$PERF_ROOT/harness/perf_gate.py" collect \
+            --baseline baseline/build-perf/mooncake-store/benchmarks/offset_allocator_concurrency_bench \
+            --candidate candidate/build-perf/mooncake-store/benchmarks/offset_allocator_concurrency_bench \
+            --baseline-sha "$BASELINE_SHA" --candidate-sha "$CANDIDATE_SHA" \
+            --collection-timeout-seconds 900 \
+            --output "$PERF_ROOT/results"
+
+      - name: Publish comparison and enforce thresholds
+        if: ${{ always() }}
+        run: |
+          mkdir -p "$PERF_ROOT/results"
+          if [ ! -f "$PERF_ROOT/harness/perf_gate.py" ]; then
+            echo '## Performance Gate: ERROR — setup or harness tests failed' > "$PERF_ROOT/results/summary.md"
+            cat "$PERF_ROOT/results/summary.md" >> "$GITHUB_STEP_SUMMARY"
+            echo '::error::Performance gate setup failed; no valid measurement is available.'
+            exit 2
+          fi
+          cp "$PERF_ROOT/harness/policy.json" "$PERF_ROOT/results/policy.json"
+          python3 "$PERF_ROOT/harness/perf_gate.py" compare \
+            --baseline "$PERF_ROOT/results/baseline.json" --candidate "$PERF_ROOT/results/candidate.json" \
+            --baseline-sha "${BASELINE_SHA:-}" --candidate-sha "${CANDIDATE_SHA:-}" \
+            --output "$PERF_ROOT/results" --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Preserve raw samples and diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-results
+          path: ${{ env.PERF_ROOT }}/results/
+          if-no-files-found: error
+          retention-days: 14

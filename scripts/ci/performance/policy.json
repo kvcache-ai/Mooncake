@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "repetitions": 5,
+  "cpu_count": 2,
+  "timeout_seconds": 120,
+  "arguments": {
+    "iterations": 2000000,
+    "warmup_iterations": 100000,
+    "pool_size_mb": 1024,
+    "failed_request_mb": 128,
+    "success_request_kb": 4,
+    "fragmentation_block_mb": 4,
+    "fragmentation_stride": 5,
+    "high_water_ratio": 0.9,
+    "mixed_failure_ratio": 0.05
+  },
+  "cases": {
+    "offset-success-1t": {"layer": "offset_allocator", "scenario": "success", "threads": 1, "result_scenario": "successful_allocate_free"},
+    "offset-success-2t": {"layer": "offset_allocator", "scenario": "success", "threads": 2, "result_scenario": "successful_allocate_free"},
+    "offset-capacity-1t": {"layer": "offset_allocator", "scenario": "capacity", "threads": 1, "result_scenario": "capacity_failed"},
+    "offset-capacity-2t": {"layer": "offset_allocator", "scenario": "capacity", "threads": 2, "result_scenario": "capacity_failed"},
+    "offset-fragmentation-1t": {"layer": "offset_allocator", "scenario": "fragmentation", "threads": 1, "result_scenario": "fragmentation_failed"},
+    "offset-fragmentation-2t": {"layer": "offset_allocator", "scenario": "fragmentation", "threads": 2, "result_scenario": "fragmentation_failed"}
+  },
+  "metrics": {
+    "qps": {"unit": "ops/s", "direction": "higher", "max_regression_percent": 5, "max_mad_percent": 5},
+    "p50_ns": {"unit": "ns", "direction": "lower", "max_regression_percent": 5, "max_mad_percent": 5},
+    "p99_ns": {"unit": "ns", "direction": "lower", "max_regression_percent": 10, "max_mad_percent": 10}
+  }
+}
