@@ -7723,8 +7723,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                     });
                 if (processing || accessor.InProcessing() ||
                     metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
-                    (IsSoftPinActive(metadata, accessor.GetKey(), tenant_id,
-                                     now) &&
+                    (IsSoftPinActive(metadata, candidate.key, tenant_id, now) &&
                      !allow_evict_soft_pinned_objects_)) {
                     all_accepted = false;
                     break;
@@ -9841,10 +9840,11 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
         return replica.is_nof_replica() && replica.is_completed() &&
                replica.get_refcnt() == 0;
     };
-    auto may_evict = [&](const ObjectMetadata& metadata) {
+    auto may_evict = [&](const ObjectMetadata& metadata, const std::string& key,
+                         const TenantId& tenant_id) {
         return !weight_manager_.IsManagedGroup(metadata.group_id) &&
                !metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
-               !IsSoftPinActive(metadata, now) &&
+               !IsSoftPinActive(metadata, key, tenant_id, now) &&
                metadata.HasReplica(is_evictable_nof_replica);
     };
 
@@ -9858,7 +9858,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
         DiscardExpiredProcessingReplicas(ns, now);
         for (auto object : ns.objects.ReadCursor()) {
             object_count++;
-            if (may_evict(object.metadata())) {
+            if (may_evict(object.metadata(), object.key(), tenant_id)) {
                 candidates.emplace_back(tenant_id, object.ref());
             }
         }
@@ -9881,7 +9881,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
             continue;
         }
         auto& metadata = accessor.Get();
-        if (!may_evict(metadata)) {
+        if (!may_evict(metadata, key, tenant_id)) {
             continue;
         }
 
