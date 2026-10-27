@@ -30,6 +30,7 @@
 
 #include "config.h"
 #include "cuda_alike.h"
+#include "transport/efa_transport/efa_discovery.h"
 #include "transport/efa_transport/efa_endpoint.h"
 #include "transport/efa_transport/efa_neuron.h"
 #include "transport/efa_transport/efa_transport.h"
@@ -85,24 +86,6 @@ inline bool isStalePeerCqError(int prov_errno) {
 
 }  // namespace
 
-// GPU builds also run on hosts without a GPU (e.g. the CUDA wheel on a CPU
-// instance). Request FI_HMEM and use the device-memory paths only when a
-// device is present; otherwise the EFA provider rejects the FI_HMEM hints.
-static bool hasGpuDevice() {
-    static const bool present = [] {
-        int count = 0;
-#if defined(USE_CUDA)
-        return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
-#elif defined(USE_HIP)
-        return hipGetDeviceCount(&count) == hipSuccess && count > 0;
-#else
-        (void)count;
-        return false;
-#endif
-    }();
-    return present;
-}
-
 // EfaContext implementation
 
 EfaContext::EfaContext(EfaTransport& engine, const std::string& device_name)
@@ -128,97 +111,18 @@ EfaContext::~EfaContext() {
 
 int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
                           int max_endpoints) {
-    const bool gpu = hasGpuDevice();
-    if (!gpu) {
-        // Without GPU memory to register (CPU build or no device), prevent
-        // libfabric's EFA provider from dlopen-ing libcudart/libcuda at
-        // fi_getinfo/fi_domain time. That initialization creates a CUDA
-        // primary context on GPU 0 and leaks ~616 MiB of device memory even
-        // when no GPU memory is ever registered. Only set if the user hasn't
-        // explicitly configured FI_HMEM.
-        //
-        // On a Neuron host the same guard has to name "neuron" instead: FI_HMEM
-        // takes exactly one interface, not a list, so "system" (or even
-        // "system,neuron") makes fi_getinfo() below report -FI_ENODATA once
-        // FI_MR_HMEM is in mr_mode.  Selecting "neuron" still leaves host
-        // memory registrable -- FI_HMEM_SYSTEM is always available -- and
-        // still keeps libfabric away from libcudart, which is the point of the
-        // guard.
-        setenv("FI_HMEM", neuronAvailable() ? "neuron" : "system", 0);
-    }
-
-    // Keep libfabric's SHM sub-provider out of the way on Neuron hosts.
-    //
-    // For same-host peers the EFA provider hands the transfer to an internal
-    // shm endpoint (efa_shm_info_create() in prov/efa/src/efa_shm.c), and shm
-    // cannot move Neuron HBM.  libfabric's FI_HMEM_NEURON op table
-    // (src/hmem.c) implements copy_to_hmem only: copy_from_hmem is
-    // neuron_copy_from_dev(), whose whole body is
-    //   FI_WARN_ONCE("Copies from AWS Neuron to host memory are not
-    //                 supported."); return -FI_ENOSYS;
-    // and every IPC entry is a ofi_hmem_no_* stub, so smr_ep.c's
-    //   use_ipc = ofi_hmem_is_ipc_enabled(iface) && ...
-    // is always false and shm has no protocol left that could read out of a
-    // source Neuron buffer.  The shm provider never uses dmabuf either.
-    //
-    // Left to itself shm therefore treats the /dev/neuron mapping as ordinary
-    // host memory and memcpy()s across what is really an uncached PCIe BAR:
-    // correct bytes, 0.07 GB/s.  Disabling shm sends intra-node traffic back
-    // over the EFA device instead, measured at 19.23 GB/s -- the same as the
-    // inter-node rate for one chip, i.e. no loss at all.
-    //
-    // Declaring FI_HMEM in hints->caps, which is what the CUDA path does and
-    // what efa_shm.c keys FI_MR_HMEM off, would be worse than this: it makes
-    // shm HMEM-aware and the transfer then fails outright on that ENOSYS
-    // rather than merely crawling.
-    //
-    // Overwrite is 0, so an explicit FI_EFA_ENABLE_SHM_TRANSFER from the
-    // environment still wins.  This is process-global and also takes host
-    // memory off the shm path on Neuron hosts; that is an acceptable trade,
-    // since intra-node host transfers loop back over EFA just as well.
-    if (neuronAvailable()) setenv("FI_EFA_ENABLE_SHM_TRANSFER", "0", 0);
+    prepareEfaLibfabricEnv();
 
     // Setup hints for EFA provider
-    hints_ = fi_allocinfo();
+    hints_ = allocEfaHints();
     if (!hints_) {
         LOG(ERROR) << "Failed to allocate fi_info hints";
         return ERR_CONTEXT;
     }
 
-    hints_->caps =
-        FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
-    if (gpu) {
-        // Declare FI_HMEM so the provider wires up HMEM-aware copy routines
-        // (cudaMemcpy) on every data path, including the intra-node SHM SAR
-        // segmentation/reassembly path. Registering device memory via
-        // FI_MR_HMEM alone is NOT enough: without FI_HMEM in caps the SHM
-        // sub-provider initializes its copy callbacks in plain-host mode and
-        // does a host memcpy() straight into a CUDA device VA during SAR,
-        // which SIGSEGVs in __memcpy_avx512_unaligned_erms.
-        // See https://github.com/ofiwg/libfabric/issues/12328.
-        hints_->caps |= FI_HMEM;
-    }
-    hints_->mode = FI_CONTEXT;
-    hints_->ep_attr->type = FI_EP_RDM;  // EFA uses RDM endpoints
-    hints_->fabric_attr->prov_name = strdup("efa");
-
     // Specify the domain (device) name - append "-rdm" for RDM endpoint
     std::string domain_name = device_name_ + "-rdm";
     hints_->domain_attr->name = strdup(domain_name.c_str());
-    hints_->domain_attr->mr_mode =
-        FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
-    if (gpu) hints_->domain_attr->mr_mode |= FI_MR_HMEM;
-    // FI_MR_HMEM is mandatory for FI_HMEM_NEURON: without it the EFA provider
-    // matches no fi_info at all (fi_getinfo -> -FI_ENODATA) rather than merely
-    // refusing the later fi_mr_regattr().  Like the GPU check above this is a
-    // runtime decision -- Neuron support costs no build flag, see efa_neuron.h.
-    //
-    // Note that FI_HMEM is deliberately NOT added to caps for Neuron, unlike
-    // the GPU path above.  See the FI_EFA_ENABLE_SHM_TRANSFER guard at the top
-    // of this function for why declaring it would turn a slow intra-node path
-    // into a broken one.
-    if (neuronAvailable()) hints_->domain_attr->mr_mode |= FI_MR_HMEM;
-    hints_->domain_attr->threading = FI_THREAD_SAFE;
 
     // Get fabric info.
     //
@@ -792,7 +696,7 @@ class ScopedCudaContext {
 static int getCudaDeviceForPointer(const void* ptr, cudaError_t& status) {
     // Without a device every pointer is host memory, and the CUDA runtime
     // would fail the query instead of saying so.
-    if (!hasGpuDevice()) {
+    if (!efaHasGpuDevice()) {
         status = cudaSuccess;
         return -1;
     }

@@ -49,6 +49,7 @@
 #include "tent/common/config.h"
 #include "tent/common/config_lifecycle.h"
 #include "tent/common/types.h"
+#include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
@@ -58,6 +59,24 @@ namespace mooncake {
 
 class TransferEngineImplTestPeer {
    public:
+    static tent::Status setCachedPeerBufferToMlu(
+        tent::TransferEngineImpl& engine, tent::SegmentID peer,
+        uint64_t address, size_t length) {
+        tent::SegmentDescRef pin;
+        return engine.metadata_->segmentManager().withCachedSegment(
+            peer, pin, [&](tent::SegmentDesc* desc) {
+                auto* buffer = desc->findBuffer(address, length);
+                if (!buffer)
+                    return tent::Status::InvalidArgument("missing buffer");
+                buffer->location = "mlu:0";
+                auto& topology =
+                    std::get<tent::MemorySegmentDesc>(desc->detail).topology;
+                topology.mem_list_.push_back(
+                    {"mlu:0", "", tent::Topology::MEM_MLU, 0, {}});
+                return tent::Status::OK();
+            });
+    }
+
     static tent::Status submitRequiringPostSubmitCancellation(
         tent::TransferEngineImpl& engine, tent::BatchID batch_id,
         const std::vector<tent::Request>& requests) {
@@ -1695,6 +1714,102 @@ TEST(EngineFailoverE2E, SubmitStageFailoverWithDerivedTasks) {
 
     EXPECT_TRUE(engine.freeBatch(batch_id).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+TEST(EngineFailoverE2E, MergedStagingRequestsShareOneSubmission) {
+    for (bool queued : {false, true}) {
+        for (bool fail : {false, true}) {
+            for (auto opcode : {Request::READ, Request::WRITE}) {
+                SCOPED_TRACE(::testing::Message()
+                             << "queued=" << queued << " fail=" << fail
+                             << " opcode=" << opcode);
+                auto cfg = makeMinimalP2PConfig();
+                cfg->set("merge_requests", true);
+                cfg->set("enable_runtime_queue", queued);
+                cfg->set("max_failover_attempts", 0);
+                cfg->set("use_legacy_transport_selection", false);
+
+                constexpr size_t kLengths[] = {512, 1024, 1536, 1024};
+                constexpr size_t kLength = 4096;
+                std::vector<uint8_t> local(kLength), remote(kLength);
+                std::atomic<bool> complete{false};
+                std::atomic<size_t> submitted_bytes{0};
+                TransferEngineImpl target(cfg), initiator(cfg);
+                ASSERT_TRUE(target.available());
+                ASSERT_TRUE(initiator.available());
+                auto network = std::make_shared<FakeTransport>(
+                    TCP,
+                    [&](const Request& request) {
+                        submitted_bytes += request.length;
+                        return TransferStatus{PENDING, 0};
+                    },
+                    [&](const Request& request, int) {
+                        if (!complete.load()) return TransferStatus{PENDING, 0};
+                        return fail ? TransferStatus{FAILED, 0}
+                                    : TransferStatus{COMPLETED, request.length};
+                    });
+                initiator.swapTransportForTest(TCP, network);
+                target.swapTransportForTest(
+                    TCP, std::make_shared<FakeTransport>(TCP));
+                ASSERT_TRUE(
+                    initiator.registerLocalMemory(local.data(), kLength).ok());
+                ASSERT_TRUE(
+                    target.registerLocalMemory(remote.data(), kLength).ok());
+                SegmentID peer;
+                ASSERT_TRUE(
+                    initiator.openSegment(peer, target.getSegmentName()).ok());
+                // Advertise a device buffer only in the initiator's cache.
+                // The peer uses host memory and the existing fake transport,
+                // exercising staging without a device SDK or hardware.
+                ASSERT_TRUE(
+                    TransferEngineImplTestPeer::setCachedPeerBufferToMlu(
+                        initiator, peer,
+                        reinterpret_cast<uint64_t>(remote.data()), kLength)
+                        .ok());
+
+                std::vector<Request> requests;
+                size_t offset = 0;
+                for (size_t length : kLengths) {
+                    Request request;
+                    request.opcode = opcode;
+                    request.source = local.data() + offset;
+                    request.target_id = peer;
+                    request.target_offset =
+                        reinterpret_cast<uint64_t>(remote.data()) + offset;
+                    request.length = length;
+                    requests.push_back(request);
+                    offset += length;
+                }
+                const auto batch = initiator.allocateBatch(requests.size());
+                ASSERT_NE(batch, static_cast<BatchID>(0));
+                ASSERT_TRUE(initiator.submitTransfer(batch, requests).ok());
+                TransferStatus status{};
+                EXPECT_TRUE(initiator.getTransferStatus(batch, 3, status).ok());
+                EXPECT_EQ(status.s, PENDING);
+                EXPECT_EQ(status.transferred_bytes, 0u);
+                complete.store(true);
+
+                // Poll aliases before their owner and preserve each request's
+                // original length, even though the physical request is merged.
+                for (size_t task_id : {3U, 2U, 1U, 0U}) {
+                    status = pollUntilDone(initiator, batch, task_id);
+                    EXPECT_EQ(status.s, fail ? FAILED : COMPLETED);
+                    EXPECT_EQ(status.transferred_bytes,
+                              fail ? 0u : kLengths[task_id]);
+                }
+                EXPECT_TRUE(initiator.getTransferStatus(batch, status).ok());
+                EXPECT_EQ(status.s, fail ? FAILED : COMPLETED);
+                EXPECT_EQ(status.transferred_bytes, fail ? 0u : kLength);
+                EXPECT_EQ(network->submitted_request_count.load(), 1);
+                EXPECT_EQ(submitted_bytes.load(), kLength);
+
+                EXPECT_TRUE(initiator.freeBatch(batch).ok());
+                EXPECT_TRUE(initiator.closeSegment(peer).ok());
+                EXPECT_TRUE(initiator.unregisterLocalMemory(local.data()).ok());
+                EXPECT_TRUE(target.unregisterLocalMemory(remote.data()).ok());
+            }
+        }
+    }
 }
 
 TEST(EngineFailoverE2E, PollStageFailoverWithDerivedTasksRunsOnce) {
