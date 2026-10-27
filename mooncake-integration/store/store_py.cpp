@@ -1563,8 +1563,7 @@ void BindP2PMethods(StoreBinding& store) {
                uint64_t route_cache_ttl_ms = 60 * 1000,
                const std::string& local_transfer_mode = "te",
                size_t local_memcpy_async_worker_num = 32,
-               size_t te_async_poll_worker_num = 32, uint16_t http_port = 9003,
-               bool enable_http_server = true,
+               uint16_t http_port = 9003, bool enable_http_server = true,
                size_t async_sender_thread_count = 4,
                size_t async_max_batch_size = 2000,
                size_t async_route_queue_size = 0,
@@ -1575,7 +1574,8 @@ void BindP2PMethods(StoreBinding& store) {
                const std::string& runtime_config = "",
                bool enable_metric_collection = true,
                uint64_t metric_report_interval_seconds = 60,
-               uint16_t heartbeat_rpc_port = 0, bool start_local_only = false) {
+               uint16_t heartbeat_rpc_port = 0, bool start_local_only = false,
+               size_t te_async_poll_worker_num = 32) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -1600,7 +1600,7 @@ void BindP2PMethods(StoreBinding& store) {
                     p2p_key_lease_scan_interval_ms, p2p_transfer_direction_mode,
                     runtime_config, enable_metric_collection,
                     metric_report_interval_seconds, DEFAULT_CLUSTER_ID, "", 0,
-                    5, 2, "", heartbeat_rpc_port, te_async_poll_worker_num,
+                    4, 1, "", heartbeat_rpc_port, te_async_poll_worker_num,
                     start_local_only);
 
                 auto ret = real_client->setup(config);
@@ -1616,7 +1616,6 @@ void BindP2PMethods(StoreBinding& store) {
             py::arg("route_cache_ttl_ms") = 60 * 1000,
             py::arg("local_transfer_mode") = "te",
             py::arg("local_memcpy_async_worker_num") = 32,
-            py::arg("te_async_poll_worker_num") = 32,
             py::arg("http_port") = 9003, py::arg("enable_http_server") = true,
             py::arg("async_sender_thread_count") = 4,
             py::arg("async_max_batch_size") = 2000,
@@ -1629,6 +1628,7 @@ void BindP2PMethods(StoreBinding& store) {
             py::arg("metric_report_interval_seconds") = 60,
             py::arg("heartbeat_rpc_port") = 0,
             py::arg("start_local_only") = false,
+            py::arg("te_async_poll_worker_num") = 32,
             "Setup the store in P2P architecture. start_local_only skips "
             "Master "
             "connection and heartbeat until an explicit POST /register.")
@@ -1674,13 +1674,13 @@ void BindP2PMethods(StoreBinding& store) {
             "  te_async_poll_worker_num: TE batch poll worker count "
             "(default 32; 0 = sync TE wait).\n"
             "  async_sender_thread_count: Async route sender thread count "
-            "(default 0).\n"
+            "(default 4).\n"
             "  async_max_batch_size: Async route max batch size (default "
             "2000).\n"
             "  async_route_queue_size: Async route queue size (default 0).\n"
             "  ipc_socket_path: IPC socket path.\n"
             "  heartbeat_rpc_port: Dedicated heartbeat RPC port on the master "
-            "(0 = disabled, default 0).");
+            "(0 uses the main RPC port, default 0).");
 }
 
 #else
