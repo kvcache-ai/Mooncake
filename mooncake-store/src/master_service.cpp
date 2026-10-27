@@ -2446,9 +2446,7 @@ void MasterService::ClearInvalidHandles() {
 void MasterService::ClearInvalidHandles(
     const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
     (void)ClearStaleHandles([&retaining_clients](const Replica& replica) {
-        return (replica.has_dead_handle() ||
-                replica.has_stale_local_disk_client(retaining_clients)) &&
-               replica.is_completed();
+        return IsStaleReplicaHandle(replica, retaining_clients);
     });
 }
 
@@ -8291,13 +8289,11 @@ bool MasterService::CleanupStaleHandles(
     // Kept as a thin wrapper over the predicate form so the owner-targeted
     // LOCAL_DISK sweep (ClearLocalDiskHandlesOwnedBy) shares this accounting
     // rather than duplicating it.
-    return CleanupStaleHandles(
-        key, tenant_id, metadata, state,
-        [&retaining_clients](const Replica& replica) {
-            return (replica.has_dead_handle() ||
-                    replica.has_stale_local_disk_client(retaining_clients)) &&
-                   replica.is_completed();
-        });
+    return CleanupStaleHandles(key, tenant_id, metadata, state,
+                               [&retaining_clients](const Replica& replica) {
+                                   return IsStaleReplicaHandle(
+                                       replica, retaining_clients);
+                               });
 }
 
 bool MasterService::CleanupStaleHandles(
