@@ -123,6 +123,10 @@ option(
   USE_XPU
   "option for enabling Intel XPU (oneAPI SYCL) staging support in TENT; this is a direct-link (native) build that requires USE_TENT and the Intel DPC++ compiler (icpx / IntelLLVM) at build time -- there is no dlopen shim"
   OFF)
+option(
+  USE_XPU_GDS
+  "GDS on Intel XPU through a cuFile-compatible library (cufile.h + libcufile.so)"
+  OFF)
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
 option(USE_FABRIC
@@ -381,6 +385,26 @@ if(USE_XPU)
   add_compile_definitions(USE_XPU)
   message(
     STATUS "Intel XPU (oneAPI SYCL, direct-link) staging support is enabled")
+endif()
+
+if(USE_XPU_GDS)
+  # The GDS transport links libcufile.so; with USE_XPU_GDS it must come from a
+  # cuFile-compatible library for Intel XPU (for example Intel xFile) instead of
+  # NVIDIA GDS. A process can load only one libcufile.so, so the two GDS
+  # flavours are mutually exclusive.
+  if(NOT USE_XPU)
+    message(
+      FATAL_ERROR
+        "USE_XPU_GDS=ON requires USE_XPU=ON (and therefore USE_TENT=ON).")
+  endif()
+  if(USE_CUDA)
+    message(
+      FATAL_ERROR
+        "USE_XPU_GDS=ON cannot be combined with USE_CUDA=ON: both resolve "
+        "libcufile.so, and a process can load only one of them.")
+  endif()
+  add_compile_definitions(USE_XPU_GDS)
+  message(STATUS "Intel XPU GDS (cuFile-compatible library) is enabled")
 endif()
 
 if(NOT DEFINED NEUWARE_ROOT OR NEUWARE_ROOT STREQUAL "")
