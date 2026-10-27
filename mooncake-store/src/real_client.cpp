@@ -5132,7 +5132,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 
     if (replica.is_disk_replica() || replica.is_dfs_replica()) {
         const char *replica_type = replica.is_dfs_replica() ? "DFS" : "DISK";
-        return partial_disk_read(
+        auto result = partial_disk_read(
             [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
                 auto read_results = client_->BatchReadFileReplicaRanges(
                     {key}, {replica}, {Slice{tmp_buf, size}}, {src_offset});
@@ -5148,6 +5148,16 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 return {};
             },
             size);
+        if (!result) return result;
+        // Same contract as Client::Get: the window may finish transferring
+        // after the QueryResult lease deadline. Reject after the successful
+        // read so a DFS/DISK allocation is not treated as still leased.
+        if (query_result.IsLeaseExpired()) {
+            LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
+                         << key;
+            return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+        }
+        return result;
     }
 
     if (!replica.is_memory_replica()) {

@@ -1455,6 +1455,7 @@ class RealClient : public PyClient {
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;
+    friend class RangedDiskLeaseTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,
                                     void *buffer, size_t size) const;
