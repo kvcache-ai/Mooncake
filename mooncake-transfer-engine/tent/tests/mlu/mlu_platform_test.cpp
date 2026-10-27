@@ -14,7 +14,9 @@
 
 #include <cnrt.h>
 #include <cn_api.h>
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <limits>
 #include <thread>
@@ -82,6 +84,44 @@ TEST_F(MluPlatformTest, ExternalInteriorPointerOnFreshWorker) {
     });
     worker.join();
     EXPECT_TRUE(std::equal(seed.begin(), seed.end() - 17, readback.begin()));
+}
+
+TEST_F(MluPlatformTest, ExportsDeviceRangeAndRejectsHostOrEmpty) {
+    DmabufExport out;
+    uint8_t host[16] = {};
+    EXPECT_TRUE(platform_.exportDmabuf(host, sizeof(host), out)
+                    .IsInvalidArgument());
+    EXPECT_EQ(out.fd, -1);
+    EXPECT_TRUE(platform_.exportDmabuf(device_, 0, out).IsInvalidArgument());
+    EXPECT_EQ(out.fd, -1);
+
+    auto status = platform_.exportDmabuf(device_, kSize, out);
+    if (!status.ok()) GTEST_SKIP() << "MLU DMA-BUF unavailable: " << status;
+    ASSERT_GE(out.fd, 0);
+    EXPECT_TRUE(out.close_fd);
+    EXPECT_EQ(out.offset, 0u);
+    EXPECT_NE(fcntl(out.fd, F_GETFD), -1);
+    EXPECT_EQ(close(out.fd), 0);
+
+    auto* interior = static_cast<uint8_t*>(device_) + 17;
+    status = platform_.exportDmabuf(interior, 4096, out);
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_LE(out.offset, 17u);
+    EXPECT_EQ(close(out.fd), 0);
+}
+
+TEST_F(MluPlatformTest, CrossBoundaryExportIsHandledByDriver) {
+    DmabufExport out;
+    auto* tail = static_cast<uint8_t*>(device_) + kSize - 1;
+    auto status = platform_.exportDmabuf(tail, 2, out);
+    EXPECT_FALSE(status.IsInvalidArgument()) << status;
+    if (status.ok()) {
+        ASSERT_GE(out.fd, 0);
+        EXPECT_TRUE(out.close_fd);
+        EXPECT_EQ(close(out.fd), 0);
+    } else {
+        EXPECT_EQ(out.fd, -1);
+    }
 }
 
 // A second driver context on the same card catches context restoration bugs

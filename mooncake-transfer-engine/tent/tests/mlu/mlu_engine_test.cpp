@@ -14,9 +14,11 @@
 
 #include <gtest/gtest.h>
 #include <cnrt.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <set>
 #include <chrono>
 #include <memory>
@@ -175,6 +177,17 @@ class TransferEngineImplTestPeer {
         return buffer &&
                std::find(buffer->transports.begin(), buffer->transports.end(),
                          tent::MLU) != buffer->transports.end();
+    }
+    static bool hasRdmaTag(tent::TransferEngineImpl& engine, void* address) {
+        auto desc = engine.metadata_->segmentManager().getLocal();
+        auto* buffer = desc->findBuffer(reinterpret_cast<uint64_t>(address), 1);
+        return buffer &&
+               std::find(buffer->transports.begin(), buffer->transports.end(),
+                         tent::RDMA) != buffer->transports.end();
+    }
+    static bool rdmaGpuDirect(tent::TransferEngineImpl& engine) {
+        const auto& rdma = engine.transport_list_[tent::RDMA];
+        return rdma && rdma->capabilities().gpu_to_gpu;
     }
     static void disableMlu(tent::TransferEngineImpl& engine) {
         engine.swapTransportForTest(tent::MLU, nullptr);
@@ -834,6 +847,170 @@ INSTANTIATE_TEST_SUITE_P(NetworkAndDispatchModes, MluEngineTest,
                          ::testing::Combine(::testing::Bool(),
                                             ::testing::Bool(),
                                             ::testing::Bool()));
+
+// A real MLU and dma-buf-capable RNIC are needed for the data-plane check.
+// Set MC_TENT_MLU_REQUIRE_DMABUF_RDMA=1 on such a host to fail instead of skip.
+class MluDirectRdmaTest : public ::testing::TestWithParam<bool> {
+   protected:
+    static constexpr size_t kDirectLength = 64 * 1024;
+
+    std::shared_ptr<Config> config() const {
+        auto conf = std::make_shared<Config>();
+        conf->set("metadata_type", "p2p");
+        conf->set("metadata_servers", "");
+        conf->set("rpc_server_hostname", "127.0.0.1");
+        conf->set("rpc_server_port", "0");
+        conf->set("log_level", "warning");
+        conf->set("transports/mlu/enable", true);
+        conf->set("transports/rdma/enable", true);
+        conf->set("transports/tcp/enable", true);
+        conf->set("transports/hp_tcp/enable", false);
+        conf->set("transports/shm/enable", false);
+        conf->set("transports/io_uring/enable", false);
+        conf->set("transports/mpcomm/enable", false);
+        conf->set("use_legacy_transport_selection", GetParam());
+        // A completed direct-RDMA test must not be rescued by a staged retry.
+        conf->set("max_failover_attempts", 0);
+        return conf;
+    }
+
+    void SetUp() override {
+        const auto* required = std::getenv("MC_TENT_MLU_REQUIRE_DMABUF_RDMA");
+        const bool strict = required && std::string_view(required) == "1";
+        unsigned int count = 0;
+        if (cnrtGetDeviceCount(&count) != cnrtSuccess || !count) {
+            if (strict) FAIL() << "No MLU device visible";
+            GTEST_SKIP() << "No MLU device visible";
+        }
+        auto& platform = Platform::getLoader(config());
+        MemoryOptions options;
+        options.location = "mlu:0";
+        void* probe = nullptr;
+        ASSERT_TRUE(platform.allocate(&probe, 4096, options).ok());
+        DmabufExport exported;
+        auto status = platform.exportDmabuf(probe, 4096, exported);
+        if (!status.ok()) {
+            ASSERT_TRUE(platform.free(probe, 4096).ok());
+            if (strict) FAIL() << "MLU DMA-BUF unavailable: " << status;
+            GTEST_SKIP() << "MLU DMA-BUF unavailable: " << status;
+        }
+        ASSERT_TRUE(exported.close_fd);
+        ASSERT_GE(exported.fd, 0);
+        ASSERT_EQ(close(exported.fd), 0);
+        ASSERT_TRUE(platform.free(probe, 4096).ok());
+        a_ = std::make_unique<TransferEngineImpl>(config());
+        b_ = std::make_unique<TransferEngineImpl>(config());
+        ASSERT_TRUE(a_->available());
+        ASSERT_TRUE(b_->available());
+        if (!TransferEngineImplTestPeer::rdmaGpuDirect(*a_)) {
+            if (strict) FAIL() << "No RNIC with ibv_reg_dmabuf_mr";
+            GTEST_SKIP() << "No RNIC with ibv_reg_dmabuf_mr";
+        }
+    }
+
+    void TearDown() override {
+        for (auto [engine, batch] : batches_)
+            EXPECT_TRUE(engine->freeBatch(batch).ok());
+        for (auto [engine, address] : allocations_) {
+            if (TransferEngineImplTestPeer::hasMluTag(*engine, address))
+                EXPECT_TRUE(engine->unregisterLocalMemory(address).ok());
+            EXPECT_TRUE(engine->freeLocalMemory(address).ok());
+        }
+        a_.reset();
+        b_.reset();
+    }
+
+    void allocate(TransferEngineImpl& engine, const char* location,
+                  void** address, TransportType registration = UNSPEC) {
+        MemoryOptions options;
+        options.location = location;
+        ASSERT_TRUE(engine.allocateLocalMemory(address, kDirectLength, options)
+                        .ok());
+        ASSERT_NE(*address, nullptr);
+        allocations_.push_back({&engine, *address});
+        options.type = registration;
+        ASSERT_TRUE(engine.registerLocalMemory({*address}, {kDirectLength},
+                                               options)
+                        .ok());
+        ASSERT_EQ(TransferEngineImplTestPeer::hasRdmaTag(engine, *address),
+                  registration != MLU);
+    }
+
+    void transfer(const char* local_location, const char* peer_location,
+                  Request::OpCode opcode, TransportType hint = UNSPEC,
+                  TransportType peer_registration = UNSPEC) {
+        void *local = nullptr, *peer = nullptr;
+        ASSERT_NO_FATAL_FAILURE(allocate(*a_, local_location, &local));
+        ASSERT_NO_FATAL_FAILURE(
+            allocate(*b_, peer_location, &peer, peer_registration));
+        std::vector<uint8_t> seed(kDirectLength, 43);
+        std::vector<uint8_t> zero(kDirectLength, 0);
+        std::vector<uint8_t> actual(kDirectLength);
+        auto& platform = Platform::getLoader();
+        void* source = opcode == Request::WRITE ? local : peer;
+        void* target = opcode == Request::WRITE ? peer : local;
+        ASSERT_TRUE(platform.copy(source, seed.data(), kDirectLength).ok());
+        ASSERT_TRUE(platform.copy(target, zero.data(), kDirectLength).ok());
+
+        Request request{};
+        request.opcode = opcode;
+        request.source = local;
+        request.target_offset = reinterpret_cast<uint64_t>(peer);
+        request.length = kDirectLength;
+        request.transport_hint = hint;
+        ASSERT_TRUE(a_->openSegment(request.target_id, b_->getSegmentName()).ok());
+        const auto route = TransferEngineImplTestPeer::route(*a_, request);
+        ASSERT_EQ(route.transport, hint == TCP ? TCP : RDMA);
+        ASSERT_EQ(route.staging_params.empty(),
+                  hint != TCP && peer_registration != MLU);
+
+        auto batch = a_->allocateBatch(1);
+        ASSERT_NE(batch, 0u);
+        batches_.push_back({a_.get(), batch});
+        ASSERT_TRUE(a_->submitTransfer(batch, {request}).ok());
+        TransferStatus result{};
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        do {
+            ASSERT_TRUE(a_->progressBatch(batch, result).ok());
+            if (result.s != PENDING) break;
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        ASSERT_EQ(result.s, COMPLETED);
+        EXPECT_EQ(result.transferred_bytes, kDirectLength);
+        ASSERT_TRUE(platform.copy(actual.data(), target, kDirectLength).ok());
+        EXPECT_EQ(actual, seed);
+        ASSERT_TRUE(a_->freeBatch(batch).ok());
+        batches_.pop_back();
+    }
+
+    std::unique_ptr<TransferEngineImpl> a_, b_;
+    std::vector<std::pair<TransferEngineImpl*, void*>> allocations_;
+    std::vector<std::pair<TransferEngineImpl*, BatchID>> batches_;
+};
+
+TEST_P(MluDirectRdmaTest, DeviceToDeviceReadAndWrite) {
+    ASSERT_NO_FATAL_FAILURE(transfer("mlu:0", "mlu:0", Request::WRITE));
+    ASSERT_NO_FATAL_FAILURE(transfer("mlu:0", "mlu:0", Request::READ));
+}
+
+TEST_P(MluDirectRdmaTest, OneDeviceSideReadAndWrite) {
+    ASSERT_NO_FATAL_FAILURE(transfer("cpu:0", "mlu:0", Request::WRITE));
+    ASSERT_NO_FATAL_FAILURE(transfer("mlu:0", "cpu:0", Request::READ));
+    ASSERT_NO_FATAL_FAILURE(transfer("mlu:0", "cpu:0", Request::WRITE));
+    ASSERT_NO_FATAL_FAILURE(transfer("cpu:0", "mlu:0", Request::READ));
+}
+
+TEST_P(MluDirectRdmaTest, TcpHintKeepsHostStaging) {
+    ASSERT_NO_FATAL_FAILURE(transfer("mlu:0", "mlu:0", Request::WRITE, TCP));
+}
+
+TEST_P(MluDirectRdmaTest, MluOnlyRegistrationKeepsHostStaging) {
+    ASSERT_NO_FATAL_FAILURE(
+        transfer("mlu:0", "mlu:0", Request::WRITE, UNSPEC, MLU));
+}
+
+INSTANTIATE_TEST_SUITE_P(SelectionModes, MluDirectRdmaTest, ::testing::Bool());
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

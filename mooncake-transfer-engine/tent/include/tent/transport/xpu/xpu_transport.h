@@ -90,7 +90,7 @@ struct XpuSubBatch : public Transport::SubBatch {
 //    exporter can reclaim the memory.
 // Cross-node VRAM traffic bypasses this transport entirely when RdmaTransport
 // registered both ends through dma-buf (GPUDirect-style, see
-// xpuDirectRdmaReady); staging remains the fallback for hosts or buffers
+// deviceDirectRdmaReady); staging remains the fallback for hosts or buffers
 // without it.
 //
 // The IPC handle names the exporter's dma-buf by a descriptor of that
