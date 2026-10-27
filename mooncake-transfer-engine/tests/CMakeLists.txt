@@ -326,6 +326,34 @@ if(USE_TCP)
   add_test(NAME shm_transport_e2e_test COMMAND shm_transport_e2e_test)
 endif()
 
+if(USE_UBMEM)
+  # Pure-logic unit tests for the peer-device-map configuration parsing.
+  add_executable(ubmem_peer_map_test ${WORKSPACE}/ubmem_peer_map_test.cpp)
+  target_include_directories(
+    ubmem_peer_map_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/transport/ubmem_transport)
+  target_link_libraries(ubmem_peer_map_test PUBLIC transfer_engine gtest
+                                                   gtest_main)
+  add_test(NAME ubmem_peer_map_test COMMAND ubmem_peer_map_test)
+
+  add_executable(ubmem_transport_test ${WORKSPACE}/ubmem_transport_test.cpp)
+  target_link_libraries(ubmem_transport_test PUBLIC transfer_engine gtest
+                                                    gtest_main gflags)
+  # The gtest-mode fixture backs the device with a sparse file, so the suite
+  # runs on every CI runner; only the cross-node initiator/target modes need
+  # a real shmdev mirror pair.
+  add_test(NAME ubmem_transport_test COMMAND ubmem_transport_test)
+endif()
+
+if(USE_UB
+   OR USE_UBMEM
+   OR USE_CXL)
+  add_executable(ub_ubmem_bench ${WORKSPACE}/ub_ubmem_bench.cpp)
+  target_link_libraries(ub_ubmem_bench PUBLIC transfer_engine glog gflags)
+  # Run manually (cross-node URMA/shmdev comparison benchmark); not
+  # registered with ctest on purpose.
+endif()
+
 if(USE_NVMEOF)
   # cuFile entry points are faked by the executable; no GPU or SSD is needed.
   add_executable(nvmeof_request_test ${WORKSPACE}/nvmeof_request_test.cpp)

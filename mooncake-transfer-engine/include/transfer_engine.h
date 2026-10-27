@@ -157,6 +157,10 @@ class TransferEngine {
 
     SegmentHandle openSegment(const std::string& segment_name);
 
+    // Protocol a remote segment published in its descriptor (empty when
+    // the segment is unknown). Read from the metadata cache.
+    std::string getSegmentProtocol(const std::string& segment_name);
+
     // Replace buffers with a snapshot of the segment's memory buffers.
     // Return 0 on success (including an empty segment), or a negative ERR_*.
     // On error, buffers is empty. Does not close the segment handle.

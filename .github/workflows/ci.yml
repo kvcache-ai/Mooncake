@@ -264,6 +264,7 @@ jobs:
           -DUSE_HTTP=ON \
           -DUSE_CXL=ON \
           -DUSE_UB=ON \
+          -DUSE_UBMEM=ON \
           -DUSE_ETCD=ON \
           -DUSE_REDIS=ON \
           -DUSE_CUDA=ON \

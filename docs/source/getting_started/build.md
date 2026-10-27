@@ -339,6 +339,7 @@ environment setup must be prepared separately.
 | ScaleFabric SHCA | `-DUSE_SHCA=ON` | Install `shca-tools`. | Supports Transfer Engine/TENT RDMA paths only; Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
 | Iluvatar CoreX | `-DUSE_COREX=ON` | Install CoreX SDK. | Set `COREX_HOME`, or pass `-DCOREX_ROOT=/path/to/corex`. Use `-DCOREX_INCLUDE_DIR` and `-DCOREX_LIB_DIR` for custom layouts. |
 | Biren GPU | `-DUSE_SUPA=ON` | Install Biren SUPA SDK. | Set `BIREN_HOME` to the SDK root containing `supa/include` and `supa/lib`, or pass `-DBIREN_HOME=/path/to/biren-sdk`. Uses a CUDA-compatible runtime. |
+| Kunpeng UB.MEM (obmm shmdev) | `-DUSE_UBMEM=ON` | Kunpeng UB interconnect with `/dev/obmm_shmdev*` devices. No additional SDK. | Set `MC_UBMEM_DEV_PATH` to a local pool device; see [UB.MEM Transport](../design/transfer-engine/transport/ubmem_transport.md). |
 
 ```{admonition} NCCL host RMA constraints
 :class: important
