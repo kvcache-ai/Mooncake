@@ -158,7 +158,7 @@ Arguments:
 
 | Function | Purpose | Notes |
 | --- | --- | --- |
-| `pg.set_host_ip(host_ip)` | Override the host IP used by the backend. | Call before `init_process_group()`. |
+| `pg.set_host_ip(host_ip)` | Override the host IP used by the backend. | Call before `init_process_group()`. On multi-node jobs the default is loopback (`127.0.0.1`); Mooncake PG tries to derive a routable address from `MASTER_ADDR` / the hostname, but if that fails you must call `set_host_ip(<node IP>)` or `set_transfer_engine(...)` or initialization fails fast instead of hanging on rank 0. |
 | `pg.set_device_filter(filters)` | Restrict NIC/HCA selection. | Call before `init_process_group()`. |
 | `pg.set_transfer_engine(engine)` | Reuse an external `TransferEngine`. | The engine must outlive all process groups. |
 | `pg.get_active_ranks(backend)` | Return the backend active-rank tensor. | Used by EP fallback and recovery paths. |

@@ -1,13 +1,19 @@
 #include <mooncake_communicator.h>
 
 #include <algorithm>
+#include <arpa/inet.h>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <future>
 #include <limits>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <optional>
 #include <string_view>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <utility>
 
 #include <glog/logging.h>
@@ -28,6 +34,135 @@ namespace {
 // A non-zero operation size is required to ensure that the worker creates a
 // task for the barrier.
 constexpr size_t kBarrierDummySize = 1;
+
+bool IsLoopbackHost(std::string_view host) {
+    return host.empty() || host == "127.0.0.1" || host == "::1" ||
+           host == "localhost";
+}
+
+// Discover the local address that would be used to reach `peer_host` by
+// opening a UDP socket and reading getsockname after connect (no packets are
+// sent). Used to replace the default loopback host_ip for multi-node PG.
+std::optional<std::string> LocalIpTowardPeer(const std::string& peer_host) {
+    if (IsLoopbackHost(peer_host)) return std::nullopt;
+
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    addrinfo* result = nullptr;
+    if (getaddrinfo(peer_host.c_str(), "1", &hints, &result) != 0 ||
+        result == nullptr) {
+        return std::nullopt;
+    }
+
+    std::optional<std::string> local_ip;
+    for (addrinfo* rp = result; rp != nullptr; rp = rp->ai_next) {
+        const int fd = socket(rp->ai_family, SOCK_DGRAM, 0);
+        if (fd < 0) continue;
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) != 0) {
+            close(fd);
+            continue;
+        }
+        sockaddr_storage local_addr{};
+        socklen_t local_len = sizeof(local_addr);
+        if (getsockname(fd, reinterpret_cast<sockaddr*>(&local_addr),
+                        &local_len) == 0) {
+            char buf[INET6_ADDRSTRLEN] = {};
+            if (local_addr.ss_family == AF_INET) {
+                auto* sin = reinterpret_cast<sockaddr_in*>(&local_addr);
+                if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) {
+                    local_ip = buf;
+                }
+            } else if (local_addr.ss_family == AF_INET6) {
+                auto* sin6 = reinterpret_cast<sockaddr_in6*>(&local_addr);
+                if (inet_ntop(AF_INET6, &sin6->sin6_addr, buf, sizeof(buf))) {
+                    local_ip = buf;
+                }
+            }
+        }
+        close(fd);
+        if (local_ip && !IsLoopbackHost(*local_ip)) break;
+        local_ip.reset();
+    }
+    freeaddrinfo(result);
+    return local_ip;
+}
+
+std::optional<std::string> LocalIpFromHostname() {
+    char hostname[256] = {};
+    if (gethostname(hostname, sizeof(hostname)) != 0) return std::nullopt;
+
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* result = nullptr;
+    if (getaddrinfo(hostname, nullptr, &hints, &result) != 0 ||
+        result == nullptr) {
+        return std::nullopt;
+    }
+
+    std::optional<std::string> local_ip;
+    for (addrinfo* rp = result; rp != nullptr; rp = rp->ai_next) {
+        char buf[INET6_ADDRSTRLEN] = {};
+        const void* addr_ptr = nullptr;
+        if (rp->ai_family == AF_INET) {
+            addr_ptr = &reinterpret_cast<sockaddr_in*>(rp->ai_addr)->sin_addr;
+        } else if (rp->ai_family == AF_INET6) {
+            addr_ptr =
+                &reinterpret_cast<sockaddr_in6*>(rp->ai_addr)->sin6_addr;
+        }
+        if (addr_ptr == nullptr) continue;
+        if (!inet_ntop(rp->ai_family, addr_ptr, buf, sizeof(buf))) continue;
+        if (IsLoopbackHost(buf)) continue;
+        local_ip = buf;
+        // Prefer IPv4 when both are available.
+        if (rp->ai_family == AF_INET) break;
+    }
+    freeaddrinfo(result);
+    return local_ip;
+}
+
+// Replace the default loopback host_ip before P2PHANDSHAKE publishes it.
+// Torchrun sets MASTER_ADDR to a routable node IP on multi-node jobs; use that
+// peer to discover the local interface address. Fall back to hostname
+// resolution. If MASTER_ADDR is clearly multi-node (non-loopback) but we still
+// only have loopback, fail fast so rank 0 does not hang forever.
+PGResult<void> MaybeResolveRoutableHostIp(std::string& host_ip) {
+    if (!IsLoopbackHost(host_ip)) return {};
+
+    const char* master_addr = std::getenv("MASTER_ADDR");
+    std::string master_host;
+    if (master_addr && *master_addr) {
+        master_host = getHostNameWithoutPort(master_addr);
+    }
+
+    if (!master_host.empty() && !IsLoopbackHost(master_host)) {
+        if (auto ip = LocalIpTowardPeer(master_host)) {
+            LOG(INFO) << "Mooncake PG: derived host_ip=" << *ip
+                      << " from interface toward MASTER_ADDR=" << master_host;
+            host_ip = std::move(*ip);
+            return {};
+        }
+    }
+
+    if (auto ip = LocalIpFromHostname()) {
+        LOG(INFO) << "Mooncake PG: derived host_ip=" << *ip
+                  << " from local hostname";
+        host_ip = std::move(*ip);
+        return {};
+    }
+
+    if (!master_host.empty() && !IsLoopbackHost(master_host)) {
+        return makePGError(
+            PGErrorCode::InvalidArgument,
+            "Mooncake PG host_ip is still loopback while MASTER_ADDR=" +
+                master_host +
+                " looks multi-node. Call mooncake.pg.set_host_ip(<routable "
+                "IP>) before init_process_group(), or pass a TransferEngine "
+                "via set_transfer_engine().");
+    }
+    return {};
+}
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
 constexpr size_t kDefaultDeviceCollectiveBufferSize =
     32ull * 1024 * 1024;  // 32 MiB
@@ -217,6 +352,10 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
         PG_VALIDATE_ARG(std::getenv("MC_MACA_HOST_TRANSPORT") != nullptr,
                         "MACA PG requires MC_MACA_HOST_TRANSPORT=1");
 #endif
+        // P2PHANDSHAKE publishes host_ip:<rpc_port> as the segment name. The
+        // default host_ip is 127.0.0.1, which hangs multi-node jobs that forget
+        // set_host_ip(); resolve a routable address when possible (#4981).
+        PG_TRY(MaybeResolveRoutableHostIp(host_ip));
         PG_TRY_TE(engine->init(P2PHANDSHAKE, host_ip));
         engine_initialized = true;
     }
@@ -1810,23 +1949,15 @@ void MooncakeCommunicator::applyGroupState(
             }
             break;
         case CollectiveExtensionState::Normal:
-            // Build the new mask before publishing it. Clearing the shared
-            // array first creates a window in which a rank that remains active
-            // can observe its own slot as inactive and reject a collective.
-            // Write each slot's final value once instead.
-            {
-                std::vector<bool> next_active_ranks(meta_->maxGroupSize, false);
-                for (size_t local_rank = 0; local_rank < view.rank_order.size();
-                     ++local_rank) {
-                    const auto global_rank = view.rank_order[local_rank];
-                    next_active_ranks[local_rank] =
-                        view.members[global_rank].isActive();
-                }
-                for (int local_rank = 0; local_rank < meta_->maxGroupSize;
-                     ++local_rank) {
-                    meta_->activeRanks[local_rank] =
-                        next_active_ranks[local_rank];
-                }
+            for (int local_rank = 0; local_rank < meta_->maxGroupSize;
+                 ++local_rank) {
+                meta_->activeRanks[local_rank] = false;
+            }
+            for (size_t local_rank = 0; local_rank < view.rank_order.size();
+                 ++local_rank) {
+                const auto global_rank = view.rank_order[local_rank];
+                meta_->activeRanks[local_rank] =
+                    view.members[global_rank].isActive();
             }
             break;
     }
