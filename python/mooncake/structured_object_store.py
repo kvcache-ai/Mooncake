@@ -25,6 +25,14 @@ from typing import (
 import numpy as np
 
 from mooncake._partial_read import MatrixReadPlan, plan_matrix_read
+from mooncake._structured_ranges import (
+    PreparedRangeLayoutChanged as PreparedRangeLayoutChanged,
+    PreparedStructuredMemberRanges,
+    StructuredMemberRange,
+    bind_prepared as _bind_prepared_ranges,
+    execute_ranges as _execute_member_ranges,
+    prepare_ranges as _prepare_member_ranges,
+)
 from mooncake.store import ReplicateConfig
 
 import msgpack as _msgpack
@@ -203,6 +211,7 @@ class _DirectCopyPayload:
         )
 
 
+@dataclass
 class _RawDestinationBuffer:
     ptr: int
     size: int
@@ -737,6 +746,37 @@ class MooncakeBundleTransfer:
     ) -> StructuredObjectResult:
         """Materialize a structured object read spec into caller-provided destinations when possible."""
         return self._structured_store.materialize_into(spec, destinations)
+
+    def materialize_ranges_into(
+        self,
+        spec: StructuredObjectReadSpec,
+        ranges: Sequence[StructuredMemberRange],
+        destinations: Mapping[str, _RawDestinationBuffer],
+    ) -> StructuredObjectResult:
+        """Read member byte ranges into caller-owned pre-registered buffers."""
+        return self._structured_store.materialize_ranges_into(
+            spec, ranges, destinations
+        )
+
+    def prepare_member_ranges(
+        self,
+        spec: StructuredObjectReadSpec,
+        ranges: Sequence[StructuredMemberRange],
+        destination: _RawDestinationBuffer,
+    ) -> PreparedStructuredMemberRanges:
+        """Compile relative chunk geometry without reading member payloads."""
+        return self._structured_store.prepare_member_ranges(spec, ranges, destination)
+
+    def materialize_prepared_ranges_into(
+        self,
+        spec: StructuredObjectReadSpec,
+        prepared: PreparedStructuredMemberRanges,
+        destination: _RawDestinationBuffer,
+    ) -> StructuredObjectResult:
+        """Rebind current keys and destination to a reusable relative plan."""
+        return self._structured_store.materialize_prepared_ranges_into(
+            spec, prepared, destination
+        )
 
     @staticmethod
     def release_result(result: Any) -> None:
@@ -3571,6 +3611,86 @@ class _StructuredObjectLayer:
         self, ref: RemoteBundleRef | Mapping[str, Any]
     ) -> StructuredObjectReadSpec:
         return StructuredObjectReadSpec(ref=ref)
+
+    def _range_read_inputs(
+        self,
+        spec: StructuredObjectReadSpec,
+        destinations: Mapping[str, _RawDestinationBuffer],
+    ) -> tuple[dict[str, Any], Mapping[str, Any], list[str]]:
+        if spec.member_slices:
+            raise ValueError(
+                "structured member slices cannot be combined with byte ranges"
+            )
+        if not isinstance(destinations, Mapping) or any(
+            not isinstance(destination, _RawDestinationBuffer)
+            for destination in destinations.values()
+        ):
+            raise TypeError(
+                "structured ranged destinations must map members to raw_destination"
+            )
+        return self._resolve_structured_read(spec)
+
+    def materialize_ranges_into(
+        self,
+        spec: StructuredObjectReadSpec,
+        ranges: Sequence[StructuredMemberRange],
+        destinations: Mapping[str, _RawDestinationBuffer],
+    ) -> StructuredObjectResult:
+        metadata, buffers, selected = self._range_read_inputs(spec, destinations)
+        plans = _prepare_member_ranges(
+            metadata, buffers, selected, tuple(ranges), destinations
+        )
+        requests = [
+            (
+                destinations[name],
+                _bind_prepared_ranges(
+                    metadata, buffers, selected, plan, destinations[name]
+                ),
+                plan,
+            )
+            for name, plan in plans.items()
+        ]
+        _execute_member_ranges(self._bundle_store._transport._get_into_ranges, requests)
+        return StructuredObjectResult(
+            metadata=dict(metadata), objects=dict(destinations)
+        )
+
+    def prepare_member_ranges(
+        self,
+        spec: StructuredObjectReadSpec,
+        ranges: Sequence[StructuredMemberRange],
+        destination: _RawDestinationBuffer,
+    ) -> PreparedStructuredMemberRanges:
+        ranges = tuple(ranges)
+        if not ranges or not isinstance(ranges[0], StructuredMemberRange):
+            raise ValueError(
+                "prepared member read requires StructuredMemberRange values"
+            )
+        name = ranges[0].member_name
+        metadata, buffers, selected = self._range_read_inputs(spec, {name: destination})
+        return _prepare_member_ranges(
+            metadata, buffers, selected, ranges, {name: destination}
+        )[name]
+
+    def materialize_prepared_ranges_into(
+        self,
+        spec: StructuredObjectReadSpec,
+        prepared: PreparedStructuredMemberRanges,
+        destination: _RawDestinationBuffer,
+    ) -> StructuredObjectResult:
+        if not isinstance(prepared, PreparedStructuredMemberRanges):
+            raise TypeError("prepared must be PreparedStructuredMemberRanges")
+        metadata, buffers, selected = self._range_read_inputs(
+            spec, {prepared.member_name: destination}
+        )
+        keys = _bind_prepared_ranges(metadata, buffers, selected, prepared, destination)
+        _execute_member_ranges(
+            self._bundle_store._transport._get_into_ranges,
+            [(destination, keys, prepared)],
+        )
+        return StructuredObjectResult(
+            metadata=dict(metadata), objects={prepared.member_name: destination}
+        )
 
     def materialize(self, spec: StructuredObjectReadSpec) -> StructuredObjectResult:
         return self.materialize_into(spec, destinations=None)

@@ -86,7 +86,11 @@ RdmaEndPoint::RdmaEndPoint()
       inflight_slices_(0),
       destroy_start_time_(0) {}
 
-RdmaEndPoint::~RdmaEndPoint() { deconstruct(); }
+RdmaEndPoint::~RdmaEndPoint() {
+    if (deconstruct())
+        LOG(FATAL)
+            << "Cannot release endpoint buffers before native QP/MR teardown";
+}
 
 int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
                             const std::string& endpoint_name) {
