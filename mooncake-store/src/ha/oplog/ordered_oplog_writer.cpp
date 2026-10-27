@@ -270,6 +270,18 @@ OrderedOpLogWriter::Reserve() {
 }
 
 tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
+OrderedOpLogWriter::ReserveFor(const OpLogEntry& entry) {
+    // The entry is the caller's and validating it takes no writer state, so it
+    // is checked before the lock: what is left for Reserve to decide is
+    // whether the writer is still taking work at all.
+    std::string reason;
+    if (!ValidateOpLogBatchEntry(entry, &reason)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return Reserve();
+}
+
+tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
 OrderedOpLogWriter::ReserveBatch(size_t entry_count) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->terminal_state.has_value()) {
