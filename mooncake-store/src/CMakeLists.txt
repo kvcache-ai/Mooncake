@@ -107,6 +107,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
+    batch_io_scheduler.cpp
     nvme_kv/backend.cpp
     nvme_kv/connector.cpp
     nvme_kv/config/connector_config.cpp

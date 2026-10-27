@@ -158,7 +158,7 @@ class StorageFile {
     bool delete_on_write_fail_ = true;
     std::string filename_;
     int fd_;
-    ErrorCode error_code_{ErrorCode::OK};
+    std::atomic<ErrorCode> error_code_{ErrorCode::OK};
     std::atomic<bool> is_locked_{false};
 };
 

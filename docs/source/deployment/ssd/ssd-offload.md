@@ -155,12 +155,30 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 
 | Environment Variable | Default | Description |
 |---|---|---|
+| `MOONCAKE_OFFLOAD_WRITE_IO_WORKERS` | `0` (disabled) | Shared writer count across buckets and their sub batches. `0` retains sequential offload; positive values enable parallel offload through `BatchIoScheduler`. |
+| `MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS` | `128` | Logical source Slices per write sub batch; minimum `4` when writers are enabled. Small tails up to one quarter join the preceding group within the same bucket. |
+| `MOONCAKE_OFFLOAD_WRITE_IO_BACKOFF_MS` | `300` | Positive delay in milliseconds before writers recheck pending or in-flight reads. |
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | `268435456` (256 MB) | Max size per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
 | `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
+
+### Optional parallel Bucket offload writes
+
+Set the write controls in the **Real Client** environment before starting the embedded Real Client:
+
+```bash
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
+export MOONCAKE_OFFLOAD_WRITE_IO_WORKERS=8
+export MOONCAKE_OFFLOAD_WRITE_SUB_BATCH_MAX_IOVECS=128
+export MOONCAKE_OFFLOAD_WRITE_IO_BACKOFF_MS=300
+```
+
+Leave the worker count unset or set it to `0` to retain sequential offload. Positive values enable a shared write worker pool across buckets. Benchmark throughput, tail latency, and CPU usage on the target volume to select a worker count. Parallel offload prepares all bucket plans in memory, publishes their sub batches together, and commits each bucket independently after its data writes and sync complete. Writers defer new sub batches while reads are active; this setting does not change master-side DRAM eviction policy. Reads retain the existing synchronous path. `MOONCAKE_OFFLOAD_USE_URING` selects the file I/O implementation separately.
+
+Write sub batches are formed within each bucket file. A final group of at most `floor(sub_batch_size / 4)` Slices joins the previous group: with the default `128`, `160` Slices form one group, while `161` form groups of `128` and `33`. Different bucket files' tails are never merged. Invalid write controls fail backend initialization.
 
 ### File-per-key backend settings
 

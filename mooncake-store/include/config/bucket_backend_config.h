@@ -26,6 +26,9 @@ inline std::ostream& operator<<(std::ostream& os,
 }
 
 struct BucketBackendConfig {
+    int64_t write_io_workers = 0;
+    int64_t write_sub_batch_max_iovecs = 128;
+    int64_t write_io_backoff_ms = 300;
     int64_t bucket_size_limit =
         256LL * 1024 * 1024;  // Max total size of a single bucket (256 MB)
 

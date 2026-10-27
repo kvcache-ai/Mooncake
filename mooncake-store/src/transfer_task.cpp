@@ -1598,8 +1598,11 @@ TransferSubmitter::submit_batch_get_offload_object(
         return std::nullopt;
     }
 
+    // CPU restores can use an RPC lease even when the owner is this process.
+    // Such leases carry a transfer endpoint, but their buffers are still local.
     const bool use_local_memcpy =
-        buffer_access == OffloadBufferAccess::kLocalAddress;
+        buffer_access == OffloadBufferAccess::kLocalAddress ||
+        canUseLocalMemcpy(transfer_engine_addr);
     if (use_local_memcpy && !canUseLocalMemcpy(transfer_engine_addr)) {
         LOG(ERROR) << "Offload source is not locally addressable: "
                    << transfer_engine_addr;

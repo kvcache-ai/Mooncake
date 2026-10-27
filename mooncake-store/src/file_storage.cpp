@@ -321,8 +321,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     }
 
     std::vector<std::vector<std::string>> buckets_keys;
-    if (auto bucket_backend =
-            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
+    auto bucket_backend =
+        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    if (bucket_backend) {
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
             storage_object_sizes, buckets_keys);
         if (!allocate_res) {
@@ -376,6 +377,22 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     // left waiting on the TTL reaper.
     std::optional<ErrorCode> abort_error;
 
+    struct OffloadBucket {
+        PinnedBufferPool* pool;
+        std::unordered_map<std::string, std::vector<Slice>> objects;
+        std::vector<PinnedBufferPool::Buffer> staging;
+        std::unordered_map<std::string, bool> reported_keys;
+        ~OffloadBucket() {
+            for (auto& buf : staging) pool->Release(std::move(buf));
+        }
+    };
+    std::unique_ptr<BucketStorageBackend::PendingOffloads> pending;
+    std::vector<std::shared_ptr<OffloadBucket>> pending_buckets;
+    if (bucket_backend && bucket_backend->HasWriteScheduler()) {
+        pending = std::make_unique<BucketStorageBackend::PendingOffloads>();
+        pending_buckets.reserve(buckets_keys.size());
+    }
+
     for (const auto& keys : buckets_keys) {
         for (const auto& k : keys) all_bucket_keys.insert(k);
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
@@ -417,9 +434,12 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 
         // D2H staging: replace device slices with host memory slices
         // so that storage_backend (ConcatSlicesToString / BuildBucket /
-        // WriteBucket) always receives host pointers.
-        std::unordered_map<std::string, std::vector<Slice>> host_batch_object;
-        std::vector<PinnedBufferPool::Buffer> staging_bufs;
+        // WriteBucket) always receives host pointers. Deferred writes keep
+        // these buffers alive through the bucket context.
+        auto bucket = std::make_shared<OffloadBucket>();
+        bucket->pool = pinned_buffer_pool_.get();
+        auto& host_batch_object = bucket->objects;
+        auto& staging_bufs = bucket->staging;
         auto runtime_accelerator =
             device::GetAcceleratorRegistry().RuntimeAccelerators();
 
@@ -452,32 +472,23 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
         }
 
-        // If every object in this bucket failed D2H staging, host_batch_object
-        // is empty (those keys are already in failed_tasks). Skip BatchOffload,
-        // which rejects an empty map as INVALID_KEY and would otherwise trip
-        // the whole-cycle abort below for a bucket that has nothing left to
-        // persist. staging_bufs can still be non-empty here (an object whose
-        // first slices copied fine but a later one failed), so hand those
-        // buffers back before continuing: the release loop after BatchOffload
-        // is unreachable on this path.
-        if (host_batch_object.empty()) {
-            for (auto& buf : staging_bufs) {
-                pinned_buffer_pool_->Release(std::move(buf));
-            }
-            continue;
-        }
+        // The context also releases buffers from partially failed staging.
+        if (host_batch_object.empty()) continue;
 
         auto offload_start = std::chrono::steady_clock::now();
-        std::unordered_set<std::string> reported_keys;
+        auto& reported_keys = bucket->reported_keys;
         reported_keys.reserve(host_batch_object.size());
+        for (const auto& [key, _] : host_batch_object)
+            reported_keys.emplace(key, false);
         auto bucket_complete_handler =
-            [this, offload_start, complete_handler, &reported_keys](
+            [this, offload_start, complete_handler, bucket](
                 const std::vector<std::string>& keys,
                 std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
             auto res = complete_handler(keys, metadatas);
             if (res == ErrorCode::OK) {
-                reported_keys.insert(keys.begin(), keys.end());
+                for (const auto& key : keys) bucket->reported_keys.at(key) = true;
             }
+            try {
             if (res == ErrorCode::OK && ssd_metric_) {
                 auto elapsed_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
@@ -496,24 +507,37 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 ssd_metric_->ssd_total_latency_us.observe(elapsed_us);
                 ssd_metric_->ssd_total_latency_summary.observe(elapsed_us);
             }
+            } catch (...) {
+                // Metrics must not roll back a replica already accepted by Master.
+                LOG(WARNING) << "Failed to record offload metrics";
+            }
             return res;
         };
+        if (pending) {
+            pending_buckets.push_back(bucket);
+            auto prepared = bucket_backend->PrepareOffload(
+                *pending, host_batch_object, bucket_complete_handler,
+                [this](const std::vector<std::string>& evicted_keys) {
+                    return NotifyEvictedDiskReplicas(evicted_keys);
+                });
+            if (!prepared) {
+                abort_error = prepared.error();
+                break;
+            }
+            continue;
+        }
         auto offload_res = storage_backend_->BatchOffload(
             host_batch_object, bucket_complete_handler,
             [this](const std::vector<std::string>& evicted_keys) {
                 return NotifyEvictedDiskReplicas(evicted_keys);
             });
 
-        // Release staging buffers back to pool.
-        for (auto& buf : staging_bufs) {
-            pinned_buffer_pool_->Release(std::move(buf));
-        }
         if (offload_res) {
             // A successful batch may skip duplicates or individual writes.
             // Only the completion callback's keys were reported to Master;
             // NACK the rest to release their tasks and source replica refs.
             for (const auto& [key, _] : host_batch_object) {
-                if (reported_keys.find(key) == reported_keys.end()) {
+                if (!reported_keys.at(key)) {
                     failed_tasks.push_back(task_by_storage_key.at(key));
                 }
             }
@@ -544,6 +568,23 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 break;
             }
             // Soft per-bucket error: keep processing the remaining buckets.
+        }
+    }
+    if (pending) {
+        // All bucket plans have been built before any write task is published.
+        if (!abort_error) {
+            auto written = bucket_backend->SubmitOffloadsAndWait(*pending);
+            if (!written) abort_error = written.error();
+        }
+        for (const auto& bucket : pending_buckets) {
+            for (const auto& [key, _] : bucket->objects) {
+                if (!bucket->reported_keys.at(key))
+                    failed_tasks.push_back(task_by_storage_key.at(key));
+            }
+        }
+        if (abort_error == ErrorCode::KEYS_ULTRA_LIMIT) {
+            MutexLocker locker(&offloading_mutex_);
+            enable_offloading_ = false;
         }
     }
 

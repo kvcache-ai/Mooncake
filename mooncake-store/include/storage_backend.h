@@ -15,6 +15,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "batch_io_scheduler.h"
 #include "config/bucket_backend_config.h"
 #include "config/file_per_key_config.h"
 #include "config/offset_allocator_backend_config.h"
@@ -750,6 +751,34 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     ~BucketStorageBackend();
 
+    using OffloadObjects = std::unordered_map<std::string, std::vector<Slice>>;
+    using OffloadComplete = std::function<ErrorCode(
+        const std::vector<std::string>&, std::vector<StorageObjectMetadata>&)>;
+    using OffloadSource =
+        std::function<tl::expected<OffloadObjects, ErrorCode>()>;
+
+    // Memory-only preparation across all buckets. Payloads may be unresolved
+    // (null Slice pointers) when load_source supplies them at execution time.
+    // Callers retain callback/source owners until SubmitOffloadsAndWait
+    // returns.
+    class PendingOffloads {
+       public:
+        PendingOffloads();
+        ~PendingOffloads();
+        PendingOffloads(const PendingOffloads&) = delete;
+        PendingOffloads& operator=(const PendingOffloads&) = delete;
+
+       private:
+        friend class BucketStorageBackend;
+        struct State;
+        std::unique_ptr<State> state_;
+    };
+    bool HasWriteScheduler() const { return write_io_scheduler_ != nullptr; }
+    tl::expected<void, ErrorCode> PrepareOffload(
+        PendingOffloads&, OffloadObjects objects, OffloadComplete complete,
+        EvictionHandler eviction = nullptr, OffloadSource load_source = {});
+    tl::expected<void, ErrorCode> SubmitOffloadsAndWait(PendingOffloads&);
+
     /**
      * @brief Offload objects in batches
      * @param batch_object  A map from object key to a list of data slices to be
@@ -979,6 +1008,17 @@ class BucketStorageBackend : public StorageBackendInterface {
         int64_t write_size = 0;
     };
 
+    tl::expected<void, ErrorCode> WaitForReadIdle() const;
+    struct WritePlan;
+    tl::expected<void, ErrorCode> InitializeWritePlan(WritePlan&);
+    tl::expected<void, ErrorCode> ExecuteWriteRange(WritePlan&, size_t, size_t);
+    tl::expected<void, ErrorCode> FinishWritePlan(
+        WritePlan&, tl::expected<void, ErrorCode>);
+    tl::expected<int64_t, ErrorCode> CommitOffloadedBucket(
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket,
+        std::vector<StorageObjectMetadata>& metadatas, PendingEviction& pending,
+        const OffloadComplete& complete_handler);
+
     /**
      * @brief Phase 1 of eviction: under exclusive lock, select and remove
      * oldest buckets (FIFO) until total_size_ + required_size <=
@@ -1113,6 +1153,12 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::set<std::pair<int64_t, int64_t>> GUARDED_BY(mutex_) lru_index_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
+    std::unique_ptr<BatchIoScheduler> write_io_scheduler_;
+    std::atomic<size_t> active_reads_{0};
+    std::atomic<bool> write_stopping_{false};
+    // Order local publication/master notification against eviction admission.
+    // Data sub batches never hold this mutex.
+    std::mutex offload_publish_mutex_;
 
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)

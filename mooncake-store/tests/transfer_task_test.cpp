@@ -479,16 +479,18 @@ TEST_F(TransferTaskTest, BatchGetOffloadObjectHonorsLocalMemcpySetting) {
     const std::unordered_map<std::string, std::vector<Slice>> slices{
         {"key", {{nullptr, 0}, {destination.data(), destination.size()}}}};
 
-    {
+    for (const auto access : {OffloadBufferAccess::kLocalAddress,
+                              OffloadBufferAccess::kTransferEngine}) {
         std::shared_ptr<StorageBackend> backend;
         TransferSubmitter submitter(engine, backend, endpoint);
+        std::fill(destination.begin(), destination.end(), 0);
         auto future = submitter.submit_batch_get_offload_object(
-            endpoint, keys, pointers, slices,
-            OffloadBufferAccess::kLocalAddress,
+            endpoint, keys, pointers, slices, access,
             TransferIntent::kBackgroundPrefetch);
         ASSERT_TRUE(future);
         EXPECT_EQ(future->strategy(), TransferStrategy::LOCAL_MEMCPY);
         EXPECT_EQ(future->get(), ErrorCode::OK);
+        EXPECT_EQ(destination, source);
         EXPECT_FALSE(submitter.submit_batch_get_offload_object(
             endpoint, keys, {std::numeric_limits<uint64_t>::max() - 7},
             {{"key", {{destination.data(), 16}}}},
