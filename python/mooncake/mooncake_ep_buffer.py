@@ -103,6 +103,7 @@ class Buffer:
         num_ep_buffer_bytes: int,
         disable_p2p: bool = False,
     ):
+        self._is_elastic = False
         from mooncake import ep
 
         # Initialize the CPP runtime
@@ -133,15 +134,21 @@ class Buffer:
         rank: int = 0,
         tcp_store_group: Optional[dist.TCPStore] = None,
         timeout_ms: int = 30000,
+        metadata_timeout_ms: int = 300000,
     ) -> "Buffer":
         """Create an opt-in rank buffer without joining a ProcessGroup.
 
         Native allocation and rank connection are deferred until
-        ``update_memory_buffers`` and ``connect_ranks``. The legacy constructor
-        keeps its eager ProcessGroup setup path.
+        ``update_memory_buffers`` and ``connect_ranks``. ``timeout_ms`` sets
+        the native GPU communication timeout in milliseconds. The separate
+        ``metadata_timeout_ms`` sets the TCPStore peer-metadata wait timeout
+        in milliseconds and defaults to 300000 (300 seconds). The legacy
+        constructor keeps its eager ProcessGroup setup path.
         """
         if timeout_ms < 0:
             raise ValueError("timeout_ms must be non-negative")
+        if metadata_timeout_ms <= 0:
+            raise ValueError("metadata_timeout_ms must be positive")
         instance = cls.__new__(cls)
         instance._initialize_elastic_fields(
             disable_ll_nvlink=disable_ll_nvlink,
@@ -149,6 +156,7 @@ class Buffer:
             rank=rank,
             tcp_store_group=tcp_store_group,
             timeout_ms=timeout_ms,
+            metadata_timeout_ms=metadata_timeout_ms,
         )
         return instance
 
@@ -159,6 +167,7 @@ class Buffer:
         rank: int,
         tcp_store_group: Optional[dist.TCPStore],
         timeout_ms: int,
+        metadata_timeout_ms: int,
     ) -> None:
         """Initialize wrapper state for the deferred, no-ProcessGroup path."""
         self.rank = rank
@@ -177,6 +186,7 @@ class Buffer:
         self.explicitly_destroy = explicitly_destroy
         self.tcp_store_group = tcp_store_group
         self.timeout_ms = timeout_ms
+        self.metadata_timeout_ms = metadata_timeout_ms
         self.num_rdma_bytes = None
         self._num_experts_per_rank = None
         self._destroyed = False
@@ -198,7 +208,7 @@ class Buffer:
         return wrapped_hook
 
     def _require_elastic_runtime(self) -> None:
-        if not getattr(self, "_is_elastic", False):
+        if not self._is_elastic:
             raise RuntimeError("This operation requires Buffer.create_elastic().")
         if self.runtime is None:
             raise RuntimeError(
@@ -212,7 +222,7 @@ class Buffer:
         num_rdma_bytes: int,
     ) -> None:
         """Allocate the fixed-capacity native buffer for an elastic instance."""
-        if not getattr(self, "_is_elastic", False):
+        if not self._is_elastic:
             raise RuntimeError("update_memory_buffers() requires an elastic buffer.")
         if self._destroyed:
             raise RuntimeError("Destroyed elastic buffers cannot be reinitialized.")
@@ -259,7 +269,7 @@ class Buffer:
         )
 
     def set_tcp_store_group(self, tcp_store_group: Optional[dist.TCPStore]) -> None:
-        if not getattr(self, "_is_elastic", False):
+        if not self._is_elastic:
             raise RuntimeError("set_tcp_store_group() requires an elastic buffer.")
         self.tcp_store_group = tcp_store_group
 
@@ -290,7 +300,10 @@ class Buffer:
             for key in outgoing_keys:
                 store.set(key, envelope)
             if incoming_keys:
-                store.wait(incoming_keys, timedelta(seconds=300))
+                store.wait(
+                    incoming_keys,
+                    timedelta(milliseconds=self.metadata_timeout_ms),
+                )
                 remote_metadata = store.multi_get(incoming_keys)
                 consumed_incoming_keys.extend(incoming_keys)
             else:
@@ -301,6 +314,21 @@ class Buffer:
                 store.delete_key(key)
 
     def connect_ranks(self, remote_ranks: List[int], activate: bool = True) -> None:
+        """Exchange peer metadata and optionally activate the connections.
+
+        A peer can be connected while inactive. ``activate=False`` still
+        stages and connects its metadata, so that peer slot is occupied.
+        Masking a rank with ``update_mask_buffer`` changes activity; it does
+        not disconnect the peer. To replace a locally connected peer, first
+        call ``disconnect_ranks`` for that slot. Both peers must then
+        coordinate a fresh metadata exchange with ``connect_ranks``; a newly
+        created replacement has no old local connection to disconnect. A
+        connection prepared with ``activate=False`` can be activated later by
+        calling ``update_mask_buffer(rank, False)``.
+
+        Calls to ``connect_ranks`` and ``disconnect_ranks`` on the same Buffer
+        must be serialized by the caller.
+        """
         self._require_elastic_runtime()
         ranks = [int(rank) for rank in remote_ranks if int(rank) != self.rank]
         if not ranks:
@@ -309,6 +337,7 @@ class Buffer:
             raise ValueError("remote_ranks must not contain duplicates.")
         if any(rank < 0 or rank >= self.group_size for rank in ranks):
             raise ValueError("remote rank is outside the configured capacity.")
+        self.runtime._validate_connect_ranks(ranks)
         local_hostname = socket.gethostname()
         with self._fetch_remote_metadata_from_tcp_store(ranks) as metadata:
             for rank, (peer_hostname, peer_metadata) in zip(ranks, metadata):
@@ -704,7 +733,7 @@ class Buffer:
     def _active_ranks_tensor(
         self, device: torch.device, dtype: torch.dtype = torch.int32
     ) -> torch.Tensor:
-        if getattr(self, "_is_elastic", False):
+        if self._is_elastic:
             if device != self._active_ranks.device or dtype != torch.int32:
                 raise ValueError(
                     "Elastic active mask must use its fixed CUDA int32 tensor."
@@ -752,7 +781,7 @@ class Buffer:
         )
 
     def dispatch(self, *args, **kwargs):
-        if getattr(self, "_is_elastic", False):
+        if self._is_elastic:
             return self._dispatch_elastic(*args, **kwargs)
         return self._dispatch_legacy(*args, **kwargs)
 
@@ -766,14 +795,13 @@ class Buffer:
         dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None,
         use_fp8: bool = True,
         round_scale: bool = False,
-        use_ue8m0: bool = False,
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
         self._require_elastic_runtime()
-        if round_scale or use_ue8m0:
+        if round_scale:
             raise NotImplementedError(
-                "Mooncake EP does not implement NIXL round_scale or UE8M0."
+                "Mooncake EP does not implement NIXL round_scale."
             )
         if dispatch_wait_recv_cost_stats is not None:
             raise NotImplementedError(
@@ -849,7 +877,7 @@ class Buffer:
         assert x.size(0) == topk_idx.size(0)
         assert x.size(0) <= num_max_dispatch_tokens_per_rank
         assert x.size(1) % 16 == 0 and x.size(1) % 128 == 0
-        elastic = getattr(self, "_is_elastic", False)
+        elastic = self._is_elastic
         if elastic:
             self._require_elastic_runtime()
             if self._use_fallback:
@@ -870,7 +898,7 @@ class Buffer:
             assert active_ranks.dim() == 1 and active_ranks.is_contiguous()
             assert active_ranks.dtype == torch.int32
             if active_ranks.numel() != self.group_size:
-                if getattr(self, "_is_elastic", False):
+                if self._is_elastic:
                     raise ValueError(
                         "active_ranks length must equal the fixed rank capacity."
                     )
@@ -937,10 +965,8 @@ class Buffer:
                 dtype=torch.float8_e4m3fn if use_fp8 else torch.bfloat16,
                 device=x.device,
             )
-            # The dispatch SEND phase resets every local-expert counter before
-            # the RECV phase reads it, so this output need not be pre-cleared.
-            # The legacy kernel accumulates receive offsets with atomicAdd.
-            packed_recv_count = torch.empty(
+            # The kernel clears these too; keep the historical zero-initialization.
+            packed_recv_count = torch.zeros(
                 (num_local_experts,), dtype=torch.int32, device=x.device
             )
             packed_recv_src_info = torch.empty(
@@ -1032,7 +1058,7 @@ class Buffer:
         )
 
     def combine(self, *args, **kwargs):
-        if getattr(self, "_is_elastic", False):
+        if self._is_elastic:
             return self._combine_elastic(*args, **kwargs)
         return self._combine_legacy(*args, **kwargs)
 
@@ -1049,6 +1075,8 @@ class Buffer:
         out: Optional[torch.Tensor] = None,
         combine_wait_recv_cost_stats: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
+        if zero_copy:
+            raise NotImplementedError(_ZERO_COPY_COMBINE_UNSUPPORTED)
         self._require_elastic_runtime()
         if use_logfmt:
             raise NotImplementedError(
@@ -1107,15 +1135,15 @@ class Buffer:
         return_recv_hook: bool = False,
         out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
-        if zero_copy and not getattr(self, "_is_elastic", False):
+        if zero_copy:
             raise NotImplementedError(_ZERO_COPY_COMBINE_UNSUPPORTED)
+        elastic = self._is_elastic
 
         if _USE_MACA:
             assert not (
                 async_finish and return_recv_hook
             ), "MACA does not support async_finish and return_recv_hook together"
 
-        elastic = getattr(self, "_is_elastic", False)
         if elastic:
             self._require_elastic_runtime()
             if self._use_fallback:
@@ -1133,7 +1161,7 @@ class Buffer:
             assert active_ranks.dim() == 1 and active_ranks.is_contiguous()
             assert active_ranks.dtype == torch.int32
             if active_ranks.numel() != self.group_size:
-                if getattr(self, "_is_elastic", False):
+                if self._is_elastic:
                     raise ValueError(
                         "active_ranks length must equal the fixed rank capacity."
                     )
@@ -1258,47 +1286,7 @@ class Buffer:
         )
 
     def get_next_combine_buffer(self, handle: object):
-        if not getattr(self, "_is_elastic", False):
-            raise NotImplementedError(_ZERO_COPY_COMBINE_UNSUPPORTED)
-        self._require_elastic_runtime()
-        if len(handle) != 4:
-            raise ValueError("Elastic dispatch handle must contain four items.")
-        _, layout_range, max_tokens, hidden = handle
-        if layout_range.dim() != 2:
-            raise ValueError("layout_range must be a rank-by-expert matrix.")
-        rank_bound = layout_range.size(1)
-        descriptor = self.runtime._get_next_combine_buffer_descriptor(
-            max_tokens, hidden, rank_bound
-        )
-        if len(descriptor) != 5:
-            raise RuntimeError(
-                "Native combine-buffer descriptor must have five fields."
-            )
-        data_ptr, logical_bytes, native_shape, native_stride, slot = descriptor
-        data_ptr = int(data_ptr)
-        logical_bytes = int(logical_bytes)
-        size = tuple(int(dim) for dim in native_shape)
-        stride = tuple(int(value) for value in native_stride)
-        expected_size = (
-            self._num_experts_per_rank,
-            rank_bound * max_tokens,
-            hidden,
-        )
-        if size != expected_size or len(stride) != len(size):
-            raise RuntimeError(
-                "Native zero-copy view shape does not match the dispatch handle."
-            )
-        tensor = self._tensor_from_native_storage(
-            data_ptr,
-            logical_bytes,
-            self._active_ranks.device,
-            torch.bfloat16,
-            size,
-            stride,
-            self,
-        )
-        tensor._mooncake_buffer_slot = slot
-        return tensor
+        raise NotImplementedError(_ZERO_COPY_COMBINE_UNSUPPORTED)
 
     # -----------------
     # Fallback helpers

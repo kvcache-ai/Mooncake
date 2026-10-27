@@ -15,9 +15,6 @@ HPE = "HPE"
 [default.extend-identifiers]
 # CPython buffer protocol flag from the Python C API.
 PyBUF_ND = "PyBUF_ND"
-# NIXL FP8 scale format identifiers.
-UE8M0 = "UE8M0"
-use_ue8m0 = "use_ue8m0"
 
 [files]
 extend-exclude = [

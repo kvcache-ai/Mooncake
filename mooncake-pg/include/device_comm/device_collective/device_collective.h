@@ -59,12 +59,6 @@ class DeviceCollectiveRuntime {
     PGResult<void> shutdown();
 
    private:
-    enum class ControlMailboxAllocationKind : uint8_t {
-        None,
-        HostMapped,
-        Managed,
-    };
-
     friend class MooncakeCommunicator;
 
     DeviceCollectiveRuntime(DeviceTransferService& transfer_service,
@@ -90,8 +84,6 @@ class DeviceCollectiveRuntime {
     std::unique_ptr<RingAllReduceAlgorithm> all_reduce_;
     StrongStream& strong_stream_;
     ControlMailbox* control_mailbox_ = nullptr;
-    ControlMailboxAllocationKind control_mailbox_allocation_kind_ =
-        ControlMailboxAllocationKind::None;
     int32_t* active_ranks_mirror_ = nullptr;
     size_t active_ranks_count_ = 0;
     std::array<int32_t, kMaxNumRanks> host_active_ranks_{};

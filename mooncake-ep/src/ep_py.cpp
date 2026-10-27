@@ -57,6 +57,8 @@ PYBIND11_MODULE(_ep, m) {
              &MooncakeEpBuffer::sync_nvlink_ipc_handles)
         .def("_configure_elastic", &MooncakeEpBuffer::configure_elastic)
         .def("_set_explicit_destroy", &MooncakeEpBuffer::set_explicit_destroy)
+        .def("_validate_connect_ranks",
+             &MooncakeEpBuffer::validate_connect_ranks)
         .def("_stage_peer",
              [](MooncakeEpBuffer& buffer, int peer_rank, int64_t raddr,
                 int32_t rkey, int64_t subnet_prefix, int64_t interface_id,
@@ -76,8 +78,6 @@ PYBIND11_MODULE(_ep, m) {
         .def("_get_comm_stream", &MooncakeEpBuffer::get_comm_stream)
         .def("_get_local_buffer_descriptor",
              &MooncakeEpBuffer::get_local_buffer_descriptor)
-        .def("_get_next_combine_buffer_descriptor",
-             &MooncakeEpBuffer::get_next_combine_buffer_descriptor)
         .def("destroy", &MooncakeEpBuffer::destroy)
         .def("dispatch", &MooncakeEpBuffer::dispatch, py::arg("x_ptr"),
              py::arg("topk_idx_ptr"), py::arg("active_ranks_ptr"),

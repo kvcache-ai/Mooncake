@@ -87,36 +87,13 @@ void DeviceCollectiveRuntime::releaseState() noexcept {
     }
 
     if (control_mailbox_) {
-        cudaError_t result = cudaSuccess;
-        switch (control_mailbox_allocation_kind_) {
-            case ControlMailboxAllocationKind::HostMapped:
-                std::destroy_at(control_mailbox_);
-                result = cudaFreeHost(control_mailbox_);
-                break;
-            case ControlMailboxAllocationKind::Managed: {
-                auto device_guard = GpuDeviceGuard::create(device_index_);
-                if (!device_guard.has_value()) {
-                    LOG(ERROR)
-                        << "Failed to select CUDA device while releasing "
-                           "managed device collective control mailbox: "
-                        << device_guard.error().message;
-                    return;
-                }
-                std::destroy_at(control_mailbox_);
-                result = cudaFree(control_mailbox_);
-                break;
-            }
-            case ControlMailboxAllocationKind::None:
-                LOG(ERROR) << "Device collective control mailbox has no "
-                              "allocator kind";
-                return;
-        }
+        std::destroy_at(control_mailbox_);
+        const auto result = cudaFreeHost(control_mailbox_);
         if (result != cudaSuccess) {
             LOG(ERROR) << "Failed to free device collective control mailbox: "
                        << cudaGetErrorString(result);
         }
         control_mailbox_ = nullptr;
-        control_mailbox_allocation_kind_ = ControlMailboxAllocationKind::None;
     }
 }
 
@@ -164,58 +141,16 @@ DeviceCollectiveRuntime::create(DeviceTransferService& transfer_service,
         PG_TRY_CUDA(
             cudaMemset(runtime->invocation_state_, 0, sizeof(InvocationState)));
 
-        // This mailbox uses system-scope atomics across the CPU and GPU.
-        // Mapped host memory needs native host atomics; otherwise use fully
-        // concurrent managed memory.
-        int host_native_atomic_supported = 0;
-        PG_TRY_CUDA(cudaDeviceGetAttribute(&host_native_atomic_supported,
-                                           cudaDevAttrHostNativeAtomicSupported,
-                                           device_index));
-        int can_map_host_memory = 0;
-        PG_TRY_CUDA(cudaDeviceGetAttribute(
-            &can_map_host_memory, cudaDevAttrCanMapHostMemory, device_index));
-        if (host_native_atomic_supported != 0 && can_map_host_memory != 0) {
-            runtime->control_mailbox_allocation_kind_ =
-                ControlMailboxAllocationKind::HostMapped;
-            void* host_mailbox = nullptr;
-            PG_TRY_CUDA(
-                cudaHostAlloc(&host_mailbox, sizeof(ControlMailbox),
-                              cudaHostAllocMapped | cudaHostAllocPortable));
-            runtime->control_mailbox_ =
-                static_cast<ControlMailbox*>(host_mailbox);
-            std::construct_at(runtime->control_mailbox_);
+        PG_TRY_CUDA(
+            cudaHostAlloc(reinterpret_cast<void**>(&runtime->control_mailbox_),
+                          sizeof(ControlMailbox),
+                          cudaHostAllocMapped | cudaHostAllocPortable));
+        std::construct_at(runtime->control_mailbox_);
 
-            void* device_mailbox = nullptr;
-            PG_TRY_CUDA(cudaHostGetDevicePointer(&device_mailbox,
-                                                 runtime->control_mailbox_, 0));
-            device_control_mailbox =
-                static_cast<ControlMailbox*>(device_mailbox);
-        } else {
-            int managed_memory = 0;
-            PG_TRY_CUDA(cudaDeviceGetAttribute(
-                &managed_memory, cudaDevAttrManagedMemory, device_index));
-            int concurrent_managed_access = 0;
-            PG_TRY_CUDA(cudaDeviceGetAttribute(
-                &concurrent_managed_access, cudaDevAttrConcurrentManagedAccess,
-                device_index));
-            if (managed_memory == 0 || concurrent_managed_access == 0) {
-                return makePGError(
-                    PGErrorCode::NotSupported,
-                    "device collective control mailbox requires either "
-                    "mapped host native atomics or managed memory with "
-                    "concurrent managed access");
-            }
-
-            runtime->control_mailbox_allocation_kind_ =
-                ControlMailboxAllocationKind::Managed;
-            void* managed_mailbox = nullptr;
-            PG_TRY_CUDA(cudaMallocManaged(
-                &managed_mailbox, sizeof(ControlMailbox), cudaMemAttachGlobal));
-            runtime->control_mailbox_ =
-                static_cast<ControlMailbox*>(managed_mailbox);
-            std::construct_at(runtime->control_mailbox_);
-            device_control_mailbox = runtime->control_mailbox_;
-        }
+        void* device_mailbox = nullptr;
+        PG_TRY_CUDA(cudaHostGetDevicePointer(&device_mailbox,
+                                             runtime->control_mailbox_, 0));
+        device_control_mailbox = static_cast<ControlMailbox*>(device_mailbox);
     }
     PG_TRY(
         runtime->all_reduce_,

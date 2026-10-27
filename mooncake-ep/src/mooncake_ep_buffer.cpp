@@ -341,6 +341,27 @@ void MooncakeEpBuffer::configure_elastic(int num_experts_per_rank,
     CUDA_CHECK(cudaStreamSynchronize(comm_stream));
 }
 
+void MooncakeEpBuffer::validate_connect_ranks(
+    const std::vector<int>& peer_ranks) {
+    std::lock_guard<std::mutex> lock(elastic_mutex_);
+    if (!elastic_enabled_ || destroyed_) {
+        throw std::runtime_error("elastic EP buffer is not configured");
+    }
+    for (int peer_rank : peer_ranks) {
+        if (peer_rank < 0 || peer_rank >= num_ranks || peer_rank == rank) {
+            std::ostringstream message;
+            message << "invalid elastic EP connect rank slot " << peer_rank;
+            throw std::invalid_argument(message.str());
+        }
+        if (elastic_connected_ranks_[peer_rank]) {
+            std::ostringstream message;
+            message << "elastic EP rank slot " << peer_rank
+                    << " is already connected; call disconnect_ranks() first";
+            throw std::invalid_argument(message.str());
+        }
+    }
+}
+
 void MooncakeEpBuffer::stage_peer(int peer_rank, int64_t raddr, int32_t rkey,
                                   int64_t subnet_prefix, int64_t interface_id,
                                   const std::vector<int32_t>& qpns,
@@ -351,7 +372,12 @@ void MooncakeEpBuffer::stage_peer(int peer_rank, int64_t raddr, int32_t rkey,
         peer_rank >= num_ranks || peer_rank == rank) {
         throw std::invalid_argument("invalid elastic EP peer rank");
     }
-    if (elastic_connected_ranks_[peer_rank]) return;
+    if (elastic_connected_ranks_[peer_rank]) {
+        std::ostringstream message;
+        message << "elastic EP rank slot " << peer_rank
+                << " is already connected; call disconnect_ranks() first";
+        throw std::invalid_argument(message.str());
+    }
     if (elastic_active_ranks_host_[peer_rank]) {
         throw std::invalid_argument(
             "cannot prepare an active elastic EP rank slot");
@@ -601,41 +627,6 @@ std::tuple<uint64_t, size_t> MooncakeEpBuffer::get_local_buffer_descriptor()
     }
     return {reinterpret_cast<uint64_t>(gdr_buffer),
             static_cast<size_t>(num_ep_buffer_bytes) - control_bytes};
-}
-
-std::tuple<uint64_t, size_t, std::vector<int64_t>, std::vector<int64_t>, int>
-MooncakeEpBuffer::get_next_combine_buffer_descriptor(
-    int num_max_dispatch_tokens_per_rank, int hidden, int rank_bound) const {
-    if (!elastic_enabled_ || rank_bound < active_rank_bound_ ||
-        rank_bound > num_ranks || num_max_dispatch_tokens_per_rank <= 0 ||
-        hidden <= 0) {
-        throw std::invalid_argument("invalid elastic combine buffer view");
-    }
-    const int capacity_experts = num_ranks * num_experts_per_rank_;
-    BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
-                      num_ranks, capacity_experts);
-    const size_t control_bytes =
-        2 * static_cast<size_t>(num_ranks) * sizeof(int32_t);
-    if (layout.total_bytes + control_bytes >
-        static_cast<size_t>(num_ep_buffer_bytes)) {
-        throw std::invalid_argument(
-            "elastic combine buffer exceeds allocation");
-    }
-    const auto& buffer = layout.buffers[buffer_idx];
-    const size_t num_elements = static_cast<size_t>(num_experts_per_rank_) *
-                                rank_bound * num_max_dispatch_tokens_per_rank *
-                                hidden;
-    const size_t num_bytes = num_elements * EP_BF16_SIZE;
-    const std::vector<int64_t> shape = {
-        num_experts_per_rank_,
-        static_cast<int64_t>(rank_bound) * num_max_dispatch_tokens_per_rank,
-        hidden};
-    const std::vector<int64_t> strides = {static_cast<int64_t>(rank_bound) *
-                                              num_max_dispatch_tokens_per_rank *
-                                              hidden,
-                                          hidden, 1};
-    return {reinterpret_cast<uint64_t>(buffer.rdma_send_data_buffer), num_bytes,
-            shape, strides, buffer_idx};
 }
 
 std::tuple<std::optional<EventHandle>, std::optional<std::function<void()>>>

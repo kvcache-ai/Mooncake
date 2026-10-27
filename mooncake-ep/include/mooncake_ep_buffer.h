@@ -141,6 +141,7 @@ struct MooncakeEpBuffer {
 
     void configure_elastic(int num_experts_per_rank, uint64_t active_ranks_ptr);
     void set_explicit_destroy(bool explicitly_destroy);
+    void validate_connect_ranks(const std::vector<int>& peer_ranks);
     void stage_peer(int peer_rank, int64_t raddr, int32_t rkey,
                     int64_t subnet_prefix, int64_t interface_id,
                     const std::vector<int32_t>& qpns,
@@ -156,10 +157,6 @@ struct MooncakeEpBuffer {
         return reinterpret_cast<uint64_t>(comm_stream);
     }
     std::tuple<uint64_t, size_t> get_local_buffer_descriptor() const;
-    std::tuple<uint64_t, size_t, std::vector<int64_t>, std::vector<int64_t>,
-               int>
-    get_next_combine_buffer_descriptor(int num_max_dispatch_tokens_per_rank,
-                                       int hidden, int rank_bound) const;
     void destroy();
 
     std::tuple<std::optional<EventHandle>, std::optional<std::function<void()>>>
