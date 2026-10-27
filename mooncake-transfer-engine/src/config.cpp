@@ -715,6 +715,19 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    if (const char* value = std::getenv("MC_HIP_KFD_PIN_FIX")) {
+        const auto parsed = TryParseBool(value);
+        if (strcasecmp(value, "force") == 0) {
+            config.hip_kfd_pin_fix = HipKfdPinFix::FORCE;
+        } else if (parsed.has_value()) {
+            config.hip_kfd_pin_fix =
+                *parsed ? HipKfdPinFix::PROBE : HipKfdPinFix::OFF;
+        } else {
+            LOG(WARNING) << "Invalid MC_HIP_KFD_PIN_FIX environment value: "
+                         << value << ", expected 0|1|force, keeping default";
+        }
+    }
+
     if (const char* value = std::getenv("MC_EFA_CQ_THREADS")) {
         const auto parsed = TryParseInteger<int>(
             value, {.trim_ascii_whitespace = true, .allow_leading_plus = true});

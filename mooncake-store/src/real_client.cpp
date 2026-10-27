@@ -1851,8 +1851,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     ssd_prefetch_dedup_ttl_sec_ =
         static_cast<int64_t>(prefetch_dedup_ttl_opt.value());
 
-    auto egm_config = ParseEgmStorePoolConfig(
-        config, protocol, global_segment_size, local_buffer_size);
+    auto egm_config =
+        ParseEgmStorePoolConfig(config, protocol, global_segment_size);
     if (!egm_config) return tl::unexpected(egm_config.error());
     try {
         auto result = setup_internal(

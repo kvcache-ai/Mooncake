@@ -78,6 +78,8 @@ endif()
 add_subdirectory(master_service)
 
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_service_restore_lifecycle_test
+               master_service_restore_lifecycle_test.cpp)
 add_store_test(master_service_probe_policy_test
                master_service_probe_policy_test.cpp)
 add_store_test(master_metadata_config_test master_metadata_config_test.cpp)
@@ -208,6 +210,13 @@ if(USE_TENT)
             --gtest_filter=TransferTaskTest.RemoteTransferWaitCompletesCorrectly
   )
   set_tests_properties(transfer_task_tent_completion_test
+                       PROPERTIES ENVIRONMENT "MC_USE_TENT=1" TIMEOUT 30)
+  add_test(
+    NAME transfer_task_tent_shared_segment_test
+    COMMAND
+      transfer_task_test
+      --gtest_filter=TransferTaskTest.NativeScatterPreservesSharedRemoteSegment)
+  set_tests_properties(transfer_task_tent_shared_segment_test
                        PROPERTIES ENVIRONMENT "MC_USE_TENT=1" TIMEOUT 30)
 endif()
 add_store_test(transfer_submitter_config_test
