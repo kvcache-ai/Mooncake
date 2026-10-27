@@ -389,8 +389,7 @@ TEST_F(EvictorTest, AReplacedDeferredObjectIsLeftAlone) {
         list.emplace_back(allocator_->allocate(128), ReplicaStatus::COMPLETE);
         (void)hold->Publish(UUID{1, 2}, Clock::time_point{}, 128,
                             std::move(list), std::nullopt, false,
-                            ObjectDataType::UNKNOWN, std::string(),
-                            TenantId("a"), "pinned");
+                            ObjectDataType::UNKNOWN, std::string());
     };
 
     Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
@@ -450,8 +449,7 @@ TEST_F(EvictorTest, AMemberReplacedBeforeItsTurnIsLeftAlone) {
         list.emplace_back(allocator_->allocate(128), ReplicaStatus::COMPLETE);
         (void)hold->Publish(UUID{1, 2}, Clock::time_point{}, 128,
                             std::move(list), std::nullopt, false,
-                            ObjectDataType::UNKNOWN, std::string(),
-                            TenantId("a"), replaced);
+                            ObjectDataType::UNKNOWN, std::string());
         SetDeadline(hold->metadata(), Clock::now() + std::chrono::hours(1));
     };
 
