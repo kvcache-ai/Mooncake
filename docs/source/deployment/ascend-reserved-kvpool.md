@@ -89,6 +89,15 @@ it cannot create enough 2 MiB physical tiles if long-term pins already block
 the required capacity. The effect on a particular failed node requires a
 same-node before/after validation.
 
+This warmup exercises **only the Store/FabricMem Host backing**. It does not
+allocate model weights, register Engram Host tables, or establish their NPU
+mappings. Those can still fail after the lasting Store reservation succeeds;
+require the actual model and Engram initialization plus a real KVPool request
+before reporting the combined workload ready. If an existing deployment
+allocates Store memory only after model loading, a pre-model warmup is a
+different allocation order and is not evidence that the original late path
+has been repaired.
+
 ## Admit zero-contribution model clients
 
 ```bash
