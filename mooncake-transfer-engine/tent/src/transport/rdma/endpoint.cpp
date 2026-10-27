@@ -39,6 +39,7 @@
 #include "tent/thirdparty/nlohmann/json.h"
 #include "tent/transport/rdma/context.h"
 #include "tent/transport/rdma/endpoint_store.h"
+#include "tent/transport/rdma/rail_monitor.h"
 
 namespace mooncake {
 namespace tent {
@@ -311,6 +312,15 @@ int RdmaEndPoint::deconstructUnlocked() {
         }
     }
     if (all_qps_destroyed) {
+        // Once every data QP is gone, none of its queued WRs can produce a
+        // flush CQE. Release their probes now; timeout marking alone must keep
+        // ownership until this point or the completion is handled.
+        for (const auto& cancellation : pending_probe_cancellations_) {
+            cancellation.monitor->cancelProbe(cancellation.local_nic,
+                                              cancellation.remote_nic,
+                                              cancellation.token);
+        }
+        pending_probe_cancellations_.clear();
         qp_list_.clear();
         slice_queue_.clear();
         delete[] queue_lock_list_;
@@ -924,6 +934,13 @@ void RdmaEndPoint::resetInflightSlices() {
         auto& queue = slice_queue_[qp_index];
         while (!queue.empty()) {
             auto current = queue.pop();
+            const auto token = current->rail_probe_token.exchange(
+                0, std::memory_order_acq_rel);
+            if (token != 0 && current->rail_monitor) {
+                pending_probe_cancellations_.push_back(
+                    {current->rail_monitor, current->source_dev_id,
+                     current->target_dev_id, token});
+            }
             updateSliceStatus(current, TransferStatusEnum::CANCELED);
         }
     }

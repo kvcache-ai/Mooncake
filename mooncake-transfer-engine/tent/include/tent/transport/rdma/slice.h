@@ -206,10 +206,13 @@ struct RdmaSlice {
     // Non-owning pointer to the per-worker RailMonitor for this slice's
     // target machine, resolved once in generatePostPath. Lets asyncPollCq
     // and disableEndpoint call markRecovered / markFailed without a
-    // string-keyed map lookup on the RDMA hot path. Stable because
-    // WorkerContext::rails stores values via unique_ptr, so rehashes do
-    // not invalidate the pointee.
-    RailMonitor* rail_monitor = nullptr;
+    // string-keyed map lookup on the RDMA hot path. Shared ownership keeps it
+    // alive through endpoint teardown and stable across map rehashes.
+    std::shared_ptr<RailMonitor> rail_monitor;
+    // Nonzero only when this slice owns an admitted probe/trial on
+    // rail_monitor. A stale completion/flush must not cancel another slice's
+    // in-flight probe on the same per-worker RailMonitor.
+    std::atomic<uint64_t> rail_probe_token{0};
     int priority = PRIO_HIGH;
 };
 

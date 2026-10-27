@@ -27,10 +27,19 @@
 
 namespace mooncake {
 namespace tent {
+class RailMonitor;
+
 class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     struct WrDepthBlock {
         std::atomic<int> value;
         uint64_t padding[7];
+    };
+
+    struct ProbeCancellation {
+        std::shared_ptr<RailMonitor> monitor;
+        int local_nic;
+        int remote_nic;
+        uint64_t token;
     };
 
     // Not synchronized: every access goes through queue_lock_list_[qp_index]
@@ -299,6 +308,9 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // Receive WRs share the QP/CQ quota but are not represented by slices.
     // Keep their signaled CQE count separately for teardown accounting.
     std::vector<size_t> recv_cqe_counts_;
+    // Tokens are released after their QPs are destroyed and cannot produce a
+    // flush CQE.
+    std::vector<ProbeCancellation> pending_probe_cancellations_;
     std::atomic<int> inflight_slices_;
     uint32_t padding_[7];
     RWSpinlock lock_;
