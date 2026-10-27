@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -122,6 +123,17 @@ std::optional<tl::expected<size_t, ErrorCode>> RdmaGetResult(const Reply& reply,
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
     return len;
+}
+
+// Whether a failed BLOB.RDMA_SET would fail the same way over TCP:
+// BLOB.TCP_SET applies the same type, length and memory checks, so resending
+// the object there only moves the bytes for nothing.
+bool TcpSetWouldFailToo(const redisReply& reply) {
+    if (reply.type != REDIS_REPLY_ERROR || !reply.str) return false;
+    const std::string_view error(reply.str, reply.len);
+    return error.starts_with("OOM ") || error.starts_with("WRONGTYPE") ||
+           error == "ERR max object size exceeded" ||
+           error == "ERR object length must be > 0";
 }
 
 // Append the (rkey, addr, len) triples of a BLOB.RDMA_* command. The key is
@@ -276,18 +288,19 @@ ValkeyObjectStorageAdapter::Connection* ValkeyObjectStorageAdapter::Acquire() {
 
 void ValkeyObjectStorageAdapter::Release(Connection* connection) {
     // A connection that hit an I/O error (e.g. a timeout) cannot be reused:
-    // replace it, or keep it out of rotation if the server is unreachable. A
-    // new connection has no RDMA session yet.
+    // replace it. If the server is unreachable, keep the broken one; requests
+    // on it fail fast and the next Release() tries again. Do not use
+    // redisReconnect(): it would not repeat AUTH, and a connection that came
+    // back unauthenticated fails every command without setting `err`, so it
+    // would never be replaced. A new connection has no RDMA session yet.
     if (connection->context->err) {
         auto fresh = Connect();
         if (fresh) {
             redisFree(connection->context);
             connection->context = *fresh;
-        } else {
-            redisReconnect(connection->context);
+            connection->rdma_tried = false;
+            connection->rdma_ready = false;
         }
-        connection->rdma_tried = false;
-        connection->rdma_ready = false;
     }
     {
         std::lock_guard<std::mutex> lock(pool_mutex_);
@@ -411,8 +424,14 @@ tl::expected<void, ErrorCode> ValkeyObjectStorageAdapter::PutOn(
             rdma_requests_.fetch_add(1, std::memory_order_relaxed);
             return {};
         }
+        if (TcpSetWouldFailToo(*reply)) {
+            LOG(ERROR) << "Valkey BLOB.RDMA_SET failed: "
+                       << std::string(reply->str, reply->len);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
         VLOG(1) << "Valkey BLOB.RDMA_SET fell back to TCP: "
-                << std::string(reply->str, reply->len);
+                << (reply->str ? std::string(reply->str, reply->len)
+                               : std::string("unexpected reply type"));
         rdma_fallbacks_.fetch_add(1, std::memory_order_relaxed);
     }
     return TcpPutOn(connection, key, iov, iovcnt);

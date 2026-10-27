@@ -57,9 +57,9 @@ struct FdGuard {
 #endif
 #ifdef HAVE_S3_ADAPTER
 #include "storage/distributed/s3_adapter.h"
+#endif
 #ifdef STORE_USE_REDIS
 #include "storage/distributed/valkey_adapter.h"
-#endif
 #endif
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
