@@ -966,20 +966,24 @@ void Workers::expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns) {
             continue;
         }
         if (now_ns - slice->enqueue_ts > slice_timeout_ns_) {
+            // Stop queued siblings and prevent a flush completion from
+            // resubmitting this task while its QP is being aborted.
+            __sync_bool_compare_and_swap(&slice->task->first_error, PENDING,
+                                         TIMEOUT);
+            slice->task->cancel_requested.store(true,
+                                                std::memory_order_release);
             auto ep = slice->ep_weak_ptr.lock();
             LOG(WARNING) << "Slice " << slice
                          << " failed: transfer timeout (software)";
-            // The slice turns terminal here, not on the CQ. Its flush
-            // completion may never be polled (acknowledge() zeroes wr_depth,
-            // so the endpoint destroys the QP and its unpolled CQEs), so
-            // return the selector charge now for it and every slice swept
-            // with it; releaseSliceQuota() is idempotent.
+            // A software deadline does not stop DMA. Abort the QP before
+            // publishing a terminal status or releasing its accounting.
             if (!ep) {
                 retire(slice);
                 updateSliceStatus(slice, TIMEOUT);
                 continue;
             }
-            auto num_slices = ep->acknowledge(slice, TIMEOUT, retire);
+            auto num_slices = ep->abortTimedOutQp(slice->qp_index, retire);
+            if (num_slices < 0) continue;
             disableEndpoint(slice);
             if (num_slices == 0) {
                 // A neighbour's retry already popped it off the queue pair

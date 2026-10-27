@@ -3378,6 +3378,7 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
         ibv_qp qp[8]{};
         int next_qp = 0;
         ibv_mr mr{};
+        std::function<int(ibv_qp*)> on_destroy;
     };
     static FakeState fake;
     // Posting order as the hardware saw it: postSend appends every work
@@ -3392,7 +3393,9 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
     static ibv_qp* createQp(ibv_pd*, ibv_qp_init_attr*) {
         return &fake.qp[fake.next_qp++];
     }
-    static int destroyQp(ibv_qp*) { return 0; }
+    static int destroyQp(ibv_qp* qp) {
+        return fake.on_destroy ? fake.on_destroy(qp) : 0;
+    }
     static int modifyQp(ibv_qp*, ibv_qp_attr*, int) { return 0; }
     static ibv_mr* regMr(ibv_pd*, void*, size_t, int) { return &fake.mr; }
     static int deregMr(ibv_mr*) { return 0; }
@@ -3623,6 +3626,71 @@ TEST_F(RdmaWorkersSharedQpTest, TimeoutSweepGivesTheOtherLaneItsSliceBack) {
     EXPECT_TRUE(lane1.inflight_slice_set.empty());
 }
 
+TEST_F(RdmaWorkersSharedQpTest,
+       TimeoutDestroysQpBeforePublishingTerminalStatus) {
+    auto* expired = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    auto* later = postSlice(/*lane=*/1, /*enqueue_ts=*/2'000'000);
+    RdmaEndPointTestPeer::markReady(endpoint_);
+    auto& lane0 = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    bool stopped = false;
+    fake.on_destroy = [&](ibv_qp*) {
+        EXPECT_EQ(expired->task->status_word, PENDING);
+        EXPECT_EQ(later->task->status_word, PENDING);
+        EXPECT_EQ(endpoint_->status(), RdmaEndPoint::EP_DESTROYING);
+        stopped = true;
+        return 0;
+    };
+
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 1'000'000);
+    RdmaTransportTestPeer::expireTimedOutSlices(*workers_, lane0, 2'000'000);
+    fake.on_destroy = {};
+
+    EXPECT_TRUE(stopped);
+    EXPECT_EQ(expired->task->status_word, TIMEOUT);
+    EXPECT_TRUE(expired->task->cancel_requested.load());
+    // QP destruction also stops younger WRs after the expired one.
+    EXPECT_EQ(later->task->status_word, TIMEOUT);
+    EXPECT_TRUE(later->task->cancel_requested.load());
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 0);
+    EXPECT_TRUE(RdmaEndPointTestPeer::queueEmpty(endpoint_, 0));
+    std::vector<RdmaSlice*> next{makeSlice()};
+    EXPECT_EQ(endpoint_->submitSlices(next, 0), 0);
+
+    // A CQE polled by another lane before destruction may still be handled.
+    // It must not revive the task or release its quota a second time.
+    completeWith(expired, IBV_WC_SUCCESS);
+    EXPECT_EQ(expired->task->status_word, TIMEOUT);
+    EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+    EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
+}
+
+TEST_F(RdmaWorkersSharedQpTest, FailedQpAbortKeepsBuffersPendingUntilRetry) {
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    RdmaEndPointTestPeer::markReady(endpoint_);
+    auto& lane0 = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    fake.on_destroy = [](ibv_qp*) { return EIO; };
+
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 1'000'000);
+    RdmaTransportTestPeer::expireTimedOutSlices(*workers_, lane0, 2'000'000);
+    EXPECT_EQ(slice->task->status_word, PENDING);
+    EXPECT_EQ(lane0.inflight_slice_set.count(slice), 1u);
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 1);
+    EXPECT_EQ(selector_->getInflightBytes(kDev), kLen);
+
+    // The background teardown must not publish cancellation either when
+    // the provider has failed to stop the QP.
+    EXPECT_NE(endpoint_->deconstruct(), 0);
+    EXPECT_EQ(slice->task->status_word, PENDING);
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 1);
+
+    fake.on_destroy = {};
+    RdmaTransportTestPeer::expireTimedOutSlices(*workers_, lane0, 3'000'000);
+    EXPECT_EQ(slice->task->status_word, TIMEOUT);
+    EXPECT_EQ(lane0.inflight_slices.load(), 0);
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 0);
+    EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+}
+
 // Tearing an endpoint down cancels whatever is still queued on it without
 // going through a sweep, so each lane is left holding a slice that will
 // never complete. The owner's next pass has to take those out: otherwise
@@ -3801,7 +3869,7 @@ TEST_F(RdmaWorkersSharedQpTest, SliceResolvedWhileQueuedIsDroppedNotPosted) {
     RdmaTransportTestPeer::expireTimedOutSlices(*workers_, lane1,
                                                 /*now_ns=*/2'000'000);
     ASSERT_EQ(slice->word, TIMEOUT);
-    ASSERT_FALSE(slice->task->cancel_requested.load());
+    ASSERT_TRUE(slice->task->cancel_requested.load());
 
     // What lane 0's next pass does with it before generating a post path.
     EXPECT_TRUE(

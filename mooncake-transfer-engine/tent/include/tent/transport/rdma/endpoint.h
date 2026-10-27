@@ -113,6 +113,11 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     void beginDestroy();
     bool finishDestroy();
 
+    // Stop the QP before publishing TIMEOUT for its queued slices. Returns
+    // -1 if destruction failed; callers must keep those slices pending.
+    int abortTimedOutQp(int qp_index,
+                        const std::function<void(RdmaSlice*)>& on_each);
+
     Status connect(const std::string& peer_server_name,
                    const std::string& peer_nic_name,
                    const std::string& peer_rpc_server_addr = "");

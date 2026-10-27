@@ -226,7 +226,6 @@ int RdmaEndPoint::deconstructUnlocked() {
     auto current_status = status_.load(std::memory_order_relaxed);
     // Idempotent, including delayed destruction through an external shared_ptr.
     if (current_status == EP_DESTROYED) return 0;
-    resetInflightSlices();
     peer_qp_num_list_.clear();
 
     // A default-constructed endpoint owns no verbs resources. A partially
@@ -282,21 +281,23 @@ int RdmaEndPoint::deconstructUnlocked() {
 
     bool all_qps_destroyed = true;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (wr_depth_list_) {
-            const int outstanding =
-                wr_depth_list_[i].value.load(std::memory_order_relaxed);
-            if (outstanding != 0) cancelQuota(i, outstanding);
-        }
-        if (!qp_list_[i]) continue;
-        if (context_->verbs_.ibv_destroy_qp(qp_list_[i])) {
+        if (qp_list_[i] && context_->verbs_.ibv_destroy_qp(qp_list_[i])) {
             PLOG(ERROR) << "Failed to destroy data QP[" << i << "]";
             result = -1;
             all_qps_destroyed = false;
         } else {
             qp_list_[i] = nullptr;
+            if (wr_depth_list_) {
+                const int outstanding =
+                    wr_depth_list_[i].value.load(std::memory_order_relaxed);
+                if (outstanding != 0) cancelQuota(i, outstanding);
+            }
         }
     }
     if (all_qps_destroyed) {
+        // A terminal task lets the caller reuse its buffers. Do not publish
+        // cancellation while a QP may still access them, even on teardown.
+        resetInflightSlices();
         qp_list_.clear();
         slice_queue_.clear();
         delete[] queue_lock_list_;
@@ -320,6 +321,39 @@ int RdmaEndPoint::deconstructUnlocked() {
 void RdmaEndPoint::beginDestroy() {
     RWSpinlock::WriteGuard guard(lock_);
     beginDestroyNoLock();
+}
+
+int RdmaEndPoint::abortTimedOutQp(
+    int qp_index, const std::function<void(RdmaSlice*)>& on_each) {
+    RWSpinlock::WriteGuard guard(lock_);
+    if (qp_index < 0 || qp_index >= (int)slice_queue_.size()) return 0;
+
+    // Reuse the existing retirement path to exclude concurrent posts and
+    // prevent reuse of this connection. Only the timed-out QP is destroyed
+    // synchronously; the other QPs follow normal endpoint reclamation.
+    beginDestroyNoLock();
+    auto*& qp = qp_list_[qp_index];
+    if (qp && context_->verbs_.ibv_destroy_qp(qp)) {
+        PLOG(ERROR) << "Failed to abort timed-out QP[" << qp_index << "]";
+        return -1;
+    }
+    qp = nullptr;
+
+    // Destroying the QP stops every WR on it, including WRs after the one
+    // that timed out. Account for the entire queue before exposing a terminal
+    // task. Keep slice storage pinned for CQ handlers already in progress.
+    auto& queue = slice_queue_[qp_index];
+    int num_entries = 0;
+    while (auto* current = queue.pop()) {
+        ++num_entries;
+        __sync_bool_compare_and_swap(&current->task->first_error, PENDING,
+                                     TIMEOUT);
+        current->task->cancel_requested.store(true, std::memory_order_release);
+        if (on_each) on_each(current);
+        updateSliceStatus(current, TIMEOUT);
+    }
+    cancelQuota(qp_index, num_entries);
+    return num_entries;
 }
 
 void RdmaEndPoint::beginDestroyNoLock() {
