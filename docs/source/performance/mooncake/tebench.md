@@ -127,6 +127,27 @@ Intel DPC++ compiler (`CXX=icpx`). In this build,
 `--backend=tent --seg_type=VRAM` allocates XPU device memory. `--local_gpu_id`
 works as in Section 3.4.
 
+For XPU-to-XPU runs between two processes:
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+
+# Target on GPU 1
+./tebench --backend=tent --seg_type=VRAM --local_gpu_id=1
+
+# Initiator on GPU 0, using the printed segment name
+./tebench --backend=tent --seg_type=VRAM --local_gpu_id=0 \
+  --target_seg_name=<SEG_NAME_FROM_TARGET> --op_type=read --duration=5
+```
+
+Leave `--xport_type` empty so the engine chooses the path per request.
+The engine then registers XPU buffers with every enabled transport: XPU IPC
+between processes on one node, dma-buf RDMA when the NIC accepts XPU memory,
+or host staging otherwise (see the XPU notes in the build guide). An explicit
+`--xport_type` registers the buffer with that transport only and fails when
+it cannot register XPU memory. `--seg_type_mix=dram,vram` also works with XPU
+memory; the NVLink example in Section 5.8 requires CUDA.
+
 A `file://<path>` target segment name makes the initiator transfer to and from
 a local file, so no target process is needed. Create the file first; it must
 cover `--target_offset` plus `max_num_threads * max_block_size *
