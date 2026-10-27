@@ -15,8 +15,6 @@
 #ifndef EFA_TRANSPORT_H_
 #define EFA_TRANSPORT_H_
 
-#include <infiniband/verbs.h>
-
 #include <atomic>
 #include <cstddef>
 #include <map>

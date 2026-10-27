@@ -5,6 +5,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -60,12 +61,19 @@ class LeaseEvictionIndexTest : public ::testing::Test {
         metadata.lease_->SetDeadline(deadline);
     }
 
-    // Every key a walk at `now` hands out, in order.
-    std::vector<EvictionIndex::Entry> Walk(Clock::time_point now) const {
+    // An entry a walk handed out, with its keys copied off the cursor.
+    struct WalkedEntry {
+        std::vector<std::string> keys;
+        EvictionIndex::Rank rank;
+    };
+
+    // Every entry a walk at `now` hands out, in order.
+    std::vector<WalkedEntry> Walk(Clock::time_point now) const {
         auto cursor = ns_.eviction_index().Scan(now);
-        std::vector<EvictionIndex::Entry> entries;
+        std::vector<WalkedEntry> entries;
         while (auto entry = cursor->Next()) {
-            entries.push_back(std::move(*entry));
+            entries.push_back(WalkedEntry{
+                {entry->keys.begin(), entry->keys.end()}, entry->rank});
         }
         return entries;
     }
@@ -147,22 +155,19 @@ TEST_F(LeaseEvictionIndexTest, AReadLeavesTheKeyAndStillAtCatchesIt) {
         ASSERT_TRUE(guard.has_value());
         SetDeadline(guard->metadata(), t0_ + seconds(10));
     }
-    auto cursor = ns_.eviction_index().Scan(t0_ + seconds(1));
-    std::vector<EvictionIndex::Entry> entries;
-    while (auto entry = cursor->Next()) {
-        entries.push_back(std::move(*entry));
-    }
-    ASSERT_EQ(entries.size(), 2u);
-
     // Under the write lock the cursor sees "k" moved on; releasing that lock
     // files it at its real deadline.
-    for (const auto& entry : entries) {
-        ASSERT_EQ(entry.keys.size(), 1u);
-        const std::string& key = entry.keys.front();
+    auto cursor = ns_.eviction_index().Scan(t0_ + seconds(1));
+    size_t entries = 0;
+    while (auto entry = cursor->Next()) {
+        ++entries;
+        ASSERT_EQ(entry->keys.size(), 1u);
+        const std::string key(entry->keys.front());
         auto guard = ns_.objects.Write(key);
         ASSERT_TRUE(guard.has_value());
-        EXPECT_EQ(cursor->StillAt(*guard, entry), key == "unmoved");
+        EXPECT_EQ(cursor->StillAt(*guard, *entry), key == "unmoved");
     }
+    EXPECT_EQ(entries, 2u);
     EXPECT_EQ(DueKeys(t0_ + seconds(1)), std::vector<std::string>{"unmoved"});
     EXPECT_EQ(DueKeys(t0_ + seconds(11)),
               (std::vector<std::string>{"unmoved", "k"}));
@@ -261,12 +266,10 @@ TEST_F(LeaseEvictionIndexTest, AKeyMovedToAnotherGroupIsNoLongerAtItsEntry) {
     PublishInGroup("g1", "g", t0_);
     PublishInGroup("g2", "g", t0_);
     Publish("k", t0_);
+    // The walk copies the bucket as it starts.
     auto cursor = ns_.eviction_index().Scan(t0_ + seconds(1));
-    std::vector<EvictionIndex::Entry> entries;
-    while (auto entry = cursor->Next()) {
-        entries.push_back(std::move(*entry));
-    }
-    ASSERT_EQ(entries.size(), 2u);
+    std::optional<EvictionIndex::Entry> entry = cursor->Next();
+    ASSERT_TRUE(entry.has_value());
 
     for (const std::string key : {"g2", "k"}) {
         auto guard = ns_.objects.Write(key);
@@ -275,13 +278,16 @@ TEST_F(LeaseEvictionIndexTest, AKeyMovedToAnotherGroupIsNoLongerAtItsEntry) {
         PublishIn(*guard, key, "h");
         SetDeadline(guard->metadata(), t0_);
     }
-    for (const auto& entry : entries) {
-        for (const std::string& key : entry.keys) {
+    size_t entries = 0;
+    for (; entry.has_value(); entry = cursor->Next()) {
+        ++entries;
+        for (const std::string_view key : entry->keys) {
             auto guard = ns_.objects.Write(key);
             ASSERT_TRUE(guard.has_value());
-            EXPECT_EQ(cursor->StillAt(*guard, entry), key == "g1") << key;
+            EXPECT_EQ(cursor->StillAt(*guard, *entry), key == "g1") << key;
         }
     }
+    EXPECT_EQ(entries, 2u);
 }
 
 // A group whose members were all torn down after the walk copied its entry

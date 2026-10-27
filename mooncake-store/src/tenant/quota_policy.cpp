@@ -48,10 +48,26 @@ bool HasProcessingMemoryReplica(const ObjectMetadata& metadata) {
     });
 }
 
-// The key's policy words: what the account holds for the key, and what the
-// object an upsert replaced under it still owes until the new write settles.
-uint64_t& Held(const PolicyContext& ctx) {
-    return ctx.guard.owner_state().policy_words[0];
+// The key's policy words. The first holds what the account holds for the
+// key, at most kMaxChargedBytes, and in its top bit whether a write the
+// account began holds the key's lock. The second holds what the object an
+// upsert replaced under the key still owes until the new write settles.
+constexpr uint64_t kWriteBegun = 1ULL << 63;
+static_assert(TenantQuotaAccount::kMaxChargedBytes < kWriteBegun);
+
+uint64_t Held(const PolicyContext& ctx) {
+    return ctx.guard.owner_state().policy_words[0] & ~kWriteBegun;
+}
+void SetHeld(const PolicyContext& ctx, uint64_t bytes) {
+    uint64_t& word = ctx.guard.owner_state().policy_words[0];
+    word = (word & kWriteBegun) | bytes;
+}
+bool WriteBegun(const PolicyContext& ctx) {
+    return ctx.guard.owner_state().policy_words[0] & kWriteBegun;
+}
+void SetWriteBegun(const PolicyContext& ctx, bool begun) {
+    uint64_t& word = ctx.guard.owner_state().policy_words[0];
+    word = begun ? word | kWriteBegun : word & ~kWriteBegun;
 }
 uint64_t& Carried(const PolicyContext& ctx) {
     return ctx.guard.owner_state().policy_words[1];
@@ -163,7 +179,20 @@ TenantQuotaPolicy::AdmitWrite(const TenantId& tenant_id) {
 
 tl::expected<void, ErrorCode> TenantQuotaPolicy::OnGrow(
     const PolicyContext& ctx, uint64_t bytes) {
-    auto charged = AccountOf(ctx).TryCharge(bytes);
+    TenantQuotaAccount& account = AccountOf(ctx);
+    // The write counts against deleting the tenant until this lock is let go,
+    // charged or not: a write that charges nothing, such as one with NoF
+    // replicas only, has not published its object yet either.
+    if (!WriteBegun(ctx)) {
+        if (auto begun = account.BeginWrite(); !begun) {
+            return tl::make_unexpected(ToErrorCode(begun.error()));
+        }
+        SetWriteBegun(ctx, true);
+    }
+    if (bytes == 0) {
+        return {};
+    }
+    auto charged = account.TryCharge(bytes);
     if (!charged) {
         const ErrorCode error = ToErrorCode(charged.error().error);
         if (error == ErrorCode::TENANT_QUOTA_EXCEEDED) {
@@ -174,8 +203,7 @@ tl::expected<void, ErrorCode> TenantQuotaPolicy::OnGrow(
     }
     // The account now holds these bytes for the key; the next release settles
     // them against what the object turns out to owe.
-    uint64_t& held = Held(ctx);
-    held = SaturatingAdd(held, bytes);
+    SetHeld(ctx, SaturatingAdd(Held(ctx), bytes));
     return {};
 }
 
@@ -194,7 +222,7 @@ void TenantQuotaPolicy::OnTearDown(const PolicyContext& ctx) {
 
 void TenantQuotaPolicy::OnWriteRelease(const PolicyContext& ctx) {
     TenantQuotaAccount& account = AccountOf(ctx);
-    uint64_t& held = Held(ctx);
+    const uint64_t held = Held(ctx);
     uint64_t& carried = Carried(ctx);
     uint64_t owed = 0;
     if (ctx.guard.has_object()) {
@@ -218,7 +246,13 @@ void TenantQuotaPolicy::OnWriteRelease(const PolicyContext& ctx) {
                        << ", bytes=" << held - owed;
         }
     }
-    held = owed;
+    SetHeld(ctx, owed);
+    // Ends only now, with what the write leaves settled and its object, if
+    // any, published.
+    if (WriteBegun(ctx)) {
+        SetWriteBegun(ctx, false);
+        account.EndWrite();
+    }
 }
 
 void TenantQuotaPolicy::OnRestored() {
