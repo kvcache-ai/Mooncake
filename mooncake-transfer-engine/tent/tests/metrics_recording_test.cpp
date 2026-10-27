@@ -536,6 +536,28 @@ TEST_F(MetricsRecordingTest,
 // Completed transfer records bytes, requests, latency. Drives the real
 // recordTaskCompletionMetrics path via FakeTransport.
 // ---------------------------------------------------------------------------
+TEST_F(MetricsRecordingTest, MnnvlEventsHaveExactJsonAndPrometheusDeltas) {
+    auto& metrics = TentMetrics::instance();
+    const MetricsSnapshot before(metrics);
+    const char* names[] = {"fabric_fallback", "strict_failure", "pool_hit",
+                           "pool_miss", "completion_query"};
+    for (size_t i = 0; i < 5; ++i)
+        metrics.recordMnnvlEvent(static_cast<TentMetrics::MnnvlEvent>(i));
+    const MetricsSnapshot after(metrics);
+    for (const auto* name : names) {
+        const auto key = std::string("tent_mnnvl_") + name + "_total";
+        const auto series =
+            std::string("tent_mnnvl_events_total{event=\"") + name + "\"}";
+        EXPECT_EQ(after.counter(key) - before.counter(key), 1);
+        EXPECT_EQ(after.series(series) - before.series(series), 1);
+    }
+    TentMetrics::setEnabled(false);
+    metrics.recordMnnvlEvent(TentMetrics::MnnvlEvent::PoolHit);
+    TentMetrics::setEnabled(true);
+    EXPECT_EQ(MetricsSnapshot(metrics).counter("tent_mnnvl_pool_hit_total"),
+              after.counter("tent_mnnvl_pool_hit_total"));
+}
+
 TEST_F(MetricsRecordingTest, CompletedTransferRecordsBytesAndLatency) {
     auto cfg = makeMetricsTestConfig();
     TransferEngineImpl engine(cfg);
