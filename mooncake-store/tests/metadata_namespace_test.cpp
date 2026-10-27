@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -344,178 +345,377 @@ TEST(NamespacePolicyTest, WithoutAPolicyEveryGrowthIsGranted) {
 
 // --- Write hooks -----------------------------------------------------------
 //
-// A write lock on a key is reported to the namespace's chain twice: before the
-// first change, where a hook may refuse it, and as the lock is released, where
-// it sees the post-state. These cases pin what a hook is promised, since the
-// OpLog hangs on it: a refused write must leave the key as it was, a write no
-// hook heard of must not reach the chain at all, and each hook's reservation
-// must live from its own begin to its own release.
+// A write lock on a key is reported to the namespace's chain twice: under the
+// key's lock before the first change, where a hook may refuse it, and under
+// that same lock as it is released, where it sees what the write left. These
+// cases pin what a hook is promised, because the OpLog will hang on it:
+//
+//   * both calls hold the key exclusively, and the second sees the post-state;
+//   * a write that changed nothing is never reported, so a refused delete can
+//     not be recorded as a delete;
+//   * a hook finishes before the namespace settles accounting and indexes, so
+//     what it changes is accounted for;
+//   * each hook gets the reservation its own begin filled, in chain order.
 
-// Marks that the guard dropped it, which is what gives back whatever a hook
-// reserved.
-struct ReservationMarker final : WriteReservation {
-    explicit ReservationMarker(bool* dropped) : dropped(dropped) {}
-    ~ReservationMarker() override { *dropped = true; }
-
-    bool* dropped;
+// Names its owner, so a reservation handed to the wrong hook is visible.
+struct Token final : WriteReservation {
+    explicit Token(std::string owner) : owner(std::move(owner)) {}
+    std::string owner;
 };
 
-struct RefusingHook final : WriteHook {
-    tl::expected<void, ErrorCode> OnWriteBegin(
-        const WriteGuard& guard, WriteChange change,
-        std::unique_ptr<WriteReservation>&) override {
-        key = guard.key();
-        seen = change;
-        held_object = guard.has_object();
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
+// Records what the chain told it, in order, and whether the key's lock was
+// held at the time. `route` is optional: only the lock cases set it.
+class ChainHook final : public WriteHook {
+   public:
+    ChainHook(std::string name, std::vector<std::string>* order, bool refuse)
+        : name_(std::move(name)), order_(order), refuse_(refuse) {}
 
-    void OnWriteRelease(const WriteGuard&, WriteChange,
-                        std::unique_ptr<WriteReservation>&) override {
-        ++releases;
-    }
-
-    std::string key;
-    WriteChange seen{WriteChange::kNone};
-    bool held_object = false;
-    int releases = 0;
-};
-
-struct RecordingHook final : WriteHook {
-    RecordingHook(std::string name, bool* reserved_alive, bool refuse = false)
-        : name(std::move(name)),
-          reserved_alive(reserved_alive),
-          refuse(refuse) {}
+    ChainHook(std::string name, std::vector<std::string>* order,
+              const route::ObjectRoute* route)
+        : name_(std::move(name)), order_(order), route_(route) {}
 
     tl::expected<void, ErrorCode> OnWriteBegin(
         const WriteGuard& guard, WriteChange change,
         std::unique_ptr<WriteReservation>& reservation) override {
-        ++begins;
-        begun_on = change;
-        reservation = std::make_unique<ReservationMarker>(reserved_alive);
-        if (refuse) {
+        ++begins_;
+        begin_change_ = change;
+        begin_object_ = guard.has_object();
+        begin_processing_ = guard.has_object() && guard.state().is_processing;
+        begin_locked_ = LockedByAnotherThread(guard);
+        reservation = std::make_unique<Token>(name_);
+        if (refuse_) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+        order_->push_back(name_ + ":begin");
         return {};
     }
 
     void OnWriteRelease(const WriteGuard& guard, WriteChange change,
                         std::unique_ptr<WriteReservation>& reservation) override {
-        ++releases;
-        released_on = change;
-        held_reservation = reservation != nullptr;
-        released_key = guard.key();
-        held_object = guard.has_object();
+        ++releases_;
+        release_change_ = change;
+        release_object_ = guard.has_object();
+        release_processing_ =
+            guard.has_object() && guard.state().is_processing;
+        release_locked_ = LockedByAnotherThread(guard);
+        auto* token = dynamic_cast<Token*>(reservation.get());
+        reservation_owner_ = token != nullptr ? token->owner : "<none>";
+        order_->push_back(name_ + ":release");
     }
 
-    std::string name;
-    bool* reserved_alive;
-    bool refuse = false;
-    int begins = 0;
-    int releases = 0;
-    WriteChange begun_on{WriteChange::kNone};
-    WriteChange released_on{WriteChange::kNone};
-    bool held_reservation = false;
-    std::string released_key;
-    bool held_object = false;
+    int begins_ = 0;
+    int releases_ = 0;
+    WriteChange begin_change_{WriteChange::kNone};
+    WriteChange release_change_{WriteChange::kNone};
+    bool begin_object_ = false;
+    bool release_object_ = false;
+    bool begin_processing_ = false;
+    bool release_processing_ = false;
+    bool begin_locked_ = false;
+    bool release_locked_ = false;
+    std::string reservation_owner_;
+
+   private:
+    // A different thread tries the key's lock, so the answer is about this
+    // thread's hold and not a recursive try of its own.
+    bool LockedByAnotherThread(const WriteGuard& guard) {
+        if (route_ == nullptr) {
+            return false;
+        }
+        const std::string key = guard.key();
+        return !std::async(std::launch::async, [this, key] {
+                    return test::ObjectRouteTestPeer::KeyLockFree(*route_, key);
+                }).get();
+    }
+
+    std::string name_;
+    std::vector<std::string>* order_;
+    const route::ObjectRoute* route_ = nullptr;
+    bool refuse_ = false;
 };
 
-TEST(NamespaceWriteHookTest, ARefusedBeginLeavesTheKeyUntouched) {
+// Records what the namespace told the policy, and when relative to the chain.
+class AccountingPolicy final : public NamespacePolicy {
+   public:
+    void OnWriteRelease(const PolicyContext& ctx) override {
+        ++releases;
+        saw_object = ctx.guard.has_object();
+        saw_processing = ctx.guard.has_object() && ctx.guard.state().is_processing;
+    }
+    int releases = 0;
+    bool saw_object = false;
+    bool saw_processing = false;
+};
+
+TEST(NamespaceWriteHookTest, BothCallsHoldTheKeyAndTheSecondSeesTheChange) {
     Namespace ns;
-    RefusingHook hook;
-    ns.RegisterWriteHook(&hook);
-    ASSERT_NE(test::PublishObject(ns.objects, "k"), 0u);
-
-    auto guard = ns.objects.Write("k", WriteChange::kReplicasRemoved);
-
-    ASSERT_FALSE(guard.has_value());
-    EXPECT_EQ(guard.error(), ErrorCode::INVALID_PARAMS);
-    // The hook judged the key it was handed, with the object still there.
-    EXPECT_EQ(hook.key, "k");
-    EXPECT_EQ(hook.seen, WriteChange::kReplicasRemoved);
-    EXPECT_TRUE(hook.held_object);
-    // A refused write is not released, so no hook records it.
-    EXPECT_EQ(hook.releases, 0);
-    EXPECT_TRUE(ns.objects.Contains("k"));
-}
-
-TEST(NamespaceWriteHookTest, AWriteNoHookHeardOfIsNotReported) {
-    Namespace ns;
-    bool dropped = false;
-    RecordingHook hook("only", &dropped);
-    ns.RegisterWriteHook(&hook);
-    ASSERT_NE(test::PublishObject(ns.objects, "k"), 0u);
-
-    { auto guard = ns.objects.Write("k"); ASSERT_TRUE(guard.has_value()); }
-
-    EXPECT_EQ(hook.begins, 0);
-    EXPECT_EQ(hook.releases, 0);
-}
-
-TEST(NamespaceWriteHookTest, ReleaseSeesTheChangeAndItsOwnReservation) {
-    Namespace ns;
-    bool dropped = false;
-    RecordingHook hook("only", &dropped);
+    std::vector<std::string> order;
+    ChainHook hook("h", &order, &ns.objects);
     ns.RegisterWriteHook(&hook);
     ASSERT_NE(test::PublishObject(ns.objects, "k"), 0u);
 
     {
-        auto guard = ns.objects.Write("k", WriteChange::kKeyRemoved);
-        ASSERT_TRUE(guard.has_value());
-        // Reserved under the lock, before anything changed.
-        EXPECT_EQ(hook.begins, 1);
-        EXPECT_EQ(hook.releases, 0);
-        EXPECT_FALSE(dropped);
+        auto result = ns.objects.Write("k", WriteChange::kNewWrite);
+        ASSERT_TRUE(result.has_value());
+        ASSERT_TRUE(result->has_value());
+        auto& guard = result->value();
+        // The first call ran, under the lock, before anything changed.
+        EXPECT_EQ(hook.begins_, 1);
+        EXPECT_EQ(hook.releases_, 0);
+        EXPECT_TRUE(hook.begin_locked_);
+        EXPECT_FALSE(hook.begin_processing_);
+        guard.state().is_processing = true;
+        guard.Commit();
+        EXPECT_EQ(hook.releases_, 0);
     }
-
-    EXPECT_EQ(hook.releases, 1);
-    EXPECT_EQ(hook.begun_on, WriteChange::kKeyRemoved);
-    EXPECT_EQ(hook.released_on, WriteChange::kKeyRemoved);
-    EXPECT_TRUE(hook.held_reservation);
-    EXPECT_EQ(hook.released_key, "k");
-    EXPECT_TRUE(hook.held_object);
-    // The reservation goes with the guard, not before its release.
-    EXPECT_TRUE(dropped);
+    EXPECT_EQ(hook.releases_, 1);
+    EXPECT_TRUE(hook.release_locked_);
+    EXPECT_TRUE(hook.release_processing_);
+    EXPECT_EQ(hook.release_change_, WriteChange::kNewWrite);
+    EXPECT_EQ(order, (std::vector<std::string>{"h:begin", "h:release"}));
 }
 
-TEST(NamespaceWriteHookTest, EachHookGetsItsOwnReservationInOrder) {
+// The case that makes a refused delete safe: taking a guard for a removal and
+// then deciding not to remove must not be reported as a removal.
+TEST(NamespaceWriteHookTest, AWriteThatChangedNothingIsNeverReported) {
     Namespace ns;
-    bool first_dropped = false;
-    bool second_dropped = false;
-    RecordingHook first("first", &first_dropped);
-    RecordingHook second("second", &second_dropped);
+    std::vector<std::string> order;
+    ChainHook hook("h", &order, /*refuse=*/false);
+    ns.RegisterWriteHook(&hook);
+    ASSERT_NE(test::PublishObject(ns.objects, "k"), 0u);
+
+    {
+        auto result = ns.objects.Write("k", WriteChange::kKeyRemoved);
+        ASSERT_TRUE(result.has_value());
+        ASSERT_TRUE(result->has_value());
+        // An ordinary refusal on the way to the removal: nothing touched.
+    }
+
+    EXPECT_EQ(hook.begins_, 1);
+    EXPECT_EQ(hook.releases_, 0);
+    EXPECT_EQ(order, (std::vector<std::string>{"h:begin"}));
+    EXPECT_TRUE(ns.objects.Contains("k"));
+}
+
+TEST(NamespaceWriteHookTest, PublishingAndTearingDownCommitTheWrite) {
+    Namespace ns;
+    std::vector<std::string> order;
+    ChainHook hook("h", &order, /*refuse=*/false);
+    ns.RegisterWriteHook(&hook);
+
+    {
+        auto created = ns.objects.WriteKey("k", WriteChange::kNewWrite);
+        ASSERT_TRUE(created.has_value());
+        (void)test::PublishEnvelope(*created);
+    }
+    EXPECT_EQ(hook.releases_, 1);
+    EXPECT_EQ(hook.release_change_, WriteChange::kNewWrite);
+    EXPECT_TRUE(hook.release_object_);
+
+    {
+        auto removed = ns.objects.Write("k", WriteChange::kKeyRemoved);
+        ASSERT_TRUE(removed.has_value());
+        ASSERT_TRUE(removed->has_value());
+        removed->value().TearDown();
+    }
+    EXPECT_EQ(hook.releases_, 2);
+    EXPECT_EQ(hook.release_change_, WriteChange::kKeyRemoved);
+    EXPECT_FALSE(hook.release_object_);
+    EXPECT_TRUE(order == (std::vector<std::string>{"h:begin", "h:release",
+                                                  "h:begin", "h:release"}));
+}
+
+TEST(NamespaceWriteHookTest, CancelUndoesACommit) {
+    Namespace ns;
+    std::vector<std::string> order;
+    ChainHook hook("h", &order, /*refuse=*/false);
+    ns.RegisterWriteHook(&hook);
+    ASSERT_NE(test::PublishObject(ns.objects, "k"), 0u);
+
+    {
+        auto result = ns.objects.Write("k", WriteChange::kReplicasRemoved);
+        ASSERT_TRUE(result.has_value() && result->has_value());
+        auto& guard = result->value();
+        guard.Commit();
+        guard.Cancel();
+    }
+    EXPECT_EQ(hook.releases_, 0);
+    EXPECT_TRUE(ns.objects.Contains("k"));
+}
+
+TEST(NamespaceWriteHookTest, EachHookGetsItsOwnReservationInChainOrder) {
+    Namespace ns;
+    std::vector<std::string> order;
+    ChainHook first("first", &order, /*refuse=*/false);
+    ChainHook second("second", &order, /*refuse=*/false);
     ns.RegisterWriteHook(&first);
     ns.RegisterWriteHook(&second);
     ASSERT_NE(test::PublishObject(ns.objects, "k"), 0u);
 
-    { auto guard = ns.objects.Write("k", WriteChange::kNewWrite); ASSERT_TRUE(guard.has_value()); }
+    {
+        auto result = ns.objects.Write("k", WriteChange::kNewWrite);
+        ASSERT_TRUE(result.has_value() && result->has_value());
+        result->value().Commit();
+    }
 
-    EXPECT_EQ(first.releases, 1);
-    EXPECT_EQ(second.releases, 1);
-    EXPECT_TRUE(first.held_reservation);
-    EXPECT_TRUE(second.held_reservation);
-    EXPECT_TRUE(first_dropped);
-    EXPECT_TRUE(second_dropped);
+    EXPECT_EQ(order, (std::vector<std::string>{"first:begin", "second:begin",
+                                               "first:release", "second:release"}));
+    // Each release got the reservation its own begin filled.
+    EXPECT_EQ(first.reservation_owner_, "first");
+    EXPECT_EQ(second.reservation_owner_, "second");
 }
 
-TEST(NamespaceWriteHookTest, ARefusedBeginDropsWhatTheEarlierHookReserved) {
+TEST(NamespaceWriteHookTest, ARefusedBeginLeavesTheKeyAsItWas) {
     Namespace ns;
-    bool kept_dropped = false;
-    bool refusing_dropped = false;
-    RecordingHook kept("kept", &kept_dropped);
-    RecordingHook refusing("refusing", &refusing_dropped, /*refuse=*/true);
+    std::vector<std::string> order;
+    ChainHook kept("kept", &order, /*refuse=*/false);
+    ChainHook refusing("refusing", &order, /*refuse=*/true);
     ns.RegisterWriteHook(&kept);
     ns.RegisterWriteHook(&refusing);
     ASSERT_NE(test::PublishObject(ns.objects, "k"), 0u);
+    { auto guard = ns.objects.Write("k"); guard->state().is_processing = true; }
+    const auto in_flight = ns.InFlightKeys();
 
-    auto guard = ns.objects.Write("k", WriteChange::kNewWrite);
+    {
+        auto refused = ns.objects.Write("k", WriteChange::kReplicasRemoved);
+        ASSERT_FALSE(refused.has_value());
+        EXPECT_EQ(refused.error(), ErrorCode::INVALID_PARAMS);
+    }
+    // The key, its work in flight and the chain are as they were.
+    EXPECT_TRUE(ns.objects.Contains("k"));
+    EXPECT_EQ(ns.InFlightKeys(), in_flight);
+    EXPECT_EQ(kept.releases_, 0);
+    EXPECT_EQ(refusing.releases_, 0);
+    EXPECT_EQ(order, (std::vector<std::string>{"kept:begin"}));
 
-    ASSERT_FALSE(guard.has_value());
-    EXPECT_EQ(kept.begins, 1);
-    EXPECT_EQ(kept.releases, 0);
-    // Both hooks gave their reservations back, so nothing outlives the write.
-    EXPECT_TRUE(kept_dropped);
-    EXPECT_TRUE(refusing_dropped);
+    // A refused write that would have created the key leaves no slot behind.
+    {
+        auto refused = ns.objects.WriteKey("fresh", WriteChange::kNewWrite);
+        EXPECT_FALSE(refused.has_value());
+    }
+    EXPECT_FALSE(ns.objects.Contains("fresh"));
+    EXPECT_EQ(test::ObjectRouteTestPeer::SlotCount(ns.objects), 1u);
+}
+
+// A hook that finishes a deferred removal at release: what it removes must be
+// settled by the accounting that follows, not before it.
+class RemovingHook final : public WriteHook {
+   public:
+    tl::expected<void, ErrorCode> OnWriteBegin(
+        const WriteGuard&, WriteChange,
+        std::unique_ptr<WriteReservation>&) override {
+        return {};
+    }
+    void OnWriteRelease(const WriteGuard& guard, WriteChange,
+                        std::unique_ptr<WriteReservation>&) override {
+        guard.TearDown();
+    }
+};
+
+TEST(NamespaceWriteHookTest, AReleaseThatRemovesTheObjectIsAccountedAfterwards) {
+    AccountingPolicy policy;
+    RemovingHook hook;
+    Namespace ns_with_policy(TenantId(), &policy);
+    ns_with_policy.RegisterWriteHook(&hook);
+    ASSERT_NE(test::PublishObject(ns_with_policy.objects, "k"), 0u);
+    // Work in flight, so the removal has to take the key off that list too.
+    { auto guard = ns_with_policy.objects.Write("k"); guard->state().is_processing = true; }
+    ASSERT_EQ(ns_with_policy.InFlightKeys(), (std::vector<std::string>{"k"}));
+    policy = AccountingPolicy{};
+
+    {
+        auto result = ns_with_policy.objects.Write("k", WriteChange::kKeyRemoved);
+        ASSERT_TRUE(result.has_value() && result->has_value());
+        result->value().Commit();
+    }
+
+    EXPECT_FALSE(ns_with_policy.objects.Contains("k"));
+    EXPECT_TRUE(ns_with_policy.InFlightKeys().empty());
+    // The policy settled a key that no longer holds an object.
+    EXPECT_EQ(policy.releases, 1);
+    EXPECT_FALSE(policy.saw_object);
+    EXPECT_FALSE(policy.saw_processing);
+}
+
+TEST(NamespaceWriteHookTest, AMovedGuardReleasesOnceAndKeepsItsReservation) {
+    Namespace ns;
+    std::vector<std::string> order;
+    ChainHook hook("h", &order, /*refuse=*/false);
+    ns.RegisterWriteHook(&hook);
+    ASSERT_NE(test::PublishObject(ns.objects, "k"), 0u);
+
+    {
+        auto result = ns.objects.Write("k", WriteChange::kNewWrite);
+        ASSERT_TRUE(result.has_value() && result->has_value());
+        auto guard = std::move(result->value());
+        EXPECT_EQ(guard.change(), WriteChange::kNewWrite);
+        EXPECT_EQ(hook.releases_, 0);
+        guard.Commit();
+    }
+    EXPECT_EQ(hook.releases_, 1);
+    EXPECT_EQ(hook.reservation_owner_, "h");
+}
+
+TEST(NamespaceWriteHookTest, OnlyAHeldPublicationIsReported) {
+    Namespace ns;
+    std::vector<std::string> order;
+    ChainHook hook("h", &order, /*refuse=*/false);
+    ns.RegisterWriteHook(&hook);
+
+    auto missing = ns.objects.Write("missing", WriteChange::kNewWrite);
+    ASSERT_TRUE(missing.has_value());
+    EXPECT_FALSE(missing->has_value());
+
+    const auto generation = test::PublishObject(ns.objects, "k");
+    ASSERT_NE(generation, 0u);
+    auto stale =
+        ns.objects.Write(route::ObjectRef{"k", generation + 1},
+                         WriteChange::kNewWrite);
+    ASSERT_TRUE(stale.has_value());
+    EXPECT_FALSE(stale->has_value());
+    EXPECT_EQ(hook.begins_, 0);
+
+    {
+        auto held =
+            ns.objects.Write(route::ObjectRef{"k", generation},
+                             WriteChange::kNewWrite);
+        ASSERT_TRUE(held.has_value() && held->has_value());
+        held->value().Commit();
+    }
+    EXPECT_EQ(hook.begins_, 1);
+    EXPECT_EQ(hook.releases_, 1);
+}
+
+// Without an observer the route still records what the caller is about to do,
+// so the intent does not depend on who is listening.
+TEST(NamespaceWriteHookTest, TheIntentIsKeptWithoutAnObserver) {
+    route::ObjectRoute route;
+    {
+        auto created = route.WriteKey("k", WriteChange::kKeyRemoved);
+        ASSERT_TRUE(created.has_value());
+        EXPECT_EQ(created->change(), WriteChange::kKeyRemoved);
+        EXPECT_FALSE(created->committed());
+        (void)test::PublishEnvelope(*created);
+        // Publishing commits the write by itself.
+        EXPECT_TRUE(created->committed());
+    }
+
+    auto found = route.Write("k", WriteChange::kReplicasRemoved);
+    ASSERT_TRUE(found.has_value() && found->has_value());
+    EXPECT_EQ(found->value().change(), WriteChange::kReplicasRemoved);
+    EXPECT_FALSE(found->value().committed());
+}
+
+TEST(NamespaceWriteHookTest, AWriteWithNoHookStillCommits) {
+    Namespace ns;
+    ASSERT_NE(test::PublishObject(ns.objects, "k"), 0u);
+    {
+        auto result = ns.objects.Write("k", WriteChange::kNewWrite);
+        ASSERT_TRUE(result.has_value() && result->has_value());
+        EXPECT_FALSE(result->value().committed());
+        result->value().Commit();
+        EXPECT_TRUE(result->value().committed());
+    }
     EXPECT_TRUE(ns.objects.Contains("k"));
 }
 

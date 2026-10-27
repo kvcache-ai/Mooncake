@@ -147,21 +147,23 @@ class Namespace final : private route::RouteObserver {
     }
 
     void OnWriteRelease(const route::WriteGuard& guard) override {
-        SyncInFlight(guard);
-        eviction_index_->OnWrite(guard);
-        if (policy_ != nullptr) {
-            policy_->OnWriteRelease(Context(guard));
-        }
-        // The chain last: it sees the key as the write left it, and a hook
-        // that records the change runs before any later hook that announces
-        // it. A write no hook heard of has no reservation and nothing to
-        // report.
-        if (guard.change() != WriteChange::kNone) {
+        // The chain runs first, and only for a write that changed something:
+        // a hook may finish what the write started (a deferred removal, a
+        // tombstone) and the steps below settle the key as the write left it,
+        // the hooks' own changes included. A hook therefore never sees an
+        // index, a list or an account that has moved on without it, and a
+        // write that decided not to write says nothing at all.
+        if (guard.committed() && guard.change() != WriteChange::kNone) {
             assert(guard.reservations().size() == hooks_.size());
             for (size_t i = 0; i < hooks_.size(); ++i) {
                 hooks_[i]->OnWriteRelease(guard, guard.change(),
                                           guard.reservations()[i]);
             }
+        }
+        SyncInFlight(guard);
+        eviction_index_->OnWrite(guard);
+        if (policy_ != nullptr) {
+            policy_->OnWriteRelease(Context(guard));
         }
         // A key with no object may be dropped once this guard lets go, or
         // published again, so whatever is kept on it must be back to its
