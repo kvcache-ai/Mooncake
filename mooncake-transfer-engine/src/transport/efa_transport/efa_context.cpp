@@ -1548,6 +1548,11 @@ int EfaContext::submitPostSend(
     // Route slices to appropriate peer handles.  Group by peer NIC path.
     std::unordered_map<std::string, std::vector<Transport::Slice*>>
         slices_by_peer;
+    // Descriptors fetched again in this call, so that a batch of slices that
+    // miss the same stale descriptor costs one fetch, not one per slice.
+    std::unordered_map<Transport::SegmentID,
+                       std::shared_ptr<TransferMetadata::SegmentDesc>>
+        refreshed_descs;
 
     for (auto* slice : slice_list) {
         if (!slice) continue;
@@ -1562,8 +1567,11 @@ int EfaContext::submitPostSend(
         }
 
         // Slow path: resolve peer info per-slice.
+        auto refreshed = refreshed_descs.find(slice->target_id);
         auto peer_segment_desc =
-            engine_.meta()->getSegmentDescByID(slice->target_id);
+            refreshed != refreshed_descs.end()
+                ? refreshed->second
+                : engine_.meta()->getSegmentDescByID(slice->target_id);
         if (!peer_segment_desc) {
             LOG(ERROR) << "Cannot get segment descriptor for target "
                        << slice->target_id;
@@ -1575,10 +1583,26 @@ int EfaContext::submitPostSend(
         if (EfaTransport::selectDevice(peer_segment_desc.get(),
                                        slice->rdma.dest_addr, slice->length,
                                        buffer_id, device_id)) {
-            LOG(ERROR) << "Cannot select device for dest_addr "
-                       << (void*)slice->rdma.dest_addr;
-            slice->markFailed();
-            continue;
+            // The cached peer descriptor may be stale: the peer may have
+            // registered buffers since it was fetched (a Store client mounts
+            // its segment in chunks and serves the first ones while it
+            // registers the rest) or re-registered them elsewhere. Fetch it
+            // again, once per target in this call, and retry, as the RDMA and
+            // CXI transports do.
+            if (refreshed == refreshed_descs.end()) {
+                peer_segment_desc = engine_.meta()->getSegmentDescByID(
+                    slice->target_id, /*force_update=*/true);
+                refreshed_descs[slice->target_id] = peer_segment_desc;
+            }
+            if (!peer_segment_desc ||
+                EfaTransport::selectDevice(peer_segment_desc.get(),
+                                           slice->rdma.dest_addr, slice->length,
+                                           buffer_id, device_id)) {
+                LOG(ERROR) << "Cannot select device for dest_addr "
+                           << (void*)slice->rdma.dest_addr;
+                slice->markFailed();
+                continue;
+            }
         }
 
         // device_id comes from the peer-supplied topology, whose HCA list is

@@ -1039,6 +1039,7 @@ Status EfaTransport::submitTransferTask(
         slices_to_post;
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
         target_segment_descs;
+    std::unordered_set<SegmentID> refreshed_targets;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     assert(local_segment_desc.get());
     const int kMaxRetryCount = globalConfig().retry_cnt;
@@ -1068,6 +1069,21 @@ Status EfaTransport::submitTransferTask(
                     .emplace(request.target_id,
                              metadata_->getSegmentDescByID(request.target_id))
                     .first;
+        }
+        // The cached descriptor can predate buffers the peer registered since,
+        // e.g. a Store client that mounts its segment in several chunks and
+        // takes traffic for the first ones while it registers the rest. Fetch
+        // it again, once per target in this call, when it does not cover the
+        // destination.
+        size_t probe_idx = SIZE_MAX;
+        if (!refreshed_targets.count(request.target_id) &&
+            efaBytesUntilChunkEnd(
+                target_desc_it->second.get(), request.target_offset,
+                /*require_remote_key=*/true, probe_idx) == 0) {
+            refreshed_targets.insert(request.target_id);
+            auto fresh = metadata_->getSegmentDescByID(request.target_id,
+                                                       /*force_update=*/true);
+            if (fresh) target_desc_it->second = std::move(fresh);
         }
         const auto& target_segment_desc = target_desc_it->second;
 

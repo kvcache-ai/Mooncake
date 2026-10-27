@@ -351,6 +351,13 @@ if(USE_EFA)
                                                       gtest_main)
   add_test(NAME efa_select_device_test COMMAND efa_select_device_test)
 
+  add_executable(efa_stale_segment_desc_test
+                 ${WORKSPACE}/efa_stale_segment_desc_test.cpp)
+  target_link_libraries(efa_stale_segment_desc_test PUBLIC transfer_engine gtest
+                                                           gtest_main)
+  add_test(NAME efa_stale_segment_desc_test
+           COMMAND efa_stale_segment_desc_test)
+
   # Compiles the real EfaEndPoint source against the test-only
   # RPC/address-vector fakes in efa_endpoint_handshake_fakes/ (shadowed
   # efa_context.h via -iquote), so the endpoint locking and generation logic
