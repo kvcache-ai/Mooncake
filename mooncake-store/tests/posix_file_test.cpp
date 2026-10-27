@@ -6,6 +6,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <fcntl.h>
 #include <sys/resource.h>
@@ -17,6 +18,9 @@
 #include <vector>
 #include "file_interface.h"
 #include "../src/uring_submit.h"
+#ifdef USE_URING
+#include <liburing.h>
+#endif
 
 namespace mooncake {
 
@@ -326,66 +330,153 @@ TEST_F(PosixFileTest, UringBatchReadReportsPerRequestResultsAcrossQueueDepth) {
     }
 }
 
+// Whether this liburing and kernel can clone a registered buffer table onto
+// another ring, which is how UringFile shares its fixed buffer. Without it
+// (liburing < 2.9 or kernel < 6.13) UringFile uses unfixed I/O by design.
+static bool uringCanCloneBuffers() {
+#if defined(IO_URING_VERSION_MAJOR) && \
+    (IO_URING_VERSION_MAJOR > 2 ||     \
+     (IO_URING_VERSION_MAJOR == 2 && IO_URING_VERSION_MINOR >= 9))
+    struct io_uring src{}, dst{};
+    if (io_uring_queue_init(1, &src, 0) < 0) return false;
+    if (io_uring_queue_init(1, &dst, 0) < 0) {
+        io_uring_queue_exit(&src);
+        return false;
+    }
+    alignas(4096) static char page[4096];
+    struct iovec iov{page, sizeof(page)};
+    bool ok = io_uring_register_buffers(&src, &iov, 1) == 0 &&
+              io_uring_clone_buffers(&dst, &src) == 0;
+    io_uring_queue_exit(&dst);
+    io_uring_queue_exit(&src);
+    return ok;
+#else
+    return false;
+#endif
+}
+
+// Pages this process has pinned, in KiB (VmPin). io_uring charges the
+// fixed buffers it pins here unless the process has CAP_IPC_LOCK.
+static long pinnedKib() {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("VmPin:", 0) == 0) return std::stol(line.substr(6));
+    }
+    return -1;
+}
+
+// A buffer larger than the kernel's 1 GiB cap on one fixed buffer, with
+// three blocks of the test file: X, Y, Z.
+class UringLargeBuffer {
+   public:
+    static constexpr size_t kGiB = 1ULL << 30;
+    static constexpr size_t kLen = kGiB + (16ULL << 20);
+    static constexpr size_t kBlock = 4096;
+
+    bool allocate() {
+        void* raw = nullptr;
+        if (posix_memalign(&raw, kBlock, kLen) != 0) return false;
+        owner_.reset(raw);
+        memset(raw, 0, kLen);
+        return true;
+    }
+    char* base() const { return static_cast<char*>(owner_.get()); }
+
+    static bool memlockTooSmall() {
+        struct rlimit rl{};
+        return geteuid() != 0 && getrlimit(RLIMIT_MEMLOCK, &rl) == 0 &&
+               rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < kLen;
+    }
+
+    // Reads into the first piece, the second piece, and across the piece
+    // boundary, from this thread and from another one.
+    static void expectReads(int test_fd, const std::string& test_filename,
+                            char* base) {
+        const char fill[3] = {'X', 'Y', 'Z'};
+        for (int i = 0; i < 3; ++i) {
+            std::vector<char> block(kBlock, fill[i]);
+            ASSERT_EQ(pwrite(test_fd, block.data(), kBlock,
+                             static_cast<off_t>(i * kBlock)),
+                      static_cast<ssize_t>(kBlock));
+        }
+        int uring_fd = dup(test_fd);
+        ASSERT_GE(uring_fd, 0);
+        UringFile uring_file(test_filename, uring_fd, 32, false);
+        // One read in piece 0, one in piece 1, one across the boundary.
+        std::array<UringFile::ReadDesc, 3> descs{
+            UringFile::ReadDesc{base + kBlock, kBlock, 0},
+            UringFile::ReadDesc{base + kGiB + kBlock, kBlock, kBlock},
+            UringFile::ReadDesc{base + kGiB - kBlock / 2, kBlock, 2 * kBlock}};
+        auto result = uring_file.batch_read(descs.data(), descs.size());
+        ASSERT_TRUE(result.has_value()) << toString(result.error());
+        for (int i = 0; i < 3; ++i) {
+            EXPECT_EQ(descs[i].error, ErrorCode::OK);
+            EXPECT_EQ(descs[i].bytes_read, kBlock);
+            const char* got = static_cast<const char*>(descs[i].buf);
+            EXPECT_EQ(std::count(got, got + kBlock, fill[i]),
+                      static_cast<std::ptrdiff_t>(kBlock))
+                << "read " << i;
+        }
+
+        memset(base + kGiB + kBlock, 0, kBlock);
+        bool other_ok = false;
+        std::thread reader([&] {
+            UringFile::ReadDesc d{base + kGiB + kBlock, kBlock, kBlock};
+            auto r = uring_file.batch_read(&d, 1);
+            other_ok =
+                r.has_value() && d.error == ErrorCode::OK &&
+                d.bytes_read == kBlock &&
+                std::count(base + kGiB + kBlock, base + kGiB + 2 * kBlock,
+                           fill[1]) == static_cast<std::ptrdiff_t>(kBlock);
+        });
+        reader.join();
+        EXPECT_TRUE(other_ok);
+    }
+
+   private:
+    std::unique_ptr<void, decltype(&free)> owner_{nullptr, free};
+};
+
 // The kernel caps one fixed buffer at 1 GiB; a larger global buffer is
-// registered in pieces. Reads inside either piece, and one crossing the piece
-// boundary (which must go unfixed), all land the right bytes.
+// registered in pieces, and another thread's ring clones the registration
+// instead of pinning the buffer again.
 TEST_F(PosixFileTest, UringRegistersGlobalBufferLargerThanOneGiB) {
-    constexpr size_t kGiB = 1ULL << 30;
-    constexpr size_t kLen = kGiB + (16ULL << 20);
-    constexpr size_t kBlock = 4096;
-    struct rlimit rl{};
-    if (geteuid() != 0 && getrlimit(RLIMIT_MEMLOCK, &rl) == 0 &&
-        rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < kLen) {
-        GTEST_SKIP() << "RLIMIT_MEMLOCK too small to pin " << kLen << " bytes";
+    if (!uringCanCloneBuffers()) {
+        GTEST_SKIP() << "io_uring cannot clone buffers here; covered by "
+                        "UringReadsUnfixedWithoutBufferClone";
     }
-    void* raw = nullptr;
-    ASSERT_EQ(posix_memalign(&raw, kBlock, kLen), 0);
-    std::unique_ptr<void, decltype(&free)> owner(raw, free);
-    memset(raw, 0, kLen);
-    ASSERT_TRUE(UringFile::register_global_buffer(raw, kLen));
-
-    const char fill[3] = {'X', 'Y', 'Z'};
-    for (int i = 0; i < 3; ++i) {
-        std::vector<char> block(kBlock, fill[i]);
-        ASSERT_EQ(pwrite(test_fd, block.data(), kBlock,
-                         static_cast<off_t>(i * kBlock)),
-                  static_cast<ssize_t>(kBlock));
+    if (UringLargeBuffer::memlockTooSmall()) {
+        GTEST_SKIP() << "RLIMIT_MEMLOCK too small to pin "
+                     << UringLargeBuffer::kLen << " bytes";
     }
-    int uring_fd = dup(test_fd);
-    ASSERT_GE(uring_fd, 0);
-    UringFile uring_file(test_filename, uring_fd, 32, false);
-    char* base = static_cast<char*>(raw);
-    std::array<UringFile::ReadDesc, 3> descs{
-        UringFile::ReadDesc{base + kBlock, kBlock, 0},              // piece 0
-        UringFile::ReadDesc{base + kGiB + kBlock, kBlock, kBlock},  // piece 1
-        UringFile::ReadDesc{base + kGiB - kBlock / 2, kBlock,
-                            2 * kBlock}};  // crosses the boundary
-    auto result = uring_file.batch_read(descs.data(), descs.size());
-    ASSERT_TRUE(result.has_value()) << toString(result.error());
-    for (int i = 0; i < 3; ++i) {
-        EXPECT_EQ(descs[i].error, ErrorCode::OK);
-        EXPECT_EQ(descs[i].bytes_read, kBlock);
-        const char* got = static_cast<const char*>(descs[i].buf);
-        EXPECT_EQ(std::count(got, got + kBlock, fill[i]),
-                  static_cast<std::ptrdiff_t>(kBlock))
-            << "read " << i;
-    }
-
-    // Another thread's ring takes the same registration (cloned, not pinned
-    // again) and reads into the second piece.
-    memset(base + kGiB + kBlock, 0, kBlock);
-    bool other_ok = false;
-    std::thread reader([&] {
-        UringFile::ReadDesc d{base + kGiB + kBlock, kBlock, kBlock};
-        auto r = uring_file.batch_read(&d, 1);
-        other_ok = r.has_value() && d.error == ErrorCode::OK &&
-                   d.bytes_read == kBlock &&
-                   std::count(base + kGiB + kBlock, base + kGiB + 2 * kBlock,
-                              fill[1]) == static_cast<std::ptrdiff_t>(kBlock);
-    });
-    reader.join();
-    EXPECT_TRUE(other_ok);
+    UringLargeBuffer buffer;
+    ASSERT_TRUE(buffer.allocate());
+    ASSERT_TRUE(UringFile::register_global_buffer(buffer.base(),
+                                                  UringLargeBuffer::kLen));
+    UringLargeBuffer::expectReads(test_fd, test_filename, buffer.base());
     UringFile::unregister_global_buffer();
+}
+
+// Where buffers cannot be cloned, registration reports failure and every read
+// falls back to unfixed I/O. On hosts that can clone, no buffer is registered,
+// which takes the same unfixed path.
+TEST_F(PosixFileTest, UringReadsUnfixedWithoutBufferClone) {
+    UringLargeBuffer buffer;
+    ASSERT_TRUE(buffer.allocate());
+    const bool can_clone = uringCanCloneBuffers();
+    if (!can_clone) {
+        const long pinned_before = pinnedKib();
+        // The second attempt runs on a ring whose clone already failed.
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            EXPECT_FALSE(UringFile::register_global_buffer(
+                buffer.base(), UringLargeBuffer::kLen));
+            // The failed registration must not keep the buffer pinned.
+            EXPECT_LE(pinnedKib(), pinned_before) << "attempt " << attempt;
+        }
+    }
+    UringLargeBuffer::expectReads(test_fd, test_filename, buffer.base());
+    if (!can_clone) UringFile::unregister_global_buffer();
 }
 
 TEST_F(PosixFileTest, UringBatchReadReportsShortReadPerRequest) {

@@ -55,9 +55,13 @@ struct GlobalBufInfo {
 };
 static GlobalBufInfo g_buf;
 
+// Unpins the source registration and closes the source ring. Unregistering
+// first makes the unpin synchronous: io_uring_queue_exit() alone leaves it to
+// the kernel's deferred ring teardown.
 static void release_source_registration() {
     std::lock_guard<std::mutex> lock(g_buf.source_mu);
     if (!g_buf.source_ready) return;
+    io_uring_unregister_buffers(&g_buf.source);
     io_uring_queue_exit(&g_buf.source);
     g_buf.source_ready = false;
 }
@@ -1078,6 +1082,17 @@ tl::expected<void, ErrorCode> UringFile::datasync() {
 // Buffer registration
 // ---------------------------------------------------------------------------
 
+// Registers the buffer on the source ring and clones it onto the calling
+// thread's ring. If the clone fails (kernels before 6.13 reject it), no ring
+// can use the source registration, so its pinned pages are released now
+// instead of at unregister.
+static bool register_and_clone(void* buffer, size_t length) {
+    if (!register_source_buffer(buffer, length)) return false;
+    if (SharedUringRing::instance().ensure_buf_registered()) return true;
+    release_source_registration();
+    return false;
+}
+
 bool UringFile::register_global_buffer(void* buffer, size_t length) {
     if (!buffer || length == 0) {
         LOG(ERROR)
@@ -1098,8 +1113,7 @@ bool UringFile::register_global_buffer(void* buffer, size_t length) {
     }
     g_buf.base.store(buffer, std::memory_order_release);
     g_buf.size.store(length, std::memory_order_release);
-    bool ok = register_source_buffer(buffer, length) &&
-              SharedUringRing::instance().ensure_buf_registered();
+    bool ok = register_and_clone(buffer, length);
     if (ok) {
         LOG(INFO) << "[UringFile::register_global_buffer] registered"
                   << " addr=" << buffer << " size=" << length;
@@ -1139,8 +1153,7 @@ bool UringFile::register_buffer(void* buffer, size_t length) {
     g_buf.base.store(buffer, std::memory_order_release);
     g_buf.size.store(length, std::memory_order_release);
     // Register once, then clone onto the calling thread's ring immediately.
-    bool ok = register_source_buffer(buffer, length) &&
-              SharedUringRing::instance().ensure_buf_registered();
+    bool ok = register_and_clone(buffer, length);
     LOG(INFO) << "[UringFile::register_buffer] addr=" << buffer
               << " size=" << length << " calling-thread-registered=" << ok;
     return ok;
