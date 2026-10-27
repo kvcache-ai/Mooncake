@@ -2620,6 +2620,7 @@ TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
     ASSERT_FALSE(batch_before[0].has_value());
     EXPECT_EQ(batch_before[0].error(), ErrorCode::REPLICA_IS_NOT_READY);
     Segment segment = MakeSegment(endpoint);
+    segment.protocol = "rdma";
     ASSERT_TRUE(service.ReMountSegment({segment}, generate_uuid()).has_value());
     ASSERT_TRUE(service.GetReplicaList(key, kDefaultTenant).has_value());
     auto batch_after = service.BatchGetReplicaList({key}, kDefaultTenant);
