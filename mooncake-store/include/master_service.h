@@ -1431,6 +1431,10 @@ class MasterService {
     bool IsSoftPinActive(
         const ObjectMetadata& metadata,
         const std::chrono::system_clock::time_point& now) const;
+    // Object-level eviction check; callers still check the replicas.
+    bool MayEvictObject(const ObjectMetadata& metadata,
+                        std::chrono::system_clock::time_point now,
+                        bool allow_soft_pinned) const;
     void CleanupExpiredSoftPins(
         const std::chrono::system_clock::time_point& now);
     auto ResolveSoftPinRequest(const ReplicateConfig& config) const
