@@ -1552,10 +1552,9 @@ void MooncakeCommunicator::applyViewUpdate(
             // can observe its own slot as inactive and reject a collective.
             // Write each slot's final value once instead.
             {
-                std::vector<bool> next_active_ranks(meta_->maxGroupSize,
-                                                    false);
-                for (size_t local_rank = 0;
-                     local_rank < view.rank_order.size(); ++local_rank) {
+                std::vector<bool> next_active_ranks(meta_->maxGroupSize, false);
+                for (size_t local_rank = 0; local_rank < view.rank_order.size();
+                     ++local_rank) {
                     const auto global_rank = view.rank_order[local_rank];
                     next_active_ranks[local_rank] =
                         view.members[global_rank].isActive();
