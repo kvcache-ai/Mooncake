@@ -633,8 +633,7 @@ TEST(BufferProtocolTest, CxlCarriesTheClientSegmentName) {
 // build does not know, so a standby snapshot from another version round-trips.
 TEST(BufferProtocolTest, DescriptorProtocolsRoundTrip) {
     auto allocator = std::make_shared<DummyBufferAllocator>("seg", "endpoint");
-    auto describe = [&allocator](std::string protocol,
-                                 std::string endpoint) {
+    auto describe = [&allocator](std::string protocol, std::string endpoint) {
         AllocatedBuffer::Descriptor descriptor{};
         descriptor.size_ = 1024;
         descriptor.buffer_address_ = 0x1000;
