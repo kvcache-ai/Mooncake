@@ -27,6 +27,7 @@
 #include "metadata/eviction_index.h"
 #include "metadata/lease_eviction_index.h"
 #include "metadata/namespace_policy.h"
+#include "metadata/write_hook.h"
 #include "metadata/object_route.h"
 #include "tenant_id.h"
 #include "types.h"
@@ -83,6 +84,11 @@ class Namespace final : private route::RouteObserver {
         }
     }
 
+    // Adds a hook to the chain every write guard of this namespace is
+    // reported to, in registration order. Registration is not synchronized:
+    // the owner adds them before the namespace serves a write.
+    void RegisterWriteHook(WriteHook* hook) { hooks_.push_back(hook); }
+
     // True when the namespace holds no object and no group membership.
     [[nodiscard]] bool Empty() const { return objects.Empty(); }
 
@@ -119,11 +125,43 @@ class Namespace final : private route::RouteObserver {
         return PolicyContext{id_, attachment_.get(), guard};
     }
 
+    // The write about to be handed out, reported to the chain under the
+    // key's lock and before its first change. An error refuses the write with
+    // nothing changed, and drops whatever the hooks reserved so far.
+    [[nodiscard]] tl::expected<void, ErrorCode> OnWriteBegin(
+        const route::WriteGuard& guard, WriteChange change,
+        WriteReservations& reservations) override {
+        reservations.clear();
+        if (hooks_.empty()) {
+            return {};
+        }
+        reservations.resize(hooks_.size());
+        for (size_t i = 0; i < hooks_.size(); ++i) {
+            auto begun = hooks_[i]->OnWriteBegin(guard, change, reservations[i]);
+            if (!begun) {
+                reservations.clear();
+                return tl::make_unexpected(begun.error());
+            }
+        }
+        return {};
+    }
+
     void OnWriteRelease(const route::WriteGuard& guard) override {
         SyncInFlight(guard);
         eviction_index_->OnWrite(guard);
         if (policy_ != nullptr) {
             policy_->OnWriteRelease(Context(guard));
+        }
+        // The chain last: it sees the key as the write left it, and a hook
+        // that records the change runs before any later hook that announces
+        // it. A write no hook heard of has no reservation and nothing to
+        // report.
+        if (guard.change() != WriteChange::kNone) {
+            assert(guard.reservations().size() == hooks_.size());
+            for (size_t i = 0; i < hooks_.size(); ++i) {
+                hooks_[i]->OnWriteRelease(guard, guard.change(),
+                                          guard.reservations()[i]);
+            }
         }
         // A key with no object may be dropped once this guard lets go, or
         // published again, so whatever is kept on it must be back to its
@@ -186,6 +224,9 @@ class Namespace final : private route::RouteObserver {
     // must outlive the hooks the lists hold.
     std::array<InFlightStripe, kInFlightStripeCount> in_flight_;
     const std::unique_ptr<EvictionIndex> eviction_index_;
+    // The hooks that hear of every write, in registration order. They are the
+    // owner's, which outlives the namespace.
+    std::vector<WriteHook*> hooks_;
 };
 
 }  // namespace metadata

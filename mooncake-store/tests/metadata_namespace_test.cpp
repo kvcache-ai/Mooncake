@@ -342,6 +342,183 @@ TEST(NamespacePolicyTest, WithoutAPolicyEveryGrowthIsGranted) {
     ns.BeforeTearDown(*guard);
 }
 
+// --- Write hooks -----------------------------------------------------------
+//
+// A write lock on a key is reported to the namespace's chain twice: before the
+// first change, where a hook may refuse it, and as the lock is released, where
+// it sees the post-state. These cases pin what a hook is promised, since the
+// OpLog hangs on it: a refused write must leave the key as it was, a write no
+// hook heard of must not reach the chain at all, and each hook's reservation
+// must live from its own begin to its own release.
+
+// Marks that the guard dropped it, which is what gives back whatever a hook
+// reserved.
+struct ReservationMarker final : WriteReservation {
+    explicit ReservationMarker(bool* dropped) : dropped(dropped) {}
+    ~ReservationMarker() override { *dropped = true; }
+
+    bool* dropped;
+};
+
+struct RefusingHook final : WriteHook {
+    tl::expected<void, ErrorCode> OnWriteBegin(
+        const WriteGuard& guard, WriteChange change,
+        std::unique_ptr<WriteReservation>&) override {
+        key = guard.key();
+        seen = change;
+        held_object = guard.has_object();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    void OnWriteRelease(const WriteGuard&, WriteChange,
+                        std::unique_ptr<WriteReservation>&) override {
+        ++releases;
+    }
+
+    std::string key;
+    WriteChange seen{WriteChange::kNone};
+    bool held_object = false;
+    int releases = 0;
+};
+
+struct RecordingHook final : WriteHook {
+    RecordingHook(std::string name, bool* reserved_alive, bool refuse = false)
+        : name(std::move(name)),
+          reserved_alive(reserved_alive),
+          refuse(refuse) {}
+
+    tl::expected<void, ErrorCode> OnWriteBegin(
+        const WriteGuard& guard, WriteChange change,
+        std::unique_ptr<WriteReservation>& reservation) override {
+        ++begins;
+        begun_on = change;
+        reservation = std::make_unique<ReservationMarker>(reserved_alive);
+        if (refuse) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return {};
+    }
+
+    void OnWriteRelease(const WriteGuard& guard, WriteChange change,
+                        std::unique_ptr<WriteReservation>& reservation) override {
+        ++releases;
+        released_on = change;
+        held_reservation = reservation != nullptr;
+        released_key = guard.key();
+        held_object = guard.has_object();
+    }
+
+    std::string name;
+    bool* reserved_alive;
+    bool refuse = false;
+    int begins = 0;
+    int releases = 0;
+    WriteChange begun_on{WriteChange::kNone};
+    WriteChange released_on{WriteChange::kNone};
+    bool held_reservation = false;
+    std::string released_key;
+    bool held_object = false;
+};
+
+TEST(NamespaceWriteHookTest, ARefusedBeginLeavesTheKeyUntouched) {
+    Namespace ns;
+    RefusingHook hook;
+    ns.RegisterWriteHook(&hook);
+    ASSERT_NE(test::PublishObject(ns.objects, "k"), 0u);
+
+    auto guard = ns.objects.Write("k", WriteChange::kReplicasRemoved);
+
+    ASSERT_FALSE(guard.has_value());
+    EXPECT_EQ(guard.error(), ErrorCode::INVALID_PARAMS);
+    // The hook judged the key it was handed, with the object still there.
+    EXPECT_EQ(hook.key, "k");
+    EXPECT_EQ(hook.seen, WriteChange::kReplicasRemoved);
+    EXPECT_TRUE(hook.held_object);
+    // A refused write is not released, so no hook records it.
+    EXPECT_EQ(hook.releases, 0);
+    EXPECT_TRUE(ns.objects.Contains("k"));
+}
+
+TEST(NamespaceWriteHookTest, AWriteNoHookHeardOfIsNotReported) {
+    Namespace ns;
+    bool dropped = false;
+    RecordingHook hook("only", &dropped);
+    ns.RegisterWriteHook(&hook);
+    ASSERT_NE(test::PublishObject(ns.objects, "k"), 0u);
+
+    { auto guard = ns.objects.Write("k"); ASSERT_TRUE(guard.has_value()); }
+
+    EXPECT_EQ(hook.begins, 0);
+    EXPECT_EQ(hook.releases, 0);
+}
+
+TEST(NamespaceWriteHookTest, ReleaseSeesTheChangeAndItsOwnReservation) {
+    Namespace ns;
+    bool dropped = false;
+    RecordingHook hook("only", &dropped);
+    ns.RegisterWriteHook(&hook);
+    ASSERT_NE(test::PublishObject(ns.objects, "k"), 0u);
+
+    {
+        auto guard = ns.objects.Write("k", WriteChange::kKeyRemoved);
+        ASSERT_TRUE(guard.has_value());
+        // Reserved under the lock, before anything changed.
+        EXPECT_EQ(hook.begins, 1);
+        EXPECT_EQ(hook.releases, 0);
+        EXPECT_FALSE(dropped);
+    }
+
+    EXPECT_EQ(hook.releases, 1);
+    EXPECT_EQ(hook.begun_on, WriteChange::kKeyRemoved);
+    EXPECT_EQ(hook.released_on, WriteChange::kKeyRemoved);
+    EXPECT_TRUE(hook.held_reservation);
+    EXPECT_EQ(hook.released_key, "k");
+    EXPECT_TRUE(hook.held_object);
+    // The reservation goes with the guard, not before its release.
+    EXPECT_TRUE(dropped);
+}
+
+TEST(NamespaceWriteHookTest, EachHookGetsItsOwnReservationInOrder) {
+    Namespace ns;
+    bool first_dropped = false;
+    bool second_dropped = false;
+    RecordingHook first("first", &first_dropped);
+    RecordingHook second("second", &second_dropped);
+    ns.RegisterWriteHook(&first);
+    ns.RegisterWriteHook(&second);
+    ASSERT_NE(test::PublishObject(ns.objects, "k"), 0u);
+
+    { auto guard = ns.objects.Write("k", WriteChange::kNewWrite); ASSERT_TRUE(guard.has_value()); }
+
+    EXPECT_EQ(first.releases, 1);
+    EXPECT_EQ(second.releases, 1);
+    EXPECT_TRUE(first.held_reservation);
+    EXPECT_TRUE(second.held_reservation);
+    EXPECT_TRUE(first_dropped);
+    EXPECT_TRUE(second_dropped);
+}
+
+TEST(NamespaceWriteHookTest, ARefusedBeginDropsWhatTheEarlierHookReserved) {
+    Namespace ns;
+    bool kept_dropped = false;
+    bool refusing_dropped = false;
+    RecordingHook kept("kept", &kept_dropped);
+    RecordingHook refusing("refusing", &refusing_dropped, /*refuse=*/true);
+    ns.RegisterWriteHook(&kept);
+    ns.RegisterWriteHook(&refusing);
+    ASSERT_NE(test::PublishObject(ns.objects, "k"), 0u);
+
+    auto guard = ns.objects.Write("k", WriteChange::kNewWrite);
+
+    ASSERT_FALSE(guard.has_value());
+    EXPECT_EQ(kept.begins, 1);
+    EXPECT_EQ(kept.releases, 0);
+    // Both hooks gave their reservations back, so nothing outlives the write.
+    EXPECT_TRUE(kept_dropped);
+    EXPECT_TRUE(refusing_dropped);
+    EXPECT_TRUE(ns.objects.Contains("k"));
+}
+
 }  // namespace
 }  // namespace metadata
 }  // namespace mooncake
