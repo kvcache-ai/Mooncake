@@ -496,7 +496,7 @@ addresses, segment names, or other unbounded values are accepted.
 
 | Label | Values | Description |
 |-------|--------|-------------|
-| `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu`, `ub`, `mpcomm`, `hp_tcp`, `xpu`, `hylink`, `fabric` | The transport that handled the transfer |
+| `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu`, `ub`, `mpcomm`, `hp_tcp`, `xpu`, `hylink`, `fabric`, `mlu`, `memfabric` | The transport that handled the transfer |
 | `operation` | `read`, `write`; `register`, `unregister` | Attempt or memory lifecycle operation, depending on the metric family |
 | `phase` | `metadata`, `admission`, `selection`, `connect`, `register`, `submit`, `queue`, `post`, `poll`, `completion`, `retry`, `failover`, `notify`, `cleanup`, `shutdown` | Stable phase where a terminal failure originated |
 | `reason` | `submit`, `poll`, `timeout`, `canceled` for `tent_task_failures_total`; `timeout`, `unavailable`, `queue_full`, `resource_exhausted`, `protocol`, `stale_generation`, `wc_error`, `cq_error`, `mr_error`, `peer_closed`, `canceled`, `internal` for `tent_terminal_failures_total` | Bounded failure classification |
@@ -518,12 +518,12 @@ addresses, segment names, or other unbounded values are accepted.
 Transport label values come from the shared `transportTypeName()` mapping.
 `unspec` covers transfers that failed before a transport was selected.
 
-**Cardinality**: the `transport` label has 17 values; the failover
-`from`/`to` pair has at most 17x17 = 289 combinations (in practice only a
-few pairs ever occur), each attempt metric has at most 17x2 = 34
-transport/operation combinations, task failures have at most 17x4 = 68,
-terminal failures have at most 17x15x12 = 3060, each memory lifecycle family
-has at most 17x2x2 = 68, worker progress has three series, each staging in-flight
+**Cardinality**: the `transport` label has 19 values; the failover
+`from`/`to` pair has at most 19x19 = 361 combinations (in practice only a
+few pairs ever occur), each attempt metric has at most 19x2 = 38
+transport/operation combinations, task failures have at most 19x4 = 76,
+terminal failures have at most 19x15x12 = 3420, each memory lifecycle family
+has at most 19x2x2 = 76, worker progress has three series, each staging in-flight
 family has two operation series, staging cleanup has three kind series, and
 each serialization family has exactly two series. Dynamic counters allocate
 only label combinations that actually occur. Build identity labels are
