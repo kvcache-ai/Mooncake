@@ -269,6 +269,12 @@ jobs:
         mooncake_http_metadata_server --port 8080 &
       shell: bash
 
+    - name: Test installed P2P CLI startup
+      run: |
+        source test_env/bin/activate
+        python mooncake-wheel/tests/test_cli.py
+      shell: bash
+
     # TODO(P2P-010.4): Adapt installed tier/service/HA workloads from run_tests.sh
     # and validate the applicable TCP/RDMA paths.
     - name: Prepare P2P test configurations

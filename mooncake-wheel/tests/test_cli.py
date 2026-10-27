@@ -52,8 +52,66 @@ def test_entry_point_installed():
         return False
 
 
-def test_run_master_and_client():
-    """Test running the master service through the entry point."""
+def test_run_p2p_master_and_client():
+    """Test the P2P master and client entry points."""
+    try:
+        # Reuse the metadata server on 8080; isolate this Master's RPC and metrics.
+        process = subprocess.Popen(
+            ["mooncake_master", "--rpc_port=61351", "--rpc_thread_num=2",
+             "--metrics_port=19003"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+        # Give it a moment to start
+        time.sleep(2)
+
+        # Check if process is running
+        if process.poll() is None:
+            print("✅ mooncake_master process started successfully")
+            tiered_backend_config = (
+                '{"tiers":[{"type":"DRAM","capacity":"128MB",'
+                '"priority":10,"allocator_type":"OFFSET"}]}'
+            )
+            client_process = subprocess.Popen(
+                ["mooncake_client", "--master_server_address=127.0.0.1:61351",
+                 "--port=61352", f"--tiered_backend_config={tiered_backend_config}",
+                 "--client_rpc_port=0", "--enable_http_server=false"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            # Give the client some time to connect
+            time.sleep(2)
+            client_started = client_process.poll() is None
+            if client_started:
+                print("✅ mooncake_client connected to mooncake_master successfully")
+                # Terminate the process
+                client_process.terminate()
+                client_process.wait(timeout=5)
+                print("✅ mooncake_client process terminated successfully")
+            else:
+                stdout, stderr = client_process.communicate()
+                print(f"❌ mooncake_client failed to start")
+                print(f"stdout: {stdout.decode()}")
+                print(f"stderr: {stderr.decode()}")
+            # Terminate the process
+            process.terminate()
+            process.wait(timeout=5)
+            print("✅ mooncake_master process terminated successfully")
+            return client_started
+        else:
+            stdout, stderr = process.communicate()
+            print(f"❌ mooncake_master process failed to start")
+            print(f"stdout: {stdout.decode()}")
+            print(f"stderr: {stderr.decode()}")
+            return False
+    except Exception as e:
+        print(f"❌ Error running mooncake_master: {e}")
+        return False
+
+def test_run_centralized_master_and_client():
+    """Test the centralized master and client entry points."""
     try:
         # Reuse the metadata server on 8080; isolate this Master's RPC and metrics.
         process = subprocess.Popen(
@@ -77,7 +135,8 @@ def test_run_master_and_client():
 
             # Give the client some time to connect
             time.sleep(2)
-            if client_process.poll() is None:
+            client_started = client_process.poll() is None
+            if client_started:
                 print("✅ mooncake_client connected to mooncake_master successfully")
                 # Terminate the process
                 client_process.terminate()
@@ -92,7 +151,7 @@ def test_run_master_and_client():
             process.terminate()
             process.wait(timeout=5)
             print("✅ mooncake_master process terminated successfully")
-            return True
+            return client_started
         else:
             stdout, stderr = process.communicate()
             print(f"❌ mooncake_master process failed to start")
@@ -111,7 +170,20 @@ if __name__ == "__main__":
     entry_point_installed = test_entry_point_installed()
 
     if entry_point_installed:
-        run_master_and_client_success = test_run_master_and_client()
+        try:
+            version = subprocess.check_output(
+                ["mooncake_master", "--version"],
+                stderr=subprocess.STDOUT, text=True,
+            ).splitlines()
+            if "architecture=p2p" in version:
+                run_master_and_client_success = test_run_p2p_master_and_client()
+            elif "architecture=centralized" in version:
+                run_master_and_client_success = test_run_centralized_master_and_client()
+            else:
+                raise ValueError("Missing or invalid master architecture")
+        except Exception as e:
+            print(f"❌ Error selecting CLI architecture: {e}")
+            run_master_and_client_success = False
     else:
         run_master_and_client_success = False
 
