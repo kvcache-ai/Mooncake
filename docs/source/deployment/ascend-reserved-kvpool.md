@@ -58,10 +58,11 @@ Try the lasting full-capacity `reserve` command above first. If it succeeds,
 If it fails on the assigned node and the obstruction appears to be movable
 pages or reclaimable cache, a node administrator can compact memory before
 retrying (Linux: `echo 1 > /proc/sys/vm/compact_memory`; this is a host-level
-operation, often unavailable inside a container). The following container-only
-fallback does one small Host FabricMem
-allocate-and-release pass through the same Store path, then retries the full
-reservation. Use fresh state directories on the **same assigned node**:
+operation, often unavailable inside a container). When host compaction is
+unavailable, the container-only alternative below temporarily holds the
+**full 16 × 30 GiB Store budget** through the same FabricMem path, releases
+it, then retries the lasting reservation. Use fresh state directories on the
+**same assigned node**:
 
 ```bash
 python3 scripts/ascend/reserved_kvpool.py reserve \
@@ -70,7 +71,8 @@ python3 scripts/ascend/reserved_kvpool.py reserve \
   --master 192.0.2.1:50051 \
   --metadata-server http://192.0.2.1:8080/metadata \
   --metrics-url http://192.0.2.1:9003/metrics \
-  --devices 0 --per-device-gib 2 --release-after-ready
+  --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+  --per-device-gib 30 --release-after-ready
 
 # Only after warmup.json reports PASS, run the normal reserve command above
 # with a new --state-dir, then admit the model.
@@ -81,10 +83,11 @@ all owners exit cleanly, and their capacity series return to zero on the
 shared master. A failed or interrupted warmup never admits the application.
 Inspect `reservation.json`, per-device logs, `MemFree`/`Cached` and NUMA
 buddy state before and after the pass; do not infer success from a temporary
-free-memory increase. A 2 GiB warmup does **not** prove that 480 GiB is
-available; the subsequent full reservation and admission do. Release then
-reserve promptly, since freed pages are not held for the application.
-This can help when pages are reclaimable;
+free-memory increase. The 2 GiB hardware smoke for this command checked only
+its lifecycle; it did not validate this 480 GiB preconditioning run. Even a
+successful full warmup does **not** secure those pages for the application:
+release then reserve promptly, and require the lasting reservation to pass.
+This may help when pages are reclaimable;
 it cannot create enough 2 MiB physical tiles if long-term pins already block
 the required capacity. The effect on a particular failed node requires a
 same-node before/after validation.
