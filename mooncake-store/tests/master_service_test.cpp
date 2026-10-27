@@ -3816,6 +3816,101 @@ TEST_F(MasterServiceTest, DrainJobMovesObjectsOfEveryTenant) {
     }
 }
 
+// With no target list, a drain moves to the least utilized segment that does
+// not already hold a replica of the key.
+TEST_F(MasterServiceTest, DrainJobPicksLeastUtilizedSegmentWithoutTheKey) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    std::vector<MountedSegmentContext> ctx;
+    for (int i = 0; i < 4; ++i) {
+        ctx.push_back(PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            0x300000000 + i * 0x100000000ULL, kDefaultSegmentSize));
+    }
+    // segment_1 holds the key's other replica and segment_3 is fuller than
+    // segment_2.
+    ReplicateConfig config;
+    config.replica_num = 2;
+    config.preferred_segments = {"segment_0", "segment_1"};
+    const std::string key = "drain_target_key";
+    PutCompletedObject(*service_, generate_uuid(), key, config);
+    PutObjectOnSegment(*service_, ctx[2].client_id, "segment_2", 2 << 20);
+    PutObjectOnSegment(*service_, ctx[3].client_id, "segment_3", 4 << 20);
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    WaitUntil([&] {
+        (void)ExecutePendingMoveTasks(*service_, ctx[0].client_id);
+        auto query = service_->QueryDrainJob(job_id.value());
+        return query.has_value() && query->status == JobStatus::SUCCEEDED;
+    });
+
+    auto replicas = service_->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    std::set<std::string> segment_names;
+    for (const auto& replica : replicas->replicas) {
+        segment_names.insert(replica.get_memory_descriptor()
+                                 .buffer_descriptor.transport_endpoint_);
+    }
+    EXPECT_EQ(segment_names, (std::set<std::string>{"segment_1", "segment_2"}));
+}
+
+// Units that cannot move yet count as blocked, whether or not the round has
+// already filled its slots.
+TEST_F(MasterServiceTest, DrainJobCountsHardPinnedKeyAsBlocked) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    // Three movable and three pinned keys on the source, one key elsewhere.
+    ReplicateConfig config;
+    config.replica_num = 1;
+    for (int i = 0; i < 7; ++i) {
+        config.preferred_segment = i < 6 ? "segment_0" : "segment_1";
+        config.with_hard_pin = i % 2 == 1;
+        PutCompletedObject(*service_, generate_uuid(),
+                           "drain_pin_key_" + std::to_string(i), config);
+    }
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    // The first round fills its one slot and leaves two movable keys
+    // unplanned, wherever the pinned keys fall among them.
+    WaitUntil([&] {
+        auto query = service_->QueryDrainJob(job_id.value());
+        return query.has_value() && query->active_units == 1;
+    });
+    auto query = service_->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->blocked_units, 3u);
+
+    WaitUntil([&] {
+        (void)ExecutePendingMoveTasks(*service_, ctx0.client_id);
+        auto query = service_->QueryDrainJob(job_id.value());
+        return query.has_value() && query->succeeded_units == 3;
+    });
+    query = service_->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->succeeded_units, 3u);
+    EXPECT_EQ(query->blocked_units, 3u);
+    EXPECT_EQ(query->status, JobStatus::RUNNING);
+}
+
 TEST_F(MasterServiceTest, CancelDrainJobRestoresSegmentStatus) {
     auto service_ = std::make_unique<MasterService>();
 

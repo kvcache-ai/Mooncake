@@ -10834,29 +10834,20 @@ std::string MasterService::MakeDrainUnitKey(
            ":" + std::to_string(key.size()) + ":" + key + ":" + source_segment;
 }
 
-std::optional<std::string> MasterService::SelectDrainTargetForKey(
-    const ObjectMetadata& metadata, const std::string& source_segment,
+std::vector<MasterService::DrainTarget> MasterService::SnapshotDrainTargets(
     const std::vector<std::string>& requested_targets) {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     std::vector<std::string> candidate_segments = requested_targets;
     if (candidate_segments.empty()) {
         auto err = segment_access.GetAllSegments(candidate_segments);
         if (err != ErrorCode::OK) {
-            return std::nullopt;
+            return {};
         }
     }
 
-    const auto existing_segments = metadata.GetReplicaSegmentNames();
-    double best_util = std::numeric_limits<double>::max();
-    std::optional<std::string> best_target;
-    for (const auto& candidate : candidate_segments) {
-        if (candidate == source_segment) {
-            continue;
-        }
-        if (std::find(existing_segments.begin(), existing_segments.end(),
-                      candidate) != existing_segments.end()) {
-            continue;
-        }
+    std::vector<DrainTarget> targets;
+    targets.reserve(candidate_segments.size());
+    for (auto& candidate : candidate_segments) {
         if (!segment_access.IsSegmentAllocatable(candidate)) {
             continue;
         }
@@ -10866,11 +10857,30 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
             capacity == 0) {
             continue;
         }
-        const double util =
-            static_cast<double>(used) / static_cast<double>(capacity);
-        if (util < best_util) {
-            best_util = util;
-            best_target = candidate;
+        targets.push_back(
+            {std::move(candidate),
+             static_cast<double>(used) / static_cast<double>(capacity)});
+    }
+    return targets;
+}
+
+std::optional<std::string> MasterService::SelectDrainTargetForKey(
+    const std::vector<DrainTarget>& targets,
+    const std::vector<std::string>& replica_segments,
+    const std::string& source_segment) {
+    double best_util = std::numeric_limits<double>::max();
+    std::optional<std::string> best_target;
+    for (const auto& target : targets) {
+        if (target.segment == source_segment) {
+            continue;
+        }
+        if (std::find(replica_segments.begin(), replica_segments.end(),
+                      target.segment) != replica_segments.end()) {
+            continue;
+        }
+        if (target.utilization < best_util) {
+            best_util = target.utilization;
+            best_target = target.segment;
         }
     }
     return best_target;
@@ -10942,52 +10952,30 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
         active_unit_keys.insert(task.unit_key);
     }
 
+    // Taken once for the round: the walk below holds a stripe lock and must
+    // not wait on the segment lock, which allocation needs as well.
+    const auto targets = SnapshotDrainTargets(job.request.target_segments);
+
     std::unordered_set<std::string> blocked_unit_keys;
     {
         std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
         VisitNamespaces([&](const TenantId& tenant_id,
                             metadata::Namespace& ns) {
-            // The walk only narrows the keys to those with a replica on a
-            // source segment: target selection waits on the segment lock,
-            // which the walk body must not do while it holds the cursor, so
-            // each key is resolved again below and judged on what it holds
-            // then.
-            std::vector<std::string> keys_on_source;
             for (auto object : ns.objects.ReadCursor()) {
-                const auto replica_segments =
-                    object.metadata().GetReplicaSegmentNames();
-                if (std::any_of(job.request.segments.begin(),
-                                job.request.segments.end(),
-                                [&](const std::string& source_segment) {
-                                    return std::find(replica_segments.begin(),
-                                                     replica_segments.end(),
-                                                     source_segment) !=
-                                           replica_segments.end();
-                                })) {
-                    keys_on_source.push_back(object.key());
-                }
-            }
-            for (const std::string& key : keys_on_source) {
-                MetadataAccessorRO accessor(this,
-                                            ObjectIdentity{tenant_id, key});
-                if (!accessor.IsPublished()) {
-                    continue;
-                }
-                const auto& metadata = accessor.Get();
+                const auto& metadata = object.metadata();
+                const auto replica_segments = metadata.GetReplicaSegmentNames();
                 for (const auto& source_segment : job.request.segments) {
-                    const auto unit_key =
-                        MakeDrainUnitKey(tenant_id, key, source_segment);
-                    if (job.completed_unit_keys.contains(unit_key) ||
-                        active_unit_keys.contains(unit_key) ||
-                        job.terminal_failed_unit_keys.contains(unit_key)) {
-                        continue;
-                    }
-
-                    const auto replica_segments =
-                        metadata.GetReplicaSegmentNames();
                     if (std::find(replica_segments.begin(),
                                   replica_segments.end(),
                                   source_segment) == replica_segments.end()) {
+                        continue;
+                    }
+
+                    const auto unit_key = MakeDrainUnitKey(
+                        tenant_id, object.key(), source_segment);
+                    if (job.completed_unit_keys.contains(unit_key) ||
+                        active_unit_keys.contains(unit_key) ||
+                        job.terminal_failed_unit_keys.contains(unit_key)) {
                         continue;
                     }
 
@@ -11014,22 +11002,22 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
 
                     if (metadata.IsHardPinned() || !metadata.IsLeaseExpired() ||
                         !metadata.AllReplicas(&Replica::fn_is_completed) ||
-                        accessor.GetState().replication_task) {
+                        object.state().replication_task) {
                         blocked_unit_keys.insert(unit_key);
                         continue;
                     }
 
                     auto target = SelectDrainTargetForKey(
-                        metadata, source_segment, job.request.target_segments);
+                        targets, replica_segments, source_segment);
                     if (!target.has_value()) {
                         blocked_unit_keys.insert(unit_key);
                         continue;
                     }
 
                     if (plans.size() < slots) {
-                        plans.push_back({tenant_id, key, source_segment,
-                                         *target, metadata.TotalLength(),
-                                         unit_key});
+                        plans.push_back({tenant_id, object.key(),
+                                         source_segment, *target,
+                                         metadata.TotalLength(), unit_key});
                     }
                 }
             }
