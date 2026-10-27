@@ -158,6 +158,43 @@ class ReservationTests(unittest.TestCase):
                 pool.monitor(self.state, self.path, [process], 0, 0)
         self.assertFalse(json.loads(self.path.read_text())["ready"])
 
+    def test_warmup_returns_only_after_full_owned_capacity(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        self.state["ready"] = False
+        with mock.patch.object(pool, "fetch_metrics", return_value=self.full):
+            pool.monitor(
+                self.state,
+                self.path,
+                [process],
+                0,
+                float("inf"),
+                release_after_ready=True,
+            )
+        self.assertTrue(json.loads(self.path.read_text())["ready"])
+        self.assertEqual(self.state["capacity_bytes"], 60 * pool.GIB)
+
+    def test_warmup_release_checks_only_its_owners(self):
+        process = mock.Mock()
+        process.poll.return_value = 0
+        unrelated = series("unrelated", 800 * pool.GIB)
+        own_zero = series("owner-a", 0) + series("owner-b", 0)
+        with mock.patch.object(
+            pool, "fetch_metrics", side_effect=[self.full, unrelated + own_zero]
+        ) as fetch, mock.patch.object(pool.time, "sleep"):
+            pool.confirm_released(self.state, [process])
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_warmup_rejects_unclean_owner_or_mounted_capacity(self):
+        process = mock.Mock()
+        process.poll.return_value = 1
+        with self.assertRaisesRegex(RuntimeError, "did not exit cleanly"):
+            pool.confirm_released(self.state, [process])
+        process.poll.return_value = 0
+        with mock.patch.object(pool, "fetch_metrics", return_value=self.full):
+            with self.assertRaisesRegex(RuntimeError, "release not confirmed"):
+                pool.confirm_released(self.state, [process], timeout=0)
+
     def test_application_gets_zero_contribution_not_inherited_budget(self):
         args = argparse.Namespace(
             state_dir=str(self.path.parent),

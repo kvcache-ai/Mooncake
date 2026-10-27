@@ -51,6 +51,39 @@ Preserve any platform-specific resource configuration required by the installed
 CANN/HDK release. This example does not choose a driver workaround or change the
 existing P/D transport configuration.
 
+### Optional same-node large-page warmup
+
+On a node where reclaimable file cache may obstruct Host huge-page allocation,
+run one explicit allocate-and-release pass before the lasting reservation.
+It uses the **same Store allocation path and segment size** as `reserve` above;
+it is not a separate HugeTLB pool or a driver setting. Use a fresh state
+directory for each command on the **same assigned node**:
+
+```bash
+python3 scripts/ascend/reserved_kvpool.py reserve \
+  --state-dir /data/kvpool-warmup-001 \
+  --local-hostname 192.0.2.10 \
+  --master 192.0.2.1:50051 \
+  --metadata-server http://192.0.2.1:8080/metadata \
+  --metrics-url http://192.0.2.1:9003/metrics \
+  --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+  --per-device-gib 30 --release-after-ready
+
+# Only after warmup.json reports PASS, run the normal reserve command above
+# with a new --state-dir, then admit the model.
+```
+
+`warmup.json` is written only after every owner mounts its full 30 GiB,
+all owners exit cleanly, and their capacity series return to zero on the
+shared master. A failed or interrupted warmup never admits the application.
+Inspect `reservation.json`, per-device logs, `MemFree`/`Cached` and NUMA
+buddy state before and after the pass; do not infer success from a temporary
+free-memory increase. Release then reserve promptly, since freed pages are
+not held for the application. This can help when pages are reclaimable;
+it cannot create enough 2 MiB physical tiles if long-term pins already block
+the required capacity. The effect on a particular failed node requires a
+same-node before/after validation.
+
 ## Admit zero-contribution model clients
 
 ```bash
@@ -97,9 +130,10 @@ contents; it does not merely pause allocation.
 
 This ordering protects an acquired reservation; it does not defragment an
 already pinned node. Apply it before loading the model on a controlled restart
-or replacement. If the full budget cannot be acquired, do not silently reduce
-the pool or start the model: release the failed reservation and use an eligible
-idle node. Whole-node free bytes are not an admission criterion.
+on the assigned node. If the full budget cannot be acquired, do not silently
+reduce the pool or start the model: release the failed reservation and inspect
+reclaimable memory versus long-term pins on that same node. Whole-node free
+bytes are not an admission criterion.
 
 This is an opt-in deployment example. It adds no automatic retry policy,
 transport fallback, or full-cluster lifecycle management.

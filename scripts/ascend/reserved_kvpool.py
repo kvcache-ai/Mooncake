@@ -91,16 +91,39 @@ def refresh(state, path):
     write_state(path, state)
 
 
-def monitor(state, path, processes, interval, startup_deadline):
+def monitor(
+    state, path, processes, interval, startup_deadline, release_after_ready=False
+):
     admitted = False
     while not STOP.is_set():
         if any(process.poll() is not None for process in processes):
             raise RuntimeError("a memory owner exited")
         refresh(state, path)
         admitted = admitted or state["ready"]
+        if release_after_ready and state["ready"]:
+            return
         if not admitted and time.monotonic() >= startup_deadline:
             raise TimeoutError(f"full reservation not ready: {state['error']}")
         STOP.wait(interval)
+
+
+def confirm_released(state, processes, timeout=60):
+    if any(process.poll() != 0 for process in processes):
+        raise RuntimeError("a warmup owner did not exit cleanly")
+    names = [owner["segment"] for owner in state["owners"]]
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            capacities = owned_capacities(fetch_metrics(state["metrics_url"]), names)
+            if all(value == 0 for value in capacities.values()):
+                return
+        except Exception as exc:
+            error = str(exc)
+        else:
+            error = f"warmup segments remain mounted: {capacities}"
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"warmup release not confirmed: {error}")
+        time.sleep(1)
 
 
 def contribute(args):
@@ -183,6 +206,7 @@ def reserve(args):
     processes, logs = [], []
     selector = selectors.DefaultSelector()
     deadline = time.monotonic() + args.startup_timeout
+    warmed = False
     write_state(path, state)
     try:
         for device in args.devices:
@@ -224,7 +248,15 @@ def reserve(args):
                 selector.unregister(key.fd)
                 os.close(key.fd)
         if not STOP.is_set():
-            monitor(state, path, processes, args.poll_interval, deadline)
+            monitor(
+                state,
+                path,
+                processes,
+                args.poll_interval,
+                deadline,
+                args.release_after_ready,
+            )
+            warmed = state["ready"] if args.release_after_ready else False
     finally:
         state.update(ready=False, stopping=True)
         write_state(path, state)
@@ -251,6 +283,14 @@ def reserve(args):
         selector.close()
         for log in logs:
             log.close()
+    if args.release_after_ready:
+        if not warmed:
+            raise RuntimeError("warmup stopped before the full capacity was mounted")
+        confirm_released(state, processes)
+        write_state(
+            directory / "warmup.json",
+            dict(status="PASS", held_bytes=state["capacity_bytes"], released=True),
+        )
 
 
 def check_admission(directory, minimum):
@@ -313,6 +353,11 @@ def main():
     reservation.add_argument("--per-device-gib", type=int, default=30)
     reservation.add_argument("--startup-timeout", type=float, default=600)
     reservation.add_argument("--poll-interval", type=float, default=5)
+    reservation.add_argument(
+        "--release-after-ready",
+        action="store_true",
+        help="release full warmup capacity",
+    )
     admission = commands.add_parser("admit")
     admission.add_argument("--state-dir", required=True)
     admission.add_argument("--minimum-gib", type=int, default=0)
