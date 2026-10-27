@@ -314,8 +314,7 @@ class Guard {
           slot_(std::move(other.slot_)),
           lock_(std::move(other.lock_)),
           handed_out_(other.handed_out_),
-                    change_(other.change_),
-                    reservations_(std::move(other.reservations_)) {}
+          state_(std::move(other.state_)) {}
     Guard(const Guard&) = delete;
     Guard& operator=(const Guard&) = delete;
     Guard& operator=(Guard&&) = delete;
@@ -359,7 +358,7 @@ class Guard {
     WriteChange change() const
         requires kWrite
     {
-        return change_;
+        return state_.change;
     }
 
     // What each hook of the owner's chain holds for this write, in the order
@@ -367,7 +366,33 @@ class Guard {
     WriteReservations& reservations() const
         requires kWrite
     {
-        return reservations_;
+        return state_.reservations;
+    }
+
+    // Whether this write changed the object, which is the only case a hook
+    // records. A guard starts out cancelled, so a caller that decides not to
+    // write after all says nothing and the owner hears nothing.
+    bool committed() const
+        requires kWrite
+    {
+        return state_.committed;
+    }
+
+    // Marks the write as having changed the object. Publish and TearDown do
+    // this themselves; a caller that changes metadata or state directly says
+    // so before the guard is released.
+    void Commit() const
+        requires kWrite
+    {
+        state_.committed = true;
+    }
+
+    // Marks the write as having changed nothing, undoing Commit. Whatever the
+    // hooks reserved is still given back as the guard goes.
+    void Cancel() const
+        requires kWrite
+    {
+        state_.committed = false;
     }
 
     // The owner's per-slot state and the slot its lists link, for the
@@ -410,11 +435,19 @@ class Guard {
     SlotHandle slot_;
     Lock lock_;
     bool handed_out_ = false;
-    // What this write will do, and what its hooks hold for it. Declared last
-    // so a reservation is dropped while the key is still locked: giving it
-    // back must not race the release that settles the key.
-    WriteChange change_ = WriteChange::kNone;
-    mutable WriteReservations reservations_;
+    // What this write will do, what its hooks hold for it, and whether it
+    // changed anything. Declared last so a reservation is dropped while the
+    // key is still locked: giving it back must not race the release that
+    // settles the key. A read guard carries none of it, so a read costs what
+    // it cost before hooks existed.
+    struct NoWriteState {};
+    struct WriteState {
+        WriteChange change = WriteChange::kNone;
+        bool committed = false;
+        WriteReservations reservations;
+    };
+    [[no_unique_address]] mutable
+        std::conditional_t<kWrite, WriteState, NoWriteState> state_;
 };
 
 class ObjectRoute {
@@ -610,6 +643,7 @@ Generation Guard<kMode>::Publish(Args&&... metadata_args) const
         LOG(FATAL) << "Publish on key " << key()
                    << ", which already holds an object";
     }
+    state_.committed = true;
     return route_->PublishLocked(*slot_, std::forward<Args>(metadata_args)...);
 }
 
@@ -620,6 +654,7 @@ void Guard<kMode>::TearDown() const
     if (!has_object()) {
         LOG(FATAL) << "TearDown on key " << key() << ", which holds no object";
     }
+    state_.committed = true;
     route_->TearDownLocked(*slot_);
 }
 
@@ -864,13 +899,13 @@ inline WriteGuard ObjectRoute::WriteKey(std::string_view key) {
 inline tl::expected<WriteGuard, ErrorCode> ObjectRoute::WriteKey(
     std::string_view key, WriteChange change) {
     WriteGuard guard(this, FindOrCreateSlot(key));
+    guard.state_.change = change;
     if (change != WriteChange::kNone && observer_ != nullptr) {
         auto begun =
-            observer_->OnWriteBegin(guard, change, guard.reservations_);
+            observer_->OnWriteBegin(guard, change, guard.state_.reservations);
         if (!begun) {
             return tl::make_unexpected(begun.error());
         }
-        guard.change_ = change;
     }
     return WriteGuard(std::move(guard).HandOut());
 }
@@ -895,8 +930,8 @@ ObjectRoute::AcquireForWrite(ObjectRoute& route, std::string_view key,
         return guard;
     }
     if (route.observer_ != nullptr) {
-        auto begun =
-            route.observer_->OnWriteBegin(*guard, change, guard->reservations_);
+        auto begun = route.observer_->OnWriteBegin(
+            *guard, change, guard->state_.reservations);
         if (!begun) {
             // Nothing changed, so nothing is reported: the key is handed back
             // as it was found.
@@ -904,7 +939,7 @@ ObjectRoute::AcquireForWrite(ObjectRoute& route, std::string_view key,
             return tl::make_unexpected(begun.error());
         }
     }
-    guard->change_ = change;
+    guard->state_.change = change;
     return guard;
 }
 

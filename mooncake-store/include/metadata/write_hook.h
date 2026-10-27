@@ -7,7 +7,14 @@
 //                   fail. Nothing has changed yet, so a failure leaves the
 //                   object as it was and the write does not happen.
 //   OnWriteRelease  under the key's lock, with the lock still held, and cannot
-//                   fail. It sees the post-state the write produced.
+//                   fail. It sees the post-state the write produced, and runs
+//                   before the owner settles the key's accounting and indexes,
+//                   so a hook that finishes the write is accounted for.
+//
+// A hook hears of a write only when the write changed the object: a guard
+// starts out cancelled, Publish and TearDown commit it, and a caller that
+// changes metadata or state itself calls Commit. A guard released without a
+// commit is a write that did not happen, and nothing is recorded for it.
 //
 // The order is why a hook that must record a change before it becomes visible
 // reserves in begin: a reservation taken before the key's lock could put two
