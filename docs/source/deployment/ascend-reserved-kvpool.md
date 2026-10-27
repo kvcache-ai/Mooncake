@@ -53,11 +53,15 @@ existing P/D transport configuration.
 
 ### Optional same-node large-page warmup
 
-On a node where reclaimable file cache may obstruct Host huge-page allocation,
-run one explicit allocate-and-release pass before the lasting reservation.
-It uses the **same Store allocation path and segment size** as `reserve` above;
-it is not a separate HugeTLB pool or a driver setting. Use a fresh state
-directory for each command on the **same assigned node**:
+Try the lasting full-capacity `reserve` command above first. If it succeeds,
+**keep that reservation**; releasing and reallocating it adds time and a race.
+If it fails on the assigned node and the obstruction appears to be movable
+pages or reclaimable cache, a node administrator can compact memory before
+retrying (Linux: `echo 1 > /proc/sys/vm/compact_memory`; this is a host-level
+operation, often unavailable inside a container). The following container-only
+fallback does one small Host FabricMem
+allocate-and-release pass through the same Store path, then retries the full
+reservation. Use fresh state directories on the **same assigned node**:
 
 ```bash
 python3 scripts/ascend/reserved_kvpool.py reserve \
@@ -66,20 +70,21 @@ python3 scripts/ascend/reserved_kvpool.py reserve \
   --master 192.0.2.1:50051 \
   --metadata-server http://192.0.2.1:8080/metadata \
   --metrics-url http://192.0.2.1:9003/metrics \
-  --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
-  --per-device-gib 30 --release-after-ready
+  --devices 0 --per-device-gib 2 --release-after-ready
 
 # Only after warmup.json reports PASS, run the normal reserve command above
 # with a new --state-dir, then admit the model.
 ```
 
-`warmup.json` is written only after every owner mounts its full 30 GiB,
+`warmup.json` is written only after every warmup owner mounts its full budget,
 all owners exit cleanly, and their capacity series return to zero on the
 shared master. A failed or interrupted warmup never admits the application.
 Inspect `reservation.json`, per-device logs, `MemFree`/`Cached` and NUMA
 buddy state before and after the pass; do not infer success from a temporary
-free-memory increase. Release then reserve promptly, since freed pages are
-not held for the application. This can help when pages are reclaimable;
+free-memory increase. A 2 GiB warmup does **not** prove that 480 GiB is
+available; the subsequent full reservation and admission do. Release then
+reserve promptly, since freed pages are not held for the application.
+This can help when pages are reclaimable;
 it cannot create enough 2 MiB physical tiles if long-term pins already block
 the required capacity. The effect on a particular failed node requires a
 same-node before/after validation.
