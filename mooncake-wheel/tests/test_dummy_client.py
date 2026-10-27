@@ -3,10 +3,6 @@ import os
 import time
 import threading
 import random
-import ctypes
-import shlex
-import socket
-import subprocess
 from mooncake.store import MooncakeDistributedStore
 
 # The lease time of the kv object, should be set equal to
