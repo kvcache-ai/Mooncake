@@ -817,7 +817,7 @@ Generation ObjectRoute::PublishLocked(KeySlot& slot, Args&&... metadata_args) {
         auto lease = groups_.AddMember(metadata.group_id, slot.key());
         assert(lease != nullptr);
         SpinLocker locker(&metadata.lock);
-        metadata.lease_ = std::move(lease);
+        metadata.group_lease_ = std::move(lease);
     }
     object_count_.fetch_add(1, std::memory_order_relaxed);
     return generation;
@@ -870,7 +870,7 @@ inline void ObjectRoute::RebuildGroupState() {
             lease->ExtendTo(it->second);
         }
         SpinLocker locker(&object.metadata().lock);
-        object.metadata().lease_ = std::move(lease);
+        object.metadata().group_lease_ = std::move(lease);
     }
 }
 

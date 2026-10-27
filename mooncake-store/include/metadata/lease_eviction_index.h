@@ -369,7 +369,7 @@ class LeaseEvictionIndex final : public EvictionIndex {
             return nullptr;
         }
         SpinLocker locker(&metadata.lock);
-        return metadata.lease_.get();
+        return &metadata.GetLease();
     }
 
     // Files `slot`, which holds `metadata` and which `owner` describes, at
@@ -386,7 +386,7 @@ class LeaseEvictionIndex final : public EvictionIndex {
             std::shared_ptr<const Lease> held;
             {
                 SpinLocker locker(&metadata.lock);
-                held = metadata.lease_;
+                held = metadata.GroupLease();
             }
             it = groups_
                      .emplace(lease, std::make_unique<Group>(std::move(held),
