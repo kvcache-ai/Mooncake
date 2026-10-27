@@ -276,6 +276,10 @@ TEST(ObjectRouteTest, AGroupKeepsOneLeaseAcrossReplacementOfItsKeys) {
     ASSERT_NE(PublishObject(route, "k2", "g1"), 0u);
     const auto group_lease = LeaseOf(route, "k1");
     ASSERT_NE(group_lease, nullptr);
+    // Hold the group's lease across the teardown below, so a fresh lease
+    // cannot land on the freed allocation's address and pass for this one.
+    const auto held_group_lease = route.Read("k1")->metadata().GroupLease();
+    ASSERT_NE(held_group_lease, nullptr);
 
     // Replacing one key of the group re-registers that member and keeps both
     // on the group's one lease.
@@ -295,6 +299,8 @@ TEST(ObjectRouteTest, AGroupKeepsOneLeaseAcrossReplacementOfItsKeys) {
     const auto late_lease = LeaseOf(route, "k1");
     ASSERT_NE(late_lease, nullptr);
     EXPECT_NE(late_lease, group_lease);
+    // The new group starts on a never-granted lease.
+    EXPECT_TRUE(late_lease->IsExpired(std::chrono::system_clock::now()));
 }
 
 TEST(ObjectRouteTest, RebuildGroupStateRegroupsMembersOnTheLatestDeadline) {
