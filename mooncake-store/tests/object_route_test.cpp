@@ -1054,8 +1054,8 @@ TEST(ObjectRouteTest, ChurnKeepsTheRouteAndTheGroupConsistent) {
                 continue;
             }
             pairs_observed.fetch_add(1, std::memory_order_relaxed);
-            const bool same_lease = &first->metadata().GetLease() ==
-                                    &second->metadata().GetLease();
+            const bool same_lease =
+                &first->metadata().GetLease() == &second->metadata().GetLease();
             if (!same_lease || !is_member("k1") || !is_member("k2")) {
                 violation();
             }
