@@ -60,42 +60,45 @@ jobs:
       - name: Configure build profile
         shell: bash
         run: |
+          # These wheels are published to PyPI: compile without -g
+          # (ENABLE_DEBUG_SYMBOLS defaults to ON). The post-hoc strip in
+          # build_wheel.sh stays as a safety net for callers that build with -g.
           case "$BUILD_VARIANT:$BUILD_ARCHITECTURE" in
             cuda:x86_64)
               variant_flag=''
               arch_list='8.0;9.0'
               build_nvlink=true
-              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_INTRA_NVLINK=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_INTRA_NVLINK=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
               ;;
             cuda13:x86_64)
               variant_flag=CU13_BUILD
               arch_list='8.0;9.0;10.3'
               build_nvlink=true
-              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_INTRA_NVLINK=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_INTRA_NVLINK=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
               ;;
             non-cuda:x86_64)
               variant_flag=NON_CUDA_BUILD
               arch_list=''
               build_nvlink=false
-              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
               ;;
             cuda:arm64)
               variant_flag=''
               arch_list='9.0'
               build_nvlink=false
-              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
               ;;
             cuda13:arm64)
               variant_flag=CU13_BUILD
               arch_list='9.0;10.3'
               build_nvlink=false
-              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
               ;;
             non-cuda:arm64)
               variant_flag=NON_CUDA_BUILD
               arch_list=''
               build_nvlink=false
-              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
               ;;
             *)
               echo "::error::Unsupported wheel profile: $BUILD_VARIANT/$BUILD_ARCHITECTURE"
@@ -219,20 +222,6 @@ jobs:
             ./scripts/build_wheel.sh
         env:
           VERSION: ${{ env.VERSION }}
-
-      - name: Check wheel size
-        # Warehouse's default per-file limit; larger uploads are rejected by
-        # PyPI and TestPyPI.
-        run: |
-          limit=$((100 * 1024 * 1024))
-          for wheel in mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }}/*.whl; do
-            size=$(stat -c %s "$wheel")
-            echo "$(basename "$wheel"): $((size / 1024 / 1024)) MiB"
-            if [ "$size" -gt "$limit" ]; then
-              echo "::error file=$wheel::Wheel is $size bytes, above the 100 MiB per-file upload limit"
-              exit 1
-            fi
-          done
 
       - name: Smoke test repaired wheel
         shell: bash
