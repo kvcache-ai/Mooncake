@@ -1515,10 +1515,9 @@ class MasterService {
     // A write's first step under the key: drops the held object's stale
     // replica handles and, without the oplog, the object itself when none is
     // left. With the oplog the cleanup is only queued and the write is refused
-    // with OBJECT_ALREADY_EXISTS.
-    auto CleanupStaleBeforeWrite(
-        const char* why, MetadataAccessorRW& accessor,
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
+    // with OBJECT_ALREADY_EXISTS. A local-disk replica is judged by the owner
+    // record it holds, so the caller needs no client_mutex_.
+    auto CleanupStaleBeforeWrite(const char* why, MetadataAccessorRW& accessor)
         -> tl::expected<void, ErrorCode>;
     // Runs a write's admission, which reports through its argument whether
     // DFS allocation itself ran out of capacity. Only then is the admission
