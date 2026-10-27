@@ -15,26 +15,31 @@ class MasterServiceTestPeer {
     explicit MasterServiceTestPeer(MasterService& service)
         : service_(service) {}
 
-    using GroupDomainAccessorRO = MasterService::GroupDomainAccessorRO;
-    using GroupDomainAccessorRW = MasterService::GroupDomainAccessorRW;
+    size_t RunWeightReconciliationForTesting(uint64_t now_ms,
+                                             size_t limit = 32) {
+        return service_.weight_manager_.ReconcileWeightMetadataStoreOnce(now_ms,
+                                                                         limit);
+    }
+
+    bool DropWeightGroupMemberForTesting(const WeightRevisionIdentity& identity,
+                                         const std::string& key) {
+        return service_
+            .RemoveObject(key, TenantId(identity.tenant_id), true, true)
+            .has_value();
+    }
+
     using MetadataAccessorRO = MasterService::MetadataAccessorRO;
     using MetadataAccessorRW = MasterService::MetadataAccessorRW;
-    using MetadataShard = MasterService::MetadataShard;
-    using MetadataShardAccessorRO = MasterService::MetadataShardAccessorRO;
-    using MetadataShardAccessorRW = MasterService::MetadataShardAccessorRW;
     using ObjectIdentity = MasterService::ObjectIdentity;
     using ObjectMetadata = mooncake::ObjectMetadata;
     using PromotionQueueResult = mooncake::PromotionQueueResult;
     using PromotionTask = mooncake::PromotionTask;
-    using QuotaEraseMode = MasterService::QuotaEraseMode;
-    using TenantQuotaEvictionResult = MasterService::TenantQuotaEvictionResult;
-    using TenantState = MasterService::TenantState;
+    using NamespaceEvictionResult = MasterService::NamespaceEvictionResult;
 
     static constexpr auto kDynamicReplicationWindowEntryLimit =
         DynamicReplicationController::kWindowEntryLimit;
     static constexpr auto kMaxPromotionExecutionFailures =
         MasterService::kMaxPromotionExecutionFailures;
-    static constexpr auto kNumShards = MasterService::kNumShards;
     static constexpr auto kPromotionCandidateMaxRetries =
         PromotionCandidateTracker::kMaxRetries;
 
@@ -48,6 +53,12 @@ class MasterServiceTestPeer {
     // the fields that payload carries.
     static std::string SerializeMetadataForOpLogForTesting(
         MasterService& service, const ObjectMetadata& metadata);
+    static std::string SerializeMetadataForOpLogWithoutMemReplicasForTesting(
+        MasterService& service, const ObjectMetadata& metadata);
+    static std::string
+    SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
+        MasterService& service, const ObjectMetadata& metadata,
+        const std::vector<Replica::Descriptor>& replicas);
 
     // Drive one eviction cycle synchronously, without the periodic worker.
     void RunBatchEvictForTesting(double evict_ratio_target,
@@ -58,25 +69,21 @@ class MasterServiceTestPeer {
 
     void RunDfsEvictionForTesting();
 
+    // Queue one segment through the private HTTP metadata cleanup path, as the
+    // client monitor does when a client times out.
+    void CleanupHttpMetadataForTesting(const std::string& segment_name);
+
+    // Segments waiting in the remote HTTP metadata cleanup queue.
+    size_t HttpMetadataCleanupQueueSizeForTesting() const;
+
     // Drive one tenant watermark eviction pass without the periodic worker.
     void RunTenantEvictForTesting();
 
-    // The service's walks over tenants and over one tenant's objects.
-    auto ReadCursor(const TenantId& tenant_id) const {
-        return service_.ReadCursor(tenant_id);
-    }
-    using CursorSlice = MasterService::CursorSlice;
-    auto ReadCursor(const TenantId& tenant_id, CursorSlice slice) const {
-        return service_.ReadCursor(tenant_id, slice);
-    }
-    auto WriteCursor(const TenantId& tenant_id) {
-        return service_.WriteCursor(tenant_id);
-    }
-    void VisitTenants(const std::function<void(const TenantId&)>& visit) const {
-        service_.VisitTenants(visit);
-    }
-    std::vector<std::string> InFlightKeys(const TenantId& tenant_id) const {
-        return service_.InFlightKeys(tenant_id);
+    // The service's walk over the namespaces that hold objects.
+    void VisitNamespaces(
+        const std::function<void(const TenantId&, metadata::Namespace&)>& visit)
+        const {
+        service_.VisitNamespaces(visit);
     }
 
     // Enable epoch bookkeeping without starting a live KV event publisher.
@@ -197,11 +204,32 @@ class MasterServiceTestPeer {
         return service.local_ssd_manager_;
     }
 
-    static auto& MetadataShards(MasterService& service) {
-        return service.metadata_shards_;
+    // One namespace per tenant id written to, owning that tenant's object
+    // route and its group index.
+    static auto& Namespaces(MasterService& service) {
+        return service.namespaces_;
     }
-    static const auto& MetadataShards(const MasterService& service) {
-        return service.metadata_shards_;
+    static const auto& Namespaces(const MasterService& service) {
+        return service.namespaces_;
+    }
+
+    // The object under `object_id`, held shared or exclusively for the
+    // caller's scope the way a request path holds it; nullopt when that
+    // tenant is absent or the key holds no object. A test parks a path that
+    // must take the key by keeping the write guard.
+    static std::optional<route::ReadGuard> ReadObject(
+        const MasterService& service, const ObjectIdentity& object_id) {
+        const metadata::Namespace* ns =
+            service.namespaces_.Lookup(object_id.tenant_id);
+        return ns == nullptr ? std::nullopt
+                             : ns->objects.Read(object_id.user_key);
+    }
+    static std::optional<route::WriteGuard> WriteObject(
+        MasterService& service, const ObjectIdentity& object_id) {
+        metadata::Namespace* ns =
+            service.namespaces_.Lookup(object_id.tenant_id);
+        return ns == nullptr ? std::nullopt
+                             : ns->objects.Write(object_id.user_key);
     }
 
     static auto& NeedMemEviction(MasterService& service) {
@@ -275,6 +303,23 @@ class MasterServiceTestPeer {
         return service.master_state_mutex_;
     }
 
+    // Restore lifecycle (RFC #4700, slice 1).
+    static MasterService::RestoreLifecycleState GetRestoreLifecycleState(
+        MasterService& service) {
+        return service.lifecycle_state_.load(std::memory_order_acquire);
+    }
+
+    // Force a lifecycle state so worker-admission can be tested without
+    // running a real promotion restore.
+    static void SetRestoreLifecycleStateForTesting(
+        MasterService& service, MasterService::RestoreLifecycleState state) {
+        service.lifecycle_state_.store(state, std::memory_order_release);
+    }
+
+    bool AdmitsBusinessWorkersForTesting() const {
+        return service_.AdmitsBusinessWorkers();
+    }
+
     static auto& SoftPinDeadlineIndex(MasterService& service) {
         return service.soft_pin_deadline_index_;
     }
@@ -290,35 +335,38 @@ class MasterServiceTestPeer {
     }
 
     static auto& TenantQuotaPolicyMutex(MasterService& service) {
-        return service.tenant_quota_manager_.policy_mutex_;
+        return service.tenant_quota_policy_->manager_.policy_mutex_;
     }
     static const auto& TenantQuotaPolicyMutex(const MasterService& service) {
-        return service.tenant_quota_manager_.policy_mutex_;
+        return service.tenant_quota_policy_->manager_.policy_mutex_;
     }
 
     static auto& TenantQuotaPolicyStore(MasterService& service) {
-        return service.tenant_quota_manager_.policy_store_;
+        return service.tenant_quota_policy_->manager_.policy_store_;
     }
     static const auto& TenantQuotaPolicyStore(const MasterService& service) {
-        return service.tenant_quota_manager_.policy_store_;
+        return service.tenant_quota_policy_->manager_.policy_store_;
     }
 
     static auto& TenantQuotaRecomputeMutex(MasterService& service) {
-        return service.tenant_quota_manager_.recompute_mutex_;
+        return service.tenant_quota_policy_->manager_.recompute_mutex_;
     }
     static const auto& TenantQuotaRecomputeMutex(const MasterService& service) {
-        return service.tenant_quota_manager_.recompute_mutex_;
+        return service.tenant_quota_policy_->manager_.recompute_mutex_;
     }
 
     static auto& TenantQuotaTable(MasterService& service) {
-        return service.tenant_quota_manager_.table_;
+        return service.tenant_quota_policy_->manager_.table_;
     }
     static const auto& TenantQuotaTable(const MasterService& service) {
-        return service.tenant_quota_manager_.table_;
+        return service.tenant_quota_policy_->manager_.table_;
     }
 
     static auto& WeightMetadata(MasterService& service) {
         return service.weight_manager_.weight_metadata_;
+    }
+    static auto& WeightManager(MasterService& service) {
+        return service.weight_manager_;
     }
     static const auto& WeightMetadata(const MasterService& service) {
         return service.weight_manager_.weight_metadata_;
@@ -348,11 +396,6 @@ class MasterServiceTestPeer {
             type, tenant_id, key, payload, std::move(callback));
     }
 
-    tl::expected<void, ErrorCode> ChargeTenantQuota(TenantQuotaHandle account,
-                                                    uint64_t bytes) {
-        return service_.ChargeTenantQuota(std::move(account), bytes);
-    }
-
     void CleanupExpiredDynamicReplicationState() {
         service_.CleanupExpiredDynamicReplicationState();
     }
@@ -362,9 +405,7 @@ class MasterServiceTestPeer {
         service_.CleanupExpiredSoftPins(now);
     }
 
-    void ClearCandidatesForReload() { service_.ClearCandidatesForReload(); }
-
-    // The caller holds the object's shard, as through MetadataAccessorRW.
+    // The caller holds the key exclusively, as through MetadataAccessorRW.
     void ClearDynamicReplicationStateForKey(const TenantId& tenant_id,
                                             const std::string& key,
                                             route::ObjectState& state) {
@@ -385,7 +426,10 @@ class MasterServiceTestPeer {
     void DiscardExpiredProcessingReplicas(
         const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) {
-        service_.DiscardExpiredProcessingReplicas(tenant_id, now);
+        if (const metadata::Namespace* ns =
+                service_.namespaces_.Lookup(tenant_id)) {
+            service_.DiscardExpiredProcessingReplicas(*ns, now);
+        }
     }
 
     uint32_t DynamicReplicationAdmissionMinHits() const {
@@ -409,9 +453,9 @@ class MasterServiceTestPeer {
             metadata, pred_fn, erased_replica_ids);
     }
 
-    TenantQuotaEvictionResult EvictTenantMemoryForQuota(
-        const TenantId& tenant_id, uint64_t target_bytes) {
-        return service_.EvictTenantMemoryForQuota(tenant_id, target_bytes);
+    NamespaceEvictionResult EvictNamespaceMemory(const TenantId& tenant_id,
+                                                 uint64_t target_bytes) {
+        return service_.EvictNamespaceMemory(tenant_id, target_bytes);
     }
 
     void FinalizeExpiredProcessingReplicasAfterDurable(
@@ -423,16 +467,15 @@ class MasterServiceTestPeer {
 
     void FinalizeMetadataEraseAfterDurable(route::ObjectRef object,
                                            const TenantId& tenant_id) {
-        service_.FinalizeMetadataEraseAfterDurable(std::move(object), tenant_id,
-                                                   QuotaEraseMode::kFull);
+        service_.FinalizeMetadataEraseAfterDurable(std::move(object),
+                                                   tenant_id);
     }
 
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
-        const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
-        const std::vector<std::string>& previous_media_hint = {}) {
-        service_.FinalizeRemovedReplicasAfterDurable(
-            durable_entry, replica_ids, quota_mode, previous_media_hint);
+        const std::vector<ReplicaID>& replica_ids) {
+        service_.FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                     replica_ids);
     }
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
@@ -440,14 +483,17 @@ class MasterServiceTestPeer {
         return service_.FindClientRecord(client_id);
     }
 
-    TenantQuotaHandle GetBoundTenantQuotaHandle(
-        const TenantState& tenant_state) const {
-        return service_.GetBoundTenantQuotaHandle(tenant_state);
+    // Resolves the namespace, creating it through the table's factory on first
+    // use; the factory hangs the namespace policy's attachment (the tenant's
+    // quota account) on it.
+    metadata::Namespace& GetOrCreateNamespace(const TenantId& tenant_id) {
+        return service_.namespaces_.GetOrCreate(tenant_id);
     }
 
-    TenantState& GetOrCreateTenantState(MetadataShard& shard,
-                                        const TenantId& tenant_id) {
-        return service_.GetOrCreateTenantState(shard, tenant_id);
+    // The tenant's one stable quota account; multi-tenancy only.
+    mooncake::TenantQuotaAccount& TenantQuotaAccount(
+        const TenantId& tenant_id) {
+        return service_.tenant_quota_policy_->manager_.AccountFor(tenant_id);
     }
 
     bool IsReplicaReadable(const Replica& replica) const {
@@ -465,7 +511,7 @@ class MasterServiceTestPeer {
     }
 
     void LoadTenantQuotaPoliciesFromStoreOrThrow() {
-        service_.tenant_quota_manager_.LoadPoliciesOrThrow();
+        service_.tenant_quota_policy_->manager_.LoadPoliciesOrThrow();
     }
 
     ObjectIdentity MakeObjectIdentityForRequest(
@@ -488,18 +534,6 @@ class MasterServiceTestPeer {
         return service_.PushOffloadingQueue(object_id, replica, mirror_clients);
     }
 
-    void RebuildTenantQuotaUsageFromMetadata() {
-        service_.RebuildTenantQuotaUsageFromMetadata();
-    }
-
-    void RecomputeTenantEffectiveQuotas() {
-        service_.RecomputeTenantEffectiveQuotas();
-    }
-
-    void ReleaseTenantQuota(TenantQuotaHandle account, uint64_t bytes) {
-        service_.ReleaseTenantQuota(std::move(account), bytes);
-    }
-
     const TenantId& ResolveRequestTenantId(const TenantId& tenant_id) const {
         return service_.ResolveRequestTenantId(tenant_id);
     }
@@ -511,15 +545,6 @@ class MasterServiceTestPeer {
     PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
                                                bool record_candidate = true) {
         return service_.TryPushPromotionQueue(object_id, record_candidate);
-    }
-
-    size_t getShardIndex(const TenantId& tenant_id,
-                         const std::string& user_key) const {
-        return service_.getShardIndex(tenant_id, user_key);
-    }
-
-    size_t getShardIndex(const std::string& key) const {
-        return service_.getShardIndex(key);
     }
 
    private:

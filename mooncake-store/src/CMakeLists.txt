@@ -12,6 +12,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     uds_transport.cpp
     config/distributed_storage_config.cpp
     config/rpc_protocol_config.cpp
+    config/replica_selection_config.cpp
     config/store_cluster_identity_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
@@ -51,7 +52,6 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     tenant/quota.cpp
     tenant/quota_manager.cpp
     tenant/quota_policy.cpp
-    tenant_quota_ledger.cpp
     tenant/quota_policy_store.cpp
     weight_metadata_store.cpp
     rpc_service.cpp
@@ -135,6 +135,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/shm_spdk_registration_config.cpp
     file_storage.cpp
     config/client_host_identity_config.cpp
+    ssd_prefetcher.cpp
     config/client_metric_config.cpp
     config/client_object_checksum_config.cpp
     config/file_storage_config.cpp
@@ -147,7 +148,6 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/local_hot_cache_config.cpp
     config/nof_register_config.cpp
     config/offset_allocator_backend_config.cpp
-    config/replica_selection_config.cpp
     config/rpc_timeout_config.cpp
     config/transfer_submitter_config.cpp
     config/egm_store_pool_config.cpp

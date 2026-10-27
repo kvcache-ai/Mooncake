@@ -39,6 +39,10 @@
 #endif
 #include "topology.h"
 #include "char_util.h"
+#ifdef USE_EFA
+#include "transport/efa_transport/efa_discovery.h"
+#include "transport/efa_transport/efa_neuron.h"
+#endif
 #ifdef USE_UB
 #include <libgen.h>
 #include <urma_api.h>
@@ -321,6 +325,83 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
     return devices;
 #endif
 }
+
+#if defined(USE_EFA) && !defined(USE_CXI)
+// Replaces the EFA NICs in `devices` with the ones libfabric reports. Those
+// are exactly the devices the EFA transport can open (EfaContext uses the same
+// fi_getinfo() hints), so EFA discovery does not depend on how a device looks
+// through libibverbs and sysfs. Existing entries keep their position, which
+// keeps NIC indices unchanged; NICs only libfabric reports are appended.
+//
+// Hosts whose verbs devices are all non-EFA (e.g. Mellanox) are left alone,
+// so RDMA-only processes never initialize libfabric.
+static void useLibfabricEfaNics(std::vector<InfinibandDevice> &devices,
+                                const std::vector<std::string> &filter) {
+    bool verbs_has_efa = false;
+    for (const auto &device : devices) {
+        if (isEfaDevice(device.name)) {
+            verbs_has_efa = true;
+            break;
+        }
+    }
+    if (!devices.empty() && !verbs_has_efa) return;
+
+    std::vector<EfaNic> nics;
+    std::string error;
+    if (!listEfaNics(nics, &error)) {
+        if (verbs_has_efa) {
+            LOG(INFO) << "Using the EFA devices found through libibverbs: "
+                         "cannot list them through libfabric ("
+                      << error << ")";
+        }
+        return;
+    }
+
+    const auto whitelist = getIbvDeviceWhitelist();
+    std::map<std::string, const EfaNic *> wanted;
+    for (const auto &nic : nics) {
+        if (!filter.empty() &&
+            std::find(filter.begin(), filter.end(), nic.name) == filter.end())
+            continue;
+        if (!whitelist.empty() && !whitelist.count(nic.name)) continue;
+        wanted[nic.name] = &nic;
+    }
+
+    auto to_device = [](const EfaNic &nic, const InfinibandDevice *verbs) {
+        InfinibandDevice device{.name = nic.name,
+                                .pci_bus_id = nic.pci_bus_id,
+                                .numa_node = nic.numa_node};
+        if (device.pci_bus_id.empty() && verbs) {
+            device.pci_bus_id = verbs->pci_bus_id;
+            device.numa_node = verbs->numa_node;
+        }
+        return device;
+    };
+
+    std::vector<InfinibandDevice> merged;
+    std::set<std::string> placed;
+    for (const auto &device : devices) {
+        if (!isEfaDevice(device.name)) {
+            merged.push_back(device);
+            continue;
+        }
+        auto it = wanted.find(device.name);
+        if (it == wanted.end()) {
+            LOG(INFO) << "Skipping EFA device " << device.name
+                      << ": libfabric does not offer it";
+            continue;
+        }
+        merged.push_back(to_device(*it->second, &device));
+        placed.insert(device.name);
+    }
+    for (const auto &entry : wanted) {
+        if (placed.count(entry.first)) continue;
+        merged.push_back(to_device(*entry.second, nullptr));
+        LOG(INFO) << "EFA device " << entry.first << " found through libfabric";
+    }
+    devices = std::move(merged);
+}
+#endif
 
 static void precomputeResolvedHcaPeerAffinity(
     const TopologyMatrix &matrix, const std::map<std::string, int> &hca_id_map,
@@ -673,6 +754,45 @@ static std::vector<TopologyEntry> discoverCudaTopology(
 }
 #endif
 
+#ifdef USE_EFA
+// Neuron (Trainium / Inferentia) devices cannot go through the PCI-distance
+// heuristic above: the driver presents them as *virtual* class devices with no
+// link back to their PCI function, so /sys offers nothing to measure.  The
+// runtime does know the mapping, and neuronNicAffinity() asks it -- see
+// efa_neuron.h for why that is safe to do this early.
+//
+// The distinction matters more here than it does for GPUs.  On trn2.48xlarge a
+// NIC one switch away from the device it is serving measured 2.5 GB/s against
+// 19.2 GB/s for a switch-local one, so getting this wrong does not shave a few
+// percent, it costs 7.7x and lands below plain host DRAM.
+static std::vector<TopologyEntry> discoverNeuronTopology(
+    const std::vector<InfinibandDevice> &all_hca) {
+    std::vector<TopologyEntry> topology;
+    for (const auto &entry : neuronNicAffinity()) {
+        std::vector<std::string> preferred_hca;
+        std::vector<std::string> avail_hca;
+        // Filtered against all_hca rather than trusted directly, so that a NIC
+        // the caller excluded stays excluded.  Everything else becomes
+        // avail_hca: a distant NIC is slow, not unusable, and it is the only
+        // thing left if the switch-local ones are down.
+        for (const auto &hca : all_hca) {
+            if (std::find(entry.second.begin(), entry.second.end(), hca.name) !=
+                entry.second.end()) {
+                preferred_hca.push_back(hca.name);
+            } else {
+                avail_hca.push_back(hca.name);
+            }
+        }
+        if (preferred_hca.empty()) continue;
+        topology.push_back(
+            TopologyEntry{.name = neuronLocationName(entry.first),
+                          .preferred_hca = std::move(preferred_hca),
+                          .avail_hca = std::move(avail_hca)});
+    }
+    return topology;
+}
+#endif
+
 Topology::Topology() {
     auto str = getenv("MC_PATH_ROUNDROBIN");
     if (str && (strcmp(str, "1") == 0 || strcasecmp(str, "true") == 0)) {
@@ -706,6 +826,9 @@ int Topology::discover(const std::vector<std::string> &filter,
     matrix_.clear();
     resolved_hca_peer_affinity_by_local_.clear();
     auto all_hca = listInfiniBandDevices(filter, exclude_efa);
+#if defined(USE_EFA) && !defined(USE_CXI)
+    if (!exclude_efa) useLibfabricEfaNics(all_hca, filter);
+#endif
     for (auto &ent : discoverCpuTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
@@ -717,6 +840,11 @@ int Topology::discover(const std::vector<std::string> &filter,
         matrix_[ent.name] = ent;
     }
     if (cuda_rc) return cuda_rc;
+#endif
+#ifdef USE_EFA
+    for (auto &ent : discoverNeuronTopology(all_hca)) {
+        matrix_[ent.name] = ent;
+    }
 #endif
 #ifdef USE_UB
     auto ub_all_hca = listUBDevices(filter);
@@ -889,8 +1017,23 @@ int Topology::resolve() {
     hca_list_.clear();
     std::map<std::string, int> hca_id_map;
     int next_hca_map_index = 0;
-    for (auto &entry : matrix_) {
-        for (auto &hca : entry.second.preferred_hca) {
+
+    // Sorted, not matrix_ order.  A device index is not private to this object:
+    // a peer rebuilds our matrix with parse() and then indexes the device and
+    // rkey arrays we published with the numbers *its* resolve() produced.
+    // matrix_ is an unordered_map, so its iteration order depends on insertion
+    // order, and the peer inserts in a different one (JSON member order, not
+    // discovery order) -- which silently hands transfers to a NIC other than
+    // the preferred one.  Sorting by storage type makes the numbering a
+    // function of the matrix contents alone, so both ends agree.
+    std::vector<std::string> storage_types;
+    storage_types.reserve(matrix_.size());
+    for (const auto &entry : matrix_) storage_types.push_back(entry.first);
+    std::sort(storage_types.begin(), storage_types.end());
+
+    for (const auto &storage_type : storage_types) {
+        const auto &topo_entry = matrix_[storage_type];
+        for (auto &hca : topo_entry.preferred_hca) {
             if (!hca_id_map.count(hca)) {
                 hca_list_.push_back(hca);
                 hca_id_map[hca] = next_hca_map_index++;
@@ -900,12 +1043,12 @@ int Topology::resolve() {
                 resolved_matrix_[kWildcardLocation]
                     .preferred_hca_name_to_index_map_[hca] = hca_id_map[hca];
             }
-            resolved_matrix_[entry.first].preferred_hca.push_back(
+            resolved_matrix_[storage_type].preferred_hca.push_back(
                 hca_id_map[hca]);
-            resolved_matrix_[entry.first]
+            resolved_matrix_[storage_type]
                 .preferred_hca_name_to_index_map_[hca] = hca_id_map[hca];
         }
-        for (auto &hca : entry.second.avail_hca) {
+        for (auto &hca : topo_entry.avail_hca) {
             if (!hca_id_map.count(hca)) {
                 hca_list_.push_back(hca);
                 hca_id_map[hca] = next_hca_map_index++;
@@ -915,8 +1058,8 @@ int Topology::resolve() {
                 resolved_matrix_[kWildcardLocation]
                     .preferred_hca_name_to_index_map_[hca] = hca_id_map[hca];
             }
-            resolved_matrix_[entry.first].avail_hca.push_back(hca_id_map[hca]);
-            resolved_matrix_[entry.first].avail_hca_name_to_index_map_[hca] =
+            resolved_matrix_[storage_type].avail_hca.push_back(hca_id_map[hca]);
+            resolved_matrix_[storage_type].avail_hca_name_to_index_map_[hca] =
                 hca_id_map[hca];
         }
     }

@@ -29,10 +29,13 @@
 #include <thread>
 
 #include <dlfcn.h>
+#include <infiniband/verbs.h>
 
 #include "common.h"
 #include "config.h"
 #include "memory_location.h"
+#include "transport/efa_transport/efa_discovery.h"
+#include "transport/efa_transport/efa_neuron.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
 #include "transport/efa_transport/efa_context.h"
@@ -297,16 +300,35 @@ int EfaTransport::registerLocalMemoryInternal(
         chunks.emplace_back(addr, length);
     }
 
-    // Resolve location name once (based on original buffer)
+    // Resolve location name once (based on original buffer).
+    //
+    // The Neuron probe deliberately runs ahead of the caller-supplied hint.  A
+    // hint is normally authoritative, but a hint of "cpu:N" over Neuron HBM is
+    // not merely imprecise: "cpu" opts the buffer into the preTouchMemory()
+    // path below, which stores to every page from the CPU.  Callers whose
+    // vocabulary is only "host or CUDA" would silently corrupt device memory,
+    // so the probe wins and says so.  On hosts without Neuron devices the probe
+    // is a cached bool, so this costs nothing.
     std::string resolved_name;
-    if (name == kWildcardLocation) {
+    int neuron_device = 0;
+    if (neuronProbeAddress(addr, length, &neuron_device)) {
+        resolved_name = neuronLocationName(neuron_device);
+        if (name != kWildcardLocation && name != resolved_name) {
+            LOG(WARNING) << "Ignoring location hint \"" << name
+                         << "\" for Neuron HBM " << addr << " (" << length
+                         << " bytes), registering it as " << resolved_name;
+        } else {
+            LOG(INFO) << "Registering Neuron HBM " << addr << " (" << length
+                      << " bytes) as " << resolved_name;
+        }
+    } else if (name != kWildcardLocation) {
+        resolved_name = name;
+    } else {
         bool only_first_page = true;
         const std::vector<MemoryLocationEntry> entries =
             getMemoryLocation(addr, length, only_first_page);
         if (entries.empty()) return -1;
         resolved_name = entries[0].location;
-    } else {
-        resolved_name = name;
     }
 
     // Pre-compute NIC assignments for each chunk.
@@ -874,7 +896,13 @@ int EfaTransport::warmupSegment(const std::string& segment_name) {
                         // slot is freed and the next warmup retry starts
                         // clean.  Cheap under the shared-endpoint model —
                         // no fi_endpoint teardown required.
-                        ctx->deleteEndpoint(path);
+                        //
+                        // ...IfIdle so we never fi_av_remove() a slot another
+                        // handle is still posting on: warmup runs concurrently
+                        // with regular traffic.  A busy peer keeps its handle
+                        // and is only retried when a later call path reaches
+                        // it (see deleteEndpointIfIdle).
+                        ctx->deleteEndpointIfIdle(path);
                     }
                     return rc;
                 }));
@@ -1225,6 +1253,82 @@ int EfaTransport::onSetupEfaConnections(const HandShakeDesc& peer_desc,
     return endpoint->setupConnectionsByPassive(peer_desc, local_desc);
 }
 
+// EFA devices come from libfabric, or from libibverbs if libfabric cannot be
+// loaded (see Topology::discover). Both share the libibverbs that this process
+// loaded first, so fi_info in another shell can list devices this process
+// cannot see. Say which libraries this process uses.
+static void logNoEfaDevices(const std::vector<std::string>& hca_list) {
+    std::string devices;
+    for (const auto& name : hca_list) {
+        devices += (devices.empty() ? "" : ",") + name;
+    }
+    std::vector<EfaNic> nics;
+    std::string error;
+    if (listEfaNics(nics, &error) && !nics.empty()) {
+        std::string names;
+        for (const auto& nic : nics) {
+            names += (names.empty() ? "" : ",") + nic.name;
+        }
+        LOG(ERROR)
+            << "EfaTransport: no EFA devices selected. libfabric offers ["
+            << names << "], but the device filter (MC_TE_FILTERS or "
+            << "the configured device names) excludes them; other "
+            << "devices: [" << devices << "]";
+        return;
+    }
+    std::string verbs = loadedLibibverbsPath();
+    LOG(ERROR) << "EfaTransport: no EFA devices found. Other devices: ["
+               << devices << "]; libfabric: "
+               << (error.empty() ? std::string("no EFA NICs")
+                                 : "unavailable (" + error + ")")
+               << "; libibverbs: " << (verbs.empty() ? "unknown" : verbs)
+               << ". If fi_info lists EFA devices in another shell, that "
+                  "shell uses a different libibverbs or provider set: install "
+                  "the EFA verbs provider (libefa) for this libibverbs, or put "
+                  "the libibverbs that libfabric uses first on "
+                  "LD_LIBRARY_PATH.";
+}
+
+// libfabric does not expose the device's maximum MR size, so query it through
+// libibverbs when the device is visible there. Otherwise assume the smallest
+// limit measured on EFA devices (192 GiB on 0xefa2; 0xefa3 allows 384 GiB),
+// so that large registrations are split rather than rejected. An explicit
+// MC_MAX_MR_SIZE is kept.
+static void clampMaxMrSize(const std::string& device_name) {
+    constexpr uint64_t kSmallestEfaMaxMrSize = 192ull << 30;
+    auto& config = globalConfig();
+    uint64_t device_limit = 0;
+    int num_devices = 0;
+    struct ibv_device** dev_list = ibv_get_device_list(&num_devices);
+    for (int i = 0; dev_list && i < num_devices; ++i) {
+        if (device_name != ibv_get_device_name(dev_list[i])) continue;
+        struct ibv_context* ctx = ibv_open_device(dev_list[i]);
+        if (ctx) {
+            struct ibv_device_attr attr;
+            if (ibv_query_device(ctx, &attr) == 0) {
+                device_limit = attr.max_mr_size;
+            }
+            ibv_close_device(ctx);
+        }
+        break;
+    }
+    if (dev_list) ibv_free_device_list(dev_list);
+
+    if (device_limit == 0) {
+        if (std::getenv("MC_MAX_MR_SIZE")) return;
+        device_limit = kSmallestEfaMaxMrSize;
+        LOG(WARNING) << "EfaTransport: cannot query max_mr_size of "
+                     << device_name << " through libibverbs; assuming "
+                     << device_limit
+                     << " bytes. Set MC_MAX_MR_SIZE to override.";
+    }
+    if (config.max_mr_size > device_limit) {
+        config.max_mr_size = device_limit;
+        LOG(INFO) << "EfaTransport: Clamped max_mr_size to device limit: "
+                  << config.max_mr_size;
+    }
+}
+
 int EfaTransport::initializeEfaResources() {
     auto hca_list = local_topology_->getHcaList();
 
@@ -1241,10 +1345,8 @@ int EfaTransport::initializeEfaResources() {
     }
 
     if (efa_devices.empty()) {
-        LOG(WARNING) << "EfaTransport: No EFA devices found, falling back to "
-                        "all devices";
-        efa_devices = hca_list;
-        non_efa_devices.clear();
+        logNoEfaDevices(hca_list);
+        return ERR_DEVICE_NOT_FOUND;
     }
 
     // Disable non-EFA devices (e.g. ibp* IB devices) in the topology so that
@@ -1272,7 +1374,7 @@ int EfaTransport::initializeEfaResources() {
         }
     }
     if (context_list_.empty()) {
-        LOG(ERROR) << "EfaTransport: No available EFA devices";
+        LOG(ERROR) << "EfaTransport: none of the EFA devices could be opened";
         return ERR_DEVICE_NOT_FOUND;
     }
 
@@ -1299,37 +1401,7 @@ int EfaTransport::initializeEfaResources() {
         }
     }
 
-    // Query EFA device max_mr_size via ibverbs and clamp globalConfig.
-    // libfabric does not expose max_mr_size, so we go through the ibverbs
-    // layer.
-    {
-        int num_devices = 0;
-        struct ibv_device** dev_list = ibv_get_device_list(&num_devices);
-        if (dev_list) {
-            const std::string& first_efa = efa_devices[0];
-            for (int i = 0; i < num_devices; ++i) {
-                if (first_efa == ibv_get_device_name(dev_list[i])) {
-                    struct ibv_context* ctx = ibv_open_device(dev_list[i]);
-                    if (ctx) {
-                        struct ibv_device_attr attr;
-                        if (ibv_query_device(ctx, &attr) == 0) {
-                            auto& config = globalConfig();
-                            if (config.max_mr_size >
-                                (uint64_t)attr.max_mr_size) {
-                                config.max_mr_size = attr.max_mr_size;
-                                LOG(INFO) << "EfaTransport: Clamped "
-                                             "max_mr_size to device limit: "
-                                          << config.max_mr_size;
-                            }
-                        }
-                        ibv_close_device(ctx);
-                    }
-                    break;
-                }
-            }
-            ibv_free_device_list(dev_list);
-        }
-    }
+    clampMaxMrSize(efa_devices[0]);
 
     return 0;
 }

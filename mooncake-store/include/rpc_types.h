@@ -2,11 +2,18 @@
 
 #include <optional>
 
+#include <ylt/util/tl/expected.hpp>
+
 #include "types.h"
 #include "replica.h"
 #include "task_manager.h"
+#include "weight_management.h"
 
 namespace mooncake {
+
+template <typename T>
+using WeightRpcResult =
+    tl::expected<tl::expected<T, WeightManagementError>, ErrorCode>;
 
 struct ObjectMeta {
     std::string key;

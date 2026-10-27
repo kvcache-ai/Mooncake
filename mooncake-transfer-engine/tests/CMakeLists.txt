@@ -88,6 +88,9 @@ target_include_directories(
   shared_segment_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/shared_segment)
 target_link_libraries(shared_segment_test PUBLIC transfer_engine gtest
                                                  gtest_main)
+if(USE_ASCEND_DIRECT)
+  target_link_libraries(shared_segment_test PUBLIC ascendcl)
+endif()
 add_test(NAME shared_segment_test COMMAND shared_segment_test)
 
 add_executable(rdma_endpoint_state_test
@@ -157,6 +160,13 @@ target_link_libraries(rdma_large_mr_test PUBLIC transfer_engine gtest
                                                 gtest_main)
 # add_test(NAME rdma_large_mr_test COMMAND rdma_large_mr_test)  # needs an RDMA
 # dev + metadata server
+
+if(USE_HIP)
+  # Needs an AMD GPU, an RDMA NIC and the amdgpu peer-memory client.
+  add_executable(rdma_hip_kfd_pin_test ${WORKSPACE}/rdma_hip_kfd_pin_test.cpp)
+  target_link_libraries(rdma_hip_kfd_pin_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+endif()
 
 # Ctrl frame codec + sender credit ledger unit tests (no RDMA device required).
 add_executable(ctrl_frame_test ${WORKSPACE}/ctrl_frame_test.cpp)
@@ -357,6 +367,11 @@ if(USE_EFA)
   target_link_libraries(efa_select_device_test PUBLIC transfer_engine gtest
                                                       gtest_main)
   add_test(NAME efa_select_device_test COMMAND efa_select_device_test)
+
+  add_executable(efa_discovery_test ${WORKSPACE}/efa_discovery_test.cpp)
+  target_link_libraries(efa_discovery_test PUBLIC transfer_engine gtest
+                                                  gtest_main)
+  add_test(NAME efa_discovery_test COMMAND efa_discovery_test)
 
   # Compiles the real EfaEndPoint source against the test-only
   # RPC/address-vector fakes in efa_endpoint_handshake_fakes/ (shadowed

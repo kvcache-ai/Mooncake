@@ -27,6 +27,20 @@ std::string MasterServiceTestPeer::SerializeMetadataForOpLogForTesting(
     return service.SerializeMetadataForOpLog(metadata);
 }
 
+std::string
+MasterServiceTestPeer::SerializeMetadataForOpLogWithoutMemReplicasForTesting(
+    MasterService& service, const ObjectMetadata& metadata) {
+    return service.SerializeMetadataForOpLogWithoutMemReplicas(metadata);
+}
+
+std::string MasterServiceTestPeer::
+    SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
+        MasterService& service, const ObjectMetadata& metadata,
+        const std::vector<Replica::Descriptor>& replicas) {
+    return service.SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                   replicas);
+}
+
 void MasterServiceTestPeer::RunBatchEvictForTesting(
     double evict_ratio_target, double evict_ratio_lowerbound) {
     service_.BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
@@ -41,8 +55,20 @@ void MasterServiceTestPeer::RunDfsEvictionForTesting() {
     service_.RunDfsEviction();
 }
 
+void MasterServiceTestPeer::CleanupHttpMetadataForTesting(
+    const std::string& segment_name) {
+    service_.cleanupHttpMetadata(segment_name);
+}
+
+size_t MasterServiceTestPeer::HttpMetadataCleanupQueueSizeForTesting() const {
+    std::lock_guard<std::mutex> lk(service_.http_metadata_cleanup_mutex_);
+    return service_.http_metadata_cleanup_queue_.size();
+}
+
 void MasterServiceTestPeer::RunTenantEvictForTesting() {
-    service_.EvictTenantsOverWatermark();
+    // The policy throttles its pass; a test asks for one now.
+    service_.tenant_quota_policy_->next_eviction_check_ = {};
+    service_.tenant_quota_policy_->OnMaintenance();
 }
 
 void MasterServiceTestPeer::SetKvTenantEpochTrackingForTesting(bool enabled) {

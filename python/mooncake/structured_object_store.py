@@ -6758,6 +6758,8 @@ _WRITE_CONFIG_COPY_FIELDS = (
     "dfs_replica_num",
     "group_ids",
     "session_ids",
+    "preferred_hca_names",
+    "per_key_preferred_hca_names",
     "nof_replica_num",
     "prefer_alloc_in_same_node",
     "preferred_nof_segments",
@@ -6771,7 +6773,7 @@ _WRITE_CONFIG_COPY_FIELDS = (
 
 
 def _config_for_grouped_keys(config: Any, key_count: int) -> Any:
-    """Return a write config whose group_ids match the physical key count."""
+    """Expand logical per-key write metadata across physical Mooncake keys."""
     if config is None or key_count <= 0:
         return config
     session_ids = getattr(config, "session_ids", None)
@@ -6786,6 +6788,17 @@ def _config_for_grouped_keys(config: Any, key_count: int) -> Any:
         if key_count != 1 or isinstance(config.session_ids, str):
             config = _copy_write_config(config)
             config.session_ids = session_ids * key_count
+    hca_hints = getattr(config, "per_key_preferred_hca_names", None)
+    if hca_hints is not None:
+        if len(hca_hints) != 1:
+            raise ValueError(
+                "config.per_key_preferred_hca_names must contain exactly one logical hint"
+            )
+        if key_count != 1:
+            config = _copy_write_config(config)
+            config.per_key_preferred_hca_names = [
+                list(hca_hints[0]) for _ in range(key_count)
+            ]
     group_ids = getattr(config, "group_ids", None)
     if group_ids is None:
         return config

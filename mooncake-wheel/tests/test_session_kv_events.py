@@ -36,7 +36,7 @@ def session_store(request, tmp_path):
         master = subprocess.Popen(
             [
                 binary,
-                f"--rpc_port={rpc}",
+                f"--port={rpc}",
                 f"--metrics_port={admin}",
                 "--enable_metric_reporting=false",
                 "--default_kv_lease_ttl=100ms",
@@ -218,26 +218,73 @@ def test_session_tags_over_rpc_and_zmq(session_store):
     assert not subscriber.poll(300)
 
 
-def test_tensor_filtering_and_tp_session_mapping(session_store):
+def test_tensor_filtering_and_tp_session_and_hca_mapping(session_store):
     torch = pytest.importorskip("torch")
     store, receive, subscriber = session_store
     tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-    results = store.batch_pub_tensor(
-        ["invalid", "valid"], [None, tensor], tagged("wrong", "right")
-    )
-    assert results[0] != 0 and results[1] == 0
-    assert receive(1)[0]["session_id"] == "right"
+    for write in (store.batch_pub_tensor, store.batch_upsert_pub_tensor):
+        config = tagged("wrong", "right")
+        config.group_ids = ["wrong-group", "right-group"]
+        config.preferred_hca_names = ["mlx5_7"]
+        config.per_key_preferred_hca_names = [["mlx5_0"], ["mlx5_1"]]
+        results = write(["invalid", "valid"], [None, tensor], config)
+        assert results[0] != 0 and results[1] == 0
+        event = next(e for e in receive(1) if e["event_type"] == "stored")
+        assert (event["object_key"], event["session_id"], event["group_id"]) == (
+            "valid",
+            "right",
+            "right-group",
+        )
+        assert torch.equal(store.get_tensor("valid"), tensor)
+        assert config.session_ids == ["wrong", "right"]
+        assert config.group_ids == ["wrong-group", "right-group"]
+        assert config.preferred_hca_names == ["mlx5_7"]
+        assert config.per_key_preferred_hca_names == [["mlx5_0"], ["mlx5_1"]]
+        assert store.remove("valid", force=True) == 0
+        assert receive(1)[0]["event_type"] == "removed"
+
     config = tagged("tp-session")
     config.group_ids = ["tp-left", "tp-right"]
+    config.per_key_preferred_hca_names = [["mlx5_0"], ["mlx5_1"]]
     assert store.pub_tensor_with_tp("tp", tensor, config, tp_size=2) == 0
     events = receive(2)
     assert [e["session_id"] for e in events] == ["tp-session"] * 2
     assert sorted(e["group_id"] for e in events) == ["tp-left", "tp-right"]
+    config = tagged("wrong", "a", "b")
+    config.group_ids = ["wrong-group", "a-group", "b-group"]
+    config.per_key_preferred_hca_names = [["mlx5_0"], ["mlx5_1"], []]
     results = store.batch_pub_tensor_with_tp(
-        ["tp-a", "tp-b"], [tensor, tensor], tagged("a", "b"), tp_size=2
+        ["tp-invalid", "tp-a", "tp-b"], [None, tensor, tensor], config, tp_size=2
     )
-    assert results == [0, 0]
-    assert sorted(e["session_id"] for e in receive(4)) == ["a", "a", "b", "b"]
+    assert results[0] != 0 and results[1:] == [0, 0]
+    assert {e["object_key"]: (e["session_id"], e["group_id"]) for e in receive(4)} == {
+        f"tp-{key}_tp_{rank}": (key, f"{key}-group")
+        for key in ("a", "b")
+        for rank in range(2)
+    }
+    assert not subscriber.poll(300)
+
+
+@pytest.mark.parametrize(
+    "field", ["session_ids", "group_ids", "per_key_preferred_hca_names"]
+)
+def test_tensor_hint_counts_are_validated_before_filtering(session_store, field):
+    torch = pytest.importorskip("torch")
+    store, _, subscriber = session_store
+    tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    config = tagged("wrong", "right")
+    config.group_ids = ["wrong-group", "right-group"]
+    config.per_key_preferred_hca_names = [["mlx5_0"], ["mlx5_1"]]
+    setattr(config, field, getattr(config, field)[1:])
+    for write, kwargs in (
+        (store.batch_pub_tensor, {}),
+        (store.batch_upsert_pub_tensor, {}),
+        (store.batch_pub_tensor_with_tp, {"tp_size": 2}),
+    ):
+        results = write(["invalid", "valid"], [None, tensor], config, **kwargs)
+        assert len(results) == 2 and all(result != 0 for result in results)
+        assert store.is_exist("valid") == 0
+        assert store.is_exist("valid_tp_0") == 0
     assert not subscriber.poll(300)
 
 
@@ -250,10 +297,15 @@ def test_structured_session_expansion_preserves_native_write_options():
     config.soft_pin_action = SoftPinAction.ENABLE
     config.soft_pin_ttl_ms = 60000
     config.session_ids = ["session"]
+    config.preferred_hca_names = ["mlx5_0"]
+    config.per_key_preferred_hca_names = [["mlx5_1"]]
     expanded = _config_for_grouped_keys(config, 2)
     assert expanded.session_ids == ["session", "session"]
     assert expanded.dfs_replica_num == 1
     assert expanded.soft_pin_action == SoftPinAction.ENABLE
     assert expanded.soft_pin_ttl_ms == 60000
+    assert expanded.preferred_hca_names == ["mlx5_0"]
+    assert expanded.per_key_preferred_hca_names == [["mlx5_1"], ["mlx5_1"]]
     assert config.session_ids == ["session"]
+    assert config.per_key_preferred_hca_names == [["mlx5_1"]]
     assert expanded.group_ids is None
