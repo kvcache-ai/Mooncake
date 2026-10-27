@@ -1120,6 +1120,17 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
     }
     if (wc.status != IBV_WC_SUCCESS) {
         const bool flush_error = wc.status == IBV_WC_WR_FLUSH_ERR;
+        auto handleEndpointError = [&] {
+            if (flush_error) {
+                if (auto* rail = slice->rail_monitor) {
+                    rail->cancelProbe(slice->source_dev_id,
+                                      slice->target_dev_id);
+                }
+                ep->resetConnection("QP flush completion");
+            } else {
+                disableEndpoint(slice);
+            }
+        };
         if (!flush_error) {
             // TE handles them automatically
             LOG(INFO) << "Detected error WQE for slice " << slice
@@ -1165,7 +1176,7 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
                                                  sweep.now_ns, nullptr);
                 });
             }
-            if (!flush_error) disableEndpoint(slice);
+            handleEndpointError();
         } else {
             // Popped but still in flight: their work requests are
             // live and their completions are still coming, so only
@@ -1177,7 +1188,7 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
                     discountFromOwner(worker, swept);
                 });
             }
-            if (!flush_error) disableEndpoint(slice);
+            handleEndpointError();
             if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
                 updateSliceStatus(slice, CANCELED);
             } else {
