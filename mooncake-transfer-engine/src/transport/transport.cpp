@@ -56,10 +56,11 @@ Status Transport::freeBatchID(BatchID batch_id) {
         return Status::BatchBusy(
             "BatchID cannot be freed until completion callbacks are quiescent");
     }
-    delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
     RWSpinlock::WriteGuard guard(batch_desc_lock_);
     batch_desc_set_.erase(batch_id);
+#else
+    delete &batch_desc;
 #endif
     return Status::OK();
 }

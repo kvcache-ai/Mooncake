@@ -277,10 +277,6 @@ RdmaTransport::RdmaTransport() {
 RdmaTransport::~RdmaTransport() {
     notify_running_.store(false, std::memory_order_release);
     if (notify_worker_.joinable()) notify_worker_.join();
-#ifdef CONFIG_USE_BATCH_DESC_SET
-    for (auto &entry : batch_desc_set_) delete entry.second;
-    batch_desc_set_.clear();
-#endif
     metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
     for (auto &[_, anchor] : kfd_pin_anchors_) deregKfdPinAnchor(anchor.mr);
