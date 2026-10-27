@@ -1722,12 +1722,13 @@ int EfaContext::submitSlicesOnPeer(
     // against it is refused even though WR credit is free (observed as
     // wr_depth=0 with unbroken FI_EAGAIN).
     //
-    // Trigger on CONSECUTIVE waves that posted nothing, not on total waves and
-    // not on elapsed time.  Total waves fails healthy long-lived batches that
-    // retry while making progress, and a multi-second timer makes each stall a
-    // multi-second stall: the request layer can only re-handshake once these
-    // slices reach a terminal state, so failing fast is what lets the transfer
-    // recover (0.01 GB/s on a 10s timer vs ~10 GB/s failing promptly).
+    // Trigger on CONSECUTIVE waves that posted nothing, not on total waves:
+    // total waves fails healthy long-lived batches that retry while making
+    // progress.  And keep the time limit short: a multi-second timer makes
+    // each stall a multi-second stall, because the request layer can only
+    // re-handshake once these slices reach a terminal state, so failing fast
+    // is what lets the transfer recover (0.01 GB/s on a 10s timer vs ~10 GB/s
+    // failing promptly).
     //
     // The count alone is not enough: a wave that bounces costs well under a
     // microsecond, so 1024 of them pass in microseconds while the provider is
