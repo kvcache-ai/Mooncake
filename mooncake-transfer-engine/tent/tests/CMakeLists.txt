@@ -407,6 +407,15 @@ target_include_directories(tent_rdma_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rdma_transport_test COMMAND tent_rdma_transport_test)
 
+# Keep real engine initialization separate from fake-verbs fixtures, which
+# initialize process-wide platform state without an engine configuration.
+add_executable(tent_rdma_progress_test rdma_progress_test.cpp)
+target_link_libraries(tent_rdma_progress_test PRIVATE gtest gtest_main
+                                                      tent_link_group ibverbs)
+target_include_directories(tent_rdma_progress_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_rdma_progress_test COMMAND tent_rdma_progress_test)
+
 # Regression test for the edge-triggered async event fd: one epoll wakeup must
 # drain the whole queue. Wraps ibv_get_async_event to script the event source,
 # so it needs no RDMA device. -Wl,--wrap is a GNU ld / lld feature that Apple's
