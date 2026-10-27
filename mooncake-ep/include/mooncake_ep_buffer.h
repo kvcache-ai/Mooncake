@@ -6,9 +6,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <unordered_map>
 #include <mooncake_ep_api.cuh>
 #include <mooncake_ep_configs.cuh>
+#include <mooncake_ep_dispatch_slots.h>
 #include <mooncake_ep_event.h>
 #include <mooncake_ep_exception.cuh>
 #include <glog/logging.h>
@@ -79,8 +79,7 @@ struct MooncakeEpBuffer {
     // Keep a private top-k snapshot slot per dispatch metadata tensor so
     // interleaved subbatches cannot overwrite one another.
     std::mutex buffer_mutex;
-    std::unordered_map<uint64_t, int> dispatch_shadow_slots;
-    int next_shadow_slot = 0;
+    DispatchSlots dispatch_slots;
     int64_t num_ep_buffer_bytes;
     void* gdr_buffer = nullptr;
 

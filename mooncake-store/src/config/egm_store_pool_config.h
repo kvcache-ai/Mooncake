@@ -20,7 +20,7 @@ struct EgmStorePoolConfig {
 
 tl::expected<EgmStorePoolConfig, ErrorCode> ParseEgmStorePoolConfig(
     const ConfigDict& config, const std::string& protocol,
-    size_t global_segment_size, size_t local_buffer_size);
+    size_t global_segment_size);
 
 struct EgmStorePoolCapacity {
     size_t alignment = 0;
