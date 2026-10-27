@@ -2725,10 +2725,42 @@ Status TransferEngineImpl::acquireReceiverCredit(
             return reserve_status;
         }
 
+        std::array<uint64_t, 2> released_now{};
+        (void)sender_credit_ledger_->released(key, CreditResource::DataBytes,
+                                              released_now[0]);
+        (void)sender_credit_ledger_->released(key, CreditResource::RequestSlots,
+                                              released_now[1]);
+        const std::array<uint64_t, 2> charge_now{request.length, 1};
+        const auto now = std::chrono::steady_clock::now();
+        auto denial_it = receiver_credit_denials_.find(key);
+        if (denial_it != receiver_credit_denials_.end()) {
+            const auto& denial = denial_it->second;
+            const bool asks_less = charge_now[0] < denial.charge[0] ||
+                                   charge_now[1] < denial.charge[1];
+            if (denial.released == released_now && !asks_less &&
+                now < denial.retry_at) {
+                return Status::OK();  // Nothing changed: requeue, no RPC.
+            }
+        }
+        // Back off exponentially (1 ms .. 32 ms) while the receiver keeps
+        // refusing. A local release retries at once; the cap bounds the
+        // wait for capacity that another sender returned.
+        auto note_denial = [&] {
+            auto& denial = receiver_credit_denials_[key];
+            if (denial.released != released_now) denial.attempts = 0;
+            denial.released = released_now;
+            denial.charge = charge_now;
+            const uint32_t shift = std::min<uint32_t>(denial.attempts, 5);
+            ++denial.attempts;
+            denial.retry_at = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(1U << shift);
+        };
+
         ReceiverCreditExchangeRequestV1 exchange_request;
         CHECK_STATUS(sender_credit_ledger_->prepareExchange(key, charge,
                                                             exchange_request));
         ReceiverCreditExchangeReplyV1 exchange_reply;
+        ++receiver_credit_demand_exchanges_;
         auto exchange_status =
             exchangeReceiverCredit(request.target_id, target.rpc_server_addr,
                                    exchange_request, exchange_reply);
@@ -2739,6 +2771,7 @@ Status TransferEngineImpl::acquireReceiverCredit(
             }
             LOG(WARNING) << "Receiver-credit exchange deferred: "
                          << exchange_status.ToString();
+            note_denial();
             return Status::OK();
         }
         if (!(exchange_reply.sender_instance_id == sender_instance_id_)) {
@@ -2756,10 +2789,12 @@ Status TransferEngineImpl::acquireReceiverCredit(
         reserve_status = sender_credit_ledger_->tryReserve(key, charge);
         if (reserve_status.IsTooManyRequests() ||
             reserve_status.IsInvalidEntry()) {
+            note_denial();
             return Status::OK();
         }
         CHECK_STATUS(reserve_status);
     }
+    receiver_credit_denials_.erase(key);
 
     reservation.active = true;
     reservation.committed = false;
@@ -2903,6 +2938,14 @@ void TransferEngineImpl::observeReceiverCreditSession(
             pending = pending_credit_releases_.erase(pending);
         } else {
             ++pending;
+        }
+    }
+    for (auto denial = receiver_credit_denials_.begin();
+         denial != receiver_credit_denials_.end();) {
+        if (denial->first.receiver_session == stale_session) {
+            denial = receiver_credit_denials_.erase(denial);
+        } else {
+            ++denial;
         }
     }
     it->second = session;

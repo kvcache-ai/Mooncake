@@ -77,6 +77,10 @@ class TransferEngineImplTestPeer {
         engine.staging_proxy_ = std::make_unique<tent::ProxyManager>(
             &engine, chunk_size, chunk_count);
     }
+    static uint64_t creditDemandExchanges(tent::TransferEngineImpl& engine) {
+        std::lock_guard<std::recursive_mutex> lk(engine.progress_mutex_);
+        return engine.receiver_credit_demand_exchanges_;
+    }
     static void adoptDeferredBatches(tent::TransferEngineImpl& engine,
                                      std::vector<tent::BatchID> batches) {
         tent::TransferEngineImpl::DeferredStageTeardown deferred;
@@ -1678,6 +1682,181 @@ TEST(RuntimeQueueDispatch, StagedFailureKeepsReceiverCreditUntilChunksDrain) {
     for (auto* buf : {&source, &target, &small_source, &small_target})
         EXPECT_TRUE(
             engine.unregisterLocalMemory(buf->data(), buf->size()).ok());
+}
+
+// Receiver credit lives in another engine, so each demand exchange is an RPC
+// made under progress_mutex_. A deferred owner must not repeat a refused
+// exchange on every poll: back-to-back RPCs hold the lock and starve the
+// in-flight owner whose completion is what returns the credit (on two UB
+// nodes this collapsed throughput by ~1000x once demand exceeded capacity).
+TEST(RuntimeQueueDispatch, RefusedCreditIsNotReexchangedOnEveryPoll) {
+    constexpr size_t kReqLen = 4096;
+    auto receiver_cfg = makeRuntimeQueueConfig(4, 1UL << 20);
+    receiver_cfg->set("receiver_credit/receiver_enable", true);
+    receiver_cfg->set("receiver_credit/data_bytes", uint64_t{kReqLen});
+    receiver_cfg->set("receiver_credit/request_slots", uint64_t{1});
+    auto sender_cfg = makeRuntimeQueueConfig(4, 1UL << 20);
+    sender_cfg->set("receiver_credit/sender_enable", true);
+    std::vector<uint8_t> source(kReqLen * 2, 0x91);
+    std::vector<uint8_t> target(kReqLen * 2, 0);
+    TransferEngineImpl receiver(receiver_cfg);
+    TransferEngineImpl sender(sender_cfg);
+    ASSERT_TRUE(receiver.available());
+    ASSERT_TRUE(sender.available());
+    installFakeUb(receiver, std::make_shared<FakeTransport>(UB));
+    std::atomic<bool> complete_first{false};
+    auto sender_ub =
+        std::make_shared<FakeTransport>(UB, [&](const Request& request, int) {
+            if (request.source == source.data() && !complete_first.load())
+                return TransferStatus{PENDING, 0};
+            return TransferStatus{COMPLETED, request.length};
+        });
+    installFakeUb(sender, sender_ub);
+    ASSERT_TRUE(sender.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(
+        receiver.registerLocalMemory(target.data(), target.size()).ok());
+    SegmentID remote = LOCAL_SEGMENT_ID;
+    ASSERT_TRUE(sender.openSegment(remote, receiver.getSegmentName()).ok());
+
+    BatchID holder = sender.allocateBatch(1);
+    BatchID waiter = sender.allocateBatch(1);
+    ASSERT_NE(holder, (BatchID)0);
+    ASSERT_NE(waiter, (BatchID)0);
+    ASSERT_TRUE(
+        sender
+            .submitTransfer(holder, {makeRemoteUbWrite(source.data(), remote,
+                                                       target.data(), kReqLen)})
+            .ok());
+    ASSERT_TRUE(
+        sender
+            .submitTransfer(
+                waiter, {makeRemoteUbWrite(source.data() + kReqLen, remote,
+                                           target.data() + kReqLen, kReqLen)})
+            .ok());
+    EXPECT_EQ(sender_ub->submit_calls.load(), 1);
+
+    // Busy-poll the refused owner. Without the backoff every poll is another
+    // exchange (thousands here); with it, a handful (1, 2, 4, ... ms).
+    const auto before =
+        TransferEngineImplTestPeer::creditDemandExchanges(sender);
+    TransferStatus waiter_status{};
+    const auto until =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    while (std::chrono::steady_clock::now() < until) {
+        ASSERT_TRUE(sender.getTransferStatus(waiter, 0, waiter_status).ok());
+        ASSERT_EQ(waiter_status.s, PENDING);
+    }
+    const auto refused =
+        TransferEngineImplTestPeer::creditDemandExchanges(sender) - before;
+    EXPECT_GE(refused, 1u);
+    EXPECT_LE(refused, 12u);
+    EXPECT_EQ(sender_ub->submit_calls.load(), 1);
+
+    // Returning the credit retries at once, without waiting out the backoff.
+    complete_first = true;
+    TransferStatus holder_status{};
+    ASSERT_TRUE(sender.getTransferStatus(holder, 0, holder_status).ok());
+    EXPECT_EQ(holder_status.s, COMPLETED);
+    EXPECT_EQ(sender_ub->submit_calls.load(), 2);
+    ASSERT_TRUE(sender.getTransferStatus(waiter, 0, waiter_status).ok());
+    EXPECT_EQ(waiter_status.s, COMPLETED);
+
+    EXPECT_TRUE(sender.freeBatch(holder).ok());
+    EXPECT_TRUE(sender.freeBatch(waiter).ok());
+    EXPECT_TRUE(sender.closeSegment(remote).ok());
+    EXPECT_TRUE(
+        sender.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        receiver.unregisterLocalMemory(target.data(), target.size()).ok());
+}
+
+// The refused sender is not told when another sender returns credit. The
+// capped backoff must still let it through without any local release.
+TEST(RuntimeQueueDispatch, RefusedCreditRecoversWhenAnotherSenderReleases) {
+    constexpr size_t kReqLen = 4096;
+    auto receiver_cfg = makeRuntimeQueueConfig(4, 1UL << 20);
+    receiver_cfg->set("receiver_credit/receiver_enable", true);
+    receiver_cfg->set("receiver_credit/data_bytes", uint64_t{kReqLen});
+    receiver_cfg->set("receiver_credit/request_slots", uint64_t{1});
+    auto sender_cfg = makeRuntimeQueueConfig(4, 1UL << 20);
+    sender_cfg->set("receiver_credit/sender_enable", true);
+    std::vector<uint8_t> source_a(kReqLen, 0xa1), source_b(kReqLen, 0xb2);
+    std::vector<uint8_t> target(kReqLen * 2, 0);
+    TransferEngineImpl receiver(receiver_cfg);
+    TransferEngineImpl sender_a(sender_cfg);
+    TransferEngineImpl sender_b(sender_cfg);
+    ASSERT_TRUE(receiver.available());
+    ASSERT_TRUE(sender_a.available());
+    ASSERT_TRUE(sender_b.available());
+    installFakeUb(receiver, std::make_shared<FakeTransport>(UB));
+    std::atomic<bool> complete_a{false};
+    auto ub_a =
+        std::make_shared<FakeTransport>(UB, [&](const Request& request, int) {
+            if (!complete_a.load()) return TransferStatus{PENDING, 0};
+            return TransferStatus{COMPLETED, request.length};
+        });
+    auto ub_b = std::make_shared<FakeTransport>(UB);
+    installFakeUb(sender_a, ub_a);
+    installFakeUb(sender_b, ub_b);
+    ASSERT_TRUE(
+        sender_a.registerLocalMemory(source_a.data(), source_a.size()).ok());
+    ASSERT_TRUE(
+        sender_b.registerLocalMemory(source_b.data(), source_b.size()).ok());
+    ASSERT_TRUE(
+        receiver.registerLocalMemory(target.data(), target.size()).ok());
+    SegmentID remote_a = LOCAL_SEGMENT_ID, remote_b = LOCAL_SEGMENT_ID;
+    ASSERT_TRUE(sender_a.openSegment(remote_a, receiver.getSegmentName()).ok());
+    ASSERT_TRUE(sender_b.openSegment(remote_b, receiver.getSegmentName()).ok());
+
+    BatchID batch_a = sender_a.allocateBatch(1);
+    BatchID batch_b = sender_b.allocateBatch(1);
+    ASSERT_TRUE(sender_a
+                    .submitTransfer(
+                        batch_a, {makeRemoteUbWrite(source_a.data(), remote_a,
+                                                    target.data(), kReqLen)})
+                    .ok());
+    ASSERT_TRUE(
+        sender_b
+            .submitTransfer(
+                batch_b, {makeRemoteUbWrite(source_b.data(), remote_b,
+                                            target.data() + kReqLen, kReqLen)})
+            .ok());
+    EXPECT_EQ(ub_a->submit_calls.load(), 1);
+    EXPECT_EQ(ub_b->submit_calls.load(), 0);
+    // Let sender B back off a few rounds while A holds the only slot.
+    TransferStatus status_b{};
+    const auto hold =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(40);
+    while (std::chrono::steady_clock::now() < hold) {
+        ASSERT_TRUE(sender_b.getTransferStatus(batch_b, 0, status_b).ok());
+        ASSERT_EQ(status_b.s, PENDING);
+    }
+
+    complete_a = true;
+    TransferStatus status_a{};
+    ASSERT_TRUE(sender_a.getTransferStatus(batch_a, 0, status_a).ok());
+    EXPECT_EQ(status_a.s, COMPLETED);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(sender_b.getTransferStatus(batch_b, 0, status_b).ok());
+        if (status_b.s != PENDING) break;
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    EXPECT_EQ(status_b.s, COMPLETED);
+    EXPECT_EQ(ub_b->submit_calls.load(), 1);
+
+    EXPECT_TRUE(sender_a.freeBatch(batch_a).ok());
+    EXPECT_TRUE(sender_b.freeBatch(batch_b).ok());
+    EXPECT_TRUE(sender_a.closeSegment(remote_a).ok());
+    EXPECT_TRUE(sender_b.closeSegment(remote_b).ok());
+    EXPECT_TRUE(
+        sender_a.unregisterLocalMemory(source_a.data(), source_a.size()).ok());
+    EXPECT_TRUE(
+        sender_b.unregisterLocalMemory(source_b.data(), source_b.size()).ok());
+    EXPECT_TRUE(
+        receiver.unregisterLocalMemory(target.data(), target.size()).ok());
 }
 
 }  // namespace

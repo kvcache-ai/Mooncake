@@ -695,6 +695,19 @@ class TransferEngineImpl {
         std::chrono::steady_clock::time_point retry_at{};
     };
 
+    // A demand exchange the receiver did not satisfy (or that failed). A
+    // deferred owner is retried on every refill, and the exchange is an RPC
+    // made under progress_mutex_; repeating it on every poll can starve the
+    // in-flight owners whose completion is what returns the credit. Until
+    // this sender releases credit for the key, asks for less, or the backoff
+    // expires, the owner is requeued without another RPC.
+    struct ReceiverCreditDenial {
+        std::array<uint64_t, 2> released{};  // DataBytes, RequestSlots
+        std::array<uint64_t, 2> charge{};
+        uint32_t attempts{0};
+        std::chrono::steady_clock::time_point retry_at{};
+    };
+
     struct QueuedOwnerState {
         Batch* batch{nullptr};
         size_t owner_task_id{0};
@@ -745,6 +758,9 @@ class TransferEngineImpl {
     std::unordered_map<CreditKey, PendingReceiverCreditRelease, CreditKeyHash>
         pending_credit_releases_;
     std::unordered_map<SegmentID, ReceiverSessionId> receiver_credit_sessions_;
+    std::unordered_map<CreditKey, ReceiverCreditDenial, CreditKeyHash>
+        receiver_credit_denials_;
+    uint64_t receiver_credit_demand_exchanges_{0};
     std::unordered_map<QueueOwnerId, QueuedOwnerState> queued_owners_;
     size_t dispatch_inflight_owners_{0};
     size_t dispatch_inflight_bytes_{0};
