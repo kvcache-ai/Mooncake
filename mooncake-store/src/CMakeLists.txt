@@ -253,6 +253,12 @@ else()
       CACHE INTERNAL "Whether the S3-compatible adapter is built")
 endif()
 
+# Valkey adapter (valkey-large-object module over hiredis).
+if(STORE_USE_REDIS)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES
+       storage/distributed/valkey_adapter.cpp)
+endif()
+
 # Find AWS SDK
 find_package(AWSSDK QUIET COMPONENTS s3)
 if(AWSSDK_FOUND)

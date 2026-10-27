@@ -21,6 +21,9 @@
 #include "test_server_helpers.h"
 #include "common/client_buffer_allocation.h"
 #include "utils/common.h"
+#ifdef STORE_USE_REDIS
+#include "storage/distributed/valkey_adapter.h"
+#endif
 
 namespace mooncake {
 
@@ -85,6 +88,104 @@ class FileStorageTest : public ::testing::Test {
         }
         return bytes;
     }
+
+#ifdef STORE_USE_REDIS
+    // Offload into Valkey (valkey-large-object module) through the
+    // distributed backend, as an owner node would, then check that Valkey
+    // holds the objects, the master tracks LOCAL_DISK replicas, and the bytes
+    // read back. Skips unless MOONCAKE_VALKEY_ADDR is set.
+    void RunValkeyOffloadScenario() {
+        const char* addr = std::getenv("MOONCAKE_VALKEY_ADDR");
+        if (!addr || !*addr) GTEST_SKIP() << "Set MOONCAKE_VALKEY_ADDR";
+        const std::string root =
+            "/mooncake-file-storage-test-" + std::to_string(getpid());
+        SetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE", "valkey");
+        SetEnv("MOONCAKE_DISTRIBUTED_ROOT_DIR", root);
+
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_default_kv_lease_ttl(0)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+        std::unique_ptr<void, decltype(&std::free)> segment(
+            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+        ASSERT_NE(segment, nullptr);
+        SimpleAllocator allocator(kSegmentSize);
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                      std::nullopt, master.master_address());
+        ASSERT_TRUE(created);
+        auto client = *created;
+        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+        ASSERT_TRUE(client->RegisterLocalMemory(
+            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+
+        const std::vector<std::string> keys{"valkey-a", "valkey-b", "valkey-c"};
+        std::vector<std::string> values;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            std::string value((1 << 20) + 4097 * i, '\0');
+            for (size_t j = 0; j < value.size(); ++j) {
+                value[j] = static_cast<char>('a' + i + j % 61);
+            }
+            auto* buffer = allocator.allocate(value.size());
+            ASSERT_NE(buffer, nullptr);
+            std::memcpy(buffer, value.data(), value.size());
+            ReplicateConfig replicate;
+            replicate.replica_num = 1;
+            std::vector<Slice> slices{{buffer, value.size()}};
+            ASSERT_TRUE(client->Put(keys[i], slices, replicate));
+            allocator.deallocate(buffer, value.size());
+            values.push_back(std::move(value));
+        }
+        std::vector<OffloadTaskItem> tasks;
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
+        ASSERT_EQ(keys.size(), tasks.size());
+
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_filepath = data_path + "/valkey_offload";
+        config.local_buffer_size = kSegmentSize;
+        config.storage_backend_type = StorageBackendType::kDistributed;
+        fs::create_directories(config.storage_filepath);
+        FileStorage storage(config, client, endpoint);
+        ASSERT_TRUE(storage.storage_backend_->Init());
+        ASSERT_TRUE(storage.OffloadObjects(tasks));
+        ASSERT_TRUE(storage.Heartbeat());
+
+        // Valkey holds one object per key under the owner's prefix.
+        ValkeyObjectStorageAdapter valkey(root);
+        ASSERT_TRUE(valkey.Init());
+        auto listed = valkey.ListKeys();
+        ASSERT_TRUE(listed);
+        EXPECT_EQ(keys.size(), listed->size());
+
+        for (size_t i = 0; i < keys.size(); ++i) {
+            // The master knows about the offloaded copy...
+            auto query = client->Query(keys[i]);
+            ASSERT_TRUE(query) << keys[i];
+            bool has_disk_replica = false;
+            for (const auto& replica : query->replicas) {
+                has_disk_replica |= replica.is_local_disk_replica();
+            }
+            EXPECT_TRUE(has_disk_replica) << keys[i];
+            // ...and the bytes come back from Valkey.
+            std::string actual(values[i].size(), '\0');
+            std::unordered_map<std::string, Slice> read{
+                {TenantId::Default().MakeScopedKey(keys[i]),
+                 {actual.data(), actual.size()}}};
+            ASSERT_TRUE(storage.storage_backend_->BatchLoad(read)) << keys[i];
+            EXPECT_EQ(values[i], actual) << keys[i];
+        }
+
+        for (const auto& info : *listed) (void)valkey.Delete(info.logical_key);
+        EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+        EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
+        UnsetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE");
+        UnsetEnv("MOONCAKE_DISTRIBUTED_ROOT_DIR");
+    }
+#endif
 
     void RunOrdinaryRemoveAllReclaimScenario(StorageBackendType backend_type) {
         testing::InProcMaster master;
@@ -1056,6 +1157,12 @@ class FileStorageTest : public ::testing::Test {
         std::free(seg_ptr);
     }
 };
+
+#ifdef STORE_USE_REDIS
+TEST_F(FileStorageTest, OffloadsToValkeyThroughDistributedBackend) {
+    RunValkeyOffloadScenario();
+}
+#endif
 
 TEST_F(FileStorageTest, SkippedOffloadAllDuplicatesReleaseSourceTasks) {
     RunSkippedOffloadScenario(2, false);
