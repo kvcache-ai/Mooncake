@@ -1,7 +1,7 @@
 #pragma once
 
 #ifdef USE_CUDA
-#include <cuda.h>
+#include "cuda_driver.h"
 #include <cuda_runtime.h>
 #include "cuda_fabric_compat.h"
 #elif defined(USE_HIP)
@@ -33,4 +33,9 @@
     !defined(USE_SUPA)
 #include <string>
 const static std::string GPU_PREFIX = "cuda:";
+#endif
+
+#ifndef USE_CUDA
+// Other vendors keep their existing CUDA-compatible Driver API mapping.
+#define MOONCAKE_CUDA_SYMBOL(symbol) symbol
 #endif

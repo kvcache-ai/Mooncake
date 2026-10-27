@@ -387,6 +387,7 @@ fn main() {
         "glog",
         "gflags",
         "pthread",
+        "dl",
         "xxhash",
         "numa",
         "ibverbs",
@@ -402,7 +403,6 @@ fn main() {
         ("etcd_wrapper", &["etcd_wrapper"] as &[&str]),
         ("hiredis", &["hiredis"]),
         ("curl", &["curl"]),
-        ("cuda", &["cuda"]),
         ("cudart", &["cudart"]),
         ("mlx5", &["mlx5"]), // IBGDA device transport (mlx5 DevX) pulled into transfer_engine, CUDA-only
         ("uring", &["uring"]),

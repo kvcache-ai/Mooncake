@@ -38,3 +38,7 @@ add_executable(ib_link_speed_test ib_link_speed_test.cpp)
 target_link_libraries(ib_link_speed_test PUBLIC mooncake_common gtest
                                                 gtest_main pthread)
 add_test(NAME ib_link_speed_test COMMAND ib_link_speed_test)
+
+if(USE_CUDA)
+  add_subdirectory(cuda_driver)
+endif()

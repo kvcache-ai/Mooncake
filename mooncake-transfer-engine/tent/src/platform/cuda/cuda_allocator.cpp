@@ -17,7 +17,7 @@
 #include "tent/common/status.h"
 
 #include <bits/stdint-uintn.h>
-#include <cuda.h>
+#include "cuda_driver.h"
 #include <cuda_runtime.h>
 #include <glog/logging.h>
 #include <mutex>
@@ -36,10 +36,12 @@ namespace {
 bool cudaPrimaryContextIsActive(int device) {
     if (!ensureCudaDriverInit()) return false;
     CUdevice cu_dev = 0;
-    if (cuDeviceGet(&cu_dev, device) != CUDA_SUCCESS) return false;
+    if (MOONCAKE_CUDA_SYMBOL(cuDeviceGet)(&cu_dev, device) != CUDA_SUCCESS)
+        return false;
     unsigned int flags = 0;
     int active = 0;
-    if (cuDevicePrimaryCtxGetState(cu_dev, &flags, &active) != CUDA_SUCCESS) {
+    if (MOONCAKE_CUDA_SYMBOL(cuDevicePrimaryCtxGetState)(
+            cu_dev, &flags, &active) != CUDA_SUCCESS) {
         return false;
     }
     return active != 0;
@@ -50,7 +52,8 @@ bool cudaPrimaryContextIsActive(int device) {
 bool cudaHasCurrentContext() {
     if (!ensureCudaDriverInit()) return false;
     CUcontext ctx = nullptr;
-    return cuCtxGetCurrent(&ctx) == CUDA_SUCCESS && ctx != nullptr;
+    return MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(&ctx) == CUDA_SUCCESS &&
+           ctx != nullptr;
 }
 
 }  // namespace
@@ -114,7 +117,7 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     // this copy creates. Save the exact identity through the driver API.
     CUcontext caller_ctx = nullptr;
     if (ensureCudaDriverInit() &&
-        cuCtxGetCurrent(&caller_ctx) != CUDA_SUCCESS) {
+        MOONCAKE_CUDA_SYMBOL(cuCtxGetCurrent)(&caller_ctx) != CUDA_SUCCESS) {
         return Status::InternalError(std::string("cuCtxGetCurrent failed") +
                                      LOC_MARK);
     }
@@ -167,7 +170,8 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
                                       cudaGetErrorString(err) + LOC_MARK);
         }
     }
-    const CUresult restore_rc = cuCtxSetCurrent(caller_ctx);
+    const CUresult restore_rc =
+        MOONCAKE_CUDA_SYMBOL(cuCtxSetCurrent)(caller_ctx);
     if (status.ok() && restore_rc != CUDA_SUCCESS) {
         status = Status::InternalError(
             std::string("cuCtxSetCurrent failed to restore the caller "

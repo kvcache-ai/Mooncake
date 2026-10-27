@@ -15,7 +15,7 @@
 #ifndef TENT_PLATFORM_CUDA_UTILS_H
 #define TENT_PLATFORM_CUDA_UTILS_H
 
-#include <cuda.h>
+#include "cuda_driver.h"
 
 #include <mutex>
 
@@ -27,7 +27,7 @@ namespace tent {
 inline bool ensureCudaDriverInit() {
     static std::once_flag flag;
     static CUresult result = CUDA_ERROR_NOT_INITIALIZED;
-    std::call_once(flag, []() { result = cuInit(0); });
+    std::call_once(flag, []() { result = MOONCAKE_CUDA_SYMBOL(cuInit)(0); });
     return result == CUDA_SUCCESS;
 }
 
@@ -37,11 +37,11 @@ inline bool ensureCudaDriverInit() {
 inline int getCudaDeviceForPtr(const void* ptr) {
     if (!ensureCudaDriverInit()) return -1;
     unsigned int mem_type = 0;
-    CUresult res = cuPointerGetAttribute(
+    CUresult res = MOONCAKE_CUDA_SYMBOL(cuPointerGetAttribute)(
         &mem_type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)ptr);
     if (res != CUDA_SUCCESS || mem_type != CU_MEMORYTYPE_DEVICE) return -1;
     unsigned int dev_ordinal = 0;
-    res = cuPointerGetAttribute(
+    res = MOONCAKE_CUDA_SYMBOL(cuPointerGetAttribute)(
         &dev_ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)ptr);
     if (res != CUDA_SUCCESS) return -1;
     return static_cast<int>(dev_ordinal);

@@ -47,10 +47,10 @@ CPP_FILE="${SCRIPT_DIR}/nvlink_allocator.cpp"
 # Choose build command based on flags
 if [ "$CI_BUILD" = true ]; then
     # CI build: use nvcc without linking cuda
-    nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -Xcompiler -fPIC -I/usr/local/cuda/include ${INCLUDE_FLAGS} -L/usr/local/cuda-12.8/targets/x86_64-linux/lib -lcuda -DUSE_CUDA=1
+    nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -Xcompiler -fPIC -I/usr/local/cuda/include ${INCLUDE_FLAGS} -L/usr/local/cuda-12.8/targets/x86_64-linux/lib -ldl -DUSE_CUDA=1
 elif [ "$USE_NVCC" = true ]; then
-    # Regular nvcc build with cuda linking
-    nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -Xcompiler -fPIC -lcuda -I/usr/local/cuda/include ${INCLUDE_FLAGS} -DUSE_CUDA=1
+    # Regular nvcc build with runtime Driver API loading
+    nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -Xcompiler -fPIC -ldl -I/usr/local/cuda/include ${INCLUDE_FLAGS} -DUSE_CUDA=1
 elif [ "$USE_HIPCC" = true ]; then
     HIPCC_DEFINES="-DUSE_HIP=1"
     [ "$WITH_HYLINK" = true ] && HIPCC_DEFINES="$HIPCC_DEFINES -DUSE_HYLINK=1"
@@ -65,7 +65,7 @@ elif [ "$USE_MACA" = true ]; then
         -L"${MACA_ROOT}/lib64" -L"${MACA_ROOT}/lib" -lmcruntime -DUSE_MACA=1
 else
     # Default g++ build
-    g++ "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lcuda -I/usr/local/cuda/include ${INCLUDE_FLAGS} -DUSE_CUDA=1
+    g++ "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -ldl -I/usr/local/cuda/include ${INCLUDE_FLAGS} -DUSE_CUDA=1
 fi
 
 if [ $? -eq 0 ]; then

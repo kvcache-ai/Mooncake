@@ -9,7 +9,7 @@ prepare_allocator_build_env() {
     local include_list=${2:-}
 
     SCRIPT_DIR=$(resolve_allocator_script_dir)
-    include_list="${include_list:+${include_list} }${SCRIPT_DIR}/../include"
+    include_list="${include_list:+${include_list} }${SCRIPT_DIR}/../include ${SCRIPT_DIR}/../../mooncake-common/include"
 
     INCLUDE_FLAGS=""
     if [ -n "$include_list" ]; then

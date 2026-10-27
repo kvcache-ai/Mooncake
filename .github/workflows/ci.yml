@@ -245,9 +245,6 @@ jobs:
           -DENABLE_SCCACHE=ON
       shell: bash
 
-    - name: Configure CUDA driver runtime
-      uses: ./.github/actions/setup-cuda-runtime
-
     - name: Build project and unit tests
       run: |
         cmake --build build --parallel 128
@@ -333,7 +330,6 @@ jobs:
         mkdir build
         cd build
         export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
         cmake -G Ninja .. \
           -DUSE_ETCD=OFF \
           -DUSE_CXL=ON \
@@ -346,7 +342,6 @@ jobs:
           -DUSE_CUDA=OFF \
           -DUSE_MNNVL=OFF \
           -DUSE_UB=OFF \
-          -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
           "-DCMAKE_C_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
           "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
           -DENABLE_DEBUG_SYMBOLS=OFF
@@ -641,7 +636,7 @@ jobs:
       matrix:
         include:
           - name: cuda-on
-            cmake_flags: '-DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs'
+            cmake_flags: '-DUSE_CUDA=ON'
             need_cuda: true
             metrics_flags: ''
           - name: cuda-off
@@ -713,10 +708,6 @@ jobs:
 
     - name: Build project with TENT
       run: |
-        if [ "${{ matrix.need_cuda }}" = "true" ]; then
-          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        fi
         cd build-tent
         if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
           cmake --build . --target tent_memfabric_transport_test transfer_engine
@@ -732,13 +723,6 @@ jobs:
     # USE_CUDA code paths compile).
     - name: Check Transfer Engine Rust bindings, examples, and tests
       run: |
-        if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
-           [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
-          sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-        fi
-        if [ "${{ matrix.need_cuda }}" = "true" ]; then
-          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        fi
         cd mooncake-transfer-engine/rust
         export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build-tent
         export MOONCAKE_TE_LIB_DIR=$GITHUB_WORKSPACE/build-tent/mooncake-transfer-engine/src
@@ -769,11 +753,8 @@ jobs:
           -R '^transfer_task_tent_shared_segment_test$'
       shell: bash
 
-    # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
-    # with USE_CUDA=ON tent's cuda_probe hits the CUDA stub library at
-    # runtime and drives some dispatch paths past the fake objects the
-    # unit tests rely on, causing false failures. cuda-on still validates
-    # that every #ifdef USE_CUDA branch compiles.
+    # Run the transport test suite on the cuda-off leg. GitHub runners have
+    # no GPU; cuda-on validates that every #ifdef USE_CUDA branch compiles.
     - name: Test (TENT)
       id: ctest
       if: '!matrix.need_cuda'

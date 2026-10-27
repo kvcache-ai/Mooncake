@@ -317,9 +317,6 @@ jobs:
             -DSTORE_USE_ETCD=ON -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_UNIT_TESTS=ON -DENABLE_SCCACHE=ON
 
-      - name: Configure CUDA driver runtime
-        uses: ./.github/actions/setup-cuda-runtime
-
       - name: Build project
         run: |
           cd build

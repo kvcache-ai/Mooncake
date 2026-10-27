@@ -246,6 +246,13 @@ environment setup must be prepared separately.
 
 ```{admonition} NCCL host RMA constraints
 :class: important
+CUDA builds require CUDA Toolkit headers and `libcudart`, but do not link against
+`libcuda.so` or CUDA driver stubs. The NVIDIA Driver API is loaded lazily from
+`libcuda.so.1` when a Driver API operation is requested. GPU operations still
+require a compatible NVIDIA driver at runtime; a missing driver library or API
+symbol produces a CUDA error and a diagnostic. Each API is resolved separately,
+so a missing optional API does not prevent resolving other Driver APIs.
+
 The first valid NCCL host WRITE freezes the ordered CUDA-buffer catalog before
 bootstrap. Registration and unregistration are not allowed afterward, even if
 bootstrap fails. Session initialization is attempted once for each

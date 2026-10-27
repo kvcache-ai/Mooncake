@@ -413,7 +413,7 @@ jobs:
       PACKAGE_VERSION: ${{ needs.version-stamp.outputs.package_version }}
       TARGET_PACKAGE: ${{ matrix.package }}
     steps:
-      - name: Install CUDA runtime and driver stub
+      - name: Install CUDA runtime
         if: ${{ matrix.package != 'mooncake-transfer-engine-non-cuda' }}
         env:
           CUDA_PACKAGE_VERSION: ${{ matrix.package == 'mooncake-transfer-engine-cuda13' && '13-0' || '12-8' }}
@@ -431,8 +431,7 @@ jobs:
           sudo dpkg -i "$keyring"
           sudo apt-get update
           sudo apt-get install -y \
-            "cuda-cudart-${CUDA_PACKAGE_VERSION}" \
-            "cuda-driver-dev-${CUDA_PACKAGE_VERSION}"
+            "cuda-cudart-${CUDA_PACKAGE_VERSION}"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -464,25 +463,10 @@ jobs:
             "$download_dir"/*.whl
 
           if [ "$TARGET_PACKAGE" != mooncake-transfer-engine-non-cuda ]; then
-            cuda_stub=
-            for candidate in /usr/local/cuda*/lib64/stubs/libcuda.so \
-                             /usr/local/cuda*/targets/*/lib/stubs/libcuda.so; do
-              if [ -f "$candidate" ]; then
-                cuda_stub="$candidate"
-                break
-              fi
-            done
-            if [ -z "$cuda_stub" ]; then
-              echo "CUDA driver stub libcuda.so was not found"
-              exit 1
-            fi
-            stub_dir=$(mktemp -d)
-            ln -s "$cuda_stub" "$stub_dir/libcuda.so.1"
-            export LD_LIBRARY_PATH="$stub_dir:${LD_LIBRARY_PATH:-}"
             for directory in /usr/local/cuda*/lib64 \
                              /usr/local/cuda*/targets/*/lib; do
               if [ -d "$directory" ]; then
-                export LD_LIBRARY_PATH="$directory:$LD_LIBRARY_PATH"
+                export LD_LIBRARY_PATH="$directory:${LD_LIBRARY_PATH:-}"
               fi
             done
           fi

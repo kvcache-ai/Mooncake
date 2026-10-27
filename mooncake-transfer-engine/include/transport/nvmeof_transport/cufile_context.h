@@ -15,6 +15,7 @@
 #ifndef CUFILE_CONTEXT_H_
 #define CUFILE_CONTEXT_H_
 
+#include "cuda_driver.h"
 #include <cufile.h>
 #include <fcntl.h>
 #include <glog/logging.h>
@@ -28,7 +29,7 @@
 
 static inline const char *GetCuErrorString(CUresult curesult) {
     const char *descp = "";
-    if (cuGetErrorName(curesult, &descp) != CUDA_SUCCESS)
+    if (MOONCAKE_CUDA_SYMBOL(cuGetErrorName)(curesult, &descp) != CUDA_SUCCESS)
         descp = "unknown cuda error";
     return descp;
 }
