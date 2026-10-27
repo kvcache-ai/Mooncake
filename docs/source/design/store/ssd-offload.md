@@ -152,11 +152,7 @@ This opt-in policy avoids the deferred-task loss described in [issue #3006](http
 
 **Ownership contract (`storage_path`)**: LOCAL_DISK allows **one live client per `storage_path`**. `BucketStorageBackend::Init()` opens `.mooncake_local_disk.lock` under that directory and takes a non-blocking exclusive `flock`; a second live client fails Init immediately with an actionable error (`storage_path already held by another live client … use standalone store or per-client directories`). Do not delete the lock file while a client is running — that would release the flock for other processes. `flock` is only meaningful on local filesystems (NFS and similar may not honor exclusive locks the same way).
 
-Recovery and orphan cleanup inspect only files directly in `storage_path`.
-Subdirectories may belong to other clients and are neither adopted nor cleaned
-by the parent backend. To recover a client's buckets, configure its own directory
-as `storage_path`; a parent directory does not aggregate nested buckets.
-The optional physical disk cap still measures the whole subtree's usage.
+Recovery and orphan cleanup inspect only files directly in `storage_path`. Subdirectories may belong to other clients and are neither adopted nor cleaned by the parent backend. To recover a client's buckets, configure its own directory as `storage_path`; a parent directory does not aggregate nested buckets. The optional physical disk cap still measures the whole subtree's usage.
 
 **Bucket-id pid salt (defense in depth)**: `BucketIdGenerator` mixes `getpid() & SEQUENCE_MASK` (`SEQUENCE_BITS = 12`, so pids alias mod 4096) into the starting id so two clients that somehow race in the same second are less likely to emit the same sequence. The salt only **narrows** the restart/collision window; it is not a substitute for exclusive ownership. The load-bearing guards remain the path `flock` and `O_EXCL` when creating a new bucket data file.
 
