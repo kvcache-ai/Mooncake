@@ -178,14 +178,15 @@ tl::expected<CudaIpcBufferMapping, ErrorCode> CudaIpcBufferMapping::Open(
     static_assert(sizeof(cudaIpcMemHandle_t) == kCudaIpcHandleSize,
                   "Unexpected CUDA IPC handle size");
 
-    if (handle.size == 0 || handle.device_id < 0 ||
-        AddOverflows(handle.offset, handle.size)) {
+    // handle.device_id is the exporter's ordinal under its own
+    // CUDA_VISIBLE_DEVICES. Do not require or switch to it here; opening on
+    // the caller's current device matches TENT NVLinkTransport (#4980).
+    if (handle.size == 0 || AddOverflows(handle.offset, handle.size)) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    int current_device = -1;
-    cudaGetDevice(&current_device);
-    if (cudaSetDevice(handle.device_id) != cudaSuccess) {
+    int open_device = -1;
+    if (cudaGetDevice(&open_device) != cudaSuccess || open_device < 0) {
         ClearCudaError();
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -193,6 +194,10 @@ tl::expected<CudaIpcBufferMapping, ErrorCode> CudaIpcBufferMapping::Open(
     cudaIpcMemHandle_t ipc_handle{};
     std::memcpy(&ipc_handle, handle.handle.data(), sizeof(ipc_handle));
 
+    // Open on the CALLER's current device. Never cudaSetDevice(handle.device_id):
+    // that ordinal is relative to the peer's CUDA_VISIBLE_DEVICES and may map
+    // to a different physical GPU (or an invalid index) in this process.
+    // cudaIpcMemLazyEnablePeerAccess enables peer access as needed.
     void *base = nullptr;
     cudaError_t ret =
         cudaIpcOpenMemHandle(&base, ipc_handle, cudaIpcMemLazyEnablePeerAccess);
@@ -209,14 +214,13 @@ tl::expected<CudaIpcBufferMapping, ErrorCode> CudaIpcBufferMapping::Open(
             ret = cudaErrorInvalidValue;
         }
     }
-    if (current_device >= 0) cudaSetDevice(current_device);
     if (ret != cudaSuccess || base == nullptr) {
         ClearCudaError();
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     auto *ptr = static_cast<char *>(base) + handle.offset;
-    return CudaIpcBufferMapping(base, ptr, handle.device_id);
+    return CudaIpcBufferMapping(base, ptr, open_device);
 #else
     (void)handle;
     return tl::unexpected(ErrorCode::INVALID_PARAMS);
