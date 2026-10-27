@@ -633,26 +633,41 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
+      # The Store library and its tests are about 70% of a full build, and
+      # the unit-tests job already builds and runs them. Only cuda-off runs
+      # Store tests here, so it builds just the TE tree plus those two test
+      # executables; the other legs configure with WITH_STORE=OFF. An empty
+      # build_targets builds and installs everything that was configured.
       matrix:
         include:
           - name: cuda-on
-            cmake_flags: '-DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs'
+            cmake_flags: >-
+              -DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs
+              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
             need_cuda: true
             metrics_flags: ''
+            build_targets: ''
           - name: cuda-off
             cmake_flags: '-DUSE_CUDA=OFF -DUSE_EVENT_DRIVEN_COMPLETION=ON'
             need_cuda: false
             metrics_flags: ''
+            build_targets: >-
+              mooncake-transfer-engine/all
+              transfer_task_test standalone_client_test
           - name: cuda-off-metrics-on
-            cmake_flags: '-DUSE_CUDA=OFF'
+            cmake_flags: '-DUSE_CUDA=OFF -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF'
             need_cuda: false
             metrics_flags: '-DTENT_METRICS_ENABLED=ON'
+            build_targets: ''
           # Exercise the native UB target with its injected mock adapter. A
           # Debug build also catches ODR/link errors hidden by optimization.
           - name: ub-mock
-            cmake_flags: '-DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug'
+            cmake_flags: >-
+              -DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug
+              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
             need_cuda: false
             metrics_flags: ''
+            build_targets: ''
           # Compile against stub ACL headers and embed host-only ACL stubs in
           # transfer_engine for Rust checks; no CANN, NPU, or libmf_smem is required.
           - name: memfabric-mock
@@ -662,6 +677,7 @@ jobs:
               -DCMAKE_BUILD_TYPE=Debug
             need_cuda: false
             metrics_flags: ''
+            build_targets: tent_memfabric_transport_test transfer_engine
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -713,8 +729,8 @@ jobs:
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         fi
         cd build-tent
-        if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
-          cmake --build . --target tent_memfabric_transport_test transfer_engine
+        if [ -n "${{ matrix.build_targets }}" ]; then
+          cmake --build . --target ${{ matrix.build_targets }}
         else
           cmake --build .
           sudo cmake --install .
