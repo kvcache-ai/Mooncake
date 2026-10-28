@@ -35,7 +35,8 @@ struct BlockPresence {
     }
 };
 
-// Maximum number of prefixes tracked for each context.
+// Default maximum number of prefixes tracked for each context; the service
+// configuration (max_blocks_per_context) may override it.
 constexpr size_t kDefaultMaxBlocks = 200000;
 // Target occupancy ratio for a batched capacity eviction.
 constexpr double kEvictTargetRatio = 0.9;
@@ -135,7 +136,7 @@ class PrefixCacheTable {
 
     mutable std::shared_mutex context_map_mutex_;
     std::unordered_map<ContextKey, std::shared_ptr<ContextState>> contexts_;
-    // Fixed for production; tests may set it before any context is registered.
+    // Set at construction and copied into each context when it is registered.
     size_t block_limit_ = kDefaultMaxBlocks;
 };
 
