@@ -295,7 +295,7 @@ Status AscendDirectTransport::submitTransfer(
 Status AscendDirectTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
     const int32_t current_engine_id = ResolveCurrentEngineId(agent_mode_);
-    std::vector<Slice *> slice_list;
+    std::vector<Slice*> slice_list;
     slice_list.reserve(task_list.size());
 
     for (auto index : task_list) {
@@ -314,7 +314,7 @@ Status AscendDirectTransport::submitTransferTask(
     if (current_engine_id < 0) {
         // MultiTransport already published these tasks. Attach every slice
         // before completing any, so rejected tasks cannot look successful.
-        for (auto *slice : slice_list) slice->markFailed();
+        for (auto* slice : slice_list) slice->markFailed();
         return Status::Context("aclrtGetDevice failed");
     }
 
