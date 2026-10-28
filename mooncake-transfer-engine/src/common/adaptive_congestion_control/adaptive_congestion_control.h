@@ -68,10 +68,12 @@ struct Signals {
     uint64_t completed_bytes = 0;
     uint64_t successful_completions = 0;
     uint64_t receiver_pressure = 0;
-    // Legacy health signals are accepted but do not affect the window.
+    // Explicit errors veto growth for the addressed domain in this epoch.
+    // They do not indicate congestion or replace transport recovery.
     uint64_t route_timeouts = 0;
     uint64_t hard_errors = 0;
     uint64_t fatal_failures = 0;
+    // Poller stalls remain observational and do not veto growth.
     bool poller_stalled = false;
 };
 
@@ -127,6 +129,7 @@ class DomainState {
     std::atomic<uint64_t> completed_bytes_{0};
     std::atomic<uint64_t> successful_completions_{0};
     std::atomic<uint64_t> receiver_pressure_{0};
+    std::atomic<bool> epoch_error_{false};
     uint32_t high_pressure_streak_ = 0;
     uint32_t low_pressure_streak_ = 0;
 };

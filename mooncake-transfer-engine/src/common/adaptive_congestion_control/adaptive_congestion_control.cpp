@@ -156,12 +156,16 @@ struct CoreAccess {
         addSaturating(state.successful_completions_,
                       signals.successful_completions);
         addSaturating(state.receiver_pressure_, signals.receiver_pressure);
+        if (signals.route_timeouts != 0 || signals.hard_errors != 0 ||
+            signals.fatal_failures != 0) {
+            state.epoch_error_.store(true, std::memory_order_relaxed);
+        }
         state.feedback_writers_.fetch_sub(1, std::memory_order_release);
     }
 
     static void recordOutcome(DomainState* state, uint32_t generation,
                               uint64_t bytes, OutcomeClass outcome,
-                              FailureScope, bool route) {
+                              FailureScope scope, bool route) {
         if (state == nullptr || state->config_.mode == Mode::kOff) return;
 
         Signals signals;
@@ -180,11 +184,25 @@ struct CoreAccess {
                 signals.receiver_pressure = 1;
                 break;
             case OutcomeClass::kRouteTimeout:
+                signals.route_timeouts = 1;
+                break;
             case OutcomeClass::kFatal:
+                signals.fatal_failures = 1;
+                break;
             case OutcomeClass::kLocalConfiguration:
             case OutcomeClass::kRemoteMetadata:
+                signals.hard_errors = 1;
+                break;
             case OutcomeClass::kDerivedFlush:
                 return;
+        }
+        // Peer-local failures do not veto healthy siblings on the device.
+        if (!route &&
+            (signals.route_timeouts != 0 || signals.hard_errors != 0 ||
+             signals.fatal_failures != 0) &&
+            scope != FailureScope::kCq && scope != FailureScope::kPort &&
+            scope != FailureScope::kDevice) {
+            return;
         }
         addSignals(*state, generation, signals);
     }
@@ -196,6 +214,7 @@ struct CoreAccess {
         state.completed_bytes_.store(0, std::memory_order_relaxed);
         state.successful_completions_.store(0, std::memory_order_relaxed);
         state.receiver_pressure_.store(0, std::memory_order_relaxed);
+        state.epoch_error_.store(false, std::memory_order_relaxed);
     }
 
     static bool pauseFeedback(DomainState& state, uint32_t generation) {
@@ -396,48 +415,38 @@ void controlTick(DomainState& state, uint64_t) {
         state.successful_completions_.exchange(0, std::memory_order_relaxed);
     const uint64_t receiver_pressure =
         state.receiver_pressure_.exchange(0, std::memory_order_relaxed);
+    const bool epoch_error =
+        state.epoch_error_.exchange(false, std::memory_order_relaxed);
     const uint64_t drain_ns = has_rate ? drainTimeNs(backlog, rate) : 0;
-    const bool high_pressure =
-        receiver_pressure != 0 ||
-        (has_rate && drain_ns > state.config_.target_drain_time_ns);
-    const bool low_pressure =
-        has_rate && drain_ns < state.config_.target_drain_time_ns / 2;
-
-    if (high_pressure) {
-        state.low_pressure_streak_ = 0;
-        state.high_pressure_streak_ =
-            addBounded(state.high_pressure_streak_, 1);
-        if (state.high_pressure_streak_ >= state.config_.high_pressure_epochs) {
-            const uint64_t current =
-                state.window_bytes_.load(std::memory_order_relaxed);
-            state.window_bytes_.store(
-                std::max(state.config_.min_window_bytes, current / 2),
-                std::memory_order_relaxed);
-            state.high_pressure_streak_ = 0;
-            state.state_.store(PathState::kCongested,
-                               std::memory_order_release);
-        }
+    // Drain remains consumed and computed, but never vetoes window growth.
+    // Preserve the original helper without changing code outside this block.
+    (void)drain_ns;
+    (void)addBounded;
+    state.high_pressure_streak_ = 0;
+    state.low_pressure_streak_ = 0;
+    if (receiver_pressure != 0) {
+        const uint64_t current =
+            state.window_bytes_.load(std::memory_order_relaxed);
+        state.window_bytes_.store(
+            std::max(state.config_.min_window_bytes, current / 2),
+            std::memory_order_relaxed);
+        state.state_.store(PathState::kCongested, std::memory_order_release);
         return;
     }
 
-    state.high_pressure_streak_ = 0;
-    if (successes != 0 && low_pressure) {
-        state.low_pressure_streak_ = addBounded(state.low_pressure_streak_, 1);
-        if (state.low_pressure_streak_ >= state.config_.low_pressure_epochs) {
-            const uint64_t current =
-                state.window_bytes_.load(std::memory_order_relaxed);
-            const uint64_t increment =
-                std::max<uint64_t>(1, state.config_.min_window_bytes / 4);
-            const uint64_t next =
-                current > state.config_.max_window_bytes - increment
-                    ? state.config_.max_window_bytes
-                    : current + increment;
-            state.window_bytes_.store(next, std::memory_order_relaxed);
-            state.low_pressure_streak_ = 0;
-            state.state_.store(PathState::kHealthy, std::memory_order_release);
-        }
-    } else {
-        state.low_pressure_streak_ = 0;
+    if (epoch_error) return;
+
+    if (successes != 0) {
+        const uint64_t current =
+            state.window_bytes_.load(std::memory_order_relaxed);
+        const uint64_t increment =
+            std::max<uint64_t>(1, state.config_.min_window_bytes / 4);
+        const uint64_t next =
+            current > state.config_.max_window_bytes - increment
+                ? state.config_.max_window_bytes
+                : current + increment;
+        state.window_bytes_.store(next, std::memory_order_relaxed);
+        state.state_.store(PathState::kHealthy, std::memory_order_release);
     }
 }
 
