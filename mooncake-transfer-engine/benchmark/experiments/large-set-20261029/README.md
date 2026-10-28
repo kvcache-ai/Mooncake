@@ -42,3 +42,9 @@ CPU lists and verify local NIC/NUMA topology; examples in the linked guide.
 The wrapper has Bash syntax validation; original measured per-process argv/env
 are preserved in the handoff archive. Do not interpret the 8 MiB in-flight
 window per thread as the active address range: all 1 GiB/thread is traversed.
+
+## Later address/receiver diagnostics
+
+[Code, commands and 32 screening results](address-progress/README.md) preserve
+address-walk/padding and receiver-progress-prefetch experiments. None improved
+the repeated 281.074 GB/s result. **Still not 400 GB/s.**

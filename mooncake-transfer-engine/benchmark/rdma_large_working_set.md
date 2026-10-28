@@ -220,3 +220,13 @@ restricted PCI capabilities, no host MSR device and no IMC/IIO/CHA PMU. The user
 has guest access only. There is **no verified guest-side DDIO disable control**,
 and this data does not establish DDIO's actual state or prove it is the sole
 bottleneck. CPU memory-loop results are not a DRAM/RDMA hardware ceiling either.
+
+## Later address and receiver-prefetch screening
+
+**Still not 400 GB/s.** The repeated candidate remains 281.074 GB/s.
+The [ordered diagnostic table](experiments/large-set-20261029/address-progress/README.md)
+contains three additional archived patches, copyable two-host commands and
+32 successful timing cases. Address padding/walk did not improve throughput;
+per-chunk progress reduced throughput to about193 GB/s, and coarse progress
+with receiver prefetch reached262.152–271.302 GB/s. These are negative single-run
+screenings, not stable gains; keep them disabled in the recommended candidate.
