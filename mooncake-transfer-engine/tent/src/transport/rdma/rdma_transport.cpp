@@ -210,6 +210,7 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
         params->endpoint.path_mtu = IBV_MTU_1024;
     else
         params->endpoint.path_mtu = IBV_MTU_512;
+    params->endpoint.max_path_mtu = params->endpoint.path_mtu;
 
     // Optional per-pool QP layout (RFC #2568 step 2). Each entry defines a
     // named pool with its own QP count and link-layer SL/TC;

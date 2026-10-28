@@ -103,6 +103,11 @@ class RdmaTransportTestPeer {
         transport.metadata_ = std::move(metadata);
     }
 
+    static void setServerName(RdmaTransport& transport,
+                              const std::string& name) {
+        transport.rdma_server_name_ = name;
+    }
+
     static void bindContexts(RdmaTransport& transport,
                              RdmaContextSet contexts) {
         transport.context_set_ = std::move(contexts);
@@ -362,6 +367,10 @@ class RdmaContextTestPeer {
 
     static void unbindDevice(RdmaContext& context) {
         context.native_context_ = nullptr;
+    }
+
+    static void setPathMtu(RdmaContext& context, ibv_mtu mtu) {
+        context.path_mtu_ = mtu;
     }
 
     // Everything construct() does before it calls enable(), so a test can
@@ -1771,6 +1780,7 @@ struct FakeRnic {
     // What the device reports.
     int phys_port_cnt = 1;
     ibv_port_state port_state = IBV_PORT_ACTIVE;
+    ibv_mtu active_mtu = IBV_MTU_1024;
     uint64_t effective_speed_100mbps = 0;
 
     // Where to fail; false / -1 means "never".
@@ -1848,7 +1858,7 @@ int fakeRnicQueryPort(ibv_context* context, uint8_t, ibv_port_attr* attr) {
     attr->state = fake_rnic.port_state;
     attr->active_speed = 128;  // NDR
     attr->active_width = 2;    // 4x -> 400 Gbps encoded
-    attr->active_mtu = IBV_MTU_1024;
+    attr->active_mtu = fake_rnic.active_mtu;
     attr->lid = 7;
     attr->gid_tbl_len = 4;
     return 0;
@@ -2003,6 +2013,30 @@ class RdmaContextEnableTest : public ::testing::Test {
     int async_fd_ = -1;
     int channel_fd_[FakeRnic::kChannels] = {-1, -1};
 };
+
+// Two NICs opened with the same params: each keeps its own path MTU, and
+// only the engine-wide value (what peers that predate the MTU exchange get)
+// still drops to the smaller one.
+TEST_F(RdmaContextEnableTest, EachNicKeepsItsOwnPathMtu) {
+    auto rail = std::make_unique<RdmaContext>(transport_);
+    RdmaContextTestPeer::verbs(*rail) = RdmaContextTestPeer::verbs(*context_);
+    RdmaContextTestPeer::prepareForEnable(*rail, FakeRnic::kName, params_);
+    fake_rnic.active_mtu = IBV_MTU_1024;
+    ASSERT_EQ(context_->enable(), 0);
+    fake_rnic.active_mtu = IBV_MTU_4096;
+    ASSERT_EQ(rail->enable(), 0);
+    EXPECT_EQ(context_->pathMtu(), IBV_MTU_1024);
+    EXPECT_EQ(rail->pathMtu(), IBV_MTU_4096);
+    EXPECT_EQ(params_->endpoint.path_mtu, IBV_MTU_1024);
+}
+
+TEST_F(RdmaContextEnableTest, ConfiguredPathMtuCapsTheNic) {
+    params_->endpoint.path_mtu = IBV_MTU_2048;
+    params_->endpoint.max_path_mtu = IBV_MTU_2048;
+    fake_rnic.active_mtu = IBV_MTU_4096;
+    ASSERT_EQ(context_->enable(), 0);
+    EXPECT_EQ(context_->pathMtu(), IBV_MTU_2048);
+}
 
 TEST_F(RdmaContextEnableTest, EnableBuildsEverythingAndDisableGivesItBack) {
     ASSERT_EQ(context_->enable(), 0);
@@ -4191,25 +4225,49 @@ TEST_F(RdmaEndpointPathMtuTest, BothQpKindsUseTheSmallerMtu) {
 }
 
 TEST_F(RdmaEndpointPathMtuTest, PeerWithoutMtuKeepsTheEngineWideMtu) {
-    params_->endpoint.path_mtu = IBV_MTU_2048;
+    RdmaContextTestPeer::setPathMtu(*context_, IBV_MTU_2048);
+    params_->endpoint.path_mtu = IBV_MTU_1024;
     BootstrapDesc local;
     ASSERT_TRUE(endpoint_->accept(peer(0), local).ok());
+    expectRtrs(IBV_MTU_1024);
+    EXPECT_EQ(local.path_mtu, 2048u);
+}
+
+// Another NIC of the engine with a smaller MTU no longer holds this one.
+TEST_F(RdmaEndpointPathMtuTest, SmallerNicElsewhereDoesNotLowerThisOne) {
+    RdmaContextTestPeer::setPathMtu(*context_, IBV_MTU_2048);
+    params_->endpoint.path_mtu = IBV_MTU_1024;
+    BootstrapDesc local;
+    ASSERT_TRUE(endpoint_->accept(peer(4096), local).ok());
     expectRtrs(IBV_MTU_2048);
     EXPECT_EQ(local.path_mtu, 2048u);
 }
 
+// A NIC connected to itself has no peer description to read the MTU from.
+TEST_F(RdmaEndpointPathMtuTest, SameNicUsesItsOwnMtu) {
+    RdmaContextTestPeer::setPathMtu(*context_, IBV_MTU_2048);
+    params_->endpoint.path_mtu = IBV_MTU_1024;
+    RdmaTransportTestPeer::setServerName(transport_, "self:1");
+    ASSERT_TRUE(endpoint_->connect("self:1", context_->name()).ok());
+    ASSERT_EQ(rtrs.size(), 1u);  // no notification QP on this path
+    EXPECT_EQ(rtrs[0].second, IBV_MTU_2048);
+}
+
 TEST_F(RdmaEndpointPathMtuTest, DuplicateBootstrapReportsTheMtu) {
+    RdmaContextTestPeer::setPathMtu(*context_, IBV_MTU_2048);
+    params_->endpoint.path_mtu = IBV_MTU_1024;
     BootstrapDesc first, again;
     ASSERT_TRUE(endpoint_->accept(peer(1024), first).ok());
     ASSERT_TRUE(endpoint_->accept(peer(1024), again).ok());
     EXPECT_EQ(rtrs.size(), 2u);  // the second one set nothing up
-    EXPECT_EQ(again.path_mtu, first.path_mtu);
+    EXPECT_EQ(again.path_mtu, 2048u);
 }
 
 // The initiator side: connect() reports its own MTU and programs the
 // smaller one the peer's reply reports.
 TEST_F(RdmaEndpointPathMtuTest, ConnectUsesTheMtuThePeerReports) {
-    params_->endpoint.path_mtu = IBV_MTU_2048;
+    RdmaContextTestPeer::setPathMtu(*context_, IBV_MTU_2048);
+    params_->endpoint.path_mtu = IBV_MTU_1024;
     std::atomic<uint32_t> reported{0};
     ControlService peer_service("p2p", "", nullptr);
     peer_service.setBootstrapRdmaCallback(

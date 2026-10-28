@@ -58,6 +58,10 @@ struct EndPointParams {
     int max_qp_wr = 256;
     int max_inline_bytes = 64;
     ibv_mtu path_mtu = IBV_MTU_4096;
+    // path_mtu as configured; path_mtu itself is lowered to the smallest
+    // active MTU of all NICs and is what peers that predate the MTU
+    // exchange get.
+    ibv_mtu max_path_mtu = IBV_MTU_4096;
 
     // Named QP pools. Empty (default) = today's behavior: a single homogeneous
     // run of qp_mul_factor data QPs, all handshaked with the global SL/TC. When

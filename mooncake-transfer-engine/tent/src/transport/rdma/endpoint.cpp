@@ -456,7 +456,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         local_desc.notify_qp_num = notifyQpNum();
         local_desc.local_lid = local_address.lid;
         local_desc.local_gid = local_address.gid;
-        local_desc.path_mtu = pathMtuBytes(params_->path_mtu);
+        local_desc.path_mtu = pathMtuBytes(context_->pathMtu());
 
         same_nic = (local_desc.local_nic_path == local_desc.peer_nic_path);
         is_self =
@@ -635,7 +635,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
             local_desc.local_lid = local_address_.lid;
             local_desc.local_gid = local_address_.gid;
             local_desc.notify_qp_num = notifyQpNum();
-            local_desc.path_mtu = pathMtuBytes(params_->path_mtu);
+            local_desc.path_mtu = pathMtuBytes(context_->pathMtu());
             return mooncake::tent::Status::OK();
         }
         // The bootstrap does not match the established connection: the peer
@@ -672,7 +672,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     local_desc.local_lid = local_address_.lid;
     local_desc.local_gid = local_address_.gid;
     local_desc.notify_qp_num = notifyQpNum();  // Pass notification QP number
-    local_desc.path_mtu = pathMtuBytes(params_->path_mtu);
+    local_desc.path_mtu = pathMtuBytes(context_->pathMtu());
     if (peer_desc.local_gid.empty()) {
         return mooncake::tent::Status::InvalidArgument(
             "Missing peer GID in bootstrap" LOC_MARK);
@@ -759,12 +759,12 @@ int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint32_t peer_lid,
         return -1;
     }
 
-    path_mtu_ =
-        negotiatedPathMtu(params_->path_mtu, peer_path_mtu, params_->path_mtu);
+    path_mtu_ = negotiatedPathMtu(context_->pathMtu(), peer_path_mtu,
+                                  params_->path_mtu);
     VLOG(1) << "Path MTU " << pathMtuBytes(path_mtu_) << " on "
             << context_->name() << " for endpoint " << peer_nic_name_ << " of "
             << peer_server_name_ << " (local "
-            << pathMtuBytes(params_->path_mtu) << ", peer " << peer_path_mtu
+            << pathMtuBytes(context_->pathMtu()) << ", peer " << peer_path_mtu
             << ")";
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
         int ret =
