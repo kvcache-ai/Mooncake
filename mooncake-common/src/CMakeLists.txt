@@ -55,5 +55,6 @@ target_link_libraries(
                          yalantinglibs::yalantinglibs)
 
 if(BUILD_SHARED_LIBS)
+  set_target_properties(mooncake_common PROPERTIES INSTALL_RPATH "$ORIGIN")
   install(TARGETS mooncake_common DESTINATION lib)
 endif()

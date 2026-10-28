@@ -51,7 +51,7 @@ class BatchEvictBench {
         return true;
     }
 
-    static bool RunSingleWaiterSnapshotMutexProbe() {
+    static bool RunSingleWaiterMasterStateMutexProbe() {
         if (std::getenv("MOONCAKE_EVICT_BENCH_LOCK_PROBE") == nullptr) {
             return true;
         }
@@ -172,41 +172,47 @@ class BatchEvictBench {
         const auto base_expiration = now - std::chrono::hours(1);
         size_t ordinal = 0;
 
-        for (size_t shard_idx = 0;
-             shard_idx < MasterServiceTestPeer::kNumShards; ++shard_idx) {
-            MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
-                                                                 shard_idx);
-            for (auto& [tenant_id, tenant_state] : shard->tenants) {
-                if (tenant_id != TenantId::Default()) {
-                    continue;
-                }
-                for (auto& [key, record] : tenant_state.metadata) {
-                    auto& metadata = record.metadata;
-                    {
-                        SpinLocker locker(&metadata.lock);
-                        metadata.lease_->SetDeadline(
-                            base_expiration +
-                            std::chrono::nanoseconds(ordinal++));
-                    }
+        // Each object is changed under its key's write lock, so whatever the
+        // service files by lease sees the new deadline once it is let go.
+        std::vector<std::string> keys;
+        const metadata::Namespace* ns =
+            MasterServiceTestPeer::Namespaces(service).Lookup(
+                TenantId::Default());
+        if (ns != nullptr) {
+            for (auto object : ns->objects.ReadCursor()) {
+                keys.push_back(object.key());
+            }
+        }
+        for (const auto& key : keys) {
+            auto hold = MasterServiceTestPeer::WriteObject(
+                service, MasterServiceTestPeer::ObjectIdentity{
+                             TenantId::Default(), key});
+            if (!hold) {
+                continue;
+            }
+            auto& metadata = hold->metadata();
+            {
+                SpinLocker locker(&metadata.lock);
+                metadata.lease_->SetDeadline(
+                    base_expiration + std::chrono::nanoseconds(ordinal++));
+            }
 
-                    ++stats.object_count;
-                    if (!metadata.IsLeaseExpired(now)) {
-                        ++stats.unexpired_leases;
+            ++stats.object_count;
+            if (!metadata.IsLeaseExpired(now)) {
+                ++stats.unexpired_leases;
+            }
+            for (const auto& replica : metadata.GetAllReplicas()) {
+                if (replica.is_memory_replica()) {
+                    if (replica.is_completed()) {
+                        ++stats.completed_memory_replicas;
+                    } else {
+                        ++stats.incomplete_replicas;
                     }
-                    for (const auto& replica : metadata.GetAllReplicas()) {
-                        if (replica.is_memory_replica()) {
-                            if (replica.is_completed()) {
-                                ++stats.completed_memory_replicas;
-                            } else {
-                                ++stats.incomplete_replicas;
-                            }
-                            if (replica.get_refcnt() != 0) {
-                                ++stats.busy_memory_replicas;
-                            }
-                        } else {
-                            ++stats.non_memory_replicas;
-                        }
+                    if (replica.get_refcnt() != 0) {
+                        ++stats.busy_memory_replicas;
                     }
+                } else {
+                    ++stats.non_memory_replicas;
                 }
             }
         }
@@ -277,7 +283,7 @@ class BatchEvictBench {
         uint64_t wait_us = 0;
         {
             std::unique_lock<std::shared_mutex> lock(
-                MasterServiceTestPeer::SnapshotMutex(service));
+                MasterServiceTestPeer::MasterStateMutex(service));
             const auto wait_end = std::chrono::steady_clock::now();
             wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
                           wait_end - wait_start)
@@ -461,7 +467,7 @@ int main(int argc, char** argv) {
 
     using mooncake::benchmarks::BatchEvictBench;
     const bool ok = BatchEvictBench::RunRealBatchEvictScales() &&
-                    BatchEvictBench::RunSingleWaiterSnapshotMutexProbe();
+                    BatchEvictBench::RunSingleWaiterMasterStateMutexProbe();
 
     google::ShutdownGoogleLogging();
     return ok ? 0 : 1;
