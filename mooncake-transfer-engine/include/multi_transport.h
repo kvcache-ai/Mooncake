@@ -15,7 +15,6 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
-#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <map>

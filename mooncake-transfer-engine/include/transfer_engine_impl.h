@@ -15,6 +15,9 @@
 #ifndef MULTI_TRANSFER_ENGINE_IMPL_H_
 #define MULTI_TRANSFER_ENGINE_IMPL_H_
 
+#include <limits.h>
+#include <string.h>
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
