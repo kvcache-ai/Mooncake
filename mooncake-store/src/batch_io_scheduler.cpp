@@ -153,13 +153,14 @@ class BatchIoScheduler::Impl {
                 result = tl::make_unexpected(*task.batch->error);
             } else {
                 lock.unlock();
-            try {
-                result = task.sub_batch.execute(task.sub_batch.slice_idx_begin,
-                                                task.sub_batch.slice_idx_end);
-            } catch (...) {
-                result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-            lock.lock();
+                try {
+                    result =
+                        task.sub_batch.execute(task.sub_batch.slice_idx_begin,
+                                               task.sub_batch.slice_idx_end);
+                } catch (...) {
+                    result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                lock.lock();
             }
             if (!result) {
                 if (!task.batch->error) task.batch->error = result.error();

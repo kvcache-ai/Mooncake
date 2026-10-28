@@ -124,7 +124,8 @@ class FileStorageTest : public ::testing::Test {
         ASSERT_EQ(tasks.size(), keys.size());
         if (write_workers > 0) {
             // A missing source must not fail the other keys in its bucket.
-            tasks.push_back({TenantId::Default().value(), "missing_source", 128});
+            tasks.push_back(
+                {TenantId::Default().value(), "missing_source", 128});
         }
         void* overwrite_buffer = allocator.allocate(values.front().size());
         ASSERT_NE(overwrite_buffer, nullptr);

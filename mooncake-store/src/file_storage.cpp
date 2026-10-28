@@ -486,29 +486,31 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
             auto res = complete_handler(keys, metadatas);
             if (res == ErrorCode::OK) {
-                for (const auto& key : keys) bucket->reported_keys.at(key) = true;
+                for (const auto& key : keys)
+                    bucket->reported_keys.at(key) = true;
             }
             try {
-            if (res == ErrorCode::OK && ssd_metric_) {
-                auto elapsed_us =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - offload_start)
-                        .count();
-                int64_t total_bytes = 0;
-                for (const auto& metadata : metadatas) {
-                    total_bytes += metadata.data_size;
+                if (res == ErrorCode::OK && ssd_metric_) {
+                    auto elapsed_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - offload_start)
+                            .count();
+                    int64_t total_bytes = 0;
+                    for (const auto& metadata : metadatas) {
+                        total_bytes += metadata.data_size;
+                    }
+                    ssd_metric_->ssd_write_ops.inc(keys.size());
+                    ssd_metric_->ssd_write_bytes.inc(total_bytes);
+                    ssd_metric_->ssd_write_latency_us.observe(elapsed_us);
+                    ssd_metric_->ssd_write_latency_summary.observe(elapsed_us);
+                    ssd_metric_->ssd_total_ops.inc(keys.size());
+                    ssd_metric_->ssd_total_bytes.inc(total_bytes);
+                    ssd_metric_->ssd_total_latency_us.observe(elapsed_us);
+                    ssd_metric_->ssd_total_latency_summary.observe(elapsed_us);
                 }
-                ssd_metric_->ssd_write_ops.inc(keys.size());
-                ssd_metric_->ssd_write_bytes.inc(total_bytes);
-                ssd_metric_->ssd_write_latency_us.observe(elapsed_us);
-                ssd_metric_->ssd_write_latency_summary.observe(elapsed_us);
-                ssd_metric_->ssd_total_ops.inc(keys.size());
-                ssd_metric_->ssd_total_bytes.inc(total_bytes);
-                ssd_metric_->ssd_total_latency_us.observe(elapsed_us);
-                ssd_metric_->ssd_total_latency_summary.observe(elapsed_us);
-            }
             } catch (...) {
-                // Metrics must not roll back a replica already accepted by Master.
+                // Metrics must not roll back a replica already accepted by
+                // Master.
                 LOG(WARNING) << "Failed to record offload metrics";
             }
             return res;

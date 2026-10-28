@@ -56,11 +56,9 @@ class BatchIoScheduler {
     // 4). A final group of at most floor(sub_batch_size / 4) Slices joins the
     // previous group. Append directly to unpublished task nodes.
     // No callback runs here. Any error invalidates the entire pending batch.
-    tl::expected<void, ErrorCode> PrepareSubBatches(PendingBatch& batch,
-                                                    size_t slice_count,
-                                                    size_t sub_batch_size,
-                                                    const Execute& execute,
-                                                    const Complete& complete = {});
+    tl::expected<void, ErrorCode> PrepareSubBatches(
+        PendingBatch& batch, size_t slice_count, size_t sub_batch_size,
+        const Execute& execute, const Complete& complete = {});
     // With complete, each nonempty preparation is an independent failure group.
     // Its callback runs once, after all group tasks terminate (including
     // skipped tasks), outside scheduler locks. A group failure does not cancel
