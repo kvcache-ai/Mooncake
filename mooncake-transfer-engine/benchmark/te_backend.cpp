@@ -1,3 +1,6 @@
+#include <sched.h>
+#include <cstdlib>
+#include <cstring>
 // Copyright 2025 KVCache.AI
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -765,6 +768,24 @@ void TEBenchRunner::pinThread(int thread_id) {
         bindToSocket(socket_id);
 #endif
     }
+    // Task-local experiment: split the two already-authorized CPUs by role.
+    // Never expand affinity; fail visibly if the process has a different mask.
+    const char* split_cpu = std::getenv("MC_EXPERIMENTAL_SPLIT_CPU");
+    if (split_cpu && std::strcmp(split_cpu, "1") == 0) {
+        cpu_set_t allowed, selected;
+        CHECK_EQ(sched_getaffinity(0, sizeof(allowed), &allowed), 0);
+        CHECK_EQ(CPU_COUNT(&allowed), 2);
+        int cpu = -1;
+        for (int i = 0; i < CPU_SETSIZE; ++i) {
+            if (CPU_ISSET(i, &allowed) && (cpu < 0 || false)) cpu = i;
+        }
+        CHECK_GE(cpu, 0);
+        CPU_ZERO(&selected);
+        CPU_SET(cpu, &selected);
+        CHECK_EQ(sched_setaffinity(0, sizeof(selected), &selected), 0);
+        LOG(INFO) << "Experimental benchmark submitter CPU=" << cpu;
+    }
+
 }
 
 int TEBenchRunner::runner(int thread_id) {

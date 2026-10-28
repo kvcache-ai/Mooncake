@@ -15,6 +15,9 @@
 #include "transport/rdma_transport/worker_pool.h"
 
 #include <sys/epoll.h>
+#include <sched.h>
+#include <cstdlib>
+#include <cstring>
 
 #include <algorithm>
 #include <cassert>
@@ -1244,6 +1247,24 @@ bool WorkerPool::hasOutstandingCq(int thread_id) {
 
 void WorkerPool::transferWorker(int thread_id) {
     bindToSocket(numa_socket_id_);
+    // Task-local experiment: split the two already-authorized CPUs by role.
+    // Never expand affinity; fail visibly if the process has a different mask.
+    const char* split_cpu = std::getenv("MC_EXPERIMENTAL_SPLIT_CPU");
+    if (split_cpu && std::strcmp(split_cpu, "1") == 0) {
+        cpu_set_t allowed, selected;
+        CHECK_EQ(sched_getaffinity(0, sizeof(allowed), &allowed), 0);
+        CHECK_EQ(CPU_COUNT(&allowed), 2);
+        int cpu = -1;
+        for (int i = 0; i < CPU_SETSIZE; ++i) {
+            if (CPU_ISSET(i, &allowed) && (cpu < 0 || true)) cpu = i;
+        }
+        CHECK_GE(cpu, 0);
+        CPU_ZERO(&selected);
+        CPU_SET(cpu, &selected);
+        CHECK_EQ(sched_setaffinity(0, sizeof(selected), &selected), 0);
+        LOG(INFO) << "Experimental RDMA worker CPU=" << cpu;
+    }
+
     // Busy-poll this long after the pool goes idle before parking
     // (MC_RDMA_WORKER_IDLE_SPIN_US, 100 ms by default).
     const uint64_t idle_spin_ns =
