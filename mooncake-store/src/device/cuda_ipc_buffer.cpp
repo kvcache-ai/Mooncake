@@ -198,8 +198,7 @@ tl::expected<CudaIpcBufferMapping, ErrorCode> CudaIpcBufferMapping::Open(
     }
 
     int previous_device = -1;
-    if (cudaGetDevice(&previous_device) != cudaSuccess ||
-        previous_device < 0) {
+    if (cudaGetDevice(&previous_device) != cudaSuccess || previous_device < 0) {
         ClearCudaError();
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
