@@ -154,7 +154,8 @@ struct GlobalConfig {
     // cap.
     int efa_cq_threads = 1;
     // Register GPU memory with ibv_reg_mr() through the nvidia-peermem kernel
-    // module instead of exporting a dma_buf. Set via WITH_NVIDIA_PEERMEM.
+    // module instead of exporting a dma_buf. loadGlobalConfig() sets it to
+    // whether a peer-memory module is loaded; WITH_NVIDIA_PEERMEM overrides.
     bool with_nvidia_peermem = true;
     // Register dma_buf MRs with mlx5 Data Direct. Set via MC_RDMA_DATA_DIRECT.
     bool rdma_data_direct = false;
