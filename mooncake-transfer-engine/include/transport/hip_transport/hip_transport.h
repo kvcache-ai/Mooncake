@@ -85,10 +85,18 @@ class HipTransport : public Transport {
     // returned status; the others stay tracked by the event.
     Status submitDeviceCopies(int device_id, const std::vector<Slice*>& slices);
 
+    // With MC_HIP_WAIT_CALLER_STREAM: make stream wait for the null stream
+    // of each device in this process that holds data of slices.
+    bool waitForCallerStreams(int device_id, hipStream_t stream,
+                              hipEvent_t event,
+                              const std::vector<Slice*>& slices);
+
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
         remap_entries_;
     RWSpinlock remap_lock_;
     bool use_fabric_mem_;
+    // MC_HIP_WAIT_CALLER_STREAM: order copies after the caller's null stream.
+    bool wait_caller_stream_;
 
     std::mutex register_mutex_;
     // Registered sub-range address → its hipMalloc base; base → live alias

@@ -18,6 +18,7 @@
 #include <hip/hip_runtime.h>
 
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -26,7 +27,8 @@ namespace mooncake {
 // StreamPool manages a pool of HIP streams per device for async operations
 class StreamPool {
    public:
-    explicit StreamPool(int num_streams_per_device);
+    // priority: "low", "normal" or "high", mapped to the device's range.
+    StreamPool(int num_streams_per_device, std::string priority);
     ~StreamPool();
 
     // Disable copy (to prevent double-free of HIP resources)
@@ -44,6 +46,7 @@ class StreamPool {
     bool initializeStreamsForDevice(int device_id);
 
     int num_streams_per_device_;
+    std::string priority_;
     std::mutex mutex_;
     std::unordered_map<int, std::vector<hipStream_t>> streams_;
     std::unordered_map<int, int> current_stream_idx_;
