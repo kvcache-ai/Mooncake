@@ -1586,9 +1586,15 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         }
 
         updateGlobalConfig(device_attr);
+        supports_rdma_atomic_ = device_attr.atomic_cap != IBV_ATOMIC_NONE;
         max_qp_rd_atom_ = clampRdAtomicDepth(device_attr.max_qp_rd_atom);
         max_qp_init_rd_atom_ =
             clampRdAtomicDepth(device_attr.max_qp_init_rd_atom);
+        if (!supports_rdma_atomic_) {
+            LOG(INFO) << "RNIC " << device_name
+                      << " reports no RDMA atomic; data QPs will not request "
+                         "IBV_ACCESS_REMOTE_ATOMIC";
+        }
         if (max_qp_rd_atom_ < kIdealRdAtomicDepth ||
             max_qp_init_rd_atom_ < kIdealRdAtomicDepth) {
             LOG(WARNING)
