@@ -88,7 +88,11 @@ RdmaEndPoint::RdmaEndPoint()
       inflight_slices_(0),
       destroy_start_time_(0) {}
 
-RdmaEndPoint::~RdmaEndPoint() { deconstruct(); }
+RdmaEndPoint::~RdmaEndPoint() {
+    if (deconstruct())
+        LOG(FATAL)
+            << "Cannot release endpoint buffers before native QP/MR teardown";
+}
 
 int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
                             const std::string& endpoint_name) {
@@ -1373,7 +1377,7 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     sge.lkey = notify_send_mr_->lkey;
 
     ibv_send_wr wr = {};
-    wr.wr_id = notify_send_wr_id_++;
+    wr.wr_id = notify_send_wr_id_;
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_SEND;
@@ -1390,6 +1394,9 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
         return false;
     }
 
+    // Only a posted WR takes a wr_id: slot reuse relies on every lower wr_id
+    // having been posted, and so counted in notify_pending_count_.
+    ++notify_send_wr_id_;
     notify_pending_count_++;
     notify_inflight_.fetch_add(1, std::memory_order_release);
     return true;

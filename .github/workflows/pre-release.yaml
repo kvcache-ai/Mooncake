@@ -75,6 +75,142 @@ jobs:
       artifact-prefix: ${{ matrix.artifact-prefix }}
       version-override: ${{ needs.version-stamp.outputs.package_version }}
 
+
+  build-npu:
+    name: Build NPU wheels (${{ matrix.arch }}, py${{ matrix.python-version }})
+    needs: version-stamp
+    strategy:
+      fail-fast: false
+      # Match the stable release-npu pipeline: at most two toolchain-heavy
+      # jobs in flight, bounding CDN load and runner-recycling exposure.
+      max-parallel: 2
+      matrix:
+        arch: [aarch64, x86_64]
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
+        include:
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            cann_arch: aarch64
+          - arch: x86_64
+            runner: ubuntu-22.04
+            cann_arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    env:
+      NPU_BUILD: "1"
+      WHEEL_VERSION: ${{ needs.version-stamp.outputs.package_version }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set Python bin
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHON_BIN="$(command -v python${{ matrix.python-version }})"
+          "$PYTHON_BIN" --version
+          echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
+
+      - name: Install CANN Toolkit
+        shell: bash
+        run: |
+          set -euo pipefail
+          CANN_BASE_URL="https://ascend.devcloud.huaweicloud.com/cann/run/software"
+          CANN_VERSION=$(curl -s "${CANN_BASE_URL}/" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+(?=/)' | sort -V | tail -1)
+          echo "Latest CANN version: ${CANN_VERSION}"
+          CANN_URL="${CANN_BASE_URL}/${CANN_VERSION}/${{ matrix.cann_arch }}/Ascend-cann-toolkit_${CANN_VERSION}_linux-${{ matrix.cann_arch }}.run"
+          echo "Downloading CANN ${CANN_VERSION} from ${CANN_URL}"
+          wget -q --show-progress -O /tmp/cann_toolkit.run "${CANN_URL}"
+          chmod +x /tmp/cann_toolkit.run
+          sudo /tmp/cann_toolkit.run --install --install-for-all --install-path=/usr/local/Ascend --quiet
+          rm -f /tmp/cann_toolkit.run
+
+      - name: Build and install HIXL
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          sudo ${PYTHON_BIN} -m pip install setuptools
+          cd /tmp
+          git clone https://gitcode.com/cann/hixl.git
+          cd hixl
+          bash build.sh -j$(nproc)
+          sudo ./build_out/cann-hixl_*.run --full --quiet --pylocal --install-path=/usr/local/Ascend
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          sudo bash dependencies.sh -y
+          sudo bash scripts/ascend/dependencies_ascend_installation.sh
+
+      - name: Configure project
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          rm -rf build
+          mkdir build
+          cd build
+          cmake ..             -DUSE_ASCEND_DIRECT=ON             -DUSE_ETCD=ON             -DSTORE_USE_ETCD=ON             -DBUILD_UNIT_TESTS=OFF             -DCMAKE_BUILD_TYPE=Release             -DPython3_EXECUTABLE="${PYTHON_BIN}"             -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF             -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF             -DCMAKE_SKIP_INSTALL_RPATH=ON
+
+      - name: Build project
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          cd build
+          cmake --build . -j"$(nproc)"
+          sudo cmake --install .
+
+      - name: Generate Python version tag
+        id: generate_tag_release
+        shell: bash
+        run: |
+          echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+
+      - name: Patch wheel version in pyproject.toml
+        run: |
+          cd mooncake-wheel
+          sed -i "s/^version = .*/version = \"${WHEEL_VERSION}\"/" pyproject.toml
+          echo "Patched pyproject.toml version to: ${WHEEL_VERSION}"
+
+      - name: Build Python wheel
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          NPU_BUILD=1 PYTHON_VERSION=${{ matrix.python-version }} \
+            OUTPUT_DIR=dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }} \
+            ./scripts/build_wheel.sh
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Prefix deliberately does not match the core 'mooncake-wheel*pre-release*'
+          # download pattern: core publish jobs must never pick up NPU artifacts.
+          name: mooncake-npu-wheel-pre-release-${{ matrix.arch }}-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          path: mooncake-wheel/dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
+
   publish-github-release:
     name: Upload wheels to GitHub Pre-release
     needs: build
@@ -172,6 +308,90 @@ jobs:
           python scripts/ci/testpypi_wheel_gate.py wait-upload-state \
             --directory mooncake-wheel/dist-release \
             --version "$PACKAGE_VERSION"
+
+  publish-npu-wheels:
+    name: Publish NPU wheels (best-effort)
+    # True best-effort: depends only on the core pre-release having been
+    # created. Publishes whichever NPU wheels actually made it; a partial
+    # matrix is published with a warning, and zero wheels leaves the run green.
+    needs: [build-npu, publish-github-release]
+    # !cancelled() keeps best-effort semantics when NPU legs fail, while the
+    # needs edge guarantees every NPU leg has reached a terminal state before
+    # this job collects artifacts (the NPU matrix at max-parallel: 2 runs far
+    # longer than the core build).
+    if: ${{ !cancelled() && needs.publish-github-release.result == 'success' }}
+    runs-on: ubuntu-22.04
+    environment: nightly
+    concurrency:
+      group: pre-release-npu-${{ github.ref_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: Download NPU wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: mooncake-wheel/dist-npu
+          pattern: mooncake-npu-wheel-pre-release-*
+          merge-multiple: true
+
+      - name: Collect NPU wheels and check coverage
+        run: |
+          set -euo pipefail
+          mkdir -p mooncake-wheel/dist-npu mooncake-wheel/dist-release
+          find mooncake-wheel/dist-npu -name "*.whl" -exec cp {} mooncake-wheel/dist-release/ \;
+          count=$(find mooncake-wheel/dist-release -name "*.whl" | wc -l)
+          echo "Collected ${count} NPU wheel(s):"
+          find mooncake-wheel/dist-release -name "*.whl" -exec ls -la {} \;
+          if [ "${count}" -eq 0 ]; then
+            echo "::warning::No NPU wheels were produced; skipping NPU publication."
+            echo "PUBLISH_NPU=no" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "PUBLISH_NPU=yes" >> "$GITHUB_ENV"
+          if [ "${count}" -lt 10 ]; then
+            echo "::warning::Partial NPU wheel set (${count}/10 expected for 2 arches x 5 Pythons); publishing what exists."
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Require TestPyPI credentials
+        if: env.PUBLISH_NPU == 'yes'
+        env:
+          TESTPYPI_API_TOKEN: ${{ secrets.TESTPYPI_API_TOKEN }}
+        run: |
+          if [ -z "$TESTPYPI_API_TOKEN" ]; then
+            echo "TESTPYPI_API_TOKEN is required"
+            exit 1
+          fi
+
+      - name: Validate NPU wheels with twine
+        if: env.PUBLISH_NPU == 'yes'
+        run: |
+          python -m pip install twine
+          twine check mooncake-wheel/dist-release/*.whl
+
+      - name: Append NPU wheels to GitHub Pre-release
+        if: env.PUBLISH_NPU == 'yes'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: true
+          make_latest: false
+          files: mooncake-wheel/dist-release/*.whl
+          fail_on_unmatched_files: true
+
+      - name: Publish NPU wheels to TestPyPI
+        if: env.PUBLISH_NPU == 'yes'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.TESTPYPI_API_TOKEN }}
+        run: >-
+          twine upload --repository testpypi --skip-existing
+          mooncake-wheel/dist-release/*.whl
 
   consume-testpypi:
     name: Consume ${{ matrix.package }} on ${{ matrix.architecture }}

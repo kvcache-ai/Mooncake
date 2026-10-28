@@ -1,3 +1,4 @@
+import functools
 import os
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
@@ -26,8 +27,25 @@ _ZERO_COPY_COMBINE_UNSUPPORTED = (
 )
 
 
+@functools.lru_cache(maxsize=None)
+def _device_type() -> str:
+    """The device the native module was built for: "cuda" or "xpu"."""
+    from mooncake import ep
+
+    return getattr(ep, "DEVICE_TYPE", "cuda")
+
+
 def _native_current_stream_ptr() -> int:
+    if _device_type() == "xpu":
+        return int(torch.xpu.current_stream().sycl_queue)
     return int(torch.cuda.current_stream().cuda_stream)
+
+
+def _synchronize_device() -> None:
+    if _device_type() == "xpu":
+        torch.xpu.synchronize()
+    else:
+        torch.cuda.synchronize()
 
 
 def _wait_native_event_on_current_stream(event: "ep.EventHandle") -> None:
@@ -107,9 +125,18 @@ class Buffer:
         self.group = group
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
         self.backend = self.group
+        self.device_type = _device_type()
+        runtime_kwargs = {}
+        if self.device_type == "xpu":
+            # The XPU runtime allocates on, and launches into, torch's queue.
+            runtime_kwargs["stream_ptr"] = _native_current_stream_ptr()
         # NIC auto-detection happens inside ep.Buffer via Topology::discover().
         self.runtime = ep.Buffer(
-            self.rank, self.group_size, num_ep_buffer_bytes, disable_p2p
+            self.rank,
+            self.group_size,
+            num_ep_buffer_bytes,
+            disable_p2p,
+            **runtime_kwargs,
         )
         # Fallback flag and buffers.
         # Note: `sync_nvlink_ipc_handles()` can mutate C++ `ibgda_disabled_` (True->False when
@@ -181,22 +208,34 @@ class Buffer:
 
         return wrapped_hook
 
+    def _bootstrap_device(self) -> torch.device:
+        """Device for the tensors that bootstrap exchanges over the group."""
+        if self.device_type != "xpu":
+            return torch.device("cuda")
+        try:
+            backend = dist.get_backend(self.group)
+        except Exception:
+            backend = None
+        return torch.device("cpu" if backend == "gloo" else "xpu")
+
     def connect(self, is_update: bool = False):
-        if not self._use_fallback:
+        device = self._bootstrap_device()
+        # XPU has no RDMA path: peers are reached over Level Zero IPC only.
+        if self.device_type != "xpu" and not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
             # torchada maps the CUDA device namespace to MUSA when enabled.
 
-            raddr = torch.tensor([raddr], dtype=torch.int64, device="cuda")
+            raddr = torch.tensor([raddr], dtype=torch.int64, device=device)
             raddrs = [
-                torch.empty(1, dtype=torch.int64, device="cuda")
+                torch.empty(1, dtype=torch.int64, device=device)
                 for _ in range(self.group_size)
             ]
             dist.all_gather(raddrs, raddr, self.group)
             raddrs = torch.cat(raddrs).tolist()
 
-            rkey = torch.tensor([rkey], dtype=torch.int32, device="cuda")
+            rkey = torch.tensor([rkey], dtype=torch.int32, device=device)
             rkeys = [
-                torch.empty(1, dtype=torch.int32, device="cuda")
+                torch.empty(1, dtype=torch.int32, device=device)
                 for _ in range(self.group_size)
             ]
             dist.all_gather(rkeys, rkey, self.group)
@@ -209,13 +248,13 @@ class Buffer:
             all_to_all_size = len(local_qpns) // self.group_size
             local_qpns = list(
                 torch.unbind(
-                    torch.tensor(local_qpns, dtype=torch.int32, device="cuda").view(
+                    torch.tensor(local_qpns, dtype=torch.int32, device=device).view(
                         -1, all_to_all_size
                     )
                 )
             )
             remote_qpns = [
-                torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
+                torch.empty(all_to_all_size, dtype=torch.int32, device=device)
                 for _ in range(self.group_size)
             ]
             dist.all_to_all(remote_qpns, local_qpns, self.group)
@@ -224,13 +263,13 @@ class Buffer:
             local_lids = self.runtime.get_local_lids()
             local_lids = list(
                 torch.unbind(
-                    torch.tensor(local_lids, dtype=torch.int32, device="cuda").view(
+                    torch.tensor(local_lids, dtype=torch.int32, device=device).view(
                         -1, all_to_all_size
                     )
                 )
             )
             remote_lids = [
-                torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
+                torch.empty(all_to_all_size, dtype=torch.int32, device=device)
                 for _ in range(self.group_size)
             ]
             dist.all_to_all(remote_lids, local_lids, self.group)
@@ -238,26 +277,26 @@ class Buffer:
 
             (subnet_prefix, interface_id) = self.runtime.get_gid()
             subnet_prefix_t = torch.tensor(
-                [subnet_prefix], dtype=torch.int64, device="cuda"
+                [subnet_prefix], dtype=torch.int64, device=device
             )
             subnet_prefixes_list = [
-                torch.empty(1, dtype=torch.int64, device="cuda")
+                torch.empty(1, dtype=torch.int64, device=device)
                 for _ in range(self.group_size)
             ]
             dist.all_gather(subnet_prefixes_list, subnet_prefix_t, self.group)
             subnet_prefixes = torch.cat(subnet_prefixes_list).tolist()
 
             interface_id_t = torch.tensor(
-                [interface_id], dtype=torch.int64, device="cuda"
+                [interface_id], dtype=torch.int64, device=device
             )
             interface_ids_list = [
-                torch.empty(1, dtype=torch.int64, device="cuda")
+                torch.empty(1, dtype=torch.int64, device=device)
                 for _ in range(self.group_size)
             ]
             dist.all_gather(interface_ids_list, interface_id_t, self.group)
             interface_ids = torch.cat(interface_ids_list).tolist()
 
-            active_ranks_mask = self._active_ranks_list(torch.device("cuda"))
+            active_ranks_mask = self._active_ranks_list(device)
             self.runtime.sync_ibgda_peers(
                 raddrs,
                 rkeys,
@@ -278,17 +317,17 @@ class Buffer:
                 local_handle_ints = self.runtime.get_ipc_handle()
                 # pybind11 converts std::vector<int32_t> to a list of integers
                 local_handle_tensor = torch.tensor(
-                    local_handle_ints, dtype=torch.int32, device="cuda"
+                    local_handle_ints, dtype=torch.int32, device=device
                 )
                 handles = [
                     torch.empty(
-                        len(local_handle_ints), dtype=torch.int32, device="cuda"
+                        len(local_handle_ints), dtype=torch.int32, device=device
                     )
                     for _ in range(self.group_size)
                 ]
                 dist.all_gather(handles, local_handle_tensor, self.group)
                 remote_handles = [h.tolist() for h in handles]
-                active_ranks_mask = self._active_ranks_list(torch.device("cuda"))
+                active_ranks_mask = self._active_ranks_list(device)
                 self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
             except Exception as e:
                 import warnings
@@ -308,6 +347,16 @@ class Buffer:
             ibgda_disabled = bool(self.runtime.ibgda_disabled())
             use_fast_path = not ibgda_disabled
 
+        if self.device_type == "xpu":
+            # Each rank maps its peers on its own, so one may reach them all
+            # while another cannot. Take the fast path only if every rank can;
+            # a rank in native kernels would wait forever on one that runs the
+            # fallback's collectives, and the other way round.
+            agreed = torch.tensor(
+                [int(use_fast_path)], dtype=torch.int32, device=device
+            )
+            dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=self.group)
+            use_fast_path = bool(agreed.item())
         self._use_fallback = not use_fast_path
 
     def update_ep_member(self):
@@ -323,7 +372,11 @@ class Buffer:
         self, device: torch.device, dtype: torch.dtype = torch.int32
     ) -> torch.Tensor:
         if not self._is_mooncake_backend():
-            if not self._warned_active_ranks_without_mooncake_backend:
+            # XPU builds have no Mooncake PG, so there is nothing to switch to.
+            if (
+                self.device_type != "xpu"
+                and not self._warned_active_ranks_without_mooncake_backend
+            ):
                 import warnings
 
                 try:
@@ -375,6 +428,7 @@ class Buffer:
         use_fp8: Optional[bool] = None,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        topk_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[
         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
         torch.Tensor,
@@ -382,6 +436,10 @@ class Buffer:
         EventOverlap,
         Callable,
     ]:
+        # topk_weights, if given, must be the weights the matching combine is
+        # called with, and every rank must pass it or none: on XPU the combine
+        # then reduces each token's rows on the expert side with them and does
+        # not read its own topk_weights. Other backends ignore it.
         assert x.dim() == 2 and x.is_contiguous()
         assert x.dtype == torch.bfloat16
         assert topk_idx.dim() == 2 and topk_idx.is_contiguous()
@@ -390,6 +448,10 @@ class Buffer:
         assert x.size(0) <= num_max_dispatch_tokens_per_rank
         assert x.size(1) % 16 == 0 and x.size(1) % 128 == 0
         assert num_experts % self.group_size == 0
+        if topk_weights is not None:
+            assert topk_weights.shape == topk_idx.shape
+            assert topk_weights.dtype == torch.float32
+            assert topk_weights.is_contiguous()
         caller_active_ranks = active_ranks
         if active_ranks is None:
             active_ranks = self._active_ranks_tensor(device=x.device, dtype=torch.int32)
@@ -500,6 +562,14 @@ class Buffer:
             native_async_finish = async_finish and not (
                 _USE_SPLIT_SEND_RECV and runtime_return_recv_hook
             )
+            native_weights = ()
+            if self.device_type == "xpu":
+                # The mode is passed apart from the pointer: an empty tensor's
+                # data_ptr() is 0, and a rank without tokens still reduces.
+                native_weights = (
+                    0 if topk_weights is None else topk_weights.data_ptr(),
+                    topk_weights is not None,
+                )
             event, hook = self.runtime.dispatch(
                 x.data_ptr(),
                 topk_idx.data_ptr(),
@@ -519,6 +589,7 @@ class Buffer:
                 native_async_finish,
                 runtime_return_recv_hook,
                 _native_current_stream_ptr(),
+                *native_weights,
             )
             if _USE_SPLIT_SEND_RECV:
                 hook = self._wrap_maca_recv_hook(hook, event)
@@ -535,6 +606,7 @@ class Buffer:
         tensors_to_record = (
             x,
             topk_idx,
+            topk_weights,
             packed_recv_x,
             packed_recv_x_scales,
             packed_recv_count,
@@ -710,10 +782,10 @@ class Buffer:
     # -----------------
     class _DummyEvent:
         def current_stream_wait(self, stream_ptr: Optional[int] = None):
-            torch.cuda.synchronize()
+            _synchronize_device()
 
         def synchronize(self):
-            torch.cuda.synchronize()
+            _synchronize_device()
 
     @staticmethod
     def _fp8_cast(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

@@ -20,10 +20,12 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <set>
 #include <thread>
@@ -35,6 +37,7 @@
 #include "buffer_range_index.h"
 #include "common.h"
 #include "config.h"
+#include "hip_device_guard.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
@@ -167,6 +170,88 @@ bool has_ibv_reg_mr_iova2(void) {
     return sym != NULL;
 }
 
+static void deregKfdPinAnchor(ibv_mr *mr) {
+    int ret = ibv_dereg_mr(mr);
+    if (ret)
+        LOG(WARNING) << "Failed to release KFD pin anchor: " << strerror(ret);
+}
+
+#ifdef USE_HIP_DMABUF
+// Whether HIP allocations get a KFD pin anchor. Process-wide: it depends on
+// the amdgpu driver and on whether any NIC takes a peer-memory MR.
+enum KfdPinAnchorState { kKfdPinUnprobed, kKfdPinAnchor, kKfdPinNoAnchor };
+
+static std::atomic<KfdPinAnchorState> &kfdPinAnchorState() {
+    static std::atomic<KfdPinAnchorState> state{
+        globalConfig().hip_kfd_pin_fix == HipKfdPinFix::OFF ? kKfdPinNoAnchor
+        : globalConfig().hip_kfd_pin_fix == HipKfdPinFix::FORCE
+            ? kKfdPinAnchor
+            : kKfdPinUnprobed};
+    return state;
+}
+
+static constexpr size_t kKfdPinProbeBytes = 64ull << 20;
+
+// Pins one page of a private, never-pinned allocation through dma-buf: a fixed
+// driver keeps KFD free VRAM flat, one that charges dma-buf pins twice drops it
+// by the whole allocation. A caller's buffer cannot serve, as it may already
+// be pinned or exceed the free VRAM that hipMemGetInfo clamps at 0. Anything
+// else, e.g. a concurrent allocation, leaves the decision to the next
+// registration.
+static KfdPinAnchorState probeKfdPin(ibv_pd *pd, int device) {
+    HipDeviceGuard guard(device);
+    void *buf = nullptr;
+    if (!guard.set_ok() || hipMalloc(&buf, kKfdPinProbeBytes) != hipSuccess) {
+        (void)hipGetLastError();
+        LOG(WARNING) << "KFD pin probe: cannot allocate its "
+                     << (kKfdPinProbeBytes >> 20) << " MiB on GPU " << device
+                     << "; probing again at the next registration";
+        return kKfdPinUnprobed;
+    }
+    DmabufExport exp;
+    const int64_t size = kKfdPinProbeBytes;
+    int64_t drop = 0;
+    KfdPinAnchorState result = kKfdPinUnprobed;
+    if (RdmaContext::exportDmabuf(buf, kKfdPinProbeBytes, exp) == 0 &&
+        exp.method == DmabufExport::Method::kDmabufReg) {
+        for (int attempt = 0; attempt < 3 && result == kKfdPinUnprobed;
+             ++attempt) {
+            size_t before = 0, after = 0, total = 0;
+            if (hipMemGetInfo(&before, &total) != hipSuccess ||
+                before < kKfdPinProbeBytes)
+                break;
+            ibv_mr *mr = ibv_reg_dmabuf_mr(pd, exp.offset, getpagesize(),
+                                           reinterpret_cast<uintptr_t>(buf),
+                                           exp.fd, IBV_ACCESS_LOCAL_WRITE);
+            if (!mr) break;
+            const bool measured = hipMemGetInfo(&after, &total) == hipSuccess;
+            if (int ret = ibv_dereg_mr(mr)) {
+                LOG(WARNING) << "Failed to deregister KFD pin probe MR: "
+                             << strerror(ret);
+                break;
+            }
+            if (!measured) break;
+            drop = (int64_t)before - (int64_t)after;
+            if (std::llabs(drop) < size / 4)
+                result = kKfdPinNoAnchor;
+            else if (std::llabs(drop - size) < size / 4)
+                result = kKfdPinAnchor;
+        }
+    }
+    RdmaContext::closeDmabufExport(exp);
+    (void)hipFree(buf);
+    LOG(INFO) << "KFD pin probe: a dma-buf pin of a private " << (size >> 20)
+              << " MiB allocation lowered KFD free VRAM by " << drop / (1 << 20)
+              << " MiB; "
+              << (result == kKfdPinAnchor ? "holding one peer-memory pin per "
+                                            "registered allocation"
+                  : result == kKfdPinNoAnchor
+                      ? "the driver counts it once, no anchor needed"
+                      : "inconclusive, probing again at the next registration");
+    return result;
+}
+#endif
+
 RdmaTransport::RdmaTransport() {
     MCIbRelaxedOrderingMode = getIbRelaxedOrderingMode();
     if (MCIbRelaxedOrderingMode == 0) {
@@ -198,6 +283,9 @@ RdmaTransport::~RdmaTransport() {
 #endif
     metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
+    for (auto &[_, anchor] : kfd_pin_anchors_) deregKfdPinAnchor(anchor.mr);
+    kfd_pin_anchors_.clear();
+    kfd_pin_anchor_of_buffer_.clear();
     context_list_.clear();
 }
 
@@ -369,6 +457,16 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         DmabufExport &exp;
         ~DmabufCloser() { RdmaContext::closeDmabufExport(exp); }
     } dmabuf_closer{dmabuf_exp};
+
+    // Taken before the first dma-buf pin and dropped after any rollback below.
+    struct KfdPinAnchorGuard {
+        RdmaTransport *transport;
+        void *addr;
+        bool held;
+        ~KfdPinAnchorGuard() {
+            if (held) transport->releaseKfdPinAnchor(addr);
+        }
+    } kfd_pin_anchor{this, addr, acquireKfdPinAnchor(addr, dmabuf_exp)};
 
     // Mooncake#2017: ibv_reg_mr silently truncates a registration to the device
     // max_mr_size, but the metadata would still advertise the full BufferDesc
@@ -659,6 +757,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         for (auto &c : chunks) chunk_addrs.push_back((uint64_t)c.first);
         chunk_map_[(uint64_t)addr] = std::move(chunk_addrs);
     }
+    kfd_pin_anchor.held = false;
     return 0;
 }
 
@@ -677,14 +776,15 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         std::lock_guard<std::mutex> lock(chunk_map_mutex_);
         auto it = chunk_map_.find((uint64_t)addr);
         if (it != chunk_map_.end()) {
-            chunk_addrs = std::move(it->second);
-            chunk_map_.erase(it);
+            // Copy, but keep the entry until the whole unregister succeeds:
+            // a retry re-enumerates the chunks through this map.
+            chunk_addrs = it->second;
         }
     }
     if (!chunk_addrs.empty()) {
-        // Unregister EVERY chunk even if one fails; chunk_map_ was already
-        // erased, so an early return would leak the remaining chunks' MRs +
-        // metadata. Remember the first error and report it at the end.
+        // Unregister EVERY chunk even if one fails; remember the first error
+        // and report it at the end. The chunk_map_ entry is erased only on
+        // full success so a later retry re-runs the complete cleanup.
         int first_err = 0;
 
         // Metadata: remove each chunk from the local desc WITHOUT publishing (a
@@ -693,7 +793,11 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         for (uint64_t ca : chunk_addrs) {
             int rc = metadata_->removeLocalMemoryBuffer(
                 reinterpret_cast<void *>(ca), /*update_metadata=*/false);
-            if (rc && !first_err) first_err = rc;
+            // ERR_ADDRESS_NOT_REGISTERED means an earlier attempt already
+            // removed this chunk's metadata and then failed partway through
+            // deregistration: tolerate it so the retry reaches the MR cleanup.
+            if (rc && rc != ERR_ADDRESS_NOT_REGISTERED && !first_err)
+                first_err = rc;
         }
 
         // MRs: unregister across contexts in PARALLEL (one thread per context,
@@ -706,6 +810,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             if (use_parallel_unreg == -1)
                 use_parallel_unreg = context_list_.size() > 1;
         }
+        int mr_err = 0;
         if (use_parallel_unreg) {
             std::vector<std::thread> threads;
             threads.reserve(context_list_.size());
@@ -721,7 +826,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             }
             for (auto &t : threads) t.join();
             for (int rc : ret_codes)
-                if (rc && !first_err) first_err = rc;
+                if (rc && !mr_err) mr_err = rc;
         } else {
             for (uint64_t ca : chunk_addrs)
                 for (auto &context : context_list_) {
@@ -730,21 +835,45 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
                     if (ret) {
                         LOG(ERROR) << "Failed to unregister chunk MR at "
                                    << reinterpret_cast<void *>(ca);
-                        if (!first_err) first_err = ret;
+                        if (!mr_err) mr_err = ret;
                     }
                 }
         }
+        if (!mr_err) releaseKfdPinAnchor(addr);
+        if (!first_err) first_err = mr_err;
 
         // Single metadata publish covering all removed chunks.
         if (update_metadata) {
             int rc = metadata_->updateLocalSegmentDesc();
             if (rc && !first_err) first_err = rc;
         }
+        if (!first_err) {
+            std::lock_guard<std::mutex> lock(chunk_map_mutex_);
+            chunk_map_.erase((uint64_t)addr);
+        }
         return first_err;
     }
 
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
-    if (rc) return rc;
+    // A missing metadata entry does NOT prove the MRs are gone: a partial
+    // ibv_dereg_mr failure on an earlier attempt leaves live MRs behind it.
+    // But a missing entry also occurs for an address that was never a
+    // registration base (e.g. an interior pointer): fall through only for a
+    // known pending cleanup, so the containing-range MR lookup cannot
+    // deregister another registration's live MR.
+    const bool metadata_missing = (rc == ERR_ADDRESS_NOT_REGISTERED);
+    if (metadata_missing) {
+        std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
+        if (!pending_dereg_.contains((uint64_t)addr)) {
+            return ERR_ADDRESS_NOT_REGISTERED;
+        }
+    } else if (rc) {
+        // Local metadata was removed but the publish failed; the MRs stay
+        // live. Record the pending cleanup so a retry can still finish it.
+        std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
+        pending_dereg_.insert((uint64_t)addr);
+        return rc;
+    }
 
     // force_sequential is used by batch operations to avoid nested parallelism
     int use_parallel_unreg = 0;
@@ -755,6 +884,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         }
     }
 
+    int dereg_err = 0;
     if (use_parallel_unreg) {
         std::vector<std::thread> unreg_threads;
         unreg_threads.reserve(context_list_.size());
@@ -770,25 +900,108 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             thread.join();
         }
 
-        for (size_t i = 0; i < ret_codes.size(); ++i) {
-            if (ret_codes[i] != 0) {
-                LOG(ERROR) << "Failed to unregister memory region with context "
-                           << i;
-                return ret_codes[i];
-            }
+        for (int ret : ret_codes) {
+            if (ret && !dereg_err) dereg_err = ret;
         }
     } else {
         for (size_t i = 0; i < context_list_.size(); ++i) {
             int ret = context_list_[i]->unregisterMemoryRegion(addr);
-            if (ret) {
-                LOG(ERROR) << "Failed to unregister memory region with context "
-                           << i;
-                return ret;
-            }
+            if (ret && !dereg_err) dereg_err = ret;
         }
     }
 
+    if (dereg_err) {
+        LOG(ERROR) << "Failed to unregister memory region at " << addr;
+        // The metadata entry is already gone; only the pending record keeps
+        // the MR cleanup reachable from a later retry.
+        if (!metadata_missing) {
+            std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
+            pending_dereg_.insert((uint64_t)addr);
+        }
+        return dereg_err;
+    }
+    releaseKfdPinAnchor(addr);
+
+    // Confirmed cleanup: report success so the engine erases its region
+    // record and the same range can be registered again.
+    if (metadata_missing) {
+        if (update_metadata) {
+            // The earlier attempt removed the local metadata entry but may
+            // have failed to publish it (that failure is what seeded the
+            // pending record). Republish now so the remote metadata server
+            // drops the stale buffer advertisement. On publish failure the
+            // pending record is kept: a later retry re-runs this path (the
+            // MR cleanup above is then a no-op) and publishes again.
+            int pub_rc = metadata_->updateLocalSegmentDesc();
+            if (pub_rc) return pub_rc;
+        }
+        std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
+        pending_dereg_.erase((uint64_t)addr);
+    }
     return 0;
+}
+
+bool RdmaTransport::acquireKfdPinAnchor(void *addr, const DmabufExport &exp) {
+#ifdef USE_HIP_DMABUF
+    auto &state = kfdPinAnchorState();
+    if (!exp.alloc_base || state.load() == kKfdPinNoAnchor) return false;
+    if (state.load() == kKfdPinUnprobed) {
+        ibv_pd *pd = nullptr;
+        for (auto &context : context_list_)
+            if ((pd = context->pd())) break;
+        if (!pd) return false;
+        // HIP registrations wait here instead of pinning during the probe.
+        static std::mutex probe_mutex;
+        std::lock_guard<std::mutex> lock(probe_mutex);
+        if (state.load() == kKfdPinUnprobed)
+            state.store(probeKfdPin(pd, exp.device));
+        if (state.load() != kKfdPinAnchor) return false;
+    }
+
+    std::lock_guard<std::mutex> lock(kfd_pin_anchor_mutex_);
+    auto base = reinterpret_cast<uintptr_t>(exp.alloc_base);
+    if (!kfd_pin_anchor_of_buffer_
+             .emplace(reinterpret_cast<uintptr_t>(addr), base)
+             .second)
+        return false;
+    auto &anchor = kfd_pin_anchors_[base];
+    if (!anchor.mr) {
+        // The peer-memory client pins the whole allocation for any range.
+        for (auto &context : context_list_) {
+            if (!context->pd()) continue;
+            anchor.mr = ibv_reg_mr(context->pd(), exp.alloc_base, getpagesize(),
+                                   IBV_ACCESS_LOCAL_WRITE);
+            if (anchor.mr) break;
+        }
+        if (!anchor.mr) {
+            const int err = errno;
+            if (state.exchange(kKfdPinNoAnchor) == kKfdPinAnchor)
+                LOG(WARNING)
+                    << "amdgpu peer-memory pin unavailable (" << strerror(err)
+                    << "); KFD will count registered GPU memory "
+                       "twice in its free VRAM";
+            kfd_pin_anchors_.erase(base);
+            kfd_pin_anchor_of_buffer_.erase(reinterpret_cast<uintptr_t>(addr));
+            return false;
+        }
+    }
+    ++anchor.refs;
+    return true;
+#else
+    return false;
+#endif
+}
+
+void RdmaTransport::releaseKfdPinAnchor(void *addr) {
+    std::lock_guard<std::mutex> lock(kfd_pin_anchor_mutex_);
+    auto owner =
+        kfd_pin_anchor_of_buffer_.find(reinterpret_cast<uintptr_t>(addr));
+    if (owner == kfd_pin_anchor_of_buffer_.end()) return;
+    auto anchor = kfd_pin_anchors_.find(owner->second);
+    kfd_pin_anchor_of_buffer_.erase(owner);
+    if (--anchor->second.refs) return;
+    deregKfdPinAnchor(anchor->second.mr);
+    kfd_pin_anchors_.erase(anchor);
 }
 
 int RdmaTransport::allocateLocalSegmentID() {
@@ -898,17 +1111,61 @@ int RdmaTransport::registerLocalMemoryBatch(
 
 int RdmaTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
+    std::atomic<bool> any_cleaned{false};
+    std::atomic<bool> any_not_registered{false};
+    // Members whose cleanup completed in this call; their pending records
+    // must be restored if the deferred publish below fails.
+    std::mutex cleaned_mutex;
+    std::vector<void *> cleaned_addrs;
     int first_error = runBoundedRegMrBatch(addr_list.size(), [&](size_t i) {
         int ret = unregisterLocalMemoryInternal(addr_list[i], false, true);
+        // NOT_REGISTERED means nothing remains for this member: its metadata
+        // entry is gone and no pending MR cleanup is recorded. A batch retry
+        // after a partial failure always hits this for the members that
+        // already succeeded — reporting it as an error would keep the
+        // engine's region records stuck forever (un-re-registerable), while
+        // the single-address path treats confirmed cleanup as success.
+        if (ret == ERR_ADDRESS_NOT_REGISTERED) {
+            any_not_registered.store(true, std::memory_order_relaxed);
+            return 0;
+        }
         if (ret) {
             LOG(WARNING) << "RdmaTransport: Failed to unregister memory: addr "
                          << addr_list[i];
+        } else {
+            any_cleaned.store(true, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(cleaned_mutex);
+            cleaned_addrs.push_back(addr_list[i]);
         }
         return ret;
     });
 
+    // Publish even on failure: members that were cleaned have their metadata
+    // entries removed locally, and this best-effort republish keeps the
+    // remote advertisement from going stale.
     int metadata_ret = metadata_->updateLocalSegmentDesc();
-    return first_error ? first_error : metadata_ret;
+    if (metadata_ret) {
+        // The deferred publish failed, but the members cleaned above already
+        // dropped their metadata entries and pending records: a retry would
+        // report NOT_REGISTERED (fatal to the engine) and could never
+        // republish. Re-seed their pending records so the retry re-runs the
+        // MR cleanup as a no-op (the MRs are already gone) and re-attempts
+        // this publish.
+        std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
+        for (void *addr : cleaned_addrs) {
+            pending_dereg_.insert((uint64_t)addr);
+        }
+    }
+    if (first_error) return first_error;
+    if (metadata_ret) return metadata_ret;
+    // Preserve the never-registered contract for the engine's multi-transport
+    // aggregation: only report NOT_REGISTERED when every member was unknown
+    // and nothing was actually cleaned.
+    if (any_not_registered.load(std::memory_order_relaxed) &&
+        !any_cleaned.load(std::memory_order_relaxed)) {
+        return ERR_ADDRESS_NOT_REGISTERED;
+    }
+    return 0;
 }
 
 Status RdmaTransport::submitTransfer(

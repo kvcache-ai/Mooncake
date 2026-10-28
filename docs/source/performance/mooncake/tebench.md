@@ -84,6 +84,68 @@ When pacing is enabled, `Avg Lat (us)` includes the pacing gap because it is
 computed from wall-clock runtime, while `Avg Tx (us)` and Tx percentiles only
 measure transfer execution time.
 
+### 3.4 MLU Device Memory
+
+Build with `USE_TENT=ON`, `USE_MLU=ON`, `USE_CUDA=OFF` and
+`BUILD_BENCHMARK=ON`. Set `NEUWARE_ROOT` to the installed Neuware SDK.
+In this build, `--backend=tent --seg_type=VRAM` allocates MLU memory.
+`--local_gpu_id=N` selects a visible MLU ordinal; `-1` allocates a buffer on
+each visible MLU. `--seg_type_mix=dram,vram` includes both host and MLU buffers.
+
+Start the target:
+
+```bash
+./tebench --backend=tent --metadata_type=p2p --seg_type=VRAM \
+  --local_gpu_id=0 --xport_type=tcp --total_buffer_size=33554432
+```
+
+Use the printed segment name on the initiator:
+
+```bash
+./tebench --backend=tent --metadata_type=p2p --seg_type=VRAM \
+  --local_gpu_id=0 --xport_type=tcp --total_buffer_size=33554432 \
+  --target_seg_name=<SEG_NAME_FROM_TARGET> \
+  --start_block_size=65536 --max_block_size=65536 \
+  --start_batch_size=1 --max_batch_size=1 \
+  --start_num_threads=1 --max_num_threads=1 \
+  --check_consistency=true --duration=5
+```
+
+For separate hosts, configure `rpc_server_hostname` in `MC_TENT_CONF` with an
+address reachable from the peer. MLU transfers over TCP or HP TCP use host
+staging, which requires both the network transport and the MLU local-copy
+transport. For VRAM or mixed DRAM/VRAM runs, an explicit `--xport_type`
+also enables the MLU local-copy transport in the benchmark configuration.
+`--check_consistency` performs WRITE/READ round trips and copies the
+result back to host memory for comparison. For throughput measurements without
+payload checks, use `--check_consistency=false --op_type=read` or `write`.
+
+### 3.5 Intel XPU Device Memory and File Targets
+
+Build with `USE_TENT=ON`, `USE_XPU=ON` and `BUILD_BENCHMARK=ON`, using the
+Intel DPC++ compiler (`CXX=icpx`). In this build,
+`--backend=tent --seg_type=VRAM` allocates XPU device memory. `--local_gpu_id`
+works as in Section 3.4.
+
+A `file://<path>` target segment name makes the initiator transfer to and from
+a local file, so no target process is needed. Create the file first; it must
+cover `--target_offset` plus `max_num_threads * max_block_size *
+max_batch_size` bytes. Select the file transport with `--xport_type`:
+
+```bash
+fallocate -l 1G /mnt/nvme/tebench.dat
+./tebench --backend=tent --metadata_type=p2p --seg_type=VRAM \
+  --local_gpu_id=0 --xport_type=iouring --total_buffer_size=268435456 \
+  --target_seg_name=file:///mnt/nvme/tebench.dat \
+  --start_block_size=1048576 --max_block_size=1048576 \
+  --start_batch_size=1 --max_batch_size=1 \
+  --start_num_threads=1 --max_num_threads=8 \
+  --op_type=write --duration=10
+```
+
+To check the data, run once with `--op_type=write_seed` and then with
+`--op_type=read_verify` (Section 5.4).
+
 ## 4. Output Metrics
 
 Each output row corresponds to one benchmark configuration.
@@ -304,10 +366,9 @@ Example:
 * `--seg_type_mix` : comma-separated segment types for mixed DRAM+VRAM runs,
   e.g. `dram,vram`. When set, the target registers buffers of each listed
   type in one segment, and initiator threads round-robin across them so a
-  single tebench process drives traffic over multiple memory types (and
-  thus multiple transports — SHM for DRAM, NVLink for VRAM) concurrently.
-  Empty falls back to `--seg_type` (single type, existing behavior). See
-  Section 5.8 for usage and the multi-transport configuration it requires.
+  single tebench process drives traffic over multiple memory types
+  concurrently. Empty falls back to `--seg_type`. See Section 5.8 for
+  transport configuration examples.
 * `--target_seg_name` : target segment name (empty → Target mode).
   A comma-separated list enables multi-target initiator mode, and worker
   threads are distributed across all listed target segments.
@@ -397,8 +458,10 @@ gpu_id + thread_id
 
 **Transport (TENT only)**
 
-* `--xport_type` : `rdma | shm | mnnvl | gds | iouring`. Selects a single
-  transport to enable (all others are disabled). Empty means no transport
+* `--xport_type` : selects the benchmark transport, such as `tcp`, `hp_tcp`,
+  `rdma`, `shm`, or `nvlink`, and disables the other selectable transports.
+  MLU VRAM runs also enable the local-copy transport needed for host staging.
+  Empty means no transport
   is explicitly enabled or disabled by tebench — the engine reads the
   transport enable list from the `MC_TENT_CONF` config file (see Section
   5.8 for multi-transport scenarios).
@@ -433,11 +496,14 @@ record has an unambiguous workload contract.
 
 ### 5.8 Mixed DRAM+VRAM and Multi-Transport
 
-By default, tebench allocates buffers of a single `--seg_type` and enables a
-single `--xport_type` per run. To exercise a mixed-transport workload where
-the engine's transport selector naturally picks SHM for DRAM→DRAM transfers
-and NVLink for VRAM→VRAM transfers within one process, combine
-`--seg_type_mix` with the `MC_TENT_CONF` environment variable:
+By default, tebench allocates buffers of a single `--seg_type`.
+`--seg_type_mix=dram,vram` allocates both host and device buffers. In a
+`USE_MLU` build, combine it with `--xport_type=tcp` or `hp_tcp` to transfer
+both memory types using host staging for MLU buffers; see Section 3.4.
+
+The following CUDA example uses SHM for DRAM→DRAM and NVLink for VRAM→VRAM
+within one process. It requires `USE_CUDA=ON` and enables multiple transports
+through `MC_TENT_CONF`:
 
 1. **Enable multiple transports via `MC_TENT_CONF`** — point it at a JSON
    config file (or inline JSON string) that enables the transports you want
@@ -482,7 +548,5 @@ and NVLink for VRAM→VRAM transfers within one process, combine
    threads share one GPU buffer and contend, which underrepresents NVLink
    throughput.
 
-Mixed mode requires `--start_num_threads` ≥ 2 (at least one thread per
-seg_type) and a build with `USE_CUDA=ON` (for VRAM/NVLink support). When
-`--seg_type_mix` is empty, tebench falls back to `--seg_type` (single type)
-and `--xport_type` (single transport) — the existing behavior.
+Use `--start_num_threads` ≥ 2 to exercise both memory types. When
+`--seg_type_mix` is empty, tebench uses `--seg_type` for all buffers.

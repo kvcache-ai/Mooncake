@@ -62,6 +62,10 @@ struct BucketBackendConfig {
     // max_physical_bytes > 0.
     int64_t disk_scan_cache_ms = 500;
 
+    // Write the final partial bucket in the current offload cycle instead of
+    // carrying keys into a later cycle without their current offload tasks.
+    bool flush_partial_buckets = false;
+
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();

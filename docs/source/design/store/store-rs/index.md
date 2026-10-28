@@ -13,6 +13,7 @@ public language APIs live under the Rust and Python API references.
 | NoF integration boundaries | [NoF](nof) |
 | Tenant control plane | [Multi-tenant admin design](multi-tenant-admin-control-plane) |
 | Strict quota accounting | [Tenant quota consistency](tenant-quota-consistency) |
+| Implemented capabilities | [Features](features) |
 
 :::{toctree}
 :maxdepth: 1
@@ -23,4 +24,5 @@ cold-tier-design
 nof
 multi-tenant-admin-control-plane
 tenant-quota-consistency
+features
 :::
