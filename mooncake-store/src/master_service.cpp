@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -251,6 +252,27 @@ struct MasterService::MemoryEviction {
             // Keep the removed IDs local until submission succeeds so a
             // consumed reservation cannot strand REMOVED replicas.
             auto reservation = service_.ReserveBatchOpLogSlot();
+            // When the writer is full (a transaction is in flight), ending the
+            // whole BatchEvict cycle forces another full-index census and keeps
+            // HA eviction far below the put rate (#4818). Wait briefly for
+            // slots to return instead. Eviction is single-threaded; the
+            // per-key accessor is still held, so only RPCs for this key are
+            // delayed.
+            if (!reservation &&
+                reservation.error() == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED) {
+                constexpr auto kWaitBudget = std::chrono::milliseconds(100);
+                constexpr auto kWaitStep = std::chrono::milliseconds(2);
+                const auto deadline =
+                    std::chrono::steady_clock::now() + kWaitBudget;
+                while (std::chrono::steady_clock::now() < deadline) {
+                    std::this_thread::sleep_for(kWaitStep);
+                    reservation = service_.ReserveBatchOpLogSlot();
+                    if (reservation || reservation.error() !=
+                                       ErrorCode::TASK_PENDING_LIMIT_EXCEEDED) {
+                        break;
+                    }
+                }
+            }
             if (!reservation) {
                 LOG(WARNING)
                     << "Eviction: OpLog reservation failed for key=" << key
