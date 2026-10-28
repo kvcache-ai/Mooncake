@@ -611,11 +611,15 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         // the expandable-segment layout. The export base is page-aligned so
         // that offset % page_size == iova % page_size, which
         // ibv_reg_dmabuf_mr() requires.
+        const size_t page = (size_t)sysconf(_SC_PAGESIZE);
         CUdeviceptr exportBase = allocBase;
-        size_t exportSize = allocSize;
+        // cuMemGetHandleForAddressRange() requires a page-aligned size, but
+        // cuMemGetAddressRange() reports the size the caller passed to
+        // cudaMalloc(), which need not be a page multiple. Round it up, as the
+        // sub-range branch below does for its own range.
+        size_t exportSize = (allocSize + page - 1) & ~(size_t)(page - 1);
         uint64_t exportOffset = (uintptr_t)addr - (uintptr_t)allocBase;
         if (length > 0 && (exportOffset != 0 || length != allocSize)) {
-            const size_t page = (size_t)sysconf(_SC_PAGESIZE);
             uintptr_t aligned = (uintptr_t)addr & ~(uintptr_t)(page - 1);
             if (aligned < (uintptr_t)allocBase) aligned = (uintptr_t)allocBase;
             exportBase = (CUdeviceptr)aligned;
@@ -742,6 +746,8 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         // Offset within the dmabuf-backed region: distance from the
         // allocation base, plus any offset hsa returned for the export.
         out.offset = (uintptr_t)addr - (uintptr_t)allocBase + hsa_dmabuf_offset;
+        out.alloc_base = allocBase;
+        out.device = hipAttr.device;
     }
 #else
     out.method = DmabufExport::Method::kHostReg;

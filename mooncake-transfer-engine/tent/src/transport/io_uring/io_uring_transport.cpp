@@ -65,6 +65,117 @@ class IOUringFileContext {
     bool ready_;
 };
 
+IOUringStagingPool::~IOUringStagingPool() {
+    if (!base_) return;
+    auto status =
+        Platform::getLoader().freePinnedHost(base_, slot_size_ * slot_count_);
+    if (!status.ok())
+        LOG(WARNING) << "IOUringStagingPool: freePinnedHost failed: "
+                     << status.ToString();
+}
+
+Status IOUringStagingPool::init(size_t slot_size, size_t slot_count) {
+    if (base_)
+        return Status::InvalidArgument(
+            "Staging pool already initialized" LOC_MARK);
+    if (slot_size == 0 || slot_size % 4096 || slot_count == 0 ||
+        slot_count > SIZE_MAX / slot_size)
+        return Status::InvalidArgument("Invalid staging pool size" LOC_MARK);
+    void* base = nullptr;
+    CHECK_STATUS(Platform::getLoader().allocatePinnedHost(
+        &base, slot_size * slot_count));
+    base_ = static_cast<char*>(base);
+    slot_size_ = slot_size;
+    slot_count_ = slot_count;
+    free_slots_.reserve(slot_count);
+    for (size_t i = slot_count; i > 0; --i)
+        free_slots_.push_back(base_ + (i - 1) * slot_size);
+    return Status::OK();
+}
+
+void* IOUringStagingPool::acquire(size_t length) {
+    if (length > slot_size_) return nullptr;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (free_slots_.empty()) return nullptr;
+    void* slot = free_slots_.back();
+    free_slots_.pop_back();
+    return slot;
+}
+
+bool IOUringStagingPool::release(void* buffer) {
+    if (!owns(buffer)) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    free_slots_.push_back(buffer);
+    return true;
+}
+
+size_t IOUringStagingPool::freeSlots() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return free_slots_.size();
+}
+
+// Staging buffers are aligned to 4 KiB, the O_DIRECT buffer alignment also
+// used for unaligned sources in submitTransferTasks(); it covers the logical
+// block size whatever the system page size.
+static constexpr size_t kStagingAlignment = 4096;
+
+// A pool slot if one is free and large enough, else a pageable
+// posix_memalign() buffer; nullptr only if that allocation fails. Release
+// with releaseStagingBuffers().
+static void* acquireStagingBuffer(IOUringStagingPool* pool, size_t length) {
+    void* buffer = pool ? pool->acquire(length) : nullptr;
+    if (buffer) return buffer;
+    if (pool) {
+        LOG_FIRST_N(WARNING, 1)
+            << "IOUringTransport: no free pinned staging slot of "
+            << pool->slotSize() << " bytes for a " << length
+            << "-byte request, using a pageable buffer (raise "
+               "MC_IOURING_STAGING_SLOTS/MC_IOURING_STAGING_SLOT_KB)";
+    }
+    if (posix_memalign(&buffer, kStagingAlignment, length)) return nullptr;
+    return buffer;
+}
+
+static void releaseStagingBuffers(IOUringStagingPool* pool,
+                                  const std::vector<void*>& buffers) {
+    for (void* buffer : buffers) {
+        if (buffer && !(pool && pool->release(buffer))) free(buffer);
+    }
+}
+
+// Best effort: returns null when the pool is disabled or cannot be allocated,
+// and staging then falls back to a posix_memalign() buffer per request.
+static std::shared_ptr<IOUringStagingPool> createStagingPool(
+    const Config& conf) {
+    if (!conf.get("transports/io_uring/pinned_staging", false)) return nullptr;
+    // Slots are rounded up to kStagingAlignment; each slot starts where the
+    // previous one ends, so every slot stays aligned.
+    const size_t slot_kb =
+        conf.get("transports/io_uring/staging_slot_kb", size_t{4096});
+    const size_t slots =
+        conf.get("transports/io_uring/staging_slots", size_t{32});
+    if (slot_kb == 0 || slot_kb > (SIZE_MAX - kStagingAlignment) / 1024) {
+        LOG(WARNING) << "IOUringTransport: no pinned staging pool, invalid "
+                        "staging_slot_kb "
+                     << slot_kb;
+        return nullptr;
+    }
+    const size_t slot_bytes = (slot_kb * 1024 + kStagingAlignment - 1) /
+                              kStagingAlignment * kStagingAlignment;
+    auto pool = std::make_shared<IOUringStagingPool>();
+    auto status = pool->init(slot_bytes, slots);
+    if (!status.ok()) {
+        LOG(WARNING) << "IOUringTransport: no pinned staging pool (" << slots
+                     << " x " << slot_bytes / 1024
+                     << " KiB), staging with pageable buffers: "
+                     << status.ToString();
+        return nullptr;
+    }
+    LOG(INFO) << "IOUringTransport: pinned staging pool of " << slots << " x "
+              << slot_bytes / 1024 << " KiB";
+    return pool;
+}
+
 IOUringTransport::IOUringTransport() : installed_(false) {}
 
 IOUringTransport::~IOUringTransport() { uninstall(); }
@@ -90,6 +201,7 @@ Status IOUringTransport::install(std::string& local_segment_name,
     if (Platform::getLoader().type() != "cpu") {
         caps.gpu_to_file = true;
     }
+    staging_pool_ = createStagingPool(*conf_);
     return Status::OK();
 }
 
@@ -108,6 +220,8 @@ Status IOUringTransport::probeCapabilities() {
 Status IOUringTransport::uninstall() {
     if (installed_) {
         metadata_.reset();
+        // Tasks still holding a slot keep the pool alive until they finish.
+        staging_pool_.reset();
         installed_ = false;
     }
     return Status::OK();
@@ -197,23 +311,26 @@ Status IOUringTransport::submitTransferTasks(
     for (auto& request : request_list) {
         if (request.opcode != Request::READ &&
             request.opcode != Request::WRITE) {
-            for (void* buffer : staging_buffers) free(buffer);
+            releaseStagingBuffers(staging_pool_.get(), staging_buffers);
             return Status::InvalidArgument("Unsupported opcode" LOC_MARK);
         }
 
         IOUringFileContext* context = findFileContext(request.target_id);
         if (!context || !context->ready()) {
-            for (void* buffer : staging_buffers) free(buffer);
+            releaseStagingBuffers(staging_pool_.get(), staging_buffers);
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
         }
         contexts.push_back(context);
 
-        if (Platform::getLoader().getMemoryType(request.source) == MTYPE_CUDA ||
+        // The kernel cannot DMA to or from a device address, so device memory
+        // is staged through an aligned host buffer.
+        const auto mtype = Platform::getLoader().getMemoryType(request.source);
+        if (mtype == MTYPE_CUDA || mtype == MTYPE_XPU ||
             (uint64_t)request.source % kPageSize) {
-            void* buffer = nullptr;
-            int rc = posix_memalign(&buffer, kPageSize, request.length);
-            if (rc) {
-                for (void* staged : staging_buffers) free(staged);
+            void* buffer =
+                acquireStagingBuffer(staging_pool_.get(), request.length);
+            if (!buffer) {
+                releaseStagingBuffers(staging_pool_.get(), staging_buffers);
                 return Status::InternalError("posix_memalign failed" LOC_MARK);
             }
             staging_buffers.push_back(buffer);
@@ -226,7 +343,7 @@ Status IOUringTransport::submitTransferTasks(
     // by a deferred submission (see below) may still occupy the ring.
     if (io_uring_sq_space_left(&io_uring_batch->ring) <
         (int)request_list.size()) {
-        for (void* buffer : staging_buffers) free(buffer);
+        releaseStagingBuffers(staging_pool_.get(), staging_buffers);
         return Status::TooManyRequests("Insufficient SQE space" LOC_MARK);
     }
 
@@ -245,6 +362,8 @@ Status IOUringTransport::submitTransferTasks(
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
         task.buffer = staging_buffers[i];
+        if (staging_pool_ && staging_pool_->owns(task.buffer))
+            task.pool = staging_pool_;
         // Vectored ops with a single iovec: IORING_OP_READV/WRITEV have
         // existed since kernel 5.1, while the non-vectored READ/WRITE
         // opcodes used by io_uring_prep_read()/io_uring_prep_write() require
@@ -326,10 +445,7 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
                         ? TransferStatusEnum::COMPLETED
                         : TransferStatusEnum::FAILED;
             }
-            if (cqe_task->buffer) {
-                free(cqe_task->buffer);
-                cqe_task->buffer = nullptr;
-            }
+            cqe_task->releaseBuffer();
         }
         io_uring_cqe_seen(&io_uring_batch->ring, cqe);
         batch->notifyProgress();

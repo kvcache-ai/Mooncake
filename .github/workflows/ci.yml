@@ -551,6 +551,7 @@ jobs:
     outputs:
       src: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.src }}
       tent: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.tent }}
+      store_rs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.store_rs }}
       docs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.docs }}
     steps:
       - uses: actions/checkout@v4
@@ -588,6 +589,19 @@ jobs:
               - 'scripts/ci/run_transfer_engine_rust_smoke.sh'
               - '.github/actions/**'
               - '.github/workflows/ci.yml'
+            store_rs:
+              - 'mooncake-store-rs/**'
+              - 'python/mooncake/store/__init__.py'
+              - 'python/mooncake/store/rs/**'
+              - 'python/tests/store/rs/**'
+              - 'mooncake-common/include/**'
+              - 'mooncake-common/FindYLT.cmake'
+              - 'mooncake-transfer-engine/include/**'
+              - 'mooncake-transfer-engine/tent/include/**'
+              - 'scripts/ci/run_store_rs_smoke.sh'
+              - 'CMakeLists.txt'
+              - 'dependencies.sh'
+              - '.github/workflows/ci.yml'
             docs:
               - 'docs/**'
               - '.github/workflows/ci.yml'
@@ -601,6 +615,11 @@ jobs:
       python-versions: '["3.12"]'
       artifact-prefix: mooncake-wheel-cu130
       version-override: 0.0.0.dev0
+      # This artifact feeds the T-One e2e pipeline (integration-test.yml picks
+      # the py312/cu130 wheel), which exercises the TENT runtime. Default
+      # engine behavior stays classic; TENT activates via MC_USE_TENT=1 set
+      # by tone_tests/scripts/common.sh.
+      use-tent: true
 
   # arm64 default wheels use a different transport set (USE_MNNVL) than
   # x86_64 (USE_INTRA_NVLINK), so build one here instead of only at release.
@@ -633,26 +652,41 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
+      # The Store library and its tests are about 70% of a full build, and
+      # the unit-tests job already builds and runs them. Only cuda-off runs
+      # Store tests here, so it builds just the TE tree plus those two test
+      # executables; the other legs configure with WITH_STORE=OFF. An empty
+      # build_targets builds and installs everything that was configured.
       matrix:
         include:
           - name: cuda-on
-            cmake_flags: '-DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs'
+            cmake_flags: >-
+              -DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs
+              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
             need_cuda: true
             metrics_flags: ''
+            build_targets: ''
           - name: cuda-off
             cmake_flags: '-DUSE_CUDA=OFF -DUSE_EVENT_DRIVEN_COMPLETION=ON'
             need_cuda: false
             metrics_flags: ''
+            build_targets: >-
+              mooncake-transfer-engine/all
+              transfer_task_test standalone_client_test
           - name: cuda-off-metrics-on
-            cmake_flags: '-DUSE_CUDA=OFF'
+            cmake_flags: '-DUSE_CUDA=OFF -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF'
             need_cuda: false
             metrics_flags: '-DTENT_METRICS_ENABLED=ON'
+            build_targets: ''
           # Exercise the native UB target with its injected mock adapter. A
           # Debug build also catches ODR/link errors hidden by optimization.
           - name: ub-mock
-            cmake_flags: '-DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug'
+            cmake_flags: >-
+              -DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug
+              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
             need_cuda: false
             metrics_flags: ''
+            build_targets: ''
           # Compile against stub ACL headers and embed host-only ACL stubs in
           # transfer_engine for Rust checks; no CANN, NPU, or libmf_smem is required.
           - name: memfabric-mock
@@ -662,6 +696,7 @@ jobs:
               -DCMAKE_BUILD_TYPE=Debug
             need_cuda: false
             metrics_flags: ''
+            build_targets: tent_memfabric_transport_test transfer_engine
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -713,8 +748,8 @@ jobs:
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         fi
         cd build-tent
-        if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
-          cmake --build . --target tent_memfabric_transport_test transfer_engine
+        if [ -n "${{ matrix.build_targets }}" ]; then
+          cmake --build . --target ${{ matrix.build_targets }}
         else
           cmake --build .
           sudo cmake --install .
@@ -755,6 +790,13 @@ jobs:
       run: |
         ctest --test-dir build-tent --output-on-failure --no-tests=error \
           -R '^tent_compat_notify_test$'
+      shell: bash
+
+    - name: Test Store scatter shared-segment ownership with TENT
+      if: matrix.name == 'cuda-off'
+      run: |
+        ctest --test-dir build-tent --output-on-failure --no-tests=error \
+          -R '^transfer_task_tent_shared_segment_test$'
       shell: bash
 
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
@@ -811,6 +853,130 @@ jobs:
       shell: bash
       run: ${SCCACHE_PATH} --show-stats
 
+  store-rs-ci:
+    name: Store-RS Classic TE smoke
+    needs: [spell-check, clang-format, check-paths]
+    if: needs.check-paths.outputs.store_rs == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CI: "true"
+      SCCACHE_GHA_ENABLED: "true"
+      MOONCAKE_ROOT_DIR: ${{ github.workspace }}
+      MOONCAKE_STORE_RS_DIR: ${{ github.workspace }}/mooncake-store-rs
+      MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build/store-rs-ci
+      MOONCAKE_PYTHON_PREFIX: ${{ github.workspace }}/build/store-rs-python-prefix
+      MOONCAKE_CLASSIC_SHIM_LIB_PATH: ${{ github.workspace }}/build/store-rs-ci/mooncake-store-rs/native-shims/libmooncake_classic_shim.so
+      MOONCAKE_TENT_SHIM_LIB_PATH: ${{ github.workspace }}/build/store-rs-ci/mooncake-store-rs/native-shims/libmooncake_tent_shim.so
+      MOONCAKE_PYTHON_BIN: python3
+      MC_STORE_RS_CHECK_CPP_FACADE: "false"
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Show Rust toolchain versions
+      run: |
+        rustc --version --verbose
+        cargo --version
+        cargo clippy --version
+        rustfmt --version
+
+    - name: Check Store-RS Rust formatting
+      run: cargo fmt --all --manifest-path mooncake-store-rs/Cargo.toml -- --check
+
+    - name: Cache Store-RS Cargo artifacts
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: |
+          mooncake-store-rs -> ../build/store-rs-ci/mooncake-store-rs/cargo-cli
+          mooncake-store-rs -> ../build/store-rs-ci/mooncake-store-rs/cargo-python
+          mooncake-store-rs -> ../build/store-rs-ci/mooncake-store-rs/cargo-tests
+
+    - name: Free up disk space
+      uses: ./.github/actions/free-disk-space
+
+    - name: Set up compiler cache
+      uses: ./.github/actions/setup-sccache
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build redis-server redis-tools
+        sudo bash -x dependencies.sh -y
+        python -m pip install --disable-pip-version-check numpy pybind11
+      shell: bash
+
+    - name: Configure Store-RS
+      run: |
+        # Store-RS's current CMake integration requires both native shims, even
+        # though this PR gate exercises only the Classic TE data path.
+        cmake -S "$MOONCAKE_ROOT_DIR" -B "$MOONCAKE_BUILD_DIR" -G Ninja \
+          -DSKBUILD=ON \
+          -DPython3_EXECUTABLE="$(command -v python3)" \
+          -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
+          -DWITH_STORE=OFF \
+          -DWITH_STORE_RUST=OFF \
+          -DWITH_STORE_RS=ON \
+          -DWITH_TE=ON \
+          -DUSE_TENT=ON \
+          -DUSE_REDIS=ON \
+          -DUSE_CUDA=OFF \
+          -DBUILD_EXAMPLES=OFF \
+          -DBUILD_UNIT_TESTS=OFF \
+          -DBUILD_SHARED_LIBS=ON \
+          -DENABLE_SCCACHE=ON \
+          -DCMAKE_BUILD_TYPE=Release
+      shell: bash
+
+    - name: Build Store-RS and native shims
+      run: |
+        cmake --build "$MOONCAKE_BUILD_DIR" \
+          --target _fast_copy engine build_store_rs \
+          --parallel "$(nproc)"
+      shell: bash
+
+    - name: Lint Store-RS Rust crates
+      run: |
+        PYO3_PYTHON="$(command -v python3)"
+        CARGO_TARGET_DIR="$MOONCAKE_BUILD_DIR/mooncake-store-rs/cargo-tests"
+        export PYO3_PYTHON CARGO_TARGET_DIR
+        source "$MOONCAKE_STORE_RS_DIR/scripts/lib/common.sh"
+        mc_scripts_setup_upstream_runtime_env none
+        cargo clippy \
+          --manifest-path "$MOONCAKE_STORE_RS_DIR/Cargo.toml" \
+          --workspace --lib --bins --release -- -D warnings
+      shell: bash
+
+    - name: Install Store-RS Python component
+      run: |
+        cmake --install "$MOONCAKE_BUILD_DIR" --component python \
+          --prefix "$MOONCAKE_PYTHON_PREFIX"
+        mkdir -p "$MOONCAKE_PYTHON_PREFIX/mooncake"
+        cp -a "$MOONCAKE_ROOT_DIR/python/mooncake/." \
+          "$MOONCAKE_PYTHON_PREFIX/mooncake/"
+      shell: bash
+
+    - name: Run Store-RS Classic TE smoke
+      run: ./scripts/ci/run_store_rs_smoke.sh
+      shell: bash
+
+    - name: Run sccache stat for check
+      if: ${{ env.SCCACHE_PATH != '' }}
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
+
   ci-gate:
     name: CI Gate
     # A cancelled branch push run reports no result rather than a failed gate.
@@ -835,6 +1001,7 @@ jobs:
       - build-wheel-efa
       - build-wheel-rocm
       - tent-ci
+      - store-rs-ci
     runs-on: ubuntu-latest
     steps:
       # Each path-gated group must succeed when selected and be skipped otherwise.
@@ -875,6 +1042,12 @@ jobs:
         env:
           EXPECTED: ${{ needs.check-paths.outputs.tent == 'true' && 'success' || 'skipped' }}
           RESULT: ${{ needs.tent-ci.result }}
+        run: test "$RESULT" = "$EXPECTED"
+
+      - name: Check Store-RS job
+        env:
+          EXPECTED: ${{ needs.check-paths.outputs.store_rs == 'true' && 'success' || 'skipped' }}
+          RESULT: ${{ needs.store-rs-ci.result }}
         run: test "$RESULT" = "$EXPECTED"
 
       - name: Check documentation job

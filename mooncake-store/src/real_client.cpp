@@ -1338,7 +1338,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             ReplicaSelectionConfig::FromEnvironment().hca_numa_segments_enabled;
         std::vector<int> seg_numa_nodes;
         if (protocol == "rdma") {
-            seg_numa_nodes = client_->GetNicNumaNodes();
+            // Only the NIC nodes this process may allocate from: binding a
+            // region to a node outside its cpuset fails setup with EINVAL.
+            seg_numa_nodes =
+                FilterNumaNodesToAllowed(client_->GetNicNumaNodes());
             if (seg_numa_nodes.size() > 1 ||
                 (partition_numa && !seg_numa_nodes.empty())) {
                 std::string nodes_str;
@@ -1851,8 +1854,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     ssd_prefetch_dedup_ttl_sec_ =
         static_cast<int64_t>(prefetch_dedup_ttl_opt.value());
 
-    auto egm_config = ParseEgmStorePoolConfig(
-        config, protocol, global_segment_size, local_buffer_size);
+    auto egm_config =
+        ParseEgmStorePoolConfig(config, protocol, global_segment_size);
     if (!egm_config) return tl::unexpected(egm_config.error());
     try {
         auto result = setup_internal(
