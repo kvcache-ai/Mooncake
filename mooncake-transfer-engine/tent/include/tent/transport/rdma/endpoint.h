@@ -226,7 +226,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
    private:
     int setupAllQPs(const std::string& peer_gid, uint32_t peer_lid,
                     std::vector<uint32_t> peer_qp_num_list, int local_gid_index,
-                    std::string* reply_msg = nullptr);
+                    uint32_t peer_path_mtu, std::string* reply_msg = nullptr);
 
     int setupOneQP(int qp_index, const std::string& peer_gid, uint32_t peer_lid,
                    uint32_t peer_qp_num, int local_gid_index,
@@ -270,6 +270,8 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // Immutable address generation used to create this endpoint's QPs and
     // bootstrap descriptors. A context refresh evicts the whole endpoint.
     RdmaAddressSnapshot local_address_;
+    // Path MTU of all QPs of this endpoint, chosen in setupAllQPs().
+    ibv_mtu path_mtu_ = IBV_MTU_4096;
 
     std::vector<ibv_qp*> qp_list_;
     // Per-pool QP layout, resolved once in construct() from params_->qp_pools.

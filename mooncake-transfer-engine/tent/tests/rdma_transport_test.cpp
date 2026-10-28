@@ -58,6 +58,20 @@
 #include "tent/transport/rdma/workers.h"
 #include "../src/platform/xpu/xpu_dmabuf_utils.h"
 
+#ifdef TENT_TEST_WRAP_MODIFY_QP
+// setupNotifyQpConnection() calls libibverbs' ibv_modify_qp directly, not
+// through the context's verbs table. This binary is linked with
+// --wrap=ibv_modify_qp, so a test can stand in for it on a fake device.
+static ibv_context* g_fake_modify_qp_context = nullptr;
+static int (*g_fake_modify_qp)(ibv_qp*, ibv_qp_attr*, int) = nullptr;
+extern "C" int __real_ibv_modify_qp(ibv_qp*, ibv_qp_attr*, int);
+extern "C" int __wrap_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr, int mask) {
+    if (g_fake_modify_qp_context && qp->context == g_fake_modify_qp_context)
+        return g_fake_modify_qp(qp, attr, mask);
+    return __real_ibv_modify_qp(qp, attr, mask);
+}
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -4122,6 +4136,98 @@ TEST_F(RdmaNotifySendSlotTest, AFailedPostDoesNotTakeASendSlot) {
     // 256 would reuse slot 0, whose wr_id 0 is still in flight.
     EXPECT_EQ(posted.back(), 255u);
 }
+
+#ifdef TENT_TEST_WRAP_MODIFY_QP
+// Records the path MTU each queue pair of the endpoint goes to RTR with:
+// the data QP (dest 42) through the verbs table, the notification QP
+// (dest 77) through the wrapped ibv_modify_qp.
+class RdmaEndpointPathMtuTest : public RdmaWorkersSharedQpTest {
+   protected:
+    static std::vector<std::pair<uint32_t, ibv_mtu>> rtrs;
+    static int recordRtr(ibv_qp*, ibv_qp_attr* attr, int mask) {
+        if ((mask & IBV_QP_STATE) && attr->qp_state == IBV_QPS_RTR)
+            rtrs.push_back({attr->dest_qp_num, attr->path_mtu});
+        return 0;
+    }
+    static int postRecv(ibv_qp*, ibv_recv_wr*, ibv_recv_wr** bad_wr) {
+        *bad_wr = nullptr;
+        return 0;
+    }
+    void SetUp() override {
+        RdmaWorkersSharedQpTest::SetUp();
+        rtrs.clear();
+        RdmaContextTestPeer::verbs(*context_).ibv_modify_qp = recordRtr;
+        fake.native.ops.post_recv = postRecv;
+        g_fake_modify_qp_context = &fake.native;
+        g_fake_modify_qp = recordRtr;
+    }
+    void TearDown() override {
+        RdmaWorkersSharedQpTest::TearDown();
+        g_fake_modify_qp_context = nullptr;
+    }
+    BootstrapDesc peer(uint32_t path_mtu) const {
+        BootstrapDesc desc;
+        desc.local_nic_path = "peer:1@rnic0";
+        desc.local_gid = context_->address().gid;
+        desc.qp_num = {42};
+        desc.notify_qp_num = 77;
+        desc.path_mtu = path_mtu;
+        return desc;
+    }
+    // Every QP that went to RTR, with the MTU it was given.
+    static void expectRtrs(ibv_mtu mtu) {
+        ASSERT_EQ(rtrs.size(), 2u);
+        EXPECT_EQ(rtrs[0], std::make_pair(42u, mtu));
+        EXPECT_EQ(rtrs[1], std::make_pair(77u, mtu));
+    }
+};
+std::vector<std::pair<uint32_t, ibv_mtu>> RdmaEndpointPathMtuTest::rtrs;
+
+TEST_F(RdmaEndpointPathMtuTest, BothQpKindsUseTheSmallerMtu) {
+    BootstrapDesc local;
+    ASSERT_TRUE(endpoint_->accept(peer(1024), local).ok());
+    expectRtrs(IBV_MTU_1024);
+    EXPECT_EQ(local.path_mtu, 4096u);  // its own MTU, not the agreed one
+}
+
+TEST_F(RdmaEndpointPathMtuTest, PeerWithoutMtuKeepsTheEngineWideMtu) {
+    params_->endpoint.path_mtu = IBV_MTU_2048;
+    BootstrapDesc local;
+    ASSERT_TRUE(endpoint_->accept(peer(0), local).ok());
+    expectRtrs(IBV_MTU_2048);
+    EXPECT_EQ(local.path_mtu, 2048u);
+}
+
+TEST_F(RdmaEndpointPathMtuTest, DuplicateBootstrapReportsTheMtu) {
+    BootstrapDesc first, again;
+    ASSERT_TRUE(endpoint_->accept(peer(1024), first).ok());
+    ASSERT_TRUE(endpoint_->accept(peer(1024), again).ok());
+    EXPECT_EQ(rtrs.size(), 2u);  // the second one set nothing up
+    EXPECT_EQ(again.path_mtu, first.path_mtu);
+}
+
+// The initiator side: connect() reports its own MTU and programs the
+// smaller one the peer's reply reports.
+TEST_F(RdmaEndpointPathMtuTest, ConnectUsesTheMtuThePeerReports) {
+    params_->endpoint.path_mtu = IBV_MTU_2048;
+    std::atomic<uint32_t> reported{0};
+    ControlService peer_service("p2p", "", nullptr);
+    peer_service.setBootstrapRdmaCallback(
+        [this, &reported](const BootstrapDesc& request, BootstrapDesc& reply) {
+            reported = request.path_mtu;
+            reply = peer(1024);
+            return 0;
+        });
+    uint16_t port = 0;
+    ASSERT_TRUE(peer_service.start(port).ok());
+    ASSERT_TRUE(
+        endpoint_
+            ->connect("peer:1", "rnic0", "127.0.0.1:" + std::to_string(port))
+            .ok());
+    expectRtrs(IBV_MTU_1024);
+    EXPECT_EQ(reported.load(), 2048u);
+}
+#endif
 
 // The handler reads the slice well past acknowledge(), which is what
 // publishes the terminal status the caller is waiting for. A batch freed in
