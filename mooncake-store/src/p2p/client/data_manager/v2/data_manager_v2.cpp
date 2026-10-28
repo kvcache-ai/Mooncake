@@ -264,6 +264,24 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
                     node["band_veryhot_threshold"].asUInt64();
             }
         }
+        if (v2.isMember("tier_placement")) {
+            const auto& node = v2["tier_placement"];
+            if (node.isMember("type")) {
+                config.tier_placement.type = node["type"].asString();
+            }
+            if (node.isMember("max_destination_usage")) {
+                config.tier_placement.max_destination_usage =
+                    node["max_destination_usage"].asDouble();
+            }
+            if (node.isMember("onboard_keeps_source")) {
+                config.tier_placement.onboard_keeps_source =
+                    node["onboard_keeps_source"].asBool();
+            }
+            if (node.isMember("lowest_priority_tier_full_policy")) {
+                config.tier_placement.lowest_priority_tier_full_policy =
+                    node["lowest_priority_tier_full_policy"].asString();
+            }
+        }
         if (v2.isMember("copier")) {
             const auto& node = v2["copier"];
             if (node.isMember("staging_buffer_bytes")) {
@@ -377,6 +395,33 @@ tl::expected<void, ErrorCode> ValidateDataManagerV2Config(
         }
         auto eviction_valid = ValidateEvictionIndexConfig(tiler.eviction);
         if (!eviction_valid) return eviction_valid;
+        if (tiler.allocation_failure_override) {
+            auto allocation_valid = ValidateAllocationFailurePolicy(
+                *tiler.allocation_failure_override);
+            if (!allocation_valid) return allocation_valid;
+        }
+    }
+    if (config.tier_placement.lowest_priority_tier_full_policy ==
+            "evict_coldest" &&
+        !config.tilers.empty()) {
+        const auto lowest_priority = std::min_element(
+            config.tilers.begin(), config.tilers.end(),
+            [](const TilerConfig& lhs, const TilerConfig& rhs) {
+                return lhs.logical.priority < rhs.logical.priority;
+            })->logical.priority;
+        for (const auto& tiler : config.tilers) {
+            if (tiler.logical.priority != lowest_priority) continue;
+            const AllocationFailurePolicyConfig& allocation =
+                tiler.allocation_failure_override
+                    ? *tiler.allocation_failure_override
+                    : config.allocation_failure;
+            if (!allocation.try_evict) {
+                LOG(ERROR) << "lowest_priority_tier_full_policy=evict_coldest "
+                              "requires allocation_failure.try_evict=true on "
+                              "every lowest-priority tier";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
     }
     if (config.max_registration_retry == 0) {
         LOG(ERROR) << "max_registration_retry must be greater than zero";

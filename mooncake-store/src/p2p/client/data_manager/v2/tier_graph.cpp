@@ -142,6 +142,15 @@ tl::expected<TierGraph, ErrorCode> TierGraph::Build(
     // every caller to special-case "one tier" before building a graph.
     graph.nodes_ = std::move(nodes);
     graph.edges_ = std::move(edges);
+    if (!graph.nodes_.empty()) {
+        const auto [lowest, highest] = std::minmax_element(
+            graph.nodes_.begin(), graph.nodes_.end(),
+            [](const TierNode& lhs, const TierNode& rhs) {
+                return lhs.priority < rhs.priority;
+            });
+        graph.lowest_priority_ = lowest->priority;
+        graph.highest_priority_ = highest->priority;
+    }
     // Diagnostics run here and not in the loops above: they ask the graph its
     // own questions, and the neighbour queries need nodes_ and edges_, which
     // only exist from this point on.
@@ -205,6 +214,12 @@ const TierNode* TierGraph::Node(const UUID& tiler_id) const {
     auto it = node_index_.find(tiler_id);
     if (it == node_index_.end()) return nullptr;
     return &nodes_[it->second];
+}
+
+bool TierGraph::IsLowestPriorityTier(const UUID& tiler_id) const {
+    const TierNode* node = Node(tiler_id);
+    return node != nullptr && lowest_priority_.has_value() &&
+           node->priority == *lowest_priority_;
 }
 
 const TierEdge* TierGraph::Edge(const UUID& source,
@@ -356,8 +371,15 @@ class NearestNeighbourPolicy final : public TierPlacementPolicy {
 
     bool Admits(const PlacementContext& context, const UUID& candidate) const {
         // A tier already at the limit is itself about to reclaim; feeding it
-        // turns one tier's pressure into two tiers' pressure.
-        if (context.usage_ratio &&
+        // turns one tier's pressure into two tiers' pressure. The explicit
+        // replacement mode is the exception for the slowest tier: admitting
+        // here lets its allocation-failure path evict a cold block only when
+        // the allocator actually needs room.
+        const bool replace_coldest =
+            context.direction == MovementDirection::kOffload &&
+            graph_->IsLowestPriorityTier(candidate) &&
+            config_.lowest_priority_tier_full_policy == "evict_coldest";
+        if (!replace_coldest && context.usage_ratio &&
             context.usage_ratio(candidate) >= config_.max_destination_usage) {
             return false;
         }
@@ -394,6 +416,13 @@ tl::expected<void, ErrorCode> ValidateTierPlacementPolicyConfig(
         LOG(ERROR) << "tier_placement_policy.max_destination_usage must be "
                       "in (0, 1], got "
                    << config.max_destination_usage;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.lowest_priority_tier_full_policy != "retain" &&
+        config.lowest_priority_tier_full_policy != "evict_coldest") {
+        LOG(ERROR) << "tier_placement_policy.lowest_priority_tier_full_policy "
+                      "must be 'retain' or 'evict_coldest', got "
+                   << config.lowest_priority_tier_full_policy;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!config.onboard_keeps_source) {

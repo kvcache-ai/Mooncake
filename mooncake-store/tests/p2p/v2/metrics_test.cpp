@@ -268,6 +268,11 @@ TEST_F(V2MetricsTest, EventAndPolicyConfigurationIsReachableFromJson) {
             "events": {"shard_count": 2, "event_queue_capacity": 32,
                        "movement_queue_capacity": 8,
                        "movement_worker_count": 3},
+            "tier_placement": {"type": "nearest_neighbour",
+                               "max_destination_usage": 0.98,
+                               "onboard_keeps_source": true,
+                               "lowest_priority_tier_full_policy":
+                                   "evict_coldest"},
             "placement_policy": {"offload_high_watermark": 0.7,
                                  "offload_low_watermark": 0.5,
                                  "onboard_min_frequency": 4},
@@ -287,6 +292,9 @@ TEST_F(V2MetricsTest, EventAndPolicyConfigurationIsReachableFromJson) {
     // file keeps meaning what it meant.
     EXPECT_EQ(config->migration.max_queued_requests, 8U);
     EXPECT_EQ(config->movement_worker_count, 3U);
+    EXPECT_DOUBLE_EQ(config->tier_placement.max_destination_usage, 0.98);
+    EXPECT_EQ(config->tier_placement.lowest_priority_tier_full_policy,
+              "evict_coldest");
     // The placement_policy JSON block keeps its name and its keys, but the
     // monolithic policy behind it is gone: each key now lands where that
     // decision actually lives. offload_low_watermark had no reader once
