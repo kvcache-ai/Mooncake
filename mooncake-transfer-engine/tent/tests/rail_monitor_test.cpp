@@ -147,7 +147,8 @@ TEST(RailMonitorConfigTest, UnknownRemoteNumaSkipsUnavailableDirectRail) {
     RailMonitor rail;
     ASSERT_TRUE(rail.load(local, remote, rail_json, nullptr).ok());
     for (int i = 0; i < 3; ++i)
-        rail.markFailed(/*local_nic=*/0, /*remote_nic=*/1);
+        rail.markFailed(/*local_nic=*/0, /*remote_nic=*/1,
+                        /*probe_token=*/0);
 
     EXPECT_FALSE(rail.isAvailable(/*local_nic=*/0, /*remote_nic=*/1));
     EXPECT_TRUE(rail.isAvailable(/*local_nic=*/0, /*remote_nic=*/0));

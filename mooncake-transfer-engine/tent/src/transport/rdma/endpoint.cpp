@@ -826,7 +826,8 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
                    << params_->signal_interval;
         return 0;
     }
-    const int signal_interval = params_->signal_interval;
+    const int signal_interval =
+        std::min(params_->signal_interval, std::max(1, params_->max_qp_wr / 2));
     int wr_count = std::min(
         params_->max_qp_wr -
             wr_depth_list_[qp_index].value.load(std::memory_order_relaxed),

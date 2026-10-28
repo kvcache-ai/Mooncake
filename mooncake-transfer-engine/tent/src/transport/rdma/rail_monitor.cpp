@@ -371,7 +371,7 @@ int RailMonitor::findBestRemoteDevice(int local_nic, int remote_numa) {
     // map instead of whichever NUMA bucket happens to be visited first.
     auto direct = direct_rails_.find(local_nic);
     if (direct != direct_rails_.end() && direct->second >= 0 &&
-        isAvailable(local_nic, direct->second))
+        isAvailableUnlocked(local_nic, direct->second))
         return direct->second;
 
     for (remote_numa = 0; remote_numa < (int)kMaxNuma; ++remote_numa) {

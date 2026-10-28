@@ -3731,8 +3731,8 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
         ctx.inflight_slices.fetch_add(1);
         // Posted straight away, as the hook inside submitSlices does it.
         RdmaTransportTestPeer::markPosted(*workers_, ctx, slice, enqueue_ts);
-        RdmaEndPointTestPeer::pretendPosted(
-            endpoint ? endpoint : endpoint_, 0, slice, signaled);
+        RdmaEndPointTestPeer::pretendPosted(endpoint ? endpoint : endpoint_, 0,
+                                            slice, signaled);
         tasks_.push_back(task);
         slices_.push_back(slice);
         return slice;
@@ -3842,10 +3842,10 @@ TEST_F(RdmaWorkersSharedQpTest,
     slice->task->request.target_id = LOCAL_SEGMENT_ID;
     slice->rail_monitor = rail;
     slice->rail_probe_token.store(probe_token, std::memory_order_release);
-    RdmaTransportTestPeer::queuePostPath(
-        *workers_, /*worker_id=*/0, /*local_device_id=*/kDev,
-        /*remote_segment_id=*/LOCAL_SEGMENT_ID, /*remote_device_id=*/kDev,
-        slice);
+    RdmaTransportTestPeer::queuePostPath(*workers_, /*worker_id=*/0,
+                                         /*local_device_id=*/kDev,
+                                         /*remote_segment_id=*/LOCAL_SEGMENT_ID,
+                                         /*remote_device_id=*/kDev, slice);
 
     RdmaTransportTestPeer::postSend(*workers_, /*worker_id=*/0);
 
@@ -3878,6 +3878,26 @@ TEST_F(RdmaWorkersSharedQpTest,
     EXPECT_EQ(slices[3]->completions_owed.load(), 1);
     EXPECT_EQ(slices[4]->completions_owed.load(), 1);
     EXPECT_EQ(cq_.getQuota(), 5);
+}
+
+TEST_F(RdmaWorkersSharedQpTest,
+       SelectiveSignalingCapsIntervalAtHalfTheSqDepth) {
+    params_->endpoint.max_qp_wr = 8;
+    params_->endpoint.signal_interval = 32;
+    RdmaEndPointTestPeer::markReady(endpoint_);
+    std::vector<RdmaSlice*> slices;
+    for (int index = 0; index < 8; ++index) slices.push_back(makeSlice());
+
+    ASSERT_EQ(endpoint_->submitSlices(slices, /*qp_index=*/0, nullptr), 8);
+    ASSERT_EQ(post_flags.size(), slices.size());
+    EXPECT_EQ(post_flags[0] & IBV_SEND_SIGNALED, 0);
+    EXPECT_EQ(post_flags[1] & IBV_SEND_SIGNALED, 0);
+    EXPECT_EQ(post_flags[2] & IBV_SEND_SIGNALED, 0);
+    EXPECT_NE(post_flags[3] & IBV_SEND_SIGNALED, 0);
+    EXPECT_EQ(post_flags[4] & IBV_SEND_SIGNALED, 0);
+    EXPECT_EQ(post_flags[5] & IBV_SEND_SIGNALED, 0);
+    EXPECT_EQ(post_flags[6] & IBV_SEND_SIGNALED, 0);
+    EXPECT_NE(post_flags[7] & IBV_SEND_SIGNALED, 0);
 }
 
 TEST_F(RdmaWorkersSharedQpTest,
