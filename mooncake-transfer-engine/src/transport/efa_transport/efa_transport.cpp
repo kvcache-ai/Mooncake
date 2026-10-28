@@ -575,12 +575,23 @@ int EfaTransport::registerLocalMemoryInternal(
                       << ", duration=" << reg_duration_ms << "ms";
         }
 
-        // Collect keys: assigned NICs have valid keys, others get 0
+        // Collect keys: assigned NICs have valid keys, others get 0.
+        // On EFA lkey() and rkey() are the same fi_mr_key(), and the segment
+        // descriptor (lkeys included) goes to every peer that opens it. So a
+        // buffer without remote_accessible publishes only a non-zero
+        // placeholder lkey: the post path takes the local MR from mrDesc(),
+        // and selectDevice() only checks which NICs hold a non-zero key.
+        // Libfabric before 2.6 registers every EFA MR with remote access
+        // whatever fi_mr_reg is asked for, so the real key must not leak.
         BufferDesc buffer_desc;
         for (auto& context : context_list_) {
-            buffer_desc.lkey.push_back(context->lkey(chunk_addr));
-            if (remote_accessible)
+            uint64_t key = context->lkey(chunk_addr);
+            if (remote_accessible) {
+                buffer_desc.lkey.push_back(key);
                 buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+            } else {
+                buffer_desc.lkey.push_back(key ? kLocalOnlyKey : 0);
+            }
         }
 
         buffer_desc.name = resolved_name;

@@ -153,6 +153,10 @@ class EfaTransport : public Transport {
     int startHandshakeDaemon(std::string& local_server_name);
 
    public:
+    // Published as the lkey of a buffer registered without remote_accessible,
+    // in place of its real MR key (see registerLocalMemoryInternal()).
+    static constexpr uint64_t kLocalOnlyKey = 1;
+
     // require_remote_key: true for a peer's segment (the device must hold an
     // rkey), false for the local segment, whose buffers registered without
     // remote_accessible publish only lkeys.
