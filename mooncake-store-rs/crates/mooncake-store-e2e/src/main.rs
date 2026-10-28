@@ -287,6 +287,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         &reader,
         value_size,
     )?;
+    target_c.register_local_memory()?;
     verify_rdma_bandwidth_isolation(
         metadata.clone(),
         planner.clone(),
@@ -1715,12 +1716,13 @@ fn run_batch_put_benchmark(
     iterations: usize,
     other_clients: &mut [&mut StoreClient],
 ) -> Result<()> {
+    let tenant = writer.default_tenant().to_string();
     for batch_size in [1usize, 8, 64] {
         let start = Instant::now();
         let mut total_bytes = 0usize;
         for iteration in 0..iterations {
             let items = build_items(
-                "bench-put",
+                &tenant,
                 &format!("put-{batch_size}-{iteration}"),
                 batch_size,
                 value_size,
@@ -1758,7 +1760,15 @@ fn run_batch_get_benchmark(
     iterations: usize,
     other_clients: &mut [&mut StoreClient],
 ) -> Result<()> {
-    let items = build_items("bench-get", "get", 64, value_size);
+    let tenant = writer.default_tenant().to_string();
+    if reader.default_tenant() != tenant {
+        return Err(StoreError::InvalidState(format!(
+            "batch get benchmark requires matching writer and reader tenants: writer={} reader={}",
+            tenant,
+            reader.default_tenant()
+        )));
+    }
+    let items = build_items(&tenant, "get", 64, value_size);
     let puts = items
         .iter()
         .map(|item| {
