@@ -736,6 +736,7 @@ These apply to any Mooncake caller — the framework sections below only add the
 |---|---|---|
 | `MOONCAKE_PROTOCOL` | `rdma` | Set to `efa` to select this transport. Read by the vLLM / SGLang connectors |
 | `MC_MAX_WR` | provider's transmit depth | Per-NIC in-flight WR cap. **Do not set** — see below |
+| `MC_EFA_STALL_MIN_MS` | `1000` | How long a peer must refuse every post (unbroken `FI_EAGAIN`, at least 1024 waves) before its slices fail. A new connection's first completions take 50–100 ms, so much lower values fail healthy peers. `<= 0` restores the count-only check |
 | `MC_EFA_CQ_THREADS` | `1` | CQ polling threads. **Leave alone** — see below |
 | `MC_EFA_NIC_SELECTION` | `all` | `local` registers each device buffer only on its topology-local NICs — see below |
 | `MC_EFA_DISABLE_NEURON` | unset | `1` skips Neuron HBM registration and stages through host memory — see [AWS Neuron](#efa-neuron) |
@@ -747,7 +748,7 @@ These apply to any Mooncake caller — the framework sections below only add the
 > Overriding it desynchronizes the counter from the queue it paces, and **both directions of error are real transfer failures, not just slowdowns** — EFA has no transport-level retransmit, so the affected slices are reported up as `FAILED`:
 >
 > - **Too small** (e.g. the old fixed default of 256): the counter saturates while the queue is mostly empty, so submitters spin in the credit-wait loop and give up — `timed out waiting for CQ drain (wr_depth=256, max=256)` — with thousands of slots the NIC would have accepted.
-> - **Too large** (e.g. `MC_MAX_WR=16384`): the counter hands out credit the queue cannot honor, so `fi_write` refuses with `-FI_EAGAIN` while `wr_depth` sits pinned at the provider's real depth and the rest of the credit is nominally free — `1024 consecutive FI_EAGAIN waves posted nothing`.
+> - **Too large** (e.g. `MC_MAX_WR=16384`): the counter hands out credit the queue cannot honor, so `fi_write` refuses with `-FI_EAGAIN` while `wr_depth` sits pinned at the provider's real depth and the rest of the credit is nominally free — `N consecutive FI_EAGAIN waves over X ms posted nothing` once the refusals have lasted `MC_EFA_STALL_MIN_MS`.
 >
 > A value **below** the provider's depth is still honored, as a deliberate per-NIC throttle; a value above it is clamped with a warning. Verify what took effect from the per-device startup line — no probe needed:
 >

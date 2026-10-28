@@ -624,6 +624,11 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.efa_cq_drain_timeout_ms = atoll(efa_cq_drain_timeout_env);
     }
 
+    const char* efa_stall_min_env = std::getenv("MC_EFA_STALL_MIN_MS");
+    if (efa_stall_min_env) {
+        config.efa_stall_min_ms = atoll(efa_stall_min_env);
+    }
+
     const char* use_rdma_twosided_env = std::getenv("MC_USE_RDMA_TWOSIDED");
     if (use_rdma_twosided_env) {
         parseBoolConfigEnv(use_rdma_twosided_env, "MC_USE_RDMA_TWOSIDED",
@@ -938,6 +943,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "efa_homogeneous_peers = " << config.efa_homogeneous_peers;
     LOG(INFO) << "efa_cq_drain_timeout_ms = " << config.efa_cq_drain_timeout_ms;
+    LOG(INFO) << "efa_stall_min_ms = " << config.efa_stall_min_ms;
     LOG(INFO) << "efa_nic_selection = "
               << (config.efa_nic_selection == EfaNicSelection::LOCAL ? "local"
                                                                      : "all");

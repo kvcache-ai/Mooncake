@@ -134,6 +134,20 @@ Status XpuPlatform::copy(void* dst, void* src, size_t length) {
     return CpuPlatform::copy(dst, src, length);
 }
 
+Status XpuPlatform::allocatePinnedHost(void** pptr, size_t size) {
+    if (backend().allocHost(pptr, size) != 0)
+        return Status::InternalError(
+            "XPU pinned host allocation failed" LOC_MARK);
+    return Status::OK();
+}
+
+Status XpuPlatform::freePinnedHost(void* ptr, size_t size) {
+    (void)size;
+    if (backend().freeHost(ptr) != 0)
+        return Status::InternalError("XPU pinned host free failed" LOC_MARK);
+    return Status::OK();
+}
+
 MemoryType XpuPlatform::getMemoryType(void* addr) {
     // USM device memory is classified whether it was allocated through this
     // platform or externally (e.g. a PyTorch XPU tensor registered via

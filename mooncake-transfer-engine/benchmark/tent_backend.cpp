@@ -211,6 +211,28 @@ static int resolveSegTypeParams(const std::string& seg_type,
                 << "local_gpu_id " << start_idx << " out of range [0, "
                 << device_count << ")";
         }
+#elif defined(USE_XPU)
+    } else if (seg_type == "VRAM" || seg_type == "vram") {
+        // XpuPlatform::probe lists one "xpu:N" memory node per device, in the
+        // same order XpuPlatform::allocate resolves "xpu:N".
+        device_prefix = "xpu";
+        std::vector<Topology::NicEntry> nics;
+        std::vector<Topology::MemEntry> mems;
+        CHECK_FAIL(Platform::getLoader().probe(nics, mems));
+        int gpu_count = 0;
+        for (const auto& mem : mems) {
+            if (LocationParser(mem.name).type() == "xpu") ++gpu_count;
+        }
+        LOG_ASSERT(gpu_count > 0) << "No XPU devices are visible";
+        start_idx = 0;
+        num_buffers = gpu_count;
+        if (XferBenchConfig::local_gpu_id != -1) {
+            start_idx = XferBenchConfig::local_gpu_id;
+            num_buffers = 1;
+            LOG_ASSERT(start_idx >= 0 && start_idx < gpu_count)
+                << "local_gpu_id " << start_idx << " out of range [0, "
+                << gpu_count << ")";
+        }
 #endif
     } else {
         LOG(ERROR) << "Unknown seg_type: " << seg_type;
@@ -262,10 +284,11 @@ int TENTBenchRunner::allocateBuffers() {
                 // runs (e.g. SHM sets shm_path, NVLink sets up GPU memory
                 // handle). registerLocalMemory below then resets options.type
                 // to UNSPEC so the buffer registers to ALL enabled transports,
-                // not just this one.
-                options.type = (seg_type == "vram")
-                                   ? (device_prefix == "mlu" ? UNSPEC : NVLINK)
-                                   : SHM;
+                // not just this one. MLU and XPU have no NVLink transport.
+                const bool no_nvlink =
+                    device_prefix == "mlu" || device_prefix == "xpu";
+                options.type =
+                    (seg_type == "vram") ? (no_nvlink ? UNSPEC : NVLINK) : SHM;
             }
             // else: single-seg_type fallback (--seg_type without
             // --seg_type_mix, no --xport_type). Leave options.type as UNSPEC

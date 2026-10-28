@@ -90,6 +90,13 @@ class XpuPlatform : public CpuPlatform {
     // dma-buf is shared, so the allocation cannot be registered on its own).
     Status exportDmabuf(void *addr, size_t length, DmabufExport &out) override;
 
+    // Page-aligned host memory imported into the devices' shared context
+    // (prepare_for_device_copy), so device queues copy to and from it by DMA
+    // and O_DIRECT file I/O can still use it.
+    Status allocatePinnedHost(void **pptr, size_t size) override;
+
+    Status freePinnedHost(void *ptr, size_t size) override;
+
     // Same-host, cross-process sharing of XPU allocations (used by
     // XpuTransport, not part of the generic Platform interface).
     //

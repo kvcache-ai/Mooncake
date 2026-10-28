@@ -391,6 +391,13 @@ if(USE_EFA)
                                                   gtest_main)
   add_test(NAME efa_discovery_test COMMAND efa_discovery_test)
 
+  add_executable(efa_stale_segment_desc_test
+                 ${WORKSPACE}/efa_stale_segment_desc_test.cpp)
+  target_link_libraries(efa_stale_segment_desc_test PUBLIC transfer_engine gtest
+                                                           gtest_main)
+  add_test(NAME efa_stale_segment_desc_test
+           COMMAND efa_stale_segment_desc_test)
+
   # Compiles the real EfaEndPoint source against the test-only
   # RPC/address-vector fakes in efa_endpoint_handshake_fakes/ (shadowed
   # efa_context.h via -iquote), so the endpoint locking and generation logic
@@ -413,6 +420,12 @@ if(USE_EFA)
   add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
   target_link_libraries(efa_c_api_test PUBLIC transfer_engine gtest gtest_main)
   add_test(NAME efa_c_api_test COMMAND efa_c_api_test)
+
+  add_executable(efa_remote_accessible_test
+                 ${WORKSPACE}/efa_remote_accessible_test.cpp)
+  target_link_libraries(efa_remote_accessible_test PUBLIC transfer_engine gtest
+                                                          gtest_main)
+  add_test(NAME efa_remote_accessible_test COMMAND efa_remote_accessible_test)
 
   add_executable(efa_single_nic_large_mr_test
                  ${WORKSPACE}/efa_single_nic_large_mr_test.cpp)

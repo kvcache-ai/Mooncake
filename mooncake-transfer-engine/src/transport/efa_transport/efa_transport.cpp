@@ -228,12 +228,11 @@ int EfaTransport::registerLocalMemory(void* addr, size_t length,
 int EfaTransport::registerLocalMemoryInternal(
     void* addr, size_t length, const std::string& name, bool remote_accessible,
     bool update_metadata, bool force_sequential, ThpPlan thp_plan) {
-    (void)remote_accessible;
-    const int kBaseAccessRights = IBV_ACCESS_LOCAL_WRITE |
-                                  IBV_ACCESS_REMOTE_WRITE |
-                                  IBV_ACCESS_REMOTE_READ;
-
-    int access_rights = kBaseAccessRights;
+    // Like RdmaTransport: a buffer that is not remote-accessible gets an MR
+    // without remote rights and publishes no rkey, so peers cannot target it.
+    int access_rights = IBV_ACCESS_LOCAL_WRITE;
+    if (remote_accessible)
+        access_rights |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
     size_t max_mr = (size_t)globalConfig().max_mr_size;
 
     // Compute chunk limit based on EFA PTE (page table entry) constraints.
@@ -578,11 +577,23 @@ int EfaTransport::registerLocalMemoryInternal(
                       << ", duration=" << reg_duration_ms << "ms";
         }
 
-        // Collect keys: assigned NICs have valid keys, others get 0
+        // Collect keys: assigned NICs have valid keys, others get 0.
+        // On EFA lkey() and rkey() are the same fi_mr_key(), and the segment
+        // descriptor (lkeys included) goes to every peer that opens it. So a
+        // buffer without remote_accessible publishes only a non-zero
+        // placeholder lkey: the post path takes the local MR from mrDesc(),
+        // and selectDevice() only checks which NICs hold a non-zero key.
+        // Libfabric before 2.6 registers every EFA MR with remote access
+        // whatever fi_mr_reg is asked for, so the real key must not leak.
         BufferDesc buffer_desc;
         for (auto& context : context_list_) {
-            buffer_desc.lkey.push_back(context->lkey(chunk_addr));
-            buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+            uint64_t key = context->lkey(chunk_addr);
+            if (remote_accessible) {
+                buffer_desc.lkey.push_back(key);
+                buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+            } else {
+                buffer_desc.lkey.push_back(key ? kLocalOnlyKey : 0);
+            }
         }
 
         buffer_desc.name = resolved_name;
@@ -1041,6 +1052,7 @@ Status EfaTransport::submitTransferTask(
         slices_to_post;
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
         target_segment_descs;
+    std::unordered_set<SegmentID> refreshed_targets;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     assert(local_segment_desc.get());
     const int kMaxRetryCount = globalConfig().retry_cnt;
@@ -1071,6 +1083,21 @@ Status EfaTransport::submitTransferTask(
                              metadata_->getSegmentDescByID(request.target_id))
                     .first;
         }
+        // The cached descriptor can predate buffers the peer registered since,
+        // e.g. a Store client that mounts its segment in several chunks and
+        // takes traffic for the first ones while it registers the rest. Fetch
+        // it again, once per target in this call, when it does not cover the
+        // destination.
+        size_t probe_idx = SIZE_MAX;
+        if (!refreshed_targets.count(request.target_id) &&
+            efaBytesUntilChunkEnd(
+                target_desc_it->second.get(), request.target_offset,
+                /*require_remote_key=*/true, probe_idx) == 0) {
+            refreshed_targets.insert(request.target_id);
+            auto fresh = metadata_->getSegmentDescByID(request.target_id,
+                                                       /*force_update=*/true);
+            if (fresh) target_desc_it->second = std::move(fresh);
+        }
         const auto& target_segment_desc = target_desc_it->second;
 
         // Find which buffer and preferred device covers this request.  This can
@@ -1079,15 +1106,16 @@ Status EfaTransport::submitTransferTask(
         // per-slice selection in the loop below.
         int request_buffer_id = -1, request_device_id = -1;
         if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
-                         request.length, request_buffer_id,
-                         request_device_id)) {
+                         request.length, request_buffer_id, request_device_id,
+                         0,
+                         /*require_remote_key=*/false)) {
             request_buffer_id = -1;
             request_device_id = -1;
         }
         // selectDevice() returns an index into the HCA space and validates it
-        // against buffer.rkey only, so bound it before indexing context_list_.
-        // Dropping to the retry path is the right recovery: it re-selects, and
-        // its own check covers context_list_ as well.
+        // against the buffer keys only, so bound it before indexing
+        // context_list_. Dropping to the retry path is the right recovery: it
+        // re-selects, and its own check covers context_list_ as well.
         if (request_device_id >= 0 &&
             (static_cast<size_t>(request_device_id) >= context_list_.size() ||
              !context_list_[request_device_id] ||
@@ -1117,7 +1145,8 @@ Status EfaTransport::submitTransferTask(
             while (retry_cnt < kMaxRetryCount && !found_device) {
                 if (selectDevice(local_segment_desc.get(),
                                  (uint64_t)source_addr, slice_length, buffer_id,
-                                 device_id, retry_cnt++))
+                                 device_id, retry_cnt++,
+                                 /*require_remote_key=*/false))
                     continue;
                 if (device_id >= 0 &&
                     static_cast<size_t>(device_id) < context_list_.size() &&
@@ -1415,13 +1444,16 @@ int EfaTransport::startHandshakeDaemon(std::string& local_server_name) {
 
 int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
                                size_t length, std::string_view hint,
-                               int& buffer_id, int& device_id,
-                               int retry_count) {
+                               int& buffer_id, int& device_id, int retry_count,
+                               bool require_remote_key) {
     if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
     const auto& buffers = desc->buffers;
     for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size());
          ++buffer_id) {
         const auto& buffer = buffers[buffer_id];
+        // A peer's buffer must carry an rkey; a local one only an lkey (buffers
+        // registered without remote_accessible publish no rkey).
+        const auto& keys = require_remote_key ? buffer.rkey : buffer.lkey;
 
         if (offset < buffer.addr || length > buffer.length ||
             offset - buffer.addr > buffer.length - length) {
@@ -1430,7 +1462,7 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
 
         // Try multiple attempts to find a device with valid MR registration.
         // With per-NIC partition, not all devices have all buffers registered,
-        // so rkey[device_id] may be 0 for unassigned NICs.
+        // so the key for an unassigned NIC is 0.
         // Topology::selectDevice() draws a random preferred HCA for try 0 and
         // returns entry (try - 1) of preferred + available for try > 0, so
         // num_devices + 1 attempts are needed for the deterministic part of the
@@ -1443,8 +1475,8 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
                     ? desc->topology.selectDevice(buffer.name, try_count)
                     : desc->topology.selectDevice(buffer.name, hint, try_count);
             if (device_id >= 0 &&
-                static_cast<size_t>(device_id) < buffer.rkey.size() &&
-                buffer.rkey[device_id] != 0) {
+                static_cast<size_t>(device_id) < keys.size() &&
+                keys[device_id] != 0) {
                 return 0;
             }
             device_id = hint.empty() ? desc->topology.selectDevice(
@@ -1452,8 +1484,8 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
                                      : desc->topology.selectDevice(
                                            kWildcardLocation, hint, try_count);
             if (device_id >= 0 &&
-                static_cast<size_t>(device_id) < buffer.rkey.size() &&
-                buffer.rkey[device_id] != 0) {
+                static_cast<size_t>(device_id) < keys.size() &&
+                keys[device_id] != 0) {
                 return 0;
             }
         }
@@ -1464,11 +1496,11 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
         // the rest. Under the disjoint per-NIC partition a chunk is registered
         // on a single NIC, so a miss fails a transfer that a registered NIC
         // could serve. Fall back to any NIC that holds a key for this buffer.
-        const size_t num_keys = buffer.rkey.size();
+        const size_t num_keys = keys.size();
         for (size_t i = 0; i < num_keys; ++i) {
             const size_t candidate =
                 (static_cast<size_t>(retry_count) + i) % num_keys;
-            if (buffer.rkey[candidate] != 0) {
+            if (keys[candidate] != 0) {
                 device_id = static_cast<int>(candidate);
                 LOG_EVERY_N(WARNING, 1000)
                     << "selectDevice: topology walk found no keyed NIC for "
@@ -1485,9 +1517,9 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
 
 int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
                                size_t length, int& buffer_id, int& device_id,
-                               int retry_count) {
+                               int retry_count, bool require_remote_key) {
     return selectDevice(desc, offset, length, "", buffer_id, device_id,
-                        retry_count);
+                        retry_count, require_remote_key);
 }
 
 }  // namespace mooncake

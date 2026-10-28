@@ -414,6 +414,29 @@ TEST(EventManager, InitialState) {
     EXPECT_FALSE(manager.IsStopped());
 }
 
+TEST(EventManager, AppliesMaxBlocksPerContextToTheIndex) {
+    EventManager manager({}, /*http_server_port=*/0, /*rpc_server_port=*/0,
+                         /*max_blocks_per_context=*/4);
+    const ServiceConfig service = VllmService();
+    PrefixCacheTable* index = manager.GetIndexer();
+    ASSERT_EQ(index->Register(RegistrationFor(service)).error, "");
+    for (uint64_t value = 1; value <= 10; ++value) {
+        ASSERT_EQ(
+            index->StoreEngine({.context = ContextFor(service),
+                                .prefixes = {{.value = value}},
+                                .owner = {.source_stream = "stream",
+                                          .instance_id = service.instance_id,
+                                          .dp_rank = service.dp_rank},
+                                .effective_block_size = service.block_size,
+                                .cache_group = service.cache_group}),
+            "");
+    }
+    const auto sizes =
+        PrefixCacheTableTestPeer::Order(*index, ContextFor(service));
+    EXPECT_LE(sizes.blocks, 4u);
+    EXPECT_GT(sizes.evicted_by_capacity, 0);
+}
+
 TEST(SubscribeToService, ExactDuplicateIsIdempotent) {
     EventManager manager({}, 0);
     const auto service = VllmService();
@@ -3218,6 +3241,60 @@ TEST(ParseConfigDeathTest, MalformedJsonExits) {
     int rpc_port = 0;
     EXPECT_EXIT(mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port),
                 ::testing::ExitedWithCode(1), "");
+    std::remove(path.c_str());
+}
+
+TEST(ParseConfig, MaxBlocksPerContextKeepsDefaultAndParsesOverrides) {
+    ConfigEnvGuard guard;
+    const std::string path = ::testing::TempDir() + "conductor_cfg_blocks.json";
+    guard.SetPath(path);
+    int port = 0;
+    int rpc_port = 0;
+    size_t max_blocks = 200000;
+
+    {
+        std::ofstream out(path);
+        out << R"({"kvevent_instance": {}})";
+    }
+    mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port, &max_blocks);
+    EXPECT_EQ(max_blocks, 200000u);
+
+    {
+        std::ofstream out(path);
+        out << R"({"max_blocks_per_context": 5000, "kvevent_instance": {}})";
+    }
+    mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port, &max_blocks);
+    EXPECT_EQ(max_blocks, 5000u);
+
+    {
+        std::ofstream out(path);
+        out << R"({"max_blocks_per_context": 0, "kvevent_instance": {}})";
+    }
+    mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port, &max_blocks);
+    EXPECT_EQ(max_blocks, 0u);
+    std::remove(path.c_str());
+}
+
+TEST(ParseConfigDeathTest, InvalidMaxBlocksPerContextExits) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ConfigEnvGuard guard;
+    const std::string path =
+        ::testing::TempDir() + "conductor_cfg_blocks_bad.json";
+    guard.SetPath(path);
+    int port = 0;
+    int rpc_port = 0;
+    size_t max_blocks = 0;
+    for (const char* value : {"-1", "1.5", "\"5000\""}) {
+        SCOPED_TRACE(value);
+        {
+            std::ofstream out(path);
+            out << R"({"max_blocks_per_context": )" << value
+                << R"(, "kvevent_instance": {}})";
+        }
+        EXPECT_EXIT(mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port,
+                                                              &max_blocks),
+                    ::testing::ExitedWithCode(1), "");
+    }
     std::remove(path.c_str());
 }
 

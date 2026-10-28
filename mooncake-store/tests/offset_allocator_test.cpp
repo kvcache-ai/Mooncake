@@ -1676,6 +1676,41 @@ TEST_F(OffsetAllocatorTest, DeserializedHintRaisesWhenAllocationsAreFreed) {
     EXPECT_TRUE(restored->allocate(ALLOCATOR_SIZE).has_value());
 }
 
+TEST_F(OffsetAllocatorTest, CreateHandleAtNodeAdoptsRestoredNode) {
+    constexpr size_t ALLOCATOR_SIZE = 1024;
+    constexpr size_t BLOCK_SIZE = ALLOCATOR_SIZE / 2;
+    constexpr uint32 MAX_ALLOCS = 1000;
+    auto original =
+        OffsetAllocator::create(0, ALLOCATOR_SIZE, MAX_ALLOCS, MAX_ALLOCS);
+
+    auto handle = original->allocate(BLOCK_SIZE);
+    ASSERT_TRUE(handle.has_value());
+
+    std::vector<SerializedByte> buffer;
+    ASSERT_EQ(serialize_to(original, buffer), ErrorCode::OK);
+    auto restored = deserialize_from<OffsetAllocator>(buffer);
+    ASSERT_NE(restored, nullptr);
+
+    // Like recovery after a restart: the node is used but has no handle.
+    std::vector<std::pair<uint32_t, uint64_t>> used_nodes;
+    restored->visit_used_nodes(
+        [&](uint64_t real_offset, uint64_t, uint32_t node_index) {
+            used_nodes.emplace_back(node_index, real_offset);
+        });
+    ASSERT_EQ(used_nodes.size(), 1u);
+
+    auto adopted = restored->createHandleAtNode(
+        used_nodes[0].first, used_nodes[0].second, BLOCK_SIZE);
+    ASSERT_TRUE(adopted.has_value());
+    EXPECT_TRUE(adopted->isValid());
+    EXPECT_EQ(adopted->address(), handle->address());
+    EXPECT_FALSE(restored->allocate(ALLOCATOR_SIZE).has_value());
+
+    // Destroying the adopted handle returns the node to the allocator.
+    adopted.reset();
+    EXPECT_TRUE(restored->allocate(ALLOCATOR_SIZE).has_value());
+}
+
 TEST_F(OffsetAllocatorTest, SerializationRandomAllocatedAllocator) {
     // The size multiplier is larger than 1 when the allocator size is larger
     // than MAX_BIN_SIZE.

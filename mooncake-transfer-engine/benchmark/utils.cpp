@@ -21,6 +21,10 @@
 #include <optional>
 #include <string_view>
 
+#ifdef USE_XPU
+#include "tent/runtime/platform.h"
+#endif
+
 DEFINE_string(seg_name, "", "Memory segment name for the local side");
 DEFINE_string(seg_type, "DRAM",
               "Memory segment type for the target side: DRAM|VRAM");
@@ -98,7 +102,8 @@ DEFINE_bool(deadline_bw_arbitration, false,
             "tent only: enable deadline-aware RDMA bandwidth arbitration.");
 DEFINE_int32(local_gpu_id, 0,
              "Local device ordinal for VRAM, -1 for all visible devices. "
-             "Selects an MLU device with --backend=tent in USE_MLU builds.");
+             "Selects an MLU or XPU device with --backend=tent in USE_MLU "
+             "or USE_XPU builds.");
 DEFINE_int32(target_gpu_id, 0,
              "Offset for round-robin assignment across target buffers; "
              "-1 uses 0.");
@@ -373,6 +378,17 @@ uint8_t stableDataSeed(uint64_t target_addr) {
     uint8_t seed = static_cast<uint8_t>(value);
     return seed == 0 ? 1 : seed;
 }
+
+#ifdef USE_XPU
+bool isXpuMemory(void* ptr) {
+    return Platform::getLoader().getMemoryType(ptr) == MTYPE_XPU;
+}
+
+void copyXpuData(void* dst, void* src, size_t length) {
+    auto status = Platform::getLoader().copy(dst, src, length);
+    LOG_ASSERT(status.ok()) << "XPU copy failed: " << status.ToString();
+}
+#endif
 
 }  // namespace tent
 }  // namespace mooncake
