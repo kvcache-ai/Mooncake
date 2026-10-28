@@ -20,9 +20,11 @@
 
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "tent/common/concurrent/thread_local_storage.h"
 #include "tent/runtime/control_plane.h"
@@ -33,18 +35,70 @@ namespace tent {
 
 class IOUringFileContext;
 
+// Fixed staging slots carved out of one pinned host allocation
+// (Platform::allocatePinnedHost), made once at install() and lent to requests
+// that need a bounce buffer. Device copies into pinned memory run as DMA,
+// several times faster than into the pageable posix_memalign() buffers used
+// otherwise. Never blocks: acquire() returns nullptr when no slot fits and
+// the caller falls back to a pageable buffer.
+class IOUringStagingPool {
+   public:
+    IOUringStagingPool() = default;
+
+    ~IOUringStagingPool();
+
+    IOUringStagingPool(const IOUringStagingPool &) = delete;
+    IOUringStagingPool &operator=(const IOUringStagingPool &) = delete;
+
+    // slot_size must be a nonzero multiple of 4096 and slot_count nonzero.
+    Status init(size_t slot_size, size_t slot_count);
+
+    // A free slot of at least `length` bytes, or nullptr if every slot is in
+    // use or `length` exceeds the slot size.
+    void *acquire(size_t length);
+
+    // Returns a slot to the pool; false (and no effect) if `buffer` is not a
+    // slot of this pool.
+    bool release(void *buffer);
+
+    bool owns(const void *buffer) const {
+        auto p = static_cast<const char *>(buffer);
+        return base_ && p >= base_ && p < base_ + slot_size_ * slot_count_ &&
+               (p - base_) % slot_size_ == 0;
+    }
+
+    size_t slotSize() const { return slot_size_; }
+
+    size_t freeSlots() const;
+
+   private:
+    mutable std::mutex mutex_;
+    char *base_ = nullptr;
+    size_t slot_size_ = 0;
+    size_t slot_count_ = 0;
+    std::vector<void *> free_slots_;
+};
+
 struct IOUringTask {
     Request request;
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
     void *buffer = nullptr;
+    // Set when `buffer` is a slot of this pool; keeps the pool alive until
+    // the slot is returned. Null when `buffer` came from posix_memalign().
+    std::shared_ptr<IOUringStagingPool> pool;
     // The kernel may read the iovec asynchronously at execution time, so it
     // must live as long as the task (i.e. until the completion is reaped).
     struct iovec iov{};
 
-    ~IOUringTask() {
-        if (buffer) free(buffer);
+    void releaseBuffer() {
+        if (!buffer) return;
+        if (!pool || !pool->release(buffer)) free(buffer);
+        buffer = nullptr;
+        pool.reset();
     }
+
+    ~IOUringTask() { releaseBuffer(); }
 };
 
 struct IOUringSubBatch : public Transport::SubBatch {
@@ -93,6 +147,8 @@ class IOUringTransport : public Transport {
         return io_uring_submit(ring);
     }
 
+    IOUringStagingPool *stagingPool() const { return staging_pool_.get(); }
+
    private:
     std::string getIOUringFilePath(SegmentID handle);
 
@@ -113,6 +169,12 @@ class IOUringTransport : public Transport {
     FileContextMap file_context_map_;
     ThreadLocalStorage<FileContextMap> tl_file_context_map_;
     uint64_t async_memcpy_threshold_;
+    // Null (every staged request uses posix_memalign()) unless
+    // transports/io_uring/pinned_staging is set and the pool was allocated.
+    // When set, staging takes a pool slot first and falls back to
+    // posix_memalign() only when no slot is free or the request exceeds the
+    // slot size.
+    std::shared_ptr<IOUringStagingPool> staging_pool_;
 };
 }  // namespace tent
 }  // namespace mooncake

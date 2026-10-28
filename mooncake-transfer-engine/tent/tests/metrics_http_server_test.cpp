@@ -83,6 +83,18 @@ TEST(TentMetricsHttpServer, DegradesToLogOnlyWhenConfiguredPortBusy) {
     EXPECT_TRUE(metrics.isInitialized());
     EXPECT_EQ(metrics.httpPort(), 0);
 
+    const std::string body = metrics.getPrometheusMetrics();
+    EXPECT_NE(body.find("tent_metrics_http_server_up 0"), std::string::npos);
+    EXPECT_NE(body.find("# TYPE tent_metrics_http_start_failures_total "
+                        "counter\n"),
+              std::string::npos);
+    EXPECT_NE(body.find("tent_metrics_http_start_failures_total 1\n"),
+              std::string::npos);
+
+    const std::string summary = metrics.getSummaryString();
+    EXPECT_NE(summary.find("Metrics HTTP: down"), std::string::npos);
+    EXPECT_NE(summary.find("start failures: 1"), std::string::npos);
+
     metrics.shutdown();
 }
 
@@ -96,6 +108,7 @@ TEST(TentMetricsHttpServer, DegradesToLogOnlyWhenConfiguredPortBusy) {
 // reports success so the test target still builds and runs in default builds.
 TEST(TentMetricsHttpServer, DisabledAtCompileTime) {
     mooncake::tent::MetricsConfig config;
+    EXPECT_FALSE(mooncake::tent::TentMetrics::isCompiledIn());
     EXPECT_TRUE(
         mooncake::tent::TentMetrics::instance().initialize(config).ok());
 }

@@ -4,9 +4,10 @@ TENT provides a built-in metrics system based on yalantinglibs, compatible with 
 
 ## Overview
 
-The metrics system supports two metric types:
+The metrics system supports three metric types:
 
 - **Counter**: Monotonically increasing values (e.g., total bytes transferred, total requests)
+- **Gauge**: Current state that can increase or decrease (e.g., in-flight attempts, HTTP server state)
 - **Histogram**: Distribution of values with configurable buckets (e.g., latency)
 
 All metrics are thread-safe and designed for high-performance data paths.
@@ -24,6 +25,10 @@ cmake -DTENT_METRICS_ENABLED=ON ..
 ```
 
 When disabled at compile time (`TENT_METRICS_ENABLED=OFF`, the default), all metrics macros expand to `((void)0)` and the `recordTaskCompletionMetrics` body is `#if`-gated out, resulting in **zero runtime overhead** on the transfer hot path.
+
+Code that needs to report this build capability without relying on an HTTP
+endpoint can query `TentMetrics::isCompiledIn()` in both enabled and disabled
+builds.
 
 ### Runtime Disable (Minimal Overhead)
 
@@ -164,7 +169,12 @@ The HTTP server provides multiple endpoints:
 - **`/metrics`**: Prometheus format
 - **`/metrics/summary`**: Human-readable summary
 - **`/metrics/json`**: JSON format
-- **`/health`**: Health check endpoint
+- **`/health`**: Metrics HTTP process liveness (`200 OK` while the endpoint is serving). It does not report TransferEngine readiness or transport health.
+
+The two serialization endpoints return HTTP `500` when their response cannot
+be serialized. The failed attempt is counted in
+`tent_metrics_serialization_failures_total` and becomes visible on the next
+successful Prometheus scrape. `/health` remains a liveness-only endpoint.
 
 ### Example Responses
 
@@ -207,13 +217,32 @@ tent_read_latency_us_bucket{transport="rdma",le="500"} 50
   "tent_read_requests_total": 100,
   "tent_write_requests_total": 50,
   "tent_read_failures_total": 2,
-  "tent_write_failures_total": 1
+  "tent_write_failures_total": 1,
+  "tent_metrics_runtime_enabled": 1,
+  "tent_metrics_http_server_up": 1,
+  "tent_metrics_http_start_failures_total": 0,
+  "tent_metrics_build_info": {
+    "version": "0.3.7",
+    "commit": "f751cff"
+  },
+  "tent_metrics_serialization_attempts_total": {
+    "prometheus": 12,
+    "json": 1
+  },
+  "tent_metrics_serialization_failures_total": {
+    "prometheus": 0,
+    "json": 0
+  },
+  "tent_metrics_last_success_timestamp_seconds": {
+    "prometheus": 1793016000,
+    "json": 1793016001
+  }
 }
 ```
 
 **Summary Format (`/metrics/summary`)**:
 ```
-Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
+Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 ```
 
 ## Available Metrics
@@ -229,7 +258,11 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_transport_failover_total` | Counter | `from`, `to` | Total cross-transport failover events |
 | `tent_transport_attempts_total` | Counter | `transport`, `operation` | Physical transport attempts submitted for execution |
 | `tent_transport_attempt_failures_total` | Counter | `transport`, `operation` | Physical transport attempts that terminated with `FAILED` |
+| `tent_task_failures_total` | Counter | `transport`, `reason` | Task failures grouped by terminal transport and failure reason |
 | `tent_deadline_infeasible_total` | Counter | `transport` | Transfers whose deadline was already in the past at submit time |
+| `tent_quarantined_batches_total` | Counter | - | Batches abandoned after repeated reclaim failures and retained until engine teardown |
+| `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
+| `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
 | `tent_read_latency_us` | Histogram | `transport` | Read latency distribution in microseconds |
 | `tent_write_latency_us` | Histogram | `transport` | Write latency distribution in microseconds |
 | `tent_read_size_bytes` | Histogram | `transport` | Read request size distribution in bytes |
@@ -240,37 +273,63 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_stage_transport_us` | Histogram | `transport` | Causal chain: transport execution latency in microseconds |
 | `tent_transport_attempt_latency_us` | Histogram | `transport`, `operation` | Observed latency of each physical transport attempt |
 
+### Metrics pipeline self-observability
+
+These families describe whether the metrics pipeline itself is usable. They
+are emitted with zero values before any transfer traffic is recorded and stay
+visible when runtime transfer recording is disabled.
+
+| Metric Name | Type | Labels | Description |
+|-------------|------|--------|-------------|
+| `tent_metrics_build_info` | Gauge | `version`, `commit` | Build identity; the series value is always `1`. Its presence means metrics were compiled into the serving process. |
+| `tent_metrics_runtime_enabled` | Gauge | - | `1` when transfer metric recording is enabled at runtime, otherwise `0` |
+| `tent_metrics_http_server_up` | Gauge | - | `1` when the metrics HTTP server successfully bound its configured port |
+| `tent_metrics_http_start_failures_total` | Counter | - | Failed metrics HTTP server start attempts since process start |
+| `tent_metrics_serialization_attempts_total` | Counter | `format` | Metrics serialization attempts, including the current request |
+| `tent_metrics_serialization_failures_total` | Counter | `format` | Metrics serialization attempts that raised an exception |
+| `tent_metrics_last_success_timestamp_seconds` | Gauge | `format` | Unix timestamp of the most recent successful serialization; `0` means that format has never succeeded |
+
 **Notes**:
 - `*_requests_total` counts terminal logical/merged-transfer outcomes. Its `transport` label is the **final transport**: a request recovered by RDMA→TCP failover is counted once under `tcp`.
 - `tent_transport_attempts_total` and `tent_transport_attempt_failures_total` measure physical transport reliability. A recovered RDMA→TCP request contributes one failed RDMA attempt and one successful TCP attempt.
 - Attempt latency currently ends when polling or the progress worker observes the terminal status, so it may include completion-observation delay.
 - `*_failures_total` does not record bytes; failed transfers transfer no bytes.
 - `tent_deadline_infeasible_total` is a dedicated counter (not a histogram sentinel) so infeasible-at-submit cases are distinguishable from genuine high-MLU samples.
-- yalantinglibs omits zero-valued counters/histograms from the Prometheus output, so a metric only appears once it has been observed at least once.
+- `tent_metrics_last_success_timestamp_seconds{format="..."} == 0` means that format has never completed a successful serialization. Prometheus freshness alerts must select `format="prometheus"` and guard on a value greater than zero; a Prometheus-only deployment is not expected to serialize JSON.
+- yalantinglibs omits zero-valued transfer counters/histograms from the Prometheus output, so a transfer metric only appears once it has been observed at least once. The metrics-pipeline self-observability families above are emitted unconditionally.
 
 ### Labels
 
 Transfer and attempt metrics carry a `transport` label (the
 `tent_transport_failover_total` counter uses `from` and `to` instead) so they
 can be sliced by transport without grepping logs. Attempt metrics also carry
-an `operation` label. Label values come exclusively from the `TransportType`
-enum closed set — no arbitrary transport strings are accepted.
+an `operation` label. Task failures add a closed-set `reason` label and metrics
+serialization adds a two-valued `format` label. Label values come from bounded
+sets; no request IDs, addresses, segment names, or other unbounded values are
+accepted.
 
 | Label | Values | Description |
 |-------|--------|-------------|
-| `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu`, `ub`, `mpcomm`, `hp_tcp`, `xpu`, `hylink`, `fabric` | The transport that handled the transfer |
+| `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu`, `ub`, `mpcomm`, `hp_tcp`, `xpu`, `hylink`, `fabric`, `mlu`, `memfabric` | The transport that handled the transfer |
 | `operation` | `read`, `write` | Attempt operation |
+| `reason` | `submit`, `poll`, `timeout`, `canceled` | Task failure classification |
+| `format` | `prometheus`, `json` | Serialization output format |
 | `from` | (same set) | Transport that failed before failover |
 | `to` | (same set) | Transport that the failover switched to |
+| `version` | Build-time constant | TENT build version |
+| `commit` | Build-time constant | Git commit used for the build |
 
 Transport label values come from the shared `transportTypeName()` mapping.
 `unspec` covers transfers that failed before a transport was selected.
 
-**Cardinality**: the `transport` label has 17 values; the failover
-`from`/`to` pair has at most 17x17 = 289 combinations (in practice only a
-few pairs ever occur), and each attempt metric has at most 17x2 = 34
-transport/operation combinations. Total series across all metrics is bounded
-by this closed set.
+**Cardinality**: the `transport` label has 19 values; the failover
+`from`/`to` pair has at most 19x19 = 361 combinations (in practice only a
+few pairs ever occur), each attempt metric has at most 19x2 = 38
+transport/operation combinations, task failures have at most 19x4 = 76, and
+each serialization family has exactly two series. Build identity labels are
+constant for the life of the process; a served `tent_metrics_build_info` series
+itself confirms that metrics were compiled in. Total series across all metrics
+is bounded by these closed sets.
 
 ### Per-rail load (`getNicLoadStats`)
 
@@ -477,4 +536,16 @@ histogram_quantile(
     }[5m])
   )
 ) / 1000000
+
+# Transfer metrics recording disabled at runtime
+tent_metrics_runtime_enabled == 0
+
+# Any serialization failure in the last five minutes
+increase(tent_metrics_serialization_failures_total[5m]) > 0
+
+# Prometheus serialization has succeeded before, but is now stale. With the
+# 15-second scrape interval above, 45 seconds allows two missed intervals.
+(tent_metrics_last_success_timestamp_seconds{format="prometheus"} > 0)
+and
+(time() - tent_metrics_last_success_timestamp_seconds{format="prometheus"} > 45)
 ```
