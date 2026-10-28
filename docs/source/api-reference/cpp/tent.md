@@ -334,6 +334,16 @@ Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
 
 Queries the status of transfer requests.
 
+For RDMA, a software timeout cancels further attempts of the expired task and
+retires its affected endpoints. The task remains `PENDING` until its posted
+work has completed or flushed, or the owning QPs have been successfully
+destroyed. It then reports `TIMEOUT`, including for completions that succeed
+after timeout cancellation. Other tasks sharing a QP can retry after their
+flush completions. A failed QP destruction does not itself finish a transfer;
+if neither completion nor destruction succeeds, the buffers must remain alive.
+This is not a hard completion deadline and does not change Python or Store
+wait deadlines.
+
 - `batch_id`: The batch to query.
 - `task_id`: Index of the specific task (for single-task query).
 - `status` / `status_list` / `overall_status`: Output parameter(s) for status.

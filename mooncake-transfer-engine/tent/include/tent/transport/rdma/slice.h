@@ -113,8 +113,8 @@ struct RdmaTask {
     std::atomic<int> resolved_slices{0};
     volatile TransferStatusEnum first_error = PENDING;
 
-    // Set by the control thread. Workers observe this flag before posting or
-    // retrying a slice. Already-posted WRs are allowed to drain normally.
+    // Set by the control thread or a worker detecting a software timeout.
+    // Workers observe it before posting/retrying; posted WRs must still drain.
     std::atomic<bool> cancel_requested{false};
 
     // Reference counting for UAF protection
@@ -229,6 +229,13 @@ static inline void updateSliceStatus(RdmaSlice* slice,
              task->num_slices)
                 ? COMPLETED
                 : task->first_error;
+        // Timeout cancellation prevents further attempts but is not itself
+        // completion evidence. Only publish it after all slices resolve,
+        // even when every CQE reports a late success. Keep task access after
+        // the slice CAS: an already-terminal slice may outlive its task.
+        if (task->cancel_requested.load(std::memory_order_acquire) &&
+            __atomic_load_n(&task->first_error, __ATOMIC_ACQUIRE) == TIMEOUT)
+            final_st = TIMEOUT;
         if (final_st == PENDING) final_st = FAILED;
         __sync_bool_compare_and_swap(&task->status_word, PENDING, final_st);
     }
