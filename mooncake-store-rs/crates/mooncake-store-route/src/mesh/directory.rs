@@ -482,15 +482,7 @@ impl EmbeddedWrhRouteDirectory {
             };
             let mut merged = BTreeMap::new();
             for scan in &mut scans {
-                if scan
-                    .routes
-                    .front()
-                    .is_some_and(|route| route.key.0 == next_key)
-                {
-                    let route = scan
-                        .routes
-                        .pop_front()
-                        .expect("front route was checked before removal");
+                if let Some(route) = scan.routes.pop_front_if(|route| route.key.0 == next_key) {
                     merge_route_listing(
                         &mut merged,
                         route,

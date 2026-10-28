@@ -269,7 +269,23 @@ static inline void copyMluData(void* host, void* device, size_t length,
 }
 #endif
 
+#ifdef USE_XPU
+// Defined in utils.cpp: tent/runtime/platform.h must stay out of this header
+// because tent/common/types.h #defines LOCAL_SEGMENT_ID, which breaks the
+// classic transfer engine headers included alongside it.
+bool isXpuMemory(void* ptr);
+void copyXpuData(void* dst, void* src, size_t length);
+#endif
+
 static inline void fillData(void* addr, size_t length, uint8_t seed) {
+#ifdef USE_XPU
+    if (isXpuMemory(addr)) {
+        std::vector<uint8_t> data(length);
+        fillData(data.data(), length, seed);
+        copyXpuData(addr, data.data(), length);
+        return;
+    }
+#endif
 #ifdef USE_MLU
     if (isMluMemory(addr)) {
         std::vector<uint8_t> data(length);
@@ -322,6 +338,17 @@ static inline uint8_t fillData(void* addr, size_t length) {
 
 static inline void verifyData(void* addr, size_t length, uint8_t seed) {
     std::vector<uint8_t> ref_data(length, seed);
+#ifdef USE_XPU
+    if (isXpuMemory(addr)) {
+        fillData(ref_data.data(), length, seed);
+        std::vector<uint8_t> act_data(length);
+        copyXpuData(act_data.data(), addr, length);
+        if (memcmp(act_data.data(), ref_data.data(), length)) {
+            LOG(FATAL) << "Inconsistent data detected";
+        }
+        return;
+    }
+#endif
 #ifdef USE_MLU
     if (isMluMemory(addr)) {
         fillData(ref_data.data(), length, seed);
