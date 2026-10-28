@@ -182,8 +182,7 @@ TEST(EnvelopePartTest, TheFirstPartStaysInsideTheEnvelope) {
     auto metadata = MakeEnvelope(kObjectLength,
                                  MakeDiskReplicas({ReplicaStatus::COMPLETE}));
 
-    const auto part =
-        reinterpret_cast<std::uintptr_t>(&metadata->GetPart(0));
+    const auto part = reinterpret_cast<std::uintptr_t>(&metadata->GetPart(0));
     const auto envelope_begin =
         reinterpret_cast<std::uintptr_t>(metadata.get());
     EXPECT_GE(part, envelope_begin);

@@ -872,11 +872,9 @@ class Replica {
     // case every read goes through. The other kinds are rare and live behind a
     // pointer so they do not size the variant (Disk 40 B, LocalDisk 72 B,
     // DFS 64 B) for the replicas that never use them.
-    using Data =
-        std::variant<MemoryReplicaData, NoFReplicaData,
-                     std::unique_ptr<DiskReplicaData>,
-                     std::unique_ptr<LocalDiskReplicaData>,
-                     std::unique_ptr<DfsReplicaData>>;
+    using Data = std::variant<
+        MemoryReplicaData, NoFReplicaData, std::unique_ptr<DiskReplicaData>,
+        std::unique_ptr<LocalDiskReplicaData>, std::unique_ptr<DfsReplicaData>>;
 
     static Data MakeBufferedData(std::unique_ptr<AllocatedBuffer> buffer,
                                  ReplicaType replica_type) {
