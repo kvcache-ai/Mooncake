@@ -1558,7 +1558,8 @@ void TransferEnginePy::batchTransferOnCuda(
         total_bytes += lengths[i];
     }
 
-    auto target_segment_desc = engine_->getMetadata()->getSegmentDescByID(handle);
+    auto target_segment_desc =
+        engine_->getMetadata()->getSegmentDescByID(handle);
     if (target_segment_desc &&
         isCudaHostFuncUnsupportedProtocol(target_segment_desc->protocol)) {
         throw std::runtime_error(
