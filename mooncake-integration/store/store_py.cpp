@@ -1216,11 +1216,20 @@ class MooncakeStorePyWrapper {
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
-        // Single-tensor TP keeps per-shard group/HCA hints and one source
-        // session ID, which is expanded to all shards below.
-        if (!config.ValidSessionIds(1) || !config.HasValidKeyHints(tp_size))
+        // Single-tensor TP keeps per-shard group/HCA hints. Session and
+        // residency affinity IDs describe the source tensor, not each shard.
+        if (!config.ValidSessionIds(1) ||
+            (config.residency_affinity_ids &&
+             config.residency_affinity_ids->size() != 1))
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         try {
+            ReplicateConfig tp_config = config;
+            if (config.residency_affinity_ids) {
+                tp_config.residency_affinity_ids = std::vector<std::string>(
+                    tp_size, config.residency_affinity_ids->front());
+            }
+            if (!tp_config.HasValidKeyHints(tp_size))
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
             std::vector<std::string> tp_keys;
             tp_keys.reserve(tp_size);
             for (int rank = 0; rank < tp_size; ++rank) {
@@ -1232,7 +1241,6 @@ class MooncakeStorePyWrapper {
             if (!infos.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            ReplicateConfig tp_config = config;
             if (config.session_ids) {
                 tp_config.session_ids =
                     std::vector<std::string>(tp_size, config.SessionId());
