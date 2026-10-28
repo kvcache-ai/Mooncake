@@ -21,7 +21,7 @@
 #include <functional>
 #include <map>
 #include <memory>
-#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -31,7 +31,6 @@ namespace mooncake {
 namespace tent {
 
 constexpr uint32_t kHixlOk = 0;
-constexpr uint32_t kHixlNotConnected = 103902;
 
 enum class HixlXferState {
     Waiting,
@@ -49,6 +48,10 @@ struct HixlOpDesc {
 // One HIXL instance per NPU: ACL context, registered handles, and a mutex so
 // dummy-real workers cannot race the same engine. Vendor is the hixl::Hixl
 // call surface so tests can inject a fake without a live CANN process.
+//
+// TENT only supports HIXL's AutoConnect mode: the engine never calls Connect
+// or Disconnect itself and keeps no peer bookkeeping. HIXL owns the sessions
+// and tears them down inside TransferAsync / Finalize.
 class HixlEngine {
    public:
     class Vendor {
@@ -61,8 +64,11 @@ class HixlEngine {
 
         virtual void Finalize() = 0;
 
+        // local_only keeps the range out of the HIXL export table: a buffer
+        // the upper layer marked as not remotely accessible must not be
+        // reachable from a peer engine.
         virtual uint32_t RegisterMem(uint64_t addr, size_t len, bool host,
-                                     void*& handle) = 0;
+                                     bool local_only, void*& handle) = 0;
 
         virtual uint32_t DeregisterMem(void* handle) = 0;
 
@@ -72,13 +78,6 @@ class HixlEngine {
 
         virtual uint32_t GetTransferStatus(void* req,
                                            HixlXferState& status) = 0;
-
-        virtual uint32_t Disconnect(const std::string& remote,
-                                    int32_t timeout_ms) = 0;
-
-        // Kept so tests can assert AutoConnect-only never calls Connect.
-        virtual uint32_t Connect(const std::string& remote,
-                                 int32_t timeout_ms) = 0;
     };
 
     using VendorFactory = std::function<std::unique_ptr<Vendor>()>;
@@ -97,14 +96,12 @@ class HixlEngine {
 
     void finalize();
 
-    Status registerMem(void* addr, size_t length, bool host);
+    Status registerMem(void* addr, size_t length, bool host, bool local_only);
     Status deregisterMem(void* addr);
-    void rollbackMem(void* addr);
 
     Status transferAsync(const std::string& remote, bool write,
                          const std::vector<HixlOpDesc>& descs, void*& req);
     Status getTransferStatus(void* req, HixlXferState& status);
-    Status disconnectOnTimeout(const std::string& remote, int32_t timeout_ms);
 
     const std::string& name() const { return name_; }
     int32_t deviceId() const { return device_id_; }
@@ -126,10 +123,12 @@ class HixlEngine {
     static VendorFactory GetVendorFactory();
     static std::unique_ptr<Vendor> CreateVendor();
 
-    std::mutex mutex_;
+    // Submitting and polling only read the vendor handle, so they share this
+    // lock and several transfer workers can hand HIXL one destination each.
+    // Setup, teardown and registration take it exclusively.
+    std::shared_mutex mutex_;
     std::unique_ptr<Vendor> vendor_;
     std::map<void*, void*> addr_to_handle_;
-    std::vector<std::string> remotes_;
     std::string name_;
     aclrtContext context_{nullptr};
     int32_t device_id_{-1};

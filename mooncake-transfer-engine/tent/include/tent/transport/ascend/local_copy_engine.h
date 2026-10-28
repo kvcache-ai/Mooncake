@@ -18,6 +18,7 @@
 #include <acl/acl.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -30,12 +31,17 @@
 namespace mooncake {
 namespace tent {
 
-// Same-engine copies: one aclrtMemcpyAsync per slice plus a D2H of a host
-// completion flag. Poll success as *host_flag == 1. Any submit/timeout
-// failure destroys the stream, recreates it, and fails every in-flight group
-// on that stream.
+// Same-engine copies: one aclrtMemcpyAsync per slice spread over several
+// streams, each closed by a D2H of a host completion flag. A group is done
+// when every stream it used has set its flag, so nothing here waits on a
+// stream. Any submit/timeout failure destroys the streams, recreates them,
+// and fails every in-flight group on them.
 class LocalCopyEngine {
    public:
+    // Runs one stream's issue work. The transport supplies a pool so a group
+    // spread over several streams does not issue one stream at a time.
+    using TaskRunner = std::function<void(std::function<void()>)>;
+
     LocalCopyEngine() = default;
     ~LocalCopyEngine();
 
@@ -44,6 +50,7 @@ class LocalCopyEngine {
 
     Status initialize(aclrtContext context, int32_t device_id);
     void finalize();
+    void setTaskRunner(TaskRunner runner);
 
     Status submit(bool write, const std::vector<HixlOpDesc>& ops, void*& req,
                   std::vector<void*>& failed_handles);
@@ -54,7 +61,10 @@ class LocalCopyEngine {
 
    private:
     struct Group {
-        volatile uint32_t* host_flag = nullptr;
+        // One flag per stream this group used, padded apart so two streams
+        // never land their completion write in the same cache line.
+        void* host_flags = nullptr;
+        size_t stream_count = 0;
         bool failed = false;
     };
 
@@ -69,18 +79,23 @@ class LocalCopyEngine {
         bool ok_{false};
     };
 
-    Status createStreamLocked();
-    Status allocHostFlag(volatile uint32_t*& flag);
-    void freeHostFlag(volatile uint32_t* flag);
+    Status createStreamsLocked();
+    void destroyStreamsLocked();
+    bool issueGroupLocked(size_t stream_count,
+                          const std::function<bool(size_t)>& issue_stream);
+    Status allocHostFlags(Group& group);
+    void freeHostFlags(Group& group);
+    static volatile uint32_t* flagAt(const Group& group, size_t index);
     std::vector<void*> failAndRecreateLocked();
     static aclrtMemcpyKind memcpyKind(void* src, void* dst);
 
     mutable std::mutex mutex_;
     aclrtContext context_{nullptr};
     int32_t device_id_{-1};
-    aclrtStream stream_{nullptr};
+    std::vector<aclrtStream> streams_;
     void* device_one_{nullptr};
     std::unordered_map<void*, std::unique_ptr<Group>> groups_;
+    TaskRunner task_runner_;
     bool initialized_{false};
 };
 
