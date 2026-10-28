@@ -56,25 +56,6 @@ struct AcquireResult {
     AdmissionReason reason;
 };
 
-uint64_t drainTimeNs(uint64_t backlog_bytes,
-                     uint64_t delivery_rate_bytes_per_sec) {
-    if (delivery_rate_bytes_per_sec == 0) return 0;
-    const long double value =
-        static_cast<long double>(backlog_bytes) * 1'000'000'000.0L /
-        static_cast<long double>(delivery_rate_bytes_per_sec);
-    return value > static_cast<long double>(
-                       std::numeric_limits<uint64_t>::max())
-               ? std::numeric_limits<uint64_t>::max()
-               : static_cast<uint64_t>(value);
-}
-
-uint32_t addBounded(uint32_t current, uint64_t value) {
-    const uint64_t sum = static_cast<uint64_t>(current) + value;
-    return sum > std::numeric_limits<uint32_t>::max()
-               ? std::numeric_limits<uint32_t>::max()
-               : static_cast<uint32_t>(sum);
-}
-
 }  // namespace
 
 struct CoreAccess {
@@ -145,14 +126,6 @@ struct CoreAccess {
         }
         if (generation == 0) return;
 
-        if (signals.delivery_rate_bytes_per_sec != 0) {
-            state.backlog_bytes_.store(signals.backlog_bytes,
-                                       std::memory_order_relaxed);
-            state.delivery_rate_bytes_per_sec_.store(
-                signals.delivery_rate_bytes_per_sec, std::memory_order_relaxed);
-            state.has_rate_sample_.store(true, std::memory_order_relaxed);
-        }
-        addSaturating(state.completed_bytes_, signals.completed_bytes);
         addSaturating(state.successful_completions_,
                       signals.successful_completions);
         addSaturating(state.receiver_pressure_, signals.receiver_pressure);
@@ -164,14 +137,13 @@ struct CoreAccess {
     }
 
     static void recordOutcome(DomainState* state, uint32_t generation,
-                              uint64_t bytes, OutcomeClass outcome,
-                              FailureScope scope, bool route) {
+                              OutcomeClass outcome, FailureScope scope,
+                              bool route) {
         if (state == nullptr || state->config_.mode == Mode::kOff) return;
 
         Signals signals;
         switch (outcome) {
             case OutcomeClass::kSuccess:
-                signals.completed_bytes = bytes;
                 signals.successful_completions = 1;
                 break;
             case OutcomeClass::kCongestion:
@@ -208,10 +180,6 @@ struct CoreAccess {
     }
 
     static void clearSignals(DomainState& state) {
-        state.backlog_bytes_.store(0, std::memory_order_relaxed);
-        state.delivery_rate_bytes_per_sec_.store(0, std::memory_order_relaxed);
-        state.has_rate_sample_.store(false, std::memory_order_relaxed);
-        state.completed_bytes_.store(0, std::memory_order_relaxed);
         state.successful_completions_.store(0, std::memory_order_relaxed);
         state.receiver_pressure_.store(0, std::memory_order_relaxed);
         state.epoch_error_.store(false, std::memory_order_relaxed);
@@ -353,9 +321,9 @@ bool complete(Permit& permit, OutcomeClass outcome, FailureScope scope) {
     }
 
     CoreAccess::recordOutcome(permit.device_, permit.device_generation_,
-                              permit.bytes_, outcome, scope, false);
-    CoreAccess::recordOutcome(permit.route_, permit.route_generation_,
-                              permit.bytes_, outcome, scope, true);
+                              outcome, scope, false);
+    CoreAccess::recordOutcome(permit.route_, permit.route_generation_, outcome,
+                              scope, true);
     if (permit.device_reserved_)
         CoreAccess::releaseBytes(*permit.device_, permit.bytes_);
     if (permit.route_reserved_)
@@ -404,26 +372,12 @@ void controlTick(DomainState& state, uint64_t) {
     if (!CoreAccess::pauseFeedback(state, generation)) return;
     FeedbackResumeGuard feedback_guard(state, generation);
 
-    const uint64_t backlog =
-        state.backlog_bytes_.exchange(0, std::memory_order_relaxed);
-    const uint64_t rate = state.delivery_rate_bytes_per_sec_.exchange(
-        0, std::memory_order_relaxed);
-    const bool has_rate =
-        state.has_rate_sample_.exchange(false, std::memory_order_relaxed);
-    state.completed_bytes_.exchange(0, std::memory_order_relaxed);
     const uint64_t successes =
         state.successful_completions_.exchange(0, std::memory_order_relaxed);
     const uint64_t receiver_pressure =
         state.receiver_pressure_.exchange(0, std::memory_order_relaxed);
     const bool epoch_error =
         state.epoch_error_.exchange(false, std::memory_order_relaxed);
-    const uint64_t drain_ns = has_rate ? drainTimeNs(backlog, rate) : 0;
-    // Drain remains consumed and computed, but never vetoes window growth.
-    // Preserve the original helper without changing code outside this block.
-    (void)drain_ns;
-    (void)addBounded;
-    state.high_pressure_streak_ = 0;
-    state.low_pressure_streak_ = 0;
     if (receiver_pressure != 0) {
         const uint64_t current =
             state.window_bytes_.load(std::memory_order_relaxed);
@@ -457,8 +411,6 @@ void resetGeneration(DomainState& state, uint32_t generation) {
     if (!CoreAccess::pauseFeedback(state, current_generation)) return;
 
     CoreAccess::clearSignals(state);
-    state.high_pressure_streak_ = 0;
-    state.low_pressure_streak_ = 0;
     state.deferred_bytes_.store(0, std::memory_order_relaxed);
     state.window_bytes_.store(state.config_.min_window_bytes,
                               std::memory_order_relaxed);

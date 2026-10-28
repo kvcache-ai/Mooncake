@@ -256,14 +256,12 @@ TEST_F(WorkerPoolRailStateTest, HealthSnapshotUsesExistingPauseAndExpiry) {
     const auto health = WorkerPoolTestPeer::railHealth(*worker_pool_, kPeerA);
     EXPECT_TRUE(health.paused);
     EXPECT_GT(health.retry_after_ns, 0u);
-    EXPECT_EQ(health.error_count, WorkerPoolTestPeer::errorThreshold());
     EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 1);
     WorkerPoolTestPeer::expirePause(*worker_pool_, kPeerA);
     const auto recovered =
         WorkerPoolTestPeer::railHealth(*worker_pool_, kPeerA);
     EXPECT_FALSE(recovered.paused);
     EXPECT_EQ(recovered.retry_after_ns, 0u);
-    EXPECT_EQ(recovered.error_count, 0);
     EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 0);
 }
 

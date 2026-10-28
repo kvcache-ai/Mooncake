@@ -63,7 +63,7 @@ bool completeTentCongestionControlAttempt(
     RdmaSlice& slice, adaptive_congestion_control::OutcomeClass outcome,
     adaptive_congestion_control::FailureScope scope);
 void tickTentCongestionControlRoute(TentRdmaCongestionControlRoute& route,
-                                    uint64_t now_ns, uint64_t elapsed_ns);
+                                    uint64_t now_ns);
 #endif
 
 class Workers {
@@ -491,7 +491,6 @@ class Workers {
     std::unordered_map<
         PostPath, std::shared_ptr<TentRdmaCongestionControlRoute>, PostPathHash>
         congestion_control_routes_;
-    uint64_t congestion_control_last_tick_ns_ = 0;
 #endif
 };
 }  // namespace tent

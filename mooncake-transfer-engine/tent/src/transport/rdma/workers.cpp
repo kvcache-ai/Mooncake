@@ -23,7 +23,6 @@
 #include <cerrno>
 #include <chrono>
 #include <fstream>
-#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -214,9 +213,6 @@ bool completeTentCongestionControlAttempt(
     const bool current_endpoint =
         route && route->endpoint_generation.load(std::memory_order_acquire) ==
                      slice.congestion_control_endpoint_generation;
-    const bool successful_attempt =
-        current_endpoint &&
-        outcome == adaptive_congestion_control::OutcomeClass::kSuccess;
     const bool current_generation =
         outcome != adaptive_congestion_control::OutcomeClass::kSuccess &&
         outcome != adaptive_congestion_control::OutcomeClass::kDerivedFlush &&
@@ -231,30 +227,12 @@ bool completeTentCongestionControlAttempt(
     if (completed && current_endpoint && current_generation) {
         recordTaskFeedback(slice, outcome, scope);
     }
-    if (completed && successful_attempt) {
-        route->completed_bytes.fetch_add(slice.length,
-                                         std::memory_order_relaxed);
-    }
     if (completed) slice.congestion_control_route = nullptr;
     return completed;
 }
 
 void tickTentCongestionControlRoute(TentRdmaCongestionControlRoute& route,
-                                    uint64_t now_ns, uint64_t elapsed_ns) {
-    if (elapsed_ns != 0) {
-        const auto state = adaptive_congestion_control::snapshot(route.domain);
-        adaptive_congestion_control::Signals signals;
-        signals.backlog_bytes = state.inflight_bytes;
-        const auto completed =
-            route.completed_bytes.exchange(0, std::memory_order_relaxed);
-        const __uint128_t scaled =
-            static_cast<__uint128_t>(completed) * 1'000'000'000ULL;
-        signals.delivery_rate_bytes_per_sec =
-            static_cast<uint64_t>(std::min<__uint128_t>(
-                scaled / elapsed_ns, std::numeric_limits<uint64_t>::max()));
-        adaptive_congestion_control::recordSignals(route.domain,
-                                                   state.generation, signals);
-    }
+                                    uint64_t now_ns) {
     adaptive_congestion_control::controlTick(route.domain, now_ns);
 }
 #endif
@@ -825,30 +803,10 @@ void Workers::completeCongestionPermit(
 
 void Workers::updateCongestionSignals(uint64_t now_ns) {
     if (congestion_control_config_.mode ==
-            adaptive_congestion_control::Mode::kOff ||
-        !device_selector_)
+        adaptive_congestion_control::Mode::kOff)
         return;
-    const uint64_t elapsed_ns = congestion_control_last_tick_ns_ == 0
-                                    ? 0
-                                    : now_ns - congestion_control_last_tick_ns_;
-    congestion_control_last_tick_ns_ = now_ns;
-    for (size_t dev_id = 0; dev_id < congestion_control_devices_.size();
-         ++dev_id) {
-        adaptive_congestion_control::Signals signals;
-        signals.backlog_bytes =
-            device_selector_->getPostedBytes(static_cast<int>(dev_id));
-        const double rate =
-            device_selector_->getTransmitBandwidth(static_cast<int>(dev_id));
-        if (rate > 0.0) {
-            signals.delivery_rate_bytes_per_sec = static_cast<uint64_t>(rate);
-        }
-        const uint32_t generation = adaptive_congestion_control::generation(
-            *congestion_control_devices_[dev_id]);
-        adaptive_congestion_control::recordSignals(
-            *congestion_control_devices_[dev_id], generation, signals);
-        adaptive_congestion_control::controlTick(
-            *congestion_control_devices_[dev_id], now_ns);
-    }
+    for (const auto& device : congestion_control_devices_)
+        adaptive_congestion_control::controlTick(*device, now_ns);
     std::vector<std::shared_ptr<TentRdmaCongestionControlRoute>> routes;
     {
         std::lock_guard<std::mutex> lock(congestion_control_routes_mutex_);
@@ -857,7 +815,7 @@ void Workers::updateCongestionSignals(uint64_t now_ns) {
             routes.push_back(route);
     }
     for (const auto& route : routes)
-        tickTentCongestionControlRoute(*route, now_ns, elapsed_ns);
+        tickTentCongestionControlRoute(*route, now_ns);
 }
 #endif
 
@@ -1096,11 +1054,6 @@ void Workers::asyncPostSend() {
                                              ? CANCELED
                                              : FAILED);
             } else if (dropUnpostableSlice(worker, slice)) {
-                // Path generated OK (admit may have armed a probe), then the
-                // slice was canceled before posting: roll back the admission.
-                if (auto* rail = slice->rail_monitor)
-                    rail->cancelProbe(slice->source_dev_id,
-                                      slice->target_dev_id);
                 slice = slice->next;
                 continue;
             } else {
@@ -1120,17 +1073,8 @@ void Workers::asyncPostSend() {
         if (slices.empty()) continue;
         slices.erase(std::remove_if(slices.begin(), slices.end(),
                                     [&](RdmaSlice* slice) {
-                                        if (!dropUnpostableSlice(worker, slice))
-                                            return false;
-                                        // Canceled after admit() armed a
-                                        // probe/trial but before the endpoint
-                                        // was obtained: roll back the
-                                        // admission.
-                                        if (auto* rail = slice->rail_monitor)
-                                            rail->cancelProbe(
-                                                slice->source_dev_id,
-                                                slice->target_dev_id);
-                                        return true;
+                                        return dropUnpostableSlice(worker,
+                                                                   slice);
                                     }),
                      slices.end());
         if (slices.empty()) continue;
@@ -1147,10 +1091,6 @@ void Workers::asyncPostSend() {
             slices.swap(clone);
             for (auto slice : clone) {
                 if (dropUnpostableSlice(worker, slice)) {
-                    // Canceled after admit() armed a probe/trial: roll back.
-                    if (auto* rail = slice->rail_monitor)
-                        rail->cancelProbe(slice->source_dev_id,
-                                          slice->target_dev_id);
                     continue;
                 }
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL

@@ -42,7 +42,7 @@ the launching shell's environment does not reconfigure running workers.
 | --- | --- | --- |
 | `MC_ADAPTIVE_CONGESTION_CONTROL_MIN_WINDOW_BYTES` | `4194304` (4 MiB) | Lower bound for the normal adaptive window. |
 | `MC_ADAPTIVE_CONGESTION_CONTROL_MAX_WINDOW_BYTES` | `67108864` (64 MiB) | Upper bound for the normal adaptive window. |
-| `MC_ADAPTIVE_CONGESTION_CONTROL_TARGET_DRAIN_US` | `2000` | Retained queue-drain setting; estimated drain no longer controls window decisions. |
+| `MC_ADAPTIVE_CONGESTION_CONTROL_TARGET_DRAIN_US` | `2000` | Parsed for configuration compatibility; not used by the current window policy. |
 | `MC_ADAPTIVE_CONGESTION_CONTROL_HIGH_PRESSURE_EPOCHS` | `2` | Parsed for configuration compatibility; not used by the current window policy. |
 | `MC_ADAPTIVE_CONGESTION_CONTROL_LOW_PRESSURE_EPOCHS` | `3` | Parsed for configuration compatibility; not used by the current window policy. |
 
@@ -64,7 +64,9 @@ it drains. The window is not an absolute transfer-size limit.
 ## Pressure and recovery
 
 Ordinary backlog and estimated drain time do not shrink the window or prevent
-growth. An epoch with successful completions and no explicit error grows the
+growth. The adapters no longer collect additional rate/backlog samples for this
+controller; existing transport and QoS accounting is unchanged. An epoch with
+successful completions and no explicit error grows the
 window by one quarter of the configured minimum, up to the maximum. Explicit
 congestion or receiver-pressure feedback halves the affected window once per
 epoch, bounded by the minimum, and takes precedence over successful completions.

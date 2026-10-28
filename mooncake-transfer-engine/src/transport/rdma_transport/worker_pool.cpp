@@ -23,7 +23,6 @@
 #include <exception>
 #include <functional>
 #include <future>
-#include <limits>
 #include <queue>
 #include <thread>
 #include <utility>
@@ -57,7 +56,6 @@ struct ClassicRdmaCongestionControl::RouteState {
     std::atomic<RdmaEndPoint *> endpoint{nullptr};
     std::atomic<uint64_t> endpoint_generation{1};
     std::mutex endpoint_mutex;
-    std::atomic<uint64_t> completed_bytes{0};
 };
 
 namespace {
@@ -346,13 +344,6 @@ void ClassicRdmaCongestionControl::complete(Transport::Slice *slice,
                 static_cast<TaskCongestionFailureScope>(result.scope));
         }
     }
-    if (completed && current_endpoint && status == IBV_WC_SUCCESS) {
-        completed_bytes_.fetch_add(slice->length, std::memory_order_relaxed);
-        if (state) {
-            state->completed_bytes.fetch_add(slice->length,
-                                             std::memory_order_relaxed);
-        }
-    }
 }
 
 void ClassicRdmaCongestionControl::releaseUnposted(Transport::Slice *slice) {
@@ -365,44 +356,11 @@ void ClassicRdmaCongestionControl::releaseUnposted(Transport::Slice *slice) {
 
 void ClassicRdmaCongestionControl::tick(uint64_t now_ns) {
     if (!enabled()) return;
-    const uint64_t elapsed = last_tick_ns_ == 0 ? 0 : now_ns - last_tick_ns_;
-    last_tick_ns_ = now_ns;
-
-    if (elapsed != 0) {
-        const auto device_snapshot =
-            adaptive_congestion_control::snapshot(*device_);
-        adaptive_congestion_control::Signals signals;
-        signals.backlog_bytes = device_snapshot.inflight_bytes;
-        const auto completed =
-            completed_bytes_.exchange(0, std::memory_order_relaxed);
-        const __uint128_t scaled =
-            static_cast<__uint128_t>(completed) * 1'000'000'000ULL;
-        signals.delivery_rate_bytes_per_sec =
-            static_cast<uint64_t>(std::min<__uint128_t>(
-                scaled / elapsed, std::numeric_limits<uint64_t>::max()));
-        adaptive_congestion_control::recordSignals(
-            *device_, device_snapshot.generation, signals);
-    }
     adaptive_congestion_control::controlTick(*device_, now_ns);
 
     std::lock_guard<std::mutex> lock(routes_mutex_);
     for (auto &entry : routes_) {
         auto &state = *entry.second;
-        if (elapsed != 0) {
-            const auto route_snapshot =
-                adaptive_congestion_control::snapshot(state.domain);
-            adaptive_congestion_control::Signals signals;
-            signals.backlog_bytes = route_snapshot.inflight_bytes;
-            const auto completed =
-                state.completed_bytes.exchange(0, std::memory_order_relaxed);
-            const __uint128_t scaled =
-                static_cast<__uint128_t>(completed) * 1'000'000'000ULL;
-            signals.delivery_rate_bytes_per_sec =
-                static_cast<uint64_t>(std::min<__uint128_t>(
-                    scaled / elapsed, std::numeric_limits<uint64_t>::max()));
-            adaptive_congestion_control::recordSignals(
-                state.domain, route_snapshot.generation, signals);
-        }
         adaptive_congestion_control::controlTick(state.domain, now_ns);
     }
 }
@@ -2183,7 +2141,6 @@ bool WorkerPool::isRailAvailable(const std::string &peer_nic_path,
         health->paused = it->second.pause_until_ns != 0;
         health->retry_after_ns =
             health->paused ? it->second.pause_until_ns - now : 0;
-        health->error_count = it->second.error_count;
     }
     return it->second.pause_until_ns == 0;
 }

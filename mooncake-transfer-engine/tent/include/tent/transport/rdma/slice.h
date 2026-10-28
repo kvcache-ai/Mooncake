@@ -46,7 +46,6 @@ struct TentRdmaCongestionControlRoute {
 
     adaptive_congestion_control::DomainState domain;
     std::atomic<uint32_t> endpoint_generation{0};
-    std::atomic<uint64_t> completed_bytes{0};
 };
 #endif
 

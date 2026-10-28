@@ -47,7 +47,6 @@ TEST(TentAdaptiveCongestionControlTest, AttemptReleasesOnce) {
     EXPECT_FALSE(completeTentCongestionControlAttempt(
         slice, adaptive_congestion_control::OutcomeClass::kSuccess,
         adaptive_congestion_control::FailureScope::kOperation));
-    EXPECT_EQ(route->completed_bytes.load(std::memory_order_relaxed), 512u);
     EXPECT_EQ(adaptive_congestion_control::snapshot(device).inflight_bytes, 0);
     EXPECT_EQ(
         adaptive_congestion_control::snapshot(route->domain).inflight_bytes, 0);
@@ -269,7 +268,7 @@ TEST(TentAdaptiveCongestionControlTest,
     ASSERT_TRUE(completeTentCongestionControlAttempt(
         first, adaptive_congestion_control::OutcomeClass::kSuccess,
         adaptive_congestion_control::FailureScope::kOperation));
-    tickTentCongestionControlRoute(route, 3, 1);
+    tickTentCongestionControlRoute(route, 3);
     EXPECT_EQ(adaptive_congestion_control::snapshot(route.domain).state,
               adaptive_congestion_control::PathState::kHealthy);
     EXPECT_EQ(adaptive_congestion_control::snapshot(device).inflight_bytes, 0u);
@@ -284,14 +283,12 @@ TEST(TentAdaptiveCongestionControlTest, EndpointUsesOneSharedRouteState) {
     EXPECT_EQ(endpoint.bindCongestionRoute(&second), &first);
 }
 
-TEST(TentAdaptiveCongestionControlTest, RouteTelemetryGrowsAndShrinksWindow) {
+TEST(TentAdaptiveCongestionControlTest,
+     RouteGrowsOnSuccessWithoutTreatingBacklogAsPressure) {
     adaptive_congestion_control::Config config;
     config.mode = adaptive_congestion_control::Mode::kEnforce;
     config.min_window_bytes = 64;
     config.max_window_bytes = 128;
-    config.target_drain_time_ns = 1'000;
-    config.low_pressure_epochs = 2;
-    config.high_pressure_epochs = 2;
     adaptive_congestion_control::DomainState device(config, 1);
     TentRdmaCongestionControlRoute route(config);
 
@@ -308,10 +305,11 @@ TEST(TentAdaptiveCongestionControlTest, RouteTelemetryGrowsAndShrinksWindow) {
         ASSERT_TRUE(completeTentCongestionControlAttempt(
             slice, adaptive_congestion_control::OutcomeClass::kSuccess,
             adaptive_congestion_control::FailureScope::kOperation));
-        tickTentCongestionControlRoute(route, tick, 1'000'000'000);
+        tickTentCongestionControlRoute(route, tick);
+        adaptive_congestion_control::controlTick(device, tick);
     }
-    EXPECT_GT(adaptive_congestion_control::snapshot(route.domain).window_bytes,
-              64u);
+    EXPECT_EQ(adaptive_congestion_control::snapshot(route.domain).window_bytes,
+              96u);
 
     RdmaSlice inflight;
     inflight.length = 64;
@@ -321,18 +319,78 @@ TEST(TentAdaptiveCongestionControlTest, RouteTelemetryGrowsAndShrinksWindow) {
     ASSERT_EQ(acquireTentCongestionControlAttempt(inflight, &route, path,
                                                   inflight.length, 7),
               adaptive_congestion_control::Decision::kAllow);
-    route.completed_bytes.store(1, std::memory_order_relaxed);
-    tickTentCongestionControlRoute(route, 3, 1'000'000'000);
-    route.completed_bytes.store(1, std::memory_order_relaxed);
-    tickTentCongestionControlRoute(route, 4, 1'000'000'000);
+    tickTentCongestionControlRoute(route, 3);
+    EXPECT_EQ(adaptive_congestion_control::snapshot(route.domain).window_bytes,
+              96u);
+
+    RdmaSlice progress;
+    progress.length = 16;
+    ASSERT_EQ(acquireTentCongestionControlAttempt(progress, &route, path,
+                                                  progress.length, 7),
+              adaptive_congestion_control::Decision::kAllow);
+    ASSERT_TRUE(completeTentCongestionControlAttempt(
+        progress, adaptive_congestion_control::OutcomeClass::kSuccess,
+        adaptive_congestion_control::FailureScope::kOperation));
+    tickTentCongestionControlRoute(route, 4);
 
     EXPECT_EQ(adaptive_congestion_control::snapshot(route.domain).state,
-              adaptive_congestion_control::PathState::kCongested);
+              adaptive_congestion_control::PathState::kHealthy);
     EXPECT_EQ(adaptive_congestion_control::snapshot(route.domain).window_bytes,
-              64u);
+              112u);
     EXPECT_TRUE(completeTentCongestionControlAttempt(
         inflight, adaptive_congestion_control::OutcomeClass::kDerivedFlush,
         adaptive_congestion_control::FailureScope::kOperation));
+}
+
+TEST(TentAdaptiveCongestionControlTest,
+     ExplicitPressureBacksOffBeforeCleanSuccessResumesGrowth) {
+    for (const auto pressure :
+         {adaptive_congestion_control::OutcomeClass::kCongestion,
+          adaptive_congestion_control::OutcomeClass::kReceiverPressure}) {
+        adaptive_congestion_control::Config config;
+        config.mode = adaptive_congestion_control::Mode::kEnforce;
+        config.min_window_bytes = 64;
+        config.max_window_bytes = 256;
+        adaptive_congestion_control::DomainState device(config, 1);
+        TentRdmaCongestionControlRoute route(config);
+        const adaptive_congestion_control::PathHandle path{
+            &device, &route.domain,
+            adaptive_congestion_control::generation(device),
+            adaptive_congestion_control::generation(route.domain)};
+        auto finish = [&](adaptive_congestion_control::OutcomeClass outcome) {
+            RdmaSlice slice;
+            slice.length = 16;
+            ASSERT_EQ(acquireTentCongestionControlAttempt(slice, &route, path,
+                                                          slice.length, 7),
+                      adaptive_congestion_control::Decision::kAllow);
+            ASSERT_TRUE(completeTentCongestionControlAttempt(
+                slice, outcome,
+                adaptive_congestion_control::FailureScope::kOperation));
+        };
+        for (uint64_t tick = 1; tick <= 6; ++tick) {
+            finish(adaptive_congestion_control::OutcomeClass::kSuccess);
+            tickTentCongestionControlRoute(route, tick);
+        }
+        ASSERT_EQ(
+            adaptive_congestion_control::snapshot(route.domain).window_bytes,
+            160u);
+        finish(adaptive_congestion_control::OutcomeClass::kSuccess);
+        finish(pressure);
+        finish(pressure);
+        tickTentCongestionControlRoute(route, 7);
+        EXPECT_EQ(
+            adaptive_congestion_control::snapshot(route.domain).window_bytes,
+            80u);
+        EXPECT_EQ(adaptive_congestion_control::snapshot(route.domain).state,
+                  adaptive_congestion_control::PathState::kCongested);
+        finish(adaptive_congestion_control::OutcomeClass::kSuccess);
+        tickTentCongestionControlRoute(route, 8);
+        EXPECT_EQ(
+            adaptive_congestion_control::snapshot(route.domain).window_bytes,
+            96u);
+        EXPECT_EQ(adaptive_congestion_control::snapshot(route.domain).state,
+                  adaptive_congestion_control::PathState::kHealthy);
+    }
 }
 
 }  // namespace

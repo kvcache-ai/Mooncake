@@ -74,8 +74,6 @@ class ClassicRdmaCongestionControl {
     adaptive_congestion_control::Config config_;
     adaptive_congestion_control::Mode mode_;
     std::unique_ptr<adaptive_congestion_control::DomainState> device_;
-    std::atomic<uint64_t> completed_bytes_{0};
-    uint64_t last_tick_ns_ = 0;
     std::mutex routes_mutex_;
     std::unordered_map<std::string, std::unique_ptr<RouteState>> routes_;
 };
@@ -143,7 +141,6 @@ class WorkerPool {
     struct RailHealthSnapshot {
         bool paused = false;
         uint64_t retry_after_ns = 0;
-        int error_count = 0;
     };
 
     void markRailFailed(const std::string &peer_nic_path,

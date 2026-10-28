@@ -8,8 +8,10 @@ This module provides environment-variable parsing and validation designed for
 the Classic TE and TENT RDMA adapters. The loader snapshots the environment
 when `loadConfigFromEnvironment()` is called. Set
 `MC_ADAPTIVE_CONGESTION_CONTROL_MODE=off` or build with
-`MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL=OFF` to preserve the original
-path.
+`MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL=OFF` to bypass adaptive admission
+and feedback. TENT's independent metadata-fenced rail recovery rule has its own
+`transports/rdma/rail_recovery_probe_enabled` switch; set it to `false` to retain
+cooldown-only recovery.
 
 | Variable | Default | Description |
 | --- | ---: | --- |
