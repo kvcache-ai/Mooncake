@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <limits>
@@ -42,8 +43,13 @@
 #include "cuda_alike.h"
 #endif
 
+DECLARE_uint64(experimental_window_requests);
+
 namespace mooncake {
 namespace tent {
+namespace {
+thread_local int experimental_thread_nic_hint = -1;
+}
 
 #ifdef USE_CUDA
 static inline int getNumaNodeFromPciDevice(const std::string& pci_bdf) {
@@ -777,6 +783,25 @@ int TEBenchRunner::stopInitiator() {
 }
 
 void TEBenchRunner::pinThread(int thread_id) {
+    experimental_thread_nic_hint = -1;
+    if (const char* value = std::getenv("MC_EXPERIMENTAL_THREAD_NICS")) {
+        const auto names = splitCommaSeparated(value);
+        CHECK_GE(thread_id, 0);
+        CHECK_LT(static_cast<size_t>(thread_id), names.size())
+            << "MC_EXPERIMENTAL_THREAD_NICS needs one NIC per submission "
+               "thread";
+        auto topology = engine_->getLocalTopology();
+        CHECK(topology);
+        const auto& hcas = topology->getHcaList();
+        auto it = std::find(hcas.begin(), hcas.end(), names[thread_id]);
+        CHECK(it != hcas.end())
+            << "Unknown experimental NIC: " << names[thread_id];
+        experimental_thread_nic_hint = static_cast<int>(it - hcas.begin());
+        LOG(INFO) << "Experimental submission thread=" << thread_id
+                  << " NIC=" << names[thread_id]
+                  << " hint=" << experimental_thread_nic_hint;
+    }
+
 #ifdef USE_SUNRISE
     if (XferBenchConfig::seg_type == "VRAM" && !pinned_buffer_list_.empty()) {
         // Tang pointer queries are device-context sensitive on worker threads.
@@ -910,6 +935,7 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
     std::vector<TransferRequest> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {
         TransferRequest entry;
+        entry.nic_hint = experimental_thread_nic_hint;
         entry.opcode =
             opcode == READ ? TransferRequest::READ : TransferRequest::WRITE;
         entry.length = block_size;
@@ -972,15 +998,28 @@ int TEBenchRunner::runRollingTransfers(uint64_t local_addr, uint64_t target_id,
     if (inflight == 0 || inflight > 64 || (inflight & (inflight - 1)) != 0 ||
         total_batch_size % inflight != 0 || total_batch_size < inflight)
         return -1;
-    const uint64_t slot_batch_size = total_batch_size / inflight;
+    const uint64_t window = FLAGS_experimental_window_requests
+                                ? FLAGS_experimental_window_requests
+                                : total_batch_size;
+    if (window > total_batch_size || window < inflight || window % inflight)
+        return -1;
+    const uint64_t slot_batch_size = window / inflight;
+    if (total_batch_size % slot_batch_size) return -1;
+    const uint64_t chunk_count = total_batch_size / slot_batch_size;
+    std::vector<bool> busy(chunk_count, false), visited(chunk_count, false);
+    uint64_t next_chunk = 0, visited_count = 0;
     const uint64_t slot_bytes =
         checkedMul(block_size, slot_batch_size, "rolling slot bytes");
     struct Slot {
         BatchID id{};
         bool active = false;
         uint64_t submitted_us = 0;
+        uint64_t chunk = 0;
+        std::vector<TransferRequest> requests;
     };
     std::vector<Slot> slots(inflight);
+    const char* reuse_env = std::getenv("MC_EXPERIMENTAL_REUSE_REQUESTS");
+    const bool reuse_requests = reuse_env && std::strcmp(reuse_env, "1") == 0;
     XferBenchTimer clock;
     const char* initiator_warm_env =
         std::getenv("MC_EXPERIMENTAL_INITIATOR_WARM_US");
@@ -1007,23 +1046,48 @@ int TEBenchRunner::runRollingTransfers(uint64_t local_addr, uint64_t target_id,
     size_t active = 0;
     auto submit = [&](size_t index) {
         auto& slot = slots[index];
-        // Preserve the original benchmark's per-batch allocation/request
-        // construction cost. Only overlap independent batch lifetimes.
+        // Keep normal per-batch construction unless request reuse is explicitly
+        // enabled. Each slot is resubmitted only after its batch completes.
+        while (busy[next_chunk]) next_chunk = (next_chunk + 1) % chunk_count;
+        slot.chunk = next_chunk;
+        busy[slot.chunk] = true;
+        if (!visited[slot.chunk]) {
+            visited[slot.chunk] = true;
+            ++visited_count;
+        }
+        next_chunk = (next_chunk + 1) % chunk_count;
         slot.submitted_us = clock.lap_us(false);
         slot.id = engine_->allocateBatchID(slot_batch_size);
         slot.active = true;
         ++active;
-        std::vector<TransferRequest> requests;
-        for (uint64_t i = 0; i < slot_batch_size; ++i) {
-            const uint64_t offset = index * slot_bytes + i * block_size;
-            TransferRequest entry;
-            entry.opcode =
-                opcode == READ ? TransferRequest::READ : TransferRequest::WRITE;
-            entry.length = block_size;
-            entry.source = reinterpret_cast<void*>(local_addr + offset);
-            entry.target_id = target_id;
-            entry.target_offset = target_addr + offset;
-            requests.emplace_back(entry);
+        std::vector<TransferRequest> temporary_requests;
+        auto& requests = reuse_requests ? slot.requests : temporary_requests;
+        if (requests.empty()) {
+            if (reuse_requests) requests.reserve(slot_batch_size);
+            for (uint64_t i = 0; i < slot_batch_size; ++i) {
+                const uint64_t offset =
+                    slot.chunk * slot_bytes + i * block_size;
+                TransferRequest entry;
+                entry.nic_hint = experimental_thread_nic_hint;
+                entry.opcode = opcode == READ ? TransferRequest::READ
+                                              : TransferRequest::WRITE;
+                entry.length = block_size;
+                entry.source = reinterpret_cast<void*>(local_addr + offset);
+                entry.target_id = target_id;
+                entry.target_offset = target_addr + offset;
+                requests.emplace_back(entry);
+            }
+        }
+        // A reused descriptor vector follows the new chunk; payload buffers
+        // remain untouched and no chunk can overlap another live batch.
+        if (reuse_requests) {
+            for (uint64_t i = 0; i < slot_batch_size; ++i) {
+                const uint64_t offset =
+                    slot.chunk * slot_bytes + i * block_size;
+                requests[i].source =
+                    reinterpret_cast<void*>(local_addr + offset);
+                requests[i].target_offset = target_addr + offset;
+            }
         }
         auto status = engine_->submitTransfer(slot.id, requests);
         if (!status.ok()) {
@@ -1033,6 +1097,7 @@ int TEBenchRunner::runRollingTransfers(uint64_t local_addr, uint64_t target_id,
             // pending.
             if (engine_->freeBatchID(slot.id).IsBatchCleanupDeferred())
                 abandoned_batches_.fetch_add(1);
+            busy[slot.chunk] = false;
             slot.active = false;
             --active;
             failed = true;
@@ -1058,6 +1123,7 @@ int TEBenchRunner::runRollingTransfers(uint64_t local_addr, uint64_t target_id,
             const auto completed_us = clock.lap_us(false);
             latencies.push_back(completed_us - slot.submitted_us);
             auto released = releaseFinishedBatch(*engine_, slot.id);
+            busy[slot.chunk] = false;
             slot.active = false;
             --active;
             if (!released.ok()) {
@@ -1091,6 +1157,12 @@ int TEBenchRunner::runRollingTransfers(uint64_t local_addr, uint64_t target_id,
         }
         slot.active = false;
     }
+    LOG(INFO) << "Rolling address coverage=" << visited_count << "/"
+              << chunk_count << " footprint_bytes="
+              << checkedMul(block_size, total_batch_size,
+                            "rolling footprint bytes")
+              << " window_bytes="
+              << checkedMul(block_size, window, "rolling window bytes");
     return failed || !g_te_running ? -1 : 0;
 }
 

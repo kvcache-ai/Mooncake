@@ -1,7 +1,8 @@
 # Reproducing the classic TE RDMA optimization steps
 
 This is an opt-in benchmark experiment. Except for `globalConfig()` initialization,
-all changes are disabled by default. It does not disable DDIO or change BIOS,
+all experimental switches are disabled by default. The later poll-notification
+cleanup also applies without an opt-in switch. It does not disable DDIO or change BIOS,
 CAT, firmware, or the system THP policy.
 
 The measurements below were made on 2026-10-26 from base
@@ -16,6 +17,14 @@ The PR ports the successful options onto main at
 that allocator is preserved. Historical throughput is **not a measurement of the
 rebased PR**. Unsuccessful experimental page-policy, polling-pause, demand-read,
 and worker-clock switches are not included.
+
+## Later large-working-set result: not 400 GB/s
+
+For one process, eight submission threads and 1 GiB/thread (8 GiB total),
+the later three-run mean rose from **258.671 to 274.464 GB/s (+6.11%)**.
+This has **not saturated 400 GB/s**. See the separate
+[large-working-set code, command and result table](rdma_large_working_set.md).
+Do not substitute the small-working-set results below for that workload.
 
 ## Ordered change / command / result table
 

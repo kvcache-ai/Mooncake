@@ -17,6 +17,8 @@ PREAMBLE = r"""
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
+#include <set>
 #include <cstdlib>
 #include <iostream>
 #include <map>
@@ -28,15 +30,15 @@ enum OpCode { READ, WRITE };
 enum class TransferStatusEnum { WAITING, PENDING, COMPLETED, FAILED };
 struct TransferStatus { TransferStatusEnum s; };
 struct Status { bool valid=true; bool deferred=false; bool ok() const {return valid;} bool IsBatchCleanupDeferred() const {return deferred;} std::string ToString() const {return "test";} };
-struct TransferRequest { enum { READ, WRITE }; int opcode; uint64_t length; void* source; uint64_t target_id; uint64_t target_offset; };
+struct TransferRequest { enum { READ, WRITE }; int opcode; int nic_hint=-1; uint64_t length; void* source; uint64_t target_id; uint64_t target_offset; };
 struct XferBenchConfig { static inline std::string seg_type="DRAM"; };
 bool g_te_running=true;
-uint64_t ticks=0;
+uint64_t ticks=0; uint64_t FLAGS_experimental_window_requests=0; int experimental_thread_nic_hint=-1;
 struct XferBenchTimer { uint64_t start=ticks; uint64_t lap_us(bool=false) {ticks+=10; return ticks-start;} };
 uint64_t checkedMul(uint64_t a,uint64_t b,const char*) {return a*b;}
 struct Engine {
  struct Batch { std::vector<TransferRequest> req; int polls=0; bool rejected=false; };
- std::map<BatchID,Batch> live; uint64_t next=0, submitted=0, completed=0, bytes=0, released=0; int fail_at=0, stop_at=0; bool deferred=false;
+ std::map<BatchID,Batch> live; uint64_t next=0, submitted=0, completed=0, bytes=0, released=0; int fail_at=0, stop_at=0; bool deferred=false; std::set<uint64_t> seen; uint64_t base=0,limit=0; bool stall=false;
  BatchID allocateBatchID(uint64_t) {live[++next]={};return next;}
  Status submitTransfer(BatchID id, const std::vector<TransferRequest>& req) {
   if (++submitted == uint64_t(fail_at)) {live[id].rejected=true;return {false};}
@@ -44,12 +46,19 @@ struct Engine {
    auto x=reinterpret_cast<uintptr_t>(a.source), y=reinterpret_cast<uintptr_t>(r.source);
    assert(x+a.length<=y || y+r.length<=x); // No overlap with an active slot.
   }
+  for(auto&r:req) {
+   auto a=reinterpret_cast<uint64_t>(r.source);
+   assert(r.nic_hint==experimental_thread_nic_hint);
+   if(limit) {assert(a>=base && a+r.length<=limit);assert(r.target_offset==a-base);}
+   seen.insert(a);
+  }
   live[id].req=req; return {};
  }
  Status getBatchTransferStatus(BatchID id,TransferStatus& s) {
   assert(live.count(id)); auto& b=live.at(id); assert(!b.rejected); // rejected submits must not be polled
-  if (++b.polls==2) {++completed; for(auto&r:b.req) bytes+=r.length;}
-  s.s=b.polls>=2?TransferStatusEnum::COMPLETED:TransferStatusEnum::PENDING;
+  int threshold=(stall&&id==1)?100:2;
+  if (++b.polls==threshold) {++completed; for(auto&r:b.req) bytes+=r.length;}
+  s.s=b.polls>=threshold?TransferStatusEnum::COMPLETED:TransferStatusEnum::PENDING;
   if(stop_at && completed>=uint64_t(stop_at)) g_te_running=false;
   return {};
  }
@@ -83,7 +92,25 @@ int main() {
  XferBenchConfig::seg_type="VRAM";g_te_running=true;Engine e;TEBenchRunner r{&e};std::vector<double> l;
  setenv("MC_EXPERIMENTAL_INITIATOR_WARM_US","10",1);
  assert(r.runRollingTransfers(0,1,0,64,16,READ,4,300,l)==-1);assert(e.submitted==0);
- std::cout<<"rolling mock checks passed: disjoint ranges, bytes, drain, rejected submit, deferred cleanup, stop, invalid partitions, DRAM guard\n";
+ unsetenv("MC_EXPERIMENTAL_INITIATOR_WARM_US"); XferBenchConfig::seg_type="DRAM";
+ experimental_thread_nic_hint=3;
+ for(int reuse:{0,1})for(int window:{8,16,32,64})for(int slots:{2,4,8}){
+  FLAGS_experimental_window_requests=window;g_te_running=true;ticks=0;Engine e;e.base=(uint64_t)buffer.data();e.limit=e.base+64*64;e.stall=true;
+  setenv("MC_EXPERIMENTAL_REUSE_REQUESTS",reuse?"1":"0",1);
+  TEBenchRunner r{&e};std::vector<double> latency;
+  int rc=r.runRollingTransfers(e.base,1,0,64,64,WRITE,slots,50000,latency);
+  assert(rc==0);assert(e.live.empty());assert(e.released==e.submitted);
+  assert(e.bytes==latency.size()*64*(window/slots));assert(e.seen.size()==64);
+ }
+ for(int window:{4,7,65}){
+  FLAGS_experimental_window_requests=window;g_te_running=true;ticks=0;Engine e;TEBenchRunner r{&e};std::vector<double> l;
+  assert(r.runRollingTransfers(0,1,0,64,64,WRITE,8,50000,l)==-1);assert(e.submitted==0);
+ }
+ for(int stop:{0,3}){
+  FLAGS_experimental_window_requests=8;g_te_running=true;ticks=0;Engine e;e.base=(uint64_t)buffer.data();e.limit=e.base+64*64;e.stop_at=stop;if(!stop)e.fail_at=3;
+  TEBenchRunner r{&e};std::vector<double> l;assert(r.runRollingTransfers(e.base,1,0,64,64,WRITE,4,50000,l)==-1);assert(e.live.empty());assert(e.bytes==l.size()*64*2);
+ }
+ std::cout<<"rolling window and mock checks passed: disjoint ranges, bytes, drain, rejected submit, deferred cleanup, stop, invalid partitions, DRAM guard\n";
 }
 """
 

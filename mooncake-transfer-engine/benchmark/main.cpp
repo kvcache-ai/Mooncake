@@ -29,6 +29,8 @@
 #include <mutex>
 #include <thread>
 
+DEFINE_uint64(experimental_window_requests, 0,
+              "Requests in flight per thread; 0 uses the full working set");
 DEFINE_uint32(experimental_inflight_batches, 0,
               "Classic read/write rolling slots (powers of two, 1..64); "
               "batch_size stays the "
@@ -92,8 +94,16 @@ int processBatchSizes(
                "write_seed/read_verify, divisible batch_size, no QoS/pacing";
         return -1;
     }
-    const size_t report_batch_size =
-        inflight ? batch_size / inflight : batch_size;
+    const uint64_t window = FLAGS_experimental_window_requests
+                                ? FLAGS_experimental_window_requests
+                                : batch_size;
+    if (FLAGS_experimental_window_requests &&
+        (!inflight || window > batch_size || window < inflight ||
+         window % inflight || batch_size % (window / inflight))) {
+        LOG(ERROR) << "Invalid rolling window partition";
+        return -1;
+    }
+    const size_t report_batch_size = inflight ? window / inflight : batch_size;
     XferBenchStats stats;
     std::vector<XferBenchStats> qos_stats(qos_classes.size());
     std::vector<TargetBenchStats> target_stats(runner.getTargetCount());
