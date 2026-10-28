@@ -154,6 +154,11 @@ target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
                                                          gtest_main)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # Control GID I/O to exercise recovery while completion failures arrive.
+  if(BUILD_SHARED_LIBS)
+    # --wrap only rewrites calls in objects linked into this executable.
+    target_sources(worker_pool_rail_state_test
+                   PRIVATE $<TARGET_OBJECTS:rdma_transport>)
+  endif()
   target_link_options(
     worker_pool_rail_state_test
     PRIVATE
@@ -387,7 +392,7 @@ if(USE_EFA)
 
   add_executable(efa_select_device_test ${WORKSPACE}/efa_select_device_test.cpp)
   target_link_libraries(efa_select_device_test PUBLIC transfer_engine gtest
-                                                       gtest_main)
+                                                      gtest_main)
   add_test(NAME efa_select_device_test COMMAND efa_select_device_test)
 
   add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
