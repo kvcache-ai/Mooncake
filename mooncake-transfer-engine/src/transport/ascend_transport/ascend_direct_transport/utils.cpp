@@ -173,6 +173,18 @@ bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str) {
     return ProtocolDescValueContainsRoce(*protocol_desc);
 }
 
+bool HasHccsDeviceProtocolDescInGlobalResourceConfig(const char* config_str) {
+    Json::Value root;
+    if (!ParseGlobalResourceConfigObject(config_str, root)) {
+        return false;
+    }
+    const Json::Value* protocol_desc = FindProtocolDescValue(root);
+    if (protocol_desc == nullptr) {
+        return false;
+    }
+    return ProtocolDescValueContainsExact(*protocol_desc, "hccs:device");
+}
+
 bool HasRoceHostProtocolDescInGlobalResourceConfig(const char* config_str) {
     Json::Value root;
     if (!ParseGlobalResourceConfigObject(config_str, root)) {

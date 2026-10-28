@@ -196,10 +196,19 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     // process-global config.
     use_fabric_mem_ = globalConfig().ascend_use_fabric_mem &&
                       globalConfig().ascend_store_te_init;
+    // Snapshot the role-resolved protocol. ascend_store_te_init is cleared
+    // after install, so a later read of the raw env would see the wrong
+    // subtree.
+    hccs_device_protocol_ = HasHccsDeviceProtocolDescInGlobalResourceConfig(
+        ResolveAscendGlobalResourceConfig(
+            std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG"))
+            .c_str());
     LOG(INFO) << "[AscendTE] init local segment, te is created for store="
               << (globalConfig().ascend_store_te_init ? "true" : "false")
               << ", roce_mode=" << (roce_mode_ ? "true" : "false")
               << ", use_fabric_mem=" << (use_fabric_mem_ ? "true" : "false")
+              << ", hccs_device_protocol="
+              << (hccs_device_protocol_ ? "true" : "false")
               << (agent_mode_
                       ? ", launched as standalone real client (manages all "
                         "local NPU devices)"
@@ -400,14 +409,16 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
         // treating that memory as host.
         mem_type = adxl::MEM_DEVICE;
     }
-    // HCCS exports remote-accessible device memory as an IPC handle on 2 MiB
-    // pages. ADXL RegisterMem accepts an unaligned base, but the export then
-    // fails later at connect time, so reject it here with a clear error.
-    if (mem_type == adxl::MEM_DEVICE && remote_accessible && !roce_mode_ &&
+    // hccs:device exports device memory on 2 MiB pages. ADXL RegisterMem
+    // accepts an unaligned base, but the export then fails at connect time.
+    // The gate is the resolved protocol and fabric mem, both captured at
+    // install.
+    const bool hccs_mode = !use_fabric_mem_ && hccs_device_protocol_;
+    if (mem_type == adxl::MEM_DEVICE && hccs_mode && remote_accessible &&
         reinterpret_cast<uintptr_t>(addr) % kHccsDeviceMemAlignment != 0) {
         LOG(ERROR) << "Device mem addr:" << addr << ", length:" << length
                    << " is not aligned to " << kHccsDeviceMemAlignment
-                   << " bytes, which HCCS requires for remote access.";
+                   << " bytes, which hccs:device requires.";
         return ERR_INVALID_ARGUMENT;
     }
 
