@@ -789,7 +789,8 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
     const uint64_t poll_ts = getCurrentTimeInNano();
     const uint64_t previous_poll_ts =
         last_poll_ts_ns_.exchange(poll_ts, std::memory_order_release);
-    last_poll_ts_ns_.notify_all();
+    // Diagnostic timestamp has no production waiters; keep CQ polling free
+    // of the global atomic-wait notification bookkeeping.
     if (previous_poll_ts > 0 && poll_ts > previous_poll_ts) {
         const uint64_t interval = poll_ts - previous_poll_ts;
         last_poll_interval_ns_.store(interval, std::memory_order_relaxed);
