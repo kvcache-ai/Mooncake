@@ -26,6 +26,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <thread>
 #include <type_traits>
 
 #include <nanobind/stl/optional.h>
@@ -85,6 +86,17 @@ class CompletionNotificationFallback : public std::runtime_error {
 static void* (*allocateMemory)(size_t) = nullptr;
 static void (*freeMemory)(void*) = nullptr;
 static std::string g_protocol;
+
+// Pause between status polls of a synchronous transfer. The first polls spin,
+// so short transfers see no added latency; later ones sleep briefly. Each poll
+// scans every task of the batch under the batch progress lock, and an
+// unthrottled loop starves the threads completing the batch, which made large
+// TENT host-staged batches up to 10x slower.
+static void backOffSyncPoll(uint64_t& polls) {
+    constexpr uint64_t kSpinPolls = 128;
+    if (++polls > kSpinPolls)
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+}
 
 enum class ScatterTransferCompletionStatus : int {
     COMPLETED = 0,
@@ -1061,6 +1073,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
         bool completed = false;
         bool release_scheduled = false;
         TransferStatus status;
+        uint64_t polls = 0;
         while (!completed) {
             Status s = engine_->getTransferStatus(batch_id, 0, status);
             LOG_ASSERT(s.ok());
@@ -1091,6 +1104,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                 }
                 return -1;
             }
+            backOffSyncPoll(polls);
         }
     }
     return -1;
@@ -1220,6 +1234,7 @@ int TransferEnginePy::batchTransferSync(
         bool completed = false;
         bool release_scheduled = false;
         TransferStatus status;
+        uint64_t polls = 0;
         while (!completed) {
             Status s = engine_->getBatchTransferStatus(batch_id, status);
             LOG_ASSERT(s.ok());
@@ -1252,6 +1267,7 @@ int TransferEnginePy::batchTransferSync(
                 }
                 return -1;
             }
+            backOffSyncPoll(polls);
         }
     }
     LOG(ERROR) << "batchTransferSync: all " << max_retry
