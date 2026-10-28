@@ -532,6 +532,7 @@ Status RdmaTransport::submitTransferTasks(
     std::vector<RdmaSliceList> slice_lists(num_workers);
     std::vector<RdmaSlice*> slice_tails(num_workers, nullptr);
     auto enqueue_ts = getCurrentTimeInNano();
+    const auto queued_at = std::chrono::steady_clock::now();
 
     // Distribute starting worker across threads to avoid contention
     static std::atomic<int> g_caller_threads(0);
@@ -546,6 +547,7 @@ Status RdmaTransport::submitTransferTasks(
         auto* task = RdmaTaskStorage::Get().allocate();
         rdma_batch->task_list.push_back(task);
         task->request = request;
+        task->queued_at = queued_at;
         task->device_mask = rdma_batch->device_mask;
         task->qp_pool = rdma_batch->qp_pool;  // RFC #2568 step 3
         task->num_slices = 0;

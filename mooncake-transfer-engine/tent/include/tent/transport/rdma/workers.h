@@ -97,6 +97,10 @@ class Workers {
 
     void asyncPollCq();
 
+    // Shared QPs can post to this lane's CQ without charging its own slice
+    // count. Such completions must keep the CQ poller awake.
+    bool hasPendingCompletions(int worker_id) const;
+
     // Resolve one completion: give back what the slice's lane accounts for,
     // feed the transmit meter, and either finish, retry or fail it. Split
     // from asyncPollCq so a test can drive it with a synthesized ibv_wc.
@@ -170,7 +174,8 @@ class Workers {
     // another lane resolved the slice while it waited for a re-post. Retires
     // it like a sweep would (retireSweptSlice), so the caller can simply
     // skip it.
-    bool dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice);
+    bool dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice,
+                             bool cancel_admission = false);
 
     // Hand back everything the selector accounts for this slice: its
     // allocation charge and, if it reached the hardware, its share of the

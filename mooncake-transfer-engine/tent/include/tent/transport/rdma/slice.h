@@ -16,6 +16,7 @@
 #define TENT_SLICE_H
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -99,6 +100,10 @@ using RdmaTaskStorage = Slab<RdmaTask>;
 struct RdmaTask {
     int num_slices;
     Request request;
+    // One monotonic timestamp for every task in a submission. A late worker
+    // must recognize work queued before a recovery probe even if it missed
+    // the probe's in-flight state. Written before publication, then immutable.
+    std::chrono::steady_clock::time_point queued_at{};
     // Resolved by TransportSelector and copied from RdmaSubBatch. The
     // per-slice path runs later on worker threads, so it must carry the same
     // device policy as the aggregate allocation path.
@@ -182,6 +187,10 @@ struct RdmaSlice {
     // (Workers::submitFromTick) while the old set entry drains later.
     std::atomic<int> counted_lane{-1};
     int retry_count = 0;
+    // The posting worker has already deferred this slice behind a recovery
+    // probe. Keep waiting if that probe fails and enters its next interval,
+    // even when this slice has not posted yet. Cleared on path admission.
+    bool recovery_waiting = false;
     // Flat (source,target) combination index last tried by
     // selectFallbackDevice; the next fallback resumes just past it so retries
     // rotate through all combinations with wraparound instead of hammering one.
@@ -207,6 +216,9 @@ struct RdmaSlice {
     // WorkerContext::rails stores values via unique_ptr, so rehashes do
     // not invalidate the pointee.
     RailMonitor* rail_monitor = nullptr;
+    // Generation returned by this attempt's admission, never another slice's
+    // recovery probe. Published before post and consumed by its completion.
+    uint64_t rail_admission = 0;
     int priority = PRIO_HIGH;
 };
 

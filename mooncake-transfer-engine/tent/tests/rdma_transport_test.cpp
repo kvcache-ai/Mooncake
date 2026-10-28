@@ -42,11 +42,13 @@
 
 #include "tent/common/config.h"
 #include "tent/common/types.h"
+#include "tent/common/utils/random.h"
 #include "tent/transfer_engine.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
 #include "tent/transport/rdma/buffers.h"
 #include "tent/transport/rdma/context.h"
+#include "tent/common/utils/string_builder.h"
 #include "tent/transport/rdma/endpoint.h"
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/ibv_loader.h"
@@ -68,12 +70,34 @@ constexpr int kGdrFailureThreshold = 2;
 // Friend accessor for driving initializeContexts() without a full install().
 class RdmaTransportTestPeer {
    public:
+    static std::shared_ptr<RdmaEndPoint> getEndpoint(Workers& workers,
+                                                     int local_device,
+                                                     SegmentID target,
+                                                     int remote_device) {
+        return workers.getEndpoint({local_device, target, remote_device});
+    }
+
     static Status generatePostPath(Workers& workers, RdmaSlice* slice) {
         const int previous = tl_wid;
         tl_wid = 0;
         auto status = workers.generatePostPath(slice);
         tl_wid = previous;
         return status;
+    }
+
+    static void queueForTick(Workers& workers, RdmaSlice* slice) {
+        workers.submitFromTick(workers.worker_context_[0], slice);
+    }
+
+    static void postPending(Workers& workers) {
+        const int previous = tl_wid;
+        tl_wid = 0;
+        workers.asyncPostSend();
+        tl_wid = previous;
+    }
+
+    static void setProbeInterval(RdmaTransport& transport, int seconds) {
+        transport.conf_->set(RailMonitor::kCfgProbeIntervalSecs, seconds);
     }
 
     static void bindTopology(RdmaTransport& transport,
@@ -233,6 +257,10 @@ class RdmaTransportTestPeer {
         workers.handleCompletion(worker, context, wc, poll_ts, last_in_pass);
     }
 
+    static bool hasPendingCompletions(Workers& workers, int lane) {
+        return workers.hasPendingCompletions(lane);
+    }
+
     static void markPosted(Workers& workers, Workers::WorkerContext& worker,
                            RdmaSlice* slice, uint64_t post_ts) {
         workers.markPosted(worker, slice, post_ts);
@@ -276,8 +304,9 @@ class RdmaTransportTestPeer {
         worker.reclaimed.clear();
     }
     static bool dropUnpostableSlice(Workers& workers, WorkerContext& worker,
-                                    RdmaSlice* slice) {
-        return workers.dropUnpostableSlice(worker, slice);
+                                    RdmaSlice* slice,
+                                    bool cancel_admission = false) {
+        return workers.dropUnpostableSlice(worker, slice, cancel_admission);
     }
 
     static void setSliceTimeout(Workers& workers, uint64_t ns) {
@@ -886,7 +915,8 @@ class RdmaPeerRailAllocationTest : public ::testing::TestWithParam<bool> {
                 for (auto* slice = first; slice; slice = slice->next) {
                     RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice,
                                                              0, 0);
-                    slice->task->deref();
+                    if (slice->word == PENDING || slice->word == INITIAL)
+                        slice->task->deref();
                 }
             }
             EXPECT_TRUE(transport_.freeSubBatch(batch_).ok());
@@ -898,6 +928,70 @@ class RdmaPeerRailAllocationTest : public ::testing::TestWithParam<bool> {
             for (const auto& nic : stats) EXPECT_EQ(nic.inflight_bytes, 0u);
             RdmaTransportTestPeer::destroyWorkerContexts(*workers_);
         }
+    }
+
+    RdmaSlice* preparePendingProbe(int probe_interval = 0) {
+        RdmaTransportTestPeer::setProbeInterval(transport_, probe_interval);
+        RdmaTransportTestPeer::setSliceTimeout(*workers_, 60'000'000'000ULL);
+        EXPECT_TRUE(
+            metadata_->segmentManager()
+                .updateLocal([](SegmentDesc& segment) {
+                    auto& buffer =
+                        std::get<MemorySegmentDesc>(segment.detail).buffers[0];
+                    buffer.lkey = {101, 102};
+                    buffer.rkey = {201, 202};
+                    return Status::OK();
+                })
+                .ok());
+        publishPeer();
+        request_.length = 4096;
+        EXPECT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+        auto* slice = static_cast<RdmaSubBatch*>(batch_)->slice_chain[0];
+        EXPECT_TRUE(
+            RdmaTransportTestPeer::generatePostPath(*workers_, slice).ok());
+        auto* rail = slice->rail_monitor;
+        for (int i = 0; i < 3; ++i)
+            rail->markFailed(slice->source_dev_id, slice->target_dev_id,
+                             slice->rail_admission);
+        if (probe_interval > 0)
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(probe_interval * 1000 + 100));
+        EXPECT_TRUE(rail->admit(slice->source_dev_id, slice->target_dev_id,
+                                other_probe_admission_));
+        // Model a retried slice whose old rail pointer is still populated.
+        // The current admission belongs to a different slice on this rail.
+        slice->retry_count = 1;
+        RdmaTransportTestPeer::queueForTick(*workers_, slice);
+        return slice;
+    }
+
+    RdmaSlice* prepareCoolingProbe(bool failed = false) {
+        auto* slice = preparePendingProbe(1);
+        auto* rail = slice->rail_monitor;
+        if (failed)
+            rail->markFailed(slice->source_dev_id, slice->target_dev_id,
+                             other_probe_admission_);
+        else
+            rail->cancelProbe(slice->source_dev_id, slice->target_dev_id,
+                              other_probe_admission_);
+        EXPECT_FALSE(
+            rail->probeInFlight(slice->source_dev_id, slice->target_dev_id));
+        return slice;
+    }
+
+    RdmaSlice* prepareWaitingFirstAttempt() {
+        auto* slice = preparePendingProbe(1);
+        auto* rail = slice->rail_monitor;
+        slice->retry_count = 0;
+        // This request arrived during the probe, after its start timestamp.
+        // Its observed wait must survive the probe's later failure.
+        slice->task->queued_at = std::chrono::steady_clock::now();
+        RdmaTransportTestPeer::postPending(*workers_);
+        EXPECT_EQ(slice->word, PENDING);
+        EXPECT_TRUE(slice->recovery_waiting);
+        rail->markFailed(slice->source_dev_id, slice->target_dev_id,
+                         other_probe_admission_);
+        return slice;
     }
 
     void publishPeer() {
@@ -913,6 +1007,7 @@ class RdmaPeerRailAllocationTest : public ::testing::TestWithParam<bool> {
         metadata_->segmentManager().invalidateRemote(request_.target_id);
     }
 
+    uint64_t other_probe_admission_ = 0;
     RdmaTransport transport_;
     std::shared_ptr<Topology> topology_;
     std::shared_ptr<ControlService> metadata_;
@@ -923,6 +1018,303 @@ class RdmaPeerRailAllocationTest : public ::testing::TestWithParam<bool> {
     Request request_{};
     std::vector<char> buffer_ = std::vector<char>(16 * 4096);
 };
+
+TEST_P(RdmaPeerRailAllocationTest, PendingProbeDefersWithoutConsumingRetries) {
+    auto* slice = preparePendingProbe();
+    auto* rail = slice->rail_monitor;
+    slice->retry_count = 0;  // First-attempt allocation must stay charged.
+    auto& worker = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    ASSERT_EQ(worker.inflight_slices.load(), 1);
+    for (int i = 0; i < 3; ++i) {
+        RdmaTransportTestPeer::postPending(*workers_);
+        EXPECT_EQ(slice->word, PENDING);
+        EXPECT_EQ(slice->retry_count, 0);
+        EXPECT_EQ(slice->charged_dev.load(), slice->source_dev_id);
+        EXPECT_EQ(slice->rail_monitor, nullptr);
+        EXPECT_EQ(worker.inflight_slices.load(), 1);
+        EXPECT_TRUE(
+            rail->probeInFlight(slice->source_dev_id, slice->target_dev_id));
+    }
+    rail->markRecovered(slice->source_dev_id, slice->target_dev_id,
+                        other_probe_admission_);
+    EXPECT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, slice).ok());
+}
+
+TEST_P(RdmaPeerRailAllocationTest, ProbeCooldownDefersRetryWithoutLosingQuota) {
+    auto* slice = prepareCoolingProbe();
+    auto* rail = slice->rail_monitor;
+    const int source = slice->source_dev_id, target = slice->target_dev_id;
+    auto& worker = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    for (int i = 0; i < 3; ++i) {
+        RdmaTransportTestPeer::postPending(*workers_);
+        EXPECT_EQ(slice->word, PENDING);
+        EXPECT_EQ(slice->retry_count, 1);
+        EXPECT_EQ(worker.inflight_slices.load(), 1);
+        EXPECT_EQ(slice->charged_dev.load(), source);
+        EXPECT_EQ(slice->rail_monitor, nullptr);
+        EXPECT_EQ(slice->rail_admission, 0u);
+    }
+    // No external resubmission or successful neighbour is needed: the same
+    // request becomes admissible once the probe interval expires.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    ASSERT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, slice).ok());
+    EXPECT_TRUE(rail->probeInFlight(source, target));
+    EXPECT_NE(slice->rail_admission, 0u);
+    rail->markRecovered(source, target, slice->rail_admission);
+}
+
+TEST_P(RdmaPeerRailAllocationTest, FailedProbeCooldownHonorsCancellation) {
+    auto* slice = prepareCoolingProbe(/*failed=*/true);
+    RdmaTransportTestPeer::postPending(*workers_);
+    ASSERT_EQ(slice->word, PENDING);
+    slice->task->cancel_requested.store(true);
+    RdmaTransportTestPeer::postPending(*workers_);
+    EXPECT_EQ(slice->word, CANCELED);
+    EXPECT_EQ(slice->charged_dev.load(), -1);
+    EXPECT_EQ(RdmaTransportTestPeer::workerContext(*workers_, 0)
+                  .inflight_slices.load(),
+              0);
+}
+
+TEST_P(RdmaPeerRailAllocationTest, ProbeCooldownKeepsFirstAttemptWaiting) {
+    auto* slice = prepareWaitingFirstAttempt();
+    const auto enqueue_ts = slice->enqueue_ts;
+    auto& worker = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    for (int i = 0; i < 3; ++i) {
+        RdmaTransportTestPeer::postPending(*workers_);
+        EXPECT_EQ(slice->word, PENDING);
+        EXPECT_EQ(slice->retry_count, 0);
+        EXPECT_EQ(slice->enqueue_ts, enqueue_ts);
+        EXPECT_EQ(worker.inflight_slices.load(), 1);
+        EXPECT_EQ(slice->charged_dev.load(), slice->source_dev_id);
+        EXPECT_EQ(slice->rail_monitor, nullptr);
+        EXPECT_EQ(slice->rail_admission, 0u);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    ASSERT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, slice).ok());
+    EXPECT_FALSE(slice->recovery_waiting);
+    slice->rail_monitor->markRecovered(
+        slice->source_dev_id, slice->target_dev_id, slice->rail_admission);
+}
+
+TEST_P(RdmaPeerRailAllocationTest, ProbeCooldownWaitingFirstAttemptCanCancel) {
+    auto* slice = prepareWaitingFirstAttempt();
+    slice->task->cancel_requested.store(true);
+    RdmaTransportTestPeer::postPending(*workers_);
+    EXPECT_EQ(slice->word, CANCELED);
+    EXPECT_EQ(slice->retry_count, 0);
+    EXPECT_EQ(slice->charged_dev.load(), -1);
+    EXPECT_EQ(RdmaTransportTestPeer::workerContext(*workers_, 0)
+                  .inflight_slices.load(),
+              0);
+}
+
+TEST_P(RdmaPeerRailAllocationTest, ProbeCooldownWaitingFirstAttemptCanTimeout) {
+    auto* slice = prepareWaitingFirstAttempt();
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 0);
+    RdmaTransportTestPeer::postPending(*workers_);
+    EXPECT_EQ(slice->word, TIMEOUT);
+    EXPECT_EQ(slice->retry_count, 0);
+    EXPECT_EQ(slice->charged_dev.load(), -1);
+    EXPECT_EQ(RdmaTransportTestPeer::workerContext(*workers_, 0)
+                  .inflight_slices.load(),
+              0);
+}
+
+TEST_P(RdmaPeerRailAllocationTest, ProbeCooldownWaitingFirstAttemptHonorsMask) {
+    auto* slice = prepareWaitingFirstAttempt();
+    slice->task->device_mask = 1ULL << 0;
+    EXPECT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, slice)
+                    .IsDeviceNotFound());
+}
+
+TEST_P(RdmaPeerRailAllocationTest, ProbeCooldownKeepsLateFirstAttemptWaiting) {
+    auto* slice = prepareCoolingProbe(/*failed=*/true);
+    slice->retry_count = 0;
+    ASSERT_FALSE(slice->recovery_waiting);
+    // Queued before the probe, but first scheduled only after it failed.
+    // No previous generatePostPath() observation of PENDING is available.
+    RdmaTransportTestPeer::postPending(*workers_);
+    EXPECT_EQ(slice->word, PENDING);
+    EXPECT_EQ(slice->retry_count, 0);
+    EXPECT_TRUE(slice->recovery_waiting);
+    EXPECT_EQ(slice->charged_dev.load(), slice->source_dev_id);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    ASSERT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, slice).ok());
+    EXPECT_FALSE(slice->recovery_waiting);
+    slice->rail_monitor->markRecovered(
+        slice->source_dev_id, slice->target_dev_id, slice->rail_admission);
+}
+
+TEST_P(RdmaPeerRailAllocationTest, ProbeCooldownWaitHasBoundedLifetime) {
+    auto* slice = prepareCoolingProbe();
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 0);
+    RdmaTransportTestPeer::postPending(*workers_);
+    EXPECT_EQ(slice->word, TIMEOUT);
+    EXPECT_EQ(slice->retry_count, 1);
+    EXPECT_EQ(slice->charged_dev.load(), -1);
+    EXPECT_EQ(RdmaTransportTestPeer::workerContext(*workers_, 0)
+                  .inflight_slices.load(),
+              0);
+}
+
+TEST_P(RdmaPeerRailAllocationTest, ProbeCooldownPrefersHealthyAlternative) {
+    RdmaTransportTestPeer::setRailTopology(
+        *workers_, R"({"all":[{"local":"mlx5_0","remote":"mlx5_0"},
+                              {"local":"mlx5_1","remote":"mlx5_1"}]})");
+    auto* slice = prepareCoolingProbe();
+    const int cooling_source = slice->source_dev_id;
+    ASSERT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, slice).ok());
+    EXPECT_NE(slice->source_dev_id, cooling_source);
+    EXPECT_EQ(slice->charged_dev.load(), slice->source_dev_id);
+}
+
+TEST_P(RdmaPeerRailAllocationTest, ProbeCooldownDoesNotHideMissingPaths) {
+    auto* slice = prepareCoolingProbe();
+    slice->task->device_mask = 1ULL << 0;  // Only the other NIC is configured.
+    EXPECT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, slice)
+                    .IsDeviceNotFound());
+    slice->task->device_mask = 1ULL << 1;
+    slice->retry_count = 0;  // Fresh traffic retains prompt transport failover.
+    slice->task->queued_at = std::chrono::steady_clock::now();
+    slice->recovery_waiting = false;
+    EXPECT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, slice)
+                    .IsDeviceNotFound());
+}
+
+TEST_P(RdmaPeerRailAllocationTest, PendingProbeWaitHonorsCancellation) {
+    auto* slice = preparePendingProbe();
+    auto* rail = slice->rail_monitor;
+    RdmaTransportTestPeer::postPending(*workers_);
+    slice->task->cancel_requested.store(true);
+    RdmaTransportTestPeer::postPending(*workers_);
+    EXPECT_EQ(slice->word, CANCELED);
+    EXPECT_EQ(RdmaTransportTestPeer::workerContext(*workers_, 0)
+                  .inflight_slices.load(),
+              0);
+    EXPECT_TRUE(
+        rail->probeInFlight(slice->source_dev_id, slice->target_dev_id));
+}
+
+TEST_P(RdmaPeerRailAllocationTest, PendingProbeWaitHasBoundedLifetime) {
+    auto* slice = preparePendingProbe();
+    auto* rail = slice->rail_monitor;
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, 0);
+    RdmaTransportTestPeer::postPending(*workers_);
+    EXPECT_EQ(slice->word, TIMEOUT);
+    EXPECT_EQ(RdmaTransportTestPeer::workerContext(*workers_, 0)
+                  .inflight_slices.load(),
+              0);
+    EXPECT_TRUE(
+        rail->probeInFlight(slice->source_dev_id, slice->target_dev_id));
+}
+
+TEST_P(RdmaPeerRailAllocationTest, PendingProbeUsesHealthyAlternative) {
+    RdmaTransportTestPeer::setRailTopology(*workers_, "");
+    auto* slice = preparePendingProbe();
+    auto* rail = slice->rail_monitor;
+    const int old_source = slice->source_dev_id;
+    const int old_target = slice->target_dev_id;
+    ASSERT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, slice).ok());
+    EXPECT_TRUE(slice->source_dev_id != old_source ||
+                slice->target_dev_id != old_target);
+    EXPECT_TRUE(rail->probeInFlight(old_source, old_target));
+    EXPECT_EQ(slice->charged_dev.load(), slice->source_dev_id);
+    std::vector<NicLoadStats> stats;
+    ASSERT_TRUE(workers_->getDeviceSelector()->getNicLoadStats(stats).ok());
+    uint64_t charged = 0;
+    for (const auto& nic : stats) charged += nic.inflight_bytes;
+    EXPECT_EQ(charged, GetParam() ? slice->length : 0u);
+}
+
+TEST_P(RdmaPeerRailAllocationTest, PendingProbeSkipsPausedAlternativeNic) {
+    RdmaTransportTestPeer::setRailTopology(
+        *workers_, R"({"all":[{"local":"mlx5_0","remote":"mlx5_0"},
+                              {"local":"mlx5_1","remote":"mlx5_1"}]})");
+    auto* slice = preparePendingProbe();
+    auto* rail = slice->rail_monitor;
+    const int source = slice->source_dev_id;
+    const int target = slice->target_dev_id;
+    ASSERT_TRUE(workers_->getDeviceSelector()
+                    ->setDeviceAvailable(1 - source, false)
+                    .ok());
+    EXPECT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, slice)
+                    .IsTooManyRequests());
+    EXPECT_TRUE(rail->probeInFlight(source, target));
+    EXPECT_EQ(slice->charged_dev.load(), source);
+    // Once the alternative port returns, it can be selected immediately.
+    ASSERT_TRUE(workers_->getDeviceSelector()
+                    ->setDeviceAvailable(1 - source, true)
+                    .ok());
+    ASSERT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, slice).ok());
+    EXPECT_EQ(slice->source_dev_id, 1 - source);
+    EXPECT_TRUE(rail->probeInFlight(source, target));
+}
+
+TEST_P(RdmaPeerRailAllocationTest, FallbackRetirementPreservesOriginalProbe) {
+    RdmaTransportTestPeer::setRailTopology(
+        *workers_, R"({"all":[{"local":"mlx5_0","remote":"mlx5_0"},
+                              {"local":"mlx5_1","remote":"mlx5_1"}]})");
+    auto* slice = preparePendingProbe();
+    auto* rail = slice->rail_monitor;
+    const int source = slice->source_dev_id, target = slice->target_dev_id;
+    ASSERT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, slice).ok());
+    ASSERT_EQ(slice->source_dev_id, 1 - source);
+    EXPECT_EQ(slice->charged_dev.load(), 1 - source);
+    // Cancellation after a fallback must release the new NIC's charge without
+    // cancelling the independent probe that still owns the original rail.
+    slice->task->cancel_requested.store(true);
+    auto& worker = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    ASSERT_TRUE(RdmaTransportTestPeer::dropUnpostableSlice(*workers_, worker,
+                                                           slice, true));
+    EXPECT_EQ(slice->word, CANCELED);
+    EXPECT_EQ(slice->charged_dev.load(), -1);
+    EXPECT_EQ(worker.inflight_slices.load(), 0);
+    EXPECT_TRUE(rail->probeInFlight(source, target));
+    for (int nic : {0, 1}) {
+        EXPECT_EQ(workers_->getDeviceSelector()->getInflightBytes(nic), 0u);
+        EXPECT_EQ(workers_->getDeviceSelector()->getPostedBytes(nic), 0u);
+    }
+}
+
+TEST_P(RdmaPeerRailAllocationTest, PendingProbeRespectsDeviceMask) {
+    auto* slice = preparePendingProbe();
+    auto* rail = slice->rail_monitor;
+    slice->task->device_mask = 1ULL << 0;  // No configured pair on NIC 0.
+    EXPECT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, slice)
+                    .IsDeviceNotFound());
+    EXPECT_TRUE(rail->probeInFlight(1, 1));
+    EXPECT_EQ(slice->rail_monitor, nullptr);
+}
+
+TEST_P(RdmaPeerRailAllocationTest, CancelBeforeRetryPreservesOtherProbe) {
+    auto* slice = preparePendingProbe();
+    auto* rail = slice->rail_monitor;
+    slice->task->cancel_requested.store(true);
+    RdmaTransportTestPeer::postPending(*workers_);
+    EXPECT_EQ(slice->word, CANCELED);
+    EXPECT_TRUE(
+        rail->probeInFlight(slice->source_dev_id, slice->target_dev_id));
+    EXPECT_EQ(slice->charged_dev.load(), -1);
+    EXPECT_EQ(RdmaTransportTestPeer::workerContext(*workers_, 0)
+                  .inflight_slices.load(),
+              0);
+}
+
+TEST_P(RdmaPeerRailAllocationTest, AdmittedCancellationPreservesNewerProbe) {
+    auto* slice = preparePendingProbe();
+    auto* rail = slice->rail_monitor;
+    // The request was admitted while healthy, before a completion paused
+    // the rail and a different request acquired the recovery probe.
+    slice->task->cancel_requested.store(true);
+    auto& worker = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    ASSERT_TRUE(RdmaTransportTestPeer::dropUnpostableSlice(*workers_, worker,
+                                                           slice, true));
+    EXPECT_TRUE(
+        rail->probeInFlight(slice->source_dev_id, slice->target_dev_id));
+    EXPECT_EQ(slice->charged_dev.load(), -1);
+    EXPECT_EQ(worker.inflight_slices.load(), 0);
+}
 
 TEST_P(RdmaPeerRailAllocationTest, AggregateExcludesUnpairedLocalNic) {
     ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
@@ -3329,6 +3721,95 @@ class RdmaWorkersCompletionTest : public ::testing::Test {
     std::vector<RdmaSlice*> extra_slices_;
 };
 
+static void armSliceProbe(RailMonitor& rail, RdmaSlice* slice) {
+    auto topo = topologyWithRdmaNics(2);
+    Config conf;
+    conf.set(RailMonitor::kCfgErrorThreshold, 1);
+    conf.set(RailMonitor::kCfgProbeIntervalSecs, 0);
+    ASSERT_TRUE(rail.load(topo, topo, "", &conf).ok());
+    slice->target_dev_id = slice->source_dev_id;
+    uint64_t ordinary;
+    ASSERT_TRUE(
+        rail.admit(slice->source_dev_id, slice->target_dev_id, ordinary));
+    rail.markFailed(slice->source_dev_id, slice->target_dev_id, ordinary);
+    ASSERT_TRUE(rail.admit(slice->source_dev_id, slice->target_dev_id,
+                           slice->rail_admission));
+    slice->rail_monitor = &rail;
+}
+
+TEST_F(RdmaWorkersTimeoutTest, MissingEndpointRetiresItsRecoveryProbe) {
+    RailMonitor rail;
+    armSliceProbe(rail, slice_);
+    ctx_.inflight_slices.store(1);
+    expire();
+    expectTimedOutAndReleased();
+    EXPECT_FALSE(rail.probeInFlight(kDev, kDev));
+    uint64_t next;
+    EXPECT_TRUE(rail.admit(kDev, kDev, next));
+    EXPECT_EQ(ctx_.inflight_slices.load(), 0);
+}
+
+TEST_F(RdmaWorkersTimeoutTest, TerminalSweepRetiresItsRecoveryProbe) {
+    RailMonitor rail;
+    armSliceProbe(rail, slice_);
+    ctx_.inflight_slices.store(1);
+    updateSliceStatus(slice_, CANCELED);
+    expire();
+    EXPECT_EQ(slice_->word, CANCELED);
+    EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+    EXPECT_FALSE(rail.probeInFlight(kDev, kDev));
+    EXPECT_EQ(ctx_.inflight_slices.load(), 0);
+    EXPECT_TRUE(ctx_.inflight_slice_set.empty());
+}
+
+TEST_F(RdmaWorkersCompletionTest, TerminalCompletionRetiresItsRecoveryProbe) {
+    RailMonitor rail;
+    armSliceProbe(rail, slice_);
+    updateSliceStatus(slice_, CANCELED);
+    complete(IBV_WC_WR_FLUSH_ERR);
+    EXPECT_EQ(slice_->word, CANCELED);
+    EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+    EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
+    EXPECT_FALSE(rail.probeInFlight(kDev, kDev));
+}
+
+TEST_F(RdmaWorkersCompletionTest, MissingEndpointCompletionRetiresProbe) {
+    RailMonitor rail;
+    armSliceProbe(rail, slice_);
+    endpoint_.reset();
+    complete(IBV_WC_WR_FLUSH_ERR);
+    EXPECT_EQ(slice_->word, FAILED);
+    EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+    EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
+    EXPECT_FALSE(rail.probeInFlight(kDev, kDev));
+}
+
+TEST_F(RdmaWorkersChargeTest, ConcurrentReleasesReturnFallbackChargeOnce) {
+    // Selection/recharge finishes before posting. CQ and timeout cleanup
+    // may then compete to release the same charge and posted backlog.
+    RdmaTransportTestPeer::rechargeSlice(*workers_, slice_, 1);
+    slice_->source_dev_id = 1;
+    selector_->notePosted(1, kLen, kNow);
+    slice_->posted_dev = 1;
+    std::atomic<bool> start{false};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 8; ++i)
+        threads.emplace_back([&] {
+            while (!start.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_,
+                                                     kNow + kLen, 0);
+        });
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) thread.join();
+    EXPECT_EQ(slice_->charged_dev.load(), -1);
+    EXPECT_EQ(slice_->posted_dev.load(), -1);
+    for (int dev : {0, 1}) {
+        EXPECT_EQ(selector_->getInflightBytes(dev), 0u);
+        EXPECT_EQ(selector_->getPostedBytes(dev), 0u);
+    }
+}
+
 // One poll pass stamps every completion it reaps with the same timestamp.
 // Sampled at each of them, the first would divide its own bytes by the
 // busy time of the whole group, and the rest -- same timestamp, no later
@@ -3460,6 +3941,7 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
         ibv_cq cq{};
         ibv_qp qp[8]{};
         int next_qp = 0;
+        int reject_after = -1;
         ibv_mr mr{};
     };
     static FakeState fake;
@@ -3483,8 +3965,14 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
     // with this op lets submitSlices run for real against the fake QPs.
     static int postSend(ibv_qp*, ibv_send_wr* wr, ibv_send_wr** bad_wr) {
         std::lock_guard<std::mutex> guard(post_mutex);
-        for (auto* w = wr; w; w = w->next)
+        int accepted = 0;
+        for (auto* w = wr; w; w = w->next) {
+            if (accepted++ == fake.reject_after) {
+                *bad_wr = w;
+                return EIO;
+            }
             post_order.push_back(reinterpret_cast<RdmaSlice*>(w->wr_id));
+        }
         *bad_wr = nullptr;
         return 0;
     }
@@ -3654,6 +4142,362 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
 RdmaWorkersSharedQpTest::FakeState RdmaWorkersSharedQpTest::fake;
 std::mutex RdmaWorkersSharedQpTest::post_mutex;
 std::vector<RdmaSlice*> RdmaWorkersSharedQpTest::post_order;
+
+class RdmaWorkersReconnectTest : public RdmaWorkersSharedQpTest {
+   protected:
+    void SetUp() override {
+        RdmaWorkersSharedQpTest::SetUp();
+        metadata_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        RdmaTransportTestPeer::bindMetadata(transport_, metadata_);
+        peer_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        uint16_t port = 0;
+        ASSERT_TRUE(peer_->start(port).ok());
+        peer_name_ = "127.0.0.1:" + std::to_string(port);
+        ASSERT_TRUE(
+            peer_->segmentManager()
+                .updateLocal([&](SegmentDesc& segment) {
+                    segment.type = SegmentType::Memory;
+                    segment.name = peer_name_;
+                    segment.rpc_server_addr = peer_name_;
+                    return std::get<MemorySegmentDesc>(segment.detail)
+                        .topology.parse(
+                            R"({"nics":[{"name":"rnic0","type":0,"numa_node":0}]})");
+                })
+                .ok());
+        ASSERT_TRUE(
+            metadata_->segmentManager().openRemote(target_, peer_name_).ok());
+        key_ = MakeNicPath(peer_name_, "rnic0");
+        old_ = context_->endpointStore()->getOrInsert(key_);
+        ASSERT_NE(old_, nullptr);
+    }
+
+    void TearDown() override {
+        if (peer_) peer_->setBootstrapRdmaCallback(nullptr);
+        // Drain the store while its fake CQ/PD are still bound, including
+        // retired endpoints retained by this fixture.
+        if (context_) {
+            EXPECT_EQ(context_->endpointStore()->clear(), 0);
+        }
+        old_.reset();
+        replacement_.reset();
+        peer_.reset();
+        RdmaWorkersSharedQpTest::TearDown();
+    }
+
+    void serveBootstrap(int retirements, bool passive_replacement = false,
+                        bool fail_rpc = false,
+                        std::function<void()> during_bootstrap = {}) {
+        peer_->setBootstrapRdmaCallback(
+            [&, retirements, passive_replacement, fail_rpc, during_bootstrap](
+                const BootstrapDesc&, BootstrapDesc& reply) {
+                const int call = ++calls_;
+                if (during_bootstrap) during_bootstrap();
+                if (fail_rpc) {
+                    reply.reply_msg = "Injected bootstrap failure";
+                    return -1;
+                }
+                reply.local_nic_path = key_;
+                reply.local_gid = context_->address().gid;
+                reply.qp_num = {42};
+                reply.endpoint_generation = 100;
+                if (call <= retirements) {
+                    auto store = context_->endpointStore();
+                    auto current = store->get(key_);
+                    EXPECT_NE(current, nullptr);
+                    if (!current) return -1;
+                    EXPECT_EQ(store->remove(current.get()), 0);
+                    if (passive_replacement) {
+                        replacement_ = store->getOrInsert(key_);
+                        BootstrapDesc local;
+                        EXPECT_TRUE(replacement_->accept(reply, local).ok());
+                    }
+                }
+                return 0;
+            });
+    }
+
+    std::shared_ptr<RdmaEndPoint> connect() {
+        return RdmaTransportTestPeer::getEndpoint(*workers_, kDev, target_, 0);
+    }
+
+    RdmaSlice* admitForBootstrap() {
+        RdmaTransportTestPeer::setSliceTimeout(*workers_, 10'000'000'000ULL);
+        auto* slice = makeSlice();
+        slice->source_dev_id = kDev;
+        slice->target_dev_id = 0;
+        slice->task->request.target_id = target_;
+        slice->enqueue_ts = getCurrentTimeInNano();
+        slice->owner_worker = 0;
+        slice->counted_lane = 0;
+        RdmaTransportTestPeer::rechargeSlice(*workers_, slice, kDev);
+        auto& worker = RdmaTransportTestPeer::workerContext(*workers_, 0);
+        worker.inflight_slices.fetch_add(1);
+        worker.requests[{kDev, target_, 0}].push_back(slice);
+        return slice;
+    }
+
+    void armProbe(RailMonitor& rail, RdmaSlice* slice) {
+        auto topo = topologyWithRdmaNics(2);
+        Config conf;
+        conf.set(RailMonitor::kCfgErrorThreshold, 1);
+        conf.set(RailMonitor::kCfgProbeIntervalSecs, 0);
+        ASSERT_TRUE(rail.load(topo, topo, "", &conf).ok());
+        uint64_t ordinary;
+        ASSERT_TRUE(rail.admit(kDev, 0, ordinary));
+        rail.markFailed(kDev, 0, ordinary);
+        ASSERT_TRUE(rail.admit(kDev, 0, slice->rail_admission));
+        slice->rail_monitor = &rail;
+    }
+
+    void expectUnposted(RdmaSlice* slice, TransferStatusEnum expected) {
+        EXPECT_EQ(slice->word, expected);
+        EXPECT_TRUE(post_order.empty());
+        EXPECT_EQ(slice->charged_dev.load(), -1);
+        EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+        EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
+        EXPECT_EQ(RdmaTransportTestPeer::workerContext(*workers_, 0)
+                      .inflight_slices.load(),
+                  0);
+        // Keep the negative-control run safe when the old worker did post.
+        if (slice->completions_owed.load() > 0) {
+            slice->task->cancel_requested.store(true);
+            completeWith(slice, IBV_WC_WR_FLUSH_ERR);
+        }
+    }
+
+    std::shared_ptr<ControlService> metadata_, peer_;
+    std::shared_ptr<RdmaEndPoint> old_, replacement_;
+    std::string peer_name_, key_;
+    SegmentID target_ = 0;
+    std::atomic<int> calls_{0};
+};
+
+TEST_F(RdmaWorkersReconnectTest, RetiredBootstrapUsesReadyReplacement) {
+    serveBootstrap(1, /*passive_replacement=*/true);
+    auto connected = connect();
+    ASSERT_NE(connected, nullptr);
+    EXPECT_EQ(connected, replacement_);
+    EXPECT_NE(connected, old_);
+    EXPECT_EQ(connected->status(), RdmaEndPoint::EP_READY);
+    EXPECT_EQ(context_->endpointStore()->get(key_), connected);
+    EXPECT_EQ(calls_.load(), 1);
+    EXPECT_EQ(cq_.getQuota(), 0);
+}
+
+TEST_F(RdmaWorkersReconnectTest, RetiredBootstrapConnectsFreshEndpoint) {
+    serveBootstrap(1);
+    auto connected = connect();
+    ASSERT_NE(connected, nullptr);
+    EXPECT_NE(connected, old_);
+    EXPECT_EQ(connected->status(), RdmaEndPoint::EP_READY);
+    EXPECT_EQ(context_->endpointStore()->get(key_), connected);
+    EXPECT_EQ(calls_.load(), 2);
+    EXPECT_EQ(cq_.getQuota(), 0);
+}
+
+TEST_F(RdmaWorkersReconnectTest, RepeatedRetirementIsBounded) {
+    serveBootstrap(2);
+    EXPECT_EQ(connect(), nullptr);
+    EXPECT_EQ(calls_.load(), 2);
+    EXPECT_EQ(cq_.getQuota(), 0);
+}
+
+TEST_F(RdmaWorkersReconnectTest, BootstrapFailureDoesNotReplaceLiveEndpoint) {
+    serveBootstrap(0, false, /*fail_rpc=*/true);
+    EXPECT_EQ(connect(), nullptr);
+    EXPECT_EQ(calls_.load(), 1);
+    EXPECT_EQ(context_->endpointStore()->get(key_), old_);
+    EXPECT_EQ(old_->status(), RdmaEndPoint::EP_HANDSHAKING);
+}
+
+TEST_F(RdmaWorkersReconnectTest, CancellationDuringBootstrapDoesNotPost) {
+    auto* slice = admitForBootstrap();
+    RailMonitor rail;
+    armProbe(rail, slice);
+    serveBootstrap(1, /*passive_replacement=*/true, /*fail_rpc=*/false,
+                   [slice] { slice->task->cancel_requested.store(true); });
+    RdmaTransportTestPeer::postPending(*workers_);
+    EXPECT_EQ(calls_.load(), 1);
+    expectUnposted(slice, CANCELED);
+    EXPECT_FALSE(rail.probeInFlight(kDev, 0));
+}
+
+TEST_F(RdmaWorkersSharedQpTest, ForeignPostsKeepIdleCqPollerAwake) {
+    auto* slice = postSlice(/*lane=*/1, /*enqueue_ts=*/1'000);
+    auto& poller = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    EXPECT_EQ(poller.inflight_slices.load(), 0);
+    EXPECT_TRUE(RdmaTransportTestPeer::hasPendingCompletions(*workers_, 0));
+    completeWith(slice, IBV_WC_SUCCESS);
+    EXPECT_FALSE(RdmaTransportTestPeer::hasPendingCompletions(*workers_, 0));
+}
+
+TEST_F(RdmaWorkersSharedQpTest, ForeignPostWakesSuspendedCqPoller) {
+    auto& poller = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    std::atomic<bool> waiting{false};
+    std::thread idle([&] {
+        std::unique_lock<std::mutex> lock(poller.mutex);
+        poller.in_suspend = true;
+        waiting.store(true, std::memory_order_release);
+        const auto begin = std::chrono::steady_clock::now();
+        EXPECT_TRUE(poller.cv.wait_for(lock, std::chrono::seconds(2), [&] {
+            return RdmaTransportTestPeer::hasPendingCompletions(*workers_, 0);
+        }));
+        EXPECT_LT(std::chrono::steady_clock::now() - begin,
+                  std::chrono::seconds(1));
+        poller.in_suspend = false;
+    });
+    while (!waiting.load(std::memory_order_acquire)) std::this_thread::yield();
+    {
+        std::lock_guard<std::mutex> waiting_guard(poller.mutex);
+    }
+    auto* slice = postSlice(/*lane=*/1, /*enqueue_ts=*/1'000);
+    // postSlice's fake reserve happens after markPosted; a real post reserves
+    // first. Invoke the hook with that quota now visible to the waiter.
+    RdmaTransportTestPeer::markPosted(
+        *workers_, RdmaTransportTestPeer::workerContext(*workers_, 1), slice,
+        1'000);
+    idle.join();
+    EXPECT_EQ(poller.inflight_slices.load(), 0);
+    completeWith(slice, IBV_WC_SUCCESS);
+}
+
+TEST_F(RdmaWorkersSharedQpTest, PostReturnsOnlyRejectedSlices) {
+    BootstrapDesc peer, reply;
+    peer.local_nic_path = MakeNicPath("peer:1234", "rnic0");
+    peer.local_gid = context_->address().gid;
+    peer.qp_num = {42};
+    peer.endpoint_generation = 11;
+    ASSERT_TRUE(endpoint_->accept(peer, reply).ok());
+    for (int accepted : {0, 1, 3}) {
+        SCOPED_TRACE(accepted);
+        fake.reject_after = accepted;
+        std::vector<RdmaSlice*> slices{makeSlice(), makeSlice(), makeSlice()};
+        std::vector<RdmaSlice*> rejected;
+        ASSERT_EQ(endpoint_->submitSlices(slices, 0, {}, &rejected), 3);
+        EXPECT_EQ(rejected, (std::vector<RdmaSlice*>(slices.begin() + accepted,
+                                                     slices.end())));
+        EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), accepted);
+        // The CQ may resolve these before the posting worker examines the
+        // result. Its rejected list must contain no successful slice.
+        for (int i = 0; i < accepted; ++i)
+            completeWith(slices[i], IBV_WC_SUCCESS);
+        for (auto* slice : rejected) {
+            EXPECT_EQ(slice->word, PENDING);
+            EXPECT_EQ(slice->completions_owed.load(), 0);
+            updateSliceStatus(slice, FAILED);
+        }
+        EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 0);
+        EXPECT_EQ(cq_.getQuota(), 0);
+    }
+}
+
+TEST_F(RdmaWorkersSharedQpTest, RecycledPeerQpNumbersRetireOldGeneration) {
+    BootstrapDesc peer, first, retry;
+    peer.local_nic_path = MakeNicPath("peer:1234", "rnic0");
+    peer.local_gid = context_->address().gid;
+    peer.qp_num = {42};
+    peer.endpoint_generation = 11;
+    ASSERT_TRUE(endpoint_->accept(peer, first).ok());
+    ASSERT_NE(first.endpoint_generation, 0u);
+    auto* slice = postSlice(0, 1'000);
+
+    // The provider gave a replacement endpoint exactly the same data QPN.
+    // This must not take the duplicate-bootstrap fast path.
+    peer.endpoint_generation = 12;
+    EXPECT_FALSE(endpoint_->accept(peer, retry).ok());
+    EXPECT_EQ(endpoint_->status(), RdmaEndPoint::EP_DESTROYING);
+    EXPECT_FALSE(endpoint_->finishDestroy());
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 1);
+    completeWith(slice, IBV_WC_SUCCESS);
+    ASSERT_TRUE(endpoint_->finishDestroy());
+
+    auto replacement = std::make_shared<RdmaEndPoint>();
+    ASSERT_EQ(
+        replacement->construct(context_.get(), &params_->endpoint, "peer:0"),
+        0);
+    ASSERT_TRUE(replacement->accept(peer, retry).ok());
+    EXPECT_NE(retry.endpoint_generation, first.endpoint_generation);
+    EXPECT_EQ(replacement->status(), RdmaEndPoint::EP_READY);
+}
+
+TEST_F(RdmaWorkersSharedQpTest, DuplicateGenerationPreservesInflightWork) {
+    BootstrapDesc peer, first, retry;
+    peer.local_nic_path = MakeNicPath("peer:1234", "rnic0");
+    peer.local_gid = context_->address().gid;
+    peer.qp_num = {42};
+    peer.endpoint_generation = 11;
+    ASSERT_TRUE(endpoint_->accept(peer, first).ok());
+    auto* slice = postSlice(0, 1'000);
+
+    ASSERT_TRUE(endpoint_->accept(peer, retry).ok());
+    EXPECT_EQ(first.endpoint_generation, retry.endpoint_generation);
+    EXPECT_EQ(first.qp_num, retry.qp_num);
+    EXPECT_EQ(endpoint_->status(), RdmaEndPoint::EP_READY);
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 1);
+    EXPECT_EQ(slice->word, PENDING);
+    completeWith(slice, IBV_WC_SUCCESS);
+    EXPECT_EQ(slice->word, COMPLETED);
+}
+
+TEST_F(RdmaWorkersSharedQpTest, ConcurrentDuplicateBootstrapKeepsLiveQp) {
+    BootstrapDesc peer, first;
+    peer.local_nic_path = MakeNicPath("peer:1234", "rnic0");
+    peer.local_gid = context_->address().gid;
+    peer.qp_num = {42};
+    peer.endpoint_generation = 11;
+    ASSERT_TRUE(endpoint_->accept(peer, first).ok());
+    auto* slice = postSlice(0, 1'000);
+    std::atomic<bool> start{false};
+    std::vector<std::thread> callers;
+    for (int i = 0; i < 4; ++i)
+        callers.emplace_back([&] {
+            while (!start.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            for (int n = 0; n < 20; ++n) {
+                BootstrapDesc reply;
+                EXPECT_TRUE(endpoint_->accept(peer, reply).ok());
+                EXPECT_EQ(reply.endpoint_generation, first.endpoint_generation);
+                EXPECT_EQ(reply.qp_num, first.qp_num);
+            }
+        });
+    start.store(true, std::memory_order_release);
+    for (auto& caller : callers) caller.join();
+    EXPECT_EQ(endpoint_->status(), RdmaEndPoint::EP_READY);
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 1);
+    EXPECT_EQ(slice->word, PENDING);
+    completeWith(slice, IBV_WC_SUCCESS);
+    EXPECT_EQ(slice->word, COMPLETED);
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 0);
+}
+
+TEST_F(RdmaWorkersSharedQpTest, LegacyBootstrapStillSupportsDuplicates) {
+    BootstrapDesc peer, first, retry;
+    peer.local_nic_path = MakeNicPath("peer:1234", "rnic0");
+    peer.local_gid = context_->address().gid;
+    peer.qp_num = {42};
+    ASSERT_EQ(peer.endpoint_generation, 0u);
+    ASSERT_TRUE(endpoint_->accept(peer, first).ok());
+    ASSERT_TRUE(endpoint_->accept(peer, retry).ok());
+    EXPECT_EQ(first.endpoint_generation, retry.endpoint_generation);
+    EXPECT_EQ(endpoint_->status(), RdmaEndPoint::EP_READY);
+
+    // A peer upgrade/restart with recycled QPNs is a new connection too.
+    peer.endpoint_generation = 12;
+    EXPECT_FALSE(endpoint_->accept(peer, retry).ok());
+    EXPECT_EQ(endpoint_->status(), RdmaEndPoint::EP_DESTROYING);
+}
+
+TEST_F(RdmaWorkersSharedQpTest, LegacyPeerReplacesGenerationAwareConnection) {
+    BootstrapDesc peer, reply;
+    peer.local_nic_path = MakeNicPath("peer:1234", "rnic0");
+    peer.local_gid = context_->address().gid;
+    peer.qp_num = {42};
+    peer.endpoint_generation = 11;
+    ASSERT_TRUE(endpoint_->accept(peer, reply).ok());
+    peer.endpoint_generation = 0;
+    EXPECT_FALSE(endpoint_->accept(peer, reply).ok());
+    EXPECT_EQ(endpoint_->status(), RdmaEndPoint::EP_DESTROYING);
+}
 
 TEST_F(RdmaWorkersSharedQpTest, EndpointPinsConstructionAddressGeneration) {
     const auto endpoint_address =
