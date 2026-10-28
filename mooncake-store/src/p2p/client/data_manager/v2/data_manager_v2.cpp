@@ -123,8 +123,7 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
         if (entry.isMember("placement_policy") &&
             entry["placement_policy"].isMember("offload_high_watermark")) {
             tiler.placement_policy.offload_high_watermark =
-                entry["placement_policy"]["offload_high_watermark"]
-                    .asDouble();
+                entry["placement_policy"]["offload_high_watermark"].asDouble();
         }
 
         if (type == "DRAM") {
@@ -404,11 +403,13 @@ tl::expected<void, ErrorCode> ValidateDataManagerV2Config(
     if (config.tier_placement.lowest_priority_tier_full_policy ==
             "evict_coldest" &&
         !config.tilers.empty()) {
-        const auto lowest_priority = std::min_element(
-            config.tilers.begin(), config.tilers.end(),
-            [](const TilerConfig& lhs, const TilerConfig& rhs) {
-                return lhs.logical.priority < rhs.logical.priority;
-            })->logical.priority;
+        const auto lowest_priority =
+            std::min_element(
+                config.tilers.begin(), config.tilers.end(),
+                [](const TilerConfig& lhs, const TilerConfig& rhs) {
+                    return lhs.logical.priority < rhs.logical.priority;
+                })
+                ->logical.priority;
         for (const auto& tiler : config.tilers) {
             if (tiler.logical.priority != lowest_priority) continue;
             const AllocationFailurePolicyConfig& allocation =

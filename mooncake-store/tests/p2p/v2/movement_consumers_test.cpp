@@ -214,11 +214,9 @@ class MovementConsumersTest : public ::testing::Test {
         logical.tiler_id = generate_uuid();
         logical.memory_type = MemoryType::DRAM;
         logical.priority = priority;
-        return std::make_unique<TilerManager>(logical, BlockIndexConfig{},
-                                              std::move(pool.value()),
-                                              registry_, EventPublisher(),
-                                              EvictionIndexConfig{},
-                                              offload_high_watermark);
+        return std::make_unique<TilerManager>(
+            logical, BlockIndexConfig{}, std::move(pool.value()), registry_,
+            EventPublisher(), EvictionIndexConfig{}, offload_high_watermark);
     }
 
     std::unique_ptr<TilerManager> MakeSsdTiler(int32_t priority,

@@ -129,12 +129,8 @@ class TierGraph {
     std::vector<const TierNode*> FasterNeighbours(const UUID& from) const;
 
     const std::vector<TierNode>& Nodes() const { return nodes_; }
-    std::optional<int32_t> LowestPriority() const {
-        return lowest_priority_;
-    }
-    std::optional<int32_t> HighestPriority() const {
-        return highest_priority_;
-    }
+    std::optional<int32_t> LowestPriority() const { return lowest_priority_; }
+    std::optional<int32_t> HighestPriority() const { return highest_priority_; }
     bool IsLowestPriorityTier(const UUID& tiler_id) const;
     size_t EdgeCount() const { return edges_.size(); }
     bool Empty() const { return nodes_.empty(); }

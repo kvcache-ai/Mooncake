@@ -143,11 +143,11 @@ tl::expected<TierGraph, ErrorCode> TierGraph::Build(
     graph.nodes_ = std::move(nodes);
     graph.edges_ = std::move(edges);
     if (!graph.nodes_.empty()) {
-        const auto [lowest, highest] = std::minmax_element(
-            graph.nodes_.begin(), graph.nodes_.end(),
-            [](const TierNode& lhs, const TierNode& rhs) {
-                return lhs.priority < rhs.priority;
-            });
+        const auto [lowest, highest] =
+            std::minmax_element(graph.nodes_.begin(), graph.nodes_.end(),
+                                [](const TierNode& lhs, const TierNode& rhs) {
+                                    return lhs.priority < rhs.priority;
+                                });
         graph.lowest_priority_ = lowest->priority;
         graph.highest_priority_ = highest->priority;
     }

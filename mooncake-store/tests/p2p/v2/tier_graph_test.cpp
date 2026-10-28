@@ -726,9 +726,8 @@ TEST_F(TierGraphTest, FullLowestPriorityTierCanReplaceItsColdestBlock) {
     usage_[kSsd] = 1.0;
 
     auto retaining = MakePolicy(graph);
-    EXPECT_FALSE(
-        retaining->Select(Context(kCxl, MovementDirection::kOffload))
-            .has_value());
+    EXPECT_FALSE(retaining->Select(Context(kCxl, MovementDirection::kOffload))
+                     .has_value());
 
     TierPlacementPolicyConfig replace_config;
     replace_config.lowest_priority_tier_full_policy = "evict_coldest";
