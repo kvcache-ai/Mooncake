@@ -45,6 +45,14 @@ def plan_matrix_read(
     if output_bytes == 0:
         return MatrixReadPlan(output_shape, 0, ())
     if selected_bytes == row_bytes:
+        if isinstance(rows, range) and rows.step == 1:
+            # A contiguous row slice is already a single byte interval.
+            ranges = (
+                ((rows.start * row_bytes, 0, output_bytes),)
+                if max_ranges >= 1
+                else None
+            )
+            return MatrixReadPlan(output_shape, output_bytes, ranges)
         ranges = []
         previous = None
         run_start = run_length = 0

@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -32,7 +33,6 @@ namespace mooncake {
 
 class PutOperation;
 class DistributedStorageBackend;
-class RealClient;
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol);
@@ -49,13 +49,19 @@ class QueryResult {
     const std::chrono::steady_clock::time_point lease_timeout;
     /** @brief Optional full-object checksum */
     const std::optional<uint64_t> object_checksum;
+    /** @brief Tenant scope the master resolved the query to, when the master
+     * reports it; readers forward it to disk-replica verify requests */
+    const std::optional<std::string> resolved_tenant_id;
 
-    QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
-                std::chrono::steady_clock::time_point lease_timeout_param,
-                std::optional<uint64_t> object_checksum_param = std::nullopt)
+    QueryResult(
+        std::vector<Replica::Descriptor>&& replicas_param,
+        std::chrono::steady_clock::time_point lease_timeout_param,
+        std::optional<uint64_t> object_checksum_param = std::nullopt,
+        std::optional<std::string> resolved_tenant_id_param = std::nullopt)
         : replicas(std::move(replicas_param)),
           lease_timeout(lease_timeout_param),
-          object_checksum(object_checksum_param) {}
+          object_checksum(object_checksum_param),
+          resolved_tenant_id(std::move(resolved_tenant_id_param)) {}
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
@@ -72,6 +78,35 @@ class QueryResult {
 class Client {
    public:
     virtual ~Client();
+
+    // One topology/registration snapshot serves every key or fragment in a
+    // batch. Returned names remain owned by that snapshot.
+    using HcaAffinity =
+        std::function<const std::vector<std::string>&(std::span<const Slice>)>;
+    static HcaAffinity MakeHcaAffinity(const Topology& topology,
+                                       std::vector<SegmentBufferInfo> buffers);
+    static std::optional<SegmentLocality> DiscoverSegmentLocality(
+        const Topology& topology, const std::string& location);
+    class ReadReplicaSelector {
+       public:
+        ErrorCode operator()(const std::vector<Replica::Descriptor>& replicas,
+                             std::span<const Slice> destinations,
+                             Replica::Descriptor& result);
+
+       private:
+        friend class Client;
+        explicit ReadReplicaSelector(const Client* client) : client_(client) {}
+        struct Context {
+            HcaAffinity infer;
+            std::unordered_set<std::string> endpoints;
+        };
+        const Client* client_;
+        std::unique_ptr<Context> context_;
+        bool initialized_{false};
+    };
+    ReadReplicaSelector MakeReadReplicaSelector() const {
+        return ReadReplicaSelector(this);
+    }
 
     using WriteBufferStager =
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(
@@ -101,7 +136,19 @@ class Client {
         const std::string& master_server_entry = kDefaultMasterAddress,
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
         std::map<std::string, std::string> labels = {},
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        std::shared_ptr<NVMeoFInitiator> nof_initiator = nullptr);
+
+    // Test-only seam: when set, Client::Create builds the default NoF
+    // initiator from this factory instead of CreateNofRuntime() whenever the
+    // caller passes no initiator (nullptr). Not thread-safe; set before
+    // Create and reset (pass nullptr) after the test.
+    static void SetDefaultNofInitiatorFactoryForTesting(
+        std::function<std::shared_ptr<NVMeoFInitiator>()> factory);
+
+    // Test-only accessor for the wiring above: the initiator this client
+    // ended up with (nullptr = NoF unavailable in this process).
+    std::shared_ptr<NVMeoFInitiator> GetNofInitiatorForTesting() const;
 
     /**
      * @brief Retrieves data for a given key
@@ -141,6 +188,23 @@ class Client {
     tl::expected<QueryResult, ErrorCode> Query(const std::string& object_key);
 
     /**
+     * @brief Read-only variant of Query(): fetches replica metadata without
+     * granting a lease, triggering promotion-on-hit, or counting valid_get
+     * metrics on the master.
+     *
+     * The returned QueryResult carries an already-expired lease
+     * (lease_ttl_ms is forced to 0): callers must not start data transfers
+     * based on it without a subsequent lease-granting Query().
+     *
+     * Intended for best-effort background paths (e.g. SSD prefetch metadata
+     * classification) that must not perturb hot-path state.
+     * @param object_key Key to query
+     * @return QueryResult containing replicas, or ErrorCode indicating failure
+     */
+    tl::expected<QueryResult, ErrorCode> QueryReadOnly(
+        const std::string& object_key);
+
+    /**
      * @brief Queries replica lists for object keys that match a regex pattern.
      * @param str The regular expression string to match against object keys.
      * @return An expected object containing a map from object keys to their
@@ -160,6 +224,16 @@ class Client {
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys);
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
+        const std::vector<std::string>& object_keys,
+        const std::string& tenant_id);
+
+    /**
+     * @brief Read-only variant of BatchQuery(); see QueryReadOnly() for the
+     * lease/metrics semantics. Per-key results keep input order.
+     */
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQueryReadOnly(
+        const std::vector<std::string>& object_keys);
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQueryReadOnly(
         const std::vector<std::string>& object_keys,
         const std::string& tenant_id);
 
@@ -209,13 +283,17 @@ class Client {
      * @param object_keys Keys of the objects
      * @param query_results Previously queried object metadata for each key
      * @param slices Map of object keys to their data slices
+     * @param group_by_target Read exact-size memory replicas on the same
+     * segment with one transfer submission. A failed submission or transfer
+     * then fails every key in that group. A size mismatch stays per key.
+     * Defaults to false.
      * @return Vector of ErrorCode results for each object
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node = false);
+        bool group_by_target = false);
 
     /**
      * @brief Stores data with replication
@@ -234,6 +312,10 @@ class Client {
      * @param batched_slices Vector of vectors of data slices to store (indexed
      * to match keys)
      * @param config Replication configuration
+     * @param group_by_target Write every memory replica on the same segment
+     * with one transfer submission. A failed submission or transfer then
+     * fails that replica for every key in the group. Defaults to false.
+     * prefer_alloc_in_same_node also groups through this path.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
@@ -242,7 +324,8 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
-        const ReplicateConfig& config, const WriteBufferStager& stager);
+        const ReplicateConfig& config, const WriteBufferStager& stager,
+        bool group_by_target = false);
 
     /**
      * @brief Write slices into a memory replica at an object-byte offset.
@@ -262,7 +345,8 @@ class Client {
         const std::vector<Replica::Descriptor>& replicas,
         const std::vector<std::vector<Slice>>& slices,
         const std::vector<std::vector<uint64_t>>& src_offsets,
-        TransferIntent intent = TransferIntent::kUnspecified);
+        TransferIntent intent = TransferIntent::kUnspecified,
+        std::span<const QueryResult* const> query_results = {});
 
     /**
      * @brief Batch ranged read from restored LOCAL_DISK arenas.
@@ -310,6 +394,7 @@ class Client {
      * @param keys Object keys
      * @param batched_slices Vector of vectors of data slices
      * @param config Replication configuration
+     * @param group_by_target Same as BatchPut. Defaults to false.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
         const std::vector<ObjectKey>& keys,
@@ -318,7 +403,8 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
-        const ReplicateConfig& config, const WriteBufferStager& stager);
+        const ReplicateConfig& config, const WriteBufferStager& stager,
+        bool group_by_target = false);
 
     /**
      * @brief Removes an object and all its replicas
@@ -365,6 +451,13 @@ class Client {
     tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
                                                    const std::string& tenant_id,
                                                    ReplicaType replica_type);
+
+    // Conditional variant: the master evicts only when its current record is
+    // still the replica the caller failed on. See MasterClient for the
+    // mixed-version behavior.
+    tl::expected<bool, ErrorCode> EvictDiskReplicaIfCurrent(
+        const std::string& key, const std::string& tenant_id,
+        ReplicaType replica_type, ReplicaID expected_replica_id);
 
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const std::vector<std::string>& keys, ReplicaType replica_type);
@@ -455,14 +548,38 @@ class Client {
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys);
 
+    WeightRpcResult<WeightRevisionMetadata> BeginWeightImport(
+        const BeginWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> CommitWeightImport(
+        const CommitWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> AbortWeightImport(
+        const AbortWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionView> GetWeightRevision(
+        const GetWeightRevisionRequest& request);
+    WeightRpcResult<ListWeightRevisionsResponse> ListWeightRevisions(
+        const ListWeightRevisionsRequest& request);
+    WeightRpcResult<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request);
+    WeightRpcResult<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request);
+    WeightRpcResult<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request);
+    WeightRpcResult<WeightResidencyOperation> StartWeightResidencyOperation(
+        const StartWeightResidencyOperationRequest& request);
+    WeightRpcResult<WeightResidencyOperation> QueryWeightOperation(
+        const QueryWeightOperationRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> DeleteWeightRevision(
+        const DeleteWeightRevisionRequest& request);
+
     /**
-     * @brief Point-in-time existence check for multiple objects, granting no
-     *        read leases
+     * @brief Probe multiple objects, optionally leasing the last complete
+     *        candidate. LastHitOnly leases the last all-true candidate.
      * @param keys Vector of keys to check
-     * @return Vector of existence results for each key
+     * @return Per-key existence results in input order
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys,
+        const GrantLeasePolicy& policy = {});
 
     /**
      * @brief Create a copy task to copy an object's replicas to target segments
@@ -559,6 +676,16 @@ class Client {
     // Virtual to enable subclassing in unit tests.
     virtual tl::expected<void, ErrorCode> PromotionObjectHeartbeat(
         std::vector<PromotionTaskItem>& promotion_objects);
+
+    /**
+     * @brief Register a master-side promotion task for SSD prefetch, without
+     * the promotion-on-hit admission gate or heartbeat mailbox. This client
+     * must hold the key's LOCAL_DISK replica. Best-effort:
+     * PROMOTION_ALREADY_EXISTS means skip quietly. The client's tenant
+     * applies.
+     */
+    virtual tl::expected<void, ErrorCode> RegisterPrefetchTask(
+        const std::string& object_key, const std::string& tenant_id);
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during
@@ -700,6 +827,11 @@ class Client {
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
+    [[nodiscard]] bool HasClassicTransport(const std::string& protocol) const {
+        return transfer_engine_ && !transfer_engine_->isUsingTent() &&
+               transfer_engine_->getTransport(protocol) != nullptr;
+    }
+
     [[nodiscard]] bool CanUseLocalMemcpy(const std::string& endpoint) const {
         return transfer_submitter_ != nullptr &&
                transfer_submitter_->canUseLocalMemcpy(endpoint);
@@ -806,6 +938,32 @@ class Client {
         const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL);
 
+    // What the dangling-replica probe established for one key. The Put path
+    // retries only on kEvicted; the batch-get path also retries on kPresent,
+    // because a batch read dies wholesale and a healthy key swept in by a
+    // sibling's wiped file must be re-read, not just left unevicted.
+    enum class DiskReplicaHealResult {
+        // Not a lone client-owned LOCAL_DISK replica; nothing to heal.
+        kNotDangling,
+        // The probe could not answer (transport/config trouble); leave
+        // everything as it was.
+        kUnknown,
+        // The backing file provably exists; nothing was evicted.
+        kPresent,
+        // The backing file is proven gone and the dangling replica was
+        // evicted, so the operation can be retried.
+        kEvicted,
+    };
+
+    // When PutStart reports OBJECT_ALREADY_EXISTS, check whether every
+    // completed replica is a LOCAL_DISK replica owned by this client, and ask
+    // the installed probe (FileStorage::Exists over the offload files) whether
+    // the backing file is gone (issue #3709). Only then evict the dangling
+    // replica so the Put can be retried; any other outcome keeps the old
+    // idempotent path. The batch-get path uses the same heal after a failed
+    // SSD read (#3884).
+    DiskReplicaHealResult healDanglingLocalDiskReplica(const ObjectKey& key);
+
    protected:
     /**
      * @brief Constructor exposed to subclasses for testing only; production
@@ -832,13 +990,6 @@ class Client {
      * @brief Internal helper functions for initialization and data transfer
      */
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
-    // When PutStart reports OBJECT_ALREADY_EXISTS, check whether every
-    // completed replica is a LOCAL_DISK replica owned by this client, and ask
-    // the installed probe (FileStorage::Exists over the offload files) whether
-    // the backing file is gone (issue #3709). Only then evict the dangling
-    // replica so the Put can be retried; any other outcome keeps the old
-    // idempotent path. Returns true only when a replica was actually evicted.
-    bool healDanglingLocalDiskReplica(const ObjectKey& key);
     // The BatchPutStart counterpart: heals the OBJECT_ALREADY_EXISTS subset
     // with one batched replica-list query and one batched evict, then retries
     // PutStart for just the evicted keys and splices the responses back, so a
@@ -936,7 +1087,7 @@ class Client {
      */
     ErrorCode FindFirstCompleteReplica(
         const std::vector<Replica::Descriptor>& replica_list,
-        Replica::Descriptor& replica);
+        Replica::Descriptor& replica) const;
 
     /**
      * @brief Batch put helper methods for structured approach
@@ -949,7 +1100,7 @@ class Client {
     void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
     void StageWriteBuffersForRemoteReplicas(std::vector<PutOperation>& ops,
                                             const WriteBufferStager& stager);
-    void SubmitTransfers(std::vector<PutOperation>& ops);
+    void SubmitTransfers(std::vector<PutOperation>& ops, bool group_by_target);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void SubmitDfsWrites(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
@@ -964,13 +1115,13 @@ class Client {
         const std::vector<const std::vector<Slice>*>& slice_lists,
         const std::vector<DistributedFSDescriptor>& descriptors);
 
-    std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
-        std::vector<PutOperation>& ops, bool is_upsert);
-    std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
-        const std::vector<std::string>& object_keys,
-        const std::vector<QueryResult>& query_results,
-        std::unordered_map<std::string, std::vector<Slice>>& slices);
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
+    HcaAffinity MakeHcaAffinity() const;
+    void AttachHcaAffinity(ReplicateConfig& config,
+                           const std::vector<Slice>& slices) const;
+    ReplicateConfig AttachBatchHcaAffinity(
+        const ReplicateConfig& config, const std::vector<PutOperation>& ops,
+        const std::vector<size_t>& indices) const;
 
     // Client identification
     const UUID client_id_;
@@ -982,6 +1133,8 @@ class Client {
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
+    // NoF initiator injected by RealClient; nullptr when NoF is unavailable.
+    std::shared_ptr<NVMeoFInitiator> nof_initiator_;
 
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;

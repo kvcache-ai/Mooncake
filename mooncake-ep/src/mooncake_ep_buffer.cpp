@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <sstream>
+#include <stdexcept>
 #include <transfer_engine.h>
 
 namespace mooncake {
@@ -61,9 +62,24 @@ bool stream_is_capturing(cudaStream_t stream) {
 
 constexpr int kTopkShadowMaxTokens = 1024;
 constexpr int kTopkShadowMaxTopk = 32;
-constexpr int kTopkShadowSlots = 8;
+constexpr int kTopkShadowSlots = kEpDispatchSlots;
 constexpr size_t kTopkShadowBytes = static_cast<size_t>(kTopkShadowMaxTokens) *
                                     kTopkShadowMaxTopk * sizeof(int64_t);
+
+int validate_rank(int rank, int num_ranks) {
+    if (num_ranks <= 0 || num_ranks > MAX_QP_COUNT || rank < 0 ||
+        rank >= num_ranks) {
+        throw std::invalid_argument("invalid EP rank or world size");
+    }
+    return rank;
+}
+
+int64_t validate_buffer_size(int64_t num_ep_buffer_bytes) {
+    if (num_ep_buffer_bytes <= 0) {
+        throw std::invalid_argument("EP buffer size must be positive");
+    }
+    return num_ep_buffer_bytes;
+}
 
 int64_t* topk_shadow(void* workspace, int shadow_slot, int num_experts) {
     auto* base = reinterpret_cast<uint8_t*>(workspace) +
@@ -107,9 +123,9 @@ static bool macaHostPhaseFenceCoversPeers() {
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
                                    bool disable_p2p, TransferEngine* engine)
-    : rank(rank),
+    : rank(validate_rank(rank, num_ranks)),
       num_ranks(num_ranks),
-      num_ep_buffer_bytes(num_ep_buffer_bytes),
+      num_ep_buffer_bytes(validate_buffer_size(num_ep_buffer_bytes)),
       p2p_enabled_(!disable_p2p),
       comm_stream(create_comm_stream()) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
@@ -265,11 +281,7 @@ MooncakeEpBuffer::dispatch(
     int shadow_slot;
     {
         std::lock_guard<std::mutex> lock(buffer_mutex);
-        auto [it, inserted] = dispatch_shadow_slots.emplace(
-            packed_recv_src_info_ptr, next_shadow_slot);
-        if (inserted)
-            next_shadow_slot = (next_shadow_slot + 1) % kTopkShadowSlots;
-        shadow_slot = it->second;
+        shadow_slot = dispatch_slots.take(packed_recv_src_info_ptr);
     }
 
     // Wait previous tasks to be finished
@@ -331,8 +343,8 @@ MooncakeEpBuffer::dispatch(
             packed_recv_layout_range, packed_recv_count, active_ranks,
             gdr_buffer, buffer.rdma_send_signal_buffer,
             buffer.rdma_recv_signal_buffer, buffer.rdma_send_data_buffer,
-            buffer.rdma_recv_data_buffer, nullptr, nullptr, raddrs_ptr,
-            rkeys_ptr, qp_devctxs_ptr, nvlink_avail, ipc_ptrs, x, topk_idx,
+            buffer.rdma_recv_data_buffer, raddrs_ptr, rkeys_ptr, qp_devctxs_ptr,
+            nvlink_avail, ipc_ptrs, x, topk_idx,
             next_buffer.rdma_recv_signal_buffer, num_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
             num_ranks, use_fp8, workspace, launch_stream, timeout_ticks, phases,
@@ -416,12 +428,14 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks, num_experts);
     EP_HOST_ASSERT(layout.total_bytes <= num_ep_buffer_bytes);
-    int shadow_slot = 0;
+    int shadow_slot;
     {
         std::lock_guard<std::mutex> lock(buffer_mutex);
-        auto it = dispatch_shadow_slots.find(src_info_ptr);
-        if (it != dispatch_shadow_slots.end()) shadow_slot = it->second;
+        shadow_slot = dispatch_slots.find(src_info_ptr);
     }
+    EP_HOST_ASSERT(shadow_slot >= 0 &&
+                   "the combine handle must come from one of the last "
+                   "kEpDispatchSlots dispatches on this buffer");
     int current_buffer_idx = buffer_idx;
     auto buffer = layout.buffers[current_buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
@@ -456,9 +470,9 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
         mooncake::combine(
             combined_x, active_ranks, gdr_buffer,
             buffer.rdma_send_signal_buffer, buffer.rdma_recv_signal_buffer,
-            buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer, nullptr,
-            nullptr, raddrs_ptr, rkeys_ptr, qp_devctxs_ptr, nvlink_avail,
-            ipc_ptrs, x, kernel_topk_idx, topk_weights, src_info, layout_range,
+            buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer,
+            raddrs_ptr, rkeys_ptr, qp_devctxs_ptr, nvlink_avail, ipc_ptrs, x,
+            kernel_topk_idx, topk_weights, src_info, layout_range,
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
