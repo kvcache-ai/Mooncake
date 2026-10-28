@@ -118,8 +118,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     worker_pool_rail_state_test
     PRIVATE
     "-Wl,--wrap=_ZN8mooncake11RdmaContext17refreshCurrentGidEPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_"
-    "-Wl,--wrap=_ZNK8mooncake11RdmaContext14queryPortStateEP14ibv_port_state"
-  )
+    "-Wl,--wrap=_ZNK8mooncake11RdmaContext14queryPortStateEP14ibv_port_state")
 endif()
 add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)
 
@@ -331,6 +330,35 @@ if(USE_MNNVL)
     set_tests_properties(nvlink_host_numa_allocation_test
                          PROPERTIES LABELS "nvlink_vmm_unit")
   endif()
+endif()
+
+if(USE_INTRA_NVLINK
+   AND USE_CUDA
+   AND NOT USE_HIP
+   AND UNIX
+   AND NOT APPLE)
+  add_executable(intranode_nvlink_submit_atomicity_test
+                 ${WORKSPACE}/intranode_nvlink_submit_atomicity_test.cpp)
+  target_link_libraries(intranode_nvlink_submit_atomicity_test
+                        PUBLIC transfer_engine gtest gtest_main)
+  foreach(
+    cuda_symbol
+    cudaGetDevice
+    cudaSetDevice
+    cudaGetDeviceProperties
+    cudaPointerGetAttributes
+    cudaStreamCreateWithFlags
+    cudaStreamDestroy
+    cudaEventCreateWithFlags
+    cudaEventRecord
+    cudaEventSynchronize
+    cudaEventDestroy
+    cudaIpcOpenMemHandle)
+    target_link_options(intranode_nvlink_submit_atomicity_test PRIVATE
+                        "-Wl,--wrap=${cuda_symbol}")
+  endforeach()
+  add_test(NAME intranode_nvlink_submit_atomicity_test
+           COMMAND intranode_nvlink_submit_atomicity_test)
 endif()
 
 if(USE_HIP)
