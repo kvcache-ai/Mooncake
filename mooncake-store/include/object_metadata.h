@@ -27,6 +27,8 @@
 #include <utility>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+
 #include "common/heap_optional.h"
 #include "lease.h"
 #include "master_metric_manager.h"
@@ -507,7 +509,8 @@ struct ObjectMetadata {
     }
 
    private:
-    std::vector<ObjectPart> parts_;
+    // The first part sits in the object itself: every object has one today.
+    boost::container::small_vector<ObjectPart, 1> parts_;
 };
 
 }  // namespace mooncake
