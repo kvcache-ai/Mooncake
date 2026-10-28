@@ -232,6 +232,8 @@ TEST_F(RebootstrapTest, SnapshotBootstrapWithoutSuffixSetsAppliedMetric) {
     service_->Stop();
     auto& metrics = HAMetricManager::instance();
     metrics.set_oplog_applied_sequence_id(0);
+    metrics.update_snapshot_runtime(
+        [](auto& runtime) { runtime.applied_batch = 0; });
     HotStandbyConfig config;
     config.enable_snapshot_bootstrap = true;
     config.enable_verification = false;
@@ -242,8 +244,11 @@ TEST_F(RebootstrapTest, SnapshotBootstrapWithoutSuffixSetsAppliedMetric) {
         std::make_unique<BatchOpLogSnapshotProvider>("n09", *backend_,
                                                      *objects_, "snapshots"));
     ASSERT_EQ(ErrorCode::OK, service_->Start("", "", "n09"));
-    EXPECT_EQ(1u, service_->GetSyncStatus().applied_seq_id);
+    const auto status = service_->GetSyncStatus();
+    EXPECT_EQ(1u, status.applied_seq_id);
+    EXPECT_EQ(0u, status.lag_entries);
     EXPECT_EQ(1, metrics.get_oplog_applied_sequence_id());
+    EXPECT_EQ(1u, metrics.get_snapshot_runtime().applied_batch);
 }
 
 TEST_F(RebootstrapTest, CorruptLatestUsesFallbackAndReplaysSuffix) {
