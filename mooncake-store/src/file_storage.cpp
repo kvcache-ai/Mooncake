@@ -1,6 +1,7 @@
 #include "file_storage.h"
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -732,18 +733,41 @@ tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
         return {};
     }
 
+    const auto evict_start = std::chrono::steady_clock::now();
+    // Atomic: the backend owns how it invokes the handler, and the timings are
+    // summed here rather than measured under a lock of ours.
+    std::atomic<int64_t> notify_us{0};
     auto eviction_result = storage_backend_->EvictAboveDiskWatermark(
         config_.disk_eviction_high_watermark_ratio,
         config_.disk_eviction_low_watermark_ratio,
-        [this](const std::vector<std::string>& evicted_keys) {
-            return NotifyEvictedDiskReplicas(evicted_keys);
+        [this, &notify_us](const std::vector<std::string>& evicted_keys) {
+            // The backend calls this while it still holds the disk, so its
+            // duration is part of the cycle and is timed separately to split
+            // "master RPC" from "local disk work".
+            const auto notify_start = std::chrono::steady_clock::now();
+            auto result = NotifyEvictedDiskReplicas(evicted_keys);
+            notify_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - notify_start)
+                             .count();
+            return result;
         });
+    const int64_t cycle_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - evict_start)
+            .count();
+    const int64_t removed_keys =
+        eviction_result ? static_cast<int64_t>(eviction_result.value().size())
+                        : 0;
+    if (ssd_metric_) {
+        ssd_metric_->ObserveEvictCycle(cycle_us, notify_us, removed_keys);
+    }
     if (!eviction_result) {
         return tl::make_unexpected(eviction_result.error());
     }
     if (!eviction_result.value().empty()) {
         LOG(INFO) << "Disk watermark eviction removed "
-                  << eviction_result.value().size() << " LOCAL_DISK key(s)";
+                  << eviction_result.value().size() << " LOCAL_DISK key(s)"
+                  << ", cycle_us=" << cycle_us << ", notify_us=" << notify_us;
     }
     return {};
 }

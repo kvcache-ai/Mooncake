@@ -66,6 +66,24 @@ TEST_F(SsdMetricsTest, SerializeTest) {
     std::cout << "Serialized SSD Metrics:\n" << serialized << std::endl;
 }
 
+TEST_F(SsdMetricsTest, EvictLatencyIsExportedByPhase) {
+    SsdMetric metrics;
+
+    // One cycle: 5ms in total, 1.2ms of it notifying the master.
+    metrics.ObserveEvictCycle(5000, 1200, 7);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    EXPECT_TRUE(serialized.find("mooncake_ssd_evict_latency_us") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("op_name=\"evict\"") != std::string::npos);
+    EXPECT_TRUE(serialized.find("op_name=\"notify\"") != std::string::npos);
+    EXPECT_TRUE(serialized.find("op_name=\"local\"") != std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_ssd_evict_keys_total") !=
+                std::string::npos);
+}
+
 TEST_F(SsdMetricsTest, SummaryMetricsTest) {
     SsdMetric metrics;
 
