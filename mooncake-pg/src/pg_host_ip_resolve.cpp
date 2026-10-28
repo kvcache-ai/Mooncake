@@ -79,8 +79,7 @@ std::optional<std::string> LocalIpFromHostname() {
         if (rp->ai_family == AF_INET) {
             addr_ptr = &reinterpret_cast<sockaddr_in*>(rp->ai_addr)->sin_addr;
         } else if (rp->ai_family == AF_INET6) {
-            addr_ptr =
-                &reinterpret_cast<sockaddr_in6*>(rp->ai_addr)->sin6_addr;
+            addr_ptr = &reinterpret_cast<sockaddr_in6*>(rp->ai_addr)->sin6_addr;
         }
         if (addr_ptr == nullptr) continue;
         if (!inet_ntop(rp->ai_family, addr_ptr, buf, sizeof(buf))) continue;
@@ -105,8 +104,7 @@ HostIpResolveResult MaybeResolveRoutableHostIpFromEnv(std::string host_ip) {
     };
     hooks.local_ip_from_hostname = []() { return LocalIpFromHostname(); };
 
-    auto result =
-        ResolveRoutableHostIp(std::move(host_ip), master_host, hooks);
+    auto result = ResolveRoutableHostIp(std::move(host_ip), master_host, hooks);
     if (result.outcome == HostIpResolveOutcome::Resolved) {
         LOG(INFO) << "Mooncake PG: derived host_ip=" << result.host_ip
                   << " (MASTER_ADDR host="

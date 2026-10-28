@@ -1,17 +1,51 @@
 #ifndef MOONCAKE_PG_HOST_IP_RESOLVE_H
 #define MOONCAKE_PG_HOST_IP_RESOLVE_H
 
+#include <arpa/inet.h>
+#include <cstring>
 #include <functional>
+#include <netinet/in.h>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 
 namespace mooncake {
+namespace detail {
+
+inline bool IsLoopbackIpv4(const in_addr& addr) {
+    // 127.0.0.0/8 (covers Debian/Ubuntu 127.0.1.1 hostname mappings).
+    return (ntohl(addr.s_addr) >> 24) == 127;
+}
+
+inline bool IsLoopbackIpv6(const in6_addr& addr) {
+    static const in6_addr kLoopback = IN6ADDR_LOOPBACK_INIT;
+    if (std::memcmp(&addr, &kLoopback, sizeof(addr)) == 0) return true;
+    // IPv4-mapped ::ffff:127.x.x.x
+    if (IN6_IS_ADDR_V4MAPPED(&addr)) {
+        in_addr v4{};
+        std::memcpy(&v4, &addr.s6_addr[12], sizeof(v4));
+        return IsLoopbackIpv4(v4);
+    }
+    return false;
+}
+
+}  // namespace detail
 
 inline bool IsLoopbackHost(std::string_view host) {
-    return host.empty() || host == "127.0.0.1" || host == "::1" ||
-           host == "localhost";
+    if (host.empty() || host == "localhost") return true;
+
+    const std::string host_str(host);
+    in_addr v4{};
+    if (inet_pton(AF_INET, host_str.c_str(), &v4) == 1) {
+        return detail::IsLoopbackIpv4(v4);
+    }
+    in6_addr v6{};
+    if (inet_pton(AF_INET6, host_str.c_str(), &v6) == 1) {
+        return detail::IsLoopbackIpv6(v6);
+    }
+    // Non-IP hostnames are not treated as loopback.
+    return false;
 }
 
 struct HostIpResolveHooks {
@@ -39,6 +73,8 @@ struct HostIpResolveResult {
 // Hostname fallback and fail-fast only run when master_host is a confirmed
 // multi-node signal (non-empty and non-loopback). Single-node torchrun with
 // MASTER_ADDR=127.0.0.1 / unset keeps the loopback default.
+// Discovery hooks that return loopback (e.g. 127.0.1.1) are ignored so the
+// next fallback / fail-fast can run.
 inline HostIpResolveResult ResolveRoutableHostIp(
     std::string host_ip, std::string_view master_host,
     const HostIpResolveHooks& hooks) {
@@ -58,19 +94,22 @@ inline HostIpResolveResult ResolveRoutableHostIp(
     }
 
     if (hooks.local_ip_toward_peer) {
-        if (auto ip =
-                hooks.local_ip_toward_peer(std::string(master_host))) {
-            result.host_ip = std::move(*ip);
-            result.outcome = HostIpResolveOutcome::Resolved;
-            return result;
+        if (auto ip = hooks.local_ip_toward_peer(std::string(master_host))) {
+            if (!IsLoopbackHost(*ip)) {
+                result.host_ip = std::move(*ip);
+                result.outcome = HostIpResolveOutcome::Resolved;
+                return result;
+            }
         }
     }
 
     if (hooks.local_ip_from_hostname) {
         if (auto ip = hooks.local_ip_from_hostname()) {
-            result.host_ip = std::move(*ip);
-            result.outcome = HostIpResolveOutcome::Resolved;
-            return result;
+            if (!IsLoopbackHost(*ip)) {
+                result.host_ip = std::move(*ip);
+                result.outcome = HostIpResolveOutcome::Resolved;
+                return result;
+            }
         }
     }
 
