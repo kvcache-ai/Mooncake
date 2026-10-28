@@ -437,6 +437,92 @@ jobs:
         run: ./scripts/ci/run_rpc_smoke.sh
         shell: bash
 
+  nightly-store-rs:
+    name: Store-RS nightly suite
+    needs: version-stamp
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    env:
+      CI: "true"
+      SCCACHE_GHA_ENABLED: "true"
+      MOONCAKE_ROOT_DIR: ${{ github.workspace }}
+      MOONCAKE_STORE_RS_DIR: ${{ github.workspace }}/mooncake-store-rs
+      MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build/store-rs-nightly
+      MOONCAKE_PYTHON_PREFIX: ${{ github.workspace }}/build/store-rs-nightly-python-prefix
+      MOONCAKE_CLASSIC_SHIM_LIB_PATH: ${{ github.workspace }}/build/store-rs-nightly/mooncake-store-rs/native-shims/libmooncake_classic_shim.so
+      MOONCAKE_TENT_SHIM_LIB_PATH: ${{ github.workspace }}/build/store-rs-nightly/mooncake-store-rs/native-shims/libmooncake_tent_shim.so
+      MOONCAKE_PYTHON_BIN: python3
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Free up disk space
+        uses: ./.github/actions/free-disk-space
+
+      - name: Set up compiler cache
+        uses: ./.github/actions/setup-sccache
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build redis-server redis-tools
+          sudo bash -x dependencies.sh -y
+          python -m pip install --disable-pip-version-check numpy pybind11
+        shell: bash
+
+      - name: Configure Store-RS
+        run: |
+          cmake -S "$MOONCAKE_ROOT_DIR" -B "$MOONCAKE_BUILD_DIR" -G Ninja \
+            -DSKBUILD=ON \
+            -DPython3_EXECUTABLE="$(command -v python3)" \
+            -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
+            -DWITH_STORE=ON \
+            -DWITH_STORE_RUST=OFF \
+            -DWITH_STORE_RS=ON \
+            -DWITH_TE=ON \
+            -DUSE_TENT=ON \
+            -DUSE_REDIS=ON \
+            -DUSE_CUDA=OFF \
+            -DBUILD_EXAMPLES=OFF \
+            -DBUILD_UNIT_TESTS=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DENABLE_SCCACHE=ON \
+            -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+
+      - name: Build Store-RS and native shims
+        run: |
+          cmake --build "$MOONCAKE_BUILD_DIR" \
+            --target _fast_copy engine store transfer_engine mooncake_store \
+              mooncake_master mooncake_client build_store_rs \
+            --parallel "$(nproc)"
+        shell: bash
+
+      - name: Install Store-RS Python component
+        run: |
+          cmake --install "$MOONCAKE_BUILD_DIR" --component python \
+            --prefix "$MOONCAKE_PYTHON_PREFIX"
+          mkdir -p "$MOONCAKE_PYTHON_PREFIX/mooncake"
+          cp -a "$MOONCAKE_ROOT_DIR/python/mooncake/." \
+            "$MOONCAKE_PYTHON_PREFIX/mooncake/"
+        shell: bash
+
+      - name: Run Store-RS nightly suite
+        env:
+          MC_STORE_RS_TRANSPORT_BACKENDS: "classic-te tent"
+        run: ./scripts/ci/run_store_rs_nightly.sh all
+        shell: bash
+
   nightly-coverage:
     runs-on: ubuntu-22.04
     env:
@@ -589,6 +675,7 @@ jobs:
       - ascend-test
       - publish-testpypi
       - nightly-test
+      - nightly-store-rs
       - nightly-coverage
     runs-on: ubuntu-22.04
     steps:

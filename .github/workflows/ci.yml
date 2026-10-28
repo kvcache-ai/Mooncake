@@ -551,6 +551,7 @@ jobs:
     outputs:
       src: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.src }}
       tent: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.tent }}
+      store_rs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.store_rs }}
       docs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.docs }}
     steps:
       - uses: actions/checkout@v4
@@ -587,6 +588,19 @@ jobs:
               - 'dependencies.sh'
               - 'scripts/ci/run_transfer_engine_rust_smoke.sh'
               - '.github/actions/**'
+              - '.github/workflows/ci.yml'
+            store_rs:
+              - 'mooncake-store-rs/**'
+              - 'python/mooncake/store/__init__.py'
+              - 'python/mooncake/store/rs/**'
+              - 'python/tests/store/rs/**'
+              - 'mooncake-common/include/**'
+              - 'mooncake-common/FindYLT.cmake'
+              - 'mooncake-transfer-engine/include/**'
+              - 'mooncake-transfer-engine/tent/include/**'
+              - 'scripts/ci/run_store_rs_smoke.sh'
+              - 'CMakeLists.txt'
+              - 'dependencies.sh'
               - '.github/workflows/ci.yml'
             docs:
               - 'docs/**'
@@ -839,6 +853,130 @@ jobs:
       shell: bash
       run: ${SCCACHE_PATH} --show-stats
 
+  store-rs-ci:
+    name: Store-RS Classic TE smoke
+    needs: [spell-check, clang-format, check-paths]
+    if: needs.check-paths.outputs.store_rs == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CI: "true"
+      SCCACHE_GHA_ENABLED: "true"
+      MOONCAKE_ROOT_DIR: ${{ github.workspace }}
+      MOONCAKE_STORE_RS_DIR: ${{ github.workspace }}/mooncake-store-rs
+      MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build/store-rs-ci
+      MOONCAKE_PYTHON_PREFIX: ${{ github.workspace }}/build/store-rs-python-prefix
+      MOONCAKE_CLASSIC_SHIM_LIB_PATH: ${{ github.workspace }}/build/store-rs-ci/mooncake-store-rs/native-shims/libmooncake_classic_shim.so
+      MOONCAKE_TENT_SHIM_LIB_PATH: ${{ github.workspace }}/build/store-rs-ci/mooncake-store-rs/native-shims/libmooncake_tent_shim.so
+      MOONCAKE_PYTHON_BIN: python3
+      MC_STORE_RS_CHECK_CPP_FACADE: "false"
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Show Rust toolchain versions
+      run: |
+        rustc --version --verbose
+        cargo --version
+        cargo clippy --version
+        rustfmt --version
+
+    - name: Check Store-RS Rust formatting
+      run: cargo fmt --all --manifest-path mooncake-store-rs/Cargo.toml -- --check
+
+    - name: Cache Store-RS Cargo artifacts
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: |
+          mooncake-store-rs -> ../build/store-rs-ci/mooncake-store-rs/cargo-cli
+          mooncake-store-rs -> ../build/store-rs-ci/mooncake-store-rs/cargo-python
+          mooncake-store-rs -> ../build/store-rs-ci/mooncake-store-rs/cargo-tests
+
+    - name: Free up disk space
+      uses: ./.github/actions/free-disk-space
+
+    - name: Set up compiler cache
+      uses: ./.github/actions/setup-sccache
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build redis-server redis-tools
+        sudo bash -x dependencies.sh -y
+        python -m pip install --disable-pip-version-check numpy pybind11
+      shell: bash
+
+    - name: Configure Store-RS
+      run: |
+        # Store-RS's current CMake integration requires both native shims, even
+        # though this PR gate exercises only the Classic TE data path.
+        cmake -S "$MOONCAKE_ROOT_DIR" -B "$MOONCAKE_BUILD_DIR" -G Ninja \
+          -DSKBUILD=ON \
+          -DPython3_EXECUTABLE="$(command -v python3)" \
+          -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
+          -DWITH_STORE=OFF \
+          -DWITH_STORE_RUST=OFF \
+          -DWITH_STORE_RS=ON \
+          -DWITH_TE=ON \
+          -DUSE_TENT=ON \
+          -DUSE_REDIS=ON \
+          -DUSE_CUDA=OFF \
+          -DBUILD_EXAMPLES=OFF \
+          -DBUILD_UNIT_TESTS=OFF \
+          -DBUILD_SHARED_LIBS=ON \
+          -DENABLE_SCCACHE=ON \
+          -DCMAKE_BUILD_TYPE=Release
+      shell: bash
+
+    - name: Build Store-RS and native shims
+      run: |
+        cmake --build "$MOONCAKE_BUILD_DIR" \
+          --target _fast_copy engine build_store_rs \
+          --parallel "$(nproc)"
+      shell: bash
+
+    - name: Lint Store-RS Rust crates
+      run: |
+        PYO3_PYTHON="$(command -v python3)"
+        CARGO_TARGET_DIR="$MOONCAKE_BUILD_DIR/mooncake-store-rs/cargo-tests"
+        export PYO3_PYTHON CARGO_TARGET_DIR
+        source "$MOONCAKE_STORE_RS_DIR/scripts/lib/common.sh"
+        mc_scripts_setup_upstream_runtime_env none
+        cargo clippy \
+          --manifest-path "$MOONCAKE_STORE_RS_DIR/Cargo.toml" \
+          --workspace --lib --bins --release -- -D warnings
+      shell: bash
+
+    - name: Install Store-RS Python component
+      run: |
+        cmake --install "$MOONCAKE_BUILD_DIR" --component python \
+          --prefix "$MOONCAKE_PYTHON_PREFIX"
+        mkdir -p "$MOONCAKE_PYTHON_PREFIX/mooncake"
+        cp -a "$MOONCAKE_ROOT_DIR/python/mooncake/." \
+          "$MOONCAKE_PYTHON_PREFIX/mooncake/"
+      shell: bash
+
+    - name: Run Store-RS Classic TE smoke
+      run: ./scripts/ci/run_store_rs_smoke.sh
+      shell: bash
+
+    - name: Run sccache stat for check
+      if: ${{ env.SCCACHE_PATH != '' }}
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
+
   ci-gate:
     name: CI Gate
     # A cancelled branch push run reports no result rather than a failed gate.
@@ -863,6 +1001,7 @@ jobs:
       - build-wheel-efa
       - build-wheel-rocm
       - tent-ci
+      - store-rs-ci
     runs-on: ubuntu-latest
     steps:
       # Each path-gated group must succeed when selected and be skipped otherwise.
@@ -903,6 +1042,12 @@ jobs:
         env:
           EXPECTED: ${{ needs.check-paths.outputs.tent == 'true' && 'success' || 'skipped' }}
           RESULT: ${{ needs.tent-ci.result }}
+        run: test "$RESULT" = "$EXPECTED"
+
+      - name: Check Store-RS job
+        env:
+          EXPECTED: ${{ needs.check-paths.outputs.store_rs == 'true' && 'success' || 'skipped' }}
+          RESULT: ${{ needs.store-rs-ci.result }}
         run: test "$RESULT" = "$EXPECTED"
 
       - name: Check documentation job

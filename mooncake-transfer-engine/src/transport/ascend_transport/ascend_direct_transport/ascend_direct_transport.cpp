@@ -35,6 +35,8 @@
 namespace mooncake {
 namespace {
 
+constexpr uintptr_t kHccsDeviceMemAlignment = 2 * 1024 * 1024;
+
 int32_t ResolveCurrentEngineId(bool agent_mode) {
     if (!agent_mode) {
         return 0;
@@ -194,10 +196,19 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     // process-global config.
     use_fabric_mem_ = globalConfig().ascend_use_fabric_mem &&
                       globalConfig().ascend_store_te_init;
+    // Snapshot the role-resolved protocol. ascend_store_te_init is cleared
+    // after install, so a later read of the raw env would see the wrong
+    // subtree.
+    hccs_device_protocol_ = HasHccsDeviceProtocolDescInGlobalResourceConfig(
+        ResolveAscendGlobalResourceConfig(
+            std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG"))
+            .c_str());
     LOG(INFO) << "[AscendTE] init local segment, te is created for store="
               << (globalConfig().ascend_store_te_init ? "true" : "false")
               << ", roce_mode=" << (roce_mode_ ? "true" : "false")
               << ", use_fabric_mem=" << (use_fabric_mem_ ? "true" : "false")
+              << ", hccs_device_protocol="
+              << (hccs_device_protocol_ ? "true" : "false")
               << (agent_mode_
                       ? ", launched as standalone real client (manages all "
                         "local NPU devices)"
@@ -295,10 +306,6 @@ Status AscendDirectTransport::submitTransfer(
 Status AscendDirectTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
     const int32_t current_engine_id = ResolveCurrentEngineId(agent_mode_);
-    if (current_engine_id < 0) {
-        return Status::Context("aclrtGetDevice failed");
-    }
-
     std::vector<Slice*> slice_list;
     slice_list.reserve(task_list.size());
 
@@ -313,6 +320,13 @@ Status AscendDirectTransport::submitTransferTask(
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
         slice_list.push_back(slice);
+    }
+
+    if (current_engine_id < 0) {
+        // MultiTransport already published these tasks. Attach every slice
+        // before completing any, so rejected tasks cannot look successful.
+        for (auto* slice : slice_list) slice->markFailed();
+        return Status::Context("aclrtGetDevice failed");
     }
 
     if (dispatcher_) {
@@ -394,6 +408,18 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
         // non-fabric TE has no fabric-enabled ADXL engine, so it must keep
         // treating that memory as host.
         mem_type = adxl::MEM_DEVICE;
+    }
+    // hccs:device exports device memory on 2 MiB pages. ADXL RegisterMem
+    // accepts an unaligned base, but the export then fails at connect time.
+    // The gate is the resolved protocol and fabric mem, both captured at
+    // install.
+    const bool hccs_mode = !use_fabric_mem_ && hccs_device_protocol_;
+    if (mem_type == adxl::MEM_DEVICE && hccs_mode && remote_accessible &&
+        reinterpret_cast<uintptr_t>(addr) % kHccsDeviceMemAlignment != 0) {
+        LOG(ERROR) << "Device mem addr:" << addr << ", length:" << length
+                   << " is not aligned to " << kHccsDeviceMemAlignment
+                   << " bytes, which hccs:device requires.";
+        return ERR_INVALID_ARGUMENT;
     }
 
     int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
