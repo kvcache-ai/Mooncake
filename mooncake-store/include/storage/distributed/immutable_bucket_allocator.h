@@ -9,7 +9,6 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include <ylt/util/tl/expected.hpp>
@@ -121,13 +120,21 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     PendingEviction PrepareEviction();
     PendingEviction PrepareEvictionForAllocationFailure();
-    // Callers coordinating external metadata must commit the allocator state
-    // while holding the same metadata locks, then delete the file after those
-    // locks are released.
+    // Callers coordinating external metadata validate it before committing
+    // the allocator state, drop the bucket's replicas from it after, and
+    // delete the file only once no metadata refers to it and no reader may
+    // still use one of them (see DeferDeletion).
     tl::expected<EvictedBucket, ErrorCode> CommitEvictionLogical(
         PendingEviction&& pending);
     tl::expected<void, ErrorCode> DeleteEvictedBucket(EvictedBucket&& bucket);
+    // Keeps the bucket's file, and its capacity, until `not_before`, for
+    // readers that may still use one of its replicas. RetryFailedEvictions
+    // deletes it from then on.
+    void DeferDeletion(EvictedBucket&& bucket,
+                       std::chrono::system_clock::time_point not_before);
     void AbortEviction(PendingEviction&& pending);
+    // Deletes the evicted buckets still waiting for it: those whose deletion
+    // failed, and deferred ones whose time has come.
     size_t RetryFailedEvictions();
 
     size_t GetBucketCount() const;
@@ -182,7 +189,10 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     std::unordered_map<std::string, int64_t> key_index_;
     std::list<int64_t> lru_;
     std::unordered_map<int64_t, std::list<int64_t>::iterator> lru_index_;
-    std::unordered_set<int64_t> failed_deletions_;
+    // Evicted buckets whose file is still to be deleted, each with the time
+    // from which it may be: the epoch once a deletion failed.
+    std::unordered_map<int64_t, std::chrono::system_clock::time_point>
+        waiting_deletions_;
     int64_t active_bucket_id_ = -1;
     int64_t next_bucket_id_ = 0;
     bool eviction_active_ = false;

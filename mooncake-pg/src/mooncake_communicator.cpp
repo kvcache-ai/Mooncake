@@ -1810,15 +1810,23 @@ void MooncakeCommunicator::applyGroupState(
             }
             break;
         case CollectiveExtensionState::Normal:
-            for (int local_rank = 0; local_rank < meta_->maxGroupSize;
-                 ++local_rank) {
-                meta_->activeRanks[local_rank] = false;
-            }
-            for (size_t local_rank = 0; local_rank < view.rank_order.size();
-                 ++local_rank) {
-                const auto global_rank = view.rank_order[local_rank];
-                meta_->activeRanks[local_rank] =
-                    view.members[global_rank].isActive();
+            // Build the new mask before publishing it. Clearing the shared
+            // array first creates a window in which a rank that remains active
+            // can observe its own slot as inactive and reject a collective.
+            // Write each slot's final value once instead.
+            {
+                std::vector<bool> next_active_ranks(meta_->maxGroupSize, false);
+                for (size_t local_rank = 0; local_rank < view.rank_order.size();
+                     ++local_rank) {
+                    const auto global_rank = view.rank_order[local_rank];
+                    next_active_ranks[local_rank] =
+                        view.members[global_rank].isActive();
+                }
+                for (int local_rank = 0; local_rank < meta_->maxGroupSize;
+                     ++local_rank) {
+                    meta_->activeRanks[local_rank] =
+                        next_active_ranks[local_rank];
+                }
             }
             break;
     }
