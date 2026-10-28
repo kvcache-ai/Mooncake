@@ -86,6 +86,11 @@ bool IsRoceModeEnabled();
 // Parse ASCEND_GLOBAL_RESOURCE_CONFIG JSON for roce protocol_desc only.
 bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str);
 
+// True when protocol_desc is "hccs:device", or an array containing that
+// entry. "hccs:host" and "roce:*" do not match. config_str is the already
+// role-resolved ASCEND_GLOBAL_RESOURCE_CONFIG.
+bool HasHccsDeviceProtocolDescInGlobalResourceConfig(const char* config_str);
+
 // True when protocol_desc is "roce:host", or an array containing that entry,
 // on this object or on its "store" subtree. "roce:device" does not match.
 // The store subtree is included because host memory is allocated after TE
@@ -101,6 +106,21 @@ bool HasRoceHostProtocolDescInGlobalResourceConfig(const char* config_str);
 //   - has "store" and normal TE      -> root with "store" removed, serialized
 // A Store TE with no "store" key falls back to the default config.
 std::string ResolveAscendGlobalResourceConfig(const char* config_str);
+
+// TE support for configuring HIXL's comm_resource_config.nic_topo_path in the
+// (already role-resolved) GlobalResourceConfig: fills it from Mooncake's
+// MC_CUSTOM_TOPO_JSON path when the HIXL option is empty. Rules:
+//   - MC_CUSTOM_TOPO_JSON unset/empty                    -> returned unchanged
+//   - nic_topo_path already set (flat or nested, string, non-empty)
+//                                                       -> returned unchanged
+//   - otherwise the MC_CUSTOM_TOPO_JSON path is written under the nested
+//     "comm_resource_config" object when one exists (any stale flat key is
+//     dropped), otherwise as the flat key
+//     "comm_resource_config.nic_topo_path". An empty input yields a minimal
+//     {"comm_resource_config.nic_topo_path":"..."} object.
+// A non-empty but unparsable input is returned unchanged (HIXL rejects it).
+std::string InjectNicTopoPathFromCustomTopoEnvTe(
+    const std::string& resolved_config);
 
 int SetDeviceAndGetContext(int32_t device_id, aclrtContext* out_context);
 
