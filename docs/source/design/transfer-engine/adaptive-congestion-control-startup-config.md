@@ -13,14 +13,20 @@ path.
 
 | Variable | Default | Description |
 | --- | ---: | --- |
-| `MC_ADAPTIVE_CONGESTION_CONTROL_HIGH_PRESSURE_EPOCHS` | 2 | Consecutive high-pressure epochs required before shrinking the window. |
-| `MC_ADAPTIVE_CONGESTION_CONTROL_LOW_PRESSURE_EPOCHS` | 3 | Consecutive low-pressure epochs required before growing the window. |
+| `MC_ADAPTIVE_CONGESTION_CONTROL_HIGH_PRESSURE_EPOCHS` | 2 | Parsed for compatibility; not used by the current window policy. |
+| `MC_ADAPTIVE_CONGESTION_CONTROL_LOW_PRESSURE_EPOCHS` | 3 | Parsed for compatibility; not used by the current window policy. |
 
 These variables accept only positive decimal integers. Epoch counts must fit
 in an unsigned 32-bit integer. Invalid input makes the
 shared loader return an invalid result with adaptive control disabled. An
 adapter consuming this loader must log the initialization error and preserve
 the original transfer behavior.
+
+Successful epochs without explicit errors now grow by the existing additive
+step, regardless of ordinary backlog. Explicit congestion or receiver pressure
+halves the affected window once per epoch. Minimum and maximum window settings
+still apply; drain targets and high/low streak counts no longer gate these
+decisions. All numeric defaults and configuration validation remain unchanged.
 
 Hard-error thresholds, cooldowns, and recovery probes belong to the existing
 transport health mechanisms, not the adaptive window controller. The draft's
