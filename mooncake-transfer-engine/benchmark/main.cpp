@@ -30,7 +30,8 @@
 #include <thread>
 
 DEFINE_uint32(experimental_inflight_batches, 0,
-              "Classic read/write rolling slots (powers of two, 1..64); batch_size stays the "
+              "Classic read/write rolling slots (powers of two, 1..64); "
+              "batch_size stays the "
               "TOTAL working-set request count. Zero keeps original loop.");
 
 using namespace mooncake::tent;
@@ -80,16 +81,19 @@ int processBatchSizes(
 
     const uint32_t inflight = FLAGS_experimental_inflight_batches;
     auto* classic = dynamic_cast<TEBenchRunner*>(&runner);
-    if (inflight && (!classic || (inflight > 64 || (inflight & (inflight - 1)) != 0) ||
-                     batch_size < inflight || batch_size % inflight != 0 ||
-                     mixed_opcode || !qos_classes.empty() ||
-                     !workload_classes.empty() || XferBenchConfig::deadline_us ||
-                     XferBenchConfig::request_interval_us)) {
-        LOG(ERROR) << "Rolling mode requires classic plain read/write or "
-                      "write_seed/read_verify, divisible batch_size, no QoS/pacing";
+    if (inflight &&
+        (!classic || (inflight > 64 || (inflight & (inflight - 1)) != 0) ||
+         batch_size < inflight || batch_size % inflight != 0 || mixed_opcode ||
+         !qos_classes.empty() || !workload_classes.empty() ||
+         XferBenchConfig::deadline_us ||
+         XferBenchConfig::request_interval_us)) {
+        LOG(ERROR)
+            << "Rolling mode requires classic plain read/write or "
+               "write_seed/read_verify, divisible batch_size, no QoS/pacing";
         return -1;
     }
-    const size_t report_batch_size = inflight ? batch_size / inflight : batch_size;
+    const size_t report_batch_size =
+        inflight ? batch_size / inflight : batch_size;
     XferBenchStats stats;
     std::vector<XferBenchStats> qos_stats(qos_classes.size());
     std::vector<TargetBenchStats> target_stats(runner.getTargetCount());
@@ -169,12 +173,15 @@ int processBatchSizes(
         XferBenchTimer timer;
         if (inflight) {
             if (write_seed)
-                fillData((void*)local_addr, thread_block_size * thread_batch_size,
+                fillData((void*)local_addr,
+                         thread_block_size * thread_batch_size,
                          stableDataSeed(target_addr));
             std::vector<double> warmup;
             if (classic->runRollingTransfers(local_addr, target_id, target_addr,
-                    thread_block_size, thread_batch_size, opcode, inflight,
-                    1000000ull, warmup) != 0) return failTask();
+                                             thread_block_size,
+                                             thread_batch_size, opcode,
+                                             inflight, 1000000ull, warmup) != 0)
+                return failTask();
         }
         while (!inflight && timer.lap_us(false) < 1000000ull) {
             if (runner.runSingleTransfer(
@@ -195,14 +202,17 @@ int processBatchSizes(
         std::vector<double> transfer_duration;
         std::vector<double> thread_instant_bandwidth;
         if (inflight) {
-            if (classic->runRollingTransfers(local_addr, target_id, target_addr,
-                    thread_block_size, thread_batch_size, opcode, inflight,
+            if (classic->runRollingTransfers(
+                    local_addr, target_id, target_addr, thread_block_size,
+                    thread_batch_size, opcode, inflight,
                     XferBenchConfig::duration * 1000000ull,
-                    transfer_duration) != 0) return failTask();
-            // These are per-slot latency-derived rates, not aggregate bandwidth.
+                    transfer_duration) != 0)
+                return failTask();
+            // These are per-slot latency-derived rates, not aggregate
+            // bandwidth.
             for (auto us : transfer_duration)
-                thread_instant_bandwidth.push_back(gbPerSecond(
-                    thread_block_size * report_batch_size, us));
+                thread_instant_bandwidth.push_back(
+                    gbPerSecond(thread_block_size * report_batch_size, us));
         } else if (mixed_opcode) {
             while (timer.lap_us(false) <
                    XferBenchConfig::duration * 1000000ull) {

@@ -1350,10 +1350,10 @@ int RdmaEndPoint::submitPostSend(
     // Experimental opt-in, to compare against the historical QP-0-first
     // policy. Tiny replenishments must not permanently favor the first QPs.
     static const bool rotate_qps = [] {
-        const char* value = std::getenv("MC_EXPERIMENTAL_RR_QP");
+        const char *value = std::getenv("MC_EXPERIMENTAL_RR_QP");
         return value && std::string_view(value) == "1";
     }();
-    const size_t start_qp = rotate_qps ? next_post_qp_ % num_qp : 0;
+    const size_t start_qp = rotate_qps && num_qp ? next_post_qp_ % num_qp : 0;
     for (size_t qp_offset = 0;
          qp_offset < num_qp && cq_remaining > 0 && cursor < requested;
          ++qp_offset) {

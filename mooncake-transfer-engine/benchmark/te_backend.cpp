@@ -1,6 +1,3 @@
-#include <sched.h>
-#include <cstdlib>
-#include <cstring>
 // Copyright 2025 KVCache.AI
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +17,10 @@
 #include <limits>
 
 #include "te_backend.h"
+
+#include <sched.h>
+#include <cstdlib>
+#include <cstring>
 #include "utils.h"
 #include "split_output.h"
 #include "common.h"
@@ -671,7 +672,8 @@ int TEBenchRunner::runTarget() {
         return -1;
     }
     const char* warm_env = std::getenv("MC_EXPERIMENTAL_TARGET_WARM_BYTES");
-    const uint64_t warm_bytes = warm_env ? std::strtoull(warm_env, nullptr, 10) : 0;
+    const uint64_t warm_bytes =
+        warm_env ? std::strtoull(warm_env, nullptr, 10) : 0;
     if (!warm_bytes) {
         while (g_te_running) sleep(1);
         return 0;
@@ -689,10 +691,14 @@ int TEBenchRunner::runTarget() {
     for (int i = 0; i < CPU_SETSIZE && cpu < 0; ++i)
         if (CPU_ISSET(i, &allowed)) cpu = i;
     CHECK_GE(cpu, 0);
-    CPU_ZERO(&selected); CPU_SET(cpu, &selected);
+    CPU_ZERO(&selected);
+    CPU_SET(cpu, &selected);
     CHECK_EQ(sched_setaffinity(0, sizeof(selected), &selected), 0);
     const char* interval_env = std::getenv("MC_EXPERIMENTAL_TARGET_WARM_US");
-    const unsigned interval_us = interval_env ? std::min(1000000ul, std::strtoul(interval_env, nullptr, 10)) : 10000;
+    const unsigned interval_us =
+        interval_env
+            ? std::min(1000000ul, std::strtoul(interval_env, nullptr, 10))
+            : 10000;
     uint64_t passes = 0;
     LOG(INFO) << "Experimental target cache assist bytes=" << warm_bytes
               << " node=" << node << " cpu=" << cpu
@@ -811,7 +817,7 @@ void TEBenchRunner::pinThread(int thread_id) {
         CHECK_EQ(CPU_COUNT(&allowed), 2);
         int cpu = -1;
         for (int i = 0; i < CPU_SETSIZE; ++i) {
-            if (CPU_ISSET(i, &allowed) && (cpu < 0 || false)) cpu = i;
+            if (CPU_ISSET(i, &allowed) && cpu < 0) cpu = i;
         }
         CHECK_GE(cpu, 0);
         CPU_ZERO(&selected);
@@ -819,7 +825,6 @@ void TEBenchRunner::pinThread(int thread_id) {
         CHECK_EQ(sched_setaffinity(0, sizeof(selected), &selected), 0);
         LOG(INFO) << "Experimental benchmark submitter CPU=" << cpu;
     }
-
 }
 
 int TEBenchRunner::runner(int thread_id) {
@@ -958,16 +963,18 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
     return -1.0;
 }
 
-
-int TEBenchRunner::runRollingTransfers(
-    uint64_t local_addr, uint64_t target_id, uint64_t target_addr,
-    uint64_t block_size, uint64_t total_batch_size, OpCode opcode,
-    uint32_t inflight, uint64_t duration_us, std::vector<double>& latencies) {
-    if (inflight == 0 || total_batch_size % inflight != 0 ||
-        total_batch_size < inflight) return -1;
+int TEBenchRunner::runRollingTransfers(uint64_t local_addr, uint64_t target_id,
+                                       uint64_t target_addr,
+                                       uint64_t block_size,
+                                       uint64_t total_batch_size, OpCode opcode,
+                                       uint32_t inflight, uint64_t duration_us,
+                                       std::vector<double>& latencies) {
+    if (inflight == 0 || inflight > 64 || (inflight & (inflight - 1)) != 0 ||
+        total_batch_size % inflight != 0 || total_batch_size < inflight)
+        return -1;
     const uint64_t slot_batch_size = total_batch_size / inflight;
-    const uint64_t slot_bytes = checkedMul(block_size, slot_batch_size,
-                                           "rolling slot bytes");
+    const uint64_t slot_bytes =
+        checkedMul(block_size, slot_batch_size, "rolling slot bytes");
     struct Slot {
         BatchID id{};
         bool active = false;
@@ -975,13 +982,17 @@ int TEBenchRunner::runRollingTransfers(
     };
     std::vector<Slot> slots(inflight);
     XferBenchTimer clock;
-    const char* initiator_warm_env = std::getenv("MC_EXPERIMENTAL_INITIATOR_WARM_US");
-    const uint64_t initiator_warm_us = initiator_warm_env ? std::strtoull(initiator_warm_env, nullptr, 10) : 0;
+    const char* initiator_warm_env =
+        std::getenv("MC_EXPERIMENTAL_INITIATOR_WARM_US");
+    const uint64_t initiator_warm_us =
+        initiator_warm_env ? std::strtoull(initiator_warm_env, nullptr, 10) : 0;
     uint64_t next_warm_us = initiator_warm_us;
     auto warm_local = [&] {
-        const uint64_t bytes = checkedMul(block_size, total_batch_size, "initiator warm bytes");
+        const uint64_t bytes =
+            checkedMul(block_size, total_batch_size, "initiator warm bytes");
         for (uint64_t offset = 0; offset < bytes; offset += 64)
-            __builtin_prefetch(reinterpret_cast<const void*>(local_addr + offset), 0, 1);
+            __builtin_prefetch(
+                reinterpret_cast<const void*>(local_addr + offset), 0, 1);
     };
     // CPU cache assistance is part of measured time and uses the existing
     // submission thread. It touches the entire unchanged active working set.
@@ -1006,8 +1017,8 @@ int TEBenchRunner::runRollingTransfers(
         for (uint64_t i = 0; i < slot_batch_size; ++i) {
             const uint64_t offset = index * slot_bytes + i * block_size;
             TransferRequest entry;
-            entry.opcode = opcode == READ ? TransferRequest::READ
-                                         : TransferRequest::WRITE;
+            entry.opcode =
+                opcode == READ ? TransferRequest::READ : TransferRequest::WRITE;
             entry.length = block_size;
             entry.source = reinterpret_cast<void*>(local_addr + offset);
             entry.target_id = target_id;
@@ -1017,6 +1028,13 @@ int TEBenchRunner::runRollingTransfers(
         auto status = engine_->submitTransfer(slot.id, requests);
         if (!status.ok()) {
             LOG(ERROR) << "Rolling submission failed: " << status.ToString();
+            // A rejected submission is not guaranteed to become pollable.
+            // Release the handle and retain buffers if transport cleanup is
+            // pending.
+            if (engine_->freeBatchID(slot.id).IsBatchCleanupDeferred())
+                abandoned_batches_.fetch_add(1);
+            slot.active = false;
+            --active;
             failed = true;
             noteTransferFailed();
         }
@@ -1028,10 +1046,9 @@ int TEBenchRunner::runRollingTransfers(
             if (!slot.active) continue;
             TransferStatus status;
             auto polled = engine_->getBatchTransferStatus(slot.id, status);
-            if (!polled.ok() ||
-                (status.s != TransferStatusEnum::WAITING &&
-                 status.s != TransferStatusEnum::PENDING &&
-                 status.s != TransferStatusEnum::COMPLETED)) {
+            if (!polled.ok() || (status.s != TransferStatusEnum::WAITING &&
+                                 status.s != TransferStatusEnum::PENDING &&
+                                 status.s != TransferStatusEnum::COMPLETED)) {
                 LOG(ERROR) << "Rolling transfer/poll failed";
                 failed = true;
                 noteTransferFailed();
