@@ -259,6 +259,26 @@ class TransferEngine:
         transport_hint: str = "",
         nic_hint: str = "",
     ) -> int: ...
+    # Pinned-staging gather/scatter APIs (TCP GPU staging pool). They return
+    # 0 (or (0, 0)) when no staging slot is available; the caller must then
+    # fall back to per-descriptor transfers.
+    def submit_gather_write(
+        self,
+        target_hostname: str,
+        gpu_segments: Sequence[int],
+        lengths: Sequence[int],
+        remote_base: int,
+        split: int = 1,
+    ) -> int: ...
+    def release_gather_slot(self, batch_id: int, /) -> None: ...
+    def acquire_scatter_slot(self) -> tuple[int, int]: ...
+    def submit_scatter_to_device(
+        self,
+        slot_addr: int,
+        dst_segments: Sequence[int],
+        lengths: Sequence[int],
+    ) -> int: ...
+    def release_scatter_slot(self, slot_addr: int, /) -> None: ...
     def transfer_sync(
         self,
         target_hostname: str,
