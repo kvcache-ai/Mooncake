@@ -15,7 +15,12 @@ struct CudaIpcBufferHandle {
     std::array<uint8_t, kCudaIpcHandleSize> handle{};
     uint64_t offset = 0;
     uint64_t size = 0;
+    // Exporter-local ordinal under its CUDA_VISIBLE_DEVICES; keep for logging
+    // / backward compatibility. Prefer pci_bus_id when opening.
     int32_t device_id = -1;
+    // Stable GPU identity across CUDA_VISIBLE_DEVICES remapping
+    // (cudaDeviceGetPCIBusId). Empty means a legacy exporter.
+    std::string pci_bus_id;
 };
 
 struct CudaIpcShmBufferRef {
@@ -38,7 +43,8 @@ struct CudaIpcReadRequest {
 
 }  // namespace mooncake
 
-YLT_REFL(mooncake::CudaIpcBufferHandle, handle, offset, size, device_id);
+YLT_REFL(mooncake::CudaIpcBufferHandle, handle, offset, size, device_id,
+         pci_bus_id);
 YLT_REFL(mooncake::CudaIpcShmBufferRef, ptr, size);
 YLT_REFL(mooncake::CudaIpcWriteRequest, key, metadata, payload);
 YLT_REFL(mooncake::CudaIpcReadRequest, key, destination, source_offset, size);
