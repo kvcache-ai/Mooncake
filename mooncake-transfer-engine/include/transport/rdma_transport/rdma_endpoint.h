@@ -290,6 +290,8 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     bool has_connected_;
     std::atomic<uint64_t> ready_wait_start_ts_;
 
+    // Protected by lock_; retain progress for submissions smaller than QP count.
+    size_t next_post_qp_ = 0;
     std::atomic<int> *wr_depth_list_;
     int max_wr_depth_;
     size_t max_sge_per_wr_;

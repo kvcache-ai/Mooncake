@@ -30,7 +30,7 @@
 #include <thread>
 
 DEFINE_uint32(experimental_inflight_batches, 0,
-              "Classic read/write rolling slots (1/2/4); batch_size stays the "
+              "Classic read/write rolling slots (powers of two, 1..64); batch_size stays the "
               "TOTAL working-set request count. Zero keeps original loop.");
 
 using namespace mooncake::tent;
@@ -80,7 +80,7 @@ int processBatchSizes(
 
     const uint32_t inflight = FLAGS_experimental_inflight_batches;
     auto* classic = dynamic_cast<TEBenchRunner*>(&runner);
-    if (inflight && (!classic || (inflight != 1 && inflight != 2 && inflight != 4) ||
+    if (inflight && (!classic || (inflight > 64 || (inflight & (inflight - 1)) != 0) ||
                      batch_size < inflight || batch_size % inflight != 0 ||
                      mixed_opcode || !qos_classes.empty() ||
                      !workload_classes.empty() || XferBenchConfig::deadline_us ||
