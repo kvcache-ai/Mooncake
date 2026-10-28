@@ -903,5 +903,103 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
     return -1.0;
 }
 
+
+int TEBenchRunner::runRollingTransfers(
+    uint64_t local_addr, uint64_t target_id, uint64_t target_addr,
+    uint64_t block_size, uint64_t total_batch_size, OpCode opcode,
+    uint32_t inflight, uint64_t duration_us, std::vector<double>& latencies) {
+    if (inflight == 0 || total_batch_size % inflight != 0 ||
+        total_batch_size < inflight) return -1;
+    const uint64_t slot_batch_size = total_batch_size / inflight;
+    const uint64_t slot_bytes = checkedMul(block_size, slot_batch_size,
+                                           "rolling slot bytes");
+    struct Slot {
+        BatchID id{};
+        bool active = false;
+        uint64_t submitted_us = 0;
+    };
+    std::vector<Slot> slots(inflight);
+    XferBenchTimer clock;
+    bool failed = false;
+    size_t active = 0;
+    auto submit = [&](size_t index) {
+        auto& slot = slots[index];
+        // Preserve the original benchmark's per-batch allocation/request
+        // construction cost. Only overlap independent batch lifetimes.
+        slot.submitted_us = clock.lap_us(false);
+        slot.id = engine_->allocateBatchID(slot_batch_size);
+        slot.active = true;
+        ++active;
+        std::vector<TransferRequest> requests;
+        for (uint64_t i = 0; i < slot_batch_size; ++i) {
+            const uint64_t offset = index * slot_bytes + i * block_size;
+            TransferRequest entry;
+            entry.opcode = opcode == READ ? TransferRequest::READ
+                                         : TransferRequest::WRITE;
+            entry.length = block_size;
+            entry.source = reinterpret_cast<void*>(local_addr + offset);
+            entry.target_id = target_id;
+            entry.target_offset = target_addr + offset;
+            requests.emplace_back(entry);
+        }
+        auto status = engine_->submitTransfer(slot.id, requests);
+        if (!status.ok()) {
+            LOG(ERROR) << "Rolling submission failed: " << status.ToString();
+            failed = true;
+            noteTransferFailed();
+        }
+    };
+    for (size_t i = 0; i < slots.size() && g_te_running; ++i) submit(i);
+    while (active != 0 && !failed && g_te_running) {
+        for (size_t i = 0; i < slots.size(); ++i) {
+            auto& slot = slots[i];
+            if (!slot.active) continue;
+            TransferStatus status;
+            auto polled = engine_->getBatchTransferStatus(slot.id, status);
+            if (!polled.ok() ||
+                (status.s != TransferStatusEnum::WAITING &&
+                 status.s != TransferStatusEnum::PENDING &&
+                 status.s != TransferStatusEnum::COMPLETED)) {
+                LOG(ERROR) << "Rolling transfer/poll failed";
+                failed = true;
+                noteTransferFailed();
+                break;
+            }
+            if (status.s != TransferStatusEnum::COMPLETED) continue;
+            const auto completed_us = clock.lap_us(false);
+            latencies.push_back(completed_us - slot.submitted_us);
+            auto released = releaseFinishedBatch(*engine_, slot.id);
+            slot.active = false;
+            --active;
+            if (!released.ok()) {
+                failed = true;
+                noteTransferFailed();
+                break;
+            }
+            if (g_te_running && clock.lap_us(false) < duration_us) submit(i);
+        }
+    }
+    // On a signal/failure, drain every submitted slot before freeing buffers.
+    // Successful runs also include their final drain in measured wall time.
+    for (auto& slot : slots) {
+        if (!slot.active) continue;
+        TransferStatus status;
+        uint64_t polls = 0;
+        auto polled = waitForBatch(slot.id, status, polls);
+        if (polled.ok() && status.s == TransferStatusEnum::COMPLETED) {
+            latencies.push_back(clock.lap_us(false) - slot.submitted_us);
+            if (!releaseFinishedBatch(*engine_, slot.id).ok()) failed = true;
+        } else {
+            // waitForBatch accounts for unknown/in-flight ownership; retain
+            // buffers via abandoned_batches_ if cleanup remains deferred.
+            if (engine_->freeBatchID(slot.id).IsBatchCleanupDeferred())
+                abandoned_batches_.fetch_add(1);
+            failed = true;
+        }
+        slot.active = false;
+    }
+    return failed || !g_te_running ? -1 : 0;
+}
+
 }  // namespace tent
 }  // namespace mooncake
