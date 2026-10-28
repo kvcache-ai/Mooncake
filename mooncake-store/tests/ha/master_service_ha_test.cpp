@@ -34,6 +34,8 @@
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/ordered_oplog_writer.h"
+#include "ha/snapshot/batch_oplog/codec.h"
+#include "metadata/lease_eviction_index.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -2124,6 +2126,172 @@ TEST_F(MasterServiceHATest, RemountRefreshesLeaseWhenAnotherReplicaIsReadable) {
             .has_value());
     EXPECT_GT(LeaseDeadlineForTesting(service, kDefaultTenant, key),
               std::chrono::system_clock::now());
+}
+
+// After promotion, eviction must still prefer the objects that were cold
+// before the failover. The standby copy of each object carries the order the
+// primary ranked it by; restore and remount keep that order, so a partial
+// eviction removes the oldest restored objects and keeps the newest ones and
+// everything written after promotion.
+TEST_F(MasterServiceBatchRecordE2ETest,
+       PromotionKeepsEvictionOrderOfRestoredObjects) {
+    const std::string cluster_id = "test_batch_record_e2e_lru_promotion";
+    const std::string endpoint = "lru_promotion_segment";
+    constexpr int kObjects = 10;
+    constexpr size_t kObjectSize = 1024;
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto primary_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(10)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService primary(primary_config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(primary).SetBatchOpLogBackendForTesting(backend));
+    auto mounted = PrepareSimpleSegment(primary, endpoint);
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    // Object i is written one eviction-index bucket after object i - 1, so
+    // the index ranks every object apart from the others.
+    std::vector<std::string> keys;
+    for (int i = 0; i < kObjects; ++i) {
+        keys.push_back("lru_promotion_key_" + std::to_string(i));
+        PutObjectOnSegment(primary, mounted.client_id, keys.back(), endpoint,
+                           kObjectSize);
+        ReadBatchEventually(storage, 2 + i, batch);
+        std::this_thread::sleep_for(metadata::LeaseEvictionIndex::kBucketWidth +
+                                    std::chrono::milliseconds(10));
+    }
+
+    MockMetadataStore standby_metadata;
+    OpLogApplier applier(&standby_metadata, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+    auto applied = reader.PollOnce();
+    ASSERT_EQ(ErrorCode::OK, applied.error);
+    ASSERT_EQ(static_cast<size_t>(kObjects + 1), applied.applied_entries);
+
+    // Rebuild the promotion input from the standby copy, newest object first
+    // so the restore files them against their order, and pass it through the
+    // batch snapshot codec, as a promotion from a snapshot does.
+    std::vector<StandbyObjectEntry> objects;
+    for (auto key = keys.rbegin(); key != keys.rend(); ++key) {
+        auto metadata =
+            standby_metadata.GetMetadata(kDefaultTenant.value(), *key);
+        ASSERT_TRUE(metadata.has_value()) << *key;
+        objects.push_back({kDefaultTenant.value(), *key, *metadata});
+    }
+    auto decoded = DecodeBatchOpLogSnapshotObjectChunk(
+        EncodeBatchOpLogSnapshotObjectChunk(0, objects), 0, objects.size());
+    ASSERT_TRUE(decoded.has_value()) << decoded.error();
+
+    MasterService promoted(MasterServiceConfig::builder()
+                               .set_enable_ha(false)
+                               .set_default_kv_lease_ttl(10)
+                               .build());
+    ASSERT_TRUE(
+        promoted
+            .RestoreFromStandbySnapshot(decoded->objects, kObjects + 1,
+                                        {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
+    ASSERT_TRUE(
+        promoted.ReMountSegment({MakeSegment(endpoint)}, mounted.client_id)
+            .has_value());
+    for (const auto& key : keys) {
+        ASSERT_TRUE(HasReadableReplicaForTesting(promoted, kDefaultTenant, key))
+            << key;
+    }
+
+    // An object written after promotion is newer than every restored one.
+    const std::string fresh_key = "lru_promotion_fresh_key";
+    PutObjectOnSegment(promoted, mounted.client_id, fresh_key, endpoint,
+                       kObjectSize);
+
+    // A read after promotion makes the oldest restored object the newest.
+    ASSERT_TRUE(promoted.GetReplicaList(keys[0], kDefaultTenant).has_value());
+
+    // Let the remount, PutEnd and read leases run out, then evict
+    // ceil(0.35 * 11) = 4 of the 11 objects.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    MasterServiceTestPeer(promoted).RunBatchEvictForTesting(
+        /*evict_ratio_target=*/0.35,
+        /*evict_ratio_lowerbound=*/0.0);
+
+    std::vector<int> kept;
+    for (int i = 0; i < kObjects; ++i) {
+        if (ReplicaCountForTesting(promoted, kDefaultTenant, keys[i]) > 0) {
+            kept.push_back(i);
+        }
+    }
+    EXPECT_EQ(kept, (std::vector<int>{0, 5, 6, 7, 8, 9}))
+        << "the 4 oldest unread restored objects must be evicted first";
+    EXPECT_EQ(ReplicaCountForTesting(promoted, kDefaultTenant, fresh_key), 1);
+}
+
+TEST_F(MasterServiceHATest, RestoredEvictionOrderIsCappedAtRestoreTime) {
+    const std::string endpoint = "order_cap_segment";
+    const auto before = std::chrono::system_clock::now();
+    const auto in_ms = [&](std::chrono::milliseconds d) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                (before + d).time_since_epoch())
+                .count());
+    };
+    const std::vector<std::pair<std::string, uint64_t>> cases = {
+        {"order_cap_unset", 0},
+        {"order_cap_past", in_ms(std::chrono::milliseconds(-60000))},
+        {"order_cap_future", in_ms(std::chrono::hours(1))},
+        {"order_cap_max", std::numeric_limits<uint64_t>::max()},
+        // ceil(2^64 / 10^6) ms is 2^64 + 448384 ns: wraps to just after the
+        // epoch if converted to nanoseconds before it is capped.
+        {"order_cap_wrap", 18446744073710ULL},
+    };
+    std::vector<StandbyObjectEntry> objects;
+    uint64_t address = 0;
+    for (const auto& [key, order_ms] : cases) {
+        objects.push_back(MakeStandbyObject(key, endpoint));
+        // Restore drops replicas that overlap, so give each its own range.
+        std::get<MemoryDescriptor>(
+            objects.back().metadata.replicas[0].descriptor_variant)
+            .buffer_descriptor.buffer_address_ = address;
+        address += 1024;
+        objects.back().metadata.eviction_order_ms = order_ms;
+    }
+
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        objects, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+    const auto after = std::chrono::system_clock::now();
+
+    for (const auto& [key, order_ms] : cases) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{kDefaultTenant, key});
+        ASSERT_TRUE(accessor.Exists()) << key;
+        const auto order = accessor.Get().EvictionOrder();
+        // Never later than the restore, so objects written after promotion
+        // rank newer than every restored one.
+        EXPECT_LE(order, after) << key;
+        if (key == "order_cap_future" || key == "order_cap_max" ||
+            key == "order_cap_wrap") {
+            // A later-than-restore order is capped at the restore time (in
+            // whole ms), not dropped or wrapped to an old one.
+            EXPECT_GE(order, before - std::chrono::milliseconds(1)) << key;
+        }
+        if (key == "order_cap_past") {
+            EXPECT_EQ(std::chrono::duration_cast<std::chrono::milliseconds>(
+                          order.time_since_epoch())
+                          .count(),
+                      static_cast<int64_t>(order_ms));
+        }
+    }
 }
 
 TEST_F(MasterServiceHATest,
