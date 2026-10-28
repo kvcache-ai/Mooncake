@@ -228,6 +228,8 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
     : context_(context),
       numa_socket_id_(numa_socket_id),
       worker_count_(context.transferWorkerCount()),
+      timeout_slices_(worker_count_),
+      last_timeout_check_ns_(worker_count_, 0),
       workers_running_(true),
       parked_worker_count_(0),
       redispatch_counter_(0),
@@ -563,6 +565,13 @@ void WorkerPool::resetContextBreaker(bool context_active) {
 void WorkerPool::trackPostedSlices(
     const std::vector<Transport::Slice *> &slice_list, size_t first,
     size_t count) {
+    if (globalConfig().slice_timeout > 0) {
+        for (size_t i = first; i < first + count; ++i) {
+            auto *slice = slice_list[i];
+            timeout_slices_[postingThreadForPeer(slice->peerNicPath())].emplace(
+                slice, slice->rdma.endpoint->shared_from_this());
+        }
+    }
     if (!globalConfig().track_rdma_posted_slices) return;
 
     std::lock_guard<std::mutex> lock(posted_slices_mutex_);
@@ -573,11 +582,57 @@ void WorkerPool::trackPostedSlices(
 void WorkerPool::untrackPostedSlices(
     const std::vector<Transport::Slice *> &slice_list, size_t first,
     size_t count) {
+    if (globalConfig().slice_timeout > 0) {
+        for (size_t i = first; i < first + count; ++i) {
+            auto *slice = slice_list[i];
+            timeout_slices_[postingThreadForPeer(slice->peerNicPath())].erase(
+                slice);
+        }
+    }
     if (!globalConfig().track_rdma_posted_slices) return;
 
     std::lock_guard<std::mutex> lock(posted_slices_mutex_);
     for (size_t i = first; i < first + count; ++i)
         posted_slices_.erase(slice_list[i]);
+}
+
+void WorkerPool::checkSliceTimeouts(int thread_id) {
+    if (globalConfig().slice_timeout <= 0) return;
+    auto &slices = timeout_slices_[thread_id];
+    if (slices.empty()) return;
+    const uint64_t now = getCurrentTimeInNano();
+    constexpr uint64_t kCheckIntervalNs = 100000000;  // 100 ms
+    if (now - last_timeout_check_ns_[thread_id] < kCheckIntervalNs) return;
+    last_timeout_check_ns_[thread_id] = now;
+    const uint64_t timeout_ns = globalConfig().slice_timeout * 1000000000ULL;
+
+    // Mark tasks before retiring any endpoint: even a flush CQE on another
+    // worker must not redispatch a sibling of a timed-out task.
+    for (const auto &[slice, endpoint] : slices) {
+        const uint64_t posted_at = slice->ts;
+        if (!posted_at || now <= posted_at || now - posted_at <= timeout_ns)
+            continue;
+        auto *task = slice->task.load(std::memory_order_acquire);
+        if (!__atomic_exchange_n(&task->rdma_timed_out, true, __ATOMIC_ACQ_REL))
+            LOG(WARNING) << "RDMA task timed out after "
+                         << globalConfig().slice_timeout
+                         << "s; draining posted work for "
+                         << slice->peerNicPath();
+    }
+    std::unordered_set<std::shared_ptr<RdmaEndPoint>> endpoints;
+    for (const auto &[slice, endpoint] : slices) {
+        if (slice->task->rdmaTimedOut() && !endpoint->retired())
+            endpoints.insert(endpoint);
+    }
+    for (const auto &endpoint : endpoints) {
+        auto lifecycle_lock =
+            context_.lockEndpointLifecycle(endpoint->peerNicPath());
+        context_.deleteEndpointByPtr(endpoint.get());
+        // Also cover an endpoint already removed from the active store.
+        endpoint->beginDestroy();
+    }
+    // Retirement is not completion. Keep every slice and its CQ charge until
+    // the owner consumes its CQE, including when QP->ERR fails or CQ stalls.
 }
 
 void WorkerPool::performPostSend(int thread_id) {
@@ -631,6 +686,18 @@ void WorkerPool::performPostSend(int thread_id) {
 
     SliceList failed_slice_list;
     for (auto &entry : local_slice_queue) {
+        if (globalConfig().slice_timeout > 0) {
+            auto &slices = entry.second;
+            slices.erase(std::remove_if(slices.begin(), slices.end(),
+                                        [&](auto *slice) {
+                                            if (!slice->task->rdmaTimedOut())
+                                                return false;
+                                            slice->markFailed();
+                                            processed_slice_count_++;
+                                            return true;
+                                        }),
+                         slices.end());
+        }
         if (entry.second.empty()) continue;
 
 #ifdef USE_FAKE_POST_SEND
@@ -782,6 +849,7 @@ void WorkerPool::performPostSend(int thread_id) {
 int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
     if (context_.cqCount() <= 0) return 0;
     if (thread_id < 0 || thread_id >= worker_count_) return 0;
+    checkSliceTimeouts(thread_id);
 
     const uint64_t poll_ts = getCurrentTimeInNano();
     const uint64_t previous_poll_ts =
@@ -814,9 +882,15 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
     int wr_retired = 0;
     const bool use_fifo = globalConfig().rdma_signal_interval > 1;
     std::vector<Transport::Slice *> drained;
+    std::vector<std::shared_ptr<RdmaEndPoint>> completing_endpoints;
     for (int i = 0; i < nr_poll; ++i) {
         Transport::Slice *completed = (Transport::Slice *)wc[i].wr_id;
         if (!completed) continue;
+        if (globalConfig().slice_timeout > 0) {
+            auto it = timeout_slices_[thread_id].find(completed);
+            if (it != timeout_slices_[thread_id].end())
+                completing_endpoints.push_back(it->second);
+        }
         assert(postingThreadForPeer(completed->peerNicPath()) == thread_id);
         drained.clear();
         if (use_fifo && completed->rdma.endpoint) {
@@ -833,10 +907,7 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
                                                     std::memory_order_acq_rel);
         }
         wr_retired += static_cast<int>(drained.size());
-        if (globalConfig().track_rdma_posted_slices) {
-            std::lock_guard<std::mutex> lock(posted_slices_mutex_);
-            for (auto *slice : drained) posted_slices_.erase(slice);
-        }
+        untrackPostedSlices(drained, 0, drained.size());
         const ibv_wc_status prefix_status = wc[i].status == IBV_WC_WR_FLUSH_ERR
                                                 ? IBV_WC_WR_FLUSH_ERR
                                                 : IBV_WC_SUCCESS;
@@ -891,6 +962,10 @@ void WorkerPool::processCompletions(int thread_id,
     for (const auto &wc : wc_list) {
         Transport::Slice *slice = (Transport::Slice *)wc.wr_id;
         assert(slice);
+        if (globalConfig().slice_timeout > 0 && slice->task->rdmaTimedOut()) {
+            finalize_slice(slice, false);
+            continue;
+        }
         if (wc.status != IBV_WC_SUCCESS) {
             // Flush errors are generated when QPs transition to ERR state
             // during normal endpoint destruction (beginDestroy). They are not
@@ -1035,6 +1110,19 @@ void WorkerPool::recordAutoGidDataPathSuccess(Transport::Slice *slice) {
 void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                             int thread_id, bool handoff_to_local_worker,
                             bool defer_local_redispatch) {
+    // Prune canceled work before metadata I/O or local-NIC handoff.
+    if (globalConfig().slice_timeout > 0) {
+        slice_list.erase(std::remove_if(slice_list.begin(), slice_list.end(),
+                                        [&](auto *slice) {
+                                            if (!slice->task->rdmaTimedOut())
+                                                return false;
+                                            slice->markFailed();
+                                            processed_slice_count_++;
+                                            return true;
+                                        }),
+                         slice_list.end());
+    }
+    if (slice_list.empty()) return;
     std::unordered_map<SegmentID, std::shared_ptr<Transport::SegmentDesc>>
         segment_desc_map;
     int shared_redispatch_count = 0;
@@ -1772,6 +1860,8 @@ bool WorkerPool::isRailAvailable(const std::string &peer_nic_path) {
 // Unified retry logic: increment retry count and return whether retry is
 // allowed
 bool WorkerPool::shouldRetrySlice(Transport::Slice *slice) {
+    if (globalConfig().slice_timeout > 0 && slice->task->rdmaTimedOut())
+        return false;
     slice->rdma.retry_cnt++;
     return slice->rdma.retry_cnt < slice->rdma.max_retry_cnt;
 }

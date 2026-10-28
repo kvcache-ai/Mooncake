@@ -63,6 +63,7 @@ class WorkerPool {
     void performPostSend(int thread_id);
 
     int performPollCq(int thread_id, bool defer_local_redispatch = false);
+    void checkSliceTimeouts(int thread_id);
     void processCompletions(int thread_id, const std::vector<ibv_wc> &wc_list,
                             bool defer_local_redispatch = false);
 
@@ -136,6 +137,14 @@ class WorkerPool {
     RdmaContext &context_;
     const int numa_socket_id_;
     const int worker_count_;
+
+    // Only the posting/CQ owner accesses its registry. Enabled by
+    // MC_SLICE_TIMEOUT independently of optional diagnostic tracking.
+    // Pin endpoints until their completions have been consumed.
+    using TimeoutSlices =
+        std::unordered_map<Transport::Slice *, std::shared_ptr<RdmaEndPoint>>;
+    std::vector<TimeoutSlices> timeout_slices_;
+    std::vector<uint64_t> last_timeout_check_ns_;
 
     std::vector<std::thread> worker_thread_;
     std::atomic<bool> workers_running_;

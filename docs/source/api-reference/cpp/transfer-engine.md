@@ -142,6 +142,16 @@ Status getTransferStatus(BatchID batch_id, size_t task_id, TransferStatus &statu
 
 Obtains the running status of the `TransferRequest` with `task_id` in `batch_id`.
 
+For classic RDMA, `MC_SLICE_TIMEOUT` (seconds, disabled by default) expires
+posted work in the transport worker. An expired task stops submitting and
+retrying its slices, retires the affected endpoints, and remains `WAITING`
+until all its slices have completed or been flushed. It then reports `FAILED`,
+including when a completion arrives successfully after timeout detection.
+If the device cannot flush the work, the task stays pending and its buffers
+must remain alive. This is not a hard bound on call duration, and does not
+change Python or Store wait deadlines. A batch-level `FAILED` can still precede
+completion of other tasks; check every task before reusing batch buffers.
+
 - `batch_id`: The `BatchID` it belongs to;
 - `task_id`: The sequence number of the `TransferRequest` to query;
 - `status`: Output Transfer status;

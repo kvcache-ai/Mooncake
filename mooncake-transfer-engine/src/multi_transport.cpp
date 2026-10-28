@@ -402,7 +402,9 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     // Helper: check if any slice has exceeded the configured timeout.
     // Returns true if a timeout was detected (and logs it).
     auto checkSliceTimeout = [&](const Transport::TransferTask& t) -> bool {
-        if (globalConfig().slice_timeout <= 0) return false;
+        if (globalConfig().slice_timeout <= 0 ||
+            (t.transport_ && t.transport_->handlesSliceTimeout()))
+            return false;
         auto current_ts = getCurrentTimeInNano();
         const int64_t kPacketDeliveryTimeout =
             globalConfig().slice_timeout * 1000000000;

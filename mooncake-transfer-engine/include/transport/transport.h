@@ -482,6 +482,14 @@ class Transport {
         // query for NVLink async transfers) in getTransferStatus().
         Transport *transport_ = nullptr;
 
+        // Classic RDMA timeout cancellation is shared by all workers owning
+        // slices of this task. Keep the task copyable for task_list; access
+        // this flag only through atomic operations while work is in flight.
+        bool rdma_timed_out = false;
+        bool rdmaTimedOut() const {
+            return __atomic_load_n(&rdma_timed_out, __ATOMIC_ACQUIRE);
+        }
+
 #ifdef WITH_METRICS
         std::chrono::steady_clock::time_point start_time;
 #endif
@@ -578,6 +586,10 @@ class Transport {
     // tasks, submits, then seals each task after submitTransferTask() has
     // finished constructing its slices.
     virtual bool supportsBatchCompletionCounter() const { return false; }
+
+    // The transport stops/drains expired work before publishing a terminal
+    // status. Do not overlay a query-only MC_SLICE_TIMEOUT on its result.
+    virtual bool handlesSliceTimeout() const { return false; }
 
     /// @brief Get the status of a submitted transfer. This function shall not
     /// be called again after completion.
