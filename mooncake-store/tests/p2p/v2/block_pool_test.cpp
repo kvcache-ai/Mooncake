@@ -3,17 +3,14 @@
 // wrappers that sit directly on top of a pool.
 //
 // Everything here is written against the public headers only. Every pool is
-// built with a null TransferEngine, so no arena is TE-registered and a
-// TransferAddress must never appear; that is itself one of the invariants
-// under test (section 5.4: "optional rather than address 0 means
-// unsupported").
+// built with a null TransferEngine, so no arena is TE-registered. DRAM still
+// exposes a local address; SSD blocks have no TransferAddress. An address
+// alone must never be treated as proof of TE registration.
 //
-// The load-bearing case is
-// ExhaustedPoolReturnsNoAvailableHandleAndKeepsLiveBlocks. Sections 3.5, 5.6
-// and invariant 7.4.12 forbid a pool from reclaiming anything on its own,
-// which is exactly what V1's StorageTier did when it evicted whole buckets and
-// told the metadata layer afterwards. V2 has no such upward channel, so "out
-// of space" must stay out of space until a lease is dropped.
+// ExhaustedPoolReturnsNoAvailableHandleAndKeepsLiveBlocks verifies that a pool
+// never evicts live allocations on its own. Unlike V1's StorageTier, V2 has no
+// channel for reporting an implicit bucket eviction, so exhaustion must persist
+// until a lease is dropped.
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -31,8 +28,8 @@
 #include <utility>
 #include <vector>
 
-#include "p2p/client/v2/block.h"
-#include "p2p/client/v2/block_pool.h"
+#include "p2p/client/data_manager/v2/block.h"
+#include "p2p/client/data_manager/v2/block_pool.h"
 #include "common_types.h"
 
 namespace mooncake::v2 {
@@ -440,7 +437,7 @@ TEST_F(BlockPoolTest, ExhaustedPoolReturnsNoAvailableHandleAndKeepsLiveBlocks) {
     // Asking again must not tempt the pool into making room. V1's StorageTier
     // evicted a whole bucket at this point and notified the metadata layer
     // afterwards; V2 has no such channel, so the only legal answer is the
-    // same refusal (sections 3.5 / 5.6, invariant 7.4.12).
+    // same refusal.
     auto retried = pool->Allocate(kBigBlock, 0);
     ASSERT_FALSE(retried.has_value());
     EXPECT_EQ(retried.error(), ErrorCode::NO_AVAILABLE_HANDLE);

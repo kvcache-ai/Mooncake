@@ -1,4 +1,4 @@
-#include "p2p/client/v2/eviction_policy.h"
+#include "p2p/client/data_manager/v2/eviction_policy.h"
 
 // Time is injected. Every watermark, half-life and horizon in this file moves
 // because FakeClock was advanced, never because a thread waited: the
@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-#include "p2p/client/v2/v2_common.h"
+#include "p2p/client/data_manager/v2/v2_common.h"
 #include "common_types.h"
 
 namespace mooncake::v2 {
@@ -376,8 +376,8 @@ TEST_F(EvictionPolicyTest, AZeroCapacityTierYieldsFiniteRatiosAndNoReclaim) {
     EXPECT_TRUE(std::isfinite(failure.usage_ratio));
 }
 
-// Detaching a pinned block removes it from the index but not from the pool
-// (section 4.3). A controller that believed the index alone would watch usage
+// Detaching a pinned block removes it from the index but not from the pool.
+// A controller that believed the index alone would watch usage
 // fall, declare the round finished and stop -- while the pool stayed full and
 // the next allocation failed anyway.
 TEST_F(EvictionPolicyTest, RetiredPinnedBytesKeepTheTierLookingFull) {

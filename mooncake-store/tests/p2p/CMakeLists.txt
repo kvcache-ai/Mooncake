@@ -118,6 +118,10 @@ add_p2p_store_test(v2_movement_tracker_test v2/movement_tracker_test.cpp)
 add_p2p_store_test(v2_tier_graph_test v2/tier_graph_test.cpp)
 add_p2p_store_test(v2_frequency_tracker_test v2/frequency_tracker_test.cpp)
 add_p2p_store_test(v2_lease_manager_test v2/lease_manager_test.cpp)
+add_p2p_store_test(v2_transfer_coordinator_test v2/transfer_coordinator_test.cpp)
+set_tests_properties(v2_transfer_coordinator_test PROPERTIES TIMEOUT 60)
+add_p2p_store_test(v2_data_manager_transfer_test v2/data_manager_transfer_test.cpp)
+set_tests_properties(v2_data_manager_transfer_test PROPERTIES TIMEOUT 60)
 add_p2p_store_test(v2_tiler_manager_test v2/tiler_manager_test.cpp)
 add_p2p_store_test(v2_config_test v2/config_test.cpp)
 add_p2p_store_test(v2_metrics_test v2/metrics_test.cpp)
@@ -200,3 +204,6 @@ target_link_libraries(redis_election_helper_test PUBLIC mooncake_store transfer_
     set_tests_properties(redis_election_helper_test redis_oplog_store_test
         PROPERTIES LABELS "p2p;ha;redis")
 endif()
+
+add_p2p_store_test(v2_review_regression_test v2/review_regression_test.cpp)
+set_tests_properties(v2_review_regression_test PROPERTIES TIMEOUT 60)

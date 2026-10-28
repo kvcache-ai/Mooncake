@@ -1,11 +1,11 @@
-// Component tests for the event pipeline (sections 3.8 and 5.10).
+// Component tests for the event pipeline.
 //
 // Everything below is about what a queue does when it is full. The pipeline
 // exists so that a fact can never stall the request path that produced it, so
 // each case fixes one of the three permitted outcomes -- fold, lose, or apply
 // on the producer's thread -- and none of them is "wait".
 
-#include "p2p/client/v2/event_center.h"
+#include "p2p/client/data_manager/v2/event_center.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -24,9 +24,9 @@
 #include <utility>
 #include <vector>
 
-#include "p2p/client/v2/block.h"
-#include "p2p/client/v2/block_registry.h"
-#include "p2p/client/v2/movement.h"
+#include "p2p/client/data_manager/v2/block.h"
+#include "p2p/client/data_manager/v2/block_registry.h"
+#include "p2p/client/data_manager/v2/movement.h"
 #include "common_types.h"
 
 namespace mooncake::v2 {
@@ -442,7 +442,7 @@ TEST_F(EventCenterTest, AnAccessEventThatCannotBeQueuedIsSimplyLost) {
     EXPECT_EQ(center_->Metrics().events_enqueued, 1U);
 }
 
-// The central rule of section 3.8: Commit and Delete may not be silently
+// Commit and Delete events may not be silently
 // lost, and may not block their publisher either. A full queue therefore
 // leaves exactly one option, applying the fact on the producer's thread.
 TEST_F(EventCenterTest, ALifecycleEventThatCannotBeQueuedIsAppliedInline) {

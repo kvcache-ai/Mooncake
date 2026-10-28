@@ -383,7 +383,16 @@ auto P2PMasterService::RegisterClient(const P2PRegisterClientRequest& req)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto make_idempotent_response = [&]() {
+    auto reconcile_segments = [&]() -> tl::expected<ViewVersionId, ErrorCode> {
+        // Re-register all reported tiers without replacing the existing client
+        // or its routes. MountSegment is idempotent and persists each mount,
+        // including retries after an earlier OpLog write failed.
+        for (const auto& segment : req.segments) {
+            auto mounted = MountSegment(segment, req.client_id);
+            if (!mounted.has_value()) {
+                return tl::make_unexpected(mounted.error());
+            }
+        }
         LOG(INFO) << "RegisterClient(P2P): client already registered, "
                      "treating as idempotent re-register"
                   << ", client_id=" << req.client_id
@@ -396,14 +405,14 @@ auto P2PMasterService::RegisterClient(const P2PRegisterClientRequest& req)
     // without retrying the missing registration log. Coordinate registration
     // completion and retry semantics in the heartbeat/HA redesign.
     if (client_manager_->GetClient(req.client_id)) {
-        return make_idempotent_response();
+        return reconcile_segments();
     }
 
     auto result = client_manager_->RegisterClient(req);
     if (!result.has_value()) {
         if (result.error() == ErrorCode::CLIENT_ALREADY_EXISTS &&
             client_manager_->GetClient(req.client_id)) {
-            return make_idempotent_response();
+            return reconcile_segments();
         }
         LOG(ERROR) << "RegisterClient(P2P): failed"
                    << ", client_id=" << req.client_id

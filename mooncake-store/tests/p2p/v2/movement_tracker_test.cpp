@@ -1,5 +1,4 @@
-// Component tests for MovementTracker (design doc section 6.3, and the
-// "every exit path settles" invariant of section 9).
+// Component tests for MovementTracker: every exit path must settle its lease.
 //
 // Time is injected: every assertion below about a cooldown or a residency
 // window is made against the clock the tracker was handed, so an
@@ -10,7 +9,7 @@
 // nothing about block contents or locations -- it is handed a dedup identity
 // and a key, and the tests speak the same language.
 
-#include "p2p/client/v2/movement_tracker.h"
+#include "p2p/client/data_manager/v2/movement_tracker.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -26,9 +25,9 @@
 #include <string_view>
 #include <utility>
 
-#include "p2p/client/v2/block.h"
-#include "p2p/client/v2/block_registry.h"
-#include "p2p/client/v2/v2_common.h"
+#include "p2p/client/data_manager/v2/block.h"
+#include "p2p/client/data_manager/v2/block_registry.h"
+#include "p2p/client/data_manager/v2/v2_common.h"
 #include "common_types.h"
 
 namespace mooncake::v2 {
@@ -430,7 +429,7 @@ TEST_F(MovementTrackerTest, MoveConstructionSettlesOnlyOnce) {
 
 // Shutdown closes admission only. Refusing the settle as well would leave the
 // last few in-flight movements holding dedup slots that nothing frees, and
-// section 9's invariant 10 says every path settles.
+// outstanding leases must remain able to settle after Stop().
 TEST_F(MovementTrackerTest, StopRejectsAcquiresButOutstandingLeaseSettles) {
     auto lease = Acquire("xi");
     ASSERT_TRUE(lease.has_value());

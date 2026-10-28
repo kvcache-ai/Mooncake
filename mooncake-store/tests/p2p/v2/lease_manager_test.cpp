@@ -1,4 +1,4 @@
-// Component tests for LeaseManager (design doc sections 5.9, 6.3, 6.4, 9.3).
+// Component tests for LeaseManager.
 //
 // Time is injected: every deadline in this file moves because ManualClock was
 // advanced, never because a thread waited. A sleeping lease test is a flaky
@@ -27,12 +27,12 @@
 #include <vector>
 
 #include "p2p/client/data_manager_types.h"
-#include "p2p/client/v2/block.h"
-#include "p2p/client/v2/block_index.h"
-#include "p2p/client/v2/block_pool.h"
-#include "p2p/client/v2/block_registry.h"
-#include "p2p/client/v2/lease_manager.h"
-#include "p2p/client/v2/v2_common.h"
+#include "p2p/client/data_manager/v2/block.h"
+#include "p2p/client/data_manager/v2/block_index.h"
+#include "p2p/client/data_manager/v2/block_pool.h"
+#include "p2p/client/data_manager/v2/block_registry.h"
+#include "p2p/client/data_manager/v2/lease_manager.h"
+#include "p2p/client/data_manager/v2/v2_common.h"
 #include "transfer_engine.h"
 #include "common_types.h"
 
@@ -176,7 +176,7 @@ class LeaseManagerTest : public ::testing::Test {
 };
 
 // ---------------------------------------------------------------------------
-// Pending write: claim precedes allocation (section 6.3)
+// Pending write: claim precedes allocation
 // ---------------------------------------------------------------------------
 
 TEST_F(LeaseManagerTest, ReserveMintsAWriteTokenForAFreeKey) {
@@ -354,6 +354,42 @@ TEST_F(LeaseManagerTest, AttachWithAForeignTokenReleasesTheTransaction) {
                     .has_value());
 }
 
+TEST_F(LeaseManagerTest, AttachRejectsAnExpiredClaimBeforeTheScannerRuns) {
+    auto token = leases_->ReservePendingWrite(kKey, Deadline(kLease));
+    ASSERT_TRUE(token.has_value());
+    clock_->Advance(kLease + 1ms);
+
+    auto attached = leases_->AttachPendingWriteTransaction(
+        kKey, *token, generate_uuid(), MakeTransaction());
+    ASSERT_FALSE(attached.has_value());
+    EXPECT_EQ(attached.error(), ErrorCode::LEASE_EXPIRED);
+    EXPECT_EQ(pool_->Usage(), 0u);
+}
+
+TEST_F(LeaseManagerTest, DetachedTransactionSurvivesExpiryAndCannotReattach) {
+    auto token = leases_->ReservePendingWrite(kKey, Deadline(kLease));
+    ASSERT_TRUE(token.has_value());
+    const UUID tiler_id = generate_uuid();
+    ASSERT_TRUE(leases_
+                    ->AttachPendingWriteTransaction(kKey, *token, tiler_id,
+                                                    MakeTransaction())
+                    .has_value());
+    auto detached = leases_->DetachPendingWriteTransaction(kKey, *token);
+    ASSERT_TRUE(detached.has_value());
+    const size_t retained = pool_->Usage();
+    ASSERT_GT(retained, 0u);
+
+    clock_->Advance(kLease + 1ms);
+    EXPECT_EQ(leases_->ScanExpiredNow(), 1u);
+    EXPECT_EQ(leases_->PendingWriteCount(), 0u);
+    EXPECT_EQ(pool_->Usage(), retained);
+
+    auto attached = leases_->AttachPendingWriteTransaction(
+        kKey, *token, detached->tiler_id, std::move(detached->transaction));
+    EXPECT_FALSE(attached.has_value());
+    EXPECT_EQ(pool_->Usage(), 0u);
+}
+
 TEST_F(LeaseManagerTest,
        TakePendingWriteHandsBackTheRecordForTheMatchingToken) {
     auto token = leases_->ReservePendingWrite(kKey, Deadline(kLease));
@@ -410,7 +446,7 @@ TEST_F(LeaseManagerTest, TakeReportsInvalidWriteOnMismatchAndKeepsTheClaim) {
 }
 
 // ---------------------------------------------------------------------------
-// Pinned read (section 6.4)
+// Pinned read
 // ---------------------------------------------------------------------------
 
 TEST_F(LeaseManagerTest, PinMintsAReadTokenAndIndexesItByToken) {

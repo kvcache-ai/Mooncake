@@ -509,8 +509,17 @@ void TierMetric::OnMoved(const UUID& source_tier, const UUID& dest_tier) {
     // Same-priority movement is neither offload nor onboard; not counted.
 }
 
+void TierMetric::UnregisterTierUsage(const UUID& tier_id) {
+    auto it = tiers_.find(tier_id);
+    if (it == tiers_.end()) return;
+    std::lock_guard<std::mutex> lock(*it->second.usage_mu);
+    it->second.usage = {};
+    used_bytes.update(it->second.label_array, 0);
+}
+
 void TierMetric::RefreshUsage() {
     for (const auto& [tier_id, entry] : tiers_) {
+        std::lock_guard<std::mutex> lock(*entry.usage_mu);
         if (!entry.usage) {
             // Registered without a usage source; keep the last known value.
             continue;

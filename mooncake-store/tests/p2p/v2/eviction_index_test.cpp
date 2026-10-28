@@ -1,5 +1,4 @@
-// Component tests for the per-tiler EvictionIndex (design doc sections 3.2,
-// 3.3 and 9).
+// Component tests for the per-tiler EvictionIndex.
 //
 // The concrete index is private to eviction_index.cpp, so everything here goes
 // through CreateEvictionIndex -- the same surface TilerManager uses. Two
@@ -12,7 +11,7 @@
 // are weak. A fake handle could never fail to upgrade, and failing to upgrade
 // is exactly what the evict engine has to be able to observe.
 
-#include "p2p/client/v2/eviction_index.h"
+#include "p2p/client/data_manager/v2/eviction_index.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -30,8 +29,10 @@
 #include <unordered_map>
 #include <vector>
 
-#include "p2p/client/v2/block.h"
-#include "p2p/client/v2/block_registry.h"
+#include "p2p/client/data_manager/v2/block.h"
+#include "p2p/client/data_manager/v2/block_pool.h"
+#include "p2p/client/data_manager/v2/evict_engine.h"
+#include "p2p/client/data_manager/v2/block_registry.h"
 #include "common_types.h"
 
 // ---------------------------------------------------------------------------
@@ -747,6 +748,50 @@ TEST_F(EvictionIndexTest, ASnapshotRowThatCannotBeFiledKeepsTheFlag) {
 // ---------------------------------------------------------------------------
 // Failure and repair
 // ---------------------------------------------------------------------------
+
+TEST_F(EvictionIndexTest,
+       ReclaimRepairsACommittedBlockAfterIndexAllocationFailure) {
+    DramArenaConfig arena;
+    arena.capacity_bytes = 1u << 20;
+    DramBlockPoolConfig pool_config;
+    pool_config.arenas.push_back(arena);
+    auto pool = CreateBlockPool(pool_config, nullptr);
+    ASSERT_TRUE(pool);
+    LogicalTilerConfig logical;
+    logical.tiler_id = kFastTiler;
+    logical.priority = 100;
+    MultiTiler tilers;
+    tilers.by_priority.push_back(std::make_unique<TilerManager>(
+        logical, BlockIndexConfig{}, *pool, registry_, EventPublisher{}));
+    tilers.Rebuild();
+    auto* tiler = tilers.Find(kFastTiler);
+    {
+        auto block = tiler->Allocate(4096);
+        ASSERT_TRUE(block);
+        auto completed = std::move(*block).Complete("recoverable");
+        ASSERT_TRUE(completed);
+        ASSERT_TRUE(tiler->Register("recoverable", std::move(*completed)));
+    }
+    auto snapshot = tiler->SnapshotAllTokens();
+    ASSERT_EQ(snapshot.entries.size(), 1u);
+    tiler->Eviction()->OnDelete(snapshot.entries.front());
+    FailAllocationAfter(0);
+    tiler->Eviction()->OnCommit(snapshot.entries.front());
+    DisarmAllocationFailure();
+    ASSERT_TRUE(tiler->Eviction()->NeedsReconcile());
+    EXPECT_TRUE(tiler->Eviction()->SelectVictims(4096).empty());
+    auto clock = std::make_shared<SteadyClock>();
+    EvictEngine engine(&tilers, &registry_, nullptr, clock);
+    ReclaimRequest request;
+    request.tiler_id = kFastTiler;
+    request.reclaim_target_bytes = 4096;
+    request.deadline = clock->Now() + std::chrono::seconds(1);
+    auto reclaimed = engine.ReclaimOneRound(request);
+    ASSERT_TRUE(reclaimed);
+    EXPECT_GE(reclaimed->physically_reclaimed_bytes, 4096u);
+    EXPECT_EQ(tiler->IndexStats().entry_count, 0u);
+    EXPECT_FALSE(tiler->Eviction()->NeedsReconcile());
+}
 
 TEST_F(EvictionIndexTest, ACommitThatRunsOutOfMemoryLeavesNoUndeletableName) {
     size_t failed_commits = 0;

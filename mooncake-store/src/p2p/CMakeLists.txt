@@ -53,28 +53,28 @@ set(MOONCAKE_STORE_P2P_SOURCES
     client/client_rpc_service.cpp
     client/data_manager_types.cpp
     client/data_manager_factory.cpp
-    client/v1/data_manager_v1.cpp
-    client/v2/v2_common.cpp
-    client/v2/movement.cpp
-    client/v2/copier.cpp
-    client/v2/eviction_index.cpp
-    client/v2/eviction_policy.cpp
-    client/v2/movement_tracker.cpp
-    client/v2/tier_graph.cpp
-    client/v2/block.cpp
-    client/v2/block_registry.cpp
-    client/v2/block_pool.cpp
-    client/v2/block_index.cpp
-    client/v2/event_center.cpp
-    client/v2/tiler_manager.cpp
-    client/v2/frequency_tracker.cpp
-    client/v2/lease_manager.cpp
-    client/v2/movement_consumers.cpp
-    client/v2/migration_engine.cpp
-    client/v2/evict_engine.cpp
-    client/v2/local_copy_engine.cpp
-    client/v2/transfer_coordinator.cpp
-    client/v2/data_manager_v2.cpp
+    client/data_manager/v1/data_manager_v1.cpp
+    client/data_manager/v2/v2_common.cpp
+    client/data_manager/v2/movement.cpp
+    client/data_manager/v2/copier.cpp
+    client/data_manager/v2/eviction_index.cpp
+    client/data_manager/v2/eviction_policy.cpp
+    client/data_manager/v2/movement_tracker.cpp
+    client/data_manager/v2/tier_graph.cpp
+    client/data_manager/v2/block.cpp
+    client/data_manager/v2/block_registry.cpp
+    client/data_manager/v2/block_pool.cpp
+    client/data_manager/v2/block_index.cpp
+    client/data_manager/v2/event_center.cpp
+    client/data_manager/v2/tiler_manager.cpp
+    client/data_manager/v2/frequency_tracker.cpp
+    client/data_manager/v2/lease_manager.cpp
+    client/data_manager/v2/movement_consumers.cpp
+    client/data_manager/v2/migration_engine.cpp
+    client/data_manager/v2/evict_engine.cpp
+    client/data_manager/v2/local_copy_engine.cpp
+    client/data_manager/v2/transfer_coordinator.cpp
+    client/data_manager/v2/data_manager_v2.cpp
     client/route_cache.cpp
     client/async_memcpy_executor.cpp
     client/async_metadata_notifier.cpp

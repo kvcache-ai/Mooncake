@@ -65,9 +65,8 @@ struct DataManagerConfig {
     LocalTransferConfig local_transfer;
     KeyLeaseConfig key_lease;
 
-    // Upper bound on how long Stop() waits for in-flight work before it gives
-    // up and cancels. Exceeding it is not an error: a caller may hold a
-    // TaskHandle it never waits on, so an unbounded wait would hang shutdown.
+    // Upper bound on waiting for deferred V2 handles. After timeout, unstarted
+    // work is cancelled; already executing I/O still drains before teardown.
     //
     // Unset means "whatever the tier configuration says", which is the normal
     // case. It used to be a plain value with a default, and the factory

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <ostream>
 #include <string>
 #include <thread>
@@ -217,15 +218,17 @@ struct TierMetric {
      *
      * NOT thread-safe; call during initialization only.
      *
-     * @param usage Polled from serialize()/summary_metrics(). It must stay
-     *        valid for as long as this metric object does -- both
-     *        implementations own their tiers and the metric together, and both
-     *        outlive it, so the callback captures a borrowed pointer rather
-     *        than keeping the tier alive and skewing shutdown.
+     * @param usage Polled from serialize()/summary_metrics(). Capture a weak
+     *        owner and return zero after expiry: externally retained metrics
+     *        and the reporting thread may outlive the storage owner.
      */
     void RegisterTier(const UUID& tier_id, const std::string& label,
                       MemoryType memory_type, int priority, size_t capacity,
                       TierUsageFn usage);
+
+    // Stop sampling and wait for any current usage callback before freeing
+    // storage. Keeps metric series available to externally retained sinks.
+    void UnregisterTierUsage(const UUID& tier_id);
 
     /** True once a tier id has a series. Lets a caller avoid double work. */
     bool HasTier(const UUID& tier_id) const;
@@ -248,6 +251,7 @@ struct TierMetric {
         int priority = 0;
         size_t capacity = 0;
         TierUsageFn usage;
+        std::unique_ptr<std::mutex> usage_mu = std::make_unique<std::mutex>();
     };
 
     // Polls each tier's usage into used_bytes. Only called from

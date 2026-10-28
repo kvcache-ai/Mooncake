@@ -8,8 +8,8 @@
 #include <glog/logging.h>
 
 #include "p2p/client/tiered_cache/tiered_backend.h"
-#include "p2p/client/v1/data_manager_v1.h"
-#include "p2p/client/v2/data_manager_v2.h"
+#include "p2p/client/data_manager/v1/data_manager_v1.h"
+#include "p2p/client/data_manager/v2/data_manager_v2.h"
 
 namespace mooncake {
 

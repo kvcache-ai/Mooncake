@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Enforces the layering rules from remake_kvbm/new_data_manager.md
-# (acceptance items 11 and 12):
-#   1. No header under p2p/client/v2/ may include tiered_backend.h or anything
+# Enforces the DataManager implementation boundaries:
+#   1. No header under p2p/client/data_manager/v2/ may include tiered_backend.h or anything
 #      under tiered_cache/. "V2 does not reuse TieredBackend" has to be a
 #      compile-time fact, not a comment.
 #   2. The base mooncake_store source list must not pull in v1/ or v2/ sources.
@@ -13,7 +12,7 @@ root="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 store="${root}/mooncake-store"
 status=0
 
-v2_include_dir="${store}/include/p2p/client/v2"
+v2_include_dir="${store}/include/p2p/client/data_manager/v2"
 if [[ -d "${v2_include_dir}" ]]; then
     while IFS= read -r -d '' header; do
         if grep -nE '^[[:space:]]*#include[[:space:]]*[<"].*(tiered_backend\.h|tiered_cache/)' \
@@ -29,7 +28,8 @@ fi
 # mooncake that is an ODR violation the linker resolves silently, and the
 # symptom is a crash in unrelated V1 code. The nested namespace makes the
 # collision impossible rather than merely unlikely.
-for dir in "${store}/include/p2p/client/v2" "${store}/src/p2p/client/v2"; do
+for dir in "${store}/include/p2p/client/data_manager/v2" \
+           "${store}/src/p2p/client/data_manager/v2"; do
     [[ -d "${dir}" ]] || continue
     while IFS= read -r -d '' source; do
         if ! grep -q '^namespace mooncake::v2 {' "${source}"; then
@@ -56,8 +56,8 @@ fi
 # The base library must stay free of DataManager implementations.
 cmake_file="${store}/src/CMakeLists.txt"
 base_block="$(awk '/^set\(MOONCAKE_STORE_SOURCES/,/^\)/' "${cmake_file}")"
-if grep -qE 'p2p/client/v[12]/' <<<"${base_block}"; then
-    echo "ERROR: MOONCAKE_STORE_SOURCES lists a p2p/client/v1|v2 source" >&2
+if grep -qE 'p2p/client/(data_manager/)?v[12]/' <<<"${base_block}"; then
+    echo "ERROR: MOONCAKE_STORE_SOURCES lists a DataManager V1/V2 source" >&2
     status=1
 fi
 

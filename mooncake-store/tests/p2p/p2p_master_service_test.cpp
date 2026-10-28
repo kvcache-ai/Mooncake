@@ -119,19 +119,32 @@ TEST_F(P2PMasterServiceTest, RegisterClientDuplicate) {
     auto client_id = generate_uuid();
     RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
 
-    // HA re-registering the same client_id is idempotent.
+    AddReplicaHelper(*service, "existing_key", 1024, client_id, seg.id);
+    auto original_client = service->GetClientManager().GetClient(client_id);
+
+    // HA re-registration fills missing tiers while preserving existing
+    // metadata.
     P2PRegisterClientRequest req;
     req.client_id = client_id;
-    req.segments = {MakeP2PSegment("seg2")};
+    auto second_segment = MakeP2PSegment("seg2");
+    req.segments = {seg, second_segment};
     req.ip_address = "127.0.0.1";
     req.rpc_port = 50051;
-    auto res = service->RegisterClient(req);
-    ASSERT_TRUE(res.has_value()) << res.error();
-
-    // Duplicate registration does not merge new segment metadata.
-    auto seg_res = service->QuerySegments("seg2");
-    EXPECT_FALSE(seg_res.has_value());
-    EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, seg_res.error());
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        auto res = service->RegisterClient(req);
+        ASSERT_TRUE(res.has_value()) << res.error();
+        EXPECT_EQ(service->GetClientManager().GetClient(client_id),
+                  original_client);
+        auto segments = original_client->GetSegments();
+        ASSERT_TRUE(segments.has_value());
+        EXPECT_EQ(segments->size(), 2u);
+        EXPECT_TRUE(original_client->IsReady());
+        EXPECT_EQ(original_client->GetAvailableCapacity(),
+                  seg.size + second_segment.size);
+        EXPECT_TRUE(service->QuerySegments(seg.name).has_value());
+        EXPECT_TRUE(service->QuerySegments(second_segment.name).has_value());
+        EXPECT_TRUE(service->GetReadRoute("existing_key").has_value());
+    }
 }
 
 // ============================================================

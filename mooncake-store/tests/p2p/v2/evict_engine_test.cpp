@@ -1,4 +1,4 @@
-// Component tests for EvictEngine (design doc sections 5.10, 6.7, 9.3).
+// Component tests for EvictEngine.
 //
 // The invariant this file exists to protect: detaching an entry from an index
 // is a *logical* removal, and the physical bytes only come back when the last
@@ -14,7 +14,7 @@
 // Time is injected. The reclaim deadline moves because ManualClock was
 // advanced, never because a thread waited.
 
-#include "p2p/client/v2/evict_engine.h"
+#include "p2p/client/data_manager/v2/evict_engine.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -34,16 +34,16 @@
 #include <vector>
 
 #include "p2p/client/data_manager_types.h"
-#include "p2p/client/v2/block.h"
-#include "p2p/client/v2/block_pool.h"
-#include "p2p/client/v2/block_registry.h"
-#include "p2p/client/v2/event_center.h"
-#include "p2p/client/v2/frequency_tracker.h"
-#include "p2p/client/v2/local_copy_engine.h"
-#include "p2p/client/v2/migration_engine.h"
-#include "p2p/client/v2/eviction_index.h"
-#include "p2p/client/v2/tiler_manager.h"
-#include "p2p/client/v2/v2_common.h"
+#include "p2p/client/data_manager/v2/block.h"
+#include "p2p/client/data_manager/v2/block_pool.h"
+#include "p2p/client/data_manager/v2/block_registry.h"
+#include "p2p/client/data_manager/v2/event_center.h"
+#include "p2p/client/data_manager/v2/frequency_tracker.h"
+#include "p2p/client/data_manager/v2/local_copy_engine.h"
+#include "p2p/client/data_manager/v2/migration_engine.h"
+#include "p2p/client/data_manager/v2/eviction_index.h"
+#include "p2p/client/data_manager/v2/tiler_manager.h"
+#include "p2p/client/data_manager/v2/v2_common.h"
 #include "p2p/common/p2p_types.h"
 
 namespace mooncake::v2 {
@@ -665,7 +665,7 @@ TEST_F(EvictEngineTest, ExecuteRemovesTheNamedReplicaAndLeavesTheOtherTier) {
 }
 
 // ---------------------------------------------------------------------------
-// Reclamation is tier-local (design section 4.1)
+// Reclamation is tier-local
 // ---------------------------------------------------------------------------
 
 // The decided trade-off, asserted rather than left implicit: a replica that

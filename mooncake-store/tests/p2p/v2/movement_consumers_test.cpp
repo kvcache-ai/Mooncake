@@ -6,7 +6,7 @@
 // kept for itself. The single most important case here is the one that could
 // not be written before: a write must not count as demand.
 
-#include "p2p/client/v2/movement_consumers.h"
+#include "p2p/client/data_manager/v2/movement_consumers.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -20,9 +20,9 @@
 #include <string>
 #include <vector>
 
-#include "p2p/client/v2/block_pool.h"
-#include "p2p/client/v2/migration_engine.h"
-#include "p2p/client/v2/tiler_manager.h"
+#include "p2p/client/data_manager/v2/block_pool.h"
+#include "p2p/client/data_manager/v2/migration_engine.h"
+#include "p2p/client/data_manager/v2/tiler_manager.h"
 #include "p2p/common/p2p_types.h"
 
 namespace mooncake::v2 {
@@ -386,6 +386,21 @@ TEST_F(MovementConsumersTest, TheSlowestTierHasNowhereToOffloadTo) {
                                 DeliveryMode::kQueued),
               ConsumeResult::kIgnored);
     EXPECT_EQ(commands_->Count(), 0U);
+}
+
+TEST_F(MovementConsumersTest,
+       InflightColdestCandidateDoesNotBlockItsNeighbours) {
+    FillFastTier(5);
+    auto block = Commit(*fast_, "trigger-skip", 0x55);
+    auto event = CommitEvent(*fast_, "trigger-skip", block);
+    EXPECT_EQ(offload_->Consume(event, DeliveryMode::kQueued),
+              ConsumeResult::kCommandEnqueued);
+    EXPECT_EQ(offload_->Consume(event, DeliveryMode::kQueued),
+              ConsumeResult::kCommandEnqueued);
+    auto requests = commands_->Requests();
+    ASSERT_EQ(requests.size(), 2u);
+    EXPECT_NE(requests[0].key, requests[1].key);
+    commands_->SettleAll(false);
 }
 
 // On a writer's thread the consumer applies the fact and produces nothing:

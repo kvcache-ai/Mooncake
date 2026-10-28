@@ -19,7 +19,7 @@
 #define private public
 #define protected public
 #include "p2p/ha/metadata_recovery_worker.h"
-#include "p2p/client/v1/data_manager_v1.h"
+#include "p2p/client/data_manager/v1/data_manager_v1.h"
 #undef protected
 #undef private
 

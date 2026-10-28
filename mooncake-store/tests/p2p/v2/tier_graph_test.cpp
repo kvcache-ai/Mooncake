@@ -1,4 +1,4 @@
-// Component tests for the explicit tier topology (design doc section 7.1) and
+// Component tests for the explicit tier topology and
 // for the nearest-neighbour policy that walks it.
 //
 // The topology under test is the thing that replaced "derive the target from
@@ -17,7 +17,7 @@
 // destination BlockIndex, and the point of passing them in is that the policy
 // keeps no copy of either.
 
-#include "p2p/client/v2/tier_graph.h"
+#include "p2p/client/data_manager/v2/tier_graph.h"
 
 #include <boost/functional/hash.hpp>
 #include <glog/logging.h>
@@ -35,9 +35,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "p2p/client/v2/copier.h"
-#include "p2p/client/v2/movement.h"
-#include "p2p/client/v2/movement_tracker.h"
+#include "p2p/client/data_manager/v2/copier.h"
+#include "p2p/client/data_manager/v2/movement.h"
+#include "p2p/client/data_manager/v2/movement_tracker.h"
 #include "common_types.h"
 
 namespace mooncake::v2 {

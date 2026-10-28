@@ -1,10 +1,11 @@
-#include "p2p/client/v2/block_index.h"
+#include "p2p/client/data_manager/v2/block_index.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <cstddef>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -15,9 +16,9 @@
 #include <unordered_set>
 #include <vector>
 
-#include "p2p/client/v2/block.h"
-#include "p2p/client/v2/block_pool.h"
-#include "p2p/client/v2/block_registry.h"
+#include "p2p/client/data_manager/v2/block.h"
+#include "p2p/client/data_manager/v2/block_pool.h"
+#include "p2p/client/data_manager/v2/block_registry.h"
 #include "common_types.h"
 
 namespace mooncake::v2 {
@@ -483,6 +484,7 @@ TEST_F(BlockIndexTest,
 
 TEST_F(BlockIndexTest, LookupRacingEraseNeverReadsTornOrFreedBytes) {
     constexpr int kKeys = 128;
+    constexpr int kReaders = 2;
     std::vector<std::string> keys;
     std::vector<BlockRegistrationHandle> registrations;
     for (int i = 0; i < kKeys; ++i) {
@@ -491,16 +493,22 @@ TEST_F(BlockIndexTest, LookupRacingEraseNeverReadsTornOrFreedBytes) {
         InsertAndForget(registrations.back(), PayloadFor(keys.back()));
     }
 
-    std::atomic<bool> go{false};
+    std::latch snapshots_ready{kReaders};
+    std::latch first_erased{1};
     std::atomic<int> corrupted{0};
     std::atomic<int> hits{0};
     auto reader = [&] {
-        while (!go.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-        }
         for (int round = 0; round < 8; ++round) {
             for (int i = 0; i < kKeys; ++i) {
                 auto found = index_->Lookup(registrations[i]);
+                if (round == 0 && i == 0) {
+                    // Pin the first block in every reader before Erase, then
+                    // read it only after the detached pointer is dropped.
+                    // A common start flag alone lets the eraser win every key.
+                    EXPECT_TRUE(found.has_value());
+                    snapshots_ready.count_down();
+                    first_erased.wait();
+                }
                 // A miss is a legal outcome of the race; a wrong hit is not.
                 if (!found.has_value()) continue;
                 ++hits;
@@ -514,23 +522,24 @@ TEST_F(BlockIndexTest, LookupRacingEraseNeverReadsTornOrFreedBytes) {
     };
 
     std::vector<std::thread> threads;
-    threads.emplace_back(reader);
-    threads.emplace_back(reader);
+    for (int i = 0; i < kReaders; ++i) {
+        threads.emplace_back(reader);
+    }
     threads.emplace_back([&] {
-        while (!go.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-        }
+        snapshots_ready.wait();
+        index_->Erase(registrations.front());
+        first_erased.count_down();
         // Dropping the detached pointer immediately is the aggressive case:
         // the free lands while readers may still hold a snapshot.
-        for (int i = 0; i < kKeys; ++i) {
+        for (int i = 1; i < kKeys; ++i) {
             index_->Erase(registrations[i]);
         }
     });
-    go.store(true, std::memory_order_release);
     for (auto& thread : threads) thread.join();
 
     EXPECT_EQ(corrupted.load(), 0);
-    EXPECT_GT(hits.load(), 0) << "the race never overlapped; test is vacuous";
+    EXPECT_GE(hits.load(), kReaders)
+        << "every reader must read a snapshot held across Erase";
     EXPECT_EQ(index_->Stats().entry_count, 0u);
     EXPECT_EQ(index_->Stats().indexed_bytes, 0u);
     for (const auto& registration : registrations) {
