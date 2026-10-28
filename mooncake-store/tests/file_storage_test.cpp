@@ -280,7 +280,16 @@ class FileStorageTest : public ::testing::Test {
             uintmax_t logical_bytes = 0;
             for (const auto& entry :
                  fs::recursive_directory_iterator(config.storage_filepath)) {
-                if (entry.is_regular_file()) logical_bytes += entry.file_size();
+                if (!entry.is_regular_file()) continue;
+                // Watermark ratios are compared against total_size_, which
+                // counts bucket data/metadata only (not the root manifest).
+                // File-per-key stores extensionless files, so the filter
+                // applies only to the bucket backend.
+                if (!file_per_key) {
+                    const auto ext = entry.path().extension();
+                    if (ext != ".bucket" && ext != ".meta") continue;
+                }
+                logical_bytes += entry.file_size();
             }
             const auto capacity = static_cast<uint64_t>(
                 fs::space(config.storage_filepath).capacity * 0.9);

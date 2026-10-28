@@ -58,7 +58,7 @@ export MOONCAKE_NVME_KV_DEVICE_PATH=/dev/nvme1n1
 export MOONCAKE_NVME_KV_TRANSPORT=auto
 ```
 
-The directory configured by `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` must already exist and be writable. NVMe KV object values are stored on the device selected by `MOONCAKE_NVME_KV_DEVICE_PATH`.
+The directory configured by `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` must already exist and be writable. NVMe KV object values are stored on the device selected by `MOONCAKE_NVME_KV_DEVICE_PATH`. Multiple comma-separated directories are only supported by `bucket_storage_backend`, not by this backend.
 
 ### Required settings
 

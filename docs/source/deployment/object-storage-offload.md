@@ -88,7 +88,7 @@ export MOONCAKE_DISTRIBUTED_ROOT_DIR=/mooncake/my-cluster/owner-1
 | Environment variable | Setting | Description |
 |----------------------|---------|-------------|
 | `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `distributed_storage_backend` | Select the backend that hosts the object-storage adapters. |
-| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `/data/file_storage` by default | Existing local directory required by common initialization; object payloads go to the bucket. |
+| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `/data/file_storage` by default | Existing local directory required by common initialization; object payloads go to the bucket. Multiple comma-separated directories are only supported by `bucket_storage_backend`. |
 | `MOONCAKE_DISTRIBUTED_FS_TYPE` | `oss` or `s3` | Select object-storage mode, and which adapter, rather than a filesystem adapter. |
 | `MOONCAKE_DISTRIBUTED_ROOT_DIR` | An owner-specific prefix | Use an absolute-style path; the adapter strips leading and trailing slashes. This is not a mount point. |
 | `MOONCAKE_DISTRIBUTED_HEALTH_CHECK` | `false` | Write and read back a probe object during initialization, then best-effort delete it. |
