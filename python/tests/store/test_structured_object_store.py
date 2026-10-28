@@ -1505,14 +1505,14 @@ def test_append_rejects_conflicting_group_before_write() -> None:
     assert len(store.put_configs) == before_puts
 
 
-@pytest.mark.parametrize("wrapped", [False, True])
-def test_put_object_preserves_zero_dimensional_ndarray(wrapped) -> None:
+@pytest.mark.parametrize("direct_value", [False, True])
+def test_put_object_preserves_zero_dimensional_ndarray(direct_value) -> None:
     _store, transfer = make_transfer()
     array = np.array(1.5, dtype=np.float32)
-    value = array if wrapped else {"value": array}
+    value = array if direct_value else {"value": array}
 
     result = transfer.get_object(transfer.put_object(value))
-    result = result if wrapped else result["value"]
+    result = result if direct_value else result["value"]
 
     assert result.shape == ()
     assert result.dtype == array.dtype

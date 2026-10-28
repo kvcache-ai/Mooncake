@@ -5931,6 +5931,8 @@ def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
     if _torch is not None and isinstance(value, _torch.Tensor):
         return _encode_torch_tensor_field(value)
     if isinstance(value, np.ndarray):
+        # np.ascontiguousarray promotes 0-D inputs to shape (1,).
+        # Keep the original shape in metadata and use array for payload bytes.
         array = np.ascontiguousarray(value)
         return {
             "encoding": "ndarray",
