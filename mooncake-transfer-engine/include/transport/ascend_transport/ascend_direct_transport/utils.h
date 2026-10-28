@@ -86,6 +86,11 @@ bool IsRoceModeEnabled();
 // Parse ASCEND_GLOBAL_RESOURCE_CONFIG JSON for roce protocol_desc only.
 bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str);
 
+// True when protocol_desc is "hccs:device", or an array containing that
+// entry. "hccs:host" and "roce:*" do not match. config_str is the already
+// role-resolved ASCEND_GLOBAL_RESOURCE_CONFIG.
+bool HasHccsDeviceProtocolDescInGlobalResourceConfig(const char* config_str);
+
 // True when protocol_desc is "roce:host", or an array containing that entry,
 // on this object or on its "store" subtree. "roce:device" does not match.
 // The store subtree is included because host memory is allocated after TE
