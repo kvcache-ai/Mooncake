@@ -1,0 +1,81 @@
+{
+    "data_manager_version": "v2",
+    "tiers": [
+        {
+            "type": "DRAM",
+            "capacity": "16GB",
+            "priority": 100,
+            "tags": ["fast", "memory"],
+            "numa_node": 0,
+            "placement_policy": {
+                "offload_high_watermark": 0.85
+            },
+            "allocation_failure": {
+                "try_evict": true,
+                "max_evict_rounds": 2,
+                "evict_timeout_ms": 100,
+                "reclaim_margin_bytes": "256MB"
+            }
+        },
+        {
+            "type": "SSD",
+            "capacity": "1TB",
+            "priority": 10,
+            "tags": ["persistent", "slow"],
+            "alignment": 4096,
+            "fsync_on_commit": false,
+            "file_path": "/data/mooncake-v2/ssd.data",
+            "placement_policy": {
+                "offload_high_watermark": 0.90
+            },
+            "allocation_failure": {
+                "try_evict": true,
+                "max_evict_rounds": 1,
+                "evict_timeout_ms": 50,
+                "reclaim_margin_bytes": "0B"
+            }
+        }
+    ],
+    "v2": {
+        "block_index": {
+            "shard_count": 64,
+            "max_load_factor": 0.875
+        },
+        "block_registry": {
+            "shard_count": 64
+        },
+        "events": {
+            "shard_count": 8,
+            "event_queue_capacity": 4096,
+            "movement_queue_capacity": 8192,
+            "movement_worker_count": 2
+        },
+        "placement_policy": {
+            "offload_high_watermark": 0.90,
+            "onboard_min_frequency": 8.0,
+            "sketch_capacity": 0,
+            "band_warm_threshold": 0,
+            "band_hot_threshold": 0,
+            "band_veryhot_threshold": 0
+        },
+        "copier": {
+            "staging_buffer_bytes": "4MB",
+            "copy_timeout_ms": 0
+        },
+        "eviction_index": {
+            "type": "tinylfu_lru",
+            "max_victim_candidates": 256,
+            "sketch_capacity": 0
+        },
+        "max_registration_retry": 8,
+        "stop_drain_timeout_ms": 5000,
+        "lease_shard_count": 64,
+        "hot_key_snapshot_limit": 4096,
+        "allocation_failure": {
+            "try_evict": true,
+            "max_evict_rounds": 1,
+            "evict_timeout_ms": 50,
+            "reclaim_margin_bytes": "0B"
+        }
+    }
+}
