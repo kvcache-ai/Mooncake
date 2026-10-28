@@ -16,8 +16,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -26,6 +28,7 @@
 
 #include "tent/common/config.h"
 #include "tent/common/types.h"
+#include "tent/runtime/deadline_mlu.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transfer_engine_impl.h"
@@ -334,6 +337,45 @@ TEST(RuntimeQueueDispatch, RejectsEmptyDispatchWindowConfig) {
     EXPECT_FALSE(byte_window_engine.available());
 }
 
+// The engine warns on kDropsFeasible and kSilentlyDisabled, so the split
+// between them decides which warning text a config gets.
+TEST(RuntimeQueueDispatch, ClassifiesMluLocalThreshold) {
+    const double inf = std::numeric_limits<double>::infinity();
+    EXPECT_EQ(ClassifyMluLocalThreshold(0.0), MluThresholdEffect::kDisabled);
+    EXPECT_EQ(ClassifyMluLocalThreshold(-0.0), MluThresholdEffect::kDisabled);
+    for (double theta : {0.5, 0.999, std::numeric_limits<double>::min()}) {
+        EXPECT_EQ(ClassifyMluLocalThreshold(theta),
+                  MluThresholdEffect::kDropsFeasible)
+            << "theta=" << theta;
+    }
+    for (double theta : {1.0, 1.5, std::numeric_limits<double>::max()}) {
+        EXPECT_EQ(ClassifyMluLocalThreshold(theta),
+                  MluThresholdEffect::kRecommended)
+            << "theta=" << theta;
+    }
+    for (double theta : {-1.0, -inf, inf, std::nan("")}) {
+        EXPECT_EQ(ClassifyMluLocalThreshold(theta),
+                  MluThresholdEffect::kSilentlyDisabled)
+            << "theta=" << theta;
+    }
+    // Why +inf disables the drop: a missed deadline yields DBL_MAX, not inf,
+    // so `mlu >= theta` never holds.
+    EXPECT_LT(DeadlineMlu(0, 1, /*deadline_ns=*/1, /*now_ns=*/2, 1e9), inf);
+}
+
+// Values outside 0 or [1.0, inf) only log a warning: existing configs keep
+// constructing.
+TEST(RuntimeQueueDispatch, AcceptsMluLocalThresholdOutsideRecommendedRange) {
+    for (double theta : {0.0, 0.5, 0.999, 1.0, 1.5, -1.0, std::nan(""),
+                         std::numeric_limits<double>::infinity()}) {
+        auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+        cfg->set("runtime_queue/deadline_aware", true);
+        cfg->set("runtime_queue/mlu_local_threshold", theta);
+        TransferEngineImpl engine(cfg);
+        EXPECT_TRUE(engine.available()) << "theta=" << theta;
+    }
+}
+
 TEST(RuntimeQueueDispatch, DispatchesOnlyOneWindowOnSubmit) {
     auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
     TransferEngineImpl engine(cfg);
@@ -479,6 +521,72 @@ TEST(RuntimeQueueDispatch, DroppedOwnerLeavesNoImplRecord) {
     EXPECT_FALSE(TransferEngineImplTestPeer::hasActiveRuntimeQueue(engine));
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+// The drop's bandwidth comes from the RDMA transport's own estimate, wired
+// by the engine from the config keys (enable_runtime_queue, deadline_aware,
+// mlu_local_threshold). No provider is injected here: a fake RDMA transport
+// reporting a bandwidth is enough to make the engine drop, and raising that
+// bandwidth makes the next request go through. This is the wiring tebench's
+// --deadline_aware / --mlu_local_threshold rely on.
+class MeteredFakeTransport : public FakeTransport {
+   public:
+    using FakeTransport::FakeTransport;
+    std::atomic<double> bandwidth_bps{1.0};
+    double getEstimatedBandwidth() const override {
+        return bandwidth_bps.load();
+    }
+};
+
+TEST(RuntimeQueueDispatch, DropReadsBandwidthFromTheRdmaTransport) {
+    auto cfg = makeRuntimeQueueConfig(4, 1UL << 20);
+    cfg->set("runtime_queue/deadline_aware", true);
+    cfg->set("runtime_queue/mlu_local_threshold", 1.0);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    // One byte per second: a request with a one-second deadline is
+    // infeasible by the queue's own MLU, with no injected provider.
+    auto fake_rdma = std::make_shared<MeteredFakeTransport>(RDMA);
+    installFakeRdma(engine, fake_rdma);
+
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> buffer(kReqLen, 0x55);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    auto one_second_out = [] {
+        return static_cast<uint64_t>(
+                   std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                       .count()) +
+               1'000'000'000ULL;
+    };
+
+    BatchID dropped = engine.allocateBatch(1);
+    ASSERT_NE(dropped, (BatchID)0);
+    auto request = makeLocalWrite(buffer.data(), kReqLen);
+    request.deadline_ns = one_second_out();
+    ASSERT_TRUE(engine.submitTransfer(dropped, {request}).ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 0);
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(dropped, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::CANCELED);
+    EXPECT_TRUE(engine.freeBatch(dropped).ok());
+
+    // The provider is live: a terabyte per second makes the same request
+    // feasible and it is dispatched to the transport.
+    fake_rdma->bandwidth_bps.store(1e12);
+    BatchID dispatched = engine.allocateBatch(1);
+    ASSERT_NE(dispatched, (BatchID)0);
+    request.deadline_ns = one_second_out();
+    ASSERT_TRUE(engine.submitTransfer(dispatched, {request}).ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    ASSERT_TRUE(engine.getTransferStatus(dispatched, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(engine.freeBatch(dispatched).ok());
+
+    EXPECT_EQ(TransferEngineImplTestPeer::queuedOwners(engine), 0u);
     EXPECT_TRUE(
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }

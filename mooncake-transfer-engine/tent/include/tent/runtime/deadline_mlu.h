@@ -33,6 +33,7 @@
 
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -63,6 +64,23 @@ inline double DeadlineMlu(size_t bytes_ahead, size_t length,
         (static_cast<double>(bytes_ahead) + static_cast<double>(length)) /
         bw_bps;
     return predicted_time_s / window_s;
+}
+
+// What a runtime_queue/mlu_local_threshold value does to the drop.
+enum class MluThresholdEffect {
+    kDisabled,          // 0: the documented way to turn the drop off
+    kRecommended,       // finite and >= 1.0
+    kDropsFeasible,     // (0, 1): also drops requests predicted to make it
+    kSilentlyDisabled,  // negative or NaN fail the `> 0` gate; +inf is never
+                        // reached, since DeadlineMlu() tops out at DBL_MAX
+};
+
+inline MluThresholdEffect ClassifyMluLocalThreshold(double theta) {
+    if (theta == 0.0) return MluThresholdEffect::kDisabled;
+    if (!(theta > 0.0) || !std::isfinite(theta))
+        return MluThresholdEffect::kSilentlyDisabled;
+    if (theta < 1.0) return MluThresholdEffect::kDropsFeasible;
+    return MluThresholdEffect::kRecommended;
 }
 
 }  // namespace tent

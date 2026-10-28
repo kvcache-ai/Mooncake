@@ -74,6 +74,18 @@ std::shared_ptr<Config> loadConfig() {
     config->set("rpc_server_port", XferBenchConfig::rpc_server_port);
     config->set("transports/rdma/deadline_bw_arbitration",
                 XferBenchConfig::deadline_bw_arbitration);
+    // Admission-queue knobs are written only when asked for, so a config
+    // file given through MC_TENT_CONF keeps its own runtime_queue settings
+    // otherwise. The drop (mlu_local_threshold) needs the queue to be on
+    // and deadline-ordered; both are implied here.
+    if (XferBenchConfig::deadline_aware) {
+        config->set("enable_runtime_queue", true);
+        config->set("runtime_queue/deadline_aware", true);
+        if (XferBenchConfig::mlu_local_threshold > 0.0) {
+            config->set("runtime_queue/mlu_local_threshold",
+                        XferBenchConfig::mlu_local_threshold);
+        }
+    }
 
     // Configure transport types based on xport_type parameter
     if (!XferBenchConfig::xport_type.empty()) {
@@ -117,6 +129,14 @@ std::shared_ptr<Config> loadConfig() {
     }
 
     return config;
+}
+
+// With --mlu_local_threshold the admission queue cancels transfers it
+// predicts will miss their deadline. That is the behaviour being measured,
+// not a failure, so it must not stop the run.
+static bool deadlineDropEnabled() {
+    return XferBenchConfig::deadline_aware &&
+           XferBenchConfig::mlu_local_threshold > 0.0;
 }
 
 static TransportType getTransportType(const std::string& xport_type) {
@@ -601,6 +621,10 @@ double TENTBenchRunner::runSingleTransfer(
             if (overall_status.s == TransferStatusEnum::COMPLETED) {
                 return finish(timer.lap_us());
             }
+            if (overall_status.s == TransferStatusEnum::CANCELED &&
+                deadlineDropEnabled()) {
+                return finish(kTransferDropped);
+            }
             if (overall_status.s == TransferStatusEnum::FAILED ||
                 overall_status.s == TransferStatusEnum::TIMEOUT ||
                 overall_status.s == TransferStatusEnum::CANCELED ||
@@ -642,6 +666,10 @@ double TENTBenchRunner::runSingleTransfer(
             const uint64_t wait_us = wait_timer.lap_us();
             logSplitXfer({batch_size, submit_us, wait_us, polls});
             return finish(static_cast<double>(submit_us + wait_us));
+        }
+        if (overall_status.s == TransferStatusEnum::CANCELED &&
+            deadlineDropEnabled()) {
+            return finish(kTransferDropped);
         }
         if (overall_status.s == TransferStatusEnum::FAILED ||
             overall_status.s == TransferStatusEnum::TIMEOUT ||
