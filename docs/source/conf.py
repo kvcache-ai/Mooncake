@@ -258,6 +258,7 @@ redirects = {
     "design/engram": "store/engram.html",
     "design/tent/tebench": "../../performance/mooncake/tebench.html",
     "deployment/ssd-offload": "ssd/ssd-offload.html",
+    "deployment/oss-offload": "object-storage-offload.html",
     "deployment/nvmf-ssd-deployment-guide": "ssd/nvmf-ssd-deployment-guide.html",
     "integrations/index": "../deployment/index.html",
     "integrations/lmcache": "../deployment/integrations/lmcache/index.html",
@@ -307,3 +308,16 @@ redirects = {
     "design/tent/cpp-api": "../../api-reference/cpp/tent.html",
     "design/conductor/indexer-api-design": "../../api-reference/http/conductor-indexer.html",
 }
+
+# Pages that embed the live ecosystem PR dashboard; its assets load only there.
+PR_DASHBOARD_PAGES = {"community/ecosystem-prs"}
+
+
+def add_pr_dashboard_assets(app, pagename, templatename, context, doctree):
+    if pagename in PR_DASHBOARD_PAGES:
+        app.add_css_file("pr-dashboard.css")
+        app.add_js_file("pr-dashboard.js", loading_method="defer")
+
+
+def setup(app):
+    app.connect("html-page-context", add_pr_dashboard_assets)

@@ -607,6 +607,10 @@ const static std::string kWildcardLocation = "*";
 
 Location strings identify device affinity: `"cpu:0"`, `"cuda:0"`, `"hip:0"`, etc. Use `"*"` for automatic detection. On AMD GPUs the canonical prefix is `hip:` (same as classic TE). The legacy TENT prefix `rocm:` is still accepted when parsing locations and custom NIC matrices.
 
+In an {ref}`XPU-enabled build <build-with-intel-xpu>`, Intel GPU device memory
+uses `"xpu:N"`; bare `"xpu"` means device 0. Host and shared USM are classified
+as CPU memory.
+
 ### TransportType
 
 ```cpp

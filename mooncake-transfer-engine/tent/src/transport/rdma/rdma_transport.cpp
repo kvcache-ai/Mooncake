@@ -263,6 +263,14 @@ static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
     if (disable_gpu_direct) {
         return false;
     }
+    // Intel XPU: no peer-memory kernel module; device buffers are exported as
+    // dma-bufs and registered with ibv_reg_dmabuf_mr, so the presence of that
+    // verb is the capability signal. Buffers that fail to export at
+    // registration time are simply not offered on RDMA and get staged.
+    if (Platform::getLoader().type() == "xpu") {
+        auto& loader = IbvLoader::Instance();
+        return loader.available() && loader.sym().ibv_reg_dmabuf_mr != nullptr;
+    }
     // Detect vendor GPUDirect/peer-memory drivers from /proc/modules.
     // NVIDIA: nvidia_peermem. AMD: peermem is built into amdgpu (linked with
     // ib_core), so the amdgpu module itself is the presence signal.
@@ -557,22 +565,12 @@ Status RdmaTransport::submitTransferTasks(
         std::vector<int> slice_dev_ids;
         // Only if a single request is enough, we perform aggregated allocation
         if (num_slices >= max_slice_count / 2) {
-            std::string source_location = kWildcardLocation;
-            auto source_locations =
-                Platform::getLoader().getLocation(request.source, 1, true);
-            if (!source_locations.empty()) {
-                source_location = source_locations[0].location;
-            }
-            auto device_selector = workers_->getDeviceSelector();
-            if (device_selector) {
-                auto status = device_selector->allocate(
-                    request.length, static_cast<uint32_t>(num_slices),
-                    block_size, source_location, slice_dev_ids,
-                    request.priority, batch->device_mask);
-                if (!status.ok() || slice_dev_ids.empty()) {
-                    LOG(WARNING) << "Device quota allocation failed: "
-                                 << status.message();
-                }
+            auto status = workers_->allocateDevices(
+                request, static_cast<uint32_t>(num_slices), block_size,
+                task->device_mask, slice_dev_ids);
+            if (!status.ok()) {
+                LOG(WARNING)
+                    << "Device quota allocation failed: " << status.message();
             }
         }
 
@@ -713,6 +711,10 @@ Status RdmaTransport::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
 
 bool RdmaTransport::warmupMemory(void* addr, size_t length) {
     if (length < kMrWarmupMinBytes) return false;
+    // Warm-up is a plain ibv_reg_mr. Intel XPU VRAM has no host pages behind
+    // it and is registered through dma-buf export instead, so the temporary
+    // ibv_reg_mr would only EFAULT.
+    if (Platform::getLoader().getMemoryType(addr) == MTYPE_XPU) return false;
     unsigned hwc = std::thread::hardware_concurrency();
     if (hwc < 4) return false;
     RdmaContext* warmup_ctx = nullptr;

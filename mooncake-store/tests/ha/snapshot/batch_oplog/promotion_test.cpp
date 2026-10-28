@@ -212,8 +212,9 @@ TEST(BatchOpLogPromotionTest, EmptyStoreRestoresWithoutChunks) {
     handoff.metadata_store = std::make_unique<StandbyMetadataStore>();
     handoff.applied_cursor = {.batch_id = 0, .last_seq = 0};
 
-    EXPECT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
-                    .has_value());
+    EXPECT_TRUE(service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
+    ASSERT_TRUE(handoff.metadata_store);
+    EXPECT_EQ(0u, handoff.metadata_store->GetKeyCount());
 }
 
 }  // namespace mooncake::test

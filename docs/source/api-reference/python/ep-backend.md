@@ -29,11 +29,31 @@ from source, enable the EP/PG extensions with:
 cmake .. -DWITH_EP=ON
 ```
 
-The extensions are compiled against a specific PyTorch version. At import time,
-`mooncake.pg` and `mooncake.ep` load version-suffixed extension modules that
-match the active `torch.__version__`. If the current PyTorch version does not
-match a built extension, import will fail with a message such as
-`Mooncake PG was not built against torch==...`.
+`mooncake.pg` compiles its Torch-facing adapter at first import and caches the
+result locally. The wheel provides the native PG core/device libraries and the
+adapter source bundle; the runtime environment provides PyTorch, a CUDA toolkit
+with `nvcc`, and Ninja.
+
+On Intel XPU, Mooncake EP is built natively with the oneAPI DPC++ compiler
+(TENT and Mooncake PG are not needed). It supports ranks on one node; see
+{ref}`Intel XPU <mooncake-ep-intel-xpu>` in the EP design notes:
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+cmake -S . -B build-xpu -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+  -DUSE_XPU=ON -DWITH_EP=ON -DUSE_CUDA=OFF -DWITH_STORE=OFF \
+  -DWITH_STORE_RUST=OFF
+```
+
+The module runs on PyTorch's SYCL queues and uses the SYCL runtime that
+PyTorch XPU installs, so build it with a oneAPI release that ships the same
+runtime major version (`libsycl.so.N`). For example, PyTorch 2.14+xpu ships
+`libsycl.so.9`, from oneAPI 2026.
+
+PG symbols are exposed through `mooncake.pg`; `mooncake.ep` is the EP entry point
+and no longer re-exports PG symbols. Existing callers should move imports such
+as `MooncakeBackendOptions` and `set_host_ip` from `mooncake.ep` to
+`mooncake.pg`.
 
 ## Mooncake PG quick start
 
@@ -320,12 +340,26 @@ Returns the workspace size in bytes for the EP buffer. Use the maximum number of
 tokens a rank may dispatch in one step. Underestimating this value can cause
 buffer overflow or incorrect dispatch results.
 
-### `Buffer(group, num_ep_buffer_bytes=0)`
+### `Buffer(group, num_ep_buffer_bytes)`
 
 Creates the EP runtime for a Mooncake process group. The constructor exchanges
 RDMA and IPC metadata through the group, initializes fast-path transports when
 available, and falls back to the Python implementation if the fast path is not
 usable.
+
+`num_ep_buffer_bytes` is required and must be positive. Use
+`Buffer.get_ep_buffer_size_hint(...)` with the maximum dispatch shape to
+calculate a suitable size before constructing the buffer:
+
+```python
+num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
+    num_max_dispatch_tokens_per_rank,
+    hidden,
+    num_ranks,
+    num_experts,
+)
+buffer = Buffer(group, num_ep_buffer_bytes)
+```
 
 ### `Buffer.dispatch(...)`
 
@@ -340,6 +374,7 @@ recv_x, recv_count, handle, event, hook = buffer.dispatch(
     use_fp8=True,
     async_finish=False,
     return_recv_hook=False,
+    topk_weights=None,
 )
 ```
 
@@ -360,6 +395,11 @@ Arguments:
   event for stream-lifetime management.
 - `return_recv_hook`: when `True`, call the returned `hook()` to complete receive
   synchronization; otherwise use `event.current_stream_wait()`.
+- `topk_weights`: optional FP32 tensor shaped like `topk_idx`, holding the
+  weights the matching `combine()` will be called with. Every rank must pass it
+  or none. On Intel XPU, combine then sums each token's rows on the expert side
+  with these weights and ignores its own `topk_weights`. Other backends ignore
+  this argument.
 
 Returns:
 
