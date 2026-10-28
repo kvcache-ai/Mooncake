@@ -670,7 +670,41 @@ int TEBenchRunner::runTarget() {
         LOG(ERROR) << "Target cannot start: initialization failed";
         return -1;
     }
-    while (g_te_running) sleep(1);
+    const char* warm_env = std::getenv("MC_EXPERIMENTAL_TARGET_WARM_BYTES");
+    const uint64_t warm_bytes = warm_env ? std::strtoull(warm_env, nullptr, 10) : 0;
+    if (!warm_bytes) {
+        while (g_te_running) sleep(1);
+        return 0;
+    }
+    // Optional receiver CPU assistance. It reads/prefetches the existing
+    // active data region; it never changes payloads or transfer accounting.
+    CHECK_EQ(XferBenchConfig::seg_type, "DRAM");
+    CHECK_LE(warm_bytes, XferBenchConfig::total_buffer_size);
+    const int node = std::max(0, XferBenchConfig::local_gpu_id);
+    CHECK_LT(static_cast<size_t>(node), pinned_buffer_list_.size());
+    auto* buffer = static_cast<unsigned char*>(pinned_buffer_list_[node]);
+    cpu_set_t allowed, selected;
+    CHECK_EQ(sched_getaffinity(0, sizeof(allowed), &allowed), 0);
+    int cpu = -1;
+    for (int i = 0; i < CPU_SETSIZE && cpu < 0; ++i)
+        if (CPU_ISSET(i, &allowed)) cpu = i;
+    CHECK_GE(cpu, 0);
+    CPU_ZERO(&selected); CPU_SET(cpu, &selected);
+    CHECK_EQ(sched_setaffinity(0, sizeof(selected), &selected), 0);
+    const char* interval_env = std::getenv("MC_EXPERIMENTAL_TARGET_WARM_US");
+    const unsigned interval_us = interval_env ? std::min(1000000ul, std::strtoul(interval_env, nullptr, 10)) : 10000;
+    uint64_t passes = 0;
+    LOG(INFO) << "Experimental target cache assist bytes=" << warm_bytes
+              << " node=" << node << " cpu=" << cpu
+              << " interval_us=" << interval_us;
+    while (g_te_running) {
+        for (uint64_t offset = 0; offset < warm_bytes; offset += 64) {
+            __builtin_prefetch(buffer + offset, 0, 1);
+        }
+        ++passes;
+        if (interval_us) usleep(interval_us);
+    }
+    LOG(INFO) << "Experimental target cache assist completed passes=" << passes;
     return 0;
 }
 
@@ -941,6 +975,23 @@ int TEBenchRunner::runRollingTransfers(
     };
     std::vector<Slot> slots(inflight);
     XferBenchTimer clock;
+    const char* initiator_warm_env = std::getenv("MC_EXPERIMENTAL_INITIATOR_WARM_US");
+    const uint64_t initiator_warm_us = initiator_warm_env ? std::strtoull(initiator_warm_env, nullptr, 10) : 0;
+    uint64_t next_warm_us = initiator_warm_us;
+    auto warm_local = [&] {
+        const uint64_t bytes = checkedMul(block_size, total_batch_size, "initiator warm bytes");
+        for (uint64_t offset = 0; offset < bytes; offset += 64)
+            __builtin_prefetch(reinterpret_cast<const void*>(local_addr + offset), 0, 1);
+    };
+    // CPU cache assistance is part of measured time and uses the existing
+    // submission thread. It touches the entire unchanged active working set.
+    if (initiator_warm_us) {
+        if (XferBenchConfig::seg_type != "DRAM") {
+            LOG(ERROR) << "Initiator cache assistance requires DRAM";
+            return -1;
+        }
+        warm_local();
+    }
     bool failed = false;
     size_t active = 0;
     auto submit = [&](size_t index) {
@@ -998,6 +1049,10 @@ int TEBenchRunner::runRollingTransfers(
                 break;
             }
             if (g_te_running && clock.lap_us(false) < duration_us) submit(i);
+            if (initiator_warm_us && completed_us >= next_warm_us) {
+                warm_local();
+                next_warm_us = clock.lap_us(false) + initiator_warm_us;
+            }
         }
     }
     // On a signal/failure, drain every submitted slot before freeing buffers.
