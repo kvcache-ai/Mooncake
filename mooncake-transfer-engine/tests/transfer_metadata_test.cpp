@@ -159,6 +159,7 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
                   [](const TransferMetadata::HandShakeDesc& peer,
                      TransferMetadata::HandShakeDesc& local) {
                       local.payload = "reply:" + peer.payload;
+                      local.auto_gid_reprobe_from = peer.auto_gid_reprobe_from;
                       // Echo the advertised path MTU so the test can check it
                       // survives both directions of the wire encoding.
                       local.local_mtu_bytes = peer.local_mtu_bytes;
@@ -190,10 +191,12 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
 
     TransferMetadata::HandShakeDesc request;
     request.payload = "bootstrap";
+    request.auto_gid_reprobe_from = "gid-before-reprobe";
     request.local_mtu_bytes = 1024;
     TransferMetadata::HandShakeDesc response;
     ASSERT_EQ(client.sendHandshake(server_name, request, response), 0);
     EXPECT_EQ(response.payload, "reply:bootstrap");
+    EXPECT_EQ(response.auto_gid_reprobe_from, "gid-before-reprobe");
     EXPECT_EQ(response.local_mtu_bytes, 1024u);
 
     // A peer that does not advertise a path MTU leaves the field at 0, which
@@ -203,6 +206,8 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
     TransferMetadata::HandShakeDesc legacy_response;
     ASSERT_EQ(
         client.sendHandshake(server_name, legacy_request, legacy_response), 0);
+    EXPECT_EQ(legacy_response.payload, "reply:legacy");
+    EXPECT_TRUE(legacy_response.auto_gid_reprobe_from.empty());
     EXPECT_EQ(legacy_response.local_mtu_bytes, 0u);
 }
 

@@ -458,7 +458,7 @@ class LocalDiskUnmountInterleavingTest : public MasterServiceSSDTest {
    protected:
     static void DeregisterHalf(MasterService& service, const UUID& client_id) {
         std::unique_lock<std::shared_mutex> snapshot_lock(
-            MasterServiceTestPeer::SnapshotMutex(service));
+            MasterServiceTestPeer::MasterStateMutex(service));
         MasterServiceTestPeer::LocalSsdManager(service).UnregisterClient(
             client_id);
     }
@@ -484,7 +484,7 @@ TEST_F(LocalDiskUnmountInterleavingTest,
     DeregisterHalf(*service, leaving);
 
     // The interleaving under test: another store mounts and registers a
-    // replica before the sweep reaches its shard. Whether the client monitor
+    // replica before the sweep reaches its key. Whether the client monitor
     // has admitted `late` to the alive set yet does not matter to an
     // owner-targeted sweep -- while a liveness-complement sweep taken before
     // this mount would classify the replica stale and erase it, and with it

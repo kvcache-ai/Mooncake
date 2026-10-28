@@ -117,6 +117,9 @@
         },
         "hylink": {
             "enable": false
+        },
+        "memfabric": {
+            "enable": false
         }
     },
     "policy": [
@@ -124,7 +127,7 @@
             "name": "default_memory",
             "segment_type": "memory",
             "devices": ["mlx5_0", "mlx5_2"],
-            "transports": ["nvlink", "rdma", "shm", "hp_tcp"]
+            "transports": ["nvlink", "xpu", "rdma", "shm", "hp_tcp"]
         },
         {
             "name": "file_storage",

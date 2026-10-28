@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include <dlfcn.h>
 
 #include <atomic>
 #include <chrono>
@@ -53,6 +54,10 @@
 
 using namespace mooncake;
 
+namespace {
+ibv_context *auto_gid_test_context = nullptr;
+}
+
 namespace mooncake {
 
 class RdmaTransportTestPeer {
@@ -78,6 +83,21 @@ class RdmaTransportTestPeer {
 
 class RdmaContextTestPeer {
    public:
+    static void enableAutoRecovery(RdmaContext &context, ibv_context *verbs) {
+        auto_gid_test_context = verbs;
+        context.context_ = verbs;
+        context.port_ = 1;
+        context.gid_ = {};
+        context.gid_.raw[15] = 1;
+        context.gid_index_ = 0;
+        context.auto_gid_selection_enabled_ = true;
+        context.peer_auto_gid_states_.configure(2, true);
+    }
+    static void clearAutoRecovery(RdmaContext &context) {
+        context.context_ = nullptr;
+        auto_gid_test_context = nullptr;
+    }
+
     static void bindCompletionQueue(RdmaContext &context, ibv_cq *cq) {
         context.cq_list_.emplace_back();
         context.cq_list_.back().native = cq;
@@ -344,6 +364,7 @@ class RdmaEndPointStateTest : public ::testing::Test {
 
     void TearDown() override {
         endpoint_->destroyQP();
+        RdmaContextTestPeer::clearAutoRecovery(*context_);
         RdmaContextTestPeer::clearCompletionQueues(*context_);
     }
 
@@ -506,6 +527,121 @@ TEST_F(RdmaEndPointStateTest,
     EXPECT_FALSE(endpoint_->connected());
 }
 
+TEST_F(RdmaEndPointStateTest,
+       StaleActiveAdvisoryDoesNotMutateNewPassiveConnection) {
+    TransferMetadata server_metadata(P2PHANDSHAKE);
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_NE(port, 0);
+    const std::string host = globalConfig().use_ipv6 ? "::1" : "127.0.0.1";
+    const std::string peer_server_name =
+        maybeWrapIpV6(host) + ":" + std::to_string(port);
+
+    std::mutex callback_mutex;
+    std::condition_variable callback_cv;
+    bool callback_started = false;
+    bool release_reply = false;
+    // Hold the Q1 reply until the test has reconstructed the endpoint as Q2.
+    ASSERT_EQ(server_metadata.startHandshakeDaemon(
+                  [&](const RdmaEndPoint::HandShakeDesc &peer_desc,
+                      RdmaEndPoint::HandShakeDesc &local_desc) {
+                      std::unique_lock<std::mutex> lock(callback_mutex);
+                      callback_started = true;
+                      callback_cv.notify_all();
+                      callback_cv.wait(lock, [&] { return release_reply; });
+
+                      local_desc.local_nic_path = peer_desc.peer_nic_path;
+                      local_desc.peer_nic_path = peer_desc.local_nic_path;
+                      local_desc.local_gid =
+                          "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00";
+                      local_desc.local_lid = 0;
+                      local_desc.qp_num.clear();
+                      local_desc.ready_ack_supported = false;
+                      local_desc.auto_gid_reprobe_from = peer_desc.local_gid;
+                      return 0;
+                  },
+                  port, sockfd),
+              0);
+
+    auto client_metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    RdmaTransportTestPeer::bindMetadata(*transport_, client_metadata,
+                                        "rdma-endpoint-state-client");
+
+    // Zero QPs keep the regression hardware-free while still exercising the
+    // real active-handshake and reconstruct state transitions.
+    ibv_cq fake_cq = {};
+    RdmaContextTestPeer::bindCompletionQueue(*context_, &fake_cq);
+    ASSERT_EQ(endpoint_->construct(&fake_cq, 0), 0);
+    endpoint_->setPeerNicPath(peer_server_name + "@peer-nic");
+    ibv_context fake_verbs = {};
+    RdmaContextTestPeer::enableAutoRecovery(*context_, &fake_verbs);
+
+    auto active_result = std::async(std::launch::async, [&] {
+        return endpoint_->setupConnectionsByActive();
+    });
+
+    bool observed_callback = false;
+    {
+        std::unique_lock<std::mutex> lock(callback_mutex);
+        observed_callback = callback_cv.wait_for(
+            lock, std::chrono::seconds(5), [&] { return callback_started; });
+    }
+    if (!observed_callback) {
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex);
+            release_reply = true;
+        }
+        callback_cv.notify_all();
+        if (active_result.wait_for(std::chrono::seconds(5)) ==
+            std::future_status::ready) {
+            active_result.get();
+        }
+        FAIL() << "Active handshake did not reach the blocking callback";
+    }
+
+    const int reconstruct_result =
+        RdmaEndPointTestPeer::reconstruct(*endpoint_);
+    const bool connected_after_reconstruct = endpoint_->connected();
+    RdmaEndPoint::HandShakeDesc passive_request, passive_response;
+    passive_request.local_nic_path = endpoint_->peerNicPath();
+    passive_request.peer_nic_path = context_->nicPath();
+    passive_request.local_gid = context_->gid();
+    passive_request.ready_ack_supported = false;
+    const int passive_rc =
+        endpoint_->setupConnectionsByPassive(passive_request, passive_response);
+    const bool passive_connected = endpoint_->connected();
+    const auto live_before = endpoint_->autoGidCompletionToken();
+    const auto selection_before =
+        context_->preparePeerGidSelection(endpoint_->peerNicPath());
+
+    // The successful Q1 reply is now stale and must not configure Q2.
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex);
+        release_reply = true;
+    }
+    callback_cv.notify_all();
+
+    const int active_rc = active_result.get();
+    ASSERT_EQ(reconstruct_result, 0);
+    ASSERT_FALSE(connected_after_reconstruct);
+    ASSERT_EQ(passive_rc, 0);
+    ASSERT_TRUE(passive_connected);
+    ASSERT_TRUE(live_before.valid);
+    EXPECT_EQ(active_rc, 0);
+    EXPECT_TRUE(endpoint_->connected());
+    const auto selection_after =
+        context_->preparePeerGidSelection(endpoint_->peerNicPath());
+    EXPECT_EQ(selection_before.selection_epoch,
+              selection_after.selection_epoch);
+    EXPECT_EQ(selection_before.selection.gid, selection_after.selection.gid);
+    const auto live_after = endpoint_->autoGidCompletionToken();
+    EXPECT_EQ(live_after.selection_epoch, selection_after.selection_epoch);
+    EXPECT_EQ(context_->recordAutoGidCompletion(
+                  endpoint_->peerNicPath(),
+                  {live_after.endpoint_id, live_after.selection_epoch}, false),
+              AutoGidDataPathAction::kRetrySameGid);
+}
+
 TEST(RdmaEndpointLifecycleGateTest,
      BidirectionalActiveHandshakeDoesNotHoldLifecycleGateDuringRpc) {
     auto barrier = std::make_shared<InProcessRdmaTransport::Barrier>();
@@ -612,4 +748,90 @@ TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
     WorkerPoolTestPeer::clearQueuedSlices(*peer.worker_pool);
 }
 
+TEST_F(RdmaEndPointStateTest, ActiveAdvisoryAdvancesOnceAndBindsSelectedGid) {
+    TransferMetadata server_metadata(P2PHANDSHAKE);
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_NE(port, 0);
+    const std::string host = globalConfig().use_ipv6 ? "::1" : "127.0.0.1";
+    const std::string peer_server_name =
+        maybeWrapIpV6(host) + ":" + std::to_string(port);
+    std::vector<std::string> observed_gids;
+    ASSERT_EQ(server_metadata.startHandshakeDaemon(
+                  [&](const RdmaEndPoint::HandShakeDesc &peer_desc,
+                      RdmaEndPoint::HandShakeDesc &local_desc) {
+                      observed_gids.push_back(peer_desc.local_gid);
+                      local_desc.local_nic_path = peer_desc.peer_nic_path;
+                      local_desc.peer_nic_path = peer_desc.local_nic_path;
+                      local_desc.local_gid = peer_desc.local_gid;
+                      local_desc.local_lid = 0;
+                      local_desc.qp_num.clear();
+                      local_desc.ready_ack_supported = false;
+                      // Repeating the original advice must not advance twice.
+                      local_desc.auto_gid_reprobe_from = observed_gids.front();
+                      return 0;
+                  },
+                  port, sockfd),
+              0);
+    auto client_metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    RdmaTransportTestPeer::bindMetadata(*transport_, client_metadata,
+                                        "rdma-endpoint-state-client");
+    ibv_cq fake_cq = {};
+    RdmaContextTestPeer::bindCompletionQueue(*context_, &fake_cq);
+    ASSERT_EQ(endpoint_->construct(&fake_cq, 0), 0);
+    endpoint_->setPeerNicPath(peer_server_name + "@peer-nic");
+    ibv_context fake_verbs = {};
+    RdmaContextTestPeer::enableAutoRecovery(*context_, &fake_verbs);
+    const auto initial =
+        context_->preparePeerGidSelection(endpoint_->peerNicPath());
+    ASSERT_EQ(endpoint_->setupConnectionsByActive(), 0);
+    ASSERT_TRUE(endpoint_->connected());
+    ASSERT_EQ(observed_gids.size(), 2u);
+    EXPECT_EQ(observed_gids.front(), initial.selection.gid);
+    EXPECT_NE(observed_gids.back(), initial.selection.gid);
+    const auto selected =
+        context_->preparePeerGidSelection(endpoint_->peerNicPath());
+    EXPECT_EQ(observed_gids.back(), selected.selection.gid);
+    EXPECT_NE(initial.selection_epoch, selected.selection_epoch);
+    const auto token = endpoint_->autoGidCompletionToken();
+    EXPECT_TRUE(token.valid);
+    EXPECT_EQ(token.selection_epoch, selected.selection_epoch);
+    EXPECT_EQ(context_->gid(), initial.selection.gid);
+}
+
 }  // namespace
+
+#undef ibv_query_port
+extern "C" {
+int ibv_query_port(ibv_context *context, uint8_t port,
+                   _compat_ibv_port_attr *compat) {
+    if (context != auto_gid_test_context || !auto_gid_test_context) {
+        using QueryPort =
+            int (*)(ibv_context *, uint8_t, _compat_ibv_port_attr *);
+        static auto real_query =
+            reinterpret_cast<QueryPort>(dlsym(RTLD_NEXT, "ibv_query_port"));
+        return real_query ? real_query(context, port, compat) : ENOSYS;
+    }
+    auto *attr = reinterpret_cast<ibv_port_attr *>(compat);
+    *attr = {};
+    attr->gid_tbl_len = 2;
+    return 0;
+}
+int _ibv_query_gid_ex(ibv_context *context, uint32_t port, uint32_t index,
+                      ibv_gid_entry *entry, uint32_t flags, size_t entry_size) {
+    if (context != auto_gid_test_context || !auto_gid_test_context) {
+        using QueryGid = int (*)(ibv_context *, uint32_t, uint32_t,
+                                 ibv_gid_entry *, uint32_t, size_t);
+        static auto real_query =
+            reinterpret_cast<QueryGid>(dlsym(RTLD_NEXT, "_ibv_query_gid_ex"));
+        return real_query
+                   ? real_query(context, port, index, entry, flags, entry_size)
+                   : ENOSYS;
+    }
+    if (index >= 2) return EINVAL;
+    *entry = {};
+    entry->gid.raw[15] = index + 1;
+    entry->gid_type = IBV_GID_TYPE_ROCE_V2;
+    return 0;
+}
+}

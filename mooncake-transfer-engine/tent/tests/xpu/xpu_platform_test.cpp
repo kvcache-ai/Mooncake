@@ -20,11 +20,16 @@
 // fails.
 
 #include <gtest/gtest.h>
+#include <fcntl.h>
 #include <sycl/sycl.hpp>
+#include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #include "tent/common/config.h"
@@ -35,6 +40,19 @@
 namespace mooncake {
 namespace tent {
 namespace {
+
+// On hardware expected to support dma-buf export, set
+// MC_TENT_XPU_REQUIRE_DMABUF_RDMA=1 so missing support fails instead of
+// skipping.
+bool requireDmabufRdma() {
+    const char *value = std::getenv("MC_TENT_XPU_REQUIRE_DMABUF_RDMA");
+    return value && std::string_view(value) == "1";
+}
+#define SKIP_UNLESS_REQUIRED(message)               \
+    do {                                            \
+        if (requireDmabufRdma()) FAIL() << message; \
+        GTEST_SKIP() << message;                    \
+    } while (0)
 
 class XpuPlatformTest : public ::testing::Test {
    protected:
@@ -51,7 +69,7 @@ class XpuPlatformTest : public ::testing::Test {
             if (m.name.rfind("xpu:", 0) == 0) device_count_++;
         }
         if (device_count_ == 0) {
-            GTEST_SKIP() << "no SYCL device available; skipping XPU test";
+            SKIP_UNLESS_REQUIRED("no SYCL device available; skipping XPU test");
         }
     }
 
@@ -73,6 +91,21 @@ TEST_F(XpuPlatformTest, ProbeRegistersOneMemEntryPerDevice) {
     }
     EXPECT_EQ(xpu_entries, device_count_)
         << "probe() should register one node per device";
+}
+
+// The oneAPI runtime exposes each Intel GPU through both Level Zero and
+// OpenCL; probe() must advertise each physical GPU once, not once per adapter.
+TEST_F(XpuPlatformTest, ProbeDoesNotDuplicateGpusAcrossAdapters) {
+    int level_zero_gpus = 0;
+    for (const auto &d :
+         sycl::device::get_devices(sycl::info::device_type::gpu)) {
+        if (d.get_backend() == sycl::backend::ext_oneapi_level_zero)
+            level_zero_gpus++;
+    }
+    if (level_zero_gpus == 0) GTEST_SKIP() << "no Level Zero GPU";
+    EXPECT_EQ(device_count_, level_zero_gpus)
+        << "OpenCL views of the same GPUs must not be advertised as extra "
+           "xpu:N nodes";
 }
 
 // Acceptance: device allocate -> host->device copy -> device->host copy ->
@@ -222,6 +255,288 @@ TEST_F(XpuPlatformTest, MalformedXpuOrdinalIsRejected) {
     Status alloc = platform_->allocate(&dev, 4096, options);
     EXPECT_FALSE(alloc.ok());
     EXPECT_EQ(dev, nullptr);
+}
+
+// Host memory is never exported: the RDMA layer registers it with ibv_reg_mr
+// instead, and relies on InvalidArgument (not a hard failure) to get there.
+TEST_F(XpuPlatformTest, HostPointerIsNotExportable) {
+    int host_value = 0;
+    DmabufExport out;
+    Status s = platform_->exportDmabuf(&host_value, sizeof(host_value), out);
+    EXPECT_TRUE(s.IsInvalidArgument()) << s;
+    EXPECT_EQ(out.fd, -1);
+}
+
+// Device USM exports as a dma-buf covering the whole allocation, so an
+// interior pointer maps to a non-zero offset and the fd is a live descriptor.
+// Level Zero owns that fd (it caches one per allocation and returns the same
+// number on every export), so the test must not close it. Skips (rather than
+// fails) on SYCL backends without Level Zero external-memory export, e.g. the
+// OpenCL CPU fallback device.
+TEST_F(XpuPlatformTest, DeviceAllocationExportsAsDmabuf) {
+    const size_t kSize = 1 << 20;
+    MemoryOptions options;
+    options.location = "xpu:0";
+    void *dev = nullptr;
+    ASSERT_TRUE(platform_->allocate(&dev, kSize, options).ok());
+
+    DmabufExport base;
+    Status s = platform_->exportDmabuf(dev, kSize, base);
+    if (s.IsInternalError()) {
+        EXPECT_TRUE(platform_->free(dev, kSize).ok());
+        SKIP_UNLESS_REQUIRED("SYCL backend has no dma-buf export: " << s);
+    }
+    ASSERT_TRUE(s.ok()) << s;
+    EXPECT_GE(base.fd, 0);
+    EXPECT_EQ(base.offset, 0u);
+    EXPECT_NE(fcntl(base.fd, F_GETFD), -1);
+
+    const size_t kInterior = 4096 * 3;
+    DmabufExport interior;
+    s = platform_->exportDmabuf(static_cast<char *>(dev) + kInterior,
+                                kSize - kInterior, interior);
+    ASSERT_TRUE(s.ok()) << s;
+    EXPECT_GE(interior.fd, 0);
+    EXPECT_EQ(interior.offset, kInterior);
+    // Both exports still refer to live descriptors; nothing was closed.
+    EXPECT_NE(fcntl(base.fd, F_GETFD), -1);
+    EXPECT_NE(fcntl(interior.fd, F_GETFD), -1);
+
+    // A range that runs past the allocation is a device-memory failure, not
+    // InvalidArgument (which would fall through to the host ibv_reg_mr path).
+    // Reusing an output must not retain a previously valid descriptor.
+    DmabufExport overrun = interior;
+    s = platform_->exportDmabuf(static_cast<char *>(dev) + kInterior,
+                                kSize - kInterior + 1, overrun);
+    EXPECT_TRUE(s.IsInternalError()) << s;
+    EXPECT_EQ(overrun.fd, -1);
+    EXPECT_EQ(overrun.offset, 0u);
+
+    EXPECT_TRUE(platform_->free(dev, kSize).ok());
+}
+
+// Small allocations made through the platform must not share a dma-buf. The
+// Intel compute runtime pools small USM device allocations into 2 MB / 16 MB
+// buffers; a pooled allocation exports the pool's fd with no way to recover
+// its offset inside, so the backend requests export at allocation time to
+// keep its own allocations out of the pool. Two 1 MB buffers therefore export
+// two distinct dma-bufs, each sized to its own allocation.
+TEST_F(XpuPlatformTest, SeparateAllocationsExportDistinctDmabufs) {
+    const size_t kSize = 1 << 20;
+    MemoryOptions options;
+    options.location = "xpu:0";
+    void *a = nullptr;
+    void *b = nullptr;
+    ASSERT_TRUE(platform_->allocate(&a, kSize, options).ok());
+    ASSERT_TRUE(platform_->allocate(&b, kSize, options).ok());
+
+    DmabufExport ea, eb;
+    Status s = platform_->exportDmabuf(a, kSize, ea);
+    if (s.IsInternalError()) {
+        EXPECT_TRUE(platform_->free(a, kSize).ok());
+        EXPECT_TRUE(platform_->free(b, kSize).ok());
+        SKIP_UNLESS_REQUIRED("SYCL backend has no dma-buf export: " << s);
+    }
+    ASSERT_TRUE(s.ok()) << s;
+    ASSERT_TRUE(platform_->exportDmabuf(b, kSize, eb).ok());
+    EXPECT_EQ(ea.offset, 0u);
+    EXPECT_EQ(eb.offset, 0u);
+    EXPECT_NE(ea.fd, eb.fd);
+    EXPECT_EQ(lseek(ea.fd, 0, SEEK_END), static_cast<off_t>(kSize));
+    EXPECT_EQ(lseek(eb.fd, 0, SEEK_END), static_cast<off_t>(kSize));
+
+    EXPECT_TRUE(platform_->free(a, kSize).ok());
+    EXPECT_TRUE(platform_->free(b, kSize).ok());
+}
+
+// Device-to-device copy through copy(): seed device A from the host, copy
+// A -> B on the device side, read B back and compare. Both allocations are
+// interior-offset by a chunk so the copy exercises interior-pointer
+// resolution as well. `dst_location` selects the peer device; "xpu:0" is the
+// same-device case.
+void deviceToDeviceRoundTrip(XpuPlatform &platform, const char *dst_location) {
+    const size_t kSize = (8UL << 20) + 4096;  // crosses the host-bounce chunk
+    const size_t kOffset = 4096;
+    MemoryOptions a_opts, b_opts;
+    a_opts.location = "xpu:0";
+    b_opts.location = dst_location;
+    void *a = nullptr, *b = nullptr;
+    ASSERT_TRUE(platform.allocate(&a, kSize + kOffset, a_opts).ok());
+    ASSERT_TRUE(platform.allocate(&b, kSize + kOffset, b_opts).ok());
+    auto *a_in = static_cast<uint8_t *>(a) + kOffset;
+    auto *b_in = static_cast<uint8_t *>(b) + kOffset;
+
+    std::vector<uint8_t> seed(kSize), zero(kSize, 0), readback(kSize, 0xAA);
+    for (size_t i = 0; i < kSize; ++i) seed[i] = static_cast<uint8_t>(i % 251);
+    ASSERT_TRUE(platform.copy(a_in, seed.data(), kSize).ok());
+    ASSERT_TRUE(platform.copy(b_in, zero.data(), kSize).ok());
+
+    Status d2d = platform.copy(b_in, a_in, kSize);
+    ASSERT_TRUE(d2d.ok()) << d2d;
+
+    ASSERT_TRUE(platform.copy(readback.data(), b_in, kSize).ok());
+    EXPECT_EQ(readback, seed);
+
+    EXPECT_TRUE(platform.free(a, kSize + kOffset).ok());
+    EXPECT_TRUE(platform.free(b, kSize + kOffset).ok());
+}
+
+TEST_F(XpuPlatformTest, DeviceToDeviceCopyOnSameDevice) {
+    deviceToDeviceRoundTrip(*platform_, "xpu:0");
+}
+
+// PCIe P2P acceptance: with two XPUs, a VRAM->VRAM copy between them is
+// correct whether the driver grants peer access (direct copy) or not (host
+// bounce inside the backend).
+TEST_F(XpuPlatformTest, DeviceToDeviceCopyAcrossDevices) {
+    if (device_count_ < 2) GTEST_SKIP() << "needs two XPU devices";
+    deviceToDeviceRoundTrip(*platform_, "xpu:1");
+}
+
+// A copy running past the end of the allocation is rejected, including one so
+// long that the interior address plus the length wraps around.
+TEST_F(XpuPlatformTest, CopyRejectsRangePastAllocationEnd) {
+    const size_t kSize = 4096;
+    const size_t kOffset = 1024;
+    MemoryOptions opts;
+    opts.location = "xpu:0";
+    void *dev = nullptr;
+    ASSERT_TRUE(platform_->allocate(&dev, kSize, opts).ok());
+    auto *interior = static_cast<uint8_t *>(dev) + kOffset;
+    std::vector<uint8_t> host(kSize);
+    for (size_t len : {kSize - kOffset + 1, SIZE_MAX - kOffset, SIZE_MAX}) {
+        EXPECT_FALSE(platform_->copy(interior, host.data(), len).ok()) << len;
+        EXPECT_FALSE(platform_->copy(host.data(), interior, len).ok()) << len;
+        EXPECT_FALSE(platform_->copy(interior, dev, len).ok()) << len;
+    }
+    EXPECT_TRUE(platform_->free(dev, kSize).ok());
+}
+
+// Cross-process sharing primitives, exercised within one process: exportIpc
+// describes the allocation (Level Zero IPC handle, base, size), importIpc
+// maps that handle as device memory the given local device can address, and
+// copies through the mapping land in the original allocation. `import_device`
+// selects where the mapping is opened; "1" makes device 1 reach device 0's
+// VRAM over PCIe P2P.
+void ipcRoundTrip(XpuPlatform &platform, int import_device) {
+    const size_t kSize = (2UL << 20) + 4096;
+    const size_t kOffset = 4096;
+    MemoryOptions opts;
+    opts.location = "xpu:0";
+    void *dev = nullptr;
+    ASSERT_TRUE(platform.allocate(&dev, kSize, opts).ok());
+
+    XpuPlatform::IpcExport exported;
+    Status s = platform.exportIpc(static_cast<char *>(dev) + kOffset,
+                                  kSize - kOffset, exported);
+    if (s.IsInternalError()) {
+        EXPECT_TRUE(platform.free(dev, kSize).ok());
+        GTEST_SKIP() << "SYCL backend has no Level Zero IPC export: " << s;
+    }
+    ASSERT_TRUE(s.ok()) << s;
+    const XpuPlatform::IpcHandle empty{};
+    EXPECT_NE(exported.handle, empty);
+    EXPECT_EQ(exported.base, reinterpret_cast<uint64_t>(dev));
+    EXPECT_EQ(exported.size, kSize);
+    EXPECT_EQ(platform.deviceByUuid(exported.owner), 0);
+    // A range running past the allocation is refused, including lengths
+    // whose end would wrap around the address space.
+    XpuPlatform::IpcExport overflow;
+    EXPECT_TRUE(
+        platform.exportIpc(dev, kSize + 1, overflow).IsInvalidArgument());
+    for (size_t len : {SIZE_MAX - kOffset + 2, SIZE_MAX}) {
+        EXPECT_TRUE(
+            platform
+                .exportIpc(static_cast<char *>(dev) + kOffset, len, overflow)
+                .IsInvalidArgument())
+            << len;
+    }
+
+    // A mapping smaller than the claimed size is refused.
+    void *mapped = nullptr;
+    EXPECT_FALSE(platform
+                     .importIpc(exported.handle, getpid(), exported.size * 4,
+                                import_device, &mapped)
+                     .ok());
+    EXPECT_EQ(mapped, nullptr);
+
+    s = platform.importIpc(exported.handle, getpid(), exported.size,
+                           import_device, &mapped);
+    if (!s.ok()) {
+        EXPECT_TRUE(platform.free(dev, kSize).ok());
+        GTEST_SKIP() << "Level Zero IPC import unavailable: " << s;
+    }
+    ASSERT_NE(mapped, nullptr);
+    EXPECT_EQ(platform.getMemoryType(mapped), MTYPE_XPU);
+    EXPECT_EQ(platform.deviceIndex(mapped), import_device);
+    EXPECT_EQ(platform.getMemoryType(static_cast<char *>(mapped) + kOffset),
+              MTYPE_XPU);
+
+    // Host -> mapping (interior offset), read back through the original.
+    const size_t kLen = kSize - kOffset;
+    std::vector<uint8_t> seed(kLen), zero(kSize, 0), readback(kLen, 0xAA);
+    for (size_t i = 0; i < kLen; ++i) seed[i] = static_cast<uint8_t>(i % 241);
+    ASSERT_TRUE(platform.copy(dev, zero.data(), kSize).ok());
+    Status w =
+        platform.copy(static_cast<char *>(mapped) + kOffset, seed.data(), kLen);
+    ASSERT_TRUE(w.ok()) << w;
+    ASSERT_TRUE(
+        platform.copy(readback.data(), static_cast<char *>(dev) + kOffset, kLen)
+            .ok());
+    EXPECT_EQ(readback, seed);
+
+    // Original -> host through the mapping (device -> host read side).
+    std::fill(readback.begin(), readback.end(), 0);
+    Status r = platform.copy(readback.data(),
+                             static_cast<char *>(mapped) + kOffset, kLen);
+    ASSERT_TRUE(r.ok()) << r;
+    EXPECT_EQ(readback, seed);
+
+    // Device -> mapping: a VRAM<->VRAM copy whose destination is imported.
+    void *other = nullptr;
+    ASSERT_TRUE(platform.allocate(&other, kLen, opts).ok());
+    for (auto &b : seed) b = static_cast<uint8_t>(b ^ 0x5A);
+    ASSERT_TRUE(platform.copy(other, seed.data(), kLen).ok());
+    Status d2d =
+        platform.copy(static_cast<char *>(mapped) + kOffset, other, kLen);
+    ASSERT_TRUE(d2d.ok()) << d2d;
+    ASSERT_TRUE(
+        platform.copy(readback.data(), static_cast<char *>(dev) + kOffset, kLen)
+            .ok());
+    EXPECT_EQ(readback, seed);
+
+    EXPECT_TRUE(platform.closeImport(mapped).ok());
+    EXPECT_EQ(platform.getMemoryType(mapped), MTYPE_CPU);
+    EXPECT_TRUE(platform.closeImport(mapped).IsInternalError());
+    EXPECT_TRUE(platform.free(other, kLen).ok());
+    EXPECT_TRUE(platform.free(dev, kSize).ok());
+}
+
+TEST_F(XpuPlatformTest, IpcImportOnSameDevice) { ipcRoundTrip(*platform_, 0); }
+
+TEST_F(XpuPlatformTest, IpcImportOnPeerDevice) {
+    if (device_count_ < 2) GTEST_SKIP() << "needs two XPU devices";
+    ipcRoundTrip(*platform_, 1);
+}
+
+TEST_F(XpuPlatformTest, HostPointerIsNotIpcExportable) {
+    int host_value = 0;
+    XpuPlatform::IpcExport out;
+    EXPECT_TRUE(platform_->exportIpc(&host_value, sizeof(host_value), out)
+                    .IsInvalidArgument());
+    EXPECT_EQ(out.handle, XpuPlatform::IpcHandle{});
+    EXPECT_EQ(out.size, 0u);
+}
+
+TEST_F(XpuPlatformTest, ImportRejectsBadArguments) {
+    void *mapped = nullptr;
+    const XpuPlatform::IpcHandle handle{};
+    EXPECT_FALSE(platform_->importIpc(handle, 0, 4096, 0, &mapped).ok());
+    EXPECT_FALSE(platform_->importIpc(handle, getpid(), 0, 0, &mapped).ok());
+    EXPECT_FALSE(
+        platform_->importIpc(handle, getpid(), 4096, device_count_, &mapped)
+            .ok());
+    EXPECT_EQ(mapped, nullptr);
 }
 
 }  // namespace
