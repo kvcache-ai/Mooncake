@@ -15,6 +15,9 @@
 #include "tent/transport/xpu/xpu_transport.h"
 
 #include <glog/logging.h>
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -207,6 +210,7 @@ Status XpuTransport::install(std::string &local_segment_name,
     }
     pid_namespace_ = pidNamespace();
     ipc_generation_ = bootTimeNs();
+    stop_watcher_ = false;
     installed_ = true;
     // Executes same-host copies only: the device<->host staging hop, the
     // intra-node device<->device copy (same XPU, or PCIe P2P between two XPUs
@@ -223,10 +227,23 @@ Status XpuTransport::install(std::string &local_segment_name,
 Status XpuTransport::uninstall() {
     if (installed_) {
         std::unordered_map<SegmentID, SegmentImports> imports;
+        std::thread watcher;
         {
             std::lock_guard<std::mutex> lock(imports_lock_);
             imports.swap(imports_);
+            stop_watcher_ = true;
+            watcher.swap(watcher_);
         }
+        if (watcher.joinable()) {
+            const uint64_t one = 1;
+            if (write(watcher_wakeup_fd_, &one, sizeof(one)) < 0)
+                PLOG(WARNING) << "XpuTransport: cannot wake exit watcher";
+            watcher.join();
+        }
+        for (auto &[pid, pidfd] : exporters_) close(pidfd);
+        exporters_.clear();
+        if (watcher_wakeup_fd_ >= 0) close(watcher_wakeup_fd_);
+        watcher_wakeup_fd_ = -1;
         imports.clear();  // closes the mappings outside imports_lock_
         metadata_.reset();
         platform_ = nullptr;
@@ -579,10 +596,104 @@ bool XpuTransport::prepareRemoteBuffer(SegmentID target_id,
             LOG(WARNING) << "XpuTransport: closing imported buffer failed: "
                          << status.ToString();
     });
-    entries.push_back(ImportEntry{attr_text, attr.base, attr.size,
+    entries.push_back(ImportEntry{attr_text, attr.pid, attr.base, attr.size,
                                   attr.generation, owner, device_index,
                                   std::move(mapping)});
+    if (!watchExporterLocked(attr.pid)) {
+        // The exporter exited meanwhile: nothing can use the mapping, and
+        // keeping it would pin the memory it held.
+        dropped.push_back(std::move(entries.back()));
+        entries.pop_back();
+        return false;
+    }
     return true;
+}
+
+bool XpuTransport::watchExporterLocked(pid_t pid) {
+    // A buffer of this very process is mapped through a dup'ed descriptor
+    // and goes away with it.
+    if (pid == getpid() || exporters_.count(pid)) return true;
+#ifdef SYS_pidfd_open
+    if (watcher_wakeup_fd_ < 0) {
+        watcher_wakeup_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (watcher_wakeup_fd_ < 0) {
+            PLOG(WARNING) << "XpuTransport: cannot watch peer processes; "
+                             "mappings of exited peers stay open until their "
+                             "segment is closed";
+            return true;
+        }
+    }
+    const int pidfd = static_cast<int>(syscall(SYS_pidfd_open, pid, 0));
+    if (pidfd < 0) {
+        if (errno == ESRCH) return false;
+        PLOG_EVERY_N(WARNING, 1000)
+            << "XpuTransport: cannot watch process " << pid
+            << "; its mappings stay open until its segment is closed";
+        return true;
+    }
+    exporters_.emplace(pid, pidfd);  // pidfd_open sets close-on-exec
+    if (!watcher_.joinable())
+        watcher_ = std::thread(&XpuTransport::watchExporters, this);
+    const uint64_t one = 1;
+    if (write(watcher_wakeup_fd_, &one, sizeof(one)) < 0)
+        PLOG(WARNING) << "XpuTransport: cannot wake exit watcher";
+#endif
+    return true;
+}
+
+void XpuTransport::watchExporters() {
+    std::vector<pollfd> fds;
+    std::vector<pid_t> pids;
+    for (;;) {
+        fds.assign(1, pollfd{watcher_wakeup_fd_, POLLIN, 0});
+        pids.clear();
+        {
+            std::lock_guard<std::mutex> lock(imports_lock_);
+            if (stop_watcher_) return;
+            for (auto &[pid, pidfd] : exporters_) {
+                fds.push_back(pollfd{pidfd, POLLIN, 0});
+                pids.push_back(pid);
+            }
+        }
+        if (poll(fds.data(), fds.size(), -1) < 0) {
+            if (errno == EINTR) continue;
+            PLOG(ERROR) << "XpuTransport: exit watcher stopped; mappings of "
+                           "exited peers stay open until their segment is "
+                           "closed";
+            return;
+        }
+        if (fds[0].revents) {
+            uint64_t count;
+            if (read(watcher_wakeup_fd_, &count, sizeof(count)) < 0 &&
+                errno != EAGAIN)
+                PLOG(WARNING) << "XpuTransport: exit watcher wake-up";
+        }
+        // Closed after imports_lock_ is released.
+        std::vector<ImportEntry> dropped;
+        std::lock_guard<std::mutex> lock(imports_lock_);
+        for (size_t i = 1; i < fds.size(); ++i) {
+            // A pidfd polls readable once its process has exited.
+            if (!fds[i].revents) continue;
+            const pid_t pid = pids[i - 1];
+            close(fds[i].fd);
+            exporters_.erase(pid);
+            const size_t before = dropped.size();
+            for (auto &[target_id, imports] : imports_) {
+                auto &entries = imports.entries;
+                for (auto e = entries.begin(); e != entries.end();) {
+                    if (e->pid != pid) {
+                        ++e;
+                        continue;
+                    }
+                    dropped.push_back(std::move(*e));
+                    e = entries.erase(e);
+                }
+            }
+            LOG(INFO) << "XpuTransport: peer process " << pid
+                      << " exited; closing its " << dropped.size() - before
+                      << " mapped buffer(s)";
+        }
+    }
 }
 
 void XpuTransport::closeRemoteSegment(SegmentID target_id) {
