@@ -44,6 +44,8 @@ def test_wheel_imports_outside_the_repository(
     with zipfile.ZipFile(wheel) as archive:
         wheel_files = set(archive.namelist())
     assert "mooncake/store/__init__.py" in wheel_files
+    assert "mooncake/_structured_ranges.py" in wheel_files
+    assert {"mooncake/py.typed", "mooncake/engine.pyi"} <= wheel_files
     assert not any(name.endswith("mooncake_store_rs.pth") for name in wheel_files)
     assert not any(name.startswith("mooncake_store_rs/") for name in wheel_files)
     assert not any("_shim.py" in name or "meta_path" in name for name in wheel_files)
@@ -197,8 +199,11 @@ assert {{
 assert util.find_spec("numpy") is None
 assert util.find_spec("PIL") is None
 assert util.find_spec("mooncake.structured_object_store") is not None
+assert util.find_spec("mooncake._structured_ranges") is not None
 assert "mooncake.structured_object_store" not in sys.modules
+assert "mooncake._structured_ranges" not in sys.modules
 assert "mooncake/structured_object_store.py" in installed_files
+assert "mooncake/_structured_ranges.py" in installed_files
 assert any(
     path.startswith("mooncake/_fast_copy.") and path.endswith(".so")
     for path in installed_files

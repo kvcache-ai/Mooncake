@@ -9,8 +9,8 @@
 // keeps what it is charged in its quota ledger. This class decides how large
 // every account is.
 //
-// Lock order: the policy lock, then (outside it) the master's snapshot lock and
-// a metadata shard lock, then the recompute lock, then the table's shard locks.
+// Lock order: the policy lock, then (outside it) the master's state lock and a
+// key lock, then the recompute lock, then the table's shard locks.
 // The capacity callback runs under the recompute lock and must take nothing
 // above it.
 
@@ -71,8 +71,9 @@ class TenantQuotaManager {
 
     tl::expected<TenantQuotaSnapshot, ErrorCode> UpsertPolicy(
         const TenantId& tenant_id, uint64_t requested_quota_bytes);
-    // TENANT_NOT_EMPTY while the tenant still charges anything or, by
-    // `tenant_has_objects`, still holds an object.
+    // TENANT_NOT_EMPTY while the tenant still charges anything, has a write
+    // in flight (TenantQuotaAccount::BeginWrite) or, by `tenant_has_objects`,
+    // still holds an object.
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode> DeletePolicy(
         const TenantId& tenant_id,
         const std::function<bool(const TenantId&)>& tenant_has_objects);

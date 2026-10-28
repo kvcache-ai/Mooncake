@@ -25,6 +25,14 @@ from typing import (
 import numpy as np
 
 from mooncake._partial_read import MatrixReadPlan, plan_matrix_read
+from mooncake._structured_ranges import (
+    PreparedRangeLayoutChanged as PreparedRangeLayoutChanged,
+    PreparedStructuredMemberRanges,
+    StructuredMemberRange,
+    bind_prepared as _bind_prepared_ranges,
+    execute_ranges as _execute_member_ranges,
+    prepare_ranges as _prepare_member_ranges,
+)
 from mooncake.store import ReplicateConfig
 
 import msgpack as _msgpack
@@ -203,6 +211,7 @@ class _DirectCopyPayload:
         )
 
 
+@dataclass
 class _RawDestinationBuffer:
     ptr: int
     size: int
@@ -737,6 +746,37 @@ class MooncakeBundleTransfer:
     ) -> StructuredObjectResult:
         """Materialize a structured object read spec into caller-provided destinations when possible."""
         return self._structured_store.materialize_into(spec, destinations)
+
+    def materialize_ranges_into(
+        self,
+        spec: StructuredObjectReadSpec,
+        ranges: Sequence[StructuredMemberRange],
+        destinations: Mapping[str, _RawDestinationBuffer],
+    ) -> StructuredObjectResult:
+        """Read member byte ranges into caller-owned pre-registered buffers."""
+        return self._structured_store.materialize_ranges_into(
+            spec, ranges, destinations
+        )
+
+    def prepare_member_ranges(
+        self,
+        spec: StructuredObjectReadSpec,
+        ranges: Sequence[StructuredMemberRange],
+        destination: _RawDestinationBuffer,
+    ) -> PreparedStructuredMemberRanges:
+        """Compile relative chunk geometry without reading member payloads."""
+        return self._structured_store.prepare_member_ranges(spec, ranges, destination)
+
+    def materialize_prepared_ranges_into(
+        self,
+        spec: StructuredObjectReadSpec,
+        prepared: PreparedStructuredMemberRanges,
+        destination: _RawDestinationBuffer,
+    ) -> StructuredObjectResult:
+        """Rebind current keys and destination to a reusable relative plan."""
+        return self._structured_store.materialize_prepared_ranges_into(
+            spec, prepared, destination
+        )
 
     @staticmethod
     def release_result(result: Any) -> None:
@@ -3207,13 +3247,31 @@ def _decode_ragged_tensor_dict_values(
     return result
 
 
+def _typed_ragged_row_dtypes(
+    rows: list[Any], arrays: list[np.ndarray]
+) -> list[np.dtype[Any]]:
+    """Return the row dtypes that should take part in typed_ragged promotion.
+
+    NumPy gives an empty Python list or tuple a float64 dtype even though it
+    carries no element type, so such rows would promote integer rows to float64.
+    They are ignored unless every row is empty.
+    """
+    dtypes = [
+        array.dtype
+        for row, array in zip(rows, arrays)
+        if array.size or not isinstance(row, (list, tuple))
+    ]
+    return dtypes or [array.dtype for array in arrays]
+
+
 def _encode_typed_ragged_values(
     values: list[Any], dtype_hint: np.dtype[Any] | None = None
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if dtype_hint is None:
-        source_arrays = [np.asarray(value) for value in values if value is not None]
+        source_rows = [value for value in values if value is not None]
+        source_arrays = [np.asarray(value) for value in source_rows]
         dtype = (
-            np.result_type(*source_arrays)
+            np.result_type(*_typed_ragged_row_dtypes(source_rows, source_arrays))
             if source_arrays
             else np.dtype(_TYPED_RAGGED_DEFAULT_DTYPE)
         )
@@ -3553,6 +3611,86 @@ class _StructuredObjectLayer:
         self, ref: RemoteBundleRef | Mapping[str, Any]
     ) -> StructuredObjectReadSpec:
         return StructuredObjectReadSpec(ref=ref)
+
+    def _range_read_inputs(
+        self,
+        spec: StructuredObjectReadSpec,
+        destinations: Mapping[str, _RawDestinationBuffer],
+    ) -> tuple[dict[str, Any], Mapping[str, Any], list[str]]:
+        if spec.member_slices:
+            raise ValueError(
+                "structured member slices cannot be combined with byte ranges"
+            )
+        if not isinstance(destinations, Mapping) or any(
+            not isinstance(destination, _RawDestinationBuffer)
+            for destination in destinations.values()
+        ):
+            raise TypeError(
+                "structured ranged destinations must map members to raw_destination"
+            )
+        return self._resolve_structured_read(spec)
+
+    def materialize_ranges_into(
+        self,
+        spec: StructuredObjectReadSpec,
+        ranges: Sequence[StructuredMemberRange],
+        destinations: Mapping[str, _RawDestinationBuffer],
+    ) -> StructuredObjectResult:
+        metadata, buffers, selected = self._range_read_inputs(spec, destinations)
+        plans = _prepare_member_ranges(
+            metadata, buffers, selected, tuple(ranges), destinations
+        )
+        requests = [
+            (
+                destinations[name],
+                _bind_prepared_ranges(
+                    metadata, buffers, selected, plan, destinations[name]
+                ),
+                plan,
+            )
+            for name, plan in plans.items()
+        ]
+        _execute_member_ranges(self._bundle_store._transport._get_into_ranges, requests)
+        return StructuredObjectResult(
+            metadata=dict(metadata), objects=dict(destinations)
+        )
+
+    def prepare_member_ranges(
+        self,
+        spec: StructuredObjectReadSpec,
+        ranges: Sequence[StructuredMemberRange],
+        destination: _RawDestinationBuffer,
+    ) -> PreparedStructuredMemberRanges:
+        ranges = tuple(ranges)
+        if not ranges or not isinstance(ranges[0], StructuredMemberRange):
+            raise ValueError(
+                "prepared member read requires StructuredMemberRange values"
+            )
+        name = ranges[0].member_name
+        metadata, buffers, selected = self._range_read_inputs(spec, {name: destination})
+        return _prepare_member_ranges(
+            metadata, buffers, selected, ranges, {name: destination}
+        )[name]
+
+    def materialize_prepared_ranges_into(
+        self,
+        spec: StructuredObjectReadSpec,
+        prepared: PreparedStructuredMemberRanges,
+        destination: _RawDestinationBuffer,
+    ) -> StructuredObjectResult:
+        if not isinstance(prepared, PreparedStructuredMemberRanges):
+            raise TypeError("prepared must be PreparedStructuredMemberRanges")
+        metadata, buffers, selected = self._range_read_inputs(
+            spec, {prepared.member_name: destination}
+        )
+        keys = _bind_prepared_ranges(metadata, buffers, selected, prepared, destination)
+        _execute_member_ranges(
+            self._bundle_store._transport._get_into_ranges,
+            [(destination, keys, prepared)],
+        )
+        return StructuredObjectResult(
+            metadata=dict(metadata), objects={prepared.member_name: destination}
+        )
 
     def materialize(self, spec: StructuredObjectReadSpec) -> StructuredObjectResult:
         return self.materialize_into(spec, destinations=None)
@@ -6737,7 +6875,11 @@ def _call_write_with_optional_config(fn: Any, *args: Any, config: Any = None) ->
 
 _WRITE_CONFIG_COPY_FIELDS = (
     "data_type",
+    "dfs_replica_num",
     "group_ids",
+    "session_ids",
+    "preferred_hca_names",
+    "per_key_preferred_hca_names",
     "nof_replica_num",
     "prefer_alloc_in_same_node",
     "preferred_nof_segments",
@@ -6745,14 +6887,38 @@ _WRITE_CONFIG_COPY_FIELDS = (
     "preferred_segments",
     "replica_num",
     "with_hard_pin",
-    "with_soft_pin",
+    "soft_pin_action",
+    "soft_pin_ttl_ms",
 )
 
 
 def _config_for_grouped_keys(config: Any, key_count: int) -> Any:
-    """Return a write config whose group_ids match the physical key count."""
+    """Expand logical per-key write metadata across physical Mooncake keys."""
     if config is None or key_count <= 0:
         return config
+    session_ids = getattr(config, "session_ids", None)
+    if session_ids is not None:
+        session_ids = (
+            [session_ids] if isinstance(session_ids, str) else list(session_ids)
+        )
+        if len(session_ids) != 1:
+            raise ValueError(
+                "config.session_ids must contain exactly one logical session id"
+            )
+        if key_count != 1 or isinstance(config.session_ids, str):
+            config = _copy_write_config(config)
+            config.session_ids = session_ids * key_count
+    hca_hints = getattr(config, "per_key_preferred_hca_names", None)
+    if hca_hints is not None:
+        if len(hca_hints) != 1:
+            raise ValueError(
+                "config.per_key_preferred_hca_names must contain exactly one logical hint"
+            )
+        if key_count != 1:
+            config = _copy_write_config(config)
+            config.per_key_preferred_hca_names = [
+                list(hca_hints[0]) for _ in range(key_count)
+            ]
     group_ids = getattr(config, "group_ids", None)
     if group_ids is None:
         return config
@@ -7240,8 +7406,8 @@ def _choose_leaf_codec(values: list[Any]) -> _CodecDecision:
         )
     if all(isinstance(value, (list, tuple)) for value in nn):
         try:
-            dtypes = [np.asarray(value).dtype for value in nn]
-            dtype = np.result_type(*dtypes)
+            arrays = [np.asarray(value) for value in nn]
+            dtype = np.result_type(*_typed_ragged_row_dtypes(nn, arrays))
         except (TypeError, ValueError, OverflowError):
             dtype = None
         if dtype is not None and np.issubdtype(dtype, np.number):
