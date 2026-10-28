@@ -197,3 +197,6 @@ ASan/UBSan. It checks disjoint in-flight regions, completion byte accounting,
 drain on stop, rejected submissions, deferred cleanup, invalid partitions and
 the DRAM-only prefetch guard. It does not compile the production headers or
 validate RDMA, QP distribution, thread placement, or the rebased throughput.
+
+Latest large-set follow-up: **281.074 GB/s**, versus fresh baseline 278.003
+(+1.10%); still below 400 GB/s. See the [ordered patches, commands and comparison](rdma_large_working_set.md#follow-up-explicit-affinity-and-completion-polling).

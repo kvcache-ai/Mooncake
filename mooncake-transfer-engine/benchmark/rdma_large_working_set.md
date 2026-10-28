@@ -1,7 +1,9 @@
 # Large-working-set RDMA Write: 8 threads × 1 GiB
 
 **The experiment has NOT saturated 400 GB/s.** The best repeated mean was
-**274.464 GB/s**, versus **258.671 GB/s** at the start of this round (+6.11%).
+**281.074 GB/s**, versus a fresh same-round baseline of **278.003 GB/s**
+(+1.10%). The preceding round improved 258.671 to 274.464 GB/s (+6.11%);
+keep the rounds separate. The 350 GB/s intermediate target is also unmet.
 Do not apply the earlier small-working-set ~385 GB/s result to this workload.
 
 ## Fixed workload and ordered changes
@@ -137,6 +139,74 @@ Sum the eight `BW_average` values and divide by 8 (Gb/s → GB/s). Repeat three
 times with fresh output directories. The 10-second smoke result was 299.539 GB/s,
 but the repeated 20-second mean was 267.941 GB/s; do not select the smoke peak as
 a stable result. This control does not establish the hardware's absolute ceiling.
+
+## Follow-up: explicit affinity and completion polling
+
+Same workload and CPU budget, three interleaved baseline/candidate runs of
+20 seconds each. Background services changed between rounds, so this round
+re-measured the previous notify-stage binary as its baseline. The **1.10%**
+gain is 281.074 / 278.003 - 1, not a gain against the older 274.464 result.
+
+| Order | Code / setting | Reproduction command prefix | Result (GB/s) |
+| --- | --- | --- | ---: |
+| 0 | Previous notify-stage binary | `CONFIG=baseline run_followup "$RUNTIME_NOTIFY"` | 278.003 mean; 277.702–278.360 |
+| 1 | `pin.patch`: explicit submission/worker CPU lists; existing same-name NIC peer affinity | `CONFIG=pin_peer run_followup "$RUNTIME_FINAL"` | Screening: pin only 278.081 vs off 278.281; peer only 279.122; pin+peer 281.125 |
+| 2 | `fast.patch`: pending-counter precheck and skip unused notification-map lock | `CONFIG=fast run_followup "$RUNTIME_FINAL"` | Combined repeated mean **281.074**; 280.938–281.184 |
+| 3 (rejected) | `source-prefetch.patch`: source Write prefetch; keep the complete active range | `CONFIG=source PREFETCH_STRIDE=64 PREFETCH_AHEAD=1 run_followup "$RUNTIME_FINAL"` | 51.060; stride 512 gives 173.640; final candidate keeps it OFF |
+| Reference | Existing cyclic perftest recipe below | `run_cyclic_perftest.sh`, 256 KiB, QP8, depth64, 128 MiB/QP | 276.219 mean; 276.088–276.466 |
+
+Steps 1 and 3 are single screening runs, not independently established gains.
+In the fixed pin+peer screen, fast paths off gave 280.511; counter-only 280.499,
+notification-lock-only 281.557, both 281.414 (single 20-second runs).
+Increasing QPs/windows gave 270.266–275.389. Source-prefetch screens were
+10 seconds; 64-byte stride with ahead 0/1/16 gave 52.220/51.060/86.043;
+256/512-byte stride with ahead 1 gave 74.034/173.640. These are negative results.
+
+The [patch series and exact input hashes](experiments/large-set-20261029/README.md)
+preserve the measured code against its **archived notify-stage source**.
+These extra patches are not applied to the newer production source in this PR.
+[Individual results and binary hashes](experiments/large-set-20261029/results.json)
+identify the actual experiments. The original full source and binaries are in
+the experiment handoff archives; a public reader can review the patch series,
+but should not mistake it for a standalone build against this PR head.
+
+Set per-host `SUBMIT_CPUS` (eight CPUs in thread order) and `WORKER_CPUS`
+(eight CPUs in mlx5_0..7 order), disjoint, NUMA-local and inside the authorized
+16-CPU mask. Export these plus `NIC_ORDER`. Use the final runtime built by
+applying all three patches in order, with source prefetch disabled for `fast`.
+This wrapper uses `env -i`, so only its explicitly listed settings propagate.
+
+```bash
+# From benchmark/experiments/large-set-20261029 on each reserved host:
+# B: restart this task's target whenever changing baseline/candidate.
+CONFIG=fast bash run_te.sh target "$RUNTIME_FINAL" "$B_CPUS" "$B_IP"
+# A: copy B's full printed TARGET_SEG; verify before measuring.
+CONFIG=fast bash run_te.sh initiator "$RUNTIME_FINAL" "$A_CPUS" "$A_IP" "$TARGET_SEG" 16 4096 1 write_seed
+CONFIG=fast bash run_te.sh initiator "$RUNTIME_FINAL" "$A_CPUS" "$A_IP" "$TARGET_SEG" 16 4096 1 read_verify
+run_followup() {
+  bash run_te.sh initiator "$1" "$A_CPUS" "$A_IP" "$TARGET_SEG" 16 4096 20 write
+}
+CONFIG=fast RESULT_JSONL=candidate-r1.jsonl run_followup "$RUNTIME_FINAL"
+# For the baseline, restart B with CONFIG=baseline and RUNTIME_NOTIFY, then:
+CONFIG=baseline RESULT_JSONL=baseline-r1.jsonl run_followup "$RUNTIME_NOTIFY"
+# Interleave baseline -> candidate for three rounds with fresh filenames.
+```
+
+Full 8 GiB seed/write/read verification, completed-byte accounting, all-NIC
+traffic, full thread-range coverage and CPU-affinity checks passed. Standard
+RDMA error counters did not increase. Task processes were independently checked
+absent after shutdown; protected service identities were unchanged and resource
+reservations were released. Extracted actual-method CPU ASan/UBSan tests passed,
+including the Read-warmup regression: the first prefetch prototype rejected
+Read verification, was fixed, and that failed attempt is excluded from results.
+
+Separate 99 Hz `cpu-clock:u` profiles kept pinning/peer mapping constant and
+toggled only the two fast paths. `TransferEngineImpl::getBatchTransferStatus`
+self samples were 6.56% before; `runRollingTransfers` changed 7.68% to 31.98%,
+consistent with moving waiting into the local counter loop, not eliminating all
+polling work. Software sample shares are not LLC/DDIO/IMC measurements and the
+profile runs are excluded from throughput means. This experiment still has
+**no verified DDIO change and no 350/400 GB/s result**.
 
 ## What remains unresolved
 
