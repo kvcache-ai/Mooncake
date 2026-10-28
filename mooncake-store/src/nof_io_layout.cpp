@@ -6,7 +6,7 @@ namespace mooncake {
 
 bool BuildNoFIoLayout(uint32_t block_size, uint64_t disk_offset,
                       uintptr_t buffer_address, size_t size,
-                      NoFIoLayout& layout) {
+                      NoFIoLayout& layout, uint64_t buffer_alignment) {
     if (block_size == 0 || size == 0) {
         return false;
     }
@@ -22,8 +22,8 @@ bool BuildNoFIoLayout(uint32_t block_size, uint64_t disk_offset,
     const uint64_t head_bytes = size - tail_bytes;
     const uint64_t padded_size =
         tail_bytes == 0 ? size : head_bytes + block_size;
-    // SpdkNofTask counts its remaining blocks in an int, so a larger
-    // request would go negative there and never be submitted or completed.
+    // Keep the block count well inside the uint32_t a segment carries, and
+    // inside the int range the worker's block accounting uses.
     const uint64_t padded_blocks = padded_size / block_size;
     if (padded_size < size ||
         padded_blocks >
@@ -37,7 +37,10 @@ bool BuildNoFIoLayout(uint32_t block_size, uint64_t disk_offset,
         return false;
     }
     std::vector<NoFIoSegment> segments;
-    if (buffer_address % block_size != 0) {
+    if (buffer_alignment == 0) {
+        buffer_alignment = block_size;
+    }
+    if (buffer_address % buffer_alignment != 0) {
         // The direct path needs a block aligned address, so the whole payload
         // goes through a bounce buffer.
         segments.push_back(NoFIoSegment{

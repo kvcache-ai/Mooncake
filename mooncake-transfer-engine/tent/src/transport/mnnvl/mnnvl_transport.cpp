@@ -25,6 +25,18 @@
 #include <memory>
 #include <unordered_map>
 
+#include <sys/syscall.h>
+#include <unistd.h>
+// Older glibc (e.g. RHEL8 in manylinux2_28) does not define the pidfd
+// syscall numbers in its kernel headers. The numbers below come from the
+// arch-independent asm-generic/unistd.h table.
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434 /* since Linux 5.3 */
+#endif
+#ifndef SYS_pidfd_getfd
+#define SYS_pidfd_getfd 438 /* since Linux 5.6 */
+#endif
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -815,8 +827,19 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             if (local_fd < 0)
                 return Status::InternalError(
                     "Unable to import fd from remote process");
-            CHECK_CU(cuMemImportFromShareableHandle(&handle, &local_fd,
-                                                    handle_type_));
+            // For POSIX_FILE_DESCRIPTOR the driver takes the fd value itself
+            // (cast to void*), not a pointer to it; the export side is the
+            // one that takes a pointer. Passing &local_fd fails with
+            // CUDA_ERROR_UNKNOWN. The imported handle holds its own
+            // reference, so the fd is closed right away either way.
+            auto import_result = cuMemImportFromShareableHandle(
+                &handle, (void *)(uintptr_t)local_fd, handle_type_);
+            close(local_fd);
+            if (import_result != CUDA_SUCCESS) {
+                return Status::InternalError(
+                    std::string("cuMemImportFromShareableHandle: cuResult ") +
+                    std::to_string(import_result) + LOC_MARK);
+            }
         } else {
             std::vector<unsigned char> output_buffer;
             deserializeBinaryData(buffer->mnnvl_handle, output_buffer);

@@ -49,6 +49,22 @@ struct AscendDirectOptions {
 
 bool ParseEnvEnabled(const char* name);
 
+// TE support for configuring HIXL's comm_resource_config.nic_topo_path in the
+// (already role-resolved) GlobalResourceConfig: fills it from the custom
+// topology path (topology/custom_json_path) when the HIXL option is empty.
+// Rules:
+//   - custom_topo_json empty                            -> returned unchanged
+//   - nic_topo_path already set (flat or nested, string, non-empty)
+//                                                       -> returned unchanged
+//   - otherwise the custom topology path is written under the nested
+//     "comm_resource_config" object when one exists (any stale flat key is
+//     dropped), otherwise as the flat key
+//     "comm_resource_config.nic_topo_path". An empty input yields a minimal
+//     {"comm_resource_config.nic_topo_path":"..."} object.
+// A non-empty but unparsable input is returned unchanged (HIXL rejects it).
+std::string InjectNicTopoPathFromCustomTopoTent(
+    const std::string& resolved_config, const std::string& custom_topo_json);
+
 AscendDirectOptions LoadAscendDirectOptions(
     const std::shared_ptr<Config>& conf);
 

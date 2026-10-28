@@ -90,6 +90,22 @@ TEST(NoFIoLayoutTest, UnalignedBufferAddressIsFullyStaged) {
     EXPECT_EQ(segment.payload_size, 1024u);
 }
 
+TEST(NoFIoLayoutTest, SglAlignmentKeepsDwordAlignedBufferDirect) {
+    // An SGL capable initiator only needs DMA (DWORD) alignment for the
+    // buffer, so a block-unaligned address still takes the direct path.
+    NoFIoLayout layout;
+    ASSERT_TRUE(BuildNoFIoLayout(kBlock512, 0, kAlignedAddress + 4, 1024,
+                                 layout, /*buffer_alignment=*/4));
+    ASSERT_EQ(layout.segments.size(), 1u);
+    EXPECT_TRUE(layout.is_direct());
+
+    // Below the DMA alignment the whole payload is still staged.
+    ASSERT_TRUE(BuildNoFIoLayout(kBlock512, 0, kAlignedAddress + 2, 1024,
+                                 layout, /*buffer_alignment=*/4));
+    ASSERT_EQ(layout.segments.size(), 1u);
+    EXPECT_EQ(layout.segments[0].kind, NoFIoSegmentKind::kStaged);
+}
+
 TEST(NoFIoLayoutTest, UnalignedAddressAndLengthArePaddedTogether) {
     NoFIoLayout layout;
     ASSERT_TRUE(BuildNoFIoLayout(kBlock4096, kBlock4096 * 2,
@@ -151,7 +167,7 @@ TEST(NoFIoLayoutTest, RejectsBlockCountOverflow) {
 }
 
 TEST(NoFIoLayoutTest, RejectsBlockCountAboveWorkerCounter) {
-    // SpdkNofTask tracks the remaining blocks in an int.
+    // The worker tracks blocks in an int.
     NoFIoLayout layout;
     const size_t max_blocks =
         static_cast<size_t>(std::numeric_limits<int>::max());

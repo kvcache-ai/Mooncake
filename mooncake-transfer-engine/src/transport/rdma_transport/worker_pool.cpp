@@ -380,9 +380,9 @@ int WorkerPool::submitPostSend(
                                  buffer_id, device_id, 0, last_buffer_id,
                                  last_device_id)) {
                 slice->markFailed();
+                failed_target_ids[slice->target_id] = getCurrentTimeInNano();
                 context_.engine().meta()->dumpMetadataContent(
-                    peer_segment_desc->name, slice->rdma.dest_addr,
-                    slice->length);
+                    peer_segment_desc, slice->rdma.dest_addr, slice->length);
                 continue;
             }
         }
@@ -537,6 +537,7 @@ bool WorkerPool::tryReactivateContext(uint64_t now_ns) {
     }
     breaker_reactivate_after_ns_ = 0;
     context_failure_count_.store(0, std::memory_order_relaxed);
+    context_disabling_event_.store(-1, std::memory_order_relaxed);
     context_.set_active(true);
     return true;
 }
@@ -554,6 +555,8 @@ void WorkerPool::resetContextBreaker(bool context_active) {
     std::lock_guard<std::mutex> lock(context_state_lock_);
     breaker_reactivate_after_ns_ = 0;
     context_failure_count_.store(0, std::memory_order_relaxed);
+    if (context_active)
+        context_disabling_event_.store(-1, std::memory_order_relaxed);
     context_.set_active(context_active);
 }
 
@@ -744,8 +747,10 @@ void WorkerPool::performPostSend(int thread_id) {
             continue;
         }
         // Set endpoint pointer for each slice before submitting
+        auto auto_gid_token = endpoint->autoGidCompletionToken();
         for (auto &slice : entry.second) {
             slice->rdma.endpoint = endpoint.get();
+            slice->rdma.auto_gid_token = auto_gid_token;
         }
         endpoint->submitPostSend(entry.second, failed_slice_list);
         if (!endpoint->active()) context_.deleteEndpointByPtr(endpoint.get());
@@ -964,8 +969,12 @@ void WorkerPool::processCompletions(int thread_id,
                 }
                 retry_list = &local_failed_slice_list;
             } else {
-                if (hasAvailablePeerRailAlternative(slice,
-                                                    slice->peerNicPath())) {
+                bool auto_gid_recovery = false;
+                if (wc.status == IBV_WC_RETRY_EXC_ERR) {
+                    auto_gid_recovery = recordAutoGidDataPathFailure(slice);
+                }
+                if (!auto_gid_recovery && hasAvailablePeerRailAlternative(
+                                              slice, slice->peerNicPath())) {
                     markRailFailed(slice->peerNicPath(), true);
                     redispatch_counter_++;
                 }
@@ -979,6 +988,9 @@ void WorkerPool::processCompletions(int thread_id,
                 finalize_slice(slice, false);
             }
         } else {
+            if (slice->rdma.auto_gid_token.observe_success) {
+                recordAutoGidDataPathSuccess(slice);
+            }
             finalize_slice(slice, true);
         }
     }
@@ -997,6 +1009,27 @@ void WorkerPool::processCompletions(int thread_id,
     if (!failed_slice_list.empty()) {
         redispatch(failed_slice_list, thread_id, false, defer_local_redispatch);
     }
+}
+
+bool WorkerPool::recordAutoGidDataPathFailure(Transport::Slice *slice) {
+    const auto token = slice->rdma.auto_gid_token;
+    if (!token.valid || !context_.autoGidSelectionEnabled() ||
+        globalConfig().auto_gid_max_retries <= 0) {
+        return false;
+    }
+    auto action = context_.recordAutoGidCompletion(
+        slice->peerNicPath(), {token.endpoint_id, token.selection_epoch},
+        /*success=*/false);
+    return action != AutoGidDataPathAction::kExhausted &&
+           action != AutoGidDataPathAction::kUnavailable;
+}
+
+void WorkerPool::recordAutoGidDataPathSuccess(Transport::Slice *slice) {
+    const auto token = slice->rdma.auto_gid_token;
+    if (!token.valid) return;
+    context_.recordAutoGidCompletion(slice->peerNicPath(),
+                                     {token.endpoint_id, token.selection_epoch},
+                                     /*success=*/true);
 }
 
 void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
@@ -1325,8 +1358,11 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
         recovery_activate_after_ns_.store(0, std::memory_order_relaxed);
         // The async event now owns this context's inactive state. Clear the
         // local-WC breaker deadline so its TTL cannot resurrect a context that
-        // a DEVICE_FATAL/PORT_ERR took down.
+        // a DEVICE_FATAL/PORT_ERR took down. Remember which event it was: the
+        // 1 Hz port poll may resume only PORT_ERR.
         resetContextBreaker(false);
+        context_disabling_event_.store(static_cast<int>(event_type),
+                                       std::memory_order_relaxed);
         refreshPublishedLocalTopology();
 
         /**
@@ -1351,9 +1387,10 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
                                         : "fatal event: ")
                   << event_type;
     } else if (event_type == IBV_EVENT_GID_CHANGE) {
-        auto gid_refresh_result = refreshPublishedLocalGid();
         if (event != nullptr) ibv_ack_async_event(event);
+        auto gid_refresh_result = refreshPublishedLocalGid();
 
+        // refreshCurrentGid already retires invalid per-peer GID bindings.
         if (gid_refresh_result != GidRefreshResult::UNCHANGED) {
             auto endpoint_lifecycle_locks =
                 context_.lockAllEndpointLifecycles();
@@ -1377,12 +1414,16 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
     return true;
 }
 
-void WorkerPool::scheduleContextRecovery(uint64_t delay_ns) {
+void WorkerPool::scheduleContextRecovery(uint64_t delay_ns,
+                                         bool override_breaker) {
     std::lock_guard<std::mutex> lock(context_state_lock_);
     // A redundant PORT_ACTIVE on an in-service context is not recovery
     // evidence: preserve its local-WC streak and do not arm a probe that
     // could later override a new local-WC trip.
     if (context_.active()) return;
+    // The 1 Hz port poll must not steal a breaker-owned pause: the port is
+    // expected to still be ACTIVE while local-WC TTL recovery runs.
+    if (!override_breaker && breaker_reactivate_after_ns_ != 0) return;
 
     // Event recovery owns this inactive period. Cancel only the breaker
     // deadline; a successful GID probe below resets the failure count.
@@ -1427,6 +1468,36 @@ void WorkerPool::maybeActivateRecoveredContext() {
     refreshPublishedLocalTopology();
     LOG(INFO) << "Worker: Context " << context_.deviceName()
               << " is now active after recovery delay";
+}
+
+void WorkerPool::resumePausedContext() {
+    if (context_.active()) return;
+    if (recovery_activate_after_ns_.load(std::memory_order_relaxed) != 0)
+        return;
+    {
+        std::lock_guard<std::mutex> lock(context_state_lock_);
+        if (breaker_reactivate_after_ns_ != 0) return;
+    }
+    // CQ_ERR / DEVICE_FATAL / WQ_FATAL / LID_CHANGE leave the same inactive
+    // state, but the port is often still ACTIVE. Republishing that RNIC does
+    // not rebuild the failed CQ or device, so only a missed PORT_ACTIVE is
+    // eligible for this poll.
+    if (context_disabling_event_.load(std::memory_order_relaxed) !=
+        static_cast<int>(IBV_EVENT_PORT_ERR))
+        return;
+
+    ibv_port_state state;
+    if (context_.queryPortState(&state) != 0) return;
+    // Only a fully active port carries traffic. Intermediate states
+    // (INIT/ARMED/ACTIVE_DEFER) mean the link is still settling, so leave
+    // the context inactive and re-check on the next tick.
+    if (state != IBV_PORT_ACTIVE) return;
+
+    LOG(WARNING) << "Worker: Context " << context_.deviceName()
+                 << " port reports ACTIVE without an IBV_EVENT_PORT_ACTIVE "
+                    "event";
+    scheduleContextRecovery(kContextRecoveryDelayNs,
+                            /*override_breaker=*/false);
 }
 
 bool WorkerPool::hasAvailablePeerRailAlternative(
@@ -1524,6 +1595,9 @@ void WorkerPool::monitorWorker() {
             // Drop expired active-connect pause entries so the map doesn't grow
             // for peers that are never re-attempted after their pause lapses.
             context_.pruneConnectPause();
+            // Safety net for a recovery event that never reached us. See
+            // issue #4694; TENT's equivalent is Workers::resumePausedContexts.
+            resumePausedContext();
             last_reset_ts = current_ts;
         }
 

@@ -20,9 +20,7 @@
 #include "replica.h"
 #include "storage_backend.h"
 #include "client_metric.h"
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
-#endif
+#include "nof/nvmeof_initiator.h"
 
 namespace mooncake {
 
@@ -179,22 +177,31 @@ class MemcpyOperationState : public OperationState {
 };
 
 /**
- * @brief Operation state for local memcpy transfers
+ * @brief Operation state for NoF (NVMe-oF) transfers
  */
-class SpdkNofOperationState : public OperationState {
+class NofOperationState : public OperationState {
    public:
     bool is_completed() override {
         std::lock_guard<std::mutex> lock(mutex_);
         return result_.has_value();
     }
 
-    virtual void set_completed(ErrorCode error_code) {
+    virtual void set_completed(ErrorCode error_code,
+                               std::string error_detail = "") {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             assert(!result_.has_value());
             result_.emplace(error_code);
+            error_detail_ = std::move(error_detail);
         }
         cv_.notify_all();
+    }
+
+    // Data-plane error detail (sc/sct/status string), empty on success.
+    // Surfaced to logs today; available here for future API plumbing.
+    [[nodiscard]] std::string error_detail() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return error_detail_;
     }
 
     void wait_for_completion() override {
@@ -205,6 +212,9 @@ class SpdkNofOperationState : public OperationState {
     TransferStrategy get_strategy() const override {
         return TransferStrategy::SPDK_NVMF;
     }
+
+   private:
+    std::string error_detail_;
 };
 
 class FilereadOperationState : public OperationState {
@@ -314,6 +324,14 @@ class TransferFuture {
      */
     TransferStrategy strategy() const;
 
+    /**
+     * @brief Create another future that observes the same operation
+     *
+     * Used when one submitted batch carries several keys, so each key can
+     * wait on it independently.
+     */
+    TransferFuture share() const { return TransferFuture(state_); }
+
    private:
     std::shared_ptr<OperationState> state_;
 };
@@ -403,36 +421,37 @@ class MemcpyWorkerPool {
     std::atomic<bool> shutdown_;
 };
 
-#ifdef USE_NOF
-// struct SpdkNofSubTask;
-struct SpdkNofQos;
+struct NofQos;
+struct NofMetric;
 
 /**
  * @brief DMA capable bounce buffer owned by a NoF operation
  *
- * SPDK can only DMA from memory it allocated, so unaligned requests borrow
- * one of these instead of the caller's buffer.
+ * The NoF initiator can only DMA from memory the DMA allocator handed out,
+ * so unaligned requests borrow one of these instead of the caller's buffer.
  */
-struct SpdkNofStagingBuffer {
+struct NofStagingBuffer {
     void* ptr = nullptr;
 
-    SpdkNofStagingBuffer() = default;
-    explicit SpdkNofStagingBuffer(void* buffer) : ptr(buffer) {}
-    SpdkNofStagingBuffer(const SpdkNofStagingBuffer&) = delete;
-    SpdkNofStagingBuffer& operator=(const SpdkNofStagingBuffer&) = delete;
-    SpdkNofStagingBuffer(SpdkNofStagingBuffer&& other) noexcept
-        : ptr(other.ptr) {
+    NofStagingBuffer() = default;
+    explicit NofStagingBuffer(void* buffer) : ptr(buffer) {}
+    NofStagingBuffer(const NofStagingBuffer&) = delete;
+    NofStagingBuffer& operator=(const NofStagingBuffer&) = delete;
+    NofStagingBuffer(NofStagingBuffer&& other) noexcept : ptr(other.ptr) {
         other.ptr = nullptr;
     }
-    SpdkNofStagingBuffer& operator=(SpdkNofStagingBuffer&& other) noexcept {
+    NofStagingBuffer& operator=(NofStagingBuffer&& other) noexcept {
         if (this != &other) {
-            SpdkWrapper::GetInstance().Free(ptr);
+            Release();
             ptr = other.ptr;
             other.ptr = nullptr;
         }
         return *this;
     }
-    ~SpdkNofStagingBuffer() { SpdkWrapper::GetInstance().Free(ptr); }
+    ~NofStagingBuffer() { Release(); }
+
+   private:
+    void Release();
 };
 
 /**
@@ -444,7 +463,7 @@ struct SpdkNofStagingBuffer {
  * has completed, at which point read payloads staged in a bounce buffer are
  * copied back into the caller's buffer.
  */
-class SpdkNofStagedOperationState : public SpdkNofOperationState {
+class NofStagedOperationState : public NofOperationState {
    public:
     // A read payload to move from a bounce buffer back to the caller.
     struct CopyBack {
@@ -453,64 +472,87 @@ class SpdkNofStagedOperationState : public SpdkNofOperationState {
         size_t size = 0;
     };
 
-    SpdkNofStagedOperationState(int part_count,
-                                std::vector<SpdkNofStagingBuffer> staging,
-                                std::vector<CopyBack> copy_backs)
+    NofStagedOperationState(int part_count,
+                            std::vector<NofStagingBuffer> staging,
+                            std::vector<CopyBack> copy_backs)
         : staging_(std::move(staging)),
           copy_backs_(std::move(copy_backs)),
           pending_parts_(part_count) {}
 
-    void set_completed(ErrorCode error_code) override {
+    void set_completed(ErrorCode error_code,
+                       std::string error_detail = "") override {
         if (error_code != ErrorCode::OK) {
-            failed_.store(true, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(detail_mutex_);
+            if (!failed_) {
+                failed_ = true;
+                first_error_detail_ = std::move(error_detail);
+            }
         }
         if (pending_parts_.fetch_sub(1, std::memory_order_acq_rel) > 1) {
             return;
         }
 
-        const bool failed = failed_.load(std::memory_order_relaxed);
+        bool failed;
+        std::string detail;
+        {
+            std::lock_guard<std::mutex> lock(detail_mutex_);
+            failed = failed_;
+            detail = std::move(first_error_detail_);
+        }
         if (!failed) {
             for (const auto& copy_back : copy_backs_) {
                 std::memcpy(copy_back.dest, copy_back.source, copy_back.size);
             }
         }
-        SpdkNofOperationState::set_completed(failed ? ErrorCode::TRANSFER_FAIL
-                                                    : ErrorCode::OK);
+        NofOperationState::set_completed(
+            failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK,
+            std::move(detail));
     }
 
    private:
-    std::vector<SpdkNofStagingBuffer> staging_;
+    std::vector<NofStagingBuffer> staging_;
     std::vector<CopyBack> copy_backs_;
     std::atomic<int> pending_parts_;
-    std::atomic<bool> failed_{false};
+    std::mutex detail_mutex_;
+    bool failed_ = false;
+    std::string first_error_detail_;
 };
 
 /**
- * @brief Spdk nvmf operation descriptor
+ * @brief NoF operation descriptor (byte-oriented, opaque handle)
  */
-struct SpdkNofTask {
-    nof_seg_handle* seg_handle;
+struct NofTask {
+    NofSegmentHandle* seg_handle;
     void* ptr;
-    uint64_t lba;
-    uint32_t lba_count;
-    int remaining_lba;
+    uint64_t byte_offset;
+    uint64_t byte_length;
+    uint64_t remaining_bytes;
     int outstanding_sub_io;
-    int op;   // kSpdkNofOpRead or kSpdkNofOpWrite
+    NofIOOp op;
     int idx;  // subop idx
     bool failed;
     bool on_chain;
-    std::shared_ptr<SpdkNofOperationState> state;
-    int64_t* io_count;
-    SpdkNofQos* nof_qos;
-    SpdkNofTask* nxt;
+    std::shared_ptr<NofOperationState> state;
+    // First failure's error detail (sc/sct/status string); written only on
+    // the failure path, empty in steady state — zero hot-path cost.
+    std::string error_detail;
+    // Shared ownership of the worker's outstanding-I/O counter (formerly a
+    // raw pointer to a worker-thread stack variable).
+    std::shared_ptr<std::atomic<int64_t>> io_count;
+    NofQos* nof_qos;
+    NofTask* nxt;
+    // Optional metrics sink; wired by TransferSubmitter, nullptr when the
+    // client has no metrics.
+    NofMetric* metric = nullptr;
 
-    SpdkNofTask(nof_seg_handle* handle, void* buf, uint64_t off, uint32_t len,
-                int op_code, std::shared_ptr<SpdkNofOperationState> s)
+    NofTask(NofSegmentHandle* handle, void* buf, uint64_t byte_off,
+            uint64_t byte_len, NofIOOp op_code,
+            std::shared_ptr<NofOperationState> s)
         : seg_handle(handle),
           ptr(buf),
-          lba(off),
-          lba_count(len),
-          remaining_lba(lba_count),
+          byte_offset(byte_off),
+          byte_length(byte_len),
+          remaining_bytes(byte_len),
           outstanding_sub_io(0),
           op(op_code),
           idx(0),
@@ -522,30 +564,36 @@ struct SpdkNofTask {
           nxt(nullptr) {}
 };
 
-struct SpdkNofSubTask {
-    SpdkNofTask* task;
-    int submit_lba_count;
-    std::stack<SpdkNofSubTask*>* sub_task_pool;
+struct NofSubTask {
+    // Embedded adaptor keeps the steady-state submit/completion path free of
+    // per-sub-IO heap allocation.
+    NofIOAdaptor adaptor;
+    NofTask* task;
+    uint32_t submit_bytes;
+    std::stack<NofSubTask*>* sub_task_pool;
 };
 
-constexpr int kDefaultSpdkNofSubmitChunkBytes = (1 << 17);    // 128k
-constexpr int kDefaultSpdkNofInflightBytesLimit = (1 << 25);  // 32M
-struct SpdkNofQos {
-    int inflight_blocks[kSpdkNofOpNum];
-    int blocks_per_chunk;
-    int inflight_blocks_limit;
-    SpdkNofTask* head[kSpdkNofOpNum];
-    SpdkNofTask* tail[kSpdkNofOpNum];
+constexpr int kDefaultNofSubmitChunkBytes = (1 << 17);    // 128k
+constexpr int kDefaultNofInflightBytesLimit = (1 << 25);  // 32M
 
-    explicit SpdkNofQos(uint32_t block_size);
+struct NofQos {
+    // Block size cached at QoS creation; the poll loop does not re-query it.
+    const uint32_t block_size;
+    const int blocks_per_chunk;
+    const int inflight_blocks_limit;
+    int inflight_blocks[static_cast<size_t>(NofIOOp::kNum)];
+    NofTask* head[static_cast<size_t>(NofIOOp::kNum)];
+    NofTask* tail[static_cast<size_t>(NofIOOp::kNum)];
+
+    explicit NofQos(uint32_t bs);
 
     bool Empty() const {
-        return (head[kSpdkNofOpRead] == nullptr &&
-                head[kSpdkNofOpWrite] == nullptr);
+        return (head[static_cast<size_t>(NofIOOp::kRead)] == nullptr &&
+                head[static_cast<size_t>(NofIOOp::kWrite)] == nullptr);
     }
 
-    void PushTask(SpdkNofTask* task) {
-        int op = task->op;
+    void PushTask(NofTask* task) {
+        size_t op = static_cast<size_t>(task->op);
         if (head[op] == nullptr) {
             head[op] = task;
             tail[op] = task;
@@ -555,52 +603,43 @@ struct SpdkNofQos {
         }
     }
 
-    void PopTask(int op) {
-        if (head[op]) {
-            head[op] = head[op]->nxt;
+    void PopTask(NofIOOp op) {
+        size_t i = static_cast<size_t>(op);
+        if (head[i]) {
+            head[i] = head[i]->nxt;
         }
     }
 };
 
-/**
- * @brief Thread pool for asynchronous spdk nvmf operations
- *
- * This class manages multiple worker thread that executes spdk nvmf operations
- * asynchronously.
- */
-constexpr int kDefaultSpdkNofWorkers = 4;
-class SpdkNofWorkerPool {
+constexpr int kDefaultNofWorkers = 4;
+class NofWorkerPool {
    public:
-    explicit SpdkNofWorkerPool(int numa_socket_id = 0);
-    ~SpdkNofWorkerPool();
+    explicit NofWorkerPool(std::shared_ptr<NVMeoFInitiator> initiator,
+                           int numa_socket_id = 0);
+    ~NofWorkerPool();
 
-    // Non-copyable, non-movable
-    SpdkNofWorkerPool(const SpdkNofWorkerPool&) = delete;
-    SpdkNofWorkerPool& operator=(const SpdkNofWorkerPool&) = delete;
-    SpdkNofWorkerPool(SpdkNofWorkerPool&&) = delete;
-    SpdkNofWorkerPool& operator=(SpdkNofWorkerPool&&) = delete;
+    NofWorkerPool(const NofWorkerPool&) = delete;
+    NofWorkerPool& operator=(const NofWorkerPool&) = delete;
+    NofWorkerPool(NofWorkerPool&&) = delete;
+    NofWorkerPool& operator=(NofWorkerPool&&) = delete;
 
-    /**
-     * @brief Submit a spdk nvmf task for async execution
-     * @param task The spdk nvmf task to execute
-     */
-    void submitTask(SpdkNofTask task);
+    void submitTask(NofTask task);
 
    private:
     void workerThread(int work_idx);
 
+    std::shared_ptr<NVMeoFInitiator> initiator_;
     int worker_count_;
     int numa_socket_id_;
     std::vector<std::thread> workers_;
-    std::unique_ptr<std::queue<SpdkNofTask>[]> task_queue_;
+    std::unique_ptr<std::queue<NofTask>[]> task_queue_;
     std::unique_ptr<std::mutex[]> queue_mutex_;
     std::unique_ptr<std::condition_variable[]> queue_cv_;
     std::atomic<bool> shutdown_;
     std::mutex seg_mutex_;
     int seg_num = 0;
-    std::map<nof_seg_handle*, int> seg_to_worker_;
+    std::map<NofSegmentHandle*, int> seg_to_worker_;
 };
-#endif
 
 /**
  * @brief Fileread task for async execution
@@ -665,11 +704,12 @@ class FilereadWorkerPool {
  */
 class TransferSubmitter {
    public:
-    explicit TransferSubmitter(TransferEngine& engine,
-                               std::shared_ptr<StorageBackend>& backend,
-                               const std::string& local_hostname,
-                               TransferMetric* transfer_metric = nullptr,
-                               int numa_socket_id = 0);
+    explicit TransferSubmitter(
+        TransferEngine& engine, std::shared_ptr<StorageBackend>& backend,
+        const std::string& local_hostname,
+        TransferMetric* transfer_metric = nullptr, int numa_socket_id = 0,
+        std::shared_ptr<NVMeoFInitiator> nof_initiator = nullptr,
+        NofMetric* nof_metric = nullptr);
 
     /**
      * @brief Submit an asynchronous transfer operation
@@ -746,9 +786,9 @@ class TransferSubmitter {
     // engine_.getLocalIpAndPort() (which allocates a string) on every transfer.
     const std::string local_endpoint_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
-#ifdef USE_NOF
-    std::unique_ptr<SpdkNofWorkerPool> spdk_nvmf_pool_;
-#endif
+    std::shared_ptr<NVMeoFInitiator> nof_initiator_;
+    NofMetric* nof_metric_ = nullptr;
+    std::unique_ptr<NofWorkerPool> nof_pool_;
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
     const std::string local_hostname_;
@@ -783,14 +823,12 @@ class TransferSubmitter {
     std::optional<TransferFuture> submitMemcpyOperations(
         std::vector<MemcpyOperation> operations);
 
-#ifdef USE_NOF
     /**
-     * @brief Submit SPDK NVMe-oF operation asynchronously
+     * @brief Submit NoF (NVMe-oF) operation asynchronously
      */
-    std::optional<TransferFuture> submitSpdkNofOperation(
+    std::optional<TransferFuture> submitNofOperation(
         const AllocatedBuffer::Descriptor& handle, void* ptr, size_t size,
         const TransferRequest::OpCode op_code);
-#endif
 
     /**
      * @brief Submit transfer engine operation asynchronously

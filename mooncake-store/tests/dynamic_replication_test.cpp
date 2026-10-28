@@ -116,7 +116,8 @@ class DynamicReplicationTest : public ::testing::Test {
             proposal.observed_version_epoch =
                 MasterServiceTestPeer(service).DynamicReplicationVersionEpoch(
                     metadata);
-            proposal.object_size_bytes = static_cast<uint64_t>(metadata.size);
+            proposal.object_size_bytes =
+                static_cast<uint64_t>(metadata.TotalLength());
         }
         if (admit) {
             AdmitDynamicReplication(service, key);
@@ -181,17 +182,26 @@ class DynamicReplicationTest : public ::testing::Test {
         accessor.Get().put_start_time += std::chrono::milliseconds(1);
     }
 
-    bool HasDynamicState(MasterService& service, const std::string& key) const {
+    // True when the object still carries dynamic-replication state: its own
+    // pending task or cooldown, or the replica-action lease the caller names
+    // by the proposal id it submitted.
+    bool HasDynamicState(MasterService& service, const std::string& key,
+                         const UUID& proposal_id) const {
+        const bool has_lease =
+            MasterServiceTestPeer::FindDynamicReplicationLease(
+                service, TenantId::Default(), proposal_id)
+                .has_value();
         MasterServiceTestPeer::MetadataAccessorRW accessor(
             &service,
             MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
-        auto& tenant_state = accessor.GetTenantState();
-        const bool has_lease = std::any_of(
-            tenant_state.dynamic_replication_leases.begin(),
-            tenant_state.dynamic_replication_leases.end(),
-            [&key](const auto& entry) { return entry.second.key == key; });
-        return tenant_state.dynamic_replication_pending.contains(key) ||
-               tenant_state.dynamic_replication_cooldowns.contains(key) ||
+        // A torn-down object keeps neither, so only a lease can outlive it.
+        if (!accessor.Exists()) {
+            return has_lease;
+        }
+        const auto& state = accessor.GetState();
+        return state.dynamic_replication_pending.has_value() ||
+               state.dynamic_replication_cooldown !=
+                   std::chrono::steady_clock::time_point{} ||
                has_lease;
     }
 
@@ -219,17 +229,13 @@ class DynamicReplicationTest : public ::testing::Test {
             MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         ASSERT_TRUE(accessor.Exists());
         MasterServiceTestPeer(service).ClearDynamicReplicationStateForKey(
-            accessor.GetTenantState(), key);
+            TenantId::Default(), key, accessor.GetState());
     }
 
-    void DiscardExpiredProcessingReplicas(MasterService& service,
-                                          const std::string& key) const {
-        const size_t shard_idx = MasterServiceTestPeer(service).getShardIndex(
-            TenantId::Default(), key);
-        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
-                                                             shard_idx);
+    void DiscardExpiredProcessingReplicas(MasterService& service) const {
         MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
-            shard, std::chrono::system_clock::now() + std::chrono::seconds(1));
+            TenantId::Default(),
+            std::chrono::system_clock::now() + std::chrono::seconds(1));
     }
 
     bool ObserveDynamicReplicationAccess(MasterService& service,
@@ -270,10 +276,11 @@ class DynamicReplicationTest : public ::testing::Test {
         MasterServiceTestPeer::MetadataAccessorRW accessor(
             &service,
             MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
-        auto& tenant_state = accessor.GetTenantState();
-        auto pending_it = tenant_state.dynamic_replication_pending.find(key);
-        ASSERT_NE(pending_it, tenant_state.dynamic_replication_pending.end());
-        pending_it->second.expire_at_ms_epoch = 1;
+        ASSERT_TRUE(accessor.Exists());
+        auto& pending = accessor.GetState().dynamic_replication_pending;
+        ASSERT_TRUE(pending.has_value())
+            << "the object carries no pending proposal";
+        pending->expire_at_ms_epoch = 1;
     }
 };
 
@@ -561,7 +568,7 @@ TEST_F(DynamicReplicationTest, CopyLifecycleMarksDynamicReplicaComplete) {
     EXPECT_EQ(DynamicReplicaCount(service, "copy-key"), 1u);
     EXPECT_TRUE(
         HasCompleteDynamicReplica(service, "copy-key", lease->target_segment));
-    EXPECT_FALSE(HasDynamicState(service, "copy-key"));
+    EXPECT_FALSE(HasDynamicState(service, "copy-key", lease->proposal_id));
 }
 
 TEST_F(DynamicReplicationTest,
@@ -599,7 +606,8 @@ TEST_F(DynamicReplicationTest,
     EXPECT_EQ(copy_end.error(), ErrorCode::REPLICA_IS_GONE);
     EXPECT_FALSE(HasIncompleteDynamicReplica(service, "invalid-target-key",
                                              lease->target_segment));
-    EXPECT_FALSE(HasDynamicState(service, "invalid-target-key"));
+    EXPECT_FALSE(
+        HasDynamicState(service, "invalid-target-key", lease->proposal_id));
 }
 
 TEST_F(DynamicReplicationTest, ObserveWindowDropsNewKeysAtEntryLimit) {
@@ -783,7 +791,8 @@ TEST_F(DynamicReplicationTest,
         stale_payload.dynamic_replication_version_epoch);
     ASSERT_FALSE(stale_copy_start.has_value());
     EXPECT_EQ(stale_copy_start.error(), ErrorCode::INVALID_VERSION);
-    EXPECT_TRUE(HasDynamicState(service, "stale-vs-current-key"));
+    EXPECT_TRUE(HasDynamicState(service, "stale-vs-current-key",
+                                current_lease->proposal_id));
 
     auto current_copy_start = service.CopyStart(
         source.client_id, "stale-vs-current-key", TenantId::Default(),
@@ -818,10 +827,11 @@ TEST_F(DynamicReplicationTest, ExpiredDynamicCopyTaskClearsDynamicState) {
     ASSERT_TRUE(HasIncompleteDynamicReplica(service, "expired-copy-task-key",
                                             lease->target_segment));
 
-    DiscardExpiredProcessingReplicas(service, "expired-copy-task-key");
+    DiscardExpiredProcessingReplicas(service);
 
     EXPECT_EQ(DynamicReplicaCount(service, "expired-copy-task-key"), 0u);
-    EXPECT_FALSE(HasDynamicState(service, "expired-copy-task-key"));
+    EXPECT_FALSE(
+        HasDynamicState(service, "expired-copy-task-key", lease->proposal_id));
 
     auto retry = service.SubmitReplicaActionProposal(
         BuildProposal(service, "expired-copy-task-key", target.segment_name));
@@ -898,7 +908,8 @@ TEST_F(DynamicReplicationTest, DynamicCopyRevokeRejectsMismatchedLease) {
         lease->lease_id, lease->version_epoch);
     ASSERT_TRUE(copy_revoke.has_value());
     EXPECT_EQ(DynamicReplicaCount(service, "copy-revoke-fence-key"), 0u);
-    EXPECT_FALSE(HasDynamicState(service, "copy-revoke-fence-key"));
+    EXPECT_FALSE(
+        HasDynamicState(service, "copy-revoke-fence-key", lease->proposal_id));
 }
 
 TEST_F(DynamicReplicationTest, CopyStartRejectsVersionMismatch) {
@@ -922,7 +933,7 @@ TEST_F(DynamicReplicationTest, CopyStartRejectsVersionMismatch) {
                           lease->lease_id, lease->version_epoch);
     ASSERT_FALSE(copy_start.has_value());
     EXPECT_EQ(copy_start.error(), ErrorCode::INVALID_VERSION);
-    EXPECT_FALSE(HasDynamicState(service, "version-key"));
+    EXPECT_FALSE(HasDynamicState(service, "version-key", lease->proposal_id));
 }
 
 TEST_F(DynamicReplicationTest, ExpiredDynamicPendingDoesNotBlockRegularCopy) {
@@ -952,7 +963,8 @@ TEST_F(DynamicReplicationTest, ExpiredDynamicPendingDoesNotBlockRegularCopy) {
         service.CopyRevoke(source.client_id, "expired-pending-regular-copy-key",
                            TenantId::Default());
     ASSERT_TRUE(copy_revoke.has_value());
-    EXPECT_FALSE(HasDynamicState(service, "expired-pending-regular-copy-key"));
+    EXPECT_FALSE(HasDynamicState(service, "expired-pending-regular-copy-key",
+                                 lease->proposal_id));
 }
 
 TEST_F(DynamicReplicationTest, ExpiredLeaseRejectsCopyStart) {
@@ -977,7 +989,33 @@ TEST_F(DynamicReplicationTest, ExpiredLeaseRejectsCopyStart) {
     ASSERT_FALSE(copy_start.has_value());
     EXPECT_EQ(copy_start.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     EXPECT_EQ(DynamicReplicaCount(service, "expired-key"), 0u);
-    EXPECT_FALSE(HasDynamicState(service, "expired-key"));
+    EXPECT_FALSE(HasDynamicState(service, "expired-key", lease->proposal_id));
+}
+
+TEST_F(DynamicReplicationTest, CleanupFailsTheTaskOfAnExpiredPendingProposal) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_max_memory_replicas = 2;
+    MasterService service(config);
+
+    auto source = PrepareSegment(service, "segment_0", 0xf00000000);
+    auto target = PrepareSegment(service, "segment_1", 0x1000000000);
+    PutObject(service, source.client_id, "cleanup-key", source.segment_name);
+    auto lease = service.SubmitReplicaActionProposal(
+        BuildProposal(service, "cleanup-key", target.segment_name));
+    ASSERT_TRUE(lease.has_value());
+
+    // A live pending proposal survives the sweep.
+    MasterServiceTestPeer(service).CleanupExpiredDynamicReplicationState();
+    EXPECT_TRUE(HasDynamicState(service, "cleanup-key", lease->proposal_id));
+
+    ExpireDynamicPending(service, "cleanup-key");
+    MasterServiceTestPeer(service).CleanupExpiredDynamicReplicationState();
+
+    EXPECT_FALSE(HasDynamicState(service, "cleanup-key", lease->proposal_id));
+    auto task = service.QueryTask(lease->task_id);
+    ASSERT_TRUE(task.has_value());
+    EXPECT_EQ(task->status, TaskStatus::FAILED);
 }
 
 TEST_F(DynamicReplicationTest, EvictedDynamicReplicaBlocksImmediateRecreate) {

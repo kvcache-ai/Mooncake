@@ -73,7 +73,7 @@ struct NoFIoLayout {
  *   - a block aligned buffer keeps its whole block prefix direct and only
  *     stages the partial trailing block;
  *   - an unaligned buffer address is staged in full, because the direct DMA
- *     path requires a block aligned address.
+ *     path requires an aligned address.
  *
  * @param block_size Namespace block size in bytes, must be non-zero.
  * @param disk_offset Byte offset of the object inside the namespace. It must
@@ -81,10 +81,13 @@ struct NoFIoLayout {
  * @param buffer_address Address of the caller's buffer.
  * @param size Logical object size in bytes, must be non-zero.
  * @param layout Populated on success, left untouched on failure.
+ * @param buffer_alignment Alignment the direct DMA path needs for the
+ *        caller's buffer address. Zero means block_size; an initiator with
+ *        SGL support only needs its DMA alignment.
  * @return true when a valid layout was produced.
  */
 bool BuildNoFIoLayout(uint32_t block_size, uint64_t disk_offset,
                       uintptr_t buffer_address, size_t size,
-                      NoFIoLayout& layout);
+                      NoFIoLayout& layout, uint64_t buffer_alignment = 0);
 
 }  // namespace mooncake

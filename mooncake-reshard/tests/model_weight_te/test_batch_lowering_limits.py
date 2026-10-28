@@ -43,6 +43,7 @@ from .helpers import (
         ("max_batch_operations", True),
         ("max_region_segments", 1.5),
         ("max_total_lowered_segments", 1.5),
+        ("max_inflight_batches", 1.5),
         ("max_completion_drain_attempts", 1.5),
         ("completion_drain_timeout_ms", 1.5),
     ),
@@ -58,6 +59,15 @@ def test_te_adapters_reject_non_integer_limits(adapter, name, value) -> None:
 )
 def test_te_adapters_allow_zero_completion_drain_attempts(adapter) -> None:
     adapter(FakeTransferEngine(), max_completion_drain_attempts=0)
+
+
+@pytest.mark.parametrize(
+    "adapter",
+    (MooncakeTransferEngineReader, MooncakeTransferEngineSink),
+)
+def test_te_adapters_reject_non_positive_max_inflight_batches(adapter) -> None:
+    with pytest.raises(ValueError, match="max_inflight_batches"):
+        adapter(FakeTransferEngine(), max_inflight_batches=0)
 
 
 def _dp_sources() -> RuntimeInputs:

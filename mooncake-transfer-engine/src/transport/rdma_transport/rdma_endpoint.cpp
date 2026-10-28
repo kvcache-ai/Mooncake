@@ -43,34 +43,20 @@ constexpr uint8_t kMaxHopLimit = 16;
 constexpr uint8_t kTimeout = 14;
 constexpr uint8_t kRetryCount = 7;
 
-static GidSelectionSnapshot fillLocalHandshakeDesc(
-    RdmaContext &context, const std::string &peer_nic,
-    const std::vector<uint32_t> &qp_num,
-    RdmaEndPoint::HandShakeDesc &local_desc) {
-    auto gid_selection = context.gidSelection();
+static void fillLocalHandshakeDesc(RdmaContext &context,
+                                   const std::string &peer_nic,
+                                   const std::vector<uint32_t> &qp_num,
+                                   const PeerAutoGidSelection &gid_selection,
+                                   RdmaEndPoint::HandShakeDesc &local_desc) {
     local_desc.local_nic_path = context.nicPath();
     local_desc.local_lid = context.lid();
-    local_desc.local_gid = gid_selection.gid;
+    local_desc.local_gid = gid_selection.selection.gid;
     local_desc.peer_nic_path = peer_nic;
     local_desc.qp_num = qp_num;
     local_desc.ready_ack = false;
     local_desc.ready_ack_supported = true;
+    local_desc.auto_gid_reprobe_from = gid_selection.auto_gid_reprobe_from;
     local_desc.reply_msg.clear();
-    return gid_selection;
-}
-
-static void rememberAutoGidSelection(
-    std::vector<AutoGidSelectionIdentity> &attempted_selections,
-    const GidSelectionSnapshot &selection) {
-    auto already_attempted =
-        std::any_of(attempted_selections.begin(), attempted_selections.end(),
-                    [&](const AutoGidSelectionIdentity &attempted) {
-                        return attempted.gid_index == selection.gid_index &&
-                               attempted.gid == selection.gid;
-                    });
-    if (!already_attempted) {
-        attempted_selections.push_back({selection.gid_index, selection.gid});
-    }
 }
 
 static std::string qpListToString(const std::vector<uint32_t> &qp_num) {
@@ -98,6 +84,7 @@ static std::string gidToString(const ibv_gid &gid) {
 
 RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
     : context_(context),
+      endpoint_id_(context.allocateEndpointId()),
       status_(INITIALIZING),
       qp_generation_(0),
       has_connected_(false),
@@ -263,6 +250,7 @@ int RdmaEndPoint::deconstructLocked() {
 
     qp_list_.clear();
     peer_qp_num_list_.clear();
+    connected_auto_gid_.reset();
     delete[] wr_depth_list_;
     wr_depth_list_ = nullptr;
     return 0;
@@ -391,6 +379,27 @@ void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
 std::string RdmaEndPoint::peerNicPath() const {
     RWSpinlock::ReadGuard guard(lock_);
     return peer_nic_path_;
+}
+
+Transport::Slice::RdmaCompletionToken RdmaEndPoint::autoGidCompletionToken()
+    const {
+    RWSpinlock::ReadGuard guard(lock_);
+    if (!connected_auto_gid_ || !connected_auto_gid_->recovery_enabled) {
+        return {0, 0, false, false};
+    }
+    return {endpoint_id_, connected_auto_gid_->selection_epoch, true,
+            connected_auto_gid_->observe_success};
+}
+
+void RdmaEndPoint::rememberConnectedAutoGid(
+    const PeerAutoGidSelection &local_selection,
+    const HandShakeDesc &peer_desc) {
+    if (!local_selection.recovery_enabled) {
+        connected_auto_gid_.reset();
+        return;
+    }
+    connected_auto_gid_ = local_selection;
+    context_.rememberPeerAdvertisedGid(peer_nic_path_, peer_desc.local_gid);
 }
 
 namespace {
@@ -656,7 +665,6 @@ int RdmaEndPoint::setupConnectionsByActive() {
     uint64_t qp_generation = 0;
     bool do_rpc = false;
     int auto_gid_retry_count = 0;
-    std::vector<AutoGidSelectionIdentity> attempted_auto_gid_selections;
 
     {
         RWSpinlock::WriteGuard guard(lock_);
@@ -669,10 +677,14 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
         // loopback mode
         if (context_.nicPath() == peer_nic_path_) {
-            int ret = doSetupConnection(context_.gid(), context_.lid(), qpNum(),
-                                        CONNECTED, nullptr, nullptr,
-                                        notificationQpNum());
+            auto local_gid_selection =
+                context_.preparePeerGidSelection(peer_nic_path_);
+            int ret = doSetupConnection(
+                local_gid_selection.selection.gid, context_.lid(), qpNum(),
+                local_gid_selection.selection.gid_index, CONNECTED, nullptr,
+                nullptr, notificationQpNum());
             if (ret == 0) {
+                connected_auto_gid_ = local_gid_selection;
                 ready_wait_start_ts_.store(0, std::memory_order_relaxed);
             }
             return ret;
@@ -736,7 +748,8 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
     for (;;) {
         std::vector<uint32_t> local_qp_num;
-        GidSelectionSnapshot local_gid_selection;
+        auto local_gid_selection =
+            context_.preparePeerGidSelection(peer_nic_path_);
         {
             RWSpinlock::ReadGuard guard(lock_);
             if (qp_generation != qp_generation_) {
@@ -748,12 +761,10 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 return ERR_ENDPOINT;
             }
             local_qp_num = qpNum();
-            local_gid_selection = fillLocalHandshakeDesc(
-                context_, peer_nic_path_, local_qp_num, local_desc);
+            fillLocalHandshakeDesc(context_, peer_nic_path_, local_qp_num,
+                                   local_gid_selection, local_desc);
             describeNotification(local_desc);
         }
-        rememberAutoGidSelection(attempted_auto_gid_selections,
-                                 local_gid_selection);
         peer_desc = HandShakeDesc();
 
         // Perform the RPC without holding the lock to avoid deadlock and allow
@@ -888,6 +899,21 @@ int RdmaEndPoint::setupConnectionsByActive() {
                     return ERR_REJECT_HANDSHAKE;
                 }
 
+                if (!peer_desc.auto_gid_reprobe_from.empty()) {
+                    auto response_gid_selection =
+                        context_.preparePeerGidSelection(
+                            peer_nic_path_, peer_desc.auto_gid_reprobe_from);
+                    if (response_gid_selection.selection_epoch !=
+                        local_gid_selection.selection_epoch) {
+                        int reset_ret = resetConnection(
+                            "apply peer auto GID reprobe advisory");
+                        if (reset_ret) return reset_ret;
+                        qp_generation = qp_generation_;
+                        status_.store(CONNECTING, std::memory_order_relaxed);
+                        continue;
+                    }
+                }
+
                 int ret = ERR_DEVICE_NOT_FOUND;
                 std::string failure_message;
                 SetupConnectionFailureInfo failure_info;
@@ -897,8 +923,10 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 if (!peer_desc.local_gid.empty()) {
                     ret = doSetupConnection(
                         peer_desc.local_gid, peer_desc.local_lid,
-                        peer_desc.qp_num, connected_status, &failure_message,
-                        &failure_info, peer_desc.notify_qp_num);
+                        peer_desc.qp_num,
+                        local_gid_selection.selection.gid_index,
+                        connected_status, &failure_message, &failure_info,
+                        peer_desc.notify_qp_num);
                 } else {
                     auto segment_desc =
                         context_.engine().meta()->getSegmentDescByName(
@@ -908,6 +936,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
                             if (nic.name == peer_nic_name) {
                                 ret = doSetupConnection(
                                     nic.gid, nic.lid, peer_desc.qp_num,
+                                    local_gid_selection.selection.gid_index,
                                     connected_status, &failure_message,
                                     &failure_info, peer_desc.notify_qp_num);
                                 break;
@@ -917,6 +946,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 }
 
                 if (ret == 0) {
+                    rememberConnectedAutoGid(local_gid_selection, peer_desc);
                     if (peer_desc.ready_ack_supported) {
                         should_send_ready_ack = true;
                         ready_ack_desc = local_desc;
@@ -934,24 +964,13 @@ int RdmaEndPoint::setupConnectionsByActive() {
                             failure_info.stage ==
                                 SetupConnectionFailureStage::kRtr,
                             failure_info.sys_errno)) {
-                        std::string previous_gid;
-                        std::string next_gid;
-                        bool reprobe_changed = context_.reprobeAutoGid(
-                            local_gid_selection, attempted_auto_gid_selections,
-                            &previous_gid, &next_gid);
-                        auto current_gid_selection = context_.gidSelection();
-                        auto retry_action = decideAutoGidRetryAction(
-                            reprobe_changed, local_gid_selection.gid_index,
-                            local_gid_selection.gid,
-                            current_gid_selection.gid_index,
-                            current_gid_selection.gid);
-                        if (retry_action != AutoGidRetryAction::kDoNotRetry) {
+                        context_.requestPeerGidAdvance(peer_nic_path_);
+                        auto next_gid_selection =
+                            context_.preparePeerGidSelection(peer_nic_path_);
+                        if (next_gid_selection.selection_epoch !=
+                            local_gid_selection.selection_epoch) {
                             int reset_ret = resetConnection(
-                                retry_action == AutoGidRetryAction::
-                                                    kRetryWithReprobedGid
-                                    ? "retry after auto GID reprobe (active)"
-                                    : "retry with externally reprobed GID "
-                                      "(active)");
+                                "retry after peer auto GID reprobe (active)");
                             if (reset_ret) return reset_ret;
                             qp_generation = qp_generation_;
                             status_.store(CONNECTING,
@@ -962,9 +981,9 @@ int RdmaEndPoint::setupConnectionsByActive() {
                                 << "Retry active handshake with updated local "
                                    "GID on "
                                 << context_.deviceName() << ": "
-                                << local_gid_selection.gid << " -> "
-                                << current_gid_selection.gid << " (attempt "
-                                << auto_gid_retry_count << "/"
+                                << local_gid_selection.selection.gid << " -> "
+                                << next_gid_selection.selection.gid
+                                << " (attempt " << auto_gid_retry_count << "/"
                                 << globalConfig().auto_gid_max_retries << ")";
                         }
                     }
@@ -1033,13 +1052,33 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
         return 0;
     }
 
+    if (peer_desc.peer_nic_path != context_.nicPath() ||
+        peer_desc.local_nic_path != peer_nic_path_) {
+        local_desc.reply_msg =
+            "Invalid argument: peer nic path inconsistency, expect " +
+            context_.nicPath() + " + " + peer_nic_path_ + ", while got " +
+            peer_desc.peer_nic_path + " + " + peer_desc.local_nic_path;
+        LOG(ERROR) << local_desc.reply_msg;
+        return ERR_REJECT_HANDSHAKE;
+    }
+
+    auto advised_gid_selection = context_.preparePeerGidSelection(
+        peer_nic_path_, peer_desc.auto_gid_reprobe_from);
+
     if (connected()) {
+        bool reset_for_advisory = false;
+        if (connected_auto_gid_ && connected_auto_gid_->selection_epoch !=
+                                       advised_gid_selection.selection_epoch) {
+            int ret = resetConnection("apply peer auto GID reprobe advisory");
+            if (ret) return ret;
+            reset_for_advisory = true;
+        }
         // If already connected with the same peer QP info, return success
-        if ((peer_qp_num_list_ == peer_desc.qp_num &&
-             (!notify_.enabled ||
-              peer_notify_qp_num_ == peer_desc.notify_qp_num))) {
+        else if ((peer_qp_num_list_ == peer_desc.qp_num &&
+                  (!notify_.enabled ||
+                   peer_notify_qp_num_ == peer_desc.notify_qp_num))) {
             fillLocalHandshakeDesc(context_, peer_nic_path_, qpNum(),
-                                   local_desc);
+                                   advised_gid_selection, local_desc);
             describeNotification(local_desc);
             if (!peer_desc.ready_ack_supported) {
                 ready_wait_start_ts_.store(0, std::memory_order_relaxed);
@@ -1053,10 +1092,11 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
             return 0;
         }
         // Different peer (e.g., peer restarted)
-        LOG(WARNING) << "Re-establish connection: " << toString();
-
-        int ret = resetConnection("re-establishing connection (passive)");
-        if (ret) return ret;
+        if (!reset_for_advisory) {
+            LOG(WARNING) << "Re-establish connection: " << toString();
+            int ret = resetConnection("re-establishing connection (passive)");
+            if (ret) return ret;
+        }
     }
 
     // At this point, the state can only be UNCONNECTED or CONNECTING.
@@ -1066,17 +1106,6 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     // peer nic path by setupConnectionsByActive on another thread, it will
     // be blocked after the RPC return. Once the lock is released, active
     // callers will confirm readiness before posting WRs.
-
-    if (peer_desc.peer_nic_path != context_.nicPath() ||
-        peer_desc.local_nic_path != peer_nic_path_) {
-        local_desc.reply_msg =
-            "Invalid argument: peer nic path inconsistency, expect " +
-            context_.nicPath() + " + " + peer_nic_path_ + ", while got " +
-            peer_desc.peer_nic_path + " + " + peer_desc.local_nic_path;
-
-        LOG(ERROR) << local_desc.reply_msg;
-        return ERR_REJECT_HANDSHAKE;
-    }
 
     auto peer_server_name = getServerNameFromNicPath(peer_nic_path_);
     auto peer_nic_name = getNicNameFromNicPath(peer_nic_path_);
@@ -1091,23 +1120,24 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     auto attempt_setup_with_peer = [&](const std::string &peer_gid,
                                        uint32_t peer_lid) -> int {
         int auto_gid_retry_count = 0;
-        std::vector<AutoGidSelectionIdentity> attempted_auto_gid_selections;
         for (;;) {
-            auto local_gid_selection = fillLocalHandshakeDesc(
-                context_, peer_nic_path_, qpNum(), local_desc);
+            auto local_gid_selection =
+                context_.preparePeerGidSelection(peer_nic_path_);
+            fillLocalHandshakeDesc(context_, peer_nic_path_, qpNum(),
+                                   local_gid_selection, local_desc);
             describeNotification(local_desc);
-            rememberAutoGidSelection(attempted_auto_gid_selections,
-                                     local_gid_selection);
 
             SetupConnectionFailureInfo failure_info;
             auto connected_status = peer_desc.ready_ack_supported
                                         ? CONNECTED_WAIT_READY_ACK
                                         : CONNECTED;
             int ret = doSetupConnection(peer_gid, peer_lid, peer_desc.qp_num,
+                                        local_gid_selection.selection.gid_index,
                                         connected_status, &local_desc.reply_msg,
                                         &failure_info, peer_desc.notify_qp_num);
             if (ret == 0) {
                 describeNotification(local_desc);
+                rememberConnectedAutoGid(local_gid_selection, peer_desc);
                 if (peer_desc.ready_ack_supported) {
                     ready_wait_start_ts_.store(getCurrentTimeInNano(),
                                                std::memory_order_relaxed);
@@ -1129,32 +1159,24 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                 return ret;
             }
 
-            std::string previous_gid;
-            std::string next_gid;
-            bool reprobe_changed = context_.reprobeAutoGid(
-                local_gid_selection, attempted_auto_gid_selections,
-                &previous_gid, &next_gid);
-            auto current_gid_selection = context_.gidSelection();
-            auto retry_action = decideAutoGidRetryAction(
-                reprobe_changed, local_gid_selection.gid_index,
-                local_gid_selection.gid, current_gid_selection.gid_index,
-                current_gid_selection.gid);
-            if (retry_action == AutoGidRetryAction::kDoNotRetry) {
+            context_.requestPeerGidAdvance(peer_nic_path_);
+            auto next_gid_selection =
+                context_.preparePeerGidSelection(peer_nic_path_);
+            if (next_gid_selection.selection_epoch ==
+                local_gid_selection.selection_epoch) {
                 resetConnection("failed connection setup (passive)");
                 return ret;
             }
 
-            int reset_ret = resetConnection(
-                retry_action == AutoGidRetryAction::kRetryWithReprobedGid
-                    ? "retry after auto GID reprobe (passive)"
-                    : "retry with externally reprobed GID (passive)");
+            int reset_ret =
+                resetConnection("retry after peer auto GID reprobe (passive)");
             if (reset_ret) return reset_ret;
             status_.store(CONNECTING, std::memory_order_relaxed);
             ++auto_gid_retry_count;
             LOG(WARNING) << "Retry passive handshake with updated local GID on "
                          << context_.deviceName() << ": "
-                         << local_gid_selection.gid << " -> "
-                         << current_gid_selection.gid << " (attempt "
+                         << local_gid_selection.selection.gid << " -> "
+                         << next_gid_selection.selection.gid << " (attempt "
                          << auto_gid_retry_count << "/"
                          << globalConfig().auto_gid_max_retries << ")";
         }
@@ -1341,6 +1363,9 @@ int RdmaEndPoint::submitPostSend(
         wr_count = std::min(wr_count, cq_remaining);
         if (wr_count <= 0) continue;
 
+        // All WRs of this chain go out in one ibv_post_send below, so stamp
+        // them with one clock read rather than one per WR under lock_.
+        const int64_t post_ts = getCurrentTimeInNano();
         for (int i = 0; i < wr_count; ++i) {
             auto *slice = slice_list[start + i];
             auto &sge = sge_list[i];
@@ -1362,7 +1387,7 @@ int RdmaEndPoint::submitPostSend(
             wr.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1];
             wr.wr.rdma.remote_addr = slice->rdma.dest_addr;
             wr.wr.rdma.rkey = slice->rdma.dest_rkey;
-            slice->ts = getCurrentTimeInNano();
+            slice->ts = post_ts;
             slice->status = Transport::Slice::POSTED;
             slice->rdma.qp_depth = &wr_depth_list_[qp_index];
             slice->rdma.qp_index = static_cast<int>(qp_index);
@@ -1460,13 +1485,11 @@ static int parseGidString(const std::string &gid_str, ibv_gid &gid_out) {
     return 0;
 }
 
-int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
-                                    uint32_t peer_lid,
-                                    std::vector<uint32_t> peer_qp_num_list,
-                                    Status connected_status,
-                                    std::string *reply_msg,
-                                    SetupConnectionFailureInfo *failure_info,
-                                    uint32_t notify_qp_num) {
+int RdmaEndPoint::doSetupConnection(
+    const std::string &peer_gid, uint32_t peer_lid,
+    std::vector<uint32_t> peer_qp_num_list, int local_gid_index,
+    Status connected_status, std::string *reply_msg,
+    SetupConnectionFailureInfo *failure_info, uint32_t notify_qp_num) {
     if (qp_list_.size() != peer_qp_num_list.size()) {
         std::string message =
             "QP count mismatch in peer and local endpoints, check "
@@ -1494,7 +1517,6 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
         return ret;
     }
 
-    int local_gid_index = context_.gidIndex();
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
         int ret = doSetupConnection(qp_index, peer_gid_raw, peer_lid,
                                     peer_qp_num_list[qp_index], local_gid_index,
