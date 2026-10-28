@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import importlib.util
 import inspect
+import subprocess
 import sys
 import types
 
@@ -10,6 +12,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from mooncake.mooncake_ep_buffer import Buffer as LegacyBuffer
 from mooncake.mooncake_elastic_buffer import (
     ElasticBuffer,
     _bootstrap_collective_device,
@@ -19,6 +22,42 @@ from mooncake.mooncake_elastic_buffer import (
     _select_transport,
     _select_transport_for_group,
 )
+
+
+def test_legacy_buffer_requires_explicit_size() -> None:
+    parameter = inspect.signature(LegacyBuffer).parameters["num_ep_buffer_bytes"]
+    assert parameter.default is inspect.Parameter.empty
+
+
+@pytest.mark.parametrize(
+    ("rank", "num_ranks", "num_buffer_bytes", "expected_error"),
+    [
+        (-1, 1, 4096, "invalid EP rank or world size"),
+        (1, 1, 4096, "invalid EP rank or world size"),
+        (0, 0, 4096, "invalid EP rank or world size"),
+        (0, 257, 4096, "invalid EP rank or world size"),
+        (0, 1, -1, "EP buffer size must be positive"),
+        (0, 1, 0, "EP buffer size must be positive"),
+    ],
+)
+def test_legacy_buffer_rejects_invalid_constructor_arguments(
+    rank: int, num_ranks: int, num_buffer_bytes: int, expected_error: str
+) -> None:
+    if importlib.util.find_spec("mooncake._ep") is None:
+        pytest.skip("requires Mooncake EP native extension")
+
+    script = f"""
+from mooncake._ep import Buffer
+try:
+    Buffer({rank}, {num_ranks}, {num_buffer_bytes})
+except ValueError as error:
+    if str(error) == {expected_error!r}:
+        raise SystemExit(0)
+    raise SystemExit(2)
+raise SystemExit(1)
+"""
+    result = subprocess.run([sys.executable, "-c", script], check=False, timeout=30)
+    assert result.returncode == 0
 
 
 def test_public_constructor_defaults_are_backward_compatible() -> None:
@@ -361,9 +400,9 @@ def test_active_rank_mask_uses_registered_mooncake_backend(
     buffer.num_ranks = 2
     buffer._device_index = 3
 
-    fake_ep = types.ModuleType("mooncake.ep")
-    fake_ep.get_active_ranks = lambda group: torch.tensor([1, 0])
-    monkeypatch.setitem(sys.modules, "mooncake.ep", fake_ep)
+    fake_pg = types.ModuleType("mooncake.pg")
+    fake_pg.get_active_ranks = lambda group: torch.tensor([1, 0])
+    monkeypatch.setitem(sys.modules, "mooncake.pg", fake_pg)
     monkeypatch.setattr(dist, "get_backend", lambda group: backend_name)
     synchronized_devices = []
     monkeypatch.setattr(torch.cuda, "synchronize", synchronized_devices.append)
@@ -379,7 +418,7 @@ def test_non_mooncake_group_uses_full_membership(monkeypatch, backend_name) -> N
     buffer.num_ranks = 2
     monkeypatch.setattr(dist, "get_backend", lambda _: backend_name)
     # No native EP/PG helper is available for these process-group backends.
-    monkeypatch.setitem(sys.modules, "mooncake.ep", types.ModuleType("mooncake.ep"))
+    monkeypatch.setitem(sys.modules, "mooncake.pg", types.ModuleType("mooncake.pg"))
     assert buffer._active_ranks_mask() == [1, 1]
 
 

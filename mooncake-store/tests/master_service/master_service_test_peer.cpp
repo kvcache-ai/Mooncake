@@ -2,11 +2,8 @@
 
 #include <algorithm>
 #include <cassert>
-
-#include "ha/snapshot/catalog/snapshot_catalog_store.h"
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
-#endif
+#include <limits>
+#include <mutex>
 
 namespace mooncake::test {
 
@@ -25,6 +22,25 @@ void MasterServiceTestPeer::SetBatchOpLogWriterFactoryForTesting(
     service_.batch_oplog_writer_factory_ = std::move(factory);
 }
 
+std::string MasterServiceTestPeer::SerializeMetadataForOpLogForTesting(
+    MasterService& service, const ObjectMetadata& metadata) {
+    return service.SerializeMetadataForOpLog(metadata);
+}
+
+std::string
+MasterServiceTestPeer::SerializeMetadataForOpLogWithoutMemReplicasForTesting(
+    MasterService& service, const ObjectMetadata& metadata) {
+    return service.SerializeMetadataForOpLogWithoutMemReplicas(metadata);
+}
+
+std::string MasterServiceTestPeer::
+    SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
+        MasterService& service, const ObjectMetadata& metadata,
+        const std::vector<Replica::Descriptor>& replicas) {
+    return service.SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                   replicas);
+}
+
 void MasterServiceTestPeer::RunBatchEvictForTesting(
     double evict_ratio_target, double evict_ratio_lowerbound) {
     service_.BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
@@ -39,17 +55,29 @@ void MasterServiceTestPeer::RunDfsEvictionForTesting() {
     service_.RunDfsEviction();
 }
 
+void MasterServiceTestPeer::CleanupHttpMetadataForTesting(
+    const std::string& segment_name) {
+    service_.cleanupHttpMetadata(segment_name);
+}
+
+size_t MasterServiceTestPeer::HttpMetadataCleanupQueueSizeForTesting() const {
+    std::lock_guard<std::mutex> lk(service_.http_metadata_cleanup_mutex_);
+    return service_.http_metadata_cleanup_queue_.size();
+}
+
 void MasterServiceTestPeer::RunTenantEvictForTesting() {
-    service_.EvictTenantsOverWatermark();
+    // The policy throttles its pass; a test asks for one now.
+    service_.tenant_quota_policy_->next_eviction_check_ = {};
+    service_.tenant_quota_policy_->OnMaintenance();
 }
 
 void MasterServiceTestPeer::SetKvTenantEpochTrackingForTesting(bool enabled) {
     service_.kv_track_tenant_epochs_ = enabled;
 }
 
-void MasterServiceTestPeer::SetRemoveAllShardHookForTesting(
-    std::function<void(size_t)> hook) {
-    service_.kv_remove_all_shard_hook_ = std::move(hook);
+void MasterServiceTestPeer::SetRemoveAllTenantHookForTesting(
+    std::function<void(const TenantId&)> hook) {
+    service_.kv_remove_all_tenant_hook_ = std::move(hook);
 }
 
 uint64_t MasterServiceTestPeer::GetKvClearedPublishedForTesting() const {
@@ -69,12 +97,7 @@ void MasterServiceTestPeer::SetNoFProbeFnForTesting(
         service_.nof_probe_fn_ = std::move(fn);
         return;
     }
-    service_.nof_probe_fn_ = [](const std::string& te_endpoint,
-                                uint32_t timeout_ms,
-                                std::string* error_reason) {
-        return SpdkWrapper::GetInstance().ProbeNofSegment(
-            te_endpoint, timeout_ms, error_reason);
-    };
+    service_.nof_probe_fn_ = &MasterService::DefaultProbeNofSegment;
 #else
     (void)fn;
 #endif
@@ -88,9 +111,8 @@ void MasterServiceTestPeer::SetNoFProbeReleaseFnForTesting(
         service_.nof_probe_release_fn_ = std::move(fn);
         return;
     }
-    service_.nof_probe_release_fn_ = [](const std::string& te_endpoint) {
-        SpdkWrapper::GetInstance().ReleaseProbeResources(te_endpoint);
-    };
+    service_.nof_probe_release_fn_ =
+        &MasterService::DefaultReleaseNofProbeResources;
 #else
     (void)fn;
 #endif
@@ -126,33 +148,34 @@ MasterServiceTestPeer::GetNoFHeartbeatFailureCountForTesting(
 }
 
 size_t MasterServiceTestPeer::RunPromotionCandidateRetryForTesting() {
-    return service_.RunPromotionCandidateRetry(MasterService::kNumShards);
+    return service_.RunPromotionCandidateRetry();
 }
 
 size_t MasterServiceTestPeer::CountCandidatesForTesting(
     const TenantId& tenant_id) {
-    size_t count = 0;
-    std::shared_lock<std::shared_mutex> lock(service_.snapshot_mutex_);
-    for (size_t i = 0; i < MasterService::kNumShards; i++) {
-        MetadataShardAccessorRO shard(&service_, i);
-        auto it = shard->tenants.find(tenant_id);
-        if (it != shard->tenants.end()) {
-            count += it->second.promotion_candidates.size();
-        }
-    }
-    return count;
+    // The count is the tenant's share of the retry index; the candidate state
+    // itself lives on each object.
+    const auto& tracker = service_.promotion_candidates_;
+    std::lock_guard<std::mutex> lock(tracker.mutex_);
+    return std::count_if(
+        tracker.due_.begin(), tracker.due_.end(),
+        [&](const auto& entry) { return entry.first.tenant_id == tenant_id; });
 }
 
 void MasterServiceTestPeer::ResetCandidateBackoffsForTesting() {
     const auto epoch = std::chrono::steady_clock::time_point{};
-    for (size_t i = 0; i < MasterService::kNumShards; i++) {
-        MetadataShardAccessorRW shard(&service_, i);
-        for (auto& [tenant_id, tenant_state] : shard->tenants) {
-            (void)tenant_id;
-            for (auto& [key, candidate] : tenant_state.promotion_candidates) {
-                (void)key;
-                candidate.retry_after = epoch;
-            }
+    auto& tracker = service_.promotion_candidates_;
+    // The index only names keys, so each key is resolved again under its
+    // shard lock and refiled as due now.
+    for (const auto& [tenant_id, key] :
+         tracker.Due(std::chrono::steady_clock::time_point::max(),
+                     std::numeric_limits<size_t>::max())) {
+        MasterService::MetadataAccessorRW accessor(
+            &service_, MasterService::ObjectIdentity{.tenant_id = tenant_id,
+                                                     .user_key = key});
+        if (accessor.Exists() && accessor.GetState().promotion_candidate) {
+            accessor.GetState().promotion_candidate->retry_after = epoch;
+            tracker.File(tenant_id, key, epoch);
         }
     }
 }
@@ -167,12 +190,6 @@ size_t MasterServiceTestPeer::SoftPinRegistrationCount() const {
     const auto& index = service_.soft_pin_deadline_index_;
     std::lock_guard lock(index.mutex_);
     return index.registrations_.size();
-}
-
-std::unique_ptr<ha::SnapshotCatalogStore>
-MasterServiceTestPeer::CreateSnapshotCatalogStore(
-    const MasterServiceConfig& config) {
-    return service_.CreateSnapshotCatalogStore(config);
 }
 
 }  // namespace mooncake::test

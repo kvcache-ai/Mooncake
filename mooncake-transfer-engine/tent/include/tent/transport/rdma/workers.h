@@ -18,6 +18,7 @@
 #include <future>
 #include <memory>
 #include <queue>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_set>
 #include <unordered_map>
@@ -79,6 +80,12 @@ class Workers {
     Status cancel(RdmaTask* task);
 
     DeviceSelector* getDeviceSelector() const { return device_selector_.get(); }
+
+    // Submit-side allocation with pinned peer metadata. An empty result leaves
+    // allocation to each worker slice (e.g. a request spans memory locations).
+    Status allocateDevices(const Request& request, uint32_t num_slices,
+                           uint64_t slice_bytes, uint64_t device_mask,
+                           std::vector<int>& slice_dev_ids);
 
    private:
     using Task = std::function<void()>;
@@ -247,6 +254,9 @@ class Workers {
     Status getRouteHint(RouteHint& hint, SegmentID segment_id, uint64_t addr,
                         uint64_t length);
 
+    uint64_t allocationDeviceMask(const RouteHint& source,
+                                  const RouteHint& target);
+
     Status selectOptimalDevice(RouteHint& source, RouteHint& target,
                                RdmaSlice* slice);
 
@@ -411,6 +421,11 @@ class Workers {
     // File contents loaded once from workers.rail_topo_path and shared by all
     // per-worker/per-peer RailMonitor instances.
     std::string rail_topo_json_;
+    // Separate from worker-owned dynamic rail state. Submitters only query
+    // static compatibility, refreshing pinned snapshots under the write lock.
+    std::shared_mutex allocation_rails_mutex_;
+    std::unordered_map<std::string, std::unique_ptr<RailMonitor>>
+        allocation_rails_;
     bool always_tier1_ = false;
     // Opt-in deadline-aware bandwidth arbitration within a priority tier
     // (RFC #2792). Default false = original FIFO order (equal bandwidth split).
