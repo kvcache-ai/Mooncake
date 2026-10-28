@@ -30,9 +30,9 @@ on:
         # Build the TENT runtime into the wheel. Runtime behavior is unchanged
         # unless a process opts in via MC_USE_TENT=1 (classic engine is the
         # default facade path), so callers can enable this purely to ship the
-        # capability. Currently opted in by the PR CI cuda13 build that feeds
-        # the T-One e2e pipeline; release callers stay false until TENT is
-        # validated on arm64.
+        # capability. Currently opted in by the PR CI cuda13 build and the
+        # nightly cuda13 x86 wheel that feed T-One; release callers stay
+        # false until TENT is validated on arm64.
         type: boolean
         default: false
 
