@@ -159,6 +159,10 @@ struct MockMemFabricState {
     std::vector<smem_trans_opcode_t> batch_opcodes;
     int status_query_calls = 0;
     int register_mem_calls = 0;
+    int batch_register_mem_calls = 0;
+    int32_t batch_register_ret = 0;
+    std::vector<void*> registered_addrs;
+    std::vector<size_t> registered_sizes;
     int deregister_mem_calls = 0;
     int32_t deregister_ret = 0;
     int set_log_level_calls = 0;
@@ -223,9 +227,14 @@ int32_t mockSmemTransRegisterMem(smem_trans_t, void*, size_t, uint32_t) {
     return 0;
 }
 
-int32_t mockSmemTransBatchRegisterMem(smem_trans_t, void*[], size_t[], uint32_t,
+int32_t mockSmemTransBatchRegisterMem(smem_trans_t, void* addrs[],
+                                      size_t sizes[], uint32_t count,
                                       uint32_t) {
-    return 0;
+    std::lock_guard<std::mutex> lock(g_state->mu);
+    g_state->batch_register_mem_calls++;
+    g_state->registered_addrs.assign(addrs, addrs + count);
+    g_state->registered_sizes.assign(sizes, sizes + count);
+    return g_state->batch_register_ret;
 }
 
 int32_t mockSmemTransDeregisterMem(smem_trans_t, void*) {
@@ -1216,6 +1225,48 @@ TEST_F(MemFabricTransportTest, AddRemoveMemoryBuffer) {
 
     ASSERT_TRUE(transport_->removeMemoryBuffer(desc).ok());
     EXPECT_EQ(state_->deregister_mem_calls, 1);
+}
+
+TEST_F(MemFabricTransportTest, BatchRegisterBuffersPreservesRanges) {
+    ASSERT_TRUE(Install().ok());
+    std::vector<BufferDesc> buffers(2);
+    buffers[0].addr = 0x201000;
+    buffers[0].length = 4096;
+    buffers[1].addr = 0x202000;
+    buffers[1].length = 8192;
+    ASSERT_TRUE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    EXPECT_EQ(state_->register_mem_calls, 0);
+    EXPECT_EQ(state_->batch_register_mem_calls, 1);
+    EXPECT_EQ(state_->registered_addrs,
+              (std::vector<void*>{reinterpret_cast<void*>(0x201000),
+                                  reinterpret_cast<void*>(0x202000)}));
+    EXPECT_EQ(state_->registered_sizes, (std::vector<size_t>{4096, 8192}));
+    for (const auto& desc : buffers) {
+        EXPECT_EQ(desc.transports, (std::vector<TransportType>{MEMFABRIC}));
+        ASSERT_EQ(desc.transport_attrs.count(MEMFABRIC), 1u);
+        EXPECT_TRUE(desc.transport_attrs.at(MEMFABRIC).empty());
+    }
+}
+
+TEST_F(MemFabricTransportTest, BatchRegisterFailureDoesNotPublishBuffers) {
+    std::vector<BufferDesc> buffers;
+    EXPECT_TRUE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    buffers.resize(2);
+    buffers[0].addr = 0x201000;
+    buffers[0].length = 4096;
+    buffers[1].addr = 0x202000;
+    buffers[1].length = 4096;
+    EXPECT_FALSE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    EXPECT_EQ(state_->batch_register_mem_calls, 0);
+    ASSERT_TRUE(Install().ok());
+    state_->batch_register_ret = -9;
+    EXPECT_FALSE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    EXPECT_EQ(state_->register_mem_calls, 0);
+    EXPECT_EQ(state_->batch_register_mem_calls, 1);
+    for (const auto& desc : buffers) {
+        EXPECT_TRUE(desc.transports.empty());
+        EXPECT_TRUE(desc.transport_attrs.empty());
+    }
 }
 
 TEST_F(MemFabricTransportTest, DeregisterFailurePropagatesError) {

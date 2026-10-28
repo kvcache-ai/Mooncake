@@ -208,7 +208,10 @@ Status IOUringTransport::submitTransferTasks(
         }
         contexts.push_back(context);
 
-        if (Platform::getLoader().getMemoryType(request.source) == MTYPE_CUDA ||
+        // The kernel cannot DMA to or from a device address, so device memory
+        // is staged through an aligned host buffer.
+        const auto mtype = Platform::getLoader().getMemoryType(request.source);
+        if (mtype == MTYPE_CUDA || mtype == MTYPE_XPU ||
             (uint64_t)request.source % kPageSize) {
             void* buffer = nullptr;
             int rc = posix_memalign(&buffer, kPageSize, request.length);

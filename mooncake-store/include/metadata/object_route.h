@@ -59,6 +59,7 @@
 #include <boost/intrusive/list.hpp>
 #include <glog/logging.h>
 
+#include "common/shrink_buckets.h"
 #include "common/transparent_string_hash.h"
 #include "metadata/group_index.h"
 #include "metadata/object_state.h"
@@ -93,9 +94,11 @@ struct ObjectRef {
 struct SlotOwnerState {
     // Whether the owner's in-flight list holds the slot.
     bool in_flight_listed{false};
-    // Whether the owner's eviction index files the slot, and at what rank.
+    // Whether the owner's eviction index files the slot, at what rank, and
+    // under which of the index's own entries for a group, if any.
     bool eviction_filed{false};
     int64_t eviction_rank{0};
+    void* eviction_group{nullptr};
     // Two words for the owner's namespace policy.
     std::array<uint64_t, 2> policy_words{};
 };
@@ -250,6 +253,12 @@ inline void SlotHandle::reset() noexcept {
     std::unique_lock<std::shared_mutex> lock(stripe->lock);
     if (slot->state_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         stripe->slots.erase(stripe->slots.find(slot->key()));
+        // erase() never gives bucket memory back, so a stripe that once held
+        // far more slots than it does now would keep its high-water buckets
+        // for good. Rehashing moves no node, so the slots guards point at stay
+        // put; only map iterators, which a cursor holds under the shared
+        // stripe lock, are invalidated.
+        ShrinkBucketsIfSparse(stripe->slots);
     }
 }
 

@@ -131,6 +131,18 @@ jobs:
         python mooncake-wheel/tests/test_cuda_fabric_compat.py -v
       shell: bash
 
+    - name: Run session and HCA write metadata regressions
+      run: |
+        source test_env/bin/activate
+        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+        python -m pip install pyzmq msgpack
+        export MOONCAKE_TEST_MASTER_BINARY="$(command -v mooncake_master)"
+        for affinity in 0 1; do
+          MC_STORE_HCA_AFFINITY="$affinity" \
+            python -m pytest -q mooncake-wheel/tests/test_session_kv_events.py
+        done
+      shell: bash
+
     - name: Run all PG CPU tests with installed PyTorch
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
@@ -589,6 +601,11 @@ jobs:
       python-versions: '["3.12"]'
       artifact-prefix: mooncake-wheel-cu130
       version-override: 0.0.0.dev0
+      # This artifact feeds the T-One e2e pipeline (integration-test.yml picks
+      # the py312/cu130 wheel), which exercises the TENT runtime. Default
+      # engine behavior stays classic; TENT activates via MC_USE_TENT=1 set
+      # by tone_tests/scripts/common.sh.
+      use-tent: true
 
   # arm64 default wheels use a different transport set (USE_MNNVL) than
   # x86_64 (USE_INTRA_NVLINK), so build one here instead of only at release.
@@ -621,26 +638,41 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
+      # The Store library and its tests are about 70% of a full build, and
+      # the unit-tests job already builds and runs them. Only cuda-off runs
+      # Store tests here, so it builds just the TE tree plus those two test
+      # executables; the other legs configure with WITH_STORE=OFF. An empty
+      # build_targets builds and installs everything that was configured.
       matrix:
         include:
           - name: cuda-on
-            cmake_flags: '-DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs'
+            cmake_flags: >-
+              -DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs
+              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
             need_cuda: true
             metrics_flags: ''
+            build_targets: ''
           - name: cuda-off
             cmake_flags: '-DUSE_CUDA=OFF -DUSE_EVENT_DRIVEN_COMPLETION=ON'
             need_cuda: false
             metrics_flags: ''
+            build_targets: >-
+              mooncake-transfer-engine/all
+              transfer_task_test standalone_client_test
           - name: cuda-off-metrics-on
-            cmake_flags: '-DUSE_CUDA=OFF'
+            cmake_flags: '-DUSE_CUDA=OFF -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF'
             need_cuda: false
             metrics_flags: '-DTENT_METRICS_ENABLED=ON'
+            build_targets: ''
           # Exercise the native UB target with its injected mock adapter. A
           # Debug build also catches ODR/link errors hidden by optimization.
           - name: ub-mock
-            cmake_flags: '-DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug'
+            cmake_flags: >-
+              -DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug
+              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
             need_cuda: false
             metrics_flags: ''
+            build_targets: ''
           # Compile against stub ACL headers and embed host-only ACL stubs in
           # transfer_engine for Rust checks; no CANN, NPU, or libmf_smem is required.
           - name: memfabric-mock
@@ -650,6 +682,7 @@ jobs:
               -DCMAKE_BUILD_TYPE=Debug
             need_cuda: false
             metrics_flags: ''
+            build_targets: tent_memfabric_transport_test transfer_engine
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -701,8 +734,8 @@ jobs:
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         fi
         cd build-tent
-        if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
-          cmake --build . --target tent_memfabric_transport_test transfer_engine
+        if [ -n "${{ matrix.build_targets }}" ]; then
+          cmake --build . --target ${{ matrix.build_targets }}
         else
           cmake --build .
           sudo cmake --install .
@@ -743,6 +776,13 @@ jobs:
       run: |
         ctest --test-dir build-tent --output-on-failure --no-tests=error \
           -R '^tent_compat_notify_test$'
+      shell: bash
+
+    - name: Test Store scatter shared-segment ownership with TENT
+      if: matrix.name == 'cuda-off'
+      run: |
+        ctest --test-dir build-tent --output-on-failure --no-tests=error \
+          -R '^transfer_task_tent_shared_segment_test$'
       shell: bash
 
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
