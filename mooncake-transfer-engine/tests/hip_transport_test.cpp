@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,6 +32,7 @@
 #include "cuda_alike.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"  // P2PHANDSHAKE
+#include "transport/hip_transport/batch_copy.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
@@ -50,7 +52,75 @@ void* allocOnDevice(size_t size, int device) {
     EXPECT_EQ(cudaMalloc(&ptr, size), cudaSuccess);
     return ptr;
 }
+
+std::vector<uint8_t> randomBytes(size_t len, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::vector<uint8_t> bytes(len);
+    for (auto& b : bytes) b = static_cast<uint8_t>(rng());
+    return bytes;
+}
+
+std::vector<uint8_t> readBack(const void* device_ptr, size_t len) {
+    std::vector<uint8_t> host(len);
+    EXPECT_EQ(cudaMemcpy(host.data(), device_ptr, len, cudaMemcpyDefault),
+              cudaSuccess);
+    return host;
+}
 }  // namespace
+
+// The kernel copies ranges of any length and alignment between two GPUs, and
+// a batch needing more launches than descriptor slots waits for the oldest
+// launch instead of failing.
+TEST(BatchCopyKernelTest, CopiesRangesOfAnyAlignment) {
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count < 1) GTEST_SKIP() << "Needs a GPU.";
+    const int peer = device_count - 1;
+    constexpr size_t kBytes = 4 << 20;
+    auto expected = randomBytes(kBytes, 1);
+    void* src = allocOnDevice(kBytes, 0);
+    void* dst = allocOnDevice(kBytes, peer);
+    ASSERT_EQ(cudaMemcpy(src, expected.data(), kBytes, cudaMemcpyDefault),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemset(dst, 0, kBytes), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    // Back-to-back ranges with lengths and offsets that are rarely
+    // 16-byte aligned, then 64 B ranges (unaligned too) to the end.
+    std::vector<BatchCopyKernel::Range> ranges;
+    const uint64_t s = (uint64_t)src, d = (uint64_t)dst;
+    uint64_t off = 0;
+    for (uint64_t len : {1, 3, 15, 16, 17, 255, 4095, 4096, 4097, 65536}) {
+        ranges.push_back({s + off, d + off, len});
+        off += len;
+    }
+    for (; off < kBytes; off += 64) {
+        ranges.push_back(
+            {s + off, d + off, std::min<uint64_t>(64, kBytes - off)});
+    }
+    ASSERT_GT(ranges.size(), 2 * BatchCopyKernel::kSlotRanges);
+
+    BatchCopyKernel kernel(/*num_slots=*/2, /*max_grid=*/64);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    if (peer != 0) {
+        cudaError_t err = cudaDeviceEnablePeerAccess(peer, 0);
+        ASSERT_TRUE(err == cudaSuccess ||
+                    err == cudaErrorPeerAccessAlreadyEnabled);
+        (void)cudaGetLastError();
+    }
+    ASSERT_TRUE(kernel.available(0));
+    cudaStream_t stream;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+              cudaSuccess);
+    EXPECT_EQ(kernel.enqueue(0, stream, ranges.data(), ranges.size()),
+              ranges.size());
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    EXPECT_TRUE(readBack(dst, kBytes) == expected);
+
+    (void)cudaStreamDestroy(stream);
+    (void)cudaFree(src);
+    (void)cudaFree(dst);
+}
 
 TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
     int device_count = 0;
@@ -280,6 +350,135 @@ TEST_F(HipTransportAsyncTest, ManySmallCopiesAcrossDevices) {
     for (auto [ptr, value] : expected) {
         EXPECT_TRUE(allEqual(ptr, kChunk * kChunks, value));
     }
+}
+
+// If the kernel cannot be set up (here: descriptor memory cannot be
+// allocated), the transport falls back to hipMemcpyAsync; the failed HIP call
+// must not stay behind as the application's last error.
+TEST(BatchCopyKernelTest, FailedSetupLeavesNoHipError) {
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count < 1) GTEST_SKIP() << "Needs a GPU.";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    (void)cudaGetLastError();
+    BatchCopyKernel kernel(/*num_slots=*/1 << 30, /*max_grid=*/64);
+    EXPECT_FALSE(kernel.available(0));
+    EXPECT_EQ(cudaGetLastError(), cudaSuccess);
+}
+
+// Pageable host memory is not GPU-addressable, so copies from or to it stay
+// on hipMemcpyAsync even in a submission large enough for the batch copy
+// kernel, which still takes the GPU-to-GPU copies next to them.
+TEST_F(HipTransportAsyncTest, HostBuffersInBatchedSubmission) {
+    constexpr size_t kChunk = 4096, kChunks = 64, kBytes = kChunk * kChunks;
+    auto expected = randomBytes(kBytes, 3);
+    std::vector<uint8_t> host_src(expected), host_back(kBytes, 0);
+    void* gpu_src = allocRegistered(kBytes, 0, 0);
+    void* gpu_dst = allocRegistered(kBytes, device_count_ - 1, 0);
+    void* gpu_peer = allocRegistered(kBytes, device_count_ - 1, 0);
+    ASSERT_EQ(cudaMemcpy(gpu_src, expected.data(), kBytes, cudaMemcpyDefault),
+              cudaSuccess);
+
+    // Host -> GPU and GPU -> GPU in one submission, then GPU -> host.
+    std::vector<TransferRequest> writes, reads;
+    for (size_t off = 0; off < kBytes; off += kChunk) {
+        writes.push_back(request(TransferRequest::WRITE, host_src.data() + off,
+                                 (char*)gpu_dst + off, kChunk));
+        writes.push_back(request(TransferRequest::WRITE, (char*)gpu_src + off,
+                                 (char*)gpu_peer + off, kChunk));
+        reads.push_back(request(TransferRequest::READ, host_back.data() + off,
+                                (char*)gpu_dst + off, kChunk));
+    }
+    for (auto* entries : {&writes, &reads}) {
+        auto batch_id = engine_->allocateBatchID(entries->size());
+        ASSERT_TRUE(engine_->submitTransfer(batch_id, *entries).ok());
+        for (size_t i = 0; i < entries->size(); ++i) {
+            ASSERT_EQ(wait(batch_id, i), TransferStatusEnum::COMPLETED) << i;
+        }
+        EXPECT_TRUE(engine_->freeBatchID(batch_id).ok());
+    }
+    EXPECT_TRUE(readBack(gpu_dst, kBytes) == expected);
+    EXPECT_TRUE(readBack(gpu_peer, kBytes) == expected);
+    EXPECT_TRUE(host_back == expected);
+}
+
+// One submission mixing copies the batch copy kernel takes (short ones of
+// any alignment, aligned ones up to 1 MiB) with ones it leaves to
+// hipMemcpyAsync (longer, or long and unaligned); every byte must land.
+TEST_F(HipTransportAsyncTest, MixedSizesAndAlignments) {
+    constexpr size_t kBytes = 40 << 20;
+    const int peer = device_count_ - 1;
+    auto expected = randomBytes(kBytes, 2);
+    void* src = allocRegistered(kBytes, 0, 0);
+    void* dst = allocRegistered(kBytes, peer, 0);
+    void* back = allocRegistered(kBytes, 0, 0);
+    ASSERT_EQ(cudaMemcpy(src, expected.data(), kBytes, cudaMemcpyDefault),
+              cudaSuccess);
+
+    std::vector<TransferRequest> writes, reads;
+    size_t off = 1;  // every copy starts unaligned
+    for (size_t len :
+         {1, 7, 100, 4096, 5000, 2112, 64, 16384, 1 << 20, 3 << 20, 9216}) {
+        for (int rep = 0; rep < 8; ++rep) {
+            writes.push_back(request(TransferRequest::WRITE, (char*)src + off,
+                                     (char*)dst + off, len));
+            reads.push_back(request(TransferRequest::READ, (char*)back + off,
+                                    (char*)dst + off, len));
+            off += len;
+            off += (off % 16 == 0) ? 0 : 16 - off % 16;  // next one aligned
+            if (rep % 2) ++off;                          // ...or not
+        }
+    }
+    ASSERT_LT(off, kBytes);
+    for (auto* entries : {&writes, &reads}) {
+        auto batch_id = engine_->allocateBatchID(entries->size());
+        ASSERT_TRUE(engine_->submitTransfer(batch_id, *entries).ok());
+        for (size_t i = 0; i < entries->size(); ++i) {
+            ASSERT_EQ(wait(batch_id, i), TransferStatusEnum::COMPLETED) << i;
+        }
+        EXPECT_TRUE(engine_->freeBatchID(batch_id).ok());
+    }
+    auto copied = readBack(dst, kBytes);
+    auto returned = readBack(back, kBytes);
+    for (auto& r : writes) {
+        size_t begin = (char*)r.source - (char*)src;
+        ASSERT_TRUE(std::equal(expected.begin() + begin,
+                               expected.begin() + begin + r.length,
+                               copied.begin() + begin))
+            << "write at " << begin << " length " << r.length;
+        ASSERT_TRUE(std::equal(expected.begin() + begin,
+                               expected.begin() + begin + r.length,
+                               returned.begin() + begin))
+            << "read at " << begin << " length " << r.length;
+    }
+}
+
+// Batches submitted before any is polled may need more kernel launches than
+// there are descriptor slots; submit must wait for the GPU, not for polls.
+TEST_F(HipTransportAsyncTest, ManyBatchesBeforeFirstPoll) {
+    constexpr size_t kChunk = 4096, kChunks = 32, kBatches = 48;
+    const int peer = device_count_ - 1;
+    void* src = allocRegistered(kChunk * kChunks * kBatches, 0, 0x6C);
+    void* dst = allocRegistered(kChunk * kChunks * kBatches, peer, 0);
+    std::vector<Transport::BatchID> batches;
+    std::vector<std::vector<TransferRequest>> entries(kBatches);
+    for (size_t b = 0; b < kBatches; ++b) {
+        for (size_t c = 0; c < kChunks; ++c) {
+            size_t off = (b * kChunks + c) * kChunk;
+            entries[b].push_back(request(TransferRequest::WRITE,
+                                         (char*)src + off, (char*)dst + off,
+                                         kChunk));
+        }
+        batches.push_back(engine_->allocateBatchID(kChunks));
+        ASSERT_TRUE(engine_->submitTransfer(batches[b], entries[b]).ok());
+    }
+    for (auto batch_id : batches) {
+        for (size_t i = 0; i < kChunks; ++i) {
+            ASSERT_EQ(wait(batch_id, i), TransferStatusEnum::COMPLETED);
+        }
+        EXPECT_TRUE(engine_->freeBatchID(batch_id).ok());
+    }
+    EXPECT_TRUE(allEqual(dst, kChunk * kChunks * kBatches, 0x6C));
 }
 
 // An unresolvable target fails the whole submission before anything is

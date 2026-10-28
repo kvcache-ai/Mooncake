@@ -16,6 +16,7 @@
 #include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
+#include "transport/hip_transport/batch_copy.h"
 #include "transport/hip_transport/event_pool.h"
 #include "transport/hip_transport/stream_pool.h"
 
@@ -59,8 +60,12 @@ class HipTransport : public Transport {
     int unregisterLocalMemoryBatch(
         const std::vector<void*>& addr_list) override;
 
+    // Maps dest_addr into this process. buffer_addr/buffer_length, if given,
+    // receive the registered buffer that contains it.
     int relocateSharedMemoryAddress(uint64_t& dest_addr, uint64_t length,
-                                    uint64_t target_id);
+                                    uint64_t target_id,
+                                    uint64_t* buffer_addr = nullptr,
+                                    uint64_t* buffer_length = nullptr);
 
     const char* getName() const override { return "hip"; }
 
@@ -77,18 +82,29 @@ class HipTransport : public Transport {
             tasks);
 
     // Enqueue one device's copies on one stream, followed by one event.
-    void submitDeviceCopies(int device_id, const std::vector<Slice*>& slices);
+    // device_memory[i]: both buffers of slices[i] are device memory.
+    void submitDeviceCopies(int device_id, const std::vector<Slice*>& slices,
+                            const std::vector<bool>& device_memory);
 
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
         remap_entries_;
     RWSpinlock remap_lock_;
     bool use_fabric_mem_;
+    // IPC mode with peer access between every pair of devices. The batch copy
+    // kernel dereferences peer memory, so it runs only then; hipMemcpyAsync
+    // works without peer access.
+    bool all_peer_access_;
 
     std::mutex register_mutex_;
 
     // Stream and event pools for async operations
     StreamPool stream_pool_;
     EventPool event_pool_;
+
+    // A device's submission with at least this many copies goes through
+    // batch_copy_ (0 disables it).
+    size_t batch_copy_min_copies_;
+    BatchCopyKernel batch_copy_;
 };
 
 }  // namespace mooncake

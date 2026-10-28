@@ -16,6 +16,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
@@ -39,8 +40,22 @@ namespace mooncake {
 // These can be overridden via environment variables:
 // - MC_HIP_NUM_STREAMS: number of HIP streams per device
 // - MC_HIP_NUM_EVENTS: number of HIP events per device
+// - MC_HIP_BATCH_COPY_MIN: small copies per device submission from which they
+//   run as one batch copy kernel instead of one hipMemcpyAsync each
+//   (0 disables)
+// - MC_HIP_BATCH_COPY_GRID: maximum workgroups of one batch copy kernel
 constexpr int kDefaultNumStreams = 64;
 constexpr int kDefaultNumEvents = 64;
+constexpr int kDefaultBatchCopyMin = 16;
+constexpr int kDefaultBatchCopyGrid = 256;
+// Descriptor slots per device; each covers BatchCopyKernel::kSlotRanges.
+constexpr int kBatchCopySlots = 32;
+// Larger copies stay on hipMemcpyAsync: the copy engines move them as fast
+// as the kernel would (faster over several links), without using CUs.
+constexpr uint64_t kBatchCopyMaxLength = 1ull << 20;
+// Copies not 16-byte aligned run byte by byte in the kernel, so only short
+// ones go there.
+constexpr uint64_t kBatchCopyMaxUnaligned = 4096;
 
 // HIP-specific type aliases
 constexpr auto HIPX_MEM_HANDLE_TYPE_FABRIC =
@@ -229,31 +244,43 @@ static int getDeviceFromPointer(void* ptr) {
     }
 }
 
-static int setDeviceContext(void* source_ptr, int& device_id) {
-    // Get device ID from source pointer
-    device_id = getDeviceFromPointer(source_ptr);
+// Device allocations already looked up in one submission. Its buffers
+// usually fall in a few allocations, so most need no HIP call.
+struct DeviceAllocation {
+    uint64_t begin;
+    uint64_t end;
+    int device_id;
+};
 
-    // For host memory, determine current device or use device 0
-    if (device_id < 0) {
-        int current_device = 0;
-        hipError_t err = hipGetDevice(&current_device);
-        if (err == hipSuccess) {
-            device_id = current_device;
-        } else {
-            device_id = 0;
+// Device that owns ptr, and whether ptr is device memory. Host memory gets
+// fallback_device.
+static int getBufferDevice(void* ptr, int fallback_device,
+                           std::vector<DeviceAllocation>& allocations,
+                           bool& device_memory) {
+    const uint64_t addr = (uint64_t)ptr;
+    for (const auto& allocation : allocations) {
+        if (addr >= allocation.begin && addr < allocation.end) {
+            device_memory = true;
+            return allocation.device_id;
         }
     }
-
-    // Set device context
-    if (!checkHip(hipSetDevice(device_id),
-                  "HipTransport: failed to set device context")) {
-        return -1;
+    int device_id = getDeviceFromPointer(ptr);
+    device_memory = device_id >= 0;
+    if (!device_memory) return fallback_device;
+    hipDeviceptr_t base = nullptr;
+    size_t size = 0;
+    if (allocations.size() < 16 &&
+        hipMemGetAddressRange(&base, &size, (hipDeviceptr_t)ptr) ==
+            hipSuccess) {
+        allocations.push_back(
+            {(uint64_t)base, (uint64_t)base + size, device_id});
     }
-
-    return 0;
+    return device_id;
 }
 
-static void setupP2PAccess(int num_devices) {
+// Returns whether every device can access every other one.
+static bool setupP2PAccess(int num_devices) {
+    bool all_enabled = true;
     // The loop switches devices; the guard restores the caller's on return.
     HipDeviceGuard device_guard;
 
@@ -274,6 +301,7 @@ static void setupP2PAccess(int num_devices) {
 
     for (int i = 0; i < num_devices; ++i) {
         if (!checkHip(hipSetDevice(i), "HipTransport: failed to set device")) {
+            all_enabled = false;
             continue;
         }
 
@@ -285,14 +313,17 @@ static void setupP2PAccess(int num_devices) {
             int can_access_peer = 0;
             if (!checkHip(hipDeviceCanAccessPeer(&can_access_peer, i, j),
                           "HipTransport: failed to query peer access")) {
+                all_enabled = false;
                 continue;
             }
+            all_enabled = all_enabled && can_access_peer;
 
             if (can_access_peer) {
                 hipError_t result = hipDeviceEnablePeerAccess(j, 0);
                 if (result == hipErrorPeerAccessAlreadyEnabled) {
                     clearStickyPeerAccessError(i, j);
                 } else if (result != hipSuccess) {
+                    all_enabled = false;
                     clearStickyPeerAccessError(i, j);
                     LOG(WARNING) << "HipTransport: failed to enable P2P access "
                                     "from device "
@@ -306,6 +337,7 @@ static void setupP2PAccess(int num_devices) {
             }
         }
     }
+    return all_enabled;
 }
 
 static int getNumStreams() {
@@ -344,6 +376,25 @@ static int getNumEvents() {
         }
     }
     return kDefaultNumEvents;
+}
+
+static int getNonNegativeEnv(const char* name, int default_value) {
+    const char* env = getenv(name);
+    if (env) {
+        try {
+            int value = std::stoi(env);
+            if (value >= 0) {
+                return value;
+            }
+            LOG(WARNING) << name << " value " << value
+                         << " must not be negative, using default "
+                         << default_value;
+        } catch (...) {
+            LOG(WARNING) << "Invalid " << name << " value, using default "
+                         << default_value;
+        }
+    }
+    return default_value;
 }
 
 static bool supportFabricMem() {
@@ -396,8 +447,14 @@ static bool supportFabricMem() {
 
 HipTransport::HipTransport()
     : use_fabric_mem_(supportFabricMem()),
+      all_peer_access_(false),
       stream_pool_(getNumStreams()),
-      event_pool_(getNumEvents()) {
+      event_pool_(getNumEvents()),
+      batch_copy_min_copies_(
+          getNonNegativeEnv("MC_HIP_BATCH_COPY_MIN", kDefaultBatchCopyMin)),
+      batch_copy_(kBatchCopySlots,
+                  std::max(1, getNonNegativeEnv("MC_HIP_BATCH_COPY_GRID",
+                                                kDefaultBatchCopyGrid))) {
     // Enable P2P access for IPC mode
     if (!use_fabric_mem_) {
         int num_devices = 0;
@@ -406,7 +463,7 @@ HipTransport::HipTransport()
             return;
         }
 
-        setupP2PAccess(num_devices);
+        all_peer_access_ = setupP2PAccess(num_devices);
     }
 }
 
@@ -464,6 +521,9 @@ struct HipCompletionEvent {
     int device_id;
     EventPool* pool;
     std::atomic<size_t> refs;
+    // Set once a query saw the event complete, so the other slices of the
+    // submission need not query it again.
+    std::atomic<bool> done{false};
 };
 
 void releaseCompletionEvent(HipCompletionEvent* completion) {
@@ -485,8 +545,14 @@ HipCompletionEvent* takeCompletionEvent(Transport::Slice* slice) {
 bool finishSlice(Transport::Slice* slice, bool wait) {
     HipCompletionEvent* completion = takeCompletionEvent(slice);
     if (completion == nullptr) return true;
-    hipError_t err = wait ? hipEventSynchronize(completion->event)
-                          : hipEventQuery(completion->event);
+    hipError_t err = hipSuccess;
+    if (!completion->done.load(std::memory_order_acquire)) {
+        err = wait ? hipEventSynchronize(completion->event)
+                   : hipEventQuery(completion->event);
+        if (err == hipSuccess) {
+            completion->done.store(true, std::memory_order_release);
+        }
+    }
     if (err == hipErrorNotReady) {
         // Still in flight; hand the event back for the next poll.
         __atomic_store_n(&slice->local.hip_event, completion, __ATOMIC_RELEASE);
@@ -510,7 +576,8 @@ void releaseSliceEvent(Transport::Slice* slice) {
 }  // namespace
 
 void HipTransport::submitDeviceCopies(int device_id,
-                                      const std::vector<Slice*>& slices) {
+                                      const std::vector<Slice*>& slices,
+                                      const std::vector<bool>& device_memory) {
     hipStream_t stream = stream_pool_.getNextStream(device_id);
     hipEvent_t event = stream ? event_pool_.getEvent(device_id) : nullptr;
     if (event == nullptr) {
@@ -520,20 +587,83 @@ void HipTransport::submitDeviceCopies(int device_id,
         return;
     }
 
-    std::vector<Slice*> posted;
-    for (Slice* slice : slices) {
-        hipError_t err;
-        if (slice->opcode == TransferRequest::READ) {
-            err = hipMemcpyAsync(slice->source_addr, slice->local.dest_addr,
-                                 slice->length, hipMemcpyDefault, stream);
+    // Small copies go to the batch copy kernel when there are enough of
+    // them, each with the index of its slice. Copies to different targets are
+    // interleaved so that the workgroups running at any moment write over
+    // several links.
+    std::vector<size_t> small;
+    std::vector<size_t> memcpy_slices;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        const Slice* slice = slices[i];
+        const bool aligned =
+            ((uint64_t)slice->source_addr | (uint64_t)slice->local.dest_addr) %
+                16 ==
+            0;
+        if (device_memory[i] && slice->length <= kBatchCopyMaxLength &&
+            (aligned || slice->length <= kBatchCopyMaxUnaligned)) {
+            small.push_back(i);
         } else {
-            err = hipMemcpyAsync(slice->local.dest_addr, slice->source_addr,
-                                 slice->length, hipMemcpyDefault, stream);
+            memcpy_slices.push_back(i);
         }
-        if (checkHip(err, "HipTransport: hipMemcpyAsync failed")) {
-            posted.push_back(slice);
+    }
+    std::vector<BatchCopyKernel::Range> ranges;
+    std::vector<size_t> range_slices;
+    if (all_peer_access_ && batch_copy_min_copies_ > 0 &&
+        small.size() >= batch_copy_min_copies_ &&
+        batch_copy_.available(device_id)) {
+        std::map<uint64_t, std::vector<size_t>> by_target;
+        for (size_t i : small) by_target[slices[i]->target_id].push_back(i);
+        for (size_t k = 0; range_slices.size() < small.size(); ++k) {
+            for (auto& [target, indices] : by_target) {
+                if (k >= indices.size()) continue;
+                const Slice* slice = slices[indices[k]];
+                uint64_t local = (uint64_t)slice->source_addr;
+                uint64_t remote = (uint64_t)slice->local.dest_addr;
+                if (slice->opcode == TransferRequest::READ) {
+                    ranges.push_back({remote, local, slice->length});
+                } else {
+                    ranges.push_back({local, remote, slice->length});
+                }
+                range_slices.push_back(indices[k]);
+            }
+        }
+    } else {
+        memcpy_slices.insert(memcpy_slices.end(), small.begin(), small.end());
+    }
+
+    size_t launched = 0;
+    if (!ranges.empty()) {
+        launched = batch_copy_.enqueue(device_id, stream, ranges.data(),
+                                       ranges.size());
+    }
+
+    std::vector<bool> failed(slices.size(), false);
+    auto copy = [&](size_t i, void* dst, const void* src, size_t len) {
+        if (!checkHip(hipMemcpyAsync(dst, src, len, hipMemcpyDefault, stream),
+                      "HipTransport: hipMemcpyAsync failed")) {
+            failed[i] = true;
+        }
+    };
+    // Ranges of a failed launch.
+    for (size_t r = launched; r < ranges.size(); ++r) {
+        copy(range_slices[r], (void*)ranges[r].dst, (const void*)ranges[r].src,
+             ranges[r].len);
+    }
+    for (size_t i : memcpy_slices) {
+        Slice* slice = slices[i];
+        if (slice->opcode == TransferRequest::READ) {
+            copy(i, slice->source_addr, slice->local.dest_addr, slice->length);
         } else {
-            slice->markFailed();
+            copy(i, slice->local.dest_addr, slice->source_addr, slice->length);
+        }
+    }
+
+    std::vector<Slice*> posted;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        if (failed[i]) {
+            slices[i]->markFailed();
+        } else {
+            posted.push_back(slices[i]);
         }
     }
     if (posted.empty()) {
@@ -567,22 +697,70 @@ Status HipTransport::submitTasks(
     // relocation of a target opens its IPC handle, which hipIpcOpenMemHandle
     // maps for the current device.
     HipDeviceGuard device_guard;
+    int caller_device = 0;
+    if (hipGetDevice(&caller_device) != hipSuccess) caller_device = 0;
+    int current_device = caller_device;
     std::vector<uint64_t> dest_addrs(tasks.size());
     std::vector<int> device_ids(tasks.size(), -1);
+    // Whether both buffers are device memory, which the batch copy kernel
+    // needs: it cannot dereference pageable host memory.
+    std::vector<bool> device_memory(tasks.size(), false);
     Status status = Status::OK();
+    std::vector<DeviceAllocation> allocations;
+    // The buffer last matched for a target, and its offset to the mapping.
+    struct Mapped {
+        uint64_t target_id;
+        uint64_t begin;
+        uint64_t end;
+        uint64_t delta;
+    };
+    std::vector<Mapped> mapped;
     for (size_t i = 0; i < tasks.size() && status.ok(); ++i) {
         const TransferRequest& request = *tasks[i].second;
-        dest_addrs[i] = request.target_offset;
-        if (setDeviceContext(request.source, device_ids[i]) != 0) {
-            status = Status::InvalidArgument("failed to set device context");
-        } else if (request.target_id != LOCAL_SEGMENT_ID &&
-                   relocateSharedMemoryAddress(dest_addrs[i], request.length,
-                                               request.target_id)) {
+        uint64_t& dest = dest_addrs[i];
+        dest = request.target_offset;
+        bool source_on_device = false;
+        device_ids[i] = getBufferDevice(request.source, caller_device,
+                                        allocations, source_on_device);
+        if (request.target_id == LOCAL_SEGMENT_ID) {
+            bool dest_on_device = false;
+            getBufferDevice((void*)dest, caller_device, allocations,
+                            dest_on_device);
+            device_memory[i] = source_on_device && dest_on_device;
+            continue;
+        }
+        // Targets of other processes are mapped device memory.
+        device_memory[i] = source_on_device;
+        auto it = std::find_if(mapped.begin(), mapped.end(), [&](auto& m) {
+            return m.target_id == request.target_id && dest >= m.begin &&
+                   dest + request.length <= m.end;
+        });
+        if (it != mapped.end()) {
+            dest += it->delta;
+            continue;
+        }
+        if (device_ids[i] != current_device) {
+            if (!checkHip(hipSetDevice(device_ids[i]),
+                          "HipTransport: failed to set device context")) {
+                status =
+                    Status::InvalidArgument("failed to set device context");
+                break;
+            }
+            current_device = device_ids[i];
+        }
+        const uint64_t original = dest;
+        uint64_t buffer_addr = 0, buffer_length = 0;
+        if (relocateSharedMemoryAddress(dest, request.length, request.target_id,
+                                        &buffer_addr, &buffer_length)) {
             status = Status::Memory("device memory not registered");
+        } else {
+            mapped.push_back({request.target_id, buffer_addr,
+                              buffer_addr + buffer_length, dest - original});
         }
     }
 
     std::map<int, std::vector<Slice*>> device_slices;
+    std::map<int, std::vector<bool>> device_slice_memory;
     for (size_t i = 0; i < tasks.size(); ++i) {
         TransferTask& task = *tasks[i].first;
         const TransferRequest& request = *tasks[i].second;
@@ -608,6 +786,7 @@ Status HipTransport::submitTasks(
             continue;
         }
         device_slices[device_ids[i]].push_back(slice);
+        device_slice_memory[device_ids[i]].push_back(device_memory[i]);
     }
 
     for (auto& [device_id, slices] : device_slices) {
@@ -616,7 +795,7 @@ Status HipTransport::submitTasks(
             for (Slice* slice : slices) slice->markFailed();
             continue;
         }
-        submitDeviceCopies(device_id, slices);
+        submitDeviceCopies(device_id, slices, device_slice_memory[device_id]);
     }
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
@@ -802,7 +981,9 @@ int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
 
 int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                                               uint64_t length,
-                                              uint64_t target_id) {
+                                              uint64_t target_id,
+                                              uint64_t* buffer_addr,
+                                              uint64_t* buffer_length) {
     auto desc = metadata_->getSegmentDescByID(target_id);
 
     // Search for matching buffer entry
@@ -817,6 +998,8 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                         .shm_addr;
                 remap_lock_.unlockShared();
                 dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
+                if (buffer_addr) *buffer_addr = entry.addr;
+                if (buffer_length) *buffer_length = entry.length;
                 return 0;
             }
             remap_lock_.unlockShared();
@@ -856,6 +1039,8 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
             auto shm_addr =
                 remap_entries_[std::make_pair(target_id, entry.addr)].shm_addr;
             dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
+            if (buffer_addr) *buffer_addr = entry.addr;
+            if (buffer_length) *buffer_length = entry.length;
             return 0;
         }
     }
