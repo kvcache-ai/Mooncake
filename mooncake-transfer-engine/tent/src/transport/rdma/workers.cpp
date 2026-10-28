@@ -35,6 +35,7 @@
 #include "tent/common/utils/string_builder.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/random.h"
+#include "tent/metrics/tent_metrics.h"
 
 namespace mooncake {
 namespace tent {
@@ -52,6 +53,31 @@ RailMonitor& getOrCreateRail(
     auto [ins, _] = rails.emplace(machine_id, std::make_unique<RailMonitor>());
     return *ins->second;
 }
+#if TENT_METRICS_ENABLED
+TentMetrics::RdmaWcErrorCategory rdmaWcErrorCategory(ibv_wc_status status) {
+    switch (status) {
+        case IBV_WC_WR_FLUSH_ERR:
+            return TentMetrics::RdmaWcErrorCategory::Flush;
+        case IBV_WC_RETRY_EXC_ERR:
+            return TentMetrics::RdmaWcErrorCategory::RetryExceeded;
+        case IBV_WC_RNR_RETRY_EXC_ERR:
+            return TentMetrics::RdmaWcErrorCategory::RnrRetryExceeded;
+        case IBV_WC_LOC_PROT_ERR:
+        case IBV_WC_LOC_ACCESS_ERR:
+        case IBV_WC_MW_BIND_ERR:
+            return TentMetrics::RdmaWcErrorCategory::LocalProtection;
+        case IBV_WC_REM_ACCESS_ERR:
+            return TentMetrics::RdmaWcErrorCategory::RemoteAccess;
+        case IBV_WC_REM_OP_ERR:
+            return TentMetrics::RdmaWcErrorCategory::RemoteOperation;
+        case IBV_WC_BAD_RESP_ERR:
+        case IBV_WC_REM_INV_REQ_ERR:
+            return TentMetrics::RdmaWcErrorCategory::Protocol;
+        default:
+            return TentMetrics::RdmaWcErrorCategory::Other;
+    }
+}
+#endif
 }  // namespace
 
 Workers::Workers(RdmaTransport* transport)
@@ -344,9 +370,19 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
     // are later swept from. First entry only: a slice arriving here has
     // never been counted, so there is nothing to move.
     auto* owned = slice_list.first;
+#if TENT_METRICS_ENABLED
+    int64_t read_slices = 0;
+    int64_t write_slices = 0;
+#endif
     for (int i = 0; i < slice_list.num_slices && owned; ++i) {
         owned->owner_worker.store(worker_id, std::memory_order_relaxed);
         owned->counted_lane.store(worker_id, std::memory_order_relaxed);
+#if TENT_METRICS_ENABLED
+        if (owned->task && owned->task->request.opcode == Request::READ)
+            ++read_slices;
+        else if (owned->task)
+            ++write_slices;
+#endif
         owned = owned->next;
     }
 
@@ -357,6 +393,20 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
     }
 
     worker.queues[priority].push(slice_list);
+#if TENT_METRICS_ENABLED
+    auto& metrics = TentMetrics::instance();
+    if (read_slices > 0) {
+        metrics.recordRdmaSliceEvent(
+            Request::READ, TentMetrics::RdmaSliceEvent::Enqueued, read_slices);
+        metrics.recordRdmaWorkerInflight(Request::READ, read_slices);
+    }
+    if (write_slices > 0) {
+        metrics.recordRdmaSliceEvent(Request::WRITE,
+                                     TentMetrics::RdmaSliceEvent::Enqueued,
+                                     write_slices);
+        metrics.recordRdmaWorkerInflight(Request::WRITE, write_slices);
+    }
+#endif
     if (!worker.inflight_slices.fetch_add(slice_list.num_slices)) {
         std::lock_guard<std::mutex> lock(worker.mutex);
         if (worker.in_suspend) worker.cv.notify_all();
@@ -394,6 +444,12 @@ void Workers::submitFromTick(WorkerContext& worker, RdmaSlice* slice) {
         if (prev >= 0 && prev != lane && prev < (int)num_workers_)
             worker_context_[prev].inflight_slices.fetch_sub(1);
         if (prev != lane) worker.inflight_slices.fetch_add(1);
+#if TENT_METRICS_ENABLED
+        if (prev < 0 && slice->task) {
+            TentMetrics::instance().recordRdmaWorkerInflight(
+                slice->task->request.opcode, 1);
+        }
+#endif
     }
     // The worker must never block on its own queue (issue #3637): a full
     // queue parks the slice in requeue_overflow and the next tick retries.
@@ -511,6 +567,12 @@ void Workers::releaseSliceQuota(RdmaSlice* slice, uint64_t now_ns,
         slice->posted_dev.exchange(-1, std::memory_order_acq_rel);
     if (posted >= 0)
         device_selector_->notePostEnded(posted, slice->length, now_ns);
+#if TENT_METRICS_ENABLED
+    if (posted >= 0 && slice->task) {
+        TentMetrics::instance().recordRdmaPostedInflight(
+            slice->task->request.opcode, -1);
+    }
+#endif
     const int charged =
         slice->charged_dev.exchange(-1, std::memory_order_acq_rel);
     if (charged >= 0)
@@ -576,6 +638,12 @@ void Workers::discountFromOwner(WorkerContext& self, RdmaSlice* slice) {
     if (lane < 0) return;
     const bool known = worker_context_ && lane < (int)num_workers_;
     (known ? worker_context_[lane] : self).inflight_slices.fetch_sub(1);
+#if TENT_METRICS_ENABLED
+    if (slice->task) {
+        TentMetrics::instance().recordRdmaWorkerInflight(
+            slice->task->request.opcode, -1);
+    }
+#endif
 }
 
 void Workers::drainReclaimed(WorkerContext& worker) {
@@ -602,6 +670,14 @@ void Workers::markPosted(WorkerContext& worker, RdmaSlice* slice,
     slice->submit_ts = post_ts;
     notePostedSlice(slice);
     worker.inflight_slice_set.insert(slice);
+#if TENT_METRICS_ENABLED
+    if (slice->task) {
+        auto& metrics = TentMetrics::instance();
+        metrics.recordRdmaSliceEvent(slice->task->request.opcode,
+                                     TentMetrics::RdmaSliceEvent::PostAttempt);
+        metrics.recordRdmaPostedInflight(slice->task->request.opcode, 1);
+    }
+#endif
 }
 
 std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
@@ -717,6 +793,11 @@ void Workers::asyncPostSend() {
             }
             auto status = generatePostPath(slice);
             if (!status.ok()) {
+#if TENT_METRICS_ENABLED
+                TentMetrics::instance().recordRdmaSliceEvent(
+                    slice->task->request.opcode,
+                    TentMetrics::RdmaSliceEvent::PathError);
+#endif
                 VLOG(1) << "Failed to generate post path for slice " << slice
                         << ": " << status.ToString();
                 LOG_EVERY_N(ERROR, 10000)
@@ -791,6 +872,11 @@ void Workers::asyncPostSend() {
                 releaseSliceQuota(slice, getCurrentTimeInNano());
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
+#if TENT_METRICS_ENABLED
+                    TentMetrics::instance().recordRdmaRetryExhausted(
+                        slice->task->request.opcode,
+                        TentMetrics::RdmaRetryCause::Endpoint);
+#endif
                     VLOG(1)
                         << "Slice " << slice << " failed: retry count exceeded";
                     LOG_EVERY_N(WARNING, 100)
@@ -806,6 +892,11 @@ void Workers::asyncPostSend() {
                     if (auto* rail = slice->rail_monitor)
                         rail->cancelProbe(slice->source_dev_id,
                                           slice->target_dev_id);
+#if TENT_METRICS_ENABLED
+                    TentMetrics::instance().recordRdmaRetry(
+                        slice->task->request.opcode,
+                        TentMetrics::RdmaRetryCause::Endpoint);
+#endif
                     submitFromTick(worker, slice);
                 }
             }
@@ -836,6 +927,11 @@ void Workers::asyncPostSend() {
         for (int id = 0; id < num_submitted; ++id) {
             auto slice = slices[id];
             if (!slice->failed) continue;
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordRdmaSliceEvent(
+                slice->task->request.opcode,
+                TentMetrics::RdmaSliceEvent::PostError);
+#endif
             // Rejected by the hardware: it never went on the wire, so take
             // back what the hook put in place.
             worker.inflight_slice_set.erase(slice);
@@ -853,6 +949,11 @@ void Workers::asyncPostSend() {
             slice->retry_count++;
             if (slice->retry_count >=
                 transport_->params_->workers.max_retry_count) {
+#if TENT_METRICS_ENABLED
+                TentMetrics::instance().recordRdmaRetryExhausted(
+                    slice->task->request.opcode,
+                    TentMetrics::RdmaRetryCause::Post);
+#endif
                 LOG(WARNING)
                     << "Slice " << slice << " failed: retry count exceeded";
                 disableEndpoint(slice);
@@ -864,6 +965,11 @@ void Workers::asyncPostSend() {
                 if (auto* rail = slice->rail_monitor)
                     rail->cancelProbe(slice->source_dev_id,
                                       slice->target_dev_id);
+#if TENT_METRICS_ENABLED
+                TentMetrics::instance().recordRdmaRetry(
+                    slice->task->request.opcode,
+                    TentMetrics::RdmaRetryCause::Post);
+#endif
                 submitFromTick(worker, slice);
             }
         }
@@ -966,6 +1072,11 @@ void Workers::expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns) {
             continue;
         }
         if (now_ns - slice->enqueue_ts > slice_timeout_ns_) {
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordRdmaSliceEvent(
+                slice->task->request.opcode,
+                TentMetrics::RdmaSliceEvent::SoftwareTimeout);
+#endif
             auto ep = slice->ep_weak_ptr.lock();
             LOG(WARNING) << "Slice " << slice
                          << " failed: transfer timeout (software)";
@@ -1026,6 +1137,24 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
     auto ep = slice->ep_weak_ptr.lock();
     double enqueue_lat = (slice->submit_ts - slice->enqueue_ts) / 1000.0;
     double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
+#if TENT_METRICS_ENABLED
+    if (wc.status != IBV_WC_SUCCESS) {
+        TentMetrics::instance().recordRdmaWcError(
+            slice->task->request.opcode, rdmaWcErrorCategory(wc.status));
+    }
+    TentMetrics::RdmaCompletionOutcome metric_outcome;
+    if (slice->word != PENDING) {
+        metric_outcome = TentMetrics::RdmaCompletionOutcome::Late;
+    } else if (wc.status == IBV_WC_SUCCESS) {
+        metric_outcome = TentMetrics::RdmaCompletionOutcome::Success;
+    } else if (wc.status == IBV_WC_WR_FLUSH_ERR) {
+        metric_outcome = TentMetrics::RdmaCompletionOutcome::Flush;
+    } else {
+        metric_outcome = TentMetrics::RdmaCompletionOutcome::WcError;
+    }
+    TentMetrics::instance().recordRdmaCompletion(slice->task->request.opcode,
+                                                 metric_outcome, inflight_lat);
+#endif
     // The selection EWMA learns only from a successful transfer, and only
     // from this attempt's own post->completion time (#3511): the time since
     // first enqueue folds in queueing and earlier failed attempts on other
@@ -1110,6 +1239,11 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
         slice->retry_count++;
         if (slice->retry_count >=
             transport_->params_->workers.max_retry_count) {
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordRdmaRetryExhausted(
+                slice->task->request.opcode,
+                TentMetrics::RdmaRetryCause::Completion);
+#endif
             LOG(WARNING) << "Slice " << slice
                          << " failed: retry count exceeded";
             ep->acknowledge(slice, FAILED, [&sweep](RdmaSlice* swept) {
@@ -1128,6 +1262,11 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
             if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
                 updateSliceStatus(slice, CANCELED);
             } else {
+#if TENT_METRICS_ENABLED
+                TentMetrics::instance().recordRdmaRetry(
+                    slice->task->request.opcode,
+                    TentMetrics::RdmaRetryCause::Completion);
+#endif
                 submitFromTick(worker, slice);
             }
         }
@@ -1180,7 +1319,12 @@ void Workers::asyncPollCq() {
         if (!cq) continue;  // inert context for a non-RDMA or failed NIC
         ibv_wc wc[kPollCount];
         int nr_poll = cq->poll(kPollCount, wc);
-        if (nr_poll < 0) continue;
+        if (nr_poll < 0) {
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordRdmaCqPollError();
+#endif
+            continue;
+        }
         auto poll_ts = getCurrentTimeInNano();
         for (int i = 0; i < nr_poll; ++i)
             handleCompletion(worker, *context, wc[i], poll_ts,
@@ -1211,6 +1355,9 @@ void Workers::workerThread(int thread_id) {
 
     uint64_t grace_ts = 0;
     uint64_t last_perf_logging_ts = 0;
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordWorkerProgress(TentMetrics::WorkerKind::Rdma);
+#endif
     while (running_) {
         auto current_ts = getCurrentTimeInNano();
         auto inflight_slices =
@@ -1220,6 +1367,10 @@ void Workers::workerThread(int thread_id) {
                 transport_->params_->workers.grace_period_ns) {
             asyncPostSend();
             asyncPollCq();
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordWorkerProgress(
+                TentMetrics::WorkerKind::Rdma);
+#endif
             if (inflight_slices) grace_ts = current_ts;
             const static uint64_t ONE_SECOND = 1000000000;
             if (transport_->params_->workers.show_latency_info &&

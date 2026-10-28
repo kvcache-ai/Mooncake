@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "tent/common/status.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/runtime/transfer_engine_impl.h"
 
 namespace mooncake {
@@ -28,6 +29,24 @@ ProgressWorker::ProgressWorker(TransferEngineImpl* impl,
     : impl_(impl), fallback_interval_(fallback_interval) {}
 
 ProgressWorker::~ProgressWorker() { stop(); }
+
+void ProgressWorker::markProgress() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    last_progress_time_ns_.store(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count(),
+        std::memory_order_release);
+}
+
+uint64_t ProgressWorker::lastProgressAgeSeconds() const {
+    const int64_t last =
+        last_progress_time_ns_.load(std::memory_order_acquire);
+    if (last <= 0) return 0;
+    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    if (now <= last) return 0;
+    return static_cast<uint64_t>(now - last) / 1000000000ULL;
+}
 
 void ProgressWorker::start() {
     if (running_.exchange(true, std::memory_order_acq_rel)) return;
@@ -72,6 +91,9 @@ void ProgressWorker::notifyRuntimeQueueReady() {
 }
 
 void ProgressWorker::runner() {
+    markProgress();
+    TentMetrics::instance().recordWorkerProgress(
+        TentMetrics::WorkerKind::EngineProgress);
     // An explicit zero disables runtime-queue scans, but must not strand a
     // transport that requires polling to produce its only completion wake.
     const auto interval = fallback_interval_.count() > 0
@@ -160,6 +182,9 @@ void ProgressWorker::runner() {
                 (void)impl_->progressRuntimeQueue();
             (void)impl_->lazyFreeBatch();
         }
+        markProgress();
+        TentMetrics::instance().recordWorkerProgress(
+            TentMetrics::WorkerKind::EngineProgress);
     }
 }
 

@@ -51,6 +51,7 @@ class SegmentTracker;
 class Platform;
 class ProxyManager;
 class ProgressWorker;
+struct EngineDiagnosticsSnapshot;
 
 // How long a poll loop should pause before polling again. Zero means poll
 // immediately.
@@ -107,6 +108,20 @@ struct TaskInfo {
     // attempt, so a task that recovers and later fails at poll still
     // attributes its root cause to submit.
     int8_t failure_stage{-1};
+    // Process-local monotonic identifiers for structured logs and traces.
+    // Unlike BatchID, none of these expose a memory address.
+    uint64_t observability_batch_id{0};
+    uint64_t observability_request_id{0};
+    uint64_t observability_task_id{0};
+    uint64_t observability_attempt_id{0};
+    bool observability_trace_retained{false};
+    // Logical-request accounting is paired independently of the runtime
+    // sample switch. `logical_observability_active` means the in-flight gauge
+    // was incremented and therefore must be decremented exactly once.
+    bool logical_observability_active{false};
+    bool logical_request_active{false};
+    bool terminal_observability_recorded{false};
+    bool stuck_observability_recorded{false};
 
     TaskInfo() = default;
 
@@ -134,7 +149,17 @@ struct TaskInfo {
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
           attempt_active(other.attempt_active),
-          failure_stage(other.failure_stage) {}
+          failure_stage(other.failure_stage),
+          observability_batch_id(other.observability_batch_id),
+          observability_request_id(other.observability_request_id),
+          observability_task_id(other.observability_task_id),
+          observability_attempt_id(other.observability_attempt_id),
+          observability_trace_retained(other.observability_trace_retained),
+          logical_observability_active(other.logical_observability_active),
+          logical_request_active(other.logical_request_active),
+          terminal_observability_recorded(
+              other.terminal_observability_recorded),
+          stuck_observability_recorded(other.stuck_observability_recorded) {}
 
     TaskInfo(TaskInfo&& other) noexcept
         : type(other.type),
@@ -160,7 +185,17 @@ struct TaskInfo {
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
           attempt_active(other.attempt_active),
-          failure_stage(other.failure_stage) {}
+          failure_stage(other.failure_stage),
+          observability_batch_id(other.observability_batch_id),
+          observability_request_id(other.observability_request_id),
+          observability_task_id(other.observability_task_id),
+          observability_attempt_id(other.observability_attempt_id),
+          observability_trace_retained(other.observability_trace_retained),
+          logical_observability_active(other.logical_observability_active),
+          logical_request_active(other.logical_request_active),
+          terminal_observability_recorded(
+              other.terminal_observability_recorded),
+          stuck_observability_recorded(other.stuck_observability_recorded) {}
 
     TaskInfo& operator=(const TaskInfo& other) {
         if (this != &other) {
@@ -190,6 +225,16 @@ struct TaskInfo {
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
             failure_stage = other.failure_stage;
+            observability_batch_id = other.observability_batch_id;
+            observability_request_id = other.observability_request_id;
+            observability_task_id = other.observability_task_id;
+            observability_attempt_id = other.observability_attempt_id;
+            observability_trace_retained = other.observability_trace_retained;
+            logical_observability_active = other.logical_observability_active;
+            logical_request_active = other.logical_request_active;
+            terminal_observability_recorded =
+                other.terminal_observability_recorded;
+            stuck_observability_recorded = other.stuck_observability_recorded;
         }
         return *this;
     }
@@ -222,6 +267,16 @@ struct TaskInfo {
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
             failure_stage = other.failure_stage;
+            observability_batch_id = other.observability_batch_id;
+            observability_request_id = other.observability_request_id;
+            observability_task_id = other.observability_task_id;
+            observability_attempt_id = other.observability_attempt_id;
+            observability_trace_retained = other.observability_trace_retained;
+            logical_observability_active = other.logical_observability_active;
+            logical_request_active = other.logical_request_active;
+            terminal_observability_recorded =
+                other.terminal_observability_recorded;
+            stuck_observability_recorded = other.stuck_observability_recorded;
         }
         return *this;
     }
@@ -245,7 +300,9 @@ class TransferEngineImpl {
     TransferEngineImpl& operator=(const TransferEngineImpl&) = delete;
 
    public:
-    bool available() const { return available_; }
+    bool available() const {
+        return available_.load(std::memory_order_acquire);
+    }
 
     const std::string getSegmentName() const;
 
@@ -404,6 +461,9 @@ class TransferEngineImpl {
     Status construct();
 
     Status deconstruct();
+
+    EngineDiagnosticsSnapshot buildDiagnosticsSnapshot();
+    EngineDiagnosticsSnapshot buildReadinessSnapshot();
 
     Status setupLocalSegment();
 
@@ -573,15 +633,26 @@ class TransferEngineImpl {
                        const std::vector<Request>& request_list,
                        const Notification& notifi);
 
-    void recordTaskCompletionMetrics(TaskInfo& task,
-                                     TransferStatusEnum prev_status,
-                                     TransferStatusEnum new_status);
+    void recordTaskCompletionObservability(TaskInfo& task,
+                                           TransferStatusEnum prev_status,
+                                           TransferStatusEnum new_status);
+
+    void recordTaskStuckObservability(TaskInfo& task);
+
+    void startLogicalRequestObservability(TaskInfo& task);
 
     void startTransportAttempt(TaskInfo& task, TransportType type,
                                std::chrono::steady_clock::time_point post_time);
 
     void finishTransportAttempt(TaskInfo& task, TransferStatusEnum status,
                                 std::chrono::steady_clock::time_point end_time);
+
+    const char* traceRetentionReason(const TaskInfo& task,
+                                     TransferStatusEnum status,
+                                     int64_t duration_us) const;
+    void emitTraceSpan(const TaskInfo& task, bool transport_attempt,
+                       TransferStatusEnum status, int64_t duration_us,
+                       const char* retention_reason) const;
 
    private:
     struct AllocatedMemory {
@@ -619,6 +690,7 @@ class TransferEngineImpl {
         size_t owner_task_id{0};
         std::vector<size_t> public_task_ids;
         size_t byte_charge{0};
+        QueueOwnerKind owner_kind{QueueOwnerKind::User};
         bool in_dispatch_window{false};
     };
 
@@ -628,7 +700,7 @@ class TransferEngineImpl {
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> topology_;
     std::unique_ptr<TransportSelector> transport_selector_;
-    bool available_;
+    std::atomic<bool> available_;
 
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
         transport_list_;
@@ -652,12 +724,19 @@ class TransferEngineImpl {
     std::shared_ptr<const RuntimeConfigSnapshot> runtime_config_snapshot_;
     bool notify_rpc_fallback_{true};
     bool enable_progress_worker_{false};
+    uint64_t slow_request_threshold_us_{0};
+    uint64_t stuck_request_threshold_us_{0};
+    bool tracing_enabled_{false};
+    uint64_t trace_sample_rate_ppm_{0};
+    uint64_t trace_slow_threshold_us_{0};
     RuntimeQueueConfig runtime_queue_config_;
     std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;
     std::unordered_map<QueueOwnerId, QueuedOwnerState> queued_owners_;
     size_t dispatch_inflight_owners_{0};
     size_t dispatch_inflight_bytes_{0};
     uint64_t next_batch_token_{1};
+    std::atomic<uint64_t> logical_requests_inflight_{0};
+    std::atomic<uint64_t> logical_inflight_since_ns_{0};
 
     // Serializes engine-global progress: runtime queue, lazyFreeBatch
     // freelist, and ProgressWorker. Recursive because freeBatch ->

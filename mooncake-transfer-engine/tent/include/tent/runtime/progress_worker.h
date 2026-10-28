@@ -63,12 +63,22 @@ class ProgressWorker {
     // bounded refill step.
     void notifyRuntimeQueueReady();
 
+    bool running() const {
+        return running_.load(std::memory_order_acquire);
+    }
+
+    // Monotonic time since the worker last completed a progress pass. Zero
+    // means the worker has not entered its runner yet.
+    uint64_t lastProgressAgeSeconds() const;
+
    private:
     void runner();
+    void markProgress();
 
     TransferEngineImpl* impl_;
     std::chrono::microseconds fallback_interval_;
     std::atomic<bool> running_{false};
+    std::atomic<int64_t> last_progress_time_ns_{0};
     std::thread thread_;
 
     std::mutex mu_;

@@ -58,6 +58,7 @@ class HighPerformanceTcpServer {
     void installAcceptedSocket(size_t worker_id,
                                std::shared_ptr<asio::ip::tcp::socket> socket);
     bool reserveConnection();
+    void releaseConnection();
     void onSessionClosed(size_t worker_id,
                          const std::shared_ptr<Session>& session);
     void cancelWorkerSessions(size_t worker_id);

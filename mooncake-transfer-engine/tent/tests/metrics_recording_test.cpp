@@ -24,6 +24,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -34,21 +35,45 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "tent/common/config.h"
 #include "tent/common/types.h"
 #include "tent/metrics/config_loader.h"
 #include "tent/metrics/tent_metrics.h"
+#include "tent/rpc/rpc.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
 #include "tent/thirdparty/nlohmann/json.h"
 
 namespace mooncake {
 namespace tent {
+
+#if TENT_METRICS_ENABLED
+
+class TentMetricsTestPeer {
+   public:
+    static bool failPrometheusSerialization(TentMetrics& metrics,
+                                            std::string& result) {
+        return metrics.serializeWithAccounting(
+            TentMetrics::kPrometheusFormat, result,
+            [](std::string& output, uint64_t) {
+                output = "partial response";
+                throw std::runtime_error("injected serialization failure");
+            });
+    }
+};
+
+#endif
+
 namespace {
 
 #if TENT_METRICS_ENABLED
@@ -173,6 +198,28 @@ class MetricsSnapshot {
     std::string prometheus_;
 };
 
+class ObservabilityLogSink : public google::LogSink {
+   public:
+    ObservabilityLogSink() { google::AddLogSink(this); }
+    ~ObservabilityLogSink() override { google::RemoveLogSink(this); }
+
+    void send(google::LogSeverity, const char*, const char*, int,
+              const std::tm*, const char* message, size_t length) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        messages_.append(message, length);
+        messages_.push_back('\n');
+    }
+
+    std::string messages() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return messages_;
+    }
+
+   private:
+    std::mutex mutex_;
+    std::string messages_;
+};
+
 // ---------------------------------------------------------------------------
 // FakeTransport: minimal Transport that completes every submitted task.
 // Pattern borrowed from causal_chain_test.cpp.
@@ -184,15 +231,22 @@ class FakeSubBatch : public Transport::SubBatch {
     size_t task_count = 0;
     std::vector<Request> requests;
     std::vector<TransferStatus> statuses;
+    std::vector<int> poll_counts;
 };
 
 class FakeTransport : public Transport {
    public:
     explicit FakeTransport(TransportType self_type, bool force_fail = false,
-                           bool force_submit_fail = false)
+                           bool force_submit_fail = false,
+                           bool force_register_fail = false,
+                           bool force_unregister_fail = false,
+                           int pending_polls = 0)
         : self_type_(self_type),
           force_fail_(force_fail),
-          force_submit_fail_(force_submit_fail) {
+          force_submit_fail_(force_submit_fail),
+          force_register_fail_(force_register_fail),
+          force_unregister_fail_(force_unregister_fail),
+          pending_polls_(pending_polls) {
         caps.dram_to_dram = true;
     }
     std::atomic<int> submit_calls{0};
@@ -230,6 +284,7 @@ class FakeTransport : public Transport {
                 force_fail_ ? TransferStatus{TransferStatusEnum::FAILED, 0}
                             : TransferStatus{TransferStatusEnum::COMPLETED,
                                              request.length});
+            fake->poll_counts.push_back(0);
             ++fake->task_count;
         }
         batch->notifyProgress();
@@ -242,11 +297,18 @@ class FakeTransport : public Transport {
         if (task_id < 0 || task_id >= (int)fake->statuses.size()) {
             return Status::InvalidArgument("bad task_id" LOC_MARK);
         }
+        if (fake->poll_counts[task_id]++ < pending_polls_) {
+            status = TransferStatus{TransferStatusEnum::PENDING, 0};
+            return Status::OK();
+        }
         status = fake->statuses[task_id];
         return Status::OK();
     }
 
     Status addMemoryBuffer(BufferDesc& desc, const MemoryOptions&) override {
+        if (force_register_fail_) {
+            return Status::InternalError("forced register failure" LOC_MARK);
+        }
         desc.transports.push_back(self_type_);
         return Status::OK();
     }
@@ -261,6 +323,9 @@ class FakeTransport : public Transport {
     }
 
     Status removeMemoryBuffer(BufferDesc& desc) override {
+        if (force_unregister_fail_) {
+            return Status::InternalError("forced unregister failure" LOC_MARK);
+        }
         desc.transports.erase(std::remove(desc.transports.begin(),
                                           desc.transports.end(), self_type_),
                               desc.transports.end());
@@ -287,6 +352,9 @@ class FakeTransport : public Transport {
     TransportType self_type_;
     bool force_fail_;
     bool force_submit_fail_;
+    bool force_register_fail_;
+    bool force_unregister_fail_;
+    int pending_polls_;
 };
 
 std::shared_ptr<Config> makeMetricsTestConfig() {
@@ -372,6 +440,676 @@ class MetricsRecordingTest : public ::testing::Test {
     void TearDown() override { TentMetrics::instance().shutdown(); }
 };
 
+// Lock the public Prometheus contract: every documented family has a stable
+// name and type, and every self-observability family is emitted even before a
+// transfer records traffic. Representative samples instantiate ylt's dynamic
+// business metrics, which intentionally omit never-observed label series.
+TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
+    auto& metrics = TentMetrics::instance();
+    ASSERT_TRUE(TentMetrics::isCompiledIn());
+
+    const std::string initial_body = metrics.getPrometheusMetrics();
+    for (std::string_view name : {
+             "tent_metrics_build_info",
+             "tent_metrics_runtime_enabled",
+             "tent_metrics_http_server_up",
+             "tent_metrics_http_start_failures_total",
+             "tent_metrics_serialization_attempts_total",
+             "tent_metrics_serialization_failures_total",
+             "tent_metrics_last_success_timestamp_seconds",
+         }) {
+        EXPECT_NE(initial_body.find("# TYPE " + std::string(name) + " "),
+                  std::string::npos)
+            << "self-observability family must not depend on transfer samples: "
+            << name;
+    }
+
+    metrics.recordReadCompleted(RDMA, 1024, 0.001);
+    metrics.recordWriteCompleted(TCP, 2048, 0.002);
+    metrics.recordReadFailed(RDMA);
+    metrics.recordWriteFailed(TCP);
+    metrics.recordTransportFailover(RDMA, TCP);
+    metrics.recordTransportAttemptStarted(RDMA, Request::READ);
+    metrics.recordTransportAttemptFinished(RDMA, Request::READ, FAILED, 42.0);
+    ASSERT_TRUE(metrics.recordLogicalRequestStarted(Request::READ));
+    metrics.recordLogicalRequestFinished(RDMA, Request::READ, TIMEOUT, 43.0);
+    metrics.recordDeadlineMLU(RDMA, 0.8);
+    metrics.recordDeadlineInfeasible(TCP);
+    metrics.recordBatchQuarantined();
+    metrics.recordTaskFailure(RDMA, TentMetrics::TaskFailureReason::Timeout);
+    metrics.recordRequestStuck(TentMetrics::StuckPhase::Transport, RDMA,
+                               Request::WRITE);
+    metrics.recordMemoryOperation(RDMA, TentMetrics::MemoryOperation::Register,
+                                  TentMetrics::OperationOutcome::Success, 4096);
+    metrics.recordWorkerProgress(TentMetrics::WorkerKind::EngineProgress);
+    metrics.recordStagingTaskStarted(Request::WRITE, 4096);
+    metrics.recordStagingTaskFinished(Request::WRITE, 4096);
+    metrics.recordStagingCleanupPending(TentMetrics::StagingCleanupKind::Group,
+                                        1);
+    metrics.recordStagingCleanupPending(TentMetrics::StagingCleanupKind::Group,
+                                        -1);
+    metrics.recordStagingCleanupTimeout();
+    metrics.recordRpcAttempt(TentMetrics::RpcMethod::Probe,
+                             TentMetrics::RpcOutcome::Success, 25.0);
+    metrics.recordRpcRetry(TentMetrics::RpcMethod::GetSegmentDesc);
+    metrics.recordRdmaSliceEvent(Request::READ,
+                                 TentMetrics::RdmaSliceEvent::Enqueued);
+    metrics.recordRdmaRetry(Request::READ,
+                            TentMetrics::RdmaRetryCause::Endpoint);
+    metrics.recordRdmaRetryExhausted(Request::WRITE,
+                                     TentMetrics::RdmaRetryCause::Post);
+    metrics.recordRdmaCqPollError();
+    metrics.recordRdmaWorkerInflight(Request::READ, 1);
+    metrics.recordRdmaWorkerInflight(Request::READ, -1);
+    metrics.recordRdmaPostedInflight(Request::WRITE, 1);
+    metrics.recordRdmaPostedInflight(Request::WRITE, -1);
+    metrics.recordRdmaCompletion(
+        Request::WRITE, TentMetrics::RdmaCompletionOutcome::Success, 35.0);
+    metrics.recordRdmaWcError(Request::WRITE,
+                              TentMetrics::RdmaWcErrorCategory::RetryExceeded);
+    metrics.recordRdmaEndpointEvent(
+        TentMetrics::RdmaEndpointEvent::Constructed);
+    metrics.recordRdmaQpTransitionFailure(
+        TentMetrics::RdmaQpType::Data,
+        TentMetrics::RdmaQpTransition::Rtr);
+    metrics.recordRdmaNotificationEvent(
+        TentMetrics::RdmaNotificationEvent::RecvPosted);
+    metrics.recordStreamEvent(TCP, Request::READ,
+                              TentMetrics::StreamEvent::Queued);
+    metrics.recordStreamAttempt(
+        HP_TCP, Request::WRITE, TentMetrics::StreamOutcome::Success, 45.0);
+    metrics.recordStreamQueueWait(TCP, Request::READ, 12.0);
+    metrics.recordStreamQueueDepth(TCP, 1);
+    metrics.recordStreamBusyWorkers(TCP, 1);
+    metrics.recordStreamAdmission(HP_TCP, 2, 4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, 1);
+    metrics.recordStreamQueueDepth(TCP, -1);
+    metrics.recordStreamBusyWorkers(TCP, -1);
+    metrics.recordStreamAdmission(HP_TCP, -2, -4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, -1);
+    metrics.recordProtocolError(
+        HP_TCP, TentMetrics::ProtocolErrorKind::RequestIdMismatch);
+    metrics.recordTcpSocketSample(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, 2, 120, 32);
+    metrics.recordShmMappingEvent(TentMetrics::ShmMappingEvent::CacheHit);
+    metrics.recordShmCopy(Request::WRITE,
+                          TentMetrics::ShmCopyOutcome::Success, 18.0);
+    metrics.recordSegmentEvent(TentMetrics::SegmentEvent::CacheHit);
+    metrics.recordSelectionEvent(TentMetrics::SelectionEvent::Selected, RDMA);
+    metrics.recordAdmissionEvent(TentMetrics::AdmissionOwnerKind::User,
+                                 TentMetrics::AdmissionEvent::Admitted);
+    metrics.recordAdmissionQueued(TentMetrics::AdmissionOwnerKind::User, 1,
+                                  1024);
+    metrics.recordAdmissionQueued(TentMetrics::AdmissionOwnerKind::User, -1,
+                                  -1024);
+    metrics.recordAdmissionWait(TentMetrics::AdmissionOwnerKind::User, 14.0);
+    metrics.recordInflightAttemptStarted(RDMA);
+    metrics.recordInflightAttemptFinished(RDMA);
+    metrics.recordRegisteredBufferBytes(RDMA, 4096);
+    metrics.recordRegisteredBufferBytes(RDMA, -4096);
+    metrics.recordStageLatency(TentMetrics::Stage::QueueWait, RDMA, 10.0);
+    metrics.recordStageLatency(TentMetrics::Stage::Dispatch, RDMA, 20.0);
+    metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
+
+    const std::string body = metrics.getPrometheusMetrics();
+    const std::array<std::pair<std::string_view, std::string_view>, 82>
+        expected_types{{
+            {"tent_read_bytes_total", "counter"},
+            {"tent_write_bytes_total", "counter"},
+            {"tent_read_requests_total", "counter"},
+            {"tent_write_requests_total", "counter"},
+            {"tent_read_failures_total", "counter"},
+            {"tent_write_failures_total", "counter"},
+            {"tent_transport_failover_total", "counter"},
+            {"tent_transport_attempts_total", "counter"},
+            {"tent_transport_attempt_failures_total", "counter"},
+            {"tent_logical_requests_started_total", "counter"},
+            {"tent_logical_request_outcomes_total", "counter"},
+            {"tent_transport_attempt_outcomes_total", "counter"},
+            {"tent_task_failures_total", "counter"},
+            {"tent_request_stuck_events_total", "counter"},
+            {"tent_terminal_failures_total", "counter"},
+            {"tent_memory_operations_total", "counter"},
+            {"tent_memory_operation_bytes_total", "counter"},
+            {"tent_deadline_infeasible_total", "counter"},
+            {"tent_quarantined_batches_total", "counter"},
+            {"tent_staging_cleanup_timeouts_total", "counter"},
+            {"tent_rpc_attempts_total", "counter"},
+            {"tent_rpc_retries_total", "counter"},
+            {"tent_rdma_slice_events_total", "counter"},
+            {"tent_rdma_retries_total", "counter"},
+            {"tent_rdma_retry_exhausted_total", "counter"},
+            {"tent_rdma_wc_errors_total", "counter"},
+            {"tent_rdma_cq_poll_errors_total", "counter"},
+            {"tent_rdma_endpoint_events_total", "counter"},
+            {"tent_rdma_qp_transition_failures_total", "counter"},
+            {"tent_rdma_notification_events_total", "counter"},
+            {"tent_stream_events_total", "counter"},
+            {"tent_protocol_errors_total", "counter"},
+            {"tent_tcp_retransmissions_total", "counter"},
+            {"tent_shm_mapping_events_total", "counter"},
+            {"tent_shm_copy_events_total", "counter"},
+            {"tent_segment_events_total", "counter"},
+            {"tent_transport_selection_events_total", "counter"},
+            {"tent_admission_events_total", "counter"},
+            {"tent_inflight_attempts", "gauge"},
+            {"tent_logical_requests_inflight", "gauge"},
+            {"tent_registered_buffer_bytes", "gauge"},
+            {"tent_worker_last_progress_timestamp_seconds", "gauge"},
+            {"tent_staging_inflight_tasks", "gauge"},
+            {"tent_staging_inflight_bytes", "gauge"},
+            {"tent_staging_cleanup_pending", "gauge"},
+            {"tent_rdma_worker_inflight_slices", "gauge"},
+            {"tent_rdma_posted_inflight_slices", "gauge"},
+            {"tent_admission_queue_owners", "gauge"},
+            {"tent_admission_queue_bytes", "gauge"},
+            {"tent_engine_ready", "gauge"},
+            {"tent_engine_readiness_reason", "gauge"},
+            {"tent_stream_queue_depth", "gauge"},
+            {"tent_stream_busy_workers", "gauge"},
+            {"tent_stream_admitted_tasks", "gauge"},
+            {"tent_stream_admitted_bytes", "gauge"},
+            {"tent_stream_connections", "gauge"},
+            {"tent_read_latency_us", "histogram"},
+            {"tent_write_latency_us", "histogram"},
+            {"tent_read_size_bytes", "histogram"},
+            {"tent_write_size_bytes", "histogram"},
+            {"tent_deadline_mlu_permille", "histogram"},
+            {"tent_stage_queue_wait_us", "histogram"},
+            {"tent_stage_dispatch_us", "histogram"},
+            {"tent_stage_transport_us", "histogram"},
+            {"tent_transport_attempt_latency_us", "histogram"},
+            {"tent_logical_request_outcome_latency_us", "histogram"},
+            {"tent_transport_attempt_outcome_latency_us", "histogram"},
+            {"tent_rpc_attempt_latency_us", "histogram"},
+            {"tent_rdma_completion_latency_us", "histogram"},
+            {"tent_stream_attempt_latency_us", "histogram"},
+            {"tent_stream_queue_wait_us", "histogram"},
+            {"tent_tcp_rtt_us", "histogram"},
+            {"tent_tcp_congestion_window_segments", "histogram"},
+            {"tent_shm_copy_latency_us", "histogram"},
+            {"tent_admission_wait_us", "histogram"},
+            {"tent_metrics_build_info", "gauge"},
+            {"tent_metrics_runtime_enabled", "gauge"},
+            {"tent_metrics_http_server_up", "gauge"},
+            {"tent_metrics_http_start_failures_total", "counter"},
+            {"tent_metrics_serialization_attempts_total", "counter"},
+            {"tent_metrics_serialization_failures_total", "counter"},
+            {"tent_metrics_last_success_timestamp_seconds", "gauge"},
+        }};
+
+    for (const auto& [name, type] : expected_types) {
+        EXPECT_NE(body.find("# TYPE " + std::string(name) + " " +
+                            std::string(type) + "\n"),
+                  std::string::npos)
+            << "missing or changed Prometheus contract for " << name;
+    }
+    EXPECT_NE(body.find("tent_metrics_build_info{version=\""),
+              std::string::npos);
+    EXPECT_EQ(body.find("compile_time_enabled"), std::string::npos);
+    EXPECT_NE(body.find("tent_metrics_serialization_attempts_total{format=\""
+                        "prometheus\"}"),
+              std::string::npos);
+    EXPECT_NE(body.find("tent_metrics_serialization_attempts_total{format=\""
+                        "json\"}"),
+              std::string::npos);
+}
+
+TEST_F(MetricsRecordingTest, SelfMetricsRemainVisibleWhenRuntimeDisabled) {
+    auto& metrics = TentMetrics::instance();
+    TentMetrics::setEnabled(false);
+
+    const auto before = MetricsSnapshot(metrics);
+    metrics.recordReadCompleted(RDMA, 4096, 0.001);
+    const auto after = MetricsSnapshot(metrics);
+
+    EXPECT_EQ(after.counter("tent_read_bytes_total") -
+                  before.counter("tent_read_bytes_total"),
+              0);
+    EXPECT_EQ(after.series("tent_metrics_runtime_enabled"), 0);
+    EXPECT_EQ(after.series("tent_metrics_http_server_up"),
+              metrics.httpPort() == 0 ? 0 : 1);
+    EXPECT_GE(after.series("tent_metrics_serialization_attempts_total{format="
+                           "\"prometheus\"}"),
+              1);
+    EXPECT_GT(after.series("tent_metrics_last_success_timestamp_seconds{"
+                           "format=\"prometheus\"}"),
+              0);
+
+    TentMetrics::setEnabled(true);
+}
+
+TEST_F(MetricsRecordingTest,
+       FailedSerializationIsVisibleOnTheNextSuccessfulScrape) {
+    auto& metrics = TentMetrics::instance();
+    const auto before = MetricsSnapshot(metrics);
+
+    std::string failed_output;
+    EXPECT_FALSE(TentMetricsTestPeer::failPrometheusSerialization(
+        metrics, failed_output));
+    EXPECT_TRUE(failed_output.empty());
+
+    const auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        after.series("tent_metrics_serialization_failures_total{format=\""
+                     "prometheus\"}") -
+            before.series("tent_metrics_serialization_failures_total{format=\""
+                          "prometheus\"}"),
+        1);
+}
+
+TEST_F(MetricsRecordingTest, RpcAgentRecordsSuccessfulPhysicalAttempt) {
+    CoroRpcAgent server;
+    ASSERT_TRUE(server
+                    .registerFunction(
+                        Probe, [](const std::string_view&, std::string&) {})
+                    .ok());
+    uint16_t port = 0;
+    ASSERT_TRUE(server.start(port).ok());
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    CoroRpcAgent client;
+    std::string response;
+    ASSERT_TRUE(
+        client.call("127.0.0.1:" + std::to_string(port), Probe, "", response)
+            .ok());
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    const std::string series =
+        "tent_rpc_attempts_total{method=\"probe\",outcome=\"success\"}";
+    EXPECT_EQ(after.series(series) - before.series(series), 1);
+    EXPECT_EQ(after.histogramCount("tent_rpc_attempt_latency_us") -
+                  before.histogramCount("tent_rpc_attempt_latency_us"),
+              1);
+    EXPECT_TRUE(server.stop().ok());
+}
+
+TEST_F(MetricsRecordingTest, RpcRetryRecordsEachConnectionAttempt) {
+    const uint16_t unused_port = getFreeTcpPort();
+    ASSERT_NE(unused_port, 0);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    CoroRpcAgent client;
+    auto [status, response] = async_simple::coro::syncAwait(
+        client.callCoroutine("127.0.0.1:" + std::to_string(unused_port),
+                             GetSegmentDesc, "", true));
+    EXPECT_FALSE(status.ok());
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    const std::string failures =
+        "tent_rpc_attempts_total{method=\"get_segment_desc\",outcome="
+        "\"connection_error\"}";
+    const std::string retries =
+        "tent_rpc_retries_total{method=\"get_segment_desc\"}";
+    EXPECT_EQ(after.series(failures) - before.series(failures), 2);
+    EXPECT_EQ(after.series(retries) - before.series(retries), 1);
+    EXPECT_EQ(after.histogramCount("tent_rpc_attempt_latency_us") -
+                  before.histogramCount("tent_rpc_attempt_latency_us"),
+              2);
+}
+
+TEST_F(MetricsRecordingTest, RdmaDataPathSignalsUseBoundedLabels) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordRdmaSliceEvent(Request::READ,
+                                 TentMetrics::RdmaSliceEvent::PostAttempt, 3);
+    metrics.recordRdmaRetry(Request::READ,
+                            TentMetrics::RdmaRetryCause::Completion);
+    metrics.recordRdmaRetryExhausted(Request::WRITE,
+                                     TentMetrics::RdmaRetryCause::Endpoint);
+    metrics.recordRdmaCqPollError();
+    metrics.recordRdmaWorkerInflight(Request::READ, 2);
+    metrics.recordRdmaPostedInflight(Request::WRITE, 1);
+    metrics.recordRdmaCompletion(
+        Request::WRITE, TentMetrics::RdmaCompletionOutcome::WcError, 42.0);
+    metrics.recordRdmaWcError(Request::WRITE,
+                              TentMetrics::RdmaWcErrorCategory::RemoteAccess);
+
+    auto active = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        active.series("tent_rdma_slice_events_total{operation=\"read\","
+                      "event=\"post_attempt\"}") -
+            before.series("tent_rdma_slice_events_total{operation=\"read\","
+                          "event=\"post_attempt\"}"),
+        3);
+    EXPECT_EQ(active.series("tent_rdma_retries_total{operation=\"read\",cause="
+                            "\"completion\"}") -
+                  before.series("tent_rdma_retries_total{operation=\"read\","
+                                "cause=\"completion\"}"),
+              1);
+    EXPECT_EQ(active.series("tent_rdma_retry_exhausted_total{operation="
+                            "\"write\",cause=\"endpoint\"}") -
+                  before.series("tent_rdma_retry_exhausted_total{operation="
+                                "\"write\",cause=\"endpoint\"}"),
+              1);
+    EXPECT_EQ(active.counter("tent_rdma_cq_poll_errors_total") -
+                  before.counter("tent_rdma_cq_poll_errors_total"),
+              1);
+    EXPECT_EQ(active.series("tent_rdma_worker_inflight_slices{operation="
+                            "\"read\"}") -
+                  before.series("tent_rdma_worker_inflight_slices{operation="
+                                "\"read\"}"),
+              2);
+    EXPECT_EQ(active.series("tent_rdma_posted_inflight_slices{operation="
+                            "\"write\"}") -
+                  before.series("tent_rdma_posted_inflight_slices{operation="
+                                "\"write\"}"),
+              1);
+    EXPECT_EQ(active.histogramCount("tent_rdma_completion_latency_us") -
+                  before.histogramCount("tent_rdma_completion_latency_us"),
+              1);
+    EXPECT_EQ(active.series("tent_rdma_wc_errors_total{operation=\"write\","
+                            "category=\"remote_access\"}") -
+                  before.series("tent_rdma_wc_errors_total{operation=\"write\","
+                                "category=\"remote_access\"}"),
+              1);
+
+    metrics.recordRdmaWorkerInflight(Request::READ, -2);
+    metrics.recordRdmaPostedInflight(Request::WRITE, -1);
+    auto drained = MetricsSnapshot(metrics);
+    EXPECT_EQ(drained.series("tent_rdma_worker_inflight_slices{operation="
+                             "\"read\"}") -
+                  before.series("tent_rdma_worker_inflight_slices{operation="
+                                "\"read\"}"),
+              0);
+    EXPECT_EQ(drained.series("tent_rdma_posted_inflight_slices{operation="
+                             "\"write\"}") -
+                  before.series("tent_rdma_posted_inflight_slices{operation="
+                                "\"write\"}"),
+              0);
+}
+
+TEST_F(MetricsRecordingTest, RdmaLifecycleSignalsUseBoundedLabels) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordRdmaEndpointEvent(
+        TentMetrics::RdmaEndpointEvent::ReadyActive);
+    metrics.recordRdmaQpTransitionFailure(
+        TentMetrics::RdmaQpType::Notification,
+        TentMetrics::RdmaQpTransition::Rts);
+    metrics.recordRdmaNotificationEvent(
+        TentMetrics::RdmaNotificationEvent::RecvPostError, 2);
+
+    auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(after.series("tent_rdma_endpoint_events_total{event="
+                           "\"ready_active\"}") -
+                  before.series("tent_rdma_endpoint_events_total{event="
+                                "\"ready_active\"}"),
+              1);
+    EXPECT_EQ(
+        after.series("tent_rdma_qp_transition_failures_total{qp_type="
+                     "\"notification\",transition=\"rts\"}") -
+            before.series("tent_rdma_qp_transition_failures_total{qp_type="
+                          "\"notification\",transition=\"rts\"}"),
+        1);
+    EXPECT_EQ(after.series("tent_rdma_notification_events_total{event="
+                           "\"recv_post_error\"}") -
+                  before.series("tent_rdma_notification_events_total{event="
+                                "\"recv_post_error\"}"),
+              2);
+}
+
+TEST_F(MetricsRecordingTest, StreamSignalsSeparateQueueAndPhysicalAttempts) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordStreamEvent(HP_TCP, Request::READ,
+                              TentMetrics::StreamEvent::Queued, 2);
+    metrics.recordStreamEvent(HP_TCP, Request::READ,
+                              TentMetrics::StreamEvent::AttemptStarted);
+    metrics.recordStreamEvent(HP_TCP, Request::READ,
+                              TentMetrics::StreamEvent::RetryIssued);
+    metrics.recordStreamAttempt(
+        HP_TCP, Request::READ, TentMetrics::StreamOutcome::PeerClosed, 51.0);
+    metrics.recordStreamQueueWait(HP_TCP, Request::READ, 17.0);
+
+    auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(after.series("tent_stream_events_total{transport=\"hp_tcp\","
+                           "operation=\"read\",event=\"queued\"}") -
+                  before.series(
+                      "tent_stream_events_total{transport=\"hp_tcp\","
+                      "operation=\"read\",event=\"queued\"}"),
+              2);
+    EXPECT_EQ(after.series("tent_stream_events_total{transport=\"hp_tcp\","
+                           "operation=\"read\",event=\"peer_closed\"}") -
+                  before.series(
+                      "tent_stream_events_total{transport=\"hp_tcp\","
+                      "operation=\"read\",event=\"peer_closed\"}"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_stream_attempt_latency_us") -
+                  before.histogramCount("tent_stream_attempt_latency_us"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_stream_queue_wait_us") -
+                  before.histogramCount("tent_stream_queue_wait_us"),
+              1);
+}
+
+TEST_F(MetricsRecordingTest, NetworkAndProtocolSignalsUseBoundedLabels) {
+    auto& metrics = TentMetrics::instance();
+    const auto before = MetricsSnapshot(metrics);
+
+    metrics.recordProtocolError(
+        HP_TCP, TentMetrics::ProtocolErrorKind::CommittedLengthMismatch);
+    metrics.recordTcpSocketSample(
+        HP_TCP, TentMetrics::StreamConnectionRole::Server, 3, 240, 64);
+
+    const auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        after.series("tent_protocol_errors_total{transport=\"hp_tcp\","
+                     "kind=\"committed_length_mismatch\"}") -
+            before.series("tent_protocol_errors_total{transport=\"hp_tcp\","
+                          "kind=\"committed_length_mismatch\"}"),
+        1);
+    EXPECT_EQ(
+        after.series("tent_tcp_retransmissions_total{transport=\"hp_tcp\","
+                     "role=\"server\"}") -
+            before.series("tent_tcp_retransmissions_total{transport=\"hp_tcp\","
+                          "role=\"server\"}"),
+        3);
+    EXPECT_EQ(after.histogramCount("tent_tcp_rtt_us") -
+                  before.histogramCount("tent_tcp_rtt_us"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_tcp_congestion_window_segments") -
+                  before.histogramCount("tent_tcp_congestion_window_segments"),
+              1);
+}
+
+TEST_F(MetricsRecordingTest, ShmSignalsUseBoundedOperationAndEventLabels) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordShmMappingEvent(TentMetrics::ShmMappingEvent::CacheMiss);
+    metrics.recordShmMappingEvent(TentMetrics::ShmMappingEvent::Created);
+    metrics.recordShmCopy(Request::WRITE,
+                          TentMetrics::ShmCopyOutcome::Success, 23.0);
+    metrics.recordShmCopy(Request::READ, TentMetrics::ShmCopyOutcome::Error,
+                          31.0);
+
+    auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(after.series("tent_shm_mapping_events_total{event=\"cache_miss\"}") -
+                  before.series(
+                      "tent_shm_mapping_events_total{event=\"cache_miss\"}"),
+              1);
+    EXPECT_EQ(after.series("tent_shm_mapping_events_total{event=\"created\"}") -
+                  before.series(
+                      "tent_shm_mapping_events_total{event=\"created\"}"),
+              1);
+    EXPECT_EQ(after.series("tent_shm_copy_events_total{operation=\"write\","
+                           "outcome=\"success\"}") -
+                  before.series(
+                      "tent_shm_copy_events_total{operation=\"write\","
+                      "outcome=\"success\"}"),
+              1);
+    EXPECT_EQ(after.series("tent_shm_copy_events_total{operation=\"read\","
+                           "outcome=\"error\"}") -
+                  before.series(
+                      "tent_shm_copy_events_total{operation=\"read\","
+                      "outcome=\"error\"}"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_shm_copy_latency_us") -
+                  before.histogramCount("tent_shm_copy_latency_us"),
+              2);
+}
+
+TEST_F(MetricsRecordingTest, SegmentSignalsUseBoundedLifecycleEvents) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordSegmentEvent(TentMetrics::SegmentEvent::CacheMiss);
+    metrics.recordSegmentEvent(TentMetrics::SegmentEvent::FetchError);
+    metrics.recordSegmentEvent(TentMetrics::SegmentEvent::GenerationAdvanced);
+
+    auto after = MetricsSnapshot(metrics);
+    for (std::string_view event : {"cache_miss", "fetch_error",
+                                   "generation_advanced"}) {
+        const std::string series =
+            "tent_segment_events_total{event=\"" + std::string(event) + "\"}";
+        EXPECT_EQ(after.series(series) - before.series(series), 1) << event;
+    }
+}
+
+TEST_F(MetricsRecordingTest, SelectionSignalsUseBoundedDecisionLabels) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordSelectionEvent(TentMetrics::SelectionEvent::Selected, RDMA);
+    metrics.recordSelectionEvent(TentMetrics::SelectionEvent::FallbackSelected,
+                                 TCP);
+    metrics.recordSelectionEvent(
+        TentMetrics::SelectionEvent::CandidateUnavailable, SHM);
+    metrics.recordSelectionEvent(TentMetrics::SelectionEvent::Exhausted);
+
+    auto after = MetricsSnapshot(metrics);
+    for (const auto& [event, transport] :
+         std::array<std::pair<std::string_view, std::string_view>, 4>{{
+             {"selected", "rdma"},
+             {"fallback_selected", "tcp"},
+             {"candidate_unavailable", "shm"},
+             {"exhausted", "unspec"},
+         }}) {
+        const std::string series =
+            "tent_transport_selection_events_total{event=\"" +
+            std::string(event) + "\",transport=\"" + std::string(transport) +
+            "\"}";
+        EXPECT_EQ(after.series(series) - before.series(series), 1) << event;
+    }
+}
+
+TEST_F(MetricsRecordingTest, AdmissionSignalsTrackDecisionsQueueAndWait) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordAdmissionEvent(TentMetrics::AdmissionOwnerKind::Staging,
+                                 TentMetrics::AdmissionEvent::Admitted, 2);
+    metrics.recordAdmissionEvent(
+        TentMetrics::AdmissionOwnerKind::User,
+        TentMetrics::AdmissionEvent::RejectedOwnerCapacity);
+    metrics.recordAdmissionQueued(TentMetrics::AdmissionOwnerKind::Staging, 2,
+                                  4096);
+    metrics.recordAdmissionWait(TentMetrics::AdmissionOwnerKind::Staging,
+                                27.0);
+
+    auto active = MetricsSnapshot(metrics);
+    EXPECT_EQ(active.series("tent_admission_events_total{owner_kind=\"staging\","
+                            "event=\"admitted\"}") -
+                  before.series(
+                      "tent_admission_events_total{owner_kind=\"staging\","
+                      "event=\"admitted\"}"),
+              2);
+    EXPECT_EQ(active.series("tent_admission_events_total{owner_kind=\"user\","
+                            "event=\"rejected_owner_capacity\"}") -
+                  before.series(
+                      "tent_admission_events_total{owner_kind=\"user\","
+                      "event=\"rejected_owner_capacity\"}"),
+              1);
+    EXPECT_EQ(active.series(
+                  "tent_admission_queue_owners{owner_kind=\"staging\"}") -
+                  before.series(
+                      "tent_admission_queue_owners{owner_kind=\"staging\"}"),
+              2);
+    EXPECT_EQ(active.series(
+                  "tent_admission_queue_bytes{owner_kind=\"staging\"}") -
+                  before.series(
+                      "tent_admission_queue_bytes{owner_kind=\"staging\"}"),
+              4096);
+    EXPECT_EQ(active.histogramCount("tent_admission_wait_us") -
+                  before.histogramCount("tent_admission_wait_us"),
+              1);
+
+    metrics.recordAdmissionQueued(TentMetrics::AdmissionOwnerKind::Staging,
+                                  -2, -4096);
+    auto released = MetricsSnapshot(metrics);
+    EXPECT_EQ(released.series(
+                  "tent_admission_queue_owners{owner_kind=\"staging\"}"),
+              before.series(
+                  "tent_admission_queue_owners{owner_kind=\"staging\"}"));
+    EXPECT_EQ(released.series(
+                  "tent_admission_queue_bytes{owner_kind=\"staging\"}"),
+              before.series(
+                  "tent_admission_queue_bytes{owner_kind=\"staging\"}"));
+}
+
+TEST_F(MetricsRecordingTest, AdmissionQueueRecordsOwnedStateTransitions) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+    LocalTransferAdmissionQueue queue({1, 128, 0, 0});
+
+    auto makeSubmit = [](uint64_t token) {
+        QueueSubmit submit;
+        submit.batch_token = token;
+        submit.batch_slots_left = 1;
+        QueueOwnerInput owner;
+        owner.owner_task_id = 0;
+        owner.request.length = 32;
+        owner.kind = QueueOwnerKind::User;
+        submit.owners.push_back(owner);
+        return submit;
+    };
+
+    std::vector<QueueOwnerId> ids;
+    ASSERT_TRUE(queue.tryAdmit(makeSubmit(1), ids).ok());
+    ASSERT_EQ(ids.size(), 1u);
+    auto admitted = MetricsSnapshot(metrics);
+    EXPECT_EQ(admitted.series(
+                  "tent_admission_queue_owners{owner_kind=\"user\"}") -
+                  before.series(
+                      "tent_admission_queue_owners{owner_kind=\"user\"}"),
+              1);
+    EXPECT_EQ(admitted.series(
+                  "tent_admission_queue_bytes{owner_kind=\"user\"}") -
+                  before.series(
+                      "tent_admission_queue_bytes{owner_kind=\"user\"}"),
+              32);
+
+    std::vector<QueueOwnerId> rejected_ids;
+    EXPECT_TRUE(queue.tryAdmit(makeSubmit(2), rejected_ids).IsTooManyRequests());
+    auto rejected = MetricsSnapshot(metrics);
+    EXPECT_EQ(rejected.series(
+                  "tent_admission_events_total{owner_kind=\"user\","
+                  "event=\"rejected_owner_capacity\"}") -
+                  before.series(
+                      "tent_admission_events_total{owner_kind=\"user\","
+                      "event=\"rejected_owner_capacity\"}"),
+              1);
+
+    auto picked = queue.pickForDispatch(1, 128);
+    ASSERT_EQ(picked, ids);
+    ASSERT_TRUE(queue.complete(ids.front(), COMPLETED).ok());
+    auto completed = MetricsSnapshot(metrics);
+    EXPECT_EQ(completed.series(
+                  "tent_admission_queue_owners{owner_kind=\"user\"}"),
+              before.series(
+                  "tent_admission_queue_owners{owner_kind=\"user\"}"));
+    EXPECT_EQ(completed.series(
+                  "tent_admission_queue_bytes{owner_kind=\"user\"}"),
+              before.series(
+                  "tent_admission_queue_bytes{owner_kind=\"user\"}"));
+}
+
 // ---------------------------------------------------------------------------
 // Completed transfer records bytes, requests, latency. Drives the real
 // recordTaskCompletionMetrics path via FakeTransport.
@@ -415,6 +1153,19 @@ TEST_F(MetricsRecordingTest, CompletedTransferRecordsBytesAndLatency) {
               1);
     EXPECT_EQ(after.counter("tent_transport_attempt_failures_total") -
                   before.counter("tent_transport_attempt_failures_total"),
+              0);
+    EXPECT_EQ(after.counter("tent_logical_requests_started_total") -
+                  before.counter("tent_logical_requests_started_total"),
+              1);
+    EXPECT_EQ(after.series(
+                  "tent_logical_request_outcomes_total{transport=\"rdma\","
+                  "operation=\"write\",outcome=\"success\"}") -
+                  before.series(
+                      "tent_logical_request_outcomes_total{transport=\"rdma\","
+                      "operation=\"write\",outcome=\"success\"}"),
+              1);
+    EXPECT_EQ(after.counter("tent_logical_requests_inflight") -
+                  before.counter("tent_logical_requests_inflight"),
               0);
     EXPECT_EQ(after.histogramCount("tent_transport_attempt_latency_us") -
                   before.histogramCount("tent_transport_attempt_latency_us"),
@@ -806,6 +1557,83 @@ TEST_F(MetricsRecordingTest, FailedTransferCountsFailureNotBytes) {
               0);
 }
 
+TEST_F(MetricsRecordingTest,
+       LogicalAndAttemptOutcomesDistinguishEveryTerminalStatus) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+    const std::array<TransferStatusEnum, 4> statuses{
+        COMPLETED, FAILED, TIMEOUT, CANCELED};
+
+    for (const auto status : statuses) {
+        ASSERT_TRUE(metrics.recordLogicalRequestStarted(Request::READ));
+        metrics.recordLogicalRequestFinished(RDMA, Request::READ, status, 50.0);
+        metrics.recordTransportAttemptStarted(RDMA, Request::READ);
+        metrics.recordTransportAttemptFinished(RDMA, Request::READ, status,
+                                               25.0);
+    }
+    auto after = MetricsSnapshot(metrics);
+
+    EXPECT_EQ(after.counter("tent_logical_requests_started_total") -
+                  before.counter("tent_logical_requests_started_total"),
+              4);
+    EXPECT_EQ(after.counter("tent_logical_request_outcomes_total") -
+                  before.counter("tent_logical_request_outcomes_total"),
+              4);
+    EXPECT_EQ(after.counter("tent_transport_attempt_outcomes_total") -
+                  before.counter("tent_transport_attempt_outcomes_total"),
+              4);
+    EXPECT_EQ(after.counter("tent_transport_attempt_failures_total") -
+                  before.counter("tent_transport_attempt_failures_total"),
+              3);
+    EXPECT_EQ(after.counter("tent_logical_requests_inflight") -
+                  before.counter("tent_logical_requests_inflight"),
+              0);
+    EXPECT_EQ(
+        after.histogramCount("tent_logical_request_outcome_latency_us") -
+            before.histogramCount(
+                "tent_logical_request_outcome_latency_us"),
+        4);
+    EXPECT_EQ(
+        after.histogramCount("tent_transport_attempt_outcome_latency_us") -
+            before.histogramCount(
+                "tent_transport_attempt_outcome_latency_us"),
+        4);
+
+    for (std::string_view outcome : {"success", "failed", "timeout",
+                                     "canceled"}) {
+        const std::string logical =
+            "tent_logical_request_outcomes_total{transport=\"rdma\","
+            "operation=\"read\",outcome=\"" +
+            std::string(outcome) + "\"}";
+        const std::string attempt =
+            "tent_transport_attempt_outcomes_total{transport=\"rdma\","
+            "operation=\"read\",outcome=\"" +
+            std::string(outcome) + "\"}";
+        EXPECT_EQ(after.series(logical) - before.series(logical), 1);
+        EXPECT_EQ(after.series(attempt) - before.series(attempt), 1);
+    }
+}
+
+TEST_F(MetricsRecordingTest, LogicalInflightGaugeSurvivesRuntimeDisable) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+    ASSERT_TRUE(metrics.recordLogicalRequestStarted(Request::WRITE));
+    TentMetrics::setEnabled(false);
+    metrics.recordLogicalRequestFinished(TCP, Request::WRITE, CANCELED, 10.0);
+    TentMetrics::setEnabled(true);
+    auto after = MetricsSnapshot(metrics);
+
+    EXPECT_EQ(after.counter("tent_logical_requests_inflight") -
+                  before.counter("tent_logical_requests_inflight"),
+              0);
+    EXPECT_EQ(after.counter("tent_logical_requests_started_total") -
+                  before.counter("tent_logical_requests_started_total"),
+              1);
+    EXPECT_EQ(after.counter("tent_logical_request_outcomes_total") -
+                  before.counter("tent_logical_request_outcomes_total"),
+              0);
+}
+
 // ---------------------------------------------------------------------------
 // A transfer whose deadline was already in the past at submit must increment
 // the dedicated tent_deadline_infeasible_total counter, and must NOT pollute
@@ -1173,6 +2001,85 @@ TEST_F(MetricsRecordingTest, ConcurrentRecordsAcrossTransportsAreExact) {
               0);
 }
 
+TEST_F(MetricsRecordingTest, MemoryLifecycleRecordsBackendCallsAndBytes) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xBC);
+    auto before = MetricsSnapshot(TentMetrics::instance());
+
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kLen).ok());
+    auto after_register = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(
+        after_register.series(
+            "tent_memory_operations_total{transport=\"rdma\",operation="
+            "\"register\",outcome=\"success\"}") -
+            before.series("tent_memory_operations_total{transport=\"rdma\","
+                          "operation=\"register\",outcome=\"success\"}"),
+        1);
+    EXPECT_EQ(after_register.series(
+                  "tent_memory_operation_bytes_total{transport=\"rdma\","
+                  "operation=\"register\",outcome=\"success\"}") -
+                  before.series(
+                      "tent_memory_operation_bytes_total{transport=\"rdma\","
+                      "operation=\"register\",outcome=\"success\"}"),
+              static_cast<double>(kLen));
+
+    ASSERT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
+    auto after_unregister = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(after_unregister.series(
+                  "tent_memory_operations_total{transport=\"rdma\",operation="
+                  "\"unregister\",outcome=\"success\"}") -
+                  after_register.series(
+                      "tent_memory_operations_total{transport=\"rdma\","
+                      "operation=\"unregister\",outcome=\"success\"}"),
+              1);
+    EXPECT_EQ(after_unregister.series(
+                  "tent_memory_operation_bytes_total{transport=\"rdma\","
+                  "operation=\"unregister\",outcome=\"success\"}") -
+                  after_register.series(
+                      "tent_memory_operation_bytes_total{transport=\"rdma\","
+                      "operation=\"unregister\",outcome=\"success\"}"),
+              static_cast<double>(kLen));
+}
+
+TEST_F(MetricsRecordingTest, MemoryRegisterFailureRecordsFailedBackendCall) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA, /*force_fail=*/false,
+                                                /*force_submit_fail=*/false,
+                                                /*force_register_fail=*/true);
+    installFakeRdma(engine, fake);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xBD);
+    auto before = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_FALSE(engine.registerLocalMemory(buf.data(), kLen).ok());
+    auto after = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(
+        after.series(
+            "tent_memory_operations_total{transport=\"rdma\",operation="
+            "\"register\",outcome=\"failure\"}") -
+            before.series("tent_memory_operations_total{transport=\"rdma\","
+                          "operation=\"register\",outcome=\"failure\"}"),
+        1);
+    EXPECT_EQ(
+        after.series("tent_memory_operation_bytes_total{transport=\"rdma\","
+                     "operation=\"register\",outcome=\"failure\"}") -
+            before.series(
+                "tent_memory_operation_bytes_total{transport=\"rdma\","
+                "operation=\"register\",outcome=\"failure\"}"),
+        static_cast<double>(kLen));
+}
+
 // Task failure with reason="submit": a synchronously rejected submit fails
 // the attempt at the submit site, so recordTaskCompletionMetrics sees
 // attempt_active == false. The counter must attribute the failure to the
@@ -1213,6 +2120,13 @@ TEST_F(MetricsRecordingTest, SubmitFailureRecordsTaskFailureWithSubmitReason) {
             "\"}") -
             before.series("tent_task_failures_total{transport=\"rdma\",reason="
                           "\"submit\"}"),
+        1);
+    EXPECT_EQ(
+        after.series("tent_terminal_failures_total{transport=\"rdma\",phase="
+                     "\"submit\",reason=\"internal\"}") -
+            before.series(
+                "tent_terminal_failures_total{transport=\"rdma\",phase="
+                "\"submit\",reason=\"internal\"}"),
         1);
     EXPECT_EQ(
         after.series(
@@ -1267,6 +2181,13 @@ TEST_F(MetricsRecordingTest, PollFailureRecordsTaskFailureWithPollReason) {
                 "poll\"}"),
         1);
     EXPECT_EQ(
+        after.series("tent_terminal_failures_total{transport=\"rdma\",phase="
+                     "\"poll\",reason=\"internal\"}") -
+            before.series(
+                "tent_terminal_failures_total{transport=\"rdma\",phase="
+                "\"poll\",reason=\"internal\"}"),
+        1);
+    EXPECT_EQ(
         after.series(
             "tent_task_failures_total{transport=\"rdma\",reason=\"submit"
             "\"}") -
@@ -1276,6 +2197,180 @@ TEST_F(MetricsRecordingTest, PollFailureRecordsTaskFailureWithPollReason) {
     EXPECT_EQ(after.counter("tent_inflight_attempts") -
                   before.counter("tent_inflight_attempts"),
               0);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
+}
+
+TEST_F(MetricsRecordingTest, FailureLogCarriesStableCorrelationFields) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA, /*force_fail=*/true,
+                                                /*force_submit_fail=*/false);
+    installFakeRdma(engine, fake);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xD1);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kLen).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+
+    ObservabilityLogSink sink;
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch), TransferStatusEnum::FAILED);
+    const std::string logs = sink.messages();
+
+    EXPECT_TRUE(std::regex_search(
+        logs,
+        std::regex("event=tent\\.request\\.failed trace_id=[0-9a-f]{32} "
+                   "request_id=[1-9][0-9]* "
+                   "batch_id=[1-9][0-9]* task_id=0 attempt_id=1 ")))
+        << logs;
+    EXPECT_NE(logs.find("transport=rdma operation=write phase=poll "),
+              std::string::npos)
+        << logs;
+    EXPECT_NE(logs.find("event=tent.transport.attempt_failed"),
+              std::string::npos)
+        << logs;
+    EXPECT_EQ(logs.find("source="), std::string::npos) << logs;
+    EXPECT_EQ(logs.find("target_offset="), std::string::npos) << logs;
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
+}
+
+TEST_F(MetricsRecordingTest, SlowLogUsesTheSameCorrelationContract) {
+    auto cfg = makeMetricsTestConfig();
+    cfg->set("observability/slow_request_threshold_us", 1UL);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake);
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xD2);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kLen).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+
+    ObservabilityLogSink sink;
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch), TransferStatusEnum::COMPLETED);
+    const std::string logs = sink.messages();
+    EXPECT_TRUE(std::regex_search(
+        logs,
+        std::regex("event=tent\\.request\\.slow trace_id=[0-9a-f]{32} "
+                   "request_id=[1-9][0-9]* "
+                   "batch_id=[1-9][0-9]* task_id=0 attempt_id=1 ")))
+        << logs;
+    EXPECT_NE(logs.find("status=completed duration_us="), std::string::npos)
+        << logs;
+    EXPECT_NE(logs.find("threshold_us=1"), std::string::npos) << logs;
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
+}
+
+TEST_F(MetricsRecordingTest, StuckEventIsCorrelatedAndRecordedOnlyOnce) {
+    auto cfg = makeMetricsTestConfig();
+    cfg->set("observability/stuck_request_threshold_us", 1UL);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(
+        RDMA, /*force_fail=*/false, /*force_submit_fail=*/false,
+        /*force_register_fail=*/false, /*force_unregister_fail=*/false,
+        /*pending_polls=*/2);
+    installFakeRdma(engine, fake);
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xD4);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kLen).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+
+    const auto before = MetricsSnapshot(TentMetrics::instance());
+    ObservabilityLogSink sink;
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    TransferStatus status;
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
+    ASSERT_EQ(status.s, TransferStatusEnum::PENDING);
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
+    ASSERT_EQ(status.s, TransferStatusEnum::PENDING);
+
+    const auto after = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(
+        after.series("tent_request_stuck_events_total{phase=\"transport\","
+                     "transport=\"rdma\",operation=\"write\"}") -
+            before.series("tent_request_stuck_events_total{phase=\"transport\","
+                          "transport=\"rdma\",operation=\"write\"}"),
+        1);
+    const std::string logs = sink.messages();
+    const std::regex event("event=tent\\.request\\.stuck");
+    EXPECT_EQ(
+        std::distance(std::sregex_iterator(logs.begin(), logs.end(), event),
+                      std::sregex_iterator()),
+        1);
+    EXPECT_TRUE(std::regex_search(
+        logs,
+        std::regex("event=tent\\.request\\.stuck trace_id=[0-9a-f]{32} "
+                   "request_id=[1-9][0-9]* batch_id=[1-9][0-9]* task_id=0 "
+                   "attempt_id=1 transport=rdma operation=write "
+                   "phase=transport status=pending")))
+        << logs;
+
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
+}
+
+TEST_F(MetricsRecordingTest, RetainedTraceLinksLogsAndOpenMetricsExemplar) {
+    auto cfg = makeMetricsTestConfig();
+    cfg->set("log_level", "info");
+    cfg->set("observability/tracing_enabled", true);
+    cfg->set("observability/trace_sample_rate_ppm", 1000000UL);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake);
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xD3);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kLen).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+
+    ObservabilityLogSink sink;
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch), TransferStatusEnum::COMPLETED);
+    const std::string logs = sink.messages();
+
+    std::smatch match;
+    const std::regex attempt_span(
+        "event=tent\\.trace\\.span trace_id=([0-9a-f]{32}).*"
+        "span_name=tent\\.transport_attempt");
+    ASSERT_TRUE(std::regex_search(logs, match, attempt_span)) << logs;
+    const std::string retained_trace_id = match[1].str();
+    EXPECT_NE(logs.find("span_name=tent.logical_transfer"), std::string::npos)
+        << logs;
+    EXPECT_NE(logs.find("retention=head_sampled"), std::string::npos) << logs;
+
+    const std::string prometheus =
+        TentMetrics::instance().getPrometheusMetrics();
+    const std::string openmetrics = TentMetrics::instance().getOpenMetrics();
+    EXPECT_EQ(prometheus.find("# {trace_id="), std::string::npos);
+    EXPECT_NE(openmetrics.find("# {trace_id=\"" + retained_trace_id +
+                               "\"}"),
+              std::string::npos)
+        << openmetrics;
+    EXPECT_TRUE(openmetrics.ends_with("# EOF\n"));
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kLen).ok());
@@ -1326,6 +2421,61 @@ TEST_F(MetricsRecordingTest, RegisteredBytesGaugeSurvivesEnableToggle) {
         after.series("tent_registered_buffer_bytes{transport=\"rdma\"}") -
             before.series("tent_registered_buffer_bytes{transport=\"rdma\"}"),
         0);
+}
+
+TEST_F(MetricsRecordingTest, StagingGaugesSurviveEnableToggle) {
+    auto& m = TentMetrics::instance();
+    auto before = MetricsSnapshot(m);
+
+    TentMetrics::setEnabled(true);
+    m.recordStagingTaskStarted(Request::WRITE, 4096);
+    m.recordStagingCleanupPending(TentMetrics::StagingCleanupKind::Batch, 2);
+    TentMetrics::setEnabled(false);
+    m.recordStagingTaskFinished(Request::WRITE, 4096);
+    m.recordStagingCleanupPending(TentMetrics::StagingCleanupKind::Batch, -2);
+    m.recordWorkerProgress(TentMetrics::WorkerKind::Staging);
+    TentMetrics::setEnabled(true);
+
+    auto after = MetricsSnapshot(m);
+    EXPECT_EQ(after.counter("tent_staging_inflight_tasks") -
+                  before.counter("tent_staging_inflight_tasks"),
+              0);
+    EXPECT_EQ(after.counter("tent_staging_inflight_bytes") -
+                  before.counter("tent_staging_inflight_bytes"),
+              0);
+    EXPECT_EQ(after.counter("tent_staging_cleanup_pending") -
+                  before.counter("tent_staging_cleanup_pending"),
+              0);
+    EXPECT_GT(after.series("tent_worker_last_progress_timestamp_seconds{worker="
+                           "\"staging\"}"),
+              0);
+}
+
+TEST_F(MetricsRecordingTest, StreamStateGaugesSurviveEnableToggle) {
+    auto& metrics = TentMetrics::instance();
+    const auto before = MetricsSnapshot(metrics);
+
+    TentMetrics::setEnabled(true);
+    metrics.recordStreamQueueDepth(HP_TCP, 1);
+    metrics.recordStreamBusyWorkers(HP_TCP, 1);
+    metrics.recordStreamAdmission(HP_TCP, 2, 4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, 1);
+    TentMetrics::setEnabled(false);
+    metrics.recordStreamQueueDepth(HP_TCP, -1);
+    metrics.recordStreamBusyWorkers(HP_TCP, -1);
+    metrics.recordStreamAdmission(HP_TCP, -2, -4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, -1);
+    TentMetrics::setEnabled(true);
+
+    const auto after = MetricsSnapshot(metrics);
+    for (const char* family :
+         {"tent_stream_queue_depth", "tent_stream_busy_workers",
+          "tent_stream_admitted_tasks", "tent_stream_admitted_bytes",
+          "tent_stream_connections"}) {
+        EXPECT_EQ(after.counter(family) - before.counter(family), 0) << family;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1387,6 +2537,28 @@ TEST_F(MetricsHttpTest, PrometheusEndpointExposesAllCounters) {
               std::string::npos);
 }
 
+TEST_F(MetricsHttpTest, OpenMetricsEndpointAddsExemplarWithoutChangingLegacy) {
+    auto& metrics = TentMetrics::instance();
+    metrics.recordTransportAttemptStarted(RDMA, Request::WRITE);
+    metrics.recordTransportAttemptFinished(RDMA, Request::WRITE, COMPLETED,
+                                           42.0);
+    metrics.recordTransportAttemptExemplar(RDMA, Request::WRITE,
+                                           0x1122334455667788ULL,
+                                           0x99aabbccddeeff00ULL, 42.0);
+
+    const auto prometheus = retryGet("/metrics");
+    const auto openmetrics = retryGet("/metrics/openmetrics");
+    ASSERT_EQ(prometheus.http_status, 200);
+    ASSERT_EQ(openmetrics.http_status, 200);
+    EXPECT_EQ(prometheus.body.find("# {trace_id="), std::string::npos);
+    EXPECT_EQ(prometheus.body.find("# EOF"), std::string::npos);
+    EXPECT_NE(openmetrics.body.find(
+                  "# {trace_id=\"112233445566778899aabbccddeeff00\"} 42"),
+              std::string::npos)
+        << openmetrics.body;
+    EXPECT_TRUE(openmetrics.body.ends_with("# EOF\n"));
+}
+
 TEST_F(MetricsHttpTest, PrometheusLabelsDistinguishTransports) {
     // Record the same metric with different transports.
     TentMetrics::instance().recordReadCompleted(RDMA, 1024, 0.001);
@@ -1421,6 +2593,60 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_read_bytes_total"));
     EXPECT_TRUE(json.contains("tent_deadline_infeasible_total"));
     EXPECT_TRUE(json.contains("tent_read_latency_us"));
+    EXPECT_TRUE(json.contains("tent_task_failures_total"));
+    EXPECT_TRUE(json.contains("tent_request_stuck_events_total"));
+    EXPECT_TRUE(json.contains("tent_terminal_failures_total"));
+    EXPECT_TRUE(json.contains("tent_logical_requests_started_total"));
+    EXPECT_TRUE(json.contains("tent_logical_request_outcomes_total"));
+    EXPECT_TRUE(json.contains("tent_logical_requests_inflight"));
+    EXPECT_TRUE(json.contains("tent_transport_attempt_outcomes_total"));
+    EXPECT_TRUE(json.contains("tent_logical_request_outcome_latency_us"));
+    EXPECT_TRUE(
+        json.contains("tent_transport_attempt_outcome_latency_us"));
+    EXPECT_TRUE(json.contains("tent_memory_operations_total"));
+    EXPECT_TRUE(json.contains("tent_memory_operation_bytes_total"));
+    EXPECT_TRUE(json.contains("tent_staging_cleanup_timeouts_total"));
+    EXPECT_TRUE(json.contains("tent_worker_last_progress_timestamp_seconds"));
+    EXPECT_TRUE(json.contains("tent_staging_inflight_tasks"));
+    EXPECT_TRUE(json.contains("tent_staging_inflight_bytes"));
+    EXPECT_TRUE(json.contains("tent_staging_cleanup_pending"));
+    EXPECT_TRUE(json.contains("tent_rpc_attempts_total"));
+    EXPECT_TRUE(json.contains("tent_rpc_retries_total"));
+    EXPECT_TRUE(json.contains("tent_rpc_attempt_latency_us"));
+    EXPECT_TRUE(json.contains("tent_rdma_slice_events_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_retries_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_retry_exhausted_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_wc_errors_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_cq_poll_errors_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_worker_inflight_slices"));
+    EXPECT_TRUE(json.contains("tent_rdma_posted_inflight_slices"));
+    EXPECT_TRUE(json.contains("tent_rdma_completion_latency_us"));
+    EXPECT_TRUE(json.contains("tent_rdma_endpoint_events_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_qp_transition_failures_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_notification_events_total"));
+    EXPECT_TRUE(json.contains("tent_stream_events_total"));
+    EXPECT_TRUE(json.contains("tent_stream_attempt_latency_us"));
+    EXPECT_TRUE(json.contains("tent_stream_queue_wait_us"));
+    EXPECT_TRUE(json.contains("tent_protocol_errors_total"));
+    EXPECT_TRUE(json.contains("tent_tcp_retransmissions_total"));
+    EXPECT_TRUE(json.contains("tent_tcp_rtt_us"));
+    EXPECT_TRUE(json.contains("tent_tcp_congestion_window_segments"));
+    EXPECT_TRUE(json.contains("tent_engine_ready"));
+    EXPECT_TRUE(json.contains("tent_engine_readiness_reason"));
+    EXPECT_TRUE(json.contains("tent_stream_queue_depth"));
+    EXPECT_TRUE(json.contains("tent_stream_busy_workers"));
+    EXPECT_TRUE(json.contains("tent_stream_admitted_tasks"));
+    EXPECT_TRUE(json.contains("tent_stream_admitted_bytes"));
+    EXPECT_TRUE(json.contains("tent_stream_connections"));
+    EXPECT_TRUE(json.contains("tent_metrics_build_info"));
+    EXPECT_FALSE(
+        json["tent_metrics_build_info"].contains("compile_time_enabled"));
+    EXPECT_EQ(json["tent_metrics_runtime_enabled"], 1);
+    EXPECT_EQ(json["tent_metrics_http_server_up"], 1);
+    EXPECT_TRUE(
+        json["tent_metrics_serialization_attempts_total"].contains("json"));
+    EXPECT_TRUE(
+        json["tent_metrics_last_success_timestamp_seconds"].contains("json"));
 }
 
 // Regression guard for the silent-drop bug: ylt's
@@ -1564,12 +2790,126 @@ TEST_F(MetricsHttpTest, HealthEndpointOk) {
     EXPECT_EQ(resp.body, "OK");
 }
 
+TEST_F(MetricsHttpTest, LiveReadyAndDiagnosticsExposeRedactedState) {
+    auto live = retryGet("/live");
+    ASSERT_EQ(live.http_status, 200);
+    auto live_json = nlohmann::json::parse(live.body, nullptr, false);
+    ASSERT_FALSE(live_json.is_discarded());
+    EXPECT_EQ(live_json["schema_version"], 1);
+    EXPECT_EQ(live_json["status"], "live");
+
+    // No provider means the process is live but the engine is not ready.
+    auto unavailable = FetchUrl(port_, "/ready");
+    ASSERT_EQ(unavailable.http_status, 503);
+    auto unavailable_json =
+        nlohmann::json::parse(unavailable.body, nullptr, false);
+    ASSERT_FALSE(unavailable_json.is_discarded());
+    EXPECT_FALSE(unavailable_json["ready"]);
+    EXPECT_EQ(unavailable_json["readiness_reasons"][0],
+              "engine_diagnostics_unavailable");
+
+    int owner = 0;
+    EngineDiagnosticsSnapshot snapshot;
+    snapshot.engine_available = true;
+    snapshot.control_plane_available = true;
+    snapshot.progress_worker_enabled = true;
+    snapshot.progress_worker_running = true;
+    snapshot.runtime_queue_enabled = true;
+    snapshot.loaded_transport_count = 2;
+    snapshot.loaded_transports = {"rdma", "tcp"};
+    snapshot.alive_batches = 3;
+    snapshot.outstanding_owners = 4;
+    snapshot.outstanding_bytes = 4096;
+    snapshot.dispatch_inflight_owners = 2;
+    snapshot.dispatch_inflight_bytes = 2048;
+    snapshot.oldest_inflight_age_us = 1234;
+    snapshot.worker_progress_age_seconds = 1;
+    snapshot.worker_stall_threshold_seconds = 5;
+    TentMetrics::instance().setDiagnosticsProvider(
+        &owner, [snapshot]() { return snapshot; });
+
+    auto ready = retryGet("/ready");
+    ASSERT_EQ(ready.http_status, 200);
+    auto ready_json = nlohmann::json::parse(ready.body, nullptr, false);
+    ASSERT_FALSE(ready_json.is_discarded());
+    EXPECT_TRUE(ready_json["ready"]);
+    EXPECT_EQ(ready_json["engine"]["loaded_transport_count"], 2);
+    EXPECT_EQ(ready_json["runtime_queue"]["outstanding_bytes"], 4096);
+    EXPECT_TRUE(ready_json["redaction"]["peer_identifiers_omitted"]);
+    EXPECT_EQ(ready.body.find("10.0.0.1"), std::string::npos);
+    EXPECT_EQ(ready.body.find("segment_name"), std::string::npos);
+
+    auto diagnostics = retryGet("/diagnostics");
+    EXPECT_EQ(diagnostics.http_status, 200);
+    EXPECT_EQ(diagnostics.body, ready.body);
+
+    snapshot.readiness_reasons = {"progress_worker_stalled"};
+    TentMetrics::instance().setDiagnosticsProvider(
+        &owner, [snapshot]() { return snapshot; });
+    auto stalled = FetchUrl(port_, "/ready");
+    ASSERT_EQ(stalled.http_status, 503);
+    auto stalled_json = nlohmann::json::parse(stalled.body, nullptr, false);
+    ASSERT_FALSE(stalled_json.is_discarded());
+    EXPECT_EQ(stalled_json["readiness_reasons"][0],
+              "progress_worker_stalled");
+
+    TentMetrics::instance().clearDiagnosticsProvider(&owner);
+}
+
+TEST_F(MetricsHttpTest,
+       ReadyUsesBoundedProviderAndDiagnosticsUsesFullProvider) {
+    int owner = 0;
+    std::atomic<int> readiness_calls{0};
+    std::atomic<int> diagnostics_calls{0};
+
+    EngineDiagnosticsSnapshot full;
+    full.engine_available = true;
+    full.control_plane_available = true;
+    full.loaded_transport_count = 2;
+    full.loaded_transports = {"rdma", "tcp"};
+    full.alive_batches = 99;
+    TentMetrics::instance().setDiagnosticsProvider(&owner, [&] {
+        diagnostics_calls.fetch_add(1, std::memory_order_relaxed);
+        return full;
+    });
+
+    EngineDiagnosticsSnapshot bounded = full;
+    bounded.loaded_transport_count = 1;
+    bounded.loaded_transports = {"tcp"};
+    bounded.alive_batches = 0;
+    TentMetrics::instance().setReadinessProvider(&owner, [&] {
+        readiness_calls.fetch_add(1, std::memory_order_relaxed);
+        return bounded;
+    });
+
+    auto ready = retryGet("/ready");
+    ASSERT_EQ(ready.http_status, 200);
+    auto ready_json = nlohmann::json::parse(ready.body, nullptr, false);
+    ASSERT_FALSE(ready_json.is_discarded());
+    EXPECT_EQ(ready_json["engine"]["loaded_transport_count"], 1);
+    EXPECT_EQ(ready_json["work"]["alive_batches"], 0);
+    EXPECT_EQ(readiness_calls.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(diagnostics_calls.load(std::memory_order_relaxed), 0);
+
+    auto diagnostics = retryGet("/diagnostics");
+    ASSERT_EQ(diagnostics.http_status, 200);
+    auto diagnostics_json =
+        nlohmann::json::parse(diagnostics.body, nullptr, false);
+    ASSERT_FALSE(diagnostics_json.is_discarded());
+    EXPECT_EQ(diagnostics_json["engine"]["loaded_transport_count"], 2);
+    EXPECT_EQ(diagnostics_json["work"]["alive_batches"], 99);
+    EXPECT_EQ(diagnostics_calls.load(std::memory_order_relaxed), 1);
+
+    TentMetrics::instance().clearDiagnosticsProvider(&owner);
+}
+
 #else  // !TENT_METRICS_ENABLED
 
 // When metrics are disabled at compile time, the recording path is a no-op
 // and there is nothing to assert on. This test confirms the stub initializes.
 TEST(MetricsRecording, DisabledAtCompileTime) {
     MetricsConfig config;
+    EXPECT_FALSE(TentMetrics::isCompiledIn());
     EXPECT_TRUE(TentMetrics::instance().initialize(config).ok());
     TentMetrics::instance().shutdown();
 }

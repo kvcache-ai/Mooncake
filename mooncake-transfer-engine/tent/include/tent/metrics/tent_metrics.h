@@ -17,6 +17,8 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -48,6 +50,28 @@ namespace mooncake::tent {
 // optimization)
 constexpr size_t kPrometheusBufferSize = 4096;
 
+// Versioned, bounded engine state exposed by /ready and /diagnostics. Keep
+// this free of peer identities, segment names, addresses, request identifiers,
+// and other unbounded or sensitive values.
+struct EngineDiagnosticsSnapshot {
+    bool engine_available{false};
+    bool control_plane_available{false};
+    bool progress_worker_enabled{false};
+    bool progress_worker_running{false};
+    bool runtime_queue_enabled{false};
+    uint64_t loaded_transport_count{0};
+    std::vector<std::string> loaded_transports;
+    uint64_t alive_batches{0};
+    uint64_t outstanding_owners{0};
+    uint64_t outstanding_bytes{0};
+    uint64_t dispatch_inflight_owners{0};
+    uint64_t dispatch_inflight_bytes{0};
+    uint64_t oldest_inflight_age_us{0};
+    uint64_t worker_progress_age_seconds{0};
+    uint64_t worker_stall_threshold_seconds{0};
+    std::vector<std::string> readiness_reasons;
+};
+
 /**
  * @brief TENT metrics system with HTTP server for Prometheus scraping
  *
@@ -65,7 +89,17 @@ constexpr size_t kPrometheusBufferSize = 4096;
  */
 class TentMetrics {
    public:
+    using DiagnosticsSnapshot = EngineDiagnosticsSnapshot;
+    using DiagnosticsProvider = std::function<DiagnosticsSnapshot()>;
+
     static TentMetrics& instance();
+
+    // Build-time capability query for embedders and diagnostics. A build with
+    // metrics compiled out has no HTTP endpoint, so this must remain available
+    // in both the enabled implementation and the no-op stub.
+    static constexpr bool isCompiledIn() noexcept {
+        return TENT_METRICS_ENABLED != 0;
+    }
 
     // Initialize with configuration and start HTTP server
     Status initialize(const MetricsConfig& config);
@@ -91,6 +125,16 @@ class TentMetrics {
                               double latency_seconds = 0.0);
     void recordReadFailed(TransportType tp);
     void recordWriteFailed(TransportType tp);
+
+    // Conservation metrics for accepted logical requests. Started/finished
+    // calls must be paired exactly once per non-derived TaskInfo. The return
+    // value says whether the in-flight gauge was incremented and therefore
+    // needs a matching finish call.
+    bool recordLogicalRequestStarted(Request::OpCode operation);
+    void recordLogicalRequestFinished(TransportType tp,
+                                      Request::OpCode operation,
+                                      TransferStatusEnum status,
+                                      double latency_us);
     // Failover counter is labeled with both the source and destination
     // transport types so failover flows (e.g. rdma->tcp) are queryable.
     void recordTransportFailover(TransportType from, TransportType to);
@@ -98,13 +142,21 @@ class TentMetrics {
     // Record physical transport attempts separately from logical requests.
     // "Started" means the engine is about to call submitTransferTasks (or the
     // staging equivalent). "Finished" records the observed attempt duration
-    // and, for a FAILED status (including synchronous submit failure),
-    // increments the attempt-failure counter.
+    // and records its bounded terminal outcome. Every non-success terminal
+    // outcome also increments the compatibility attempt-failure counter.
     void recordTransportAttemptStarted(TransportType tp,
                                        Request::OpCode operation);
     void recordTransportAttemptFinished(TransportType tp,
                                         Request::OpCode operation,
                                         TransferStatusEnum status,
+                                        double latency_us);
+    // Latest retained trace for a transport-attempt histogram series. This is
+    // rendered only by /metrics/openmetrics; the legacy /metrics response
+    // remains Prometheus 0.0.4 and never receives exemplar syntax.
+    void recordTransportAttemptExemplar(TransportType tp,
+                                        Request::OpCode operation,
+                                        uint64_t trace_id_high,
+                                        uint64_t trace_id_low,
                                         double latency_us);
 
     // Record the deadline feasibility ratio (MLU) for a completed transfer
@@ -135,6 +187,322 @@ class TentMetrics {
     // the only failure metric that records TIMEOUT/CANCELED outcomes.
     void recordTaskFailure(TransportType tp, TaskFailureReason reason);
 
+    enum class StuckPhase { Queue, Dispatch, Transport };
+
+    // Counts the first configured stuck-threshold crossing for a logical
+    // request. The caller guarantees at-most-once recording per request;
+    // labels deliberately remain within bounded engine enums.
+    void recordRequestStuck(StuckPhase phase, TransportType transport,
+                            Request::OpCode operation);
+
+    // Stable public failure taxonomy. Native transport details (errno, WC
+    // status, peer identity, etc.) belong in logs/traces; metric labels stay
+    // within these bounded enums.
+    enum class FailurePhase {
+        Metadata,
+        Admission,
+        Selection,
+        Connect,
+        Register,
+        Submit,
+        Queue,
+        Post,
+        Poll,
+        Completion,
+        Retry,
+        Failover,
+        Notify,
+        Cleanup,
+        Shutdown,
+    };
+    enum class FailureReason {
+        Timeout,
+        Unavailable,
+        QueueFull,
+        ResourceExhausted,
+        Protocol,
+        StaleGeneration,
+        WcError,
+        CqError,
+        MrError,
+        PeerClosed,
+        Canceled,
+        Internal,
+    };
+
+    // Record one terminal logical task failure. Callers must use the phase
+    // where the failure originated when known, and Internal rather than
+    // guessing a more specific native cause.
+    void recordTerminalFailure(TransportType tp, FailurePhase phase,
+                               FailureReason reason);
+
+    enum class MemoryOperation { Register, Unregister };
+    enum class OperationOutcome { Success, Failure };
+
+    // Record one physical backend memory lifecycle call and the bytes covered
+    // by that call. A batched register counts as one operation whose bytes are
+    // the sum of the descriptors in the batch.
+    void recordMemoryOperation(TransportType tp, MemoryOperation operation,
+                               OperationOutcome outcome, size_t bytes);
+
+    enum class WorkerKind { EngineProgress, Staging, Rdma };
+    enum class StagingCleanupKind { Group, Batch, RemoteOperation };
+
+    // Worker timestamps and staging gauges are current state, so updates stay
+    // visible across runtime enable/disable transitions. Staging add/sub
+    // updates must remain paired.
+    void recordWorkerProgress(WorkerKind worker);
+    void recordStagingTaskStarted(Request::OpCode operation, size_t bytes);
+    void recordStagingTaskFinished(Request::OpCode operation, size_t bytes);
+    void recordStagingCleanupPending(StagingCleanupKind kind, int64_t delta);
+    void recordStagingCleanupTimeout();
+
+    enum class RpcMethod {
+        GetSegmentDesc,
+        BootstrapRdma,
+        SendData,
+        RecvData,
+        Notify,
+        Probe,
+        Delegate,
+        Pin,
+        Unpin,
+        SubscribeSegmentUpdate,
+        NotifySegmentUpdated,
+        BootstrapUb,
+        Unknown,
+    };
+    enum class RpcOutcome { Success, ConnectionError, RpcError };
+
+    // Record physical client RPC attempts at the CoroRpcAgent attempt loop.
+    // One logical call may produce two attempts when its idempotent retry is
+    // enabled; recordRpcRetry counts the second attempt when it is issued.
+    void recordRpcAttempt(RpcMethod method, RpcOutcome outcome,
+                          double latency_us);
+    void recordRpcRetry(RpcMethod method);
+
+    enum class RdmaSliceEvent {
+        Enqueued,
+        PostAttempt,
+        PathError,
+        PostError,
+        CompletionSuccess,
+        CompletionError,
+        CompletionFlush,
+        LateCompletion,
+        SoftwareTimeout,
+    };
+    enum class RdmaRetryCause { Endpoint, Post, Completion };
+    enum class RdmaCompletionOutcome { Success, WcError, Flush, Late };
+    enum class RdmaWcErrorCategory {
+        Flush,
+        RetryExceeded,
+        RnrRetryExceeded,
+        LocalProtection,
+        RemoteAccess,
+        RemoteOperation,
+        Protocol,
+        Other,
+    };
+    enum class RdmaEndpointEvent {
+        Constructed,
+        ConstructFailure,
+        ReadyActive,
+        ReadyPassive,
+        Retiring,
+        Destroyed,
+        DestroyError,
+    };
+    enum class RdmaQpType { Data, Notification };
+    enum class RdmaQpTransition {
+        Create,
+        Reset,
+        Init,
+        Rtr,
+        Rts,
+        Error,
+        Destroy,
+    };
+    enum class RdmaNotificationEvent {
+        RecvPosted,
+        RecvPostError,
+        RecvDelivered,
+        RecvInvalid,
+        RecvDropped,
+        SendPosted,
+        SendCompleted,
+        SendUnavailable,
+        SendEncodeError,
+        SendPostError,
+        CompletionError,
+        CqPollError,
+        UnknownQp,
+        ChannelDisabled,
+    };
+
+    // RDMA data-path metrics count slices, not logical requests. Retry
+    // counters advance only when another worker-queue attempt is actually
+    // issued; retry-exhausted is terminal and does not also count as retry.
+    void recordRdmaSliceEvent(Request::OpCode operation, RdmaSliceEvent event,
+                              int64_t count = 1);
+    void recordRdmaRetry(Request::OpCode operation, RdmaRetryCause cause);
+    void recordRdmaRetryExhausted(Request::OpCode operation,
+                                  RdmaRetryCause cause);
+    void recordRdmaCqPollError();
+    void recordRdmaWorkerInflight(Request::OpCode operation, int64_t delta);
+    void recordRdmaPostedInflight(Request::OpCode operation, int64_t delta);
+    void recordRdmaCompletion(Request::OpCode operation,
+                              RdmaCompletionOutcome outcome, double latency_us);
+    void recordRdmaWcError(Request::OpCode operation,
+                           RdmaWcErrorCategory category);
+    void recordRdmaEndpointEvent(RdmaEndpointEvent event);
+    void recordRdmaQpTransitionFailure(RdmaQpType qp_type,
+                                       RdmaQpTransition transition);
+    void recordRdmaNotificationEvent(RdmaNotificationEvent event,
+                                     int64_t count = 1);
+
+    enum class StreamEvent {
+        Queued,
+        AttemptStarted,
+        AttemptSuccess,
+        ConnectStarted,
+        ConnectSuccess,
+        ConnectionError,
+        IoError,
+        Timeout,
+        PeerClosed,
+        Canceled,
+        RemoteError,
+        RetryIssued,
+        RetryExhausted,
+    };
+    enum class StreamOutcome {
+        Success,
+        ConnectionError,
+        IoError,
+        Timeout,
+        PeerClosed,
+        Canceled,
+        RemoteError,
+    };
+
+    // Stream metrics cover TCP and HP-TCP. A queued event belongs to a
+    // logical task for TCP and a physical slice operation for HP-TCP; attempt
+    // events and latency always describe a physical network attempt.
+    void recordStreamEvent(TransportType transport, Request::OpCode operation,
+                           StreamEvent event, int64_t count = 1);
+    void recordStreamAttempt(TransportType transport,
+                             Request::OpCode operation, StreamOutcome outcome,
+                             double latency_us);
+    void recordStreamQueueWait(TransportType transport,
+                               Request::OpCode operation, double latency_us);
+    enum class StreamConnectionRole { Client, Server };
+    enum class ProtocolErrorKind {
+        InvalidSize,
+        BadMagic,
+        BadVersion,
+        InvalidReserved,
+        BadOpcode,
+        BadLength,
+        InvalidStatus,
+        RequestIdMismatch,
+        CommittedLengthMismatch,
+    };
+    // Paired stream state gauges. These updates remain active when runtime
+    // sampling is disabled so current state cannot drift.
+    void recordStreamQueueDepth(TransportType transport, int64_t delta);
+    void recordStreamBusyWorkers(TransportType transport, int64_t delta);
+    void recordStreamAdmission(TransportType transport, int64_t task_delta,
+                               int64_t byte_delta);
+    void recordStreamConnection(TransportType transport,
+                                StreamConnectionRole role, int64_t delta);
+    void recordProtocolError(TransportType transport, ProtocolErrorKind kind);
+    void recordTcpSocketSample(TransportType transport,
+                               StreamConnectionRole role,
+                               uint32_t retransmit_delta, uint32_t rtt_us,
+                               uint32_t congestion_window_segments);
+
+    enum class ShmMappingEvent {
+        CacheHit,
+        CacheMiss,
+        MetadataError,
+        OpenError,
+        StatError,
+        SizeMismatch,
+        MapError,
+        Created,
+    };
+    enum class ShmCopyOutcome { Success, Error };
+
+    // SHM copies are synchronous physical attempts. Mapping events describe
+    // the remote-address relocation cache and backing-object setup; labels
+    // deliberately exclude segment ids, addresses and shm paths.
+    void recordShmMappingEvent(ShmMappingEvent event);
+    void recordShmCopy(Request::OpCode operation, ShmCopyOutcome outcome,
+                       double latency_us);
+
+    enum class SegmentEvent {
+        SnapshotPublished,
+        MutationError,
+        RegistryPublishSuccess,
+        RegistryPublishError,
+        RegistryDeleteSuccess,
+        RegistryDeleteError,
+        CacheHit,
+        CacheMiss,
+        CacheReset,
+        FetchSuccess,
+        FetchError,
+        EntryInvalidated,
+        GenerationAdvanced,
+    };
+
+    // Segment metadata events are recorded at SegmentManager, the owner of
+    // local snapshot publication, registry I/O and remote cache generations.
+    // Segment names and handles are intentionally excluded from labels.
+    void recordSegmentEvent(SegmentEvent event);
+
+    enum class SelectionEvent {
+        Selected,
+        FallbackSelected,
+        CandidateUnavailable,
+        PolicyMiss,
+        CandidateEmpty,
+        HintRejected,
+        HintUnavailable,
+        Exhausted,
+        MetadataRefresh,
+    };
+
+    // Selection metrics count decisions, not transfers. `transport` is the
+    // selected, rejected or unavailable bounded enum value; events without a
+    // concrete candidate use UNSPEC.
+    void recordSelectionEvent(SelectionEvent event,
+                              TransportType transport = UNSPEC);
+
+    enum class AdmissionOwnerKind { User, Staging, All };
+    enum class AdmissionEvent {
+        Admitted,
+        RejectedBatchCapacity,
+        RejectedOwnerCapacity,
+        RejectedByteCapacity,
+        RejectedUserOwnerCapacity,
+        RejectedUserByteCapacity,
+        RejectedDispatchWindow,
+        Dispatched,
+        DeadlineDropped,
+        Canceled,
+    };
+
+    // Admission events count queue owners, not public request aliases. Queue
+    // gauges are paired charge/uncharge updates and therefore remain active
+    // across runtime metric enable/disable transitions.
+    void recordAdmissionEvent(AdmissionOwnerKind kind, AdmissionEvent event,
+                              int64_t count = 1);
+    void recordAdmissionQueued(AdmissionOwnerKind kind, int64_t owner_delta,
+                               int64_t byte_delta);
+    void recordAdmissionWait(AdmissionOwnerKind kind, double latency_us);
+
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
     // sitting in the engine right now — a persistently high or stuck value
@@ -160,6 +528,7 @@ class TentMetrics {
 
     // Get metrics for HTTP server
     std::string getPrometheusMetrics();
+    std::string getOpenMetrics();
     std::string getJsonMetrics();
     std::string getSummaryString();
 
@@ -173,6 +542,21 @@ class TentMetrics {
     uint16_t httpPort() const {
         return bound_http_port_.load(std::memory_order_relaxed);
     }
+
+    // The owner token makes registration safe when multiple engines share the
+    // process-wide metrics singleton: teardown only clears its own provider.
+    // getDiagnosticsSnapshot invokes the provider under the same mutex, so
+    // clearDiagnosticsProvider waits for an in-flight callback to finish.
+    void setDiagnosticsProvider(const void* owner,
+                                DiagnosticsProvider provider);
+    // /ready and scrape-time readiness gauges use this lightweight provider;
+    // /diagnostics retains the full, potentially O(number of live tasks)
+    // snapshot. setDiagnosticsProvider also installs the same callback as the
+    // default readiness provider for backward compatibility with embedders.
+    void setReadinessProvider(const void* owner, DiagnosticsProvider provider);
+    void clearDiagnosticsProvider(const void* owner);
+    bool getDiagnosticsSnapshot(DiagnosticsSnapshot& snapshot);
+    bool getReadinessSnapshot(DiagnosticsSnapshot& snapshot);
 
    private:
     TentMetrics() = default;
@@ -189,8 +573,39 @@ class TentMetrics {
     // separate from config_.http_port and atomic because httpPort() may be read
     // by other threads while the initializing thread is still binding a port.
     std::atomic<uint16_t> bound_http_port_{0};
+    std::mutex diagnostics_provider_mutex_;
+    const void* diagnostics_provider_owner_{nullptr};
+    DiagnosticsProvider diagnostics_provider_;
+    DiagnosticsProvider readiness_provider_;
 
 #if TENT_METRICS_ENABLED
+    friend class TentMetricsTestPeer;
+
+    static constexpr size_t kSerializationFormatCount = 2;
+    static constexpr size_t kPrometheusFormat = 0;
+    static constexpr size_t kJsonFormat = 1;
+
+    // Metrics about the metrics pipeline itself. They deliberately live in
+    // plain atomics instead of the ylt registry so they are always emitted,
+    // including while runtime recording is disabled or before any transfer
+    // metric has received a sample.
+    std::atomic<uint64_t> http_start_failures_{0};
+    std::array<std::atomic<uint64_t>, kSerializationFormatCount>
+        serialization_attempts_{{0, 0}};
+    std::array<std::atomic<uint64_t>, kSerializationFormatCount>
+        serialization_failures_{{0, 0}};
+    std::array<std::atomic<uint64_t>, kSerializationFormatCount>
+        last_serialization_success_timestamp_seconds_{{0, 0}};
+
+    struct AttemptExemplar {
+        // Even sequence values are stable; odd values mean a writer is
+        // publishing the remaining fields.
+        std::atomic<uint64_t> sequence{0};
+        std::atomic<uint64_t> trace_id_high{0};
+        std::atomic<uint64_t> trace_id_low{0};
+        std::atomic<int64_t> value_us{0};
+    };
+
     // Initialize and start the HTTP server on the configured port. Port
     // assignment is deterministic: co-located ranks are expected to be given
     // distinct ports explicitly (e.g. base_port + local_rank) rather than
@@ -198,9 +613,23 @@ class TentMetrics {
     // then degrades to log-only metrics); on success bound_http_port_ is set.
     Status initHttpServer();
 
-    // Register the /metrics, /metrics/summary, /metrics/json and /health
-    // endpoints on the current http_server_ instance.
+    // Register metrics plus compatibility /health, process /live, engine
+    // /ready, and the redacted /diagnostics endpoint.
     void registerHttpHandlers();
+    void appendReadinessPrometheus(std::string& out);
+
+    // Build an endpoint response and report whether serialization succeeded.
+    // The public string-returning methods retain their existing API, while the
+    // HTTP handlers use the boolean result to return 5xx on failure.
+    bool tryGetPrometheusMetrics(bool open_metrics, std::string& result);
+    bool tryGetJsonMetrics(std::string& result);
+
+    // Apply common attempt/failure/last-success accounting around both output
+    // formats. Kept off the transfer hot path; this runs only on scrape or
+    // direct serialization requests.
+    bool serializeWithAccounting(
+        size_t format, std::string& result,
+        const std::function<void(std::string&, uint64_t)>& serializer);
 
     // HTTP server for metrics endpoint
     std::unique_ptr<coro_http::coro_http_server> http_server_;
@@ -224,8 +653,55 @@ class TentMetrics {
                                                                    "to"};
     static inline const std::array<std::string, 2> kAttemptLabels{"transport",
                                                                   "operation"};
+    static inline const std::array<std::string, 3> kOutcomeLabels{
+        "transport", "operation", "outcome"};
     static inline const std::array<std::string, 2> kTaskFailureLabels{
         "transport", "reason"};
+    static inline const std::array<std::string, 3> kRequestStuckLabels{
+        "phase", "transport", "operation"};
+    static inline const std::array<std::string, 3> kTerminalFailureLabels{
+        "transport", "phase", "reason"};
+    static inline const std::array<std::string, 3> kMemoryOperationLabels{
+        "transport", "operation", "outcome"};
+    static inline const std::array<std::string, 1> kWorkerLabel{"worker"};
+    static inline const std::array<std::string, 1> kOperationLabel{"operation"};
+    static inline const std::array<std::string, 1> kCleanupKindLabel{"kind"};
+    static inline const std::array<std::string, 2> kRpcAttemptLabels{"method",
+                                                                     "outcome"};
+    static inline const std::array<std::string, 1> kRpcMethodLabel{"method"};
+    static inline const std::array<std::string, 2> kRdmaEventLabels{"operation",
+                                                                    "event"};
+    static inline const std::array<std::string, 2> kRdmaRetryLabels{"operation",
+                                                                    "cause"};
+    static inline const std::array<std::string, 2> kRdmaWcErrorLabels{
+        "operation", "category"};
+    static inline const std::array<std::string, 2> kRdmaCompletionLabels{
+        "operation", "outcome"};
+    static inline const std::array<std::string, 1> kRdmaEndpointEventLabel{
+        "event"};
+    static inline const std::array<std::string, 2> kRdmaQpFailureLabels{
+        "qp_type", "transition"};
+    static inline const std::array<std::string, 1> kRdmaNotificationEventLabel{
+        "event"};
+    static inline const std::array<std::string, 3> kStreamEventLabels{
+        "transport", "operation", "event"};
+    static inline const std::array<std::string, 3> kStreamAttemptLabels{
+        "transport", "operation", "outcome"};
+    static inline const std::array<std::string, 2> kStreamConnectionLabels{
+        "transport", "role"};
+    static inline const std::array<std::string, 2> kProtocolErrorLabels{
+        "transport", "kind"};
+    static inline const std::array<std::string, 1> kShmMappingEventLabel{
+        "event"};
+    static inline const std::array<std::string, 2> kShmCopyLabels{"operation",
+                                                                 "outcome"};
+    static inline const std::array<std::string, 1> kSegmentEventLabel{"event"};
+    static inline const std::array<std::string, 2> kSelectionEventLabels{
+        "event", "transport"};
+    static inline const std::array<std::string, 2> kAdmissionEventLabels{
+        "owner_kind", "event"};
+    static inline const std::array<std::string, 1> kAdmissionOwnerKindLabel{
+        "owner_kind"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -234,7 +710,62 @@ class TentMetrics {
     static constexpr size_t kTransportDomain =
         static_cast<size_t>(kNumTransportTypes);
     static constexpr size_t kAttemptDomain = kTransportDomain * 2;
+    static constexpr size_t kOutcomeValueDomain = 4;
+    static constexpr size_t kOutcomeDomain =
+        kAttemptDomain * kOutcomeValueDomain;
+    std::array<AttemptExemplar, kAttemptDomain> attempt_exemplars_{};
     static constexpr size_t kTaskFailureDomain = kTransportDomain * 4;
+    static constexpr size_t kStuckPhaseDomain = 3;
+    static constexpr size_t kRequestStuckDomain =
+        kStuckPhaseDomain * kTransportDomain * 2;
+    static constexpr size_t kWorkerDomain = 3;
+    static constexpr size_t kOperationDomain = 2;
+    static constexpr size_t kCleanupKindDomain = 3;
+    static constexpr size_t kRpcMethodDomain = 13;
+    static constexpr size_t kRpcOutcomeDomain = 3;
+    static constexpr size_t kRpcAttemptDomain =
+        kRpcMethodDomain * kRpcOutcomeDomain;
+    static constexpr size_t kRdmaSliceEventDomain = 9;
+    static constexpr size_t kRdmaRetryCauseDomain = 3;
+    static constexpr size_t kRdmaWcErrorCategoryDomain = 8;
+    static constexpr size_t kRdmaCompletionOutcomeDomain = 4;
+    static constexpr size_t kRdmaEndpointEventDomain = 7;
+    static constexpr size_t kRdmaQpTypeDomain = 2;
+    static constexpr size_t kRdmaQpTransitionDomain = 7;
+    static constexpr size_t kRdmaQpFailureDomain =
+        kRdmaQpTypeDomain * kRdmaQpTransitionDomain;
+    static constexpr size_t kRdmaNotificationEventDomain = 14;
+    static constexpr size_t kStreamEventValueDomain = 13;
+    static constexpr size_t kStreamOutcomeDomain = 7;
+    static constexpr size_t kStreamOperationDomain = kTransportDomain * 2;
+    static constexpr size_t kStreamEventDomain =
+        kStreamOperationDomain * kStreamEventValueDomain;
+    static constexpr size_t kStreamAttemptDomain =
+        kStreamOperationDomain * kStreamOutcomeDomain;
+    static constexpr size_t kStreamConnectionDomain = kTransportDomain * 2;
+    static constexpr size_t kProtocolErrorKindDomain = 9;
+    static constexpr size_t kProtocolErrorDomain =
+        kTransportDomain * kProtocolErrorKindDomain;
+    static constexpr size_t kShmMappingEventDomain = 8;
+    static constexpr size_t kShmCopyOutcomeDomain = 2;
+    static constexpr size_t kShmCopyDomain =
+        kOperationDomain * kShmCopyOutcomeDomain;
+    static constexpr size_t kSegmentEventDomain = 13;
+    static constexpr size_t kSelectionEventValueDomain = 9;
+    static constexpr size_t kSelectionEventDomain =
+        kSelectionEventValueDomain * kTransportDomain;
+    static constexpr size_t kAdmissionOwnerKindDomain = 3;
+    static constexpr size_t kAdmissionEventValueDomain = 10;
+    static constexpr size_t kAdmissionEventDomain =
+        kAdmissionOwnerKindDomain * kAdmissionEventValueDomain;
+    static constexpr size_t kRdmaEventDomain =
+        kOperationDomain * kRdmaSliceEventDomain;
+    static constexpr size_t kRdmaRetryDomain =
+        kOperationDomain * kRdmaRetryCauseDomain;
+    static constexpr size_t kRdmaWcErrorDomain =
+        kOperationDomain * kRdmaWcErrorCategoryDomain;
+    static constexpr size_t kRdmaCompletionDomain =
+        kOperationDomain * kRdmaCompletionOutcomeDomain;
 
     // Stable slot indices into the cached-cell label domain.
     static size_t transportSlot(TransportType tp) {
@@ -243,8 +774,86 @@ class TentMetrics {
     static size_t attemptSlot(TransportType tp, Request::OpCode op) {
         return static_cast<size_t>(tp) * 2 + (op == Request::READ ? 0u : 1u);
     }
+    static size_t outcomeSlot(TransportType tp, Request::OpCode op,
+                              TransferStatusEnum status);
     static size_t taskFailureSlot(TransportType tp, TaskFailureReason reason) {
         return static_cast<size_t>(tp) * 4 + static_cast<size_t>(reason);
+    }
+    static size_t requestStuckSlot(StuckPhase phase, TransportType transport,
+                                   Request::OpCode operation) {
+        return (static_cast<size_t>(phase) * kTransportDomain +
+                transportSlot(transport)) *
+                   2 +
+               operationSlot(operation);
+    }
+    static size_t operationSlot(Request::OpCode operation) {
+        return operation == Request::READ ? 0u : 1u;
+    }
+    static size_t rpcAttemptSlot(RpcMethod method, RpcOutcome outcome) {
+        return static_cast<size_t>(method) * kRpcOutcomeDomain +
+               static_cast<size_t>(outcome);
+    }
+    static size_t rdmaEventSlot(Request::OpCode operation,
+                                RdmaSliceEvent event) {
+        return operationSlot(operation) * kRdmaSliceEventDomain +
+               static_cast<size_t>(event);
+    }
+    static size_t rdmaRetrySlot(Request::OpCode operation,
+                                RdmaRetryCause cause) {
+        return operationSlot(operation) * kRdmaRetryCauseDomain +
+               static_cast<size_t>(cause);
+    }
+    static size_t rdmaCompletionSlot(Request::OpCode operation,
+                                     RdmaCompletionOutcome outcome) {
+        return operationSlot(operation) * kRdmaCompletionOutcomeDomain +
+               static_cast<size_t>(outcome);
+    }
+    static size_t rdmaQpFailureSlot(RdmaQpType qp_type,
+                                    RdmaQpTransition transition) {
+        return static_cast<size_t>(qp_type) * kRdmaQpTransitionDomain +
+               static_cast<size_t>(transition);
+    }
+    static size_t streamOperationSlot(TransportType transport,
+                                      Request::OpCode operation) {
+        return transportSlot(transport) * 2 + operationSlot(operation);
+    }
+    static size_t streamEventSlot(TransportType transport,
+                                  Request::OpCode operation,
+                                  StreamEvent event) {
+        return streamOperationSlot(transport, operation) *
+                   kStreamEventValueDomain +
+               static_cast<size_t>(event);
+    }
+    static size_t streamAttemptSlot(TransportType transport,
+                                    Request::OpCode operation,
+                                    StreamOutcome outcome) {
+        return streamOperationSlot(transport, operation) *
+                   kStreamOutcomeDomain +
+               static_cast<size_t>(outcome);
+    }
+    static size_t streamConnectionSlot(TransportType transport,
+                                       StreamConnectionRole role) {
+        return transportSlot(transport) * 2 + static_cast<size_t>(role);
+    }
+    static size_t protocolErrorSlot(TransportType transport,
+                                    ProtocolErrorKind kind) {
+        return transportSlot(transport) * kProtocolErrorKindDomain +
+               static_cast<size_t>(kind);
+    }
+    static size_t shmCopySlot(Request::OpCode operation,
+                              ShmCopyOutcome outcome) {
+        return operationSlot(operation) * kShmCopyOutcomeDomain +
+               static_cast<size_t>(outcome);
+    }
+    static size_t selectionEventSlot(SelectionEvent event,
+                                     TransportType transport) {
+        return static_cast<size_t>(event) * kTransportDomain +
+               transportSlot(transport);
+    }
+    static size_t admissionEventSlot(AdmissionOwnerKind kind,
+                                     AdmissionEvent event) {
+        return static_cast<size_t>(kind) * kAdmissionEventValueDomain +
+               static_cast<size_t>(event);
     }
 
     // Per-transport counters (label: transport). Values are int64_t.
@@ -277,8 +886,19 @@ class TentMetrics {
         kAttemptLabels, kAttemptDomain};
     metrics::CachedDynamicCounter<2> transport_attempt_failures_total_{
         "tent_transport_attempt_failures_total",
-        "Physical transport attempts that terminated with FAILED",
+        "Physical transport attempts that terminated unsuccessfully",
         kAttemptLabels, kAttemptDomain};
+    metrics::CachedDynamicCounter<1> logical_requests_started_total_{
+        "tent_logical_requests_started_total",
+        "Accepted logical requests by operation", kOperationLabel,
+        kOperationDomain};
+    metrics::CachedDynamicCounter<3> logical_request_outcomes_total_{
+        "tent_logical_request_outcomes_total",
+        "Terminal logical request outcomes", kOutcomeLabels, kOutcomeDomain};
+    metrics::CachedDynamicCounter<3> transport_attempt_outcomes_total_{
+        "tent_transport_attempt_outcomes_total",
+        "Terminal physical transport attempt outcomes", kOutcomeLabels,
+        kOutcomeDomain};
     // Task-level failures with a reason label, so Grafana can alert on the
     // failure signature (submit vs poll vs timeout vs canceled) without log
     // scraping. Additive to the legacy read/write_failures_total counters.
@@ -286,6 +906,26 @@ class TentMetrics {
         "tent_task_failures_total",
         "Task-level failures by terminal transport and failure reason",
         kTaskFailureLabels, kTaskFailureDomain};
+    metrics::CachedDynamicCounter<3> request_stuck_events_total_{
+        "tent_request_stuck_events_total",
+        "Logical requests crossing the configured stuck threshold once",
+        kRequestStuckLabels, kRequestStuckDomain};
+    // Terminal failures and memory lifecycle operations are rare control-path
+    // events, so they use the plain dynamic counter instead of reserving the
+    // full bounded-label cross product in cached cells.
+    ylt::metric::basic_dynamic_counter<int64_t, 3> terminal_failures_total_{
+        "tent_terminal_failures_total",
+        "Terminal logical task failures by transport, phase and reason",
+        kTerminalFailureLabels};
+    ylt::metric::basic_dynamic_counter<int64_t, 3> memory_operations_total_{
+        "tent_memory_operations_total",
+        "Physical backend memory lifecycle calls by outcome",
+        kMemoryOperationLabels};
+    ylt::metric::basic_dynamic_counter<int64_t, 3>
+        memory_operation_bytes_total_{
+            "tent_memory_operation_bytes_total",
+            "Bytes covered by physical backend memory lifecycle calls",
+            kMemoryOperationLabels};
     metrics::CachedDynamicCounter<1> deadline_infeasible_total_{
         "tent_deadline_infeasible_total",
         "Transfers whose deadline was already in the past at submit",
@@ -296,6 +936,80 @@ class TentMetrics {
         "tent_quarantined_batches_total",
         "Batches abandoned by lazyFreeBatch after repeated failed reclaim "
         "attempts; reclaimed only at engine teardown"};
+    ylt::metric::counter_t staging_cleanup_timeouts_total_{
+        "tent_staging_cleanup_timeouts_total",
+        "Staging shutdown drains that reached their configured deadline"};
+    metrics::CachedDynamicCounter<2> rpc_attempts_total_{
+        "tent_rpc_attempts_total",
+        "Physical TENT client RPC attempts by method and transport outcome",
+        kRpcAttemptLabels, kRpcAttemptDomain};
+    metrics::CachedDynamicCounter<1> rpc_retries_total_{
+        "tent_rpc_retries_total",
+        "Physical TENT client RPC retry attempts actually issued",
+        kRpcMethodLabel, kRpcMethodDomain};
+    metrics::CachedDynamicCounter<2> rdma_slice_events_total_{
+        "tent_rdma_slice_events_total",
+        "RDMA slice lifecycle events by operation and event", kRdmaEventLabels,
+        kRdmaEventDomain};
+    metrics::CachedDynamicCounter<2> rdma_retries_total_{
+        "tent_rdma_retries_total",
+        "RDMA slice retries actually re-enqueued by cause", kRdmaRetryLabels,
+        kRdmaRetryDomain};
+    metrics::CachedDynamicCounter<2> rdma_retry_exhausted_total_{
+        "tent_rdma_retry_exhausted_total",
+        "RDMA slices terminated after exhausting retries by cause",
+        kRdmaRetryLabels, kRdmaRetryDomain};
+    metrics::CachedDynamicCounter<2> rdma_wc_errors_total_{
+        "tent_rdma_wc_errors_total",
+        "RDMA work completions with a non-success status by bounded category",
+        kRdmaWcErrorLabels, kRdmaWcErrorDomain};
+    ylt::metric::counter_t rdma_cq_poll_errors_total_{
+        "tent_rdma_cq_poll_errors_total",
+        "RDMA completion queue poll calls that returned an error"};
+    metrics::CachedDynamicCounter<1> rdma_endpoint_events_total_{
+        "tent_rdma_endpoint_events_total",
+        "RDMA endpoint lifecycle transitions", kRdmaEndpointEventLabel,
+        kRdmaEndpointEventDomain};
+    metrics::CachedDynamicCounter<2> rdma_qp_transition_failures_total_{
+        "tent_rdma_qp_transition_failures_total",
+        "RDMA queue-pair transition failures by QP type and transition",
+        kRdmaQpFailureLabels, kRdmaQpFailureDomain};
+    metrics::CachedDynamicCounter<1> rdma_notification_events_total_{
+        "tent_rdma_notification_events_total",
+        "RDMA notification channel events", kRdmaNotificationEventLabel,
+        kRdmaNotificationEventDomain};
+    metrics::CachedDynamicCounter<3> stream_events_total_{
+        "tent_stream_events_total",
+        "TCP and HP-TCP queue, attempt, connection, retry and terminal events",
+        kStreamEventLabels, kStreamEventDomain};
+    metrics::CachedDynamicCounter<2> protocol_errors_total_{
+        "tent_protocol_errors_total",
+        "Rejected or inconsistent transport protocol frames",
+        kProtocolErrorLabels, kProtocolErrorDomain};
+    metrics::CachedDynamicCounter<2> tcp_retransmissions_total_{
+        "tent_tcp_retransmissions_total",
+        "Kernel TCP retransmissions observed through TCP_INFO deltas",
+        kStreamConnectionLabels, kStreamConnectionDomain};
+    metrics::CachedDynamicCounter<1> shm_mapping_events_total_{
+        "tent_shm_mapping_events_total",
+        "SHM remote-address relocation and backing-object mapping events",
+        kShmMappingEventLabel, kShmMappingEventDomain};
+    metrics::CachedDynamicCounter<2> shm_copy_events_total_{
+        "tent_shm_copy_events_total",
+        "Synchronous physical SHM copy attempts by operation and outcome",
+        kShmCopyLabels, kShmCopyDomain};
+    metrics::CachedDynamicCounter<1> segment_events_total_{
+        "tent_segment_events_total",
+        "Segment snapshot, registry and remote-cache lifecycle events",
+        kSegmentEventLabel, kSegmentEventDomain};
+    metrics::CachedDynamicCounter<2> selection_events_total_{
+        "tent_transport_selection_events_total",
+        "Transport selector decisions by bounded event and transport",
+        kSelectionEventLabels, kSelectionEventDomain};
+    metrics::CachedDynamicCounter<2> admission_events_total_{
+        "tent_admission_events_total",
+        "Runtime admission queue owner decisions by kind and event",
+        kAdmissionEventLabels, kAdmissionEventDomain};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_
@@ -304,9 +1018,62 @@ class TentMetrics {
         "tent_inflight_attempts",
         "In-flight transport attempts (submitted, not yet finished)",
         kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> logical_requests_inflight_{
+        "tent_logical_requests_inflight",
+        "Accepted logical requests without a terminal outcome",
+        kOperationLabel, kOperationDomain};
+    metrics::CachedDynamicCounter<1> stream_queue_depth_{
+        "tent_stream_queue_depth", "Queued stream transport operations",
+        kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> stream_busy_workers_{
+        "tent_stream_busy_workers", "Stream workers executing operations",
+        kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> stream_admitted_tasks_{
+        "tent_stream_admitted_tasks",
+        "HP-TCP tasks holding bounded admission capacity", kTransportLabel,
+        kTransportDomain};
+    metrics::CachedDynamicCounter<1> stream_admitted_bytes_{
+        "tent_stream_admitted_bytes",
+        "HP-TCP bytes holding bounded admission capacity", kTransportLabel,
+        kTransportDomain};
+    metrics::CachedDynamicCounter<2> stream_connections_{
+        "tent_stream_connections", "Open stream connections by endpoint role",
+        kStreamConnectionLabels, kStreamConnectionDomain};
     metrics::CachedDynamicCounter<1> registered_buffer_bytes_{
         "tent_registered_buffer_bytes", "Registered local buffer bytes",
         kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> worker_last_progress_timestamp_seconds_{
+        "tent_worker_last_progress_timestamp_seconds",
+        "Unix timestamp of the last observed worker progress", kWorkerLabel,
+        kWorkerDomain};
+    metrics::CachedDynamicCounter<1> staging_inflight_tasks_{
+        "tent_staging_inflight_tasks",
+        "Parent staging tasks currently executing in staging workers",
+        kOperationLabel, kOperationDomain};
+    metrics::CachedDynamicCounter<1> staging_inflight_bytes_{
+        "tent_staging_inflight_bytes",
+        "Parent request bytes currently executing in staging workers",
+        kOperationLabel, kOperationDomain};
+    metrics::CachedDynamicCounter<1> staging_cleanup_pending_{
+        "tent_staging_cleanup_pending",
+        "Deferred staging cleanup resources still awaiting safe release",
+        kCleanupKindLabel, kCleanupKindDomain};
+    metrics::CachedDynamicCounter<1> rdma_worker_inflight_slices_{
+        "tent_rdma_worker_inflight_slices",
+        "RDMA slices owned by worker queues or completion processing",
+        kOperationLabel, kOperationDomain};
+    metrics::CachedDynamicCounter<1> rdma_posted_inflight_slices_{
+        "tent_rdma_posted_inflight_slices",
+        "RDMA slices reserved for posting or awaiting completion",
+        kOperationLabel, kOperationDomain};
+    metrics::CachedDynamicCounter<1> admission_queue_owners_{
+        "tent_admission_queue_owners",
+        "Runtime admission queue owners charged as outstanding",
+        kAdmissionOwnerKindLabel, kAdmissionOwnerKindDomain};
+    metrics::CachedDynamicCounter<1> admission_queue_bytes_{
+        "tent_admission_queue_bytes",
+        "Runtime admission queue bytes charged as outstanding",
+        kAdmissionOwnerKindLabel, kAdmissionOwnerKindDomain};
     std::vector<metrics::CachedDynamicCounter<1>*> gauges_;
 
     // Latency histograms use microseconds (us) as unit
@@ -329,6 +1096,8 @@ class TentMetrics {
     // Buckets span 10us to 500ms to capture both fast RDMA and slower TCP.
     static inline const std::vector<double> kStageBuckets{
         10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000};
+    static inline const std::vector<double> kCongestionWindowBuckets{
+        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 4096};
 
     // Histograms are composed of cached-cell counters: one counter per bucket
     // plus a sum counter. The sum is part of the histogram itself, so no
@@ -365,16 +1134,65 @@ class TentMetrics {
         "tent_transport_attempt_latency_us",
         "Observed physical transport attempt latency in microseconds",
         kLatencyBuckets, kAttemptLabels, kAttemptDomain};
+    metrics::CachedDynamicHistogram<3> logical_request_outcome_latency_{
+        "tent_logical_request_outcome_latency_us",
+        "Logical request latency by terminal outcome in microseconds",
+        kLatencyBuckets, kOutcomeLabels, kOutcomeDomain};
+    metrics::CachedDynamicHistogram<3> transport_attempt_outcome_latency_{
+        "tent_transport_attempt_outcome_latency_us",
+        "Physical transport attempt latency by terminal outcome in "
+        "microseconds",
+        kLatencyBuckets, kOutcomeLabels, kOutcomeDomain};
+    metrics::CachedDynamicHistogram<2> rpc_attempt_latency_{
+        "tent_rpc_attempt_latency_us",
+        "Physical TENT client RPC attempt latency in microseconds",
+        kLatencyBuckets, kRpcAttemptLabels, kRpcAttemptDomain};
+    metrics::CachedDynamicHistogram<2> rdma_completion_latency_{
+        "tent_rdma_completion_latency_us",
+        "RDMA posted-slice completion latency in microseconds", kLatencyBuckets,
+        kRdmaCompletionLabels, kRdmaCompletionDomain};
+    metrics::CachedDynamicHistogram<3> stream_attempt_latency_{
+        "tent_stream_attempt_latency_us",
+        "Physical TCP and HP-TCP attempt latency in microseconds",
+        kLatencyBuckets, kStreamAttemptLabels, kStreamAttemptDomain};
+    metrics::CachedDynamicHistogram<2> tcp_rtt_us_{
+        "tent_tcp_rtt_us", "Kernel smoothed TCP RTT samples in microseconds",
+        kLatencyBuckets, kStreamConnectionLabels, kStreamConnectionDomain};
+    metrics::CachedDynamicHistogram<2> tcp_congestion_window_segments_{
+        "tent_tcp_congestion_window_segments",
+        "Kernel TCP send congestion window samples in segments",
+        kCongestionWindowBuckets, kStreamConnectionLabels,
+        kStreamConnectionDomain};
+    metrics::CachedDynamicHistogram<2> stream_queue_wait_{
+        "tent_stream_queue_wait_us",
+        "TCP logical-task and HP-TCP physical-slice queue wait in microseconds",
+        kLatencyBuckets, kAttemptLabels, kStreamOperationDomain};
+    metrics::CachedDynamicHistogram<2> shm_copy_latency_{
+        "tent_shm_copy_latency_us",
+        "Synchronous physical SHM copy latency in microseconds",
+        kLatencyBuckets, kShmCopyLabels, kShmCopyDomain};
+    metrics::CachedDynamicHistogram<1> admission_wait_latency_{
+        "tent_admission_wait_us",
+        "Runtime admission queue wait before dispatch in microseconds",
+        kLatencyBuckets, kAdmissionOwnerKindLabel, kAdmissionOwnerKindDomain};
 
     // Per-transport (N=1) histograms for unified serialization; the N=2
-    // transport_attempt_latency_ histogram is serialized separately (see
-    // getPrometheusMetrics / getJsonMetrics) via the same templated helpers.
+    // attempt histograms are serialized separately (see getPrometheusMetrics /
+    // getJsonMetrics) via the same templated helpers.
     std::vector<metrics::CachedDynamicHistogram<1>*> histograms_;
 
     // Serialize a gauge backed by a cached-cell counter: emits the current
     // value per label with # TYPE ... gauge.
-    void serializeGaugePrometheus(metrics::CachedDynamicCounter<1>& gauge,
+    template <uint8_t N>
+    void serializeGaugePrometheus(metrics::CachedDynamicCounter<N>& gauge,
                                   std::string& out) const;
+
+    // Append the fixed single-series metrics-pipeline state plus the
+    // two-valued serialization format series. `prometheus_success_timestamp`
+    // is the timestamp for the scrape currently being built, so the response
+    // reports its own successful serialization rather than lagging one scrape.
+    void appendSelfMetricsPrometheus(
+        std::string& out, uint64_t prometheus_success_timestamp) const;
 
     // Helper to register all metrics to the vectors
     void registerMetrics();
@@ -392,7 +1210,9 @@ class TentMetrics {
     // and the transport-attempt (N=2) histogram share one implementation.
     template <uint8_t N>
     void serializeHistogramPrometheus(metrics::CachedDynamicHistogram<N>& hist,
-                                      std::string& out) const;
+                                      std::string& out,
+                                      bool include_exemplars = false) const;
+
 #endif  // TENT_METRICS_ENABLED
 };
 

@@ -50,6 +50,7 @@ class HighPerformanceTcpClient {
         uint64_t length{0};
         HighPerformanceTcpOpcode opcode{HighPerformanceTcpOpcode::kRead};
         uint64_t request_id{0};
+        uint64_t enqueue_ts_ns{0};
         std::function<void(TransferStatusEnum, size_t,
                            std::optional<HighPerformanceTcpStatus>)>
             complete;

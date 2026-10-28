@@ -7,6 +7,8 @@
 
 #include <glog/logging.h>
 
+#include "tent/metrics/tent_metrics.h"
+
 namespace mooncake::tent {
 
 Status HighPerformanceTcpAdmissionController::tryReserve(uint64_t tasks,
@@ -30,6 +32,10 @@ Status HighPerformanceTcpAdmissionController::tryReserve(uint64_t tasks,
     }
     tasks_ += tasks;
     bytes_ += bytes;
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordStreamAdmission(TransportType::HP_TCP, tasks,
+                                                  bytes);
+#endif
     return Status::OK();
 }
 
@@ -48,6 +54,11 @@ void HighPerformanceTcpAdmissionController::release(uint64_t tasks,
         } else {
             tasks_ -= tasks;
             bytes_ -= bytes;
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordStreamAdmission(
+                TransportType::HP_TCP, -static_cast<int64_t>(tasks),
+                -static_cast<int64_t>(bytes));
+#endif
             notify_waiters = tasks_ == 0 && bytes_ == 0;
         }
     }
