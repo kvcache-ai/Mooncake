@@ -1019,6 +1019,87 @@ TEST(IOUringTransportTest, ReusesOnlyDrainedRings) {
     EXPECT_EQ(transport.cachedRingCount(), 0u);
 }
 
+// A staged 1 MiB read runs as four 256 KiB chunks whose copies overlap the
+// other chunks' reads; the data must land exactly as unsplit. A read that
+// hits EOF settles with the bytes before EOF; the chunks past it read
+// nothing, so the destination past EOF stays untouched. Staged writes stay
+// whole.
+TEST(IOUringTransportTest, SplitsLargeStagedRequestsIntoChunks) {
+    const size_t kLength = 1024 * 1024;
+    const size_t kChunk = kLength / 4;
+    ScopedTempFile file(kLength);
+    ASSERT_GE(file.fd(), 0);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalFileSegment(*metadata, file.path(), kLength).ok());
+    IOUringTransport transport;
+    auto installed = installTransport(transport, metadata);
+    if (!installed.ok()) GTEST_SKIP() << installed.message();
+
+    // Off by one byte from page alignment, so every request is staged.
+    void* allocation = nullptr;
+    ASSERT_EQ(posix_memalign(&allocation, kPageSize, kLength + kPageSize), 0);
+    std::unique_ptr<void, decltype(&free)> memory(allocation, free);
+    auto* host = static_cast<uint8_t*>(allocation) + 1;
+    std::vector<uint8_t> pattern(kLength);
+    for (size_t i = 0; i < kLength; ++i)
+        pattern[i] = static_cast<uint8_t>(i * 7 + i / kPageSize);
+
+    auto run = [&](Request::OpCode opcode, size_t length,
+                   std::vector<size_t>* chunk_lengths) {
+        Request request{};
+        request.opcode = opcode;
+        request.source = host;
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.length = length;
+        Transport::SubBatchRef batch = nullptr;
+        EXPECT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+        EXPECT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+        for (const auto& chunk :
+             static_cast<IOUringSubBatch*>(batch)->task_list[0].chunks)
+            chunk_lengths->push_back(chunk.length);
+        auto status = pollUntilSettled(transport, batch, 0);
+        EXPECT_TRUE(transport.freeSubBatch(batch).ok());
+        return status;
+    };
+
+    std::vector<size_t> chunks;
+    std::memcpy(host, pattern.data(), kLength);
+    auto status = run(Request::WRITE, kLength, &chunks);
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, kLength);
+    EXPECT_TRUE(chunks.empty());
+    std::vector<uint8_t> actual(kLength, 0);
+    ASSERT_EQ(pread(file.fd(), actual.data(), kLength, 0), (ssize_t)kLength);
+    EXPECT_EQ(actual, pattern);
+
+    chunks.clear();
+    std::memset(host, 0x5A, kLength);
+    status = run(Request::READ, kLength, &chunks);
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, kLength);
+    EXPECT_EQ(chunks, std::vector<size_t>(4, kChunk));
+    EXPECT_EQ(std::memcmp(host, pattern.data(), kLength), 0);
+
+    // Below two minimum chunks: not split.
+    chunks.clear();
+    status = run(Request::READ, 2 * kChunk - kPageSize, &chunks);
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(chunks.empty());
+
+    // EOF inside the third chunk; the fourth reads nothing.
+    const size_t kShort = 2 * kChunk + 22 * kPageSize;
+    ASSERT_EQ(ftruncate(file.fd(), (off_t)kShort), 0);
+    chunks.clear();
+    std::memset(host, 0x5A, kLength);
+    status = run(Request::READ, kLength, &chunks);
+    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(status.transferred_bytes, kShort);
+    EXPECT_EQ(chunks.size(), 4u);
+    EXPECT_EQ(std::memcmp(host, pattern.data(), kShort), 0);
+    for (size_t i = kShort; i < kLength; ++i) ASSERT_EQ(host[i], 0x5A) << i;
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

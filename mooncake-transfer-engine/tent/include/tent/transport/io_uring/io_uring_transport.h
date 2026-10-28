@@ -79,6 +79,19 @@ class IOUringStagingPool {
     std::vector<void *> free_slots_;
 };
 
+struct IOUringTask;
+
+// One SQE of a staged request split by submitTransferTasks(), so that the
+// staging copy of each chunk overlaps with the I/O of the others.
+struct IOUringChunk {
+    IOUringTask *task = nullptr;
+    size_t offset = 0;  // from the start of the request
+    size_t length = 0;
+    int result = 0;  // the CQE result, once completed
+    // Read by the kernel at execution time, like IOUringTask::iov.
+    struct iovec iov{};
+};
+
 struct IOUringTask {
     Request request;
     volatile TransferStatusEnum status_word;
@@ -90,6 +103,10 @@ struct IOUringTask {
     // The kernel may read the iovec asynchronously at execution time, so it
     // must live as long as the task (i.e. until the completion is reaped).
     struct iovec iov{};
+    // Empty unless the request was split; the task then completes when the
+    // last of its chunks does.
+    std::vector<IOUringChunk> chunks;
+    size_t chunks_pending = 0;
 
     void releaseBuffer() {
         if (!buffer) return;
