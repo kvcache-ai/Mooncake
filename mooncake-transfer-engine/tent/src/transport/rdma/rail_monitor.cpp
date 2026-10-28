@@ -135,6 +135,12 @@ uint64_t RailMonitor::localDeviceMask(const Topology::MemEntry& remote_memory,
 }
 
 bool RailMonitor::admit(int local_nic, int remote_nic) {
+    uint64_t admission = 0;
+    return admit(local_nic, remote_nic, admission);
+}
+
+bool RailMonitor::admit(int local_nic, int remote_nic, uint64_t& admission) {
+    admission = 0;
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
     if (it == rail_states_.end()) return false;
     auto& st = it->second;
@@ -158,6 +164,7 @@ bool RailMonitor::admit(int local_nic, int remote_nic) {
              now - st.last_probe_time >= probe_interval_)) {
             st.probe_in_flight = true;
             st.last_probe_time = now;
+            admission = st.generation = ++next_generation_;
             return true;
         }
         return false;
@@ -171,6 +178,7 @@ bool RailMonitor::admit(int local_nic, int remote_nic) {
         st.half_open = true;
         st.probe_in_flight = true;
         st.last_probe_time = now;
+        admission = st.generation = ++next_generation_;
         LOG(INFO) << "Rail half-open: local_nic=" << local_nic
                   << " remote_nic=" << remote_nic
                   << " (cooldown=" << st.cooldown.count()
@@ -183,6 +191,14 @@ bool RailMonitor::admit(int local_nic, int remote_nic) {
 void RailMonitor::cancelProbe(int local_nic, int remote_nic) {
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
     if (it == rail_states_.end()) return;
+    cancelProbe(local_nic, remote_nic, it->second.generation);
+}
+
+void RailMonitor::cancelProbe(int local_nic, int remote_nic,
+                              uint64_t admission) {
+    if (admission == 0) return;
+    auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
+    if (it == rail_states_.end() || it->second.generation != admission) return;
     auto& st = it->second;
     if (st.probe_in_flight) {
         st.probe_in_flight = false;

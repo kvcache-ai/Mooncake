@@ -502,6 +502,24 @@ bool Workers::dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice) {
     return true;
 }
 
+bool Workers::expireUnpostedSlice(WorkerContext& worker, RdmaSlice* slice,
+                                  uint64_t now_ns, bool admitted) {
+    // A terminal orphan can outlive its task while a CQE is still owed.
+    // Leave it to the existing terminal cleanup without reading the task.
+    if (!slice || slice->word != PENDING || !slice->task ||
+        now_ns <= slice->enqueue_ts ||
+        now_ns - slice->enqueue_ts <= slice_timeout_ns_)
+        return false;
+    const bool canceled =
+        slice->task->cancel_requested.load(std::memory_order_acquire);
+    if (admitted && slice->rail_monitor)
+        slice->rail_monitor->cancelProbe(
+            slice->source_dev_id, slice->target_dev_id, slice->rail_admission);
+    retireSweptSlice(worker, slice, now_ns, nullptr);
+    updateSliceStatus(slice, canceled ? CANCELED : TIMEOUT);
+    return true;
+}
+
 void Workers::releaseSliceQuota(RdmaSlice* slice, uint64_t now_ns,
                                 double latency) {
     if (!slice || !device_selector_) return;
@@ -707,12 +725,16 @@ void Workers::asyncPostSend() {
         if (!result.empty()) break;
     }
 
+    const auto dequeue_ts = result.empty() ? 0 : getCurrentTimeInNano();
     for (auto& slice_list : result) {
         if (slice_list.num_slices == 0) continue;
         auto slice = slice_list.first;
         for (int id = 0; id < slice_list.num_slices; ++id) {
-            if (dropUnpostableSlice(worker, slice)) {
-                slice = slice->next;
+            // A terminal status lets the caller free the slice chain.
+            auto* next = slice->next;
+            if (expireUnpostedSlice(worker, slice, dequeue_ts) ||
+                dropUnpostableSlice(worker, slice)) {
+                slice = next;
                 continue;
             }
             auto status = generatePostPath(slice);
@@ -742,7 +764,7 @@ void Workers::asyncPostSend() {
                 if (auto* rail = slice->rail_monitor)
                     rail->cancelProbe(slice->source_dev_id,
                                       slice->target_dev_id);
-                slice = slice->next;
+                slice = next;
                 continue;
             } else {
                 PostPath path{
@@ -751,7 +773,7 @@ void Workers::asyncPostSend() {
                     .remote_device_id = slice->target_dev_id};
                 worker.requests[path].push_back(slice);
             }
-            slice = slice->next;
+            slice = next;
         }
     }
 
@@ -759,6 +781,15 @@ void Workers::asyncPostSend() {
         auto& path = entry.first;
         auto& slices = entry.second;
         if (slices.empty()) continue;
+        auto expire_unposted = [&](uint64_t now_ns) {
+            slices.erase(std::remove_if(slices.begin(), slices.end(),
+                                        [&](RdmaSlice* slice) {
+                                            return expireUnpostedSlice(
+                                                worker, slice, now_ns, true);
+                                        }),
+                         slices.end());
+        };
+        expire_unposted(getCurrentTimeInNano());
         slices.erase(std::remove_if(slices.begin(), slices.end(),
                                     [&](RdmaSlice* slice) {
                                         if (!dropUnpostableSlice(worker, slice))
@@ -776,6 +807,10 @@ void Workers::asyncPostSend() {
                      slices.end());
         if (slices.empty()) continue;
         auto endpoint = getEndpoint(path);
+        // Bootstrap may outlast the transfer, whether it succeeds or fails.
+        // Check again before posting or consuming another retry.
+        expire_unposted(getCurrentTimeInNano());
+        if (slices.empty()) continue;
         if (!endpoint) {
             std::vector<RdmaSlice*> clone;
             slices.swap(clone);
@@ -1690,8 +1725,8 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
                                        slice->target_dev_id, src_gpu, dst_gpu);
     }
 
-    if (gdr_excluded ||
-        !rail.admit(slice->source_dev_id, slice->target_dev_id)) {
+    if (gdr_excluded || !rail.admit(slice->source_dev_id, slice->target_dev_id,
+                                    slice->rail_admission)) {
         VLOG(1) << "Optimal device pair not available: source_dev_id "
                 << slice->source_dev_id << ", target_dev_id "
                 << slice->target_dev_id;
@@ -1813,8 +1848,9 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
         if (!same_machine && gdr_learned &&
             gdrPairExcluded(source, target, sdev, tdev, src_gpu, dst_gpu))
             continue;
-        bool reachable = same_machine ? (sdev == tdev)  // loopback is safe
-                                      : rail_mon->admit(sdev, tdev);
+        bool reachable =
+            same_machine ? (sdev == tdev)  // loopback is safe
+                         : rail_mon->admit(sdev, tdev, slice->rail_admission);
 
         if (reachable) {
             // A retry gets here after the failure path returned the slice's
@@ -1835,6 +1871,7 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
 }
 
 Status Workers::generatePostPath(RdmaSlice* slice) {
+    slice->rail_admission = 0;
     RouteHint source, target;
     CHECK_STATUS(getRouteHint(source, LOCAL_SEGMENT_ID,
                               (uint64_t)slice->source_addr, slice->length));

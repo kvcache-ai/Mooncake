@@ -172,6 +172,12 @@ class Workers {
     // skip it.
     bool dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice);
 
+    // Unposted work retains its original enqueue deadline through bootstrap,
+    // retries and QP-capacity waits. Cancel admission before publishing
+    // timeout.
+    bool expireUnpostedSlice(WorkerContext& worker, RdmaSlice* slice,
+                             uint64_t now_ns, bool admitted = false);
+
     // Hand back everything the selector accounts for this slice: its
     // allocation charge and, if it reached the hardware, its share of the
     // NIC's posted backlog. `now_ns` closes the NIC's busy stretch when
