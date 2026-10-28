@@ -144,11 +144,17 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor(
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {
+    // Build the state first. It is the only step that can throw, and a buffer
+    // whose address is already an offset but whose protocol is still TCP would
+    // be freed at the wrong address during unwinding (see
+    // CachelibBufferAllocator::deallocate).
+    auto state = std::make_unique<ProtocolState>();
+    state->kind = BufferProtocol::kCxl;
+    state->value = std::move(client_segment_name);
+
     uint64_t offset_raw = reinterpret_cast<uintptr_t>(buffer_ptr_);
     buffer_ptr_ = reinterpret_cast<void*>(offset_raw - DEFAULT_CXL_BASE);
-    protocol_ = std::make_unique<ProtocolState>();
-    protocol_->kind = BufferProtocol::kCxl;
-    protocol_->value = std::move(client_segment_name);
+    protocol_ = std::move(state);
 }
 
 void* AllocatedBuffer::get_vaddr_from_cxl() {
