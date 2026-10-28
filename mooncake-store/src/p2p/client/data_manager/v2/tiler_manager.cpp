@@ -12,10 +12,12 @@ TilerManager::TilerManager(const LogicalTilerConfig& logical_config,
                            std::shared_ptr<BlockPool> block_pool,
                            BlockRegistry block_registry,
                            EventPublisher event_publisher,
-                           const EvictionIndexConfig& eviction_config)
+                           const EvictionIndexConfig& eviction_config,
+                           double offload_high_watermark)
     : tiler_id_(logical_config.tiler_id),
       memory_type_(logical_config.memory_type),
       priority_(logical_config.priority),
+      offload_high_watermark_(offload_high_watermark),
       tags_(logical_config.tags),
       block_pool_(std::move(block_pool)),
       block_index_(

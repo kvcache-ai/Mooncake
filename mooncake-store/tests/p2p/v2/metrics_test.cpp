@@ -258,12 +258,17 @@ TEST_F(V2MetricsTest, InlineAppliedLifecycleEventsAreCounted) {
 TEST_F(V2MetricsTest, EventAndPolicyConfigurationIsReachableFromJson) {
     auto config =
         ParseDataManagerV2Config(ParseJson(R"({
-        "tiers": [{"type": "DRAM", "capacity": 1048576, "priority": 10}],
+        "tiers": [
+            {"type": "DRAM", "capacity": 1048576, "priority": 10,
+             "placement_policy": {"offload_high_watermark": 0.75}},
+            {"type": "DRAM", "capacity": 1048576, "priority": 5,
+             "placement_policy": {"offload_high_watermark": 0.8}}
+        ],
         "v2": {
             "events": {"shard_count": 2, "event_queue_capacity": 32,
                        "movement_queue_capacity": 8,
                        "movement_worker_count": 3},
-            "placement_policy": {"offload_high_watermark": 0.75,
+            "placement_policy": {"offload_high_watermark": 0.7,
                                  "offload_low_watermark": 0.5,
                                  "onboard_min_frequency": 4},
             "max_registration_retry": 3,
@@ -286,7 +291,13 @@ TEST_F(V2MetricsTest, EventAndPolicyConfigurationIsReachableFromJson) {
     // monolithic policy behind it is gone: each key now lands where that
     // decision actually lives. offload_low_watermark had no reader once
     // offload became one decision per event, so it is accepted and ignored.
-    EXPECT_DOUBLE_EQ(config->movement.offload_high_watermark, 0.75);
+    EXPECT_DOUBLE_EQ(
+        config->tilers[0].placement_policy.EffectiveOffloadHighWatermark(),
+        0.75);
+    EXPECT_DOUBLE_EQ(
+        config->tilers[1].placement_policy.EffectiveOffloadHighWatermark(),
+        0.8);
+    EXPECT_DOUBLE_EQ(config->movement.offload_high_watermark, 0.7);
     EXPECT_DOUBLE_EQ(config->movement.onboard_min_read_heat, 4.0);
     EXPECT_EQ(config->max_registration_retry, 3U);
     EXPECT_EQ(config->stop_drain_timeout, std::chrono::milliseconds(250));
@@ -310,8 +321,8 @@ TEST_F(V2MetricsTest, InvalidEventAndPolicyConfigurationIsRejected) {
     // single-tier object alive.
     auto no_headroom =
         ParseDataManagerV2Config(ParseJson(R"({
-        "tiers": [{"type": "DRAM", "capacity": 1048576}],
-        "v2": {"placement_policy": {"offload_high_watermark": 1.0}}
+        "tiers": [{"type": "DRAM", "capacity": 1048576,
+                   "placement_policy": {"offload_high_watermark": 1.0}}]
     })"),
                                  LocalTransferConfig{}, KeyLeaseConfig{});
     ASSERT_FALSE(no_headroom.has_value());
