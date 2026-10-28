@@ -394,6 +394,25 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* handshake_max_connections =
+        std::getenv("MC_HANDSHAKE_MAX_CONNECTIONS");
+    if (handshake_max_connections) {
+        try {
+            int val = std::stoi(handshake_max_connections);
+            if (val > 0) {
+                config.handshake_max_connections = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_HANDSHAKE_MAX_CONNECTIONS";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_HANDSHAKE_MAX_CONNECTIONS environment "
+                            "value: "
+                         << handshake_max_connections
+                         << ". Error: " << e.what();
+        }
+    }
+
     const char* handshake_connect_timeout =
         std::getenv("MC_HANDSHAKE_CONNECT_TIMEOUT");
     if (handshake_connect_timeout) {
