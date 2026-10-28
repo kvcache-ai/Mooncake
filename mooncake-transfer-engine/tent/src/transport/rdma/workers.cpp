@@ -969,9 +969,7 @@ void Workers::expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns) {
             slice->task->cancel_requested.load(std::memory_order_acquire) &&
             __atomic_load_n(&slice->task->first_error, __ATOMIC_ACQUIRE) ==
                 TIMEOUT;
-        if (task_timed_out ||
-            (now_ns > slice->enqueue_ts &&
-             now_ns - slice->enqueue_ts > slice_timeout_ns_)) {
+        if (task_timed_out || now_ns - slice->enqueue_ts > slice_timeout_ns_) {
             // Stop queued siblings and prevent a flush completion from
             // resubmitting this task while its QP is being aborted.
             if (__sync_bool_compare_and_swap(&slice->task->first_error, PENDING,

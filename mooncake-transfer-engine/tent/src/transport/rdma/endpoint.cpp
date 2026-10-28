@@ -912,7 +912,8 @@ void RdmaEndPoint::resetInflightSlices(int qp_index) {
     // cleanup to avoid indexing queues that were never created.
     if (qp_index >= (int)slice_queue_.size()) return;
     auto& queue = slice_queue_[qp_index];
-    while (auto* current = queue.pop()) {
+    while (!queue.empty()) {
+        auto current = queue.pop();
         updateSliceStatus(current, TransferStatusEnum::CANCELED);
     }
 }
