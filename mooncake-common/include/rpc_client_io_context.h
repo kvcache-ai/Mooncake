@@ -20,6 +20,21 @@
 
 namespace mooncake {
 
+class Environ;
+
+// RPC client I/O thread counts. MC_RPC_CLIENT_IO_THREADS sets the shared
+// value; MC_STORE_RPC_CLIENT_IO_THREADS and MC_TE_RPC_CLIENT_IO_THREADS
+// override it per component. Invalid or non-positive values fall back.
+struct RpcClientIoThreadsConfig {
+    uint32_t common{0};
+    uint32_t store{0};
+    uint32_t transfer_engine{0};
+
+    static RpcClientIoThreadsConfig FromEnvironment(const Environ& env);
+    // Resolved from the process environment once, on first use.
+    static const RpcClientIoThreadsConfig& Process();
+};
+
 std::shared_ptr<coro_io::io_context_pool> CreateRpcClientIoContextPool(
     uint32_t thread_count);
 

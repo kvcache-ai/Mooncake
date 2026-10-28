@@ -484,6 +484,42 @@ curl "http://localhost:9003/api/v1/segments/status?segment=segment_name"
 - `status` (integer): Numeric segment status
 - `status_name` (string): Segment status name. One of `UNDEFINED` (0), `OK` (1), `DRAINING` (2), `DRAINED` (3), `GRACEFULLY_UNMOUNTING` (4), `UNMOUNTING` (5)
 
+#### `PUT /api/v1/segments/status`
+Switch a segment between `OK` and `DRAINING` without creating a drain job.
+While a segment is `DRAINING`, new allocations skip it, and replicas already on
+it stay in place and remain readable. Setting `OK` makes it available for new
+allocations again.
+
+**Method**: `PUT`
+**Parameters**: `segment` (query parameter) - Segment name
+**Request Body**: JSON object with `status` set to `"OK"` or `"DRAINING"`
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON object with `success`, `segment`, `status`, and
+`status_name`
+
+**Status Codes**:
+- `200 OK`: The segment is now in the requested status, including when it
+  already was
+- `400 Bad Request`: Missing `segment`, malformed body, or a `status` other
+  than `OK` or `DRAINING`
+- `404 Not Found`: No mounted segment has this name
+- `409 Conflict`: An unfinished drain job lists this segment as a source, or
+  the segment is in a status other than `OK` or `DRAINING`
+
+**Example**:
+```bash
+curl -X PUT "http://localhost:9003/api/v1/segments/status?segment=segment_0" \
+  -H "Content-Type: application/json" \
+  -d '{"status": "DRAINING"}'
+```
+
+```json
+{"success":true,"segment":"segment_0","status":2,"status_name":"DRAINING","error_code":0,"error_message":""}
+```
+
+The change is not written to the HA operation log, so it is not guaranteed to
+survive a master failover.
+
 ### DFS Storage Endpoints
 
 These endpoints manage the shard layout of the descriptor-based DFS (shared
@@ -761,6 +797,55 @@ curl -X DELETE "http://localhost:9003/api/v1/tenant_quotas?tenant_id=tenant-a"
   "data": null
 }
 ```
+
+### Soft-Pin Control Endpoints
+
+`POST /api/v1/soft_pin` and `POST /api/v1/soft_unpin` update existing
+objects without another Put or Upsert. They are served on the master's admin
+HTTP port, not the Store RPC or Transfer Engine metadata port.
+
+```bash
+curl -X POST http://localhost:9003/api/v1/soft_pin \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"default","keys":["object-a","object-b"],"ttl_ms":60000}'
+
+curl -X POST http://localhost:9003/api/v1/soft_unpin \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"default","keys":["object-a","object-b"]}'
+```
+
+- `keys` contains 1–4096 exact object keys. Logical KV pages split into multiple
+  component objects require every relevant key to be supplied.
+- `tenant_id` defaults to `default`, with the same tenant resolution as Store
+  operations. When multi-tenancy is disabled, operations use the default tenant.
+- `ttl_ms` is required for `soft_pin` and must be absent for `soft_unpin`.
+  Each successful pin replaces the deadline with the master's current time plus
+  this TTL, so a repeated command can extend or shorten protection. The master's
+  `max_kv_soft_pin_ttl` limit applies. Zero TTL clears the soft pin.
+- Unpin clears the object's soft pin regardless of which sessions use it. The
+  caller owns sharing policy and command ordering. Neither operation changes
+  hard pins, read leases, session tags, or object data.
+- TTL expiration makes the object eligible for normal eviction; it does not
+  delete the object. Eviction checks the deadline directly; the soft-pin count
+  metric can lag until the existing periodic cleanup runs. Pressure eviction
+  still follows `allow_evict_soft_pinned_objects`. These soft pins are volatile master state,
+  following existing write-time soft-pin behavior; they are not persisted in
+  the metadata OpLog for failover.
+
+HTTP 200 contains one result per input key, in input order. A batch is not
+atomic and HTTP 200 does not mean that every key succeeded:
+
+```json
+{"results":[{"key":"object-a","error_code":0},{"key":"object-b","error_code":-704}]}
+```
+
+`0` means success, `-704` means the object was not found, `-703` means a write
+is in progress or there is no completed replica, and `-600` means invalid
+parameters (including TTL above the configured limit). Missing objects are
+not created. Repeated unpin succeeds while the object still exists.
+Malformed requests return HTTP 400. An inactive service plane returns HTTP
+503. A transport timeout leaves the result unknown; callers must coordinate
+retries with newer commands because replaying a pin resets its deadline.
 
 ### Data Deletion Endpoints
 

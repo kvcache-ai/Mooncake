@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -35,7 +36,14 @@ class TransferEngineImpl;
 namespace tent {
 class Config;
 class TransferEngine;
-};
+};  // namespace tent
+
+namespace transfer_intent_values {
+inline constexpr int kUnspecified = 0;
+inline constexpr int kForegroundGet = 1;
+inline constexpr int kBackgroundPrefetch = 2;
+inline constexpr int kMigration = 3;
+}  // namespace transfer_intent_values
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
 namespace device {
@@ -71,6 +79,10 @@ enum class PeerLiveness : uint8_t {
 
 struct AutoDiscoverConfig {
     bool enabled = false;
+    // Transport hint, read whether or not auto-discovery is enabled: "efa"
+    // selects EFA, and on an Ascend Direct build the hint decides between
+    // Ascend Direct and the host transports. Written by setAutoDiscover(), or
+    // by the protocol argument of init() when that is not empty.
     std::string protocol;
 };
 
@@ -127,6 +139,18 @@ class TransferEngine {
     int getRpcPort();
 
     bool isUsingTent() const { return use_tent_; }
+    // Expose the internal TENT engine so callers (Store, TransferSubmitter)
+    // can call tent::TransferEngine native API directly, bypassing the
+    // compat-layer type conversion. Returns nullptr when not in TENT mode.
+    std::shared_ptr<mooncake::tent::TransferEngine> getTentEngine() const {
+        return use_tent_ ? impl_tent_ : nullptr;
+    }
+
+    // Configuration of the successfully initialized engine, for clients that
+    // reuse it without repeating the metadata connection string.
+    const std::string& getMetadataConnectionString() const {
+        return metadata_conn_string_;
+    }
 
     SegmentHandle openSegment(const std::string& segment_name);
 
@@ -174,6 +198,7 @@ class TransferEngine {
         std::span<const size_t> remote_offsets;
         std::span<const size_t> lengths;
         std::function<void(size_t, const Status&)> on_fragment_complete;
+        int intent_type = 0;
     };
 
     class ScatterTransferOperation {
@@ -327,10 +352,14 @@ class TransferEngine {
 
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
+    std::unique_ptr<Transport> tent_compat_transport_;
+    std::mutex tent_compat_transport_mutex_;
+    std::once_flag tent_compat_log_once_;
     std::shared_ptr<ShutdownToken> shutdown_token_;
     // Classic callers provide this through TransferEngine(auto_discover,
     // filter) before init() creates the native TENT engine.
     std::vector<std::string> tent_device_filter_;
+    std::string metadata_conn_string_;
     bool use_tent_{false};
     friend class TransferEngineImplTestPeer;
 };

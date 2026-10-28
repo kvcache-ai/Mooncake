@@ -9,6 +9,11 @@
 #include "mooncake_communicator.h"
 #include "control_plane/link_manager.h"
 #include "control_plane/rpc_runtime.h"
+#include "device_comm/device_collective/device_collective_feature.h"
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+#include "device_comm/device_collective/device_collective_workspace.h"
+#include "device_comm/device_transfer/transfer_service.h"
+#endif
 #include "pg_utils.h"
 
 namespace mooncake {
@@ -52,10 +57,14 @@ void AgentRpcServiceImpl::onViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
 
 AgentHost::AgentHost(std::string coordinator_addr, const std::string& host_ip,
                      GlobalRank rank, int max_world_size,
+                     DeviceTransferService* device_transfer_service,
+                     DeviceCollectiveWorkspace* device_collective_workspace,
                      LinkManager& link_manager,
                      int64_t fault_reconciliation_window_us)
     : agent_(rank, max_world_size),
       executor_("AgentHost"),
+      device_transfer_service_(device_transfer_service),
+      device_collective_workspace_(device_collective_workspace),
       link_manager_(link_manager),
       host_ip_(host_ip),
       rank_(rank),
@@ -251,18 +260,22 @@ PGResult<void> AgentHost::waitUntilRankActive(
 PGResult<GroupId> AgentHost::registerGroup(
     GroupBootstrapId group_bootstrap_id, int32_t max_group_size,
     std::vector<GlobalRank> rank_order,
+    std::optional<GpuCollectiveBackend> preferred_gpu_collective_backend,
     GroupBootstrapIdResolvePolicy resolve_policy, bool auto_deactivate,
     MooncakeCommunicator* communicator) {
     return executor_.postAndWait(
         [this, group_bootstrap_id = std::move(group_bootstrap_id),
-         max_group_size, rank_order = std::move(rank_order), resolve_policy,
-         auto_deactivate, communicator]() mutable -> PGResult<GroupId> {
+         max_group_size, rank_order = std::move(rank_order),
+         preferred_gpu_collective_backend, resolve_policy, auto_deactivate,
+         communicator]() mutable -> PGResult<GroupId> {
             RegisterGroupRequest req;
             req.rank = rank_;
             req.agent_session_id = agent_.getAgentSessionId();
             req.group_bootstrap_id = std::move(group_bootstrap_id);
             req.max_group_size = max_group_size;
             req.rank_order = std::move(rank_order);
+            req.preferred_gpu_collective_backend =
+                preferred_gpu_collective_backend;
             req.resolve_policy = resolve_policy;
             req.auto_deactivate = auto_deactivate;
 
@@ -492,6 +505,16 @@ void AgentHost::startAgentRegistration(bool start_new_session) {
     req.agent_addr = rpc_server_->getListenAddr(host_ip_);
     req.te_server_name = link_manager_.localServerName();
     req.warmup_recv_addr = link_manager_.getWarmupRecvAddr();
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    if (device_transfer_service_) {
+        req.transfer_service_endpoint =
+            device_transfer_service_->localEndpoint();
+    }
+    if (device_collective_workspace_) {
+        req.collective_workspace_endpoint =
+            device_collective_workspace_->localEndpoint();
+    }
+#endif
     req.agent_session_id = agent_session_id_;
     const uint64_t request_session_id = req.agent_session_id;
 
@@ -622,6 +645,23 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
     for (const auto& effect : effects) {
         std::visit(
             overloaded{
+                [this](const InstallDeviceTransferEndpoint& e) {
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+                    PG_ASSERT_OK(device_transfer_service_->installPeerEndpoint(
+                        e.rank, e.endpoint));
+#else
+                    (void)e;
+#endif
+                },
+                [this](const InstallDeviceCollectiveWorkspaceEndpoint& e) {
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+                    PG_ASSERT_OK(
+                        device_collective_workspace_->installPeerEndpoint(
+                            e.rank, e.endpoint));
+#else
+                    (void)e;
+#endif
+                },
                 [this](const EnablePeerProbe& e) {
                     link_manager_.enablePeerProbe(e.rank, e.rank_epoch,
                                                   e.te_server_name,
@@ -682,11 +722,18 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                         }
                     }
                 },
-                [this](const ApplyViewToCommunicator& e) {
+                [this](const ApplyGroupStateToCommunicator& e) {
                     withCommunicator(e.view.group_id, [&](auto communicator) {
-                        communicator->applyViewUpdate(e.view, e.rank_states,
+                        communicator->applyGroupState(e.view, e.rank_states,
                                                       e.rank_epochs,
                                                       e.activatable);
+                    });
+                },
+                [this](const ApplyRankStateToCommunicator& e) {
+                    withCommunicator(e.group_id, [&](auto communicator) {
+                        communicator->applyRankStateUpdate(
+                            e.rank, e.in_group_rank, e.state, e.rank_epoch,
+                            e.activatable);
                     });
                 },
                 [this](const NotifyGroupReady& e) {

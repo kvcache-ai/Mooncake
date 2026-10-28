@@ -1098,13 +1098,13 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
         bool remote_gdr_err = (wc.status == IBV_WC_REM_ACCESS_ERR ||
                                wc.status == IBV_WC_REM_OP_ERR);
         if (local_gdr_err && slice->source_gpu_ordinal >= 0 &&
-            slice->source_nic_name) {
+            !slice->source_nic_name.empty()) {
             GdrReachability::instance().reportLocalFailure(
                 slice->source_nic_name, slice->source_gpu_ordinal);
         } else if (remote_gdr_err && slice->target_gpu_ordinal >= 0 &&
-                   slice->target_nic_name && slice->target_machine_id) {
+                   !slice->target_nic_name.empty()) {
             GdrReachability::instance().reportRemoteFailure(
-                *slice->target_machine_id, slice->target_nic_name,
+                slice->target_machine_id, slice->target_nic_name,
                 slice->target_gpu_ordinal);
         }
         slice->retry_count++;
@@ -1142,12 +1142,13 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
         // entirely until something has actually been excluded.
         if (GdrReachability::hasAnyExclusion()) {
             auto& gdr = GdrReachability::instance();
-            if (slice->source_gpu_ordinal >= 0 && slice->source_nic_name)
+            if (slice->source_gpu_ordinal >= 0 &&
+                !slice->source_nic_name.empty())
                 gdr.reportLocalSuccess(slice->source_nic_name,
                                        slice->source_gpu_ordinal);
-            if (slice->target_gpu_ordinal >= 0 && slice->target_nic_name &&
-                slice->target_machine_id)
-                gdr.reportRemoteSuccess(*slice->target_machine_id,
+            if (slice->target_gpu_ordinal >= 0 &&
+                !slice->target_nic_name.empty())
+                gdr.reportRemoteSuccess(slice->target_machine_id,
                                         slice->target_nic_name,
                                         slice->target_gpu_ordinal);
         }
@@ -1523,8 +1524,65 @@ Status Workers::getRouteHint(RouteHint& hint, SegmentID segment_id,
     auto mem_id = hint.topo->getMemId(location);
     if (mem_id < 0) mem_id = hint.topo->getMemId(kWildcardLocation);
     hint.topo_entry = hint.topo->getMemEntry(mem_id);
+    if (!hint.topo_entry)
+        return Status::DeviceNotFound(
+            "Unknown memory topology location" LOC_MARK);
     hint.location = std::move(location);
     return Status::OK();
+}
+
+uint64_t Workers::allocationDeviceMask(const RouteHint& source,
+                                       const RouteHint& target) {
+    const auto& machine = target.segment->machine_id;
+    const bool same_machine = source.segment->machine_id == machine;
+    {
+        std::shared_lock<std::shared_mutex> guard(allocation_rails_mutex_);
+        auto it = allocation_rails_.find(machine);
+        if (it != allocation_rails_.end() &&
+            it->second->local() == source.topo &&
+            it->second->remote() == target.topo)
+            return it->second->localDeviceMask(*target.topo_entry,
+                                               same_machine);
+    }
+    std::unique_lock<std::shared_mutex> guard(allocation_rails_mutex_);
+    auto& rail = getOrCreateRail(allocation_rails_, machine);
+    // No admission state or per-worker configuration is needed in this cache.
+    rail.load(std::shared_ptr<const Topology>(source.pin, source.topo),
+              std::shared_ptr<const Topology>(target.pin, target.topo),
+              rail_topo_json_);
+    return rail.localDeviceMask(*target.topo_entry, same_machine);
+}
+
+Status Workers::allocateDevices(const Request& request, uint32_t num_slices,
+                                uint64_t slice_bytes, uint64_t device_mask,
+                                std::vector<int>& slice_dev_ids) {
+    slice_dev_ids.clear();
+    RouteHint source, target;
+    CHECK_STATUS(getRouteHint(source, LOCAL_SEGMENT_ID,
+                              reinterpret_cast<uint64_t>(request.source),
+                              request.length));
+    CHECK_STATUS(getRouteHint(target, request.target_id, request.target_offset,
+                              request.length));
+    // A whole-request location is chosen by largest overlap. It cannot stand
+    // in for every slice when coalesced memory has different locations. Keep
+    // those requests on the per-slice path, before charging any allocation.
+    auto uniform_location = [&](const RouteHint& hint, uint64_t addr) {
+        uint64_t offset = hint.buffer->addr;
+        for (const auto& region : hint.buffer->regions) {
+            if (offset < addr + request.length && addr < offset + region.size &&
+                region.location != hint.location)
+                return false;
+            offset += region.size;
+        }
+        return true;
+    };
+    if (!uniform_location(source, reinterpret_cast<uint64_t>(request.source)) ||
+        !uniform_location(target, request.target_offset))
+        return Status::OK();
+    device_mask &= allocationDeviceMask(source, target);
+    return device_selector_->allocate(request.length, num_slices, slice_bytes,
+                                      source.topo_entry->name, slice_dev_ids,
+                                      request.priority, device_mask);
 }
 
 int Workers::getDeviceRank(const RouteHint& hint, int device_id) {
@@ -1539,10 +1597,22 @@ int Workers::getDeviceRank(const RouteHint& hint, int device_id) {
 Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
                                     RdmaSlice* slice) {
     auto& worker = worker_context_[tl_wid];
+    auto& rail = getOrCreateRail(worker.rails, target.segment->machine_id);
+    if (!rail.ready() || source.topo != rail.local() ||
+        target.topo != rail.remote())
+        CHECK_STATUS(
+            rail.load(std::shared_ptr<const Topology>(source.pin, source.topo),
+                      std::shared_ptr<const Topology>(target.pin, target.topo),
+                      rail_topo_json_, transport_->conf_.get()));
     if (slice->source_dev_id < 0) {
+        const uint64_t device_mask =
+            slice->task->device_mask &
+            rail.localDeviceMask(
+                *target.topo_entry,
+                source.segment->machine_id == target.segment->machine_id);
         CHECK_STATUS(device_selector_->allocate(
-            slice->length, source.buffer->location, slice->source_dev_id,
-            slice->priority, slice->task->device_mask));
+            slice->length, source.topo_entry->name, slice->source_dev_id,
+            slice->priority, device_mask));
         slice->charged_dev = slice->source_dev_id;
     }
 
@@ -1550,16 +1620,10 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
         return Status::DeviceNotFound(
             "No device could access the slice memory region" LOC_MARK);
 
-    auto& rail = getOrCreateRail(worker.rails, target.segment->machine_id);
-    if (!rail.ready() || target.topo != rail.remote())
-        rail.load(std::shared_ptr<const Topology>(source.pin, source.topo),
-                  std::shared_ptr<const Topology>(target.pin, target.topo),
-                  rail_topo_json_, transport_->conf_.get());
     if (slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
-        for (size_t rank = 0; rank < Topology::DevicePriorityRanks - 1;
-             ++rank) {
+        for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
             if (rank && always_tier1_) break;
             const auto& list = target.topo_entry->device_list[rank];
             if (list.empty()) continue;
@@ -1721,6 +1785,13 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
         same_machine
             ? nullptr
             : &getOrCreateRail(worker.rails, target.segment->machine_id);
+    if (rail_mon && (!rail_mon->ready() || source.topo != rail_mon->local() ||
+                     target.topo != rail_mon->remote())) {
+        CHECK_STATUS(rail_mon->load(
+            std::shared_ptr<const Topology>(source.pin, source.topo),
+            std::shared_ptr<const Topology>(target.pin, target.topo),
+            rail_topo_json_, transport_->conf_.get()));
+    }
     size_t start =
         static_cast<size_t>(slice->last_fallback_idx + 1) % total_combos;
     const uint64_t device_mask = slice->task->device_mask;
@@ -1797,18 +1868,18 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
             "Selected device has no registered memory key" LOC_MARK);
     slice->source_lkey = lkeys[slice->source_dev_id];
     slice->target_rkey = rkeys[slice->target_dev_id];
-    // Stash identifiers for GPUDirect reachability learning in asyncPollCq.
-    // The name pointers alias stable Topology::NicEntry / segment storage and
-    // remain valid for the slice's lifetime.
+    // Copy identifiers for GPUDirect reachability learning in asyncPollCq.
+    // RouteHint pins the metadata snapshot only through this call; completion
+    // handling may happen after the segment publishes a replacement snapshot.
     {
         LocationParser s(source.location), d(target.location);
         slice->source_gpu_ordinal = (s.type() == "cuda") ? s.index() : -1;
         slice->target_gpu_ordinal = (d.type() == "cuda") ? d.index() : -1;
         const auto* lnic = source.topo->getNicEntry(slice->source_dev_id);
         const auto* rnic = target.topo->getNicEntry(slice->target_dev_id);
-        slice->source_nic_name = lnic ? lnic->name.c_str() : nullptr;
-        slice->target_nic_name = rnic ? rnic->name.c_str() : nullptr;
-        slice->target_machine_id = &target.segment->machine_id;
+        slice->source_nic_name = lnic ? lnic->name : "";
+        slice->target_nic_name = rnic ? rnic->name : "";
+        slice->target_machine_id = target.segment->machine_id;
     }
     if (transport_->params_->log_slice_affinity) {
         const auto* local_nic = source.topo->getNicEntry(slice->source_dev_id);

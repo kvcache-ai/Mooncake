@@ -45,6 +45,7 @@ struct FilePerKeyEnvironmentVariables {
 };
 
 struct BucketBackendEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE);
@@ -59,6 +60,10 @@ struct ClientAutoPortEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_SETUP_RETRIES);
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MIN_PORT);
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MAX_PORT);
+};
+
+struct EmbeddedMasterEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_ENABLE_EMBEDDED_MASTER);
 };
 
 struct ClientObjectChecksumEnvironmentVariables {
@@ -164,6 +169,26 @@ struct OssAdapterEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MOONCAKE_OSS_UPLOAD_BUFFER_SIZE);
 };
 
+struct S3AdapterEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_S3_ENDPOINT);
+    MC_DEFINE_ENV_VAR(std::string, AWS_ENDPOINT_URL);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_S3_BUCKET);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_S3_REGION);
+    MC_DEFINE_ENV_VAR(std::string, AWS_REGION);
+    MC_DEFINE_ENV_VAR(std::string, AWS_DEFAULT_REGION);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_S3_ACCESS_KEY_ID);
+    MC_DEFINE_ENV_VAR(std::string, AWS_ACCESS_KEY_ID);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_S3_SECRET_ACCESS_KEY);
+    MC_DEFINE_ENV_VAR(std::string, AWS_SECRET_ACCESS_KEY);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_S3_SESSION_TOKEN);
+    MC_DEFINE_ENV_VAR(std::string, AWS_SESSION_TOKEN);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_S3_PATH_STYLE);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_S3_ANONYMOUS);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_S3_MAX_CONNECTIONS);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_S3_RECEIVE_BUFFER_SIZE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_S3_UPLOAD_BUFFER_SIZE);
+};
+
 struct OffsetAllocatorBackendEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFSET_EVICTION_POLICY);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFSET_HIGH_RATIO);
@@ -176,6 +201,8 @@ struct OffsetAllocatorBackendEnvironmentVariables {
 };
 
 struct ReplicaSelectionEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MC_STORE_HCA_AFFINITY);
+    MC_DEFINE_ENV_VAR(bool, MC_STORE_HCA_NUMA_SEGMENTS);
     // Only the exact string "1" enables scoring, unlike canonical bool parsing.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_REPLICA_SCORING);
 };
@@ -303,6 +330,12 @@ struct S3ClientEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_AWS_RESPONSE_CHECKSUM_VALIDATION);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_AWS_CONNECT_TIMEOUT_MS);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_AWS_REQUEST_TIMEOUT_MS);
+};
+
+struct RpcClientIoEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(int, MC_RPC_CLIENT_IO_THREADS);
+    MC_DEFINE_ENV_VAR(int, MC_STORE_RPC_CLIENT_IO_THREADS);
+    MC_DEFINE_ENV_VAR(int, MC_TE_RPC_CLIENT_IO_THREADS);
 };
 
 #undef MC_DEFINE_ENV_VAR

@@ -1,5 +1,15 @@
 """Public contracts for framework-neutral model-weight resharding."""
 
+from .tiled_coo import (
+    BoundTiledCOOReadPlan,
+    TiledCOOIndexRange,
+    TiledCOOLayout,
+    TiledCOOPayloadRange,
+    TiledCOOReadPlan,
+    TiledCOORecord,
+    TiledCOOTileRun,
+    plan_tiled_coo_read,
+)
 from .manifest import (
     OwnershipAxis,
     ParallelRank,
@@ -53,8 +63,30 @@ from .store import (
     WeightStore,
     WeightStoreError,
 )
+from .te import (
+    DirectReadReceipt,
+    DirectTransferReceipt,
+    MemoryRegistrationLease,
+    MooncakeTransferEngineReader,
+    MooncakeTransferEngineSink,
+    TransferCompletionFailedError,
+    TransferCompletionInterrupted,
+    TransferCompletionUnknownError,
+    TransferEngineError,
+    TransferRegistrationCleanupPendingError,
+    WeightAllocationGuardProvider,
+    WeightAllocationGuardProviders,
+)
 
 __all__ = [
+    "BoundTiledCOOReadPlan",
+    "TiledCOOIndexRange",
+    "TiledCOOLayout",
+    "TiledCOOPayloadRange",
+    "TiledCOOReadPlan",
+    "TiledCOORecord",
+    "TiledCOOTileRun",
+    "plan_tiled_coo_read",
     "ParallelRank",
     "ParallelTopology",
     "PlacementFragment",
@@ -106,4 +138,16 @@ __all__ = [
     "plan_stored_transfer_to_target_placement",
     "resolve_executor_plan",
     "resolve_executor_plans",
+    "DirectReadReceipt",
+    "DirectTransferReceipt",
+    "MemoryRegistrationLease",
+    "MooncakeTransferEngineReader",
+    "MooncakeTransferEngineSink",
+    "TransferCompletionFailedError",
+    "TransferCompletionInterrupted",
+    "TransferCompletionUnknownError",
+    "TransferEngineError",
+    "TransferRegistrationCleanupPendingError",
+    "WeightAllocationGuardProvider",
+    "WeightAllocationGuardProviders",
 ]

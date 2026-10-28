@@ -27,8 +27,9 @@
 #include <cufile.h>
 #endif
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_SUPA)
 #include <cassert>
 #include "common/base/status.h"
 
@@ -42,10 +43,12 @@ static void checkCudaError(cudaError_t result, const char *message) {
 #endif
 
 #include "transfer_engine.h"
+#include "transfer_engine_c.h"
 #include "transport/transport.h"
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_SUPA)
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
 
@@ -338,6 +341,61 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
     }
     LOG_ASSERT(0 == memcmp((uint8_t *)(addr), (uint8_t *)(addr) + kDataLength,
                            kDataLength));
+}
+
+TEST_F(TCPTransportTest, CApiBatchTransferStatus) {
+    const size_t kDataLength = 1 << 20;
+    const size_t kTaskCount = 2;
+    const size_t kPayload = kTaskCount * kDataLength;
+    const size_t ram_buffer_size = 2 * kPayload;
+    // disable topology auto discovery for testing.
+    auto engine = std::make_unique<TransferEngine>(false);
+    auto hostname_port = parseHostNameWithPort(local_server_name);
+    auto rc = engine->init(metadata_server, local_server_name,
+                           hostname_port.first.c_str(), hostname_port.second);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NE(engine->installTransport("tcp", nullptr), nullptr);
+
+    auto *addr = (uint8_t *)allocateMemoryPool(ram_buffer_size, 0, false);
+    ASSERT_EQ(engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0"), 0);
+    for (size_t offset = 0; offset < kPayload; ++offset)
+        addr[offset] = 'a' + lrand48() % 26;
+
+    auto segment_id = engine->openSegment(local_server_name);
+    auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
+    uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
+    std::vector<TransferRequest> entries(kTaskCount);
+    for (size_t i = 0; i < kTaskCount; ++i) {
+        entries[i].opcode = TransferRequest::WRITE;
+        entries[i].length = kDataLength;
+        entries[i].source = addr + i * kDataLength;
+        entries[i].target_id = segment_id;
+        entries[i].target_offset = remote_base + kPayload + i * kDataLength;
+    }
+    auto batch_id = engine->allocateBatchID(kTaskCount);
+    ASSERT_TRUE(engine->submitTransfer(batch_id, entries).ok());
+
+    transfer_engine_t c_engine = engine.get();
+    transfer_status_t status{};
+    do {
+        ASSERT_EQ(getBatchTransferStatus(c_engine, batch_id, &status), 0);
+        ASSERT_NE(status.status, STATUS_FAILED);
+    } while (status.status != STATUS_COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, kPayload);
+    EXPECT_EQ(0, memcmp(addr, addr + kPayload, kPayload));
+
+    const int kInvalidArgument =
+        static_cast<int>(Status::Code::kInvalidArgument);
+    EXPECT_EQ(getBatchTransferStatus(nullptr, batch_id, &status),
+              kInvalidArgument);
+    EXPECT_EQ(getBatchTransferStatus(c_engine, INVALID_BATCH, &status),
+              kInvalidArgument);
+    EXPECT_EQ(getBatchTransferStatus(c_engine, batch_id, nullptr),
+              kInvalidArgument);
+
+    ASSERT_TRUE(engine->freeBatchID(batch_id).ok());
+    ASSERT_EQ(engine->unregisterLocalMemory(addr), 0);
+    numa_free(addr, ram_buffer_size);
 }
 
 }  // namespace mooncake

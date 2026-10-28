@@ -3,6 +3,8 @@
 // transport references are replaced with Mooncake Device API adapters.
 #pragma once
 
+#include <type_traits>
+
 #include <elastic/mooncake_ep_elastic_transport.cuh>
 
 #include <elastic/mooncake_ep_elastic_comm.cuh>
@@ -13,6 +15,30 @@
 #include <elastic/mooncake_ep_elastic_ptx.cuh>
 
 namespace mooncake::elastic {
+
+template <typename Ops>
+struct HybridDispatchKernelArgs {
+    void* x;
+    sf_pack_t* sf;
+    topk_idx_t* topk_idx;
+    float* topk_weights;
+    topk_idx_t* copied_topk_idx;
+    int* cumulative_local_expert_recv_stats;
+    int* psum_num_recv_tokens_per_scaleup_rank;
+    int* psum_num_recv_tokens_per_expert;
+    int* dst_buffer_slot_idx;
+    int* token_metadata_at_forward;
+    int num_tokens;
+    int sf_token_stride;
+    int sf_hidden_stride;
+    // TODO(NCCL): so many params, plans to optimize?
+    typename Ops::Context comm_ctx;
+    void* buffer;
+    void* workspace;
+    void* mapped_host_workspace;
+    int scaleout_rank_idx;
+    int scaleup_rank_idx;
+};
 
 template <
     typename Ops, bool kDoCPUSync, bool kReuseSlotIndices, int kNumSMs,
@@ -34,20 +60,34 @@ template <
     int kNumForwardThreads = kNumForwardWarps * 32,
     int kNumThreads = kNumNotifyThreads + kNumScaleoutSendThreads +
                       kNumForwardThreads>
-__global__ void __launch_bounds__(kNumThreads, 1)
-    hybrid_dispatch_impl(void* x, sf_pack_t* sf, topk_idx_t* topk_idx,
-                         float* topk_weights, topk_idx_t* copied_topk_idx,
-                         int* cumulative_local_expert_recv_stats,
-                         int* psum_num_recv_tokens_per_scaleup_rank,
-                         int* psum_num_recv_tokens_per_expert,
-                         int* dst_buffer_slot_idx,
-                         int* token_metadata_at_forward, const int num_tokens,
-                         const int sf_token_stride, const int sf_hidden_stride,
-                         // TODO(NCCL): so many params, plans to optimize?
-                         const typename Ops::Context comm_ctx, void* buffer,
-                         void* workspace, void* mapped_host_workspace,
-                         const int scaleout_rank_idx,
-                         const int scaleup_rank_idx) {
+__device__ __forceinline__ void hybrid_dispatch_kernel_impl(
+    const HybridDispatchKernelArgs<Ops>& args) {
+    static_assert(
+        std::is_trivially_copyable<HybridDispatchKernelArgs<Ops>>::value,
+        "HybridDispatchKernelArgs must be trivially copyable");
+
+    void* x = args.x;
+    sf_pack_t* sf = args.sf;
+    topk_idx_t* topk_idx = args.topk_idx;
+    float* topk_weights = args.topk_weights;
+    topk_idx_t* copied_topk_idx = args.copied_topk_idx;
+    int* cumulative_local_expert_recv_stats =
+        args.cumulative_local_expert_recv_stats;
+    int* psum_num_recv_tokens_per_scaleup_rank =
+        args.psum_num_recv_tokens_per_scaleup_rank;
+    int* psum_num_recv_tokens_per_expert = args.psum_num_recv_tokens_per_expert;
+    int* dst_buffer_slot_idx = args.dst_buffer_slot_idx;
+    int* token_metadata_at_forward = args.token_metadata_at_forward;
+    const int num_tokens = args.num_tokens;
+    const int sf_token_stride = args.sf_token_stride;
+    const int sf_hidden_stride = args.sf_hidden_stride;
+    const typename Ops::Context& comm_ctx = args.comm_ctx;
+    void* buffer = args.buffer;
+    void* workspace = args.workspace;
+    void* mapped_host_workspace = args.mapped_host_workspace;
+    const int scaleout_rank_idx = args.scaleout_rank_idx;
+    const int scaleup_rank_idx = args.scaleup_rank_idx;
+
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr int kNumExpertsPerScaleout = kNumExperts / kNumScaleoutRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0,
@@ -893,6 +933,24 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     EP_STATIC_ASSERT(kNumScaleupRanks <= kNumThreads, "Insufficient threads");
     if (not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumScaleupRanks)
         workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
+}
+
+template <typename Ops, bool kDoCPUSync, bool kReuseSlotIndices, int kNumSMs,
+          int kNumNotifyWarps, int kNumScaleoutWarps, int kNumForwardWarps,
+          int kNumScaleoutRanks, int kNumScaleupRanks, int kNumHiddenBytes,
+          int kNumSFPacks, int kNumMaxTokensPerRank, int kNumExperts,
+          int kNumTopk, int kExpertAlignment, int kNumQPs,
+          int64_t kNumTimeoutCycles,
+          int kNumThreads =
+              (kNumNotifyWarps + kNumScaleoutWarps + kNumForwardWarps) * 32>
+__global__ void __launch_bounds__(kNumThreads, 1)
+    hybrid_dispatch(const HybridDispatchKernelArgs<Ops> args) {
+    hybrid_dispatch_kernel_impl<
+        Ops, kDoCPUSync, kReuseSlotIndices, kNumSMs, kNumNotifyWarps,
+        kNumScaleoutWarps, kNumForwardWarps, kNumScaleoutRanks,
+        kNumScaleupRanks, kNumHiddenBytes, kNumSFPacks, kNumMaxTokensPerRank,
+        kNumExperts, kNumTopk, kExpertAlignment, kNumQPs, kNumTimeoutCycles>(
+        args);
 }
 
 }  // namespace mooncake::elastic

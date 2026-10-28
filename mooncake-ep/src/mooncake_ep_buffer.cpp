@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <sstream>
+#include <stdexcept>
 #include <transfer_engine.h>
 
 namespace mooncake {
@@ -11,19 +12,25 @@ namespace {
 
 int active_qps_per_rank_for_ep(int qps_per_rank, bool is_roce, int cap,
                                int num_local_experts) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    // MUSA's verified protocol uses one active QP until each QP owns an
+    // independent source row.
+    return 1;
+#else
     if (!is_roce) return qps_per_rank;
     // CUDA RoCE shares HCAs across local GPUs; spreading small EP messages
-    // over all expert QPs adds doorbell/progress overhead. MUSA keeps the
+    // over all expert QPs adds doorbell/progress overhead. MACA keeps the
     // existing expert-scaled policy until its high-QP path is fully tuned.
     int target = cap;
     if (target <= 0) {
-#ifdef MOONCAKE_EP_USE_MUSA
+#ifdef MOONCAKE_EP_USE_MACA
         target = std::max(8, num_local_experts);
 #else
         target = 8;
 #endif
     }
     return std::min(qps_per_rank, target);
+#endif
 }
 
 cudaStream_t create_comm_stream() {
@@ -55,9 +62,24 @@ bool stream_is_capturing(cudaStream_t stream) {
 
 constexpr int kTopkShadowMaxTokens = 1024;
 constexpr int kTopkShadowMaxTopk = 32;
-constexpr int kTopkShadowSlots = 8;
+constexpr int kTopkShadowSlots = kEpDispatchSlots;
 constexpr size_t kTopkShadowBytes = static_cast<size_t>(kTopkShadowMaxTokens) *
                                     kTopkShadowMaxTopk * sizeof(int64_t);
+
+int validate_rank(int rank, int num_ranks) {
+    if (num_ranks <= 0 || num_ranks > MAX_QP_COUNT || rank < 0 ||
+        rank >= num_ranks) {
+        throw std::invalid_argument("invalid EP rank or world size");
+    }
+    return rank;
+}
+
+int64_t validate_buffer_size(int64_t num_ep_buffer_bytes) {
+    if (num_ep_buffer_bytes <= 0) {
+        throw std::invalid_argument("EP buffer size must be positive");
+    }
+    return num_ep_buffer_bytes;
+}
 
 int64_t* topk_shadow(void* workspace, int shadow_slot, int num_experts) {
     auto* base = reinterpret_cast<uint8_t*>(workspace) +
@@ -71,16 +93,21 @@ int64_t* topk_shadow(void* workspace, int shadow_slot, int num_experts) {
 // create QPs.  Returns true on success, false if IBGDA is unavailable.
 static bool initRdmaTransport(device::RdmaTransport* t, void* gdr_buffer,
                               int64_t num_ep_buffer_bytes, int num_ranks,
-                              int use_qp_count, void* stream) {
+                              int use_qp_count, void* stream,
+                              device::RdmaMemoryRegion& memory_region) {
     int ret = t->initialize("", num_ranks, use_qp_count);
     if (ret == 0) {
-        ret = t->registerMemory(gdr_buffer, num_ep_buffer_bytes);
+        ret = t->registerMemory(gdr_buffer, num_ep_buffer_bytes, memory_region);
     }
     if (ret == 0) {
         ret = t->allocateControlBuffer();
     }
     if (ret == 0) {
         ret = t->createQueuePairs(stream);
+    }
+    if (ret != 0 && memory_region.addr) {
+        t->unregisterMemory(memory_region);
+        memory_region = {};
     }
     return ret == 0;
 }
@@ -96,16 +123,16 @@ static bool macaHostPhaseFenceCoversPeers() {
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
                                    bool disable_p2p, TransferEngine* engine)
-    : rank(rank),
+    : rank(validate_rank(rank, num_ranks)),
       num_ranks(num_ranks),
-      num_ep_buffer_bytes(num_ep_buffer_bytes),
+      num_ep_buffer_bytes(validate_buffer_size(num_ep_buffer_bytes)),
       p2p_enabled_(!disable_p2p),
       comm_stream(create_comm_stream()) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
 
-    // Optional runtime override for the RoCE active-QP count. Without an
-    // override, CUDA uses eight QPs and MUSA scales up to local experts.
+    // Optional runtime override for the CUDA/MACA RoCE active-QP count.
     active_qps_cap_ = 0;
+#ifndef MOONCAKE_EP_USE_MUSA
     if (const char* env = std::getenv("MOONCAKE_EP_ACTIVE_QPS_PER_RANK")) {
         char* end = nullptr;
         long v = std::strtol(env, &end, 10);
@@ -120,6 +147,9 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     LOG(INFO) << "[EP] RoCE active QPs/rank override = "
               << (active_qps_cap_ > 0 ? std::to_string(active_qps_cap_)
                                       : "auto");
+#else
+    LOG(INFO) << "[EP] MUSA active QPs/rank = 1";
+#endif
 
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
@@ -147,7 +177,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         if (rdma_transport_) {
             if (!initRdmaTransport(rdma_transport_, gdr_buffer,
                                    num_ep_buffer_bytes, num_ranks, USE_QP_COUNT,
-                                   comm_stream)) {
+                                   comm_stream, rdma_memory_region_)) {
                 rdma_transport_ = nullptr;
                 ibgda_disabled_ = true;
                 LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
@@ -169,7 +199,8 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         }
         auto t = device::createIbgdaDeviceTransport(device_filter);
         if (initRdmaTransport(t.get(), gdr_buffer, num_ep_buffer_bytes,
-                              num_ranks, USE_QP_COUNT, comm_stream)) {
+                              num_ranks, USE_QP_COUNT, comm_stream,
+                              rdma_memory_region_)) {
             owned_rdma_transport_ = std::move(t);
             rdma_transport_ = owned_rdma_transport_.get();
         } else {
@@ -184,8 +215,14 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
 }
 
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
-    // When EP owns the rdma transport, destructor handles QP/MR/ctrl_buf
-    // teardown. When engine owns it, just clear the pointer.
+    // When EP owns the rdma transport, its destructor handles QP/MR/control
+    // teardown. When the engine owns it, unregister this buffer's MR.
+    if (!owned_rdma_transport_ && rdma_transport_ && rdma_memory_region_.addr) {
+        const int ret = rdma_transport_->unregisterMemory(rdma_memory_region_);
+        if (ret != 0) {
+            LOG(ERROR) << "[EP] Failed to unregister the IBGDA memory region";
+        }
+    }
     owned_rdma_transport_.reset();
     rdma_transport_ = nullptr;
 
@@ -241,15 +278,10 @@ MooncakeEpBuffer::dispatch(
     int current_buffer_idx = buffer_idx;
     auto buffer = layout.buffers[current_buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
-    int phase_epoch = ++phase_epochs[current_buffer_idx];
     int shadow_slot;
     {
         std::lock_guard<std::mutex> lock(buffer_mutex);
-        auto [it, inserted] = dispatch_shadow_slots.emplace(
-            packed_recv_src_info_ptr, next_shadow_slot);
-        if (inserted)
-            next_shadow_slot = (next_shadow_slot + 1) % kTopkShadowSlots;
-        shadow_slot = it->second;
+        shadow_slot = dispatch_slots.take(packed_recv_src_info_ptr);
     }
 
     // Wait previous tasks to be finished
@@ -305,38 +337,14 @@ MooncakeEpBuffer::dispatch(
     int active_qps_per_rank = active_qps_per_rank_for_ep(
         USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce(),
         active_qps_cap_, num_experts / num_ranks);
-    auto mark_send_done = [=]() {
-#ifdef MOONCAKE_EP_PHASE_ACK
-        mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
-                                 buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream);
-#endif
-    };
-
-    auto wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_PHASE_ACK
-        mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream,
-                                 timeout_ticks);
-#endif
-    };
-
-    auto mark_and_wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_PHASE_ACK
-        mooncake::mark_and_wait_phase_ack(
-            gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
-            rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
-#endif
-    };
-
     auto launcher = [=](int phases) {
         mooncake::dispatch(
             packed_recv_x, packed_recv_x_scales, packed_recv_src_info,
             packed_recv_layout_range, packed_recv_count, active_ranks,
             gdr_buffer, buffer.rdma_send_signal_buffer,
             buffer.rdma_recv_signal_buffer, buffer.rdma_send_data_buffer,
-            buffer.rdma_recv_data_buffer, nullptr, nullptr, raddrs_ptr,
-            rkeys_ptr, qp_devctxs_ptr, nvlink_avail, ipc_ptrs, x, topk_idx,
+            buffer.rdma_recv_data_buffer, raddrs_ptr, rkeys_ptr, qp_devctxs_ptr,
+            nvlink_avail, ipc_ptrs, x, topk_idx,
             next_buffer.rdma_recv_signal_buffer, num_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
             num_ranks, use_fp8, workspace, launch_stream, timeout_ticks, phases,
@@ -345,13 +353,11 @@ MooncakeEpBuffer::dispatch(
     if (return_recv_hook &&
         (!graph_capture || !macaHostPhaseFenceCoversPeers())) {
         launcher(LOW_LATENCY_SEND_PHASE);
-        mark_send_done();
     } else if (graph_capture) {
         launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
     } else {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         launcher(LOW_LATENCY_SEND_PHASE);
-        mark_and_wait_peer_send_done();
         launcher(LOW_LATENCY_RECV_PHASE);
 #else
         launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
@@ -376,7 +382,6 @@ MooncakeEpBuffer::dispatch(
     if (return_recv_hook)
         recv_hook = [=]() {
             if (graph_capture && macaHostPhaseFenceCoversPeers()) return;
-            if (!macaHostPhaseFenceCoversPeers()) wait_peer_send_done();
             launcher(LOW_LATENCY_RECV_PHASE);
         };
 
@@ -423,16 +428,17 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks, num_experts);
     EP_HOST_ASSERT(layout.total_bytes <= num_ep_buffer_bytes);
-    int shadow_slot = 0;
+    int shadow_slot;
     {
         std::lock_guard<std::mutex> lock(buffer_mutex);
-        auto it = dispatch_shadow_slots.find(src_info_ptr);
-        if (it != dispatch_shadow_slots.end()) shadow_slot = it->second;
+        shadow_slot = dispatch_slots.find(src_info_ptr);
     }
+    EP_HOST_ASSERT(shadow_slot >= 0 &&
+                   "the combine handle must come from one of the last "
+                   "kEpDispatchSlots dispatches on this buffer");
     int current_buffer_idx = buffer_idx;
     auto buffer = layout.buffers[current_buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
-    int phase_epoch = ++phase_epochs[current_buffer_idx];
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream, whose native
@@ -457,30 +463,6 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
         USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce(),
         active_qps_cap_, num_experts / num_ranks);
 
-    auto mark_send_done = [=]() {
-#ifdef MOONCAKE_EP_PHASE_ACK
-        mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
-                                 buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream);
-#endif
-    };
-
-    auto wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_PHASE_ACK
-        mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream,
-                                 timeout_ticks);
-#endif
-    };
-
-    auto mark_and_wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_PHASE_ACK
-        mooncake::mark_and_wait_phase_ack(
-            gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
-            rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
-#endif
-    };
-
     // Kernel launch
     auto launcher = [=](int phases) {
         auto* kernel_topk_idx =
@@ -488,9 +470,9 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
         mooncake::combine(
             combined_x, active_ranks, gdr_buffer,
             buffer.rdma_send_signal_buffer, buffer.rdma_recv_signal_buffer,
-            buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer, nullptr,
-            nullptr, raddrs_ptr, rkeys_ptr, qp_devctxs_ptr, nvlink_avail,
-            ipc_ptrs, x, kernel_topk_idx, topk_weights, src_info, layout_range,
+            buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer,
+            raddrs_ptr, rkeys_ptr, qp_devctxs_ptr, nvlink_avail, ipc_ptrs, x,
+            kernel_topk_idx, topk_weights, src_info, layout_range,
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
@@ -499,13 +481,11 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     if (return_recv_hook &&
         (!graph_capture || !macaHostPhaseFenceCoversPeers())) {
         launcher(LOW_LATENCY_SEND_PHASE);
-        mark_send_done();
     } else if (graph_capture) {
         launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
     } else {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         launcher(LOW_LATENCY_SEND_PHASE);
-        mark_and_wait_peer_send_done();
         launcher(LOW_LATENCY_RECV_PHASE);
 #else
         launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
@@ -530,7 +510,6 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     if (return_recv_hook)
         recv_hook = [=]() {
             if (graph_capture && macaHostPhaseFenceCoversPeers()) return;
-            if (!macaHostPhaseFenceCoversPeers()) wait_peer_send_done();
             launcher(LOW_LATENCY_RECV_PHASE);
         };
 
@@ -571,8 +550,9 @@ void MooncakeEpBuffer::sync_ibgda_peers(
     }
 
     int ret = rdma_transport_->connectPeers(
-        rank, rdma_transport_->isRoce(), remote_addrs, remote_keys, flat_qpns,
-        flat_lids, subnet_prefixes, interface_ids, active_ranks_mask);
+        rank, rdma_transport_->isRoce(), rdma_memory_region_.lkey, remote_addrs,
+        remote_keys, flat_qpns, flat_lids, subnet_prefixes, interface_ids,
+        active_ranks_mask);
     if (ret != 0) {
         ibgda_disabled_ = true;
         LOG(WARNING)

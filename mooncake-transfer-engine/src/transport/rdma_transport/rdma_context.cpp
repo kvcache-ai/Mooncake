@@ -40,7 +40,6 @@
 
 #include "config.h"
 #include "cuda_alike.h"
-#include "environ.h"
 #include "hip_device_guard.h"
 #if defined(USE_HIP_DMABUF)
 #include <sys/utsname.h>
@@ -50,6 +49,7 @@
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 #endif
+#include "transport/rdma_transport/data_direct_topology.h"
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_gid_probe.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
@@ -101,7 +101,7 @@ static Mlx5RegDmabufMr dataDirectRegMr() {
 
 bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
     const auto region_start = reinterpret_cast<uintptr_t>(region.addr);
-    const auto region_length = static_cast<uintptr_t>(region.mr->length);
+    const auto region_length = static_cast<uintptr_t>(region.length);
     return region_start <= addr && addr - region_start < region_length;
 }
 
@@ -270,6 +270,9 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
                    << static_cast<int>(port) << " with GID " << gid_index;
         return ERR_CONTEXT;
     }
+    peer_auto_gid_states_.configure(
+        static_cast<uint32_t>(std::max(globalConfig().auto_gid_max_retries, 0)),
+        auto_gid_selection_enabled_ && globalConfig().auto_gid_max_retries > 0);
 
     if (context_->num_comp_vectors <= 0) {
         LOG(ERROR) << "RDMA device " << device_name_
@@ -452,6 +455,7 @@ int RdmaContext::deconstruct() {
     notify_endpoints_.clear();
 
     for (auto &[_, entry] : memory_region_map_) {
+        if (!entry.mr) continue;  // skipped on a non-paired Data Direct NIC
         int ret = ibv_dereg_mr(entry.mr);
         if (ret) {
             LOG(ERROR) << "Failed to unregister memory region: "
@@ -510,7 +514,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     out = DmabufExport{};
     (void)addr;  // unused on the host-only (#else) build
     (void)length;
-    const bool data_direct = Environ::Get().GetRdmaDataDirect();
+    const bool data_direct = globalConfig().rdma_data_direct;
     if (data_direct) {
 #ifdef USE_CUDA
         if (!dataDirectRegMr()) return ERR_CONTEXT;
@@ -533,7 +537,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         out.method = DmabufExport::Method::kHostReg;
 #if defined(USE_CUDA) || defined(USE_SUPA)
     } else if (memType == CU_MEMORYTYPE_DEVICE &&
-               Environ::Get().GetWithNvidiaPeermem() && !data_direct) {
+               globalConfig().with_nvidia_peermem && !data_direct) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
         // GPU memory (requires the nvidia-peermem kernel module to be loaded).
         out.method = DmabufExport::Method::kHostReg;
@@ -550,6 +554,14 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         cuDeviceGet(&cuDev, devOrd);
         cuDevicePrimaryCtxRetain(&cuCtx, cuDev);
         cuCtxSetCurrent(cuCtx);
+        // Remember which PCI root the GPU hangs off: Data Direct registration
+        // only works on NICs whose Data Direct function shares that root.
+        {
+            char pci_bus_id[32] = {0};
+            if (cuDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), cuDev) ==
+                CUDA_SUCCESS)
+                out.pci_root = pciSysfsRoot(pci_bus_id);
+        }
 
         // Use cuMemGetAddressRange to get the true allocation base and
         // size — addr may sit at an offset within a larger cudaMalloc
@@ -584,18 +596,30 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         // resulting dma_buf, and ibv_reg_dmabuf_mr() below then fails with
         // EINVAL for every buffer larger than one chunk (Mooncake#2511).
         //
-        // When the reported allocation does not cover the range the caller is
-        // about to register, export exactly [addr, addr + length) instead.
+        // The opposite case matters too: when the allocation is LARGER than
+        // the range being registered (a sub-range of one big cudaMalloc, e.g.
+        // each pre-touch block of a KV cache in preTouchMemory(), or several
+        // buffers carved out of one allocation), exporting the whole
+        // allocation makes every ibv_reg_dmabuf_mr() import map the full
+        // allocation through BAR1. N concurrent imports of an N-way split then
+        // exhaust BAR1 and fail with ENOMEM, notably on MIG instances.
+        //
+        // So whenever the reported allocation is not exactly the range the
+        // caller is about to register, export exactly [addr, addr + length).
         // cuMemGetHandleForAddressRange() accepts a range spanning several
         // mappings as long as they are contiguously mapped, which is precisely
         // the expandable-segment layout. The export base is page-aligned so
         // that offset % page_size == iova % page_size, which
         // ibv_reg_dmabuf_mr() requires.
+        const size_t page = (size_t)sysconf(_SC_PAGESIZE);
         CUdeviceptr exportBase = allocBase;
-        size_t exportSize = allocSize;
+        // cuMemGetHandleForAddressRange() requires a page-aligned size, but
+        // cuMemGetAddressRange() reports the size the caller passed to
+        // cudaMalloc(), which need not be a page multiple. Round it up, as the
+        // sub-range branch below does for its own range.
+        size_t exportSize = (allocSize + page - 1) & ~(size_t)(page - 1);
         uint64_t exportOffset = (uintptr_t)addr - (uintptr_t)allocBase;
-        if (exportOffset + length > allocSize) {
-            const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+        if (length > 0 && (exportOffset != 0 || length != allocSize)) {
             uintptr_t aligned = (uintptr_t)addr & ~(uintptr_t)(page - 1);
             if (aligned < (uintptr_t)allocBase) aligned = (uintptr_t)allocBase;
             exportBase = (CUdeviceptr)aligned;
@@ -604,12 +628,13 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
                 (exportOffset + length + page - 1) & ~(size_t)(page - 1);
             VLOG(1) << "dma_buf: reported allocation for " << (uintptr_t)addr
                     << " (base=" << (uintptr_t)allocBase
-                    << " size=" << allocSize << ") does not cover length "
-                    << length << "; exporting the requested range instead"
-                    << " (base=" << (uintptr_t)exportBase
-                    << " size=" << exportSize
+                    << " size=" << allocSize << ") differs from the " << length
+                    << "-byte range being registered; exporting"
+                    << " the requested range instead (base="
+                    << (uintptr_t)exportBase << " size=" << exportSize
                     << "). Expected for CUDA VMM allocations such as PyTorch"
-                       " expandable_segments.";
+                       " expandable_segments, and for sub-ranges of a larger"
+                       " allocation.";
         }
 
         // Without Data Direct, flags must be 0: the PCIE-BAR1 mapping flag is
@@ -721,6 +746,8 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         // Offset within the dmabuf-backed region: distance from the
         // allocation base, plus any offset hsa returned for the export.
         out.offset = (uintptr_t)addr - (uintptr_t)allocBase + hsa_dmabuf_offset;
+        out.alloc_base = allocBase;
+        out.device = hipAttr.device;
     }
 #else
     out.method = DmabufExport::Method::kHostReg;
@@ -754,6 +781,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         return ERR_INVALID_ARGUMENT;
     }
     mrMeta.addr = addr;
+    mrMeta.length = length;
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
     defined(USE_HIP_DMABUF) || defined(USE_SUPA)
     if (exp.method == DmabufExport::Method::kDmabufReg) {
@@ -762,11 +790,35 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         // reference, so all NICs share one dma_buf object (and one BAR1
         // window).
 #ifdef USE_CUDA
-        if (Environ::Get().GetRdmaDataDirect()) {
+        // Under MC_RDMA_DATA_DIRECT_PAIRING a NIC that is not Data
+        // Direct-paired with the buffer's GPU cannot register this memory at
+        // all: the Data Direct call fails with ENOTSUPP, and so does a plain
+        // dma-buf registration of the shared export (it was made with the
+        // PCIe mapping flag). Record a region without an MR (keys read as 0,
+        // like a placeholder context); the paired topology never routes a
+        // transfer to such a NIC, and discovery already rejected any layout
+        // where the pairing cannot hold. Without the pairing flag the
+        // registration proceeds and fails loudly, as before this change.
+        if (globalConfig().rdma_data_direct &&
+            globalConfig().rdma_data_direct_pairing &&
+            !dataDirectPairedWith(exp)) {
+            mrMeta.mr = nullptr;
+            return 0;
+        }
+        if (globalConfig().rdma_data_direct) {
             auto reg_mr = dataDirectRegMr();
             if (!reg_mr) return ERR_CONTEXT;
-            mrMeta.mr = reg_mr(pd_, exp.offset, length, (uintptr_t)addr, exp.fd,
-                               access, MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
+            const size_t prefix = (uintptr_t)addr % getpagesize();
+            if (exp.offset < prefix ||
+                prefix > (size_t)globalConfig().max_mr_size - length) {
+                LOG(ERROR) << "Cannot align Data Direct memory region at "
+                           << addr << " length " << length << " dmabuf_offset "
+                           << exp.offset;
+                return ERR_INVALID_ARGUMENT;
+            }
+            mrMeta.mr = reg_mr(pd_, exp.offset - prefix, length + prefix,
+                               (uintptr_t)addr - prefix, exp.fd, access,
+                               MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
         } else
 #endif
         {
@@ -784,10 +836,35 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         PLOG(ERROR) << "Failed to register memory " << addr << " length "
                     << length << " dmabuf_offset " << exp.offset << " on "
                     << device_name_ << " MC_RDMA_DATA_DIRECT="
-                    << Environ::Get().GetRdmaDataDirect();
+                    << globalConfig().rdma_data_direct;
         return ERR_CONTEXT;
     }
     return 0;
+}
+
+bool RdmaContext::dataDirectPairedWith(const DmabufExport &exp) {
+    std::call_once(data_direct_root_once_, [this]() {
+        data_direct_root_ = dataDirectSysfsRoot(context_);
+        if (data_direct_root_.empty()) {
+            LOG(INFO) << device_name_
+                      << ": no Data Direct function reported by libmlx5; "
+                         "assuming every GPU is reachable through Data Direct";
+        } else {
+            VLOG(1) << device_name_ << ": Data Direct function under "
+                    << data_direct_root_;
+        }
+    });
+    if (exp.pci_root.empty() || data_direct_root_.empty()) return true;
+    if (exp.pci_root == data_direct_root_) return true;
+    if (!data_direct_mismatch_logged_.exchange(true)) {
+        LOG(WARNING) << device_name_ << ": Data Direct function is under "
+                     << data_direct_root_ << " but the GPU memory is under "
+                     << exp.pci_root
+                     << "; not registering it on this NIC (its keys read as "
+                        "0). The topology keeps this NIC out of that GPU's "
+                        "HCA list.";
+    }
+    return false;
 }
 
 int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access,
@@ -825,12 +902,17 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
     if (iter == memory_region_map_.end()) {
         return 0;
     }
+    if (!iter->second.mr) {  // skipped on a non-paired Data Direct NIC
+        memory_region_map_.erase(iter);
+        return 0;
+    }
     // Cache addr/length before ibv_dereg_mr: the MR is freed by dereg_mr, so
     // reading mr->length (or the cached region length) afterwards is a use-
     // after-free. We restore fork state on the same range to undo the
     // MADV_DONTFORK applied at register time (see issue #3639).
-    void *region_addr = iter->second.addr;
     size_t region_length = iter->second.mr->length;
+    void *region_addr = static_cast<char *>(iter->second.addr) -
+                        (region_length - iter->second.length);
     if (ibv_dereg_mr(iter->second.mr)) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
@@ -860,6 +942,7 @@ int RdmaContext::preTouchMemory(void *addr, size_t length) {
     if (ret != 0) {
         return ret;
     }
+    if (!mrMeta.mr) return 0;  // skipped on a non-paired Data Direct NIC
     return ibv_dereg_mr(mrMeta.mr);
 }
 
@@ -868,7 +951,8 @@ uint32_t RdmaContext::rkey(void *addr) {
     if (!pd_) return 0;
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
     auto iter = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
-    if (iter != memory_region_map_.end()) return iter->second.mr->rkey;
+    if (iter != memory_region_map_.end())
+        return iter->second.mr ? iter->second.mr->rkey : 0;
 
     LOG(ERROR) << "Address " << addr << " rkey not found for " << deviceName();
     return 0;
@@ -878,7 +962,8 @@ uint32_t RdmaContext::lkey(void *addr) {
     if (!pd_) return 0;  // see rkey()
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
     auto iter = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
-    if (iter != memory_region_map_.end()) return iter->second.mr->lkey;
+    if (iter != memory_region_map_.end())
+        return iter->second.mr ? iter->second.mr->lkey : 0;
 
     LOG(ERROR) << "Address " << addr << " lkey not found for " << deviceName();
     return 0;
@@ -1158,11 +1243,9 @@ static GidNetworkState autoGidStateFromSelection(
     return GidNetworkState::GID_NOT_FOUND;
 }
 
-GidNetworkState RdmaContext::findBestGidIndex(const std::string &device_name,
-                                              struct ibv_context *context,
-                                              ibv_port_attr &port_attr,
-                                              uint8_t port, int &gid_index) {
-    gid_index = -1;
+static std::vector<AutoGidCandidate> queryGidCandidates(
+    const std::string &device_name, ibv_context *context,
+    const ibv_port_attr &port_attr, uint8_t port) {
     std::vector<AutoGidCandidate> candidates;
     candidates.reserve(port_attr.gid_tbl_len);
 
@@ -1193,6 +1276,15 @@ GidNetworkState RdmaContext::findBestGidIndex(const std::string &device_name,
         candidates.push_back(candidate);
     }
 
+    return candidates;
+}
+
+GidNetworkState RdmaContext::findBestGidIndex(const std::string &device_name,
+                                              struct ibv_context *context,
+                                              ibv_port_attr &port_attr,
+                                              uint8_t port, int &gid_index) {
+    gid_index = -1;
+    auto candidates = queryGidCandidates(device_name, context, port_attr, port);
     auto selection = selectBestAutoGidCandidate(candidates);
     if (!selection.has_value()) {
         return GidNetworkState::GID_NOT_FOUND;
@@ -1205,243 +1297,125 @@ GidNetworkState RdmaContext::findBestGidIndex(const std::string &device_name,
     return autoGidStateFromSelection(*selection);
 }
 
-bool RdmaContext::reprobeAutoGid(
-    const GidSelectionSnapshot &expected_selection,
-    const std::vector<AutoGidSelectionIdentity> &tried_selections,
-    std::string *previous_gid, std::string *next_gid) {
-    std::lock_guard<std::mutex> reprobe_guard(gid_reprobe_lock_);
-    std::string current_gid_string;
-    std::string next_gid_string;
-    int current_gid_index = -1;
-    int next_gid_index = -1;
-    uint32_t current_lid = 0;
-    ibv_context *current_context = nullptr;
-    uint8_t current_port = 0;
-    AutoGidCandidateClass next_candidate_class =
-        AutoGidCandidateClass::kFallbackNonzero;
+std::vector<AutoGidCandidate> RdmaContext::queryAutoGidCandidates() const {
+    ibv_context *verbs_context = nullptr;
+    uint8_t port = 0;
     {
         std::lock_guard<std::mutex> guard(gid_lock_);
-        if (!auto_gid_selection_enabled_ || !context_) {
-            return false;
-        }
-
-        current_gid_index = gid_index_;
-        current_gid_string = gidBytesToString(gid_.raw);
-        current_lid = lid_;
-        current_context = context_;
-        current_port = port_;
-        if (current_gid_index != expected_selection.gid_index ||
-            current_gid_string != expected_selection.gid) {
-            return false;
-        }
+        verbs_context = context_;
+        port = port_;
     }
+    if (!verbs_context) return {};
 
     ibv_port_attr port_attr;
-    int ret = ibv_query_port(current_context, current_port, &port_attr);
-    if (ret) {
-        LOG(WARNING) << "Failed to reprobe port attributes on " << device_name_
-                     << "/" << static_cast<int>(current_port) << ": "
-                     << strerror(ret);
-        return false;
+    if (ibv_query_port(verbs_context, port, &port_attr)) return {};
+
+    return queryGidCandidates(device_name_, verbs_context, port_attr, port);
+}
+
+PeerAutoGidSelection RdmaContext::preparePeerGidSelection(
+    const std::string &peer_nic_path, std::string_view auto_gid_reprobe_from) {
+    std::lock_guard<std::mutex> reprobe_guard(gid_reprobe_lock_);
+    const std::string &peer = peer_nic_path;
+    auto context_default = gidSelection();
+    AutoGidSelection default_selection{context_default.gid_index,
+                                       context_default.gid};
+    if (!peer_auto_gid_states_.needsCandidateScan(peer, default_selection,
+                                                  auto_gid_reprobe_from)) {
+        return peer_auto_gid_states_.prepare(peer, default_selection);
     }
+    auto candidates = rankAutoGidCandidates(queryAutoGidCandidates());
+    return peer_auto_gid_states_.prepare(peer, default_selection, candidates,
+                                         auto_gid_reprobe_from);
+}
 
-    std::vector<AutoGidCandidate> candidates;
-    candidates.reserve(port_attr.gid_tbl_len);
-    for (int i = 0; i < port_attr.gid_tbl_len; ++i) {
-        AutoGidCandidate candidate;
-        candidate.gid_index = i;
+void RdmaContext::requestPeerGidAdvance(const std::string &peer_nic_path) {
+    auto context_default = gidSelection();
+    peer_auto_gid_states_.requestAdvance(
+        peer_nic_path, {context_default.gid_index, context_default.gid});
+}
 
-        struct ibv_gid_entry gid_entry;
-        if (ibv_query_gid_ex(current_context, current_port, i, &gid_entry, 0)) {
-            candidate.query_succeeded = false;
-            candidates.push_back(candidate);
-            continue;
-        }
+AutoGidDataPathAction RdmaContext::recordAutoGidCompletion(
+    const std::string &peer_nic_path, const AutoGidDataPathAttempt &attempt,
+    bool success) {
+    return peer_auto_gid_states_.recordCompletion(peer_nic_path, attempt,
+                                                  success);
+}
 
-        const auto *gid_addr =
-            reinterpret_cast<const struct in6_addr *>(gid_entry.gid.raw);
-        std::string ndev = readGidNdev(device_name_, current_port, i);
-        candidate.gid = gidBytesToString(gid_entry.gid.raw);
-        candidate.gid_type = gid_entry.gid_type;
-        candidate.has_network_device = !ndev.empty();
-        candidate.is_ipv4_mapped = ipv6_addr_v4mapped(gid_addr);
-        candidate.is_link_local_ipv6 = isLinkLocalIpv6(gid_addr);
-        candidate.is_overlay_network =
-            candidate.has_network_device && isOverlayNetwork(ndev);
-        candidate.is_overlay_ipv4 =
-            candidate.is_ipv4_mapped && isOverlayIPv4(gid_addr);
-        candidate.is_null_gid = isNullGid(&gid_entry.gid);
-        candidates.push_back(candidate);
-    }
-
-    auto selection = reselectAutoGidCandidate(
-        candidates, current_gid_index, current_gid_string, tried_selections);
-    if (!selection.has_value()) {
-        if (next_gid) {
-            *next_gid = current_gid_string;
-        }
-        return false;
-    }
-
-    ibv_gid new_gid = {};
-    if (ibv_query_gid(current_context, current_port, selection->gid_index,
-                      &new_gid)) {
-        return false;
-    }
-    if (isNullGid(&new_gid)) {
-        return false;
-    }
-
-    if (previous_gid) {
-        *previous_gid = current_gid_string;
-    }
-    next_gid_string = gidBytesToString(new_gid.raw);
-
-    int publish_ret = engine_.refreshLocalDeviceDesc(device_name_, current_lid,
-                                                     next_gid_string);
-    if (publish_ret) {
-        LOG(ERROR) << "Failed to refresh local device descriptor for "
-                   << device_name_ << ": " << publish_ret;
-        return false;
-    }
-
-    {
-        std::lock_guard<std::mutex> guard(gid_lock_);
-        gid_ = new_gid;
-        gid_index_ = selection->gid_index;
-        next_gid_index = selection->gid_index;
-        next_candidate_class = selection->candidate_class;
-        if (next_gid) {
-            *next_gid = next_gid_string;
-        }
-    }
-
-    if (next_gid_string.empty()) {
-        return false;
-    }
-
-    LOG(WARNING) << "Auto GID reprobe switched " << device_name_ << "/"
-                 << static_cast<int>(port_) << " from index "
-                 << current_gid_index << " (" << current_gid_string << ") to "
-                 << next_gid_index << " (" << next_gid_string << "), class "
-                 << autoGidCandidateClassToString(next_candidate_class);
-    return true;
+void RdmaContext::rememberPeerAdvertisedGid(const std::string &peer_nic_path,
+                                            std::string_view peer_gid) {
+    peer_auto_gid_states_.rememberPeerAdvertisedGid(peer_nic_path, peer_gid);
 }
 
 GidRefreshResult RdmaContext::refreshCurrentGid(std::string *previous_gid,
                                                 std::string *next_gid) {
-    std::lock_guard<std::mutex> reprobe_guard(gid_reprobe_lock_);
-    std::string current_gid_string;
-    int current_gid_index = -1;
-    int next_gid_index = -1;
-    uint32_t current_lid = 0;
-    ibv_context *current_context = nullptr;
-    uint8_t current_port = 0;
-    bool auto_gid_selection_enabled = false;
-    {
-        std::lock_guard<std::mutex> guard(gid_lock_);
-        if (!context_) {
-            return GidRefreshResult::FAILED;
-        }
-        current_gid_index = gid_index_;
-        current_gid_string = gidBytesToString(gid_.raw);
-        current_lid = lid_;
-        current_context = context_;
-        current_port = port_;
-        auto_gid_selection_enabled = auto_gid_selection_enabled_;
-    }
-
-    if (auto_gid_selection_enabled) {
-        ibv_port_attr port_attr;
-        int ret = ibv_query_port(current_context, current_port, &port_attr);
-        if (ret) {
-            LOG(WARNING) << "Failed to refresh port attributes on "
-                         << device_name_ << "/"
-                         << static_cast<int>(current_port) << ": "
-                         << strerror(ret);
-            return GidRefreshResult::FAILED;
-        }
-
-        std::vector<AutoGidCandidate> candidates;
-        candidates.reserve(port_attr.gid_tbl_len);
-        for (int i = 0; i < port_attr.gid_tbl_len; ++i) {
-            AutoGidCandidate candidate;
-            candidate.gid_index = i;
-
-            struct ibv_gid_entry gid_entry;
-            if (ibv_query_gid_ex(current_context, current_port, i, &gid_entry,
-                                 0)) {
-                candidate.query_succeeded = false;
-                candidates.push_back(candidate);
-                continue;
-            }
-
-            const auto *gid_addr =
-                reinterpret_cast<const struct in6_addr *>(gid_entry.gid.raw);
-            std::string ndev = readGidNdev(device_name_, current_port, i);
-            candidate.gid = gidBytesToString(gid_entry.gid.raw);
-            candidate.gid_type = gid_entry.gid_type;
-            candidate.has_network_device = !ndev.empty();
-            candidate.is_ipv4_mapped = ipv6_addr_v4mapped(gid_addr);
-            candidate.is_link_local_ipv6 = isLinkLocalIpv6(gid_addr);
-            candidate.is_overlay_network =
-                candidate.has_network_device && isOverlayNetwork(ndev);
-            candidate.is_overlay_ipv4 =
-                candidate.is_ipv4_mapped && isOverlayIPv4(gid_addr);
-            candidate.is_null_gid = isNullGid(&gid_entry.gid);
-            candidates.push_back(candidate);
-        }
-
-        auto selection = selectBestAutoGidCandidate(candidates);
-        if (!selection.has_value()) {
+    std::unique_lock<std::mutex> reprobe_guard(gid_reprobe_lock_);
+    auto current = gidSelection();
+    ibv_context *verbs_context = context_;
+    if (!verbs_context) return GidRefreshResult::FAILED;
+    int next_gid_index = current.gid_index;
+    std::vector<AutoGidSelection> candidates;
+    if (auto_gid_selection_enabled_) {
+        candidates = rankAutoGidCandidates(queryAutoGidCandidates());
+        if (candidates.empty()) {
             LOG(WARNING) << "No suitable GID found while refreshing "
-                         << device_name_ << "/"
-                         << static_cast<int>(current_port);
+                         << device_name_ << "/" << static_cast<int>(port_);
             return GidRefreshResult::FAILED;
         }
-        next_gid_index = selection->gid_index;
-    } else {
-        next_gid_index = current_gid_index;
+        next_gid_index = candidates.front().gid_index;
     }
 
     ibv_gid new_gid = {};
-    std::string next_gid_string;
-    if (ibv_query_gid(current_context, current_port, next_gid_index,
-                      &new_gid)) {
+    if (ibv_query_gid(verbs_context, port_, next_gid_index, &new_gid) ||
+        isNullGid(&new_gid)) {
         return GidRefreshResult::FAILED;
     }
-    if (isNullGid(&new_gid)) {
-        return GidRefreshResult::FAILED;
-    }
-    next_gid_string = gidBytesToString(new_gid.raw);
-
-    if (next_gid_index == current_gid_index &&
-        next_gid_string == current_gid_string) {
-        if (next_gid) *next_gid = current_gid_string;
-        return GidRefreshResult::UNCHANGED;
-    }
-
-    int publish_ret = engine_.refreshLocalDeviceDesc(device_name_, current_lid,
-                                                     next_gid_string);
-    if (publish_ret) {
-        LOG(ERROR) << "Failed to refresh local device descriptor for "
-                   << device_name_ << ": " << publish_ret;
-        return GidRefreshResult::FAILED;
-    }
-
-    {
+    const std::string next_gid_string = gidBytesToString(new_gid.raw);
+    const bool changed =
+        next_gid_index != current.gid_index || next_gid_string != current.gid;
+    if (changed) {
+        int ret =
+            engine_.refreshLocalDeviceDesc(device_name_, lid_, next_gid_string);
+        if (ret) {
+            LOG(ERROR) << "Failed to refresh local device descriptor for "
+                       << device_name_ << ": " << ret;
+            return GidRefreshResult::FAILED;
+        }
         std::lock_guard<std::mutex> guard(gid_lock_);
         gid_ = new_gid;
         gid_index_ = next_gid_index;
     }
-    if (previous_gid) *previous_gid = current_gid_string;
+    if (previous_gid) *previous_gid = current.gid;
     if (next_gid) *next_gid = next_gid_string;
 
-    LOG(WARNING) << "Refreshed GID on " << device_name_ << "/"
-                 << static_cast<int>(port_) << ": index " << current_gid_index
-                 << " (" << current_gid_string << ") -> " << next_gid_index
-                 << " (" << next_gid_string << ")";
-    return GidRefreshResult::CHANGED;
+    auto invalidated_peers =
+        peer_auto_gid_states_.refreshCandidates(candidates);
+    // Endpoint setup acquires its lifecycle lock before the reprobe lock.
+    // Release the latter before retiring only invalid peer GID bindings.
+    reprobe_guard.unlock();
+    for (const auto &peer : invalidated_peers) {
+        auto lifecycle_lock = lockEndpointLifecycle(peer);
+        auto endpoint = findEndpoint(peer);
+        if (!endpoint) continue;
+        auto selected = peer_auto_gid_states_.prepare(
+            peer, {next_gid_index, next_gid_string});
+        auto token = endpoint->autoGidCompletionToken();
+        if (!token.valid || token.selection_epoch != selected.selection_epoch)
+            deleteEndpoint(peer);
+    }
+    return changed ? GidRefreshResult::CHANGED : GidRefreshResult::UNCHANGED;
+}
+
+int RdmaContext::queryPortState(ibv_port_state *state) const {
+    if (!state || !context_) return -1;
+    ibv_port_attr port_attr;
+    if (ibv_query_port(context_, port_, &port_attr)) {
+        PLOG(WARNING) << "Failed to query state of port "
+                      << static_cast<int>(port_) << " on " << device_name_;
+        return -1;
+    }
+    *state = port_attr.state;
+    return 0;
 }
 
 int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
@@ -1516,7 +1490,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         // not just GPUs listing it as preferred.  Runtime selection falls
         // back to avail_hca when a preferred NIC is disabled, so we must
         // validate both lists.
-        if (!Environ::Get().GetWithNvidiaPeermem()) {
+        if (!globalConfig().with_nvidia_peermem) {
             std::vector<int> mapped_gpu_devices;
             if (engine_.local_topology_) {
                 const auto topology_matrix =
@@ -1593,7 +1567,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
                     }
                 }
             }
-        }  // !Environ::Get().GetWithNvidiaPeermem()
+        }  // !globalConfig().with_nvidia_peermem
 #endif
 
         ibv_port_attr port_attr;
@@ -1612,6 +1586,19 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         }
 
         updateGlobalConfig(device_attr);
+        max_qp_rd_atom_ = clampRdAtomicDepth(device_attr.max_qp_rd_atom);
+        max_qp_init_rd_atom_ =
+            clampRdAtomicDepth(device_attr.max_qp_init_rd_atom);
+        if (max_qp_rd_atom_ < kIdealRdAtomicDepth ||
+            max_qp_init_rd_atom_ < kIdealRdAtomicDepth) {
+            LOG(WARNING)
+                << "Device " << device_name
+                << " advertises a reduced RD-atomic depth: max_qp_rd_atom="
+                << max_qp_rd_atom_
+                << ", max_qp_init_rd_atom=" << max_qp_init_rd_atom_
+                << "; QPs on this NIC will use those "
+                << "values instead of the default " << kIdealRdAtomicDepth;
+        }
         GidNetworkState gid_state;
         auto_gid_selection_enabled_ = gid_index < 0;
         if (gid_index < 0) {

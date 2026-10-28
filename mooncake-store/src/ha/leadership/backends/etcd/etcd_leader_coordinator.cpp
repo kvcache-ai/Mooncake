@@ -213,8 +213,11 @@ EtcdLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
         return tl::make_unexpected(err);
     }
 
+    const int64_t lease_ttl_sec = spec_.leader_lease_ttl_sec > 0
+                                      ? spec_.leader_lease_ttl_sec
+                                      : DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     EtcdLeaseId lease_id = 0;
-    err = EtcdHelper::GrantLease(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC, lease_id);
+    err = EtcdHelper::GrantLease(lease_ttl_sec, lease_id);
     if (err != ErrorCode::OK) {
         (void)ResetConnection();
         return tl::make_unexpected(err);
@@ -257,7 +260,7 @@ EtcdLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
         .view = MasterView{.leader_address = leader_address,
                            .view_version = view_version},
         .owner_token = owner_token,
-        .lease_ttl = std::chrono::seconds(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC),
+        .lease_ttl = std::chrono::seconds(lease_ttl_sec),
     };
 
     {

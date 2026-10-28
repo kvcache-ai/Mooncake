@@ -108,6 +108,12 @@ When this variable is set, the `mooncake::TransferEngine` class internally deleg
 
 Passing a NIC priority matrix through `installTransport(..., args)` is **not** supported under TENT. Configure custom topology via `MC_TENT_CONF` or `MC_CUSTOM_TOPO_JSON` instead (see below).
 
+### TCP Worker Configuration
+
+For standard TCP, `transports/tcp/max_concurrent_tasks` controls the worker
+thread count and must be greater than zero. A zero value makes TCP installation
+return `InvalidArgument`; it does not select an automatic worker count.
+
 (custom-nic-priority-matrix)=
 ### Custom NIC Priority Matrix
 
@@ -600,6 +606,10 @@ const static std::string kWildcardLocation = "*";
 ```
 
 Location strings identify device affinity: `"cpu:0"`, `"cuda:0"`, `"hip:0"`, etc. Use `"*"` for automatic detection. On AMD GPUs the canonical prefix is `hip:` (same as classic TE). The legacy TENT prefix `rocm:` is still accepted when parsing locations and custom NIC matrices.
+
+In an {ref}`XPU-enabled build <build-with-intel-xpu>`, Intel GPU device memory
+uses `"xpu:N"`; bare `"xpu"` means device 0. Host and shared USM are classified
+as CPU memory.
 
 ### TransportType
 
