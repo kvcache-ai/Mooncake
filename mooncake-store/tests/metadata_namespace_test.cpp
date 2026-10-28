@@ -390,13 +390,13 @@ class ChainHook final : public WriteHook {
         return {};
     }
 
-    void OnWriteRelease(const WriteGuard& guard, WriteChange change,
-                        std::unique_ptr<WriteReservation>& reservation) override {
+    void OnWriteRelease(
+        const WriteGuard& guard, WriteChange change,
+        std::unique_ptr<WriteReservation>& reservation) override {
         ++releases_;
         release_change_ = change;
         release_object_ = guard.has_object();
-        release_processing_ =
-            guard.has_object() && guard.state().is_processing;
+        release_processing_ = guard.has_object() && guard.state().is_processing;
         release_locked_ = LockedByAnotherThread(guard);
         auto* token = dynamic_cast<Token*>(reservation.get());
         reservation_owner_ = token != nullptr ? token->owner : "<none>";
@@ -440,7 +440,8 @@ class AccountingPolicy final : public NamespacePolicy {
     void OnWriteRelease(const PolicyContext& ctx) override {
         ++releases;
         saw_object = ctx.guard.has_object();
-        saw_processing = ctx.guard.has_object() && ctx.guard.state().is_processing;
+        saw_processing =
+            ctx.guard.has_object() && ctx.guard.state().is_processing;
     }
     int releases = 0;
     bool saw_object = false;
@@ -522,7 +523,7 @@ TEST(NamespaceWriteHookTest, PublishingAndTearingDownCommitTheWrite) {
     EXPECT_EQ(hook.release_change_, WriteChange::kKeyRemoved);
     EXPECT_FALSE(hook.release_object_);
     EXPECT_TRUE(order == (std::vector<std::string>{"h:begin", "h:release",
-                                                  "h:begin", "h:release"}));
+                                                   "h:begin", "h:release"}));
 }
 
 TEST(NamespaceWriteHookTest, CancelUndoesACommit) {
@@ -558,8 +559,9 @@ TEST(NamespaceWriteHookTest, EachHookGetsItsOwnReservationInChainOrder) {
         result->value().Commit();
     }
 
-    EXPECT_EQ(order, (std::vector<std::string>{"first:begin", "second:begin",
-                                               "first:release", "second:release"}));
+    EXPECT_EQ(order,
+              (std::vector<std::string>{"first:begin", "second:begin",
+                                        "first:release", "second:release"}));
     // Each release got the reservation its own begin filled.
     EXPECT_EQ(first.reservation_owner_, "first");
     EXPECT_EQ(second.reservation_owner_, "second");
@@ -573,7 +575,10 @@ TEST(NamespaceWriteHookTest, ARefusedBeginLeavesTheKeyAsItWas) {
     ns.RegisterWriteHook(&kept);
     ns.RegisterWriteHook(&refusing);
     ASSERT_NE(test::PublishObject(ns.objects, "k"), 0u);
-    { auto guard = ns.objects.Write("k"); guard->state().is_processing = true; }
+    {
+        auto guard = ns.objects.Write("k");
+        guard->state().is_processing = true;
+    }
     const auto in_flight = ns.InFlightKeys();
 
     {
@@ -612,19 +617,24 @@ class RemovingHook final : public WriteHook {
     }
 };
 
-TEST(NamespaceWriteHookTest, AReleaseThatRemovesTheObjectIsAccountedAfterwards) {
+TEST(NamespaceWriteHookTest,
+     AReleaseThatRemovesTheObjectIsAccountedAfterwards) {
     AccountingPolicy policy;
     RemovingHook hook;
     Namespace ns_with_policy(TenantId(), &policy);
     ns_with_policy.RegisterWriteHook(&hook);
     ASSERT_NE(test::PublishObject(ns_with_policy.objects, "k"), 0u);
     // Work in flight, so the removal has to take the key off that list too.
-    { auto guard = ns_with_policy.objects.Write("k"); guard->state().is_processing = true; }
+    {
+        auto guard = ns_with_policy.objects.Write("k");
+        guard->state().is_processing = true;
+    }
     ASSERT_EQ(ns_with_policy.InFlightKeys(), (std::vector<std::string>{"k"}));
     policy = AccountingPolicy{};
 
     {
-        auto result = ns_with_policy.objects.Write("k", WriteChange::kKeyRemoved);
+        auto result =
+            ns_with_policy.objects.Write("k", WriteChange::kKeyRemoved);
         ASSERT_TRUE(result.has_value() && result->has_value());
         result->value().Commit();
     }
@@ -668,17 +678,15 @@ TEST(NamespaceWriteHookTest, OnlyAHeldPublicationIsReported) {
 
     const auto generation = test::PublishObject(ns.objects, "k");
     ASSERT_NE(generation, 0u);
-    auto stale =
-        ns.objects.Write(route::ObjectRef{"k", generation + 1},
-                         WriteChange::kNewWrite);
+    auto stale = ns.objects.Write(route::ObjectRef{"k", generation + 1},
+                                  WriteChange::kNewWrite);
     ASSERT_TRUE(stale.has_value());
     EXPECT_FALSE(stale->has_value());
     EXPECT_EQ(hook.begins_, 0);
 
     {
-        auto held =
-            ns.objects.Write(route::ObjectRef{"k", generation},
-                             WriteChange::kNewWrite);
+        auto held = ns.objects.Write(route::ObjectRef{"k", generation},
+                                     WriteChange::kNewWrite);
         ASSERT_TRUE(held.has_value() && held->has_value());
         held->value().Commit();
     }

@@ -111,12 +111,11 @@ route::Generation PublishRecorded(metadata::Namespace& ns,
 
 size_t Count(const std::vector<RecordingBackend::Record>& records, OpType type,
              const std::string& key) {
-    return static_cast<size_t>(std::count_if(
-        records.begin(), records.end(), [&](const auto& record) {
+    return static_cast<size_t>(
+        std::count_if(records.begin(), records.end(), [&](const auto& record) {
             return record.op_type == type && record.key == key;
         }));
 }
-
 
 class OpLogRouteHookTest : public ::testing::Test {
    protected:
@@ -244,7 +243,8 @@ TEST_F(OpLogRouteHookTest, TwoWritesOfOneKeyAreRecordedInTheOrderTheyBegan) {
 // The kind of change decides the record, not the post-state: a tombstone
 // removal commits as REMOVE while the object is still there, which is what
 // lets a deferred removal keep its replicas until the record is durable.
-TEST_F(OpLogRouteHookTest, ATombstoneRemovalRecordsARemoveWithTheObjectStillThere) {
+TEST_F(OpLogRouteHookTest,
+       ATombstoneRemovalRecordsARemoveWithTheObjectStillThere) {
     ASSERT_NE(PublishRecorded(ns(), "k"), 0u);
     ASSERT_TRUE(backend()->WaitForRecords(1));
 
@@ -264,7 +264,8 @@ TEST_F(OpLogRouteHookTest, ATombstoneRemovalRecordsARemoveWithTheObjectStillTher
 // The one failure a release can meet: the writer stops accepting between the
 // reserve and the commit. The record is dropped and reported, not retried, and
 // the object state is what the write made it.
-TEST_F(OpLogRouteHookTest, AWriterThatStopsBetweenReserveAndCommitDropsTheRecord) {
+TEST_F(OpLogRouteHookTest,
+       AWriterThatStopsBetweenReserveAndCommitDropsTheRecord) {
     ASSERT_NE(PublishRecorded(ns(), "k"), 0u);
 
     {
@@ -286,8 +287,7 @@ TEST_F(OpLogRouteHookTest, ARecorderThatRefusesInBeginLeavesTheKeyAlone) {
        public:
         using OpLogRouteHook::OpLogRouteHook;
         tl::expected<void, ErrorCode> OnWriteBegin(
-            const metadata::WriteGuard& guard,
-            metadata::WriteChange change,
+            const metadata::WriteGuard& guard, metadata::WriteChange change,
             std::unique_ptr<metadata::WriteReservation>& reservation) override {
             if (guard.key() == "k") {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -306,5 +306,5 @@ TEST_F(OpLogRouteHookTest, ARecorderThatRefusesInBeginLeavesTheKeyAlone) {
     EXPECT_TRUE(with_refuser.objects.Contains("k"));
 }
 
-}  // namespace test
-}  // namespace mooncake
+}  // namespace
+}  // namespace mooncake::test

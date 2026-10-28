@@ -446,8 +446,8 @@ class Guard {
         bool committed = false;
         WriteReservations reservations;
     };
-    [[no_unique_address]] mutable
-        std::conditional_t<kWrite, WriteState, NoWriteState> state_;
+    [[no_unique_address]] mutable std::conditional_t<kWrite, WriteState,
+                                                     NoWriteState> state_;
 };
 
 class ObjectRoute {
@@ -930,8 +930,8 @@ ObjectRoute::AcquireForWrite(ObjectRoute& route, std::string_view key,
         return guard;
     }
     if (route.observer_ != nullptr) {
-        auto begun = route.observer_->OnWriteBegin(
-            *guard, change, guard->state_.reservations);
+        auto begun = route.observer_->OnWriteBegin(*guard, change,
+                                                   guard->state_.reservations);
         if (!begun) {
             // Nothing changed, so nothing is reported: the key is handed back
             // as it was found.
