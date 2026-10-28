@@ -155,6 +155,9 @@ fi
 # relative path would silently point to the wrong location.
 CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
 
+# Kernel header tree the CUDA EP JIT compiles against at runtime.
+CUDA_EP_JIT_DIR="${BUILD_DIR_ABS}/mooncake_ep_jit"
+
 # CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
 # If EP/PG .so files were staged inside the build directory, preserve them in a
 # temporary location so they survive the cleanup.
@@ -164,6 +167,11 @@ if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
         CUDA_EP_STAGING_TEMP=$(mktemp -d)
         cp "$CUDA_EP_STAGING_DIR"/*.so "$CUDA_EP_STAGING_TEMP/"
         echo "Preserved EP/PG .so files to ${CUDA_EP_STAGING_TEMP} before build-dir cleanup"
+        if [ -d "$CUDA_EP_JIT_DIR" ]; then
+            cp -r "$CUDA_EP_JIT_DIR" "$CUDA_EP_STAGING_TEMP/"
+            CUDA_EP_JIT_DIR="${CUDA_EP_STAGING_TEMP}/mooncake_ep_jit"
+            echo "Preserved EP JIT headers to ${CUDA_EP_JIT_DIR} before build-dir cleanup"
+        fi
     fi
     echo "Freeing disk space: removing build directory (artifacts already copied)"
     rm -rf "${BUILD_DIR}/"
@@ -194,7 +202,10 @@ STORE_FACADE_STAGING_DIR="${MIGRATED_PYTHON_STAGING_DIR}/store"
 MIGRATED_PYTHON_INIT_BACKUP=""
 MIGRATED_PYTHON_MODULES=(
     __init__.py
+    py.typed
+    engine.pyi
     structured_object_store.py
+    _structured_ranges.py
     _fast_copy.c
     http_metadata_server.py
     _launcher.py
@@ -484,7 +495,18 @@ fi
 # libmpcomm.so; and (b) let patchelf rewrite a library carrying CUDA fatbins
 # (MPComm builds TMA kernels with USE_CUDA_KERNELS=ON by default), the same
 # corruption risk the EP/PG extensions are kept away from below.
+#
+# The SYCL, Level Zero and Intel compiler runtimes of an XPU build are
+# excluded too: the XPU EP runs on PyTorch's own sycl::queue, so it must share
+# the one SYCL runtime that PyTorch XPU installs (intel-sycl-rt,
+# intel-cmplr-lib-rt) rather than carry a second copy.
 ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
+    --exclude libsycl.so* \
+    --exclude libze_loader.so* \
+    --exclude libsvml.so* \
+    --exclude libimf.so* \
+    --exclude libirng.so* \
+    --exclude libintlc.so* \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
     --exclude libefa.so* \
@@ -596,6 +618,11 @@ if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; 
                 cp "$so_file" "$UNPACKED_PKG_DIR/mooncake/$(basename "$so_file")"
             fi
         done
+        # Kernel headers for the EP JIT (runtime nvcc).
+        if [ -d "$CUDA_EP_JIT_DIR" ]; then
+            echo "  Adding EP JIT header tree"
+            cp -r "$CUDA_EP_JIT_DIR" "$UNPACKED_PKG_DIR/mooncake/"
+        fi
         # The host EP extension is repaired before the device library is
         # injected.  auditwheel therefore only adds its vendored .libs path;
         # add the package directory as well so the sibling device library is

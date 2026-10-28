@@ -39,6 +39,12 @@ enum class EfaNicSelection {
     LOCAL = 1,  // device memory only on that GPU's topology-local NICs
 };
 
+enum class HipKfdPinFix {
+    OFF = 0,    // never hold a KFD pin anchor
+    PROBE = 1,  // hold anchors if a probe shows the driver needs them
+    FORCE = 2,  // hold anchors without probing
+};
+
 struct GlobalConfig {
     size_t num_cq_per_ctx = 1;
     size_t num_comp_channels_per_ctx = 1;
@@ -101,6 +107,33 @@ struct GlobalConfig {
     // not-yet-posted slices fail/redispatch instead of hanging. 0 disables.
     // Override via MC_CONN_PAUSE_TTL_MS.
     int conn_pause_ttl_ms = 0;
+    // Tell the EFA provider that every peer runs our platform, build, and
+    // capabilities, which lets it skip the per-peer RDM handshake. That
+    // handshake is what limits the first transfers to a new peer to 16 queued
+    // ops before returning FI_EAGAIN, endpoint-wide rather than per-peer.
+    // Defaults OFF: without the handshake, a passively connected endpoint can
+    // write before the peer has inserted our address, which fails the write
+    // with prov_errno=14 under bilateral first contact. Opt in with
+    // MC_EFA_HOMOGENEOUS_PEERS=1 only for one-directional traffic between
+    // identical hosts. See buildSharedEndpoint() for the full rationale.
+    bool efa_homogeneous_peers = false;
+    // Wall-clock safety net for the WR/CQ credit wait in
+    // EfaContext::submitSlicesOnPeer, in milliseconds.  A credit wait is
+    // ordinary backpressure and resolves on its own; only a wait this long
+    // means completions have genuinely stopped coming back.  Override with
+    // MC_EFA_CQ_DRAIN_TIMEOUT_MS; <= 0 waits forever (the stalled-wave escape
+    // hatch still bounds a provider that refuses every post).
+    int64_t efa_cq_drain_timeout_ms = 1000;
+    // Minimum wall time, in milliseconds, that EfaContext::submitSlicesOnPeer
+    // must see unbroken FI_EAGAIN waves before it gives up on a peer.  The
+    // wave count alone (kMaxStalledWaves) passes in microseconds when the
+    // provider is merely busy -- many submitters on one NIC, or the RDM
+    // handshake to a new peer still in flight -- and fails live transfers.
+    // The default matches efa_cq_drain_timeout_ms: on a fresh cross-host
+    // connection the first completions take 50-100 ms, so a floor much below
+    // that still fails healthy peers.  Override with MC_EFA_STALL_MIN_MS;
+    // <= 0 restores the count-only check.
+    int64_t efa_stall_min_ms = 1000;
     // Context-level circuit-breaker pause. Repeated local WC failures
     // deactivate the local RNIC context for this many milliseconds. The
     // monitor then reactivates it with a reset failure count. Must be positive
@@ -131,7 +164,8 @@ struct GlobalConfig {
     // cap.
     int efa_cq_threads = 1;
     // Register GPU memory with ibv_reg_mr() through the nvidia-peermem kernel
-    // module instead of exporting a dma_buf. Set via WITH_NVIDIA_PEERMEM.
+    // module instead of exporting a dma_buf. loadGlobalConfig() sets it to
+    // whether a peer-memory module is loaded; WITH_NVIDIA_PEERMEM overrides.
     bool with_nvidia_peermem = true;
     // Register dma_buf MRs with mlx5 Data Direct. Set via MC_RDMA_DATA_DIRECT.
     bool rdma_data_direct = false;
@@ -142,6 +176,10 @@ struct GlobalConfig {
     // memory). Set via MC_RDMA_DATA_DIRECT_PAIRING; requires
     // MC_RDMA_DATA_DIRECT.
     bool rdma_data_direct_pairing = false;
+    // Hold one peer-memory pin per HIP allocation registered through dma-buf
+    // so that amdgpu before 6.19.14 does not charge it to KFD free VRAM twice.
+    // Set via MC_HIP_KFD_PIN_FIX=0|1|force.
+    HipKfdPinFix hip_kfd_pin_fix = HipKfdPinFix::PROBE;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;

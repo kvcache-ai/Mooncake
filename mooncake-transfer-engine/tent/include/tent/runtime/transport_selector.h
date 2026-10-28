@@ -89,6 +89,13 @@ struct SelectionContext {
     // Match policy against the original memory types, but select a network
     // transport for the host-to-host leg of a staged request.
     bool host_staging{false};
+    // The peer's XPU buffer may be mapped into this process (Level Zero IPC),
+    // so XpuTransport can address it, unstaged, although the segment is not
+    // local. Other transports still follow host_staging.
+    bool xpu_ipc{false};
+    // Only XpuTransport may carry the request: the device memory has neither
+    // a dma-buf RDMA registration nor a host staging route.
+    bool xpu_ipc_only{false};
 };
 
 /**

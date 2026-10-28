@@ -30,7 +30,7 @@ imported and accepts cpp or rs.
 This page describes the shared facade and the default C++ backend. See the
 [Store-RS Python API](store-rs.md) for backend-specific runtime behavior, API
 coverage, and compatibility notes. The
-[source-checkout quickstart](../../getting_started/store-rs.md) shows how to
+{ref}`Build with Store-RS <build-with-store-rs>` section shows how to
 build the root wheel with Store-RS enabled.
 
 ## Quick Start
@@ -667,9 +667,10 @@ config.nof_replica_num = 1
 **Default:** `0`
 **Status:** **Work in progress; development and evaluation only.**
 **Description:** Requests an additional replica in the configured shared
-distributed filesystem. The supported values are currently `0` and `1`. When
-set to `1`, `replica_num` must be at least `1`, so DFS-only placement is not
-supported. DFS replicas currently support only the `default` tenant.
+distributed filesystem. The supported values are currently `0` and `1`.
+DFS-only placement (`replica_num = 0` with `dfs_replica_num = 1`) is supported;
+the DFS replica is then the object's only copy, so DFS eviction or removal
+deletes the object. DFS replicas currently support only the `default` tenant.
 
 ```python
 config = ReplicateConfig()
@@ -743,6 +744,40 @@ config.preferred_segment = self.get_hostname()
 config = ReplicateConfig()
 config.prefer_alloc_in_same_node = True
 ```
+
+#### session_ids
+**Type:** `Optional[List[str]]`
+**Default:** `None`
+
+Optional per-key write attribution. Supply one entry for each input key (one
+entry for a single-key write). Each ID must be valid UTF-8 and at most 256 bytes.
+An empty string means no new attribution. The field does not change object identity,
+replication, group membership, leases, or eviction policy.
+
+```python
+config = ReplicateConfig()
+config.session_ids = ["session-a", "session-a", "session-b"]
+store.batch_put_from(keys, buffer_ptrs, buffer_sizes, config)
+```
+
+The tag becomes committed when the first replica of the write becomes readable.
+A skipped duplicate Put leaves the original tag unchanged. Upsert with a
+non-empty ID replaces attribution at commit; an omitted or empty ID preserves
+the previous tag, including when storage is reallocated. Failed/preempted
+writes do not commit their pending tags. Committed tags survive metadata
+OpLog/snapshot recovery and standby promotion; old metadata defaults to no tag.
+
+With KV events enabled, each `stored` / `BlockStored` map carries a single
+`session_id` string, or MessagePack `nil` when untagged. Replica availability
+changes reuse the committed object tag. `removed` and `cleared` keep their
+existing schemas: they retract availability, not a particular session's
+association. This matches SGLang's single-session stored-event attribution;
+it does not enumerate every session that has reused a shared object.
+
+Old RPC readers can ignore the compatible extension, but do not persist or
+publish session tags. Upgrade the Store client and Master to enable attribution.
+A storage node's disk scan alone cannot reconstruct metadata tags after all
+Master metadata is lost; preserve the metadata recovery artifacts as well.
 
 #### group_ids
 **Type:** `List[str] | None`
@@ -1119,9 +1154,15 @@ store.setup({
 
 `enable_egm_store_pool` defaults to `false`; `egm_numa_nodes` defaults to
 `auto`. These controls apply only to this dictionary overload. The EGM pool
-requires a `USE_MNNVL=ON` build, a non-TENT Transfer Engine, and the exact
-`nvlink`/nonzero-global/zero-local combination shown above. With `auto`, nodes
-come from the visible GPUs' CUDA `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID` values.
+requires a `USE_MNNVL=ON` build, a non-TENT Transfer Engine, and
+`protocol="nvlink"` with `global_segment_size>0`. With `auto`, nodes come from
+the visible GPUs' CUDA `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID` values.
+
+`local_buffer_size` is independent of the EGM pool. A nonzero value uses the
+existing client-buffer allocator for local staging; it does not add EGM
+capacity. Keep it nonzero when the Provider also uses APIs such as `put()` or
+`get_buffer()` that allocate staging buffers. A storage-only Provider can use
+zero, as shown above.
 
 EGM capacity is rounded down to a multiple of the common alignment: the
 maximum of the Store slab alignment and the selected nodes' CUDA allocation

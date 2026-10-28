@@ -22,7 +22,7 @@ bool IsPowerOfTwo(size_t value) {
 
 tl::expected<EgmStorePoolConfig, ErrorCode> ParseEgmStorePoolConfig(
     const ConfigDict& config, const std::string& protocol,
-    size_t global_segment_size, size_t local_buffer_size) {
+    size_t global_segment_size) {
     EgmStorePoolConfig parsed;
     const auto enabled = config.find(CONFIG_KEY_ENABLE_EGM_STORE_POOL);
     if (enabled != config.end()) {
@@ -36,10 +36,9 @@ tl::expected<EgmStorePoolConfig, ErrorCode> ParseEgmStorePoolConfig(
     }
     if (!parsed.enabled) return parsed;
 
-    if (protocol != "nvlink" || global_segment_size == 0 ||
-        local_buffer_size != 0) {
+    if (protocol != "nvlink" || global_segment_size == 0) {
         LOG(ERROR) << "EGM Store Pool requires protocol=nvlink, "
-                      "global_segment_size>0 and local_buffer_size=0";
+                      "global_segment_size>0";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
