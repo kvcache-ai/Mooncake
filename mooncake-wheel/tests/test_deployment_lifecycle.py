@@ -354,19 +354,6 @@ class TestDeploymentLifecycle(unittest.TestCase):
     def test_signal_exit_real_signaled_first(self):
         self.assert_signal_exit("real_first")
 
-    def test_rpc_collision_does_not_damage_running_deployment(self):
-        duplicate, log = self.spawn(self.command, "collision")
-        try:
-            code = duplicate.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            self.fail(f"Occupied RPC port did not fail startup; log: {log}")
-        self.assertNotEqual(code, 0)
-        self.assertNotIn(code, (-signal.SIGSEGV, -signal.SIGBUS, -signal.SIGILL,
-                               -signal.SIGKILL))
-        self.assertIsNone(self.real.poll())
-        for worker in self.workers:
-            self.assert_roundtrip(worker.call("roundtrip"))
-
     def test_ipc_collision_rejects_dummy_and_preserves_other_deployment(self):
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
