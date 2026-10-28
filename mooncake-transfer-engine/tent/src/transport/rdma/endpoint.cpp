@@ -292,12 +292,14 @@ int RdmaEndPoint::deconstructUnlocked() {
                     wr_depth_list_[i].value.load(std::memory_order_relaxed);
                 if (outstanding != 0) cancelQuota(i, outstanding);
             }
+            // Detach this QP's slices in the same critical section as its
+            // quota release. Another QP may fail destruction; a later CQE
+            // must not find these entries and release their quota again.
+            // Only this successfully destroyed QP can publish cancellation.
+            resetInflightSlices(i);
         }
     }
     if (all_qps_destroyed) {
-        // A terminal task lets the caller reuse its buffers. Do not publish
-        // cancellation while a QP may still access them, even on teardown.
-        resetInflightSlices();
         qp_list_.clear();
         slice_queue_.clear();
         delete[] queue_lock_list_;
@@ -323,37 +325,23 @@ void RdmaEndPoint::beginDestroy() {
     beginDestroyNoLock();
 }
 
-int RdmaEndPoint::abortTimedOutQp(
-    int qp_index, const std::function<void(RdmaSlice*)>& on_each) {
-    RWSpinlock::WriteGuard guard(lock_);
-    if (qp_index < 0 || qp_index >= (int)slice_queue_.size()) return 0;
-
-    // Reuse the existing retirement path to exclude concurrent posts and
-    // prevent reuse of this connection. Only the timed-out QP is destroyed
-    // synchronously; the other QPs follow normal endpoint reclamation.
-    beginDestroyNoLock();
-    auto*& qp = qp_list_[qp_index];
-    if (qp && context_->verbs_.ibv_destroy_qp(qp)) {
-        PLOG(ERROR) << "Failed to abort timed-out QP[" << qp_index << "]";
-        return -1;
+bool RdmaEndPoint::retireForTimeout(RdmaSlice* slice) {
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        const int qp_index = slice->qp_index;
+        if (qp_index < 0 || qp_index >= (int)slice_queue_.size() ||
+            !slice_queue_[qp_index].contains(slice) ||
+            status_.load(std::memory_order_relaxed) != EP_READY)
+            return false;
+        // A stale worker-set entry must not retire unrelated work. Once
+        // validated, stop new posts and request flushes without resolving
+        // any WR here. Other tasks on the QP retain their normal retry path.
+        beginDestroyNoLock();
     }
-    qp = nullptr;
-
-    // Destroying the QP stops every WR on it, including WRs after the one
-    // that timed out. Account for the entire queue before exposing a terminal
-    // task. Keep slice storage pinned for CQ handlers already in progress.
-    auto& queue = slice_queue_[qp_index];
-    int num_entries = 0;
-    while (auto* current = queue.pop()) {
-        ++num_entries;
-        __sync_bool_compare_and_swap(&current->task->first_error, PENDING,
-                                     TIMEOUT);
-        current->task->cancel_requested.store(true, std::memory_order_release);
-        if (on_each) on_each(current);
-        updateSliceStatus(current, TIMEOUT);
-    }
-    cancelQuota(qp_index, num_entries);
-    return num_entries;
+    // Match resetConnection(): remove outside the endpoint lock so the
+    // monitor can reclaim it even when there are no future submissions.
+    context_->endpointStore()->remove(this);
+    return true;
 }
 
 void RdmaEndPoint::beginDestroyNoLock() {
@@ -918,16 +906,14 @@ int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
     return 1;
 }
 
-void RdmaEndPoint::resetInflightSlices() {
+void RdmaEndPoint::resetInflightSlices(int qp_index) {
     // qp_list_ is sized up front, while slice_queue_ grows after each
     // successful QP creation. Use the latter during partial-construction
     // cleanup to avoid indexing queues that were never created.
-    for (int qp_index = 0; qp_index < (int)slice_queue_.size(); ++qp_index) {
-        auto& queue = slice_queue_[qp_index];
-        while (!queue.empty()) {
-            auto current = queue.pop();
-            updateSliceStatus(current, TransferStatusEnum::CANCELED);
-        }
+    if (qp_index >= (int)slice_queue_.size()) return;
+    auto& queue = slice_queue_[qp_index];
+    while (auto* current = queue.pop()) {
+        updateSliceStatus(current, TransferStatusEnum::CANCELED);
     }
 }
 

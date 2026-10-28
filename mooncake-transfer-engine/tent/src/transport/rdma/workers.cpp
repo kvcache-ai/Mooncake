@@ -965,34 +965,34 @@ void Workers::expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns) {
             retire(slice);
             continue;
         }
-        if (now_ns - slice->enqueue_ts > slice_timeout_ns_) {
+        const bool task_timed_out =
+            slice->task->cancel_requested.load(std::memory_order_acquire) &&
+            __atomic_load_n(&slice->task->first_error, __ATOMIC_ACQUIRE) ==
+                TIMEOUT;
+        if (task_timed_out ||
+            (now_ns > slice->enqueue_ts &&
+             now_ns - slice->enqueue_ts > slice_timeout_ns_)) {
             // Stop queued siblings and prevent a flush completion from
             // resubmitting this task while its QP is being aborted.
-            __sync_bool_compare_and_swap(&slice->task->first_error, PENDING,
-                                         TIMEOUT);
+            if (__sync_bool_compare_and_swap(&slice->task->first_error, PENDING,
+                                             TIMEOUT))
+                LOG(WARNING) << "Slice " << slice
+                             << " failed: transfer timeout (software)";
             slice->task->cancel_requested.store(true,
                                                 std::memory_order_release);
             auto ep = slice->ep_weak_ptr.lock();
-            LOG(WARNING) << "Slice " << slice
-                         << " failed: transfer timeout (software)";
-            // A software deadline does not stop DMA. Abort the QP before
-            // publishing a terminal status or releasing its accounting.
-            if (!ep) {
+            // A software deadline does not stop DMA. Only a completed WR or
+            // successful endpoint destruction permits terminal publication.
+            if (!ep || ep->status() == RdmaEndPoint::EP_DESTROYED ||
+                slice->completions_owed.load(std::memory_order_acquire) == 0) {
                 retire(slice);
                 updateSliceStatus(slice, TIMEOUT);
                 continue;
             }
-            auto num_slices = ep->abortTimedOutQp(slice->qp_index, retire);
-            if (num_slices < 0) continue;
-            disableEndpoint(slice);
-            if (num_slices == 0) {
-                // A neighbour's retry already popped it off the queue pair
-                // and discounted it there, so only its charge and its set
-                // entry are still outstanding.
-                releaseSliceQuota(slice, now_ns);
-                if (routeSetRemoval(worker, slice))
-                    slice_to_remove.push_back(slice);
-                updateSliceStatus(slice, TIMEOUT);
+            if (ep->retireForTimeout(slice)) {
+                if (auto* rail = slice->rail_monitor)
+                    rail->markFailed(slice->source_dev_id,
+                                     slice->target_dev_id);
             }
         }
     }
@@ -1076,6 +1076,19 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
     }
     if (!ep) {
         updateSliceStatus(slice, FAILED);
+        discountFromOwner(worker, slice);
+        return;
+    }
+    if (wc.status != IBV_WC_SUCCESS &&
+        slice->task->cancel_requested.load(std::memory_order_acquire) &&
+        __atomic_load_n(&slice->task->first_error, __ATOMIC_ACQUIRE) ==
+            TIMEOUT) {
+        // This CQE proves only this slice is done. Do not fail other tasks
+        // in the QP prefix or spend a retry on the canceled task.
+        ep->acknowledge(slice, PENDING, [&](RdmaSlice* swept) {
+            discountFromOwner(worker, swept);
+        });
+        updateSliceStatus(slice, TIMEOUT);
         discountFromOwner(worker, slice);
         return;
     }
