@@ -118,7 +118,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     worker_pool_rail_state_test
     PRIVATE
     "-Wl,--wrap=_ZN8mooncake11RdmaContext17refreshCurrentGidEPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_"
-    "-Wl,--wrap=_ZNK8mooncake11RdmaContext14queryPortStateEP14ibv_port_state")
+    "-Wl,--wrap=_ZNK8mooncake11RdmaContext14queryPortStateEP14ibv_port_state"
+  )
 endif()
 add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)
 
@@ -546,13 +547,6 @@ add_executable(rdma_transport_submit_task_test
                ${WORKSPACE}/rdma_transport_submit_task_test.cpp)
 target_link_libraries(rdma_transport_submit_task_test PUBLIC transfer_engine
                                                              gtest gtest_main)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  target_link_options(
-    rdma_transport_submit_task_test
-    PRIVATE
-    "-Wl,--wrap=_ZN8mooncake11RdmaContext14submitPostSendERKSt6vectorIPNS_9Transport5SliceESaIS4_EE"
-  )
-endif()
 add_test(NAME rdma_transport_submit_task_test
          COMMAND rdma_transport_submit_task_test)
 

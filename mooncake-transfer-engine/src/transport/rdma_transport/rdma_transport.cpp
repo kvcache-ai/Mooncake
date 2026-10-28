@@ -1253,7 +1253,8 @@ Status RdmaTransport::submitTransferTask(
                 __sync_fetch_and_add(&task.slice_count, 1);
             }
 
-            // Bound pending work across requests, including reused slices.
+            // Flush prepared slices so TE worker post can overlap with slice
+            // preparation
             if (++pending_slice_count >= kSubmitWatermark)
                 flush_pending_slices();
 

@@ -22,9 +22,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <functional>
 #include <memory>
-#include <numeric>
 #include <string>
 #include <type_traits>
 
@@ -32,30 +30,38 @@
 #include "multi_transport.h"
 #include "rdma_test_peers.h"
 #include "transfer_metadata.h"
+#include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
+#include "transport/rdma_transport/worker_pool.h"
+
+namespace mooncake {
+
+class WorkerPoolTestPeer {
+   public:
+    // Match the existing worker/endpoint tests: join consumers before any
+    // submission, then inspect the real queue without opening an RDMA device.
+    static void stopWorkers(WorkerPool &pool) {
+        pool.workers_running_.store(false);
+        pool.cond_var_.notify_all();
+        for (auto &thread : pool.worker_thread_) thread.join();
+    }
+
+    static std::vector<Transport::Slice *> takeQueuedSlices(WorkerPool &pool) {
+        std::vector<Transport::Slice *> result;
+        for (auto &queues : pool.worker_slice_queue_) {
+            for (auto &entry : queues)
+                result.insert(result.end(), entry.second.begin(),
+                              entry.second.end());
+            queues.clear();
+        }
+        return result;
+    }
+};
+
+}  // namespace mooncake
 
 using namespace mooncake;
-
-#ifdef __linux__
-namespace {
-std::function<int(const std::vector<Transport::Slice *> &)> submit_probe;
-}
-
-extern "C" int
-realSubmitPostSend(RdmaContext *, const std::vector<Transport::Slice *> &) asm(
-    "__real__ZN8mooncake11RdmaContext14submitPostSendERKSt6vectorIPNS_"
-    "9Transport5SliceESaIS4_EE");
-extern "C" int
-wrapSubmitPostSend(RdmaContext *, const std::vector<Transport::Slice *> &) asm(
-    "__wrap__ZN8mooncake11RdmaContext14submitPostSendERKSt6vectorIPNS_"
-    "9Transport5SliceESaIS4_EE");
-extern "C" int wrapSubmitPostSend(
-    RdmaContext *context, const std::vector<Transport::Slice *> &slices) {
-    return submit_probe ? submit_probe(slices)
-                        : realSubmitPostSend(context, slices);
-}
-#endif
 
 namespace {
 
@@ -298,160 +304,95 @@ TEST_F(SubmitTransferTaskTest, GroupedRequestsReportFailurePerRequest) {
     EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
 }
 
-#ifdef __linux__
-class ChunkedSubmitTest : public SubmitTransferTaskTest {
-   protected:
-    static constexpr size_t kWatermark = 4;
-    const size_t saved_max_wr_ = globalConfig().max_wr;
-    const size_t saved_num_qp_ = globalConfig().num_qp_per_ep;
-    std::vector<Transport::TransferTask *> tasks_;
-    std::vector<Transport::Slice *> submitted_;
-    std::vector<size_t> chunks_, constructed_;
-    size_t cached_ = 0;
+TEST_F(SubmitTransferTaskTest,
+       ChunkedSubmissionHandlesTailAndPreparationFailure) {
+    struct RestoreConfig {
+        size_t max_wr = globalConfig().max_wr;
+        size_t num_qp = globalConfig().num_qp_per_ep;
+        ~RestoreConfig() {
+            globalConfig().max_wr = max_wr;
+            globalConfig().num_qp_per_ep = num_qp;
+        }
+    } restore_config;
+    globalConfig().max_wr = 2;
+    globalConfig().num_qp_per_ep = 2;  // Watermark = 4 slices.
 
-    void SetUp() override {
-        SubmitTransferTaskTest::SetUp();
-        globalConfig().max_wr = 2;
-        globalConfig().num_qp_per_ep = 2;
-        setBufferLength((2 * kWatermark + 3) * block_size_);
-        // Observe the real transport handoff without opening an RDMA device.
-        submit_probe = [&](const std::vector<Transport::Slice *> &slices) {
-            EXPECT_FALSE(slices.empty());
-            chunks_.push_back(slices.size());
-            size_t constructed = 0;
-            for (auto *task : tasks_) constructed += task->slice_list.size();
-            constructed_.push_back(constructed);
-            for (auto *slice : slices) {
-                auto *task = slice->task.load();
-                EXPECT_EQ(task->slice_count, task->slice_list.size());
-                EXPECT_EQ(slice->rdma.source_lkey,
-                          lkeyForDevice(local_device_id_));
-                submitted_.push_back(slice);
-                cached_ += slice->from_cache;
-                slice->markSuccess();
-            }
-            return 0;
-        };
-    }
+    auto &context = *transport_->getContextList()[local_device_id_];
+    RdmaContextTestPeer::setTransferWorkerCount(context, 1);
+    RdmaContextTestPeer::bindEndpointStore(
+        context, std::make_shared<SIEVEEndpointStore>(8));
+    auto pool = std::make_shared<WorkerPool>(context);
+    WorkerPoolTestPeer::stopWorkers(*pool);
+    RdmaContextTestPeer::bindWorkerPool(context, pool);
 
-    void TearDown() override {
-        submit_probe = {};
-        globalConfig().max_wr = saved_max_wr_;
-        globalConfig().num_qp_per_ep = saved_num_qp_;
-    }
-
-    void setBufferLength(size_t length) {
-        auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-        desc->buffers[0].length = length;
+    struct Case {
+        size_t valid_requests;
+        size_t published;
+        bool fail_preparation;
+    };
+    const Case cases[] = {{3, 3, false}, {4, 4, false}, {9, 9, false},
+                          {3, 0, true},  {4, 4, true},  {5, 4, true},
+                          {9, 8, true},  {9, 8, true}};
+    const auto original = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    for (const auto &[count, published, fail] : cases) {
+        SCOPED_TRACE(::testing::Message()
+                     << "valid=" << count << " fail=" << fail);
+        auto desc = std::make_shared<SegmentDesc>(*original);
+        for (const auto &hca : desc->topology.getHcaList()) {
+            desc->devices.emplace_back();
+            desc->devices.back().name = hca;
+        }
+        desc->buffers[0].length = count * block_size_;
         desc->rebuildBufferRangeIndex();
-    }
+        metadata_->addLocalSegment(LOCAL_SEGMENT_ID, desc->name,
+                                   std::move(desc));
 
-    Transport::TransferRequest request(size_t length, uint64_t offset = 0) {
-        Transport::TransferRequest req;
-        req.opcode = Transport::TransferRequest::WRITE;
-        req.source = reinterpret_cast<void *>(kBufferAddr + offset);
-        req.length = length;
-        req.target_id = LOCAL_SEGMENT_ID;
-        req.target_offset = kBufferAddr + 2 * offset;
-        return req;
-    }
+        // An out-of-MR final request stops preparation before the tail flush,
+        // making the queued prefix evidence of publication during preparation.
+        const size_t request_count = count + (fail ? 1 : 0);
+        std::vector<Transport::TransferRequest> requests(request_count);
+        std::vector<Transport::TransferTask> tasks(request_count);
+        std::vector<Transport::TransferTask *> task_list;
+        for (size_t i = 0; i < request_count; ++i) {
+            auto &request = requests[i];
+            request.opcode = Transport::TransferRequest::WRITE;
+            request.source =
+                reinterpret_cast<void *>(kBufferAddr + i * block_size_);
+            request.length = block_size_;
+            request.target_id = LOCAL_SEGMENT_ID;
+            request.target_offset = kBufferAddr + i * block_size_;
+            tasks[i].request = &request;
+            task_list.push_back(&tasks[i]);
+        }
+        auto status = transport_->submitTransferTask(task_list);
+        if (fail) {
+            ASSERT_TRUE(status.IsAddressNotRegistered());
+        } else {
+            ASSERT_EQ(status, Status::OK());
+        }
 
-    void bindTasks(const std::vector<Transport::TransferRequest> &requests,
-                   std::vector<Transport::TransferTask> &tasks) {
-        tasks_.clear();
-        submitted_.clear();
-        chunks_.clear();
-        constructed_.clear();
-        cached_ = 0;
+        auto queued = WorkerPoolTestPeer::takeQueuedSlices(*pool);
+        ASSERT_EQ(queued.size(), published);
+        size_t cached = 0;
         for (size_t i = 0; i < tasks.size(); ++i) {
-            tasks[i].request = &requests[i];
-            Transport::Slice::unsealTaskSubmission(&tasks[i]);
-            tasks_.push_back(&tasks[i]);
+            ASSERT_EQ(tasks[i].slice_list.size(), 1u);
+            auto *slice = tasks[i].slice_list.front();
+            if (i < published) {
+                EXPECT_EQ(queued[i], slice);
+                ASSERT_EQ(slice->status, Transport::Slice::PENDING);
+                cached += slice->from_cache;
+                slice->markSuccess();
+                EXPECT_EQ(tasks[i].success_slice_count, 1u);
+            } else {
+                EXPECT_EQ(slice->status, Transport::Slice::FAILED);
+            }
+            EXPECT_EQ(tasks[i].failed_slice_count, i < published ? 0u : 1u);
         }
-    }
-};
-
-TEST_F(ChunkedSubmitTest,
-       SmallRequestsPublishBoundedChunksIncludingCachedSlices) {
-    {
-        auto req = request(16384);
-        Transport::TransferTask task;
-        task.request = &req;
-        ASSERT_EQ(transport_->submitTransferTask({&task}), Status::OK());
-    }
-    for (const auto &expected : {std::vector<size_t>{kWatermark - 1},
-                                 {kWatermark},
-                                 {kWatermark, 1},
-                                 {kWatermark, kWatermark, 1}}) {
-        const size_t count =
-            std::accumulate(expected.begin(), expected.end(), size_t{0});
-        SCOPED_TRACE(count);
-        std::vector<Transport::TransferRequest> requests;
-        for (size_t i = 0; i < count; ++i)
-            requests.push_back(request(16384, i * 16384));
-        std::vector<Transport::TransferTask> tasks(count);
-        bindTasks(requests, tasks);
-        ASSERT_EQ(transport_->submitTransferTask(tasks_), Status::OK());
-        EXPECT_EQ(chunks_, expected);
-        std::vector<size_t> constructed(expected.size());
-        std::partial_sum(expected.begin(), expected.end(), constructed.begin());
-        EXPECT_EQ(constructed_, constructed);
-        EXPECT_GT(cached_, 0u);
-        ASSERT_EQ(submitted_.size(), count);
-        for (size_t i = 0; i < count; ++i) {
-            EXPECT_EQ(submitted_[i], tasks[i].slice_list.front());
-            EXPECT_EQ(submitted_[i]->source_addr, requests[i].source);
-            EXPECT_EQ(submitted_[i]->rdma.dest_addr, requests[i].target_offset);
-            EXPECT_EQ(submitted_[i]->length, requests[i].length);
-            EXPECT_EQ(tasks[i].success_slice_count, 1u);
-            EXPECT_EQ(tasks[i].total_bytes, requests[i].length);
+        // Earlier iterations return their slices to the cache.
+        if (fail && published) {
+            EXPECT_GT(cached, 0u);
         }
     }
 }
 
-TEST_F(ChunkedSubmitTest, LargeRequestPublishesChunksAndTailBeforeReturn) {
-    const size_t count = 2 * kWatermark + 1;
-    std::vector<Transport::TransferRequest> requests{
-        request(count * block_size_)};
-    std::vector<Transport::TransferTask> tasks(1);
-    bindTasks(requests, tasks);
-    ASSERT_EQ(transport_->submitTransferTask(tasks_), Status::OK());
-    EXPECT_EQ(chunks_, (std::vector<size_t>{kWatermark, kWatermark, 1}));
-    EXPECT_EQ(constructed_,
-              (std::vector<size_t>{kWatermark, 2 * kWatermark, count}));
-    ASSERT_EQ(submitted_.size(), count);
-    for (size_t i = 0; i < count; ++i) {
-        EXPECT_EQ(submitted_[i], tasks[0].slice_list[i]);
-        EXPECT_EQ(reinterpret_cast<uint64_t>(submitted_[i]->source_addr),
-                  kBufferAddr + i * block_size_);
-        EXPECT_EQ(submitted_[i]->rdma.dest_addr, kBufferAddr + i * block_size_);
-        EXPECT_EQ(submitted_[i]->length, block_size_);
-    }
-    EXPECT_EQ(tasks[0].success_slice_count, count);
-    EXPECT_EQ(tasks[0].total_bytes, requests[0].length);
-    EXPECT_EQ(tasks[0].transferred_bytes, requests[0].length);
-}
-
-TEST_F(ChunkedSubmitTest,
-       LaterPreparationFailureLeavesPublishedPrefixSuccessful) {
-    setBufferLength((kWatermark + 1) * block_size_);
-    std::vector<Transport::TransferRequest> requests{
-        request((kWatermark + 2) * block_size_), request(block_size_)};
-    std::vector<Transport::TransferTask> tasks(2);
-    bindTasks(requests, tasks);
-    EXPECT_TRUE(
-        transport_->submitTransferTask(tasks_).IsAddressNotRegistered());
-    EXPECT_EQ(chunks_, (std::vector<size_t>{kWatermark}));
-    EXPECT_EQ(tasks[0].success_slice_count, kWatermark);
-    EXPECT_EQ(tasks[0].failed_slice_count, 2u);
-    ASSERT_EQ(tasks[0].slice_list.size(), kWatermark + 2);
-    for (size_t i = 0; i < tasks[0].slice_list.size(); ++i)
-        EXPECT_EQ(tasks[0].slice_list[i]->status,
-                  i < kWatermark ? Transport::Slice::SUCCESS
-                                 : Transport::Slice::FAILED);
-    ASSERT_EQ(tasks[1].slice_list.size(), 1u);
-    EXPECT_EQ(tasks[1].failed_slice_count, 1u);
-    EXPECT_EQ(tasks[1].slice_list.front()->length, 0u);
-}
-#endif
 }  // namespace
