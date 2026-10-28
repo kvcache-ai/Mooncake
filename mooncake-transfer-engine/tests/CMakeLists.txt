@@ -293,8 +293,8 @@ target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest
 add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
 if(USE_CUDA AND NOT USE_HIP)
   # GPU sub-range export test (skipped at runtime without a CUDA device).
-  # WITH_NVIDIA_PEERMEM defaults to true, which selects ibv_reg_mr instead of
-  # the DMA-BUF export under test.
+  # On a host with a peer-memory module loaded the default is ibv_reg_mr;
+  # WITH_NVIDIA_PEERMEM=0 selects the DMA-BUF export under test either way.
   target_include_directories(dmabuf_export_test
                              PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
   target_link_libraries(dmabuf_export_test PUBLIC CUDA::cudart)

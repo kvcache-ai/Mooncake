@@ -105,7 +105,19 @@ void parseNicPeerAffinity(
 
 }  // namespace
 
+// Whether a GPU peer-memory kernel module is loaded: nvidia-peermem, or
+// nv_peer_mem from MLNX_OFED. ibv_reg_mr() on device memory needs one.
+static bool peerMemoryModuleLoaded() {
+    return std::filesystem::exists("/sys/module/nvidia_peermem") ||
+           std::filesystem::exists("/sys/module/nv_peer_mem");
+}
+
 void loadGlobalConfig(GlobalConfig& config) {
+    // Without a peer-memory module, ibv_reg_mr() fails with EFAULT at the
+    // first GPU buffer, so the dma_buf export is the default there;
+    // WITH_NVIDIA_PEERMEM below still decides when set.
+    config.with_nvidia_peermem = peerMemoryModuleLoaded();
+
     const char* num_cq_per_ctx_env = std::getenv("MC_NUM_CQ_PER_CTX");
     if (num_cq_per_ctx_env) {
         int val = atoi(num_cq_per_ctx_env);
