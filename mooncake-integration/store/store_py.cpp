@@ -3440,7 +3440,6 @@ PYBIND11_MODULE(_store, m) {
 
     m.def("get_alloc_func_addr", &get_alloc_func_addr);
     m.def("get_free_func_addr", &get_free_func_addr);
-
 }
 
 }  // namespace mooncake
