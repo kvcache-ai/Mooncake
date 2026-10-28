@@ -23,6 +23,7 @@
 #include <cerrno>
 #include <cstring>
 #include <map>
+#include <set>
 #include <unistd.h>
 #include <sys/syscall.h>
 
@@ -39,6 +40,11 @@ namespace mooncake {
 // These can be overridden via environment variables:
 // - MC_HIP_NUM_STREAMS: number of HIP streams per device
 // - MC_HIP_NUM_EVENTS: number of HIP events per device
+// - MC_HIP_WAIT_CALLER_STREAM: 1 to order copies after the caller's null
+//   stream (default 0: the caller makes sure the source is ready)
+// - MC_HIP_STREAM_PRIORITY: priority of the copy streams: low, normal
+//   (alias default) or high (default low with MC_HIP_WAIT_CALLER_STREAM=1,
+//   else normal)
 constexpr int kDefaultNumStreams = 64;
 constexpr int kDefaultNumEvents = 64;
 
@@ -346,6 +352,32 @@ static int getNumEvents() {
     return kDefaultNumEvents;
 }
 
+static bool getWaitCallerStream() {
+    const char* env = getenv("MC_HIP_WAIT_CALLER_STREAM");
+    return env && std::string(env) == "1";
+}
+
+// With MC_HIP_WAIT_CALLER_STREAM=1 the copy streams wait for an event
+// recorded on the caller's null stream. The runtime maps streams of one
+// priority onto a few hardware queues; when that event lands on a queue
+// shared with a copy stream, it completes only after the copies already
+// queued there, which serializes the copies of later submissions (half the
+// bandwidth when one GPU sends to four). Streams of another priority use
+// other hardware queues, so the copy streams then default to low priority,
+// which applications rarely use. It does not slow the SDMA copies, also next
+// to a busy GEMM.
+static std::string getStreamPriority(bool wait_caller_stream) {
+    const std::string fallback = wait_caller_stream ? "low" : "normal";
+    const char* env = getenv("MC_HIP_STREAM_PRIORITY");
+    if (!env) return fallback;
+    std::string value = env;
+    if (value == "default") return "normal";
+    if (value == "low" || value == "normal" || value == "high") return value;
+    LOG(WARNING) << "Invalid MC_HIP_STREAM_PRIORITY value " << value
+                 << ", using " << fallback;
+    return fallback;
+}
+
 static bool supportFabricMem() {
     // By default, use IPC mode. Fabric memory is enabled only when
     // MC_USE_HIP_IPC=0 or MC_USE_NVLINK_IPC=0 is explicitly set.
@@ -396,7 +428,8 @@ static bool supportFabricMem() {
 
 HipTransport::HipTransport()
     : use_fabric_mem_(supportFabricMem()),
-      stream_pool_(getNumStreams()),
+      wait_caller_stream_(getWaitCallerStream()),
+      stream_pool_(getNumStreams(), getStreamPriority(wait_caller_stream_)),
       event_pool_(getNumEvents()) {
     // Enable P2P access for IPC mode
     if (!use_fabric_mem_) {
@@ -509,6 +542,37 @@ void releaseSliceEvent(Transport::Slice* slice) {
 
 }  // namespace
 
+bool HipTransport::waitForCallerStreams(int device_id, hipStream_t stream,
+                                        hipEvent_t event,
+                                        const std::vector<Slice*>& slices) {
+    std::set<int> devices = {device_id};
+    for (const Slice* slice : slices) {
+        if (slice->opcode == TransferRequest::READ &&
+            slice->target_id == LOCAL_SEGMENT_ID) {
+            int data_device = getDeviceFromPointer(slice->local.dest_addr);
+            if (data_device >= 0) devices.insert(data_device);  // not host
+        }
+    }
+    for (int data_device : devices) {
+        const bool own = data_device == device_id;
+        hipEvent_t ready = own ? event : event_pool_.getEvent(data_device);
+        bool ok =
+            ready != nullptr &&
+            checkHip(hipSetDevice(data_device),
+                     "HipTransport: failed to set device context") &&
+            checkHip(
+                hipEventRecord(ready, nullptr),
+                "HipTransport: hipEventRecord on the null stream failed") &&
+            checkHip(hipSetDevice(device_id),
+                     "HipTransport: failed to set device context") &&
+            checkHip(hipStreamWaitEvent(stream, ready, 0),
+                     "HipTransport: hipStreamWaitEvent failed");
+        if (!own && ready) event_pool_.putEvent(ready, data_device);
+        if (!ok) return false;
+    }
+    return true;
+}
+
 void HipTransport::submitDeviceCopies(int device_id,
                                       const std::vector<Slice*>& slices) {
     hipStream_t stream = stream_pool_.getNextStream(device_id);
@@ -516,6 +580,24 @@ void HipTransport::submitDeviceCopies(int device_id,
     if (event == nullptr) {
         LOG(ERROR) << "HipTransport: failed to get a stream or event on device "
                    << device_id;
+        for (Slice* slice : slices) slice->markFailed();
+        return;
+    }
+
+    // Pool streams are non-blocking, so by default a copy may start before
+    // the caller's kernel that produced the source has finished; the caller
+    // must make sure the source is ready, e.g. by synchronizing its stream.
+    // With wait_caller_stream_, order the copies after the work the caller
+    // already queued on the null stream of every device holding their data
+    // instead: this device (a WRITE's source) and, for a READ of this
+    // process's memory, the device of that memory. A READ of another
+    // process's memory cannot be ordered after that process's streams. The
+    // waits run on the GPU and are fixed at this call, so the events can be
+    // reused right away (this device's below as the completion marker).
+    if (wait_caller_stream_ &&
+        !waitForCallerStreams(device_id, stream, event, slices)) {
+        (void)hipSetDevice(device_id);
+        event_pool_.putEvent(event, device_id);
         for (Slice* slice : slices) slice->markFailed();
         return;
     }

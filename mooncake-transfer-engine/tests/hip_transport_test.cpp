@@ -282,6 +282,88 @@ TEST_F(HipTransportAsyncTest, ManySmallCopiesAcrossDevices) {
     }
 }
 
+// MC_HIP_WAIT_CALLER_STREAM=1 is read when the transport is created.
+class HipTransportCallerWaitTest : public HipTransportAsyncTest {
+   protected:
+    void SetUp() override {
+        setenv("MC_HIP_WAIT_CALLER_STREAM", "1", 1);
+        HipTransportAsyncTest::SetUp();
+    }
+    void TearDown() override {
+        HipTransportAsyncTest::TearDown();
+        unsetenv("MC_HIP_WAIT_CALLER_STREAM");
+    }
+};
+
+// With MC_HIP_WAIT_CALLER_STREAM=1 the copy is ordered after the caller's
+// default (null) stream: a source written there right before submit, behind a
+// long memset, must be what lands even though the caller never synchronizes.
+TEST_F(HipTransportCallerWaitTest, WaitsForCallerDefaultStream) {
+    constexpr size_t kBusyLen = 4ull << 30, kCopyLen = 16ull << 20;
+    void* busy = allocOnDevice(kBusyLen, 0);
+    void* src = allocRegistered(kCopyLen, 0, 0x11);
+    void* dst = allocRegistered(kCopyLen, device_count_ - 1, 0);
+
+    // Warm up first: creating the transport's stream pool synchronizes the
+    // device, which would hide the race.
+    auto warmup = engine_->allocateBatchID(1);
+    ASSERT_TRUE(engine_
+                    ->submitTransfer(warmup, {request(TransferRequest::WRITE,
+                                                      src, dst, kCopyLen)})
+                    .ok());
+    EXPECT_EQ(wait(warmup, 0), TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(engine_->freeBatchID(warmup).ok());
+
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(busy, 0, kBusyLen, nullptr), cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(src, 0x22, kCopyLen, nullptr), cudaSuccess);
+    auto batch_id = engine_->allocateBatchID(1);
+    ASSERT_TRUE(engine_
+                    ->submitTransfer(batch_id, {request(TransferRequest::WRITE,
+                                                        src, dst, kCopyLen)})
+                    .ok());
+    EXPECT_EQ(wait(batch_id, 0), TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(engine_->freeBatchID(batch_id).ok());
+    EXPECT_TRUE(allEqual(dst, kCopyLen, 0x22));
+    (void)cudaFree(busy);
+}
+
+// A READ of this process's memory on another GPU is ordered after that
+// GPU's null stream: data written there right before submit, behind a long
+// memset, must be what is read even though the caller never synchronizes.
+TEST_F(HipTransportCallerWaitTest, ReadWaitsForDataDeviceDefaultStream) {
+    if (device_count_ < 2) GTEST_SKIP() << "Needs two GPUs.";
+    constexpr size_t kBusyLen = 4ull << 30, kCopyLen = 16ull << 20;
+    const int data_device = device_count_ - 1;
+    void* busy = allocOnDevice(kBusyLen, data_device);
+    void* data = allocRegistered(kCopyLen, data_device, 0x11);
+    void* dst = allocRegistered(kCopyLen, 0, 0);
+
+    // Warm up first: creating the transport's stream pool synchronizes the
+    // device, which would hide the race.
+    auto warmup = engine_->allocateBatchID(1);
+    ASSERT_TRUE(engine_
+                    ->submitTransfer(warmup, {request(TransferRequest::READ,
+                                                      dst, data, kCopyLen)})
+                    .ok());
+    EXPECT_EQ(wait(warmup, 0), TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(engine_->freeBatchID(warmup).ok());
+
+    ASSERT_EQ(cudaSetDevice(data_device), cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(busy, 0, kBusyLen, nullptr), cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(data, 0x22, kCopyLen, nullptr), cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto batch_id = engine_->allocateBatchID(1);
+    ASSERT_TRUE(engine_
+                    ->submitTransfer(batch_id, {request(TransferRequest::READ,
+                                                        dst, data, kCopyLen)})
+                    .ok());
+    EXPECT_EQ(wait(batch_id, 0), TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(engine_->freeBatchID(batch_id).ok());
+    EXPECT_TRUE(allEqual(dst, kCopyLen, 0x22));
+    (void)cudaFree(busy);
+}
+
 // An unresolvable target fails the whole submission before anything is
 // enqueued, and every task still reaches FAILED so the batch can be freed.
 // A second engine opens this one as a remote segment so the address is
