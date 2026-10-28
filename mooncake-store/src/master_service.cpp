@@ -267,8 +267,9 @@ struct MasterService::MemoryEviction {
                 while (std::chrono::steady_clock::now() < deadline) {
                     std::this_thread::sleep_for(kWaitStep);
                     reservation = service_.ReserveBatchOpLogSlot();
-                    if (reservation || reservation.error() !=
-                                       ErrorCode::TASK_PENDING_LIMIT_EXCEEDED) {
+                    if (reservation ||
+                        reservation.error() !=
+                            ErrorCode::TASK_PENDING_LIMIT_EXCEEDED) {
                         break;
                     }
                 }
