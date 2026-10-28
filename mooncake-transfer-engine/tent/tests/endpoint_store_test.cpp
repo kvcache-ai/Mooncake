@@ -14,8 +14,10 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "tent/transport/rdma/context.h"
@@ -187,16 +189,21 @@ TEST_P(EndpointStoreTest, ClearDeconstructsExternallyOwnedWaitingEndpoint) {
 // lifetime of the process. Idle eviction is what gives them back, and it must
 // leave an endpoint that is still carrying traffic alone.
 TEST_P(EndpointStoreTest, EvictIdleRetiresUnusedEndpointsAndKeepsFreshOnes) {
-    constexpr uint64_t kOneHourNs = 3600ull * 1000000000ull;
+    // Stamp both endpoints explicitly instead of relying on a zero
+    // last-used time: the steady clock counts from boot, so on a freshly
+    // started machine "never used" is not yet older than any long window.
+    constexpr uint64_t kIdleWindowNs = 1000ull * 1000000ull;  // 1s
     auto store = makeStore();
     auto departed = std::make_shared<RdmaEndPoint>();
     auto active = std::make_shared<RdmaEndPoint>();
     insertActive(*store, "10.0.0.1:12345@mlx5_0", departed);
     insertActive(*store, "10.0.0.2:12345@mlx5_0", active);
+    departed->noteUsed();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
     active->noteUsed();
     ASSERT_EQ(store->size(), 2);
 
-    EXPECT_EQ(store->evictIdle(kOneHourNs), 1);
+    EXPECT_EQ(store->evictIdle(kIdleWindowNs), 1);
     EXPECT_EQ(store->size(), 1);
     EXPECT_EQ(store->get("10.0.0.2:12345@mlx5_0"), active);
     EXPECT_EQ(store->get("10.0.0.1:12345@mlx5_0"), nullptr);
@@ -209,7 +216,7 @@ TEST_P(EndpointStoreTest, EvictIdleRetiresUnusedEndpointsAndKeepsFreshOnes) {
     EXPECT_EQ(departed->status(), RdmaEndPoint::EP_DESTROYED);
 
     // A second sweep inside the window must not touch the survivor.
-    EXPECT_EQ(store->evictIdle(kOneHourNs), 0);
+    EXPECT_EQ(store->evictIdle(kIdleWindowNs), 0);
     EXPECT_EQ(store->size(), 1);
 }
 
