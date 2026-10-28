@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <future>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -664,54 +665,59 @@ TEST_F(TransferTaskTest, RemoteTransferWaitCompletesCorrectly) {
     EXPECT_EQ(server.unregisterLocalMemory(remote.data()), 0);
 }
 
-// Test TransferStrategy enum and stream operator
 TEST_F(TransferTaskTest, TimedOutTransferDrainsBeforeReturning) {
     ScopedEnvVar tent_config("MC_TENT_CONF", nullptr);
-    constexpr size_t kSize = 64 * 1024 * 1024;
-    std::vector<char> local(kSize, 0), remote(kSize, 'A');
-    TransferEngine client(false), server(false);
-    ASSERT_EQ(client.init("P2PHANDSHAKE", "127.0.0.1:0", "", 0, "tcp"), 0);
-    ASSERT_EQ(server.init("P2PHANDSHAKE", "127.0.0.1:0", "", 0, "tcp"), 0);
-    if (client.isUsingTent()) GTEST_SKIP() << "Requires the classic engine";
-    ASSERT_NE(client.installTransport("tcp", nullptr), nullptr);
-    ASSERT_NE(server.installTransport("tcp", nullptr), nullptr);
-    ASSERT_EQ(client.registerLocalMemory(local.data(), local.size(), "cpu:0"),
-              0);
-    ASSERT_EQ(server.registerLocalMemory(remote.data(), remote.size(), "cpu:0"),
-              0);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "127.0.0.1:0", "", 0, "tcp"), 0);
+    if (engine.isUsingTent()) GTEST_SKIP() << "Requires the classic engine";
 
-    auto segment = client.openSegment(server.getLocalIpAndPort());
-    BatchID batch_id = client.allocateBatchID(1);
+    // One task with a single outstanding slice. It stays in flight until the
+    // test completes the slice, so the deadline is always crossed mid-transfer
+    // instead of racing a real transfer against the timeout.
+    BatchID batch_id = engine.allocateBatchID(1);
     ASSERT_NE(batch_id, INVALID_BATCH_ID);
-    TransferRequest request;
-    request.opcode = TransferRequest::READ;
-    request.source = local.data();
-    request.target_id = segment;
-    request.target_offset = reinterpret_cast<uint64_t>(remote.data());
-    request.length = kSize;
-    ASSERT_TRUE(client.submitTransfer(batch_id, {request}).ok());
+    auto& batch_desc = Transport::toBatchDesc(batch_id);
+    batch_desc.task_list.resize(1);
+    auto& task = batch_desc.task_list[0];
+    task.batch_id = batch_id;
+    task.slice_count = 1;
 
+    constexpr int64_t kTimeoutMilliseconds = 20;
+    auto state = std::make_shared<TransferEngineOperationState>(
+        engine, batch_id, 1, kTimeoutMilliseconds);
+    TransferFuture future(state);
+    ASSERT_FALSE(future.isReady());
+
+    std::promise<ErrorCode> waited;
+    auto result = waited.get_future();
+    std::thread waiter([&] { waited.set_value(future.wait()); });
+
+    // Far past the deadline the wait must still be blocked on the in-flight
+    // task rather than returning and letting the caller reuse its buffers.
+    EXPECT_EQ(
+        result.wait_for(std::chrono::milliseconds(25 * kTimeoutMilliseconds)),
+        std::future_status::timeout);
+
+    // Release the transfer.
+    __atomic_store_n(&task.success_slice_count, 1, __ATOMIC_RELEASE);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
     {
-        // A zero timeout expires while the READ is still in flight. The wait
-        // must not return until the READ has stopped writing into `local`.
-        auto state = std::make_shared<TransferEngineOperationState>(
-            client, batch_id, 1, /*timeout_milliseconds=*/0);
-        TransferFuture future(state);
-        const bool ready_before_wait = future.isReady();
-        const ErrorCode result = future.wait();
-        if (!ready_before_wait) {
-            EXPECT_EQ(result, ErrorCode::TRANSFER_FAIL);
-        }
-
-        TransferStatus status;
-        ASSERT_TRUE(client.getTransferStatus(batch_id, 0, status).ok());
-        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
-        EXPECT_EQ(local, remote);
+        std::lock_guard<std::mutex> lock(batch_desc.completion_mutex);
+        batch_desc.is_finished.store(true, std::memory_order_release);
     }
-    EXPECT_EQ(client.unregisterLocalMemory(local.data()), 0);
-    EXPECT_EQ(server.unregisterLocalMemory(remote.data()), 0);
+    batch_desc.completion_cv.notify_all();
+#endif
+    waiter.join();
+
+    // The task itself succeeded, so TRANSFER_FAIL can only come from the
+    // deadline having been crossed while it was in flight.
+    EXPECT_EQ(result.get(), ErrorCode::TRANSFER_FAIL);
+    TransferStatus status;
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
 }
 
+// Test TransferStrategy enum and stream operator
 TEST_F(TransferTaskTest, TransferStrategyEnum) {
     // Test enum values
     EXPECT_EQ(static_cast<int>(TransferStrategy::LOCAL_MEMCPY), 0);
