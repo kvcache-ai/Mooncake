@@ -137,7 +137,8 @@ class Namespace final : private route::RouteObserver {
         }
         reservations.resize(hooks_.size());
         for (size_t i = 0; i < hooks_.size(); ++i) {
-            auto begun = hooks_[i]->OnWriteBegin(guard, change, reservations[i]);
+            auto begun =
+                hooks_[i]->OnWriteBegin(guard, change, reservations[i]);
             if (!begun) {
                 reservations.clear();
                 return tl::make_unexpected(begun.error());

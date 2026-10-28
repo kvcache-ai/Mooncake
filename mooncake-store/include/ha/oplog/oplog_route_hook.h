@@ -38,7 +38,8 @@ class OpLogRouteHook : public metadata::WriteHook {
     // without a lookup under the key's lock.
     OpLogRouteHook(const TenantId& tenant_id, OrderedOpLogWriter* writer,
                    Serializer serializer)
-        : tenant_id_(tenant_id.value()), writer_(writer),
+        : tenant_id_(tenant_id.value()),
+          writer_(writer),
           serializer_(std::move(serializer)) {}
 
     // Validates what the record will name and holds a slot for it, before the
@@ -59,8 +60,8 @@ class OpLogRouteHook : public metadata::WriteHook {
         if (!reserved) {
             return tl::make_unexpected(reserved.error());
         }
-        reservation = std::make_unique<Reservation>(writer_,
-                                                    std::move(*reserved));
+        reservation =
+            std::make_unique<Reservation>(writer_, std::move(*reserved));
         return {};
     }
 
@@ -90,12 +91,10 @@ class OpLogRouteHook : public metadata::WriteHook {
         entry.tenant_id = tenant_id_;
         entry.object_key = guard.key();
         entry.payload = std::move(payload).value_or(std::string{});
-        auto committed =
-            writer_->Commit(std::move(held->reservation_), std::move(entry),
-                            nullptr);
+        auto committed = writer_->Commit(std::move(held->reservation_),
+                                         std::move(entry), nullptr);
         if (!committed) {
-            LOG(WARNING) << "OpLog hook: commit failed for key="
-                         << guard.key()
+            LOG(WARNING) << "OpLog hook: commit failed for key=" << guard.key()
                          << ", err=" << static_cast<int>(committed.error());
         }
     }

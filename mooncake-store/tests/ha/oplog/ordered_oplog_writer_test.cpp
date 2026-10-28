@@ -1853,7 +1853,6 @@ TEST(OrderedOpLogWriterAdmissionTest, CommitBatchRejectsSlotMismatch) {
     writer.Abort(std::move(*next));
 }
 
-
 // Reserving for a known entry is what lets a caller check a record before it
 // changes anything: everything Commit would refuse about the entry itself is
 // refused here, so a commit that follows can only fail for a writer that
@@ -1895,7 +1894,8 @@ TEST(OrderedOpLogWriterReserveForTest, TheSizeLimitsAreInclusive) {
     FakeBatchWriter storage;
     auto writer = MakeReserveForWriter(storage);
 
-    auto largest_key = writer->ReserveFor(MakeEntry(KeyOfSize(kMaxOpLogObjectKeySize)));
+    auto largest_key =
+        writer->ReserveFor(MakeEntry(KeyOfSize(kMaxOpLogObjectKeySize)));
     ASSERT_TRUE(largest_key.has_value());
     writer->Abort(std::move(*largest_key));
 
