@@ -918,6 +918,36 @@ TEST_F(ClientIntegrationTest, TaggedBatchWritesSkipChecksumFailures) {
     client_buffer_allocator_->deallocate(buffer, 4);
 }
 
+TEST_F(ClientIntegrationTest, AffinityOnlyBatchWritesSkipChecksumFailures) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+    void* buffer = client_buffer_allocator_->allocate(4);
+    ASSERT_NE(buffer, nullptr);
+    std::memcpy(buffer, "data", 4);
+    for (bool upsert : {false, true}) {
+        const std::vector<ObjectKey> keys = {
+            "affinity-invalid-slice",
+            upsert ? "affinity-filtered-upsert" : "affinity-filtered-put"};
+        std::vector<std::vector<Slice>> slices{{Slice{nullptr, 1}},
+                                               {Slice{buffer, 4}}};
+        ReplicateConfig config;
+        config.residency_affinity_ids =
+            std::vector<std::string>{"invalid-affinity", "valid-affinity"};
+        auto results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                              : test_client_->BatchPut(keys, slices, config);
+        ASSERT_EQ(results.size(), 2);
+        ASSERT_FALSE(results[0]);
+        EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_TRUE(results[1]) << (upsert ? "BatchUpsert" : "BatchPut");
+        if (!results[1]) continue;
+        auto query = test_client_->Query(keys[1]);
+        ASSERT_TRUE(query);
+        EXPECT_EQ(query->object_checksum, ComputeCrcChecksum("data", 4));
+    }
+    client_buffer_allocator_->deallocate(buffer, 4);
+}
+
 // Test Remove operation
 TEST_F(ClientIntegrationTest, RemoveOperation) {
     const std::string test_data = "Test data for removal";
