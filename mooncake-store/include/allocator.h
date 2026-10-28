@@ -176,10 +176,9 @@ class AllocatedBuffer {
     struct ProtocolState {
         // Never kTcp: plain TCP is the null pointer.
         BufferProtocol kind;
-        // The client segment name a CXL buffer transfers from.
-        std::string cxl_segment_name;
-        // The original protocol of a descriptor this build does not know.
-        std::string text;
+        // kCxl: the client segment name the buffer transfers from.
+        // kOther: the protocol of a descriptor this build does not know.
+        std::string value;
     };
 
     bool copyTransferProtocolFrom(const AllocatedBuffer& source);
