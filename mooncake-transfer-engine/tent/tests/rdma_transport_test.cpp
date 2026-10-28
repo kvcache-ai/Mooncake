@@ -253,6 +253,14 @@ class RdmaTransportTestPeer {
     static WorkerContext& workerContext(Workers& workers, size_t i) {
         return workers.worker_context_[i];
     }
+
+    static const Topology* railLocalTopology(Workers& workers,
+                                             const std::string& machine_id) {
+        auto it = workers.worker_context_[0].rails.find(machine_id);
+        return it == workers.worker_context_[0].rails.end()
+                   ? nullptr
+                   : it->second->local();
+    }
     static void retireSweptSlice(Workers& workers, WorkerContext& self,
                                  RdmaSlice* slice, uint64_t now_ns,
                                  bool bytes_moved = false) {
@@ -673,6 +681,81 @@ TEST_F(RdmaSliceMetadataLifetimeTest,
     EXPECT_TRUE(gdr.localReachable(expected_nic_name, source_gpu));
     EXPECT_TRUE(gdr.remoteReachable(expected_machine_id, expected_nic_name,
                                     target_gpu));
+}
+
+TEST_F(RdmaSliceMetadataLifetimeTest,
+       RefreshesRailMappingAfterLocalTopologySnapshotUpdate) {
+    batch_->device_mask = 1ULL << 1;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    auto* first = static_cast<RdmaSubBatch*>(batch_)->slice_chain[0];
+    ASSERT_NE(first, nullptr);
+    ASSERT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, first).ok());
+
+    SegmentDescRef remote;
+    ASSERT_TRUE(metadata_->segmentManager()
+                    .getRemoteCached(remote, request_.target_id)
+                    .ok());
+    const auto machine_id = remote->machine_id;
+    const auto* old_local =
+        RdmaTransportTestPeer::railLocalTopology(*workers_, machine_id);
+    ASSERT_NE(old_local, nullptr);
+
+    ASSERT_TRUE(
+        metadata_->segmentManager()
+            .updateLocal([](SegmentDesc& segment) {
+                auto& topology =
+                    std::get<MemorySegmentDesc>(segment.detail).topology;
+                topology.nic_list_[0].numa_node = 1;
+                return Status::OK();
+            })
+            .ok());
+
+    RdmaTask task;
+    task.request = request_;
+    RdmaSlice second;
+    second.task = &task;
+    second.source_addr = request_.source;
+    second.target_addr = request_.target_offset;
+    second.length = request_.length;
+    ASSERT_TRUE(
+        RdmaTransportTestPeer::generatePostPath(*workers_, &second).ok());
+
+    const auto current_local =
+        &std::get<MemorySegmentDesc>(
+             metadata_->segmentManager().getLocal()->detail)
+             .topology;
+    EXPECT_NE(RdmaTransportTestPeer::railLocalTopology(*workers_, machine_id),
+              old_local);
+    EXPECT_EQ(RdmaTransportTestPeer::railLocalTopology(*workers_, machine_id),
+              current_local);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, &second, 0, 0);
+
+    ASSERT_TRUE(
+        metadata_->segmentManager()
+            .updateLocal([](SegmentDesc& segment) {
+                auto& topology =
+                    std::get<MemorySegmentDesc>(segment.detail).topology;
+                topology.nic_list_[0].numa_node = 0;
+                return Status::OK();
+            })
+            .ok());
+    const auto fallback_local =
+        &std::get<MemorySegmentDesc>(
+             metadata_->segmentManager().getLocal()->detail)
+             .topology;
+    ASSERT_NE(fallback_local, current_local);
+
+    RdmaSlice fallback;
+    fallback.task = &task;
+    fallback.source_addr = request_.source;
+    fallback.target_addr = request_.target_offset;
+    fallback.length = request_.length;
+    fallback.retry_count = 1;
+    ASSERT_TRUE(
+        RdmaTransportTestPeer::generatePostPath(*workers_, &fallback).ok());
+    EXPECT_EQ(RdmaTransportTestPeer::railLocalTopology(*workers_, machine_id),
+              fallback_local);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, &fallback, 0, 0);
 }
 
 bool waitBatchDone(TransferEngine& engine, BatchID batch) {
