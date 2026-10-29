@@ -2531,19 +2531,23 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                 },
                 [&job, &unfinished_affiliated_replica](
                     const ObjectMetadata& metadata) {
-                    // An object this pass is about to drop has no replica
-                    // left to wait for: the sweep either erases it or
-                    // enqueues its REMOVE below, so its PROCESSING replica
-                    // can never surface again. Waiting on it would only
-                    // cost a retry.
-                    if (unfinished_affiliated_replica || !metadata.IsValid()) {
+                    if (unfinished_affiliated_replica) {
                         return;
                     }
                     const auto is_unfinished = [&job](const Replica& replica) {
                         return replica.is_processing() &&
                                replica.isAffiliatedWith(job.liveness);
                     };
-                    if (metadata.HasReplica(is_unfinished)) {
+                    if (!metadata.HasReplica(is_unfinished)) {
+                        return;
+                    }
+                    // An object this pass drops has no replica left to wait
+                    // for: the sweep either erases it or enqueues its REMOVE
+                    // below, so its PROCESSING replica can never surface
+                    // again. Waiting on it would only cost a retry. Ask only
+                    // where the answer matters: a replica scan per object is
+                    // the whole cost of this pass.
+                    if (metadata.IsValid()) {
                         unfinished_affiliated_replica = true;
                     }
                 });
