@@ -8,6 +8,7 @@ import sys
 import threading
 import unittest
 from collections.abc import Callable
+from unittest.mock import patch
 
 from mooncake.engine import TransferEngine
 
@@ -55,6 +56,7 @@ class _OneShotWorker:
 
 
 class TestTransferEngineGil(unittest.TestCase):
+    @patch.dict("os.environ", MC_FORCE_TCP="1")
     def test_single_memory_registration_releases_gil(self) -> None:
         max_calls = 2048
         region_size = 4096
