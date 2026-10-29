@@ -79,6 +79,8 @@ struct XferBenchConfig {
     static int start_num_threads;
     static size_t target_offset;
     static size_t target_range_size;
+    static std::string target_access;
+    static size_t target_window_size;
     static std::string qos_classes;
     static std::string qos_classes_json;
     static std::string workload_classes_json;
