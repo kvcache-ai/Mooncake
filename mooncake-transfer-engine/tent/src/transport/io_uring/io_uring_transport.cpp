@@ -244,11 +244,46 @@ Status IOUringTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     return Status::OK();
 }
 
+// Reaps the completions of `outstanding` requests before the ring is
+// destroyed: io_uring_queue_exit() does not wait for in-flight I/O. SQEs
+// still in the SQ ring were never submitted and never run, so they are not
+// waited for. Returns 0, or the negative errno of a failed wait, with
+// requests possibly still in flight.
+static int waitForInFlight(struct io_uring* ring, size_t outstanding) {
+    const size_t unsubmitted = io_uring_sq_ready(ring);
+    size_t in_flight =
+        outstanding > unsubmitted ? outstanding - unsubmitted : 0;
+    while (in_flight) {
+        struct io_uring_cqe* cqe = nullptr;
+        int rc = io_uring_wait_cqe(ring, &cqe);
+        if (rc == -EINTR) continue;
+        if (rc < 0) return rc;
+        io_uring_cqe_seen(ring, cqe);
+        --in_flight;
+    }
+    return 0;
+}
+
 Status IOUringTransport::freeSubBatch(SubBatchRef& batch) {
     auto io_uring_batch = dynamic_cast<IOUringSubBatch*>(batch);
     if (!io_uring_batch)
         return Status::InvalidArgument("Invalid IO Uring sub-batch" LOC_MARK);
-    io_uring_queue_exit(&io_uring_batch->ring);
+    auto& ring = io_uring_batch->ring;
+    // io_uring_queue_exit() does not wait for in-flight I/O, which would
+    // then land in staging buffers freed below: reap it first.
+    size_t outstanding = 0;
+    for (auto& task : io_uring_batch->task_list)
+        if (task.status_word == TransferStatusEnum::PENDING) ++outstanding;
+    if (int rc = waitForInFlight(&ring, outstanding); rc < 0) {
+        // The kernel may still write into the staging buffers: leak the
+        // sub-batch with its ring and buffers rather than free them.
+        LOG(ERROR) << "IOUringTransport: io_uring_wait_cqe failed: "
+                   << strerror(-rc) << "; leaking the sub-batch";
+        batch = nullptr;
+        return Status::InternalError(
+            "Leaked an io_uring sub-batch with I/O in flight" LOC_MARK);
+    }
+    io_uring_queue_exit(&ring);
     Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
     batch = nullptr;
     return Status::OK();

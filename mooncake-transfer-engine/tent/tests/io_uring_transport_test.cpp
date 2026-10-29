@@ -15,20 +15,26 @@
 #include <gtest/gtest.h>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
 #include "tent/common/config.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/runtime/slab.h"
 #include "tent/transport/io_uring/io_uring_transport.h"
 
 namespace mooncake {
@@ -814,6 +820,129 @@ TEST(IOUringPinnedStagingTest, RejectedSubmissionAndFreeSubBatchReturnSlots) {
     EXPECT_EQ(pool->freeSlots(), 0u);
     ASSERT_TRUE(transport.freeSubBatch(batch).ok());
     EXPECT_EQ(pool->freeSlots(), 1u);
+}
+
+// Freeing a sub-batch whose read is still in flight waits for the read:
+// the kernel would otherwise complete it into the freed staging buffer. A
+// FIFO keeps the read in flight until the test writes to it.
+TEST(IOUringTransportTest, FreeSubBatchWaitsForInFlightIo) {
+    char dir_template[] = "/tmp/io_uring_fifo_XXXXXX";
+    ASSERT_NE(mkdtemp(dir_template), nullptr);
+    const std::string path = std::string(dir_template) + "/fifo";
+    ASSERT_EQ(mkfifo(path.c_str(), 0600), 0);
+    int writer = open(path.c_str(), O_RDWR | O_NONBLOCK);
+    ASSERT_GE(writer, 0);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalFileSegment(*metadata, path, kPageSize).ok());
+    IOUringTransport transport;
+    auto installed = installTransport(transport, metadata);
+    if (!installed.ok()) {
+        close(writer);
+        unlink(path.c_str());
+        rmdir(dir_template);
+        GTEST_SKIP() << installed.message();
+    }
+
+    void* allocation = nullptr;
+    ASSERT_EQ(posix_memalign(&allocation, kPageSize, 2 * kPageSize), 0);
+    std::unique_ptr<void, decltype(&free)> memory(allocation, free);
+    Request read{};
+    read.opcode = Request::READ;
+    read.source = static_cast<uint8_t*>(allocation) + 1;  // staged
+    read.target_id = LOCAL_SEGMENT_ID;
+    read.length = kPageSize;
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {read}).ok());
+
+    // Free on a worker: it must stay blocked while the FIFO is unfed, and
+    // finish once the read is fed. Feed and join on every path, so that a
+    // failed check cannot leave the worker blocked.
+    std::atomic<bool> done{false};
+    Status freed;
+    std::thread worker([&] {
+        freed = transport.freeSubBatch(batch);
+        done = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_FALSE(done.load()) << "freeSubBatch() returned with I/O in flight";
+    std::vector<uint8_t> data(kPageSize, 0x5A);
+    EXPECT_EQ(write(writer, data.data(), data.size()), (ssize_t)kPageSize);
+    worker.join();
+    EXPECT_TRUE(freed.ok()) << freed.ToString();
+    close(writer);
+    unlink(path.c_str());
+    rmdir(dir_template);
+}
+
+// If that wait fails, freeSubBatch() leaks the sub-batch rather than free
+// staging memory the kernel may still write into. Replacing the ring fd with
+// a non-io_uring file makes io_uring_wait_cqe() fail, while the ring itself
+// stays alive through its mappings.
+TEST(IOUringPinnedStagingTest, FreeSubBatchLeaksWhenWaitFails) {
+    char dir_template[] = "/tmp/io_uring_fifo_XXXXXX";
+    ASSERT_NE(mkdtemp(dir_template), nullptr);
+    const std::string path = std::string(dir_template) + "/fifo";
+    ASSERT_EQ(mkfifo(path.c_str(), 0600), 0);
+    int writer = open(path.c_str(), O_RDWR | O_NONBLOCK);
+    ASSERT_GE(writer, 0);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalFileSegment(*metadata, path, kPageSize).ok());
+    PinnedStagingIOUringTransport transport;
+    auto installed = installPinnedStaging(transport, metadata, 4, 1);
+    if (!installed.ok()) {
+        close(writer);
+        unlink(path.c_str());
+        rmdir(dir_template);
+        GTEST_SKIP() << installed.message();
+    }
+    auto* pool = transport.stagingPool();
+    ASSERT_NE(pool, nullptr);
+
+    void* allocation = nullptr;
+    ASSERT_EQ(posix_memalign(&allocation, kPageSize, 2 * kPageSize), 0);
+    std::unique_ptr<void, decltype(&free)> memory(allocation, free);
+    Request read{};
+    read.opcode = Request::READ;
+    read.source = static_cast<uint8_t*>(allocation) + 1;  // staged
+    read.target_id = LOCAL_SEGMENT_ID;
+    read.length = kPageSize;
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {read}).ok());
+    EXPECT_EQ(pool->freeSlots(), 0u);
+
+    auto* leaked = static_cast<IOUringSubBatch*>(batch);
+    const int ring_fd = leaked->ring.ring_fd;
+    int null_fd = open("/dev/null", O_RDONLY);
+    ASSERT_GE(null_fd, 0);
+    ASSERT_EQ(dup2(null_fd, ring_fd), ring_fd);
+    close(null_fd);
+    EXPECT_FALSE(transport.freeSubBatch(batch).ok());
+    EXPECT_EQ(batch, nullptr);
+    // The slot stays out of the pool: the read may still land in it.
+    EXPECT_EQ(pool->freeSlots(), 0u);
+
+    // The read completes into the leaked slot. Its CQE is in the mapped CQ
+    // ring, which io_uring_peek_cqe() reads without entering the kernel.
+    std::vector<uint8_t> data(kPageSize, 0x5A);
+    EXPECT_EQ(write(writer, data.data(), data.size()), (ssize_t)kPageSize);
+    struct io_uring_cqe* cqe = nullptr;
+    for (int i = 0; i < 500 && io_uring_peek_cqe(&leaked->ring, &cqe); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ASSERT_NE(cqe, nullptr);
+    EXPECT_EQ(cqe->res, (int)kPageSize);
+    const auto* slot = static_cast<const uint8_t*>(leaked->task_list[0].buffer);
+    EXPECT_TRUE(std::equal(data.begin(), data.end(), slot));
+
+    // Reclaim what freeSubBatch() leaked, as it would have done.
+    io_uring_cqe_seen(&leaked->ring, cqe);
+    io_uring_queue_exit(&leaked->ring);
+    Slab<IOUringSubBatch>::Get().deallocate(leaked);
+    EXPECT_EQ(pool->freeSlots(), 1u);
+    close(writer);
+    unlink(path.c_str());
+    rmdir(dir_template);
 }
 
 }  // namespace
