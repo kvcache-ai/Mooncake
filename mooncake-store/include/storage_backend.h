@@ -945,6 +945,17 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<iovec>& iovs,
         std::vector<StorageObjectMetadata>& metadatas);
 
+    // BuildBucket for bucket_backend_config_.aligned_direct_write: every
+    // iovec starts and ends on a 4 KiB boundary of the file. The copied
+    // bytes live in a per-thread buffer that stays valid until the next
+    // call on the same thread.
+    tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode>
+    BuildAlignedDirectBucket(
+        int64_t bucket_id,
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::vector<iovec>& iovs,
+        std::vector<StorageObjectMetadata>& metadatas);
+
     tl::expected<void, ErrorCode> WriteBucket(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
         std::vector<iovec>& iovs);
@@ -962,8 +973,11 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<std::string, ErrorCode> GetBucketDataPath(int64_t bucket_id);
 
+    // direct_write (Write only): an aligned direct bucket data file, opened
+    // for O_DIRECT where the file system allows it.
     tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
-        const std::string& path, FileMode mode) const;
+        const std::string& path, FileMode mode,
+        bool direct_write = false) const;
 
     tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
@@ -1100,8 +1114,23 @@ class BucketStorageBackend : public StorageBackendInterface {
         test_datasync_failure_.store(enabled, std::memory_order_relaxed);
     }
 
+    // Test-only: bytes the last aligned direct bucket copied (key blocks,
+    // partial value blocks, unaligned values).
+    size_t GetLastAlignedCopyBytesForTest() const {
+        return last_aligned_copy_bytes_.load(std::memory_order_relaxed);
+    }
+
+    // Test-only: open aligned direct bucket files as on a file system that
+    // refuses O_DIRECT.
+    void SetDirectIOUnavailableForTest(bool unavailable) {
+        test_direct_io_unavailable_.store(unavailable,
+                                          std::memory_order_relaxed);
+    }
+
    private:
     std::atomic<bool> test_datasync_failure_{false};
+    std::atomic<size_t> last_aligned_copy_bytes_{0};
+    std::atomic<bool> test_direct_io_unavailable_{false};
     // Alignment helper functions for O_DIRECT I/O
     static constexpr size_t kDirectIOAlignment = 4096;
 

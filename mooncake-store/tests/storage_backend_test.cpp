@@ -5484,4 +5484,366 @@ TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
     EXPECT_FALSE(exists.value());
 }
 
+namespace {
+
+using AlignedTestBuffer = std::unique_ptr<char, decltype(&std::free)>;
+
+AlignedTestBuffer AllocateAligned(size_t size) {
+    void* buf = nullptr;
+    if (posix_memalign(&buf, 4096, std::max<size_t>(size, 1)) != 0) {
+        return AlignedTestBuffer(nullptr, &std::free);
+    }
+    return AlignedTestBuffer(static_cast<char*>(buf), &std::free);
+}
+
+// One object of an aligned direct write test: its key, its value bytes, and
+// the slices that hand those bytes to BatchOffload from buffers placed at
+// chosen offsets from a 4 KiB boundary.
+struct AlignedTestObject {
+    std::string key;
+    std::string value;
+    std::vector<AlignedTestBuffer> buffers;
+    std::vector<Slice> slices;
+};
+
+// pieces: (byte offset from a 4 KiB boundary, length) for each slice.
+AlignedTestObject MakeAlignedTestObject(
+    const std::string& key,
+    const std::vector<std::pair<size_t, size_t>>& pieces, int seed) {
+    AlignedTestObject object{key, {}, {}, {}};
+    for (const auto& [offset, length] : pieces) {
+        object.buffers.push_back(AllocateAligned(offset + length));
+        char* p = object.buffers.back().get() + offset;
+        for (size_t i = 0; i < length; ++i) {
+            p[i] = static_cast<char>((seed * 131 + object.value.size() + i) &
+                                     0xff);
+        }
+        object.value.append(p, length);
+        object.slices.push_back(Slice{p, length});
+    }
+    return object;
+}
+
+std::unordered_map<std::string, std::vector<Slice>> BatchOf(
+    const std::vector<AlignedTestObject>& objects) {
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    for (const auto& object : objects) batch.emplace(object.key, object.slices);
+    return batch;
+}
+
+ErrorCode AcceptAll(const std::vector<std::string>&,
+                    std::vector<StorageObjectMetadata>&) {
+    return ErrorCode::OK;
+}
+
+std::string ReadWholeFile(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), {});
+}
+
+fs::path OnlyBucketFile(const std::string& dir) {
+    fs::path found;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (entry.path().extension() == ".bucket") {
+            EXPECT_TRUE(found.empty()) << "more than one bucket file";
+            found = entry.path();
+        }
+    }
+    return found;
+}
+
+size_t AlignUp4K(size_t n) { return (n + 4095) & ~size_t{4095}; }
+
+// The bucket file must hold, for each object, zeros and the key ending on a
+// 4 KiB boundary, then the value padded with zeros to a 4 KiB boundary, at
+// the offsets the metadata reports, and nothing else.
+void ExpectAlignedLayout(BucketStorageBackend& backend,
+                         const std::vector<AlignedTestObject>& objects,
+                         const std::string& dir) {
+    std::vector<std::string> keys;
+    size_t expected_size = 0;
+    for (const auto& object : objects) {
+        keys.push_back(object.key);
+        expected_size +=
+            AlignUp4K(object.key.size()) + AlignUp4K(object.value.size());
+    }
+    std::unordered_map<std::string, StorageObjectMetadata> metadata;
+    ASSERT_TRUE(backend.BatchQuery(keys, metadata).has_value());
+
+    const fs::path bucket_path = OnlyBucketFile(dir);
+    ASSERT_FALSE(bucket_path.empty());
+    const std::string file = ReadWholeFile(bucket_path);
+    ASSERT_EQ(file.size(), expected_size);
+
+    std::string expected(file.size(), '\0');
+    for (const auto& object : objects) {
+        SCOPED_TRACE(object.key.substr(0, 16));
+        const auto& m = metadata.at(object.key);
+        EXPECT_EQ(m.key_size, static_cast<int64_t>(object.key.size()));
+        EXPECT_EQ(m.data_size, static_cast<int64_t>(object.value.size()));
+        EXPECT_EQ((m.offset + m.key_size) % 4096, 0);
+        ASSERT_LE(static_cast<size_t>(m.offset + m.key_size + m.data_size),
+                  file.size());
+        expected.replace(m.offset, m.key_size, object.key);
+        expected.replace(m.offset + m.key_size, m.data_size, object.value);
+    }
+    EXPECT_TRUE(file == expected)
+        << "the bucket file differs from keys and values at their offsets "
+           "with zeros elsewhere";
+}
+
+void ExpectLoadsBack(BucketStorageBackend& backend,
+                     const std::vector<AlignedTestObject>& objects) {
+    std::vector<std::string> loaded(objects.size());
+    std::unordered_map<std::string, Slice> load_batch;
+    for (size_t i = 0; i < objects.size(); ++i) {
+        loaded[i].resize(objects[i].value.size());
+        load_batch.emplace(objects[i].key,
+                           Slice{loaded[i].data(), loaded[i].size()});
+    }
+    ASSERT_TRUE(backend.BatchLoad(load_batch).has_value());
+    for (size_t i = 0; i < objects.size(); ++i) {
+        EXPECT_TRUE(loaded[i] == objects[i].value)
+            << objects[i].key.substr(0, 16);
+    }
+}
+
+// Aligned values, a partial last block, an unaligned buffer, several slices,
+// a short middle slice and a key longer than a block.
+std::vector<AlignedTestObject> MixedAlignedTestObjects() {
+    std::vector<AlignedTestObject> objects;
+    objects.push_back(MakeAlignedTestObject("ad_aligned", {{0, 65536}}, 1));
+    objects.push_back(MakeAlignedTestObject("ad_tail", {{0, 65536 + 100}}, 2));
+    objects.push_back(
+        MakeAlignedTestObject("ad_unaligned", {{1, 8192 + 7}}, 3));
+    objects.push_back(MakeAlignedTestObject(
+        "ad_slices", {{0, 4096}, {0, 8192}, {0, 1000}}, 4));
+    objects.push_back(
+        MakeAlignedTestObject("ad_short_slice", {{0, 1000}, {0, 4096}}, 5));
+    objects.push_back(
+        MakeAlignedTestObject(std::string(5000, 'k'), {{0, 12288}}, 6));
+    return objects;
+}
+
+}  // namespace
+
+// The data file has the aligned layout, and only the key blocks, the partial
+// last blocks and the unaligned values were copied; aligned blocks went to
+// the file from the caller's buffers.
+TEST_F(StorageBackendTest, AlignedDirectWriteAlignsEveryValue) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.aligned_direct_write = true;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+
+    const auto objects = MixedAlignedTestObjects();
+    auto offload_result =
+        storage_backend.BatchOffload(BatchOf(objects), AcceptAll);
+    ASSERT_TRUE(offload_result.has_value()) << offload_result.error();
+
+    // Copied: ad_aligned key block (4096); ad_tail key block and tail block
+    // (8192); ad_unaligned key block and its whole value (4096 + 12288);
+    // ad_slices key block and the block of its 1000-byte last slice (8192);
+    // ad_short_slice key block and its whole value, since its 1000-byte
+    // first slice is not a block multiple (4096 + 8192); the 5000-byte key
+    // (8192).
+    EXPECT_EQ(storage_backend.GetLastAlignedCopyBytesForTest(), 57344u);
+    ExpectAlignedLayout(storage_backend, objects, data_path);
+    ExpectLoadsBack(storage_backend, objects);
+}
+
+// Where O_DIRECT is unavailable, the same layout goes through the page cache.
+TEST_F(StorageBackendTest, AlignedDirectWriteFallsBackToPageCache) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.aligned_direct_write = true;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+    storage_backend.SetDirectIOUnavailableForTest(true);
+
+    const auto objects = MixedAlignedTestObjects();
+    auto offload_result =
+        storage_backend.BatchOffload(BatchOf(objects), AcceptAll);
+    ASSERT_TRUE(offload_result.has_value()) << offload_result.error();
+    ExpectAlignedLayout(storage_backend, objects, data_path);
+    ExpectLoadsBack(storage_backend, objects);
+}
+
+// A backend with the option off reads aligned direct buckets after a
+// restart, and the restart counts the same total size as the writer did
+// (logical sizes, not the padded file).
+TEST_F(StorageBackendTest, AlignedDirectBucketsSurviveRestartWithOptionOff) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    std::vector<AlignedTestObject> objects;
+    for (int i = 0; i < 8; ++i) {
+        const size_t offset = static_cast<size_t>(i % 2);
+        const size_t length = 4096 * static_cast<size_t>(i) + 333;
+        objects.push_back(MakeAlignedTestObject(
+            "ad_restart_" + std::to_string(i), {{offset, length}}, i));
+    }
+    int64_t total_size_after_write = 0;
+    {
+        BucketBackendConfig bucket_config;
+        bucket_config.aligned_direct_write = true;
+        BucketStorageBackend writer(config, bucket_config);
+        ASSERT_TRUE(writer.Init().has_value());
+        ASSERT_TRUE(writer.BatchOffload(BatchOf(objects), AcceptAll));
+        auto store_metadata = writer.GetStoreMetadata();
+        ASSERT_TRUE(store_metadata.has_value());
+        total_size_after_write = store_metadata->total_size;
+    }
+
+    BucketStorageBackend reader(config, BucketBackendConfig{});
+    ASSERT_TRUE(reader.Init().has_value());
+    auto store_metadata = reader.GetStoreMetadata();
+    ASSERT_TRUE(store_metadata.has_value());
+    EXPECT_EQ(store_metadata->total_keys, static_cast<int64_t>(objects.size()));
+    EXPECT_EQ(store_metadata->total_size, total_size_after_write);
+    ExpectLoadsBack(reader, objects);
+}
+
+// 600 objects of 4 KiB + 100 bytes need 1800 iovecs (key block, whole block,
+// tail block), more than one pwritev takes.
+TEST_F(StorageBackendTest, AlignedDirectWriteSplitsAtIovMax) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.aligned_direct_write = true;
+    bucket_config.bucket_keys_limit = 600;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+
+    std::vector<AlignedTestObject> objects;
+    for (int i = 0; i < 600; ++i) {
+        objects.push_back(MakeAlignedTestObject("ad_iov_" + std::to_string(i),
+                                                {{0, 4096 + 100}}, i));
+    }
+    auto offload_result =
+        storage_backend.BatchOffload(BatchOf(objects), AcceptAll);
+    ASSERT_TRUE(offload_result.has_value()) << offload_result.error();
+    ExpectLoadsBack(storage_backend, objects);
+}
+
+// The space an aligned direct bucket reserves includes its padding: with a
+// max_physical_bytes cap that the new bucket's logical size would fit under
+// but its padded file would not, the write must not push the directory over
+// the cap.
+TEST_F(StorageBackendTest, AlignedDirectReservationCountsPadding) {
+    const auto disk_bytes = [this] {
+        int64_t total = 0;
+        for (const auto& entry : fs::recursive_directory_iterator(data_path)) {
+            struct stat st{};
+            if (entry.is_regular_file() &&
+                ::stat(entry.path().c_str(), &st) == 0) {
+                total += static_cast<int64_t>(st.st_blocks) * 512;
+            }
+        }
+        return total;
+    };
+    // 600 x (4 KiB + 100 B): about 2.4 MiB of keys and values, 7 MiB of file.
+    const auto make_objects = [](const std::string& prefix) {
+        std::vector<AlignedTestObject> objects;
+        for (int i = 0; i < 600; ++i) {
+            objects.push_back(MakeAlignedTestObject(prefix + std::to_string(i),
+                                                    {{0, 4096 + 100}}, i));
+        }
+        return objects;
+    };
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.aligned_direct_write = true;
+    bucket_config.bucket_keys_limit = 600;
+    const auto first = make_objects("ad_res_a_");
+    {
+        BucketStorageBackend writer(config, bucket_config);
+        ASSERT_TRUE(writer.Init().has_value());
+        ASSERT_TRUE(writer.BatchOffload(BatchOf(first), AcceptAll));
+    }
+
+    const auto second = make_objects("ad_res_b_");
+    int64_t second_logical = 0;
+    for (const auto& object : second) {
+        second_logical +=
+            static_cast<int64_t>(object.key.size() + object.value.size());
+    }
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.disk_scan_cache_ms = 0;
+    bucket_config.max_physical_bytes =
+        disk_bytes() + second_logical + (1 << 20);
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+    // Evicting the first bucket does not make room either (the freed estimate
+    // is logical), so the write is rejected; either way the cap holds.
+    (void)storage_backend.BatchOffload(
+        BatchOf(second), AcceptAll,
+        [](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
+            return {};
+        });
+    EXPECT_LE(disk_bytes(), bucket_config.max_physical_bytes);
+}
+
+// A failed datasync removes the aligned direct bucket like a packed one.
+TEST_F(StorageBackendTest, AlignedDirectDatasyncFailureRemovesBucket) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.aligned_direct_write = true;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+    storage_backend.SetDatasyncFailureForTest(true);
+
+    const auto objects = MixedAlignedTestObjects();
+    auto offload_result =
+        storage_backend.BatchOffload(BatchOf(objects), AcceptAll);
+    ASSERT_FALSE(offload_result.has_value());
+    EXPECT_EQ(offload_result.error(), ErrorCode::FILE_WRITE_FAIL);
+    for (const auto& entry : fs::directory_iterator(data_path)) {
+        EXPECT_NE(entry.path().extension(), ".bucket") << entry.path();
+        EXPECT_NE(entry.path().extension(), ".meta") << entry.path();
+    }
+    for (const auto& object : objects) {
+        auto exists = storage_backend.IsExist(object.key);
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_FALSE(exists.value()) << object.key.substr(0, 16);
+    }
+}
+
+#ifdef USE_URING
+// The io_uring read path reads each value from its aligned offset with
+// O_DIRECT.
+TEST_F(StorageBackendTest, AlignedDirectBucketBatchLoadWithUring) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+    BucketBackendConfig bucket_config;
+    bucket_config.aligned_direct_write = true;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+
+    const auto objects = MixedAlignedTestObjects();
+    ASSERT_TRUE(storage_backend.BatchOffload(BatchOf(objects), AcceptAll));
+
+    std::vector<AlignedTestBuffer> read_buffers;
+    std::unordered_map<std::string, Slice> load_batch;
+    for (const auto& object : objects) {
+        read_buffers.push_back(AllocateAligned(object.value.size() + 8192));
+        load_batch.emplace(
+            object.key, Slice{read_buffers.back().get(), object.value.size()});
+    }
+    auto load_result = storage_backend.BatchLoad(load_batch);
+    ASSERT_TRUE(load_result.has_value()) << load_result.error();
+    for (const auto& object : objects) {
+        const auto& loaded = load_batch.at(object.key);
+        EXPECT_TRUE(std::string_view(static_cast<char*>(loaded.ptr),
+                                     loaded.size) == object.value)
+            << object.key.substr(0, 16);
+    }
+}
+#endif
+
 }  // namespace mooncake::test

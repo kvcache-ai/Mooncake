@@ -66,6 +66,14 @@ struct BucketBackendConfig {
     // carrying keys into a later cycle without their current offload tasks.
     bool flush_partial_buckets = false;
 
+    // Write bucket data files with O_DIRECT instead of through the page
+    // cache. Every value starts on a 4 KiB boundary of the file (zeros, then
+    // the key, in front of it), so the 4 KiB blocks of a value in 4 KiB
+    // aligned buffers go to the device from those buffers; only key blocks,
+    // each value's last partial block and unaligned values are copied.
+    // Files written this way stay readable when the option is off.
+    bool aligned_direct_write = false;
+
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();
