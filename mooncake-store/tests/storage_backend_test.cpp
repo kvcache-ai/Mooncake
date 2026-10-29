@@ -2768,6 +2768,57 @@ TEST_F(StorageBackendTest, BucketStorageBackend_BatchLoadWithMixedBuckets) {
     EXPECT_EQ(std::string(readB2.get(), valueB2.size()), valueB2);
 }
 
+TEST_F(StorageBackendTest, BucketStorageBackend_BatchLoadSpanReadsWindow) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    const std::string key = "layer_object";
+    std::string value(4096, '\0');
+    for (size_t i = 0; i < value.size(); ++i) {
+        value[i] = static_cast<char>(i & 0xff);
+    }
+    {
+        auto buf = std::make_unique<char[]>(value.size());
+        std::memcpy(buf.get(), value.data(), value.size());
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
+        auto stored = storage_backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(stored.has_value());
+    }
+
+    constexpr uint64_t kOffset = 1000;
+    constexpr size_t kLength = 144;
+    auto window = std::make_unique<char[]>(kLength);
+    std::memset(window.get(), 0x5a, kLength);
+    std::unordered_map<std::string, StorageValueSpan> spans;
+    spans.emplace(key, StorageValueSpan{kOffset, value.size(),
+                                        Slice{window.get(), kLength}});
+    ASSERT_TRUE(storage_backend.BatchLoadSpans(spans));
+    EXPECT_EQ(std::string(static_cast<char*>(spans.at(key).slice.ptr), kLength),
+              value.substr(kOffset, kLength));
+
+    auto past_end = std::make_unique<char[]>(8);
+    std::unordered_map<std::string, StorageValueSpan> overflow;
+    overflow.emplace(key, StorageValueSpan{value.size() - 4, value.size(),
+                                           Slice{past_end.get(), 8}});
+    auto rejected = storage_backend.BatchLoadSpans(overflow);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::INVALID_PARAMS);
+
+    auto wrong = std::make_unique<char[]>(value.size() - 1);
+    std::unordered_map<std::string, Slice> full;
+    full.emplace(key, Slice{wrong.get(), value.size() - 1});
+    auto mismatch = storage_backend.BatchLoad(full);
+    ASSERT_FALSE(mismatch.has_value());
+    EXPECT_EQ(mismatch.error(), ErrorCode::INVALID_PARAMS);
+}
+
 //-----------------------------------------------------------------------------
 // DeleteBucket Tests
 //-----------------------------------------------------------------------------
