@@ -715,7 +715,8 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     timer.LogRequest("object_key=", object_key, ", tenant_id=", tenant_id);
 
     auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             GetReplicaListResponse>(object_key, tenant_id);
+                             GetReplicaListResponse>(
+        object_key, tenant_id, struct_pack::compatible<uint32_t>{});
     timer.LogResponseExpected(result);
     return result;
 }
@@ -734,7 +735,8 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
                                    GetReplicaListResponse>(
-        object_keys.size(), object_keys, tenant_id);
+        object_keys.size(), object_keys, tenant_id,
+        struct_pack::compatible<std::vector<uint32_t>>{});
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -791,7 +793,9 @@ MasterClient::PutStart(const std::string& key,
 
     auto result = invoke_rpc<&WrappedMasterService::PutStart,
                              std::vector<Replica::Descriptor>>(
-        client_id_, key, total_slice_length, config, tenant_id_.value());
+        client_id_, key, total_slice_length, config, tenant_id_.value(),
+        struct_pack::compatible<uint32_t>{},
+        struct_pack::compatible<uint32_t>{});
     timer.LogResponseExpected(result);
     return result;
 }
@@ -817,7 +821,8 @@ MasterClient::BatchPutStart(
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
                                    std::vector<Replica::Descriptor>>(
         keys.size(), client_id_, keys, total_slice_lengths, config,
-        tenant_id_.value());
+        tenant_id_.value(), struct_pack::compatible<std::vector<uint32_t>>{},
+        struct_pack::compatible<uint32_t>{});
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -828,7 +833,9 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(
     timer.LogRequest("key=", object_meta.key);
 
     auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
-        client_id_, object_meta, replica_type, tenant_id_.value());
+        client_id_, object_meta, replica_type, tenant_id_.value(),
+        struct_pack::compatible<uint32_t>{},
+        struct_pack::compatible<std::vector<uint64_t>>{});
     timer.LogResponseExpected(result);
     return result;
 }
@@ -840,7 +847,8 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
         object_metas.size(), client_id_, object_metas, replica_type,
-        tenant_id_.value());
+        tenant_id_.value(), struct_pack::compatible<std::vector<uint32_t>>{},
+        struct_pack::compatible<std::vector<std::vector<uint64_t>>>{});
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -851,7 +859,9 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
     timer.LogRequest("key=", key);
 
     auto result = invoke_rpc<&WrappedMasterService::PutRevoke, void>(
-        client_id_, key, replica_type, tenant_id_.value());
+        client_id_, key, replica_type, tenant_id_.value(),
+        struct_pack::compatible<uint32_t>{},
+        struct_pack::compatible<std::vector<uint64_t>>{});
     timer.LogResponseExpected(result);
     return result;
 }
@@ -862,7 +872,9 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
     timer.LogRequest("keys_count=", keys.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
-        keys.size(), client_id_, keys, replica_type, tenant_id_.value());
+        keys.size(), client_id_, keys, replica_type, tenant_id_.value(),
+        struct_pack::compatible<std::vector<uint32_t>>{},
+        struct_pack::compatible<std::vector<std::vector<uint64_t>>>{});
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

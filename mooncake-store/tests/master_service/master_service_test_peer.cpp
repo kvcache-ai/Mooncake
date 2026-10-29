@@ -41,6 +41,42 @@ std::string MasterServiceTestPeer::
                                                                    replicas);
 }
 
+UUID MasterServiceTestPeer::GetLastWriter(MasterService& service,
+                                          const TenantId& tenant_id,
+                                          const std::string& key,
+                                          size_t part_index) {
+    MetadataAccessorRO access(
+        &service, service.MakeObjectIdentityForRequest(key, tenant_id));
+    if (!access.IsPublished()) {
+        return {};
+    }
+    const auto* attempt = access.Get().GetAttempt(part_index);
+    return attempt != nullptr ? attempt->writer : UUID{};
+}
+
+size_t MasterServiceTestPeer::GetPartCount(MasterService& service,
+                                           const TenantId& tenant_id,
+                                           const std::string& key) {
+    MetadataAccessorRO access(
+        &service, service.MakeObjectIdentityForRequest(key, tenant_id));
+    if (!access.IsPublished()) {
+        return 0;
+    }
+    return access.Get().PartCount();
+}
+
+bool MasterServiceTestPeer::GetReadable(MasterService& service,
+                                        const TenantId& tenant_id,
+                                        const std::string& key) {
+    MetadataAccessorRO access(
+        &service, service.MakeObjectIdentityForRequest(key, tenant_id));
+    return access.IsPublished() && access.Get().IsReadable();
+}
+
+MasterService& MasterServiceTestPeer::ServiceOf(WrappedMasterService& service) {
+    return service.master_service_;
+}
+
 void MasterServiceTestPeer::RunBatchEvictForTesting(
     double evict_ratio_target, double evict_ratio_lowerbound) {
     service_.BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
