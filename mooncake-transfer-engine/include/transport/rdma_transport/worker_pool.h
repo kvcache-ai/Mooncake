@@ -68,8 +68,6 @@ class ClassicRdmaCongestionControl {
     adaptive_congestion_control::Config config_;
     adaptive_congestion_control::Mode mode_;
     std::unique_ptr<adaptive_congestion_control::DomainState> device_;
-    std::atomic<uint64_t> completed_bytes_{0};
-    uint64_t last_tick_ns_ = 0;
     std::mutex routes_mutex_;
     std::unordered_map<std::string, std::unique_ptr<RouteState>> routes_;
 };

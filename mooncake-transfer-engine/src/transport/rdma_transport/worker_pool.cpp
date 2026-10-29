@@ -23,7 +23,6 @@
 #include <exception>
 #include <functional>
 #include <future>
-#include <limits>
 #include <queue>
 #include <thread>
 
@@ -56,7 +55,6 @@ struct ClassicRdmaCongestionControl::RouteState {
     std::atomic<RdmaEndPoint *> endpoint{nullptr};
     std::atomic<uint64_t> endpoint_generation{1};
     std::mutex endpoint_mutex;
-    std::atomic<uint64_t> completed_bytes{0};
 };
 
 ClassicRdmaCongestionControl::ClassicRdmaCongestionControl(
@@ -146,13 +144,20 @@ void ClassicRdmaCongestionControl::retireEndpoint(
 }
 
 size_t ClassicRdmaCongestionControl::gate(SliceList &queued) {
-    if (!enabled()) return queued.size();
+    if (!enabled() || queued.empty()) return queued.size();
     size_t admitted_count = 0;
     size_t cursor = 0;
+    auto *first_route = static_cast<RouteState *>(
+        queued.front()->rdma_congestion_control_route);
+    bool coalesce = mode_ == adaptive_congestion_control::Mode::kEnforce &&
+                    first_route != nullptr &&
+                    adaptive_congestion_control::snapshot(first_route->domain)
+                            .inflight_bytes != 0;
     while (cursor < queued.size()) {
         auto *slice = queued[cursor];
         auto *state =
             static_cast<RouteState *>(slice->rdma_congestion_control_route);
+        if (state != first_route) coalesce = false;
         if (state == nullptr) {
             std::swap(queued[admitted_count++], queued[cursor++]);
             continue;
@@ -173,7 +178,26 @@ size_t ClassicRdmaCongestionControl::gate(SliceList &queued) {
             ++cursor;
         }
     }
-    return admitted_count;
+    size_t retained = admitted_count;
+    // Group an active route's partial replenishment; idle routes and fully
+    // admitted tails always make progress.
+    if (coalesce && admitted_count != queued.size()) {
+        retained = 0;
+        uint64_t bytes = 0;
+        for (size_t i = 0; i < admitted_count; ++i) {
+            bytes += std::min<uint64_t>(queued[i]->length,
+                                        config_.min_window_bytes - bytes);
+            if (bytes == config_.min_window_bytes ||
+                (i + 1 < queued.size() &&
+                 queued[i + 1]->length > config_.min_window_bytes - bytes)) {
+                retained = i + 1;
+                bytes = 0;
+            }
+        }
+        for (size_t i = retained; i < admitted_count; ++i)
+            releaseUnposted(queued[i]);
+    }
+    return retained;
 }
 
 void ClassicRdmaCongestionControl::complete(Transport::Slice *slice,
@@ -196,19 +220,8 @@ void ClassicRdmaCongestionControl::complete(Transport::Slice *slice,
                   adaptive_congestion_control::OutcomeClass::kDerivedFlush,
                   adaptive_congestion_control::FailureScope::kOperation, false,
                   vendor_error};
-    const bool current_generation =
-        adaptive_congestion_control::isCurrentGeneration(
-            slice->rdma_congestion_control_permit);
-    const bool completed = adaptive_congestion_control::complete(
-        slice->rdma_congestion_control_permit, result.outcome, result.scope);
-    if (completed && current_endpoint && current_generation &&
-        status == IBV_WC_SUCCESS) {
-        completed_bytes_.fetch_add(slice->length, std::memory_order_relaxed);
-        if (state) {
-            state->completed_bytes.fetch_add(slice->length,
-                                             std::memory_order_relaxed);
-        }
-    }
+    adaptive_congestion_control::complete(slice->rdma_congestion_control_permit,
+                                          result.outcome, result.scope);
 }
 
 void ClassicRdmaCongestionControl::releaseUnposted(Transport::Slice *slice) {
@@ -221,44 +234,11 @@ void ClassicRdmaCongestionControl::releaseUnposted(Transport::Slice *slice) {
 
 void ClassicRdmaCongestionControl::tick(uint64_t now_ns) {
     if (!enabled()) return;
-    const uint64_t elapsed = last_tick_ns_ == 0 ? 0 : now_ns - last_tick_ns_;
-    last_tick_ns_ = now_ns;
-
-    if (elapsed != 0) {
-        const auto device_snapshot =
-            adaptive_congestion_control::snapshot(*device_);
-        adaptive_congestion_control::Signals signals;
-        signals.backlog_bytes = device_snapshot.inflight_bytes;
-        const auto completed =
-            completed_bytes_.exchange(0, std::memory_order_relaxed);
-        const __uint128_t scaled =
-            static_cast<__uint128_t>(completed) * 1'000'000'000ULL;
-        signals.delivery_rate_bytes_per_sec =
-            static_cast<uint64_t>(std::min<__uint128_t>(
-                scaled / elapsed, std::numeric_limits<uint64_t>::max()));
-        adaptive_congestion_control::recordSignals(
-            *device_, device_snapshot.generation, signals);
-    }
     adaptive_congestion_control::controlTick(*device_, now_ns);
 
     std::lock_guard<std::mutex> lock(routes_mutex_);
     for (auto &entry : routes_) {
         auto &state = *entry.second;
-        if (elapsed != 0) {
-            const auto route_snapshot =
-                adaptive_congestion_control::snapshot(state.domain);
-            adaptive_congestion_control::Signals signals;
-            signals.backlog_bytes = route_snapshot.inflight_bytes;
-            const auto completed =
-                state.completed_bytes.exchange(0, std::memory_order_relaxed);
-            const __uint128_t scaled =
-                static_cast<__uint128_t>(completed) * 1'000'000'000ULL;
-            signals.delivery_rate_bytes_per_sec =
-                static_cast<uint64_t>(std::min<__uint128_t>(
-                    scaled / elapsed, std::numeric_limits<uint64_t>::max()));
-            adaptive_congestion_control::recordSignals(
-                state.domain, route_snapshot.generation, signals);
-        }
         adaptive_congestion_control::controlTick(state.domain, now_ns);
     }
 }
