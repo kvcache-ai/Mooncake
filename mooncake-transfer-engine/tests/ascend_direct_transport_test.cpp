@@ -18,6 +18,10 @@
 #include <acl/acl.h>
 #include <acl/acl_rt.h>
 #include <algorithm>
+#include <array>
+#include "transfer_engine.h"
+#include "transfer_engine_impl.h"
+#include "multi_transport.h"
 #include <cstdint>
 #include <cstdlib>
 #include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
@@ -52,6 +56,7 @@ static thread_local int g_device_id = 0;
 static int g_device_count = 1;
 static thread_local aclrtContext g_context =
     reinterpret_cast<aclrtContext>(0x10000);
+static thread_local aclError g_get_device_result = ACL_ERROR_NONE;
 static aclError g_memcpy_result = ACL_ERROR_NONE;
 static aclError g_memcpy_async_result = ACL_ERROR_NONE;
 static int g_memcpy_async_call_count = 0;
@@ -85,6 +90,7 @@ namespace mock_acl {
 void reset() {
     std::lock_guard<std::mutex> lock(g_acl_mutex);
     g_device_id = 0;
+    g_get_device_result = ACL_ERROR_NONE;
     g_device_count = 1;
     g_context = ContextForDevice(0);
     g_memcpy_result = ACL_ERROR_NONE;
@@ -178,6 +184,7 @@ aclError aclrtGetDeviceCount(uint32_t* count) {
 
 aclError aclrtGetDevice(int* deviceId) {
     g_get_device_call_count++;
+    if (g_get_device_result != ACL_ERROR_NONE) return g_get_device_result;
     *deviceId = g_device_id;
     return ACL_ERROR_NONE;
 }
@@ -2988,6 +2995,97 @@ TEST_F(ClientServerModeTest, UserEnvOverridesAutoInject) {
     ASSERT_NE(it, opts.end());
     EXPECT_EQ(it->second, R"({"version":"1.2"})");
 }
+
+// Bind the real transport without a remote server; only device resolution
+// fails.
+namespace mooncake {
+class TransferEngineImplTestPeer {
+   public:
+    static void bindAscend(TransferEngine& engine,
+                           std::shared_ptr<Transport> transport) {
+        auto& impl = *engine.impl_;
+        impl.multi_transports_->transport_map_.clear();
+        impl.multi_transports_->transport_map_.emplace("ascend", transport);
+        auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+        desc->name = "resolve-test-remote";
+        desc->protocol = "ascend";
+        const auto name = desc->name;
+        impl.getMetadata()->addLocalSegment(41, name, std::move(desc));
+    }
+};
+}  // namespace mooncake
+
+namespace {
+struct ResolveFailureScope {
+    ResolveFailureScope() { g_get_device_result = 1; }
+    ~ResolveFailureScope() { g_get_device_result = ACL_ERROR_NONE; }
+};
+
+struct RestoreAgentMode {
+    bool original = globalConfig().ascend_agent_mode;
+    ~RestoreAgentMode() { globalConfig().ascend_agent_mode = original; }
+};
+}  // namespace
+
+class AscendScatterResolveFailureTest
+    : public AscendDirectTransportTest,
+      public ::testing::WithParamInterface<size_t> {};
+
+TEST_P(AscendScatterResolveFailureTest, RejectsEveryLegacyFragmentExactlyOnce) {
+    RestoreAgentMode restore;
+    globalConfig().ascend_agent_mode = true;
+    auto installed = createTransport();
+    ASSERT_NE(installed, nullptr);
+    std::shared_ptr<AscendDirectTransport> transport(std::move(installed));
+    ASSERT_FALSE(transport->supportsGroupedScatter());
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    TransferEngineImplTestPeer::bindAscend(engine, transport);
+
+    std::array<char, 128> local, remote;
+    local.fill('L');
+    remote.fill('R');
+    const auto before_local = local;
+    const auto before_remote = remote;
+    const std::array<size_t, 3> offsets{8, 40, 96};
+    const std::array<size_t, 3> lengths{8, 8, 8};
+    std::vector<std::pair<size_t, bool>> callbacks;
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "resolve-test-remote",
+        .remote_base_offset = reinterpret_cast<uint64_t>(remote.data()),
+        .remote_size = remote.size(),
+        .local_buffer = local.data(),
+        .local_capacity = local.size(),
+        .local_offsets = std::span(offsets).first(GetParam()),
+        .remote_offsets = std::span(offsets).first(GetParam()),
+        .lengths = std::span(lengths).first(GetParam()),
+        .on_fragment_complete = [&callbacks](size_t index,
+                                             const Status& status) {
+            callbacks.emplace_back(index, status.ok());
+        }};
+    const auto device_calls = mock_acl::get_get_device_call_count();
+    const auto sync_copies = adxl_mock::get_transfer_count();
+    const auto async_copies = adxl_mock::get_transfer_async_count();
+    ResolveFailureScope inject;
+    auto operation = engine.submitScatter({range});
+    EXPECT_FALSE(operation.wait().ok());
+    std::vector<std::pair<size_t, bool>> expected;
+    for (size_t i = 0; i < GetParam(); ++i) expected.emplace_back(i, false);
+    EXPECT_EQ(callbacks, expected);
+    EXPECT_GT(mock_acl::get_get_device_call_count(), device_calls);
+    EXPECT_EQ(adxl_mock::get_transfer_count(), sync_copies);
+    EXPECT_EQ(adxl_mock::get_transfer_async_count(), async_copies);
+    EXPECT_EQ(local, before_local);
+    EXPECT_EQ(remote, before_remote);
+    EXPECT_FALSE(operation.wait().ok());
+    EXPECT_FALSE(operation.waitFor(std::chrono::milliseconds(0)).ok());
+    EXPECT_EQ(callbacks, expected);
+}
+
+INSTANTIATE_TEST_SUITE_P(SingleAndMultipleLegacyTasks,
+                         AscendScatterResolveFailureTest,
+                         ::testing::Values(size_t{1}, size_t{3}));
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);

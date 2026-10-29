@@ -242,6 +242,18 @@ bool macaP2pPairAllowed(int src_physical, int dst_physical) {
 #endif
 
 class P2pDeviceTransportImpl : public P2pTransport {
+    struct StagedPeerMapping {
+        bool staged = false;
+        bool available = false;
+        bool owns_mapping = false;
+        void* ptr = nullptr;
+        size_t size = 0;
+        std::vector<int32_t> handle;
+#if defined(USE_CUDA)
+        CUmemGenericAllocationHandle fabric_handle{};
+#endif
+    };
+
    public:
     explicit P2pDeviceTransportImpl(int num_ranks)
         : num_ranks_(num_ranks), use_fabric_mem_(supportFabricMem()) {
@@ -263,6 +275,9 @@ class P2pDeviceTransportImpl : public P2pTransport {
     }
 
     ~P2pDeviceTransportImpl() override {
+        for (size_t slot = 0; slot < staged_peer_mappings_.size(); ++slot) {
+            discardStagedPeer(static_cast<int>(slot));
+        }
 #if defined(USE_CUDA)
         cleanupFabricPeerMappings();
         cleanupFabricAllocations();
@@ -498,6 +513,284 @@ class P2pDeviceTransportImpl : public P2pTransport {
         std::vector<int32_t> result(kNumInt32s);
         memcpy(result.data(), &handle, kHandleBytes);
         return result;
+    }
+
+    int stagePeerHandle(void* local_ptr, int local_rank, int rank,
+                        const std::vector<int32_t>& remote_handle) override {
+        if (local_ptr == nullptr || local_rank < 0 ||
+            local_rank >= num_ranks_ || rank < 0 || rank >= num_ranks_ ||
+            rank == local_rank) {
+            LOG(ERROR) << "[EP P2P] invalid elastic peer slot";
+            return -1;
+        }
+        if (staged_peer_mappings_.empty()) {
+            staged_peer_mappings_.resize(num_ranks_);
+            elastic_connected_slots_.assign(num_ranks_, 0);
+        }
+        discardStagedPeer(rank);
+        local_ptr_ = local_ptr;
+        local_rank_ = local_rank;
+        auto& staged = staged_peer_mappings_[rank];
+        staged.staged = true;
+        staged.handle = remote_handle;
+        if (remote_handle.empty()) return 0;
+
+#if defined(USE_CUDA)
+        if (use_fabric_mem_) {
+            CUmemFabricHandle export_handle;
+            size_t mapped_size = 0;
+            if (!deserializeFabricHandle(remote_handle, &export_handle,
+                                         &mapped_size)) {
+                LOG(ERROR) << "[EP P2P] invalid fabric IPC handle for rank "
+                           << rank;
+                staged = {};
+                return -1;
+            }
+            CUmemGenericAllocationHandle handle;
+            CUresult res = cuMemImportFromShareableHandle(
+                &handle, &export_handle, CU_MEM_HANDLE_TYPE_FABRIC);
+            if (res != CUDA_SUCCESS) {
+                LOG(ERROR) << "[EP P2P] fabric IPC import failed for rank "
+                           << rank << ": " << res;
+                staged = {};
+                return -1;
+            }
+            CUdeviceptr peer_reserved = 0;
+            res = cuMemAddressReserve(&peer_reserved, mapped_size, 0, 0, 0);
+            if (res != CUDA_SUCCESS) {
+                cuMemRelease(handle);
+                LOG(ERROR) << "[EP P2P] fabric address reserve failed for rank "
+                           << rank << ": " << res;
+                staged = {};
+                return -1;
+            }
+            res = cuMemMap(peer_reserved, mapped_size, 0, handle, 0);
+            if (res != CUDA_SUCCESS) {
+                cuMemAddressFree(peer_reserved, mapped_size);
+                cuMemRelease(handle);
+                LOG(ERROR) << "[EP P2P] fabric mapping failed for rank " << rank
+                           << ": " << res;
+                staged = {};
+                return -1;
+            }
+            int device_count = 0;
+            cudaGetDeviceCount(&device_count);
+            std::vector<CUmemAccessDesc> access(device_count);
+            for (int i = 0; i < device_count; ++i) {
+                access[i].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                access[i].location.id = i;
+                access[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            }
+            res = cuMemSetAccess(peer_reserved, mapped_size, access.data(),
+                                 device_count);
+            if (res != CUDA_SUCCESS) {
+                cuMemUnmap(peer_reserved, mapped_size);
+                cuMemAddressFree(peer_reserved, mapped_size);
+                cuMemRelease(handle);
+                LOG(ERROR) << "[EP P2P] fabric access setup failed for rank "
+                           << rank << ": " << res;
+                staged = {};
+                return -1;
+            }
+            staged.ptr = reinterpret_cast<void*>(peer_reserved);
+            staged.size = mapped_size;
+            staged.fabric_handle = handle;
+            staged.available = true;
+            staged.owns_mapping = true;
+            return 0;
+        }
+#endif
+
+#if defined(USE_CUDA)
+        if (imported_classic_handle_keys_.size() !=
+            static_cast<size_t>(num_ranks_)) {
+            imported_classic_handle_keys_.resize(num_ranks_);
+        }
+        if (peer_ptrs_host_[rank] != nullptr &&
+            imported_classic_handle_keys_[rank] == remote_handle) {
+            staged.ptr = peer_ptrs_host_[rank];
+            staged.available = true;
+            return 0;
+        }
+#endif
+        constexpr size_t kHandleBytes = sizeof(cudaIpcMemHandle_t);
+        constexpr size_t kNumInt32s =
+            (kHandleBytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+        if (remote_handle.size() < kNumInt32s) {
+            LOG(ERROR) << "[EP P2P] invalid classic IPC handle for rank "
+                       << rank;
+            staged = {};
+            return -1;
+        }
+        cudaIpcMemHandle_t handle;
+        memcpy(&handle, remote_handle.data(), kHandleBytes);
+        void* peer_ptr = nullptr;
+        const auto status = cudaIpcOpenMemHandle(
+            &peer_ptr, handle, cudaIpcMemLazyEnablePeerAccess);
+        if (status != cudaSuccess) {
+            LOG(ERROR) << "[EP P2P] failed to stage IPC mapping for rank "
+                       << rank << ": " << cudaGetErrorString(status);
+            staged = {};
+            return -1;
+        }
+        staged.ptr = peer_ptr;
+        staged.available = true;
+        staged.owns_mapping = true;
+        return 0;
+    }
+
+    int publishStagedPeer(int rank) override {
+        if (rank < 0 || rank >= num_ranks_ ||
+            staged_peer_mappings_.size() != static_cast<size_t>(num_ranks_) ||
+            !staged_peer_mappings_[rank].staged) {
+            LOG(ERROR) << "[EP P2P] no staged peer mapping for slot " << rank;
+            return -1;
+        }
+        auto& staged = staged_peer_mappings_[rank];
+        void* next_ptr = staged.available ? staged.ptr : nullptr;
+        const int32_t next_available = staged.available ? 1 : 0;
+        auto status = cudaMemcpyAsync(
+            available_table_ + rank, &next_available, sizeof(next_available),
+            cudaMemcpyHostToDevice, peer_table_stream_);
+        if (status == cudaSuccess) {
+            status = cudaMemcpyAsync(peer_ptrs_dev_ + rank, &next_ptr,
+                                     sizeof(next_ptr), cudaMemcpyHostToDevice,
+                                     peer_table_stream_);
+        }
+        if (status == cudaSuccess)
+            status = cudaStreamSynchronize(peer_table_stream_);
+        if (status != cudaSuccess) {
+            LOG(ERROR) << "[EP P2P] failed to publish peer slot " << rank
+                       << ": " << cudaGetErrorString(status);
+            return -1;
+        }
+
+        void* old_ptr = peer_ptrs_host_[rank];
+        if (use_fabric_mem_) {
+#if defined(USE_CUDA)
+            auto& old_mapping = fabric_peer_mappings_[rank];
+            if (old_mapping.ptr != nullptr && old_mapping.ptr != next_ptr) {
+                cuMemUnmap(reinterpret_cast<CUdeviceptr>(old_mapping.ptr),
+                           old_mapping.size);
+                cuMemAddressFree(reinterpret_cast<CUdeviceptr>(old_mapping.ptr),
+                                 old_mapping.size);
+                cuMemRelease(old_mapping.handle);
+                old_mapping = {};
+            }
+            if (staged.owns_mapping) {
+                fabric_peer_mappings_[rank] = {staged.ptr, staged.size,
+                                               staged.fabric_handle};
+                staged.owns_mapping = false;
+            }
+#endif
+        } else if (old_ptr != nullptr && old_ptr != local_ptr_ &&
+                   old_ptr != next_ptr) {
+            const auto close_status = cudaIpcCloseMemHandle(old_ptr);
+            if (close_status != cudaSuccess) {
+                LOG(ERROR) << "[EP P2P] failed to close replaced IPC mapping "
+                           << rank << ": " << cudaGetErrorString(close_status);
+            }
+        }
+        peer_ptrs_host_[rank] = next_ptr;
+        if (imported_classic_handle_keys_.size() !=
+            static_cast<size_t>(num_ranks_)) {
+            imported_classic_handle_keys_.resize(num_ranks_);
+        }
+        imported_classic_handle_keys_[rank] =
+            staged.available ? staged.handle : std::vector<int32_t>{};
+        staged.owns_mapping = false;
+        staged = {};
+        elastic_connected_slots_[rank] = 1;
+        refreshElasticAccessibility();
+        LOG(INFO) << "[EP P2P] elastic slot=" << rank
+                  << " available=" << next_available;
+        return 0;
+    }
+
+    void discardStagedPeer(int rank) override {
+        if (rank < 0 || rank >= num_ranks_ ||
+            staged_peer_mappings_.size() != static_cast<size_t>(num_ranks_))
+            return;
+        auto& staged = staged_peer_mappings_[rank];
+        if (!staged.staged) return;
+        if (staged.owns_mapping && staged.ptr != nullptr) {
+            if (use_fabric_mem_) {
+#if defined(USE_CUDA)
+                cuMemUnmap(reinterpret_cast<CUdeviceptr>(staged.ptr),
+                           staged.size);
+                cuMemAddressFree(reinterpret_cast<CUdeviceptr>(staged.ptr),
+                                 staged.size);
+                cuMemRelease(staged.fabric_handle);
+#endif
+            } else {
+                const auto status = cudaIpcCloseMemHandle(staged.ptr);
+                if (status != cudaSuccess) {
+                    LOG(ERROR) << "[EP P2P] failed to close staged IPC mapping "
+                               << rank << ": " << cudaGetErrorString(status);
+                }
+            }
+        }
+        staged = {};
+    }
+
+    int disconnectPeer(int rank) override {
+        if (rank < 0 || rank >= num_ranks_ || rank == local_rank_ ||
+            staged_peer_mappings_.size() != static_cast<size_t>(num_ranks_) ||
+            elastic_connected_slots_.size() !=
+                static_cast<size_t>(num_ranks_)) {
+            LOG(ERROR) << "[EP P2P] invalid elastic peer disconnect slot "
+                       << rank;
+            return -1;
+        }
+        discardStagedPeer(rank);
+        const int32_t unavailable = 0;
+        void* no_peer = nullptr;
+        auto status = cudaMemcpyAsync(
+            available_table_ + rank, &unavailable, sizeof(unavailable),
+            cudaMemcpyHostToDevice, peer_table_stream_);
+        if (status == cudaSuccess) {
+            status = cudaMemcpyAsync(peer_ptrs_dev_ + rank, &no_peer,
+                                     sizeof(no_peer), cudaMemcpyHostToDevice,
+                                     peer_table_stream_);
+        }
+        if (status == cudaSuccess)
+            status = cudaStreamSynchronize(peer_table_stream_);
+        if (status != cudaSuccess) {
+            LOG(ERROR) << "[EP P2P] failed to invalidate peer slot " << rank
+                       << ": " << cudaGetErrorString(status);
+            return -1;
+        }
+
+        void* old_ptr = peer_ptrs_host_[rank];
+        peer_ptrs_host_[rank] = nullptr;
+        if (use_fabric_mem_) {
+#if defined(USE_CUDA)
+            auto& mapping = fabric_peer_mappings_[rank];
+            if (mapping.ptr != nullptr) {
+                cuMemUnmap(reinterpret_cast<CUdeviceptr>(mapping.ptr),
+                           mapping.size);
+                cuMemAddressFree(reinterpret_cast<CUdeviceptr>(mapping.ptr),
+                                 mapping.size);
+                cuMemRelease(mapping.handle);
+                mapping = {};
+            }
+#endif
+        } else if (old_ptr != nullptr && old_ptr != local_ptr_) {
+            const auto close_status = cudaIpcCloseMemHandle(old_ptr);
+            if (close_status != cudaSuccess) {
+                LOG(ERROR)
+                    << "[EP P2P] failed to close disconnected IPC mapping "
+                    << rank << ": " << cudaGetErrorString(close_status);
+                return -1;
+            }
+        }
+        if (imported_classic_handle_keys_.size() ==
+            static_cast<size_t>(num_ranks_)) {
+            imported_classic_handle_keys_[rank].clear();
+        }
+        elastic_connected_slots_[rank] = 0;
+        refreshElasticAccessibility();
+        return 0;
     }
 
     void importPeerHandles(
@@ -812,6 +1105,19 @@ class P2pDeviceTransportImpl : public P2pTransport {
     }
 
    private:
+    void refreshElasticAccessibility() {
+        if (elastic_connected_slots_.size() != static_cast<size_t>(num_ranks_))
+            return;
+        all_peers_accessible_ = true;
+        for (int slot = 0; slot < num_ranks_; ++slot) {
+            if (elastic_connected_slots_[slot] &&
+                peer_ptrs_host_[slot] == nullptr) {
+                all_peers_accessible_ = false;
+                break;
+            }
+        }
+    }
+
 #if defined(USE_CUDA)
     struct FabricPeerMapping {
         void* ptr = nullptr;
@@ -850,7 +1156,11 @@ class P2pDeviceTransportImpl : public P2pTransport {
 
     int num_ranks_;
     bool use_fabric_mem_ = false;
+    std::vector<std::vector<int32_t>> imported_classic_handle_keys_;
+    std::vector<StagedPeerMapping> staged_peer_mappings_;
+    std::vector<uint8_t> elastic_connected_slots_;
     void* local_ptr_ = nullptr;
+    int local_rank_ = -1;
     int32_t* available_table_ = nullptr;
     void** peer_ptrs_host_ = nullptr;
     void** peer_ptrs_dev_ = nullptr;
