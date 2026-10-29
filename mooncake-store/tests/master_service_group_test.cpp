@@ -180,6 +180,12 @@ TEST_F(MasterServiceTest, RemoveAllPreservesManagedGroupImportedDuringScan) {
             .payload_group_id = {},
             .expected_payload_count = 1,
             .expected_logical_bytes = 1024,
+            .policy =
+                WeightStoragePolicy{
+                    .preferred_residency = WeightResidencyState::HOT,
+                    .migration_mode = WeightMigrationMode::MANUAL},
+            .affinity_summary = {.affinity_count = 1,
+                                 .affinity_digest = std::string(64, 'a')},
         });
         if (importing) {
             ReplicateConfig config;
@@ -187,8 +193,10 @@ TEST_F(MasterServiceTest, RemoveAllPreservesManagedGroupImportedDuringScan) {
             config.group_ids =
                 std::vector<std::string>{importing->manifest.payload_group_id};
             config.data_type = ObjectDataType::WEIGHT;
+            config.residency_affinity_ids = std::vector<std::string>{"payload"};
             PutCompletedObject(service, client_id, payload_key, config, 1024);
             config.data_type = ObjectDataType::METADATA;
+            config.residency_affinity_ids.reset();
             PutCompletedObject(service, client_id, manifest_key, config, 128);
             auto ready = service.CommitWeightImport(CommitWeightImportRequest{
                 .identity = identity,
@@ -328,6 +336,16 @@ TEST_F(MasterServiceTest,
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = kObjectSize,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'c'),
+            },
     });
     ASSERT_TRUE(importing.has_value());
     const std::string payload_key = "managed-weight-payload";
@@ -338,10 +356,13 @@ TEST_F(MasterServiceTest,
     payload_config.data_type = ObjectDataType::WEIGHT;
     payload_config.group_ids =
         std::vector<std::string>{importing->manifest.payload_group_id};
+    payload_config.residency_affinity_ids =
+        std::vector<std::string>{payload_key};
     PutCompletedObject(service, client_id, payload_key, payload_config,
                        kObjectSize);
     auto manifest_config = payload_config;
     manifest_config.data_type = ObjectDataType::METADATA;
+    manifest_config.residency_affinity_ids.reset();
     PutCompletedObject(service, client_id, manifest_key, manifest_config,
                        kObjectSize);
     auto ready = service.CommitWeightImport(CommitWeightImportRequest{

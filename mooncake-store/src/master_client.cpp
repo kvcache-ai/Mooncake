@@ -380,6 +380,7 @@ DEFINE_WEIGHT_RPC_NAME(CommitWeightImport);
 DEFINE_WEIGHT_RPC_NAME(AbortWeightImport);
 DEFINE_WEIGHT_RPC_NAME(GetWeightRevision);
 DEFINE_WEIGHT_RPC_NAME(ListWeightRevisions);
+DEFINE_WEIGHT_RPC_NAME(UpdateWeightPolicy);
 DEFINE_WEIGHT_RPC_NAME(AcquireWeightRevisionLease);
 DEFINE_WEIGHT_RPC_NAME(RenewWeightRevisionLease);
 DEFINE_WEIGHT_RPC_NAME(ReleaseWeightRevisionLease);
@@ -540,6 +541,8 @@ DEFINE_WEIGHT_CLIENT_METHOD(GetWeightRevision, GetWeightRevisionRequest,
                             WeightRevisionView)
 DEFINE_WEIGHT_CLIENT_METHOD(ListWeightRevisions, ListWeightRevisionsRequest,
                             ListWeightRevisionsResponse)
+DEFINE_WEIGHT_CLIENT_METHOD(UpdateWeightPolicy, UpdateWeightPolicyRequest,
+                            WeightRevisionMetadata)
 DEFINE_WEIGHT_CLIENT_METHOD(AcquireWeightRevisionLease,
                             AcquireWeightRevisionLeaseRequest,
                             WeightRevisionLease)

@@ -29,6 +29,11 @@ tl::expected<void, ErrorCode> MasterStoreBackend::RemoveObject(
     return master_.RemoveObject(key, tenant_id, force, allow_managed_weight);
 }
 
+bool MasterStoreBackend::QueueManagedWeightMemberOffload(
+    const WeightRevisionMetadata& revision, const std::string& key) {
+    return master_.QueueManagedWeightMemberOffload(revision, key);
+}
+
 void MasterStoreBackend::EvictManagedWeightMembersToCold(
     const WeightRevisionMetadata& revision,
     const std::vector<std::string>& member_keys) {
@@ -92,6 +97,7 @@ MasterStoreBackend::SnapshotWeightGroup(
         }
         members.push_back(WeightGroupMemberSnapshot{
             .key = key,
+            .residency_affinity_id = metadata.residency_affinity_id,
             .size = metadata.TotalLength(),
             .data_type = metadata.data_type,
             .readable = master_.HasReadableReplica(metadata),

@@ -316,6 +316,9 @@ class WrappedMasterService {
     WeightMetadataStore::Result<ListWeightRevisionsResponse>
     ListWeightRevisions(const ListWeightRevisionsRequest& request,
                         const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> UpdateWeightPolicy(
+        const UpdateWeightPolicyRequest& request,
+        const std::string& tenant_id = "default");
     WeightMetadataStore::Result<WeightRevisionLease> AcquireWeightRevisionLease(
         const AcquireWeightRevisionLeaseRequest& request,
         const std::string& tenant_id = "default");

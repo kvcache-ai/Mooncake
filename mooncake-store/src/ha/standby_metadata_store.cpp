@@ -239,7 +239,7 @@ bool StandbyMetadataStore::RestoreWeightMetadata(
 WeightMetadataSnapshot StandbyMetadataStore::SnapshotWeightMetadata() const {
     std::lock_guard<std::mutex> lock(mutex_);
     WeightMetadataSnapshot snapshot{
-        .schema_version = 1,
+        .schema_version = kWeightMetadataSchemaVersion,
         .metadata = {},
         .leases = {},
         .operations = {},

@@ -35,6 +35,16 @@ class MasterServiceWeightManagementTest : public MasterServiceTest {
             .payload_group_id = {},
             .expected_payload_count = payload_count,
             .expected_logical_bytes = logical_bytes,
+            .policy =
+                WeightStoragePolicy{
+                    .preferred_residency = WeightResidencyState::HOT,
+                    .migration_mode = WeightMigrationMode::MANUAL,
+                },
+            .affinity_summary =
+                WeightAffinitySummary{
+                    .affinity_count = payload_count,
+                    .affinity_digest = std::string(64, 'c'),
+                },
         });
         EXPECT_TRUE(result.has_value());
         return *result;
@@ -48,6 +58,9 @@ class MasterServiceWeightManagementTest : public MasterServiceTest {
         config.with_hard_pin = true;
         config.data_type = data_type;
         config.group_ids = std::vector<std::string>{group_id};
+        if (data_type == ObjectDataType::WEIGHT) {
+            config.residency_affinity_ids = std::vector<std::string>{key};
+        }
         PutCompletedObject(service, client_id, key, config, size);
     }
 
@@ -70,6 +83,23 @@ class MasterServiceWeightManagementTest : public MasterServiceTest {
         };
     }
 };
+
+TEST_F(MasterServiceWeightManagementTest,
+       RejectsUnsatisfiableSingleAffinityMixedImport) {
+    MasterService service;
+    BeginWeightImportRequest request{
+        .identity = Identity(),
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+        .affinity_summary = {.affinity_count = 1,
+                             .affinity_digest = std::string(64, 'c')},
+    };
+
+    auto importing = service.BeginWeightImport(request);
+
+    ASSERT_FALSE(importing.has_value());
+    EXPECT_EQ(WeightManagementError::POLICY_UNSATISFIABLE, importing.error());
+}
 
 TEST_F(MasterServiceWeightManagementTest,
        PublishesReadyAndRetriesAfterResponseLoss) {
@@ -130,6 +160,16 @@ TEST_F(MasterServiceWeightManagementTest, CommitsPercentEncodedIdentity) {
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'c'),
+            },
     });
     ASSERT_TRUE(importing.has_value());
     const auto manifest_key = MakeWeightManifestKey(identity);
@@ -160,6 +200,16 @@ TEST_F(MasterServiceWeightManagementTest,
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'c'),
+            },
     });
     ASSERT_FALSE(importing.has_value());
     EXPECT_EQ(WeightManagementError::INVALID_ARGUMENT, importing.error());
@@ -179,6 +229,16 @@ TEST_F(MasterServiceWeightManagementTest,
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'c'),
+            },
     });
     ASSERT_TRUE(importing.has_value());
     EXPECT_EQ(identity, importing->identity);
@@ -444,7 +504,7 @@ TEST_F(MasterServiceWeightManagementTest,
 
     auto result = operation.get();
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(WeightOperationState::REHYDRATING, result->operation);
+    EXPECT_EQ(WeightOperationKind::MIGRATING, result->kind);
 }
 
 }  // namespace

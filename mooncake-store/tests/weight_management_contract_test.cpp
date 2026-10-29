@@ -74,7 +74,9 @@ TEST(WeightManagementContractTest, ValidatesSha256AndGeneration) {
         .manifest = ValidManifest(),
         .availability = WeightAvailabilityState::READY,
         .residency = WeightResidencyState::HOT,
-        .operation = WeightOperationState::NONE,
+        .affinity_count = 2,
+        .affinity_digest = std::string(64, 'c'),
+        .observed_hot_ratio = 1.0,
         .metadata_generation = 0,
         .created_at_ms = 1,
         .updated_at_ms = 1,
@@ -94,7 +96,9 @@ TEST(WeightManagementContractTest, RejectsNonCanonicalWeightObjectNames) {
         .manifest = ValidManifest(),
         .availability = WeightAvailabilityState::READY,
         .residency = WeightResidencyState::HOT,
-        .operation = WeightOperationState::NONE,
+        .affinity_count = 2,
+        .affinity_digest = std::string(64, 'c'),
+        .observed_hot_ratio = 1.0,
         .metadata_generation = 1,
         .created_at_ms = 1,
         .updated_at_ms = 1,
@@ -109,41 +113,53 @@ TEST(WeightManagementContractTest, RejectsNonCanonicalWeightObjectNames) {
     EXPECT_FALSE(ValidateWeightRevisionMetadata(metadata).ok());
 }
 
+TEST(WeightManagementContractTest, RejectsInvalidStoragePolicyEnums) {
+    auto policy = WeightStoragePolicy{};
+    EXPECT_TRUE(ValidateWeightStoragePolicy(policy).ok());
+    EXPECT_EQ(WeightMigrationMode::MANUAL, policy.migration_mode);
+    policy.migration_mode = WeightMigrationMode::AUTO;
+    EXPECT_FALSE(ValidateWeightStoragePolicy(policy).ok());
+    policy.migration_mode = static_cast<WeightMigrationMode>(255);
+    EXPECT_FALSE(ValidateWeightStoragePolicy(policy).ok());
+}
+
 TEST(WeightManagementContractTest, EnforcesStateCombinationAndOperationIds) {
     WeightRevisionMetadata metadata{
         .identity = ValidIdentity(),
         .manifest = ValidManifest(),
         .availability = WeightAvailabilityState::READY,
         .residency = WeightResidencyState::HOT,
-        .operation = WeightOperationState::EVICTING,
-        .operation_id = 0,
+        .operation_id = 10,
+        .affinity_count = 2,
+        .affinity_digest = std::string(64, 'c'),
+        .observed_hot_ratio = 1.0,
         .metadata_generation = 1,
         .created_at_ms = 1,
         .updated_at_ms = 1,
     };
-    EXPECT_FALSE(ValidateWeightRevisionMetadata(metadata).ok());
-    metadata.operation_id = 10;
     EXPECT_TRUE(ValidateWeightRevisionMetadata(metadata).ok());
-    metadata.operation = WeightOperationState::NONE;
-    EXPECT_FALSE(ValidateWeightRevisionMetadata(metadata).ok());
 
-    metadata.operation_id = 0;
+    metadata.operation_id.reset();
     metadata.residency = WeightResidencyState::ABSENT;
+    metadata.observed_hot_ratio = 0.0;
     EXPECT_FALSE(ValidateWeightRevisionMetadata(metadata).ok());
     metadata.residency = WeightResidencyState::UNKNOWN;
     EXPECT_FALSE(ValidateWeightRevisionMetadata(metadata).ok());
     metadata.residency = WeightResidencyState::HOT;
+    metadata.observed_hot_ratio = 1.0;
     EXPECT_TRUE(ValidateWeightRevisionMetadata(metadata).ok());
     metadata.availability = WeightAvailabilityState::DEGRADED;
     metadata.residency = WeightResidencyState::UNKNOWN;
     EXPECT_FALSE(ValidateWeightRevisionMetadata(metadata).ok());
     metadata.residency = WeightResidencyState::ABSENT;
+    metadata.observed_hot_ratio = 0.0;
     EXPECT_TRUE(ValidateWeightRevisionMetadata(metadata).ok());
 
     metadata.availability = WeightAvailabilityState::DELETED;
     metadata.residency = WeightResidencyState::HOT;
     EXPECT_FALSE(ValidateWeightRevisionMetadata(metadata).ok());
     metadata.residency = WeightResidencyState::ABSENT;
+    metadata.observed_hot_ratio = 0.0;
     EXPECT_TRUE(ValidateWeightRevisionMetadata(metadata).ok());
 
     metadata.availability = static_cast<WeightAvailabilityState>(255);
@@ -152,13 +168,22 @@ TEST(WeightManagementContractTest, EnforcesStateCombinationAndOperationIds) {
     metadata.residency = static_cast<WeightResidencyState>(255);
     EXPECT_FALSE(ValidateWeightRevisionMetadata(metadata).ok());
     metadata.residency = WeightResidencyState::ABSENT;
-    metadata.operation = static_cast<WeightOperationState>(255);
+    metadata.availability = WeightAvailabilityState::IMPORTING;
+    metadata.residency = WeightResidencyState::ABSENT;
+    EXPECT_FALSE(ValidateWeightRevisionMetadata(metadata).ok());
+    metadata.residency = WeightResidencyState::UNKNOWN;
+    EXPECT_TRUE(ValidateWeightRevisionMetadata(metadata).ok());
+    metadata.operation_id = 10;
     EXPECT_FALSE(ValidateWeightRevisionMetadata(metadata).ok());
 
-    metadata.availability = WeightAvailabilityState::IMPORTING;
-    metadata.residency = WeightResidencyState::UNKNOWN;
-    metadata.operation = WeightOperationState::EVICTING;
-    metadata.operation_id = 1;
+    metadata.operation_id.reset();
+    metadata.availability = WeightAvailabilityState::READY;
+    EXPECT_FALSE(ValidateWeightRevisionMetadata(metadata).ok());
+    metadata.residency = static_cast<WeightResidencyState>(255);
+    EXPECT_FALSE(ValidateWeightRevisionMetadata(metadata).ok());
+    metadata.residency = WeightResidencyState::HOT;
+    metadata.observed_hot_ratio = 1.0;
+    metadata.availability = static_cast<WeightAvailabilityState>(255);
     EXPECT_FALSE(ValidateWeightRevisionMetadata(metadata).ok());
 }
 
@@ -189,14 +214,73 @@ TEST(WeightManagementContractTest, RestrictsAvailabilityTransitions) {
         IsValidWeightAvailabilityTransition(State::READY, State::READY));
 }
 
+TEST(WeightManagementContractTest, ValidatesIntrinsicOperationShape) {
+    WeightResidencyOperation valid{
+        .kind = WeightOperationKind::MIGRATING,
+        .target_residency = WeightResidencyState::HOT,
+        .processed_units = 1,
+        .total_units = 2,
+        .processed_bytes = 128,
+        .total_bytes = 256,
+    };
+    EXPECT_TRUE(IsValidWeightOperationShape(valid));
+    auto operation = valid;
+    operation.kind = WeightOperationKind::REPAIRING;
+    EXPECT_TRUE(IsValidWeightOperationShape(operation));
+    operation.kind = static_cast<WeightOperationKind>(255);
+    EXPECT_FALSE(IsValidWeightOperationShape(operation));
+    for (const auto target :
+         {WeightResidencyState::UNKNOWN, WeightResidencyState::ABSENT}) {
+        operation = valid;
+        operation.target_residency = target;
+        EXPECT_FALSE(IsValidWeightOperationShape(operation));
+    }
+    for (const auto ratio :
+         {0.0, 1.0, -0.1, std::numeric_limits<double>::infinity(),
+          std::numeric_limits<double>::quiet_NaN()}) {
+        operation = valid;
+        operation.target_residency = WeightResidencyState::MIXED;
+        operation.target_hot_ratio = ratio;
+        EXPECT_FALSE(IsValidWeightOperationShape(operation));
+    }
+    operation = valid;
+    operation.target_residency = WeightResidencyState::MIXED;
+    EXPECT_FALSE(IsValidWeightOperationShape(operation));
+    operation.target_hot_ratio = 0.5;
+    EXPECT_TRUE(IsValidWeightOperationShape(operation));
+    operation.target_residency = WeightResidencyState::COLD;
+    EXPECT_FALSE(IsValidWeightOperationShape(operation));
+    operation.target_hot_ratio.reset();
+    EXPECT_TRUE(IsValidWeightOperationShape(operation));
+    operation = valid;
+    operation.total_units = 0;
+    EXPECT_FALSE(IsValidWeightOperationShape(operation));
+    operation = valid;
+    operation.total_bytes = 0;
+    EXPECT_FALSE(IsValidWeightOperationShape(operation));
+    operation = valid;
+    operation.processed_units = operation.total_units + 1;
+    EXPECT_FALSE(IsValidWeightOperationShape(operation));
+    operation = valid;
+    operation.processed_bytes = operation.total_bytes + 1;
+    EXPECT_FALSE(IsValidWeightOperationShape(operation));
+    operation = valid;
+    operation.cursor = std::string(1, '\0');
+    EXPECT_FALSE(IsValidWeightOperationShape(operation));
+    operation.cursor = "affinity-a";
+    EXPECT_TRUE(IsValidWeightOperationShape(operation));
+}
+
 TEST(WeightManagementContractTest, RoundTripsWireEnumsAndMetadata) {
     WeightRevisionMetadata metadata{
         .identity = ValidIdentity(),
         .manifest = ValidManifest(),
         .availability = WeightAvailabilityState::DEGRADED,
         .residency = WeightResidencyState::MIXED,
-        .operation = WeightOperationState::REPAIRING,
         .operation_id = 42,
+        .affinity_count = 2,
+        .affinity_digest = std::string(64, 'c'),
+        .observed_hot_ratio = 0.5,
         .metadata_generation = 9,
         .created_at_ms = 100,
         .updated_at_ms = 200,
