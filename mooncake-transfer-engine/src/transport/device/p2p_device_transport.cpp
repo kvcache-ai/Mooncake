@@ -927,9 +927,8 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 int can_access = 0;
                 cudaDeviceCanAccessPeer(&can_access, device_id, dst_device);
                 LOG(INFO) << "[EP P2P] rank " << rank << " (device "
-                          << device_id << ") -> rank " << dst
-                          << " (device " << dst_device
-                          << "): canAccessPeer=" << can_access;
+                          << device_id << ") -> rank " << dst << " (device "
+                          << dst_device << "): canAccessPeer=" << can_access;
                 if (!can_access) continue;
 
                 cudaError_t err = cudaDeviceEnablePeerAccess(dst_device, 0);
