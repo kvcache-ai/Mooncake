@@ -4134,6 +4134,71 @@ TEST_F(MasterServiceTest,
 }
 
 TEST_F(MasterServiceTest,
+       ClientOffboardingWaitsForProcessingReplicaOfOffboardedClient) {
+    MasterService service;
+    auto segment = MakeSegment("offboarding_processing_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = segment.name;
+    const std::string key = "offboarding_processing_key";
+    ASSERT_TRUE(
+        service.PutStart(client_id, key, TenantId::Default(), 1024, config)
+            .has_value());
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(job.liveness);
+
+    // Metadata phase only: the still-PROCESSING replica of the offboarded
+    // client keeps the job from accepting cleanup, and the object stays (its
+    // handle is still valid).
+    ASSERT_FALSE(ProcessClientOffboardingForTest(service, job));
+    EXPECT_FALSE(job.metadata_cleanup_accepted);
+    auto pending_exists = service.ExistKey(key, TenantId::Default());
+    ASSERT_TRUE(pending_exists.has_value());
+    EXPECT_TRUE(*pending_exists);
+
+    ASSERT_TRUE(service
+                    .PutEnd(client_id, key, TenantId::Default(),
+                            ReplicaType::MEMORY)
+                    .has_value());
+
+    // Once it completes, the same single pass sweeps it and accepts cleanup.
+    job.pending_prepare_segments.push_back(
+        {.segment_id = segment.id,
+         .segment_name = segment.name,
+         .transport_endpoint = segment.te_endpoint});
+    ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
+    EXPECT_TRUE(job.metadata_cleanup_accepted);
+    EXPECT_TRUE(job.prepared_segments.empty());
+    auto exists = service.ExistKey(key, TenantId::Default());
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(*exists);
+}
+
+TEST_F(MasterServiceTest, ClearStaleHandlesVisitsEveryObjectExactlyOnce) {
+    MasterService service;
+    auto segment = MakeSegment("stale_visit_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    (void)PutObjectOnSegment(service, client_id, segment.name);
+    (void)PutObjectOnSegment(service, client_id, segment.name);
+
+    size_t visits = 0;
+    auto count_visited = [&visits](const auto&) { ++visits; };
+    auto result = MasterServiceTestPeer(service).ClearStaleHandles(
+        [](const Replica&) { return false; }, count_visited);
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+    // The visitor rides on the read pass the sweep already performs: one call
+    // per object, no second walk.
+    EXPECT_EQ(visits, 2u);
+}
+
+TEST_F(MasterServiceTest,
        ClientOffboardingKeepsPreparedResidualWithoutRepreparingIt) {
     MasterService service;
     const UUID client_id = generate_uuid();

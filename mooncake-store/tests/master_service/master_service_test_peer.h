@@ -423,6 +423,12 @@ class MasterServiceTestPeer {
         service_.ClearInvalidHandles(retaining_clients);
     }
 
+    tl::expected<void, ErrorCode> ClearStaleHandles(
+        const std::function<bool(const Replica&)>& is_stale,
+        const std::function<void(const ObjectMetadata&)>& on_visited) {
+        return service_.ClearStaleHandles(is_stale, on_visited);
+    }
+
     void DiscardExpiredProcessingReplicas(
         const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) {
