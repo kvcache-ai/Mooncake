@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <set>
@@ -84,10 +85,11 @@ class AllocatorManager {
     bool removeAllocator(
         const std::string& name,
         const std::shared_ptr<SegmentAllocatorRegistration>& registration) {
-        auto it = allocators_.find(name);
-        if (it == allocators_.end()) {
+        if (!GetDirectory().allocators.contains(name)) {
             return false;
         }
+        auto& directory = MutableDirectory();
+        auto it = directory.allocators.find(name);
 
         bool registration_removed = false;
         auto registration_it =
@@ -98,11 +100,12 @@ class AllocatorManager {
         }
 
         if (it->second.empty()) {
-            allocators_.erase(name);
-            auto name_it = std::find(names_.begin(), names_.end(), name);
-            if (name_it != names_.end()) {
-                std::swap(*name_it, names_.back());
-                names_.pop_back();
+            directory.allocators.erase(it);
+            auto& names = directory.names;
+            auto name_it = std::find(names.begin(), names.end(), name);
+            if (name_it != names.end()) {
+                std::swap(*name_it, names.back());
+                names.pop_back();
             }
         }
 
@@ -116,11 +119,12 @@ class AllocatorManager {
     };
 
     bool replaceAllocators(const std::vector<Replacement>& replacements) {
-        std::vector<decltype(allocators_)::mapped_type::iterator> targets;
+        const auto& allocators = GetDirectory().allocators;
+        std::vector<std::shared_ptr<SegmentAllocatorRegistration>> targets;
         targets.reserve(replacements.size());
         for (const auto& replacement : replacements) {
-            auto it = allocators_.find(replacement.name);
-            if (it == allocators_.end() || !replacement.replacement) {
+            auto it = allocators.find(replacement.name);
+            if (it == allocators.end() || !replacement.replacement) {
                 return false;
             }
             auto target = std::find_if(
@@ -131,31 +135,38 @@ class AllocatorManager {
             if (target == it->second.end()) {
                 return false;
             }
-            targets.push_back(target);
+            targets.push_back(*target);
         }
         for (size_t i = 0; i < replacements.size(); ++i) {
-            (*targets[i])->BindAllocator(replacements[i].replacement);
+            targets[i]->BindAllocator(replacements[i].replacement);
         }
         return true;
     }
 
-    AllocatorManager Snapshot(
-        const std::unordered_map<std::string, UUID>* owners = nullptr) const {
+    AllocatorManager Snapshot() const {
         AllocatorManager snapshot;
-        snapshot.names_ = names_;
-        snapshot.allocators_ = allocators_;
-        if (owners) {
-            snapshot.owner_by_name_ = *owners;
+        if (directory_ &&
+            !directory_->published.load(std::memory_order_relaxed)) {
+            directory_->published.store(true, std::memory_order_relaxed);
         }
+        snapshot.directory_ = directory_;
         return snapshot;
+    }
+
+    void SetOwnerClientId(const std::string& name, const UUID& client_id) {
+        MutableDirectory().owner_by_name[name] = client_id;
+    }
+
+    void RemoveOwnerClientId(const std::string& name) {
+        MutableDirectory().owner_by_name.erase(name);
     }
 
     [[nodiscard]] std::optional<UUID> GetOwnerClientId(
         const std::string& name) const {
-        const auto owner = owner_by_name_.find(name);
-        return owner == owner_by_name_.end()
-                   ? std::nullopt
-                   : std::optional<UUID>(owner->second);
+        const auto& owners = GetDirectory().owner_by_name;
+        const auto owner = owners.find(name);
+        return owner == owners.end() ? std::nullopt
+                                     : std::optional<UUID>(owner->second);
     }
 
     /**
@@ -163,13 +174,16 @@ class AllocatorManager {
      *        names so that we can randomly pick a segment without traversing.
      * @return a vector of names of all mounted segments
      */
-    const std::vector<std::string>& getNames() const { return names_; }
+    const std::vector<std::string>& getNames() const {
+        return GetDirectory().names;
+    }
 
     [[nodiscard]] std::vector<std::string> getServingNames() const {
         std::vector<std::string> serving_names;
-        serving_names.reserve(names_.size());
-        for (const auto& name : names_) {
-            const auto& registrations = allocators_.at(name);
+        const auto& directory = GetDirectory();
+        serving_names.reserve(directory.names.size());
+        for (const auto& name : directory.names) {
+            const auto& registrations = directory.allocators.at(name);
             if (std::any_of(registrations.begin(), registrations.end(),
                             [](const auto& registration) {
                                 return registration->IsServing();
@@ -186,8 +200,9 @@ class AllocatorManager {
      */
     const std::vector<std::shared_ptr<SegmentAllocatorRegistration>>*
     getAllocators(const std::string& name) const {
-        auto it = allocators_.find(name);
-        if (it != allocators_.end()) {
+        const auto& allocators = GetDirectory().allocators;
+        auto it = allocators.find(name);
+        if (it != allocators.end()) {
             return &it->second;
         } else {
             return nullptr;
@@ -198,19 +213,51 @@ class AllocatorManager {
     void addRegistration(
         const std::string& name,
         const std::shared_ptr<SegmentAllocatorRegistration>& registration) {
-        if (!allocators_.contains(name)) {
-            names_.push_back(name);
+        auto& directory = MutableDirectory();
+        if (!directory.allocators.contains(name)) {
+            directory.names.push_back(name);
         }
-        allocators_[name].push_back(registration);
+        directory.allocators[name].push_back(registration);
     }
 
-    // Name array for randomly picking allocators.
-    std::vector<std::string> names_;
-    // Segment name to allocator registrations mapping.
-    std::unordered_map<
-        std::string, std::vector<std::shared_ptr<SegmentAllocatorRegistration>>>
-        allocators_;
-    std::unordered_map<std::string, UUID> owner_by_name_;
+    struct Directory {
+        Directory() = default;
+        Directory(const Directory& other)
+            : names(other.names),
+              allocators(other.allocators),
+              owner_by_name(other.owner_by_name) {}
+
+        std::vector<std::string> names;
+        std::unordered_map<
+            std::string,
+            std::vector<std::shared_ptr<SegmentAllocatorRegistration>>>
+            allocators;
+        // Deliberately lossy when several clients share a segment name.
+        std::unordered_map<std::string, UUID> owner_by_name;
+        // Snapshot readers share the segment lock, so first publication is
+        // atomic. Once published, this directory is never modified again.
+        mutable std::atomic<bool> published{false};
+    };
+
+    const Directory& GetDirectory() const {
+        static const Directory empty;
+        return directory_ ? *directory_ : empty;
+    }
+
+    Directory& MutableDirectory() {
+        if (!directory_) {
+            directory_ = std::make_shared<Directory>();
+        } else if (directory_->published.load(std::memory_order_relaxed)) {
+            directory_ = std::make_shared<Directory>(*directory_);
+        }
+        return *directory_;
+    }
+
+    // Snapshot publication and directory mutation use the existing external
+    // segment lock. Only membership/ownership is frozen; registrations remain
+    // shared so unmount and client liveness still invalidate old snapshots.
+    std::shared_ptr<Directory> directory_;
+    // HCA hints belong to one request, never to the shared directory.
     std::vector<std::string> preferred_hcas_;
     friend class ScopedSegmentAccess;
 };
