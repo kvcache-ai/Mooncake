@@ -4,7 +4,6 @@
 #include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
 #include <csignal>
-#include <cmath>
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
 #include <memory>   // For std::unique_ptr
@@ -259,7 +258,7 @@ DEFINE_double(
     "Controls the payload or object count queued for offload in a single "
     "eviction cycle before falling back to force-evict");
 DEFINE_validator(offload_cap_ratio, [](const char* flagname, double value) {
-    if (!std::isfinite(value) || value < 0.0 || value > 1.0) {
+    if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "offload_cap_ratio must be between 0.0 and 1.0";
         return false;
     }
