@@ -1136,8 +1136,7 @@ TEST(OssObjectStorageAdapterTest, ValidatesContentRangeForSingleAndBatchReads) {
 }
 
 TEST(OssObjectStorageAdapterTest, BackendGathersAndReadsRangesOverHttp) {
-    ScriptedOssServer server(
-        {{200, ""}, {206, "bc"}, {206, "defg"}, {204, ""}});
+    ScriptedOssServer server({{200, ""}, {206, "bcdefg"}, {204, ""}});
     ScopedEnvironment environment;
     ConfigureFaultEndpoint(environment, server.port());
     auto adapter = std::make_shared<OssObjectStorageAdapter>("/backend-io/");
@@ -1162,12 +1161,11 @@ TEST(OssObjectStorageAdapterTest, BackendGathersAndReadsRangesOverHttp) {
     EXPECT_EQ(std::string(output.data(), output.size()), "!bcdefg!");
     ASSERT_TRUE(adapter->Delete("key"));
     server.Wait();
-    ASSERT_EQ(server.requests().size(), 4U);
+    ASSERT_EQ(server.requests().size(), 3U);
     EXPECT_TRUE(server.requests()[0].starts_with("PUT "));
     EXPECT_TRUE(server.requests()[0].ends_with("\r\n\r\nabcdefgh"));
-    EXPECT_NE(server.requests()[1].find("Range: bytes=1-2"), std::string::npos);
-    EXPECT_NE(server.requests()[2].find("Range: bytes=3-6"), std::string::npos);
-    EXPECT_TRUE(server.requests()[3].starts_with("DELETE "));
+    EXPECT_NE(server.requests()[1].find("Range: bytes=1-6"), std::string::npos);
+    EXPECT_TRUE(server.requests()[2].starts_with("DELETE "));
 }
 
 TEST(OssObjectStorageAdapterTest, ValidatesVectorAndRangeArguments) {

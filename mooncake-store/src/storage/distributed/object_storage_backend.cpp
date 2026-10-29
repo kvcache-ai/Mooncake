@@ -161,24 +161,36 @@ ErrorCode ObjectStorageBackend::Read(const std::string& object_key,
         return ErrorCode::NO_AVAILABLE_HANDLE;
     }
 
-    for (const auto& slice : slices) {
-        for (size_t done = 0; done < slice.size;) {
-            const auto length = std::min<uint64_t>(chunk, slice.size - done);
-            const auto result = adapter_->GetRange(
-                object_key, staging.get(), length, static_cast<off_t>(offset));
-            if (!result) {
-                return result.error();
+    size_t slice_index = 0;
+    size_t slice_offset = 0;
+    for (uint64_t remaining = *total_bytes; remaining != 0;) {
+        const auto length = std::min(chunk, remaining);
+        const auto result = adapter_->GetRange(
+            object_key, staging.get(), length, static_cast<off_t>(offset));
+        if (!result) {
+            return result.error();
+        }
+        if (*result != length) {
+            return ErrorCode::FILE_READ_FAIL;
+        }
+
+        for (size_t done = 0; done < length;) {
+            while (slice_offset == slices[slice_index].size) {
+                ++slice_index;
+                slice_offset = 0;
             }
-            if (*result != length) {
-                return ErrorCode::FILE_READ_FAIL;
-            }
-            if (!from_host(static_cast<char*>(slice.ptr) + done, staging.get(),
-                           length)) {
+            const auto count = std::min<uint64_t>(
+                length - done, slices[slice_index].size - slice_offset);
+            if (!from_host(
+                    static_cast<char*>(slices[slice_index].ptr) + slice_offset,
+                    staging.get() + done, count)) {
                 return ErrorCode::TRANSFER_FAIL;
             }
-            done += length;
-            offset += length;
+            done += count;
+            slice_offset += count;
         }
+        remaining -= length;
+        offset += length;
     }
     return ErrorCode::OK;
 }

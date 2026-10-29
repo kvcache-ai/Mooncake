@@ -195,7 +195,8 @@ before the adapter call; an error with this flag set can have an ambiguous
 remote outcome. The backend does not retry PUT.
 
 `Read` validates the requested range against the caller-supplied object size,
-then scatters exact range GETs into destination slices. Each staging allocation
+then reads consecutive chunks independently of destination slice boundaries
+and scatters each chunk into the slices. GETs remain serial. Each staging allocation
 is at most 4 MiB, or the configured staging limit if smaller. Reads fail on a
 short response. OSS and the REST adapter used by S3 also validate `Content-Range`
 against the requested offset and length, for both individual and batch reads.

@@ -105,12 +105,83 @@ TEST_F(ObjectStorageBackendTest, GathersFullObjectAndScattersExactRange) {
             HostCopy),
         ErrorCode::OK);
     EXPECT_EQ(std::string(output.data(), output.size()), "!bcdefg!");
-    ASSERT_EQ(adapter->ranges.size(), 2U);
-    EXPECT_EQ(adapter->ranges[0], std::make_pair(off_t{1}, size_t{2}));
-    EXPECT_EQ(adapter->ranges[1], std::make_pair(off_t{3}, size_t{4}));
+    ASSERT_EQ(adapter->ranges.size(), 1U);
+    EXPECT_EQ(adapter->ranges[0], std::make_pair(off_t{1}, size_t{6}));
     ASSERT_TRUE(adapter->Delete(key));
     EXPECT_EQ(backend.Read(key, 8, {{output.data(), 1}}, 0, HostCopy),
               ErrorCode::FILE_NOT_FOUND);
+}
+
+TEST_F(ObjectStorageBackendTest, CoalescesRangesAcrossDestinationBoundaries) {
+    constexpr size_t max_chunk = 4 * 1024 * 1024;
+    for (const size_t budget : {size_t{3}, max_chunk}) {
+        SCOPED_TRACE(budget);
+        const size_t size = budget == 3 ? 13 : max_chunk + 11;
+        std::string source(size + 13, '\0');
+        for (size_t i = 0; i < source.size(); ++i) {
+            source[i] = static_cast<char>(i % 251);
+        }
+        adapter->objects["key"] = source;
+        adapter->ranges.clear();
+        ObjectStorageBackend backend({source.size(), budget}, adapter);
+        std::string last(8, '!');
+        std::string middle(size - 6, '!');
+        std::string first(4, '!');
+        EXPECT_EQ(backend.Read("key", source.size(),
+                               {{nullptr, 0},
+                                {first.data() + 1, 2},
+                                {middle.data() + 1, size - 8},
+                                {nullptr, 0},
+                                {last.data() + 1, 6},
+                                {nullptr, 0}},
+                               5, HostCopy),
+                  ErrorCode::OK);
+        EXPECT_EQ(
+            first.substr(1, 2) + middle.substr(1, size - 8) + last.substr(1, 6),
+            source.substr(5, size));
+        for (const auto* output : {&first, &middle, &last}) {
+            EXPECT_EQ(output->front(), '!');
+            EXPECT_EQ(output->back(), '!');
+        }
+        const auto chunk = std::min(max_chunk, budget);
+        ASSERT_EQ(adapter->ranges.size(), (size + chunk - 1) / chunk);
+        size_t next = 5;
+        for (const auto& [offset, length] : adapter->ranges) {
+            EXPECT_EQ(offset, next);
+            EXPECT_EQ(length, std::min(chunk, size + 5 - next));
+            next += length;
+        }
+        EXPECT_EQ(next, size + 5);
+    }
+}
+
+TEST_F(ObjectStorageBackendTest,
+       LaterChunkFailurePreservesEarlierScatterAndReleasesBudget) {
+    ObjectStorageBackend backend({9, 4}, adapter);
+    adapter->objects["key"] = "abcdefghi";
+    std::array<char, 5> first, last, middle;
+    first.fill('!');
+    middle.fill('!');
+    last.fill('!');
+    const std::vector<Slice> slices{{first.data() + 1, 3},
+                                    {nullptr, 0},
+                                    {middle.data() + 1, 3},
+                                    {last.data() + 1, 3}};
+    adapter->before_read = [&] {
+        adapter->short_read = adapter->ranges.back().first == 4;
+    };
+    EXPECT_EQ(backend.Read("key", 9, slices, 0, HostCopy),
+              ErrorCode::FILE_READ_FAIL);
+    EXPECT_EQ(std::string(first.data(), first.size()), "!abc!");
+    EXPECT_EQ(std::string(middle.data(), middle.size()), "!d!!!");
+    EXPECT_EQ(std::string(last.data(), last.size()), "!!!!!");
+
+    adapter->before_read = {};
+    adapter->short_read = false;
+    EXPECT_EQ(backend.Read("key", 9, slices, 0, HostCopy), ErrorCode::OK);
+    EXPECT_EQ(std::string(first.data(), first.size()), "!abc!");
+    EXPECT_EQ(std::string(middle.data(), middle.size()), "!def!");
+    EXPECT_EQ(std::string(last.data(), last.size()), "!ghi!");
 }
 
 TEST_F(ObjectStorageBackendTest, RejectsInvalidConfiguration) {
