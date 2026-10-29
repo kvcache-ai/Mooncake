@@ -643,6 +643,7 @@ jobs:
   build-wheel-rocm:
     needs: [spell-check, clang-format, check-paths]
     if: needs.check-paths.outputs.src == 'true'
+    # Dual-engine ROCm wheel (TENT compiled in; runtime classic unless MC_USE_TENT=1).
     uses: ./.github/workflows/ci_rocm.yml
     secrets: inherit
 

@@ -5,6 +5,10 @@ name: 'Build Wheel (ROCm)'
 # hipcc / HIP headers / hsa-runtime are available; no GPU is needed to compile.
 # On-device external-PD tests consume these artifacts later on the trusted
 # self-hosted ROCm runner in integration-test-rocm.yml.
+#
+# Dual-engine: TENT is compiled in (same as the cuda13 use-tent wheel). Runtime
+# stays classic unless MC_USE_TENT=1. Release wheels in release-rocm.yaml stay
+# classic-only.
 
 on:
   workflow_call:
@@ -134,8 +138,11 @@ jobs:
         set -eo pipefail
         export PATH="/opt/rocm/bin:$PATH"   # hipify-perl for USE_HIP
         rm -rf build && mkdir build && cd build
+        # Dual-engine: TENT is compiled in; runtime stays classic unless
+        # MC_USE_TENT=1. liburing comes from mooncake_provide_liburing().
         cmake -G Ninja .. \
           -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF \
+          -DUSE_TENT=ON -DTENT_METRICS_ENABLED=ON \
           -DENABLE_MULTI_PROTOCOL=ON \
           -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON \
           -DBUILD_UNIT_TESTS=OFF -DENABLE_SCCACHE=ON \
@@ -203,6 +210,7 @@ jobs:
         export LD_LIBRARY_PATH="/opt/rocm/lib:/usr/local/lib:${LD_LIBRARY_PATH:-}"
         "$smoke_venv/bin/python" scripts/e2e/python/verify_rocm_wheel.py
         site="$("$smoke_venv/bin/python" -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))')"
+        "$smoke_venv/bin/python" -c "from pathlib import Path; p = Path(r'$site') / 'engine.so'; raise SystemExit(0 if b'MC_USE_TENT' in p.read_bytes() else 'ROCm wheel was built without USE_TENT')"
         "$site/mooncake_master" --version
 
     - name: Upload Python wheel artifact
