@@ -74,7 +74,7 @@ class AllocatedBuffer {
     // Forward declaration of the descriptor struct
     struct Descriptor;
 
-    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
+    AllocatedBuffer(std::weak_ptr<BufferAllocatorBase> allocator,
                     void* buffer_ptr, std::size_t size,
                     std::optional<offset_allocator::OffsetAllocationHandle>&&
                         offset_handle = std::nullopt)
@@ -83,7 +83,7 @@ class AllocatedBuffer {
           size_(size),
           offset_handle_(std::move(offset_handle)) {}
 
-    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
+    AllocatedBuffer(std::weak_ptr<BufferAllocatorBase> allocator,
                     const Descriptor& descriptor);
 
     ~AllocatedBuffer();
