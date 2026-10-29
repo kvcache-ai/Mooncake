@@ -101,6 +101,8 @@ struct ObjectMetadata {
     UUID client_id;
     // Updated by UpsertStart (Case B) to reset the discard timeout.
     std::chrono::system_clock::time_point put_start_time;
+    // Local retry state; not part of the persisted metadata format.
+    bool primary_end_oplog_pending{false};
     const ObjectDataType data_type{ObjectDataType::UNKNOWN};
     const std::string group_id;
     const TenantId tenant_id;

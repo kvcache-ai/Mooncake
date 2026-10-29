@@ -5334,6 +5334,15 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
             }
         }
         if (has_target_replica && all_target_replicas_complete) {
+            if (enable_oplog_ && metadata.primary_end_oplog_pending) {
+                auto result = AppendOpLogVisibleBeforeDurable(
+                    OpType::PUT_END, object_id.tenant_id.value(), key,
+                    SerializeMetadataForOpLog(metadata));
+                if (!result) {
+                    return tl::make_unexpected(result.error());
+                }
+                metadata.primary_end_oplog_pending = false;
+            }
             return {};
         }
         LOG(ERROR) << "key=" << key << ", error=no_primary_write_in_progress";
@@ -5368,6 +5377,9 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         }
     }
 
+    if (enable_oplog_) {
+        metadata.primary_end_oplog_pending = true;
+    }
     const bool had_completed_replica =
         metadata.HasReplica(&Replica::fn_is_completed);
     const bool advanced_primary_write =
@@ -5445,14 +5457,16 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     metadata.GrantReadLease(std::chrono::milliseconds::zero());
     PublishKvStored(key, metadata, object_id.tenant_id);
 
-    if (enable_oplog_ && ordered_oplog_writer_) {
+    if (enable_oplog_) {
         std::string payload = SerializeMetadataForOpLog(metadata);
         auto result = AppendOpLogVisibleBeforeDurable(
             OpType::PUT_END, object_id.tenant_id.value(), key, payload);
         if (!result) {
             LOG(WARNING) << "PutEnd: OpLog queue failed for key=" << key
                          << ", err=" << static_cast<int>(result.error());
+            return tl::make_unexpected(result.error());
         }
+        metadata.primary_end_oplog_pending = false;
     }
     if (advanced_primary_write) {
         import_write->Accept();
