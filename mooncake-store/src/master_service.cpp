@@ -3111,6 +3111,10 @@ struct MasterService::LegacyRestoreContext {
     std::unordered_map<std::string, uint64_t>& accounted_bytes;
     size_t& rejected_count;
     size_t& already_existing_count;
+    // Objects whose surviving replicas all sat on segments the handoff no
+    // longer carries. Their loss is the unmounted segment's contents, not a
+    // corrupt snapshot, so they do not count against the all-rejected guard.
+    size_t dropped_stale_object_count{0};
     std::vector<std::pair<TenantId, std::string>>& repair_remove_keys;
     std::vector<std::pair<TenantId, std::string>>& repair_canonical_keys;
     std::vector<std::pair<TenantId, route::ObjectRef>>& installed;
@@ -3121,6 +3125,8 @@ struct MasterService::LegacyRestoreContext {
         const StandbyObjectEntry* entry;
         TenantId tenant_id;
         std::string user_key;
+        // At least one replica was dropped because its endpoint is gone.
+        bool lost_unknown_endpoint{false};
     };
     std::vector<AcceptedEntry> accepted;
     std::unordered_set<std::string> object_ids;
@@ -3176,6 +3182,8 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             continue;
         }
         bool valid = true;
+        bool lost_unknown_endpoint = false;
+        std::vector<size_t> dropped_desc_idx;
         // (segment, address, size, descriptor index) for this object's
         // live memory replicas. They join ctx.pending_ranges only after the
         // object is ctx.accepted, so a rejected object never leaves ranges
@@ -3193,9 +3201,17 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             auto segment_it =
                 ctx.segments_by_alias.find(buffer.transport_endpoint_);
             if (segment_it == ctx.segments_by_alias.end()) {
-                NoteLegacyStandbyRejection(ctx, entry, "unknown_endpoint");
-                valid = false;
-                break;
+                // The snapshot can still carry replicas on segments that were
+                // unloaded before the handoff. Those replicas are gone for
+                // good, so drop just them and keep whatever else the object
+                // has; the object is only lost when nothing else survives.
+                LOG(WARNING)
+                    << "RestoreFromStandbySnapshot: dropping replica id="
+                    << desc.id << " on unknown memory endpoint="
+                    << buffer.transport_endpoint_ << ", key=" << user_key;
+                lost_unknown_endpoint = true;
+                dropped_desc_idx.push_back(desc_idx);
+                continue;
             }
             if (buffer.size_ != entry.metadata.size || buffer.size_ == 0 ||
                 buffer.buffer_address_ >
@@ -3216,8 +3232,15 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             continue;
         }
         const size_t owner = ctx.accepted.size();
-        ctx.accepted.push_back(
-            {&entry, std::move(tenant_id), std::move(user_key)});
+        ctx.accepted.push_back({&entry, std::move(tenant_id),
+                                std::move(user_key), lost_unknown_endpoint});
+        // Registering the drops here is what keeps the rest of the walk
+        // honest: the reliable-replica count below and the construction phase
+        // both skip them, instead of counting a gone endpoint as reliable or
+        // looking it up with .at().
+        for (size_t desc_idx : dropped_desc_idx) {
+            ctx.discarded_replicas[owner].insert(desc_idx);
+        }
         for (const auto& [segment, addr, size, desc_idx] : object_ranges) {
             ctx.pending_ranges[segment].emplace_back(addr, size, owner,
                                                      desc_idx);
@@ -3280,13 +3303,25 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             ++reliable;
         }
         if (reliable == 0) {
-            // Covers both overlap casualties and objects that arrived with
-            // every replica already REMOVED/FAILED: an object with no
-            // readable replica is dropped instead of lingering as
-            // metadata-only, and the durable REMOVE below stops a later
+            // Covers overlap casualties, objects that arrived with every
+            // replica already REMOVED/FAILED, and objects whose surviving
+            // replicas all sit on segments the handoff no longer carries: an
+            // object with no readable replica is dropped instead of lingering
+            // as metadata-only, and the durable REMOVE below stops a later
             // promotion from replaying it.
-            NoteLegacyStandbyRejection(ctx, *accepted_entry.entry,
-                                       "no_reliable_replica");
+            if (accepted_entry.lost_unknown_endpoint) {
+                // The segment was unloaded before the handoff, so this is an
+                // expected loss of its contents rather than a corrupt entry
+                // and must not trip the all-rejected guard.
+                ++ctx.dropped_stale_object_count;
+                LOG(WARNING)
+                    << "RestoreFromStandbySnapshot: dropping object whose "
+                       "replicas all sat on unloaded segments, key="
+                    << accepted_entry.entry->key;
+            } else {
+                NoteLegacyStandbyRejection(ctx, *accepted_entry.entry,
+                                           "no_reliable_replica");
+            }
             ctx.repair_remove_keys.emplace_back(accepted_entry.tenant_id,
                                                 accepted_entry.user_key);
             accepted_entry.entry = nullptr;
@@ -3421,14 +3456,22 @@ tl::expected<size_t, ErrorCode> MasterService::InstallLegacyStandbyObjects(
     // A snapshot whose objects all fail to land is a failed restore, not
     // an empty cluster: reporting success here would let the supervisor
     // serve on zero state. Duplicates of already-served objects are the
-    // exception, since their state is present already. How partial
+    // exception, since their state is present already. Objects lost because
+    // their segments were unloaded before the handoff are the other
+    // exception: the cluster is legitimately empty of them. How partial
     // restores gate serving is N07/N08 scope (#3808), not this stop-gap.
     if (!ctx.objects.empty() && restored_count == 0 &&
-        ctx.already_existing_count < ctx.objects.size()) {
+        ctx.already_existing_count + ctx.dropped_stale_object_count <
+            ctx.objects.size()) {
         LOG(ERROR) << "RestoreFromStandbySnapshot: every standby object "
                    << "was rejected, objects=" << ctx.objects.size()
                    << ", rejected=" << ctx.rejected_count;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (ctx.dropped_stale_object_count > 0) {
+        LOG(WARNING) << "RestoreFromStandbySnapshot: dropped objects whose "
+                        "segments were unloaded before the handoff, count="
+                     << ctx.dropped_stale_object_count;
     }
 
     if (auto published = PublishRestoredObjects(ctx.prepared, ctx.installed);
@@ -3994,8 +4037,17 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                     << "RestoreFromStandbySnapshot: skipping object with no "
                     << "surviving replicas, tenant=" << tenant_id.value()
                     << ", key=" << user_key;
+                // Persist the removal so a later promotion cannot replay
+                // these descriptors onto whatever segment reuses the
+                // endpoint.
+                repair_remove_keys.emplace_back(tenant_id, user_key);
                 ++chunk_skipped_objects;
                 continue;
+            }
+            if (dropped_stale_replica) {
+                // Survives with some replicas dropped: persist the survivors
+                // so a later promotion cannot replay the unloaded ones.
+                repair_canonical_keys.emplace_back(tenant_id, user_key);
             }
             prepared.push_back({&entry, std::move(tenant_id),
                                 std::move(user_key), std::move(replicas)});
@@ -4031,6 +4083,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
             *legacy_objects,     memory_segments_by_alias,
             restored_allocators, restored_accounted_memory_bytes,
             rejected_count,      already_existing_count,
+            /*dropped_stale_object_count=*/0,
             repair_remove_keys,  repair_canonical_keys,
             installed,           new_known_owner_records};
         if (auto r = ValidateLegacyStandbyEntries(legacy_ctx); !r) {
