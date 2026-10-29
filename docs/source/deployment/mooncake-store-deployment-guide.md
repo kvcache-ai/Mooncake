@@ -43,7 +43,69 @@ Master service started on port 50051, max_threads=4, ...
 
 The master's default RPC port is `50051`. (To embed an HTTP metadata server instead of using P2P, add `--enable_http_metadata_server=true --http_metadata_server_port=8080`.)
 
-When the metadata backend is the Python HTTP server (`python -m mooncake.http_metadata_server`, the `http://host:8080/metadata` conn strings in this guide), it answers unauthenticated GET/PUT/DELETE on the bind address. Use `--host 127.0.0.1` for a single-host setup. Anywhere beyond a single trusted host, set `MC_METADATA_HTTP_TOKEN` on the server and on every engine: the server then requires `Authorization: Bearer <token>` on each metadata request, and the Transfer Engine's HTTP storage plugin attaches the same token automatically. A server asked to bind a non-loopback address with no token refuses to start; on a trusted network you can export `MC_METADATA_HTTP_ALLOW_INSECURE=1` to keep the legacy open behavior (it still logs a loud startup warning). Its in-memory store is capped by `MC_METADATA_MAX_KEYS` and `MC_METADATA_MAX_TOTAL_BYTES` (64K entries and 1 GiB by default), with the byte total covering UTF-8 key bytes and value bytes but not Python object overhead. `MC_METADATA_MAX_BODY_BYTES` and `MC_METADATA_MAX_CONCURRENT_PUTS` (1 MiB and 8 by default) bound each PUT body and the number read concurrently. These limits bound stored payload bytes and concurrent body reads, not connections waiting for a PUT slot or total process RSS; they are not a complete process-level memory or DoS limit. All four quota settings must be positive integers at startup.
+Both the Python HTTP metadata server (`python -m mooncake.http_metadata_server`)
+and the embedded C++ server (`--enable_http_metadata_server=true`) use the same
+`http://host:8080/metadata` API and shared-token contract. Set
+`MC_METADATA_HTTP_TOKEN` on the server and on every Transfer Engine process:
+GET/PUT/DELETE then require `Authorization: Bearer <token>`, which the engine's
+HTTP storage plugin sends automatically. Missing or incorrect credentials return
+401, including on loopback. The C++ `/health` probe remains unauthenticated.
+HTTP does not encrypt the token or metadata; use a trusted network or TLS
+termination.
+
+**Migration for embedded C++ deployments:** the default bind remains `0.0.0.0`,
+but startup now fails on a non-loopback address without a token. Before upgrading,
+configure the same secret on the master and every engine, then restart them to
+load it. For a single-host setup, use `--http_metadata_server_host=127.0.0.1`
+(or `--host 127.0.0.1` for Python). For temporary legacy compatibility on a trusted
+network, set `MC_METADATA_HTTP_ALLOW_INSECURE=1` on the server; it logs a warning
+and allows unauthenticated access only when no token is configured. This opt-in
+also accepts case-insensitive `true` and `yes`; it never disables a configured
+token. C++ reads these settings when constructing the server. Literal loopback
+IPv4/IPv6 addresses are allowed without a token; `localhost` is pinned to
+`127.0.0.1` by the C++ server rather than resolved through DNS.
+
+For example, provision `MC_METADATA_HTTP_TOKEN` through your secret-management
+system on the master and all engine processes, then start the master:
+
+```bash
+mooncake_master --enable_http_metadata_server=true \
+  --http_metadata_server_host=0.0.0.0 --http_metadata_server_port=8080
+```
+
+Both implementations accept these quotas (unset or empty values use defaults):
+
+| Environment variable | Default | What is bounded |
+| --- | --- | --- |
+| `MC_METADATA_MAX_KEYS` | 65536 | Number of stored keys |
+| `MC_METADATA_MAX_TOTAL_BYTES` | 1073741824 (1 GiB) | Sum of decoded key bytes and value bytes |
+| `MC_METADATA_MAX_BODY_BYTES` | 1048576 (1 MiB) | Each request body |
+
+Quota values must be positive integers; C++ accepts decimal digits up to
+`INT64_MAX` and rejects malformed or out-of-range settings during construction.
+Writes exceeding the key or byte budget return 503 in C++ (507 in Python)
+without modifying existing metadata. The pinned C++ HTTP library cannot serialize
+507, so C++ uses 503 with a key/size budget exhaustion message. Replacing a value
+charges only the new entry's size; deleting entries,
+including C++ internal client-timeout cleanup, releases both quotas. Byte-identical
+`rpc_meta` republication still succeeds at capacity; conflicting values retain
+the existing rejection behavior.
+
+The embedded C++ server enforces `Content-Length` before allocating/reading the
+full body. The pinned HTTP library returns **400** for an oversized declared
+body; Python returns 413. The C++ endpoint rejects chunked and multipart PUTs
+with 400 instead of treating an unread stream as an empty value. The existing
+HTTP storage plugin already uses supported fixed-length bodies. Keys are URL
+decoded once, consistently for GET/PUT/DELETE, byte accounting and internal
+cleanup.
+
+These limits bound stored key/value payloads and individual body reads, **not
+process RSS**: map nodes, string/allocator overhead, HTTP buffers, connections
+and concurrent requests add memory. Only Python supports
+`MC_METADATA_MAX_CONCURRENT_PUTS` (default 8, also a positive integer), limiting
+concurrent PUT body reads; it does not bound waiting connections. The C++ server
+does not implement that setting. Neither implementation's quotas are a complete
+process-level memory or DoS limit.
 
 (start-a-store-client)=
 ### 3. Start a Store Client
