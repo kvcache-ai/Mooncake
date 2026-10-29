@@ -235,6 +235,8 @@ class Transport {
                 void *cuda_stream;  // cudaStream_t, used by async NVLink
                                     // transport
                 int cuda_device;    // device that owns cuda_stream
+                void *hip_event;    // completion event of the async HIP
+                                    // transport (see hip_transport.cpp)
             } local;
             struct {
                 void *event;  // cudaEvent_t
