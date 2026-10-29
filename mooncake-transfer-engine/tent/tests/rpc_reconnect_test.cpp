@@ -20,6 +20,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <filesystem>
+#include <future>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <thread>
@@ -262,6 +266,162 @@ TEST_F(RpcReconnectTest, ConcurrentStaleCallsAllRecover) {
     (void)round("first");
     // By the second round every caller is on a fresh connection.
     EXPECT_EQ(round("second"), kCallers);
+}
+
+// A thread-local control client can outlive many services, each restarted on
+// another port. The peer's FIN is only observed on the next RPC to that same
+// address, so an unbounded address cache retains all of these idle sockets.
+TEST(RpcPoolLifetimeTest, AddressChurnDoesNotAccumulateIdleSockets) {
+#ifdef __linux__
+    auto fdCount = [] {
+        return std::distance(
+            std::filesystem::directory_iterator("/proc/self/fd"),
+            std::filesystem::directory_iterator{});
+    };
+    CoroRpcAgent client;
+    auto churn = [&] {
+        for (int i = 0; i < 256; ++i) {
+            CoroRpcAgent server;
+            ASSERT_TRUE(
+                server
+                    .registerFunction(kEchoFunc,
+                                      [](const std::string_view& request,
+                                         std::string& response) {
+                                          response = std::string(request);
+                                      })
+                    .ok());
+            uint16_t port = 0;
+            ASSERT_TRUE(server.start(port).ok());
+            std::string response;
+            const auto address = "127.0.0.1:" + std::to_string(port);
+            // As in getSegmentDesc(), a read may retry a stale pooled call.
+            auto status = client.call(address, kEchoFunc, "echo", response);
+            if (status.IsRpcServiceError())
+                status = client.call(address, kEchoFunc, "echo", response);
+            ASSERT_TRUE(status.ok()) << status.ToString();
+            ASSERT_EQ(response, "echo");
+        }
+    };
+    churn();
+    ASSERT_FALSE(HasFatalFailure());
+    const auto first = fdCount();
+    churn();
+    ASSERT_FALSE(HasFatalFailure());
+    // Leave room for asynchronous close callbacks, but not another cache's
+    // worth of old peer sockets. This checks resources, not map internals.
+    const auto deadline = steady_clock::now() + 2s;
+    while (fdCount() > first + 32 && steady_clock::now() < deadline)
+        std::this_thread::sleep_for(1ms);
+    EXPECT_LE(fdCount(), first + 32);
+#else
+    GTEST_SKIP() << "File descriptor accounting requires /proc/self/fd";
+#endif
+}
+
+TEST(RpcPoolLifetimeTest, EvictionPreservesConcurrentCalls) {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false, release = false;
+    CoroRpcAgent server, client;
+    ASSERT_TRUE(
+        server
+            .registerFunction(
+                kBarrierFunc,
+                [&](const std::string_view& request, std::string& response) {
+                    std::unique_lock lock(mutex);
+                    entered = true;
+                    cv.notify_all();
+                    if (!cv.wait_for(lock, 10s, [&] { return release; }))
+                        throw std::runtime_error("eviction test gate timeout");
+                    response = std::string(request);
+                },
+                true)
+            .ok());
+    uint16_t port = 0;
+    ASSERT_TRUE(server.start(port).ok());
+    auto reply =
+        std::make_shared<std::promise<std::pair<Status, std::string>>>();
+    auto future = reply->get_future();
+    const auto address = "127.0.0.1:" + std::to_string(port);
+    client.callAsync(address, kBarrierFunc, "held",
+                     [reply](auto status, auto body) {
+                         reply->set_value({std::move(status), std::move(body)});
+                     });
+    {
+        std::unique_lock lock(mutex);
+        EXPECT_TRUE(cv.wait_for(lock, 3s, [&] { return entered; }));
+    }
+    // Shared agent: address lookup, LRU updates and late lease returns race
+    // with other calls. More distinct live destinations than the cache can
+    // retain force eviction of the held call's pool.
+    std::atomic<int> successes{0};
+    std::vector<std::thread> callers;
+    for (int lane = 0; lane < 4; ++lane) {
+        callers.emplace_back([&] {
+            for (int i = 0; i < 80; ++i) {
+                CoroRpcAgent peer;
+                EXPECT_TRUE(
+                    peer.registerFunction(kEchoFunc,
+                                          [](const std::string_view& request,
+                                             std::string& response) {
+                                              response = std::string(request);
+                                          })
+                        .ok());
+                uint16_t other_port = 0;
+                auto started = peer.start(other_port);
+                EXPECT_TRUE(started.ok()) << started.ToString();
+                if (!started.ok()) break;
+                std::string response;
+                auto other = "127.0.0.1:" + std::to_string(other_port);
+                auto status =
+                    client.call(other, kEchoFunc, "parallel", response);
+                if (status.IsRpcServiceError())
+                    status =
+                        client.call(other, kEchoFunc, "parallel", response);
+                EXPECT_TRUE(status.ok()) << status.ToString();
+                if (status.ok() && response == "parallel") ++successes;
+            }
+        });
+    }
+    for (auto& caller : callers) caller.join();
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    cv.notify_all();
+    ASSERT_EQ(future.wait_for(12s), std::future_status::ready);
+    auto [status, response] = future.get();
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(response, "held");
+    EXPECT_EQ(successes.load(), 320);
+    response.clear();
+    auto again = client.call(address, kBarrierFunc, "after-eviction", response);
+    EXPECT_TRUE(again.ok()) << again.ToString();
+    EXPECT_EQ(response, "after-eviction");
+}
+
+TEST(RpcPoolLifetimeTest, SameAgentCanStartAfterStop) {
+    CoroRpcAgent server;
+    ASSERT_TRUE(server
+                    .registerFunction(kEchoFunc,
+                                      [](const std::string_view& request,
+                                         std::string& response) {
+                                          response = std::string(request);
+                                      })
+                    .ok());
+    uint16_t port = 0;
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_TRUE(server.start(port).ok());
+        CoroRpcAgent client;
+        std::string response;
+        ASSERT_TRUE(client
+                        .call("127.0.0.1:" + std::to_string(port), kEchoFunc,
+                              "restarted", response)
+                        .ok());
+        EXPECT_EQ(response, "restarted");
+        ASSERT_TRUE(server.stop().ok());
+        ASSERT_TRUE(server.stop().ok());
+    }
 }
 
 }  // namespace
