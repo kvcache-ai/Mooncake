@@ -96,3 +96,7 @@ add_executable(oplog_batch_e2e_test oplog_batch_e2e_test.cpp process_handler.cpp
 target_link_libraries(oplog_batch_e2e_test PUBLIC glog::glog gtest pthread)
 add_test(NAME oplog_batch_e2e_test COMMAND oplog_batch_e2e_test)
 set_tests_properties(oplog_batch_e2e_test PROPERTIES LABELS oplog_batch_smoke)
+
+if(COMMAND mooncake_label_tests)
+  mooncake_label_tests(store)
+endif()

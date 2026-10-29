@@ -25,3 +25,8 @@ install(
     FILES ${ETCD_WRAPPER_LIB}
     DESTINATION lib
 )
+
+if(BUILD_UNIT_TESTS AND COMMAND mooncake_label_tests)
+  mooncake_label_tests(common)
+  add_dependencies(mooncake-tests-common build_etcd_wrapper)
+endif()

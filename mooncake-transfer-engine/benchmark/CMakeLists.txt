@@ -155,3 +155,8 @@ if(BUILD_UNIT_TESTS)
       bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tebench_multinode_test.sh"
       "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_tebench_multinode.sh")
 endif()
+
+if(BUILD_UNIT_TESTS AND COMMAND mooncake_label_tests)
+  mooncake_label_tests(te)
+  add_dependencies(mooncake-tests-te tebench)
+endif()

@@ -61,3 +61,7 @@ if(BUILD_UNIT_TESTS)
   add_subdirectory(tests)
   include(${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda_plugin_context_tests.cmake)
 endif()
+
+if(COMMAND mooncake_label_tests)
+  mooncake_label_tests(tent)
+endif()

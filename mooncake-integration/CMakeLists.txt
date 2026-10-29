@@ -409,3 +409,8 @@ if(SKBUILD)
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()
 endif()
+
+if(BUILD_UNIT_TESTS AND USE_TENT AND COMMAND mooncake_label_tests)
+  mooncake_label_tests(tent)
+  add_dependencies(mooncake-tests-tent engine)
+endif()

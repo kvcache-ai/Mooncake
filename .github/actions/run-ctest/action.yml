@@ -7,6 +7,9 @@ inputs:
   junit-report:
     description: Optional repository-relative JUnit output path
     default: ''
+  label-include:
+    description: Optional CTest component label regex to include (empty runs all)
+    default: ''
   label-exclude:
     description: Optional CTest label regex to exclude
     default: ''
@@ -17,5 +20,6 @@ runs:
       env:
         RESERVE_RPC_PORT: ${{ inputs.reserve-rpc-port }}
         JUNIT_REPORT: ${{ inputs.junit-report }}
+        CTEST_LABEL_INCLUDE: ${{ inputs.label-include }}
         CTEST_LABEL_EXCLUDE: ${{ inputs.label-exclude }}
       run: bash "$GITHUB_ACTION_PATH/run.sh"

@@ -29,6 +29,7 @@ class RunCTestTest(unittest.TestCase):
         }
         # An inherited workflow setting must not affect the unset-value case.
         env.pop("CTEST_LABEL_EXCLUDE", None)
+        env.pop("CTEST_LABEL_INCLUDE", None)
         env.update(overrides)
         return subprocess.run(
             [
@@ -105,6 +106,26 @@ source "$SCRIPT"
         )
         self.assertEqual(args[args.index("--label-exclude") + 1], "^nvlink_gpu$")
         self.assertTrue((self.root / report).parent.is_dir())
+
+    def test_include_and_hardware_exclusion_coexist(self):
+        regex = "^component-(te|store-client)$"
+        result = self.run_suite(
+            CTEST_LABEL_INCLUDE=regex, CTEST_LABEL_EXCLUDE="^nvlink_gpu$"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.recorded("ctest.args"),
+            [
+                "--parallel",
+                "6",
+                "--output-on-failure",
+                "--label-regex",
+                regex,
+                "--no-tests=error",
+                "--label-exclude",
+                "^nvlink_gpu$",
+            ],
+        )
 
     def test_port_reservation_preserves_existing_ports(self):
         for existing in ("", "12345,23456-23460"):
