@@ -408,6 +408,130 @@ TEST_F(PosixFileTest, UringBatchReadDrainsErrorsBeforeNextOperation) {
     EXPECT_EQ(std::string_view(output.data(), output.size()), data);
 }
 
+TEST_F(PosixFileTest, UringVectorWritePreservesHeadAndTailNeighbors) {
+    const std::string direct_filename = "direct_vector_head_tail.bin";
+    remove(direct_filename.c_str());
+
+    int direct_fd = open(direct_filename.c_str(),
+                         O_CREAT | O_RDWR | O_DIRECT | O_CLOEXEC, 0644);
+    ASSERT_GE(direct_fd, 0) << strerror(errno);
+    constexpr size_t kBlock = 4096;
+    constexpr size_t kFileSize = 8 * kBlock;
+    ASSERT_EQ(ftruncate(direct_fd, kFileSize), 0);
+
+    UringFile uring_file(direct_filename, direct_fd, 32, true);
+
+    std::string before(kFileSize, 'n');
+    iovec before_iov{before.data(), before.size()};
+    auto fill = uring_file.vector_write(&before_iov, 1, 0);
+    ASSERT_TRUE(fill.has_value()) << toString(fill.error());
+
+    // {offset, length}: unaligned head and tail across several blocks,
+    // aligned head with a partial tail, unaligned head with an aligned end,
+    // a two-block span with no middle, and one-block spans with an aligned
+    // and an unaligned head.
+    const std::pair<off_t, size_t> cases[] = {
+        {kBlock + 100, 3 * kBlock},
+        {2 * kBlock, 2 * kBlock + 100},
+        {kBlock + 100, 3 * kBlock - 100},
+        {kBlock + 100, kBlock},
+        {5 * kBlock, 100},
+        {6 * kBlock + 100, 200},
+    };
+    std::string expected = before;
+    char fill_byte = 'a';
+    for (const auto& [offset, length] : cases) {
+        std::string payload(length, fill_byte++);
+        iovec payload_iov{payload.data(), payload.size()};
+        auto write_result = uring_file.vector_write(&payload_iov, 1, offset);
+        ASSERT_TRUE(write_result.has_value()) << toString(write_result.error());
+        EXPECT_EQ(*write_result, length);
+        expected.replace(offset, length, payload);
+
+        std::string after(kFileSize, '\0');
+        iovec after_iov{after.data(), after.size()};
+        auto read_result = uring_file.vector_read(&after_iov, 1, 0);
+        ASSERT_TRUE(read_result.has_value()) << toString(read_result.error());
+        ASSERT_EQ(*read_result, kFileSize);
+        EXPECT_EQ(after, expected)
+            << "offset " << offset << " length " << length;
+    }
+
+    remove(direct_filename.c_str());
+}
+
+TEST_F(PosixFileTest, UringVectorWriteZeroFillsPastEndOfFile) {
+    const std::string direct_filename = "direct_vector_past_eof.bin";
+    constexpr size_t kBlock = 4096;
+
+    // The file ends inside the last block of the write, so the read-back of
+    // that block is short. The first case reads it as the head block of a
+    // one-block span, the second as the tail block after a full head block.
+    // Both writes end the file at two blocks.
+    struct Case {
+        size_t file_size;
+        off_t offset;
+        size_t length;
+        size_t bounce_len;
+    };
+    const Case cases[] = {
+        {kBlock + 50, kBlock + 100, 10, kBlock},
+        {kBlock + 300, 100, kBlock, 2 * kBlock},
+    };
+    constexpr size_t kFileEnd = 2 * kBlock;
+    for (const auto& c : cases) {
+        remove(direct_filename.c_str());
+        std::string before(c.file_size, 'n');
+        {
+            int setup_fd = open(direct_filename.c_str(),
+                                O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
+            ASSERT_GE(setup_fd, 0) << strerror(errno);
+            ASSERT_EQ(write(setup_fd, before.data(), before.size()),
+                      static_cast<ssize_t>(before.size()));
+            close(setup_fd);
+        }
+
+        // Leave stale bytes in a freed bounce buffer of the same size, so a
+        // missing zero-fill likely shows up as 'J' rather than as bytes that
+        // happen to be zero.
+        {
+            const std::string scratch_filename = "direct_vector_scratch.bin";
+            int scratch_fd =
+                open(scratch_filename.c_str(),
+                     O_CREAT | O_RDWR | O_TRUNC | O_DIRECT | O_CLOEXEC, 0644);
+            ASSERT_GE(scratch_fd, 0) << strerror(errno);
+            UringFile scratch_file(scratch_filename, scratch_fd, 32, true);
+            std::string junk(c.bounce_len - 1, 'J');
+            iovec junk_iov{junk.data(), junk.size()};
+            ASSERT_TRUE(scratch_file.vector_write(&junk_iov, 1, 1).has_value());
+            remove(scratch_filename.c_str());
+        }
+
+        int direct_fd =
+            open(direct_filename.c_str(), O_RDWR | O_DIRECT | O_CLOEXEC);
+        ASSERT_GE(direct_fd, 0) << strerror(errno);
+        UringFile uring_file(direct_filename, direct_fd, 32, true);
+
+        std::string payload(c.length, 'P');
+        iovec payload_iov{payload.data(), payload.size()};
+        auto write_result = uring_file.vector_write(&payload_iov, 1, c.offset);
+        ASSERT_TRUE(write_result.has_value()) << toString(write_result.error());
+        EXPECT_EQ(*write_result, payload.size());
+
+        std::string expected = before;
+        expected.resize(kFileEnd, '\0');
+        expected.replace(c.offset, payload.size(), payload);
+        std::string after(kFileEnd, 'x');
+        iovec after_iov{after.data(), after.size()};
+        auto read_result = uring_file.vector_read(&after_iov, 1, 0);
+        ASSERT_TRUE(read_result.has_value()) << toString(read_result.error());
+        ASSERT_EQ(*read_result, kFileEnd);
+        EXPECT_EQ(after, expected) << "offset " << c.offset;
+    }
+
+    remove(direct_filename.c_str());
+}
+
 TEST_F(PosixFileTest, UringVectorIoHandlesUnalignedDirectIo) {
     const std::string direct_filename = "direct_vector_test.bin";
     remove(direct_filename.c_str());

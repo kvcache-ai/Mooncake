@@ -861,23 +861,39 @@ tl::expected<size_t, ErrorCode> UringFile::vector_write(const iovec* iov,
         if (!bounce) return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
 
         // Preserve bytes outside [offset, offset+total) within the aligned
-        // region; otherwise padding would clobber neighboring data.
-        const bool needs_rmw = (head != 0) || (aligned_len != total);
-        if (needs_rmw) {
-            auto read_res = SharedUringRing::instance().read(
-                fd_, bounce.get(), aligned_len, aligned_off);
-            if (!read_res) {
-                // A real read error must not proceed with a zero-filled
-                // bounce buffer — that would silently corrupt neighbors.
+        // region; otherwise padding would clobber neighboring data. Only the
+        // first and last blocks can hold such bytes, so read back just those,
+        // in one submission.
+        char* const buf = static_cast<char*>(bounce.get());
+        const size_t last_block = aligned_len - ALIGNMENT_;
+        ReadDesc descs[2];
+        int ndescs = 0;
+        if (head != 0) {
+            descs[ndescs++] = {buf, ALIGNMENT_, aligned_off};
+        }
+        const bool tail_partial = span != aligned_len;
+        // A one-block span was already read as the head block.
+        const bool tail_is_head = head != 0 && last_block == 0;
+        if (tail_partial && !tail_is_head) {
+            descs[ndescs++] = {buf + last_block, ALIGNMENT_,
+                               aligned_off + static_cast<off_t>(last_block)};
+        }
+        if (ndescs > 0) {
+            // A real read error must not proceed with a zero-filled
+            // bounce buffer — that would silently corrupt neighbors.
+            if (!SharedUringRing::instance().batch_read(fd_, descs, ndescs)) {
                 return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
             }
-            if (read_res.value() < aligned_len) {
-                // EOF / short read: only zero the unread suffix.
-                std::memset(static_cast<char*>(bounce.get()) + read_res.value(),
-                            0, aligned_len - read_res.value());
+            for (int i = 0; i < ndescs; ++i) {
+                // EOF / short read: zero the unread rest of this block.
+                if (descs[i].bytes_read < ALIGNMENT_) {
+                    std::memset(
+                        static_cast<char*>(descs[i].buf) + descs[i].bytes_read,
+                        0, ALIGNMENT_ - descs[i].bytes_read);
+                }
             }
         }
-        CopyFromIovec(static_cast<char*>(bounce.get()) + head, iov, iovcnt);
+        CopyFromIovec(buf + head, iov, iovcnt);
 
         res = SharedUringRing::instance().write(fd_, bounce.get(), aligned_len,
                                                 aligned_off);
