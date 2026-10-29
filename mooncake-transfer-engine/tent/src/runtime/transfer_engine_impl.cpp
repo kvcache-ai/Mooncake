@@ -836,6 +836,13 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
 
 Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
                                                MemoryOptions& options) {
+    // XPU memory reaches RDMA only when the NIC accepts its dma-buf, and
+    // otherwise relies on XPU IPC or host staging. When the caller left the
+    // transport unspecified, the allocator picked here must not limit later
+    // registration of the buffer to that transport.
+    const bool unspecified_xpu =
+        options.type == UNSPEC &&
+        LocationParser(options.location).type() == "xpu";
     if (options.type == UNSPEC) {
         auto location_type = LocationParser(options.location).type();
         bool host_location =
@@ -876,6 +883,7 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
                           .transport = transport.get(),
                           .options = options};
     allocated_memory_.push_back(entry);
+    if (unspecified_xpu) options.type = UNSPEC;
     return Status::OK();
 }
 
