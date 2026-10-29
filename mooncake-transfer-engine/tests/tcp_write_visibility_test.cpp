@@ -115,6 +115,7 @@ enum WorkFailureReasonForTest {
     kWorkConnectFailed = 3,
     kWorkSessionFailed = 4,
     kWorkShutdown = 5,
+    kWorkAbandoned = 6,
 };
 
 enum SessionProgressTestEvent {
@@ -172,6 +173,7 @@ std::atomic<int> connect_failure_count{0};
 std::atomic<int> runtime_unavailable_failure_count{0};
 std::atomic<int> session_failure_count{0};
 std::atomic<int> shutdown_failure_count{0};
+std::atomic<int> abandoned_failure_count{0};
 std::atomic<int> session_progress_target_event{0};
 std::atomic<int> session_progress_action{0};
 std::atomic<int> session_timeout_committed_count{0};
@@ -247,6 +249,7 @@ void resetLaneTestState() noexcept {
     runtime_unavailable_failure_count.store(0, std::memory_order_release);
     session_failure_count.store(0, std::memory_order_release);
     shutdown_failure_count.store(0, std::memory_order_release);
+    abandoned_failure_count.store(0, std::memory_order_release);
 }
 
 void resetSessionProgressTestState() noexcept {
@@ -386,6 +389,8 @@ void observeWorkFailureReason(int reason) noexcept {
         session_failure_count.fetch_add(1, std::memory_order_relaxed);
     if (reason == kWorkShutdown)
         shutdown_failure_count.fetch_add(1, std::memory_order_relaxed);
+    if (reason == kWorkAbandoned)
+        abandoned_failure_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 int observeSessionProgress(int event, bool detail) noexcept {
@@ -4494,6 +4499,79 @@ TEST(TcpWriteVisibilityTest, RpcMetadataRefreshInvalidatesCachedHost) {
         << "RED: segment metadata refreshed, but getRpcMetaEntry() retained "
            "the independently cached host "
         << initial_rpc.ip_or_host_name;
+}
+
+// Issue #4491 (engine half). A Store put that times out stops waiting, the
+// operation state calls freeBatchID (BatchCleanupDeferred while slices are
+// still queued), and the master revokes the put and hands the same buffer
+// range to the next writer. Slices of the abandoned batch that were never
+// posted must not be delivered afterwards, or they overwrite the next
+// writer's data. Already-posted bytes cannot be recalled; this only pins the
+// unposted part.
+TEST(TcpWriteVisibilityTest, AbandonedBatchMustNotDeliverUnpostedSlices) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    const char* env = std::getenv("MC_METADATA_SERVER");
+    std::string metadata_server = env ? env : "P2PHANDSHAKE";
+    EngineHandle h;
+    h.init(metadata_server, "127.0.0.2:17991", 8ull << 20);
+    ASSERT_TRUE(h.ok) << "engine/segment setup failed";
+
+    constexpr size_t kLength = 64 * 1024;
+    constexpr unsigned char kStale = 0xA1;  // abandoned writer
+    constexpr unsigned char kNext = 0xB2;   // next owner of the range
+    char* base = static_cast<char*>(h.pool);
+    char* dst = base;                       // shared destination range
+    char* stale_src = base + kRegionAlign;  // source of the abandoned write
+    char* probe_src = base + kRegionAlign + kLength;
+    memset(stale_src, kStale, kLength);
+    memset(probe_src, 0x5C, kLength);
+
+    // Hold the lane before it connects: submitTransfer returns, and the slice
+    // stays queued but unposted, as on a peer that stops answering.
+    ScopedLaneHooks hooks(/*block_first_connect_handler=*/true);
+    auto batch_id = h.engine->allocateBatchID(1);
+    TransferRequest stale = makeWriteRequest(h, kLength);
+    stale.source = stale_src;
+    ASSERT_TRUE(h.engine->submitTransfer(batch_id, {stale}).ok());
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return lane_connect_handler_entered.load(std::memory_order_acquire);
+        },
+        std::chrono::seconds(5)));
+
+    // The owner gives up, as TransferEngineOperationState's destructor does
+    // after wait_for_completion() times out.
+    Status free_status = h.engine->freeBatchID(batch_id);
+    EXPECT_TRUE(free_status.IsBatchCleanupDeferred()) << free_status.ToString();
+
+    // The range now belongs to someone else.
+    memset(dst, kNext, kLength);
+
+    // Let the lane connect, then push a probe write through the same single
+    // lane. Lanes are FIFO, so once the probe completes the abandoned slice
+    // has been either delivered or dropped. The failure-reason hook stays
+    // installed so the drop is observed.
+    releaseLaneConnectHandler();
+    TransferRequest probe =
+        makeWriteRequest(h, kLength, h.remote_base + 2 * kLength);
+    probe.source = probe_src;
+    ASSERT_EQ(runOne(h.engine.get(), probe), TransferStatusEnum::COMPLETED);
+
+    size_t overwritten = 0;
+    size_t stale_bytes = 0;
+    for (size_t i = 0; i < kLength; ++i) {
+        const auto byte = static_cast<unsigned char>(dst[i]);
+        if (byte != kNext) ++overwritten;
+        if (byte == kStale) ++stale_bytes;
+    }
+    EXPECT_EQ(overwritten, 0u)
+        << overwritten << "/" << kLength
+        << " bytes of the next owner's data were overwritten (" << stale_bytes
+        << " carry the abandoned write's pattern) by an unposted slice of a "
+           "batch its owner had already freed";
+    // The slice is dropped as abandoned rather than sent or failed for another
+    // reason, which also lets the deferred cleanup reclaim the batch.
+    EXPECT_EQ(abandoned_failure_count.load(std::memory_order_acquire), 1);
 }
 
 #endif

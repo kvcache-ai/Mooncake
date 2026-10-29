@@ -146,6 +146,30 @@ void TcpTransport::clearQueuedBytesLocked(PeerConnectionGroup& group) {
     group.queued_bytes_saturated = false;
 }
 
+size_t TcpTransport::dropAbandonedQueueHeadLocked(
+    PeerConnectionGroup& group, std::deque<TcpWorkItem>& abandoned) {
+    // A queued slice has not been sent yet, so its batch cannot have been
+    // reclaimed and reading the flag is safe. Slices without a batch
+    // (handshake/dummy) are never dropped.
+    auto is_abandoned = [](const Slice* slice) {
+        TransferTask* task = slice->task.load(std::memory_order_acquire);
+        return task != nullptr && task->batch_id != 0 &&
+               toBatchDesc(task->batch_id)
+                   .abandoned.load(std::memory_order_acquire);
+    };
+    size_t dropped = 0;
+    while (!group.queue.empty() && is_abandoned(group.queue.front().slice)) {
+        const uint64_t length = group.queue.front().slice->length;
+        abandoned.push_back(std::move(group.queue.front()));
+        group.queue.pop_front();
+        removeQueuedBytesLocked(group, length);
+        removeAdmittedBytesLocked(group, length);
+        ++dropped;
+    }
+    if (dropped != 0 && group.queue.empty()) clearQueuedBytesLocked(group);
+    return dropped;
+}
+
 bool TcpTransport::hasQueuedByteCapacityLocked(const PeerConnectionGroup& group,
                                                uint64_t length) {
     if (group.queued_byte_capacity == 0) return true;
@@ -780,6 +804,7 @@ void TcpTransport::runGroupPump(
     std::deque<TcpWorkItem> failed;
     std::deque<TcpWorkItem> expired;
     std::deque<TcpWorkItem> runtime_failed;
+    std::deque<TcpWorkItem> abandoned;
     std::shared_ptr<asio::steady_timer> admission_timer_to_cancel;
     WorkFailureReason failure_reason = WorkFailureReason::CONNECT_FAILED;
     uint64_t followup_pump_epoch = 0;
@@ -801,6 +826,7 @@ void TcpTransport::runGroupPump(
         promoted += promotePendingAdmissionsLocked(*group);
 
         for (const auto& lane : group->lanes) {
+            dropAbandonedQueueHeadLocked(*group, abandoned);
             if (group->queue.empty()) break;
             if (lane->state != LaneState::IDLE) continue;
             // is_open() only describes the local descriptor. A peer may have
@@ -969,6 +995,8 @@ void TcpTransport::runGroupPump(
                   group->failure_counters);
     failWorkItems(std::move(runtime_failed),
                   WorkFailureReason::RUNTIME_UNAVAILABLE,
+                  group->failure_counters);
+    failWorkItems(std::move(abandoned), WorkFailureReason::ABANDONED,
                   group->failure_counters);
     if (followup_pump_epoch != 0) postGroupPump(group, followup_pump_epoch);
     scheduleGroupRetirement(group);
@@ -1423,6 +1451,9 @@ uint64_t TcpTransport::recordWorkFailure(
             break;
         case WorkFailureReason::SHUTDOWN:
             counter = &counters->shutdown;
+            break;
+        case WorkFailureReason::ABANDONED:
+            counter = &counters->abandoned;
             break;
     }
     if (!counter) return 0;
