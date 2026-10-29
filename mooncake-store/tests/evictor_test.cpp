@@ -700,6 +700,39 @@ TEST_F(OffloadingReclaimerTest, PastTheCapAForcedRunDropsWithoutOffload) {
     EXPECT_TRUE(queue_.pushed.empty());
 }
 
+TEST_F(OffloadingReclaimerTest, ByteCapUsesQueuedBytesAndWholeObjectSize) {
+    Publish("a", "fits", seconds(10));
+    Publish("a", "exceeds", seconds(10));
+    eviction::Report so_far;
+    so_far.offload_bytes = 128;
+    so_far.outcomes[static_cast<size_t>(Outcome::kOffloadQueued)] = 1;
+    auto fits =
+        Apply("fits", {.cap = 256, .force_evict = true, .cap_in_bytes = true},
+              so_far);
+    ASSERT_TRUE(fits.has_value());
+    EXPECT_EQ(fits->outcome, Outcome::kOffloadQueued);
+    so_far.Add(*fits);
+    auto exceeds =
+        Apply("exceeds",
+              {.cap = 256, .force_evict = true, .cap_in_bytes = true}, so_far);
+    ASSERT_TRUE(exceeds.has_value());
+    EXPECT_EQ(exceeds->reason, eviction::DropReason::kOffloadCap);
+    EXPECT_EQ(queue_.pushed, std::vector<std::string>{"fits"});
+}
+
+TEST_F(OffloadingReclaimerTest, OversizedByteCapOnlyForcesWhenEnabled) {
+    Publish("a", "forced", seconds(10));
+    Publish("a", "unforced", seconds(10));
+    auto forced = Apply(
+        "forced", {.cap = 127, .force_evict = true, .cap_in_bytes = true});
+    ASSERT_TRUE(forced.has_value());
+    EXPECT_EQ(forced->reason, eviction::DropReason::kOffloadCap);
+    auto unforced = Apply(
+        "unforced", {.cap = 127, .force_evict = false, .cap_in_bytes = true});
+    ASSERT_TRUE(unforced.has_value());
+    EXPECT_EQ(unforced->outcome, Outcome::kOffloadQueued);
+}
+
 // --- Report observers --------------------------------------------------------
 
 TEST_F(EvictorTest, MetricsLeaveAPoolRunToItsCaller) {

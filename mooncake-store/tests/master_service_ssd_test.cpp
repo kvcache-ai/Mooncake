@@ -4,6 +4,8 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -86,6 +88,89 @@ void PutAndOffload(MasterService& service, const UUID& client_id,
                          .size = object_size};
     ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, {task}, {metadata})
                     .has_value());
+}
+
+TEST_F(MasterServiceSSDTest,
+       ByteAdmissionAndWholeQueueDrainReachServingMaster) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 0;
+    config.eviction_high_watermark_ratio = 1.0;
+    config.offloading_queue_limit = 1;
+    config.offload_queue_limits.use_bytes = true;
+    config.offload_queue_limits.max_pending_bytes = 3072;
+    MasterService service(config);
+    const auto client = generate_uuid();
+    MountMemoryAndLocalDisk(service, client, "byte-budget", 0x1100000000);
+    for (int i = 0; i < 4; ++i) {
+        const auto key = "byte-key-" + std::to_string(i);
+        ASSERT_TRUE(service
+                        .PutStart(client, key, TenantId::Default(), 1024,
+                                  {.replica_num = 1})
+                        .has_value());
+        ASSERT_TRUE(
+            service
+                .PutEnd(client, key, TenantId::Default(), ReplicaType::MEMORY)
+                .has_value());
+    }
+    auto tasks = service.OffloadObjectHeartbeat(client, true);
+    ASSERT_TRUE(tasks.has_value());
+    ASSERT_EQ(tasks->size(), 3);
+    for (const auto& task : *tasks) EXPECT_EQ(task.size, 1024);
+    EXPECT_TRUE(service.OffloadObjectHeartbeat(client, true)->empty());
+}
+
+TEST_F(MasterServiceSSDTest, ForceEvictCapUsesBytesForGlobalAndTenantEviction) {
+    for (const bool tenant : {false, true}) {
+        SCOPED_TRACE(tenant);
+        MasterServiceConfig config;
+        config.enable_multi_tenants = tenant;
+        const auto policy_path =
+            std::filesystem::temp_directory_path() /
+            ("mooncake-ssd-cap-" + std::to_string(generate_uuid().first) +
+             ".yaml");
+        if (tenant) {
+            std::ofstream policy(policy_path);
+            policy << "version: 1\ntenants:\n  - name: "
+                   << TenantId::Default().value()
+                   << "\n    quota: 1073741824\n";
+            policy.close();
+            config.tenant_quota_connector_uri = policy_path.string();
+        }
+        config.enable_offload = true;
+        config.offload_on_evict = true;
+        config.offload_force_evict = true;
+        config.default_kv_lease_ttl = 0;
+        config.eviction_high_watermark_ratio = 1.0;
+        config.offloading_queue_limit = 1;
+        config.offload_queue_limits.use_bytes = true;
+        config.offload_queue_limits.max_pending_bytes = 8192;
+        config.offload_cap_ratio = 0.5;
+        MasterService service(config);
+        if (tenant) std::filesystem::remove(policy_path);
+        const auto client = generate_uuid();
+        MountMemoryAndLocalDisk(service, client, "byte-cap", 0x1200000000);
+        for (int i = 0; i < 10; ++i) {
+            const auto key = "cap-key-" + std::to_string(i);
+            ASSERT_TRUE(service
+                            .PutStart(client, key, TenantId::Default(), 1536,
+                                      {.replica_num = 1})
+                            .has_value());
+            ASSERT_TRUE(service
+                            .PutEnd(client, key, TenantId::Default(),
+                                    ReplicaType::MEMORY)
+                            .has_value());
+        }
+        MasterServiceTestPeer peer(service);
+        if (tenant)
+            peer.EvictNamespaceMemory(TenantId::Default(), 15360);
+        else
+            peer.RunBatchEvictForTesting(1.0, 1.0);
+        auto tasks = service.OffloadObjectHeartbeat(client, true);
+        ASSERT_TRUE(tasks.has_value());
+        // 4096-byte per-cycle cap admits two 1536-byte objects, not three.
+        EXPECT_EQ(tasks->size(), 2);
+    }
 }
 
 TEST_F(MasterServiceSSDTest, PutRevokeProcessingDiskKeepsSsdTotal) {
