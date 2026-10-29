@@ -20,6 +20,7 @@
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/oplog_batch_types.h"
+#include "metadata_store.h"
 #include "metadata/lease_eviction_index.h"
 #include "tenant/quota_policy_store.h"
 #include "types.h"
@@ -512,6 +513,61 @@ TEST_F(MasterServiceEvictScenarioTest, OpLogRecordsEvictedTenantAndKey) {
     EXPECT_EQ(batch.entries[0].op_type, OpType::REMOVE);
     EXPECT_EQ(batch.entries[0].tenant_id, "tenant-a");
     EXPECT_EQ(batch.entries[0].object_key, "cold");
+}
+
+TEST_F(MasterServiceEvictScenarioTest, OffloadCompletionWritesOpLog) {
+    // With enable_offload, PutEnd queues an offload and the LOCAL_DISK replica
+    // is registered when the offload completes. That registration must reach
+    // the OpLog, as the no-task path in AddReplicaForRetainedClient does, or a
+    // standby never learns of the disk copy.
+    const std::string cluster_id = "evict_scenario_offload_completion_oplog";
+    auto backend = std::make_shared<EvictFakeBatchHaKvBackend>();
+    auto config = HaConfig(cluster_id);
+    config.enable_offload = true;
+    MasterScenario scenario("offload completion writes oplog", config, backend);
+    scenario.Given(MemoryNode("memory"))
+        .When(MountLocalDisk("memory"))
+        .When(PutStart("cold", kObjectSize).By("memory"))
+        .When(PutEnd("cold").By("memory"));
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    // Find the batch that carries cold's PUT_END, so the next one is the
+    // offload completion's record.
+    uint64_t put_end_batch = 0;
+    for (int attempt = 0; attempt < 100 && put_end_batch == 0; ++attempt) {
+        for (uint64_t id = 1; id <= 16; ++id) {
+            if (storage.ReadBatch(id, batch) != ErrorCode::OK) break;
+            if (batch.entries.size() == 1 &&
+                batch.entries[0].op_type == OpType::PUT_END &&
+                batch.entries[0].object_key == "cold") {
+                put_end_batch = id;
+            }
+        }
+        if (put_end_batch == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    ASSERT_NE(put_end_batch, 0u);
+
+    scenario.When(CompleteOffload({"cold"}).By("memory").OnNode("memory"));
+    ASSERT_NO_FATAL_FAILURE(
+        ReadBatchEventually(storage, put_end_batch + 1, batch));
+
+    ASSERT_EQ(batch.entries.size(), 1u);
+    EXPECT_EQ(batch.entries[0].op_type, OpType::PUT_END);
+    EXPECT_EQ(batch.entries[0].object_key, "cold");
+    MetadataPayload payload;
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(payload, batch.entries[0].payload));
+    size_t local_disk = 0;
+    size_t memory = 0;
+    for (const auto& replica : payload.replicas) {
+        if (replica.is_local_disk_replica()) ++local_disk;
+        if (replica.is_memory_replica()) ++memory;
+    }
+    EXPECT_EQ(local_disk, 1u);
+    EXPECT_EQ(memory, 1u);
 }
 
 TEST_F(MasterServiceEvictScenarioTest,

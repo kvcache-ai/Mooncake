@@ -1565,6 +1565,12 @@ class MasterService {
     bool ProbeNoFSegment(const std::string& te_endpoint,
                          std::string* error_reason);
 
+    // Appends the PUT_END that registering (or refreshing) client_id's
+    // LOCAL_DISK replica on `metadata` produces. No-op without the OpLog.
+    tl::expected<void, ErrorCode> PersistLocalDiskReplicaToOpLog(
+        const ObjectIdentity& object_id, const ObjectMetadata& metadata,
+        const UUID& client_id, const Replica& replica);
+
     // Pushes an offload mirror for `replica` onto its host client's LocalSSD
     // mailbox. When `mirror_clients` is non-null, the destination client is
     // appended to it on success.
