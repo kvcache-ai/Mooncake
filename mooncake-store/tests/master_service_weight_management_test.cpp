@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <future>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,22 @@ class MasterServiceWeightManagementTest : public MasterServiceTest {
         return "weights/production/llama-70b/step-100/7/manifest";
     }
 
+    static BeginWeightImportRequest BeginRequest(
+        std::optional<WeightStoragePolicy> policy) {
+        return BeginWeightImportRequest{
+            .identity = Identity(),
+            .payload_group_id = {},
+            .expected_payload_count = 2,
+            .expected_logical_bytes = 2048,
+            .policy = policy,
+            .affinity_summary =
+                WeightAffinitySummary{
+                    .affinity_count = 2,
+                    .affinity_digest = std::string(64, 'c'),
+                },
+        };
+    }
+
     WeightRevisionMetadata Begin(MasterService& service, uint64_t payload_count,
                                  uint64_t logical_bytes) {
         auto result = service.BeginWeightImport(BeginWeightImportRequest{
@@ -35,6 +52,16 @@ class MasterServiceWeightManagementTest : public MasterServiceTest {
             .payload_group_id = {},
             .expected_payload_count = payload_count,
             .expected_logical_bytes = logical_bytes,
+            .policy =
+                WeightStoragePolicy{
+                    .preferred_residency = WeightResidencyState::HOT,
+                    .migration_mode = WeightMigrationMode::MANUAL,
+                },
+            .affinity_summary =
+                WeightAffinitySummary{
+                    .affinity_count = payload_count,
+                    .affinity_digest = std::string(64, 'c'),
+                },
         });
         EXPECT_TRUE(result.has_value());
         return *result;
@@ -48,6 +75,9 @@ class MasterServiceWeightManagementTest : public MasterServiceTest {
         config.with_hard_pin = true;
         config.data_type = data_type;
         config.group_ids = std::vector<std::string>{group_id};
+        if (data_type == ObjectDataType::WEIGHT) {
+            config.residency_affinity_ids = std::vector<std::string>{key};
+        }
         PutCompletedObject(service, client_id, key, config, size);
     }
 
@@ -70,6 +100,70 @@ class MasterServiceWeightManagementTest : public MasterServiceTest {
         };
     }
 };
+
+TEST_F(MasterServiceWeightManagementTest,
+       UsesConfiguredDefaultPolicyWhenRequestOmitsPolicy) {
+    auto config = MasterServiceConfig::builder()
+                      .set_default_weight_storage_policy(WeightStoragePolicy{
+                          .preferred_residency = WeightResidencyState::COLD,
+                          .mixed_hot_ratio = 0.25,
+                          .migration_mode = WeightMigrationMode::MANUAL,
+                      })
+                      .build();
+    MasterService service(config);
+
+    auto importing = service.BeginWeightImport(BeginRequest(std::nullopt));
+
+    ASSERT_TRUE(importing.has_value());
+    EXPECT_EQ(WeightResidencyState::COLD,
+              importing->policy.preferred_residency);
+    EXPECT_DOUBLE_EQ(0.25, importing->policy.mixed_hot_ratio);
+    EXPECT_EQ(WeightMigrationMode::MANUAL, importing->policy.migration_mode);
+}
+
+TEST_F(MasterServiceWeightManagementTest,
+       RequestPolicyOverridesConfiguredDefault) {
+    auto config = MasterServiceConfig::builder()
+                      .set_default_weight_storage_policy(WeightStoragePolicy{
+                          .preferred_residency = WeightResidencyState::COLD,
+                          .mixed_hot_ratio = 0.25,
+                          .migration_mode = WeightMigrationMode::MANUAL,
+                      })
+                      .build();
+    MasterService service(config);
+    const WeightStoragePolicy request_policy{
+        .preferred_residency = WeightResidencyState::HOT,
+        .mixed_hot_ratio = 0.75,
+        .migration_mode = WeightMigrationMode::PINNED,
+    };
+
+    auto importing = service.BeginWeightImport(BeginRequest(request_policy));
+
+    ASSERT_TRUE(importing.has_value());
+    EXPECT_EQ(request_policy, importing->policy);
+}
+
+TEST_F(MasterServiceWeightManagementTest,
+       RejectsInvalidConfiguredDefaultPolicy) {
+    MasterServiceConfig config;
+    config.default_weight_storage_policy.mixed_hot_ratio = 1.0;
+
+    EXPECT_THROW(MasterService service(config), std::invalid_argument);
+}
+
+TEST_F(MasterServiceWeightManagementTest,
+       RejectsUnsatisfiableSingleAffinityMixedImport) {
+    MasterService service;
+    auto request = BeginRequest(std::nullopt);
+    request.expected_payload_count = 1;
+    request.expected_logical_bytes = 1024;
+    request.affinity_summary.affinity_count = 1;
+
+    auto importing = service.BeginWeightImport(request);
+
+    ASSERT_FALSE(importing.has_value());
+    EXPECT_EQ(WeightManagementError::POLICY_UNSATISFIABLE, importing.error());
+}
 
 TEST_F(MasterServiceWeightManagementTest,
        PublishesReadyAndRetriesAfterResponseLoss) {
@@ -130,6 +224,16 @@ TEST_F(MasterServiceWeightManagementTest, CommitsPercentEncodedIdentity) {
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'c'),
+            },
     });
     ASSERT_TRUE(importing.has_value());
     const auto manifest_key = MakeWeightManifestKey(identity);
@@ -160,6 +264,16 @@ TEST_F(MasterServiceWeightManagementTest,
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'c'),
+            },
     });
     ASSERT_FALSE(importing.has_value());
     EXPECT_EQ(WeightManagementError::INVALID_ARGUMENT, importing.error());
@@ -179,6 +293,16 @@ TEST_F(MasterServiceWeightManagementTest,
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'c'),
+            },
     });
     ASSERT_TRUE(importing.has_value());
     EXPECT_EQ(identity, importing->identity);
@@ -444,7 +568,7 @@ TEST_F(MasterServiceWeightManagementTest,
 
     auto result = operation.get();
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(WeightOperationState::REHYDRATING, result->operation);
+    EXPECT_EQ(WeightOperationKind::MIGRATING, result->kind);
 }
 
 }  // namespace

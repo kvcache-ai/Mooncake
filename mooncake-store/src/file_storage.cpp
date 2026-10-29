@@ -356,7 +356,7 @@ bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::vector<OffloadTaskItem>& offloading_objects) {
-    if (offloading_objects.empty()) {
+    if (offloading_objects.empty() && deferred_task_by_storage_key_.empty()) {
         return {};
     }
     std::unordered_map<std::string, int64_t> storage_object_sizes;
@@ -397,6 +397,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                     << storage_key;
             continue;
         }
+        storage_object_sizes.emplace(storage_key, task.size);
         task_by_storage_key.emplace(storage_key, task);
     }
 
@@ -881,7 +882,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     // Generic removal reclaims files through metadata-checked eviction, not a
     // backend-wide wipe that could remove managed objects or another tenant.
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
-    if (!offloading_objects.empty()) {
+    if (!offloading_objects.empty() || !deferred_task_by_storage_key_.empty()) {
         auto offload_result = OffloadObjects(offloading_objects);
         if (!offload_result) {
             LOG(ERROR) << "Failed to persist objects with error: "

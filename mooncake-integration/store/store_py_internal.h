@@ -868,7 +868,8 @@ bool is_default_replicate_config(const ReplicateConfig &config) {
            config.preferred_segments.empty() &&
            config.preferred_segment.empty() &&
            !config.prefer_alloc_in_same_node && !config.group_ids.has_value() &&
-           !config.session_ids.has_value();
+           !config.session_ids.has_value() &&
+           !config.residency_affinity_ids.has_value();
 }
 
 std::optional<ParallelAxisSpec> parse_parallel_axis_spec(

@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
@@ -185,10 +186,18 @@ class FileStorageTest : public ::testing::Test {
                                               .resource_id = "ssd-weight",
                                               .revision = "v1",
                                               .weight_generation = 1};
-        auto begin = client->BeginWeightImport({.identity = identity,
-                                                .payload_group_id = {},
-                                                .expected_payload_count = 1,
-                                                .expected_logical_bytes = 128});
+        auto begin = client->BeginWeightImport({
+            .identity = identity,
+            .payload_group_id = {},
+            .expected_payload_count = 1,
+            .expected_logical_bytes = 128,
+            .policy =
+                WeightStoragePolicy{
+                    .preferred_residency = WeightResidencyState::HOT,
+                    .migration_mode = WeightMigrationMode::MANUAL},
+            .affinity_summary = {.affinity_count = 1,
+                                 .affinity_digest = std::string(64, 'c')},
+        });
         ASSERT_TRUE(begin && *begin);
         const auto manifest_key = MakeWeightManifestKey(identity);
         const std::vector<std::string> keys{"ordinary-ssd", "managed-payload",
@@ -206,6 +215,10 @@ class FileStorageTest : public ::testing::Test {
                 config.group_ids = {(*begin)->manifest.payload_group_id};
                 config.data_type =
                     i == 1 ? ObjectDataType::WEIGHT : ObjectDataType::METADATA;
+                if (i == 1) {
+                    config.residency_affinity_ids =
+                        std::vector<std::string>{"payload"};
+                }
             }
             std::vector<Slice> slices{{buffer, values[i].size()}};
             ASSERT_TRUE(client->Put(keys[i], slices, config));
@@ -319,6 +332,73 @@ class FileStorageTest : public ::testing::Test {
         EXPECT_EQ(baseline, StoredFileBytes(config.storage_filepath));
         EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
         EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
+    }
+
+    void RunDeferredHeartbeatTailScenario() {
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_default_kv_lease_ttl(0)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+        std::unique_ptr<void, decltype(&std::free)> segment(
+            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+        ASSERT_NE(segment, nullptr);
+        SimpleAllocator allocator(kSegmentSize);
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                      std::nullopt, master.master_address());
+        ASSERT_TRUE(created);
+        auto client = created.value();
+        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+        ASSERT_TRUE(client->RegisterLocalMemory(
+            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+        void* buffer = allocator.allocate(128);
+        ASSERT_NE(buffer, nullptr);
+        std::memset(buffer, 't', 128);
+        std::vector<Slice> slices{{buffer, 128}};
+        ReplicateConfig replicate;
+        replicate.replica_num = 1;
+        ASSERT_TRUE(client->Put("heartbeat-tail", slices, replicate));
+
+        auto config = FileStorageConfig::FromEnvironment();
+        config.storage_backend_type = StorageBackendType::kBucket;
+        config.storage_filepath = data_path + "/heartbeat_tail";
+        config.local_buffer_size = 1024 * 1024;
+        fs::create_directories(config.storage_filepath);
+        FileStorage storage(config, client, endpoint);
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = 10;
+        bucket_config.flush_partial_buckets = false;
+        auto backend =
+            std::make_shared<BucketStorageBackend>(config, bucket_config);
+        storage.storage_backend_ = backend;
+        ASSERT_TRUE(backend->Init());
+        ASSERT_TRUE(storage.RegisterLocalMemory());
+        storage.enable_offloading_ = true;
+        ASSERT_TRUE(storage.Heartbeat());
+        ASSERT_EQ(1u, storage.deferred_task_by_storage_key_.size());
+        EXPECT_EQ(1u, backend->UngroupedOffloadingObjectsSize());
+        std::vector<OffloadTaskItem> fresh;
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, fresh));
+        ASSERT_TRUE(fresh.empty());
+
+        ASSERT_TRUE(storage.Heartbeat());
+        EXPECT_TRUE(storage.deferred_task_by_storage_key_.empty());
+        EXPECT_EQ(0u, backend->UngroupedOffloadingObjectsSize());
+        auto query = client->Query("heartbeat-tail");
+        ASSERT_TRUE(query);
+        EXPECT_EQ(1u,
+                  std::count_if(query->replicas.begin(), query->replicas.end(),
+                                [](const auto& replica) {
+                                    return replica.is_local_disk_replica();
+                                }));
+        std::vector<OffloadTaskItem> remaining;
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, remaining));
+        EXPECT_TRUE(remaining.empty());
+        EXPECT_TRUE(client->Upsert("heartbeat-tail", slices, replicate));
     }
 
     void RunDeferredOffloadFailureScenario(bool capacity_limit) {
@@ -1278,6 +1358,29 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_deduplicates_carryover) {
     EXPECT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
 }
 
+TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_flushes_replayed_tail) {
+    std::unordered_map<std::string, int64_t> offloading_objects;
+    offloading_objects.emplace("tail-0", 1);
+    offloading_objects.emplace("tail-1", 1);
+
+    std::vector<std::vector<std::string>> buckets_keys;
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_TRUE(buckets_keys.empty());
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 2);
+
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_EQ(buckets_keys.size(), 1);
+    EXPECT_EQ(buckets_keys.front().size(), 2);
+    EXPECT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
+}
+
 TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_size_limit) {
     std::unordered_map<std::string, int64_t> offloading_objects;
     for (size_t i = 0; i < 35; i++) {
@@ -1355,6 +1458,10 @@ TEST_F(FileStorageTest,
     }
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
+}
+
+TEST_F(FileStorageTest, EmptyHeartbeatFlushesDeferredTail) {
+    RunDeferredHeartbeatTailScenario();
 }
 
 TEST_F(FileStorageTest, OffloadObjects_capacity_limit_releases_deferred_tasks) {

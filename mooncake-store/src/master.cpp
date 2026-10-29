@@ -3,12 +3,15 @@
 
 #include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
+#include <cmath>
 #include <csignal>
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
 #include <memory>   // For std::unique_ptr
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>  // For std::thread
 #include <json/json.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -79,6 +82,64 @@ uint64_t ParseDurationFlagOrDie(const char* flag_name,
                    << ". " << error;
     }
     return parsed_value;
+}
+
+bool ValidateWeightResidencyTargetFlag(const char* flagname,
+                                       const std::string& value) {
+    if (!mooncake::ParseWeightResidencyTarget(value).has_value()) {
+        LOG(ERROR) << "Invalid value for --" << flagname << ": " << value
+                   << ". Expected one of: hot, cold, mixed";
+        return false;
+    }
+    return true;
+}
+
+bool ValidateWeightMigrationModeFlag(const char* flagname,
+                                     const std::string& value) {
+    const auto mode = mooncake::ParseWeightMigrationMode(value);
+    if (!mode.has_value() || *mode == mooncake::WeightMigrationMode::AUTO) {
+        LOG(ERROR) << "Invalid value for --" << flagname << ": " << value
+                   << ". Expected pinned or manual; auto is not supported yet";
+        return false;
+    }
+    return true;
+}
+
+bool ValidateWeightMixedHotRatioFlag(const char* flagname, double value) {
+    if (!std::isfinite(value) || value <= 0.0 || value >= 1.0) {
+        LOG(ERROR) << "Invalid value for --" << flagname << ": " << value
+                   << ". Expected a finite value in (0, 1)";
+        return false;
+    }
+    return true;
+}
+
+mooncake::WeightStoragePolicy ParseWeightStoragePolicyOrThrow(
+    std::string_view preferred_residency, double mixed_hot_ratio,
+    std::string_view migration_mode) {
+    const auto parsed_residency =
+        mooncake::ParseWeightResidencyTarget(preferred_residency);
+    if (!parsed_residency.has_value()) {
+        throw std::invalid_argument(
+            "default_weight_preferred_residency must be one of: hot, cold, "
+            "mixed");
+    }
+    const auto parsed_mode = mooncake::ParseWeightMigrationMode(migration_mode);
+    if (!parsed_mode.has_value()) {
+        throw std::invalid_argument(
+            "default_weight_migration_mode must be pinned or manual");
+    }
+    mooncake::WeightStoragePolicy policy{
+        .preferred_residency = *parsed_residency,
+        .mixed_hot_ratio = mixed_hot_ratio,
+        .migration_mode = *parsed_mode,
+    };
+    const auto validation = mooncake::ValidateWeightStoragePolicy(policy);
+    if (!validation.ok()) {
+        throw std::invalid_argument("invalid default weight storage policy: " +
+                                    validation.message());
+    }
+    return policy;
 }
 
 // Derive the metadata server address for cleanup when it is deployed
@@ -152,12 +213,25 @@ DEFINE_string(max_kv_soft_pin_ttl, kDefaultMaxKvSoftPinTtlFlagValue,
               "Maximum request-level soft pin TTL for kv objects. Supports "
               "raw milliseconds or duration strings with ms, s, m, or h "
               "suffixes");
+DEFINE_string(default_weight_preferred_residency, "mixed",
+              "Default preferred residency for managed weights: hot, cold, "
+              "or mixed");
+DEFINE_double(default_weight_mixed_hot_ratio, 0.5,
+              "Default hot byte ratio for managed weights in mixed state");
+DEFINE_string(default_weight_migration_mode, "manual",
+              "Default migration mode for managed weights: pinned or manual");
 DEFINE_bool(allow_evict_soft_pinned_objects,
             mooncake::DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
             "Whether to allow eviction of soft pinned objects during eviction");
 DEFINE_validator(default_kv_lease_ttl, ValidateDurationFlag);
 DEFINE_validator(default_kv_soft_pin_ttl, ValidateDurationFlag);
 DEFINE_validator(max_kv_soft_pin_ttl, ValidateDurationFlag);
+DEFINE_validator(default_weight_preferred_residency,
+                 ValidateWeightResidencyTargetFlag);
+DEFINE_validator(default_weight_mixed_hot_ratio,
+                 ValidateWeightMixedHotRatioFlag);
+DEFINE_validator(default_weight_migration_mode,
+                 ValidateWeightMigrationModeFlag);
 DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
               "Ratio of objects to evict when Memory space is full");
 DEFINE_double(eviction_high_watermark_ratio,
@@ -558,6 +632,22 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDurationMs("max_kv_soft_pin_ttl",
                                  &master_config.max_kv_soft_pin_ttl,
                                  mooncake::DEFAULT_MAX_KV_SOFT_PIN_TTL_MS);
+    std::string default_weight_preferred_residency;
+    double default_weight_mixed_hot_ratio = 0.5;
+    std::string default_weight_migration_mode;
+    default_config.GetString("default_weight_preferred_residency",
+                             &default_weight_preferred_residency,
+                             FLAGS_default_weight_preferred_residency);
+    default_config.GetDouble("default_weight_mixed_hot_ratio",
+                             &default_weight_mixed_hot_ratio,
+                             FLAGS_default_weight_mixed_hot_ratio);
+    default_config.GetString("default_weight_migration_mode",
+                             &default_weight_migration_mode,
+                             FLAGS_default_weight_migration_mode);
+    master_config.default_weight_storage_policy =
+        ParseWeightStoragePolicyOrThrow(default_weight_preferred_residency,
+                                        default_weight_mixed_hot_ratio,
+                                        default_weight_migration_mode);
     default_config.GetBool("allow_evict_soft_pinned_objects",
                            &master_config.allow_evict_soft_pinned_objects,
                            FLAGS_allow_evict_soft_pinned_objects);
@@ -888,6 +978,29 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.max_kv_soft_pin_ttl = ParseDurationFlagOrDie(
             "max_kv_soft_pin_ttl", FLAGS_max_kv_soft_pin_ttl);
+    }
+    if ((google::GetCommandLineFlagInfo("default_weight_preferred_residency",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.default_weight_storage_policy.preferred_residency =
+            *mooncake::ParseWeightResidencyTarget(
+                FLAGS_default_weight_preferred_residency);
+    }
+    if ((google::GetCommandLineFlagInfo("default_weight_mixed_hot_ratio",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.default_weight_storage_policy.mixed_hot_ratio =
+            FLAGS_default_weight_mixed_hot_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("default_weight_migration_mode",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.default_weight_storage_policy.migration_mode =
+            *mooncake::ParseWeightMigrationMode(
+                FLAGS_default_weight_migration_mode);
     }
     if ((google::GetCommandLineFlagInfo("allow_evict_soft_pinned_objects",
                                         &info) &&
@@ -1458,11 +1571,11 @@ int main(int argc, char* argv[]) {
         default_config.SetPath(conf_path);
         try {
             default_config.Load();
+            InitMasterConf(default_config, master_config);
         } catch (const std::exception& e) {
             LOG(FATAL) << "Failed to initialize default config: " << e.what();
             return 1;
         }
-        InitMasterConf(default_config, master_config);
         loaded_default_config = &default_config;
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
@@ -1591,6 +1704,14 @@ int main(int argc, char* argv[]) {
         << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
         << ", default_kv_soft_pin_ttl=" << master_config.default_kv_soft_pin_ttl
         << ", max_kv_soft_pin_ttl=" << master_config.max_kv_soft_pin_ttl
+        << ", default_weight_preferred_residency="
+        << mooncake::WeightResidencyTargetName(
+               master_config.default_weight_storage_policy.preferred_residency)
+        << ", default_weight_mixed_hot_ratio="
+        << master_config.default_weight_storage_policy.mixed_hot_ratio
+        << ", default_weight_migration_mode="
+        << mooncake::WeightMigrationModeName(
+               master_config.default_weight_storage_policy.migration_mode)
         << ", allow_evict_soft_pinned_objects="
         << master_config.allow_evict_soft_pinned_objects
         << ", eviction_ratio=" << master_config.eviction_ratio

@@ -80,7 +80,7 @@ void PublishUnder(const route::WriteGuard& guard, size_t length,
         UUID{1, 2},
         std::chrono::system_clock::time_point(std::chrono::seconds(1)), length,
         std::move(replicas), std::nullopt, false, ObjectDataType::UNKNOWN,
-        std::string{}, TenantId(), guard.key());
+        std::string{}, std::string{}, TenantId(), guard.key());
 }
 
 void MarkMemoryReplicasComplete(const route::WriteGuard& guard) {

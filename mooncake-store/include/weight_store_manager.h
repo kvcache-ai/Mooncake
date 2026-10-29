@@ -24,8 +24,8 @@ class WeightStoreManager {
     };
 
    public:
-    explicit WeightStoreManager(WeightStoreBackend& backend)
-        : backend_(backend) {}
+    explicit WeightStoreManager(WeightStoreBackend& backend,
+                                WeightStoragePolicy policy = {});
 
     // A successful guard excludes append-to-publication mutations while the
     // caller captures the OpLog boundary and weight state together.
@@ -59,6 +59,11 @@ class WeightStoreManager {
     tl::expected<ImportWriteGuard, ErrorCode> TrackImportWrite(
         const TenantId& tenant, const std::string& group);
     void RecordImportWrite(const TenantId& tenant, const std::string& group);
+    bool RecordOffloadFailures(std::vector<uint64_t> operation_ids);
+    bool HasActiveLease(const WeightRevisionIdentity& identity,
+                        uint64_t generation, uint64_t now_ms) const {
+        return weight_metadata_.HasActiveLease(identity, generation, now_ms);
+    }
     size_t ReconcileWeightMetadataStoreOnce(uint64_t now_ms, size_t limit);
     bool IsManagedGroup(const std::string& group) const {
         return weight_metadata_.IsManagedGroup(group);
@@ -90,6 +95,8 @@ class WeightStoreManager {
     WeightMetadataStore::Result<WeightRevisionMetadata> DeleteWeightRevision(
         const DeleteWeightRevisionRequest& request);
 
+    WeightMetadataStore::Result<WeightRevisionMetadata> UpdateWeightPolicy(
+        const UpdateWeightPolicyRequest& request);
     WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
         const BeginWeightImportRequest& request);
     WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(
@@ -107,8 +114,6 @@ class WeightStoreManager {
         const ReconcileWeightRevisionRequest& request, size_t* member_budget);
     WeightMetadataStore::Result<void> RemoveWeightMembers(
         const WeightRevisionMetadata& revision, size_t* member_budget);
-    std::vector<std::string> SelectReconciliationMembers(
-        const WeightRevisionMetadata& revision, size_t* member_budget);
     void ForgetReconciliationCursor(const WeightRevisionIdentity& identity);
     WeightMetadataStore::Result<WeightResidencyOperation>
     PersistAndPublishWeightOperationMutation(
@@ -120,7 +125,8 @@ class WeightStoreManager {
     std::unique_lock<std::mutex> LockGroup(
         const WeightRevisionIdentity& identity);
     WeightMetadataStore::Result<void> ValidateWeightGroupForCommit(
-        const CommitWeightImportRequest& request) const;
+        const CommitWeightImportRequest& request,
+        uint64_t expected_affinity_count) const;
 
     WeightStoreBackend& backend_;
     std::shared_ptr<ImportActivity> FindImportActivity(
@@ -130,15 +136,16 @@ class WeightStoreManager {
     std::mutex import_activity_mutex_;
     std::unordered_map<std::string, std::shared_ptr<ImportActivity>>
         import_activity_;
+    const WeightStoragePolicy default_weight_storage_policy_;
     WeightMetadataStore weight_metadata_;
     std::shared_mutex mutation_mutex_;
     std::array<std::mutex, 4096> group_locks_;
     size_t weight_reconciliation_offset_{0};
     bool expire_leases_on_unit_budget_{true};
     std::mutex reconciliation_mutex_;
-    std::mutex member_cursor_mutex_;
+    std::mutex affinity_cursor_mutex_;
     // Retry offsets are local scheduling hints, not durable progress tokens.
-    std::unordered_map<std::string, size_t> member_cursors_;
+    std::unordered_map<std::string, size_t> affinity_cursors_;
 };
 
 }  // namespace mooncake

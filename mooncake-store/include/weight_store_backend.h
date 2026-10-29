@@ -11,6 +11,7 @@ namespace mooncake {
 
 struct WeightGroupMemberSnapshot {
     std::string key;
+    std::string residency_affinity_id;
     uint64_t size{0};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
     bool readable{false};
@@ -25,6 +26,11 @@ class WeightStoreBackend {
     // The consumer must arbitrate completion before publishing metadata.
     using DurableFinalize = std::function<void(const DurableResult&)>;
     virtual ~WeightStoreBackend() = default;
+    virtual bool QueueManagedWeightMemberOffload(
+        const WeightRevisionMetadata& revision, const std::string& key) = 0;
+    virtual void EvictManagedWeightMembersToCold(
+        const WeightRevisionMetadata& revision,
+        const std::vector<std::string>& keys) = 0;
     virtual bool CanPublishWeightMutations() const = 0;
     virtual PromotionQueueResult PromoteWeightObject(
         const TenantId& tenant_id, const std::string& key) = 0;
@@ -33,9 +39,6 @@ class WeightStoreBackend {
     virtual tl::expected<void, ErrorCode> RemoveObject(
         const std::string& key, const TenantId& tenant_id, bool force,
         bool allow_managed_weight) = 0;
-    virtual void EvictManagedWeightMembersToCold(
-        const WeightRevisionMetadata& revision,
-        const std::vector<std::string>& member_keys) = 0;
     virtual bool IsOpLogEnabled() const = 0;
     virtual bool IsTenantSupported(const std::string& tenant_id) const = 0;
     virtual tl::expected<OpLogEntry, ErrorCode> AppendOpLogWithDurableFinalize(
@@ -51,6 +54,11 @@ class MasterService;
 class MasterStoreBackend final : public WeightStoreBackend {
    public:
     explicit MasterStoreBackend(MasterService& master) : master_(master) {}
+    bool QueueManagedWeightMemberOffload(const WeightRevisionMetadata& revision,
+                                         const std::string& key) override;
+    void EvictManagedWeightMembersToCold(
+        const WeightRevisionMetadata& revision,
+        const std::vector<std::string>& keys) override;
     bool CanPublishWeightMutations() const override;
     PromotionQueueResult PromoteWeightObject(const TenantId& tenant_id,
                                              const std::string& key) override;
@@ -59,9 +67,6 @@ class MasterStoreBackend final : public WeightStoreBackend {
     tl::expected<void, ErrorCode> RemoveObject(
         const std::string& key, const TenantId& tenant_id, bool force,
         bool allow_managed_weight) override;
-    void EvictManagedWeightMembersToCold(
-        const WeightRevisionMetadata& revision,
-        const std::vector<std::string>& member_keys) override;
     bool IsOpLogEnabled() const override;
     bool IsTenantSupported(const std::string& tenant_id) const override;
     tl::expected<OpLogEntry, ErrorCode> AppendOpLogWithDurableFinalize(

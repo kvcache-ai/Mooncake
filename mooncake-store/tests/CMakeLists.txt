@@ -41,6 +41,8 @@ add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(weight_management_contract_test
                weight_management_contract_test.cpp)
 add_store_test(weight_metadata_store_test weight_metadata_store_test.cpp)
+add_store_test(weight_policy_state_test weight_policy_state_test.cpp)
+add_store_test(weight_residency_planner_test weight_residency_planner_test.cpp)
 add_store_test(weight_revision_lease_test weight_revision_lease_test.cpp)
 add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(replica_allocator_test replica_allocator_test.cpp)
@@ -561,3 +563,7 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+add_store_test(weight_manual_residency_e2e_test
+               weight_manual_residency_e2e_test.cpp)
+set_tests_properties(weight_manual_residency_e2e_test PROPERTIES TIMEOUT 420)

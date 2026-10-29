@@ -54,6 +54,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     tenant/quota_policy.cpp
     tenant/quota_policy_store.cpp
     weight_metadata_store.cpp
+    weight_residency_planner.cpp
     rpc_service.cpp
     master_admin_service.cpp
     offset_allocator.cpp

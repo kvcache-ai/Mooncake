@@ -320,4 +320,23 @@ TEST(MasterServiceConfigTest,
     EXPECT_EQ(from_supervisor.http_port, UINT16_MAX);
 }
 
+TEST(MasterServiceConfigTest, DefaultWeightPolicyPropagatesToServingConfig) {
+    MasterConfig master_config{};
+    master_config.default_weight_storage_policy = WeightStoragePolicy{
+        .preferred_residency = WeightResidencyState::COLD,
+        .mixed_hot_ratio = 0.25,
+        .migration_mode = WeightMigrationMode::MANUAL,
+    };
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    WrappedMasterServiceConfig wrapped_config(supervisor_config, 1);
+    MasterServiceConfig service_config(wrapped_config);
+
+    EXPECT_EQ(master_config.default_weight_storage_policy,
+              supervisor_config.default_weight_storage_policy);
+    EXPECT_EQ(master_config.default_weight_storage_policy,
+              wrapped_config.default_weight_storage_policy);
+    EXPECT_EQ(master_config.default_weight_storage_policy,
+              service_config.default_weight_storage_policy);
+}
+
 }  // namespace mooncake::test
