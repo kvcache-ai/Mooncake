@@ -4162,10 +4162,9 @@ TEST_F(MasterServiceTest,
     ASSERT_TRUE(pending_exists.has_value());
     EXPECT_TRUE(*pending_exists);
 
-    ASSERT_TRUE(service
-                    .PutEnd(client_id, key, TenantId::Default(),
-                            ReplicaType::MEMORY)
-                    .has_value());
+    ASSERT_TRUE(
+        service.PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
 
     // Once it completes, the same single pass sweeps it and accepts cleanup.
     job.pending_prepare_segments.push_back(
