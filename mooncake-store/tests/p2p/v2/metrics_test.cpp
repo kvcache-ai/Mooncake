@@ -258,12 +258,23 @@ TEST_F(V2MetricsTest, InlineAppliedLifecycleEventsAreCounted) {
 TEST_F(V2MetricsTest, EventAndPolicyConfigurationIsReachableFromJson) {
     auto config =
         ParseDataManagerV2Config(ParseJson(R"({
-        "tiers": [{"type": "DRAM", "capacity": 1048576, "priority": 10}],
+        "tiers": [
+            {"type": "DRAM", "capacity": 1048576, "priority": 10,
+             "placement_policy": {"offload_high_watermark": 0.75}},
+            {"type": "DRAM", "capacity": 1048576, "priority": 5,
+             "placement_policy": {"offload_high_watermark": 0.8}},
+            {"type": "DRAM", "capacity": 1048576, "priority": 1}
+        ],
         "v2": {
             "events": {"shard_count": 2, "event_queue_capacity": 32,
                        "movement_queue_capacity": 8,
                        "movement_worker_count": 3},
-            "placement_policy": {"offload_high_watermark": 0.75,
+            "tier_placement": {"type": "nearest_neighbour",
+                               "max_destination_usage": 0.98,
+                               "onboard_keeps_source": true,
+                               "lowest_priority_tier_full_policy":
+                                   "evict_coldest"},
+            "placement_policy": {"offload_high_watermark": 0.7,
                                  "offload_low_watermark": 0.5,
                                  "onboard_min_frequency": 4},
             "max_registration_retry": 3,
@@ -282,11 +293,23 @@ TEST_F(V2MetricsTest, EventAndPolicyConfigurationIsReachableFromJson) {
     // file keeps meaning what it meant.
     EXPECT_EQ(config->migration.max_queued_requests, 8U);
     EXPECT_EQ(config->movement_worker_count, 3U);
+    EXPECT_DOUBLE_EQ(config->tier_placement.max_destination_usage, 0.98);
+    EXPECT_EQ(config->tier_placement.lowest_priority_tier_full_policy,
+              "evict_coldest");
     // The placement_policy JSON block keeps its name and its keys, but the
     // monolithic policy behind it is gone: each key now lands where that
     // decision actually lives. offload_low_watermark had no reader once
     // offload became one decision per event, so it is accepted and ignored.
-    EXPECT_DOUBLE_EQ(config->movement.offload_high_watermark, 0.75);
+    EXPECT_DOUBLE_EQ(
+        config->tilers[0].placement_policy.EffectiveOffloadHighWatermark(),
+        0.75);
+    EXPECT_DOUBLE_EQ(
+        config->tilers[1].placement_policy.EffectiveOffloadHighWatermark(),
+        0.8);
+    EXPECT_DOUBLE_EQ(
+        config->tilers[2].placement_policy.EffectiveOffloadHighWatermark(),
+        0.7);
+    EXPECT_DOUBLE_EQ(config->movement.offload_high_watermark, 0.7);
     EXPECT_DOUBLE_EQ(config->movement.onboard_min_read_heat, 4.0);
     EXPECT_EQ(config->max_registration_retry, 3U);
     EXPECT_EQ(config->stop_drain_timeout, std::chrono::milliseconds(250));
@@ -310,12 +333,28 @@ TEST_F(V2MetricsTest, InvalidEventAndPolicyConfigurationIsRejected) {
     // single-tier object alive.
     auto no_headroom =
         ParseDataManagerV2Config(ParseJson(R"({
-        "tiers": [{"type": "DRAM", "capacity": 1048576}],
-        "v2": {"placement_policy": {"offload_high_watermark": 1.0}}
+        "tiers": [{"type": "DRAM", "capacity": 1048576,
+                   "placement_policy": {"offload_high_watermark": 1.0}}]
     })"),
                                  LocalTransferConfig{}, KeyLeaseConfig{});
     ASSERT_FALSE(no_headroom.has_value());
     EXPECT_EQ(no_headroom.error(), ErrorCode::INVALID_PARAMS);
+
+    auto replace_without_reclaim =
+        ParseDataManagerV2Config(ParseJson(R"({
+        "tiers": [
+            {"type": "DRAM", "capacity": 1048576, "priority": 100},
+            {"type": "SSD", "capacity": 1048576, "priority": 10,
+             "file_path": "/tmp/mooncake_v2_test_ssd.data",
+             "allocation_failure": {"try_evict": false}}
+        ],
+        "v2": {"tier_placement": {
+            "lowest_priority_tier_full_policy": "evict_coldest"
+        }}
+    })"),
+                                 LocalTransferConfig{}, KeyLeaseConfig{});
+    ASSERT_FALSE(replace_without_reclaim.has_value());
+    EXPECT_EQ(replace_without_reclaim.error(), ErrorCode::INVALID_PARAMS);
 
     auto zero_timeout =
         ParseDataManagerV2Config(ParseJson(R"({

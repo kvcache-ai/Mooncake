@@ -251,6 +251,13 @@ TEST_F(TierGraphTest, OffloadWalksTheChainOneHopAtATime) {
     auto graph = ThreeLevelChain();
     auto policy = MakePolicy(graph);
 
+    ASSERT_TRUE(graph->LowestPriority().has_value());
+    ASSERT_TRUE(graph->HighestPriority().has_value());
+    EXPECT_EQ(*graph->LowestPriority(), graph->Node(kSsd)->priority);
+    EXPECT_EQ(*graph->HighestPriority(), graph->Node(kDram)->priority);
+    EXPECT_TRUE(graph->IsLowestPriorityTier(kSsd));
+    EXPECT_FALSE(graph->IsLowestPriorityTier(kDram));
+
     // If this jumped straight to the SSD, the CXL tier a deployment paid for
     // would never hold anything and every DRAM eviction would pay disk cost.
     EXPECT_EQ(IdsOf(graph->SlowerNeighbours(kDram)), (std::vector<UUID>{kCxl}));
@@ -713,6 +720,27 @@ TEST_F(TierGraphTest, AFullDestinationIsSkippedForTheNextCandidate) {
                      .has_value());
 }
 
+TEST_F(TierGraphTest, FullLowestPriorityTierFollowsItsFullPolicy) {
+    auto graph = ThreeLevelChain();
+    usage_[kCxl] = 0.99;
+    usage_[kSsd] = 1.0;
+
+    TierPlacementPolicyConfig retain_config;
+    retain_config.lowest_priority_tier_full_policy = "retain";
+    auto retaining = MakePolicy(graph, retain_config);
+    EXPECT_FALSE(retaining->Select(Context(kCxl, MovementDirection::kOffload))
+                     .has_value());
+
+    TierPlacementPolicyConfig replace_config;
+    replace_config.lowest_priority_tier_full_policy = "evict_coldest";
+    auto replacing = MakePolicy(graph, replace_config);
+    auto decision =
+        replacing->Select(Context(kCxl, MovementDirection::kOffload));
+    ASSERT_TRUE(decision.has_value());
+    EXPECT_EQ(decision->destination_tiler, kSsd);
+    EXPECT_EQ(decision->kind, MovementKind::kMigrate);
+}
+
 TEST_F(TierGraphTest, ADestinationThatAlreadyHoldsTheBlockIsSuppressed) {
     auto fan_out = Explicit({DramNode(), CxlNode(), SsdNode()},
                             {MakeEdge(kDram, kCxl, /*cost=*/1.0),
@@ -852,6 +880,8 @@ TEST_F(TierGraphTest, TheFactoryRejectsAnUnusableConfiguration) {
     EXPECT_TRUE(ValidateTierPlacementPolicyConfig(usable).has_value());
     usable.max_destination_usage = 1.0;
     EXPECT_TRUE(ValidateTierPlacementPolicyConfig(usable).has_value());
+    usable.lowest_priority_tier_full_policy = "discard_everything";
+    EXPECT_FALSE(ValidateTierPlacementPolicyConfig(usable).has_value());
 
     // Without a graph there is no topology to walk, and deriving one from
     // priority is the behaviour this component exists to remove.

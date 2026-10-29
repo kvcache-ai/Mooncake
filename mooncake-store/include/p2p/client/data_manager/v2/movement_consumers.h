@@ -41,12 +41,7 @@ namespace mooncake::v2 {
  * @struct MovementConsumerConfig
  */
 struct MovementConsumerConfig {
-    /**
-     * Fraction of a tier's capacity above which committing another block
-     * starts offloading. Must leave room before reclamation begins: with a
-     * tier-local reclaim path, offload is the only thing keeping a
-     * single-tier object alive.
-     */
+    /** Default offload threshold inherited by tiers without an override. */
     double offload_high_watermark = 0.9;
 
     /**

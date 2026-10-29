@@ -113,7 +113,7 @@ class OffloadConsumer final : public EventConsumer {
 
         TilerManager* source = deps_.tilers->Find(event.tiler_id);
         if (source == nullptr) return ConsumeResult::kIgnored;
-        if (UsageRatioOf(*source) < config_.offload_high_watermark) {
+        if (UsageRatioOf(*source) < source->OffloadHighWatermark()) {
             return ConsumeResult::kIgnored;
         }
 
@@ -238,9 +238,7 @@ tl::expected<void, ErrorCode> ValidateMovementConsumerConfig(
     if (!(config.offload_high_watermark > 0.0) ||
         !(config.offload_high_watermark < 1.0)) {
         LOG(ERROR) << "movement.offload_high_watermark must be in (0, 1), got "
-                   << config.offload_high_watermark
-                   << "; offload has to start before the tier is full or it "
-                      "cannot keep ahead of reclamation";
+                   << config.offload_high_watermark;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (config.onboard_min_read_heat < 0.0) {

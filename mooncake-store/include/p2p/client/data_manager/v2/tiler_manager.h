@@ -56,9 +56,21 @@ struct LogicalTilerConfig {
  *        logical half reaches TilerManager.
  */
 struct TilerConfig {
+    inline static constexpr double kDefaultOffloadHighWatermark = 0.9;
+
     LogicalTilerConfig logical;
     BlockPoolConfig pool;
     std::optional<AllocationFailurePolicyConfig> allocation_failure_override;
+    /** Source-tier policy for deciding when this tier should offload. */
+    struct PlacementPolicy {
+        // nullopt inherits the legacy/global placement_policy default.
+        std::optional<double> offload_high_watermark;
+
+        double EffectiveOffloadHighWatermark(
+            double fallback = kDefaultOffloadHighWatermark) const {
+            return offload_high_watermark.value_or(fallback);
+        }
+    } placement_policy;
     /** Which cold/hot ordering this tier's evict engine selects victims from.
      */
     EvictionIndexConfig eviction;
@@ -78,7 +90,9 @@ class TilerManager {
                  const BlockIndexConfig& index_config,
                  std::shared_ptr<BlockPool> block_pool,
                  BlockRegistry block_registry, EventPublisher event_publisher,
-                 const EvictionIndexConfig& eviction_config = {});
+                 const EvictionIndexConfig& eviction_config = {},
+                 double offload_high_watermark =
+                     TilerConfig::kDefaultOffloadHighWatermark);
 
     /** @param alignment 0 means the pool's minimum alignment. */
     tl::expected<MutableBlock, ErrorCode> Allocate(size_t size,
@@ -186,6 +200,7 @@ class TilerManager {
     UUID Id() const { return tiler_id_; }
     MemoryType Medium() const { return memory_type_; }
     int32_t Priority() const { return priority_; }
+    double OffloadHighWatermark() const { return offload_high_watermark_; }
     BlockPoolCapabilities Capabilities() const;
     bool IsTeAddressable() const;
 
@@ -230,6 +245,7 @@ class TilerManager {
     UUID tiler_id_;
     MemoryType memory_type_;
     int32_t priority_ = 0;
+    double offload_high_watermark_ = 0.9;
     std::vector<std::string> tags_;
     std::shared_ptr<BlockPool> block_pool_;
     std::unique_ptr<BlockIndex> block_index_;

@@ -82,7 +82,6 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
     DataManagerV2Config config;
     config.local_transfer = local_transfer;
     config.key_lease = key_lease;
-
     if (!tier_config.isMember("tiers") || !tier_config["tiers"].isArray() ||
         tier_config["tiers"].empty()) {
         LOG(ERROR) << "DataManagerV2 config has no 'tiers' array";
@@ -119,6 +118,12 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
         if (capacity == 0) {
             LOG(ERROR) << "tier '" << type << "' has no capacity";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        if (entry.isMember("placement_policy") &&
+            entry["placement_policy"].isMember("offload_high_watermark")) {
+            tiler.placement_policy.offload_high_watermark =
+                entry["placement_policy"]["offload_high_watermark"].asDouble();
         }
 
         if (type == "DRAM") {
@@ -182,9 +187,8 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
         config.tilers.push_back(std::move(tiler));
     }
 
-    // One ordering for every tier. A per-tier override is deliberately not
-    // offered yet: nothing in the design asks for it, and an unused override
-    // is a configuration surface that has to be kept working for no reason.
+    // Eviction ordering defaults are shared unless a per-tier override is
+    // added in the future. Offload watermarks are tier-specific.
     EvictionIndexConfig default_eviction;
 
     if (tier_config.isMember("v2")) {
@@ -227,9 +231,9 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
             }
         }
         if (v2.isMember("placement_policy")) {
-            // The monolithic policy is gone; the JSON block keeps its name and
-            // its keys so an existing tier file still means what it meant,
-            // and each key now lands where that decision actually lives.
+            // Keep the global offload threshold as the default for tiers with
+            // no local override. Other policy keys retain their established
+            // JSON locations and are copied into the components that use them.
             const auto& node = v2["placement_policy"];
             if (node.isMember("offload_high_watermark")) {
                 config.movement.offload_high_watermark =
@@ -257,6 +261,24 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
             if (node.isMember("band_veryhot_threshold")) {
                 default_eviction.band_veryhot_threshold =
                     node["band_veryhot_threshold"].asUInt64();
+            }
+        }
+        if (v2.isMember("tier_placement")) {
+            const auto& node = v2["tier_placement"];
+            if (node.isMember("type")) {
+                config.tier_placement.type = node["type"].asString();
+            }
+            if (node.isMember("max_destination_usage")) {
+                config.tier_placement.max_destination_usage =
+                    node["max_destination_usage"].asDouble();
+            }
+            if (node.isMember("onboard_keeps_source")) {
+                config.tier_placement.onboard_keeps_source =
+                    node["onboard_keeps_source"].asBool();
+            }
+            if (node.isMember("lowest_priority_tier_full_policy")) {
+                config.tier_placement.lowest_priority_tier_full_policy =
+                    node["lowest_priority_tier_full_policy"].asString();
             }
         }
         if (v2.isMember("copier")) {
@@ -321,7 +343,13 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
         }
     }
 
-    for (auto& tiler : config.tilers) tiler.eviction = default_eviction;
+    for (auto& tiler : config.tilers) {
+        tiler.eviction = default_eviction;
+        if (!tiler.placement_policy.offload_high_watermark) {
+            tiler.placement_policy.offload_high_watermark =
+                config.movement.offload_high_watermark;
+        }
+    }
 
     auto valid = ValidateDataManagerV2Config(config);
     if (!valid) return tl::make_unexpected(valid.error());
@@ -356,8 +384,45 @@ tl::expected<void, ErrorCode> ValidateDataManagerV2Config(
         ValidateFrequencyTrackerConfig(config.frequency_tracker);
     if (!frequency_valid) return frequency_valid;
     for (const auto& tiler : config.tilers) {
+        const double watermark =
+            tiler.placement_policy.EffectiveOffloadHighWatermark(
+                config.movement.offload_high_watermark);
+        if (watermark <= 0.0 || watermark >= 1.0) {
+            LOG(ERROR) << "tier " << tiler.logical.tiler_id
+                       << " offload_high_watermark must be in (0, 1)";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
         auto eviction_valid = ValidateEvictionIndexConfig(tiler.eviction);
         if (!eviction_valid) return eviction_valid;
+        if (tiler.allocation_failure_override) {
+            auto allocation_valid = ValidateAllocationFailurePolicy(
+                *tiler.allocation_failure_override);
+            if (!allocation_valid) return allocation_valid;
+        }
+    }
+    if (config.tier_placement.lowest_priority_tier_full_policy ==
+            "evict_coldest" &&
+        !config.tilers.empty()) {
+        const auto lowest_priority =
+            std::min_element(
+                config.tilers.begin(), config.tilers.end(),
+                [](const TilerConfig& lhs, const TilerConfig& rhs) {
+                    return lhs.logical.priority < rhs.logical.priority;
+                })
+                ->logical.priority;
+        for (const auto& tiler : config.tilers) {
+            if (tiler.logical.priority != lowest_priority) continue;
+            const AllocationFailurePolicyConfig& allocation =
+                tiler.allocation_failure_override
+                    ? *tiler.allocation_failure_override
+                    : config.allocation_failure;
+            if (!allocation.try_evict) {
+                LOG(ERROR) << "lowest_priority_tier_full_policy=evict_coldest "
+                              "requires allocation_failure.try_evict=true on "
+                              "every lowest-priority tier";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
     }
     if (config.max_registration_retry == 0) {
         LOG(ERROR) << "max_registration_retry must be greater than zero";
@@ -472,7 +537,9 @@ tl::expected<void, ErrorCode> DataManagerV2::Init() {
         }
         tilers_.by_priority.push_back(std::make_unique<TilerManager>(
             tiler_config.logical, config_.block_index, std::move(pool.value()),
-            block_registry_, EventPublisher(), tiler_config.eviction));
+            block_registry_, EventPublisher(), tiler_config.eviction,
+            tiler_config.placement_policy.EffectiveOffloadHighWatermark(
+                config_.movement.offload_high_watermark)));
     }
     tilers_.Rebuild();
 

@@ -72,7 +72,7 @@ class ReviewRegressionTest : public ::testing::Test {
             ParseDataManagerV2Config(Tiers(), local, KeyLeaseConfig{});
         ASSERT_TRUE(config);
         config->register_tiers_with_transfer_engine = false;
-        config->movement.offload_high_watermark = 0.5;
+        config->tilers[0].placement_policy.offload_high_watermark = 0.5;
         config->stop_drain_timeout = 20ms;
         config->migration.max_batch_items = 1;
         clock_ = std::make_shared<ManualClock>();

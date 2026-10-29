@@ -124,7 +124,7 @@ class MovementConsumersTest : public ::testing::Test {
         registry_ = BlockRegistry(BlockRegistryConfig{/*shard_count=*/8});
         sink_ = std::make_shared<AcceptingSink>();
 
-        auto fast = MakeDramTiler(/*priority=*/100, kFastCapacity);
+        auto fast = MakeDramTiler(/*priority=*/100, kFastCapacity, 0.5);
         auto slow = MakeSsdTiler(/*priority=*/10, kSlowCapacity);
         ASSERT_NE(fast, nullptr);
         ASSERT_NE(slow, nullptr);
@@ -163,12 +163,7 @@ class MovementConsumersTest : public ::testing::Test {
         movement_ =
             std::make_unique<MovementTracker>(MovementTrackerConfig{}, clock_);
         commands_ = std::make_shared<RecordingSink>();
-        // Half full is "above the watermark" here. The production default of
-        // 0.9 would need the tier filled to within one block of capacity,
-        // which makes the test about allocator padding rather than about the
-        // threshold it is supposed to exercise.
         MovementConsumerConfig config;
-        config.offload_high_watermark = 0.5;
         Build(config);
     }
 
@@ -182,7 +177,6 @@ class MovementConsumersTest : public ::testing::Test {
     /** Keeps the fixture's relaxed watermark when a test overrides onboard. */
     void BuildWithOnboardHeat(double heat) {
         MovementConsumerConfig config;
-        config.offload_high_watermark = 0.5;
         config.onboard_min_read_heat = heat;
         Build(config);
     }
@@ -205,8 +199,10 @@ class MovementConsumersTest : public ::testing::Test {
         onboard_ = std::move(onboard.value());
     }
 
-    std::unique_ptr<TilerManager> MakeDramTiler(int32_t priority,
-                                                size_t capacity) {
+    std::unique_ptr<TilerManager> MakeDramTiler(
+        int32_t priority, size_t capacity,
+        double offload_high_watermark =
+            TilerConfig::kDefaultOffloadHighWatermark) {
         DramArenaConfig arena;
         arena.capacity_bytes = capacity;
         DramBlockPoolConfig pool_config;
@@ -218,9 +214,9 @@ class MovementConsumersTest : public ::testing::Test {
         logical.tiler_id = generate_uuid();
         logical.memory_type = MemoryType::DRAM;
         logical.priority = priority;
-        return std::make_unique<TilerManager>(logical, BlockIndexConfig{},
-                                              std::move(pool.value()),
-                                              registry_, EventPublisher());
+        return std::make_unique<TilerManager>(
+            logical, BlockIndexConfig{}, std::move(pool.value()), registry_,
+            EventPublisher(), EvictionIndexConfig{}, offload_high_watermark);
     }
 
     std::unique_ptr<TilerManager> MakeSsdTiler(int32_t priority,
@@ -564,9 +560,9 @@ TEST_F(MovementConsumersTest, ASettledMoveIsHeldBackByTheCooldown) {
 TEST_F(MovementConsumersTest, ConfigValidationRejectsUnusableValues) {
     EXPECT_TRUE(ValidateMovementConsumerConfig({}).has_value());
 
-    MovementConsumerConfig full;
-    full.offload_high_watermark = 1.0;
-    EXPECT_FALSE(ValidateMovementConsumerConfig(full).has_value());
+    MovementConsumerConfig invalid_watermark;
+    invalid_watermark.offload_high_watermark = 1.0;
+    EXPECT_FALSE(ValidateMovementConsumerConfig(invalid_watermark).has_value());
 
     MovementConsumerConfig negative;
     negative.onboard_min_read_heat = -1.0;

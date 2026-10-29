@@ -129,6 +129,9 @@ class TierGraph {
     std::vector<const TierNode*> FasterNeighbours(const UUID& from) const;
 
     const std::vector<TierNode>& Nodes() const { return nodes_; }
+    std::optional<int32_t> LowestPriority() const { return lowest_priority_; }
+    std::optional<int32_t> HighestPriority() const { return highest_priority_; }
+    bool IsLowestPriorityTier(const UUID& tiler_id) const;
     size_t EdgeCount() const { return edges_.size(); }
     bool Empty() const { return nodes_.empty(); }
 
@@ -144,6 +147,8 @@ class TierGraph {
 
     std::vector<TierNode> nodes_;
     std::vector<TierEdge> edges_;
+    std::optional<int32_t> lowest_priority_;
+    std::optional<int32_t> highest_priority_;
     std::unordered_map<UUID, size_t, boost::hash<UUID>> node_index_;
     std::unordered_map<EdgeKey, size_t, EdgeKeyHash> edge_index_;
 };
@@ -230,6 +235,13 @@ struct TierPlacementPolicyConfig {
      * that is itself about to reclaim just moves the problem one level down.
      */
     double max_destination_usage = 0.95;
+    /**
+     * What to do when the slowest tier reaches max_destination_usage.
+     * "retain" keeps its existing blocks and rejects further offloads;
+     * "evict_coldest" admits offloads and lets that tier's allocation-failure
+     * policy reclaim cold blocks when physical capacity is exhausted.
+     */
+    std::string lowest_priority_tier_full_policy = "retain";
     /**
      * Whether an onboard keeps the slow copy. Kept explicit because "replicate
      * up and delete the source" is a real policy some deployments want, and
