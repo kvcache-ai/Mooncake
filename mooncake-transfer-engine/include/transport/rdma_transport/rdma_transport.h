@@ -102,6 +102,11 @@ class RdmaTransport : public Transport {
     Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) override;
 
+    // Submit fresh tasks without an external submission seal owner. No slices
+    // may have been published before this call; all return statuses seal tasks.
+    Status submitTransferTaskWithSeal(
+        const std::vector<TransferTask *> &task_list);
+
     bool supportsGroupedScatter() const override { return true; }
 
     Status getTransferStatus(BatchID batch_id,

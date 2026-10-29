@@ -1026,9 +1026,14 @@ Status RdmaTransport::submitTransfer(
 #else
         task.request = &request;
 #endif
-        Slice::unsealTaskSubmission(&task);
         task_list.push_back(&task);
     }
+    return submitTransferTaskWithSeal(task_list);
+}
+
+Status RdmaTransport::submitTransferTaskWithSeal(
+    const std::vector<TransferTask *> &task_list) {
+    for (auto *task : task_list) Slice::unsealTaskSubmission(task);
     auto status = submitTransferTask(task_list);
     for (auto *task : task_list) Slice::sealTaskSubmission(task);
     return status;
