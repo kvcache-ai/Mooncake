@@ -19,12 +19,15 @@
 #include <glog/logging.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
+#include <climits>
 #include <cstdlib>
+#include <cstring>
 #include <future>
 #include <limits>
 #include <sstream>
@@ -55,6 +58,18 @@ namespace tent {
 namespace {
 
 constexpr uint64_t kDefaultRdmaQuiesceTimeoutNs = 10000000000ull;
+
+// EFA devices are listed by ibverbs but have no RC QPs; they are served by
+// the fabric transport instead.
+bool isEfaDevice(const std::string& name) {
+    const std::string link = "/sys/class/infiniband/" + name + "/device/driver";
+    char target[PATH_MAX];
+    ssize_t len = readlink(link.c_str(), target, sizeof(target) - 1);
+    if (len <= 0) return false;
+    target[len] = '\0';
+    const char* base = strrchr(target, '/');
+    return strcmp(base ? base + 1 : target, "efa") == 0;
+}
 
 uint16_t getRdmaBindDefaultPort(const Config& config) {
     constexpr const char* kKey = "rpc_server_port";
@@ -169,6 +184,7 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_ENDPOINT(endpoint_store_cap, params->endpoint.endpoint_store_cap);
     SET_ENDPOINT(max_sge, params->endpoint.max_sge);
     SET_ENDPOINT(max_qp_wr, params->endpoint.max_qp_wr);
+    SET_ENDPOINT(signal_interval, params->endpoint.signal_interval);
     SET_ENDPOINT(max_inline_bytes, params->endpoint.max_inline_bytes);
     SET_ENDPOINT(pkey_index, params->endpoint.pkey_index);
     SET_ENDPOINT(hop_limit, params->endpoint.hop_limit);
@@ -185,6 +201,14 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_ENDPOINT(send_retry_count, params->endpoint.send_retry_count);
     SET_ENDPOINT(send_rnr_count, params->endpoint.send_rnr_count);
     SET_ENDPOINT(max_rd_atomic, params->endpoint.max_rd_atomic);
+
+    if (params->endpoint.signal_interval <= 0) {
+        std::stringstream ss;
+        ss << "Invalid RDMA endpoint.signal_interval: "
+           << params->endpoint.signal_interval
+           << ", expected a positive integer";
+        return Status::InvalidArgument(ss.str() + LOC_MARK);
+    }
 
     size_t mtu_val = conf->get("transports/rdma/endpoint/path_mtu", 4096);
     if (mtu_val == 4096)
@@ -248,6 +272,14 @@ static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
     if (disable_gpu_direct) {
         return false;
     }
+    // Intel XPU: no peer-memory kernel module; device buffers are exported as
+    // dma-bufs and registered with ibv_reg_dmabuf_mr, so the presence of that
+    // verb is the capability signal. Buffers that fail to export at
+    // registration time are simply not offered on RDMA and get staged.
+    if (Platform::getLoader().type() == "xpu") {
+        auto& loader = IbvLoader::Instance();
+        return loader.available() && loader.sym().ibv_reg_dmabuf_mr != nullptr;
+    }
     // Detect vendor GPUDirect/peer-memory drivers from /proc/modules.
     // NVIDIA: nvidia_peermem. AMD: peermem is built into amdgpu (linked with
     // ib_core), so the amdgpu module itself is the presence signal.
@@ -282,7 +314,10 @@ size_t RdmaTransport::initializeContexts() {
     size_t context_count = 0;
     for (size_t i = 0; i < local_topology_->getNicCount(); ++i) {
         auto entry = local_topology_->getNicEntry(i);
-        if (entry->type == Topology::NIC_RDMA) {
+        if (entry->type == Topology::NIC_RDMA && isEfaDevice(entry->name)) {
+            LOG(INFO) << "Skip EFA device " << entry->name
+                      << " (not RC capable; use the fabric transport)";
+        } else if (entry->type == Topology::NIC_RDMA) {
             auto context = std::make_shared<RdmaContext>(*this);
             if (context->construct(entry->name, params_) == 0) {
                 context_name_lookup_[entry->name] = i;
@@ -539,22 +574,12 @@ Status RdmaTransport::submitTransferTasks(
         std::vector<int> slice_dev_ids;
         // Only if a single request is enough, we perform aggregated allocation
         if (num_slices >= max_slice_count / 2) {
-            std::string source_location = kWildcardLocation;
-            auto source_locations =
-                Platform::getLoader().getLocation(request.source, 1, true);
-            if (!source_locations.empty()) {
-                source_location = source_locations[0].location;
-            }
-            auto device_selector = workers_->getDeviceSelector();
-            if (device_selector) {
-                auto status = device_selector->allocate(
-                    request.length, static_cast<uint32_t>(num_slices),
-                    block_size, source_location, slice_dev_ids,
-                    request.priority, batch->device_mask);
-                if (!status.ok() || slice_dev_ids.empty()) {
-                    LOG(WARNING) << "Device quota allocation failed: "
-                                 << status.message();
-                }
+            auto status = workers_->allocateDevices(
+                request, static_cast<uint32_t>(num_slices), block_size,
+                task->device_mask, slice_dev_ids);
+            if (!status.ok()) {
+                LOG(WARNING)
+                    << "Device quota allocation failed: " << status.message();
             }
         }
 
@@ -700,6 +725,10 @@ Status RdmaTransport::getSelectionStats(SelectionStats& stats) const {
 
 bool RdmaTransport::warmupMemory(void* addr, size_t length) {
     if (length < kMrWarmupMinBytes) return false;
+    // Warm-up is a plain ibv_reg_mr. Intel XPU VRAM has no host pages behind
+    // it and is registered through dma-buf export instead, so the temporary
+    // ibv_reg_mr would only EFAULT.
+    if (Platform::getLoader().getMemoryType(addr) == MTYPE_XPU) return false;
     unsigned hwc = std::thread::hardware_concurrency();
     if (hwc < 4) return false;
     RdmaContext* warmup_ctx = nullptr;

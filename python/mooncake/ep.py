@@ -1,11 +1,11 @@
 import importlib
-import re
 
-import torch
-
-
-torch_version = re.match(r"\d+(?:\.\d+)*", torch.__version__).group()
-version_suffix = "_" + torch_version.replace(".", "_")
+try:
+    # The XPU module links against the SYCL and Intel compiler runtimes that
+    # PyTorch XPU loads, so load torch first when it is installed.
+    import torch  # noqa: F401
+except ImportError:
+    pass
 
 try:
     backend_module = importlib.import_module("mooncake._ep")
@@ -16,15 +16,4 @@ except ModuleNotFoundError:
     )
 globals().update(
     {k: v for k, v in backend_module.__dict__.items() if not k.startswith("_")}
-)
-
-try:
-    backend_compat_module = importlib.import_module("mooncake.pg" + version_suffix)
-except ModuleNotFoundError:
-    raise ImportError(
-        f"Mooncake PG was not built against torch=={torch_version}.\n"
-        f"Open an issue at https://github.com/kvcache-ai/Mooncake/issues."
-    )
-globals().update(
-    {k: v for k, v in backend_compat_module.__dict__.items() if not k.startswith("_")}
 )

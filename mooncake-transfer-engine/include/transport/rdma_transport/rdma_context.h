@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 
@@ -41,6 +42,20 @@
 #include "transport/transport.h"
 
 namespace mooncake {
+
+// The historical Mooncake value for outstanding RDMA READ/atomic operations
+// per QP (the IB default most HCAs advertise).
+constexpr int kIdealRdAtomicDepth = 16;
+
+// Program a QP's RD-atomic depth from the device's advertised limit. Capped at
+// kIdealRdAtomicDepth to preserve the previous behaviour on HCAs that support
+// more, and floored at 1 so a device that reports 0 (no single-sided READ
+// support) fails loudly in ibv_modify_qp() instead of silently on every later
+// READ.
+inline int clampRdAtomicDepth(int device_max) {
+    if (device_max <= 0) return 1;
+    return device_max < kIdealRdAtomicDepth ? device_max : kIdealRdAtomicDepth;
+}
 
 class RdmaEndPoint;
 class RdmaTransport;
@@ -85,6 +100,7 @@ struct MemoryRegionMeta {
     // mr->addr is not set to starting address for iova based mr. Therefore we
     // track it ourselves.
     void *addr;
+    size_t length;
     struct ibv_mr *mr;
 };
 
@@ -99,6 +115,13 @@ struct DmabufExport {
     Method method = Method::kHostReg;
     int fd = -1;          // live dma_buf fd; -1 when not applicable
     uint64_t offset = 0;  // offset of addr within the exported allocation
+    // sysfs PCI root of the GPU owning the memory ("pci0009:00"); empty when
+    // unknown. Data Direct registration is only possible on NICs whose Data
+    // Direct function sits under the same root.
+    std::string pci_root;
+    // HIP: the exported allocation and the GPU that owns it.
+    void *alloc_base = nullptr;
+    int device = -1;
 };
 
 // RdmaContext represents the set of resources controlled by each local NIC,
@@ -161,6 +184,12 @@ class RdmaContext {
     int registerMemoryRegionInternal(void *addr, size_t length, int access,
                                      const DmabufExport &exp,
                                      MemoryRegionMeta &mrMeta);
+
+    // True when this NIC can register the exported GPU memory through Data
+    // Direct: its Data Direct function and the GPU share a PCI root, or the
+    // pairing is unknown (no sysfs path from libmlx5, no GPU root recorded).
+    // Logs the first mismatch per NIC.
+    bool dataDirectPairedWith(const DmabufExport &exp);
 
     using MemoryRegionMap = std::map<uintptr_t, MemoryRegionMeta>;
 
@@ -240,16 +269,34 @@ class RdmaContext {
 
     bool autoGidSelectionEnabled() const { return auto_gid_selection_enabled_; }
 
-    bool reprobeAutoGid(
-        const GidSelectionSnapshot &expected_selection,
-        const std::vector<AutoGidSelectionIdentity> &tried_selections = {},
-        std::string *previous_gid = nullptr, std::string *next_gid = nullptr);
+    PeerAutoGidSelection preparePeerGidSelection(
+        const std::string &peer_nic_path,
+        std::string_view auto_gid_reprobe_from = {});
+
+    void requestPeerGidAdvance(const std::string &peer_nic_path);
+
+    AutoGidDataPathAction recordAutoGidCompletion(
+        const std::string &peer_nic_path, const AutoGidDataPathAttempt &attempt,
+        bool success);
+
+    void rememberPeerAdvertisedGid(const std::string &peer_nic_path,
+                                   std::string_view peer_gid);
+
+    uint64_t allocateEndpointId() {
+        return next_endpoint_id_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     // Refresh the runtime GID after IBV_EVENT_GID_CHANGE. Auto-GID mode uses
     // the same candidate filtering/ranking as initial device open; explicit
     // MC_GID_INDEX keeps the configured index and refreshes only its value.
     GidRefreshResult refreshCurrentGid(std::string *previous_gid = nullptr,
                                        std::string *next_gid = nullptr);
+
+    // Read the port's current state from the hardware. The monitor worker
+    // polls this for event-disabled contexts so a link that came back without
+    // a usable IBV_EVENT_PORT_ACTIVE is still noticed. Returns -1 and leaves
+    // *state untouched if no device is open or the query fails.
+    int queryPortState(ibv_port_state *state) const;
 
     ibv_context *context() const { return context_; }
 
@@ -265,6 +312,12 @@ class RdmaContext {
     int activeWidth() const { return active_width_; }
 
     ibv_mtu activeMTU() const { return active_mtu_; }
+
+    // Per-NIC outstanding RD-atomic depths, derived from this device's
+    // ibv_device_attr so a slower NIC on a heterogeneous host cannot cap the
+    // QPs of the faster ones.
+    int maxQpRdAtom() const { return max_qp_rd_atom_; }
+    int maxQpInitRdAtom() const { return max_qp_init_rd_atom_; }
 
     ibv_comp_channel *compChannel();
 
@@ -302,6 +355,8 @@ class RdmaContext {
                                      ibv_port_attr &port_attr, uint8_t port,
                                      int &gid_index);
 
+    std::vector<AutoGidCandidate> queryAutoGidCandidates() const;
+
    public:
     int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
 
@@ -316,6 +371,11 @@ class RdmaContext {
 
     ibv_context *context_ = nullptr;
     ibv_pd *pd_ = nullptr;
+    // PCI root of this NIC's Data Direct function, resolved once on first
+    // Data Direct registration; empty when the NIC has none.
+    std::once_flag data_direct_root_once_;
+    std::string data_direct_root_;
+    std::atomic<bool> data_direct_mismatch_logged_{false};
     uint64_t max_mr_size;
     int event_fd_ = -1;
 
@@ -329,10 +389,14 @@ class RdmaContext {
     int active_width_ = 1;
     ibv_mtu active_mtu_;
     uint8_t num_lag_ports_ = 0;  // 0/1 = not in LAG; ≥2 = LAG active
+    int max_qp_rd_atom_ = kIdealRdAtomicDepth;
+    int max_qp_init_rd_atom_ = kIdealRdAtomicDepth;
     ibv_gid gid_;
     mutable std::mutex gid_lock_;
     mutable std::mutex gid_reprobe_lock_;
     bool auto_gid_selection_enabled_ = false;
+    PeerAutoGidStateTable peer_auto_gid_states_;
+    std::atomic<uint64_t> next_endpoint_id_{1};
 
     RWSpinlock memory_regions_lock_;
     MemoryRegionMap memory_region_map_;

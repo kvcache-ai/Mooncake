@@ -1,0 +1,18 @@
+[package]
+name = "mooncake_conductor"
+version = "0.1.0"
+edition = "2021"
+description = "Rust bindings for the Mooncake Conductor client"
+license = "Apache-2.0"
+
+[lib]
+name = "mooncake_conductor"
+crate-type = ["rlib"]
+
+[dependencies]
+thiserror = "2.0"
+
+# build.rs generates the FFI from conductor_c.h and statically links
+# libconductor_cpp_core, so a built Mooncake tree must be present at build time.
+[build-dependencies]
+bindgen = "0.70"

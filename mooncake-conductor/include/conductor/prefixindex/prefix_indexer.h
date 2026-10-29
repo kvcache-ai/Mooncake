@@ -24,18 +24,19 @@ struct RegistrationResult {
 };
 
 struct BlockPresence {
-    std::set<EngineOwner> npu_owners;
+    std::set<EngineOwner> device_owners;
     std::set<EngineOwner> cpu_local_owners;
     std::set<SharedObjectOwner> cpu_share_owners;
     std::set<TierOwner> disk_owners;
 
     bool Empty() const {
-        return npu_owners.empty() && cpu_local_owners.empty() &&
+        return device_owners.empty() && cpu_local_owners.empty() &&
                cpu_share_owners.empty() && disk_owners.empty();
     }
 };
 
-// Maximum number of prefixes tracked for each context.
+// Default maximum number of prefixes tracked for each context; the service
+// configuration (max_blocks_per_context) may override it.
 constexpr size_t kDefaultMaxBlocks = 200000;
 // Target occupancy ratio for a batched capacity eviction.
 constexpr double kEvictTargetRatio = 0.9;
@@ -63,7 +64,7 @@ struct ContextState {
 };
 
 struct RankCacheHitResult {
-    int64_t npu = 0;
+    int64_t device = 0;
     int64_t cpu_local = 0;
     int64_t cpu_share = 0;
     int64_t disk = 0;
@@ -75,10 +76,12 @@ struct CacheHitResult {
     int64_t longest_match_tokens = 0;
     std::map<int64_t, int64_t> dp;
     std::map<int64_t, RankCacheHitResult> rank_matches;
-    int64_t npu = 0;
+    int64_t device = 0;
     int64_t cpu_local = 0;
     int64_t cpu_share = 0;
     int64_t disk = 0;
+
+    bool operator==(const CacheHitResult&) const = default;
 };
 
 struct ContextView {
@@ -133,7 +136,7 @@ class PrefixCacheTable {
 
     mutable std::shared_mutex context_map_mutex_;
     std::unordered_map<ContextKey, std::shared_ptr<ContextState>> contexts_;
-    // Fixed for production; tests may set it before any context is registered.
+    // Set at construction and copied into each context when it is registered.
     size_t block_limit_ = kDefaultMaxBlocks;
 };
 

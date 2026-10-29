@@ -73,7 +73,7 @@ TEST(MasterServiceConcurrentScenarioTest,
         "grouped and ungrouped first creates admit a single writer");
     scenario.Given(MemoryNode("memory"))
         .When(RacePutStart(key, 1_KB).Threads(16).AcrossGroups(
-            {GroupOnDifferentShard(key), ""}))
+            {key + "_group", ""}))
         .Then(Object(key).HasReplicas(1).HasCompleteReplicas(1))
         .Then(MatchingKeys("^" + key + "$").HasCount(1));
 }
@@ -81,12 +81,12 @@ TEST(MasterServiceConcurrentScenarioTest,
 TEST(MasterServiceConcurrentScenarioTest,
      DifferentlyGroupedFirstCreatesAdmitOneWriter) {
     const std::string key = "different_grouped_first_create";
-    const std::string group_a = GroupOnDifferentShard(key);
+    const std::string group_a = key + "_group";
     MasterScenario scenario(
         "first creates under different groups admit a single writer");
     scenario.Given(MemoryNode("memory"))
         .When(RacePutStart(key, 1_KB).Threads(16).AcrossGroups(
-            {group_a, GroupOnDifferentShard(group_a)}))
+            {group_a, group_a + "_group"}))
         .Then(Object(key).HasReplicas(1).HasCompleteReplicas(1))
         .Then(MatchingKeys("^" + key + "$").HasCount(1));
 }

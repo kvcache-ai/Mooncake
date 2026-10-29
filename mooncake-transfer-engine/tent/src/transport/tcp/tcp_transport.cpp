@@ -86,6 +86,12 @@ Status TcpTransport::install(std::string &local_segment_name,
                       params_.max_concurrent_tasks);
     }
 
+    if (params_.max_concurrent_tasks == 0) {
+        return Status::InvalidArgument(
+            "transports/tcp/max_concurrent_tasks must be greater than "
+            "0" LOC_MARK);
+    }
+
     shutting_down_.store(false, std::memory_order_release);
     thread_pool_ = std::make_unique<ThreadPool>(params_.max_concurrent_tasks);
 
@@ -96,8 +102,10 @@ Status TcpTransport::install(std::string &local_segment_name,
         return 0;
     });
     caps.dram_to_dram = true;
+    // The peer's RPC handler stages its GPU memory for both READ and WRITE.
+    // Only access to a local GPU buffer requires a local device platform.
+    caps.dram_to_gpu = true;
     if (Platform::getLoader().type() != "cpu") {
-        caps.dram_to_gpu = true;
         caps.gpu_to_dram = true;
         caps.gpu_to_gpu = true;
     }

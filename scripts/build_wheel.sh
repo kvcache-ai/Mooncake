@@ -25,6 +25,11 @@ rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
 
+if [ -d "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" ]; then
+    rm -rf mooncake-wheel/mooncake/_pg_jit
+    cp -R "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" mooncake-wheel/mooncake/
+fi
+
 echo "Creating directory structure..."
 
 # Copy shared allocator helper used by both CUDA and Ascend pluggable allocators.
@@ -54,10 +59,10 @@ cp mooncake-integration/shared_segment.py mooncake-wheel/mooncake/shared_segment
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
 
-# Copy store.so to mooncake directory
-if compgen -G "${BUILD_DIR}/mooncake-integration/store.*.so" >/dev/null; then
-    echo "Copying store.so..."
-    cp ${BUILD_DIR}/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
+# Copy the private C++ Store extension to the mooncake package.
+if compgen -G "${BUILD_DIR}/mooncake-integration/_store.*.so" >/dev/null; then
+    echo "Copying _store extension..."
+    cp ${BUILD_DIR}/mooncake-integration/_store.*.so mooncake-wheel/mooncake/
     echo "Copying master binary..."
     # Copy master binary
     cp ${BUILD_DIR}/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
@@ -66,7 +71,7 @@ if compgen -G "${BUILD_DIR}/mooncake-integration/store.*.so" >/dev/null; then
     # Stage the canonical async Store client for the legacy wheel builder.
     cp python/mooncake/async_store.py mooncake-wheel/mooncake/async_store.py
 else
-    echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
+    echo "Skipping _store extension (not built - likely WITH_STORE is set to OFF)"
 fi
 
 # Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
@@ -150,6 +155,9 @@ fi
 # relative path would silently point to the wrong location.
 CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
 
+# Kernel header tree the CUDA EP JIT compiles against at runtime.
+CUDA_EP_JIT_DIR="${BUILD_DIR_ABS}/mooncake_ep_jit"
+
 # CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
 # If EP/PG .so files were staged inside the build directory, preserve them in a
 # temporary location so they survive the cleanup.
@@ -159,6 +167,11 @@ if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
         CUDA_EP_STAGING_TEMP=$(mktemp -d)
         cp "$CUDA_EP_STAGING_DIR"/*.so "$CUDA_EP_STAGING_TEMP/"
         echo "Preserved EP/PG .so files to ${CUDA_EP_STAGING_TEMP} before build-dir cleanup"
+        if [ -d "$CUDA_EP_JIT_DIR" ]; then
+            cp -r "$CUDA_EP_JIT_DIR" "$CUDA_EP_STAGING_TEMP/"
+            CUDA_EP_JIT_DIR="${CUDA_EP_STAGING_TEMP}/mooncake_ep_jit"
+            echo "Preserved EP JIT headers to ${CUDA_EP_JIT_DIR} before build-dir cleanup"
+        fi
     fi
     echo "Freeing disk space: removing build directory (artifacts already copied)"
     rm -rf "${BUILD_DIR}/"
@@ -184,7 +197,16 @@ echo "Building wheel package..."
 # combined-wheel builder. Each tracked source remains in its authoritative tree.
 MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
 MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
+STORE_FACADE_SOURCE_DIR="python/mooncake/store"
+STORE_FACADE_STAGING_DIR="${MIGRATED_PYTHON_STAGING_DIR}/store"
+MIGRATED_PYTHON_INIT_BACKUP=""
 MIGRATED_PYTHON_MODULES=(
+    __init__.py
+    py.typed
+    engine.pyi
+    structured_object_store.py
+    _structured_ranges.py
+    _fast_copy.c
     http_metadata_server.py
     _launcher.py
     cli.py
@@ -205,16 +227,28 @@ RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
 RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
 cleanup_migrated_python_staging() {
     for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+        if [ "${module}" = "__init__.py" ]; then
+            continue
+        fi
         rm -f "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
     done
+    if [ -n "${MIGRATED_PYTHON_INIT_BACKUP}" ]; then
+        cp "${MIGRATED_PYTHON_INIT_BACKUP}" "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py"
+        rm -f "${MIGRATED_PYTHON_INIT_BACKUP}"
+        MIGRATED_PYTHON_INIT_BACKUP=""
+    fi
+    rm -rf "${STORE_FACADE_STAGING_DIR}"
     rm -rf "${RESHARD_STAGING_DIR}"
 }
 trap cleanup_migrated_python_staging EXIT
 cleanup_migrated_python_staging
+MIGRATED_PYTHON_INIT_BACKUP=$(mktemp)
+cp "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py" "${MIGRATED_PYTHON_INIT_BACKUP}"
 for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
     cp "${MIGRATED_PYTHON_SOURCE_DIR}/${module}" \
        "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
 done
+cp -R "${STORE_FACADE_SOURCE_DIR}" "${STORE_FACADE_STAGING_DIR}"
 cp -R "${RESHARD_SOURCE_DIR}" "${RESHARD_STAGING_DIR}"
 
 # Build the wheel package
@@ -461,10 +495,22 @@ fi
 # libmpcomm.so; and (b) let patchelf rewrite a library carrying CUDA fatbins
 # (MPComm builds TMA kernels with USE_CUDA_KERNELS=ON by default), the same
 # corruption risk the EP/PG extensions are kept away from below.
+#
+# The SYCL, Level Zero and Intel compiler runtimes of an XPU build are
+# excluded too: the XPU EP runs on PyTorch's own sycl::queue, so it must share
+# the one SYCL runtime that PyTorch XPU installs (intel-sycl-rt,
+# intel-cmplr-lib-rt) rather than carry a second copy.
 ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
+    --exclude libsycl.so* \
+    --exclude libze_loader.so* \
+    --exclude libsvml.so* \
+    --exclude libimf.so* \
+    --exclude libirng.so* \
+    --exclude libintlc.so* \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
     --exclude libefa.so* \
+    --exclude libhwloc.so* \
     --exclude libibverbs.so* \
     --exclude libmlx5.so* \
     --exclude libnuma.so* \
@@ -572,6 +618,11 @@ if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; 
                 cp "$so_file" "$UNPACKED_PKG_DIR/mooncake/$(basename "$so_file")"
             fi
         done
+        # Kernel headers for the EP JIT (runtime nvcc).
+        if [ -d "$CUDA_EP_JIT_DIR" ]; then
+            echo "  Adding EP JIT header tree"
+            cp -r "$CUDA_EP_JIT_DIR" "$UNPACKED_PKG_DIR/mooncake/"
+        fi
         # The host EP extension is repaired before the device library is
         # injected.  auditwheel therefore only adds its vendored .libs path;
         # add the package directory as well so the sibling device library is

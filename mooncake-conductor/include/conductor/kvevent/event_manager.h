@@ -25,9 +25,21 @@ namespace cinatra {
 class coro_http_server;
 }
 
+// Forward declarations keeping coro_rpc out of this header. `coro_rpc_server`
+// is an alias (`coro_rpc_server_base<config_t>`), not a class, so the real
+// declarations from ylt/coro_rpc are mirrored here; redeclaring an alias with
+// the same target is legal, and the full header stays confined to the .cpp.
+namespace coro_rpc {
+struct config_t;
+template <typename server_config>
+class coro_rpc_server_base;
+using coro_rpc_server = coro_rpc_server_base<config_t>;
+}  // namespace coro_rpc
+
 namespace mooncake::conductor::kvevent {
 
 class EventManager;
+class ConductorService;
 
 // KVEventHandler adapts the generic EventHandler interface for EventManager.
 class KVEventHandler : public zmq::EventHandler {
@@ -139,8 +151,12 @@ std::string MakeServiceKey(const std::string& instance_id,
 
 class EventManager {
    public:
-    EventManager(std::vector<common::ServiceConfig> services,
-                 int http_server_port);
+    // max_blocks_per_context caps the prefix entries kept per index context;
+    // zero disables capacity eviction.
+    EventManager(
+        std::vector<common::ServiceConfig> services, int http_server_port,
+        int rpc_server_port = 0,
+        size_t max_blocks_per_context = prefixindex::kDefaultMaxBlocks);
     ~EventManager();
     EventManager(const EventManager&) = delete;
     EventManager& operator=(const EventManager&) = delete;
@@ -157,7 +173,17 @@ class EventManager {
     // the port cannot be bound.
     bool StartHTTPServer();
 
+    // Starts the coro_rpc server on the configured port, sharing the same
+    // ConductorService as the HTTP channel. rpc_server_port==0 disables the
+    // channel: the call is a no-op and returns true.
+    bool StartRPCServer();
+
+    // Actual bound RPC port; 0 when the RPC server is not running.
+    uint16_t RpcPort() const;
+
     prefixindex::PrefixCacheTable* GetIndexer() { return &indexer_; }
+
+    ConductorService& GetService() { return *service_; }
 
     // True once Stop() has begun; checked by KVEventHandler::HandleBatch
     // under mu_ (read).
@@ -166,6 +192,7 @@ class EventManager {
    private:
     friend class KVEventHandler;
     friend class EventManagerTestPeer;
+    friend class ConductorService;
 
     // Requires mu_ held (exclusive). Returns {is_new, error}: is_new is
     // false for duplicates (idempotent registration).
@@ -183,6 +210,7 @@ class EventManager {
     prefixindex::PrefixCacheTable indexer_;
     std::vector<common::ServiceConfig> services_;
     int http_server_port_;
+    int rpc_server_port_;
 
     // Concurrent-map fields, guarded by mu_ alongside services_.
     std::unordered_map<std::string, std::shared_ptr<zmq::ZMQClient>>
@@ -199,6 +227,8 @@ class EventManager {
     std::condition_variable_any stop_cv_;
 
     std::unique_ptr<cinatra::coro_http_server> http_server_;
+    std::unique_ptr<coro_rpc::coro_rpc_server> rpc_server_;
+    std::unique_ptr<ConductorService> service_;
 };
 
 }  // namespace mooncake::conductor::kvevent

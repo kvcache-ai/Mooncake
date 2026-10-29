@@ -19,7 +19,6 @@
 #include <asio/ip/v6_only.hpp>
 #include <asio/post.hpp>
 #include <asio/steady_timer.hpp>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -75,7 +74,7 @@ std::atomic<size_t> staging_device_query_count{0};
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
 void recordStagingBufferAllocationForTest() noexcept {
     staging_buffer_allocation_count.fetch_add(1, std::memory_order_relaxed);
 }
@@ -559,6 +558,9 @@ Status TcpTransport::submitTransfer(
     for (auto& request : entries) {
         TransferTask& task = batch_desc.task_list[task_id];
         ++task_id;
+        // Match every sibling transport: attach the batch so completion
+        // callbacks pin the BatchDesc and publish into finishIfComplete.
+        task.batch_id = batch_id;
         startTransfer(prepareTransfer(&task, request));
     }
 

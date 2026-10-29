@@ -5,12 +5,12 @@ file(GLOB TENT_METRICS_SOURCES "*.cpp")
 # across DSOs. When statically linked, the metrics code is copied into every
 # consumer .so (engine.so and store.so), giving each its own TentMetrics
 # instance: a process that loads both modules ends up with two independent
-# metrics singletons, two periodic report threads ("TENT Metrics:" logged
-# twice per interval), and a metrics HTTP port clash (both default to 9100,
-# so only one binds and the other silently degrades to log-only). As a shared
-# library, both modules take a single DT_NEEDED on libtent_metrics.so and
-# share the one process-wide singleton. PIC is already on for the whole tent
-# tree (tent/CMakeLists.txt sets CMAKE_POSITION_INDEPENDENT_CODE ON), so the
+# metrics singletons, two periodic report threads ("TENT Metrics:" logged twice
+# per interval), and a metrics HTTP port clash (both default to 9100, so only
+# one binds and the other silently degrades to log-only). As a shared library,
+# both modules take a single DT_NEEDED on libtent_metrics.so and share the one
+# process-wide singleton. PIC is already on for the whole tent tree
+# (tent/CMakeLists.txt sets CMAKE_POSITION_INDEPENDENT_CODE ON), so the
 # tent_common OBJECT dependency links cleanly into the shared object.
 add_library(tent_metrics SHARED ${TENT_METRICS_SOURCES})
 # Installed libtent_metrics.so sits next to libasio.so / libtent_common.so in
@@ -32,6 +32,9 @@ set_target_properties(tent_metrics PROPERTIES INSTALL_RPATH "$ORIGIN")
 target_link_libraries(
   tent_metrics PUBLIC tent_common tent_interface yalantinglibs::yalantinglibs
                       glog::glog pthread)
+target_compile_definitions(
+  tent_metrics PRIVATE TENT_BUILD_VERSION="${TENT_BUILD_VERSION}"
+                       TENT_GIT_COMMIT="${TENT_GIT_COMMIT}")
 
 # Pass compile definition based on option
 if(TENT_METRICS_ENABLED)
@@ -43,9 +46,7 @@ else()
 endif()
 
 # Install to lib/ for libtent_shared.so / system consumers. The python C
-# extensions (engine.so, store.so) resolve it via $ORIGIN, so a second
-# install lands libtent_metrics.so next to them — see
+# extensions (engine.so, store.so) resolve it via $ORIGIN, so a second install
+# lands libtent_metrics.so next to them — see
 # mooncake-integration/CMakeLists.txt.
-install(
-  TARGETS tent_metrics
-  LIBRARY DESTINATION lib)
+install(TARGETS tent_metrics LIBRARY DESTINATION lib)
