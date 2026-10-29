@@ -142,6 +142,7 @@ struct MessageMetadata {
     std::string endpoint;
     std::string topic;
     int64_t sequence = -1;
+    bool from_replay = false;
 };
 
 }  // namespace mooncake::conductor::zmq

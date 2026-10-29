@@ -85,6 +85,9 @@ class ZMQClient {
     // Cumulative counts inferred from transport sequence gaps.
     int64_t GetDroppedEvents() const { return dropped_events_.load(); }
     int64_t GetGapCount() const { return gap_count_.load(); }
+    uint64_t GetBatchFailures() const { return batch_failures_.load(); }
+    uint64_t GetReplaySuccesses() const { return replay_successes_.load(); }
+    uint64_t GetReplayFailures() const { return replay_failures_.load(); }
 
    private:
     friend class ZMQClientTestPeer;
@@ -103,6 +106,7 @@ class ZMQClient {
         std::string topic;
         int64_t sequence;
         std::string payload;
+        bool from_replay = false;
     };
 
     enum class ReplayFailure {
@@ -124,7 +128,8 @@ class ZMQClient {
         std::chrono::steady_clock::time_point recovery_deadline);
     std::string ResetReplaySocket();
     std::string DispatchMessage(const std::string& topic, int64_t sequence,
-                                const char* payload, size_t payload_size);
+                                const char* payload, size_t payload_size,
+                                bool from_replay = false);
     void UpdateLastSequence(int64_t sequence);
     bool BufferMessage(BufferedMessage message, std::string* error);
     std::string DrainBufferedMessages(bool allow_initial_baseline = false);
@@ -155,6 +160,9 @@ class ZMQClient {
     // Counters updated when a transport sequence skips one or more events.
     std::atomic<int64_t> dropped_events_{0};
     std::atomic<int64_t> gap_count_{0};
+    std::atomic<uint64_t> batch_failures_{0};
+    std::atomic<uint64_t> replay_successes_{0};
+    std::atomic<uint64_t> replay_failures_{0};
 
     // Lifecycle.
     std::atomic<bool> stop_requested_{false};
