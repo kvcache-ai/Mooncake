@@ -262,7 +262,8 @@ TEST_F(V2MetricsTest, EventAndPolicyConfigurationIsReachableFromJson) {
             {"type": "DRAM", "capacity": 1048576, "priority": 10,
              "placement_policy": {"offload_high_watermark": 0.75}},
             {"type": "DRAM", "capacity": 1048576, "priority": 5,
-             "placement_policy": {"offload_high_watermark": 0.8}}
+             "placement_policy": {"offload_high_watermark": 0.8}},
+            {"type": "DRAM", "capacity": 1048576, "priority": 1}
         ],
         "v2": {
             "events": {"shard_count": 2, "event_queue_capacity": 32,
@@ -305,6 +306,9 @@ TEST_F(V2MetricsTest, EventAndPolicyConfigurationIsReachableFromJson) {
     EXPECT_DOUBLE_EQ(
         config->tilers[1].placement_policy.EffectiveOffloadHighWatermark(),
         0.8);
+    EXPECT_DOUBLE_EQ(
+        config->tilers[2].placement_policy.EffectiveOffloadHighWatermark(),
+        0.7);
     EXPECT_DOUBLE_EQ(config->movement.offload_high_watermark, 0.7);
     EXPECT_DOUBLE_EQ(config->movement.onboard_min_read_heat, 4.0);
     EXPECT_EQ(config->max_registration_retry, 3U);
@@ -335,6 +339,22 @@ TEST_F(V2MetricsTest, InvalidEventAndPolicyConfigurationIsRejected) {
                                  LocalTransferConfig{}, KeyLeaseConfig{});
     ASSERT_FALSE(no_headroom.has_value());
     EXPECT_EQ(no_headroom.error(), ErrorCode::INVALID_PARAMS);
+
+    auto replace_without_reclaim =
+        ParseDataManagerV2Config(ParseJson(R"({
+        "tiers": [
+            {"type": "DRAM", "capacity": 1048576, "priority": 100},
+            {"type": "SSD", "capacity": 1048576, "priority": 10,
+             "file_path": "/tmp/mooncake_v2_test_ssd.data",
+             "allocation_failure": {"try_evict": false}}
+        ],
+        "v2": {"tier_placement": {
+            "lowest_priority_tier_full_policy": "evict_coldest"
+        }}
+    })"),
+                                 LocalTransferConfig{}, KeyLeaseConfig{});
+    ASSERT_FALSE(replace_without_reclaim.has_value());
+    EXPECT_EQ(replace_without_reclaim.error(), ErrorCode::INVALID_PARAMS);
 
     auto zero_timeout =
         ParseDataManagerV2Config(ParseJson(R"({

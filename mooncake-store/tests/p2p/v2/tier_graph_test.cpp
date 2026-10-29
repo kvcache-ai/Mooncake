@@ -720,12 +720,14 @@ TEST_F(TierGraphTest, AFullDestinationIsSkippedForTheNextCandidate) {
                      .has_value());
 }
 
-TEST_F(TierGraphTest, FullLowestPriorityTierCanReplaceItsColdestBlock) {
+TEST_F(TierGraphTest, FullLowestPriorityTierFollowsItsFullPolicy) {
     auto graph = ThreeLevelChain();
     usage_[kCxl] = 0.99;
     usage_[kSsd] = 1.0;
 
-    auto retaining = MakePolicy(graph);
+    TierPlacementPolicyConfig retain_config;
+    retain_config.lowest_priority_tier_full_policy = "retain";
+    auto retaining = MakePolicy(graph, retain_config);
     EXPECT_FALSE(retaining->Select(Context(kCxl, MovementDirection::kOffload))
                      .has_value());
 
