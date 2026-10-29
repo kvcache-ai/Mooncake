@@ -11,9 +11,12 @@
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <algorithm>
+#include <exception>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <optional>
+#include <system_error>
 #include <vector>
 
 #include "real_client.h"
@@ -439,6 +442,91 @@ inline bool HasMemoryReplica(const std::vector<Replica::Descriptor> &replicas) {
         }
     }
     return false;
+}
+
+// Max number of LOCAL_DISK owners read concurrently within one batch.
+// MC_OFFLOAD_OWNER_READ_CONCURRENCY=1 (default) keeps the sequential path.
+size_t OffloadOwnerReadConcurrency() {
+    static const size_t value = [] {
+        const char *env = std::getenv("MC_OFFLOAD_OWNER_READ_CONCURRENCY");
+        size_t parsed = 1;
+        if (env) {
+            parsed = TryParseInteger<size_t>(env,
+                                             {.trim_ascii_whitespace = true,
+                                              .allow_leading_plus = true})
+                         .value_or(0);
+            if (parsed == 0) {
+                LOG(WARNING) << "Invalid MC_OFFLOAD_OWNER_READ_CONCURRENCY="
+                             << env << ", falling back to 1";
+                parsed = 1;
+            }
+        }
+        LOG(INFO) << "Offload owner read concurrency: " << parsed;
+        return parsed;
+    }();
+    return value;
+}
+
+// Runs fn(endpoint, objects) for every owner group, with up to
+// OffloadOwnerReadConcurrency() owners in flight. Each owner group holds
+// disjoint keys, so fn may write per-key results without extra locking.
+template <typename OffloadObjects, typename Fn>
+void ForEachOffloadOwner(OffloadObjects &offload_objects, Fn &&fn) {
+    if (offload_objects.empty()) return;
+    auto start_time = std::chrono::steady_clock::now();
+    std::vector<typename OffloadObjects::value_type *> owners;
+    owners.reserve(offload_objects.size());
+    size_t key_count = 0;
+    for (auto &owner : offload_objects) {
+        owners.push_back(&owner);
+        key_count += owner.second.size();
+    }
+
+    const size_t concurrency =
+        std::min(OffloadOwnerReadConcurrency(), owners.size());
+    if (concurrency <= 1) {
+        for (auto *owner : owners) fn(owner->first, owner->second);
+    } else {
+        // The caller thread also takes work, so the batch progresses even if
+        // helper threads cannot be created.
+        std::atomic<size_t> next{0};
+        std::mutex exception_mutex;
+        std::exception_ptr first_exception;
+        auto worker = [&]() {
+            for (size_t i = next.fetch_add(1); i < owners.size();
+                 i = next.fetch_add(1)) {
+                try {
+                    fn(owners[i]->first, owners[i]->second);
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(exception_mutex);
+                    if (!first_exception) {
+                        first_exception = std::current_exception();
+                    }
+                }
+            }
+        };
+        std::vector<std::thread> helpers;
+        helpers.reserve(concurrency - 1);
+        for (size_t i = 1; i < concurrency; ++i) {
+            try {
+                helpers.emplace_back(worker);
+            } catch (const std::system_error &e) {
+                LOG(WARNING) << "Failed to start offload owner reader: "
+                             << e.what();
+                break;
+            }
+        }
+        worker();
+        for (auto &helper : helpers) helper.join();
+        if (first_exception) std::rethrow_exception(first_exception);
+    }
+
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - start_time)
+                          .count();
+    LOG(INFO) << "Offload owner reads: owners=" << owners.size()
+              << ", keys=" << key_count << ", concurrency=" << concurrency
+              << ", elapsed=" << elapsed_us << "us";
 }
 
 }  // namespace
@@ -3327,8 +3415,9 @@ RealClient::batch_get_buffer_internal(
             disk_key_to_idx[op.key] = idx;
         }
 
-        for (auto &[endpoint, objects] : offload_objects) {
-            if (objects.empty()) continue;
+        ForEachOffloadOwner(offload_objects, [&](const std::string &endpoint,
+                                                 auto &objects) {
+            if (objects.empty()) return;
             auto read_result =
                 batch_get_into_offload_object_internal(endpoint, objects);
             for (auto &[key, slices] : objects) {
@@ -3354,7 +3443,7 @@ RealClient::batch_get_buffer_internal(
                                << "': " << toString(read_result.error());
                 }
             }
-        }
+        });
     }
 
     return final_results;
@@ -5312,21 +5401,24 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     [[maybe_unused]] size_t offload_object_count = 0;
     [[maybe_unused]] auto start_read_store_time =
         std::chrono::steady_clock::now();
-    for (auto &offload_objects_it : offload_objects) {
+    for (const auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
-        auto batch_get_offload_result = batch_get_into_offload_object_internal(
-            offload_objects_it.first, offload_objects_it.second);
+    }
+    ForEachOffloadOwner(offload_objects, [&](const std::string &endpoint,
+                                             auto &objects) {
+        auto batch_get_offload_result =
+            batch_get_into_offload_object_internal(endpoint, objects);
         if (!batch_get_offload_result) {
             LOG(ERROR) << "Batch get store object failed with error: "
                        << batch_get_offload_result.error();
-            for (const auto &offload_object_it : offload_objects_it.second) {
+            for (const auto &offload_object_it : objects) {
                 results[valid_local_disk_operations.at(offload_object_it.first)
                             .original_index] =
                     tl::make_unexpected(batch_get_offload_result.error());
             }
-            continue;
+            return;
         }
-        for (const auto &offload_object_it : offload_objects_it.second) {
+        for (const auto &offload_object_it : objects) {
             const auto &op =
                 valid_local_disk_operations.at(offload_object_it.first);
             auto checksum_result = client_->VerifyObjectChecksum(
@@ -5337,7 +5429,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                     tl::make_unexpected(checksum_result.error());
             }
         }
-    }
+    });
 
     auto end_time = std::chrono::steady_clock::now();
     [[maybe_unused]] auto elapsed_time =
@@ -6328,8 +6420,10 @@ RealClient::batch_get_into_multi_buffers_internal(
                     .emplace(key, std::move(user_slices));
             }
 
-            for (auto &[endpoint, objects] : offload_objects) {
-                if (objects.empty()) continue;
+            ForEachOffloadOwner(offload_objects, [&](const std::string
+                                                         &endpoint,
+                                                     auto &objects) {
+                if (objects.empty()) return;
                 auto read_result =
                     batch_get_into_offload_object_internal(endpoint, objects);
                 // On success: results[original_index] was already pre-filled
@@ -6344,7 +6438,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                         results[disk_it->second.original_index] =
                             tl::make_unexpected(read_result.error());
                     }
-                    continue;
+                    return;
                 }
                 for (auto &[key, slices] : objects) {
                     auto disk_it = valid_local_disk_ops.find(key);
@@ -6358,7 +6452,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                             tl::make_unexpected(checksum_result.error());
                     }
                 }
-            }
+            });
         }
 
         // DISK/DFS: one batched BatchGet into temp buffers, then scatter.
