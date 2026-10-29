@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <iterator>
 #include <limits>
-#include <stdexcept>
 #include <mutex>
 #include <utility>
 
@@ -17,7 +16,9 @@ ErrorCode LocalSsdTaskMailbox::EnqueueOffload(OffloadTaskItem task,
                                               size_t limit) {
     if (task.size <= 0) return ErrorCode::INVALID_PARAMS;
     MutexLocker lock(&mutex_);
-    if (!enable_offloading_) return ErrorCode::UNABLE_OFFLOADING;
+    if (!enable_offloading_) {
+        return ErrorCode::UNABLE_OFFLOADING;
+    }
     const uint64_t byte_limit = offload_limits_.max_pending_bytes;
     const auto bytes = static_cast<uint64_t>(task.size);
     if ((offload_limits_.use_bytes &&
@@ -28,8 +29,9 @@ ErrorCode LocalSsdTaskMailbox::EnqueueOffload(OffloadTaskItem task,
         return ErrorCode::KEYS_ULTRA_LIMIT;
     }
     auto index = TenantId(task.tenant_id).MakeScopedKey(task.key);
-    if (!pending_offloads_.emplace(std::move(index), std::move(task)).second)
+    if (!pending_offloads_.emplace(std::move(index), std::move(task)).second) {
         return ErrorCode::OBJECT_ALREADY_EXISTS;
+    }
     pending_offload_bytes_ += bytes;
     return ErrorCode::OK;
 }

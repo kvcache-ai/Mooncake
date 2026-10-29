@@ -252,11 +252,10 @@ DEFINE_uint64(offloading_queue_limit_bytes,
               mooncake::DEFAULT_OFFLOADING_QUEUE_LIMIT_BYTES,
               "Pending offload payload byte limit per local disk segment; "
               "used only when offloading_queue_use_bytes is enabled");
-DEFINE_double(
-    offload_cap_ratio, 0.5,
-    "Per-cycle offload cap as a fraction of the active queue limit. "
-    "Controls the payload or object count queued for offload in a single "
-    "eviction cycle before falling back to force-evict");
+DEFINE_double(offload_cap_ratio, 0.5,
+              "Per-cycle offload cap as a fraction of the active queue limit. "
+              "Controls the payload or object count queued for offload in a "
+              "single eviction cycle before falling back to force-evict");
 DEFINE_validator(offload_cap_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "offload_cap_ratio must be between 0.0 and 1.0";

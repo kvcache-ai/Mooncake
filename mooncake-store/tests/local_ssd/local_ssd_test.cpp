@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <limits>
-#include <stdexcept>
 #include <thread>
 
 #include "local_ssd/manager.h"
