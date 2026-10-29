@@ -3412,8 +3412,8 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
                     .has_value());
 
-    auto replicas = ReplicaDescriptorsForTesting(
-        service, kDefaultTenant, "standby_batch_drop_survivor");
+    auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                 "standby_batch_drop_survivor");
     ASSERT_EQ(1u, replicas.size());
     EXPECT_EQ(replicas.front()
                   .get_memory_descriptor()
