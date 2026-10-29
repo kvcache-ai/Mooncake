@@ -736,6 +736,7 @@ These apply to any Mooncake caller — the framework sections below only add the
 |---|---|---|
 | `MOONCAKE_PROTOCOL` | `rdma` | Set to `efa` to select this transport. Read by the vLLM / SGLang connectors |
 | `MC_MAX_WR` | provider's transmit depth | Per-NIC in-flight WR cap. **Do not set** — see below |
+| `MC_EFA_STALL_MIN_MS` | `1000` | How long a peer must refuse every post (unbroken `FI_EAGAIN`, at least 1024 waves) before its slices fail. A new connection's first completions take 50–100 ms, so much lower values fail healthy peers. `<= 0` restores the count-only check |
 | `MC_EFA_CQ_THREADS` | `1` | CQ polling threads. **Leave alone** — see below |
 | `MC_EFA_NIC_SELECTION` | `all` | `local` registers each device buffer only on its topology-local NICs — see below |
 | `MC_EFA_DISABLE_NEURON` | unset | `1` skips Neuron HBM registration and stages through host memory — see [AWS Neuron](#efa-neuron) |
@@ -747,7 +748,7 @@ These apply to any Mooncake caller — the framework sections below only add the
 > Overriding it desynchronizes the counter from the queue it paces, and **both directions of error are real transfer failures, not just slowdowns** — EFA has no transport-level retransmit, so the affected slices are reported up as `FAILED`:
 >
 > - **Too small** (e.g. the old fixed default of 256): the counter saturates while the queue is mostly empty, so submitters spin in the credit-wait loop and give up — `timed out waiting for CQ drain (wr_depth=256, max=256)` — with thousands of slots the NIC would have accepted.
-> - **Too large** (e.g. `MC_MAX_WR=16384`): the counter hands out credit the queue cannot honor, so `fi_write` refuses with `-FI_EAGAIN` while `wr_depth` sits pinned at the provider's real depth and the rest of the credit is nominally free — `1024 consecutive FI_EAGAIN waves posted nothing`.
+> - **Too large** (e.g. `MC_MAX_WR=16384`): the counter hands out credit the queue cannot honor, so `fi_write` refuses with `-FI_EAGAIN` while `wr_depth` sits pinned at the provider's real depth and the rest of the credit is nominally free — `N consecutive FI_EAGAIN waves over X ms posted nothing` once the refusals have lasted `MC_EFA_STALL_MIN_MS`.
 >
 > A value **below** the provider's depth is still honored, as a deliberate per-NIC throttle; a value above it is clamped with a warning. Verify what took effect from the per-device startup line — no probe needed:
 >
@@ -765,6 +766,25 @@ These apply to any Mooncake caller — the framework sections below only add the
 > ```
 
 > **`MC_EFA_NIC_SELECTION`** — `all` (default) registers every buffer on every NIC, so any NIC can serve any transfer. `local` narrows a device buffer to the NICs the topology reports as closest to its GPU, which trades bandwidth for registration time: fewer NICs can serve a transfer touching that buffer, but registering one buffer on N NICs costs roughly N registrations, and for device memory a per-domain cost is paid on top. Measured on p5.48xlarge with 48 × 391 MB GPU buffers registered serially: **123.7 s across 32 NICs, 17.6 s across 4, 4.4 s on 1.** Use it when startup registration time dominates, not to chase throughput. Host (`cpu:N`) buffers are deliberately never narrowed — a NUMA node's NIC set is half the machine, not a rail group. This knob is unrelated to the Neuron switch-locality win, which comes from the topology's transfer-time NIC preference and needs no configuration.
+
+(efa-large-memory)=
+## Registering Large Memory: Use Huge Pages
+
+Back large buffers with huge pages, either THP or hugetlb. This is a requirement, not a tuning option. Which kind to use depends on whether you can change host settings:
+
+- **You control the host:** use hugetlb. Reserve the pages up front (`vm.nr_hugepages`, sized for every buffer you register) and set `MC_STORE_USE_HUGEPAGE`. The pages are guaranteed once reserved, and this is the only way to back `memfd` buffers (below).
+- **You run in a container and cannot change the host:** use THP. It needs no reservation; the Store asks for it on its segment. `memfd` buffers stay on 4 KB pages in this case.
+
+An EFA NIC maps a registered buffer through a page table of about 22 million entries. With 4 KB pages, one registration covers at most about 88 GiB. With 2 MB pages the same entries cover about 44 TB, so the device's `max_mr_size` becomes the limit instead. For a 4 KB-backed buffer larger than that, the transport splits it into chunks and plans each NIC against the same budget:
+
+- With several NICs, each chunk is registered on only some of them (`Disjoint NIC partition` in the log). Transfers that touch a chunk then use only those NICs.
+- With one NIC, for example r8i.48xlarge, a 4 KB-backed buffer above about 88 GiB is rejected (`per-NIC PTE budget ... is exceeded even with round-robin`).
+
+The `Auto-split params: page_size=...` log line shows which budget a registration was planned with.
+
+**Store segments.** The Store allocates its segment with `MADV_HUGEPAGE`, so THP with `enabled=madvise`, the common default, is enough. Check that the backing actually happened: `AnonHugePages` in `/proc/meminfo` should grow by the segment size. For example, a 1 TB segment on a single-NIC r8i.48xlarge registers in about a minute, with `AnonHugePages` at 1 TiB. THP faults compact memory directly, so on a host with fragmented memory, compact it first (`echo 1 > /proc/sys/vm/compact_memory`). Set `MC_STORE_USE_HUGEPAGE` only together with a reserved hugetlb pool: it switches the segment to hugetlb, and allocation fails if the pool is too small.
+
+**Shared-memory buffers.** These buffers come from `memfd`, for example the HiCache host pool that SGLang allocates for its `mooncake` storage backend. `MADV_HUGEPAGE` THP does not apply to `memfd`. Such buffers use 2 MB pages only with `MC_STORE_USE_HUGEPAGE` set and enough hugetlb pages reserved (`vm.nr_hugepages`). Otherwise they are 4 KB-backed, and the limits above apply to each of them.
 
 ## Usage with vLLM
 
@@ -979,6 +999,12 @@ Solution: Verify `/opt/amazon/efa/lib` is in the library path:
 ```bash
 export LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
 ```
+
+### Large buffer registration fails or is split across NICs
+
+`fi_mr_reg ... Cannot allocate memory`, `Disjoint NIC partition`, or `per-NIC PTE budget ... is exceeded` on a large buffer means it is backed by 4 KB pages. Back it with huge pages; see [Registering Large Memory](#efa-large-memory).
+
+`Cannot allocate memory` can also mean the host is out of memory to pin. Check `MemAvailable` before shrinking anything. On GPU hosts, inference engines' host caches can already hold most of the DRAM.
 
 ### Workers hang under high concurrency
 

@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -21,6 +22,7 @@
 
 #include "tent/common/utils/string_builder.h"
 #include "tent/transport/rdma/endpoint.h"
+#include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/slice.h"
 
 namespace mooncake {
@@ -28,6 +30,22 @@ namespace tent {
 
 class EndpointTestAccess {
    public:
+    static void attachNotificationResources(RdmaEndPoint& endpoint,
+                                            RdmaContext& context, ibv_qp& qp,
+                                            ibv_mr& recv_mr, ibv_mr& send_mr) {
+        endpoint.context_ = &context;
+        endpoint.notify_qp_ = &qp;
+        endpoint.notify_recv_mr_ = &recv_mr;
+        endpoint.notify_send_mr_ = &send_mr;
+        endpoint.notify_recv_buffer_.resize(128);
+        endpoint.notify_send_buffer_.resize(128);
+        endpoint.status_.store(RdmaEndPoint::EP_HANDSHAKING);
+    }
+    static size_t notificationBytes(const RdmaEndPoint& endpoint) {
+        return endpoint.notify_recv_buffer_.size() +
+               endpoint.notify_send_buffer_.size();
+    }
+
     // Puts a context-less endpoint into the state a completed bootstrap
     // leaves behind, so accept() can be driven without an RDMA device.
     static void markConnected(RdmaEndPoint& endpoint,
@@ -79,6 +97,25 @@ class EndpointTestAccess {
     static bool decodeNotifyPayload(const char* data, size_t byte_len,
                                     std::string* name, std::string* msg) {
         return RdmaEndPoint::decodeNotifyPayload(data, byte_len, name, msg);
+    }
+};
+
+class RdmaContextTestPeer {
+   public:
+    static IbvSymbols& verbs(RdmaContext& context) { return context.verbs_; }
+    static void bindStore(RdmaContext& context,
+                          std::shared_ptr<EndpointStore> store, ibv_pd& pd) {
+        context.endpoint_store_ = std::move(store);
+        context.native_pd_ = &pd;
+    }
+};
+
+class EndpointStoreTestAccess {
+   public:
+    static void retain(FIFOEndpointStore& store,
+                       std::shared_ptr<RdmaEndPoint> endpoint) {
+        endpoint->beginDestroy();
+        store.waiting_list_.insert(std::move(endpoint));
     }
 };
 
@@ -443,6 +480,110 @@ TEST(EndpointLifecycleTest, NotifyRecvIsRearmedOnlyWhileReady) {
     EndpointTestAccess::beginDestroy(endpoint);
     EXPECT_FALSE(S::shouldRearmNotifyRecv(endpoint.status(),
                                           endpoint.notifyConnected()));
+}
+
+// Verbs failures must preserve the whole owner graph, including terminal
+// destructors that have no caller left to retry cleanup. No RNIC is needed.
+class RdmaTeardownTest : public ::testing::Test {
+   protected:
+    static inline bool fail_qp = false;
+    static inline bool fail_mr = false;
+    static inline size_t deregistrations = 0;
+    RdmaTransport transport_;
+    std::unique_ptr<RdmaContext> context_;
+    std::shared_ptr<RdmaEndPoint> endpoint_;
+    ibv_qp qp_{};
+    ibv_mr recv_mr_{}, send_mr_{};
+    ibv_pd pd_{};
+
+    void SetUp() override {
+        fail_qp = fail_mr = false;
+        deregistrations = 0;
+        context_ = std::make_unique<RdmaContext>(transport_);
+        auto& verbs = RdmaContextTestPeer::verbs(*context_);
+        verbs.ibv_destroy_qp = [](ibv_qp*) {
+            if (!fail_qp) return 0;
+            errno = EIO;
+            return EIO;
+        };
+        verbs.ibv_dereg_mr = [](ibv_mr*) {
+            ++deregistrations;
+            if (!fail_mr) return 0;
+            errno = EIO;
+            return EIO;
+        };
+        verbs.ibv_dealloc_pd = [](ibv_pd*) { return 0; };
+        endpoint_ = std::make_shared<RdmaEndPoint>();
+        EndpointTestAccess::attachNotificationResources(
+            *endpoint_, *context_, qp_, recv_mr_, send_mr_);
+    }
+    void TearDown() override {
+        fail_qp = fail_mr = false;
+        if (context_) {
+            endpoint_.reset();
+            context_.reset();
+        }
+    }
+    void bindStore() {
+        auto store = std::make_shared<FIFOEndpointStore>(*context_, 1);
+        EndpointStoreTestAccess::retain(*store, endpoint_);
+        RdmaContextTestPeer::bindStore(*context_, std::move(store), pd_);
+    }
+};
+
+TEST_F(RdmaTeardownTest, ExplicitEndpointTeardownRetainsBuffersUntilRetry) {
+    fail_qp = true;
+    EXPECT_NE(endpoint_->deconstruct(), 0);
+    EXPECT_EQ(deregistrations, 0u);
+    EXPECT_EQ(EndpointTestAccess::notificationBytes(*endpoint_), 256u);
+    fail_qp = false;
+    fail_mr = true;
+    EXPECT_NE(endpoint_->deconstruct(), 0);
+    EXPECT_EQ(deregistrations, 2u);
+    EXPECT_EQ(EndpointTestAccess::notificationBytes(*endpoint_), 256u);
+    fail_mr = false;
+    EXPECT_EQ(endpoint_->deconstruct(), 0);
+    EXPECT_EQ(deregistrations, 4u);
+    EXPECT_EQ(EndpointTestAccess::notificationBytes(*endpoint_), 0u);
+}
+
+TEST_F(RdmaTeardownTest, ExplicitContextDisableCanBeRetried) {
+    bindStore();
+    fail_qp = true;
+    EXPECT_NE(context_->disable(), 0);
+    EXPECT_EQ(EndpointTestAccess::notificationBytes(*endpoint_), 256u);
+    fail_qp = false;
+    EXPECT_EQ(context_->disable(), 0);
+    EXPECT_EQ(endpoint_->status(), RdmaEndPoint::EP_DESTROYED);
+    EXPECT_EQ(EndpointTestAccess::notificationBytes(*endpoint_), 0u);
+}
+
+TEST_F(RdmaTeardownTest, EndpointDestructorStopsOnLiveQp) {
+    ASSERT_DEATH(
+        {
+            fail_qp = true;
+            endpoint_.reset();
+        },
+        "Cannot release endpoint buffers before native QP/MR teardown");
+}
+
+TEST_F(RdmaTeardownTest, EndpointDestructorStopsOnRegisteredMemory) {
+    ASSERT_DEATH(
+        {
+            fail_mr = true;
+            endpoint_.reset();
+        },
+        "Cannot release endpoint buffers before native QP/MR teardown");
+}
+
+TEST_F(RdmaTeardownTest, ContextDestructorStopsOnFailedEndpointTeardown) {
+    ASSERT_DEATH(
+        {
+            bindStore();
+            fail_qp = true;
+            context_.reset();
+        },
+        "Cannot destroy RDMA context with live endpoint resources");
 }
 
 }  // namespace
