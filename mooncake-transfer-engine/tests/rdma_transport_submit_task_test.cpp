@@ -22,8 +22,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
 #include <string>
+#include <thread>
 #include <type_traits>
 
 #include "config.h"
@@ -309,9 +311,11 @@ TEST_F(SubmitTransferTaskTest,
     struct RestoreConfig {
         size_t max_wr = globalConfig().max_wr;
         size_t num_qp = globalConfig().num_qp_per_ep;
+        size_t fragment_limit = globalConfig().fragment_limit;
         ~RestoreConfig() {
             globalConfig().max_wr = max_wr;
             globalConfig().num_qp_per_ep = num_qp;
+            globalConfig().fragment_limit = fragment_limit;
         }
     } restore_config;
     globalConfig().max_wr = 2;
@@ -351,8 +355,6 @@ TEST_F(SubmitTransferTaskTest,
         // making the queued prefix evidence of publication during preparation.
         const size_t request_count = count + (fail ? 1 : 0);
         std::vector<Transport::TransferRequest> requests(request_count);
-        std::vector<Transport::TransferTask> tasks(request_count);
-        std::vector<Transport::TransferTask *> task_list;
         for (size_t i = 0; i < request_count; ++i) {
             auto &request = requests[i];
             request.opcode = Transport::TransferRequest::WRITE;
@@ -361,10 +363,9 @@ TEST_F(SubmitTransferTaskTest,
             request.length = block_size_;
             request.target_id = LOCAL_SEGMENT_ID;
             request.target_offset = kBufferAddr + i * block_size_;
-            tasks[i].request = &request;
-            task_list.push_back(&tasks[i]);
         }
-        auto status = transport_->submitTransferTask(task_list);
+        auto batch_id = transport_->allocateBatchID(request_count);
+        auto status = transport_->submitTransfer(batch_id, requests);
         if (fail) {
             ASSERT_TRUE(status.IsAddressNotRegistered());
         } else {
@@ -373,13 +374,21 @@ TEST_F(SubmitTransferTaskTest,
 
         auto queued = WorkerPoolTestPeer::takeQueuedSlices(*pool);
         ASSERT_EQ(queued.size(), published);
+        auto &batch = Transport::toBatchDesc(batch_id);
+        auto &tasks = batch.task_list;
+        ASSERT_EQ(tasks.size(), request_count);
+        EXPECT_EQ(batch.finished_task_count.load(), request_count - published);
         size_t cached = 0;
         for (size_t i = 0; i < tasks.size(); ++i) {
             ASSERT_EQ(tasks[i].slice_list.size(), 1u);
+            EXPECT_NE(tasks[i].completion_state &
+                          Transport::Slice::kCompletionSealBit,
+                      0u);
             auto *slice = tasks[i].slice_list.front();
             if (i < published) {
                 EXPECT_EQ(queued[i], slice);
                 ASSERT_EQ(slice->status, Transport::Slice::PENDING);
+                EXPECT_FALSE(tasks[i].completion_published);
                 cached += slice->from_cache;
                 slice->markSuccess();
                 EXPECT_EQ(tasks[i].success_slice_count, 1u);
@@ -387,12 +396,81 @@ TEST_F(SubmitTransferTaskTest,
                 EXPECT_EQ(slice->status, Transport::Slice::FAILED);
             }
             EXPECT_EQ(tasks[i].failed_slice_count, i < published ? 0u : 1u);
+            EXPECT_TRUE(tasks[i].completion_published);
+            Transport::TransferStatus transfer_status;
+            ASSERT_EQ(
+                transport_->getTransferStatus(batch_id, i, transfer_status),
+                Status::OK());
+            EXPECT_EQ(transfer_status.s,
+                      i < published ? Transport::COMPLETED : Transport::FAILED);
         }
+        EXPECT_EQ(batch.finished_task_count.load(), request_count);
+        EXPECT_EQ(batch.has_failure.load(), fail);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        EXPECT_TRUE(batch.is_finished.load());
+#endif
         // Earlier iterations return their slices to the cache.
         if (fail && published) {
             EXPECT_GT(cached, 0u);
         }
+        EXPECT_EQ(transport_->freeBatchID(batch_id), Status::OK());
     }
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    // One task spans a full chunk plus a tail. Invalid remote addresses make
+    // the real WorkerPool finish the first chunk before the tail is built.
+    globalConfig().fragment_limit = 0;
+    auto desc = std::make_shared<SegmentDesc>(*original);
+    desc->buffers[0].length = 5 * block_size_;
+    desc->rebuildBufferRangeIndex();
+    metadata_->addLocalSegment(LOCAL_SEGMENT_ID, desc->name, std::move(desc));
+    std::vector<Transport::TransferRequest> requests(1);
+    requests[0].opcode = Transport::TransferRequest::WRITE;
+    requests[0].source = reinterpret_cast<void *>(kBufferAddr);
+    requests[0].length = 5 * block_size_;
+    requests[0].target_id = LOCAL_SEGMENT_ID;
+    requests[0].target_offset = kBufferAddr + requests[0].length;
+    auto batch_id = transport_->allocateBatchID(1);
+    auto &batch = Transport::toBatchDesc(batch_id);
+    std::unique_lock<std::mutex> lock(batch.completion_mutex);
+    Status submit_status;
+    // A fresh submit thread also isolates WorkerPool's failed-target cache.
+    std::thread submitter([&] {
+        submit_status = transport_->submitTransfer(batch_id, requests);
+    });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (batch.finished_task_count.load(std::memory_order_acquire) == 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    const bool published = batch.finished_task_count.load() == 1;
+    // Completion increments the counter before taking completion_mutex. Keep
+    // that callback blocked so construction cannot advance past publication.
+    const auto slices_at_publication =
+        published
+            ? __atomic_load_n(&batch.task_list[0].slice_count, __ATOMIC_ACQUIRE)
+            : 0;
+    lock.unlock();
+    submitter.join();
+
+    ASSERT_TRUE(published);
+    EXPECT_EQ(slices_at_publication, 5u);  // Without unseal this is 4.
+    EXPECT_EQ(submit_status, Status::OK());
+    const auto &task = batch.task_list[0];
+    EXPECT_EQ(task.slice_count, 5u);
+    EXPECT_EQ(task.failed_slice_count, 5u);
+    EXPECT_EQ(task.completion_state, Transport::Slice::kCompletionSealBit | 5u);
+    EXPECT_TRUE(task.completion_published);
+    EXPECT_TRUE(task.is_finished);
+    EXPECT_EQ(batch.finished_task_count.load(), 1u);
+    EXPECT_TRUE(batch.is_finished.load());
+    EXPECT_TRUE(batch.has_failure.load());
+    Transport::TransferStatus transfer_status;
+    ASSERT_EQ(transport_->getTransferStatus(batch_id, 0, transfer_status),
+              Status::OK());
+    EXPECT_EQ(transfer_status.s, Transport::FAILED);
+    EXPECT_EQ(transport_->freeBatchID(batch_id), Status::OK());
+#endif
 }
 
 }  // namespace

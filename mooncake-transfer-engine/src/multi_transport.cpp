@@ -374,12 +374,19 @@ Status MultiTransport::mp_submitTransfer(
 #else
         task.request = &request;
 #endif
+        if (transport->supportsBatchCompletionCounter())
+            Transport::Slice::unsealTaskSubmission(&task);
         ++task_id;
         submit_tasks[transport].push_back(&task);
     }
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
+        for (auto* task : entry.second) {
+            if ((__atomic_load_n(&task->completion_state, __ATOMIC_RELAXED) &
+                 Transport::Slice::kCompletionSealBit) == 0)
+                Transport::Slice::sealTaskSubmission(task);
+        }
         if (!status.ok()) {
             // LOG(ERROR) << "Failed to submit transfer task to "
             //            << entry.first->getName();

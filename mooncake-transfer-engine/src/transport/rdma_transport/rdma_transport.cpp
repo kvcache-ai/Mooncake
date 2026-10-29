@@ -1026,9 +1026,12 @@ Status RdmaTransport::submitTransfer(
 #else
         task.request = &request;
 #endif
+        Slice::unsealTaskSubmission(&task);
         task_list.push_back(&task);
     }
-    return submitTransferTask(task_list);
+    auto status = submitTransferTask(task_list);
+    for (auto *task : task_list) Slice::sealTaskSubmission(task);
+    return status;
 }
 
 Status RdmaTransport::submitTransferTask(
