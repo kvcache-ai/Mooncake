@@ -632,8 +632,14 @@ class Buffer:
 
     def connect(self, is_update: bool = False):
         device = self._bootstrap_device()
+        if self.device_type != "xpu" and is_update:
+            self.runtime.update_local_qpns()
         # XPU has no RDMA path: peers are reached over Level Zero IPC only.
-        if self.device_type != "xpu" and not self._use_fallback:
+        if (
+            self.device_type != "xpu"
+            and not self._use_fallback
+            and not self.runtime.ibgda_disabled()
+        ):
             (raddr, rkey) = self.runtime.get_mr_info()
             # torchada maps the CUDA device namespace to MUSA when enabled.
 
@@ -652,9 +658,6 @@ class Buffer:
             ]
             dist.all_gather(rkeys, rkey, self.group)
             rkeys = torch.cat(rkeys).tolist()
-
-            if is_update:
-                self.runtime.update_local_qpns()
 
             local_qpns = self.runtime.get_local_qpns()
             all_to_all_size = len(local_qpns) // self.group_size
