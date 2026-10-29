@@ -485,7 +485,7 @@ OffsetAllocStorageReportFull __Allocator::storageReportFull() const {
 
 // OffsetAllocationHandle implementation
 OffsetAllocationHandle::OffsetAllocationHandle(
-    std::shared_ptr<OffsetAllocator> allocator, OffsetAllocation allocation,
+    std::weak_ptr<OffsetAllocator> allocator, OffsetAllocation allocation,
     uint64_t base, uint64_t size)
     : m_allocator(std::move(allocator)),
       m_allocation(allocation),
@@ -617,9 +617,11 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
         m_base + (allocation.getOffset() << m_multiplier_bits);
     guard.unlock();
 
-    // Handle construction and shared_ptr reference-counting do not access
+    // Handle construction and weak_ptr reference-counting do not access
     // allocator state and should not extend the serialized critical section.
-    return OffsetAllocationHandle(shared_from_this(), allocation, real_base,
+    // The handle keeps only a weak reference; weak_from_this() avoids taking
+    // and dropping a strong one.
+    return OffsetAllocationHandle(weak_from_this(), allocation, real_base,
                                   size);
 }
 
@@ -782,7 +784,7 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::createHandleAtNode(
     }
 
     OffsetAllocation allocation(node.dataOffset, node_index);
-    return OffsetAllocationHandle(shared_from_this(), allocation, real_offset,
+    return OffsetAllocationHandle(weak_from_this(), allocation, real_offset,
                                   requested_size);
 }
 

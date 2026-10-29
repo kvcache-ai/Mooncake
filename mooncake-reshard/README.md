@@ -80,6 +80,80 @@ turn a compact N-D plan into an unbounded number of operations.
 The logical planner is copy-only. It does not infer model semantics from tensor
 names or transform dtype, quantization, packing, swizzle, or checkpoint format.
 
+### Stored-source geometry
+
+For an already published source, use `StoredWeightManifest` and
+`plan_stored_transfer_to_target_placement(source_manifest, target_placement)`.
+Each `StoredFragmentSnapshot` identifies a logical box by `global_offset` and
+`local_shape`, and its bytes by `object_key`, `object_offset`, and `nbytes`.
+There is no source rank, training mesh, or framework runtime object in this
+fragment contract. Source fragment count, boundaries, and dimensions can differ
+from the target placement.
+
+The framework adapter determines the logical boxes and which consistent source
+copy to publish. It must decompose any nonrectangular local allocation into
+valid boxes. Mooncake validates the declared snapshot and geometry, computes
+source/target intersections, and lowers them to byte ranges; it does not infer
+training sharding or select a training replica from runtime state.
+
+The stored-source planner tests reconstruct exact bytes for nonuniform 4-to-8
+and 8-to-4 layouts, both tensor dimensions, shuffled fragments, and padded
+object offsets. These are CPU planning regressions, not transport or throughput
+measurements. This path does not replace sparse coordinate planning or change
+its wire format.
+
+## Tiled COO Partial Reads
+
+`TiledCOOLayout` and `plan_tiled_coo_read` provide a CPU-only, two-dimensional
+range planner for sparse coordinate/value streams. Source and target boxes may
+split different dimensions or use different parallel degrees. This planner
+does not gather a full tensor or prepartition the payload for a particular
+target topology.
+
+The producer orders entries by source record, then by row-major tile. Tiles
+are aligned to global tensor coordinates; each source record has its own
+contiguous tile directory even when records share a tensor ID. Coordinates and
+values remain separate flat arrays in the same entry order. A cumulative
+directory of `total_tiles + 1` entry offsets addresses the entire packed stream,
+including empty tiles; offsets do not restart at zero for each record.
+
+```python
+from mooncake.reshard.weight import TiledCOOLayout, plan_tiled_coo_read
+
+layout = TiledCOOLayout.build(
+    names=("weight",),
+    shapes=((512, 4096),),
+    offsets=((0, 0),),
+    tile_shape=(128, 64),
+)
+plan = plan_tiled_coo_read(layout, local_target_fragments)
+```
+
+Reuse `layout` and `plan` while tensor geometry and target placement stay the
+same. For every generation:
+
+1. Read `plan.offset_ranges` into a compact directory buffer. The planner may
+   combine nearby metadata windows, with at most 64 extra directory entries
+   per bridged gap.
+2. Project those windows using `plan.offset_gather_indices` and pass the fresh
+   integer endpoints to `plan.bind_offsets`. Never reuse previous-generation
+   offsets merely because the model structure is unchanged.
+3. Read the returned `payload_ranges` from both coordinate and value arrays,
+   converting entry offsets to bytes for each array's element size. Payload
+   ranges never bridge unrelated entries. `counts` and `compact_entries` map
+   each `plan.tile_runs` item to its compact destination interval, including
+   empty runs.
+4. Filter coordinates against the exact source/target intersection before
+   applying updates: a boundary tile may contain entries outside the target.
+
+Multiple targets may read the same tile into different compact destination
+intervals. This API does not deduplicate replicas, select a source generation,
+choose sparse/dense thresholds, encode values, or define additive versus
+replacement updates. Those decisions belong to the producer/consumer layer.
+The executor owns array-length, address, capacity and native integer-overflow
+checks, transport completion, and buffer lifetime. No Store, CUDA, BufferPool,
+or framework dependency is required to construct or bind this plan.
+
 ## Runtime Binding
 
 `bind_logical_transfer_plan` attaches selected typed
@@ -92,6 +166,17 @@ This plan records runtime evidence but neither submits a copy nor retains the
 underlying allocation. A Transfer Engine executor must acquire allocation
 guards and revalidate bindings atomically with the submission that consumes
 the plan.
+
+### Shared allocation validation
+
+Runtime binding checks every fragment's logical geometry and physical view
+range. Many disjoint model-weight views may share one backing allocation;
+identical `(storage_address, storage_nbytes)` pairs are collapsed only for the
+backing-allocation overlap sweep. Distinct overlapping allocations still fail,
+including a partial overlap hidden behind repeated aliases of another arena.
+The sweep sorts unique allocations once instead of repeatedly comparing every
+pair of views in the same arena. View-overlap and declared-alias checks are
+unchanged; no persistent validation cache or new lifetime owner is introduced.
 
 ## Transfer Engine Execution
 

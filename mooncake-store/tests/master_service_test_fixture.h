@@ -9,6 +9,7 @@
 
 #include "master_service.h"
 #include "master_service/master_service_test_peer.h"
+#include "object_test_helpers.h"
 #include "types.h"
 
 #include <glog/logging.h>
@@ -128,19 +129,13 @@ class MasterServiceTest : public ::testing::Test {
         const TenantId normalized_tenant =
             MasterServiceTestPeer(service).ResolveRequestTenantId(
                 TenantId(tenant_id));
-        const size_t shard_idx = MasterServiceTestPeer(service).getShardIndex(
-            normalized_tenant, key);
-        MasterServiceTestPeer::MetadataShardAccessorRO shard(&service,
-                                                             shard_idx);
-        const auto tenant_it = shard->tenants.find(normalized_tenant);
-        if (tenant_it == shard->tenants.end()) {
+        auto hold = MasterServiceTestPeer::ReadObject(
+            service,
+            MasterServiceTestPeer::ObjectIdentity{normalized_tenant, key});
+        if (!hold) {
             return std::nullopt;
         }
-        const auto metadata_it = tenant_it->second.metadata.find(key);
-        if (metadata_it == tenant_it->second.metadata.end()) {
-            return std::nullopt;
-        }
-        return metadata_it->second.metadata.GetCommittedSoftPinTimeout();
+        return hold->metadata().GetCommittedSoftPinTimeout();
     }
 
     void CleanupExpiredSoftPinsAt(
@@ -149,26 +144,28 @@ class MasterServiceTest : public ::testing::Test {
         MasterServiceTestPeer(service).CleanupExpiredSoftPins(now);
     }
 
-    size_t MetadataShardIndex(MasterService& service, const std::string& key,
-                              const TenantId& tenant_id = TenantId::Default()) {
-        return MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
+    std::unique_lock<std::mutex> AcquireWeightGroupOperationLockForTest(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& group_id) {
+        return MasterServiceTestPeer::WeightManager(service).LockGroup(
+            tenant_id, group_id);
     }
 
-    std::unique_ptr<SharedMutexLocker> LockMetadataShardForTest(
-        MasterService& service, size_t shard_idx) {
-        return std::make_unique<SharedMutexLocker>(
-            &MasterServiceTestPeer::MetadataShards(service)[shard_idx].mutex);
+    // The stripe of the tenant's route that `key` lives in.
+    size_t RouteStripeIndex(const std::string& key) {
+        return ObjectRouteTestPeer::StripeIndex(key);
     }
 
-    size_t MetadataBucketCount(
-        MasterService& service, size_t shard_idx,
+    // The bucket count of one stripe of the tenant's route; zero when the
+    // tenant has no namespace.
+    size_t RouteStripeBucketCount(
+        MasterService& service, size_t stripe_idx,
         const TenantId& tenant_id = TenantId::Default()) {
-        MasterServiceTestPeer::MetadataShardAccessorRO shard(&service,
-                                                             shard_idx);
-        const auto tenant_it = shard->tenants.find(tenant_id);
-        return tenant_it == shard->tenants.end()
-                   ? 0
-                   : tenant_it->second.metadata.bucket_count();
+        const metadata::Namespace* ns =
+            MasterServiceTestPeer::Namespaces(service).Lookup(tenant_id);
+        return ns == nullptr ? 0
+                             : ObjectRouteTestPeer::StripeBucketCount(
+                                   ns->objects, stripe_idx);
     }
 
     void SetSoftPinDeadlineForTest(
@@ -178,15 +175,13 @@ class MasterServiceTest : public ::testing::Test {
         const TenantId normalized_tenant =
             MasterServiceTestPeer(service).ResolveRequestTenantId(
                 TenantId(tenant_id));
-        const size_t shard_idx = MasterServiceTestPeer(service).getShardIndex(
-            normalized_tenant, key);
-        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
-                                                             shard_idx);
-        auto& metadata =
-            shard->tenants.at(normalized_tenant).metadata.at(key).metadata;
         {
-            SpinLocker locker(&metadata.lock);
-            metadata.soft_pin_timeout = deadline;
+            auto hold = MasterServiceTestPeer::WriteObject(
+                service,
+                MasterServiceTestPeer::ObjectIdentity{normalized_tenant, key});
+            ASSERT_TRUE(hold.has_value());
+            SpinLocker locker(&hold->metadata().lock);
+            hold->metadata().soft_pin_timeout = deadline;
         }
         MasterServiceTestPeer::SoftPinDeadlineIndex(service).Upsert(
             normalized_tenant.MakeScopedKey(key), deadline);
@@ -380,21 +375,6 @@ class MasterServiceTest : public ::testing::Test {
         return key;
     }
 
-    std::string FindGroupIdOnDifferentShard(const std::string& key) const {
-        static constexpr size_t kMetadataShardCountForTest = 1024;
-        const size_t key_shard =
-            std::hash<std::string>{}(key) % kMetadataShardCountForTest;
-        for (int i = 0; i < 10000; ++i) {
-            std::string group_id = key + "_group_" + std::to_string(i);
-            if (std::hash<std::string>{}(group_id) %
-                    kMetadataShardCountForTest !=
-                key_shard) {
-                return group_id;
-            }
-        }
-        return key + "_fallback_group";
-    }
-
     void PutCompletedObject(MasterService& service, const UUID& client_id,
                             const std::string& key,
                             const ReplicateConfig& config,
@@ -523,12 +503,14 @@ class MasterServiceTest : public ::testing::Test {
         const TenantId normalized_tenant =
             MasterServiceTestPeer(service).ResolveRequestTenantId(
                 TenantId(tenant_id));
-        MasterServiceTestPeer::GroupDomainAccessorRO gs(&service);
-        auto it = gs->groups.find(normalized_tenant.MakeScopedKey(group_id));
-        if (it == gs->groups.end()) {
+        // Membership is per tenant, so the group id alone is not enough.
+        const metadata::Namespace* ns =
+            MasterServiceTestPeer::Namespaces(service).Lookup(
+                normalized_tenant);
+        if (ns == nullptr) {
             return {};
         }
-        return {it->second.member_keys.begin(), it->second.member_keys.end()};
+        return ns->objects.GroupMembers(group_id);
     }
 
     std::shared_ptr<Lease> GetGroupLeaseForTest(
@@ -537,9 +519,19 @@ class MasterServiceTest : public ::testing::Test {
         const TenantId normalized_tenant =
             MasterServiceTestPeer(service).ResolveRequestTenantId(
                 TenantId(tenant_id));
-        MasterServiceTestPeer::GroupDomainAccessorRO gs(&service);
-        auto it = gs->groups.find(normalized_tenant.MakeScopedKey(group_id));
-        return it == gs->groups.end() ? nullptr : it->second.lease;
+        // Every member points at the group's one shared lease.
+        const metadata::Namespace* ns =
+            MasterServiceTestPeer::Namespaces(service).Lookup(
+                normalized_tenant);
+        if (ns == nullptr) {
+            return nullptr;
+        }
+        for (const auto& member_key : ns->objects.GroupMembers(group_id)) {
+            if (auto hold = ns->objects.Read(member_key)) {
+                return hold->metadata().lease_;
+            }
+        }
+        return nullptr;
     }
 };
 

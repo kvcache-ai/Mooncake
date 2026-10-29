@@ -53,6 +53,10 @@ class ServingStateGate {
 // process exit. main() arms the shutdown watchdog with it.
 inline constexpr std::chrono::seconds kHaShutdownDeadline{15};
 
+// Exit status of a completed HA shutdown whose lease release was not
+// confirmed. A lease that remains is then left to TTL expiry.
+inline constexpr int kHaShutdownReleaseFailedStatus = 2;
+
 class MasterServiceSupervisor {
    public:
     // shutdown_requested defaults to the process signal flag; tests inject

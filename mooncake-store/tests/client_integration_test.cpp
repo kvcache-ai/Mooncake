@@ -1319,11 +1319,11 @@ TEST_F(ClientIntegrationTest, BatchGetChecksLeasesWithPreferredNode) {
         {keys[1], {{live_dst, value.size()}}}};
 
     // Both public BatchGet modes must apply the same per-key lease contract.
-    for (bool prefer_same_node : {false, true}) {
-        SCOPED_TRACE(prefer_same_node);
+    for (bool group_by_target : {false, true}) {
+        SCOPED_TRACE(group_by_target);
         memset(expired_dst, 0, value.size() * 2);
         const auto results = test_client_->BatchGet(
-            keys, query_results, destinations, prefer_same_node);
+            keys, query_results, destinations, group_by_target);
         ASSERT_EQ(results.size(), keys.size());
         ASSERT_FALSE(results[0].has_value());
         EXPECT_EQ(results[0].error(), ErrorCode::LEASE_EXPIRED);
@@ -1360,10 +1360,10 @@ TEST_F(ClientIntegrationTest, BatchGetPreservesTransferErrorWithExpiredLease) {
     // Invalid transfer length fails submission before any bytes are copied.
     std::unordered_map<std::string, std::vector<Slice>> destinations{
         {key, {{buffer, value.size() - 1}}}};
-    for (bool prefer_same_node : {false, true}) {
-        SCOPED_TRACE(prefer_same_node);
+    for (bool group_by_target : {false, true}) {
+        SCOPED_TRACE(group_by_target);
         const auto results = test_client_->BatchGet(
-            {key}, query_results, destinations, prefer_same_node);
+            {key}, query_results, destinations, group_by_target);
         ASSERT_EQ(results.size(), 1);
         ASSERT_FALSE(results[0].has_value());
         EXPECT_EQ(results[0].error(), ErrorCode::TRANSFER_FAIL);

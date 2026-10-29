@@ -30,6 +30,7 @@
 
 #include "config.h"
 #include "cuda_alike.h"
+#include "transport/efa_transport/efa_discovery.h"
 #include "transport/efa_transport/efa_endpoint.h"
 #include "transport/efa_transport/efa_neuron.h"
 #include "transport/efa_transport/efa_transport.h"
@@ -85,24 +86,6 @@ inline bool isStalePeerCqError(int prov_errno) {
 
 }  // namespace
 
-// GPU builds also run on hosts without a GPU (e.g. the CUDA wheel on a CPU
-// instance). Request FI_HMEM and use the device-memory paths only when a
-// device is present; otherwise the EFA provider rejects the FI_HMEM hints.
-static bool hasGpuDevice() {
-    static const bool present = [] {
-        int count = 0;
-#if defined(USE_CUDA)
-        return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
-#elif defined(USE_HIP)
-        return hipGetDeviceCount(&count) == hipSuccess && count > 0;
-#else
-        (void)count;
-        return false;
-#endif
-    }();
-    return present;
-}
-
 // EfaContext implementation
 
 EfaContext::EfaContext(EfaTransport& engine, const std::string& device_name)
@@ -128,97 +111,18 @@ EfaContext::~EfaContext() {
 
 int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
                           int max_endpoints) {
-    const bool gpu = hasGpuDevice();
-    if (!gpu) {
-        // Without GPU memory to register (CPU build or no device), prevent
-        // libfabric's EFA provider from dlopen-ing libcudart/libcuda at
-        // fi_getinfo/fi_domain time. That initialization creates a CUDA
-        // primary context on GPU 0 and leaks ~616 MiB of device memory even
-        // when no GPU memory is ever registered. Only set if the user hasn't
-        // explicitly configured FI_HMEM.
-        //
-        // On a Neuron host the same guard has to name "neuron" instead: FI_HMEM
-        // takes exactly one interface, not a list, so "system" (or even
-        // "system,neuron") makes fi_getinfo() below report -FI_ENODATA once
-        // FI_MR_HMEM is in mr_mode.  Selecting "neuron" still leaves host
-        // memory registrable -- FI_HMEM_SYSTEM is always available -- and
-        // still keeps libfabric away from libcudart, which is the point of the
-        // guard.
-        setenv("FI_HMEM", neuronAvailable() ? "neuron" : "system", 0);
-    }
-
-    // Keep libfabric's SHM sub-provider out of the way on Neuron hosts.
-    //
-    // For same-host peers the EFA provider hands the transfer to an internal
-    // shm endpoint (efa_shm_info_create() in prov/efa/src/efa_shm.c), and shm
-    // cannot move Neuron HBM.  libfabric's FI_HMEM_NEURON op table
-    // (src/hmem.c) implements copy_to_hmem only: copy_from_hmem is
-    // neuron_copy_from_dev(), whose whole body is
-    //   FI_WARN_ONCE("Copies from AWS Neuron to host memory are not
-    //                 supported."); return -FI_ENOSYS;
-    // and every IPC entry is a ofi_hmem_no_* stub, so smr_ep.c's
-    //   use_ipc = ofi_hmem_is_ipc_enabled(iface) && ...
-    // is always false and shm has no protocol left that could read out of a
-    // source Neuron buffer.  The shm provider never uses dmabuf either.
-    //
-    // Left to itself shm therefore treats the /dev/neuron mapping as ordinary
-    // host memory and memcpy()s across what is really an uncached PCIe BAR:
-    // correct bytes, 0.07 GB/s.  Disabling shm sends intra-node traffic back
-    // over the EFA device instead, measured at 19.23 GB/s -- the same as the
-    // inter-node rate for one chip, i.e. no loss at all.
-    //
-    // Declaring FI_HMEM in hints->caps, which is what the CUDA path does and
-    // what efa_shm.c keys FI_MR_HMEM off, would be worse than this: it makes
-    // shm HMEM-aware and the transfer then fails outright on that ENOSYS
-    // rather than merely crawling.
-    //
-    // Overwrite is 0, so an explicit FI_EFA_ENABLE_SHM_TRANSFER from the
-    // environment still wins.  This is process-global and also takes host
-    // memory off the shm path on Neuron hosts; that is an acceptable trade,
-    // since intra-node host transfers loop back over EFA just as well.
-    if (neuronAvailable()) setenv("FI_EFA_ENABLE_SHM_TRANSFER", "0", 0);
+    prepareEfaLibfabricEnv();
 
     // Setup hints for EFA provider
-    hints_ = fi_allocinfo();
+    hints_ = allocEfaHints();
     if (!hints_) {
         LOG(ERROR) << "Failed to allocate fi_info hints";
         return ERR_CONTEXT;
     }
 
-    hints_->caps =
-        FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
-    if (gpu) {
-        // Declare FI_HMEM so the provider wires up HMEM-aware copy routines
-        // (cudaMemcpy) on every data path, including the intra-node SHM SAR
-        // segmentation/reassembly path. Registering device memory via
-        // FI_MR_HMEM alone is NOT enough: without FI_HMEM in caps the SHM
-        // sub-provider initializes its copy callbacks in plain-host mode and
-        // does a host memcpy() straight into a CUDA device VA during SAR,
-        // which SIGSEGVs in __memcpy_avx512_unaligned_erms.
-        // See https://github.com/ofiwg/libfabric/issues/12328.
-        hints_->caps |= FI_HMEM;
-    }
-    hints_->mode = FI_CONTEXT;
-    hints_->ep_attr->type = FI_EP_RDM;  // EFA uses RDM endpoints
-    hints_->fabric_attr->prov_name = strdup("efa");
-
     // Specify the domain (device) name - append "-rdm" for RDM endpoint
     std::string domain_name = device_name_ + "-rdm";
     hints_->domain_attr->name = strdup(domain_name.c_str());
-    hints_->domain_attr->mr_mode =
-        FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
-    if (gpu) hints_->domain_attr->mr_mode |= FI_MR_HMEM;
-    // FI_MR_HMEM is mandatory for FI_HMEM_NEURON: without it the EFA provider
-    // matches no fi_info at all (fi_getinfo -> -FI_ENODATA) rather than merely
-    // refusing the later fi_mr_regattr().  Like the GPU check above this is a
-    // runtime decision -- Neuron support costs no build flag, see efa_neuron.h.
-    //
-    // Note that FI_HMEM is deliberately NOT added to caps for Neuron, unlike
-    // the GPU path above.  See the FI_EFA_ENABLE_SHM_TRANSFER guard at the top
-    // of this function for why declaring it would turn a slow intra-node path
-    // into a broken one.
-    if (neuronAvailable()) hints_->domain_attr->mr_mode |= FI_MR_HMEM;
-    hints_->domain_attr->threading = FI_THREAD_SAFE;
 
     // Get fabric info.
     //
@@ -791,7 +695,7 @@ class ScopedCudaContext {
 static int getCudaDeviceForPointer(const void* ptr, cudaError_t& status) {
     // Without a device every pointer is host memory, and the CUDA runtime
     // would fail the query instead of saying so.
-    if (!hasGpuDevice()) {
+    if (!efaHasGpuDevice()) {
         status = cudaSuccess;
         return -1;
     }
@@ -809,7 +713,6 @@ static int getCudaDeviceForPointer(const void* ptr, cudaError_t& status) {
 int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
                                              int access,
                                              EfaMemoryRegionMeta& mrMeta) {
-    (void)access;
     if (length > (size_t)globalConfig().max_mr_size) {
         LOG(ERROR) << "Buffer length " << length
                    << " exceeds device max_mr_size "
@@ -822,8 +725,11 @@ int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
     mrMeta.addr = addr;
     mrMeta.length = length;
 
-    // For EFA, we need local read/write and remote read/write
-    uint64_t fi_access = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+    // Local read/write always; remote rights only when the caller asked for
+    // them (IBV_ACCESS_REMOTE_* derived from remote_accessible).
+    uint64_t fi_access = FI_READ | FI_WRITE;
+    if (access & IBV_ACCESS_REMOTE_READ) fi_access |= FI_REMOTE_READ;
+    if (access & IBV_ACCESS_REMOTE_WRITE) fi_access |= FI_REMOTE_WRITE;
 
     // Detect memory type and use fi_mr_regattr() for GPU memory.
     // The EFA provider's fi_mr_reg() hardcodes iface=FI_HMEM_SYSTEM,
@@ -1548,6 +1454,11 @@ int EfaContext::submitPostSend(
     // Route slices to appropriate peer handles.  Group by peer NIC path.
     std::unordered_map<std::string, std::vector<Transport::Slice*>>
         slices_by_peer;
+    // Descriptors fetched again in this call, so that a batch of slices that
+    // miss the same stale descriptor costs one fetch, not one per slice.
+    std::unordered_map<Transport::SegmentID,
+                       std::shared_ptr<TransferMetadata::SegmentDesc>>
+        refreshed_descs;
 
     for (auto* slice : slice_list) {
         if (!slice) continue;
@@ -1562,8 +1473,11 @@ int EfaContext::submitPostSend(
         }
 
         // Slow path: resolve peer info per-slice.
+        auto refreshed = refreshed_descs.find(slice->target_id);
         auto peer_segment_desc =
-            engine_.meta()->getSegmentDescByID(slice->target_id);
+            refreshed != refreshed_descs.end()
+                ? refreshed->second
+                : engine_.meta()->getSegmentDescByID(slice->target_id);
         if (!peer_segment_desc) {
             LOG(ERROR) << "Cannot get segment descriptor for target "
                        << slice->target_id;
@@ -1575,10 +1489,26 @@ int EfaContext::submitPostSend(
         if (EfaTransport::selectDevice(peer_segment_desc.get(),
                                        slice->rdma.dest_addr, slice->length,
                                        buffer_id, device_id)) {
-            LOG(ERROR) << "Cannot select device for dest_addr "
-                       << (void*)slice->rdma.dest_addr;
-            slice->markFailed();
-            continue;
+            // The cached peer descriptor may be stale: the peer may have
+            // registered buffers since it was fetched (a Store client mounts
+            // its segment in chunks and serves the first ones while it
+            // registers the rest) or re-registered them elsewhere. Fetch it
+            // again, once per target in this call, and retry, as the RDMA and
+            // CXI transports do.
+            if (refreshed == refreshed_descs.end()) {
+                peer_segment_desc = engine_.meta()->getSegmentDescByID(
+                    slice->target_id, /*force_update=*/true);
+                refreshed_descs[slice->target_id] = peer_segment_desc;
+            }
+            if (!peer_segment_desc ||
+                EfaTransport::selectDevice(peer_segment_desc.get(),
+                                           slice->rdma.dest_addr, slice->length,
+                                           buffer_id, device_id)) {
+                LOG(ERROR) << "Cannot select device for dest_addr "
+                           << (void*)slice->rdma.dest_addr;
+                slice->markFailed();
+                continue;
+            }
         }
 
         // device_id comes from the peer-supplied topology, whose HCA list is
@@ -1722,16 +1652,37 @@ int EfaContext::submitSlicesOnPeer(
     // against it is refused even though WR credit is free (observed as
     // wr_depth=0 with unbroken FI_EAGAIN).
     //
-    // Trigger on CONSECUTIVE waves that posted nothing, not on total waves and
-    // not on elapsed time.  Total waves fails healthy long-lived batches that
-    // retry while making progress, and a multi-second timer makes each stall a
-    // multi-second stall: the request layer can only re-handshake once these
-    // slices reach a terminal state, so failing fast is what lets the transfer
-    // recover (0.01 GB/s on a 10s timer vs ~10 GB/s failing promptly).
+    // Trigger on CONSECUTIVE waves that posted nothing, not on total waves:
+    // total waves fails healthy long-lived batches that retry while making
+    // progress.  And keep the time limit short: a multi-second timer makes
+    // each stall a multi-second stall, because the request layer can only
+    // re-handshake once these slices reach a terminal state, so failing fast
+    // is what lets the transfer recover (0.01 GB/s on a 10s timer vs ~10 GB/s
+    // failing promptly).
+    //
+    // The count alone is not enough: a wave that bounces costs well under a
+    // microsecond, so 1024 of them pass in microseconds while the provider is
+    // only briefly busy (many submitters sharing the NIC, or the RDM handshake
+    // to a new peer still in flight) and completions keep arriving.  Also
+    // require the stall to have lasted efa_stall_min_ms of wall time (1 s by
+    // default); that still fails a dead peer far sooner than the multi-second
+    // timer described above.
+    //
+    // Past the wave count, posting faster does not finish a handshake sooner:
+    // every further fi_write just bounces, while this thread holds the
+    // endpoint read lock that later peers of the same submitTransfer and
+    // disconnect() wait on.  So from there on wake about once per
+    // kStallBackoff and post one more wave, instead of spinning through the
+    // floor.  A peer that recovers is noticed at most one interval late.
     const int kMaxStalledWaves = 1024;
+    constexpr auto kStallBackoff = std::chrono::milliseconds(1);
+    const int64_t stall_min_ns = globalConfig().efa_stall_min_ms * 1000000;
     int stalled_waves = 0;
+    uint64_t stall_start_ns = 0;
     while (cursor < slice_list.size() || !retry_slices.empty()) {
-        if (stalled_waves > kMaxStalledWaves) {
+        if (stalled_waves > kMaxStalledWaves &&
+            (stall_min_ns <= 0 || monotonicNowNs() - stall_start_ns >=
+                                      static_cast<uint64_t>(stall_min_ns))) {
             // retry_slices holds the previous wave's bounced slices here (they
             // are spliced back in just below), so either side can name the
             // peer.
@@ -1740,9 +1691,10 @@ int EfaContext::submitSlicesOnPeer(
                     ? retry_slices.front()
                     : (cursor < slice_list.size() ? slice_list[cursor]
                                                   : nullptr);
-            LOG(WARNING) << "EFA submitSlicesOnPeer: " << kMaxStalledWaves
-                         << " consecutive FI_EAGAIN waves posted nothing on "
-                         << nicPath() << " -> "
+            LOG(WARNING) << "EFA submitSlicesOnPeer: " << stalled_waves
+                         << " consecutive FI_EAGAIN waves over "
+                         << (monotonicNowNs() - stall_start_ns) / 1000000
+                         << " ms posted nothing on " << nicPath() << " -> "
                          << ((probe && !probe->peer_nic_path.empty())
                                  ? probe->peer_nic_path
                                  : "unknown")
@@ -1782,7 +1734,10 @@ int EfaContext::submitSlicesOnPeer(
             std::copy(retry_slices.begin(), retry_slices.end(),
                       slice_list.begin() + cursor);
             retry_slices.clear();
-            std::this_thread::yield();
+            if (stalled_waves > kMaxStalledWaves)
+                std::this_thread::sleep_for(kStallBackoff);
+            else
+                std::this_thread::yield();
         }
 
         const size_t remaining = slice_list.size() - cursor;
@@ -1823,6 +1778,14 @@ int EfaContext::submitSlicesOnPeer(
                 wr_prev = cur_wr;
             }
         };
+        // Once a stall is past its wave count, this wait shares the stall's
+        // deadline, so a peer that stops completing fails at about
+        // efa_stall_min_ms rather than that plus a whole drain timeout.
+        const bool capped_by_stall =
+            stall_min_ns > 0 && stalled_waves > kMaxStalledWaves;
+        const uint64_t stall_deadline_ns =
+            stall_start_ns + static_cast<uint64_t>(stall_min_ns);
+        bool hit_stall_deadline = false;
         // Counts the yield and reports whether the deadline has passed.  Must
         // be called after note_starved(), which arms wait_t0 on the first call.
         // The clock is read once per 1024 yields: at ~0.2 us per yield that
@@ -1830,8 +1793,13 @@ int EfaContext::submitSlicesOnPeer(
         // clock_gettime off the hot path.
         auto drain_deadline_hit = [&]() -> bool {
             ++backoff;
-            if (drain_timeout_ms <= 0.0) return false;
+            if (drain_timeout_ms <= 0.0 && !capped_by_stall) return false;
             if ((backoff & 1023) != 0) return false;
+            if (capped_by_stall && monotonicNowNs() >= stall_deadline_ns) {
+                hit_stall_deadline = true;
+                return true;
+            }
+            if (drain_timeout_ms <= 0.0) return false;
             return std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - wait_t0)
                        .count() > drain_timeout_ms;
@@ -1903,7 +1871,11 @@ int EfaContext::submitSlicesOnPeer(
                 << " (fi_addr=" << peer_fi_addr
                 << "): starved_on=" << starved_on << ", waited=" << waited_ms
                 << "ms over " << backoff << " yields (deadline "
-                << drain_timeout_ms << "ms, MC_EFA_CQ_DRAIN_TIMEOUT_MS)"
+                << (hit_stall_deadline ? globalConfig().efa_stall_min_ms
+                                       : static_cast<int64_t>(drain_timeout_ms))
+                << (hit_stall_deadline
+                        ? "ms of FI_EAGAIN waves, MC_EFA_STALL_MIN_MS)"
+                        : "ms, MC_EFA_CQ_DRAIN_TIMEOUT_MS)")
                 << "; wr_depth=" << wr_depth_.load(std::memory_order_relaxed)
                 << "/" << max_wr_depth_ << " (at first backoff " << wr_first
                 << ", observed min=" << wr_min << " max=" << wr_max
@@ -2049,10 +2021,11 @@ int EfaContext::submitSlicesOnPeer(
         // straight back onto retry_slices is submission genuinely stuck, so
         // that is the only case that keeps the stall clock running.
         if (batch_count > 0 &&
-            static_cast<int>(retry_slices.size()) >= batch_count)
-            ++stalled_waves;
-        else
+            static_cast<int>(retry_slices.size()) >= batch_count) {
+            if (stalled_waves++ == 0) stall_start_ns = monotonicNowNs();
+        } else {
             stalled_waves = 0;
+        }
     }
 
     slice_list.clear();

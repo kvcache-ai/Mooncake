@@ -2209,6 +2209,15 @@ PYBIND11_MODULE(_store, m) {
         .value("FAILED", ReplicaStatus::FAILED)
         .export_values();
 
+    py::class_<ExistOptions>(m, "ExistOptions")
+        .def(py::init<>())
+        .def_readwrite("prefetch_to_memory", &ExistOptions::prefetch_to_memory)
+        .def("__str__", [](const ExistOptions &options) {
+            std::ostringstream oss;
+            oss << options;
+            return oss.str();
+        });
+
     py::class_<MemoryDescriptor>(m, "MemoryDescriptor")
         .def_readwrite("buffer_descriptor",
                        &MemoryDescriptor::buffer_descriptor);
@@ -2512,7 +2521,8 @@ PYBIND11_MODULE(_store, m) {
             "  rdma_devices: RDMA device list.\n"
             "  enable_egm_store_pool: Use EGM DRAM for the global Store pool "
             "(default false; requires protocol 'nvlink', "
-            "global_segment_size>0, and local_buffer_size=0).\n"
+            "global_segment_size>0). Local buffers use the existing "
+            "client-buffer allocator.\n"
             "  egm_numa_nodes: Provider NUMA nodes ('auto' or comma-separated "
             "IDs; default 'auto').\n"
             "  master_server_addr: Master server address.\n"
@@ -2524,6 +2534,12 @@ PYBIND11_MODULE(_store, m) {
             "  enable_client_http_server: Enable client HTTP endpoints "
             "(default false).\n"
             "  client_http_port: Client HTTP metrics port (default 9300).\n"
+            "  enable_ssd_prefetch: Enable best-effort SSD-to-DRAM prefetch "
+            "on exist probes (default false).\n"
+            "  ssd_prefetch_cooldown_sec: Prefetch memory-pressure backoff "
+            "in seconds (default 5, 0 disables).\n"
+            "  ssd_prefetch_dedup_ttl_sec: Prefetch per-key dedup/rate-limit "
+            "TTL in seconds (default 30, 0 disables).\n"
             "  enable_embedded_master: Start an in-process master so no "
             "external mooncake_master is required (default false). This is "
             "test/eval plumbing, not a documented deployment mode.")
@@ -2635,20 +2651,32 @@ PYBIND11_MODULE(_store, m) {
             py::arg("keys"), py::arg("force") = false,
             "Batch remove objects by keys. Returns a list of status codes "
             "(0=success, negative=error code) for each key.")
-        .def("is_exist",
-             [](MooncakeStorePyWrapper &self, const std::string &key) {
-                 py::gil_scoped_release release;
-                 return self.store_->isExist(key);
-             })
+        .def(
+            "is_exist",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               const ExistOptions &options) {
+                py::gil_scoped_release release;
+                return self.store_->isExist(key, options);
+            },
+            py::arg("key"), py::arg("options") = ExistOptions{},
+            "Check if an object exists. Returns 1 if exists, 0 if not "
+            "exists, negative error code on failure. When "
+            "options.prefetch_to_memory is true and the client is configured "
+            "with enable_ssd_prefetch, SSD-only keys get a best-effort "
+            "asynchronous SSD-to-DRAM promotion so a later get can hit DRAM.")
         .def(
             "batch_is_exist",
             [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
+               const std::vector<std::string> &keys,
+               const ExistOptions &options) {
                 py::gil_scoped_release release;
-                return self.store_->batchIsExist(keys);
+                return self.store_->batchIsExist(keys, options);
             },
-            py::arg("keys"),
-            "Check if multiple objects exist. Returns list of results: 1 if "
+            py::arg("keys"), py::arg("options") = ExistOptions{},
+            "Check if multiple objects exist. When options.prefetch_to_memory "
+            "is true (and enable_ssd_prefetch is configured), triggers "
+            "best-effort SSD-to-DRAM promotion for keys that only have "
+            "LOCAL_DISK replicas. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
         .def(
             "probe_key",

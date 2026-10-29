@@ -73,7 +73,7 @@ class OffsetAllocationHandle {
           requested_size(0) {}
 
     // Constructor for valid allocation
-    OffsetAllocationHandle(std::shared_ptr<OffsetAllocator> allocator,
+    OffsetAllocationHandle(std::weak_ptr<OffsetAllocator> allocator,
                            OffsetAllocation allocation, uint64_t base,
                            uint64_t size);
 

@@ -8,7 +8,9 @@ Usage:
 """
 
 import os
+import socket
 import subprocess
+import sys
 import time
 import unittest
 
@@ -72,128 +74,143 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
             f"Using master port: {cls.mooncake_master_port}, metadata port: {cls.mooncake_metadata_port}"
         )
 
-        # Start metadata service with configurable port
-        try:
-            # Start metadata server with port configuration
-            cls.metadata_service_process = subprocess.Popen(
-                [
-                    "python3",
-                    "-m",
-                    "mooncake.http_metadata_server",
-                    "--port",
-                    str(cls.mooncake_metadata_port),
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                preexec_fn=os.setsid,  # Create new process group
-            )
-            print(
-                f"Mooncake metadata service started on port {cls.mooncake_metadata_port}"
-            )
-        except (FileNotFoundError, subprocess.SubprocessError) as e:
-            print(f"Warning: Could not start Mooncake metadata service: {e}")
-            cls.metadata_service_process = None
+        # The metadata service is bound to loopback on purpose: it refuses an
+        # unauthenticated non-loopback bind (mooncake #4472), and every client
+        # used by this test runs on the same host. Child output is inherited so
+        # a failed launch shows up in the CI log instead of being swallowed by
+        # an unread pipe.
+        cls.metadata_service_process = cls._spawn_service(
+            "metadata",
+            [
+                sys.executable,
+                "-m",
+                "mooncake.http_metadata_server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(cls.mooncake_metadata_port),
+            ],
+        )
 
         # Start master service with configurable port
-        try:
-            # Start master server with port configuration
-            cls.master_service_process = subprocess.Popen(
-                ["mooncake_master", "--port", str(cls.mooncake_master_port)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                preexec_fn=os.setsid,  # Create new process group
-            )
-            print(f"Mooncake master service started on port {cls.mooncake_master_port}")
-        except (FileNotFoundError, subprocess.SubprocessError) as e:
-            print(f"Warning: Could not start Mooncake master service: {e}")
-            cls.master_service_process = None
+        cls.master_service_process = cls._spawn_service(
+            "master",
+            ["mooncake_master", "--port", str(cls.mooncake_master_port)],
+        )
 
         # Wait for services to be ready instead of fixed sleep
         cls._wait_for_mooncake_services_ready()
 
     @classmethod
-    def _wait_for_mooncake_services_ready(cls, timeout: int = 30) -> bool:
-        """Wait for Mooncake services to be ready by checking their endpoints"""
+    def _spawn_service(cls, name, command):
+        """Start a Mooncake service process, returning None if it cannot be spawned"""
+        try:
+            process = subprocess.Popen(
+                command,
+                preexec_fn=os.setsid,  # Create new process group
+            )
+        except (FileNotFoundError, subprocess.SubprocessError) as e:
+            print(f"Warning: Could not start Mooncake {name} service: {e}")
+            return None
+        print(f"Mooncake {name} service started (pid={process.pid})")
+        return process
+
+    @classmethod
+    def _wait_for_mooncake_services_ready(cls, timeout: int = 60) -> bool:
+        """Wait for Mooncake services to be ready by checking their endpoints
+
+        Fails fast when a service exits, so a broken launch is reported here
+        instead of surfacing later as "Failed to setup Mooncake store".
+        """
         print("Waiting for Mooncake services to be ready...")
 
-        start_time = time.time()
-        services_ready = False
+        deadline = time.time() + timeout
+        metadata_ready = False
+        master_ready = False
 
-        while time.time() - start_time < timeout:
-            try:
-                # Check metadata service
-                metadata_ready = False
-                if (
-                    cls.metadata_service_process
-                    and cls.metadata_service_process.poll() is None
-                ):
-                    try:
-                        # Try to connect to the metadata service
-                        metadata_url = (
-                            f"http://127.0.0.1:{cls.mooncake_metadata_port}/metadata"
-                        )
-                        response = requests.get(metadata_url, timeout=2)
-                        if response.status_code == 200:
-                            metadata_ready = True
-                            print("Mooncake metadata service is ready")
-                    except (requests.RequestException, ConnectionError):
-                        # Service might not be fully started yet
-                        pass
+        while time.time() < deadline:
+            cls._ensure_service_running("metadata", cls.metadata_service_process)
+            cls._ensure_service_running("master", cls.master_service_process)
 
-                # Check master service (if it has a health endpoint)
-                master_ready = False
-                if (
-                    cls.master_service_process
-                    and cls.master_service_process.poll() is None
-                ):
-                    # For now, we'll assume master service is ready if process is running
-                    # and it's been a few seconds since startup
-                    if (
-                        time.time() - start_time > 5
-                    ):  # Give master service time to initialize
-                        master_ready = True
-                        print("Mooncake master service is ready")
+            if not metadata_ready and cls._probe_metadata_endpoint():
+                metadata_ready = True
+                print("Mooncake metadata service is ready")
 
-                # Both services should be ready
-                if metadata_ready and master_ready:
-                    services_ready = True
-                    print("All Mooncake services are ready")
-                    break
+            if not master_ready and cls._probe_tcp_port(cls.mooncake_master_port):
+                master_ready = True
+                print("Mooncake master service is ready")
 
-            except Exception as e:
-                print(f"Error checking service readiness: {e}")
+            # Both services should be ready
+            if metadata_ready and master_ready:
+                print("All Mooncake services are ready")
+                return True
 
-            time.sleep(2)
+            time.sleep(1)
 
-        if not services_ready:
-            print(
-                "Warning: Mooncake services may not be fully ready, continuing anyway..."
+        raise RuntimeError(
+            f"Mooncake services were not ready within {timeout}s "
+            f"(metadata port {cls.mooncake_metadata_port}: "
+            f"{'ready' if metadata_ready else 'not ready'}, "
+            f"master port {cls.mooncake_master_port}: "
+            f"{'ready' if master_ready else 'not ready'})"
+        )
+
+    @staticmethod
+    def _ensure_service_running(name, process):
+        """Raise if a Mooncake service process has already exited"""
+        if process is None:
+            raise RuntimeError(f"Mooncake {name} service was never started")
+        return_code = process.poll()
+        if return_code is not None:
+            raise RuntimeError(
+                f"Mooncake {name} service exited with code {return_code} before "
+                "it became ready; check the service output above"
             )
 
-        return services_ready
+    @classmethod
+    def _probe_metadata_endpoint(cls) -> bool:
+        """Return True once the metadata service answers requests"""
+        # Any HTTP status means the listener is up: a missing key is answered
+        # with 400/404 and a token-protected server with 401.
+        url = (
+            f"http://127.0.0.1:{cls.mooncake_metadata_port}"
+            "/metadata?key=__hicache_probe__"
+        )
+        try:
+            requests.get(url, timeout=2)
+        except (requests.RequestException, ConnectionError):
+            # Service might not be fully started yet
+            return False
+        return True
+
+    @classmethod
+    def _probe_tcp_port(cls, port: int, host: str = "127.0.0.1") -> bool:
+        """Return True when something accepts connections on host:port"""
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                return True
+        except OSError:
+            return False
 
     @classmethod
     def _stop_mooncake_services(cls):
         """Stop Mooncake services"""
         print("Stopping Mooncake services...")
 
-        # Stop metadata service
-        if hasattr(cls, "metadata_service_process") and cls.metadata_service_process:
+        for name in ("metadata", "master"):
+            process = getattr(cls, f"{name}_service_process", None)
+            if process is None:
+                continue
+            if process.poll() is not None:
+                # Already gone, e.g. it exited during readiness detection.
+                print(f"Mooncake {name} service already exited")
+                continue
             try:
-                os.killpg(os.getpgid(cls.metadata_service_process.pid), 9)
-                cls.metadata_service_process.wait(timeout=5)
-                print("Mooncake metadata service stopped")
+                os.killpg(os.getpgid(process.pid), 9)
+                process.wait(timeout=5)
+                print(f"Mooncake {name} service stopped")
             except (ProcessLookupError, subprocess.TimeoutExpired, OSError) as e:
-                print(f"Warning: Could not stop Mooncake metadata service: {e}")
-
-        # Stop master service
-        if hasattr(cls, "master_service_process") and cls.master_service_process:
-            try:
-                os.killpg(os.getpgid(cls.master_service_process.pid), 9)
-                cls.master_service_process.wait(timeout=5)
-                print("Mooncake master service stopped")
-            except (ProcessLookupError, subprocess.TimeoutExpired, OSError) as e:
-                print(f"Warning: Could not stop Mooncake master service: {e}")
+                print(f"Warning: Could not stop Mooncake {name} service: {e}")
 
     @classmethod
     def _get_additional_server_args_and_env(cls):

@@ -52,7 +52,6 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     tenant/quota.cpp
     tenant/quota_manager.cpp
     tenant/quota_policy.cpp
-    tenant_quota_ledger.cpp
     tenant/quota_policy_store.cpp
     weight_metadata_store.cpp
     rpc_service.cpp
@@ -136,6 +135,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/shm_spdk_registration_config.cpp
     file_storage.cpp
     config/client_host_identity_config.cpp
+    ssd_prefetcher.cpp
     config/client_metric_config.cpp
     config/client_object_checksum_config.cpp
     config/file_storage_config.cpp

@@ -35,6 +35,8 @@
 namespace mooncake {
 namespace {
 
+constexpr uintptr_t kHccsDeviceMemAlignment = 2 * 1024 * 1024;
+
 int32_t ResolveCurrentEngineId(bool agent_mode) {
     if (!agent_mode) {
         return 0;
@@ -47,8 +49,8 @@ int32_t ResolveCurrentEngineId(bool agent_mode) {
     return current_device_id;
 }
 
-int ResolveAscendMemType(const std::string &location, void *addr,
-                         adxl::MemType &mem_type) {
+int ResolveAscendMemType(const std::string& location, void* addr,
+                         adxl::MemType& mem_type) {
     if (location.starts_with("cpu")) {
         mem_type = adxl::MEM_HOST;
         return 0;
@@ -75,16 +77,16 @@ int ResolveAscendMemType(const std::string &location, void *addr,
     return 0;
 }
 
-int StampBufferDeviceId(TransferMetadata::BufferDesc &buffer_desc) {
+int StampBufferDeviceId(TransferMetadata::BufferDesc& buffer_desc) {
     int32_t device_id = -1;
     CHECK_ACL(aclrtGetDevice(&device_id));
     buffer_desc.device_id = device_id;
     return 0;
 }
 
-void InitializeSlice(const Transport::TransferRequest &request,
-                     int32_t current_engine_id, Transport::TransferTask *task,
-                     Transport::Slice *slice) {
+void InitializeSlice(const Transport::TransferRequest& request,
+                     int32_t current_engine_id, Transport::TransferTask* task,
+                     Transport::Slice* slice) {
     slice->source_addr = request.source;
     slice->length = request.length;
     slice->opcode = request.opcode;
@@ -101,7 +103,7 @@ void InitializeSlice(const Transport::TransferRequest &request,
 AscendDirectTransport::AscendDirectTransport() = default;
 
 AscendDirectTransport::~AscendDirectTransport() {
-    LOG(INFO) << "AscendDirectTransport destructor called";
+    VLOG(1) << "AscendDirectTransport destructor called";
 
     if (dispatcher_) {
         dispatcher_->stop();
@@ -112,7 +114,7 @@ AscendDirectTransport::~AscendDirectTransport() {
     }
 }
 
-int AscendDirectTransport::install(std::string &local_server_name,
+int AscendDirectTransport::install(std::string& local_server_name,
                                    std::shared_ptr<TransferMetadata> meta,
                                    std::shared_ptr<Topology> topo) {
     LOG(INFO) << "install AscendDirectTransport for: " << local_server_name;
@@ -155,24 +157,27 @@ int AscendDirectTransport::install(std::string &local_server_name,
 
     if (agent_mode_ && roce_mode_) {
         dispatcher_ = std::make_unique<RoceDummyRealSliceDispatcher>(
-            transfer_executor_.get(), local_engine_contexts_);
+            transfer_executor_.get(), local_engine_contexts_,
+            local_engine_device_ids_);
     } else {
         dispatcher_ = std::make_unique<DefaultSliceDispatcher>(
-            transfer_executor_.get(), local_engine_contexts_);
+            transfer_executor_.get(), local_engine_contexts_,
+            local_engine_device_ids_);
     }
     return 0;
 }
 
 int AscendDirectTransport::addEngineToSegmentDesc(int32_t device_id,
                                                   aclrtContext context,
-                                                  const std::string &host_ip,
-                                                  SegmentDesc *desc) {
+                                                  const std::string& host_ip,
+                                                  SegmentDesc* desc) {
     uint16_t listen_port = FindAdxlListenPort(base_port_, device_id);
     if (listen_port == 0) {
         LOG(ERROR) << "Find available port failed for device: " << device_id;
         return FAILED;
     }
     local_engine_contexts_.push_back(context);
+    local_engine_device_ids_.push_back(device_id);
     desc->rank_info.endpoints.push_back(
         GenAdxlEngineName(host_ip, listen_port));
     return 0;
@@ -191,15 +196,24 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     // process-global config.
     use_fabric_mem_ = globalConfig().ascend_use_fabric_mem &&
                       globalConfig().ascend_store_te_init;
+    // Snapshot the role-resolved protocol. ascend_store_te_init is cleared
+    // after install, so a later read of the raw env would see the wrong
+    // subtree.
+    hccs_device_protocol_ = HasHccsDeviceProtocolDescInGlobalResourceConfig(
+        ResolveAscendGlobalResourceConfig(
+            std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG"))
+            .c_str());
     LOG(INFO) << "[AscendTE] init local segment, te is created for store="
               << (globalConfig().ascend_store_te_init ? "true" : "false")
               << ", roce_mode=" << (roce_mode_ ? "true" : "false")
               << ", use_fabric_mem=" << (use_fabric_mem_ ? "true" : "false")
+              << ", hccs_device_protocol="
+              << (hccs_device_protocol_ ? "true" : "false")
               << (agent_mode_
                       ? ", launched as standalone real client (manages all "
                         "local NPU devices)"
                       : "");
-    char *adxl_base_port = std::getenv("ASCEND_BASE_PORT");
+    char* adxl_base_port = std::getenv("ASCEND_BASE_PORT");
     if (adxl_base_port) {
         std::optional<int32_t> base_port =
             parseFromString<int32_t>(adxl_base_port);
@@ -217,7 +231,7 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     uint32_t device_count = 0;
     CHECK_ACL(aclrtGetDeviceCount(&device_count));
     if (agent_mode_) {
-        auto &ctx_mgr = ContextManager::getInstance();
+        auto& ctx_mgr = ContextManager::getInstance();
         if (!ctx_mgr.isInitialized()) {
             LOG(ERROR) << "ContextManager is not initialized.";
             return -1;
@@ -252,8 +266,8 @@ int AscendDirectTransport::allocateLocalSegmentID() {
 }
 
 Status AscendDirectTransport::submitTransfer(
-    BatchID batch_id, const std::vector<TransferRequest> &entries) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    auto& batch_desc = *((BatchDesc*)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR) << "AscendDirectTransport: Exceed the limitation of current "
                       "batch's capacity";
@@ -270,14 +284,14 @@ Status AscendDirectTransport::submitTransfer(
 
     auto cur_task_size = batch_desc.task_list.size();
     batch_desc.task_list.resize(cur_task_size + entries.size());
-    std::vector<Slice *> slice_list;
+    std::vector<Slice*> slice_list;
     slice_list.reserve(entries.size());
 
-    for (auto &request : entries) {
-        TransferTask &task = batch_desc.task_list[cur_task_size];
+    for (auto& request : entries) {
+        TransferTask& task = batch_desc.task_list[cur_task_size];
         ++cur_task_size;
         task.total_bytes = request.length;
-        Slice *slice = getSliceCache().allocate();
+        Slice* slice = getSliceCache().allocate();
         InitializeSlice(request, current_engine_id, &task, slice);
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
@@ -290,26 +304,29 @@ Status AscendDirectTransport::submitTransfer(
 }
 
 Status AscendDirectTransport::submitTransferTask(
-    const std::vector<TransferTask *> &task_list) {
+    const std::vector<TransferTask*>& task_list) {
     const int32_t current_engine_id = ResolveCurrentEngineId(agent_mode_);
-    if (current_engine_id < 0) {
-        return Status::Context("aclrtGetDevice failed");
-    }
-
-    std::vector<Slice *> slice_list;
+    std::vector<Slice*> slice_list;
     slice_list.reserve(task_list.size());
 
     for (auto index : task_list) {
         assert(index);
-        auto &task = *index;
+        auto& task = *index;
         assert(task.request);
-        auto &request = *task.request;
+        auto& request = *task.request;
         task.total_bytes = request.length;
-        Slice *slice = getSliceCache().allocate();
+        Slice* slice = getSliceCache().allocate();
         InitializeSlice(request, current_engine_id, &task, slice);
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
         slice_list.push_back(slice);
+    }
+
+    if (current_engine_id < 0) {
+        // MultiTransport already published these tasks. Attach every slice
+        // before completing any, so rejected tasks cannot look successful.
+        for (auto* slice : slice_list) slice->markFailed();
+        return Status::Context("aclrtGetDevice failed");
     }
 
     if (dispatcher_) {
@@ -321,15 +338,15 @@ Status AscendDirectTransport::submitTransferTask(
 // actually not called, just use getTransferStatus in multi_transport
 Status AscendDirectTransport::getTransferStatus(BatchID batch_id,
                                                 size_t task_id,
-                                                TransferStatus &status) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
+                                                TransferStatus& status) {
+    auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     if (task_id >= task_count) {
         return Status::InvalidArgument(
             "getTransportStatus invalid argument, batch id: " +
             std::to_string(batch_id));
     }
-    auto &task = batch_desc.task_list[task_id];
+    auto& task = batch_desc.task_list[task_id];
     uint64_t success_slice_count =
         __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
     uint64_t failed_slice_count =
@@ -350,8 +367,8 @@ Status AscendDirectTransport::getTransferStatus(BatchID batch_id,
     return Status::OK();
 }
 
-int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
-                                               const std::string &location,
+int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
+                                               const std::string& location,
                                                bool remote_accessible,
                                                bool update_metadata) {
     aclrtContext saved_ctx = nullptr;
@@ -392,6 +409,18 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
         // treating that memory as host.
         mem_type = adxl::MEM_DEVICE;
     }
+    // hccs:device exports device memory on 2 MiB pages. ADXL RegisterMem
+    // accepts an unaligned base, but the export then fails at connect time.
+    // The gate is the resolved protocol and fabric mem, both captured at
+    // install.
+    const bool hccs_mode = !use_fabric_mem_ && hccs_device_protocol_;
+    if (mem_type == adxl::MEM_DEVICE && hccs_mode && remote_accessible &&
+        reinterpret_cast<uintptr_t>(addr) % kHccsDeviceMemAlignment != 0) {
+        LOG(ERROR) << "Device mem addr:" << addr << ", length:" << length
+                   << " is not aligned to " << kHccsDeviceMemAlignment
+                   << " bytes, which hccs:device requires.";
+        return ERR_INVALID_ARGUMENT;
+    }
 
     int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (ret) {
@@ -415,7 +444,7 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     return register_ret;
 }
 
-int AscendDirectTransport::unregisterLocalMemory(void *addr,
+int AscendDirectTransport::unregisterLocalMemory(void* addr,
                                                  bool update_metadata) {
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
@@ -435,13 +464,13 @@ int AscendDirectTransport::unregisterLocalMemory(void *addr,
 }
 
 int AscendDirectTransport::registerLocalMemoryBatch(
-    const std::vector<Transport::BufferEntry> &buffer_list,
-    const std::string &location) {
+    const std::vector<Transport::BufferEntry>& buffer_list,
+    const std::string& location) {
     LOG(INFO) << "AscendDirectTransport::registerLocalMemoryBatch called with "
                  "buffer count: "
               << buffer_list.size() << ", location: " << location;
 
-    for (const auto &buffer : buffer_list) {
+    for (const auto& buffer : buffer_list) {
         int ret = registerLocalMemory(buffer.addr, buffer.length, location,
                                       true, false);
         if (ret != 0) {
@@ -456,13 +485,13 @@ int AscendDirectTransport::registerLocalMemoryBatch(
 }
 
 int AscendDirectTransport::unregisterLocalMemoryBatch(
-    const std::vector<void *> &addr_list) {
+    const std::vector<void*>& addr_list) {
     LOG(INFO) << "AscendDirectTransport::unregisterLocalMemoryBatch called "
                  "with addr count: "
               << addr_list.size();
 
     int first_error = 0;
-    for (void *addr : addr_list) {
+    for (void* addr : addr_list) {
         int ret = unregisterLocalMemory(addr, false);
         if (ret != 0) {
             LOG(ERROR) << "Failed to unregister memory in batch, addr: "

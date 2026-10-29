@@ -67,8 +67,9 @@ The prefix index is scoped by a context key:
 Each context is bound to exactly one hash profile. Registering a service whose
 hash profile conflicts with an existing binding for the same context is
 rejected. Each context records which instances and DP ranks are registered in
-it, and holds at most 200000 prefix entries. When the cap is exceeded, the
-oldest entries are evicted in a batch down to 90% of the cap.
+it, and holds at most `max_blocks_per_context` prefix entries (default 200000).
+When the cap is exceeded, the oldest entries are evicted in a batch down to 90%
+of the cap; `0` disables the cap.
 
 A prefix entry records owners per storage tier:
 
@@ -174,6 +175,7 @@ used. Invalid entries are logged and skipped.
 {
   "http_server_port": 13333,
   "rpc_server_port": 13334,
+  "max_blocks_per_context": 200000,
   "kvevent_instance": {
     "vllm-prefill-node1": {
       "endpoint": "tcp://127.0.0.1:5557",
@@ -199,6 +201,7 @@ used. Invalid entries are logged and skipped.
 |---|---|---|
 | `http_server_port` | `13333` without a config file | HTTP port. Set it explicitly. |
 | `rpc_server_port` | `13334` | RPC port. `0` disables the RPC server. |
+| `max_blocks_per_context` | `200000` | Prefix entries kept per context (tenant, model, LoRA, block size); the oldest are evicted beyond it. `0` disables the cap. |
 | `kvevent_instance` | none | Static services keyed by name. |
 
 ## Environment variables
