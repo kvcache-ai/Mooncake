@@ -115,16 +115,14 @@ TEST(ClassicRdmaCongestionControlTest,
     config.mode = adaptive_congestion_control::Mode::kEnforce;
     config.min_window_bytes = 64;
     config.max_window_bytes = 128;
-    config.target_drain_time_ns = 100'000'000;
-    config.high_pressure_epochs = config.low_pressure_epochs = 1;
     ClassicRdmaCongestionControl adapter(config);
     adapter.tick(1);
-    Transport::Slice stale{}, success{}, outstanding{}, probe{};
+    Transport::Slice stale{}, outstanding{}, probe{};
     stale.length = 1'000'000;
-    success.length = outstanding.length = 64;
+    outstanding.length = 64;
     probe.length = 16;
     auto *endpoint = reinterpret_cast<RdmaEndPoint *>(uintptr_t{1});
-    for (auto *slice : {&stale, &success, &outstanding, &probe}) {
+    for (auto *slice : {&stale, &outstanding, &probe}) {
         adapter.prepare(slice, "peer@nic");
         adapter.bindEndpoint(slice, endpoint);
     }
@@ -134,15 +132,36 @@ TEST(ClassicRdmaCongestionControlTest,
     adapter.complete(&stale, IBV_WC_SUCCESS);
     EXPECT_FALSE(stale.rdma_congestion_control_permit.active());
 
-    queued = {&success};
-    ASSERT_EQ(adapter.gate(queued), 1u);
-    adapter.complete(&success, IBV_WC_SUCCESS);
     queued = {&outstanding};
     ASSERT_EQ(adapter.gate(queued), 1u);
     adapter.tick(1'000'000'001);
 
     queued = {&probe};
     EXPECT_EQ(adapter.gate(queued), 0u);
+    adapter.releaseUnposted(&outstanding);
+    adapter.releaseUnposted(&probe);
+}
+
+TEST(ClassicRdmaCongestionControlTest, CleanSuccessGrowsWindowOnNextTick) {
+    adaptive_congestion_control::Config config;
+    config.mode = adaptive_congestion_control::Mode::kEnforce;
+    config.min_window_bytes = 64;
+    config.max_window_bytes = 128;
+    ClassicRdmaCongestionControl adapter(config);
+    Transport::Slice completed{}, outstanding{}, probe{};
+    completed.length = outstanding.length = 64;
+    probe.length = 16;
+    for (auto *slice : {&completed, &outstanding, &probe})
+        adapter.prepare(slice, "peer@nic");
+    std::vector<Transport::Slice *> queued{&completed};
+    ASSERT_EQ(adapter.gate(queued), 1u);
+    adapter.complete(&completed, IBV_WC_SUCCESS);
+    adapter.tick(1);
+
+    queued = {&outstanding};
+    ASSERT_EQ(adapter.gate(queued), 1u);
+    queued = {&probe};
+    EXPECT_EQ(adapter.gate(queued), 1u);
     adapter.releaseUnposted(&outstanding);
     adapter.releaseUnposted(&probe);
 }
