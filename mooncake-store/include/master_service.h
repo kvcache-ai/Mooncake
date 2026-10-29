@@ -101,6 +101,57 @@ class PrefetchTaskMasterTest;
  * quota table, so these two locks are never nested.
  */
 
+/*
+ * @brief Lock-site annotations (RFC #4700).
+ *
+ * Every acquisition of master_state_mutex_ in master_service.cpp carries two
+ * tags on the line above it:
+ *
+ *   [inv:<domain>]   which invariant domain the site belongs to:
+ *                    segment-registry, object-metadata, task-registry,
+ *                    promotion-state, local-ssd, eviction,
+ *                    client-registry, restore-window.
+ *   [needs:<what>]   what the site still needs from the global lock.
+ *
+ * A shared-lock site gets exactly one thing from master_state_mutex_: exclusion
+ * against the four exclusive holders.
+ *
+ *   ReMountSegment              rebuilds the allocator and repairs replicas.
+ *                               Its per-key walk collects Replica* pointers,
+ *                               drops the key locks, then imports and repairs,
+ *                               so anything that frees a replica inside that
+ *                               gap leaves the collected pointers dangling.
+ *   GracefulUnmountSegment      tears a segment down.
+ *   RestoreFromStandbyStateCore rebuilds object metadata wholesale.
+ *   UnmountLocalDiskSegment     deregisters local-disk capacity.
+ *
+ * The second tag is therefore:
+ *
+ *   lifecycle-order  the site must not overlap any of the four above. That
+ *                    includes the remount walk/repair gap, the restore
+ *                    window and local-disk deregistration -- not only segment
+ *                    mount and unmount. Every site that writes, frees or
+ *                    relocates a replica belongs here, and so does every
+ *                    background worker the restore window has to exclude.
+ *   cross-shard-view the site needs one consistent view across keys.
+ *   none             the site can overlap all four holders safely: read-only
+ *                    single-key paths, and the task registry, which the
+ *                    restore core never touches.
+ *
+ * [needs:none] is the extraction candidate set, and it is deliberately small.
+ * Dropping the global lock from those sites is a pure removal; everything else
+ * needs its replacement mechanism first -- a registry-generation pin for
+ * lifecycle-order, a shard-set epoch for cross-shard-view. The tags are
+ * greppable on purpose, so each extraction PR reviews exactly one tag set:
+ *
+ *   grep -c 'needs:none'             mooncake-store/src/master_service.cpp
+ *   grep -c 'needs:lifecycle-order'  mooncake-store/src/master_service.cpp
+ *   grep -c 'needs:cross-shard-view' mooncake-store/src/master_service.cpp
+ *
+ * The tags describe today's behaviour. They add no synchronization and change
+ * none; the lock order above still holds as written.
+ */
+
 class MasterService {
     friend class MasterStoreBackend;
     friend class test::MasterServiceTestPeer;
