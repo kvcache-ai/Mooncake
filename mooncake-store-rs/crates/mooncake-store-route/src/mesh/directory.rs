@@ -430,6 +430,7 @@ impl EmbeddedWrhRouteDirectory {
         visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
     ) -> Result<()> {
         let mut scans = Vec::new();
+        let mut last_authority_error = None;
         for authority in self.authority_candidates(observer)? {
             match self.list_routes_by_replica_owner_page_from_authority(&authority, owner, None) {
                 Ok(page) => {
@@ -448,14 +449,16 @@ impl EmbeddedWrhRouteDirectory {
                         &error,
                         "route_list_by_replica_owner_failed",
                     );
-                    return Err(error);
+                    last_authority_error = Some(error);
                 }
             }
         }
 
         loop {
-            for scan in &mut scans {
+            let mut next_scans = Vec::with_capacity(scans.len());
+            for mut scan in scans {
                 if !scan.routes.is_empty() || scan.next_cursor.is_none() {
+                    next_scans.push(scan);
                     continue;
                 }
                 let cursor = scan
@@ -466,10 +469,28 @@ impl EmbeddedWrhRouteDirectory {
                     &scan.authority,
                     owner,
                     Some(&cursor),
-                )?;
+                );
+                let page = match page {
+                    Ok(page) => page,
+                    Err(error) => {
+                        self.maybe_mark_authority_suspect(
+                            &scan.authority,
+                            &error,
+                            "route_list_by_replica_owner_failed",
+                        );
+                        last_authority_error = Some(error);
+                        continue;
+                    }
+                };
                 validate_owner_route_page(Some(&cursor), &page, &mut scan.seen_cursors)?;
                 scan.routes = VecDeque::from(page.routes);
                 scan.next_cursor = page.next_cursor;
+                next_scans.push(scan);
+            }
+            scans = next_scans;
+
+            if scans.is_empty() {
+                return last_authority_error.map_or(Ok(()), Err);
             }
 
             let Some(next_key) = scans
