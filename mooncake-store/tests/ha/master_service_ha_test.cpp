@@ -1602,20 +1602,28 @@ TEST_F(MasterServiceHATest, FailedRestoreDoesNotAdvanceReplicaIdCounter) {
         ReplicaDescriptorsForTesting(service, kDefaultTenant, first_key);
     ASSERT_EQ(first.size(), 1);
 
-    // With the tolerant restore, a whole-restore failure only happens when
-    // nothing lands at all. Give both entries unknown endpoints so neither
-    // can land, then the counter must stay exactly where it was.
-    auto valid = MakeStandbyObject("replica_id_counter_valid",
-                                   "unknown_replica_id_endpoint_a");
-    valid.metadata.replicas.front().id = first.front().id + 1000;
-    valid.metadata.replicas.front()
+    // With the tolerant restore, replicas on unloaded segments are expected
+    // losses rather than a failure, so a whole-restore failure now needs
+    // entries the master cannot interpret at all. Give both entries a
+    // zero-length buffer against the mounted segment so neither can land, then
+    // the counter must stay exactly where it was.
+    auto first_entry =
+        MakeStandbyObject("replica_id_counter_valid", "replica_id_counter");
+    first_entry.metadata.replicas.front().id = first.front().id + 1000;
+    auto& first_buffer = first_entry.metadata.replicas.front()
+                             .get_memory_descriptor()
+                             .buffer_descriptor;
+    first_buffer.buffer_address_ = kDefaultSegmentBase + 4096;
+    first_buffer.size_ = 0;
+    auto second_entry =
+        MakeStandbyObject("replica_id_counter_invalid", "replica_id_counter");
+    second_entry.metadata.replicas.front().id = first.front().id + 2000;
+    second_entry.metadata.replicas.front()
         .get_memory_descriptor()
-        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
-    auto invalid = MakeStandbyObject("replica_id_counter_invalid",
-                                     "unknown_replica_id_endpoint_b");
-    invalid.metadata.replicas.front().id = first.front().id + 2000;
+        .buffer_descriptor.size_ = 0;
     auto result = service.RestoreFromStandbySnapshot(
-        {valid, invalid}, 7, {MakeStandbyMemorySegment("replica_id_counter")});
+        {first_entry, second_entry}, 7,
+        {MakeStandbyMemorySegment("replica_id_counter")});
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
