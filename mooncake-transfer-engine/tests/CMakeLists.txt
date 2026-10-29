@@ -333,6 +333,30 @@ if(USE_MNNVL)
   endif()
 endif()
 
+# The fd channel of nvlink_intra's VMM support does not use CUDA, so it is
+# tested on every Linux build.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(
+    intranode_nvlink_vmm_fd_channel_test
+    ${WORKSPACE}/intranode_nvlink_vmm_fd_channel_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/transport/intranode_nvlink_transport/vmm_fd_channel.cpp
+  )
+  target_include_directories(intranode_nvlink_vmm_fd_channel_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_libraries(intranode_nvlink_vmm_fd_channel_test
+                        PRIVATE glog::glog gtest gtest_main)
+  add_test(NAME intranode_nvlink_vmm_fd_channel_test
+           COMMAND intranode_nvlink_vmm_fd_channel_test)
+endif()
+
+if(USE_INTRA_NVLINK AND USE_CUDA)
+  add_executable(intranode_nvlink_vmm_test
+                 ${WORKSPACE}/intranode_nvlink_vmm_test.cpp)
+  target_link_libraries(intranode_nvlink_vmm_test PUBLIC transfer_engine gtest)
+  add_test(NAME intranode_nvlink_vmm_test COMMAND intranode_nvlink_vmm_test)
+  set_tests_properties(intranode_nvlink_vmm_test PROPERTIES LABELS "nvlink_gpu")
+endif()
+
 if(USE_HIP)
   add_executable(hip_transport_test ${WORKSPACE}/hip_transport_test.cpp)
   target_link_libraries(hip_transport_test PUBLIC transfer_engine gtest
