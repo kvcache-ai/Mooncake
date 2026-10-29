@@ -167,6 +167,7 @@ deployment/store-rs/index
 deployment/kubernetes-deployment-guide/index
 deployment/integrations/sglang/index
 deployment/integrations/vllm/index
+deployment/mooncake-ep-jit
 Mooncake x LMCache Integration<deployment/integrations/lmcache/index>
 Mooncake x LMDeploy Integration<deployment/integrations/lmdeploy>
 :::
@@ -195,6 +196,7 @@ design/transfer-engine/index
 design/tent/overview
 design/store/mooncake-store
 design/store/store-rs/index
+design/store/ssd-prefetch
 design/mooncake-backend-pg
 design/mooncake-ep
 design/conductor/index
@@ -238,4 +240,5 @@ troubleshooting/store-rs-key-access
 :hidden:
 
 community/governance
+community/ecosystem-prs
 :::

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -97,7 +98,11 @@ def test_structured_object_storage_has_one_authoritative_source() -> None:
     legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
     legacy_test_root = REPOSITORY_ROOT / "mooncake-wheel" / "tests"
 
-    for module in ("structured_object_store.py", "_fast_copy.c"):
+    for module in (
+        "structured_object_store.py",
+        "_structured_ranges.py",
+        "_fast_copy.c",
+    ):
         assert (package_root / module).is_file()
         assert not (legacy_package_root / module).exists()
 
@@ -114,7 +119,11 @@ def test_structured_object_storage_has_one_authoritative_source() -> None:
         .split(")", 1)[0]
         .split()
     )
-    assert {"structured_object_store.py", "_fast_copy.c"} <= set(migrated_modules)
+    assert {
+        "structured_object_store.py",
+        "_structured_ranges.py",
+        "_fast_copy.c",
+    } <= set(migrated_modules)
 
 
 def test_http_metadata_service_has_one_authoritative_source(
@@ -382,6 +391,54 @@ def test_lightweight_modules_have_one_authoritative_source() -> None:
     assert not (
         REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_buffer_pool_native.py"
     ).exists()
+
+
+def test_engine_typing_ships_from_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+    typing_files = ("py.typed", "engine.pyi")
+
+    for name in typing_files:
+        assert (package_root / name).is_file()
+        assert not (legacy_package_root / name).exists()
+
+    legacy_build_script = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    migrated_modules = (
+        legacy_build_script.split("MIGRATED_PYTHON_MODULES=(", 1)[1]
+        .split(")", 1)[0]
+        .split()
+    )
+    assert set(typing_files) <= set(migrated_modules)
+
+    legacy = tomllib.loads(
+        (REPOSITORY_ROOT / "mooncake-wheel" / "pyproject.toml").read_text()
+    )
+    package_data = legacy["tool"]["setuptools"]["package-data"]["mooncake"]
+    assert {"*.pyi", "py.typed"} <= set(package_data)
+
+    integration_cmake = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    for name in typing_files:
+        assert f"../python/mooncake/{name}" in integration_cmake
+
+    stub = (package_root / "engine.pyi").read_text()
+    for binding in (
+        "mooncake-integration/transfer_engine/transfer_engine_py.cpp",
+        "mooncake-integration/transfer_engine/shared_segment_py.cpp",
+        "mooncake-transfer-engine/src/transport/rpc_communicator/rpc_interface.cpp",
+    ):
+        source = (REPOSITORY_ROOT / binding).read_text()
+        bound_names = re.findall(
+            r'(?:\.def\w*|m\.attr|py::(?:class_|enum_)<.*?>)\(\s*(?:m,\s*)?"(\w+)"',
+            source,
+        )
+        bound_names += re.findall(r'\.value\(\s*"(\w+)"', source)
+        assert bound_names, binding
+        missing = sorted(
+            name for name in set(bound_names) if not re.search(rf"\b{name}\b", stub)
+        )
+        assert not missing, f"{binding} binds names missing from engine.pyi: {missing}"
 
 
 def test_ssd_administration_modules_have_one_authoritative_source() -> None:
