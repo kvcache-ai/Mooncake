@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -36,8 +37,8 @@ namespace tent {
 // Maintains the buffer list of the local SegmentDesc (ref-counted
 // registration / deregistration). All mutations are applied through
 // SegmentManager::updateLocal(), so concurrent readers of getLocal() always
-// observe consistent snapshots; SegmentTracker itself holds no state besides
-// the manager reference.
+// observe consistent snapshots. Registration callbacks are serialized so a
+// failed removal can restore its entry without racing a new registration.
 class SegmentTracker {
    public:
     explicit SegmentTracker(SegmentManager& manager) : manager_(manager) {}
@@ -48,10 +49,11 @@ class SegmentTracker {
     SegmentTracker& operator==(const SegmentTracker&) = delete;
 
    public:
-    // on_removed runs after rollback publication, outside the writer lock.
+    // on_removed runs after rollback publication under the tracker mutex,
+    // outside SegmentManager's snapshot writer lock.
     Status addInBatch(std::vector<BufferDesc>& desc_list,
                       std::function<Status(std::vector<BufferDesc>&)> callback,
-                      std::function<void(BufferDesc&)> on_removed = {});
+                      std::function<Status(BufferDesc&)> on_removed = {});
 
     Status add(uint64_t base, size_t length,
                std::function<Status(BufferDesc&)> callback);
@@ -65,6 +67,7 @@ class SegmentTracker {
     Status forEach(std::function<Status(const BufferDesc&)> callback);
 
    private:
+    std::recursive_mutex mutex_;
     SegmentManager& manager_;
 };
 }  // namespace tent

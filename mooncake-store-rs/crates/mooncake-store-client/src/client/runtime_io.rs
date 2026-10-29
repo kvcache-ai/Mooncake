@@ -667,6 +667,7 @@ impl StoreClient {
         policy: Option<&ReplicationPolicy>,
     ) -> Result<ObjectRoute> {
         let tenant = object.tenant.unwrap_or(self.default_tenant());
+        self.ensure_control_plane_tenant(tenant)?;
         let object_id = LogicalObjectId::new(
             NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
             object.key,
@@ -700,6 +701,7 @@ impl StoreClient {
         policy: Option<&ReplicationPolicy>,
     ) -> Result<ObjectRoute> {
         let tenant = object.tenant.unwrap_or(self.default_tenant());
+        self.ensure_control_plane_tenant(tenant)?;
         let object_id = LogicalObjectId::new(
             NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
             object.key,
@@ -2324,16 +2326,17 @@ impl StoreClient {
         true
     }
 
-    fn scoped_object_key_for_ref(&self, object: &ObjectRef<'_>) -> (String, ObjectKey) {
+    fn scoped_object_key_for_ref(&self, object: &ObjectRef<'_>) -> Result<(String, ObjectKey)> {
         let tenant = object.tenant.unwrap_or(self.default_tenant());
+        self.ensure_control_plane_tenant(tenant)?;
         let object_id = LogicalObjectId::new(
             NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
             object.key,
         );
-        (
+        Ok((
             tenant.to_string(),
             mooncake_store_core::ObjectKey::from_logical_id(&object_id),
-        )
+        ))
     }
 
     fn scoped_object_key_for_tenant(&self, tenant: &str, key: &str) -> ObjectKey {
@@ -2425,7 +2428,7 @@ impl StoreClient {
             let scoped = objects
                 .iter()
                 .map(|object| self.scoped_object_key_for_ref(object))
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>>>()?;
             let routes = self
                 .route_ops()
                 .load_routes(

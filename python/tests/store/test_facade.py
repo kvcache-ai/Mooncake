@@ -37,6 +37,7 @@ _CPP_PUBLIC_NAMES = {
     "ObjectDataType",
     "SoftPinAction",
     "ReplicateConfig",
+    "ExistOptions",
     "ReplicaStatus",
     "MemoryDescriptor",
     "DiskDescriptor",
