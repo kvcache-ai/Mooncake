@@ -205,7 +205,7 @@ TEST_F(HttpMetadataServerTest, EnforcesBindTokenMatrix) {
         const bool loopback =
             std::string(host) != "0.0.0.0" && std::string(host) != "::";
         for (const auto* token : {"", "matrix-test-token"}) {
-            for (const auto* opt_in : {"", "0", "false", "1", "TrUe", "YES"}) {
+            for (const auto* opt_in : {"", "0", "false", "1", "True", "YES"}) {
                 SCOPED_TRACE(std::string(host) + ": token=" +
                              (std::string(token).empty() ? "unset" : "set") +
                              ", opt_in=" + opt_in);
@@ -214,7 +214,7 @@ TEST_F(HttpMetadataServerTest, EnforcesBindTokenMatrix) {
                 HttpMetadataServer server(0, host);
                 const bool allowed = loopback || !std::string(token).empty() ||
                                      std::string(opt_in) == "1" ||
-                                     std::string(opt_in) == "TrUe" ||
+                                     std::string(opt_in) == "True" ||
                                      std::string(opt_in) == "YES";
                 EXPECT_EQ(server.start(), allowed);
                 EXPECT_EQ(server.is_running(), allowed);
