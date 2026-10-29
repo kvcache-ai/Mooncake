@@ -2514,7 +2514,8 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
             // matches completed replicas, so it can never erase the PROCESSING
             // replica the visitor is looking for; at worst a replica that
             // completes while this pass runs is still seen as PROCESSING, and
-            // the next attempt sweeps it.
+            // the next attempt sweeps it. Objects this pass drops are ignored:
+            // their PROCESSING replica cannot surface again.
             bool unfinished_affiliated_replica = false;
             const auto cleanup_result = ClearStaleHandles(
                 [&job](const Replica& replica) {
@@ -2530,7 +2531,12 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                 },
                 [&job, &unfinished_affiliated_replica](
                     const ObjectMetadata& metadata) {
-                    if (unfinished_affiliated_replica) {
+                    // An object this pass is about to drop has no replica
+                    // left to wait for: the sweep either erases it or
+                    // enqueues its REMOVE below, so its PROCESSING replica
+                    // can never surface again. Waiting on it would only
+                    // cost a retry.
+                    if (unfinished_affiliated_replica || !metadata.IsValid()) {
                         return;
                     }
                     const auto is_unfinished = [&job](const Replica& replica) {

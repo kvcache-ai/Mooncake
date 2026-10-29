@@ -4186,6 +4186,41 @@ TEST_F(MasterServiceTest,
     EXPECT_FALSE(accessor.IsPublished());
 }
 
+TEST_F(MasterServiceTest,
+       ClientOffboardingDoesNotWaitForAProcessingReplicaItDrops) {
+    MasterService service;
+    auto segment = MakeSegment("offboarding_drop_processing_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = segment.name;
+    const std::string key = "offboarding_drop_processing_key";
+    ASSERT_TRUE(
+        service.PutStart(client_id, key, TenantId::Default(), 1024, config)
+            .has_value());
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(job.liveness);
+    job.pending_prepare_segments.push_back(
+        {.segment_id = segment.id,
+         .segment_name = segment.name,
+         .transport_endpoint = segment.te_endpoint});
+
+    // Preparing the segment invalidates the only replica, so this attempt
+    // drops the object outright. Its PROCESSING marker is not something the
+    // job should wait for: no later attempt could ever see it again.
+    ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
+    EXPECT_TRUE(job.metadata_cleanup_accepted);
+    MasterServiceTestPeer::MetadataAccessorRO accessor(
+        &service, MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
+                      key, TenantId::Default()));
+    EXPECT_FALSE(accessor.IsPublished());
+}
+
 TEST_F(MasterServiceTest, ClearStaleHandlesVisitsEveryObjectExactlyOnce) {
     MasterService service;
     auto segment = MakeSegment("stale_visit_segment");
