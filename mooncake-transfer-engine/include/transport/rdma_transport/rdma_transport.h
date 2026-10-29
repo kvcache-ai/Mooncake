@@ -67,6 +67,8 @@ class RdmaTransport : public Transport {
 
     bool supportsBatchCompletionCounter() const override { return true; }
 
+    bool handlesSliceTimeout() const override { return true; }
+
     // Ordinary RDMA's native notification channel. Success means the SEND
     // was posted locally, not that the remote application consumed it.
     int sendNativeNotify(const std::string &peer_server_name,

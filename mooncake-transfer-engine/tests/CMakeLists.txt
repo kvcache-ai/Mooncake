@@ -123,6 +123,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)
 
+if(UNIX AND NOT APPLE)
+  add_executable(worker_pool_timeout_test
+                 ${WORKSPACE}/worker_pool_timeout_test.cpp)
+  target_link_libraries(worker_pool_timeout_test PRIVATE transfer_engine gtest
+                                                         gtest_main)
+  target_link_options(
+    worker_pool_timeout_test PRIVATE "-Wl,--wrap=ibv_create_qp"
+    "-Wl,--wrap=ibv_modify_qp" "-Wl,--wrap=ibv_destroy_qp")
+  add_test(NAME worker_pool_timeout_test COMMAND worker_pool_timeout_test)
+endif()
+
 # Integration test for the monitorWorker reclaim tick (issue #1845). Self-skips
 # when no RDMA device is present, so safe to register with ctest.
 add_executable(endpoint_store_integration_test

@@ -1186,6 +1186,7 @@ Status RdmaTransport::submitTransfer(
         auto &task = batch_desc.task_list[task_id];
         ++task_id;
         task.batch_id = batch_id;
+        task.transport_ = this;
 #ifdef USE_ASCEND_HETEROGENEOUS
         task.request = const_cast<TransferRequest *>(&request);
 #else

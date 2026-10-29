@@ -1325,6 +1325,19 @@ int RdmaEndPoint::submitPostSend(
         return 0;
     }
 
+    // Cancellation may arrive on another CQ owner while this worker is
+    // establishing the endpoint. Recheck immediately before admitting WRs.
+    if (globalConfig().slice_timeout > 0) {
+        slice_list.erase(std::remove_if(slice_list.begin(), slice_list.end(),
+                                        [&](auto *slice) {
+                                            if (!slice->task->rdmaTimedOut())
+                                                return false;
+                                            failed_slice_list.push_back(slice);
+                                            return true;
+                                        }),
+                         slice_list.end());
+    }
+
     const size_t num_qp = qp_list_.size();
     if (slice_list.empty()) return 0;
     const size_t requested = slice_list.size();
