@@ -19,10 +19,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
 #include <memory>
+#include <thread>
 
 #include "tent/runtime/slab.h"
 #include "tent/common/utils/os.h"
@@ -247,21 +249,33 @@ Status IOUringTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
 // Reaps the completions of `outstanding` requests before the ring is
 // destroyed: io_uring_queue_exit() does not wait for in-flight I/O. SQEs
 // still in the SQ ring were never submitted and never run, so they are not
-// waited for. Returns 0, or the negative errno of a failed wait, with
-// requests possibly still in flight.
-static int waitForInFlight(struct io_uring* ring, size_t outstanding) {
+// waited for. If io_uring_wait_cqe() fails, the CQ ring is polled instead:
+// it is mapped into this process and still receives completions, so the
+// requests are reaped either way.
+static void waitForInFlight(struct io_uring* ring, size_t outstanding) {
     const size_t unsubmitted = io_uring_sq_ready(ring);
     size_t in_flight =
         outstanding > unsubmitted ? outstanding - unsubmitted : 0;
+    bool polling = false;
     while (in_flight) {
         struct io_uring_cqe* cqe = nullptr;
-        int rc = io_uring_wait_cqe(ring, &cqe);
+        int rc = polling ? io_uring_peek_cqe(ring, &cqe)
+                         : io_uring_wait_cqe(ring, &cqe);
+        if (rc < 0 && polling) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
         if (rc == -EINTR) continue;
-        if (rc < 0) return rc;
+        if (rc < 0) {
+            LOG(ERROR) << "IOUringTransport: io_uring_wait_cqe failed: "
+                       << strerror(-rc) << "; polling for " << in_flight
+                       << " in-flight completions";
+            polling = true;
+            continue;
+        }
         io_uring_cqe_seen(ring, cqe);
         --in_flight;
     }
-    return 0;
 }
 
 Status IOUringTransport::freeSubBatch(SubBatchRef& batch) {
@@ -269,20 +283,13 @@ Status IOUringTransport::freeSubBatch(SubBatchRef& batch) {
     if (!io_uring_batch)
         return Status::InvalidArgument("Invalid IO Uring sub-batch" LOC_MARK);
     auto& ring = io_uring_batch->ring;
-    // io_uring_queue_exit() does not wait for in-flight I/O, which would
-    // then land in staging buffers freed below: reap it first.
+    // io_uring_queue_exit() does not wait for in-flight I/O, which would then
+    // land in staging buffers freed below, or in caller memory reused once the
+    // batch is freed: reap it first.
     size_t outstanding = 0;
     for (auto& task : io_uring_batch->task_list)
         if (task.status_word == TransferStatusEnum::PENDING) ++outstanding;
-    if (int rc = waitForInFlight(&ring, outstanding); rc < 0) {
-        // The kernel may still write into the staging buffers: leak the
-        // sub-batch with its ring and buffers rather than free them.
-        LOG(ERROR) << "IOUringTransport: io_uring_wait_cqe failed: "
-                   << strerror(-rc) << "; leaking the sub-batch";
-        batch = nullptr;
-        return Status::InternalError(
-            "Leaked an io_uring sub-batch with I/O in flight" LOC_MARK);
-    }
+    waitForInFlight(&ring, outstanding);
     io_uring_queue_exit(&ring);
     Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
     batch = nullptr;

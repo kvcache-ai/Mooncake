@@ -34,7 +34,6 @@
 
 #include "tent/common/config.h"
 #include "tent/runtime/control_plane.h"
-#include "tent/runtime/slab.h"
 #include "tent/transport/io_uring/io_uring_transport.h"
 
 namespace mooncake {
@@ -875,11 +874,11 @@ TEST(IOUringTransportTest, FreeSubBatchWaitsForInFlightIo) {
     rmdir(dir_template);
 }
 
-// If that wait fails, freeSubBatch() leaks the sub-batch rather than free
-// staging memory the kernel may still write into. Replacing the ring fd with
-// a non-io_uring file makes io_uring_wait_cqe() fail, while the ring itself
-// stays alive through its mappings.
-TEST(IOUringPinnedStagingTest, FreeSubBatchLeaksWhenWaitFails) {
+// If that wait fails, freeSubBatch() keeps reaping by polling the CQ ring,
+// so it still frees nothing the kernel may write into. Replacing the ring fd
+// with a non-io_uring file makes io_uring_wait_cqe() fail, while the ring
+// itself stays alive through its mappings.
+TEST(IOUringPinnedStagingTest, FreeSubBatchDrainsWhenWaitFails) {
     char dir_template[] = "/tmp/io_uring_fifo_XXXXXX";
     ASSERT_NE(mkdtemp(dir_template), nullptr);
     const std::string path = std::string(dir_template) + "/fifo";
@@ -912,34 +911,34 @@ TEST(IOUringPinnedStagingTest, FreeSubBatchLeaksWhenWaitFails) {
     ASSERT_TRUE(transport.submitTransferTasks(batch, {read}).ok());
     EXPECT_EQ(pool->freeSlots(), 0u);
 
-    auto* leaked = static_cast<IOUringSubBatch*>(batch);
-    const int ring_fd = leaked->ring.ring_fd;
+    auto* sub_batch = static_cast<IOUringSubBatch*>(batch);
+    const auto* slot =
+        static_cast<const uint8_t*>(sub_batch->task_list[0].buffer);
+    const int ring_fd = sub_batch->ring.ring_fd;
     int null_fd = open("/dev/null", O_RDONLY);
     ASSERT_GE(null_fd, 0);
     ASSERT_EQ(dup2(null_fd, ring_fd), ring_fd);
     close(null_fd);
-    EXPECT_FALSE(transport.freeSubBatch(batch).ok());
-    EXPECT_EQ(batch, nullptr);
-    // The slot stays out of the pool: the read may still land in it.
-    EXPECT_EQ(pool->freeSlots(), 0u);
 
-    // The read completes into the leaked slot. Its CQE is in the mapped CQ
-    // ring, which io_uring_peek_cqe() reads without entering the kernel.
+    // As above: freeSubBatch() must stay blocked, with the slot out of the
+    // pool, until the read is fed.
+    std::atomic<bool> done{false};
+    Status freed;
+    std::thread worker([&] {
+        freed = transport.freeSubBatch(batch);
+        done = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_FALSE(done.load()) << "freeSubBatch() returned with I/O in flight";
+    EXPECT_EQ(pool->freeSlots(), 0u);
     std::vector<uint8_t> data(kPageSize, 0x5A);
     EXPECT_EQ(write(writer, data.data(), data.size()), (ssize_t)kPageSize);
-    struct io_uring_cqe* cqe = nullptr;
-    for (int i = 0; i < 500 && io_uring_peek_cqe(&leaked->ring, &cqe); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    ASSERT_NE(cqe, nullptr);
-    EXPECT_EQ(cqe->res, (int)kPageSize);
-    const auto* slot = static_cast<const uint8_t*>(leaked->task_list[0].buffer);
-    EXPECT_TRUE(std::equal(data.begin(), data.end(), slot));
-
-    // Reclaim what freeSubBatch() leaked, as it would have done.
-    io_uring_cqe_seen(&leaked->ring, cqe);
-    io_uring_queue_exit(&leaked->ring);
-    Slab<IOUringSubBatch>::Get().deallocate(leaked);
+    worker.join();
+    EXPECT_TRUE(freed.ok()) << freed.ToString();
+    EXPECT_EQ(batch, nullptr);
+    // The read landed in the slot before the slot went back to the pool.
     EXPECT_EQ(pool->freeSlots(), 1u);
+    EXPECT_TRUE(std::equal(data.begin(), data.end(), slot));
     close(writer);
     unlink(path.c_str());
     rmdir(dir_template);
