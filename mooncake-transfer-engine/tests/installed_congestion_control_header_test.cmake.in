@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+
 set(prefix
     "@CMAKE_CURRENT_BINARY_DIR@/installed_congestion_control_header_prefix")
 file(REMOVE_RECURSE "${prefix}")
@@ -10,9 +12,14 @@ else()
   set(consumer_flags -fsyntax-only)
 endif()
 
+set(expected_adaptive_control 0)
+if("@MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL@")
+  set(expected_adaptive_control 1)
+endif()
+
 execute_process(
   COMMAND "@CMAKE_COMMAND@" "-DCMAKE_INSTALL_PREFIX=${prefix}"
-          -P "@CMAKE_BINARY_DIR@/mooncake-transfer-engine/include/cmake_install.cmake"
+          -P "@CMAKE_CURRENT_BINARY_DIR@/../include/cmake_install.cmake"
   RESULT_VARIABLE install_result
   OUTPUT_VARIABLE install_output
   ERROR_VARIABLE install_error)
@@ -26,7 +33,7 @@ endif()
 execute_process(
   COMMAND
     "@CMAKE_CXX_COMPILER@" -std=c++20
-    -DMOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL=1 -I${prefix}/include
+    -DMC_EXPECT_ADAPTIVE_CONTROL=${expected_adaptive_control} -I${prefix}/include
     "@CMAKE_CURRENT_SOURCE_DIR@/installed_congestion_control_header_test.cpp"
     ${consumer_flags}
   RESULT_VARIABLE compile_result

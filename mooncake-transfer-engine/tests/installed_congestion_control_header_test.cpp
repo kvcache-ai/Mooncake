@@ -14,6 +14,11 @@
 
 #include <transfer_engine.h>
 
+#if defined(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL) != \
+    MC_EXPECT_ADAPTIVE_CONTROL
+#error "Installed headers do not match the library build configuration"
+#endif
+
 struct SliceCacheConsumer : mooncake::Transport {
     using Transport::getSliceCache;
 };

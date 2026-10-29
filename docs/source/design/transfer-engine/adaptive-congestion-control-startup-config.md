@@ -20,6 +20,10 @@ it does not create a second health/recovery state machine.
 the shared core target is available to Classic TE and TENT builds. Each Classic
 RDMA worker pool snapshots the environment during construction.
 
+Installed headers read this build setting from `mooncake_te_build_config.h` so
+their public layouts match the library. Consumers do not need to define the
+macro themselves; the generated header overrides conflicting definitions.
+
 | Variable | Default | Description |
 | --- | ---: | --- |
 | `MC_ADAPTIVE_CONGESTION_CONTROL_MODE` | `off` | `off` bypasses core accounting and admission; `observe` records pressure without deferring transfers; `enforce` applies byte-window admission. |

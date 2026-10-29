@@ -1,3 +1,5 @@
+configure_file(mooncake_te_build_config.h.in mooncake_te_build_config.h @ONLY)
+
 install(FILES transfer_engine_c.h DESTINATION include)
 install(FILES buffer_range_index.h DESTINATION include)
 install(FILES common.h DESTINATION include)
@@ -11,6 +13,8 @@ install(FILES transfer_metadata.h DESTINATION include)
 install(FILES ub_allocator.h DESTINATION include)
 install(FILES common/base/status.h DESTINATION include/common/base)
 install(FILES transport/transport.h DESTINATION include/transport)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/mooncake_te_build_config.h
+        DESTINATION include)
 
 if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
   install(

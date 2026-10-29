@@ -31,6 +31,7 @@
 #include <mutex>
 #include <condition_variable>
 
+#include "mooncake_te_build_config.h"
 #include "common/base/status.h"
 #include "transfer_metadata.h"
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
