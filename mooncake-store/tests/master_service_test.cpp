@@ -4221,6 +4221,43 @@ TEST_F(MasterServiceTest,
     EXPECT_FALSE(accessor.IsPublished());
 }
 
+TEST_F(MasterServiceTest,
+       ClientOffboardingWithoutOplogWaitsForTheProcessingReplicaItKeeps) {
+    // HA without an OpLog: the sweep cannot erase the object and has no
+    // REMOVE to enqueue, so the background reaper keeps it. The job must
+    // still wait for its PROCESSING replica instead of accepting cleanup.
+    auto config = MasterServiceConfig::builder().set_enable_ha(true).build();
+    MasterService service(config);
+    auto segment = MakeSegment("offboarding_ha_no_oplog_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig put_config;
+    put_config.replica_num = 1;
+    put_config.preferred_segment = segment.name;
+    const std::string key = "offboarding_ha_no_oplog_key";
+    ASSERT_TRUE(
+        service.PutStart(client_id, key, TenantId::Default(), 1024, put_config)
+            .has_value());
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(job.liveness);
+    job.pending_prepare_segments.push_back(
+        {.segment_id = segment.id,
+         .segment_name = segment.name,
+         .transport_endpoint = segment.te_endpoint});
+
+    ASSERT_FALSE(ProcessClientOffboardingForTest(service, job));
+    EXPECT_FALSE(job.metadata_cleanup_accepted);
+    MasterServiceTestPeer::MetadataAccessorRO accessor(
+        &service, MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
+                      key, TenantId::Default()));
+    EXPECT_TRUE(accessor.IsPublished());
+    EXPECT_TRUE(accessor.Get().HasReplica(&Replica::fn_is_processing));
+}
+
 TEST_F(MasterServiceTest, ClearStaleHandlesVisitsEveryObjectExactlyOnce) {
     MasterService service;
     auto segment = MakeSegment("stale_visit_segment");

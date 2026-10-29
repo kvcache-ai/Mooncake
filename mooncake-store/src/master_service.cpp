@@ -2529,7 +2529,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                     return replica.is_memory_replica() &&
                            replica.isAffiliatedWith(job.liveness);
                 },
-                [&job, &unfinished_affiliated_replica](
+                [this, &job, &unfinished_affiliated_replica](
                     const ObjectMetadata& metadata) {
                     if (unfinished_affiliated_replica) {
                         return;
@@ -2541,13 +2541,18 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                     if (!metadata.HasReplica(is_unfinished)) {
                         return;
                     }
-                    // An object this pass drops has no replica left to wait
-                    // for: the sweep either erases it or enqueues its REMOVE
-                    // below, so its PROCESSING replica can never surface
-                    // again. Waiting on it would only cost a retry. Ask only
-                    // where the answer matters: a replica scan per object is
-                    // the whole cost of this pass.
                     if (metadata.IsValid()) {
+                        unfinished_affiliated_replica = true;
+                        return;
+                    }
+                    // No usable replica left. The sweep then erases the
+                    // object, or enqueues its REMOVE and fails the whole walk
+                    // if that enqueue fails, so its PROCESSING replica cannot
+                    // surface again and waiting on it would only cost a
+                    // retry. HA without an OpLog is the exception: the sweep
+                    // leaves the object to the background reaper, so the
+                    // replica is still one this job has to wait for.
+                    if (enable_ha_ && !enable_oplog_) {
                         unfinished_affiliated_replica = true;
                     }
                 });
