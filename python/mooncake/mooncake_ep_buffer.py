@@ -220,6 +220,7 @@ class Buffer:
 
     def connect(self, is_update: bool = False):
         device = self._bootstrap_device()
+        coordinated_fallback = False
         # XPU has no IBGDA QPNs; its peers use Level Zero IPC.
         if is_update and self.device_type != "xpu":
             if not self._use_fallback:
@@ -232,7 +233,7 @@ class Buffer:
             dist.all_reduce(ibgda_failed, op=dist.ReduceOp.MAX, group=self.group)
             if bool(ibgda_failed.item()):
                 self._use_fallback = True
-                return self.connect(False)
+                coordinated_fallback = True
 
         # XPU has no RDMA path: peers are reached over Level Zero IPC only.
         if self.device_type != "xpu" and not self._use_fallback:
@@ -368,7 +369,7 @@ class Buffer:
             )
             dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=self.group)
             use_fast_path = bool(agreed.item())
-        self._use_fallback = not use_fast_path
+        self._use_fallback = coordinated_fallback or not use_fast_path
 
     def update_ep_member(self):
         self.connect(True)
