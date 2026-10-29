@@ -4154,13 +4154,19 @@ TEST_F(MasterServiceTest,
     ASSERT_TRUE(job.liveness);
 
     // Metadata phase only: the still-PROCESSING replica of the offboarded
-    // client keeps the job from accepting cleanup, and the object stays (its
-    // handle is still valid).
+    // client keeps the job from accepting cleanup, and the object survives
+    // (its handle is still valid). ExistKey would say false here: it asks for
+    // a readable replica, and a PROCESSING one is not readable yet.
     ASSERT_FALSE(ProcessClientOffboardingForTest(service, job));
     EXPECT_FALSE(job.metadata_cleanup_accepted);
-    auto pending_exists = service.ExistKey(key, TenantId::Default());
-    ASSERT_TRUE(pending_exists.has_value());
-    EXPECT_TRUE(*pending_exists);
+    {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
+                key, TenantId::Default()));
+        EXPECT_TRUE(accessor.IsPublished());
+        EXPECT_TRUE(accessor.Get().HasReplica(&Replica::fn_is_processing));
+    }
 
     ASSERT_TRUE(
         service.PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
@@ -4174,9 +4180,10 @@ TEST_F(MasterServiceTest,
     ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
     EXPECT_TRUE(job.metadata_cleanup_accepted);
     EXPECT_TRUE(job.prepared_segments.empty());
-    auto exists = service.ExistKey(key, TenantId::Default());
-    ASSERT_TRUE(exists.has_value());
-    EXPECT_FALSE(*exists);
+    MasterServiceTestPeer::MetadataAccessorRO accessor(
+        &service, MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
+                      key, TenantId::Default()));
+    EXPECT_FALSE(accessor.IsPublished());
 }
 
 TEST_F(MasterServiceTest, ClearStaleHandlesVisitsEveryObjectExactlyOnce) {
