@@ -27,6 +27,41 @@ class Lease {
                !deadline_ns_.compare_exchange_weak(cur, new_deadline,
                                                    std::memory_order_relaxed)) {
         }
+        // A read or write makes the object recently used, so it ranks by its
+        // new deadline from now on, not by the order it was restored with.
+        restored_order_ns_.store(0, std::memory_order_relaxed);
+    }
+
+    // Like GrantReadLease, but keeps the restored eviction order: remount
+    // protects a restored object for ttl without making it look recently
+    // used.
+    void GrantRestoreLease(std::chrono::milliseconds ttl) {
+        const int64_t new_deadline =
+            NowNs() +
+            std::chrono::duration_cast<std::chrono::nanoseconds>(ttl).count();
+        int64_t cur = deadline_ns_.load(std::memory_order_relaxed);
+        while (cur < new_deadline &&
+               !deadline_ns_.compare_exchange_weak(cur, new_deadline,
+                                                   std::memory_order_relaxed)) {
+        }
+    }
+
+    // Record the eviction order an object had on the primary it was restored
+    // from (monotonic max, so a group takes its latest member's order).
+    void SetRestoredOrder(const std::chrono::system_clock::time_point order) {
+        const int64_t o = NowNs(order);
+        int64_t cur = restored_order_ns_.load(std::memory_order_relaxed);
+        while (cur < o && !restored_order_ns_.compare_exchange_weak(
+                              cur, o, std::memory_order_relaxed)) {
+        }
+    }
+
+    // The time eviction ranks by: the restored order until the object is
+    // read or written again, otherwise the deadline.
+    std::chrono::system_clock::time_point EvictionOrder() const {
+        const int64_t restored =
+            restored_order_ns_.load(std::memory_order_relaxed);
+        return restored != 0 ? FromNs(restored) : ExpiresAt();
     }
 
     // Merge an externally-derived deadline (used when rebuilding a group's
@@ -56,13 +91,15 @@ class Lease {
     std::chrono::system_clock::time_point ExpiresAt() const {
         // system_clock is coarser than nanoseconds on some platforms (e.g.
         // microseconds with libc++), so the conversion must be explicit.
-        return std::chrono::system_clock::time_point(
-            std::chrono::duration_cast<std::chrono::system_clock::duration>(
-                std::chrono::nanoseconds(
-                    deadline_ns_.load(std::memory_order_relaxed))));
+        return FromNs(deadline_ns_.load(std::memory_order_relaxed));
     }
 
    private:
+    static std::chrono::system_clock::time_point FromNs(int64_t ns) {
+        return std::chrono::system_clock::time_point(
+            std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                std::chrono::nanoseconds(ns)));
+    }
     static int64_t NowNs() {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
                    std::chrono::system_clock::now().time_since_epoch())
@@ -75,6 +112,8 @@ class Lease {
     }
 
     std::atomic<int64_t> deadline_ns_{0};
+    // 0 unless the object was restored from a standby and not touched since.
+    std::atomic<int64_t> restored_order_ns_{0};
 };
 
 }  // namespace mooncake

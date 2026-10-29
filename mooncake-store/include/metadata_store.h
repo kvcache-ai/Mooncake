@@ -28,10 +28,8 @@ struct StandbyObjectMetadata {
     UUID client_id{0, 0};
     uint64_t size{0};
     std::vector<Replica::Descriptor> replicas;
-    // NOTE: Lease information is NOT stored because:
-    // 1. Standby does not perform eviction, so lease info is not used
-    // 2. After promotion, new Primary should grant fresh leases, not restore
-    // old ones
+    // NOTE: Leases are NOT stored: after promotion the new Primary grants
+    // fresh leases. Only the eviction order (eviction_order_ms) is kept.
     // Soft pin is also omitted because it is runtime-only eviction-priority
     // state; promoted objects resume as ordinary cache.
     std::string group_id;  // Tenant group identifier
@@ -42,10 +40,18 @@ struct StandbyObjectMetadata {
     struct_pack::compatible<std::string, 2> session_id;
     struct_pack::compatible<uint64_t, 3> object_checksum;
 
+    // The object's eviction order on the primary (its lease deadline: the
+    // last write time, or last read + lease TTL), in ms since the epoch of
+    // the primary's system clock. Restore ranks eviction by it, so the
+    // promoted primary still evicts the coldest objects first. Absent (old
+    // primary) or 0 means unknown.
+    struct_pack::compatible<uint64_t, 4> eviction_order_ms;
+
     StandbyObjectMetadata() = default;
 
     YLT_REFL(StandbyObjectMetadata, client_id, size, replicas, group_id,
-             data_type, hard_pinned, session_id, object_checksum);
+             data_type, hard_pinned, session_id, object_checksum,
+             eviction_order_ms);
 
     // Check if this metadata has valid replicas
     bool HasReplicas() const { return !replicas.empty(); }
@@ -111,9 +117,11 @@ struct MetadataPayload {
 
     struct_pack::compatible<std::string, 2> session_id;
     struct_pack::compatible<uint64_t, 3> object_checksum;
+    // See StandbyObjectMetadata::eviction_order_ms.
+    struct_pack::compatible<uint64_t, 4> eviction_order_ms;
 
     YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type,
-             hard_pinned, session_id, object_checksum);
+             hard_pinned, session_id, object_checksum, eviction_order_ms);
 
     // Convert to StandbyObjectMetadata
     StandbyObjectMetadata ToStandbyMetadata() const {
@@ -124,6 +132,7 @@ struct MetadataPayload {
         meta.group_id = group_id.value_or("");
         meta.session_id = session_id.value_or("");
         meta.object_checksum = object_checksum;
+        meta.eviction_order_ms = eviction_order_ms;
         meta.data_type = data_type.value_or(ObjectDataType::UNKNOWN);
         meta.hard_pinned = hard_pinned.value_or(false);
         return meta;

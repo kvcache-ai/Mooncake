@@ -332,6 +332,19 @@ struct ObjectMetadata {
         return lease_->ExpiresAt();
     }
 
+    // The time eviction ranks candidates by. Equal to EvictionDeadline()
+    // except for a standby-restored object not read or written since: that
+    // keeps the order it had on the old primary (see Lease::EvictionOrder).
+    std::chrono::system_clock::time_point EvictionOrder() const {
+        return lease_->EvictionOrder();
+    }
+
+    // Remount protection for a restored object; keeps its restored order.
+    void GrantRestoreLease(std::chrono::milliseconds ttl) const {
+        SpinLocker locker(&lock);
+        lease_->GrantRestoreLease(ttl);
+    }
+
     SoftPinEvaluation EvaluateSoftPin(
         const std::chrono::system_clock::time_point& now) const {
         SpinLocker locker(&lock);

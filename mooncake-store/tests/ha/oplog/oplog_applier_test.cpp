@@ -718,6 +718,62 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd) {
     EXPECT_EQ(1u, mock_metadata_store_->GetKeyCount());
 }
 
+// MetadataPayload as a primary built before eviction_order_ms serialized it.
+struct LegacyMetadataPayload {
+    UUID client_id{0, 0};
+    uint64_t size{0};
+    std::vector<Replica::Descriptor> replicas;
+    struct_pack::compatible<std::string, 1> group_id;
+    struct_pack::compatible<ObjectDataType, 1> data_type;
+    struct_pack::compatible<bool, 1> hard_pinned;
+    struct_pack::compatible<std::string, 2> session_id;
+    struct_pack::compatible<uint64_t, 3> object_checksum;
+    YLT_REFL(LegacyMetadataPayload, client_id, size, replicas, group_id,
+             data_type, hard_pinned, session_id, object_checksum);
+};
+
+// The eviction order reaches the standby copy, and a PUT_END written by a
+// primary that predates the field still applies, with an unknown order.
+TEST_F(OpLogApplierTest, TestApplyPutEndCarriesEvictionOrder) {
+    mooncake::MetadataPayload payload;
+    payload.client_id = {1, 2};
+    payload.size = 1024;
+    payload.object_checksum = 42;
+    payload.eviction_order_ms = 1'700'000'000'123ULL;
+    auto bytes = struct_pack::serialize(payload);
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::PUT_END, "ordered",
+                  std::string(bytes.begin(), bytes.end()))));
+    auto ordered = mock_metadata_store_->GetMetadata("ordered");
+    ASSERT_TRUE(ordered.has_value());
+    EXPECT_EQ(ordered->eviction_order_ms.value_or(0), 1'700'000'000'123ULL);
+    EXPECT_EQ(ordered->object_checksum.value_or(0), 42u);
+
+    LegacyMetadataPayload legacy;
+    legacy.client_id = {3, 4};
+    legacy.size = 2048;
+    legacy.session_id = std::string("legacy_session");
+    legacy.object_checksum = 7;
+    auto legacy_bytes = struct_pack::serialize(legacy);
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(2, OpType::PUT_END, "legacy",
+                  std::string(legacy_bytes.begin(), legacy_bytes.end()))));
+    auto restored = mock_metadata_store_->GetMetadata("legacy");
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->size, 2048u);
+    EXPECT_EQ(restored->session_id.value_or(""), "legacy_session");
+    EXPECT_EQ(restored->object_checksum.value_or(0), 7u);
+    EXPECT_FALSE(restored->eviction_order_ms.has_value());
+
+    // A new payload read by an old standby keeps every older field.
+    LegacyMetadataPayload old_reader;
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(
+                  old_reader, std::string(bytes.begin(), bytes.end())));
+    EXPECT_EQ(old_reader.size, 1024u);
+    EXPECT_EQ(old_reader.object_checksum.value_or(0), 42u);
+}
+
 TEST_F(OpLogApplierTest, TestApplyPutRevoke) {
     // First add a key
     std::string payload = MakeValidPayload();
