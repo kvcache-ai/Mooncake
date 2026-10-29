@@ -133,8 +133,9 @@ class CudaPlatform : public Platform {
                              int deviceId = CUDAStreamPool::kCurrentDevice);
 
    private:
-    // Device owning `addr`, or kCurrentDevice when `addr` is not device memory.
-    int getPointerDeviceId(void* addr);
+    // Device owning CUDA/managed memory, or kCurrentDevice for confirmed host
+    // memory. A failed classification is never a host fallback.
+    Status getPointerDeviceId(void* addr, int& device);
 
     std::shared_ptr<Config> conf;
     CUDAStreamPool stream_pool;

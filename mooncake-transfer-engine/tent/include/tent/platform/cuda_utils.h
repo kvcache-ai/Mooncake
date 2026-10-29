@@ -24,27 +24,76 @@ namespace tent {
 
 // cuInit() is idempotent and creates no context; the driver API does not
 // initialize itself lazily, so it must run before any driver query.
-inline bool ensureCudaDriverInit() {
+inline CUresult cudaDriverInitResult() {
     static std::once_flag flag;
     static CUresult result = CUDA_ERROR_NOT_INITIALIZED;
     std::call_once(flag, []() { result = cuInit(0); });
-    return result == CUDA_SUCCESS;
+    return result;
 }
 
-// Device ordinal owning `ptr`, or -1 for host memory. Unlike the runtime
-// cudaPointerGetAttributes(), this never implicitly initializes the calling
-// thread's current device and its primary context (default GPU 0).
-inline int getCudaDeviceForPtr(const void* ptr) {
-    if (!ensureCudaDriverInit()) return -1;
+inline bool ensureCudaDriverInit() {
+    return cudaDriverInitResult() == CUDA_SUCCESS;
+}
+
+enum class CudaMemoryKind { Unknown, Host, Device, Managed };
+
+struct CudaPointerInfo {
+    CudaMemoryKind kind = CudaMemoryKind::Unknown;
+    int device = -1;
+    bool registered_host = false;
+
+    // CUDA copy/free eligibility, not GPUDirect transport eligibility.
+    bool isCuda() const {
+        return kind == CudaMemoryKind::Device ||
+               kind == CudaMemoryKind::Managed;
+    }
+};
+
+// No runtime API calls: classification must not create or switch contexts.
+// Only a successful multi-attribute query can authorize host handling. Unlike
+// cuPointerGetAttribute(), cuPointerGetAttributes() returns success with
+// default attributes for ordinary, unregistered host pointers. This is
+// classification, not validation of a host address or allocation ownership.
+inline CUresult getCudaPointerInfo(const void* ptr, CudaPointerInfo& info) {
+    info = {};
+    if (!ptr) return CUDA_ERROR_INVALID_VALUE;
+    CUresult res = cudaDriverInitResult();
+    if (res != CUDA_SUCCESS) return res;
     unsigned int mem_type = 0;
-    CUresult res = cuPointerGetAttribute(
-        &mem_type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)ptr);
-    if (res != CUDA_SUCCESS || mem_type != CU_MEMORYTYPE_DEVICE) return -1;
-    unsigned int dev_ordinal = 0;
-    res = cuPointerGetAttribute(
-        &dev_ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)ptr);
-    if (res != CUDA_SUCCESS) return -1;
-    return static_cast<int>(dev_ordinal);
+    unsigned int managed = 0;
+    int device = -1;
+    CUpointer_attribute attributes[] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                                        CU_POINTER_ATTRIBUTE_IS_MANAGED,
+                                        CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL};
+    void* values[] = {&mem_type, &managed, &device};
+    res = cuPointerGetAttributes(3, attributes, values, (CUdeviceptr)ptr);
+    if (res != CUDA_SUCCESS) return res;
+    if (managed > 1 ||
+        (mem_type != 0 && mem_type != CU_MEMORYTYPE_HOST &&
+         mem_type != CU_MEMORYTYPE_DEVICE &&
+         mem_type != CU_MEMORYTYPE_UNIFIED) ||
+        (managed && mem_type == 0))
+        return CUDA_ERROR_INVALID_VALUE;
+    CudaPointerInfo result;
+    if (managed || mem_type == CU_MEMORYTYPE_UNIFIED) {
+        result.kind = CudaMemoryKind::Managed;
+    } else if (mem_type == CU_MEMORYTYPE_DEVICE) {
+        result.kind = CudaMemoryKind::Device;
+    } else if (mem_type == 0 || mem_type == CU_MEMORYTYPE_HOST) {
+        result.kind = CudaMemoryKind::Host;
+        result.registered_host = mem_type == CU_MEMORYTYPE_HOST;
+    } else {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (result.isCuda()) {
+        if (device < 0) return CUDA_ERROR_INVALID_DEVICE;
+        CUdevice cu_device;
+        res = cuDeviceGet(&cu_device, device);
+        if (res != CUDA_SUCCESS) return res;
+        result.device = device;
+    }
+    info = result;
+    return CUDA_SUCCESS;
 }
 
 }  // namespace tent

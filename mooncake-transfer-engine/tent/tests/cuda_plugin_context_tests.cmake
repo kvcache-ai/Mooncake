@@ -8,7 +8,8 @@ set(cuda_plugin_context_wrap_options)
 foreach(
   symbol
   cuInit
-  cuPointerGetAttribute
+  cuDeviceGet
+  cuPointerGetAttributes
   cuCtxGetCurrent
   cuCtxSetCurrent
   cudaGetDevice

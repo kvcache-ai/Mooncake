@@ -970,6 +970,15 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         desc.addr = (uint64_t)addr_list[i];
         desc.length = size_list[i];
 
+        // CUDA must reject unknown/managed memory before temporary
+        // registration. Other platforms may resolve unknown pointers through
+        // getLocation().
+        auto& platform = Platform::getLoader();
+        if (platform.type() == "cuda" &&
+            platform.getMemoryType(addr_list[i]) == MTYPE_UNKNOWN)
+            return Status::InvalidArgument(
+                "Unsupported or unknown CUDA memory type" LOC_MARK);
+
         // MR warm-up: pin pages via temp ibv_reg_mr, benefits both
         // subsequent RDMA registration and NUMA probing
         bool pages_pinned = false;

@@ -264,24 +264,10 @@ Status CudaPlatform::probe(std::vector<Topology::NicEntry>& nic_list,
 }
 
 namespace {
-bool cudaDevicePresent() {
-    static const bool present = [] {
-        int device_count = 0;
-        if (cudaGetDeviceCount(&device_count) != cudaSuccess ||
-            device_count == 0) {
-            LOG(WARNING) << "No CUDA device detected; treating buffers as "
-                            "host memory";
-            return false;
-        }
-        return true;
-    }();
-    return present;
-}
-
 bool cudaAbiMatches() {
     static const bool matches = [] {
         int runtime_version = 0;
-        // Major version only: struct layout changes across CUDA majors.
+        // Preserve the platform's existing CUDA Runtime major-version guard.
         if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess &&
             runtime_version / 1000 != CUDART_VERSION / 1000) {
             LOG(ERROR) << "CUDA ABI mismatch: built against CUDART "
@@ -298,19 +284,29 @@ bool cudaAbiMatches() {
 }  // namespace
 
 MemoryType CudaPlatform::getMemoryType(void* addr) {
-    if (!cudaDevicePresent()) return MTYPE_CPU;
+    CudaPointerInfo info;
+    const CUresult result = getCudaPointerInfo(addr, info);
+    if (result == CUDA_ERROR_NO_DEVICE &&
+        cudaDriverInitResult() == CUDA_ERROR_NO_DEVICE)
+        return MTYPE_CPU;
+    if (result != CUDA_SUCCESS) return MTYPE_UNKNOWN;
     if (!cudaAbiMatches()) return MTYPE_UNKNOWN;
-    return getCudaDeviceForPtr(addr) >= 0 ? MTYPE_CUDA : MTYPE_CPU;
+    // This type selects transfer backends. Managed memory is CUDA-addressable
+    // but is not supported by GPUDirect RDMA.
+    if (info.kind == CudaMemoryKind::Managed) return MTYPE_UNKNOWN;
+    return info.kind == CudaMemoryKind::Device ? MTYPE_CUDA : MTYPE_CPU;
 }
 
-int CudaPlatform::getPointerDeviceId(void* addr) {
-    // Same guards as getMemoryType().
-    if (!cudaDevicePresent() || !cudaAbiMatches()) {
-        return CUDAStreamPool::kCurrentDevice;
-    }
-    int device = getCudaDeviceForPtr(addr);
-    if (device < 0) return CUDAStreamPool::kCurrentDevice;
-    return device;
+Status CudaPlatform::getPointerDeviceId(void* addr, int& device) {
+    CudaPointerInfo info;
+    const CUresult result = getCudaPointerInfo(addr, info);
+    if (!(result == CUDA_ERROR_NO_DEVICE &&
+          cudaDriverInitResult() == CUDA_ERROR_NO_DEVICE))
+        CHECK_CU(result);
+    if (result == CUDA_SUCCESS && !cudaAbiMatches())
+        return Status::InvalidArgument("CUDA Runtime ABI mismatch");
+    device = info.isCuda() ? info.device : CUDAStreamPool::kCurrentDevice;
+    return Status::OK();
 }
 
 static inline uintptr_t alignPage(uintptr_t address) {
@@ -334,18 +330,21 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
 
-    if (cudaDevicePresent() && !cudaAbiMatches()) {
-        entries.push_back({(uint64_t)start, len, kWildcardLocation});
+    CudaPointerInfo info;
+    // The interface has no error channel. An empty result reports no known
+    // location without touching potentially inaccessible device memory.
+    const CUresult result = getCudaPointerInfo(start, info);
+    if (result != CUDA_SUCCESS &&
+        !(result == CUDA_ERROR_NO_DEVICE &&
+          cudaDriverInitResult() == CUDA_ERROR_NO_DEVICE))
         return entries;
-    }
-    if (cudaDevicePresent()) {
-        // Unregistered pointers fall through to the NUMA probe below.
-        int cuda_dev = getCudaDeviceForPtr(start);
-        if (cuda_dev >= 0) {
-            entries.push_back(
-                {(uint64_t)start, len, genCudaNodeName(cuda_dev)});
-            return entries;
-        }
+    if (result == CUDA_SUCCESS && !cudaAbiMatches()) return entries;
+    // Do not publish managed memory as ordinary cuda:N memory: registration
+    // would authorize transports without Unified Memory coherence support.
+    if (info.kind == CudaMemoryKind::Managed) return entries;
+    if (info.kind == CudaMemoryKind::Device) {
+        entries.push_back({(uint64_t)start, len, genCudaNodeName(info.device)});
+        return entries;
     }
 
     // start and end address may not be page aligned.
