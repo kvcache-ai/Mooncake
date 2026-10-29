@@ -924,14 +924,14 @@ class MluDirectRdmaTest : public ::testing::TestWithParam<bool> {
                   void** address, TransportType registration = UNSPEC) {
         MemoryOptions options;
         options.location = location;
-        ASSERT_TRUE(engine.allocateLocalMemory(address, kDirectLength, options)
-                        .ok());
+        ASSERT_TRUE(
+            engine.allocateLocalMemory(address, kDirectLength, options).ok());
         ASSERT_NE(*address, nullptr);
         allocations_.push_back({&engine, *address});
         options.type = registration;
-        ASSERT_TRUE(engine.registerLocalMemory({*address}, {kDirectLength},
-                                               options)
-                        .ok());
+        ASSERT_TRUE(
+            engine.registerLocalMemory({*address}, {kDirectLength}, options)
+                .ok());
         ASSERT_EQ(TransferEngineImplTestPeer::hasRdmaTag(engine, *address),
                   registration != MLU);
     }
@@ -958,7 +958,8 @@ class MluDirectRdmaTest : public ::testing::TestWithParam<bool> {
         request.target_offset = reinterpret_cast<uint64_t>(peer);
         request.length = kDirectLength;
         request.transport_hint = hint;
-        ASSERT_TRUE(a_->openSegment(request.target_id, b_->getSegmentName()).ok());
+        ASSERT_TRUE(
+            a_->openSegment(request.target_id, b_->getSegmentName()).ok());
         const auto route = TransferEngineImplTestPeer::route(*a_, request);
         ASSERT_EQ(route.transport, hint == TCP ? TCP : RDMA);
         ASSERT_EQ(route.staging_params.empty(),

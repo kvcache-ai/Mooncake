@@ -89,8 +89,8 @@ TEST_F(MluPlatformTest, ExternalInteriorPointerOnFreshWorker) {
 TEST_F(MluPlatformTest, ExportsDeviceRangeAndRejectsHostOrEmpty) {
     DmabufExport out;
     uint8_t host[16] = {};
-    EXPECT_TRUE(platform_.exportDmabuf(host, sizeof(host), out)
-                    .IsInvalidArgument());
+    EXPECT_TRUE(
+        platform_.exportDmabuf(host, sizeof(host), out).IsInvalidArgument());
     EXPECT_EQ(out.fd, -1);
     EXPECT_TRUE(platform_.exportDmabuf(device_, 0, out).IsInvalidArgument());
     EXPECT_EQ(out.fd, -1);

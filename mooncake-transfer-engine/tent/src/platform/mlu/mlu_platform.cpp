@@ -257,7 +257,8 @@ Status MluPlatform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
         offset = address - aligned;
         if (offset > std::numeric_limits<size_t>::max() - length ||
             offset + length > std::numeric_limits<size_t>::max() - (page - 1))
-            return Status::InvalidArgument("MLU DMA-BUF size overflow" LOC_MARK);
+            return Status::InvalidArgument(
+                "MLU DMA-BUF size overflow" LOC_MARK);
         export_size = ((offset + length + page - 1) / page) * page;
     }
 
