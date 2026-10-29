@@ -633,6 +633,7 @@ Status RdmaTransport::submitTransferTasks(
             workers_->submit(slice_lists[i], i);
         }
     }
+    if (!request_list.empty()) rdma_batch->notifyProgress();
     return Status::OK();
 }
 

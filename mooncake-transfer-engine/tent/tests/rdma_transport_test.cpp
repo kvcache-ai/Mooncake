@@ -969,6 +969,31 @@ class RdmaPeerRailAllocationTest : public ::testing::TestWithParam<bool> {
     std::vector<char> buffer_ = std::vector<char>(16 * 4096);
 };
 
+TEST_P(RdmaPeerRailAllocationTest, WakesProgressAfterEachPublishedSubmission) {
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    ASSERT_TRUE(transport_.allocateSubBatch(batch_, 2).ok());
+    request_.length = 4096;
+    batch_->progress_batch_id = 123;
+    size_t wakes = 0;
+    batch_->notify_progress = [&](BatchID id) {
+        EXPECT_EQ(id, 123u);
+        EXPECT_TRUE(batch_->needsProgressPolling());
+        auto* rdma_batch = static_cast<RdmaSubBatch*>(batch_);
+        EXPECT_EQ(rdma_batch->task_list.size(), ++wakes);
+        EXPECT_EQ(rdma_batch->slice_chain.size(), wakes);
+        EXPECT_EQ(rdma_batch->task_list.back()->num_slices, 1);
+    };
+
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {}).ok());
+    EXPECT_EQ(wakes, 0u);
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    EXPECT_EQ(wakes, 1u);
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    EXPECT_EQ(wakes, 2u);
+    EXPECT_FALSE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    EXPECT_EQ(wakes, 2u);
+}
+
 TEST_P(RdmaPeerRailAllocationTest, AggregateExcludesUnpairedLocalNic) {
     ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
     size_t count = 0;
