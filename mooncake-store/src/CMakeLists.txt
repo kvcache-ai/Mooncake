@@ -375,14 +375,14 @@ endif()
 # configuration so unit tests can exercise it without SPDK; both mooncake_store
 # and mooncake_nof_spdk link it (the latter cannot link mooncake_store — that
 # would be a cycle).
-add_library(mooncake_nof_core STATIC nof/page_registry.cpp
-                                     nof/probe_context_pool.cpp
-                                     config/spdk_controller_config.cpp)
+add_library(
+  mooncake_nof_core STATIC nof/page_registry.cpp nof/probe_context_pool.cpp
+                           config/spdk_controller_config.cpp)
 target_include_directories(mooncake_nof_core
                            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-target_link_libraries(mooncake_nof_core
-                      PUBLIC glog::glog yalantinglibs::yalantinglibs
-                             cachelib_memory_allocator mooncake_common)
+target_link_libraries(
+  mooncake_nof_core PUBLIC glog::glog yalantinglibs::yalantinglibs
+                           cachelib_memory_allocator mooncake_common)
 
 if(USE_NOF)
   set(SPDK_INCLUDE_DIR
@@ -476,11 +476,10 @@ if(USE_NOF)
   target_include_directories(
     mooncake_nof_spdk
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SPDK_INCLUDE_DIR}
-            ${DPDK_INCLUDE_DIR})
-  target_link_libraries(mooncake_nof_spdk
-                        PRIVATE ${SPDK_STATIC_LIBS} glog::glog
-                                mooncake_nof_core yalantinglibs::yalantinglibs)
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
+  target_link_libraries(
+    mooncake_nof_spdk PRIVATE ${SPDK_STATIC_LIBS} glog::glog mooncake_nof_core
+                              yalantinglibs::yalantinglibs)
 
   # spdk_mem_register (SPDK >= 22.05) compile-time probe.
   # CMAKE_TRY_COMPILE_TARGET_TYPE was added in CMake 3.6 (project requires
@@ -489,10 +488,8 @@ if(USE_NOF)
   set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
   include(CheckCXXSourceCompiles)
   set(CMAKE_REQUIRED_INCLUDES ${SPDK_INCLUDE_DIR})
-  check_cxx_source_compiles(
-    "#include <spdk/env.h>
-     int main() { (void)&spdk_mem_register; return 0; }"
-    HAVE_SPDK_MEM_REGISTER)
+  check_cxx_source_compiles("#include <spdk/env.h>
+     int main() { (void)&spdk_mem_register; return 0; }" HAVE_SPDK_MEM_REGISTER)
   unset(CMAKE_REQUIRED_INCLUDES)
   unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
   if(HAVE_SPDK_MEM_REGISTER)
@@ -500,11 +497,10 @@ if(USE_NOF)
                                PRIVATE HAVE_SPDK_MEM_REGISTER=1)
   else()
     message(
-      WARNING
-      "spdk_mem_register not found under ${SPDK_INCLUDE_DIR} "
-      "(SPDK < 22.05?). NoF-over-RDMA user-buffer registration (#3131) "
-      "will remain unfixed: pure-NoF writes over RDMA will fail with "
-      "'No translation for ptr' errors.")
+      WARNING "spdk_mem_register not found under ${SPDK_INCLUDE_DIR} "
+              "(SPDK < 22.05?). NoF-over-RDMA user-buffer registration (#3131) "
+              "will remain unfixed: pure-NoF writes over RDMA will fail with "
+              "'No translation for ptr' errors.")
   endif()
 endif()
 
