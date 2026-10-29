@@ -1,4 +1,12 @@
 find_package(CUDAToolkit REQUIRED)
+# Set defaults locally: CUDA may already be enabled in a sibling directory.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
+  if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+    set(CMAKE_CUDA_ARCHITECTURES 80 90 103)
+  else()
+    set(CMAKE_CUDA_ARCHITECTURES 80 90)
+  endif()
+endif()
 enable_language(CUDA)
 
 pybind11_add_module(_engram_cuda engram_local_cuda.cpp engram_local_cuda.cu)
