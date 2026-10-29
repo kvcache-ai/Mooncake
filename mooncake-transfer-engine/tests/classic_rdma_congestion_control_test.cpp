@@ -494,6 +494,158 @@ TEST(ClassicRdmaCongestionControlTest, BatchPrepareSharesOneRouteWindow) {
     EXPECT_EQ(queued.size(), 2u);
 }
 
+TEST(ClassicRdmaCongestionControlTest,
+     ActiveRouteDefersPartialReplenishmentWithoutLeakingPermits) {
+    adaptive_congestion_control::Config config;
+    config.mode = adaptive_congestion_control::Mode::kEnforce;
+    config.min_window_bytes = 64;
+    config.max_window_bytes = 64;
+    ClassicRdmaCongestionControl adapter(config);
+    Transport::Slice active{};
+    active.length = 48;
+    std::vector<Transport::Slice *> initial{&active};
+    adapter.prepare(initial, "peer@nic");
+    ASSERT_EQ(adapter.gate(initial), 1u);
+
+    Transport::Slice first{}, second{};
+    Transport::TransferTask task{};
+    task.slice_count = 1;
+    first.task = &task;
+    first.length = second.length = 16;
+    std::vector<Transport::Slice *> queued{&first, &second};
+    adapter.prepare(queued, "peer@nic");
+    for (int retry = 0; retry < 3; ++retry) {
+        EXPECT_EQ(adapter.gate(queued), 0u);
+        EXPECT_FALSE(first.rdma_congestion_control_permit.active());
+        EXPECT_FALSE(second.rdma_congestion_control_permit.active());
+        EXPECT_TRUE(first.rdma_congestion_control_observed_blocked.load());
+    }
+
+    adapter.releaseUnposted(&active);
+    EXPECT_EQ(adapter.gate(queued), 2u);
+    EXPECT_FALSE(first.rdma_congestion_control_observed_blocked.load());
+    adapter.releaseUnposted(&first);
+    adapter.releaseUnposted(&second);
+}
+
+TEST(ClassicRdmaCongestionControlTest, ActiveRouteAdmitsCompleteShortTail) {
+    adaptive_congestion_control::Config config;
+    config.mode = adaptive_congestion_control::Mode::kEnforce;
+    config.min_window_bytes = config.max_window_bytes = 64;
+    ClassicRdmaCongestionControl adapter(config);
+    Transport::Slice active{}, tail{};
+    active.length = 48;
+    tail.length = 16;
+    std::vector<Transport::Slice *> initial{&active}, queued{&tail};
+    adapter.prepare(initial, "peer@nic");
+    adapter.prepare(queued, "peer@nic");
+    ASSERT_EQ(adapter.gate(initial), 1u);
+    EXPECT_EQ(adapter.gate(queued), 1u);
+    adapter.releaseUnposted(&active);
+    adapter.releaseUnposted(&tail);
+}
+
+TEST(ClassicRdmaCongestionControlTest,
+     ActiveRouteRetainsWholeReplenishmentGroups) {
+    adaptive_congestion_control::Config config;
+    config.mode = adaptive_congestion_control::Mode::kEnforce;
+    config.min_window_bytes = 64;
+    config.max_window_bytes = 128;
+    ClassicRdmaCongestionControl adapter(config);
+    Transport::Slice completed{};
+    completed.length = 16;
+    std::vector<Transport::Slice *> growth{&completed};
+    adapter.prepare(growth, "peer@nic");
+    for (uint64_t epoch = 1; epoch <= 4; ++epoch) {
+        ASSERT_EQ(adapter.gate(growth), 1u);
+        adapter.complete(&completed, IBV_WC_SUCCESS);
+        adapter.tick(epoch);
+    }
+    Transport::Slice active{};
+    active.length = 48;
+    std::vector<Transport::Slice *> initial{&active};
+    adapter.prepare(initial, "peer@nic");
+    ASSERT_EQ(adapter.gate(initial), 1u);
+    Transport::Slice slices[6]{};
+    std::vector<Transport::Slice *> queued;
+    for (auto &slice : slices) {
+        slice.length = 16;
+        queued.push_back(&slice);
+    }
+    adapter.prepare(queued, "peer@nic");
+    EXPECT_EQ(adapter.gate(queued), 4u);
+    for (size_t i = 0; i < queued.size(); ++i) {
+        EXPECT_EQ(queued[i]->rdma_congestion_control_permit.active(), i < 4);
+        adapter.releaseUnposted(queued[i]);
+    }
+    adapter.releaseUnposted(&active);
+}
+
+TEST(ClassicRdmaCongestionControlTest,
+     MixedRoutesDoNotCoalescePartialAdmission) {
+    adaptive_congestion_control::Config config;
+    config.mode = adaptive_congestion_control::Mode::kEnforce;
+    config.min_window_bytes = 64;
+    config.max_window_bytes = 64;
+    ClassicRdmaCongestionControl adapter(config);
+    Transport::Slice active{}, first{}, second{};
+    active.length = 32;
+    first.length = 16;
+    second.length = 32;
+    std::vector<Transport::Slice *> initial{&active}, queued{&first, &second};
+    adapter.prepare(initial, "peer@nic");
+    adapter.prepare(&first, "peer@nic");
+    adapter.prepare(&second, "other@nic");
+    ASSERT_EQ(adapter.gate(initial), 1u);
+    EXPECT_EQ(adapter.gate(queued), 1u);
+    adapter.releaseUnposted(&active);
+    adapter.releaseUnposted(&first);
+}
+
+TEST(ClassicRdmaCongestionControlTest,
+     ReplenishmentKeepsIndivisibleSliceGroups) {
+    adaptive_congestion_control::Config config;
+    config.mode = adaptive_congestion_control::Mode::kEnforce;
+    config.min_window_bytes = config.max_window_bytes = 64;
+    ClassicRdmaCongestionControl adapter(config);
+    Transport::Slice active{}, slices[3]{};
+    active.length = 16;
+    std::vector<Transport::Slice *> initial{&active}, queued;
+    adapter.prepare(initial, "peer@nic");
+    ASSERT_EQ(adapter.gate(initial), 1u);
+    for (auto &slice : slices) {
+        slice.length = 24;
+        queued.push_back(&slice);
+    }
+    adapter.prepare(queued, "peer@nic");
+    EXPECT_EQ(adapter.gate(queued), 2u);
+    for (auto *slice : queued) adapter.releaseUnposted(slice);
+    adapter.releaseUnposted(&active);
+}
+
+TEST(ClassicRdmaCongestionControlTest, OffAndObserveDoNotGroupReplenishment) {
+    for (auto mode : {adaptive_congestion_control::Mode::kOff,
+                      adaptive_congestion_control::Mode::kObserve}) {
+        adaptive_congestion_control::Config config;
+        config.mode = mode;
+        config.min_window_bytes = config.max_window_bytes = 64;
+        ClassicRdmaCongestionControl adapter(config);
+        Transport::Slice active{}, first{}, second{};
+        active.length = 48;
+        first.length = second.length = 16;
+        std::vector<Transport::Slice *> empty, initial{&active};
+        std::vector<Transport::Slice *> queued{&first, &second};
+        EXPECT_EQ(adapter.gate(empty), 0u);
+        adapter.prepare(initial, "peer@nic");
+        adapter.prepare(queued, "peer@nic");
+        ASSERT_EQ(adapter.gate(initial), 1u);
+        EXPECT_EQ(adapter.gate(queued), 2u);
+        adapter.releaseUnposted(&active);
+        adapter.releaseUnposted(&first);
+        adapter.releaseUnposted(&second);
+    }
+}
+
 TEST(ClassicRdmaCongestionControlTest, CompletionLetsRetryReacquire) {
     adaptive_congestion_control::Config config;
     config.mode = adaptive_congestion_control::Mode::kEnforce;

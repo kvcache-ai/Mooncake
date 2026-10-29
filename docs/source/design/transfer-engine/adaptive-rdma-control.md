@@ -61,6 +61,13 @@ domain is empty, it may admit one slice larger than its current window. The full
 slice length is reserved and prevents additional over-window admission until
 it drains. The window is not an absolute transfer-size limit.
 
+In Classic TE enforce mode, a partially admitted queue on an already-active
+single route replenishes in groups bounded by the configured minimum window,
+without splitting slices. Unsubmitted permits are returned, and those slices
+remain deferred in task status. Idle routes, fully admitted tails, mixed-route
+queues, and off/observe modes do not wait for a replenishment group. This is a
+posting-granularity optimization, not an additional pressure or recovery rule.
+
 ## Pressure and recovery
 
 Ordinary backlog and estimated drain time do not shrink the window or prevent

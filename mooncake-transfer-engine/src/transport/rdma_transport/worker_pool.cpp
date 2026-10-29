@@ -214,13 +214,20 @@ void ClassicRdmaCongestionControl::retireEndpoint(
 }
 
 size_t ClassicRdmaCongestionControl::gate(SliceList &queued) {
-    if (!enabled()) return queued.size();
+    if (!enabled() || queued.empty()) return queued.size();
     size_t admitted_count = 0;
     size_t cursor = 0;
+    auto *first_route = static_cast<RouteState *>(
+        queued.front()->rdma_congestion_control_route);
+    bool coalesce = mode_ == adaptive_congestion_control::Mode::kEnforce &&
+                    first_route != nullptr &&
+                    adaptive_congestion_control::snapshot(first_route->domain)
+                            .inflight_bytes != 0;
     while (cursor < queued.size()) {
         auto *slice = queued[cursor];
         auto *state =
             static_cast<RouteState *>(slice->rdma_congestion_control_route);
+        if (state != first_route) coalesce = false;
         if (state == nullptr) {
             std::swap(queued[admitted_count++], queued[cursor++]);
             continue;
@@ -238,7 +245,6 @@ size_t ClassicRdmaCongestionControl::gate(SliceList &queued) {
                 state->endpoint.load(std::memory_order_acquire);
             slice->rdma_congestion_control_endpoint_generation =
                 state->endpoint_generation.load(std::memory_order_acquire);
-            resolveCongestion(slice);
             std::swap(queued[admitted_count++], queued[cursor++]);
         } else {
             if (evidence.reason ==
@@ -255,7 +261,36 @@ size_t ClassicRdmaCongestionControl::gate(SliceList &queued) {
             ++cursor;
         }
     }
-    return admitted_count;
+    size_t retained = admitted_count;
+    // Group an active route's partial replenishment; idle routes and fully
+    // admitted tails always make progress.
+    if (coalesce && admitted_count != queued.size()) {
+        retained = 0;
+        uint64_t bytes = 0;
+        for (size_t i = 0; i < admitted_count; ++i) {
+            bytes += std::min<uint64_t>(queued[i]->length,
+                                        config_.min_window_bytes - bytes);
+            if (bytes == config_.min_window_bytes ||
+                (i + 1 < queued.size() &&
+                 queued[i + 1]->length > config_.min_window_bytes - bytes)) {
+                retained = i + 1;
+                bytes = 0;
+            }
+        }
+        for (size_t i = retained; i < admitted_count; ++i) {
+            releaseUnposted(queued[i]);
+            recordCongestion(
+                queued[i],
+                adaptive_congestion_control::snapshot(first_route->domain),
+                first_route->peer_nic_path, TaskCongestionReason::kByteWindow,
+                TaskCongestionFailureScope::kRoute);
+        }
+    }
+    for (size_t i = 0; i < retained; ++i) {
+        if (queued[i]->rdma_congestion_control_route)
+            resolveCongestion(queued[i]);
+    }
+    return retained;
 }
 
 void ClassicRdmaCongestionControl::observeUnavailable(
