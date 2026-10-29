@@ -278,6 +278,29 @@ TEST_F(MasterServiceEvictScenarioTest, EvictsExactOldestObjectsAtLowRatio) {
         .Then(IndexedObjects(kExpectedEvicted, kObjectCount).AreReadable());
 }
 
+// A put of an object the store already holds renews its lease, as a read does:
+// the oldest object, put again, is no longer the first to go.
+TEST_F(MasterServiceEvictScenarioTest, PutOfHeldObjectRenewsItsEvictionRank) {
+    constexpr size_t kObjectCount = 400;
+    constexpr size_t kExpectedEvicted = 20;
+
+    MasterScenario scenario("a put of a held object renews its rank",
+                            EvictConfig());
+    scenario.Given(MemoryNode("memory").Capacity(256 * 1024 * 1024))
+        .Given(IndexedObjects(0, kObjectCount)
+                   .Size(kObjectSize)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase()))
+        .When(PutStart(Key(0), kObjectSize)
+                  .ExpectError(ErrorCode::OBJECT_ALREADY_EXISTS))
+        .When(EvictMemory(0.05))
+        .Then(ReadableCount(IndexedObjects(0, kObjectCount),
+                            kObjectCount - kExpectedEvicted))
+        .Then(Object(Key(0)).IsReadable())
+        .Then(IndexedObjects(1, kExpectedEvicted + 1).DoNotExist())
+        .Then(IndexedObjects(kExpectedEvicted + 1, kObjectCount).AreReadable());
+}
+
 TEST_F(MasterServiceEvictScenarioTest, TargetEqualsLowerBoundEvictsExactCount) {
     constexpr size_t kObjectCount = 250;
     constexpr size_t kExpectedEvicted = 25;

@@ -5286,6 +5286,12 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             if (metadata.HasReplica(&Replica::fn_is_completed) ||
                 metadata.put_start_time + put_start_discard_timeout_sec_ >=
                     now) {
+                // A put of what the store already holds is a read of it: the
+                // writer just showed the object is still wanted.
+                if (HasReadableReplica(metadata)) {
+                    metadata.GrantReadLease(
+                        std::chrono::milliseconds(default_kv_lease_ttl_));
+                }
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
             if (enable_oplog_ && ordered_oplog_writer_) {
