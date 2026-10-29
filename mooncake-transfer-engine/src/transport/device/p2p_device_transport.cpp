@@ -37,6 +37,16 @@ namespace device {
 
 namespace {
 
+bool envEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return false;
+    std::string s(value);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s == "1" || s == "on" || s == "true" || s == "yes";
+}
+
 #if defined(USE_CUDA)
 bool supportFabricMem() {
     const char* nvlink_ipc = std::getenv("MC_USE_NVLINK_IPC");
@@ -807,6 +817,8 @@ class P2pDeviceTransportImpl : public P2pTransport {
         std::vector<int32_t> available(num_ranks_, 0);
         available[rank] = 1;
         peer_ptrs_host_[rank] = local_ptr;
+        const bool allow_cross_node_p2p =
+            envEnabled("MC_DEVICE_API_P2P_ALLOW_CROSS_LOGICAL_NODE");
 
 #if defined(USE_CUDA)
         if (use_fabric_mem_) {
@@ -900,17 +912,38 @@ class P2pDeviceTransportImpl : public P2pTransport {
         int group_start = node_id * device_count;
         int group_end = std::min(group_start + device_count, num_ranks_);
 
-        for (int dst = group_start; dst < group_end; ++dst) {
+        const int peer_start = allow_cross_node_p2p ? 0 : group_start;
+        const int peer_end = allow_cross_node_p2p ? num_ranks_ : group_end;
+        if (allow_cross_node_p2p) {
+            LOG(INFO) << "[EP P2P] allowing cross-logical-node IPC probing";
+        }
+
+        for (int dst = peer_start; dst < peer_end; ++dst) {
             if (active_ranks_mask[dst] == 0) continue;
             if (dst == rank) continue;
 
             int dst_device = dst % device_count;
-            int can_access = 0;
-            cudaDeviceCanAccessPeer(&can_access, device_id, dst_device);
-            LOG(INFO) << "[EP P2P] rank " << rank << " (device " << device_id
-                      << ") -> rank " << dst << " (device " << dst_device
-                      << "): canAccessPeer=" << can_access;
-            if (!can_access) continue;
+            if (!allow_cross_node_p2p) {
+                int can_access = 0;
+                cudaDeviceCanAccessPeer(&can_access, device_id, dst_device);
+                LOG(INFO) << "[EP P2P] rank " << rank << " (device "
+                          << device_id << ") -> rank " << dst
+                          << " (device " << dst_device
+                          << "): canAccessPeer=" << can_access;
+                if (!can_access) continue;
+
+                cudaError_t err = cudaDeviceEnablePeerAccess(dst_device, 0);
+                if (err != cudaSuccess &&
+                    err != cudaErrorPeerAccessAlreadyEnabled) {
+                    LOG(WARNING)
+                        << "[EP P2P] rank " << rank
+                        << " failed to enable peer access to device "
+                        << dst_device << ": " << cudaGetErrorString(err);
+                    continue;
+                }
+                if (err == cudaErrorPeerAccessAlreadyEnabled)
+                    cudaGetLastError();
+            }
 
 #ifdef USE_MACA
             int src_physical = physicalDeviceFromVisibleList(device_id);
@@ -926,16 +959,6 @@ class P2pDeviceTransportImpl : public P2pTransport {
             }
 #endif
 
-            cudaError_t err = cudaDeviceEnablePeerAccess(dst_device, 0);
-            if (err != cudaSuccess &&
-                err != cudaErrorPeerAccessAlreadyEnabled) {
-                LOG(WARNING) << "[EP P2P] rank " << rank
-                             << " failed to enable peer access to device "
-                             << dst_device << ": " << cudaGetErrorString(err);
-                continue;
-            }
-            if (err == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
-
             if (dst >= static_cast<int>(remote_handles.size())) continue;
             const auto& h = remote_handles[dst];
             if (h.empty()) continue;
@@ -943,6 +966,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
             constexpr size_t kHandleBytes = sizeof(cudaIpcMemHandle_t);
             constexpr size_t kNumInt32s =
                 (kHandleBytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+            cudaError_t err;
 #ifdef USE_MACA
             std::string ipc_mode = macaIpcMode();
             if (ipc_mode == "cross-v2" || ipc_mode == "cross_v2") {
@@ -1010,7 +1034,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
             }
         }
         // Multi-node: P2P only within a node
-        if (all_peers_accessible_ && num_ranks_ > 1) {
+        if (!allow_cross_node_p2p && all_peers_accessible_ && num_ranks_ > 1) {
             int first_node = 0 / device_count;
             int last_node = (num_ranks_ - 1) / device_count;
             if (first_node != last_node) all_peers_accessible_ = false;
