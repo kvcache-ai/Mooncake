@@ -986,6 +986,19 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
+    // Same order as MountSegment: master_state_mutex_ before segment access.
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+    if (IsNoFSegmentQuarantined(segment)) {
+        // A standby restore left replicas pointing into this namespace whose
+        // ranges this mount would treat as free. Fail closed: serving the
+        // mount would let a fresh allocation alias a live descriptor.
+        LOG(ERROR) << "NoF segment mount: client_id=" << client_id
+                   << ", segment_name=" << segment.name
+                   << ", endpoint=" << segment.te_endpoint
+                   << ", error=endpoint_quarantined_by_standby_restore";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
     ScopedNoFSegmentAccess nof_segment_access =
         nof_segment_manager_.getNoFSegmentAccess();
 
@@ -1002,6 +1015,11 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
     }
     return {};
 #endif
+}
+
+bool MasterService::IsNoFSegmentQuarantined(const NoFSegment& segment) const {
+    return invalid_nof_replica_endpoints_.contains(segment.te_endpoint) ||
+           invalid_nof_replica_endpoints_.contains(segment.name);
 }
 
 ErrorCode MasterService::ValidateStandbyRemountSegment(
@@ -1383,6 +1401,19 @@ auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
+    // Same order as MountSegment: master_state_mutex_ before segment access.
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+    for (const auto& segment : segments) {
+        if (IsNoFSegmentQuarantined(segment)) {
+            LOG(ERROR) << "NoF segment remount: client_id=" << client_id
+                       << ", segment_name=" << segment.name
+                       << ", endpoint=" << segment.te_endpoint
+                       << ", error=endpoint_quarantined_by_standby_restore";
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
+
     ScopedNoFSegmentAccess nof_segment_access =
         nof_segment_manager_.getNoFSegmentAccess();
     ErrorCode err = nof_segment_access.ReMountSegment(segments, client_id);
@@ -3730,6 +3761,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
         restored_allocators;
     std::unordered_set<std::string> restored_invalid_endpoints;
+    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
+        restored_nof_allocators;
+    std::unordered_set<std::string> restored_invalid_nof_endpoints;
     for (const auto& seg : segments) {
         if (!seg.is_memory_segment) {
             continue;
@@ -3921,13 +3955,33 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                                    << ", key=" << user_key;
                         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                     }
+                    // A NoF descriptor points at a physical offset inside a
+                    // remote NVMe namespace, and the namespace allocator
+                    // state is not part of the snapshot. The next NoF mount
+                    // builds an empty allocator over the whole namespace and
+                    // would consider this offset free, so the restored replica
+                    // must not be served and the offset must not be handed out
+                    // again.
+                    //
+                    // Quarantine the endpoint rather than invalidating the
+                    // handle. The placeholder allocator is kept alive, so the
+                    // descriptor stays complete (including transport_endpoint_,
+                    // which get_descriptor() reads off the allocator) and
+                    // has_invalid_nof_handle() stays false, which keeps
+                    // ClearInvalidHandles from reaping the replica. Membership
+                    // in invalid_nof_replica_endpoints_ is what hides it from
+                    // every read path, and MountNoFSegment refuses to mount a
+                    // quarantined namespace, so nothing can alias the offset
+                    // while the descriptor survives for a later import.
                     auto& alloc =
-                        restored_allocators[buffer.transport_endpoint_];
+                        restored_nof_allocators[buffer.transport_endpoint_];
                     if (!alloc) {
                         alloc = std::make_shared<DummyBufferAllocator>(
                             buffer.transport_endpoint_,
                             buffer.transport_endpoint_);
                     }
+                    restored_invalid_nof_endpoints.insert(
+                        buffer.transport_endpoint_);
                     auto restored_buffer =
                         std::make_unique<AllocatedBuffer>(alloc, buffer);
                     replicas.push_back(
@@ -4033,6 +4087,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     const auto prev_standby_memory_segments = standby_memory_segments_;
     const auto prev_standby_allocator_keepalive = standby_allocator_keepalive_;
     const auto prev_invalid_replica_endpoints = invalid_replica_endpoints_;
+    const auto prev_standby_nof_allocator_keepalive =
+        standby_nof_allocator_keepalive_;
+    const auto prev_invalid_nof_replica_endpoints =
+        invalid_nof_replica_endpoints_;
 
     // A failed restore leaves nothing behind: installed keys go back out
     // through the canonical removal, bookkeeping returns to its pre-restore
@@ -4050,6 +4108,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         standby_memory_segments_ = prev_standby_memory_segments;
         standby_allocator_keepalive_ = prev_standby_allocator_keepalive;
         invalid_replica_endpoints_ = prev_invalid_replica_endpoints;
+        standby_nof_allocator_keepalive_ = prev_standby_nof_allocator_keepalive;
+        invalid_nof_replica_endpoints_ = prev_invalid_nof_replica_endpoints;
         for (const auto& [client_id, record] : new_known_owner_records) {
             client_liveness_records_.erase(client_id);
             MasterMetricManager::instance().on_client_liveness_record_removed(
@@ -4062,7 +4122,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         std::move(restored_accounted_memory_bytes);
     standby_memory_segments_ = std::move(restored_memory_segments);
     standby_allocator_keepalive_ = std::move(restored_allocators);
+    standby_nof_allocator_keepalive_ = std::move(restored_nof_allocators);
     invalid_replica_endpoints_ = std::move(restored_invalid_endpoints);
+    invalid_nof_replica_endpoints_ = std::move(restored_invalid_nof_endpoints);
     for (auto& [client_id, record] : new_known_owner_records) {
         // Copy, not move: rollback_restored_state() still needs a valid
         // record (state() for the removal metric) when a later durable
@@ -4207,7 +4269,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
               << " objects, " << segments.size()
               << " segments, initial_seq_id=" << initial_oplog_sequence_id
               << ", invalid_endpoints=" << invalid_replica_endpoints_.size()
-              << ", rejected_objects=" << rejected_count;
+              << ", rejected_objects=" << rejected_count
+              << ", quarantined_nof_endpoints="
+              << invalid_nof_replica_endpoints_.size();
     if (dropped_stale_replica_count > 0) {
         LOG(WARNING) << "Restored from standby dropped "
                      << dropped_stale_replica_count
@@ -4469,13 +4533,22 @@ auto MasterService::BatchReplicaClear(
 }
 
 bool MasterService::IsAwaitingRemount(const Replica& replica) const {
-    // The set is empty outside the window between a standby restore and the
-    // owners' remounts, so the endpoint is looked up only inside it.
-    if (invalid_replica_endpoints_.empty()) {
+    // The sets are empty outside the window between a standby restore and the
+    // owners' remounts (or, for NoF, a later import), so the endpoint is
+    // looked up only inside it.
+    if (invalid_replica_endpoints_.empty() &&
+        invalid_nof_replica_endpoints_.empty()) {
         return false;
     }
     const auto endpoint = replica.transport_endpoint();
-    return endpoint && invalid_replica_endpoints_.contains(*endpoint);
+    if (!endpoint) {
+        return false;
+    }
+    if (replica.is_nof_replica() &&
+        invalid_nof_replica_endpoints_.contains(*endpoint)) {
+        return true;
+    }
+    return invalid_replica_endpoints_.contains(*endpoint);
 }
 
 bool MasterService::TryGetReadableReplicaDescriptor(
@@ -9780,9 +9853,12 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
     uint64_t total_freed_size = 0;
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
 
-    auto is_evictable_nof_replica = [](const Replica& replica) {
+    // Same readability gate as IsEvictableMemoryReplica: a NoF replica on a
+    // quarantined endpoint is kept until a mount can import it, so eviction
+    // must not reclaim its descriptor either.
+    auto is_evictable_nof_replica = [this](const Replica& replica) {
         return replica.is_nof_replica() && replica.is_completed() &&
-               replica.get_refcnt() == 0;
+               IsReplicaReadable(replica) && replica.get_refcnt() == 0;
     };
     auto may_evict = [&](const ObjectMetadata& metadata) {
         return !weight_manager_.IsManagedGroup(metadata.group_id) &&
