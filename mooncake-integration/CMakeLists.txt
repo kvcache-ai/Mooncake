@@ -154,8 +154,8 @@ if(WITH_STORE)
     store/buffer_pool.cpp
     store/engram_store_py.cpp
     integration_utils.h)
-  set_target_properties(
-    store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH "$ORIGIN")
+  set_target_properties(store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH
+                                                              "$ORIGIN")
   if(USE_TENT)
     target_link_libraries(store PRIVATE tent)
   endif()
@@ -167,6 +167,35 @@ if(WITH_STORE)
     target_link_libraries(
       store PUBLIC transfer_engine glog::glog gflags::gflags mooncake_store
                    cachelib_memory_allocator)
+  endif()
+  if(BUILD_UNIT_TESTS)
+    pybind11_add_module(
+      engram_store_test_client tests/engram_store_test_client.cpp
+      store/engram_store_py.cpp)
+    target_link_libraries(
+      engram_store_test_client PRIVATE mooncake_store transfer_engine
+                                       cachelib_memory_allocator glog::glog)
+    add_dependencies(engram_store_test_client mooncake_master)
+    add_test(
+      NAME engram_store_lifetime_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env
+        PYTHONPATH=$<TARGET_FILE_DIR:engram_store_test_client>
+        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:asio_shared>:$<TARGET_FILE_DIR:mooncake_common>:$<TARGET_FILE_DIR:transfer_engine>:${CMAKE_BINARY_DIR}/mooncake-common/etcd
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_engram_store_lifetime.py)
+    add_test(
+      NAME engram_store_create_only_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env
+        PYTHONPATH=${CMAKE_SOURCE_DIR}/python:$<TARGET_FILE_DIR:engram_store_test_client>
+        MOONCAKE_BUILD_DIR=${CMAKE_BINARY_DIR}
+        MOONCAKE_PYTHON_BIN=${Python3_EXECUTABLE}
+        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:asio_shared>:$<TARGET_FILE_DIR:mooncake_common>:$<TARGET_FILE_DIR:transfer_engine>:${CMAKE_BINARY_DIR}/mooncake-common/etcd
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_engram_store_create_only.py)
+    set_tests_properties(engram_store_lifetime_test
+                         engram_store_create_only_test PROPERTIES TIMEOUT 60)
   endif()
 endif()
 

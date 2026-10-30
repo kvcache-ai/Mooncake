@@ -438,6 +438,18 @@ class PyClient {
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
+    // Existing keys must return OBJECT_ALREADY_EXISTS, not idempotent success.
+    // Backends without strict creation support must fail rather than fall back.
+    // Adding this virtual changes the PyClient vtable layout: out-of-tree C++
+    // subclasses must be recompiled, and subclasses that only override
+    // batch_put_from fail closed through this default until they implement it.
+    virtual std::vector<int> batch_put_from_create_only(
+        const std::vector<std::string> &keys, const std::vector<void *> &,
+        const std::vector<size_t> &, const ReplicateConfig &) {
+        return std::vector<int>(keys.size(),
+                                static_cast<int>(ErrorCode::INVALID_PARAMS));
+    }
+
     virtual std::vector<int> batch_put_from_multi_buffers(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,

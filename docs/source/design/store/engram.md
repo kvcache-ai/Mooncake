@@ -14,8 +14,9 @@ or any other model-side Engram algorithm.
 
 ## Current Backend Boundary
 
-EngramStore uses the existing `batch_put_from`, `batch_query`, and
-`get_into_ranges` Store interfaces. It stores one object per head and reads only
+EngramStore writes through the strict `batch_put_from_create_only` path and uses
+the existing `batch_query` and `get_into_ranges` Store interfaces. It stores one
+object per head and reads only
 the requested byte ranges. Lookup is synchronous; the Python binding releases
 the GIL during I/O. There is no model-specific hashing or GPU execution here.
 
@@ -85,10 +86,13 @@ table.lookup_into(1, row_ids, output)
 
 This mode copies selected rows directly from CPU-addressable memory into output;
 it performs no Store metadata queries, registration, or network transfers. The
-Python binding retains the supplied list and arrays. Do not change that list,
-modify/resize the arrays, or truncate/unmap their backing files while bound.
+Python binding retains an independent array-reference snapshot until the
+EngramStore is destroyed; clearing or replacing input-list elements does not
+release the bound arrays. Do not modify/resize the arrays or truncate/unmap
+their backing files while bound.
 Binding a layer twice, binding with a Store client, and lookup of an unbound
-layer are rejected. C++ callers retain ownership of the bound memory.
+layer are rejected. Raw C++ callers must keep bound memory alive; the
+owner-aware overload retains the supplied owner until Store destruction.
 
 Same-host ranks can map the same immutable tmpfs files to share physical pages
 without RDMA. Each rank still owns its staging output. Merely placing data in
@@ -160,15 +164,66 @@ Populate follows the existing Store write path:
 2. validate that every table matches `[N_h, row_bytes]`
 3. verify that the target head-table keys do not already exist
 4. register each embedding table buffer
-5. upload all head tables with `batch_put_from(...)`
+5. upload all head tables with `batch_put_from_create_only(...)`
 6. unregister the staging buffers
 
 `populate(...)` is defined as a create-only operation for the selected layer. To
 reuse a `layer_id`, first remove that layer's old tables with `remove_from_store(layer_id, ...)`. Other layers are unaffected.
 
-If upload fails after some head tables have already been written, or if publish
-finishes but post-write buffer cleanup fails, the backend best-effort removes
-the keys written by the failed populate attempt before returning an error.
+Engram uses a strict create-only write path: an existing key remains an error,
+including when another writer creates it after the existence precheck. Ordinary
+Store Put keeps its existing idempotent behavior. Failed Engram uploads may leave
+partial tables. They do **not** automatically delete keys: without an object
+version/write token, a cleanup cannot prove that the current object belongs to
+this attempt. Explicit removal and reuse require coordination with other writers.
+
+The strict write path is a new `PyClient` virtual method. Adding it changes the
+`PyClient` vtable layout: out-of-tree C++ subclasses must be recompiled, and
+backends that do not implement strict creation fail closed through the default
+implementation instead of falling back to idempotent writes.
+
+Flexible dual-replica configurations (`replica_num=1`, `nof_replica_num=1`,
+`dfs_replica_num=0`) are rejected before registration. Their successful result
+can conceal a timed-out transfer to the other replica, so it cannot establish
+that all accesses to the source buffers have ended.
+
+If upload succeeds but finalization cannot be confirmed, the published tables
+are **kept**: deleting data does not release buffer registrations. The C++ API
+returns `-2`; failed registration or upload with uncertain resource state returns
+`-3`. Failures before registration return `-1`. Failed uploads do not guarantee
+an empty destination.
+
+Python raises an exception for each failure. Before registration it takes an
+independent reference to every input array and copies the replication settings
+while holding the GIL. Later changes to the caller's config do not affect the
+in-flight populate. On `-2` or `-3`, those array references
+are deliberately retained until process exit, independently of the EngramStore
+and Client lifetimes. A failed registration may leave partial registrations, and
+an upload timeout may leave DMA pending even if unregister succeeds; therefore
+later successful cleanup does not reclaim these retained references. Repeated
+failures can accumulate retained memory. Normal successful populate and
+pre-registration failures do not retain arrays beyond the call.
+
+C++ callers can use the owner-aware overload to obtain the same retention
+behavior. Raw-buffer callers must themselves keep all inputs alive on `-2` or
+`-3` until process exit. Do not mutate inputs during upload, or resize, remap or
+explicitly unmap retained inputs.
+
+The fault-injection regression test compiles the real implementation and Python
+binding against a test client, including exception and object-destruction cases:
+
+```bash
+cmake --build build --target engram_store_test_client
+ctest --test-dir build -R '^engram_store_lifetime_test$' --output-on-failure
+```
+
+Configure with `WITH_STORE=ON` and `BUILD_UNIT_TESTS=ON` to enable this test.
+
+Within one EngramStore instance, same-layer populate, binding and removal are
+serialized against lookups. Removal invalidates the snapshot before deleting
+any key, including partial failures and exceptions; in-flight lookups complete
+before a same-instance forced removal starts. Forced mutations through another
+instance/client must be coordinated by the caller.
 
 ## Lookup Flow
 
