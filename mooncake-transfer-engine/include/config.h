@@ -155,11 +155,13 @@ struct GlobalConfig {
     // MC_MAX_CONCURRENT_REG_MR; the best value is platform-specific, see the
     // measured tables in efa_transport.cpp before choosing one.
     size_t max_concurrent_reg_mr = 0;
-    // Which NICs a buffer is registered on in the EFA transport. ALL (default)
-    // registers every buffer on every NIC; LOCAL restricts device memory to the
-    // NICs the topology reports as closest to that GPU. Set via
+    // Which NICs a buffer is registered on in the EFA transport. LOCAL
+    // (default) restricts device memory to the NICs the topology reports as
+    // closest to that GPU -- the only NICs selectDevice() picks for it on a
+    // first attempt anyway; ALL registers every buffer on every NIC. Host
+    // memory is always registered on every NIC. Set via
     // MC_EFA_NIC_SELECTION=all|local; see efa_transport.cpp for the trade-off.
-    EfaNicSelection efa_nic_selection = EfaNicSelection::ALL;
+    EfaNicSelection efa_nic_selection = EfaNicSelection::LOCAL;
     // Cap on EFA CQ poller threads. Set via MC_EFA_CQ_THREADS; 0 disables the
     // cap.
     int efa_cq_threads = 1;
