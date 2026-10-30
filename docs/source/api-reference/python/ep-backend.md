@@ -158,7 +158,7 @@ Arguments:
 
 | Function | Purpose | Notes |
 | --- | --- | --- |
-| `pg.set_host_ip(host_ip)` | Override the host IP used by the backend. | Call before `init_process_group()`. |
+| `pg.set_host_ip(host_ip)` | Override the host IP used by the backend. | Call before `init_process_group()`. Single-node (`MASTER_ADDR` unset or loopback, including the whole `127.0.0.0/8` range such as Debian/Ubuntu `127.0.1.1`) keeps the default `127.0.0.1`. On multi-node jobs (`MASTER_ADDR` is a non-loopback host or hostname) Mooncake PG derives a routable address toward `MASTER_ADDR` (hostname fallback only when that result is also non-loopback); if derivation fails, call `set_host_ip(<node IP>)` or `set_transfer_engine(...)` or initialization fails fast instead of hanging on rank 0. |
 | `pg.set_device_filter(filters)` | Restrict NIC/HCA selection. | Call before `init_process_group()`. |
 | `pg.set_transfer_engine(engine)` | Reuse an external `TransferEngine`. | The engine must outlive all process groups. |
 | `pg.get_active_ranks(backend)` | Return the backend active-rank tensor. | Used by EP fallback and recovery paths. |

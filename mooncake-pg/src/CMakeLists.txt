@@ -148,6 +148,7 @@ add_library(
   mooncake_pg.cpp
   mooncake_worker_host.cpp
   mooncake_worker_thread.cpp
+  pg_host_ip_resolve.cpp
   p2p_proxy.cpp)
 
 # The initial collective v2 runtime implementation is CUDA-only.
