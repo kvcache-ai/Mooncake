@@ -28,7 +28,6 @@
 #include "p2p/client/tiered_cache/tiered_backend.h"
 #include "test_p2p_server_helpers.h"
 #include "types.h"
-#include "../utils/common.h"
 
 namespace mooncake {
 namespace test {
@@ -149,9 +148,10 @@ class MetadataRecoveryWorkerTest : public ::testing::Test {
         }
 
         auto tiered_backend = std::make_unique<TieredBackend>();
-        auto init_result = InitTieredBackendForTest(*tiered_backend, config);
+        auto init_result =
+            tiered_backend->Init(config, nullptr, nullptr, nullptr, nullptr);
         if (!init_result.has_value()) {
-            ADD_FAILURE() << "InitTieredBackendForTest failed: "
+            ADD_FAILURE() << "TieredBackend::Init failed: "
                           << init_result.error();
             return std::nullopt;
         }

@@ -3,8 +3,8 @@
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <thread>
 
@@ -29,7 +29,7 @@ void RemoveClient(RealClient& rc, const UUID& id) {
 
 // A client absent from the map (never registered, or dropped) gets
 // DISCONNECTION; a mapped client gets HEALTH.
-TEST(RealClientRemountTest, PingStatusFollowsMapPresence) {
+TEST(RealClientShmPingTest, PingStatusFollowsMapPresence) {
     RealClient rc;
     UUID id{1, 2};
 
@@ -38,11 +38,11 @@ TEST(RealClientRemountTest, PingStatusFollowsMapPresence) {
     AddClient(rc, id);
     EXPECT_EQ(rc.ping(id).value().status, DummyClientStatus::HEALTH);
 
-    // Simulate the monitor dropping the client's segments.
+    // Erase the context directly to simulate a missing map entry.
     RemoveClient(rc, id);
     EXPECT_EQ(rc.ping(id).value().status, DummyClientStatus::DISCONNECTION);
 
-    // Re-registration makes it healthy again.
+    // Reinsert an empty context to restore the map entry.
     AddClient(rc, id);
     EXPECT_EQ(rc.ping(id).value().status, DummyClientStatus::HEALTH);
 }
@@ -51,7 +51,7 @@ TEST(RealClientRemountTest, PingStatusFollowsMapPresence) {
 // so the dummy can detect a partial loss (present but under-mapped) and
 // re-register. mapped_shm_count is 0 when absent and tracks
 // mapped_shms_.size().
-TEST(RealClientRemountTest, PingReportsMappedShmCount) {
+TEST(RealClientShmPingTest, PingReportsMappedShmCount) {
     RealClient rc;
     UUID id{5, 6};
 
@@ -81,7 +81,7 @@ TEST(RealClientRemountTest, PingReportsMappedShmCount) {
 }
 
 // Mapped and unmapped clients are reported independently.
-TEST(RealClientRemountTest, PingStatusIsPerClient) {
+TEST(RealClientShmPingTest, PingStatusIsPerClient) {
     RealClient rc;
     UUID mapped{1, 2};
     UUID absent{3, 4};
@@ -91,46 +91,31 @@ TEST(RealClientRemountTest, PingStatusIsPerClient) {
     EXPECT_EQ(rc.ping(absent).value().status, DummyClientStatus::DISCONNECTION);
 }
 
-// ping() must take dummy_client_mutex_ in SHARED mode, so a concurrent reader
-// (another ping, or a put/get doing find_shm_context) never blocks a heartbeat.
-// If ping mistakenly took the lock exclusively, this call would block behind
-// the reader below and the test would time out.
-TEST(RealClientRemountTest, PingNotBlockedByConcurrentReader) {
+// ping() must finish while another reader holds the shared map lock.
+// Release the reader before checking or collecting the async result,
+// including when the wait times out.
+TEST(RealClientShmPingTest, PingNotBlockedByConcurrentReader) {
     RealClient rc;
     UUID id{7, 8};
 
-    std::atomic<bool> locked{false};
-    std::atomic<bool> release{false};
-    std::thread reader([&] {
-        SharedMutexLocker lock(&RealClientTestHelper::ShmMutex(rc),
-                               shared_lock);
-        locked.store(true);
-        while (!release.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
-    });
-
-    while (!locked.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // Keep the future outside the lock scope so unwinding unlocks first.
+    std::future<tl::expected<DummyHeartbeatResponse, ErrorCode>> pending;
+    std::future_status status;
+    {
+        SharedMutexLocker reader(&RealClientTestHelper::ShmMutex(rc),
+                                 shared_lock);
+        pending = std::async(std::launch::async, [&] { return rc.ping(id); });
+        status = pending.wait_for(std::chrono::seconds(5));
     }
 
-    auto start = std::chrono::steady_clock::now();
-    auto r = rc.ping(id);
-    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - start)
-                          .count();
-
-    EXPECT_TRUE(r.has_value());
-    EXPECT_LT(elapsed_ms, 200);
-
-    release.store(true);
-    reader.join();
+    EXPECT_EQ(status, std::future_status::ready);
+    auto result = pending.get();
+    EXPECT_TRUE(result.has_value());
 }
 
-// Concurrent add/remove/ping across many threads must be race-free (run under
-// TSan). shm_contexts_ is guarded by dummy_client_mutex_; ping reads it under a
-// shared lock while add/remove take it exclusively.
-TEST(RealClientRemountTest, PingConcurrentWithMapMutation) {
+// Concurrent map/ping smoke test; TSan checks races on the executed paths.
+// Each thread owns its UUID, so its expected ping status is deterministic.
+TEST(RealClientShmPingTest, PingConcurrentWithMapMutation) {
     RealClient rc;
     constexpr int kThreads = 8;
     constexpr int kIters = 2000;
@@ -147,6 +132,9 @@ TEST(RealClientRemountTest, PingConcurrentWithMapMutation) {
                 }
                 auto r = rc.ping(id);
                 ASSERT_TRUE(r.has_value());
+                EXPECT_EQ(r.value().status,
+                          (i & 1) ? DummyClientStatus::HEALTH
+                                  : DummyClientStatus::DISCONNECTION);
             }
         });
     }

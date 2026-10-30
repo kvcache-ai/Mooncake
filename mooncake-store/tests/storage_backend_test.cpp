@@ -4,6 +4,8 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <iostream>
+#include <ranges>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -165,8 +167,8 @@ TEST_F(StorageBackendTest, StorageBackendAll) {
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
     std::vector<int64_t> buckets;
-    ASSERT_TRUE(mooncake::BatchOffloadUtil(storage_backend, keys, sizes,
-                                           test_data, buckets));
+    ASSERT_TRUE(
+        BatchOffloadUtil(storage_backend, keys, sizes, test_data, buckets));
 
     std::unordered_map<std::string, StorageObjectMetadata>
         batche_object_metadata;
@@ -220,8 +222,8 @@ TEST_F(StorageBackendTest, BucketScan) {
     std::vector<int64_t> sizes;
     std::vector<int64_t> buckets;
     std::unordered_map<std::string, std::string> batch_data;
-    ASSERT_TRUE(mooncake::BatchOffloadUtil(storage_backend, keys, sizes,
-                                           batch_data, buckets));
+    ASSERT_TRUE(
+        BatchOffloadUtil(storage_backend, keys, sizes, batch_data, buckets));
     std::vector<std::string> scan_keys;
     std::vector<StorageObjectMetadata> scan_metadatas;
     std::vector<int64_t> scan_buckets;

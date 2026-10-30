@@ -795,10 +795,10 @@ P2PClientMetric::P2PClientMetric(
     }
 }
 
-P2PClientMetric::~P2PClientMetric() { StopMetricsReportingThread(); }
+P2PClientMetric::~P2PClientMetric() { StopMetricReporting(); }
 
 void P2PClientMetric::StartMetricReporting(uint64_t interval_seconds) {
-    StopMetricsReportingThread();
+    StopMetricReporting();
     metrics_interval_seconds_ = interval_seconds;
     if (metrics_interval_seconds_ > 0) {
         StartMetricsReportingThread();
@@ -832,7 +832,7 @@ void P2PClientMetric::StartMetricsReportingThread() {
     });
 }
 
-void P2PClientMetric::StopMetricsReportingThread() {
+void P2PClientMetric::StopMetricReporting() {
     should_stop_metrics_thread_ = true;
     if (metrics_reporting_thread_.joinable()) {
         LOG(INFO) << "Waiting for client metrics reporting thread to join...";
@@ -840,6 +840,7 @@ void P2PClientMetric::StopMetricsReportingThread() {
         metrics_reporting_thread_.join();
         LOG(INFO) << "Client metrics reporting thread joined";
     }
+    metrics_interval_seconds_ = 0;
 }
 
 ClientMetricSnapshot P2PClientMetric::BuildSyncSnapshot() {

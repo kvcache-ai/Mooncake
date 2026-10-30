@@ -111,7 +111,6 @@ def create_store_connection():
             client_rpc_port=0,
             enable_http_server=False,
             enable_metric_collection=False,
-            runtime_config='{"write":{"remote_weight":0.0}}',
         )
     else:
         rc = store.setup(
@@ -131,7 +130,6 @@ def create_write_config():
     """Select the write policy for this single-client test deployment."""
     if IS_P2P:
         config = P2PWriteRouteConfig()
-        config.remote_weight = 0.0
     else:
         config = ReplicateConfig()
         config.replica_num = 1
@@ -189,7 +187,7 @@ class MooncakeTestBase(unittest.TestCase):
 
         # 2. [Critical] Clean environment before the test starts
         # This ensures no stale data from previous tests affects the current one
-        self.store.remove_all()
+        self.assertGreaterEqual(self.store.remove_all(force=True), 0)
 
 # ==========================================
 #  Functional Tests
@@ -642,7 +640,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         print(f"--- Running Standard Batch Benchmark ({self.BENCH_ITERATIONS} iters) ---")
         for i in range(self.BENCH_ITERATIONS):
             # Clean store before each iteration for "cold" writes
-            self.store.remove_all()
+            self.assertGreaterEqual(self.store.remove_all(force=True), 0)
 
             # Measure Put
             t0 = time.perf_counter()
@@ -667,7 +665,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
 
         print(f"--- Running TP Batch Benchmark (TP={tp_size}) ---")
         for i in range(self.BENCH_ITERATIONS):
-            self.store.remove_all()
+            self.assertGreaterEqual(self.store.remove_all(force=True), 0)
 
             # Measure TP Put (Auto-chunking)
             t0 = time.perf_counter()
@@ -684,12 +682,10 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         self._print_perf(f"TP Batch Put (TP={tp_size})", put_times)
         self._print_perf(f"TP Batch Get (TP={tp_size})", get_times)
 
-    # TODO(#4849): Re-enable P2P coverage once global remove/remove_all is implemented.
-    @unittest.skipIf(IS_P2P, "P2P global remove/remove_all is not implemented yet")
     def test_benchmark_03_batch_put_get_into(self):
         """Benchmark: Zero copy Batch Get."""
-        self.store.remove_all()
-        buffer_spacing = 300 * 1024 * 1024  # 300MB per tensor slot
+        self.assertGreaterEqual(self.store.remove_all(force=True), 0)
+        buffer_spacing = (self.TENSOR_SIZE_MB + 1) * 1024 * 1024
         batch_size = len(self.keys)
         total_buffer_size = buffer_spacing * batch_size
 
@@ -716,7 +712,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
 
         for i in range(self.BENCH_ITERATIONS):
             # Clean store before each iteration for "cold" writes
-            self.store.remove_all()
+            self.assertGreaterEqual(self.store.remove_all(force=True), 0)
 
             # Measure Put
             t0 = time.perf_counter()
@@ -746,15 +742,13 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         for r in res:
             self.assertEqual(r, 0, f"Buffer unregistration failed for buffer at {large_buffer_ptr}")
 
-    # TODO(#4849): Re-enable P2P coverage once global remove/remove_all is implemented.
-    @unittest.skipIf(IS_P2P, "P2P global remove/remove_all is not implemented yet")
     def test_benchmark_04_batch_put_get_into_with_tp(self):
         """Benchmark: Zero copy Batch Get with tp."""
         tp_size = 4
         split_dim = 0
         batch_size = len(self.keys)
-        self.store.remove_all()
-        buffer_spacing = 64 * 1024 * 1024  # 64MB per tensor slot
+        self.assertGreaterEqual(self.store.remove_all(force=True), 0)
+        buffer_spacing = (self.TENSOR_SIZE_MB // tp_size + 1) * 1024 * 1024
 
         # Allocate and register a separate buffer for each TP rank
         rank_buffers = []  # Store metadata for cleanup
@@ -790,7 +784,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
 
         for i in range(self.BENCH_ITERATIONS):
             # Clean store before each iteration for "cold" writes
-            self.store.remove_all()
+            self.assertGreaterEqual(self.store.remove_all(force=True), 0)
 
             # Measure Put
             t0 = time.perf_counter()
@@ -846,7 +840,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         print(f"--- Running Standard Batch Benchmark ({self.BENCH_ITERATIONS} iters) ---")
         for i in range(self.BENCH_ITERATIONS):
             # Clean store before each iteration for "cold" writes
-            self.store.remove_all()
+            self.assertGreaterEqual(self.store.remove_all(force=True), 0)
 
             # Measure Put
             t0 = time.perf_counter()
@@ -872,7 +866,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
 
         print(f"--- Running TP Batch Benchmark (TP={tp_size}) ---")
         for i in range(self.BENCH_ITERATIONS):
-            self.store.remove_all()
+            self.assertGreaterEqual(self.store.remove_all(force=True), 0)
 
             # Measure TP Put (Auto-chunking)
             t0 = time.perf_counter()

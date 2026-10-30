@@ -66,35 +66,10 @@ class IPv6ClientTest : public ::testing::Test {
         if (client_) {
             client_->tearDownAll();
         }
-        if (storage_provider_) {
-            storage_provider_->tearDownAll();
-        }
         master_.Stop();
     }
 
-    bool StartStorageProvider(const std::string& server_address) {
-        // The tested client has no storage; provide a separate IPv6 segment.
-        const auto host = parseHostNameWithPort(server_address).first;
-        const std::string rdma_devices =
-            FLAGS_protocol == "rdma" ? FLAGS_device_name : std::string("");
-        storage_provider_ = RealClient::create();
-        auto config =
-            CentralizedClientConfigBuilder::build_centralized_real_client(
-                maybeWrapIpV6(host) + ":0", "P2PHANDSHAKE", FLAGS_protocol,
-                rdma_devices.empty() ? std::nullopt
-                                     : std::optional<std::string>(rdma_devices),
-                master_address_, 16 * 1024 * 1024, 0);
-        const int result = storage_provider_->setup(config);
-        if (result != 0) {
-            LOG(ERROR) << "Failed to start IPv6 storage provider at " << host
-                       << ": " << result;
-            return false;
-        }
-        return true;
-    }
-
     std::shared_ptr<RealClient> client_;
-    std::shared_ptr<RealClient> storage_provider_;
     mooncake::testing::InProcMaster master_;
     std::string master_address_;
 };
@@ -112,8 +87,6 @@ TEST_F(IPv6ClientTest, BasicPutGetOverIPv6Loopback) {
         << "Failed to start in-proc master";
     master_address_ = master_.master_address();
     LOG(INFO) << "Started in-proc master at " << master_address_;
-    ASSERT_TRUE(StartStorageProvider(FLAGS_server_address))
-        << "Failed to start IPv6 storage provider";
 
     // Setup the client with IPv6 address
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
@@ -123,12 +96,13 @@ TEST_F(IPv6ClientTest, BasicPutGetOverIPv6Loopback) {
     LOG(INFO) << "Setting up client with server address: "
               << FLAGS_server_address;
 
-    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
-        FLAGS_server_address, "P2PHANDSHAKE", FLAGS_protocol,
-        rdma_devices.empty() ? std::nullopt
-                             : std::optional<std::string>(rdma_devices),
-        master_address_, 0, 16 * 1024 * 1024);
-    ASSERT_EQ(client_->setup(config), 0)
+    auto setup_config =
+        CentralizedClientConfigBuilder::build_centralized_real_client(
+            FLAGS_server_address, "P2PHANDSHAKE", FLAGS_protocol,
+            rdma_devices.empty() ? std::nullopt
+                                 : std::optional<std::string>(rdma_devices),
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+    ASSERT_EQ(client_->setup(setup_config), 0)
         << "Client setup should succeed with IPv6 address";
 
     // Test Put operation
@@ -136,10 +110,10 @@ TEST_F(IPv6ClientTest, BasicPutGetOverIPv6Loopback) {
     const std::string key = "ipv6_test_key";
 
     std::span<const char> data_span(test_data.data(), test_data.size());
-    ReplicateConfig replicate_config;
-    replicate_config.replica_num = 1;
+    ReplicateConfig config;
+    config.replica_num = 1;
 
-    int put_result = client_->put(key, data_span, replicate_config);
+    int put_result = client_->put(key, data_span, config);
     EXPECT_EQ(put_result, 0) << "Put operation should succeed over IPv6";
 
     // Test Get operation
@@ -184,20 +158,19 @@ TEST_F(IPv6ClientTest, BasicPutGetOverLinkLocalIPv6) {
         << "Failed to start in-proc master";
     master_address_ = master_.master_address();
     LOG(INFO) << "Started in-proc master at " << master_address_;
-    ASSERT_TRUE(StartStorageProvider(server_address))
-        << "Failed to start link-local IPv6 storage provider";
 
     // Setup client with link-local address
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
 
-    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
-        server_address, "P2PHANDSHAKE", FLAGS_protocol,
-        rdma_devices.empty() ? std::nullopt
-                             : std::optional<std::string>(rdma_devices),
-        master_address_, 0, 16 * 1024 * 1024);
-    ASSERT_EQ(client_->setup(config), 0)
+    auto setup_config =
+        CentralizedClientConfigBuilder::build_centralized_real_client(
+            server_address, "P2PHANDSHAKE", FLAGS_protocol,
+            rdma_devices.empty() ? std::nullopt
+                                 : std::optional<std::string>(rdma_devices),
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+    ASSERT_EQ(client_->setup(setup_config), 0)
         << "Client setup should succeed with link-local IPv6 address";
 
     // Test Put operation
@@ -205,10 +178,10 @@ TEST_F(IPv6ClientTest, BasicPutGetOverLinkLocalIPv6) {
     const std::string key = "ipv6_linklocal_test_key";
 
     std::span<const char> data_span(test_data.data(), test_data.size());
-    ReplicateConfig replicate_config;
-    replicate_config.replica_num = 1;
+    ReplicateConfig config;
+    config.replica_num = 1;
 
-    int put_result = client_->put(key, data_span, replicate_config);
+    int put_result = client_->put(key, data_span, config);
     EXPECT_EQ(put_result, 0)
         << "Put operation should succeed over link-local IPv6";
 
@@ -240,20 +213,19 @@ TEST_F(IPv6ClientTest, BatchOperationsOverIPv6) {
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start in-proc master";
     master_address_ = master_.master_address();
-    ASSERT_TRUE(StartStorageProvider(FLAGS_server_address))
-        << "Failed to start IPv6 storage provider";
 
     // Setup the client
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
 
-    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
-        FLAGS_server_address, "P2PHANDSHAKE", FLAGS_protocol,
-        rdma_devices.empty() ? std::nullopt
-                             : std::optional<std::string>(rdma_devices),
-        master_address_, 0, 16 * 1024 * 1024);
-    ASSERT_EQ(client_->setup(config), 0);
+    auto setup_config =
+        CentralizedClientConfigBuilder::build_centralized_real_client(
+            FLAGS_server_address, "P2PHANDSHAKE", FLAGS_protocol,
+            rdma_devices.empty() ? std::nullopt
+                                 : std::optional<std::string>(rdma_devices),
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+    ASSERT_EQ(client_->setup(setup_config), 0);
 
     // Prepare batch data
     const int num_keys = 10;
@@ -273,11 +245,10 @@ TEST_F(IPv6ClientTest, BatchOperationsOverIPv6) {
     }
 
     // Batch Put
-    ReplicateConfig replicate_config;
-    replicate_config.replica_num = 1;
+    ReplicateConfig config;
+    config.replica_num = 1;
 
-    int batch_put_result =
-        client_->put_batch(keys, data_spans, replicate_config);
+    int batch_put_result = client_->put_batch(keys, data_spans, config);
     EXPECT_EQ(batch_put_result, 0) << "Batch put should succeed over IPv6";
 
     // Batch Get

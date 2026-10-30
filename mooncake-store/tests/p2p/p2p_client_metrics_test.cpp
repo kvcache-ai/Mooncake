@@ -196,7 +196,7 @@ TEST_F(P2PClientMetricsTest, P2PReportingCanRestartAndStop) {
     EXPECT_EQ(metrics->GetReportingInterval(), 1u);
     metrics->StartMetricReporting(2);
     EXPECT_EQ(metrics->GetReportingInterval(), 2u);
-    metrics->StartMetricReporting(0);
+    metrics->StopMetricReporting();
     EXPECT_EQ(metrics->GetReportingInterval(), 0u);
 
     // Destruction must join the reporter before destroying its metric members.

@@ -18,6 +18,11 @@ struct RealClientTestHelper {
         return client.find_shm_context(id);
     }
 
+    static bool ShmMappingsEmpty(const ShmContext& context) {
+        SharedMutexLocker lock(&context.mutex_, shared_lock);
+        return context.mapped_shms_.empty();
+    }
+
     static auto& ShmMutex(RealClient& client) {
         return client.dummy_client_mutex_;
     }
@@ -34,29 +39,27 @@ struct RealClientTestHelper {
         return client.ipc_running_.load();
     }
 
-    static bool DummyRpcStopped(RealClient& client) {
-        return client.dummy_rpc_exit_.hasResult();
-    }
-
-    static bool DummyMonitorRunning(const RealClient& client) {
-        return client.dummy_client_monitor_running_.load();
+    static bool DummyMonitorJoinable(const RealClient& client) {
+        return client.dummy_client_monitor_thread_.joinable();
     }
 
     static auto NativeClient(const RealClient& client) {
         return client.client_service_;
     }
 
-    static auto& DummyRpcServer(RealClient& client) {
-        return client.dummy_rpc_server_;
+    static uint16_t DummyRpcPort(const RealClient& client) {
+        return client.dummy_rpc_server_ ? client.dummy_rpc_server_->port() : 0;
     }
 
-    static auto& LifecycleMutex(RealClient& client) {
-        return client.lifecycle_mutex_;
-    }
-
-    static void CloseAdmission(RealClient& client) {
-        client.state_.store(RealClient::State::CLOSING,
-                            std::memory_order_release);
+    // Only the two handler-drain cases use this after setup without Dummy RPC.
+    // Real teardown owns/stops the server; no owning pointer escapes.
+    template <typename Handler>
+    static auto StartPausedDummyReadServer(RealClient& client,
+                                           Handler& handler) {
+        client.dummy_rpc_server_ =
+            std::make_unique<coro_rpc::coro_rpc_server>(2, 0, "127.0.0.1");
+        client.dummy_rpc_server_->register_handler<&Handler::Read>(&handler);
+        return client.dummy_rpc_server_->async_start();
     }
 };
 

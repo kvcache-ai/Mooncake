@@ -13,7 +13,6 @@
 #include <vector>
 
 #include "allocator.h"
-#include "client_config_builder.h"
 #include "client_service.h"
 #include "types.h"
 #include "utils.h"
@@ -73,8 +72,7 @@ bool initialize_segment() {
         return false;
     }
 
-    auto result = g_client->MountSegment(g_segment_ptr, g_ram_buffer_size,
-                                         FLAGS_protocol);
+    auto result = g_client->MountSegment(g_segment_ptr, g_ram_buffer_size);
     if (!result.has_value()) {
         LOG(ERROR) << "Failed to mount segment: " << toString(result.error());
         return false;
@@ -213,8 +211,7 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
         std::string key = stored_keys[key_index];
 
         auto start_time = std::chrono::high_resolution_clock::now();
-        auto result = g_client->Get(key, write_buffer,
-                                    static_cast<size_t>(FLAGS_value_size));
+        auto result = g_client->Get(key.data(), slices);
         auto end_time = std::chrono::high_resolution_clock::now();
 
         auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(

@@ -6,12 +6,28 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include <cstdlib>
+#include <map>
+#include <string>
+
 using namespace mooncake;
 
 TEST(UtilsTest, IsZeroUUID) {
     EXPECT_TRUE(IsZeroUUID(UUID{0, 0}));
     EXPECT_FALSE(IsZeroUUID(UUID{0, 1}));
     EXPECT_FALSE(IsZeroUUID(UUID{1, 0}));
+}
+
+TEST(UtilsTest, MergeLabelsPreservesClusterPrecedence) {
+    const std::map<std::string, std::string> labels = {
+        {"cluster_id", "caller-cluster"}, {"instance", "test-instance"}};
+    const auto merged = merge_labels(labels);
+    // The helper caches the cluster ID at process startup; do not change it here.
+    const char* cluster = std::getenv("MC_STORE_CLUSTER_ID");
+    EXPECT_EQ(merged.at("cluster_id"),
+              cluster && *cluster ? cluster : "caller-cluster");
+    EXPECT_EQ(merged.at("instance"), "test-instance");
+    EXPECT_EQ(labels.at("cluster_id"), "caller-cluster");
 }
 
 TEST(UtilsTest, ByteSizeToString) {
@@ -187,4 +203,61 @@ TEST(UtilsTest, AutoPortBinderCustomRange) {
 
     EXPECT_GE(port, 50000);
     EXPECT_LE(port, 50100);
+}
+
+TEST(UtilsTest, AutoPortBinderRebindRecoversAndReleasesPort) {
+    struct ScopedSocket {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        ~ScopedSocket() {
+            if (fd >= 0) {
+                EXPECT_EQ(close(fd), 0) << "close failed, errno=" << errno;
+            }
+        }
+    } occupied, probe;
+    ASSERT_GE(occupied.fd, 0) << "socket failed, errno=" << errno;
+    ASSERT_GE(probe.fd, 0) << "socket failed, errno=" << errno;
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(0);
+    ASSERT_EQ(bind(occupied.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
+              0)
+        << "bind failed, errno=" << errno;
+    socklen_t addr_len = sizeof(addr);
+    ASSERT_EQ(getsockname(occupied.fd, reinterpret_cast<sockaddr*>(&addr),
+                          &addr_len),
+              0)
+        << "getsockname failed, errno=" << errno;
+    const int port = ntohs(addr.sin_port);
+    ASSERT_GT(port, 0);
+
+    {
+        // A single-port range makes the conflict deterministic.
+        AutoPortBinder binder(port, port);
+        ASSERT_EQ(binder.getPort(), -1);
+        ASSERT_EQ(binder.rebind(), -1);
+        EXPECT_EQ(binder.getPort(), -1);
+
+        const int close_result = close(occupied.fd);
+        occupied.fd = -1;
+        ASSERT_EQ(close_result, 0) << "close failed, errno=" << errno;
+
+        // Recover from failure, then rebind an already reserved port.
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            SCOPED_TRACE(attempt);
+            ASSERT_EQ(binder.rebind(), port);
+            EXPECT_EQ(binder.getPort(), port);
+
+            const int bind_result =
+                bind(probe.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+            const int bind_error = errno;
+            ASSERT_EQ(bind_result, -1);
+            EXPECT_EQ(bind_error, EADDRINUSE);
+        }
+    }
+
+    // Destruction must release the socket acquired by the last rebind.
+    EXPECT_EQ(bind(probe.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0)
+        << "port was not released, errno=" << errno;
 }

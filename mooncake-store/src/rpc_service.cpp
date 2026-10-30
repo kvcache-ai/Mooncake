@@ -247,7 +247,13 @@ void WrappedMasterService::init_http_server() {
             resp.set_status_and_content(status_type::ok, std::move(ss));
         });
 
-    http_server_.async_start();
+    auto ec = http_server_.async_start();
+    if (ec.hasResult()) {
+        LOG(ERROR) << "Failed to start HTTP metrics server on port "
+                   << http_server_.port() << ": " << ec.value().message();
+        return;
+    }
+    http_server_started_ = true;
     LOG(INFO) << "HTTP metrics server started on port " << http_server_.port();
 }
 
