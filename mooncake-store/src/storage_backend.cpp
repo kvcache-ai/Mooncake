@@ -1996,8 +1996,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         total_size_ = 0;
         int64_t max_bucket_id = BucketIdGenerator::INIT_NEW_START_ID;
 
-        for (const auto& entry :
-             fs::recursive_directory_iterator(storage_path_)) {
+        // Bucket paths are relative to this directory, whose lock we hold.
+        // Subdirectories may belong to other clients; do not recover them.
+        for (const auto& entry : fs::directory_iterator(storage_path_)) {
             if (entry.is_regular_file() &&
                 entry.path().extension() == BUCKET_METADATA_FILE_SUFFIX) {
                 const auto& bucket_id_str = entry.path().stem();
@@ -2122,8 +2123,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         }
 
         // Clean up orphaned bucket files (.bucket files without corresponding
-        // .meta files) This handles the crash consistency case where data write
-        // succeeded but metadata write failed
+        // .meta files) in the owned directory only. This handles the crash
+        // consistency case where data write succeeded but metadata write
+        // failed.
         std::unordered_set<int64_t> valid_bucket_ids;
         for (const auto& [id, _] : buckets_) {
             valid_bucket_ids.insert(id);
@@ -2132,8 +2134,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         uint64_t orphaned_files_count = 0;
         uint64_t orphaned_space_freed = 0;
 
-        for (const auto& entry :
-             fs::recursive_directory_iterator(storage_path_)) {
+        for (const auto& entry : fs::directory_iterator(storage_path_)) {
             if (!entry.is_regular_file()) {
                 continue;
             }
@@ -2849,9 +2850,8 @@ int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
     }
     int64_t total = 0;
     std::error_code ec;
-    // Recursive scan: matches Init()'s recursive_directory_iterator and the
-    // du/kubelet accounting basis (the whole subtree, not just top-level
-    // entries), so nested content can never be silently missed.
+    // Physical usage includes the whole subtree (du/kubelet accounting), even
+    // though recovery and eviction only manage buckets in this directory.
     fs::recursive_directory_iterator it(storage_path_, ec), end;
     if (ec) {
         // Cannot even open storage_path_. This is a hard safety cap, so fail
