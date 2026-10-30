@@ -397,7 +397,8 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if not
      * ready
      */
-    auto GetReplicaList(const std::string& key, const TenantId& tenant_id)
+    auto GetReplicaList(const std::string& key, const TenantId& tenant_id,
+                        std::optional<std::string> session_id = std::nullopt)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
@@ -414,7 +415,8 @@ class MasterService {
      */
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
-                        const TenantId& tenant_id);
+                        const TenantId& tenant_id,
+                        std::optional<std::string> session_id = std::nullopt);
 
     /**
      * @brief Read-only batch replica list query for admin use.
@@ -695,6 +697,37 @@ class MasterService {
     auto BatchRemove(const std::vector<std::string>& keys,
                      const TenantId& tenant_id, bool force = false)
         -> std::vector<tl::expected<void, ErrorCode>>;
+
+    /**
+     * @brief Remove all objects associated with a session.
+     * Uses the session→keys reverse index to find and delete all keys
+     * belonging to the given session_id.
+     * @param session_id The session ID to clean up.
+     * @param tenant_id The tenant scope.
+     * @param cleaned_bytes Optional output: total bytes of deleted objects.
+     * @return Number of keys removed.
+     */
+    size_t RemoveBySession(const std::string& session_id,
+                            const TenantId& tenant_id = TenantId::Default(),
+                            int64_t* cleaned_bytes = nullptr);
+
+    void BatchUpdateActiveSessions(
+        const std::unordered_map<std::string,
+                                 std::chrono::system_clock::time_point>& sessions) {
+        active_session_tracker_.BatchUpdateActive(sessions);
+    }
+
+    size_t GetActiveSessionCount() const {
+        return active_session_tracker_.GetSessionCount();
+    }
+
+    struct SessionInfo {
+        std::string session_id;
+        int64_t last_active_ts_ms{0};
+        size_t key_count{0};
+    };
+    std::vector<SessionInfo> GetActiveSessionInfo() const;
+    
 
     /**
      * @brief Get the count of keys
@@ -1301,10 +1334,131 @@ class MasterService {
 
     mutable SoftPinDeadlineIndex soft_pin_deadline_index_;
 
+    // Session → keys forward index. Used by RemoveBySession to find all
+    // keys associated with a session for refcount-based cleanup.
+    // RegisterKey returns true only on first registration of a
+    // (session_id, scoped_key) pair, so callers can use it to decide
+    // whether to increment session_refcount_.
+    // Lock order: after shard mutex (same as group_routing_mutex_).
+    class SessionKeyIndex {
+       public:
+        using SessionId = std::string;
+
+        // Returns true if this is a new (session_id, key) pair.
+        // Returns false if already registered (idempotent — no refcount inc
+        // needed).
+        bool RegisterKey(const SessionId& session_id,
+                         const std::string& scoped_key) {
+            std::unique_lock lock(mutex_);
+            return session_keys_[session_id].insert(scoped_key).second;
+        }
+
+        void UnregisterKey(const SessionId& session_id,
+                           const std::string& scoped_key) {
+            std::unique_lock lock(mutex_);
+            auto sit = session_keys_.find(session_id);
+            if (sit != session_keys_.end()) {
+                sit->second.erase(scoped_key);
+                if (sit->second.empty()) {
+                    session_keys_.erase(sit);
+                }
+            }
+        }
+
+        // Remove the given scoped_key from every session that references it.
+        // Returns the number of sessions from which the key was removed.
+        size_t UnregisterKeyFromAllSessions(const std::string& scoped_key) {
+            std::unique_lock lock(mutex_);
+            size_t removed = 0;
+            for (auto it = session_keys_.begin(); it != session_keys_.end();) {
+                if (it->second.erase(scoped_key) > 0) {
+                    ++removed;
+                }
+                if (it->second.empty()) {
+                    it = session_keys_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            return removed;
+        }
+
+        std::vector<std::string> GetKeys(const SessionId& session_id) const {
+            std::shared_lock lock(mutex_);
+            auto it = session_keys_.find(session_id);
+            if (it == session_keys_.end()) return {};
+            return {it->second.begin(), it->second.end()};
+        }
+
+        std::vector<SessionId> GetSessions() const {
+            std::shared_lock lock(mutex_);
+            std::vector<SessionId> result;
+            result.reserve(session_keys_.size());
+            for (const auto& [sid, _] : session_keys_) {
+                result.push_back(sid);
+            }
+            return result;
+        }
+
+        void RemoveSession(const SessionId& session_id) {
+            std::unique_lock lock(mutex_);
+            session_keys_.erase(session_id);
+        }
+
+        void Clear() {
+            std::unique_lock lock(mutex_);
+            session_keys_.clear();
+        }
+
+       private:
+        mutable std::shared_mutex mutex_;
+        std::unordered_map<SessionId, std::unordered_set<std::string>>
+            session_keys_ GUARDED_BY(mutex_);
+    };
+
+    // Tracks active sessions and their last-active timestamps for
+    // expiration-based cleanup. Updated via HTTP API from SGLang engines.
+    class ActiveSessionTracker {
+       public:
+        using SessionId = std::string;
+        using TimePoint = std::chrono::system_clock::time_point;
+
+        void BatchUpdateActive(
+            const std::unordered_map<SessionId, TimePoint>& sessions) {
+            std::unique_lock lock(mutex_);
+            for (const auto& [sid, tp] : sessions) {
+                sessions_[sid] = tp;
+            }
+        }
+
+        void Remove(const SessionId& session_id) {
+            std::unique_lock lock(mutex_);
+            sessions_.erase(session_id);
+        }
+
+        std::unordered_map<SessionId, TimePoint> GetActiveSessions() const {
+            std::shared_lock lock(mutex_);
+            return sessions_;
+        }
+
+        size_t GetSessionCount() const {
+            std::shared_lock lock(mutex_);
+            return sessions_.size();
+        }
+
+       private:
+        mutable std::shared_mutex mutex_;
+        std::unordered_map<SessionId, TimePoint> sessions_ GUARDED_BY(mutex_);
+    };
+
+    mutable SessionKeyIndex session_key_index_;
+    mutable ActiveSessionTracker active_session_tracker_;
+
     static bool HasCompletedMemoryCacheReplica(const ObjectMetadata& metadata);
     static bool HasCompletedDiskCacheReplica(const ObjectMetadata& metadata);
     static void SyncCacheTotalAccounting(ObjectMetadata& metadata);
     static void AccountCacheTotalRemoval(ObjectMetadata& metadata);
+    void RebuildSessionKeyIndex();
     std::vector<Replica> PopReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn);
@@ -1920,7 +2074,8 @@ class MasterService {
     // for when no key is held goes to `follow_ups`.
     auto ReadReplicaList(const TenantId& tenant_id, const std::string& key,
                          const ObjectMetadata& metadata,
-                         ReadFollowUps& follow_ups)
+                         ReadFollowUps& follow_ups,
+                         std::optional<std::string> session_id = std::nullopt)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
     // An admin read of an object, which leaves it as it is.
     auto ReadReplicaListForAdmin(const ObjectMetadata& metadata) const
@@ -1942,6 +2097,14 @@ class MasterService {
     std::atomic<bool> client_monitor_running_{false};
     static constexpr uint64_t kClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
+
+    // Session cleanup thread related members
+    std::thread session_cleanup_thread_;
+    std::atomic<bool> session_cleanup_running_{false};
+    static constexpr uint64_t kSessionCleanupSleepMs = 300000; // 5 min sleep between session cleanup checks
+    const int64_t session_ttl_sec_;
+    const int64_t session_cleanup_batch_size_bytes_;
+    void SessionCleanupFunc();
     const int64_t client_active_ttl_sec_;
     const int64_t client_suspicion_ttl_sec_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;

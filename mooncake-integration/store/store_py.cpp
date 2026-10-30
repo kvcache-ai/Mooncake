@@ -2162,6 +2162,7 @@ PYBIND11_MODULE(_store, m) {
                        &ReplicateConfig::prefer_alloc_in_same_node)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
+        .def_readwrite("session_id", &ReplicateConfig::session_id)
         .def_property(
             "session_ids",
             [](const ReplicateConfig &config)
@@ -3147,16 +3148,18 @@ PYBIND11_MODULE(_store, m) {
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
                const std::vector<uintptr_t> &buffer_ptrs,
-               const std::vector<size_t> &sizes) {
+               const std::vector<size_t> &sizes,
+               const std::string &session_id) {
                 std::vector<void *> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
                     buffers.push_back(reinterpret_cast<void *>(ptr));
                 }
                 py::gil_scoped_release release;
-                return self.store_->batch_get_into(keys, buffers, sizes);
+                return self.store_->batch_get_into(keys, buffers, sizes, session_id);
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+            py::arg("session_id") = std::string(),
             "Get object data directly into pre-allocated buffers for "
             "multiple "
             "keys")
@@ -3204,17 +3207,23 @@ PYBIND11_MODULE(_store, m) {
                const std::vector<std::string> &keys,
                const std::vector<uintptr_t> &buffer_ptrs,
                const std::vector<size_t> &sizes,
+               const std::string &session_id = "",
                const ReplicateConfig &config = ReplicateConfig{}) {
                 std::vector<void *> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
                     buffers.push_back(reinterpret_cast<void *>(ptr));
                 }
+                ReplicateConfig effective_config = config;
+                if (!session_id.empty()) {
+                    effective_config.session_id = session_id;
+                }
                 py::gil_scoped_release release;
                 return self.store_->batch_put_from(keys, buffers, sizes,
-                                                   config);
+                                                   effective_config);
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+            py::arg("session_id") = std::string(),
             py::arg("config") = ReplicateConfig{},
             "Put object data directly from pre-allocated buffers for "
             "multiple "
@@ -3296,16 +3305,22 @@ PYBIND11_MODULE(_store, m) {
                const std::vector<std::string> &keys,
                const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
                const std::vector<std::vector<size_t>> &all_sizes,
+               const std::string &session_id = "",
                const ReplicateConfig &config = ReplicateConfig{}) {
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
                     return std::vector<int>{};
                 }
+                ReplicateConfig effective_config = config;
+                if (!session_id.empty()) {
+                    effective_config.session_id = session_id;
+                }
                 py::gil_scoped_release release;
                 return self.store_->batch_put_from_multi_buffers(
-                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config);
+                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, effective_config);
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
+            py::arg("session_id") = std::string(),
             py::arg("config") = ReplicateConfig{},
             "Put object data directly from multiple pre-allocated buffers for "
             "multiple "

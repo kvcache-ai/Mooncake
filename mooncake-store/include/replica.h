@@ -131,6 +131,9 @@ struct ReplicateConfig {
     // Per-key write attribution, independent of key identity and eviction
     // groups. Preserve the session extension already used by main.
     struct_pack::compatible<std::vector<std::string>, 1> session_ids;
+
+    std::optional<std::string> session_id{};
+
     // Best-effort receiver affinity. A matching range is local to every
     // named HCA on that receiver; NUMA IDs are never compared across hosts.
     struct_pack::compatible<std::vector<std::string>, 2> preferred_hca_names;

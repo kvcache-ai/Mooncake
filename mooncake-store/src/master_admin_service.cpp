@@ -1429,6 +1429,117 @@ void MasterAdminServer::HandleRemoveAll(coro_http::coro_http_request& req,
     });
 }
 
+struct HttpUpdateActiveSessionsRequest {
+    std::map<std::string, int64_t> sessions;
+};
+YLT_REFL(HttpUpdateActiveSessionsRequest, sessions);
+
+struct HttpUpdateActiveSessionsResponse {
+    bool success{true};
+    size_t updated_count{0};
+    size_t total_active_sessions{0};
+};
+YLT_REFL(HttpUpdateActiveSessionsResponse, success, updated_count,
+         total_active_sessions);
+
+void MasterAdminServer::HandleUpdateActiveSessions(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    HttpUpdateActiveSessionsRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           std::string("Invalid JSON body: ") + e.what());
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        std::unordered_map<std::string, std::chrono::system_clock::time_point>
+            active_map;
+        for (const auto& [id_str, ts_ms] : request.sessions) {
+            auto tp = std::chrono::system_clock::time_point(
+                std::chrono::milliseconds(ts_ms));
+            active_map[id_str] = tp;
+        }
+        size_t updated = service->BatchUpdateActiveSessions(active_map);
+        size_t total = service->GetActiveSessionCount();
+        WriteJsonResponse(resp, coro_http::status_type::ok,
+                          HttpUpdateActiveSessionsResponse{
+                              .updated_count = updated,
+                              .total_active_sessions = total});
+    });
+}
+
+struct HttpRemoveBySessionRequest {
+    std::string session_id;
+};
+YLT_REFL(HttpRemoveBySessionRequest, session_id);
+
+struct HttpRemoveBySessionResponse {
+    bool success{true};
+    size_t removed_key_count{0};
+};
+YLT_REFL(HttpRemoveBySessionResponse, success, removed_key_count);
+void MasterAdminServer::HandleRemoveBySession(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    HttpRemoveBySessionRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           std::string("Invalid JSON body: ") + e.what());
+        return;
+    }
+
+    if (request.session_id.empty()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           "session_id must not be empty");
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        size_t removed = service->RemoveBySession(request.session_id);
+        WriteJsonResponse(resp, coro_http::status_type::ok,
+                          HttpRemoveBySessionResponse{
+                              .removed_key_count = removed});
+    });
+}
+
+struct HttpSessionInfo {
+    std::string session_id;
+    int64_t last_active_ts_ms{0};
+    size_t key_count{0};
+};
+YLT_REFL(HttpSessionInfo, session_id, last_active_ts_ms, key_count);
+
+struct HttpGetActiveSessionsResponse {
+    bool success{true};
+    size_t total_sessions{0};
+    std::vector<HttpSessionInfo> sessions;
+};
+YLT_REFL(HttpGetActiveSessionsResponse, success, total_sessions, sessions);
+
+void MasterAdminServer::HandleGetActiveSessions(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    WithActiveService(resp, [&](auto service) {
+        auto active = service->GetActiveSessions();
+        std::vector<HttpSessionInfo> session_infos;
+        session_infos.reserve(active.size());
+        for (auto& s : active) {
+            session_infos.push_back({std::move(s.session_id),
+                                     s.last_active_ts_ms, s.key_count});
+        }
+        WriteJsonResponse(
+            resp, coro_http::status_type::ok,
+            HttpGetActiveSessionsResponse{
+                .total_sessions = session_infos.size(),
+                .sessions = std::move(session_infos)});
+    });
+}
+
 void MasterAdminServer::RegisterHandler() {
     using namespace coro_http;
 
@@ -1561,6 +1672,21 @@ void MasterAdminServer::RegisterHandler() {
         "/api/v1/remove_all",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleRemoveAll(req, resp);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/sessions/update_active",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleUpdateActiveSessions(req, resp);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/sessions/remove",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleRemoveBySession(req, resp);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/sessions",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleGetActiveSessions(req, resp);
         });
 }
 }  // namespace mooncake
