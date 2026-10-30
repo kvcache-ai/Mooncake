@@ -115,20 +115,23 @@ TEST_F(BufferAllocatorTest, AllocateAndDeallocate) {
 }
 
 TEST_F(BufferAllocatorTest, AllocatedBufferDoesNotExtendAllocatorLifetime) {
-    std::string segment_name = "1";
-    size_t size = 1024 * 1024 * 16;
-    std::weak_ptr<BufferAllocatorBase> weak_allocator;
-    std::unique_ptr<AllocatedBuffer> bufHandle;
-    {
-        auto allocator = CreateTestAllocator(segment_name, 0, size);
-        weak_allocator = allocator;
-        bufHandle = allocator->allocate(1024);
-        ASSERT_NE(bufHandle, nullptr);
+    for (const auto& allocator_type : allocator_types_) {
+        std::string segment_name = "1";
+        size_t size = 1024 * 1024 * 16;
+        std::weak_ptr<BufferAllocatorBase> weak_allocator;
+        std::unique_ptr<AllocatedBuffer> bufHandle;
+        {
+            auto allocator =
+                CreateTestAllocator(segment_name, 0, size, allocator_type);
+            weak_allocator = allocator;
+            bufHandle = allocator->allocate(1024);
+            ASSERT_NE(bufHandle, nullptr);
+        }
+        // Allocator is destroyed; the buffer must not keep it alive.
+        ASSERT_TRUE(weak_allocator.expired());
+        // isAllocatorValid() must report the allocator is gone.
+        EXPECT_FALSE(bufHandle->isAllocatorValid());
     }
-    // Allocator is destroyed; the buffer must not keep it alive.
-    ASSERT_TRUE(weak_allocator.expired());
-    // isAllocatorValid() must report the allocator is gone.
-    EXPECT_FALSE(bufHandle->isAllocatorValid());
 }
 
 // Test multiple allocations within the buffer
