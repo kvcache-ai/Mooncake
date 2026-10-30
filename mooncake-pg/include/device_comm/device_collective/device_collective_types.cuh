@@ -86,7 +86,8 @@ struct CollectiveChunk {
 
 inline constexpr uint32_t kMaxDeviceCollectiveChannels = 32;
 static_assert(kMaxDeviceCollectiveChannels <= kTransferLaneCount);
-inline constexpr uint32_t kMaxDeviceControlUpdateOperations = 8;
+// Simple (3), LL (1), Ring/OneShot/Tree/TwoShot plans (4), recovery mirror (1).
+inline constexpr uint32_t kMaxDeviceControlUpdateOperations = 9;
 inline constexpr uint32_t kDeviceControlUpdatePayloadBytes = 8192;
 
 inline constexpr bool isDeviceAllReduceCombinationSupported(

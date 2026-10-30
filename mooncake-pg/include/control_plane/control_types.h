@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include <ylt/struct_pack/compatible.hpp>
+
 #include "common_types.h"
 
 namespace mooncake {
@@ -105,6 +107,27 @@ struct OneShotEndpoint {
     bool operator==(const OneShotEndpoint&) const = default;
 };
 
+// Reserve #4747's wire extension before appending TwoShot. struct_pack's
+// compatible versions describe successive schemas, not independent field IDs.
+// This runtime leaves the Tree capability absent until that algorithm exists.
+inline constexpr uint32_t kTreeEndpointVersion = 1;
+struct TreeEndpoint {
+    uint32_t version = kTreeEndpointVersion;
+    bool operator==(const TreeEndpoint&) const = default;
+};
+
+// Two-shot reuses Simple signals and the shared workspace. Its initial direct
+// path conservatively requires native atomic P2P access for signal updates.
+inline constexpr uint32_t kTwoShotEndpointVersion = 1;
+
+struct TwoShotEndpoint {
+    uint32_t version = kTwoShotEndpointVersion;
+    DeviceUUID device_uuid{};
+    std::vector<DeviceUUID> native_atomic_peer_uuids;
+
+    bool operator==(const TwoShotEndpoint&) const = default;
+};
+
 // Runtime, protocol and algorithm endpoints owned by one communicator.
 struct DeviceGroupEndpoint {
     // Runtime-owned signal slice for synchronizing one GroupView incarnation.
@@ -115,10 +138,15 @@ struct DeviceGroupEndpoint {
     std::optional<SimpleEndpoint> simple;
     std::optional<LLEndpoint> ll;
     std::optional<OneShotEndpoint> one_shot;
+    // Preserve the #4372 and #4747 wire prefixes, including an absent Tree
+    // slot.
+    struct_pack::compatible<TreeEndpoint, 20260930> tree;
+    struct_pack::compatible<TwoShotEndpoint, 20261030> two_shot;
 
     [[nodiscard]] bool empty() const noexcept {
         return view_epoch_signal_count == 0 && !simple.has_value() &&
-               !ll.has_value() && !one_shot.has_value();
+               !ll.has_value() && !one_shot.has_value() && !tree.has_value() &&
+               !two_shot.has_value();
     }
 
     // Ring is the baseline; LL and one-shot resources are optional.
@@ -232,6 +260,8 @@ enum class GroupStatus : uint8_t {
 enum class DeviceAllReduceAlgorithm : uint8_t {
     Ring = 1,
     OneShot = 2,
+    // 3 is reserved for Tree (#4747).
+    TwoShot = 4,
 };
 
 // Coordinator-provided upper bounds, in increasing byte order.
