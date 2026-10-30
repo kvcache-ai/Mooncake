@@ -352,7 +352,8 @@ def test_te_reader_batches_large_repeats_without_segment_tuple_expansion(
         0,
     )
     plan = plan_transfer_to_local_target(sources, target)
-    state = {"yielded": 0, "exhausted": False, "first_batch": None}
+    produced_batch_counts = []
+    state = {"first_batch": None}
 
     class StreamingProbeTransferEngine(FakeTransferEngine):
         def batch_transfer_sync_read(
@@ -363,7 +364,7 @@ def test_te_reader_batches_large_repeats_without_segment_tuple_expansion(
             sizes,
         ):
             if state["first_batch"] is None:
-                state["first_batch"] = (state["yielded"], state["exhausted"])
+                state["first_batch"] = tuple(produced_batch_counts)
             return super().batch_transfer_sync_read(
                 endpoint,
                 target_addresses,
@@ -376,21 +377,16 @@ def test_te_reader_batches_large_repeats_without_segment_tuple_expansion(
     assert [operation.repeat for operation in plan.operations] == [repeat, repeat]
     assert all(isinstance(operation, TransferRegion) for operation in plan.operations)
 
-    original_iter_segments = TransferRegion.iter_segments
+    from mooncake.reshard.transfer_engine import TransferBatch
 
-    def observe_streaming_segments(
-        self: TransferRegion,
-        *,
-        max_segments: int,
-    ):
-        try:
-            for segment in original_iter_segments(self, max_segments=max_segments):
-                state["yielded"] += 1
-                yield segment
-        finally:
-            state["exhausted"] = True
+    original_from_ranges = TransferBatch.from_ranges
 
-    monkeypatch.setattr(TransferRegion, "iter_segments", observe_streaming_segments)
+    def observe_streaming_batches(*, endpoint, ranges):
+        batch = original_from_ranges(endpoint=endpoint, ranges=ranges)
+        produced_batch_counts.append(batch.operation_count)
+        return batch
+
+    monkeypatch.setattr(TransferBatch, "from_ranges", observe_streaming_batches)
 
     receipts = execute_reader(
         MooncakeTransferEngineReader(engine, max_batch_operations=1024),
@@ -407,7 +403,7 @@ def test_te_reader_batches_large_repeats_without_segment_tuple_expansion(
     assert all(len(call[3]) == 1024 for call in engine.calls)
     assert [receipt.operation_count for receipt in receipts] == [repeat, repeat]
     assert [receipt.nbytes for receipt in receipts] == [repeat * 4, repeat * 4]
-    assert state["first_batch"] == (1024, False)
+    assert state["first_batch"] == (1024,)
     assert engine.calls[0][1][0] == 0x40000
     assert engine.calls[7][1][-1] == 0x40000 + (repeat - 1) * 8
     assert engine.calls[8][1][0] == 0x40004

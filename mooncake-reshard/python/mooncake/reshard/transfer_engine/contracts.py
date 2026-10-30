@@ -52,16 +52,35 @@ class TransferBatchRange:
         }
         if lengths != {len(self.sizes)} or not self.sizes:
             raise ValueError("transfer range fragments must be non-empty and aligned")
-        for index, size in enumerate(self.sizes):
+        source_capacity = self.source_capacity
+        target_capacity = self.target_capacity
+        for source_offset, target_offset, size in zip(
+            self.source_offsets, self.target_offsets, self.sizes
+        ):
             if type(size) is not int or size <= 0 or size > _MAX_U64:
                 raise ValueError("transfer range size is invalid")
-            for side in ("source", "target"):
-                offset = getattr(self, f"{side}_offsets")[index]
-                capacity = getattr(self, f"{side}_capacity")
-                if type(offset) is not int or offset < 0 or offset > _MAX_U64:
-                    raise ValueError(f"transfer range {side} offset is invalid")
-                if offset > capacity or size > capacity - offset:
-                    raise ValueError(f"transfer range exceeds {side} allocation bounds")
+            if (
+                type(source_offset) is not int
+                or source_offset < 0
+                or source_offset > _MAX_U64
+            ):
+                raise ValueError("transfer range source offset is invalid")
+            if (
+                source_offset > source_capacity
+                or size > source_capacity - source_offset
+            ):
+                raise ValueError("transfer range exceeds source allocation bounds")
+            if (
+                type(target_offset) is not int
+                or target_offset < 0
+                or target_offset > _MAX_U64
+            ):
+                raise ValueError("transfer range target offset is invalid")
+            if (
+                target_offset > target_capacity
+                or size > target_capacity - target_offset
+            ):
+                raise ValueError("transfer range exceeds target allocation bounds")
 
     @property
     def operation_count(self) -> int:
