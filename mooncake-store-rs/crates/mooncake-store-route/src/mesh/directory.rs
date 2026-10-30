@@ -6,8 +6,8 @@ use parking_lot::Mutex;
 
 use mooncake_store_core::{
     CasResult, ClientLease, ClientRuntimeId, ClientStableId, MetadataBackend, NamespaceScope,
-    ObjectKey, ObjectRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory, RouteVersion,
-    StoreError,
+    ObjectKey, ObjectRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory,
+    RouteOwnerScanStatus, RouteVersion, StoreError,
 };
 use tracing::{debug, trace, warn};
 
@@ -428,7 +428,7 @@ impl EmbeddedWrhRouteDirectory {
         observer: &ClientLease,
         owner: &ClientRuntimeId,
         visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<RouteOwnerScanStatus> {
         let mut scans = Vec::new();
         let mut last_authority_error = None;
         for authority in self.authority_candidates(observer)? {
@@ -490,7 +490,10 @@ impl EmbeddedWrhRouteDirectory {
             scans = next_scans;
 
             if scans.is_empty() {
-                return last_authority_error.map_or(Ok(()), Err);
+                return match last_authority_error {
+                    Some(error) => Err(error),
+                    None => Ok(RouteOwnerScanStatus::Complete),
+                };
             }
 
             let Some(next_key) = scans
@@ -499,7 +502,11 @@ impl EmbeddedWrhRouteDirectory {
                 .min()
                 .map(ToOwned::to_owned)
             else {
-                return Ok(());
+                return Ok(if last_authority_error.is_some() {
+                    RouteOwnerScanStatus::Incomplete
+                } else {
+                    RouteOwnerScanStatus::Complete
+                });
             };
             let mut merged = BTreeMap::new();
             for scan in &mut scans {
@@ -1305,6 +1312,16 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         owner: &ClientRuntimeId,
         visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
     ) -> Result<()> {
+        self.visit_routes_by_replica_owner_pages(observer, owner, visitor)
+            .map(|_| ())
+    }
+
+    fn visit_routes_by_replica_owner_with_status(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+        visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
+    ) -> Result<RouteOwnerScanStatus> {
         self.visit_routes_by_replica_owner_pages(observer, owner, visitor)
     }
 
