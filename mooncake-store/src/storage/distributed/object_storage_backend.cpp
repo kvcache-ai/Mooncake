@@ -60,6 +60,20 @@ tl::expected<uint64_t, ErrorCode> SliceBytes(const std::vector<Slice>& slices,
     return total_bytes;
 }
 
+ErrorCode ValidateWriteSlices(uint64_t object_size, uint64_t max_object_bytes,
+                              const std::vector<Slice>& slices) {
+    if (object_size > max_object_bytes ||
+        object_size > std::numeric_limits<size_t>::max()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    const auto total_bytes = SliceBytes(slices, object_size);
+    if (!total_bytes) {
+        return total_bytes.error();
+    }
+    return *total_bytes == object_size ? ErrorCode::OK
+                                       : ErrorCode::INVALID_PARAMS;
+}
+
 }  // namespace
 
 ObjectStorageBackend::ObjectStorageBackend(
@@ -81,16 +95,10 @@ ErrorCode ObjectStorageBackend::Write(const std::string& object_key,
     if (upload_started != nullptr) {
         *upload_started = false;
     }
-    if (object_size > config_.max_object_bytes ||
-        object_size > std::numeric_limits<size_t>::max()) {
-        return ErrorCode::INVALID_PARAMS;
-    }
-    const auto total_bytes = SliceBytes(slices, object_size);
-    if (!total_bytes) {
-        return total_bytes.error();
-    }
-    if (*total_bytes != object_size) {
-        return ErrorCode::INVALID_PARAMS;
+    const auto validation =
+        ValidateWriteSlices(object_size, config_.max_object_bytes, slices);
+    if (validation != ErrorCode::OK) {
+        return validation;
     }
     if (object_size != 0 && !to_host) {
         return ErrorCode::INVALID_PARAMS;
@@ -121,8 +129,78 @@ ErrorCode ObjectStorageBackend::Write(const std::string& object_key,
     if (upload_started != nullptr) {
         *upload_started = true;
     }
+    const auto result = adapter_->Put(object_key, {staging.get(), object_size});
+    return result ? ErrorCode::OK : result.error();
+}
+
+ErrorCode ObjectStorageBackend::WriteV(const std::string& object_key,
+                                       uint64_t object_size,
+                                       const std::vector<Slice>& slices,
+                                       const IsHostMemory& is_host,
+                                       const Copy& to_host,
+                                       bool* upload_started) {
+    if (upload_started != nullptr) {
+        *upload_started = false;
+    }
+    const auto validation =
+        ValidateWriteSlices(object_size, config_.max_object_bytes, slices);
+    if (validation != ErrorCode::OK) {
+        return validation;
+    }
+    if (object_size != 0 && !is_host) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (slices.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (!adapter_->SupportsSinglePutVAttempt()) {
+        return ErrorCode::NOT_SUPPORTED;
+    }
+
+    std::vector<iovec> iov;
+    iov.reserve(slices.size());
+    uint64_t staging_bytes = 0;
+    for (const auto& slice : slices) {
+        const bool borrow = slice.size != 0 && is_host(slice);
+        iov.push_back({borrow ? slice.ptr : nullptr, slice.size});
+        if (!borrow) {
+            staging_bytes += slice.size;
+        }
+    }
+    if (staging_bytes != 0 && !to_host) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    auto reservation =
+        staging_bytes != 0
+            ? StagingReservation::TryAcquire(
+                  staging_bytes_, config_.max_staging_bytes, staging_bytes)
+            : std::nullopt;
+    if (staging_bytes != 0 && !reservation) {
+        return ErrorCode::NO_AVAILABLE_HANDLE;
+    }
+    std::unique_ptr<char[]> staging;
+    if (staging_bytes != 0) {
+        staging.reset(new (std::nothrow) char[staging_bytes]);
+        if (!staging) {
+            return ErrorCode::NO_AVAILABLE_HANDLE;
+        }
+    }
+    size_t offset = 0;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        if (iov[i].iov_len != 0 && iov[i].iov_base == nullptr) {
+            if (!to_host(staging.get() + offset, slices[i].ptr,
+                         slices[i].size)) {
+                return ErrorCode::TRANSFER_FAIL;
+            }
+            iov[i].iov_base = staging.get() + offset;
+            offset += slices[i].size;
+        }
+    }
+    if (upload_started != nullptr) {
+        *upload_started = true;
+    }
     const auto result =
-        adapter_->Put(object_key, {staging.get(), *total_bytes});
+        adapter_->PutV(object_key, iov.data(), static_cast<int>(iov.size()));
     return result ? ErrorCode::OK : result.error();
 }
 

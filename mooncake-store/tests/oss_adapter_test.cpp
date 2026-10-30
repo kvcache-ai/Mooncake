@@ -1678,5 +1678,62 @@ TEST(OssObjectStorageAdapterTest, StorageBackendFactoryRunsObjectHealthCheck) {
     EXPECT_EQ(server.requests()[2].rfind("DELETE ", 0), 0U);
 }
 
+TEST(OssObjectStorageAdapterTest,
+     BackendWriteVBorrowsAndStagesBeforeSingleUpload) {
+    ScriptedOssServer server({{200, ""},
+                              {200, "", "", false, true},
+                              {200, ""},
+                              {200, ""},
+                              {200, ""}});
+    ScopedEnvironment environment;
+    ConfigureFaultEndpoint(environment, server.port());
+    auto adapter = std::make_shared<OssObjectStorageAdapter>("/backend-io/");
+    ASSERT_TRUE(adapter->Init());
+    ASSERT_TRUE(adapter->SupportsSinglePutVAttempt());
+    ObjectStorageBackend backend({16, 2}, adapter);
+    std::string first = "abc", device = "de", last = "fgh";
+    const std::vector<Slice> slices{
+        {first.data(), 3}, {nullptr, 0}, {device.data(), 2}, {last.data(), 3}};
+    const auto host = [&](const Slice& slice) {
+        return slice.ptr != device.data();
+    };
+    size_t copied = 0;
+    const auto copy = [&](void* dst, const void* src, size_t bytes) {
+        EXPECT_EQ(src, device.data());
+        copied += bytes;
+        return std::memcpy(dst, src, bytes) != nullptr;
+    };
+    bool started = false;
+    EXPECT_EQ(backend.WriteV("first", 8, slices, host, copy, &started),
+              ErrorCode::OK);
+    EXPECT_TRUE(started);
+    EXPECT_EQ(backend.WriteV("uncertain", 8, slices, host, copy, &started),
+              ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_TRUE(started);
+    EXPECT_EQ(backend.WriteV("fresh-attempt", 8, slices, host, copy, &started),
+              ErrorCode::OK);
+    EXPECT_TRUE(started);
+    EXPECT_EQ(copied, 6U);
+    std::string only = "host-only";
+    EXPECT_EQ(backend.WriteV(
+                  "host", only.size(), {{only.data(), only.size()}},
+                  [](const Slice&) { return true; }, {}, &started),
+              ErrorCode::OK);
+    EXPECT_TRUE(started);
+    EXPECT_EQ(backend.WriteV("empty", 0, {{nullptr, 0}}, {}, {}, &started),
+              ErrorCode::OK);
+    EXPECT_TRUE(started);
+    server.Wait();
+    EXPECT_TRUE(server.error().empty()) << server.error();
+    ASSERT_EQ(server.requests().size(), 5U);
+    for (size_t i = 0; i < 3; ++i) {
+        EXPECT_TRUE(server.requests()[i].starts_with("PUT "));
+        EXPECT_TRUE(server.requests()[i].ends_with("\r\n\r\nabcdefgh"));
+    }
+    EXPECT_TRUE(server.requests()[3].ends_with("\r\n\r\nhost-only"));
+    EXPECT_TRUE(server.requests()[4].starts_with("PUT "));
+    EXPECT_TRUE(server.requests()[4].ends_with("\r\n\r\n"));
+}
+
 }  // namespace
 }  // namespace mooncake

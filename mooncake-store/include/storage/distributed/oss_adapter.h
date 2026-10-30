@@ -41,6 +41,7 @@ class OssObjectStorageAdapter : public ObjectStorageAdapter {
     tl::expected<void, ErrorCode> CheckHealth() override;
     const char* GetName() const override { return "oss"; }
     bool SupportsSinglePutAttempt() const override { return true; }
+    bool SupportsSinglePutVAttempt() const override { return true; }
 
     // OSS-specific operations that are intentionally not part of the common
     // ObjectStorageAdapter contract.

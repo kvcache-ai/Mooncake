@@ -20,6 +20,8 @@ class MemoryObjectAdapter : public ObjectStorageAdapter {
     std::map<std::string, std::string> objects;
     std::vector<std::pair<off_t, size_t>> ranges;
     size_t put_calls{0};
+    size_t putv_calls{0};
+    std::vector<iovec> putv_inputs;
     bool short_read{false};
     ErrorCode put_error{ErrorCode::OK};
     ErrorCode read_error{ErrorCode::OK};
@@ -34,9 +36,28 @@ class MemoryObjectAdapter : public ObjectStorageAdapter {
         objects[key] = std::string(data.begin(), data.end());
         return {};
     }
-    tl::expected<void, ErrorCode> PutV(const std::string&, const iovec*,
-                                       int) override {
-        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    tl::expected<void, ErrorCode> PutV(const std::string& key, const iovec* iov,
+                                       int count) override {
+        ++putv_calls;
+        putv_inputs.clear();
+        if (count != 0) {
+            putv_inputs.assign(iov, iov + count);
+        }
+        if (before_put) {
+            before_put();
+        }
+        if (put_error != ErrorCode::OK) {
+            return tl::make_unexpected(put_error);
+        }
+        std::string value;
+        for (int i = 0; i < count; ++i) {
+            if (iov[i].iov_len != 0) {
+                value.append(static_cast<const char*>(iov[i].iov_base),
+                             iov[i].iov_len);
+            }
+        }
+        objects[key] = std::move(value);
+        return {};
     }
     tl::expected<size_t, ErrorCode> Get(const std::string&, void*,
                                         size_t) override {
@@ -71,6 +92,7 @@ class MemoryObjectAdapter : public ObjectStorageAdapter {
     tl::expected<void, ErrorCode> Init() override { return {}; }
     const char* GetName() const override { return "memory"; }
     bool SupportsSinglePutAttempt() const override { return true; }
+    bool SupportsSinglePutVAttempt() const override { return true; }
 };
 
 bool HostCopy(void* dst, const void* src, size_t size) {
@@ -424,6 +446,163 @@ TEST_F(ObjectStorageBackendTest,
     char byte;
     EXPECT_EQ(backend.Read("key", 1, {{&byte, 1}}, 0, HostCopy),
               ErrorCode::NOT_SUPPORTED);
+}
+
+TEST_F(ObjectStorageBackendTest, WriteVBorrowsHostAndStagesOnlyOtherSlices) {
+    ObjectStorageBackend backend({16, 3}, adapter);
+    std::string first = "ab", device = "cde", last = "fg";
+    size_t classified = 0, copied = 0;
+    bool started = false;
+    const auto is_host = [&](const Slice& slice) {
+        ++classified;
+        return slice.ptr != device.data();
+    };
+    const auto copy = [&](void* dst, const void* src, size_t bytes) {
+        EXPECT_EQ(src, device.data());
+        copied += bytes;
+        return HostCopy(dst, src, bytes);
+    };
+    adapter->before_put = [&] {
+        ASSERT_EQ(adapter->putv_inputs.size(), 4U);
+        EXPECT_EQ(adapter->putv_inputs[0].iov_base, first.data());
+        EXPECT_EQ(adapter->putv_inputs[3].iov_base, last.data());
+        EXPECT_NE(adapter->putv_inputs[2].iov_base, device.data());
+        EXPECT_EQ(std::string(
+                      static_cast<char*>(adapter->putv_inputs[2].iov_base), 3),
+                  device);
+        char out;
+        EXPECT_EQ(backend.Read("key", 7, {{&out, 1}}, 0, HostCopy),
+                  ErrorCode::NO_AVAILABLE_HANDLE);
+    };
+    ASSERT_EQ(backend.WriteV("key", 7,
+                             {{first.data(), 2},
+                              {nullptr, 0},
+                              {device.data(), 3},
+                              {last.data(), 2}},
+                             is_host, copy, &started),
+              ErrorCode::OK);
+    EXPECT_TRUE(started);
+    EXPECT_EQ(classified, 3U);
+    EXPECT_EQ(copied, 3U);
+    EXPECT_EQ(adapter->objects.at("key"), "abcdefg");
+    EXPECT_EQ(adapter->putv_calls, 1U);
+    EXPECT_EQ(adapter->put_calls, 0U);
+    adapter->before_put = {};
+    char out = '!';
+    EXPECT_EQ(backend.Read("key", 7, {{&out, 1}}, 0, HostCopy), ErrorCode::OK);
+    EXPECT_EQ(out, 'a');
+}
+
+TEST_F(ObjectStorageBackendTest, HostWriteNeedsNoStagingEvenWhenBudgetIsFull) {
+    ObjectStorageBackend backend({16, 1}, adapter);
+    adapter->objects["read"] = "x";
+    std::string first = "abc", last = "def";
+    const auto host = [](const Slice&) { return true; };
+    adapter->before_read = [&] {
+        bool started = false;
+        EXPECT_EQ(
+            backend.WriteV("host", 6, {{first.data(), 3}, {last.data(), 3}},
+                           host, {}, &started),
+            ErrorCode::OK);
+        EXPECT_TRUE(started);
+    };
+    char out;
+    EXPECT_EQ(backend.Read("read", 1, {{&out, 1}}, 0, HostCopy), ErrorCode::OK);
+    EXPECT_EQ(adapter->objects.at("host"), "abcdef");
+    EXPECT_EQ(adapter->put_calls, 0U);
+    EXPECT_EQ(adapter->putv_calls, 1U);
+    EXPECT_EQ(adapter->putv_inputs[0].iov_base, first.data());
+    EXPECT_EQ(adapter->putv_inputs[1].iov_base, last.data());
+}
+
+TEST_F(ObjectStorageBackendTest,
+       WriteVValidatesInputsAndRequiresItsOwnCapability) {
+    class PutOnlyAdapter : public MemoryObjectAdapter {
+       public:
+        bool SupportsSinglePutVAttempt() const override {
+            return ObjectStorageAdapter::SupportsSinglePutVAttempt();
+        }
+    };
+    auto put_only = std::make_shared<PutOnlyAdapter>();
+    ObjectStorageBackend unsupported({8, 8}, put_only);
+    char byte = 'x';
+    size_t classified = 0;
+    const auto host = [&](const Slice&) {
+        ++classified;
+        return true;
+    };
+    bool started = true;
+    EXPECT_EQ(unsupported.WriteV("key", 1, {{&byte, 1}}, host, {}, &started),
+              ErrorCode::NOT_SUPPORTED);
+    EXPECT_FALSE(started);
+    EXPECT_EQ(classified, 0U);
+    EXPECT_EQ(put_only->putv_calls, 0U);
+    EXPECT_EQ(unsupported.Write("legacy", 1, {{&byte, 1}}, HostCopy),
+              ErrorCode::OK);
+    EXPECT_EQ(put_only->put_calls, 1U);
+    ObjectStorageBackend backend({8, 8}, adapter);
+    for (const auto& slices : std::vector<std::vector<Slice>>{
+             {{nullptr, 1}}, {{&byte, 1}, {nullptr, 1}}, {{&byte, 9}}}) {
+        EXPECT_EQ(backend.WriteV("key", 1, slices, host, {}, &started),
+                  ErrorCode::INVALID_PARAMS);
+        EXPECT_FALSE(started);
+    }
+    EXPECT_EQ(backend.WriteV("key", 1, {{&byte, 1}}, {}, HostCopy, &started),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(backend.WriteV(
+                  "key", 1, {{&byte, 1}}, [](const Slice&) { return false; },
+                  {}, &started),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(classified, 0U);
+    EXPECT_EQ(adapter->putv_calls, 0U);
+    EXPECT_EQ(backend.WriteV("empty", 0, {{nullptr, 0}}, {}, {}, &started),
+              ErrorCode::OK);
+    EXPECT_TRUE(started);
+    EXPECT_TRUE(adapter->objects.at("empty").empty());
+}
+
+TEST_F(ObjectStorageBackendTest, WriteVFailuresReleaseStagingAndNeverRetry) {
+    ObjectStorageBackend backend({8, 2}, adapter);
+    std::string host = "ab", device = "cd";
+    const std::vector<Slice> slices{{host.data(), 2}, {device.data(), 2}};
+    const auto is_host = [&](const Slice& slice) {
+        return slice.ptr == host.data();
+    };
+    bool started = true;
+    EXPECT_EQ(backend.WriteV(
+                  "large", 4, slices, [](const Slice&) { return false; },
+                  HostCopy, &started),
+              ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_FALSE(started);
+    EXPECT_EQ(backend.WriteV(
+                  "key", 4, slices, is_host,
+                  [](void*, const void*, size_t) { return false; }, &started),
+              ErrorCode::TRANSFER_FAIL);
+    EXPECT_FALSE(started);
+    EXPECT_EQ(adapter->putv_calls, 0U);
+    const auto throws_copy = [](void*, const void*, size_t) -> bool {
+        throw std::runtime_error("copy failed");
+    };
+    EXPECT_THROW(
+        backend.WriteV("key", 4, slices, is_host, throws_copy, &started),
+        std::runtime_error);
+    EXPECT_FALSE(started);
+    adapter->before_put = [] { throw std::runtime_error("adapter failed"); };
+    EXPECT_THROW(backend.WriteV("key", 4, slices, is_host, HostCopy, &started),
+                 std::runtime_error);
+    EXPECT_TRUE(started);
+    adapter->before_put = {};
+    adapter->put_error = ErrorCode::DFS_SERVICE_UNAVAILABLE;
+    EXPECT_EQ(backend.WriteV("key", 4, slices, is_host, HostCopy, &started),
+              ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_TRUE(started);
+    EXPECT_EQ(adapter->putv_calls, 2U);
+    adapter->put_error = ErrorCode::OK;
+    EXPECT_EQ(
+        backend.WriteV("new-attempt", 4, slices, is_host, HostCopy, &started),
+        ErrorCode::OK);
+    EXPECT_EQ(adapter->putv_calls, 3U);
+    EXPECT_EQ(adapter->objects.at("new-attempt"), "abcd");
 }
 
 }  // namespace

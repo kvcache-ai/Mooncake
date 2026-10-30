@@ -46,7 +46,8 @@ class ObjectStorageAdapter {
     virtual tl::expected<void, ErrorCode> Put(const std::string& logical_key,
                                               std::span<const char> data) = 0;
 
-    // Atomic multi-region write: one commit and one result.
+    // Atomic, synchronous multi-region write: one commit and one result.
+    // Iovecs and payloads must remain valid and unchanged until return.
     virtual tl::expected<void, ErrorCode> PutV(const std::string& logical_key,
                                                const iovec* iov,
                                                int iovcnt) = 0;
@@ -116,6 +117,10 @@ class ObjectStorageAdapter {
     // Required by the immutable-attempt backend protocol. Existing
     // whole-object offload and batch operations keep their own retry policy.
     virtual bool SupportsSinglePutAttempt() const { return false; }
+
+    // Separate capability: a single-attempt Put does not imply that PutV
+    // avoids retries. Includes the empty-object path through Put, if any.
+    virtual bool SupportsSinglePutVAttempt() const { return false; }
 };
 
 }  // namespace mooncake

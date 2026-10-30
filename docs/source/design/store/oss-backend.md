@@ -180,9 +180,9 @@ independently of the client-owned offload path above. Construct it with an
 initialized `ObjectStorageAdapter` and `ObjectStorageBackendConfig`:
 
 - `max_object_bytes` defaults to 256 MiB and limits the declared object size.
-- `max_staging_bytes` defaults to 1 GiB and bounds concurrent host staging
-  allocations within one backend instance. It does not include caller buffers
-  or the adapter's own HTTP buffers.
+- `max_staging_bytes` defaults to 1 GiB and bounds concurrent payload staging
+  allocations within one backend instance. It does not include iovec metadata,
+  caller buffers or the adapter's own HTTP buffers.
 
 `Write` validates and gathers all slices into a full-object host buffer, then
 invokes the adapter's `Put` once. It requires enough staging budget for the
@@ -193,6 +193,32 @@ rejected for these immutable-attempt writes; its legacy offload API is unchanged
 The optional `upload_started` output becomes true immediately
 before the adapter call; an error with this flag set can have an ambiguous
 remote outcome. The backend does not retry PUT.
+
+`WriteV` is the opt-in path for borrowing host buffers. The caller supplies an
+`IsHostMemory` predicate; the backend does not detect pointer address spaces.
+Nonempty slices classified as host are passed directly to the adapter's
+`PutV` and must remain valid and unchanged until the synchronous call returns.
+Other slices are gathered through `to_host`, reserving only their combined
+size from the staging budget. The predicate is evaluated once per nonempty
+slice. An all-host write needs neither payload staging nor a copy callback,
+even if the instance's staging budget is occupied by another operation.
+For borrowed buffers this budget is not an upload concurrency limit; the
+caller remains responsible for request admission and its own buffer budget.
+
+This path requires `SupportsSinglePutVAttempt()`, separately from the legacy
+`Put` capability. OSS advertises both; retrying REST/S3 writes remain rejected.
+All validation and staging complete before the single `PutV` invocation;
+`upload_started` and failure/exception cleanup follow the same rules as `Write`.
+This removes the backend's gathering copy for borrowed slices, not copies
+inside the adapter or network stack. Existing `Write` calls retain their
+full-object staging behavior.
+
+For input known by the caller to be entirely host-accessible:
+
+```cpp
+backend.WriteV(object_key, object_size, slices,
+               [](const Slice&) { return true; }, {}, &upload_started);
+```
 
 `Read` validates the requested range against the caller-supplied object size,
 then reads consecutive chunks independently of destination slice boundaries

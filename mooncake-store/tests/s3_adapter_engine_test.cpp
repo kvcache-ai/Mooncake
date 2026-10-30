@@ -39,6 +39,7 @@
 
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/s3_adapter.h"
+#include "storage/distributed/object_storage_backend.h"
 #include "storage_backend.h"
 #include "oss_fault_test_helpers.h"
 
@@ -1724,6 +1725,32 @@ TEST(S3ObjectStorageAdapterEngineTest,
     EXPECT_NE(server.requests()[0].find("/bucket" + root + "/"),
               std::string::npos)
         << server.requests()[0];
+}
+
+TEST(S3ObjectStorageAdapterEngineTest,
+     BackendWriteVRejectsRetryingAdapterBeforeClassification) {
+    using Server = test::OssFaultHttpServer;
+    Server server({{"key", Server::Reply(200, "")}});
+    ScopedEnvironment environment;
+    ConfigureFaultEndpoint(environment, server.port());
+    auto adapter = std::make_shared<S3ObjectStorageAdapter>("/backend-io/");
+    ASSERT_TRUE(adapter->Init());
+    ObjectStorageBackend backend({8, 1}, adapter);
+    char byte = 'x';
+    bool started = true;
+    size_t classified = 0;
+    EXPECT_EQ(backend.WriteV(
+                  "key", 1, {{&byte, 1}},
+                  [&](const Slice&) {
+                      ++classified;
+                      return true;
+                  },
+                  {}, &started),
+              ErrorCode::NOT_SUPPORTED);
+    EXPECT_FALSE(started);
+    EXPECT_EQ(classified, 0U);
+    server.Stop();
+    EXPECT_TRUE(server.requests().empty());
 }
 
 }  // namespace

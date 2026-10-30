@@ -20,12 +20,17 @@ struct ObjectStorageBackendConfig {
 // name allocation, upload claims/retries, leases and deletion safety; this
 // component does not publish replicas or retry an ambiguous PUT.
 // The adapter must be initialized and support concurrent calls if shared.
-// Writes require SupportsSinglePutAttempt(); retrying adapters are rejected.
+// Write requires SupportsSinglePutAttempt(); WriteV requires
+// SupportsSinglePutVAttempt(). Retrying upload paths are rejected.
 class ObjectStorageBackend {
    public:
     // Copy between caller memory (possibly device memory) and host staging.
     // Return only when copying is complete; false reports TRANSFER_FAIL.
     using Copy = std::function<bool(void*, const void*, size_t)>;
+
+    // True only for host-accessible buffers that can be borrowed unchanged
+    // until the synchronous WriteV returns. Invoked once per nonempty slice.
+    using IsHostMemory = std::function<bool(const Slice&)>;
 
     // Throws std::invalid_argument for a null adapter or zero limits.
     ObjectStorageBackend(ObjectStorageBackendConfig config,
@@ -37,6 +42,15 @@ class ObjectStorageBackend {
     ErrorCode Write(const std::string& object_key, uint64_t object_size,
                     const std::vector<Slice>& slices, const Copy& to_host,
                     bool* upload_started = nullptr);
+
+    // Borrow host slices and stage only the remaining slices before one PutV.
+    // The caller supplies memory classification; no pointer probing is done.
+    // Requires SupportsSinglePutVAttempt(). to_host may be empty when every
+    // nonempty slice is borrowed. upload_started has the same meaning as Write.
+    ErrorCode WriteV(const std::string& object_key, uint64_t object_size,
+                     const std::vector<Slice>& slices,
+                     const IsHostMemory& is_host, const Copy& to_host,
+                     bool* upload_started = nullptr);
 
     // Coalesce continuous object ranges across destination slice boundaries,
     // then scatter using at most min(4 MiB, max_staging_bytes) of
