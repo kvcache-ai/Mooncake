@@ -53,6 +53,12 @@ HTTP storage plugin sends automatically. Missing or incorrect credentials return
 HTTP does not encrypt the token or metadata; use a trusted network or TLS
 termination.
 
+When the metadata server is deployed separately and
+`--enable_metadata_cleanup_on_timeout=true` is enabled, also set
+`MC_METADATA_HTTP_TOKEN` on the master. The master snapshots it when configuring
+remote cleanup and sends the same Bearer header when deleting stale `ram` and
+`rpc_meta` entries.
+
 **Migration for embedded C++ deployments:** the default bind remains `0.0.0.0`,
 but startup now fails on a non-loopback address without a token. Before upgrading,
 configure the same secret on the master and every engine, then restart them to

@@ -2060,6 +2060,8 @@ class MasterService {
     // deployed separately. Empty = no remote cleanup (co-located prefers the
     // pointer).
     std::string http_metadata_remote_url_;
+    // Snapshot authentication before starting the remote cleanup worker.
+    std::unordered_map<std::string, std::string> http_metadata_remote_headers_;
 
     // Cached HTTP metadata key prefix (initialized once at startup)
     std::string http_metadata_prefix_;

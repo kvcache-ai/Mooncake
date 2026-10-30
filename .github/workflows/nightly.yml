@@ -424,6 +424,7 @@ jobs:
             --eviction_high_watermark_ratio=0.95 \
             --cluster_id=nightly_test_cluster \
             --port 50051 \
+            --http_metadata_server_host=127.0.0.1 \
             --enable_http_metadata_server=true &
           master_pid=$!
           trap 'kill "$master_pid" 2>/dev/null || true; wait "$master_pid" 2>/dev/null || true' EXIT
