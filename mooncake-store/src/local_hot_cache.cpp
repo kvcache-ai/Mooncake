@@ -211,7 +211,7 @@ bool LocalHotCache::removeHotKeyLocked(const std::string& key) {
 bool LocalHotCache::RemoveHotKey(const std::string& key) {
     std::unique_lock<std::shared_mutex> lk(lru_mutex_);
 
-    key_generation_[key]++;
+    bumpKeyGenerationLocked(key);
     drainDeferredTouches();
 
     const bool removed = removeHotKeyLocked(key);
@@ -231,7 +231,7 @@ size_t LocalHotCache::RemoveHotKeys(const std::vector<std::string>& keys) {
 
     size_t removed = 0;
     for (const auto& key : keys) {
-        key_generation_[key]++;
+        bumpKeyGenerationLocked(key);
         if (removeHotKeyLocked(key)) {
             ++removed;
         }
@@ -269,7 +269,7 @@ size_t LocalHotCache::RemoveHotKeysByRegex(const std::string& regex_pattern) {
 
     size_t removed = 0;
     for (const auto& key : matching_keys) {
-        key_generation_[key]++;
+        bumpKeyGenerationLocked(key);
         if (removeHotKeyLocked(key)) {
             ++removed;
         }
@@ -297,9 +297,27 @@ size_t LocalHotCache::RemoveAllHotKeys() {
     return removed;
 }
 
+void LocalHotCache::bumpKeyGenerationLocked(const std::string& key) {
+    auto it = key_generation_.find(key);
+    if (it != key_generation_.end()) {
+        ++it->second;
+        return;
+    }
+
+    // Bound version metadata by the number of payload blocks. Reclaiming
+    // generations must also invalidate old tokens, including generation zero.
+    // The epoch cancels pending fills; published cache entries stay intact.
+    if (key_generation_.size() >= blocks_.size()) {
+        cache_epoch_.fetch_add(1, std::memory_order_relaxed);
+        key_generation_.clear();
+        return;
+    }
+    key_generation_.emplace(key, 1);
+}
+
 void LocalHotCache::BumpKeyGeneration(const std::string& key) {
     std::unique_lock<std::shared_mutex> lk(lru_mutex_);
-    key_generation_[key]++;
+    bumpKeyGenerationLocked(key);
 }
 
 void LocalHotCache::BumpKeyGenerations(const std::vector<std::string>& keys) {
@@ -309,7 +327,7 @@ void LocalHotCache::BumpKeyGenerations(const std::vector<std::string>& keys) {
 
     std::unique_lock<std::shared_mutex> lk(lru_mutex_);
     for (const auto& key : keys) {
-        key_generation_[key]++;
+        bumpKeyGenerationLocked(key);
     }
 }
 
