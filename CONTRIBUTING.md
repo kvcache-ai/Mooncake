@@ -144,9 +144,12 @@ further changes are needed.
 ## Selective PR Unit Tests
 
 PR CI selects native tests by component, while branch pushes, manual runs, and
-nightly retain the full sweep. TE implementation changes exercise TE and Store
-client tests, not master internals. Master implementation changes exercise master
-tests plus a small client/master contract suite, not TE/TENT or PG tests.
+nightly retain the full sweep. TE implementation changes exercise TE, Store
+client, and PG tests (PG CPU tests run over the TE TCP transport), not master
+internals. Master implementation changes exercise master tests plus a small
+client/master contract suite, not TE/TENT or PG tests. PG and EP select only
+their own tests; PG has no CTest targets, so its selection gates the Python PG
+step in the wheel job.
 Multiple-component changes take the union. Public headers, shared code, build
 configuration, and unclassified source changes conservatively select all.
 

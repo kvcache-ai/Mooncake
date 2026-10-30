@@ -26,7 +26,7 @@ class ComponentSelectionTest(unittest.TestCase):
     def select(self, *paths):
         return SELECTOR.select_components(paths)
 
-    def test_te_changes_stop_at_client_not_master_or_pg(self):
+    def test_te_changes_stop_at_client_and_pg_not_master(self):
         for path in (
             "mooncake-transfer-engine/src/transfer_engine.cpp",
             "mooncake-transfer-engine/src/transport/tcp_transport/tcp_transport.cpp",
@@ -40,7 +40,10 @@ class ComponentSelectionTest(unittest.TestCase):
                 self.assertNotIn("store-master", components)
                 outputs = SELECTOR.selection_outputs(components)
                 self.assertEqual(outputs["te_tests"], "true")
-                self.assertEqual(outputs["pg_tests"], "false")
+                # PG CPU tests run over the TE TCP transport.
+                self.assertEqual(outputs["pg_tests"], "true")
+                self.assertNotIn("pg", outputs["unit_test_labels"])
+                self.assertNotIn("mooncake-tests-pg", outputs["unit_test_targets"])
 
     def test_every_master_source_excludes_transport_and_pg_tests(self):
         for path, owner in SELECTOR.store_source_owners().items():
@@ -99,12 +102,32 @@ class ComponentSelectionTest(unittest.TestCase):
         self.assertEqual(self.select(te, "CMakeLists.txt"), {"all"})
         self.assertEqual(self.select(te, "README.md"), self.select(te))
 
-    def test_pg_and_ep_changes_select_their_own_tests(self):
-        for path in ("mooncake-pg/tests/test_cpu.py", "mooncake-ep/src/ep.cpp"):
-            components = self.select(path)
-            self.assertIn("ep", components)
-            self.assertNotIn("store-master", components)
-            self.assertEqual(SELECTOR.selection_outputs(components)["pg_tests"], "true")
+    def test_pg_and_ep_changes_select_only_their_own_tests(self):
+        for path, own, other, pg_tests in (
+            ("mooncake-pg/tests/test_cpu.py", "pg", "ep", "true"),
+            ("mooncake-pg/src/pg_utils.cpp", "pg", "ep", "true"),
+            ("mooncake-ep/src/ep.cpp", "ep", "pg", "false"),
+        ):
+            with self.subTest(path=path):
+                components = self.select(path)
+                self.assertIn(own, components)
+                self.assertNotIn(other, components)
+                self.assertNotIn("te", components)
+                self.assertNotIn("store-master", components)
+                outputs = SELECTOR.selection_outputs(components)
+                self.assertEqual(outputs["pg_tests"], pg_tests)
+
+    def test_pg_has_no_native_label_or_target(self):
+        outputs = SELECTOR.selection_outputs(
+            self.select("mooncake-pg/src/pg_utils.cpp")
+        )
+        self.assertEqual(
+            outputs["unit_test_labels"], "^component-(common|unclassified)$"
+        )
+        self.assertEqual(
+            outputs["unit_test_targets"],
+            "mooncake-tests-common mooncake-tests-unclassified",
+        )
 
     def test_manual_push_and_empty_inputs_cannot_silently_select_nothing(self):
         self.assertEqual(self.select(), {"all"})

@@ -91,11 +91,13 @@ def select_components(paths, *, full=False, root=ROOT):
         ):
             # TENT is exercised by tent-ci; the classic job checks its facade
             # consumers without pulling master implementation tests into it.
-            selected.update(("te", "store-client", "store-shared"))
+            # PG CPU tests run over the TE TCP transport.
+            selected.update(("te", "pg", "store-client", "store-shared"))
         elif path.startswith(("mooncake-pg/", "mooncake-ep/")) and Path(
             path
         ).suffix in (".cpp", ".h", ".hpp", ".cu", ".cuh", ".py"):
-            selected.add("ep")
+            # PG and EP share no code; each selects only its own tests.
+            selected.add(path.split("/")[0].removeprefix("mooncake-"))
         elif path.startswith("mooncake-conductor/") and Path(path).suffix in (
             ".cpp",
             ".h",
@@ -107,17 +109,21 @@ def select_components(paths, *, full=False, root=ROOT):
     return selected if len(selected) > 2 else {"all"}
 
 
+# Components whose tests are Python steps in the wheel job, with no CTest
+# label or build target.
+PYTHON_COMPONENTS = {"pg"}
+
+
 def selection_outputs(components):
     full = "all" in components
+    native = sorted(components - PYTHON_COMPONENTS)
     return {
-        "unit_test_labels": ""
-        if full
-        else "^component-(" + "|".join(sorted(components)) + ")$",
+        "unit_test_labels": "" if full else "^component-(" + "|".join(native) + ")$",
         "unit_test_targets": ""
         if full
-        else " ".join("mooncake-tests-" + c for c in sorted(components)),
+        else " ".join("mooncake-tests-" + c for c in native),
         "te_tests": str(full or "te" in components).lower(),
-        "pg_tests": str(full or "ep" in components).lower(),
+        "pg_tests": str(full or "pg" in components).lower(),
         "store_client_tests": str(full or "store-client" in components).lower(),
     }
 
