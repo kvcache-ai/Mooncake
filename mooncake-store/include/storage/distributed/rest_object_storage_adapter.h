@@ -33,6 +33,13 @@ class RestObjectStorageAdapter : public ObjectStorageAdapter {
                                       std::span<const char> data) override;
     tl::expected<void, ErrorCode> PutV(const std::string& logical_key,
                                        const iovec* iov, int iovcnt) override;
+    tl::expected<void, ErrorCode> PutOnce(const std::string& logical_key,
+                                          std::span<const char> data) override;
+    tl::expected<void, ErrorCode> PutVOnce(const std::string& logical_key,
+                                           const iovec* iov,
+                                           int iovcnt) override;
+    bool SupportsSinglePutAttempt() const override { return true; }
+    bool SupportsSinglePutVAttempt() const override { return true; }
     tl::expected<size_t, ErrorCode> Get(const std::string& logical_key,
                                         void* buf, size_t len) override;
     tl::expected<size_t, ErrorCode> GetRange(const std::string& logical_key,
@@ -118,7 +125,14 @@ class RestObjectStorageAdapter : public ObjectStorageAdapter {
         const char* body = nullptr, size_t body_size = 0,
         const std::string& range = "", const iovec* upload_iov = nullptr,
         int upload_iovcnt = 0, void* download_buffer = nullptr,
-        size_t download_capacity = 0) const;
+        size_t download_capacity = 0, bool retry = true) const;
+
+    tl::expected<void, ErrorCode> PutImpl(const std::string& logical_key,
+                                          std::span<const char> data,
+                                          bool retry);
+    tl::expected<void, ErrorCode> PutVImpl(const std::string& logical_key,
+                                           const iovec* iov, int iovcnt,
+                                           bool retry);
 
     // Runs the batch, then retries requests that failed transiently.
     std::vector<tl::expected<size_t, ErrorCode>> RequestBatch(

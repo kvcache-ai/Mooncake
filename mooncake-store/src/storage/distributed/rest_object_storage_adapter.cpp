@@ -446,7 +446,8 @@ RestObjectStorageAdapter::Request(
     const std::string& method, const std::string& physical_key,
     const std::map<std::string, std::string>& query, const char* body,
     size_t body_size, const std::string& range, const iovec* upload_iov,
-    int upload_iovcnt, void* download_buffer, size_t download_capacity) const {
+    int upload_iovcnt, void* download_buffer, size_t download_capacity,
+    bool retry) const {
     if (!initialized_) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -478,7 +479,7 @@ RestObjectStorageAdapter::Request(
         const bool transient =
             IsTransientFailure(result, response.status,
                                context.download_context.overflow, context.curl);
-        if (transient && attempt < kMaxAttempts) {
+        if (retry && transient && attempt < kMaxAttempts) {
             LOG(WARNING) << LogName() << " " << method << " attempt " << attempt
                          << " failed ("
                          << (result != CURLE_OK
@@ -503,8 +504,19 @@ RestObjectStorageAdapter::Request(
 
 tl::expected<void, ErrorCode> RestObjectStorageAdapter::Put(
     const std::string& logical_key, std::span<const char> data) {
-    auto response = Request("PUT", LogicalToPhysicalKey(logical_key), {},
-                            data.data(), data.size());
+    return PutImpl(logical_key, data, true);
+}
+
+tl::expected<void, ErrorCode> RestObjectStorageAdapter::PutOnce(
+    const std::string& logical_key, std::span<const char> data) {
+    return PutImpl(logical_key, data, false);
+}
+
+tl::expected<void, ErrorCode> RestObjectStorageAdapter::PutImpl(
+    const std::string& logical_key, std::span<const char> data, bool retry) {
+    auto response =
+        Request("PUT", LogicalToPhysicalKey(logical_key), {}, data.data(),
+                data.size(), "", nullptr, 0, nullptr, 0, retry);
     if (!response) return tl::make_unexpected(response.error());
     if (!IsSuccess(response->status))
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
@@ -513,11 +525,22 @@ tl::expected<void, ErrorCode> RestObjectStorageAdapter::Put(
 
 tl::expected<void, ErrorCode> RestObjectStorageAdapter::PutV(
     const std::string& logical_key, const iovec* iov, int iovcnt) {
+    return PutVImpl(logical_key, iov, iovcnt, true);
+}
+
+tl::expected<void, ErrorCode> RestObjectStorageAdapter::PutVOnce(
+    const std::string& logical_key, const iovec* iov, int iovcnt) {
+    return PutVImpl(logical_key, iov, iovcnt, false);
+}
+
+tl::expected<void, ErrorCode> RestObjectStorageAdapter::PutVImpl(
+    const std::string& logical_key, const iovec* iov, int iovcnt, bool retry) {
     auto total = GetIovecSize(iov, iovcnt);
     if (!total) return tl::make_unexpected(total.error());
-    if (*total == 0) return Put(logical_key, {});
-    auto response = Request("PUT", LogicalToPhysicalKey(logical_key), {},
-                            nullptr, *total, "", iov, iovcnt);
+    if (*total == 0) return PutImpl(logical_key, {}, retry);
+    auto response =
+        Request("PUT", LogicalToPhysicalKey(logical_key), {}, nullptr, *total,
+                "", iov, iovcnt, nullptr, 0, retry);
     if (!response) return tl::make_unexpected(response.error());
     if (!IsSuccess(response->status))
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);

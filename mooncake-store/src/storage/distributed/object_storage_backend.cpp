@@ -129,7 +129,8 @@ ErrorCode ObjectStorageBackend::Write(const std::string& object_key,
     if (upload_started != nullptr) {
         *upload_started = true;
     }
-    const auto result = adapter_->Put(object_key, {staging.get(), object_size});
+    const auto result =
+        adapter_->PutOnce(object_key, {staging.get(), object_size});
     return result ? ErrorCode::OK : result.error();
 }
 
@@ -199,8 +200,8 @@ ErrorCode ObjectStorageBackend::WriteV(const std::string& object_key,
     if (upload_started != nullptr) {
         *upload_started = true;
     }
-    const auto result =
-        adapter_->PutV(object_key, iov.data(), static_cast<int>(iov.size()));
+    const auto result = adapter_->PutVOnce(object_key, iov.data(),
+                                           static_cast<int>(iov.size()));
     return result ? ErrorCode::OK : result.error();
 }
 

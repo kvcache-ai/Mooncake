@@ -19,6 +19,7 @@
 
 #include "storage/distributed/s3_adapter.h"
 #include "storage/distributed/object_storage_backend.h"
+#include "oss_fault_test_helpers.h"
 
 namespace mooncake {
 namespace {
@@ -479,19 +480,39 @@ TEST(S3ObjectStorageAdapterTest, GenericAndBatchReadsValidateContentRange) {
     EXPECT_EQ(server.requests().size(), 6U);
 }
 
-TEST(S3ObjectStorageAdapterTest, ImmutableBackendRejectsAutomaticPutRetries) {
+TEST(S3ObjectStorageAdapterTest, ImmutableBackendUsesSingleAttemptUploads) {
+    using Server = test::OssFaultHttpServer;
+    Server server(
+        {{"uncertain", Server::Reset()}, {"fresh", Server::Reply(200, "")}});
+    ScopedEnvironment env;
+    ConfigureLocalEndpoint(env, server.port());
     auto adapter = std::make_shared<S3ObjectStorageAdapter>("p");
-    EXPECT_FALSE(adapter->SupportsSinglePutAttempt());
+    ASSERT_TRUE(adapter->Init());
+    EXPECT_TRUE(adapter->SupportsSinglePutAttempt());
+    EXPECT_TRUE(adapter->SupportsSinglePutVAttempt());
     ObjectStorageBackend backend({}, adapter);
     char value = 'x';
-    bool started = true;
+    bool started = false;
     const auto copy = [](void* dst, const void* src, size_t bytes) {
         std::memcpy(dst, src, bytes);
         return true;
     };
-    EXPECT_EQ(backend.Write("key", 1, {{&value, 1}}, copy, &started),
-              ErrorCode::NOT_SUPPORTED);
-    EXPECT_FALSE(started);
+    EXPECT_EQ(backend.Write("uncertain", 1, {{&value, 1}}, copy, &started),
+              ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_TRUE(started);
+    EXPECT_EQ(backend.WriteV(
+                  "fresh", 1, {{&value, 1}}, [](const Slice&) { return true; },
+                  {}, &started),
+              ErrorCode::OK);
+    EXPECT_TRUE(started);
+    server.Stop();
+    EXPECT_TRUE(server.error().empty()) << server.error();
+    ASSERT_EQ(server.requests().size(), 2U);
+    EXPECT_NE(server.requests()[0].find("/uncertain HTTP/"), std::string::npos);
+    EXPECT_NE(server.requests()[1].find("/fresh HTTP/"), std::string::npos);
+    for (const auto& request : server.requests()) {
+        EXPECT_TRUE(request.ends_with("\r\n\r\nx"));
+    }
 }
 
 // A connection dropped before any response (for example a reset after a

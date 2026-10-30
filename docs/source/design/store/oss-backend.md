@@ -185,11 +185,11 @@ initialized `ObjectStorageAdapter` and `ObjectStorageBackendConfig`:
   caller buffers or the adapter's own HTTP buffers.
 
 `Write` validates and gathers all slices into a full-object host buffer, then
-invokes the adapter's `Put` once. It requires enough staging budget for the
+invokes the adapter's `PutOnce`. It requires enough staging budget for the
 entire object. The adapter must advertise `SupportsSinglePutAttempt()`; otherwise
-writes return `NOT_SUPPORTED` before staging or issuing PUT. OSS supports this
-contract. The REST/S3 adapter automatically retries ambiguous uploads and is
-rejected for these immutable-attempt writes; its legacy offload API is unchanged.
+writes return `NOT_SUPPORTED` before staging or issuing PUT. Both OSS and S3
+support this contract. The S3 single-attempt entry points disable retries for
+that call only; its legacy offload API is unchanged.
 The optional `upload_started` output becomes true immediately
 before the adapter call; an error with this flag set can have an ambiguous
 remote outcome. The backend does not retry PUT.
@@ -197,7 +197,7 @@ remote outcome. The backend does not retry PUT.
 `WriteV` is the opt-in path for borrowing host buffers. The caller supplies an
 `IsHostMemory` predicate; the backend does not detect pointer address spaces.
 Nonempty slices classified as host are passed directly to the adapter's
-`PutV` and must remain valid and unchanged until the synchronous call returns.
+`PutVOnce` and must remain valid and unchanged until the synchronous call returns.
 Other slices are gathered through `to_host`, reserving only their combined
 size from the staging budget. The predicate is evaluated once per nonempty
 slice. An all-host write needs neither payload staging nor a copy callback,
@@ -205,9 +205,12 @@ even if the instance's staging budget is occupied by another operation.
 For borrowed buffers this budget is not an upload concurrency limit; the
 caller remains responsible for request admission and its own buffer budget.
 
-This path requires `SupportsSinglePutVAttempt()`, separately from the legacy
-`Put` capability. OSS advertises both; retrying REST/S3 writes remain rejected.
-All validation and staging complete before the single `PutV` invocation;
+This path requires `SupportsSinglePutVAttempt()`, separately from the
+`PutOnce` capability. OSS and S3 support both single-attempt entry points.
+S3 uses a per-request retry policy: `PutOnce` and `PutVOnce` never retry,
+including empty uploads, while existing `Put`, `PutV` and batch calls retain
+their retry behavior. Concurrent calls do not change shared retry settings.
+All validation and staging complete before the single `PutVOnce` invocation;
 `upload_started` and failure/exception cleanup follow the same rules as `Write`.
 This removes the backend's gathering copy for borrowed slices, not copies
 inside the adapter or network stack. Existing `Write` calls retain their

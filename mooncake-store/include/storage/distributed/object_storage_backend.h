@@ -21,7 +21,7 @@ struct ObjectStorageBackendConfig {
 // component does not publish replicas or retry an ambiguous PUT.
 // The adapter must be initialized and support concurrent calls if shared.
 // Write requires SupportsSinglePutAttempt(); WriteV requires
-// SupportsSinglePutVAttempt(). Retrying upload paths are rejected.
+// SupportsSinglePutVAttempt(). Uses PutOnce/PutVOnce without upload retries.
 class ObjectStorageBackend {
    public:
     // Copy between caller memory (possibly device memory) and host staging.
@@ -37,16 +37,17 @@ class ObjectStorageBackend {
                          std::shared_ptr<ObjectStorageAdapter> adapter);
 
     // Gather a full object before issuing one PUT. upload_started is reset on
-    // entry and set just before invoking Put: true means PUT may have begun,
-    // including when the adapter returns an error.
+    // entry and set just before invoking PutOnce: true means PUT may have
+    // begun, including when the adapter returns an error.
     ErrorCode Write(const std::string& object_key, uint64_t object_size,
                     const std::vector<Slice>& slices, const Copy& to_host,
                     bool* upload_started = nullptr);
 
-    // Borrow host slices and stage only the remaining slices before one PutV.
-    // The caller supplies memory classification; no pointer probing is done.
-    // Requires SupportsSinglePutVAttempt(). to_host may be empty when every
-    // nonempty slice is borrowed. upload_started has the same meaning as Write.
+    // Borrow host slices and stage only the remaining slices before one
+    // PutVOnce. The caller supplies memory classification; no pointer probing
+    // is done. Requires SupportsSinglePutVAttempt(). to_host may be empty when
+    // every nonempty slice is borrowed. upload_started has the same meaning as
+    // Write.
     ErrorCode WriteV(const std::string& object_key, uint64_t object_size,
                      const std::vector<Slice>& slices,
                      const IsHostMemory& is_host, const Copy& to_host,

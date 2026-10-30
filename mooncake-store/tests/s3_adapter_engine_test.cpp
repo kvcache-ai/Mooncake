@@ -1728,29 +1728,98 @@ TEST(S3ObjectStorageAdapterEngineTest,
 }
 
 TEST(S3ObjectStorageAdapterEngineTest,
-     BackendWriteVRejectsRetryingAdapterBeforeClassification) {
+     BackendUploadsMakeOneAttemptIncludingEmptyAndLostResponses) {
     using Server = test::OssFaultHttpServer;
-    Server server({{"key", Server::Reply(200, "")}});
+    for (int mode = 0; mode < 4; ++mode) {
+        for (int failure = 0; failure < 3; ++failure) {
+            SCOPED_TRACE(::testing::Message()
+                         << "mode=" << mode << " failure=" << failure);
+            Server server({{"key", failure == 0   ? Server::Reply(200, "")
+                                   : failure == 1 ? Server::Reply(503, "busy")
+                                                  : Server::Reset()}});
+            ScopedEnvironment environment;
+            ConfigureFaultEndpoint(environment, server.port());
+            auto adapter =
+                std::make_shared<S3ObjectStorageAdapter>("/backend-io/");
+            ASSERT_TRUE(adapter->Init());
+            ObjectStorageBackend backend({16, 2}, adapter);
+            std::string host = "abc", device = "de", last = "fgh";
+            const bool empty = mode >= 2;
+            const std::vector<Slice> slices =
+                empty ? std::vector<Slice>{{nullptr, 0}}
+                      : std::vector<Slice>{{host.data(), 3},
+                                           {nullptr, 0},
+                                           {device.data(), 2},
+                                           {last.data(), 3}};
+            bool started = false;
+            const auto copy = [](void* dst, const void* src, size_t size) {
+                std::memcpy(dst, src, size);
+                return true;
+            };
+            ErrorCode result;
+            if (mode % 2 == 0) {
+                // Legacy backend Write still stages the full payload.
+                ObjectStorageBackend full_staging({16, 8}, adapter);
+                result = full_staging.Write("key", empty ? 0 : 8, slices, copy,
+                                            &started);
+            } else {
+                result = backend.WriteV(
+                    "key", empty ? 0 : 8, slices,
+                    [&](const Slice& slice) {
+                        return slice.ptr != device.data();
+                    },
+                    copy, &started);
+            }
+            EXPECT_TRUE(started);
+            EXPECT_EQ(result, failure == 0 ? ErrorCode::OK
+                              : failure == 1
+                                  ? ErrorCode::FILE_WRITE_FAIL
+                                  : ErrorCode::DFS_SERVICE_UNAVAILABLE);
+            server.Stop();
+            EXPECT_TRUE(server.error().empty()) << server.error();
+            const auto requests = server.requests();
+            ASSERT_EQ(requests.size(), 1U);
+            EXPECT_TRUE(requests[0].starts_with("PUT "));
+            EXPECT_TRUE(
+                requests[0].ends_with(empty ? "\r\n\r\n" : "\r\n\r\nabcdefgh"));
+        }
+    }
+}
+
+TEST(S3ObjectStorageAdapterEngineTest,
+     SingleAttemptDoesNotChangeLegacyRetries) {
+    using Server = test::OssFaultHttpServer;
+    Server server({{"once", Server::Gate(503, "busy")},
+                   {"put", Server::Reply(503, "busy")},
+                   {"putv", Server::Reply(503, "busy")}},
+                  true);
     ScopedEnvironment environment;
     ConfigureFaultEndpoint(environment, server.port());
-    auto adapter = std::make_shared<S3ObjectStorageAdapter>("/backend-io/");
-    ASSERT_TRUE(adapter->Init());
-    ObjectStorageBackend backend({8, 1}, adapter);
-    char byte = 'x';
-    bool started = true;
-    size_t classified = 0;
-    EXPECT_EQ(backend.WriteV(
-                  "key", 1, {{&byte, 1}},
-                  [&](const Slice&) {
-                      ++classified;
-                      return true;
-                  },
-                  {}, &started),
-              ErrorCode::NOT_SUPPORTED);
-    EXPECT_FALSE(started);
-    EXPECT_EQ(classified, 0U);
+    S3ObjectStorageAdapter adapter("/backend-io/");
+    ASSERT_TRUE(adapter.Init());
+    std::string data = "payload";
+    const iovec iov{data.data(), data.size()};
+    auto once_result = std::async(std::launch::async, [&] {
+        return adapter.PutOnce("once", {data.data(), data.size()});
+    });
+    EXPECT_TRUE(server.WaitForRequest("once"));
+    // Legacy uploads still retry while the single-attempt call is in flight.
+    EXPECT_FALSE(adapter.Put("put", {data.data(), data.size()}));
+    EXPECT_FALSE(adapter.PutV("putv", &iov, 1));
+    server.ReleaseResponses();
+    EXPECT_FALSE(once_result.get());
     server.Stop();
-    EXPECT_TRUE(server.requests().empty());
+    EXPECT_TRUE(server.error().empty()) << server.error();
+    size_t once = 0, put = 0, putv = 0;
+    for (const auto& request : server.requests()) {
+        EXPECT_TRUE(request.ends_with("\r\n\r\npayload"));
+        if (request.find("/once HTTP/") != std::string::npos) ++once;
+        if (request.find("/put HTTP/") != std::string::npos) ++put;
+        if (request.find("/putv HTTP/") != std::string::npos) ++putv;
+    }
+    EXPECT_EQ(once, 1U);
+    EXPECT_EQ(put, kAttempts);
+    EXPECT_EQ(putv, kAttempts);
 }
 
 }  // namespace

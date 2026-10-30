@@ -112,15 +112,30 @@ class ObjectStorageAdapter {
     }
     virtual const char* GetName() const = 0;
 
-    // True only when Put never retries an ambiguous physical upload. A fresh
-    // retry could materialize after DELETE even if a later PUT succeeds.
-    // Required by the immutable-attempt backend protocol. Existing
-    // whole-object offload and batch operations keep their own retry policy.
+    // Single-attempt entry points for the immutable-object backend. Support
+    // must be advertised separately for each path. Never resend an ambiguous
+    // upload: a delayed retry could materialize after object deletion.
+    // Legacy adapters can reuse
+    // Put/PutV only when those operations already avoid retries.
     virtual bool SupportsSinglePutAttempt() const { return false; }
-
-    // Separate capability: a single-attempt Put does not imply that PutV
-    // avoids retries. Includes the empty-object path through Put, if any.
     virtual bool SupportsSinglePutVAttempt() const { return false; }
+
+    virtual tl::expected<void, ErrorCode> PutOnce(
+        const std::string& logical_key, std::span<const char> data) {
+        if (!SupportsSinglePutAttempt()) {
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+        }
+        return Put(logical_key, data);
+    }
+
+    // Same synchronous buffer lifetime contract as PutV, including empty data.
+    virtual tl::expected<void, ErrorCode> PutVOnce(
+        const std::string& logical_key, const iovec* iov, int iovcnt) {
+        if (!SupportsSinglePutVAttempt()) {
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+        }
+        return PutV(logical_key, iov, iovcnt);
+    }
 };
 
 }  // namespace mooncake
