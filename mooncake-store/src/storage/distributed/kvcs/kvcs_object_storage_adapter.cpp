@@ -162,8 +162,7 @@ std::vector<tl::expected<void, ErrorCode>> KvcsObjectStorageAdapter::PutBatch(
     pending_indices.reserve(put_indices.size());
     for (size_t i = 0; i < deleted.size(); ++i) {
         if (!deleted[i]) {
-            results[put_indices[i]] =
-                tl::make_unexpected(deleted[i].error());
+            results[put_indices[i]] = tl::make_unexpected(deleted[i].error());
             continue;
         }
         pending.push_back(std::move(puts[i]));

@@ -3899,8 +3899,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
             dfs_storage_backend_->BatchDeleteObjects(removed_keys);
         if (deleted.size() != removed_keys.size()) {
             for (size_t index : removed_indices) {
-                results[index] =
-                    tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
         } else {
             for (size_t i = 0; i < deleted.size(); ++i) {

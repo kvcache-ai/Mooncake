@@ -192,8 +192,7 @@ class KvcsLowLevelDriver final : public KvcsDriver {
 
     tl::expected<std::vector<KvcsMountpointStat>, ErrorCode>
     GetMountpointStats() override {
-        if (!client_)
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        if (!client_) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         std::vector<kvcs_mountpoint_stat_t> native(KVCS_MOUNTPOINT_MAX);
         int count = 0;
         const int call = kvcs_ll_mp_stat(

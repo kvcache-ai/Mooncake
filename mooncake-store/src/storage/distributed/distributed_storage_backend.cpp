@@ -670,8 +670,7 @@ DistributedStorageBackend::BatchWrite(
             if (request.slices.empty() || !total_size ||
                 request.slices.size() >
                     static_cast<size_t>(std::numeric_limits<int>::max()) ||
-                desc.object_size == 0 ||
-                *total_size != desc.object_size) {
+                desc.object_size == 0 || *total_size != desc.object_size) {
                 results[index] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
@@ -796,8 +795,7 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
             auto capacity = CalculateSliceBytes(request.slices);
             if (request.slices.empty() || !capacity ||
                 desc.object_size > std::numeric_limits<size_t>::max() ||
-                desc.object_size == 0 ||
-                *capacity < desc.object_size) {
+                desc.object_size == 0 || *capacity < desc.object_size) {
                 results[index] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }

@@ -3515,8 +3515,8 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
             } else if (desc.is_dfs_replica()) {
                 const auto& dfs_desc = desc.get_dfs_descriptor();
                 if (!use_kvcs_ || dfs_desc.object_size != standby_meta.size) {
-                    NoteLegacyStandbyRejection(
-                        ctx, entry, "invalid_dfs_descriptor");
+                    NoteLegacyStandbyRejection(ctx, entry,
+                                               "invalid_dfs_descriptor");
                     construction_ok = false;
                     break;
                 }
@@ -5228,9 +5228,8 @@ auto MasterService::PrepareWriteStart(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (config.dfs_replica_num > 0 &&
-        (!enable_dfs_ ||
-         (!use_kvcs_ &&
-          (!dfs_allocator_ || !dfs_allocator_->IsInitialized())))) {
+        (!enable_dfs_ || (!use_kvcs_ && (!dfs_allocator_ ||
+                                         !dfs_allocator_->IsInitialized())))) {
         LOG(ERROR) << "key=" << key
                    << ", dfs_replica_num=" << config.dfs_replica_num
                    << ", error=dfs_service_unavailable";

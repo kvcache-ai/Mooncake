@@ -125,10 +125,7 @@ KvcsObjectStorageAdapter MakeAdapter() {
 TEST(KvcsCapacityProviderTest, SelectsConfiguredMountpoint) {
     std::vector<KvcsMountpointStat> stats{
         {.index = 1, .id = "other", .total_bytes = 200, .used_bytes = 50},
-        {.index = 2,
-         .id = "target-mp",
-         .total_bytes = 100,
-         .used_bytes = 25}};
+        {.index = 2, .id = "target-mp", .total_bytes = 100, .used_bytes = 25}};
     KvcsCapacityProvider provider(
         2, "target-mp", std::make_unique<MemoryDriver>(std::move(stats)));
     auto capacity = provider.GetCapacity();
@@ -141,16 +138,14 @@ TEST(KvcsCapacityProviderTest, SelectsConfiguredMountpoint) {
 TEST(KvcsCapacityProviderTest, RejectsUnknownOrInconsistentCapacity) {
     auto get_capacity = [](std::vector<KvcsMountpointStat> stats) {
         KvcsCapacityProvider provider(
-            2, "target-mp",
-            std::make_unique<MemoryDriver>(std::move(stats)));
+            2, "target-mp", std::make_unique<MemoryDriver>(std::move(stats)));
         return provider.GetCapacity();
     };
     EXPECT_FALSE(get_capacity({}).has_value());
-    EXPECT_FALSE(get_capacity({{.index = 2,
-                                .id = "other",
-                                .total_bytes = 100,
-                                .used_bytes = 25}})
-                     .has_value());
+    EXPECT_FALSE(
+        get_capacity(
+            {{.index = 2, .id = "other", .total_bytes = 100, .used_bytes = 25}})
+            .has_value());
     EXPECT_FALSE(get_capacity({{.index = 2,
                                 .id = "target-mp",
                                 .total_bytes = 0,

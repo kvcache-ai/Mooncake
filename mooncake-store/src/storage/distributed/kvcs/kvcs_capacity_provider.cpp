@@ -9,17 +9,16 @@
 
 namespace mooncake {
 
-KvcsCapacityProvider::KvcsCapacityProvider(
-    uint32_t mountpoint_index, std::string mountpoint_id,
-    std::unique_ptr<KvcsDriver> driver)
+KvcsCapacityProvider::KvcsCapacityProvider(uint32_t mountpoint_index,
+                                           std::string mountpoint_id,
+                                           std::unique_ptr<KvcsDriver> driver)
     : mountpoint_index_(mountpoint_index),
       mountpoint_id_(std::move(mountpoint_id)),
       driver_(std::move(driver)) {}
 
 KvcsCapacityProvider::~KvcsCapacityProvider() = default;
 
-tl::expected<DfsUsageSnapshot, ErrorCode>
-KvcsCapacityProvider::GetCapacity() {
+tl::expected<DfsUsageSnapshot, ErrorCode> KvcsCapacityProvider::GetCapacity() {
     if (!driver_ || mountpoint_index_ == 0 || mountpoint_id_.empty())
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     auto initialized = driver_->Init();
