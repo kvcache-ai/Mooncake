@@ -184,3 +184,21 @@ TEST(NoFIoLayoutTest, RejectsLbaRangeThatWraps) {
     EXPECT_FALSE(BuildNoFIoLayout(1, last_lba, kAlignedAddress, 2, layout));
     EXPECT_TRUE(BuildNoFIoLayout(1, last_lba - 1, kAlignedAddress, 1, layout));
 }
+
+TEST(NoFIoLayoutTest, IoBytesCoverThePaddedExtent) {
+    // A 513 B object touches 1024 B of disk whether the address is aligned
+    // (direct head + staged tail) or not (one staged segment), so a 513 B
+    // allocation cannot take the padded write.
+    NoFIoLayout aligned;
+    ASSERT_TRUE(BuildNoFIoLayout(kBlock512, 0, kAlignedAddress, 513, aligned));
+    EXPECT_EQ(aligned.io_bytes(kBlock512), 1024u);
+
+    NoFIoLayout unaligned;
+    ASSERT_TRUE(
+        BuildNoFIoLayout(kBlock512, 0, kAlignedAddress + 1, 513, unaligned));
+    EXPECT_EQ(unaligned.io_bytes(kBlock512), 1024u);
+
+    NoFIoLayout exact;
+    ASSERT_TRUE(BuildNoFIoLayout(kBlock512, 0, kAlignedAddress, 1024, exact));
+    EXPECT_EQ(exact.io_bytes(kBlock512), 1024u);
+}

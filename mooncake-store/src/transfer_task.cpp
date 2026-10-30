@@ -2036,6 +2036,17 @@ std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
                    << " cannot be mapped onto block size " << block_size;
         return std::nullopt;
     }
+    // A padded write overwrites the bytes between the logical end of the
+    // object and the end of its last block, which is only safe when the
+    // allocation reserved them. Reads just discard the padding.
+    const uint64_t io_bytes = layout.io_bytes(block_size);
+    if (op_code == TransferRequest::WRITE && io_bytes > handle.size_) {
+        LOG(ERROR) << "NoF write offset=" << handle.buffer_address_
+                   << ", size=" << size << " pads to " << io_bytes
+                   << " bytes, beyond the allocated buffer_size="
+                   << handle.size_;
+        return std::nullopt;
+    }
 
     const NofIOOp op =
         (op_code == TransferRequest::READ) ? NofIOOp::kRead : NofIOOp::kWrite;

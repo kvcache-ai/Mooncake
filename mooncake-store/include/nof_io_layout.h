@@ -61,6 +61,15 @@ struct NoFIoLayout {
         }
         return bytes;
     }
+
+    // Total on-disk bytes the layout touches, padding included.
+    uint64_t io_bytes(uint32_t block_size) const {
+        uint64_t bytes = 0;
+        for (const auto& segment : segments) {
+            bytes += static_cast<uint64_t>(segment.lba_count) * block_size;
+        }
+        return bytes;
+    }
 };
 
 /**
