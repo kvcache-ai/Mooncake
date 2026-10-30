@@ -14,33 +14,36 @@ these runners. Destroy/reimage the runner after each job. Docker access is
 host administration capability: container flags are not a substitute for this
 runner isolation.
 
-Install Docker, `gh`, Python 3.12, `flock`, and `timeout`. Supply these
-**host-owned runner environment variables**, not PR-controlled workflow inputs:
+Each eight-GPU host runs four runners, each owning a fixed, non-overlapping
+pair. GitHub runs one job at a time per runner; no additional allocation lock
+or lock-directory configuration is needed. No other workload may use those
+assigned devices.
+
+Install Docker, `gh`, Python 3.12, and `timeout`. The only required GPU
+configuration is the runner's existing **host-owned** environment variable:
 
 ```sh
 ZE_AFFINITY_MASK=0,1
-XPU_RENDER_DEVICES="/dev/dri/renderD128 /dev/dri/renderD129"
-XPU_LOCK_DIRECTORY=/var/lock/mooncake-xpu
-XPU_SECCOMP_PROFILE=/etc/mooncake-ci/xpu-seccomp.json
 ```
 
-`ZE_AFFINITY_MASK` must select two distinct whole GPUs. `XPU_RENDER_DEVICES`
-can be omitted only on a host exposing exactly two render nodes. Verify that
-the mask still identifies the assigned B60 pair inside the device-restricted
-container: GPU ordinals can change when devices are hidden. The container must
-see exactly two B60s. No privileged mode, host network/PID/IPC namespace, Docker
-socket, publishing token, or `CAP_SYS_PTRACE` is passed to the test container.
+For example, the four masks can be `0,1`, `2,3`, `4,5`, and `6,7`, using the
+host's Level Zero whole-device ordinals. All render nodes are passed into the
+container to preserve device enumeration; the mask selects the assigned pair.
+Preflight requires exactly two visible B60s and real GPU arithmetic.
+**The mask is not a security boundary:** this setup trusts the fixed runner
+allocation and test code not to use other devices. It is not suitable for
+untrusted multi-tenant code. No privileged mode, host network/PID/IPC namespace,
+Docker socket, publishing token, or `CAP_SYS_PTRACE` is passed to the container.
 
-Create a shared writable lock directory for allocations on the same host.
-Every user of a render node must honor its per-node lock; do not provision
-overlapping runners. Locks cover container startup through verified teardown,
-and are per device rather than global across both runner pairs.
-
-Provide a root-owned, runner-readable but **not runner-writable** seccomp
-profile. Start from the Docker default for the deployed Docker version and
-explicitly allow `pidfd_open`, `pidfd_getfd`, `io_uring_setup`,
-`io_uring_enter`, and `io_uring_register` without adding `CAP_SYS_PTRACE`.
-Do not use `seccomp=unconfined`. Host Yama `ptrace_scope` must be 0 or 1,
+CI automatically downloads a commit-pinned Moby default seccomp profile,
+verifies its SHA256, and writes a per-run profile allowing `pidfd_open`,
+`pidfd_getfd`, `io_uring_setup`, `io_uring_enter`, and `io_uring_register`.
+All other default rules remain unchanged. No `XPU_SECCOMP_PROFILE`,
+`XPU_LOCK_DIRECTORY`, or `XPU_RENDER_DEVICES` setting is required or consumed.
+The host needs HTTPS access to `raw.githubusercontent.com`; download or
+checksum failure aborts the job, never falls back to `seccomp=unconfined`.
+The generated profile is retained in the diagnostic artifact.
+Host Yama `ptrace_scope` must be 0 or 1,
 Level Zero IPC/P2P must work, and the run's output filesystem must support
 `O_DIRECT` and io_uring. Missing permissions/capabilities fail core, not skip it.
 

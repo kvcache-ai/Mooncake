@@ -14,8 +14,44 @@ import sys
 import tarfile
 import time
 import unittest
+import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
+
+
+SECCOMP_URL = (
+    "https://raw.githubusercontent.com/moby/profiles/"
+    "4b8214fc4971e06172938a1f1554ccff6647ee80/seccomp/default.json"
+)
+SECCOMP_SHA256 = "6416b47770785a41ac59073cdc77d9fe98517df2799dc83ef207e622de3053f6"
+XPU_SYSCALLS = {
+    "pidfd_open",
+    "pidfd_getfd",
+    "io_uring_setup",
+    "io_uring_enter",
+    "io_uring_register",
+}
+
+
+def prepare_seccomp(output: Path) -> None:
+    with urllib.request.urlopen(SECCOMP_URL, timeout=30) as response:
+        content = response.read()
+    require(
+        hashlib.sha256(content).hexdigest() == SECCOMP_SHA256,
+        "Docker default seccomp profile checksum mismatch",
+    )
+    profile = json.loads(content)
+    require(
+        profile["defaultAction"] == "SCMP_ACT_ERRNO", "Expected deny-by-default seccomp"
+    )
+    rules = []
+    for rule in profile["syscalls"]:
+        names = [name for name in rule["names"] if name not in XPU_SYSCALLS]
+        if names:
+            rules.append({**rule, "names": names})
+    rules.append({"names": sorted(XPU_SYSCALLS), "action": "SCMP_ACT_ALLOW"})
+    profile["syscalls"] = rules
+    output.write_text(json.dumps(profile, indent=2))
 
 
 def require(condition: bool, message: str) -> None:
@@ -558,6 +594,8 @@ def main() -> None:
         suite(*(Path(arg) for arg in args))
     elif mode == "store":
         store_test(*(Path(arg) for arg in args))
+    elif mode == "seccomp":
+        prepare_seccomp(Path(args[0]))
     else:
         raise RuntimeError(f"Unknown XPU core command: {mode}")
 

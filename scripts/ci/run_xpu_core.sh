@@ -45,46 +45,29 @@ exec > >(tee "$run_directory/output/runner.log") 2>&1
 
 [ "$(id -u)" -ne 0 ] || { echo "XPU runner must not run as root" >&2; exit 1; }
 : "${ZE_AFFINITY_MASK:?Set a host-owned two-GPU ZE_AFFINITY_MASK}"
-: "${XPU_SECCOMP_PROFILE:?Set a host-owned seccomp profile permitting IPC and io_uring}"
-: "${XPU_LOCK_DIRECTORY:?Set a host-owned shared allocation lock directory}"
 : "${XPU_IMAGE:?Missing pinned runtime image}"
 : "${CHECKOUT_SHA:?Missing authorized SHA}"
-[[ "$ZE_AFFINITY_MASK" =~ ^([0-9]+),([0-9]+)$ ]] || {
+[[ "$ZE_AFFINITY_MASK" =~ ^(0|[1-9][0-9]*),(0|[1-9][0-9]*)$ ]] || {
   echo "ZE_AFFINITY_MASK must select two whole devices, not subdevices" >&2; exit 1;
 }
 [ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[2]}" ] || fail "Affinity must select distinct GPUs"
 [[ "$XPU_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] || fail "Runtime image must be digest-pinned"
-[[ "$XPU_SECCOMP_PROFILE" = /* ]] || fail "Seccomp profile path must be absolute"
-[ -r "$XPU_SECCOMP_PROFILE" ] && [ ! -w "$XPU_SECCOMP_PROFILE" ] \
-  || fail "Seccomp profile must be readable but not writable by the runner"
-[ "$(stat -c %u "$XPU_SECCOMP_PROFILE")" -eq 0 ] || fail "Seccomp profile must be root-owned"
-[ -d "$XPU_LOCK_DIRECTORY" ] && [ -w "$XPU_LOCK_DIRECTORY" ] \
-  || fail "Allocation lock directory must exist and be writable"
-for command in docker flock timeout; do
+for command in docker python3 timeout; do
   command -v "$command" >/dev/null || fail "Missing runner command: $command"
 done
 
-# Passing only assigned render nodes is the device boundary; the affinity mask
-# alone is not isolation. A dedicated two-GPU host can use the default nodes.
-if [ -n "${XPU_RENDER_DEVICES:-}" ]; then
-  read -ra devices <<< "$XPU_RENDER_DEVICES"
-else
-  shopt -s nullglob
-  devices=(/dev/dri/renderD*)
-fi
-[ "${#devices[@]}" -eq 2 ] || {
-  echo "Assign exactly two render nodes with XPU_RENDER_DEVICES on shared hosts" >&2; exit 1;
-}
-mapfile -t devices < <(printf '%s\n' "${devices[@]}" | sort -u)
-[ "${#devices[@]}" -eq 2 ] || fail "Assign two distinct render nodes"
+# Each runner owns a fixed pair. Preserve host enumeration so masks such as
+# 2,3 and 6,7 stay valid; the mask is scheduling, not a device security boundary.
+shopt -s nullglob
+devices=(/dev/dri/renderD*)
+[ "${#devices[@]}" -ge 2 ] || fail "At least two GPU render nodes are required"
 device_args=()
 for device in "${devices[@]}"; do
   [[ "$device" =~ ^/dev/dri/renderD[0-9]+$ ]] && [ -c "$device" ] \
     || fail "Not a GPU render character device: $device"
-  exec {lock_fd}>"$XPU_LOCK_DIRECTORY/$(basename "$device").lock"
-  flock -n "$lock_fd" || { echo "XPU allocation busy: $device" >&2; exit 1; }
   device_args+=(--device "$device" --group-add "$(stat -c %g "$device")")
 done
+python3 "$control_directory/ci/xpu_core.py" seccomp "$run_directory/output/seccomp.json"
 
 container_id=
 cleanup() {
@@ -108,7 +91,7 @@ container_id=$(docker create \
   --label "mooncake.xpu.run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
   --user "$(id -u):$(id -g)" --cap-drop ALL \
   --security-opt no-new-privileges \
-  --security-opt "seccomp=$XPU_SECCOMP_PROFILE" \
+  --security-opt "seccomp=$run_directory/output/seccomp.json" \
   --network none --ipc private --shm-size 2g \
   --pids-limit 1024 --ulimit core=0 \
   "${device_args[@]}" \

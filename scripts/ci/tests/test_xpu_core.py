@@ -411,6 +411,61 @@ class ReportTest(unittest.TestCase):
 
 
 class ShellLifecycleTest(unittest.TestCase):
+    def test_fixed_runner_masks_need_no_lock_or_profile_variables(self):
+        script = (ROOT / "scripts/ci/run_xpu_core.sh").read_text()
+        start = script.index(': "${ZE_AFFINITY_MASK:')
+        stop = script.index("# Each runner owns a fixed pair.")
+        for mask, valid in (
+            ("0,1", True),
+            ("2,3", True),
+            ("4,5", True),
+            ("6,7", True),
+            ("0,0", False),
+            ("00,0", False),
+            ("0", False),
+            ("0.0,0.1", False),
+            ("", False),
+        ):
+            environment = {
+                key: value
+                for key, value in os.environ.items()
+                if key
+                not in {
+                    "XPU_LOCK_DIRECTORY",
+                    "XPU_SECCOMP_PROFILE",
+                    "XPU_RENDER_DEVICES",
+                }
+            }
+            environment.update(
+                {
+                    "ZE_AFFINITY_MASK": mask,
+                    "XPU_IMAGE": "image@sha256:" + "a" * 64,
+                    "CHECKOUT_SHA": "b" * 40,
+                }
+            )
+            with self.subTest(mask=mask):
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-ec",
+                        'fail() { echo "$*" >&2; exit 1; }\n' + script[start:stop],
+                    ],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode == 0, valid, result.stderr)
+        self.assertNotIn("XPU_LOCK_DIRECTORY", script)
+        self.assertNotIn("XPU_SECCOMP_PROFILE", script)
+        self.assertNotIn("XPU_RENDER_DEVICES", script)
+        self.assertNotIn("flock", script)
+        self.assertIn("devices=(/dev/dri/renderD*)", script)
+        self.assertIn('--env "ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK"', script)
+        self.assertIn(
+            '--security-opt "seccomp=$run_directory/output/seccomp.json"', script
+        )
+
     def test_cleanup_recheck_propagates_docker_query_failure(self):
         for query_status in (0, 2):
             with self.subTest(
@@ -581,6 +636,86 @@ echo dependency > xpu-ci-output/python-deps/dependency.whl
             'cp -R xpu-ci-output/python-deps "$out/"',
             steps["Package native tests"]["run"],
         )
+
+
+class SeccompTest(unittest.TestCase):
+    def test_only_required_syscalls_are_unconditionally_allowed(self):
+        original = {
+            "defaultAction": "SCMP_ACT_ERRNO",
+            "defaultErrnoRet": 1,
+            "archMap": [{"architecture": "SCMP_ARCH_X86_64", "subArchitectures": []}],
+            "syscalls": [
+                {"names": ["read", "write", "pidfd_open"], "action": "SCMP_ACT_ALLOW"},
+                {
+                    "names": ["pidfd_getfd", "ptrace"],
+                    "action": "SCMP_ACT_ALLOW",
+                    "includes": {"caps": ["CAP_SYS_PTRACE"]},
+                },
+                {
+                    "names": ["io_uring_setup"],
+                    "action": "SCMP_ACT_ERRNO",
+                    "errnoRet": 1,
+                },
+                {
+                    "names": ["mount"],
+                    "action": "SCMP_ACT_ALLOW",
+                    "includes": {"caps": ["CAP_SYS_ADMIN"]},
+                },
+            ],
+        }
+        content = json.dumps(original).encode()
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "seccomp.json"
+            with (
+                patch.object(CORE.urllib.request, "urlopen") as download,
+                patch.object(
+                    CORE, "SECCOMP_SHA256", hashlib.sha256(content).hexdigest()
+                ),
+            ):
+                download.return_value.__enter__.return_value.read.return_value = content
+                CORE.prepare_seccomp(output)
+                download.assert_called_once_with(CORE.SECCOMP_URL, timeout=30)
+            actual = json.loads(output.read_text())
+            self.assertEqual(actual["defaultAction"], original["defaultAction"])
+            self.assertEqual(actual["archMap"], original["archMap"])
+            self.assertEqual(
+                actual["syscalls"][-1],
+                {
+                    "names": sorted(CORE.XPU_SYSCALLS),
+                    "action": "SCMP_ACT_ALLOW",
+                },
+            )
+            remaining = []
+            for rule in original["syscalls"]:
+                names = [
+                    name for name in rule["names"] if name not in CORE.XPU_SYSCALLS
+                ]
+                if names:
+                    remaining.append({**rule, "names": names})
+            self.assertEqual(actual["syscalls"][:-1], remaining)
+
+    def test_download_checksum_and_default_action_failures_abort(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "seccomp.json"
+            with patch.object(
+                CORE.urllib.request, "urlopen", side_effect=OSError("download failed")
+            ):
+                with self.assertRaisesRegex(OSError, "download failed"):
+                    CORE.prepare_seccomp(output)
+            with patch.object(CORE.urllib.request, "urlopen") as download:
+                download.return_value.__enter__.return_value.read.return_value = (
+                    b"corrupted"
+                )
+                with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
+                    CORE.prepare_seccomp(output)
+                content = b'{"defaultAction":"SCMP_ACT_ALLOW"}'
+                download.return_value.__enter__.return_value.read.return_value = content
+                with patch.object(
+                    CORE, "SECCOMP_SHA256", hashlib.sha256(content).hexdigest()
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "deny-by-default"):
+                        CORE.prepare_seccomp(output)
+            self.assertFalse(output.exists())
 
 
 class WorkflowTest(unittest.TestCase):
