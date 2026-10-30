@@ -214,9 +214,10 @@ class UringFile : public StorageFile {
                                                   size_t length,
                                                   off_t offset = 0);
 
-    // Batch read: submit up to 32 independent reads at once (each at its own
-    // offset) before waiting for completions, giving NVMe queue depth > 1.
-    // Use in BatchLoadBucket instead of per-key read_aligned() loops.
+    // Batch read: keep up to 32 independent reads (each at its own offset) in
+    // flight, refilling the window as each one completes, giving NVMe queue
+    // depth > 1. Use in BatchLoadBucket instead of per-key read_aligned()
+    // loops.
     struct ReadDesc {
         void *buf;
         size_t len;
@@ -226,6 +227,17 @@ class UringFile : public StorageFile {
         bool completed = false;
     };
     tl::expected<void, ErrorCode> batch_read(ReadDesc *descs, int cnt);
+
+    // One read of a multi-file batch: @p desc is read from @p file.
+    struct BatchReadItem {
+        UringFile *file;
+        ReadDesc *desc;
+    };
+    // Like batch_read(), but the reads may target different files, so a
+    // caller that reads from several bucket files can drive one sliding
+    // window across all of them instead of one serial batch per file.
+    static tl::expected<void, ErrorCode> batch_read_multi(BatchReadItem *items,
+                                                          int cnt);
 
     // Flush data to stable storage via IORING_FSYNC_DATASYNC.
     // Must be called after write_aligned and before writing dependent metadata.

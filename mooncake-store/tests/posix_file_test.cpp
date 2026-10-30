@@ -832,6 +832,49 @@ TEST_F(PosixFileTest, UringBatchReadDrainsErrorsBeforeNextOperation) {
     EXPECT_EQ(std::string_view(output.data(), output.size()), data);
 }
 
+// Sliding-window batch read across files: reads from two files are
+// interleaved and outnumber the 32-entry ring; every desc must get its data.
+TEST_F(PosixFileTest, UringBatchReadMultiAcrossFiles) {
+    constexpr size_t kBlock = 64;
+    constexpr int kPerFile = 100;  // 200 reads in total, well above 32
+    const std::string other = "test_file_b.txt";
+    int fd_b = open(other.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_GE(fd_b, 0);
+    for (int i = 0; i < kPerFile; ++i) {
+        std::array<char, kBlock> a, b;
+        a.fill(static_cast<char>('A' + i % 26));
+        b.fill(static_cast<char>('a' + i % 26));
+        ASSERT_EQ(pwrite(test_fd, a.data(), kBlock, i * kBlock),
+                  static_cast<ssize_t>(kBlock));
+        ASSERT_EQ(pwrite(fd_b, b.data(), kBlock, i * kBlock),
+                  static_cast<ssize_t>(kBlock));
+    }
+
+    UringFile file_a(test_filename, dup(test_fd), 32, false);
+    UringFile file_b(other, dup(fd_b), 32, false);
+    std::vector<std::array<char, kBlock>> out(2 * kPerFile);
+    std::vector<UringFile::ReadDesc> descs(2 * kPerFile);
+    std::vector<UringFile::BatchReadItem> items(2 * kPerFile);
+    for (int i = 0; i < 2 * kPerFile; ++i) {
+        descs[i] = UringFile::ReadDesc{out[i].data(), kBlock,
+                                       static_cast<off_t>((i / 2) * kBlock)};
+        items[i] =
+            UringFile::BatchReadItem{i % 2 ? &file_b : &file_a, &descs[i]};
+    }
+    auto result = UringFile::batch_read_multi(items.data(),
+                                              static_cast<int>(items.size()));
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+    for (int i = 0; i < 2 * kPerFile; ++i) {
+        char expect = static_cast<char>((i % 2 ? 'a' : 'A') + (i / 2) % 26);
+        EXPECT_TRUE(descs[i].completed);
+        EXPECT_EQ(descs[i].bytes_read, kBlock);
+        EXPECT_EQ(out[i][0], expect) << "desc " << i;
+        EXPECT_EQ(out[i][kBlock - 1], expect) << "desc " << i;
+    }
+    close(fd_b);
+    remove(other.c_str());
+}
+
 TEST_F(PosixFileTest, UringVectorIoHandlesUnalignedDirectIo) {
     const std::string direct_filename = "direct_vector_test.bin";
     remove(direct_filename.c_str());

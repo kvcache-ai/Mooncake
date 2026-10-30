@@ -1259,6 +1259,34 @@ class BucketStorageBackend : public StorageBackendInterface {
     void ReleaseDiskOwnerLocks();
 
     std::atomic<bool> test_datasync_failure_{false};
+
+    // One object read of BatchLoad, copied from the bucket index under lock.
+    struct BucketReadPlan {
+        std::string key;
+        int64_t bucket_id;
+        int64_t offset;
+        int64_t key_size;
+        int64_t data_size;
+        int64_t value_offset;  // read window start inside the value
+        Slice dest_slice;
+        int disk_index;  // offload disk that holds the bucket
+    };
+
+#ifdef USE_URING
+    // One bucket file of a BatchLoad and the reads that target it.
+    struct UringBucketReads {
+        UringFile* file;
+        const std::vector<BucketReadPlan>* plans;
+    };
+
+    // Reads every plan of one bucket read as a single sliding-window io_uring
+    // batch across all bucket files, then points each span's slice at its
+    // data inside the aligned destination buffer.
+    static tl::expected<void, ErrorCode> BatchLoadUring(
+        const std::vector<UringBucketReads>& buckets,
+        std::unordered_map<std::string, StorageValueSpan>& spans);
+#endif
+
     // Alignment helper functions for O_DIRECT I/O
     static constexpr size_t kDirectIOAlignment = 4096;
 
