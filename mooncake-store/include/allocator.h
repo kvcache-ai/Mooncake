@@ -181,7 +181,7 @@ class AllocatedBuffer {
  * Virtual base class for buffer allocators.
  * Defines the interface that all buffer allocators must implement.
  */
-class BufferAllocatorBase {
+class BufferAllocatorBase : public std::enable_shared_from_this<BufferAllocatorBase> {
    public:
     virtual ~BufferAllocatorBase() = default;
 
@@ -300,8 +300,7 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
  * ```
  */
 class CachelibBufferAllocator
-    : public BufferAllocatorBase,
-      public std::enable_shared_from_this<CachelibBufferAllocator> {
+    : public BufferAllocatorBase {
    public:
     static tl::expected<std::shared_ptr<CachelibBufferAllocator>, ErrorCode>
     Create(std::string segment_name, size_t base, size_t size,
@@ -379,8 +378,7 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
  * optimization.
  */
 class OffsetBufferAllocator
-    : public BufferAllocatorBase,
-      public std::enable_shared_from_this<OffsetBufferAllocator> {
+    : public BufferAllocatorBase {
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
                           std::string transport_endpoint,
