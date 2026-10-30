@@ -355,6 +355,7 @@ struct StorageOwnerState {
 #[derive(Default)]
 struct StorageClockState {
     entries: Vec<Option<ClockEntry>>,
+    free_slots: Vec<usize>,
     by_id: BTreeMap<ClockEntryId, usize>,
     by_key: BTreeMap<ObjectKey, Vec<usize>>,
     pending_hot_keys: BTreeSet<ObjectKey>,
