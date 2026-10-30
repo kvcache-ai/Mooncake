@@ -6218,6 +6218,7 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
                                          ReplicaType replica_type,
                                          const ReplicaID* expected_replica_id)
     -> tl::expected<bool, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
