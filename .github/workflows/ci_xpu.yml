@@ -165,6 +165,16 @@ jobs:
           cd "$RUNNER_TEMP"
           "$smoke_venv/bin/python" "$GITHUB_WORKSPACE/scripts/e2e/python/verify_xpu_wheel.py"
 
+      - name: Package Python dependencies for hardware
+        run: |
+          set -euo pipefail
+          out=xpu-ci-output/python-deps
+          mkdir -p "$out"
+          for wheel in xpu-ci-output/*.whl; do
+            python -m pip download --only-binary=:all: --dest "$out" "$wheel"
+            rm "$out/$(basename "$wheel")"
+          done
+
       - name: Package native tests
         run: |
           set -eo pipefail
@@ -173,6 +183,7 @@ jobs:
           export LD_LIBRARY_PATH="$library_dirs:${LD_LIBRARY_PATH:-}"
           out=xpu-ci-output/native-tests
           mkdir -p "$out/lib"
+          cp -R xpu-ci-output/python-deps "$out/"
           cp xpu-ci-output/provenance.txt "$out/"
           for binary in \
             "$BUILD_DIR"/mooncake-transfer-engine/tent/tests/tent_xpu_{platform,transport,engine,ipc_process}_test \
