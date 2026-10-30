@@ -1,5 +1,7 @@
 #include "hf3fs/hf3fs.h"
 
+#include <atomic>
+
 namespace mooncake {
 // ============================================================================
 // USRBIO Resource manager Implementation
@@ -54,39 +56,39 @@ void ThreadUSRBIOResource::Cleanup() {
     initialized = false;
 }
 
-// Resource manager implementation
+namespace {
+std::atomic<uint64_t> next_manager_id{1};
+}  // namespace
+
+USRBIOResourceManager::USRBIOResourceManager()
+    : cache_id_(next_manager_id.fetch_add(1, std::memory_order_relaxed)) {}
+
+// Like the I/O using the returned pointer, lookup must not race destruction
+// of this manager. TLS borrows resources; it never extends their lifetime.
 struct ThreadUSRBIOResource *USRBIOResourceManager::getThreadResource(
     const Hf3fsConfig &config) {
-    std::thread::id thread_id = std::this_thread::get_id();
+    struct Cache {
+        uint64_t manager_id = 0;
+        ThreadUSRBIOResource *resource = nullptr;
+    };
+    static thread_local Cache cache;
 
-    {
-        std::lock_guard<std::mutex> lock(resource_map_mutex);
-
-        // Find if current thread already has resources
-        auto it = thread_resources.find(thread_id);
-        if (it != thread_resources.end()) {
-            return it->second;
-        }
-
-        // Create new thread resources
-        ThreadUSRBIOResource *resource = new ThreadUSRBIOResource();
-        if (!resource->Initialize(config)) {
-            delete resource;
-            return nullptr;
-        }
-
-        // Store resource mapping
-        thread_resources[thread_id] = resource;
-        return resource;
+    // Check the identity before dereferencing the borrowed pointer: a previous
+    // manager may have been destroyed, even at the same address as this one.
+    if (cache.manager_id == cache_id_ && cache.resource->initialized) {
+        return cache.resource;
     }
+
+    std::lock_guard<std::mutex> lock(resource_map_mutex);
+    auto &resource = thread_resources[std::this_thread::get_id()];
+    if (!resource) resource = std::make_unique<ThreadUSRBIOResource>();
+    // Cleanup() invalidates the fast path. Failed initialization is retried on
+    // the next lookup, without caching a partially initialized resource.
+    if (!resource->Initialize(config)) return nullptr;
+    cache = {cache_id_, resource.get()};
+    return resource.get();
 }
 
-USRBIOResourceManager::~USRBIOResourceManager() {
-    // Clean up all thread resources
-    for (auto &pair : thread_resources) {
-        delete pair.second;
-    }
-    thread_resources.clear();
-}
+USRBIOResourceManager::~USRBIOResourceManager() = default;
 
 }  // namespace mooncake

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <mutex>
@@ -29,7 +31,7 @@ struct Hf3fsConfig {
 
 class USRBIOResourceManager {
    public:
-    USRBIOResourceManager() {}
+    USRBIOResourceManager();
 
     void setDefaultParams(const Hf3fsConfig &config) {
         default_config_ = config;
@@ -48,11 +50,15 @@ class USRBIOResourceManager {
     USRBIOResourceManager &operator=(const USRBIOResourceManager &) = delete;
     Hf3fsConfig default_config_;
 
+    // Unique across manager lifetimes, including reuse of the same address.
+    const uint64_t cache_id_;
+
     // Thread resources map protection lock
     std::mutex resource_map_mutex;
 
     // ThreadID to resource mapping
-    std::unordered_map<std::thread::id, struct ThreadUSRBIOResource *>
+    std::unordered_map<std::thread::id,
+                       std::unique_ptr<struct ThreadUSRBIOResource>>
         thread_resources;
 };
 
