@@ -35,6 +35,10 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     mooncake_metadata_port_base = 8080
 
     @classmethod
+    def _use_store_rs(cls):
+        return os.getenv("MOONCAKE_STORE_BACKEND") == "rs"
+
+    @classmethod
     def _get_model_name(cls):
         if os.getenv("CI_ACCELERATOR") == "rocm":
             return ROCM_MHA_MODEL_NAME_FOR_TEST
@@ -47,9 +51,12 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         cls.mooncake_master_port = find_available_port(
             HiCacheStorageMooncakeBackendBaseMixin.mooncake_master_port_base
         )
-        cls.mooncake_metadata_port = find_available_port(
-            HiCacheStorageMooncakeBackendBaseMixin.mooncake_metadata_port_base
-        )
+        if cls._use_store_rs():
+            cls.mooncake_metadata_port = cls.mooncake_master_port
+        else:
+            cls.mooncake_metadata_port = find_available_port(
+                HiCacheStorageMooncakeBackendBaseMixin.mooncake_metadata_port_base
+            )
 
         # Start Mooncake services first
         cls._start_mooncake_services()
@@ -69,6 +76,29 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     @classmethod
     def _start_mooncake_services(cls):
         """Start Mooncake metadata and master services with configurable ports and readiness detection"""
+        if cls._use_store_rs():
+            print(
+                f"Starting Store-RS Redis metadata on port {cls.mooncake_master_port}"
+            )
+            cls.redis_service_process = subprocess.Popen(
+                [
+                    "redis-server",
+                    "--bind",
+                    "127.0.0.1",
+                    "--port",
+                    str(cls.mooncake_master_port),
+                    "--save",
+                    "",
+                    "--appendonly",
+                    "no",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setsid,
+            )
+            cls._wait_for_mooncake_services_ready()
+            return
+
         print("Starting Mooncake services...")
         print(
             f"Using master port: {cls.mooncake_master_port}, metadata port: {cls.mooncake_metadata_port}"
@@ -122,6 +152,35 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         Fails fast when a service exits, so a broken launch is reported here
         instead of surfacing later as "Failed to setup Mooncake store".
         """
+        if cls._use_store_rs():
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if cls.redis_service_process.poll() is not None:
+                    stdout, stderr = cls.redis_service_process.communicate()
+                    raise RuntimeError(
+                        "Store-RS Redis metadata exited before becoming ready: "
+                        f"stdout={stdout.decode(errors='replace')} "
+                        f"stderr={stderr.decode(errors='replace')}"
+                    )
+                probe = subprocess.run(
+                    [
+                        "redis-cli",
+                        "-h",
+                        "127.0.0.1",
+                        "-p",
+                        str(cls.mooncake_master_port),
+                        "PING",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if probe.returncode == 0 and probe.stdout.strip() == "PONG":
+                    print("Store-RS Redis metadata is ready")
+                    return True
+                time.sleep(0.2)
+            raise RuntimeError("Store-RS Redis metadata did not become ready")
+
         print("Waiting for Mooncake services to be ready...")
 
         deadline = time.time() + timeout
@@ -195,6 +254,16 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     @classmethod
     def _stop_mooncake_services(cls):
         """Stop Mooncake services"""
+        if cls._use_store_rs():
+            process = getattr(cls, "redis_service_process", None)
+            if process is not None and process.poll() is None:
+                try:
+                    os.killpg(os.getpgid(process.pid), 9)
+                    process.wait(timeout=5)
+                except (ProcessLookupError, subprocess.TimeoutExpired, OSError) as e:
+                    print(f"Warning: Could not stop Store-RS Redis metadata: {e}")
+            return
+
         print("Stopping Mooncake services...")
 
         for name in ("metadata", "master"):
@@ -223,15 +292,36 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
             "--mem-fraction-static": 0.8,
         }
 
-        # Set the environment variables for Mooncake using dynamic ports
-        env_vars = {
-            "MOONCAKE_MASTER": f"127.0.0.1:{cls.mooncake_master_port}",
-            "MOONCAKE_PROTOCOL": "tcp",
-            "MC_MS_AUTO_DISC": "0",
-            "MOONCAKE_DEVICE": "",
-            "MOONCAKE_TE_META_DATA_SERVER": f"http://127.0.0.1:{cls.mooncake_metadata_port}/metadata",
-            "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4294967296",  # 4 GiB
-        }
+        if cls._use_store_rs():
+            redis_url = f"redis://127.0.0.1:{cls.mooncake_master_port}/0"
+            env_vars = {
+                "MOONCAKE_STORE_BACKEND": "rs",
+                # SGLang passes these two values to the compatibility setup API.
+                # Store-RS interprets them as its data-plane and routing metadata.
+                "MOONCAKE_MASTER": redis_url,
+                "MOONCAKE_TE_META_DATA_SERVER": redis_url,
+                "MOONCAKE_CHECK_SERVER": "false",
+                "MOONCAKE_PROTOCOL": "rdma",
+                "MOONCAKE_DEVICE": os.getenv("MOONCAKE_TRANSFER_DEVICE", ""),
+                "MOONCAKE_GLOBAL_SEGMENT_SIZE": "1073741824",  # 1 GiB
+                "MC_STORE_RS_METADATA_URL": redis_url,
+                "MC_STORE_RS_TRANSPORT_METADATA_URL": redis_url,
+                "MC_STORE_RS_TRANSPORT_BACKEND": os.getenv(
+                    "MC_STORE_RS_TRANSPORT_BACKEND", "classic-te"
+                ),
+                "MC_STORE_RS_ROUTE_CONTROL": "embedded-wrh",
+                "MC_STORE_RS_REPLICA_COUNT": "1",
+            }
+        else:
+            # Set the environment variables for the C++ Store using dynamic ports.
+            env_vars = {
+                "MOONCAKE_MASTER": f"127.0.0.1:{cls.mooncake_master_port}",
+                "MOONCAKE_PROTOCOL": "tcp",
+                "MC_MS_AUTO_DISC": "0",
+                "MOONCAKE_DEVICE": "",
+                "MOONCAKE_TE_META_DATA_SERVER": f"http://127.0.0.1:{cls.mooncake_metadata_port}/metadata",
+                "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4294967296",  # 4 GiB
+            }
 
         return server_args, env_vars
 

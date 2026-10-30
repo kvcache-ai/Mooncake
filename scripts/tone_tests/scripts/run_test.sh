@@ -18,6 +18,8 @@ MOONCAKE_RDMA_DEVICES=${MOONCAKE_RDMA_DEVICES:-}
 MOONCAKE_RDMA_NETDEVS=${MOONCAKE_RDMA_NETDEVS:-}
 MOONCAKE_TRANSFER_DEVICE=${MOONCAKE_TRANSFER_DEVICE:-}
 MOONCAKE_GID_INDEX=${MOONCAKE_GID_INDEX:-}
+MC_STORE_RS_TRANSPORT_BACKEND=${MC_STORE_RS_TRANSPORT_BACKEND:-classic-te}
+RUN_STORE_RS_TESTS=${RUN_STORE_RS_TESTS:-false}
 USE_HUGGINGFACE_MIRROR=${USE_HUGGINGFACE_MIRROR:-true}
 MOONCAKE_RENDER_DEVICES=${MOONCAKE_RENDER_DEVICES:-}
 MOONCAKE_GPU_INDICES=${MOONCAKE_GPU_INDICES:-}
@@ -57,6 +59,17 @@ All_TEST_SCRIPTS_VLLM=(
     "test_vllm_1p1d_erdma.sh"
 )
 
+# Store-RS uses a wheel built by scripts/build_store_rs_wheel.sh. Keep these
+# tests out of the existing run-all lane so the regular release wheel and its
+# established coverage remain unchanged.
+All_TEST_SCRIPTS_STORE_RS_SGLANG=(
+    "test_hicache_storage_mooncake_store_rs.sh"
+)
+
+All_TEST_SCRIPTS_STORE_RS_VLLM=(
+    "test_vllm_mooncake_store_rs.sh"
+)
+
 list_tests() {
     case "${1:-default}" in
         default)
@@ -68,8 +81,19 @@ list_tests() {
         VLLM)
             printf '%s\n' "${All_TEST_SCRIPTS_VLLM[@]}"
             ;;
+        STORE_RS)
+            printf '%s\n' \
+                "${All_TEST_SCRIPTS_STORE_RS_SGLANG[@]}" \
+                "${All_TEST_SCRIPTS_STORE_RS_VLLM[@]}"
+            ;;
+        STORE_RS_SGLANG)
+            printf '%s\n' "${All_TEST_SCRIPTS_STORE_RS_SGLANG[@]}"
+            ;;
+        STORE_RS_VLLM)
+            printf '%s\n' "${All_TEST_SCRIPTS_STORE_RS_VLLM[@]}"
+            ;;
         *)
-            echo "ERROR: Unknown framework '$1'. Use SGLANG or VLLM." >&2
+            echo "ERROR: Unknown framework '$1'. Use SGLANG, VLLM, STORE_RS, STORE_RS_SGLANG, or STORE_RS_VLLM." >&2
             return 1
             ;;
     esac
@@ -96,5 +120,14 @@ REMOTE_WORK_ROOT=/tmp/Mooncake_tone/mooncake_ci_test
 source "$E2E_DIR/scripts/controller.sh"
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-    main "$@"
+    if [ "${RUN_STORE_RS_TESTS}" = "true" ] && [ "${1:-}" = "run-all" ]; then
+        # The T-One template has an established `run-all [framework]` command.
+        # Keep that template stable and redirect only the dedicated Store-RS
+        # job to both Store-RS cases. Ignore a legacy framework argument here:
+        # the dedicated job must validate both SGLang and vLLM regardless of
+        # whether the external T-One template says `run-all` or `run-all SGLANG`.
+        main run-store-rs
+    else
+        main "$@"
+    fi
 fi

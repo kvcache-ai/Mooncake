@@ -85,6 +85,83 @@ class TestSuiteLayout(unittest.TestCase):
                 "! declare -f parse"
             )
 
+    def test_store_rs_cases_are_an_explicit_tone_lane(self):
+        runner = SCRIPTS / "tone_tests" / "scripts" / "run_test.sh"
+        regular = self.shell(f'"{runner}" list-tests')
+        store_rs = self.shell(f'"{runner}" list-tests STORE_RS')
+
+        self.assertEqual(
+            store_rs.splitlines(),
+            [
+                "test_hicache_storage_mooncake_store_rs.sh",
+                "test_vllm_mooncake_store_rs.sh",
+            ],
+        )
+        self.assertNotIn("mooncake_store_rs", regular)
+
+    def test_store_rs_controller_uses_the_matching_framework(self):
+        controller = SCRIPTS / "e2e" / "scripts" / "controller.sh"
+        output = self.shell(
+            f"""All_TEST_SCRIPTS_SGLANG=(regular-sglang.sh)
+            All_TEST_SCRIPTS_VLLM=(regular-vllm.sh)
+            All_TEST_SCRIPTS_STORE_RS_SGLANG=(store-rs-sglang.sh)
+            All_TEST_SCRIPTS_STORE_RS_VLLM=(store-rs-vllm.sh)
+            source "{controller}"
+            [ "$(get_framework_from_test_name store-rs-sglang.sh)" = SGLANG ]
+            [ "$(get_framework_from_test_name store-rs-vllm.sh)" = VLLM ]
+            run_single_test() {{ printf '%s\n' "$1"; }}
+            run_store_rs_tests
+            """
+        )
+        self.assertEqual(
+            output.splitlines(), ["store-rs-sglang.sh", "store-rs-vllm.sh"]
+        )
+
+    def test_store_rs_tone_job_redirects_the_existing_run_all_command(self):
+        runner = SCRIPTS / "tone_tests" / "scripts" / "run_test.sh"
+        output = self.shell(
+            f'''RUN_STORE_RS_TESTS=true LOCAL_IP=192.0.2.1 REMOTE_IP=192.0.2.2
+            source "{runner}"
+            main() {{ printf '%s\\n' "$@"; }}
+            set -- run-all SGLANG
+            if [ "$RUN_STORE_RS_TESTS" = true ] && [ "$1" = run-all ]; then
+                main run-store-rs
+            else
+                main "$@"
+            fi'''
+        )
+        self.assertEqual(output.splitlines(), ["run-store-rs"])
+
+    def test_store_rs_e2e_job_selects_the_exact_combined_wheel(self):
+        repository_root = SCRIPTS.parent
+        nightly_workflow = (
+            repository_root / ".github/workflows/nightly.yml"
+        ).read_text()
+        integration_workflow = (
+            repository_root / ".github/workflows/integration-test.yml"
+        ).read_text()
+        wheel_workflow = (
+            repository_root / ".github/workflows/_build-wheel.yaml"
+        ).read_text()
+
+        self.assertIn("build-wheel-store-rs-tone:", nightly_workflow)
+        self.assertIn("artifact-prefix: tone-store-rs-wheel", nightly_workflow)
+        self.assertIn(
+            "artifact_name: tone-store-rs-wheel-py312", nightly_workflow
+        )
+        self.assertIn("run-store-rs: true", nightly_workflow)
+        self.assertIn("tone-store-rs-integration-tent:", nightly_workflow)
+        self.assertIn("store-rs-transport-backend: classic-te", nightly_workflow)
+        self.assertIn("store-rs-transport-backend: tent", nightly_workflow)
+        self.assertNotIn("artifact-prefix: nightly-store-rs", nightly_workflow)
+        self.assertIn("RUN_STORE_RS_TESTS=true", integration_workflow)
+        self.assertIn(
+            "MC_STORE_RS_TRANSPORT_BACKEND=${store_rs_backend}",
+            integration_workflow,
+        )
+        self.assertIn("use-store-rs:", wheel_workflow)
+        self.assertIn("default: false", wheel_workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

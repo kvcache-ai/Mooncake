@@ -15,6 +15,7 @@ OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 # their normal CMake output paths before auditwheel, like the PG core library.
 BUILD_DIR="${BUILD_DIR:-build}"
 BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
+INCLUDE_STORE_RS="${INCLUDE_STORE_RS:-0}"
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
@@ -24,6 +25,35 @@ echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
+
+if [ "$INCLUDE_STORE_RS" = "1" ]; then
+    STORE_RS_PYTHON_PREFIX=${STORE_RS_PYTHON_PREFIX:?STORE_RS_PYTHON_PREFIX must name the Store-RS CMake install prefix}
+    STORE_RS_PACKAGE_DIR="${STORE_RS_PYTHON_PREFIX}/mooncake"
+    store_rs_extensions=("${STORE_RS_PACKAGE_DIR}"/_store_rs.*.so)
+    if [ "${#store_rs_extensions[@]}" -ne 1 ] || [ ! -f "${store_rs_extensions[0]}" ]; then
+        echo "Error: expected one Store-RS extension under ${STORE_RS_PACKAGE_DIR}"
+        exit 1
+    fi
+    STORE_RS_EXPECTED_EXTENSION="_store_rs$("python${PYTHON_VERSION}" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+    if [ "$(basename "${store_rs_extensions[0]}")" != "${STORE_RS_EXPECTED_EXTENSION}" ]; then
+        echo "Error: Store-RS extension was built for a different Python ABI: ${store_rs_extensions[0]}"
+        exit 1
+    fi
+    for artifact in \
+        "${store_rs_extensions[0]}" \
+        "${STORE_RS_PACKAGE_DIR}/libmooncake_classic_shim.so" \
+        "${STORE_RS_PACKAGE_DIR}/libmooncake_tent_shim.so" \
+        "${STORE_RS_PACKAGE_DIR}/libtent_shared.so" \
+        "${STORE_RS_PACKAGE_DIR}/mooncake-store-rs-client" \
+        "${STORE_RS_PACKAGE_DIR}/mooncake-store-rs-admin" \
+        "${STORE_RS_PACKAGE_DIR}/mooncake-store-rs-bench"; do
+        if [ ! -f "$artifact" ]; then
+            echo "Error: Store-RS CMake install is missing ${artifact}"
+            exit 1
+        fi
+        cp -a "$artifact" mooncake-wheel/mooncake/
+    done
+fi
 
 if [ -d "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" ]; then
     rm -rf mooncake-wheel/mooncake/_pg_jit
@@ -373,6 +403,24 @@ elif [ "$HIP_BUILD" = "1" ]; then
     echo "Package name modified to: mooncake-transfer-engine-rocm"
 else
     echo "Using standard package name: mooncake-transfer-engine"
+fi
+
+if [ "$INCLUDE_STORE_RS" = "1" ]; then
+    # The legacy wheel metadata intentionally omits Store-RS commands from
+    # ordinary release wheels. Preserve the pristine metadata (unless a build
+    # variant already did so), then add the Store-RS-only entry points and
+    # native executables for this opt-in wheel build. The EXIT trap above
+    # restores pyproject.toml even when the build fails.
+    if [ ! -f pyproject.toml.backup ]; then
+        cp pyproject.toml pyproject.toml.backup
+    fi
+    sed -i '/^transfer_engine_bench = /a\mooncake-store-rs-client = "mooncake._launcher:store_rs_client"\nmooncake-store-rs-admin = "mooncake._launcher:store_rs_admin"\nmooncake-store-rs-bench = "mooncake._launcher:store_rs_bench"' pyproject.toml
+    sed -i 's/"transfer_engine_bench",/"transfer_engine_bench", "mooncake-store-rs-client", "mooncake-store-rs-admin", "mooncake-store-rs-bench",/' pyproject.toml
+    if ! grep -q '^mooncake-store-rs-client = ' pyproject.toml || \
+       ! grep -q '"mooncake-store-rs-client"' pyproject.toml; then
+        echo "Error: failed to add Store-RS metadata to the legacy wheel"
+        exit 1
+    fi
 fi
 
 echo "Cleaning up previous build artifacts..."

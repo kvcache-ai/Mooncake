@@ -130,6 +130,43 @@ jobs:
       use-tent: true
     secrets: inherit
 
+  # Test-only wheel containing both the established C++ Store and Store-RS.
+  # Its artifact prefix intentionally does not match `nightly-*`, so the
+  # TestPyPI publishing job cannot publish this validation-only package.
+  build-wheel-store-rs-tone:
+    needs: version-stamp
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      architecture: x86_64
+      python-versions: '["3.12"]'
+      artifact-prefix: tone-store-rs-wheel
+      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
+      use-tent: true
+      use-store-rs: true
+
+  tone-store-rs-integration:
+    needs: build-wheel-store-rs-tone
+    uses: ./.github/workflows/integration-test.yml
+    with:
+      pr_sha: ${{ github.sha }}
+      source_run_id: ${{ github.run_id }}
+      artifact_name: tone-store-rs-wheel-py312
+      run-store-rs: true
+      store-rs-transport-backend: classic-te
+    secrets: inherit
+
+  tone-store-rs-integration-tent:
+    needs: build-wheel-store-rs-tone
+    uses: ./.github/workflows/integration-test.yml
+    with:
+      pr_sha: ${{ github.sha }}
+      source_run_id: ${{ github.run_id }}
+      artifact_name: tone-store-rs-wheel-py312
+      run-store-rs: true
+      store-rs-transport-backend: tent
+    secrets: inherit
+
   build-wheel-rocm:
     needs: version-stamp
     uses: ./.github/workflows/ci_rocm.yml
@@ -685,6 +722,9 @@ jobs:
       - build-wheels
       - tone-sglang-integration
       - tone-sglang-integration-tent
+      - build-wheel-store-rs-tone
+      - tone-store-rs-integration
+      - tone-store-rs-integration-tent
       - build-wheel-rocm
       - rocm-integration-test
       - build-musa

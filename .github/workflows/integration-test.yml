@@ -32,6 +32,20 @@ on:
         required: false
         type: boolean
         default: false
+      run-store-rs:
+        description: >-
+          Run the dedicated Store-RS SGLang and vLLM cases using the exact
+          combined wheel artifact supplied by the caller.
+        required: false
+        type: boolean
+        default: false
+      store-rs-transport-backend:
+        description: >-
+          Store-RS transport backend selected by the dedicated T-One job.
+          Supported values are classic-te and tent.
+        required: false
+        type: string
+        default: classic-te
 
 jobs:
   test-sglang-integration:
@@ -84,6 +98,7 @@ jobs:
         if: ${{ env.tone_user_name != '' }}
         env:
           TESTPYPI_ARTIFACT_ID: ${{ steps.testpypi-wheel.outputs.artifact-id }}
+          STORE_RS_TRANSPORT_BACKEND: ${{ inputs.store-rs-transport-backend }}
         run: |
           # Priority: explicit inputs > PR event context > push SHA
           SHA="${{ inputs.pr_sha || github.event.pull_request.head.sha || github.sha }}"
@@ -178,6 +193,18 @@ jobs:
             ENV_INFO="${ENV_INFO} USE_TENT=true"
             JOB_NAME="mooncake-ci-tent-${SHA}"
           fi
+          if [ "${{ inputs.run-store-rs }}" = "true" ]; then
+            store_rs_backend="$STORE_RS_TRANSPORT_BACKEND"
+            case "$store_rs_backend" in
+              classic-te|tent) ;;
+              *)
+                echo "Unsupported Store-RS transport backend: $store_rs_backend" >&2
+                exit 1
+                ;;
+            esac
+            ENV_INFO="${ENV_INFO} RUN_STORE_RS_TESTS=true MC_STORE_RS_TRANSPORT_BACKEND=${store_rs_backend}"
+            JOB_NAME="mooncake-ci-store-rs-${store_rs_backend}-${SHA}"
+          fi
           signature="${{ secrets.TONE_USER_NAME }}|${{ secrets.TONE_USER_TOKEN }}|$(python3 -c "import time;print(time.time())")"
           signature="$(python3 -c "import base64;print(base64.b64encode(\"$signature\".encode('utf-8')).decode('utf-8'))")"
           curl -s -H 'Content-Type: application/json' -X POST -d "{\"workspace\":\"mooncake_test\",\"project\":\"mooncake-ci\",\"template\":\"mooncake-ci-test\",\"name\":\"${JOB_NAME}\",\"username\":\"${{ secrets.TONE_USER_NAME }}\",\"env_ifs\":\" \",\"env_info\":\"${ENV_INFO}\",\"signature\":\"$signature\"}" https://tone.openanolis.cn/api/job/create/ > job.json
@@ -190,7 +217,7 @@ jobs:
           job_id=$(jq .data.id job.json)
           echo "check job status here and remember to cancel it before restart the job !"
           echo "job_url: https://tone.openanolis.cn/ws/gclfnh19/test_result/${job_id}?tab=4"
-          echo "job_id=${job_id}" >> $GITHUB_ENV
+          echo "job_id=${job_id}" >> "$GITHUB_ENV"
         shell: bash
 
       - name: qurey job results

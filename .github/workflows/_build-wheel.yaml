@@ -35,6 +35,11 @@ on:
         # false until TENT is validated on arm64.
         type: boolean
         default: false
+      use-store-rs:
+        # Test-only combined wheel used by the T-One Store-RS lane. Release
+        # callers keep the default false and continue through build_wheel.sh.
+        type: boolean
+        default: false
 
 env:
   SCCACHE_GHA_ENABLED: "true"
@@ -123,6 +128,13 @@ jobs:
             cmake_args="$cmake_args -DUSE_TENT=ON -DTENT_METRICS_ENABLED=ON"
           fi
 
+          # Store-RS links both the classic TE and TENT shims. This opt-in is
+          # reserved for the T-One test artifact; normal/release wheels keep
+          # their existing CMake profile.
+          if [ "${{ inputs.use-store-rs }}" = "true" ]; then
+            cmake_args="$cmake_args -DUSE_TENT=ON -DTENT_METRICS_ENABLED=ON -DWITH_STORE_RS=ON -DWITH_STORE_RUST=OFF"
+          fi
+
           {
             echo "VARIANT_FLAG=$variant_flag"
             echo "TORCH_CUDA_ARCH_LIST=$arch_list"
@@ -150,6 +162,10 @@ jobs:
           PYBIN="/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin"
           echo "$PYBIN" >> "$GITHUB_PATH"
           "$PYBIN/pip" install --quiet "cmake<4" setuptools wheel
+
+      - name: Install Rust toolchain for Store-RS
+        if: ${{ inputs.use-store-rs }}
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -228,10 +244,14 @@ jobs:
           export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
           variant=()
           [ -n "$VARIANT_FLAG" ] && variant=("$VARIANT_FLAG=1")
+          wheel_builder=./scripts/build_wheel.sh
+          if [ "${{ inputs.use-store-rs }}" = "true" ]; then
+            wheel_builder=./scripts/build_store_rs_wheel.sh
+          fi
           env "${variant[@]}" \
             PYTHON_VERSION="${{ matrix.python-version }}" \
             OUTPUT_DIR="dist-py${{ steps.pytag.outputs.tag }}" \
-            ./scripts/build_wheel.sh
+            "$wheel_builder"
         env:
           VERSION: ${{ env.VERSION }}
 
@@ -291,6 +311,18 @@ jobs:
           fi
 
           "$smoke_venv/bin/mooncake_master" --version
+
+          if [ "${{ inputs.use-store-rs }}" = "true" ]; then
+            MOONCAKE_STORE_BACKEND=rs "$smoke_venv/bin/python" - <<'PY'
+          import mooncake._store_rs
+          import mooncake.store
+
+          assert mooncake.store._BACKEND == "rs"
+          PY
+            for command in mooncake-store-rs-client mooncake-store-rs-admin mooncake-store-rs-bench; do
+              test -x "$smoke_venv/bin/$command"
+            done
+          fi
 
           # EFA support must not add a link-time libfabric dependency: the
           # builder image has no libfabric, so importing the engine here also
