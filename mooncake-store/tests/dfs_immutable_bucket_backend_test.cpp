@@ -52,10 +52,11 @@ DistributedStorageConfig MakeConfig(const TempDir& dir) {
 
 class CountingPosixAdapter : public PosixFsAdapter {
    public:
-    tl::expected<int, ErrorCode> OpenExistingFile(
-        const std::string& path) override {
+    tl::expected<int, ErrorCode> OpenExistingFile(const std::string& path,
+                                                  bool write) override {
         ++opens;
-        return PosixFsAdapter::OpenExistingFile(path);
+        ++(write ? writable_opens : read_only_opens);
+        return PosixFsAdapter::OpenExistingFile(path, write);
     }
     tl::expected<void, ErrorCode> CloseFile(int fd) override {
         ++closes;
@@ -63,6 +64,8 @@ class CountingPosixAdapter : public PosixFsAdapter {
     }
 
     int opens = 0;
+    int writable_opens = 0;
+    int read_only_opens = 0;
     int closes = 0;
 };
 
@@ -94,9 +97,9 @@ class ShortIoPosixAdapter : public CountingPosixAdapter {
 
 class RecordingPosixAdapter : public CountingPosixAdapter {
    public:
-    tl::expected<int, ErrorCode> OpenExistingFile(
-        const std::string& path) override {
-        auto fd = CountingPosixAdapter::OpenExistingFile(path);
+    tl::expected<int, ErrorCode> OpenExistingFile(const std::string& path,
+                                                  bool write) override {
+        auto fd = CountingPosixAdapter::OpenExistingFile(path, write);
         if (fd) peak_open = std::max(peak_open, ++open_now);
         return fd;
     }
@@ -173,6 +176,53 @@ TEST_P(ImmutableBucketShortIoTest, BufferedScatterIoUsesRequestScopedHandles) {
 }
 
 INSTANTIATE_TEST_SUITE_P(ScalarAndBatch, ImmutableBucketShortIoTest,
+                         ::testing::Bool());
+
+class ImmutableBucketOpenModeTest : public ::testing::TestWithParam<bool> {};
+
+// Reads must not request write access: on 3FS a writable open adds metadata
+// round trips on open and close to every bucket read.
+TEST_P(ImmutableBucketOpenModeTest, ReadsOpenBucketsReadOnly) {
+    TempDir dir;
+    const auto config = MakeConfig(dir);
+    ImmutableBucketAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+    auto descriptor = allocator.Allocate("key", 4);
+    ASSERT_TRUE(descriptor);
+
+    std::unique_ptr<RecordingPosixAdapter> adapter =
+        GetParam() ? std::make_unique<BatchRecordingPosixAdapter>()
+                   : std::make_unique<RecordingPosixAdapter>();
+    auto* recorded = adapter.get();
+    FileStorageConfig file_config;
+    DistributedStorageBackend backend(file_config, config, std::move(adapter));
+    ASSERT_TRUE(backend.Init());
+
+    std::string value = "abcd";
+    auto writes =
+        backend.BatchWrite({{"key", *descriptor, {{value.data(), 4}}}});
+    ASSERT_EQ(writes.size(), 1u);
+    ASSERT_TRUE(writes[0]);
+    EXPECT_EQ(recorded->writable_opens, 1);
+    EXPECT_EQ(recorded->read_only_opens, 0);
+
+    // A read-only bucket file stays readable.
+    std::filesystem::permissions(descriptor->file_path,
+                                 std::filesystem::perms::owner_read |
+                                     std::filesystem::perms::group_read |
+                                     std::filesystem::perms::others_read);
+    std::string output(4, '\0');
+    auto reads =
+        backend.BatchRead({{"key", *descriptor, {{output.data(), 4}}}});
+    ASSERT_EQ(reads.size(), 1u);
+    ASSERT_TRUE(reads[0]);
+    EXPECT_EQ(output, value);
+    EXPECT_EQ(recorded->writable_opens, 1);
+    EXPECT_EQ(recorded->read_only_opens, 1);
+    EXPECT_EQ(recorded->closes, 2);
+}
+
+INSTANTIATE_TEST_SUITE_P(ScalarAndBatch, ImmutableBucketOpenModeTest,
                          ::testing::Bool());
 
 TEST(ImmutableBucketBackendTest, PosixKeepsPerRequestBucketHandles) {
