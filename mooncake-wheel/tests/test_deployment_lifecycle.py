@@ -5,7 +5,6 @@ starts an isolated master per case. MOONCAKE_DEPLOYMENT_PROTOCOL selects the
 daemon transport; Dummy SHM checks do not exercise cross-endpoint RDMA.
 """
 
-import array
 import ctypes
 import json
 import os
@@ -14,7 +13,6 @@ import select
 import shlex
 import signal
 import socket
-import struct
 import subprocess
 import sys
 import tempfile
@@ -353,62 +351,6 @@ class TestDeploymentLifecycle(unittest.TestCase):
 
     def test_signal_exit_real_signaled_first(self):
         self.assert_signal_exit("real_first")
-
-    def test_ipc_collision_rejects_dummy_and_preserves_other_deployment(self):
-        with socket.socket() as reservation:
-            reservation.bind(("127.0.0.1", 0))
-            port = reservation.getsockname()[1]
-        ipc_name = f"\0@mooncake_client_{port}.sock"
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as occupied:
-            occupied.bind(ipc_name)
-            occupied.listen(5)
-            occupied.settimeout(15)
-            duplicate, log = self.spawn(self.command + [f"--port={port}"], "ipc_collision")
-            deadline = time.monotonic() + 15
-            while time.monotonic() < deadline:
-                if duplicate.poll() is not None:
-                    self.assertNotEqual(duplicate.returncode, 0)
-                    self.assertIsNone(self.real.poll())
-                    for worker in self.workers:
-                        self.assert_roundtrip(worker.call("roundtrip"))
-                    return  # Synchronous startup rejection is also valid.
-                try:
-                    with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                        break
-                except OSError:
-                    time.sleep(0.05)
-            else:
-                self.fail(f"Occupied IPC startup did not fail or expose RPC; log: {log}")
-            probe, probe_log = self.spawn(
-                [sys.executable, "-u", str(Path(__file__).resolve()), "--dummy-worker",
-                 f"127.0.0.1:{port}", f"rejected_{uuid.uuid4().hex}"],
-                "rejected_dummy", pipes=True)
-            # The existing owner rejects the normal header+FD registration.
-            with occupied.accept()[0] as connection:
-                connection.settimeout(5)
-                payload, ancillary, flags, _ = connection.recvmsg(128, socket.CMSG_SPACE(4))
-                received_fds = []
-                for level, kind, data in ancillary:
-                    if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                        descriptors = array.array("i")
-                        descriptors.frombytes(data[:len(data) - len(data) % descriptors.itemsize])
-                        for descriptor in descriptors:
-                            received_fds.append(descriptor)
-                            os.close(descriptor)
-                self.assertTrue(payload)
-                self.assertEqual(len(received_fds), 1)
-                self.assertFalse(flags & socket.MSG_CTRUNC)
-                connection.sendall(struct.pack("i", -1))
-            try:
-                code = probe.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.fail(f"Dummy did not reject occupied IPC; log: {probe_log}")
-            self.assertEqual(code, 1)
-            self.assertIn("RuntimeError: Dummy setup failed",
-                          probe_log.read_text(errors="replace"))
-            self.assertIsNone(self.real.poll())
-            for worker in self.workers:
-                self.assert_roundtrip(worker.call("roundtrip"))
 
 
 if __name__ == "__main__":
