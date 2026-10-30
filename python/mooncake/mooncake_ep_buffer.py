@@ -639,15 +639,11 @@ class Buffer:
                 dtype=torch.int32,
                 device=device,
             )
-            dist.all_reduce(
-                ibgda_ready_tensor, op=dist.ReduceOp.MIN, group=self.group
-            )
+            dist.all_reduce(ibgda_ready_tensor, op=dist.ReduceOp.MIN, group=self.group)
             ibgda_ready = bool(ibgda_ready_tensor.item())
             if ibgda_ready:
                 self.runtime.update_local_qpns()
-                ibgda_ready_tensor.fill_(
-                    int(not self.runtime.ibgda_disabled())
-                )
+                ibgda_ready_tensor.fill_(int(not self.runtime.ibgda_disabled()))
                 dist.all_reduce(
                     ibgda_ready_tensor, op=dist.ReduceOp.MIN, group=self.group
                 )
@@ -788,9 +784,7 @@ class Buffer:
         # Each rank maps its peers on its own, so one may reach them all while
         # another cannot. Take the fast path only if every rank can; a rank in
         # native kernels would wait forever on one that runs fallback collectives.
-        agreed = torch.tensor(
-            [int(use_fast_path)], dtype=torch.int32, device=device
-        )
+        agreed = torch.tensor([int(use_fast_path)], dtype=torch.int32, device=device)
         dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=self.group)
         use_fast_path = bool(agreed.item())
         self._use_fallback = not use_fast_path

@@ -918,8 +918,8 @@ class P2pDeviceTransportImpl : public P2pTransport {
             cudaError_t err = cudaSuccess;
             if (is_local_group_peer) {
                 int can_access = 0;
-                err = cudaDeviceCanAccessPeer(&can_access, device_id,
-                                              dst_device);
+                err =
+                    cudaDeviceCanAccessPeer(&can_access, device_id, dst_device);
                 if (err != cudaSuccess) {
                     LOG(WARNING)
                         << "[EP P2P] cudaDeviceCanAccessPeer failed for rank "
