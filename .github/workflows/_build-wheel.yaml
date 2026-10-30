@@ -111,7 +111,7 @@ jobs:
               exit 1
               ;;
           esac
-          cmake_args="$cmake_args -DENABLE_KV_EVENTS=ON"
+          cmake_args="$cmake_args -DENABLE_KV_EVENTS=ON -DWITH_CONDUCTOR=ON"
           # AWS EFA transport. It dlopens libfabric when protocol=efa is used,
           # so the wheel only needs the headers (fetched below) and still
           # imports on hosts without libfabric.
