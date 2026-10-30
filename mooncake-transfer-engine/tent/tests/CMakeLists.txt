@@ -533,6 +533,61 @@ target_include_directories(tent_transport_selector_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_transport_selector_test COMMAND tent_transport_selector_test)
 
+# Transport plugins (include/tent/transport_plugin.h). The test plugins link no
+# TENT library: they take TENT's symbols from the test executable, which exports
+# them (ENABLE_EXPORTS), and only borrow TENT's include directories (as SYSTEM,
+# like the third-party ones among them). Each plugin has a directory of its own.
+set(TENT_TEST_PLUGIN_ROOT ${CMAKE_CURRENT_BINARY_DIR}/transport_plugins)
+add_executable(tent_transport_plugin_loader_test
+               transport_plugin_loader_test.cpp)
+target_link_libraries(tent_transport_plugin_loader_test
+                      PRIVATE gtest gtest_main tent_link_group)
+target_include_directories(tent_transport_plugin_loader_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_compile_definitions(
+  tent_transport_plugin_loader_test
+  PRIVATE TENT_TEST_PLUGIN_ROOT="${TENT_TEST_PLUGIN_ROOT}")
+set_target_properties(tent_transport_plugin_loader_test
+                      PROPERTIES ENABLE_EXPORTS ON)
+add_test(NAME tent_transport_plugin_loader_test
+         COMMAND tent_transport_plugin_loader_test)
+# a and b: two builds of the memcpy plugin in one directory.
+foreach(
+  plugin
+  memcpy
+  a
+  b
+  bad_type
+  declines
+  throws
+  no_entry
+  no_build_id
+  wrong_build)
+  set(target tent_test_plugin_${plugin})
+  set(dir ${plugin})
+  if(plugin MATCHES "^(memcpy|a|b)$")
+    add_library(${target} MODULE plugins/memcpy_transport.cpp)
+  else()
+    add_library(${target} MODULE plugins/bad_plugins.cpp)
+    target_compile_definitions(${target} PRIVATE VARIANT_${plugin})
+  endif()
+  if(plugin MATCHES "^(a|b)$")
+    set(dir two)
+  endif()
+  target_compile_features(${target} PRIVATE cxx_std_20)
+  target_include_directories(
+    ${target} SYSTEM
+    PRIVATE $<TARGET_PROPERTY:tent_runtime,INTERFACE_INCLUDE_DIRECTORIES>)
+  target_compile_definitions(
+    ${target}
+    PRIVATE $<TARGET_PROPERTY:tent_runtime,INTERFACE_COMPILE_DEFINITIONS>)
+  set_target_properties(
+    ${target}
+    PROPERTIES OUTPUT_NAME tent_xport_${plugin} LIBRARY_OUTPUT_DIRECTORY
+                                                ${TENT_TEST_PLUGIN_ROOT}/${dir})
+  add_dependencies(tent_transport_plugin_loader_test ${target})
+endforeach()
+
 add_executable(tent_topology_priority_matrix_test
                topology_priority_matrix_test.cpp)
 target_link_libraries(tent_topology_priority_matrix_test
