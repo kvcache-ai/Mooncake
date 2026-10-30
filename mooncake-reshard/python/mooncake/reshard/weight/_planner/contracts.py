@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import repeat
 from math import prod
 from types import MappingProxyType
 from typing import (
@@ -331,26 +332,40 @@ class TransferRegion(Generic[_SourceFragmentT, _TargetFragmentT]):
         if not self.outer_loop_counts:
             yield self.source_base_offset, self.target_base_offset, self.inner_bytes
             return
-        indices = [0] * len(self.outer_loop_counts)
-        while True:
-            yield (
-                self.source_base_offset
-                + sum(
-                    index * stride
-                    for index, stride in _strict_zip(indices, self.source_strides)
+        if (
+            len(self.outer_loop_counts) == 1
+            and self.source_strides[0] > 0
+            and self.target_strides[0] > 0
+        ):
+            count = self.outer_loop_counts[0]
+            yield from zip(
+                range(
+                    self.source_base_offset,
+                    self.source_base_offset + count * self.source_strides[0],
+                    self.source_strides[0],
                 ),
-                self.target_base_offset
-                + sum(
-                    index * stride
-                    for index, stride in _strict_zip(indices, self.target_strides)
+                range(
+                    self.target_base_offset,
+                    self.target_base_offset + count * self.target_strides[0],
+                    self.target_strides[0],
                 ),
-                self.inner_bytes,
+                repeat(self.inner_bytes, count),
             )
+            return
+        indices = [0] * len(self.outer_loop_counts)
+        source_offset = self.source_base_offset
+        target_offset = self.target_base_offset
+        while True:
+            yield source_offset, target_offset, self.inner_bytes
             for dim in range(len(indices) - 1, -1, -1):
                 indices[dim] += 1
+                source_offset += self.source_strides[dim]
+                target_offset += self.target_strides[dim]
                 if indices[dim] < self.outer_loop_counts[dim]:
                     break
                 indices[dim] = 0
+                source_offset -= self.outer_loop_counts[dim] * self.source_strides[dim]
+                target_offset -= self.outer_loop_counts[dim] * self.target_strides[dim]
             else:
                 return
 
