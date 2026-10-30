@@ -27,12 +27,6 @@ std::string MasterServiceTestPeer::SerializeMetadataForOpLogForTesting(
     return service.SerializeMetadataForOpLog(metadata);
 }
 
-std::string
-MasterServiceTestPeer::SerializeMetadataForOpLogWithoutMemReplicasForTesting(
-    MasterService& service, const ObjectMetadata& metadata) {
-    return service.SerializeMetadataForOpLogWithoutMemReplicas(metadata);
-}
-
 std::string MasterServiceTestPeer::
     SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
         MasterService& service, const ObjectMetadata& metadata,

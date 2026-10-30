@@ -88,12 +88,6 @@ struct PromotionCandidate {
     // consumption; reset only when a genuinely new chain starts (fresh
     // insert with 0, e.g. after a give-up or a success).
     uint32_t execution_failures{0};
-    // True when the task was registered by a prefetch caller
-    // (RegisterPrefetchTask) rather than promotion-on-hit admission. Same
-    // execution chain, but failure handling differs: a prefetch failure is
-    // retried by the client-side throttle, not re-recorded as an on-hit
-    // candidate.
-    bool from_prefetch{false};
 };
 
 // NotifyPromotionSuccess should commit, so a concurrent Put on the

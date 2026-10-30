@@ -63,6 +63,18 @@ DEFINE_uint64(
     target_range_size, 0,
     "Per-initiator target range size. 0 disables range validation; "
     "non-zero requires every target address to stay inside the range.");
+DEFINE_string(target_access, "fixed",
+              "Target offset of each operation within the thread's window: "
+              "fixed (same offset every time) or random (a random "
+              "operation-aligned slot, never the previous one). Rewriting one "
+              "SSD block back to back can be far slower than writing "
+              "different blocks; random avoids that.");
+DEFINE_uint64(target_window_size, 0,
+              "Bytes of target each thread spreads its operations over, e.g. "
+              "file size / thread count. Requires --target_access=random "
+              "and a multiple of 4096. Threads' windows do not overlap. 0 "
+              "uses max_block_size x max_batch_size, which is also the "
+              "minimum.");
 DEFINE_string(
     qos_classes, "",
     "QoS classes as name:threads:slo_us:weight[:isolated_gbps],...; "
@@ -162,6 +174,8 @@ int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
 size_t XferBenchConfig::target_offset = 0;
 size_t XferBenchConfig::target_range_size = 0;
+std::string XferBenchConfig::target_access;
+size_t XferBenchConfig::target_window_size = 0;
 std::string XferBenchConfig::qos_classes;
 std::string XferBenchConfig::qos_classes_json;
 std::string XferBenchConfig::workload_classes_json;
@@ -251,6 +265,8 @@ void XferBenchConfig::loadFromFlags() {
     max_num_threads = FLAGS_max_num_threads;
     target_offset = FLAGS_target_offset;
     target_range_size = FLAGS_target_range_size;
+    target_access = FLAGS_target_access;
+    target_window_size = FLAGS_target_window_size;
     qos_classes = FLAGS_qos_classes;
     qos_classes_json = FLAGS_qos_classes_json;
     workload_classes_json = FLAGS_workload_classes_json;

@@ -241,4 +241,5 @@ troubleshooting/store-rs-key-access
 
 community/governance
 community/ecosystem-prs
+community/pypi-downloads
 :::
