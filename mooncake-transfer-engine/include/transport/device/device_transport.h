@@ -73,6 +73,16 @@ class P2pTransport {
         const std::vector<std::vector<int32_t>>& remote_handles,
         const std::vector<int>& active_ranks_mask) = 0;
 
+    // Elastic EP connects one fixed global-rank slot at a time. Staging opens
+    // the mapping without publishing it to device kernels; publish is called
+    // only after local users of the old slot have quiesced.
+    virtual int stagePeerHandle(void*, int, int, const std::vector<int32_t>&) {
+        return -1;
+    }
+    virtual int publishStagedPeer(int) { return -1; }
+    virtual void discardStagedPeer(int) {}
+    virtual int disconnectPeer(int) { return -1; }
+
     // Device pointer to int32_t[num_ranks]: 1 if P2P is available to rank i.
     virtual int32_t* availableTablePtr() = 0;
 

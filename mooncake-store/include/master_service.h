@@ -63,14 +63,12 @@
 
 namespace mooncake {
 
-class EtcdOpLogStore;
 class ShardAllocator;
 class DfsAllocatorInterface;
 class ImmutableBucketAllocator;
 
 // Forward declarations
 class AllocationStrategy;
-class EvictionStrategy;
 class HaKvBackend;
 class HttpMetadataServer;
 class OpLogBatchStorage;
@@ -360,22 +358,15 @@ class MasterService {
      * @param segment_name The name of the segment (storage device) to clear
      * from. If empty, clears replicas from all segments for the given
      * client_id.
+     * @param tenant_id The tenant that owns the keys.
      * @return An expected object containing a vector of successfully cleared
      * keys on success, or an ErrorCode on failure. Only successfully
      * cleared keys are included in the result.
      */
-    // Existing key-only overload (signature unchanged): kept for legacy
-    // callers; delegates with "default".
-    auto BatchReplicaClear(const std::vector<std::string>& object_keys,
-                           const UUID& client_id,
-                           const std::string& segment_name)
-        -> tl::expected<std::vector<std::string>, ErrorCode>;
-
-    // New: tenant-aware overload
-    auto BatchReplicaClear(const std::vector<std::string>& object_keys,
-                           const UUID& client_id,
-                           const std::string& segment_name,
-                           const std::string& tenant_id)
+    auto BatchReplicaClear(
+        const std::vector<std::string>& object_keys, const UUID& client_id,
+        const std::string& segment_name,
+        const std::string& tenant_id = std::string(TenantId::kDefaultValue))
         -> tl::expected<std::vector<std::string>, ErrorCode>;
 
     /**
@@ -879,13 +870,6 @@ class MasterService {
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const TenantId& tenant_id,
         const std::vector<std::string>& targets);
-
-    /**
-     * @brief Submit a dynamic replica action proposal after Master-side
-     * hotness admission.
-     */
-    tl::expected<ReplicaActionLease, ErrorCode> SubmitReplicaActionProposal(
-        const ReplicaActionProposal& proposal);
 
     /**
      * @brief Create a move task to move an object's replica from source segment
@@ -1696,11 +1680,10 @@ class MasterService {
         }
 
         // Holds the key only while it holds an object.
-        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id,
-                           bool cleanup_invalid = true)
+        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
             : MetadataAccessorRW(service, std::move(object_id), AsIs{}) {
             // Invalid memory replicas go first, which may tear the object down.
-            if (cleanup_invalid && IsPublished()) {
+            if (IsPublished()) {
                 service_->CleanupInvalidMemoryReplicas(*this);
             }
         }
@@ -1873,9 +1856,6 @@ class MasterService {
         std::optional<route::ReadGuard> guard_;
     };
 
-    friend class MetadataAccessorRW;
-    friend class MetadataAccessorRO;
-
     // Calls `visit` with each namespace that holds an object when the walk
     // starts, holding no lock, so `visit` may reach any key. A namespace that
     // gains its first object meanwhile may or may not be visited. Its objects
@@ -1949,13 +1929,9 @@ class MasterService {
     const uint32_t nof_heartbeat_failures_threshold_;
 
     struct NoFHeartbeatState {
-        UUID owner_client_id{0, 0};
-        std::string segment_name;
-        std::string te_endpoint;
         std::chrono::steady_clock::time_point next_probe_at{};
         std::chrono::steady_clock::time_point last_success_at{};
         uint32_t consecutive_failures{0};
-        std::string last_error_reason;
     };
     std::mutex nof_heartbeat_mutex_;
     std::unordered_map<UUID, NoFHeartbeatState, boost::hash<UUID>>
@@ -2195,8 +2171,6 @@ class MasterService {
 
     static constexpr uint32_t kMaxDrainUnitRetries = 3;
 
-    tl::expected<void, ErrorCode> ValidateDrainRequest(
-        const CreateDrainJobRequest& request);
     tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
         ScopedSegmentAccess& segment_access,
         const CreateDrainJobRequest& request);
@@ -2332,8 +2306,6 @@ class MasterService {
 
     // OpLog publishing helpers
     std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
-    std::string SerializeMetadataForOpLogWithoutMemReplicas(
-        const ObjectMetadata& metadata) const;
     std::string SerializeMetadataForOpLogFromReplicaDescriptors(
         const ObjectMetadata& metadata,
         const std::vector<Replica::Descriptor>& replicas) const;
@@ -2382,27 +2354,20 @@ class MasterService {
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     /**
-     * Segment lifecycle persist helper. Tries to durably persist the
-     * SEGMENT_MOUNT / SEGMENT_UNMOUNT entry up-front; on failure enqueues
-     * the same OpLogEntry (with its already-allocated sequence_id) for
-     * background retry so the standby segment registry eventually
-     * converges. Suitable for paths where the local segment commit has
-     * already happened (UnmountSegment) and rolling back is impossible.
+     * Appends a SEGMENT_MOUNT / SEGMENT_UNMOUNT entry without waiting for it
+     * to become durable. The local segment change has already happened and
+     * cannot be rolled back, so a failed append is only logged; nothing
+     * retries it.
      */
-    void PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
-                                        const std::string& key,
-                                        const std::string& payload);
-    void PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
-                                        const TenantId& tenant_id,
-                                        const std::string& key,
-                                        const std::string& payload);
+    void PersistSegmentOpForHA(const char* why, OpType type,
+                               const std::string& key,
+                               const std::string& payload);
 
     /**
-     * Helper to persist REMOVE OpLog for a key with strong-consistency.
-     * @return OK on success, error on persist failure (caller must skip erase)
+     * Appends a REMOVE entry for the key, without waiting for it to become
+     * durable.
+     * @return OK on success, error on append failure (caller must skip erase)
      */
-    tl::expected<void, ErrorCode> PersistRemoveForHA(const char* why,
-                                                     const std::string& key);
     tl::expected<void, ErrorCode> PersistRemoveForHA(const char* why,
                                                      const TenantId& tenant_id,
                                                      const std::string& key);

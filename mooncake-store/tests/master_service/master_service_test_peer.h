@@ -53,8 +53,6 @@ class MasterServiceTestPeer {
     // the fields that payload carries.
     static std::string SerializeMetadataForOpLogForTesting(
         MasterService& service, const ObjectMetadata& metadata);
-    static std::string SerializeMetadataForOpLogWithoutMemReplicasForTesting(
-        MasterService& service, const ObjectMetadata& metadata);
     static std::string
     SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
         MasterService& service, const ObjectMetadata& metadata,
@@ -443,6 +441,14 @@ class MasterServiceTestPeer {
     uint64_t DynamicReplicationVersionEpoch(
         const ObjectMetadata& metadata) const {
         return DynamicReplicationController::VersionEpoch(metadata);
+    }
+
+    // Submits a dynamic replica proposal under the shared state lock that
+    // SubmitReplicaActionProposalLocked expects.
+    tl::expected<ReplicaActionLease, ErrorCode> SubmitReplicaActionProposal(
+        const ReplicaActionProposal& proposal) {
+        std::shared_lock<std::shared_mutex> lock(service_.master_state_mutex_);
+        return service_.SubmitReplicaActionProposalLocked(proposal);
     }
 
     size_t EraseReplicasWithCacheTotalAccounting(

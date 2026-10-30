@@ -5,23 +5,39 @@
 
 #include <cooperative_groups.h>
 
+#include <type_traits>
+
 #include <elastic/mooncake_ep_elastic_compiled.cuh>
 #include <elastic/mooncake_ep_elastic_math.cuh>
 #include <elastic/mooncake_ep_elastic_ptx.cuh>
 
 namespace mooncake::elastic {
 
+struct DispatchDeterministicPrologueKernelArgs {
+    topk_idx_t* topk_idx;
+    int* rank_count_buffer;
+    int* dst_buffer_slot_idx;
+    int num_tokens;
+    int scaleup_rank_idx;
+};
+
+static_assert(
+    std::is_trivially_copyable<DispatchDeterministicPrologueKernelArgs>::value,
+    "DispatchDeterministicPrologueKernelArgs must be trivially copyable");
+
 // Slot preassignment runs in the active scale-up domain.  Hybrid scale-out
 // forwarding is handled by the hybrid dispatch kernel.
 template <int kNumSMs, int kNumWarps, int kNumScaleupRanks,
           int kNumMaxTokensPerRank, int kNumExperts, int kNumTopk,
           int kNumThreads = kNumWarps * 32>
-__global__ void __launch_bounds__(kNumThreads, 1)
-    dispatch_deterministic_prologue_impl(topk_idx_t* topk_idx,
-                                         int* rank_count_buffer,
-                                         int* dst_buffer_slot_idx,
-                                         const int num_tokens,
-                                         const int scaleup_rank_idx) {
+__device__ __forceinline__ void dispatch_deterministic_prologue_kernel_impl(
+    const DispatchDeterministicPrologueKernelArgs& args) {
+    topk_idx_t* topk_idx = args.topk_idx;
+    int* rank_count_buffer = args.rank_count_buffer;
+    int* dst_buffer_slot_idx = args.dst_buffer_slot_idx;
+    int num_tokens = args.num_tokens;
+    int scaleup_rank_idx = args.scaleup_rank_idx;
+
     constexpr int kNumExpertsPerRank = kNumExperts / kNumScaleupRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0,
                      "Invalid number of experts or ranks");
@@ -166,6 +182,17 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             rank_count_warp_psum[deduped_rank_idx] += __popc(rank_idx_mask);
         __syncwarp();
     }
+}
+
+template <int kNumSMs, int kNumWarps, int kNumScaleupRanks,
+          int kNumMaxTokensPerRank, int kNumExperts, int kNumTopk,
+          int kNumThreads = kNumWarps * 32>
+__global__ void __launch_bounds__(kNumThreads, 1)
+    dispatch_deterministic_prologue(
+        const DispatchDeterministicPrologueKernelArgs args) {
+    dispatch_deterministic_prologue_kernel_impl<
+        kNumSMs, kNumWarps, kNumScaleupRanks, kNumMaxTokensPerRank, kNumExperts,
+        kNumTopk>(args);
 }
 
 }  // namespace mooncake::elastic
