@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -26,7 +27,52 @@
 #include "config.h"
 #include "rdma_context.h"
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#include "adaptive_congestion_control.h"
+#endif
+
 namespace mooncake {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+class ClassicRdmaCongestionControl {
+   public:
+    using SliceList = std::vector<Transport::Slice *>;
+
+    explicit ClassicRdmaCongestionControl(
+        adaptive_congestion_control::Config config);
+    ~ClassicRdmaCongestionControl();
+
+    ClassicRdmaCongestionControl(const ClassicRdmaCongestionControl &) = delete;
+    ClassicRdmaCongestionControl &operator=(
+        const ClassicRdmaCongestionControl &) = delete;
+
+    bool enabled() const {
+        return mode_ != adaptive_congestion_control::Mode::kOff;
+    }
+    void prepare(Transport::Slice *slice, const std::string &peer_nic_path);
+    void prepare(SliceList &slices, const std::string &peer_nic_path);
+    void bindEndpoint(Transport::Slice *slice, RdmaEndPoint *endpoint);
+    void retireEndpoint(const std::string &peer_nic_path,
+                        RdmaEndPoint *endpoint);
+    size_t gate(SliceList &queued);
+    void complete(Transport::Slice *slice, ibv_wc_status status,
+                  uint32_t vendor_error = 0);
+    void releaseUnposted(Transport::Slice *slice);
+    void tick(uint64_t now_ns);
+    void resetDevice();
+
+   private:
+    struct RouteState;
+
+    RouteState *route(const std::string &peer_nic_path);
+
+    adaptive_congestion_control::Config config_;
+    adaptive_congestion_control::Mode mode_;
+    std::unique_ptr<adaptive_congestion_control::DomainState> device_;
+    std::mutex routes_mutex_;
+    std::unordered_map<std::string, std::unique_ptr<RouteState>> routes_;
+};
+#endif
+
 class WorkerPoolTestPeer;
 class WorkerPool {
     friend class WorkerPoolTestPeer;
@@ -97,8 +143,17 @@ class WorkerPool {
     GidRefreshResult refreshPublishedLocalGid();
     bool handleContextEvent(ibv_event_type event_type, bool injected_for_test,
                             struct ibv_async_event *event = nullptr);
-    void scheduleContextRecovery(uint64_t delay_ns = kContextRecoveryDelayNs);
+    void scheduleContextRecovery(uint64_t delay_ns = kContextRecoveryDelayNs,
+                                 bool override_breaker = true);
     void maybeActivateRecoveredContext();
+    // Safety net for a PORT_ERR whose PORT_ACTIVE never arrived. At most the
+    // 1 Hz monitor tick calls this, and only when context_disabling_event_
+    // is IBV_EVENT_PORT_ERR. On IBV_PORT_ACTIVE it arms the same delayed GID
+    // probe as the event path. DEVICE_FATAL, CQ_ERR, WQ_FATAL and LID_CHANGE
+    // stay inactive: the probe does not rebuild a failed CQ or device.
+    // Breaker-owned pauses are left alone so TTL reactivation still owns
+    // local-WC downtime.
+    void resumePausedContext();
     bool hasAvailablePeerRailAlternative(Transport::Slice *slice,
                                          const std::string &failed_peer_path);
     bool recordAutoGidDataPathFailure(Transport::Slice *slice);
@@ -155,6 +210,9 @@ class WorkerPool {
 
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
     std::atomic<uint64_t> recovery_activate_after_ns_{0};
+    // Fatal async event that owns the inactive context, or -1 when none does.
+    // The 1 Hz port poll resumes only IBV_EVENT_PORT_ERR.
+    std::atomic<int> context_disabling_event_{-1};
 
     // Rail state management: peer_nic_path -> RailState
     std::unordered_map<std::string, RailState> rail_states_;
@@ -179,6 +237,9 @@ class WorkerPool {
     std::atomic<int> context_failure_count_{0};
     uint64_t breaker_reactivate_after_ns_{0};
     static constexpr int kLocalCompletionFailureThreshold = 32;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    ClassicRdmaCongestionControl adaptive_congestion_control_;
+#endif
 };
 }  // namespace mooncake
 

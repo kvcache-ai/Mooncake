@@ -44,6 +44,18 @@ endif()
 option(MOONCAKE_ENABLE_OPLOG_PERF_METRICS
        "Enable detailed batch OpLog performance metrics" OFF)
 
+# Without TENT only Mooncake EP builds for XPU: the Store's XPU device gets its
+# SYCL flags from TENT's platform library. Checked before the Store's
+# dependencies are looked up, which would fail first and less clearly.
+if(USE_XPU
+   AND NOT USE_TENT
+   AND WITH_STORE)
+  message(
+    FATAL_ERROR
+      "USE_XPU=ON without USE_TENT=ON builds Mooncake EP only. Re-run cmake with -DWITH_EP=ON -DWITH_STORE=OFF, or with -DUSE_TENT=ON."
+  )
+endif()
+
 include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
 if(SKBUILD)
   set(PYBIND11_FINDPYTHON ON)
@@ -129,6 +141,11 @@ endif()
 add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
 
 add_subdirectory(mooncake-common)
+if(BUILD_UNIT_TESTS)
+  # Tests of the EP code shared across backends: host-only, so they run
+  # without WITH_EP or a GPU.
+  add_subdirectory(mooncake-ep/tests)
+endif()
 include_directories(mooncake-common/etcd)
 include_directories(mooncake-common/k8s-lease)
 include_directories(mooncake-common/include)
@@ -177,7 +194,13 @@ if (WITH_STORE_RS)
 endif()
 
 option(EP_USE_IDE "Enable intelligent indexing for IDEs" OFF)
-if(WITH_EP)
+if(WITH_EP AND USE_XPU)
+  # Mooncake PG is CUDA/MUSA/MACA-only; the XPU EP bootstraps over any
+  # torch.distributed group, so only the EP module is built.
+  message(
+    STATUS "WITH_EP enabled on Intel XPU: building the SYCL Mooncake EP module")
+  add_subdirectory(mooncake-ep)
+elseif(WITH_EP)
   add_subdirectory(mooncake-pg)
   include_directories(mooncake-pg/include)
 

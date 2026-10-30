@@ -197,6 +197,39 @@ TenantQuotaResult TenantQuotaAccount::Release(uint64_t bytes) {
     }
 }
 
+TenantQuotaResult TenantQuotaAccount::BeginWrite() {
+    for (;;) {
+        const uint64_t sequence_before =
+            policy_sequence_.load(std::memory_order_acquire);
+        if (sequence_before & 1) {
+            continue;
+        }
+
+        // Sequentially consistent, as is DisableTenantPolicyIfEmpty closing
+        // admission and then reading the count: of a racing write and disable,
+        // at least one sees the other.
+        writes_in_flight_.fetch_add(1, std::memory_order_seq_cst);
+        if (!(charged_state_.load(std::memory_order_seq_cst) &
+              kAdmissionClosed)) {
+            return {};
+        }
+        writes_in_flight_.fetch_sub(1, std::memory_order_release);
+
+        const uint64_t sequence_after =
+            policy_sequence_.load(std::memory_order_acquire);
+        if (sequence_before == sequence_after && !(sequence_after & 1)) {
+            return tl::make_unexpected(TenantQuotaError::kTenantNotRegistered);
+        }
+    }
+}
+
+void TenantQuotaAccount::EndWrite() {
+    const uint64_t previous =
+        writes_in_flight_.fetch_sub(1, std::memory_order_release);
+    assert(previous != 0);
+    (void)previous;
+}
+
 uint64_t TenantQuotaAccount::ChargedBytes() const {
     return charged_state_.load(std::memory_order_acquire) & kChargedBytesMask;
 }
@@ -228,8 +261,9 @@ void TenantQuotaAccount::SetAdmissionClosed(bool closed) {
     for (;;) {
         const uint64_t desired =
             closed ? expected | kAdmissionClosed : expected & kChargedBytesMask;
+        // Sequentially consistent for BeginWrite; see there.
         if (charged_state_.compare_exchange_weak(expected, desired,
-                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_seq_cst,
                                                  std::memory_order_acquire)) {
             return;
         }
@@ -281,7 +315,8 @@ TenantQuotaResult TenantQuotaTable::DisableTenantPolicyIfEmpty(
     auto& account = *it->second;
     account.BeginPolicyUpdate();
     account.SetAdmissionClosed(true);
-    if (account.ChargedBytes() != 0) {
+    if (account.ChargedBytes() != 0 ||
+        account.writes_in_flight_.load(std::memory_order_seq_cst) != 0) {
         account.SetAdmissionClosed(false);
         account.EndPolicyUpdate();
         return tl::make_unexpected(TenantQuotaError::kTenantNotEmpty);

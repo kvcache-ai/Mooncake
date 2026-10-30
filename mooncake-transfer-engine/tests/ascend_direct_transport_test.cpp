@@ -18,6 +18,10 @@
 #include <acl/acl.h>
 #include <acl/acl_rt.h>
 #include <algorithm>
+#include <array>
+#include "transfer_engine.h"
+#include "transfer_engine_impl.h"
+#include "multi_transport.h"
 #include <cstdint>
 #include <cstdlib>
 #include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
@@ -32,8 +36,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace mooncake;
@@ -50,9 +56,12 @@ static thread_local int g_device_id = 0;
 static int g_device_count = 1;
 static thread_local aclrtContext g_context =
     reinterpret_cast<aclrtContext>(0x10000);
+static thread_local aclError g_get_device_result = ACL_ERROR_NONE;
 static aclError g_memcpy_result = ACL_ERROR_NONE;
 static aclError g_memcpy_async_result = ACL_ERROR_NONE;
-static aclError g_memcpy_batch_result = ACL_ERROR_NONE;
+static int g_memcpy_async_call_count = 0;
+static int g_stream_create_count = 0;
+static std::vector<std::string> g_memcpy_async_thread_names;
 static int g_get_device_call_count = 0;
 static int g_set_device_call_count = 0;
 static std::set<int> g_set_device_ids;
@@ -81,11 +90,14 @@ namespace mock_acl {
 void reset() {
     std::lock_guard<std::mutex> lock(g_acl_mutex);
     g_device_id = 0;
+    g_get_device_result = ACL_ERROR_NONE;
     g_device_count = 1;
     g_context = ContextForDevice(0);
     g_memcpy_result = ACL_ERROR_NONE;
     g_memcpy_async_result = ACL_ERROR_NONE;
-    g_memcpy_batch_result = ACL_ERROR_NONE;
+    g_memcpy_async_call_count = 0;
+    g_stream_create_count = 0;
+    g_memcpy_async_thread_names.clear();
     g_get_device_call_count = 0;
     g_set_device_call_count = 0;
     g_set_device_ids.clear();
@@ -122,14 +134,24 @@ void set_memcpy_result(aclError result) {
     g_memcpy_result = result;
 }
 
-void set_memcpy_batch_result(aclError result) {
-    std::lock_guard<std::mutex> lock(g_acl_mutex);
-    g_memcpy_batch_result = result;
-}
-
 void set_memcpy_async_result(aclError result) {
     std::lock_guard<std::mutex> lock(g_acl_mutex);
     g_memcpy_async_result = result;
+}
+
+int memcpy_async_call_count() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_memcpy_async_call_count;
+}
+
+std::vector<std::string> memcpy_async_thread_names() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_memcpy_async_thread_names;
+}
+
+int stream_create_count() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_stream_create_count;
 }
 
 int get_get_device_call_count() {
@@ -162,6 +184,7 @@ aclError aclrtGetDeviceCount(uint32_t* count) {
 
 aclError aclrtGetDevice(int* deviceId) {
     g_get_device_call_count++;
+    if (g_get_device_result != ACL_ERROR_NONE) return g_get_device_result;
     *deviceId = g_device_id;
     return ACL_ERROR_NONE;
 }
@@ -196,6 +219,8 @@ aclError aclrtCreateStreamWithConfig(aclrtStream* stream, uint32_t priority,
     (void)priority;
     (void)config;
     *stream = reinterpret_cast<aclrtStream>(0x5678);
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    ++g_stream_create_count;
     return ACL_ERROR_NONE;
 }
 
@@ -237,40 +262,20 @@ aclError aclrtMemcpyAsync(void* dst, size_t destMax, const void* src,
     (void)destMax;
     (void)kind;
     (void)stream;
+    char thread_name[16] = {};
+    pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
+
     aclError result;
     {
         std::lock_guard<std::mutex> lock(g_acl_mutex);
         result = g_memcpy_async_result;
+        ++g_memcpy_async_call_count;
+        g_memcpy_async_thread_names.emplace_back(thread_name);
         if (result == ACL_ERROR_NONE) {
             memcpy(dst, src, count);
         }
     }
     return result;
-}
-
-aclError aclrtMemcpyBatch(void** dstList, size_t* dstSizes, void** srcList,
-                          size_t* srcSizes, size_t count,
-                          aclrtMemcpyBatchAttr* attrs, size_t* attrIds,
-                          size_t attrCount, size_t* failIdx) {
-    (void)attrs;
-    (void)attrIds;
-    (void)attrCount;
-
-    std::lock_guard<std::mutex> lock(g_acl_mutex);
-
-    if (g_memcpy_batch_result == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
-        return ACL_ERROR_RT_FEATURE_NOT_SUPPORT;
-    }
-
-    if (g_memcpy_batch_result != ACL_ERROR_NONE) {
-        *failIdx = 0;
-        return g_memcpy_batch_result;
-    }
-
-    for (size_t i = 0; i < count; i++) {
-        memcpy(dstList[i], srcList[i], dstSizes[i]);
-    }
-    return ACL_ERROR_NONE;
 }
 
 aclError aclrtPointerGetAttributes(const void* ptr,
@@ -686,6 +691,7 @@ class AscendDirectTransportTest : public ::testing::Test {
     void SetUp() override {
         // Unit tests mock explicit Connect(); disable auto-connect by default.
         setenv("ASCEND_AUTO_CONNECT", "0", 1);
+        unsetenv("MC_CUSTOM_TOPO_JSON");
         mock_acl::reset();
         adxl_mock::reset();
 
@@ -708,6 +714,9 @@ class AscendDirectTransportTest : public ::testing::Test {
 
     void TearDown() override {
         unsetenv("ASCEND_AUTO_CONNECT");
+        unsetenv("MC_CUSTOM_TOPO_JSON");
+        unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+        unsetenv("HCCL_INTRA_ROCE_ENABLE");
         ContextManager::getInstance().finalize();
         google::ShutdownGoogleLogging();
     }
@@ -889,6 +898,18 @@ class AscendDirectTransportTest : public ::testing::Test {
             }
         }
         return {true, false, status};
+    }
+
+    struct FreeDeleter {
+        void operator()(void* ptr) const { free(ptr); }
+    };
+
+    // Returns a buffer starting on a 2 MiB boundary, as HCCS requires for
+    // remote-accessible device memory.
+    static std::unique_ptr<void, FreeDeleter> allocateDeviceAlignedBuffer() {
+        constexpr size_t kAlignment = 2 * 1024 * 1024;
+        return std::unique_ptr<void, FreeDeleter>(
+            aligned_alloc(kAlignment, 2 * kAlignment));
     }
 
     size_t getLocalBufferCount(AscendDirectTransport* transport) {
@@ -1364,13 +1385,80 @@ TEST_F(AscendDirectTransportTest, Memory_RegisterWithDeviceLocation) {
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);
 
-    mock_acl::set_pointer_location(test_buffer_src_,
-                                   ACL_MEM_LOCATION_TYPE_DEVICE, 0);
+    auto buffer = allocateDeviceAlignedBuffer();
+    ASSERT_NE(buffer, nullptr);
+    mock_acl::set_pointer_location(buffer.get(), ACL_MEM_LOCATION_TYPE_DEVICE,
+                                   0);
 
-    EXPECT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+    EXPECT_EQ(transport->registerLocalMemory(buffer.get(), kRegisterMemSize,
                                              "*", true, true),
               0);
-    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+    EXPECT_EQ(transport->unregisterLocalMemory(buffer.get(), true), 0);
+}
+
+TEST_F(AscendDirectTransportTest, Memory_RegisterRejectsUnalignedDeviceMem) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    // Mirrors a torch_npu caching-allocator sub-block 512 bytes past a 2 MiB
+    // boundary, which HCCS cannot export for remote access.
+    auto buffer = allocateDeviceAlignedBuffer();
+    ASSERT_NE(buffer, nullptr);
+    void* unaligned = static_cast<char*>(buffer.get()) + 512;
+
+    const size_t buffer_count_before = getLocalBufferCount(transport.get());
+    EXPECT_EQ(transport->registerLocalMemory(unaligned, kRegisterMemSize,
+                                             "npu:0", true, true),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 0);
+    EXPECT_EQ(getLocalBufferCount(transport.get()), buffer_count_before);
+}
+
+TEST_F(AscendDirectTransportTest,
+       Memory_RegisterAllowsUnalignedLocalOnlyDeviceMem) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    auto buffer = allocateDeviceAlignedBuffer();
+    ASSERT_NE(buffer, nullptr);
+    void* unaligned = static_cast<char*>(buffer.get()) + 512;
+
+    // local_only memory is never exported over HCCS, so alignment is moot.
+    EXPECT_EQ(transport->registerLocalMemory(unaligned, kRegisterMemSize,
+                                             "npu:0", false, true),
+              0);
+    EXPECT_EQ(transport->unregisterLocalMemory(unaligned, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest,
+       Memory_RegisterAllowsUnalignedHostMemWithRemoteAccess) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    auto buffer = allocateDeviceAlignedBuffer();
+    ASSERT_NE(buffer, nullptr);
+    void* unaligned = static_cast<char*>(buffer.get()) + 512;
+
+    EXPECT_EQ(transport->registerLocalMemory(unaligned, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    EXPECT_EQ(transport->unregisterLocalMemory(unaligned, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest, Memory_RoceAllowsUnalignedDeviceMem) {
+    setenv("HCCL_INTRA_ROCE_ENABLE", "1", 1);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    auto buffer = allocateDeviceAlignedBuffer();
+    ASSERT_NE(buffer, nullptr);
+    void* unaligned = static_cast<char*>(buffer.get()) + 512;
+
+    EXPECT_EQ(transport->registerLocalMemory(unaligned, kRegisterMemSize,
+                                             "npu:0", true, true),
+              0);
+    EXPECT_EQ(transport->unregisterLocalMemory(unaligned, true), 0);
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
 }
 
 TEST_F(AscendDirectTransportTest, Memory_registerLocalMemoryBatch_Success) {
@@ -1614,99 +1702,93 @@ TEST_F(AscendDirectTransportTest, LocalCopy_Async_MemcpyFailure) {
     transport->freeBatchID(batch_id);
 }
 
-TEST_F(AscendDirectTransportTest, LocalCopy_Batch_aclrtMemcpyBatchFailure) {
+class AscendDirectParallelLocalCopyTest : public AscendDirectTransportTest {
+   protected:
+    static constexpr size_t kSliceCount = 500;
+    static constexpr size_t kSliceSize = 8;
+    static constexpr size_t kCopyBytes = kSliceCount * kSliceSize;
+
+    // Copies kSliceCount host slices to device memory in one batch, which is
+    // the shape a store batch put produces for a single target.
+    TransferWaitResult runHostToDeviceSlices(AscendDirectTransport* transport) {
+        mock_acl::set_pointer_location(test_buffer_src_,
+                                       ACL_MEM_LOCATION_TYPE_HOST, 0);
+        mock_acl::set_pointer_location(test_buffer_dst_,
+                                       ACL_MEM_LOCATION_TYPE_DEVICE, 0);
+        initTestData(kCopyBytes);
+
+        auto batch_id = transport->allocateBatchID(kSliceCount);
+        EXPECT_NE(batch_id, 0);
+        std::vector<Transport::TransferRequest> requests;
+        for (size_t i = 0; i < kSliceCount; ++i) {
+            Transport::TransferRequest req;
+            req.opcode = Transport::TransferRequest::WRITE;
+            req.source = test_buffer_src_ + i * kSliceSize;
+            req.target_id = 0;
+            req.target_offset =
+                reinterpret_cast<uint64_t>(test_buffer_dst_ + i * kSliceSize);
+            req.length = kSliceSize;
+            requests.push_back(req);
+        }
+        EXPECT_TRUE(transport->submitTransfer(batch_id, requests).ok());
+        auto result = waitForTransfer(transport, batch_id, kSliceCount);
+        transport->freeBatchID(batch_id);
+        return result;
+    }
+};
+
+TEST_F(AscendDirectParallelLocalCopyTest, AsyncCopyUsesSixStreams) {
+    const int streams_before = mock_acl::stream_create_count();
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);
-
     ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
                                              "cpu:0", true, true),
               0);
     ASSERT_EQ(transport->registerLocalMemory(test_buffer_dst_, kRegisterMemSize,
                                              "cpu:0", true, true),
               0);
+    EXPECT_EQ(mock_acl::stream_create_count(), streams_before + 6);
 
-    initTestData(kTransferBufSize);
-    memset(test_buffer_dst_, 0, kTransferBufSize);
-
-    mock_acl::set_pointer_location(test_buffer_src_, ACL_MEM_LOCATION_TYPE_HOST,
-                                   0);
-    mock_acl::set_pointer_location(test_buffer_dst_,
-                                   ACL_MEM_LOCATION_TYPE_DEVICE, 0);
-
-    mock_acl::set_memcpy_batch_result(ACL_ERROR_RT_DEVICE_TASK_ABORT);
-
-    auto batch_id = transport->allocateBatchID(1);
-    ASSERT_NE(batch_id, 0);
-
-    std::vector<Transport::TransferRequest> requests;
-    Transport::TransferRequest req;
-    req.opcode = Transport::TransferRequest::WRITE;
-    req.source = test_buffer_src_;
-    req.target_id = 0;
-    req.target_offset = reinterpret_cast<uint64_t>(test_buffer_dst_);
-    req.length = kTransferBufSize;
-    requests.push_back(req);
-
-    Status s = transport->submitTransfer(batch_id, requests);
-    EXPECT_TRUE(s.ok());
-
-    auto result = waitForTransfer(transport.get(), batch_id);
+    auto result = runHostToDeviceSlices(transport.get());
     ASSERT_TRUE(result.finished);
-    EXPECT_TRUE(result.failed)
-        << "Transfer should fail when batch memcpy fails";
-    EXPECT_EQ(result.status.transferred_bytes, 0)
-        << "Transferred bytes should be 0 on failure";
-    EXPECT_FALSE(verifyTestData(kTransferBufSize))
-        << "Destination should not match source on failure";
-
-    mock_acl::set_memcpy_batch_result(ACL_ERROR_NONE);
-    transport->freeBatchID(batch_id);
+    EXPECT_FALSE(result.failed);
+    EXPECT_TRUE(verifyTestData(kCopyBytes));
+    EXPECT_EQ(mock_acl::memcpy_async_call_count(),
+              static_cast<int>(kSliceCount));
+    EXPECT_EQ(mock_acl::stream_create_count(), streams_before + 6);
+    const auto thread_names = mock_acl::memcpy_async_thread_names();
+    ASSERT_EQ(thread_names.size(), kSliceCount);
+    for (const auto& name : thread_names) {
+        EXPECT_EQ(name.compare(0, 7, "mc-cpy-"), 0)
+            << "aclrtMemcpyAsync ran on " << name;
+    }
 }
 
-TEST_F(AscendDirectTransportTest,
-       LocalCopy_Batch_FeatureNotSupport_FallbackToAsync) {
+TEST_F(AscendDirectParallelLocalCopyTest, MultiDeviceDefersPerDeviceStreams) {
+    globalConfig().ascend_agent_mode = true;
+    ContextManager::getInstance().finalize();
+    constexpr int kDeviceCount = 4;
+    mock_acl::set_device_count(kDeviceCount);
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+
+    const int streams_before = mock_acl::stream_create_count();
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);
-
     ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
                                              "cpu:0", true, true),
               0);
     ASSERT_EQ(transport->registerLocalMemory(test_buffer_dst_, kRegisterMemSize,
                                              "cpu:0", true, true),
               0);
+    EXPECT_EQ(mock_acl::stream_create_count(), streams_before);
 
-    initTestData(kTransferBufSize);
-    memset(test_buffer_dst_, 0, kTransferBufSize);
+    ASSERT_EQ(aclrtSetDevice(0), ACL_ERROR_NONE);
+    auto first = runHostToDeviceSlices(transport.get());
+    ASSERT_TRUE(first.finished);
+    EXPECT_FALSE(first.failed);
+    EXPECT_EQ(mock_acl::stream_create_count(), streams_before + 6);
 
-    mock_acl::set_pointer_location(test_buffer_src_, ACL_MEM_LOCATION_TYPE_HOST,
-                                   0);
-    mock_acl::set_pointer_location(test_buffer_dst_,
-                                   ACL_MEM_LOCATION_TYPE_DEVICE, 0);
-
-    mock_acl::set_memcpy_batch_result(ACL_ERROR_RT_FEATURE_NOT_SUPPORT);
-
-    auto batch_id = transport->allocateBatchID(1);
-    ASSERT_NE(batch_id, 0);
-
-    std::vector<Transport::TransferRequest> requests;
-    Transport::TransferRequest req;
-    req.opcode = Transport::TransferRequest::WRITE;
-    req.source = test_buffer_src_;
-    req.target_id = 0;
-    req.target_offset = reinterpret_cast<uint64_t>(test_buffer_dst_);
-    req.length = kTransferBufSize;
-    requests.push_back(req);
-
-    Status s = transport->submitTransfer(batch_id, requests);
-    EXPECT_TRUE(s.ok());
-
-    auto result = waitForTransfer(transport.get(), batch_id);
-    ASSERT_TRUE(result.finished);
-    ASSERT_FALSE(result.failed) << "Transfer should fallback to async path";
-    EXPECT_TRUE(verifyTestData(kTransferBufSize));
-
-    mock_acl::set_memcpy_batch_result(ACL_ERROR_NONE);
-    transport->freeBatchID(batch_id);
+    globalConfig().ascend_agent_mode = false;
 }
 
 // -----------------------------------------------------------------------------
@@ -2524,6 +2606,76 @@ TEST(AgentModeAllocTest, EntireBestEffortFailureDoesNotConsumeSlot) {
     ascend_free_memory("ascend", ok);
 }
 
+struct BoundRunnerGuard {
+    const void* owner = nullptr;
+    ~BoundRunnerGuard() {
+        ClearPerDeviceBoundAffinityRunners(owner);
+        ClearBoundAffinityRunner(owner);
+    }
+};
+
+TEST(BoundAffinityRunnerTest, DeviceTaskRunsOnThatDevicePool) {
+    auto pool0 = std::make_unique<AscendThreadPool>(1, "t0-");
+    auto pool1 = std::make_unique<AscendThreadPool>(1, "t1-");
+    BoundRunnerGuard guard{pool0.get()};
+    int which = -1;
+    std::vector<std::function<void(std::function<void()>)>> runners;
+    runners.push_back([raw = pool0.get(), &which](std::function<void()> task) {
+        raw->enqueue([&which, task = std::move(task)] {
+            which = 0;
+            task();
+        });
+    });
+    runners.push_back([raw = pool1.get(), &which](std::function<void()> task) {
+        raw->enqueue([&which, task = std::move(task)] {
+            which = 1;
+            task();
+        });
+    });
+    SetPerDeviceBoundAffinityRunners(guard.owner, std::move(runners));
+
+    which = -1;
+    RunOnDeviceBoundAffinityThread(0, [] {});
+    EXPECT_EQ(which, 0);
+    which = -1;
+    RunOnDeviceBoundAffinityThread(1, [] {});
+    EXPECT_EQ(which, 1);
+
+    ClearPerDeviceBoundAffinityRunners(guard.owner);
+    which = -1;
+    RunOnDeviceBoundAffinityThread(1, [&which] { which = 7; });
+    EXPECT_EQ(which, 7);
+}
+
+TEST(BoundAffinityRunnerTest, MissingDeviceUsesSharedRunner) {
+    auto shared = std::make_unique<AscendThreadPool>(1, "sh-");
+    auto device = std::make_unique<AscendThreadPool>(1, "dv-");
+    int which = -1;
+    BoundRunnerGuard guard{shared.get()};
+    SetBoundAffinityRunner(
+        guard.owner, [raw = shared.get(), &which](std::function<void()> task) {
+            raw->enqueue([&which, task = std::move(task)] {
+                which = 0;
+                task();
+            });
+        });
+    std::vector<std::function<void(std::function<void()>)>> runners;
+    runners.push_back([raw = device.get(), &which](std::function<void()> task) {
+        raw->enqueue([&which, task = std::move(task)] {
+            which = 1;
+            task();
+        });
+    });
+    SetPerDeviceBoundAffinityRunners(guard.owner, std::move(runners));
+
+    which = -1;
+    RunOnDeviceBoundAffinityThread(0, [] {});
+    EXPECT_EQ(which, 1);
+    which = -1;
+    RunOnDeviceBoundAffinityThread(3, [] {});
+    EXPECT_EQ(which, 0);
+}
+
 TEST(RoceModeDetectionTest, GlobalResourceConfig_StringRoceDesc) {
     EXPECT_TRUE(HasRoceProtocolDescInGlobalResourceConfig(
         R"({"comm_resource_config.protocol_desc":"roce:device"})"));
@@ -2687,6 +2839,117 @@ TEST(StoreResourceConfigSplitTest, IsRoceModeEnabled_StoreRoceP2pHccs) {
 }
 
 // -----------------------------------------------------------------------------
+// Inject MC_CUSTOM_TOPO_JSON as comm_resource_config.nic_topo_path when the
+// HIXL global resource config leaves nic_topo_path empty (Host RoCE endpoint
+// auto-generation fallback).
+// -----------------------------------------------------------------------------
+
+namespace {
+struct CustomTopoJsonScope {
+    explicit CustomTopoJsonScope(const char* value) {
+        if (value == nullptr) {
+            unsetenv("MC_CUSTOM_TOPO_JSON");
+        } else {
+            setenv("MC_CUSTOM_TOPO_JSON", value, 1);
+        }
+    }
+    ~CustomTopoJsonScope() { unsetenv("MC_CUSTOM_TOPO_JSON"); }
+};
+}  // namespace
+
+TEST(InjectNicTopoPathTest, NoCustomTopoJson_ConfigUnchanged) {
+    CustomTopoJsonScope env(nullptr);
+    const std::string cfg =
+        R"({"comm_resource_config":{"protocol_desc":"roce:host"}})";
+    EXPECT_EQ(InjectNicTopoPathFromCustomTopoEnvTe(cfg), cfg);
+}
+
+TEST(InjectNicTopoPathTest, EmptyConfig_CreatesConfigWithFlatKey) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string out = InjectNicTopoPathFromCustomTopoEnvTe("");
+    EXPECT_NE(out.find("comm_resource_config.nic_topo_path"),
+              std::string::npos);
+    EXPECT_NE(out.find("/etc/mooncake/nic_topo.json"), std::string::npos);
+}
+
+TEST(InjectNicTopoPathTest, EmptyNicTopoPath_IsInjected) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string out = InjectNicTopoPathFromCustomTopoEnvTe(
+        R"({"comm_resource_config.nic_topo_path":""})");
+    EXPECT_NE(out.find("/etc/mooncake/nic_topo.json"), std::string::npos);
+}
+
+TEST(InjectNicTopoPathTest, FlatNicTopoPath_NotOverwritten) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string cfg =
+        R"({"comm_resource_config.nic_topo_path":"/explicit.json"})";
+    EXPECT_EQ(InjectNicTopoPathFromCustomTopoEnvTe(cfg), cfg);
+}
+
+TEST(InjectNicTopoPathTest, NestedNicTopoPath_NotOverwritten) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string cfg =
+        R"({"comm_resource_config":{"nic_topo_path":"/explicit.json"}})";
+    EXPECT_EQ(InjectNicTopoPathFromCustomTopoEnvTe(cfg), cfg);
+}
+
+TEST(InjectNicTopoPathTest, ProtocolDescPreservedWhenInjected) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string out = InjectNicTopoPathFromCustomTopoEnvTe(
+        R"({"comm_resource_config":{"protocol_desc":"roce:host"}})");
+    EXPECT_NE(out.find("roce:host"), std::string::npos);
+    EXPECT_NE(out.find("/etc/mooncake/nic_topo.json"), std::string::npos);
+    // A nested comm_resource_config already exists: inject nested, not flat.
+    EXPECT_EQ(out.find("comm_resource_config.nic_topo_path"),
+              std::string::npos);
+}
+
+TEST(InjectNicTopoPathTest, NestedCommResourceConfigInjectsNestedDropsFlat) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string out = InjectNicTopoPathFromCustomTopoEnvTe(
+        R"({"comm_resource_config":{"protocol_desc":"roce:host"},)"
+        R"("comm_resource_config.nic_topo_path":""})");
+    EXPECT_NE(out.find("/etc/mooncake/nic_topo.json"), std::string::npos);
+    EXPECT_EQ(out.find("comm_resource_config.nic_topo_path"), std::string::npos)
+        << "the flat key must be dropped once the nested object is used";
+}
+
+TEST(InjectNicTopoPathTest, InvalidJson_Unchanged) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string cfg = "{not json";
+    EXPECT_EQ(InjectNicTopoPathFromCustomTopoEnvTe(cfg), cfg);
+}
+
+// End-to-end: MC_CUSTOM_TOPO_JSON is injected regardless of the transport
+// scenario (HIXL decides whether to consume nic_topo_path).
+TEST_F(AscendDirectTransportTest, GlobalResourceConfig_InjectsCustomTopoJson) {
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+    setenv("MC_CUSTOM_TOPO_JSON", "/etc/mooncake/nic_topo.json", 1);
+    mock_acl::set_device_count(1);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const auto opts = adxl_mock::get_last_init_options();
+    auto it = opts.find("GlobalResourceConfig");
+    ASSERT_NE(it, opts.end());
+    EXPECT_NE(it->second.find("/etc/mooncake/nic_topo.json"),
+              std::string::npos);
+    unsetenv("MC_CUSTOM_TOPO_JSON");
+}
+
+TEST_F(AscendDirectTransportTest,
+       GlobalResourceConfig_NoInjectWithoutCustomTopoJson) {
+    unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+    unsetenv("MC_CUSTOM_TOPO_JSON");
+    mock_acl::set_device_count(1);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const auto opts = adxl_mock::get_last_init_options();
+    EXPECT_EQ(opts.find("GlobalResourceConfig"), opts.end())
+        << "GlobalResourceConfig must stay unset when nothing is configured";
+}
+
+// -----------------------------------------------------------------------------
 // Client-Server mode: when capability is supported and user did not set
 // ASCEND_LOCAL_COMM_RES, Mooncake auto-injects LocalCommRes={"version":"1.3"}
 // so EngineFactory selects HixlEngine (HixlCS path).
@@ -2732,6 +2995,97 @@ TEST_F(ClientServerModeTest, UserEnvOverridesAutoInject) {
     ASSERT_NE(it, opts.end());
     EXPECT_EQ(it->second, R"({"version":"1.2"})");
 }
+
+// Bind the real transport without a remote server; only device resolution
+// fails.
+namespace mooncake {
+class TransferEngineImplTestPeer {
+   public:
+    static void bindAscend(TransferEngine& engine,
+                           std::shared_ptr<Transport> transport) {
+        auto& impl = *engine.impl_;
+        impl.multi_transports_->transport_map_.clear();
+        impl.multi_transports_->transport_map_.emplace("ascend", transport);
+        auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+        desc->name = "resolve-test-remote";
+        desc->protocol = "ascend";
+        const auto name = desc->name;
+        impl.getMetadata()->addLocalSegment(41, name, std::move(desc));
+    }
+};
+}  // namespace mooncake
+
+namespace {
+struct ResolveFailureScope {
+    ResolveFailureScope() { g_get_device_result = 1; }
+    ~ResolveFailureScope() { g_get_device_result = ACL_ERROR_NONE; }
+};
+
+struct RestoreAgentMode {
+    bool original = globalConfig().ascend_agent_mode;
+    ~RestoreAgentMode() { globalConfig().ascend_agent_mode = original; }
+};
+}  // namespace
+
+class AscendScatterResolveFailureTest
+    : public AscendDirectTransportTest,
+      public ::testing::WithParamInterface<size_t> {};
+
+TEST_P(AscendScatterResolveFailureTest, RejectsEveryLegacyFragmentExactlyOnce) {
+    RestoreAgentMode restore;
+    globalConfig().ascend_agent_mode = true;
+    auto installed = createTransport();
+    ASSERT_NE(installed, nullptr);
+    std::shared_ptr<AscendDirectTransport> transport(std::move(installed));
+    ASSERT_FALSE(transport->supportsGroupedScatter());
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    TransferEngineImplTestPeer::bindAscend(engine, transport);
+
+    std::array<char, 128> local, remote;
+    local.fill('L');
+    remote.fill('R');
+    const auto before_local = local;
+    const auto before_remote = remote;
+    const std::array<size_t, 3> offsets{8, 40, 96};
+    const std::array<size_t, 3> lengths{8, 8, 8};
+    std::vector<std::pair<size_t, bool>> callbacks;
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "resolve-test-remote",
+        .remote_base_offset = reinterpret_cast<uint64_t>(remote.data()),
+        .remote_size = remote.size(),
+        .local_buffer = local.data(),
+        .local_capacity = local.size(),
+        .local_offsets = std::span(offsets).first(GetParam()),
+        .remote_offsets = std::span(offsets).first(GetParam()),
+        .lengths = std::span(lengths).first(GetParam()),
+        .on_fragment_complete = [&callbacks](size_t index,
+                                             const Status& status) {
+            callbacks.emplace_back(index, status.ok());
+        }};
+    const auto device_calls = mock_acl::get_get_device_call_count();
+    const auto sync_copies = adxl_mock::get_transfer_count();
+    const auto async_copies = adxl_mock::get_transfer_async_count();
+    ResolveFailureScope inject;
+    auto operation = engine.submitScatter({range});
+    EXPECT_FALSE(operation.wait().ok());
+    std::vector<std::pair<size_t, bool>> expected;
+    for (size_t i = 0; i < GetParam(); ++i) expected.emplace_back(i, false);
+    EXPECT_EQ(callbacks, expected);
+    EXPECT_GT(mock_acl::get_get_device_call_count(), device_calls);
+    EXPECT_EQ(adxl_mock::get_transfer_count(), sync_copies);
+    EXPECT_EQ(adxl_mock::get_transfer_async_count(), async_copies);
+    EXPECT_EQ(local, before_local);
+    EXPECT_EQ(remote, before_remote);
+    EXPECT_FALSE(operation.wait().ok());
+    EXPECT_FALSE(operation.waitFor(std::chrono::milliseconds(0)).ok());
+    EXPECT_EQ(callbacks, expected);
+}
+
+INSTANTIATE_TEST_SUITE_P(SingleAndMultipleLegacyTasks,
+                         AscendScatterResolveFailureTest,
+                         ::testing::Values(size_t{1}, size_t{3}));
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);

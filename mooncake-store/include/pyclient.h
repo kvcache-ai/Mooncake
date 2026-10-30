@@ -170,6 +170,27 @@ class ClientRequester {
                                 uint64_t batch_id);
 
     /**
+     * @brief Asks a remote holder node to prefetch (promote SSD->DRAM) the
+     * given keys. Used for cross-node SSD prefetch: the holder must register
+     * the promotion task itself (the master validates holder_id ==
+     * client_id), so the requester delegates via this RPC instead of calling
+     * RegisterPrefetchTask locally. Best-effort: errors are logged, not
+     * propagated, and never block the originating exist() call. Old peers
+     * reject the RPC and the keys simply stay SSD-only.
+     * @param client_addr Network address of the holder's offload RPC service.
+     * @param keys SSD-only keys held by the remote node.
+     * @param sizes Object sizes (bytes), index-aligned with keys. Hint only;
+     *        the holder re-reads sizes from its authoritative local metadata.
+     * @param tenant_id The keys' tenant. A shared SSD holder stores objects
+     *        from other tenants, so lookup/registration/promotion must run
+     *        under the object's own tenant, not the holder's.
+     */
+    void prefetch_offload_object(const std::string &client_addr,
+                                 const std::vector<std::string> &keys,
+                                 const std::vector<int64_t> &sizes,
+                                 const std::string &tenant_id);
+
+    /**
      * @brief Asks a replica owner to verify the backing file of each key and
      * evict its own replica when the file is proven gone.
      * @param client_addr Network address of the replica owner's offload RPC
@@ -402,7 +423,7 @@ class PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node) = 0;
+        bool prefer_alloc_in_same_node) = 0;
 
     virtual int put_from(const std::string &key, void *buffer, size_t size,
                          const ReplicateConfig &config = ReplicateConfig{}) = 0;
@@ -540,6 +561,65 @@ class PyClient {
     virtual std::vector<int> batchProbeKey(
         const std::vector<std::string> &keys,
         const GrantLeasePolicy &policy = {}) = 0;
+    virtual WeightRpcResult<WeightRevisionMetadata> begin_weight_import(
+        const BeginWeightImportRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionMetadata> commit_weight_import(
+        const CommitWeightImportRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionMetadata> abort_weight_import(
+        const AbortWeightImportRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionView> get_weight_revision(
+        const GetWeightRevisionRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<ListWeightRevisionsResponse> list_weight_revisions(
+        const ListWeightRevisionsRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionLease> acquire_weight_revision_lease(
+        const AcquireWeightRevisionLeaseRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionLease> renew_weight_revision_lease(
+        const RenewWeightRevisionLeaseRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<void> release_weight_revision_lease(
+        const ReleaseWeightRevisionLeaseRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightResidencyOperation>
+    start_weight_residency_operation(
+        const StartWeightResidencyOperationRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightResidencyOperation> query_weight_operation(
+        const QueryWeightOperationRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionMetadata> delete_weight_revision(
+        const DeleteWeightRevisionRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // ExistOptions variants. The default implementation ignores the options
+    // (prefetch unsupported); RealClient overrides them when
+    // enable_ssd_prefetch is on. See docs/source/design/store/ssd-prefetch.md.
+    virtual int isExist(const std::string &key, const ExistOptions &options) {
+        (void)options;
+        return isExist(key);
+    }
+
+    virtual std::vector<int> batchIsExist(const std::vector<std::string> &keys,
+                                          const ExistOptions &options) {
+        (void)options;
+        return batchIsExist(keys);
+    }
 
     virtual int64_t getSize(const std::string &key) = 0;
 

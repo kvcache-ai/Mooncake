@@ -216,7 +216,8 @@ int TransferExecutorBase::initEngines() {
     if (!local_copy_engine_) {
         return ERR_MEMORY;
     }
-    int ret = local_copy_engine_->Initialize(params_.transfer_timeout);
+    int ret = local_copy_engine_->Initialize(params_.transfer_timeout,
+                                             local_engine_contexts_.size());
     if (ret != 0) {
         LOG(ERROR) << "Failed to initialize LocalCopyEngine, ret: " << ret;
         return ret;
@@ -271,12 +272,9 @@ int TransferExecutorBase::initEngines() {
         LOG(INFO) << "Set LocalCommRes to:" << local_comm_res;
     } else if (params_.client_server_mode) {
         options["adxl.LocalCommRes"] = R"({"version":"1.3"})";
-        LOG(INFO) << "Client-Server mode enabled, set LocalCommRes to "
-                     "{\"version\":\"1.3\"}";
     }
 
     options[kAutoConnect] = params_.auto_connect ? kEnabled : kDisabled;
-    LOG(INFO) << "Set AutoConnect to: " << (params_.auto_connect ? "1" : "0");
 
     options["adxl.BufferPool"] = "0:0";
     char* buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
@@ -301,6 +299,10 @@ int TransferExecutorBase::initEngines() {
     char* global_resource_config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
     std::string resolved_resource_config =
         ResolveAscendGlobalResourceConfig(global_resource_config);
+    // TE support for configuring HIXL's nic_topo_path from MC_CUSTOM_TOPO_JSON
+    // (if set). HIXL decides whether to consume it based on protocol_desc.
+    resolved_resource_config =
+        InjectNicTopoPathFromCustomTopoEnvTe(resolved_resource_config);
     if (!resolved_resource_config.empty()) {
         options["GlobalResourceConfig"] = resolved_resource_config.c_str();
         LOG(INFO) << "[AscendTE] init adxl, te is created for store="
@@ -471,8 +473,7 @@ void TransferExecutorBase::disconnectAllForEngine(size_t engine_idx) {
                        << connected_segment
                        << ", errmsg: " << aclGetRecentErrMsg();
         } else {
-            LOG(INFO) << "Success to disconnect AdxlEngine:"
-                      << connected_segment;
+            VLOG(1) << "Success to disconnect AdxlEngine:" << connected_segment;
         }
     }
     connected_segments_.erase(it);
@@ -676,6 +677,13 @@ bool TransferExecutorBase::resolveLocalCopyDestinations(
         dest_addrs.push_back(local_addr);
     }
     return true;
+}
+
+void TransferExecutorBase::setLocalCopyTaskRunner(
+    std::function<void(std::function<void()>)> runner) {
+    if (local_copy_engine_) {
+        local_copy_engine_->SetTaskRunner(std::move(runner));
+    }
 }
 
 void TransferExecutorBase::processSliceList(

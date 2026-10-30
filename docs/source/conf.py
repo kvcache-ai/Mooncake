@@ -308,3 +308,23 @@ redirects = {
     "design/tent/cpp-api": "../../api-reference/cpp/tent.html",
     "design/conductor/indexer-api-design": "../../api-reference/http/conductor-indexer.html",
 }
+
+# Pages that embed the live ecosystem PR dashboard; its assets load only there.
+PR_DASHBOARD_PAGES = {"community/ecosystem-prs"}
+
+
+def add_pr_dashboard_assets(app, pagename, templatename, context, doctree):
+    if pagename in PR_DASHBOARD_PAGES:
+        app.add_css_file("pr-dashboard.css")
+        app.add_js_file("pr-dashboard.js", loading_method="defer")
+
+
+def add_pypi_downloads_assets(app, pagename, templatename, context, doctree):
+    if pagename == "community/pypi-downloads":
+        app.add_css_file("pypi-downloads.css")
+        app.add_js_file("pypi-downloads.js", loading_method="defer")
+
+
+def setup(app):
+    app.connect("html-page-context", add_pr_dashboard_assets)
+    app.connect("html-page-context", add_pypi_downloads_assets)
