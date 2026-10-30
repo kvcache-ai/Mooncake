@@ -231,7 +231,10 @@ int UrmaContext::deconstruct() {
         urma_context_ = nullptr;
     }
 
-    urma_uninit();
+    // urma_init()/urma_uninit() are process-global and owned by
+    // UbTransport, which pairs them once per transport. Releasing the
+    // module per context tears it down while sibling contexts still hold
+    // jetties, so the next urma_unbind_jetty() faults.
     return 0;
 }
 
