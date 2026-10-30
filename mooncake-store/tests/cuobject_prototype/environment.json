@@ -1,0 +1,13 @@
+{
+  "date": "2026-10-26",
+  "mooncake_base": "7d0ff6c65c34f41cb261f4262f74e89ff33b12e9",
+  "hardware": {"cpu":{"Architecture":"aarch64","CPU(s)":"72","Model name":"Neoverse-V2"},"network":"same-host mlx5 RDMA and loopback HTTP/TCP","storage":"shared NVMe, ext4"},
+  "server": {"implementation":"development MinIO build with cuObject support","GOMAXPROCS":8,"registered_host_buffers":16,"buffer_MiB":32,"source_included":false},
+  "client": {"cuObject":"1.2.0","cuFile":"1.18.0","registration":"DMA-BUF, two caller-owned host buffers reused","concurrency":1,"HTTP":"SigV4 UNSIGNED-PAYLOAD, no TLS"},
+  "method": {"repeats":3,"sizes_MiB":[4,16],"MiB_per_operation":512,"order":"TCP first for repeats 0 and 2, cuObject first for repeat 1","read_cache":"warm","summary":"median per mode/size/operation, then ratio of medians"},
+  "CPU_scope": "CLOCK_PROCESS_CPUTIME_ID inside measured loops; excludes initialization, registration, preparation, verification, other processes and kernel work not charged to this process",
+  "validation": {"successful_live_runs":6,"test_cases":35,"SDK_enabled_and_disabled_builds":"pass","noop_PUT_mutation":"detected","noop_measured_GET_mutation":"detected"},
+  "limitations": ["shared host with uncontrolled background activity","no full Store integration run","no colocated application or CPU-quota experiment","no total-host CPU accounting","development server not bundled"],
+  "source_sha256": {"adapter.cpp":"a74485ec11521b9058f3441fb0b564dab771a9aaf45d3e391d547057d4eeba70","adapter.h":"67d9ed5b709af7c74c89d239a0c9392d7ef5f0b0cd3ff455655d32dbef95607d","sdk.cpp":"5af07b31d7c0c0d4a1075c4aaebecf9460bbda006743eff88fbe8ad6e1e20691","benchmark.cpp":"dd4669a5e7f7a6de2f2db94600174139f225e9b5aa4a01fc1c2d9a40a97f9464"},
+  "binary_sha256": "e84849b089ddbe8424a095c8d9b00f8da02b4542dcaaeb86aca36204e334bf0b"
+}
