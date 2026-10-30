@@ -85,6 +85,17 @@ struct BatchRemoteWriteRequest {
 
 YLT_REFL(BatchRemoteWriteRequest, keys, src_buffers_list, target_tier_ids);
 
+struct RemoteRemoveRequest {
+    std::string_view key;
+    UUID client_id{0, 0};
+};
+YLT_REFL(RemoteRemoveRequest, key, client_id);
+
+struct RemoteRemoveAllRequest {
+    UUID client_id{0, 0};
+};
+YLT_REFL(RemoteRemoveAllRequest, client_id);
+
 struct PreWriteRequest {
     std::string_view key;
     uint64_t size_bytes = 0;

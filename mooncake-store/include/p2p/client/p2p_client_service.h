@@ -161,8 +161,13 @@ class P2PClientService final {
         bool aggregate_same_segment_task = false);
 
     /**
-     * @brief Removes an object and all its replicas
+     * @brief Removes the key on all owners in a master snapshot and locally.
+     * Visits clients serially; LOCAL_ONLY/DEGRADED only removes local replicas.
+     * Non-atomic; callers must exclude concurrent writes/replication of key.
+     * Success acknowledges local deletion, not async metadata delivery.
      * @param key Key to remove
+     * @param force Reserved for API parity; both values have identical
+     * behavior.
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> Remove(const ObjectKey& key,
@@ -179,9 +184,17 @@ class P2PClientService final {
                                                 bool force = false);
 
     /**
-     * @brief Removes all objects and all its replicas
-     * @param force If true, skip lease and replication task checks.
-     * @return tl::expected<long, ErrorCode> number of removed objects or error
+     * @brief Removes all local keys on a snapshot of registered clients and
+     * self. Non-atomic; callers must exclude concurrent writes/replication
+     * globally. Success acknowledges local deletion, not async metadata
+     * delivery.
+     * LOCAL_ONLY/DEGRADED removes only local keys. ONLINE removes remote
+     * replicas in parallel, then removes local keys.
+     * @param force Reserved for API parity; both values have identical
+     * behavior.
+     * @return Sum of distinct local key counts, or error on any failed client.
+     * A key on two clients counts twice; multiple tiers on one client count
+     * once.
      */
     tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 

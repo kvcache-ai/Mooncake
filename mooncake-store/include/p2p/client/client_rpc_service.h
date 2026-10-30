@@ -30,11 +30,12 @@ class ClientRpcService {
      * @brief Constructor
      * @param data_manager Reference to DataManager instance (must outlive this
      * object)
+     * @param client_id Identity published with this service's endpoint
      * @param metrics Optional pointer to P2PClientMetric for recording peer
      * request metrics
      */
     explicit ClientRpcService(
-        DataManager& data_manager,
+        DataManager& data_manager, const UUID& client_id,
         std::shared_ptr<P2PClientMetric> metrics = nullptr);
 
     // After local callers have drained, wait for peer handlers and leases,
@@ -74,6 +75,12 @@ class ClientRpcService {
     async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>> WriteRemoteData(
         const RemoteWriteRequest& request);
 
+    // Completion acknowledges local deletion, not asynchronous route delivery.
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> RemoveRemoteData(
+        const RemoteRemoveRequest& request);
+    async_simple::coro::Lazy<tl::expected<long, ErrorCode>> RemoveAllRemoteData(
+        const RemoteRemoveAllRequest& request);
+
     tl::expected<PreWriteResponse, ErrorCode> PreWrite(
         const PreWriteRequest& request);
 
@@ -93,12 +100,13 @@ class ClientRpcService {
 
    private:
     DataManager& data_manager_;  // Reference: owned by Client, same lifetime
+    const UUID client_id_;
     std::shared_ptr<P2PClientMetric>
         metrics_;  // Optional: shared from P2PClientService
 
     std::atomic<bool> ready_{false};
     // Normal operation RPCs: ReadRemoteData, WriteRemoteData, PreWrite and
-    // PinKey.
+    // PinKey, RemoveRemoteData and RemoveAllRemoteData.
     InflightTracker normal_op_tracker_;
     // RPCs that complete or release existing leases: WriteCommit, WriteRevoke
     // and UnPinKey. Keep accepting them while new operations are draining,

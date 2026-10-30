@@ -244,6 +244,23 @@ P2PMasterRpcService::BatchQueryIp(const std::vector<UUID>& client_ids) {
     return result;
 }
 
+tl::expected<std::vector<P2PClientInfo>, ErrorCode>
+P2PMasterRpcService::GetKeyClients(std::string_view key) {
+    ScopedVLogTimer timer(1, "GetKeyClients");
+    timer.LogRequest("key=", key);
+    auto result = master_service_.GetKeyClients(key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<P2PClientInfo>, ErrorCode>
+P2PMasterRpcService::ListClients() {
+    ScopedVLogTimer timer(1, "ListClients");
+    auto result = master_service_.ListClients();
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
              ErrorCode>
 P2PMasterRpcService::GetReadRouteByRegex(std::string_view regex) {
@@ -560,6 +577,10 @@ void RegisterP2PRpcService(
     server.register_handler<&P2PMasterRpcService::BatchExistKey>(
         &wrapped_master_service);
     server.register_handler<&P2PMasterRpcService::BatchQueryIp>(
+        &wrapped_master_service);
+    server.register_handler<&P2PMasterRpcService::GetKeyClients>(
+        &wrapped_master_service);
+    server.register_handler<&P2PMasterRpcService::ListClients>(
         &wrapped_master_service);
     server.register_handler<&P2PMasterRpcService::GetReadRouteByRegex>(
         &wrapped_master_service);

@@ -28,6 +28,11 @@ class PeerClient {
     async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>
     AsyncWriteRemoteData(const RemoteWriteRequest& request);
 
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+    AsyncRemoveRemoteData(const RemoteRemoveRequest& request);
+    async_simple::coro::Lazy<tl::expected<long, ErrorCode>>
+    AsyncRemoveAllRemoteData(const RemoteRemoveAllRequest& request);
+
     async_simple::coro::Lazy<tl::expected<PreWriteResponse, ErrorCode>>
     AsyncPreWrite(const PreWriteRequest& request);
 
@@ -48,6 +53,8 @@ class PeerClient {
         const RemoteReadRequest& request);
     tl::expected<UUID, ErrorCode> WriteRemoteData(
         const RemoteWriteRequest& request);
+    tl::expected<void, ErrorCode> RemoveRemoteData(
+        const RemoteRemoveRequest& request);
     tl::expected<PreWriteResponse, ErrorCode> PreWrite(
         const PreWriteRequest& request);
     tl::expected<void, ErrorCode> WriteCommit(

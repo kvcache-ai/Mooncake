@@ -114,6 +114,34 @@ class P2PMasterRpcTest : public ::testing::Test {
     P2PSegment second_;
 };
 
+TEST_F(P2PMasterRpcTest, ClientQueriesRoundTripWithoutReadFiltering) {
+    ASSERT_TRUE(Publish("owners", first_.id).has_value());
+    ASSERT_TRUE(Publish("owners", second_.id).has_value());
+    ASSERT_TRUE(
+        client_
+            ->Heartbeat({.client_id = client_id_,
+                         .service_state = P2PClientServiceState::LOCAL_ONLY})
+            .has_value());
+    auto owners = client_->GetKeyClients("owners");
+    ASSERT_TRUE(owners.has_value());
+    ASSERT_EQ(owners->size(), 1u);
+    EXPECT_EQ(owners->front().client_id, client_id_);
+    EXPECT_EQ(owners->front().ip_address, "127.0.0.1");
+    EXPECT_EQ(owners->front().rpc_port, kClientPort);
+    auto all = client_->ListClients();
+    ASSERT_TRUE(all.has_value());
+    ASSERT_EQ(all->size(), 1u);
+    EXPECT_EQ(all->front().client_id, client_id_);
+    EXPECT_EQ(all->front().rpc_port, kClientPort);
+    auto missing = client_->GetKeyClients("absent");
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+    ASSERT_TRUE(client_->UnregisterClient(client_id_).has_value());
+    all = client_->ListClients();
+    ASSERT_TRUE(all.has_value());
+    EXPECT_TRUE(all->empty());
+}
+
 TEST_F(P2PMasterRpcTest, BatchQueryIpPreservesPartialResultsAndItemMetrics) {
     auto& metrics = P2PMasterMetricManager::instance();
     const auto requests = metrics.get_batch_query_ip_requests();

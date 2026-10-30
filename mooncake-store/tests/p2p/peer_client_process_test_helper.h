@@ -226,7 +226,8 @@ class PeerClientRpcServerStack {
         data_manager_ = std::make_unique<DataManagerV1>(
             std::move(tiered_backend), transfer_engine_,
             /*lock_shard_count=*/1024, local_transfer_config);
-        rpc_service_ = std::make_unique<ClientRpcService>(*data_manager_);
+        rpc_service_ =
+            std::make_unique<ClientRpcService>(*data_manager_, generate_uuid());
         rpc_service_->SetReady();
         control_service_ =
             std::make_unique<PeerClientTestControlRpcService>(*data_manager_);

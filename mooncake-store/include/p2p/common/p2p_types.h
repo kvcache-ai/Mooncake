@@ -272,6 +272,14 @@ struct P2PWithdrawRouteOperation {
 };
 YLT_REFL(P2PWithdrawRouteOperation, key, segment_id);
 
+// Registered endpoint information, without read/write eligibility filtering.
+struct P2PClientInfo {
+    UUID client_id{0, 0};
+    std::string ip_address;
+    uint16_t rpc_port{0};
+};
+YLT_REFL(P2PClientInfo, client_id, ip_address, rpc_port);
+
 struct P2PRouteDescriptor {
     UUID client_id{0, 0};
     UUID segment_id{0, 0};

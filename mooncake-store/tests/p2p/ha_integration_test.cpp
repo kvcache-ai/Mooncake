@@ -623,8 +623,8 @@ TEST_F(HAIntegrationTest, MetadataCallbacksStayLocalBeforeServicePublication) {
     EXPECT_EQ(client->recovery_worker_, nullptr);
     EXPECT_NE(client->GetServiceState(), P2PClientServiceState::ONLINE);
     // Registration alone must not publish metadata before Service READY.
-    client->client_rpc_service_.emplace(*client->data_manager_,
-                                        client->metrics_);
+    client->client_rpc_service_.emplace(
+        *client->data_manager_, client->GetClientID(), client->metrics_);
     auto segments = client->CollectTierSegments();
     ASSERT_FALSE(segments.empty());
     EXPECT_TRUE(

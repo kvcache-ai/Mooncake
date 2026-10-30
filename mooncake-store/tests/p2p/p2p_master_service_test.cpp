@@ -102,6 +102,83 @@ class P2PMasterServiceTest : public ::testing::Test {
 // RegisterClient Tests
 // ============================================================
 
+TEST_F(P2PMasterServiceTest, ClientQueriesDoNotFilterOrDuplicateOwners) {
+    auto service = CreateService();
+    service->GetClientManager().Stop();
+    const UUID first_id{1, 1}, second_id{2, 2}, third_id{3, 3};
+    const auto first =
+        MakeP2PSegment("first", kDefaultSegmentSize, {"skip"}, -1);
+    const auto second = MakeP2PSegment("second", kDefaultSegmentSize, {}, 10);
+    const auto third = MakeP2PSegment("third");
+    RegisterP2PClient(*service, first_id, {first, second}, "10.0.0.1", 50001);
+    RegisterP2PClient(*service, second_id, {third}, "10.0.0.2", 50002);
+    RegisterP2PClient(*service, third_id, {}, "10.0.0.3", 50003, false);
+    AddReplicaHelper(*service, "owners", 64, first_id, first.id);
+    AddReplicaHelper(*service, "owners", 64, first_id, second.id);
+    AddReplicaHelper(*service, "owners", 64, second_id, third.id);
+
+    auto first_client = service->GetClientManager().GetClient(first_id);
+    auto second_client = service->GetClientManager().GetClient(second_id);
+    first_client->SetServiceState(P2PClientServiceState::DEGRADED);
+    second_client->health_state_.last_heartbeat =
+        std::chrono::steady_clock::now() -
+        std::chrono::seconds(second_client->disconnect_timeout_sec_ + 1);
+    ASSERT_EQ(second_client->CheckHealth().second,
+              P2PClientStatus::DISCONNECTION);
+    EXPECT_FALSE(service->GetReadRoute("owners").has_value());
+
+    auto owners = service->GetKeyClients("owners");
+    ASSERT_TRUE(owners.has_value());
+    ASSERT_EQ(owners->size(), 2u);
+    std::sort(owners->begin(), owners->end(), [](const auto& a, const auto& b) {
+        return a.client_id < b.client_id;
+    });
+    EXPECT_EQ((*owners)[0].client_id, first_id);
+    EXPECT_EQ((*owners)[0].ip_address, "10.0.0.1");
+    EXPECT_EQ((*owners)[0].rpc_port, 50001);
+    EXPECT_EQ((*owners)[1].client_id, second_id);
+    EXPECT_EQ((*owners)[1].ip_address, "10.0.0.2");
+    EXPECT_EQ((*owners)[1].rpc_port, 50002);
+    auto all = service->ListClients();
+    ASSERT_TRUE(all.has_value());
+    EXPECT_EQ(all->size(), 3u);
+    EXPECT_TRUE(std::any_of(all->begin(), all->end(), [&](const auto& info) {
+        return info.client_id == third_id && info.ip_address == "10.0.0.3" &&
+               info.rpc_port == 50003;
+    }));
+    // Queries must not mutate route metadata.
+    EXPECT_EQ(service->GetRouteSnapshot("owners")->locations.size(), 3u);
+}
+
+TEST_F(P2PMasterServiceTest, ClientQueriesReportMissingMetadata) {
+    auto service = CreateService();
+    service->GetClientManager().Stop();
+    auto all = service->ListClients();
+    ASSERT_TRUE(all.has_value());
+    EXPECT_TRUE(all->empty());
+    auto absent = service->GetKeyClients("absent");
+    ASSERT_FALSE(absent.has_value());
+    EXPECT_EQ(absent.error(), ErrorCode::OBJECT_NOT_FOUND);
+    auto empty = service->GetKeyClients("");
+    ASSERT_FALSE(empty.has_value());
+    EXPECT_EQ(empty.error(), ErrorCode::INVALID_PARAMS);
+
+    const auto id = generate_uuid();
+    const auto segment = MakeP2PSegment();
+    RegisterP2PClient(*service, id, {segment});
+    AddReplicaHelper(*service, "orphan", 64, id, segment.id);
+    // Inject an orphan route without running normal unregister cleanup.
+    auto& manager = service->GetClientManager();
+    {
+        SharedMutexLocker lock(&manager.clients_mutex_);
+        manager.client_metas_.erase(id);
+    }
+    auto orphan = service->GetKeyClients("orphan");
+    ASSERT_FALSE(orphan.has_value());
+    EXPECT_EQ(orphan.error(), ErrorCode::CLIENT_NOT_FOUND);
+    EXPECT_TRUE(service->GetRouteSnapshot("orphan").has_value());
+}
+
 TEST_F(P2PMasterServiceTest, RegisterClientBasic) {
     auto service = CreateService();
     auto seg = MakeP2PSegment("seg1", kDefaultSegmentSize, {"memory"}, 5);
