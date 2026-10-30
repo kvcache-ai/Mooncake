@@ -6,12 +6,16 @@
 #include <chrono>
 #include <climits>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 #include <glog/logging.h>
@@ -41,7 +45,8 @@ static GlobalBufInfo g_buf;
 //  - One ring per *thread*: eliminates all mutex contention between threads.
 //    Different threads can perform I/O fully concurrently.
 //  - Within one thread: no lock needed (single owner), so multiple SQEs can
-//    be batched before waiting, exposing NVMe queue depth > 1.
+//    be batched before waiting, exposing NVMe queue depth > 1. A contiguous
+//    O_DIRECT write of up to detail::single_sqe_write_max() bytes is one SQE.
 //  - Buffer registration: stored globally in g_buf, registered lazily on
 //    each thread-local ring on first use (ensure_buf_registered()).
 //  - File-descriptor registration (IOSQE_FIXED_FILE) intentionally omitted:
@@ -117,15 +122,17 @@ class SharedUringRing {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         ensure_buf_registered();
         bool fix = in_registered_buf(buf, len);
-        return submit_rw(/*write=*/false, fd, buf, len, off, fix);
+        return submit_rw(/*write=*/false, fd, buf, len, off, fix,
+                         /*single_sqe_max=*/0);
     }
 
+    // @p single_sqe_max: see detail::write_chunk_size.
     tl::expected<size_t, ErrorCode> write(int fd, const void* buf, size_t len,
-                                          off_t off) {
+                                          off_t off, size_t single_sqe_max) {
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         return submit_rw(/*write=*/true, fd, const_cast<void*>(buf), len, off,
-                         /*use_fixed_buf=*/false);
+                         /*use_fixed_buf=*/false, single_sqe_max);
     }
 
     tl::expected<size_t, ErrorCode> vector_read(int fd, const iovec* iovs,
@@ -315,24 +322,6 @@ class SharedUringRing {
         return buf_addr >= rb && (buf_addr + len) <= (rb + buf_size_);
     }
 
-    static size_t next_pow2(size_t n) {
-        if (n == 0) return 1;
-        --n;
-        n |= n >> 1;
-        n |= n >> 2;
-        n |= n >> 4;
-        n |= n >> 8;
-        n |= n >> 16;
-        n |= n >> 32;
-        return n + 1;
-    }
-
-    static size_t calc_chunk(size_t remaining, unsigned depth) {
-        size_t s = (remaining + depth - 1) / depth;
-        s = next_pow2(s);
-        return std::max(s, MIN_CHUNK);
-    }
-
     static size_t max_rw_count() {
         static const size_t value = [] {
             long page_size = sysconf(_SC_PAGESIZE);
@@ -440,10 +429,11 @@ class SharedUringRing {
         return {};
     }
 
-    // Chunked contiguous read or write.
+    // Chunked contiguous read or write (see detail::write_chunk_size).
     tl::expected<size_t, ErrorCode> submit_rw(bool is_write, int fd, void* buf,
                                               size_t len, off_t off,
-                                              bool use_fixed_buf) {
+                                              bool use_fixed_buf,
+                                              size_t single_sqe_max) {
         const ErrorCode err_code =
             is_write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL;
         const bool fix_buf = (use_fixed_buf && buf_registered_);
@@ -455,7 +445,11 @@ class SharedUringRing {
         off_t cur = off;
 
         while (remaining > 0) {
-            size_t cs = calc_chunk(remaining, QUEUE_DEPTH);
+            size_t cs =
+                is_write ? detail::write_chunk_size(remaining, QUEUE_DEPTH,
+                                                    MIN_CHUNK, single_sqe_max)
+                         : detail::split_chunk_size(remaining, QUEUE_DEPTH,
+                                                    MIN_CHUNK);
             unsigned n = std::min(
                 static_cast<unsigned>((remaining + cs - 1) / cs), QUEUE_DEPTH);
 
@@ -517,7 +511,8 @@ class SharedUringRing {
             if (iovs[idx].iov_len > max_io) {
                 auto res = submit_rw(is_write, fd, iovs[idx].iov_base,
                                      iovs[idx].iov_len, cur,
-                                     /*use_fixed_buf=*/false);
+                                     /*use_fixed_buf=*/false,
+                                     /*single_sqe_max=*/0);
                 if (!res) return res;
                 total += res.value();
                 cur += static_cast<off_t>(iovs[idx].iov_len);
@@ -576,9 +571,49 @@ class SharedUringRing {
 // UringFile — thin wrapper over SharedUringRing
 // ============================================================================
 
+namespace detail {
+
+size_t single_sqe_write_max(dev_t dev, const std::string& sysfs) {
+    if (major(dev) == 0) return 0;
+    const std::string base = sysfs + "/dev/block/" +
+                             std::to_string(major(dev)) + ":" +
+                             std::to_string(minor(dev));
+    for (const char* queue :
+         {"/queue/max_sectors_kb", "/../queue/max_sectors_kb"}) {
+        std::ifstream in(base + queue);
+        size_t kb = 0;
+        if (in >> kb && kb > 0)
+            return std::min(2 * kb * 1024, kSingleSqeWriteCap);
+    }
+    return 0;
+}
+
+}  // namespace detail
+
+// detail::single_sqe_write_max for the device that holds @p fd's file, read
+// from sysfs once per device and thread and never re-read. A block-device fd
+// gets 0 (its st_dev is devtmpfs), so raw-device writes keep the split.
+static size_t single_sqe_write_max_for(int fd) {
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) return 0;
+    thread_local std::unordered_map<dev_t, size_t> cache;
+    auto it = cache.find(st.st_dev);
+    if (it == cache.end()) {
+        it = cache.emplace(st.st_dev, detail::single_sqe_write_max(st.st_dev))
+                 .first;
+        VLOG(1) << "[UringFile] single-SQE write limit for device "
+                << major(st.st_dev) << ":" << minor(st.st_dev) << " is "
+                << it->second << " bytes";
+    }
+    return it->second;
+}
+
 UringFile::UringFile(const std::string& filename, int fd,
                      unsigned /*queue_depth*/, bool use_direct_io)
-    : StorageFile(filename, fd), use_direct_io_(use_direct_io) {
+    : StorageFile(filename, fd),
+      use_direct_io_(use_direct_io),
+      // Buffered writes keep the split: they were not measured.
+      single_sqe_write_max_(use_direct_io ? single_sqe_write_max_for(fd) : 0) {
     if (fd < 0) {
         error_code_ = ErrorCode::FILE_INVALID_HANDLE;
         return;
@@ -675,7 +710,8 @@ tl::expected<size_t, ErrorCode> UringFile::write(std::span<const char> data,
         src = static_cast<char*>(bounce);
     }
 
-    auto res = SharedUringRing::instance().write(fd_, src, write_len, 0);
+    auto res = SharedUringRing::instance().write(fd_, src, write_len, 0,
+                                                 single_sqe_write_max_);
 
     if (bounce) free_aligned_buffer(bounce);
 
@@ -743,7 +779,8 @@ tl::expected<size_t, ErrorCode> UringFile::write_aligned(const void* buffer,
             return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
-    return SharedUringRing::instance().write(fd_, buffer, length, offset);
+    return SharedUringRing::instance().write(fd_, buffer, length, offset,
+                                             single_sqe_write_max_);
 }
 
 tl::expected<size_t, ErrorCode> UringFile::read_aligned(void* buffer,
@@ -879,8 +916,8 @@ tl::expected<size_t, ErrorCode> UringFile::vector_write(const iovec* iov,
         }
         CopyFromIovec(static_cast<char*>(bounce.get()) + head, iov, iovcnt);
 
-        res = SharedUringRing::instance().write(fd_, bounce.get(), aligned_len,
-                                                aligned_off);
+        res = SharedUringRing::instance().write(
+            fd_, bounce.get(), aligned_len, aligned_off, single_sqe_write_max_);
 
         if (res && res.value() >= span) {
             res = total;
