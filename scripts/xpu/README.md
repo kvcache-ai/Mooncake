@@ -139,17 +139,21 @@ CPU-only regression validation:
 
 ```sh
 python3 -m unittest scripts.ci.tests.test_xpu_ci -v
-bash -n scripts/ci/run_xpu_core.sh
 ```
 
 All XPU CI regressions share this one test module and common workflow/module
 loaders; they validate packaging and orchestration contracts, not actual B60
-behavior. The runtime entry points have different roles:
+behavior. Docker launch, device mapping, traps and cleanup are inline in
+`.github/workflows/integration-test-xpu.yml`. A temporary cleanup helper is
+created from that trusted workflow in the host run directory and shared by
+the exit trap and the `always()` cleanup recheck; it is not mounted into the
+test container.
 
-- `scripts/ci/run_xpu_core.sh` owns host Docker launch and cleanup.
-- `scripts/ci/xpu_core.py` verifies artifacts and executes the container suites.
-- `scripts/e2e/python/verify_xpu_wheel.py` checks the installed wheel and is
-  reused by both hosted builds and hardware runs.
+`scripts/e2e/python/verify_xpu_wheel.py` is the single verification entry point:
+no arguments retain the hosted wheel smoke checks; `unpack` verifies the
+downloaded artifact, `seccomp` prepares the pinned profile, and `run` installs
+the wheel offline and launches the `suite`/`store` hardware checks. There are
+no separate XPU runtime scripts under `scripts/ci/`.
 
 Enable hardware only after provisioning and successfully running the exact
 core workflow; record real queue/runtime measurements during rollout.

@@ -34,13 +34,23 @@ def load_script(name, path):
 
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/ci_xpu.yml").read_text())
 E2E_WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/e2e-ci.yml").read_text())
-CORE = load_script("xpu_core", "scripts/ci/xpu_core.py")
+INTEGRATION = yaml.safe_load(
+    (ROOT / ".github/workflows/integration-test-xpu.yml").read_text()
+)
 
 
 def workflow_step(name):
     return next(
         step
         for step in WORKFLOW["jobs"]["build-wheel-xpu"]["steps"]
+        if step.get("name") == name
+    )["run"]
+
+
+def hardware_step(name):
+    return next(
+        step
+        for step in INTEGRATION["jobs"]["core"]["steps"]
         if step.get("name") == name
     )["run"]
 
@@ -556,6 +566,51 @@ echo dependency > xpu-ci-output/python-deps/dependency.whl
                 )
 
 
+class CommandLineTest(unittest.TestCase):
+    def test_no_arguments_preserve_host_only_wheel_checks(self):
+        with (
+            patch.object(sys, "argv", ["verify_xpu_wheel.py"]),
+            patch.object(VERIFY, "main") as verify,
+        ):
+            VERIFY.cli()
+            verify.assert_called_once_with()
+
+    def test_hardware_subcommands_and_unknown_command(self):
+        for arguments, callback, expected in (
+            (
+                ["unpack", "dir", "sha", "42", "digest"],
+                "unpack",
+                [Path("dir"), "sha", "42", "digest"],
+            ),
+            (
+                ["run", "bundle", "source", "output"],
+                "run",
+                [Path("bundle"), Path("source"), Path("output")],
+            ),
+            (
+                ["suite", "native", "source", "output"],
+                "suite",
+                [Path("native"), Path("source"), Path("output")],
+            ),
+            (
+                ["store", "source", "report"],
+                "store_test",
+                [Path("source"), Path("report")],
+            ),
+            (["seccomp", "profile"], "prepare_seccomp", [Path("profile")]),
+        ):
+            with (
+                self.subTest(arguments=arguments),
+                patch.object(sys, "argv", ["verify_xpu_wheel.py", *arguments]),
+                patch.object(VERIFY, callback) as command,
+            ):
+                VERIFY.cli()
+                command.assert_called_once_with(*expected)
+        with patch.object(sys, "argv", ["verify_xpu_wheel.py", "unknown"]):
+            with self.assertRaisesRegex(RuntimeError, "Unknown XPU verification"):
+                VERIFY.cli()
+
+
 class InstalledWheelTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -757,7 +812,7 @@ class NativeBundleTest(unittest.TestCase):
 def write_sums(root, excluded=()):
     (root / "SHA256SUMS").write_text(
         "".join(
-            f"{CORE.digest(path)}  ./{path.relative_to(root)}\n"
+            f"{VERIFY.digest(path)}  ./{path.relative_to(root)}\n"
             for path in sorted(root.rglob("*"))
             if path.is_file() and path.name not in (*excluded, "SHA256SUMS")
         )
@@ -783,7 +838,7 @@ class ArtifactTest(unittest.TestCase):
             with zipfile.ZipFile(root / "artifact.zip", "w") as archive:
                 for name, data in payload.items():
                     archive.writestr(name, data)
-            checksum = CORE.digest(root / "artifact.zip")
+            checksum = VERIFY.digest(root / "artifact.zip")
             original = {
                 "id": 42,
                 "name": f"mooncake-xpu-ci-py312-{sha}-123-2",
@@ -808,20 +863,20 @@ class ArtifactTest(unittest.TestCase):
                         json.dumps({**original, **change})
                     )
                     with self.assertRaises(RuntimeError):
-                        CORE.unpack(root, sha, "42", checksum)
+                        VERIFY.unpack(root, sha, "42", checksum)
             (root / "artifact.json").write_text(json.dumps(original))
             with patch.dict(os.environ, environment):
                 with self.assertRaises(RuntimeError):
-                    CORE.unpack(root, sha, "42", "0" * 64)
-                CORE.unpack(root, sha, "42", checksum)
+                    VERIFY.unpack(root, sha, "42", "0" * 64)
+                VERIFY.unpack(root, sha, "42", checksum)
             bundle = root / "bundle"
             with self.assertRaises(RuntimeError):
-                CORE.verify_provenance(bundle, "c" * 40, image, "123/2")
+                VERIFY.verify_provenance(bundle, "c" * 40, image, "123/2")
             with self.assertRaises(RuntimeError):
-                CORE.verify_provenance(bundle, sha, image + "changed", "123/2")
+                VERIFY.verify_provenance(bundle, sha, image + "changed", "123/2")
             (bundle / wheel).write_bytes(b"corrupted")
             with self.assertRaises(RuntimeError):
-                CORE.verify_hashes(bundle, {"provenance.txt"})
+                VERIFY.verify_hashes(bundle, {"provenance.txt"})
 
     def test_zip_rejects_traversal_and_duplicate_entries(self):
         for names in (
@@ -834,7 +889,7 @@ class ArtifactTest(unittest.TestCase):
                 with zipfile.ZipFile(root / "artifact.zip", "w") as archive:
                     for name in names:
                         archive.writestr(name, b"data")
-                checksum = CORE.digest(root / "artifact.zip")
+                checksum = VERIFY.digest(root / "artifact.zip")
                 (root / "artifact.json").write_text(
                     json.dumps(
                         {
@@ -850,7 +905,7 @@ class ArtifactTest(unittest.TestCase):
                     os.environ, {"GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1"}
                 ):
                     with self.assertRaises(RuntimeError):
-                        CORE.unpack(root, "a" * 40, "1", checksum)
+                        VERIFY.unpack(root, "a" * 40, "1", checksum)
 
     def test_hash_inventory_rejects_unhashed_missing_duplicate_and_unsafe_files(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -858,7 +913,7 @@ class ArtifactTest(unittest.TestCase):
             (root / "a").write_bytes(b"a")
             write_sums(root)
             valid = (root / "SHA256SUMS").read_text()
-            CORE.verify_hashes(root)
+            VERIFY.verify_hashes(root)
             for content in (
                 "",
                 valid * 2,
@@ -868,11 +923,11 @@ class ArtifactTest(unittest.TestCase):
                 with self.subTest(content=content):
                     (root / "SHA256SUMS").write_text(content)
                     with self.assertRaises(RuntimeError):
-                        CORE.verify_hashes(root)
+                        VERIFY.verify_hashes(root)
             (root / "SHA256SUMS").write_text(valid)
             (root / "unhashed").write_text("extra")
             with self.assertRaises(RuntimeError):
-                CORE.verify_hashes(root)
+                VERIFY.verify_hashes(root)
 
     def test_native_tar_roundtrip_and_rejection_of_links_and_traversal(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -890,7 +945,7 @@ class ArtifactTest(unittest.TestCase):
                 archive.add(native, arcname="native-tests")
             output = root / "valid"
             output.mkdir()
-            extracted = CORE.extract_native(root, output)
+            extracted = VERIFY.extract_native(root, output)
             self.assertEqual((extracted / "test").stat().st_mode & 0o777, 0o755)
             for index, (name, kind) in enumerate(
                 (
@@ -908,7 +963,7 @@ class ArtifactTest(unittest.TestCase):
                     output = root / str(index)
                     output.mkdir()
                     with self.assertRaises(RuntimeError):
-                        CORE.extract_native(root, output)
+                        VERIFY.extract_native(root, output)
 
 
 class ReportTest(unittest.TestCase):
@@ -944,17 +999,20 @@ class ReportTest(unittest.TestCase):
             with self.subTest(store_report=store_report, ep_complete=ep_complete):
                 with tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)
-                    for name, (inventory, _) in CORE.SUITES.items():
+                    for name, (inventory, _) in VERIFY.SUITES.items():
                         (root / f"{name}.list").write_text(inventory_text(inventory))
 
                     def run_command(args, log, timeout=600):
+                        if log.name == "wheel.log":
+                            self.assertEqual(args, [sys.executable, VERIFY.__file__])
+                            self.assertTrue(Path(args[1]).is_file())
                         if "--gtest_list_tests" in args:
-                            return inventory_text(CORE.SUITES[Path(args[0]).name][0])
+                            return inventory_text(VERIFY.SUITES[Path(args[0]).name][0])
                         for argument in args:
                             if argument.startswith("--gtest_output=xml:"):
                                 write_report(
                                     Path(argument.split("xml:", 1)[1]),
-                                    CORE.SUITES[Path(args[0]).name][1],
+                                    VERIFY.SUITES[Path(args[0]).name][1],
                                 )
                         if len(args) > 2 and args[2] == "store" and store_report:
                             write_report(
@@ -974,10 +1032,10 @@ class ReportTest(unittest.TestCase):
                         return ""
 
                     with (
-                        patch.object(CORE, "preflight"),
-                        patch.object(CORE, "command", side_effect=run_command),
-                        patch.object(CORE.socket, "create_connection"),
-                        patch.object(CORE.subprocess, "Popen") as process,
+                        patch.object(VERIFY, "preflight"),
+                        patch.object(VERIFY, "command", side_effect=run_command),
+                        patch.object(VERIFY.socket, "create_connection"),
+                        patch.object(VERIFY.subprocess, "Popen") as process,
                         patch.object(
                             importlib.metadata, "distribution"
                         ) as distribution,
@@ -986,13 +1044,13 @@ class ReportTest(unittest.TestCase):
                         distribution.return_value.locate_file.return_value = root
                         process.return_value.__enter__.return_value.poll.return_value = None
                         if valid:
-                            CORE.suite(root, ROOT, root)
+                            VERIFY.suite(root, ROOT, root)
                             result = json.loads((root / "result.json").read_text())
                             self.assertEqual(result["cpp_cases"], 149)
                             self.assertEqual(result["ep_rounds"], 8)
                         else:
                             with self.assertRaises((RuntimeError, FileNotFoundError)):
-                                CORE.suite(root, ROOT, root)
+                                VERIFY.suite(root, ROOT, root)
                             self.assertFalse((root / "result.json").exists())
 
     def test_exact_case_identity_count_and_no_skips_or_failures(self):
@@ -1015,40 +1073,40 @@ class ReportTest(unittest.TestCase):
                 ET.ElementTree(root).write(report)
                 with self.subTest(attributes=attributes, child=child):
                     if valid:
-                        CORE.validate_report(report, {"Suite.Case"})
+                        VERIFY.validate_report(report, {"Suite.Case"})
                         for expected in (
                             set(),
                             {"Suite.Other"},
                             {"Suite.Case", "Suite.Missing"},
                         ):
                             with self.assertRaises(RuntimeError):
-                                CORE.validate_report(report, expected)
+                                VERIFY.validate_report(report, expected)
                         suite.append(ET.fromstring(ET.tostring(case)))
                         ET.ElementTree(root).write(report)
                         with self.assertRaises(RuntimeError):
-                            CORE.validate_report(report, {"Suite.Case"})
+                            VERIFY.validate_report(report, {"Suite.Case"})
                     else:
                         with self.assertRaises(RuntimeError):
-                            CORE.validate_report(report, {"Suite.Case"})
+                            VERIFY.validate_report(report, {"Suite.Case"})
 
     def test_inventory_parser(self):
         self.assertEqual(
-            CORE.parse_inventory(
+            VERIFY.parse_inventory(
                 "noise\nModes/Suite.\n  Case/0  # GetParam() = false\n  Case/1\n"
             ),
             {"Modes/Suite.Case/0", "Modes/Suite.Case/1"},
         )
         for text in ("", "noise\n", "  Case\n", "Suite.\n  Case\n  Case\n"):
             with self.subTest(text=text), self.assertRaises(RuntimeError):
-                CORE.parse_inventory(text)
+                VERIFY.parse_inventory(text)
 
     def test_required_inventory_matches_cpp_sources(self):
         tent = ROOT / "mooncake-transfer-engine/tent/tests/xpu"
         for filename, names in (
-            ("xpu_platform_test.cpp", CORE.PLATFORM),
-            ("xpu_transport_test.cpp", CORE.TRANSPORT),
-            ("xpu_engine_test.cpp", CORE.ENGINE | CORE.RDMA),
-            ("xpu_ipc_process_test.cpp", CORE.IPC),
+            ("xpu_platform_test.cpp", VERIFY.PLATFORM),
+            ("xpu_transport_test.cpp", VERIFY.TRANSPORT),
+            ("xpu_engine_test.cpp", VERIFY.ENGINE | VERIFY.RDMA),
+            ("xpu_ipc_process_test.cpp", VERIFY.IPC),
         ):
             declared = set(
                 re.findall(
@@ -1063,33 +1121,33 @@ class ReportTest(unittest.TestCase):
                 for identity in names
             }
             self.assertEqual(selected, declared, filename)
-        self.assertEqual(len(CORE.ENGINE), 124)
-        self.assertEqual(len(CORE.INAPPLICABLE), 10)
+        self.assertEqual(len(VERIFY.ENGINE), 124)
+        self.assertEqual(len(VERIFY.INAPPLICABLE), 10)
         self.assertEqual(
-            sum(len(selected) for _, selected in CORE.SUITES.values()), 149
+            sum(len(selected) for _, selected in VERIFY.SUITES.values()), 149
         )
-        selected_engine = CORE.SUITES["tent_xpu_engine_test"][1]
-        self.assertFalse(selected_engine & CORE.RDMA)
-        self.assertFalse(selected_engine & CORE.INAPPLICABLE.keys())
+        selected_engine = VERIFY.SUITES["tent_xpu_engine_test"][1]
+        self.assertFalse(selected_engine & VERIFY.RDMA)
+        self.assertFalse(selected_engine & VERIFY.INAPPLICABLE.keys())
 
     def test_command_exit_and_timeout_propagate(self):
         with tempfile.TemporaryDirectory() as temporary:
             log = Path(temporary) / "command.log"
             diagnostics = io.StringIO()
             with (
-                patch.object(CORE.sys, "stderr", diagnostics),
+                patch.object(VERIFY.sys, "stderr", diagnostics),
                 self.assertRaises(subprocess.CalledProcessError),
             ):
-                CORE.command(["bash", "-c", "echo failed; exit 2"], log)
+                VERIFY.command(["bash", "-c", "echo failed; exit 2"], log)
             self.assertIn("failed", log.read_text())
             self.assertIn(str(log), diagnostics.getvalue())
             self.assertIn("failed", diagnostics.getvalue())
             diagnostics = io.StringIO()
             with (
-                patch.object(CORE.sys, "stderr", diagnostics),
+                patch.object(VERIFY.sys, "stderr", diagnostics),
                 self.assertRaises(subprocess.TimeoutExpired),
             ):
-                CORE.command(["sleep", "2"], log, timeout=0.01)
+                VERIFY.command(["sleep", "2"], log, timeout=0.01)
             self.assertIn(str(log), diagnostics.getvalue())
 
     def test_command_failure_diagnostics_are_bounded(self):
@@ -1097,10 +1155,10 @@ class ReportTest(unittest.TestCase):
             log = Path(temporary) / "command.log"
             diagnostics = io.StringIO()
             with (
-                patch.object(CORE.sys, "stderr", diagnostics),
+                patch.object(VERIFY.sys, "stderr", diagnostics),
                 self.assertRaises(subprocess.CalledProcessError),
             ):
-                CORE.command(["bash", "-c", "seq 1 100; exit 2"], log)
+                VERIFY.command(["bash", "-c", "seq 1 100; exit 2"], log)
             lines = diagnostics.getvalue().splitlines()
             self.assertEqual(len(lines), 41)
             self.assertEqual(lines[1:], [str(i) for i in range(61, 101)])
@@ -1155,15 +1213,50 @@ class ReportTest(unittest.TestCase):
                     patch.object(Path, "read_text", runtime_text),
                 ):
                     if valid:
-                        CORE.preflight(output)
+                        VERIFY.preflight(output)
                     else:
                         with self.assertRaises(RuntimeError):
-                            CORE.preflight(output)
+                            VERIFY.preflight(output)
 
 
 class ShellLifecycleTest(unittest.TestCase):
+    def test_inline_hardware_shell_syntax_and_removed_launchers(self):
+        for step in INTEGRATION["jobs"]["core"]["steps"]:
+            if "run" in step:
+                with self.subTest(step=step["name"]):
+                    result = subprocess.run(
+                        ["bash", "-n"],
+                        input=step["run"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("run_xpu_core.sh", "xpu_core.py"):
+            self.assertFalse((ROOT / "scripts/ci" / name).exists())
+        self.assertIn(
+            "scripts/e2e/python/verify_xpu_wheel.py unpack",
+            hardware_step("Download exact build artifact"),
+        )
+
+    def prepare_run(self, root):
+        output = root / "github-output"
+        subprocess.run(
+            ["bash", "-ec", hardware_step("Allocate run directory")],
+            env={
+                **os.environ,
+                "RUNNER_TEMP": str(root),
+                "GITHUB_OUTPUT": str(output),
+            },
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return Path(output.read_text().strip().removeprefix("directory="))
+
     def test_network_isolation_sets_store_and_ep_loopback_interfaces(self):
-        script = (ROOT / "scripts/ci/run_xpu_core.sh").read_text()
+        script = hardware_step("Execute isolated two-B60 core")
         start = script.index("container_id=$(docker create")
         stop = script.index("timeout --signal=TERM", start)
         docker_command = script[start:stop]
@@ -1210,11 +1303,15 @@ echo container-id
                 self.assertIn(variable, args)
                 self.assertEqual(args[args.index(variable) - 1], "--env")
             self.assertNotIn("--privileged", args)
+            self.assertIn(
+                "python3 /control/e2e/python/verify_xpu_wheel.py run /bundle /source /output",
+                "\n".join(args),
+            )
 
     def test_fixed_runner_masks_need_no_lock_or_profile_variables(self):
-        script = (ROOT / "scripts/ci/run_xpu_core.sh").read_text()
+        script = hardware_step("Execute isolated two-B60 core")
         start = script.index(': "${ZE_AFFINITY_MASK:')
-        stop = script.index("# Each runner owns a fixed pair.")
+        stop = script.index("# Preserve host GPU ordinals")
         for mask, valid in (
             ("0,1", True),
             ("2,3", True),
@@ -1272,7 +1369,7 @@ echo container-id
                 query_status=query_status
             ), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
-                (root / "output").mkdir()
+                run_directory = self.prepare_run(root)
                 docker = root / "docker"
                 docker.write_text("""#!/bin/bash
 set -eu
@@ -1286,9 +1383,8 @@ esac
                 result = subprocess.run(
                     [
                         "bash",
-                        str(ROOT / "scripts/ci/run_xpu_core.sh"),
-                        "--cleanup",
-                        str(root),
+                        "-ec",
+                        hardware_step("Recheck current-run container cleanup"),
                     ],
                     env={
                         **os.environ,
@@ -1296,6 +1392,7 @@ esac
                         "GITHUB_RUN_ID": "123",
                         "GITHUB_RUN_ATTEMPT": "1",
                         "QUERY_STATUS": str(query_status),
+                        "RUN_DIRECTORY": str(run_directory),
                     },
                     capture_output=True,
                     text=True,
@@ -1303,17 +1400,14 @@ esac
                 )
                 self.assertEqual(result.returncode, query_status, result.stderr)
                 self.assertEqual(
-                    (root / "output/cleanup-recheck.json").exists(), query_status == 0
+                    (run_directory / "output/cleanup-recheck.json").exists(),
+                    query_status == 0,
                 )
 
     def test_owned_container_cleanup_and_failures_propagate(self):
-        script = (ROOT / "scripts/ci/run_xpu_core.sh").read_text()
+        script = hardware_step("Execute isolated two-B60 core")
         cleanup = (
-            script[
-                script.index("cleanup_container()") : script.index(
-                    "# Actions may interrupt"
-                )
-            ]
+            'source "$RUN_DIRECTORY/cleanup.sh"\n'
             + script[
                 script.index("container_id=\n") : script.index(
                     'docker pull "$XPU_IMAGE"'
@@ -1330,7 +1424,8 @@ esac
             ):
                 with tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)
-                    (root / "output").mkdir()
+                    run_directory = self.prepare_run(root)
+                    (run_directory / "output").mkdir()
                     docker = root / "docker"
                     docker.write_text("""#!/bin/bash
 set -eu
@@ -1357,8 +1452,8 @@ esac
                         env={
                             **os.environ,
                             "PATH": f"{root}:{os.environ['PATH']}",
-                            "run_directory": str(root),
-                            "RUN_DIRECTORY": str(root),
+                            "run_directory": str(run_directory),
+                            "RUN_DIRECTORY": str(run_directory),
                             "CLEANUP_FAILURE": cleanup_failure,
                         },
                         capture_output=True,
@@ -1368,33 +1463,96 @@ esac
                     self.assertEqual(
                         result.returncode, expected, result.stdout + result.stderr
                     )
-                    commands = (root / "docker.commands").read_text()
+                    commands = (run_directory / "docker.commands").read_text()
                     self.assertIn("stop --time 10 owned-container", commands)
                     self.assertIn("rm owned-container", commands)
                     self.assertNotIn("prune", commands)
-                    report = json.loads((root / "output/cleanup.json").read_text())
+                    report = json.loads(
+                        (run_directory / "output/cleanup.json").read_text()
+                    )
                     self.assertEqual(
                         report["cleanup_status"] == 0, cleanup_failure == "no"
                     )
 
+    def test_cleanup_recheck_removes_only_current_run_container(self):
+        for container_id, valid in (("a" * 64, True), ("invalid-id", False)):
+            with self.subTest(
+                container_id=container_id
+            ), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                run_directory = self.prepare_run(root)
+                docker = root / "docker"
+                docker.write_text("""#!/bin/bash
+set -eu
+echo "$*" >> "$RUN_DIRECTORY/docker.commands"
+case "$1" in
+  ps) echo "$OWNED_CONTAINER" ;;
+  info|stop) exit 0 ;;
+  inspect)
+    [ ! -e "$RUN_DIRECTORY/removed" ] || exit 1
+    if [ "${2:-}" = --format ]; then echo false; else echo '{}'; fi ;;
+  rm) touch "$RUN_DIRECTORY/removed" ;;
+  *) exit 99 ;;
+esac
+""")
+                docker.chmod(0o755)
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-ec",
+                        hardware_step("Recheck current-run container cleanup"),
+                    ],
+                    env={
+                        **os.environ,
+                        "PATH": f"{root}:{os.environ['PATH']}",
+                        "RUN_DIRECTORY": str(run_directory),
+                        "OWNED_CONTAINER": container_id,
+                        "GITHUB_RUN_ID": "123",
+                        "GITHUB_RUN_ATTEMPT": "1",
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode == 0, valid, result.stderr)
+                commands = (run_directory / "docker.commands").read_text()
+                self.assertIn("--filter label=mooncake.xpu.run=123-1", commands)
+                self.assertEqual((run_directory / "removed").exists(), valid)
+                self.assertEqual(
+                    (run_directory / "output/cleanup-recheck.json").exists(), valid
+                )
+                if valid:
+                    self.assertIn(f"rm {container_id}", commands)
+                else:
+                    self.assertNotIn("stop ", commands)
+                    self.assertNotIn("rm ", commands)
+                self.assertNotIn("prune", commands)
+
     def test_host_preflight_rejects_root(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            (root / "output").mkdir()
+            fake_id = root / "id"
+            fake_id.write_text("#!/bin/sh\necho 0\n")
+            fake_id.chmod(0o755)
+            script = hardware_step("Execute isolated two-B60 core")
             result = subprocess.run(
                 [
                     "bash",
-                    str(ROOT / "scripts/ci/run_xpu_core.sh"),
-                    str(root),
-                    str(ROOT),
-                    str(ROOT / "scripts"),
+                    "-ec",
+                    script[script.index("exec >") :],
                 ],
+                env={
+                    **os.environ,
+                    "PATH": f"{root}:{os.environ['PATH']}",
+                    "run_directory": str(root),
+                },
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
-            if os.getuid() == 0:
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("must not run as root", result.stdout + result.stderr)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must not run as root", result.stdout + result.stderr)
 
 
 class SeccompTest(unittest.TestCase):
@@ -1426,28 +1584,28 @@ class SeccompTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "seccomp.json"
             with (
-                patch.object(CORE.urllib.request, "urlopen") as download,
+                patch.object(VERIFY.urllib.request, "urlopen") as download,
                 patch.object(
-                    CORE, "SECCOMP_SHA256", hashlib.sha256(content).hexdigest()
+                    VERIFY, "SECCOMP_SHA256", hashlib.sha256(content).hexdigest()
                 ),
             ):
                 download.return_value.__enter__.return_value.read.return_value = content
-                CORE.prepare_seccomp(output)
-                download.assert_called_once_with(CORE.SECCOMP_URL, timeout=30)
+                VERIFY.prepare_seccomp(output)
+                download.assert_called_once_with(VERIFY.SECCOMP_URL, timeout=30)
             actual = json.loads(output.read_text())
             self.assertEqual(actual["defaultAction"], original["defaultAction"])
             self.assertEqual(actual["archMap"], original["archMap"])
             self.assertEqual(
                 actual["syscalls"][-1],
                 {
-                    "names": sorted(CORE.XPU_SYSCALLS),
+                    "names": sorted(VERIFY.XPU_SYSCALLS),
                     "action": "SCMP_ACT_ALLOW",
                 },
             )
             remaining = []
             for rule in original["syscalls"]:
                 names = [
-                    name for name in rule["names"] if name not in CORE.XPU_SYSCALLS
+                    name for name in rule["names"] if name not in VERIFY.XPU_SYSCALLS
                 ]
                 if names:
                     remaining.append({**rule, "names": names})
@@ -1457,23 +1615,23 @@ class SeccompTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "seccomp.json"
             with patch.object(
-                CORE.urllib.request, "urlopen", side_effect=OSError("download failed")
+                VERIFY.urllib.request, "urlopen", side_effect=OSError("download failed")
             ):
                 with self.assertRaisesRegex(OSError, "download failed"):
-                    CORE.prepare_seccomp(output)
-            with patch.object(CORE.urllib.request, "urlopen") as download:
+                    VERIFY.prepare_seccomp(output)
+            with patch.object(VERIFY.urllib.request, "urlopen") as download:
                 download.return_value.__enter__.return_value.read.return_value = (
                     b"corrupted"
                 )
                 with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
-                    CORE.prepare_seccomp(output)
+                    VERIFY.prepare_seccomp(output)
                 content = b'{"defaultAction":"SCMP_ACT_ALLOW"}'
                 download.return_value.__enter__.return_value.read.return_value = content
                 with patch.object(
-                    CORE, "SECCOMP_SHA256", hashlib.sha256(content).hexdigest()
+                    VERIFY, "SECCOMP_SHA256", hashlib.sha256(content).hexdigest()
                 ):
                     with self.assertRaisesRegex(RuntimeError, "deny-by-default"):
-                        CORE.prepare_seccomp(output)
+                        VERIFY.prepare_seccomp(output)
             self.assertFalse(output.exists())
 
 
