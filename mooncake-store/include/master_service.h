@@ -2131,6 +2131,24 @@ class MasterService {
         std::chrono::system_clock::time_point ttl_;
         uint64_t mem_size_;
     };
+
+    // The steps of DiscardExpiredProcessingReplicas for the key `accessor`
+    // holds, in this order: an expired write's processing replicas, then an
+    // expired replication, offloading or promotion task. Each does nothing
+    // once an earlier one tore the object down. Replicas whose release waits
+    // go to `discarded_replicas`.
+    void DiscardExpiredPut(MetadataAccessorRW& accessor,
+                           const std::chrono::system_clock::time_point& now,
+                           std::list<DiscardedReplicas>& discarded_replicas);
+    void DiscardExpiredReplication(
+        MetadataAccessorRW& accessor,
+        const std::chrono::system_clock::time_point& now,
+        std::list<DiscardedReplicas>& discarded_replicas);
+    void DropExpiredOffloading(
+        MetadataAccessorRW& accessor,
+        const std::chrono::system_clock::time_point& now);
+    void DropExpiredPromotion(MetadataAccessorRW& accessor,
+                              const std::chrono::system_clock::time_point& now);
     std::mutex discarded_replicas_mutex_;
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
