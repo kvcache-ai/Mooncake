@@ -139,13 +139,18 @@ bool MasterService::DefaultProbeNofSegment(const std::string& te_endpoint,
 // Memory eviction's ties to this service: memory replicas are what it takes,
 // and the reclaimer that takes them follows the HA and offload settings.
 struct MasterService::MemoryEviction {
+    enum class ReplicaKind { kMemory, kKvcsDfs };
+
     // A completed memory replica nobody holds may go, except a managed
     // weight's. A soft-pinned object gives its memory only to make up a
     // round's minimum, and only when soft pins may be evicted at all.
     class Policy final : public eviction::EvictionPolicy {
        public:
-        Policy(const MasterService& service, bool allow_soft_pinned)
-            : service_(service), allow_soft_pinned_(allow_soft_pinned) {}
+        Policy(const MasterService& service, bool allow_soft_pinned,
+               ReplicaKind kind = ReplicaKind::kMemory)
+            : service_(service),
+              allow_soft_pinned_(allow_soft_pinned),
+              kind_(kind) {}
 
         tl::expected<eviction::Plan, eviction::SkipReason> Decide(
             const eviction::Candidate& candidate) const override {
@@ -167,7 +172,11 @@ struct MasterService::MemoryEviction {
             }
             eviction::Plan plan;
             for (const Replica& replica : candidate.metadata.GetAllReplicas()) {
-                if (service_.IsEvictableMemoryReplica(replica)) {
+                const bool evictable =
+                    kind_ == ReplicaKind::kMemory
+                        ? service_.IsEvictableMemoryReplica(replica)
+                        : replica.is_dfs_replica() && replica.is_completed();
+                if (evictable) {
                     plan.release.push_back(replica.id());
                 }
             }
@@ -181,6 +190,7 @@ struct MasterService::MemoryEviction {
        private:
         const MasterService& service_;
         const bool allow_soft_pinned_;
+        const ReplicaKind kind_;
     };
 
     // Takes the replicas off the object on the spot, with the cache and
@@ -318,18 +328,21 @@ struct MasterService::MemoryEviction {
     // finalize announces it instead.
     class KvEventObserver final : public eviction::EvictionObserver {
        public:
-        explicit KvEventObserver(MasterService& service) : service_(service) {}
+        explicit KvEventObserver(MasterService& service,
+                                 const char* medium = "cpu")
+            : service_(service), medium_(medium) {}
 
         void OnApplied(const eviction::ObjectView& view,
                        const eviction::Effect& effect) override {
             if (effect.released_bytes > 0) {
                 service_.PublishKvRemovedAfterEvict(
-                    view.key, 1, "cpu", view.metadata, view.tenant_id);
+                    view.key, 1, medium_, view.metadata, view.tenant_id);
             }
         }
 
        private:
         MasterService& service_;
+        const char* medium_;
     };
 
     struct Settings {
@@ -378,6 +391,57 @@ struct MasterService::MemoryEviction {
     eviction::MetricsObserver metrics;
     eviction::LogObserver log;
     // Last, so everything it refers to is built first.
+    eviction::Evictor evictor;
+};
+
+// KVCS reuses the common replica evictor above. Provider deletion and the DFS
+// metadata mutation run under the same key lock, so a concurrent Put/Upsert
+// cannot publish a replacement between them. A failed delete leaves metadata
+// unchanged for the next capacity refresh to retry.
+struct MasterService::KvcsDfsEviction {
+    class Reclaimer final : public eviction::Reclaimer {
+       public:
+        explicit Reclaimer(MasterService& service)
+            : service_(service), metadata_(service) {}
+
+        tl::expected<eviction::Effect, ErrorCode> Apply(
+            metadata::Namespace& ns, const route::WriteGuard& hold,
+            const eviction::Plan& plan,
+            const eviction::Report& report) override {
+            auto deleted =
+                service_.dfs_kvcs_capacity_provider_->DeleteObject(hold.key());
+            if (deleted) return metadata_.Apply(ns, hold, plan, report);
+            ++failures_;
+            LOG(ERROR) << "KVCS DFS watermark provider delete failed, key="
+                       << hold.key() << ", error=" << toString(deleted.error());
+            return tl::make_unexpected(deleted.error());
+        }
+
+        void TearDown(metadata::Namespace& ns,
+                      const route::WriteGuard& hold) override {
+            metadata_.TearDown(ns, hold);
+        }
+
+        size_t TakeFailures() { return std::exchange(failures_, 0); }
+
+       private:
+        MasterService& service_;
+        MemoryEviction::ImmediateReclaimer metadata_;
+        size_t failures_{0};
+    };
+
+    KvcsDfsEviction(MasterService& service, bool allow_soft_pinned)
+        : policy(service, allow_soft_pinned,
+                 MemoryEviction::ReplicaKind::kKvcsDfs),
+          reclaimer(service),
+          kv_events(service, "disk"),
+          evictor(service.namespaces_, policy, reclaimer,
+                  {&metrics, &kv_events}) {}
+
+    MemoryEviction::Policy policy;
+    Reclaimer reclaimer;
+    MemoryEviction::KvEventObserver kv_events;
+    eviction::MetricsObserver metrics;
     eviction::Evictor evictor;
 };
 
@@ -587,7 +651,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
             .offload = {.cap = static_cast<long>(offloading_queue_limit_ *
                                                  config.offload_cap_ratio),
                         .force_evict = config.offload_force_evict}});
-
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY. Only meaningful when offload is enabled
     // (otherwise no LOCAL_DISK replicas exist in the first place).
@@ -817,6 +880,10 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         }
         dfs_kvcs_capacity_provider_ = std::move(*provider);
         dfs_kvcs_capacity_check_interval_ = dfs_config.eviction_check_interval;
+        dfs_kvcs_eviction_enabled_ = dfs_config.eviction_enabled;
+        dfs_kvcs_eviction_high_watermark_ = dfs_config.eviction_high_watermark;
+        dfs_kvcs_eviction_low_watermark_ = dfs_config.eviction_low_watermark;
+        InitKvcsDfsEviction();
         LOG(INFO) << "KVCS distributed object storage initialized without "
                      "DFS extent allocator, config={"
                   << dfs_config.FormatStr() << "}";
@@ -7864,15 +7931,75 @@ void MasterService::RefreshKvcsDfsUsage() {
     if (!dfs_kvcs_capacity_provider_) return;
 
     auto capacity = dfs_kvcs_capacity_provider_->GetCapacity();
-    std::lock_guard lock(dfs_kvcs_usage_mutex_);
     if (capacity) {
-        dfs_kvcs_usage_ = std::move(*capacity);
+        {
+            std::lock_guard lock(dfs_kvcs_usage_mutex_);
+            dfs_kvcs_usage_ = *capacity;
+        }
+        RunKvcsDfsEviction(*capacity);
     } else {
         // Do not let a stale success drive a later watermark decision.
+        std::lock_guard lock(dfs_kvcs_usage_mutex_);
         dfs_kvcs_usage_ = {};
         VLOG(1) << "KVCS DFS capacity is unknown: "
                 << toString(capacity.error());
     }
+}
+
+void MasterService::InitKvcsDfsEviction() {
+    if (!kvcs_dfs_eviction_) {
+        kvcs_dfs_eviction_ = std::make_unique<KvcsDfsEviction>(
+            *this, allow_evict_soft_pinned_objects_);
+    }
+}
+
+void MasterService::RunKvcsDfsEviction(const DfsUsageSnapshot& usage) {
+    if (!dfs_kvcs_capacity_provider_ || !kvcs_dfs_eviction_ ||
+        !dfs_kvcs_eviction_enabled_ || !usage.enabled ||
+        usage.capacity_bytes == 0) {
+        return;
+    }
+    if (enable_oplog_) {
+        VLOG(1) << "KVCS DFS watermark eviction is disabled with OpLog";
+        return;
+    }
+
+    const long double high_bytes =
+        static_cast<long double>(usage.capacity_bytes) *
+        dfs_kvcs_eviction_high_watermark_;
+    if (static_cast<long double>(usage.used_bytes) <= high_bytes) return;
+
+    const uint64_t low_bytes =
+        static_cast<uint64_t>(static_cast<long double>(usage.capacity_bytes) *
+                              dfs_kvcs_eviction_low_watermark_);
+    const uint64_t target_bytes = usage.used_bytes - low_bytes;
+    eviction::Report report;
+    {
+        std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+        report = kvcs_dfs_eviction_->evictor.Run(
+            TenantId::Default(),
+            eviction::ByteGoal{.target_bytes = target_bytes});
+    }
+
+    const size_t failed = kvcs_dfs_eviction_->reclaimer.TakeFailures();
+
+    auto& metrics = MasterMetricManager::instance();
+    if (report.MadeProgress()) {
+        metrics.inc_eviction_success(
+            static_cast<int64_t>(report.evicted_objects),
+            static_cast<int64_t>(std::min<uint64_t>(
+                report.released_bytes,
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))));
+    } else if (report.filed > 0) {
+        metrics.inc_eviction_fail();
+    }
+    LOG(INFO) << "action=kvcs_dfs_watermark_eviction"
+              << ", used_bytes=" << usage.used_bytes
+              << ", capacity_bytes=" << usage.capacity_bytes
+              << ", target_bytes=" << target_bytes
+              << ", evicted_objects=" << report.evicted_objects
+              << ", released_bytes=" << report.released_bytes
+              << ", provider_delete_failures=" << failed;
 }
 
 void MasterService::RunShardDfsEviction() {

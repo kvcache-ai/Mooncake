@@ -1,5 +1,6 @@
 #include "storage/distributed/kvcs/kvcs_capacity_provider.h"
 
+#include <array>
 #include <utility>
 
 #include "storage/distributed/kvcs/kvcs_capi_driver.h"
@@ -41,6 +42,21 @@ KvcsCapacityProvider::GetCapacity() {
                             .used_bytes = match->used_bytes,
                             .capacity_bytes = match->total_bytes,
                             .file_count = 0};
+}
+
+tl::expected<void, ErrorCode> KvcsCapacityProvider::DeleteObject(
+    const std::string& logical_key) {
+    if (!driver_) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    auto initialized = driver_->Init();
+    if (!initialized) return tl::make_unexpected(initialized.error());
+    auto encoded = EncodeKvcsKey(logical_key);
+    if (!IsKvcsKeyStringSafe(encoded, driver_->MaxKeySize()))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    const std::array<ObjectKey, 1> keys{std::move(encoded)};
+    auto deleted = driver_->BatchDelete(keys);
+    if (deleted.size() != 1)
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    return std::move(deleted.front());
 }
 
 tl::expected<std::unique_ptr<KvcsCapacityProvider>, ErrorCode>

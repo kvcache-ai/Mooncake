@@ -81,15 +81,32 @@ Master calls the KVCS SDK 0.6.0+ `kvcs_ll_mp_stat` API and selects the entry
 whose `index` and `id` match the configured target. Its `used_bytes` and
 `total_bytes` are published through the existing `DfsUsageSnapshot`. DFS
 remains the single place for watermark configuration, metrics, scheduling, and
-future eviction decisions; KVCS does not introduce a second capacity model.
+eviction decisions; KVCS does not introduce a second capacity model.
 
 `kvcs_ll_mp_stat` is a synchronous, uncached EFC control-plane RPC. Mooncake
 therefore calls it only from the existing periodic capacity refresh worker,
 not from the read or write path. A missing or duplicate target, an SDK/RPC
 error, `total_bytes == 0`, or `used_bytes > total_bytes` makes capacity unknown.
 The last successful value is cleared so stale capacity cannot drive a later
-decision. This change publishes capacity through the existing DFS snapshot but
-does not yet trigger automatic Mooncake eviction from that snapshot.
+decision. When usage exceeds `MOONCAKE_DFS_EVICTION_HIGH_WATERMARK`, Master
+uses the existing eviction index and its lease, pin, and managed-weight checks
+to remove eligible KVCS DFS metadata until the logical bytes selected cover
+the distance to `MOONCAKE_DFS_EVICTION_LOW_WATERMARK`. It then deletes those
+logical keys through the same KVCS Low Level driver and commits the metadata
+change under the same key lock, so a concurrent Put/Upsert cannot publish a
+replacement between them. A failed provider delete leaves metadata unchanged
+for the next refresh to retry. A later capacity refresh confirms the physical
+watermark; if provider accounting includes non-Mooncake data, or too little
+Mooncake data is eligible, usage can remain above the low watermark.
+
+This first stage reuses the existing memory eviction index. An automatic KVCS
+watermark candidate must therefore have both a completed memory replica and a
+completed KVCS DFS replica, which matches the HiCache configuration validated
+for this change. DFS-only KVCS objects are not selected by automatic watermark
+eviction yet.
+
+Automatic KVCS watermark eviction is disabled when OpLog durability is enabled
+because provider deletion is not yet tied to the durable metadata finalizer.
 
 Deployments should configure the KVCS GC watermark to 100%. Current KVCS
 cannot fully disable automatic GC, so this only makes provider-side deletion

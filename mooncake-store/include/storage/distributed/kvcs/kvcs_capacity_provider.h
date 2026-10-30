@@ -21,6 +21,7 @@ class KvcsCapacityProvider {
     ~KvcsCapacityProvider();
 
     tl::expected<DfsUsageSnapshot, ErrorCode> GetCapacity();
+    tl::expected<void, ErrorCode> DeleteObject(const std::string& logical_key);
 
    private:
     uint32_t mountpoint_index_;

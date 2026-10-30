@@ -1532,7 +1532,9 @@ class MasterService {
     void RunDfsEviction();
     void RunShardDfsEviction();
     void RunBucketDfsEviction();
+    void InitKvcsDfsEviction();
     void RefreshKvcsDfsUsage();
+    void RunKvcsDfsEviction(const DfsUsageSnapshot& usage);
     bool RunBucketDfsEvictionInternal(bool force_one);
     bool TryRecoverDfsSpaceAfterAllocationFailure();
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
@@ -1641,6 +1643,8 @@ class MasterService {
     // starts.
     struct MemoryEviction;
     std::unique_ptr<MemoryEviction> memory_eviction_;
+    struct KvcsDfsEviction;
+    std::unique_ptr<KvcsDfsEviction> kvcs_dfs_eviction_;
 
     // Eviction thread related members
     std::thread eviction_thread_;
@@ -2067,6 +2071,9 @@ class MasterService {
     bool use_kvcs_{false};
     std::unique_ptr<KvcsCapacityProvider> dfs_kvcs_capacity_provider_;
     std::chrono::seconds dfs_kvcs_capacity_check_interval_{5};
+    bool dfs_kvcs_eviction_enabled_{false};
+    double dfs_kvcs_eviction_high_watermark_{0.9};
+    double dfs_kvcs_eviction_low_watermark_{0.7};
     mutable std::mutex dfs_kvcs_usage_mutex_;
     DfsUsageSnapshot dfs_kvcs_usage_;
     std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;

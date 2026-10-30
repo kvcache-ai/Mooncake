@@ -78,6 +78,7 @@ class MemoryDriver final : public KvcsDriver {
     KvcsIoResults BatchDelete(std::span<const ObjectKey> keys) override {
         KvcsIoResults results;
         for (const auto& key : keys) {
+            deleted_keys_.push_back(key);
             values_.erase(key);
             results.emplace_back();
         }
@@ -85,11 +86,13 @@ class MemoryDriver final : public KvcsDriver {
     }
 
     size_t put_calls() const { return put_calls_; }
+    const std::vector<ObjectKey>& deleted_keys() const { return deleted_keys_; }
 
    private:
     size_t put_calls_ = 0;
     std::map<ObjectKey, std::string> values_;
     std::vector<KvcsMountpointStat> stats_;
+    std::vector<ObjectKey> deleted_keys_;
 };
 
 class ScopedEfcEnvironment {
@@ -158,6 +161,18 @@ TEST(KvcsCapacityProviderTest, RejectsUnknownOrInconsistentCapacity) {
                                 .total_bytes = 100,
                                 .used_bytes = 101}})
                      .has_value());
+}
+
+TEST(KvcsCapacityProviderTest, DeletesLogicalKeyWithSharedEncoding) {
+    auto driver = std::make_unique<MemoryDriver>();
+    auto* driver_ptr = driver.get();
+    KvcsCapacityProvider provider(1, "target-mp", std::move(driver));
+    EXPECT_TRUE(provider.DeleteObject("key"));
+    auto invalid = provider.DeleteObject(std::string(300, 'x'));
+    ASSERT_FALSE(invalid);
+    EXPECT_EQ(invalid.error(), ErrorCode::INVALID_PARAMS);
+    ASSERT_EQ(driver_ptr->deleted_keys().size(), 1u);
+    EXPECT_EQ(driver_ptr->deleted_keys()[0], EncodeKvcsKey("key"));
 }
 
 TEST(KvcsObjectStorageAdapterTest, PutGetAndRemove) {
