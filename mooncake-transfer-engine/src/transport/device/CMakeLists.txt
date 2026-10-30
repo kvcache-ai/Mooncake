@@ -1,4 +1,4 @@
-# Device transport sources â€?conditional on GPU vendor. mlx5gda.cpp (IBGDA QP
+# Device transport sources â€” conditional on GPU vendor. mlx5gda.cpp (IBGDA QP
 # lifecycle) is compiled directly into the device_transport OBJECT library, like
 # every other transport module, so its mlx5gda_* symbols flow into
 # transfer_engine without a separate static lib. This keeps them visible to

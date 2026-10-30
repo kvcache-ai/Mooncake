@@ -1,4 +1,3 @@
-// Mooncake EP dispatch & combine kernels (Hygon Stage 19: glc slc L2 bypass)
 // clang-format off
 
 #include <cstdio>
@@ -105,7 +104,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
-    // Communication context â€?platform dispatch is inside comm_device.cuh
+    // Communication context â€” platform dispatch is inside comm_device.cuh
     const CommCtx comm_ctx = make_comm_ctx(
         mxa_buffer, nvlink_available, ipc_peer_ptrs,
         raddrs, rkeys, qp_devctxs,
@@ -243,7 +242,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
                 void* write_dst = mc_route_put(comm_ctx, dst_rank, dst_ptr);
                 if (write_dst != nullptr) {
-                    // Local or P2P path â€?warp-cooperative copy
+                    // Local or P2P path â€” warp-cooperative copy
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
 #ifndef MOONCAKE_EP_USE_MUSA
@@ -264,7 +263,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     mc_fence();
 #endif
                 } else {
-                    // IBGDA path â€?send directly from source buffer
+                    // IBGDA path â€” send directly from source buffer
                     mc_fence();
 #if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
                     // MACA and MUSA execute two 32-lane sub-warps in one
@@ -680,7 +679,7 @@ combine(void* combined_x, int32_t* active_ranks,
     constexpr size_t num_bytes_per_slot = kHidden * EP_BF16_SIZE;
     EP_STATIC_ASSERT(num_bytes_per_slot % sizeof(int4) == 0, "Invalid vectorization");
 
-    // Communication context â€?platform dispatch is inside comm_device.cuh
+    // Communication context â€” platform dispatch is inside comm_device.cuh
     const CommCtx comm_ctx = make_comm_ctx(
         mxa_buffer, nvlink_available, ipc_peer_ptrs,
         raddrs, rkeys, qp_devctxs,
@@ -760,7 +759,7 @@ combine(void* combined_x, int32_t* active_ranks,
 
             void* write_dst = mc_route_put(comm_ctx, dst_rank, dst_ptr);
             if (write_dst != nullptr) {
-                // Local or P2P path â€?warp-cooperative copy
+                // Local or P2P path â€” warp-cooperative copy
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
 #ifdef MOONCAKE_EP_USE_HYGON
                 for (size_t i = physical_lane_id; i < hidden_bf16_int4;
@@ -773,7 +772,7 @@ combine(void* combined_x, int32_t* active_ranks,
                 mc_fence();
 #endif
             } else {
-                // IBGDA path â€?stage to send buffer then RDMA write
+                // IBGDA path â€” stage to send buffer then RDMA write
                 const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
                 if (not zero_copy) {
 #ifdef MOONCAKE_EP_USE_HYGON

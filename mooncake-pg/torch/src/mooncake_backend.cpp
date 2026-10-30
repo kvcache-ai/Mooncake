@@ -454,6 +454,7 @@ int MooncakeBackend::getSize() const {
     return size;
 }
 
+#if defined(USE_HYGON)
 at::Tensor MooncakeBackend::getActiveRanksTensor() {
     auto snapshot = at::empty(
         {max_group_size_},
@@ -482,6 +483,11 @@ at::Tensor MooncakeBackend::getActiveRanksTensor() {
     }
     return snapshot;
 }
+#else
+at::Tensor MooncakeBackend::getActiveRanksTensor() {
+    return activeRanks_;
+}
+#endif
 
 template <auto CpuFn, auto GpuFn, typename... Args>
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::launchCollective(

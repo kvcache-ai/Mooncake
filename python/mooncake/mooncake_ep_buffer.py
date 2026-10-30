@@ -18,6 +18,8 @@ def _env_enabled(name: str, default: bool = False) -> bool:
 _USE_MACA = _env_enabled("MOONCAKE_EP_USE_MACA") or bool(
     getattr(torch.version, "maca", None)
 )
+
+
 def _detect_hygon() -> bool:
     if _env_enabled("MOONCAKE_EP_USE_HYGON"):
         return True
@@ -246,15 +248,15 @@ class Buffer:
 
         return wrapped_hook
 
-
     def connect(self, is_update: bool = False):
-
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
             # torchada maps the CUDA device namespace to MUSA when enabled.
             ctrl_device = "cpu" if _USE_HYGON else "cuda"
             ctrl_group = (
-                self._hygon_control_group if _USE_HYGON and self._hygon_control_group is not None else self.group
+                self._hygon_control_group
+                if _USE_HYGON and self._hygon_control_group is not None
+                else self.group
             )
 
             raddr = torch.tensor([raddr], dtype=torch.int64, device=ctrl_device)
@@ -280,9 +282,9 @@ class Buffer:
             all_to_all_size = len(local_qpns) // self.group_size
             local_qpns = list(
                 torch.unbind(
-                    torch.tensor(local_qpns, dtype=torch.int32, device=ctrl_device).view(
-                        -1, all_to_all_size
-                    )
+                    torch.tensor(
+                        local_qpns, dtype=torch.int32, device=ctrl_device
+                    ).view(-1, all_to_all_size)
                 )
             )
             remote_qpns = [
@@ -295,9 +297,9 @@ class Buffer:
             local_lids = self.runtime.get_local_lids()
             local_lids = list(
                 torch.unbind(
-                    torch.tensor(local_lids, dtype=torch.int32, device=ctrl_device).view(
-                        -1, all_to_all_size
-                    )
+                    torch.tensor(
+                        local_lids, dtype=torch.int32, device=ctrl_device
+                    ).view(-1, all_to_all_size)
                 )
             )
             remote_lids = [
@@ -349,9 +351,7 @@ class Buffer:
                 local_handle_ints = self.runtime.get_ipc_handle()
                 # pybind11 converts std::vector<int32_t> to a list of integers
                 handle_device = "cpu" if _USE_HYGON else "cuda"
-                handle_group = (
-                    self._hygon_control_group if _USE_HYGON else self.group
-                )
+                handle_group = self._hygon_control_group if _USE_HYGON else self.group
                 local_handle_tensor = torch.tensor(
                     local_handle_ints, dtype=torch.int32, device=handle_device
                 )
@@ -1197,7 +1197,6 @@ class Buffer:
                 event,
                 hook,
             )
-
 
     def _fallback_combine(
         self,

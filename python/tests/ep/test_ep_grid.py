@@ -1,4 +1,5 @@
 import os
+
 os.environ.setdefault("HSA_FORCE_FINE_GRAIN_PCIE", "1")
 import itertools
 import unittest
@@ -412,6 +413,7 @@ class TestMooncakeEPBuffer(unittest.TestCase):
         self.world_size = torch.cuda.device_count()
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         import socket
+
         port = int(os.environ.get("MASTER_PORT", 29500))
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:

@@ -633,12 +633,24 @@ class P2pDeviceTransportImpl : public P2pTransport {
             }
 #endif
 
+#if defined(USE_HYGON)
             // cudaIpcMemLazyEnablePeerAccess asks the IPC-open operation to
             // enable peer access when needed.  Enabling it eagerly here is
             // redundant and some HIP-compatible runtimes reject the later
             // IPC open with invalid-argument when the peer link is already
             // enabled.
             cudaError_t err = cudaSuccess;
+#else
+            cudaError_t err = cudaDeviceEnablePeerAccess(dst_device, 0);
+            if (err != cudaSuccess &&
+                err != cudaErrorPeerAccessAlreadyEnabled) {
+                LOG(WARNING) << "[EP P2P] rank " << rank
+                             << " failed to enable peer access to device "
+                             << dst_device << ": " << cudaGetErrorString(err);
+                continue;
+            }
+            if (err == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
+#endif
 
             if (dst >= static_cast<int>(remote_handles.size())) continue;
             const auto& h = remote_handles[dst];
