@@ -268,7 +268,7 @@ cleanup_wheel_metadata_state() {
 }
 trap cleanup_wheel_metadata_state EXIT
 
-BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD EFA_BUILD EFA_CU13_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD HIP_BUILD"
+BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD EFA_BUILD EFA_CU13_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD HIP_BUILD XPU_BUILD"
 BUILD_VARIANT_COUNT=0
 for build_variant in $BUILD_VARIANTS; do
     if [ "${!build_variant}" = "1" ]; then
@@ -371,6 +371,14 @@ elif [ "$HIP_BUILD" = "1" ]; then
     sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "rocm", "amd", "hip"]/' pyproject.toml
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-rocm"
+elif [ "$XPU_BUILD" = "1" ]; then
+    echo "Modifying package name for Intel XPU build"
+    cp pyproject.toml pyproject.toml.backup
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-xpu"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (Intel XPU version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "intel", "xpu", "sycl"]/' pyproject.toml
+    sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-xpu"
 else
     echo "Using standard package name: mooncake-transfer-engine"
 fi

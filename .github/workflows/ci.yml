@@ -552,6 +552,7 @@ jobs:
       src: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.src }}
       tent: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.tent }}
       store_rs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.store_rs }}
+      xpu: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.xpu }}
       docs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.docs }}
     steps:
       - uses: actions/checkout@v4
@@ -605,6 +606,19 @@ jobs:
             docs:
               - 'docs/**'
               - '.github/workflows/ci.yml'
+            xpu:
+              - 'mooncake-*/**'
+              - 'python/**'
+              - 'extern/**'
+              - 'cmake/**'
+              - 'CMakeLists.txt'
+              - 'dependencies.sh'
+              - '.gitmodules'
+              - 'scripts/**'
+              - '.github/actions/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/ci_xpu.yml'
+              - '.github/workflows/nightly.yml'
 
   build-wheel-cu13:
     needs: [spell-check, clang-format, check-paths]
@@ -645,6 +659,11 @@ jobs:
     if: needs.check-paths.outputs.src == 'true'
     uses: ./.github/workflows/ci_rocm.yml
     secrets: inherit
+
+  build-wheel-xpu:
+    needs: [spell-check, clang-format, check-paths]
+    if: needs.check-paths.outputs.xpu == 'true'
+    uses: ./.github/workflows/ci_xpu.yml
 
   tent-ci:
     needs: [spell-check, clang-format, check-paths]
@@ -1000,6 +1019,7 @@ jobs:
       - build-wheel-cu13-arm64
       - build-wheel-efa
       - build-wheel-rocm
+      - build-wheel-xpu
       - tent-ci
       - store-rs-ci
     runs-on: ubuntu-latest
@@ -1037,6 +1057,12 @@ jobs:
           for result in $RESULTS; do
             test "$result" = "$EXPECTED" || exit 1
           done
+
+      - name: Check XPU build and packaging
+        env:
+          EXPECTED: ${{ needs.check-paths.outputs.xpu == 'true' && 'success' || 'skipped' }}
+          RESULT: ${{ needs.build-wheel-xpu.result }}
+        run: test "$RESULT" = "$EXPECTED"
 
       - name: Check TENT jobs
         env:
