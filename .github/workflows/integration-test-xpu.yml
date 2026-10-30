@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   core:
-    runs-on: [self-hosted, Linux, X64, xpu]
+    runs-on: xpu
     timeout-minutes: 90
     env:
       XPU_IMAGE: intel/pytorch:xpu-2.13.0-ubuntu24.04-20260907@sha256:7366f264bd7aaa7f0df7d1bfba43be7c84c126df21ba448ae5445a34c2def4f9
