@@ -55,10 +55,12 @@ def setup(hostname, segment_bytes, local_buffer_bytes, ssd_path=None):
 
 
 def run_owner(args):
-    setup(args.hostname, args.segment_mb * MB, 16 * MB, args.ssd_path)
+    # Keep the store referenced: if it is collected the client stops pinging,
+    # the master expires it and unmounts the segment.
+    store = setup(args.hostname, args.segment_mb * MB, 16 * MB, args.ssd_path)
     print(f"OWNER_READY {args.hostname} ssd={args.ssd_path}", flush=True)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    while True:
+    while store is not None:
         time.sleep(3600)
 
 
@@ -73,6 +75,10 @@ def run_write(args):
             time.sleep(0.2)
         else:
             failed += 1
+            # Nothing ever fit: the owners' segments are not usable, so
+            # retrying the remaining keys only burns time.
+            if failed == i + 1 and failed >= 3:
+                sys.exit(f"WRITE_ABORT first {failed} keys all failed")
         if args.put_interval:
             time.sleep(args.put_interval)
         if (i + 1) % 100 == 0:

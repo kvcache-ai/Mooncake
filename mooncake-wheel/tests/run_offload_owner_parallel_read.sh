@@ -24,7 +24,32 @@ if ! ldconfig -p | grep -q 'libcuda.so.1 '; then
     export LD_LIBRARY_PATH=/tmp/culib:${LD_LIBRARY_PATH:-}
 fi
 
+# A stale master on these ports silently swallows our owners' mounts.
+if ss -ltn | grep -qE ':(50051|8080|9003)\s'; then
+    echo "ports 50051/8080/9003 already in use; kill the old mooncake_master first:"
+    ss -ltnp | grep -E ':(50051|8080|9003)\s'
+    exit 1
+fi
+
 rm -rf "$WORK" && mkdir -p "$WORK"
+
+# Preflight: owner segments + client local buffers + read buffer must fit in
+# RAM (and the cgroup limit); every value may end up on disk under $WORK.
+NEED_MEM_MB=$((OWNERS * (SEGMENT_MB + 16) + 2 * 128 + BATCH * VALUE_MB + 256))
+NEED_DISK_MB=$((NUM_KEYS * VALUE_MB * 12 / 10))
+AVAIL_MEM_MB=$(awk '/MemAvailable/ {print int($2 / 1024)}' /proc/meminfo)
+CG_LIMIT=$(cat /sys/fs/cgroup/memory.max 2>/dev/null \
+    || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo max)
+if [[ "$CG_LIMIT" =~ ^[0-9]+$ ]] && ((CG_LIMIT / 1024 / 1024 < AVAIL_MEM_MB)); then
+    AVAIL_MEM_MB=$((CG_LIMIT / 1024 / 1024))
+fi
+AVAIL_DISK_MB=$(df -Pm "$WORK" | awk 'NR == 2 {print $4}')
+echo "preflight: mem need=${NEED_MEM_MB}MB avail=${AVAIL_MEM_MB}MB," \
+    "disk need=${NEED_DISK_MB}MB avail=${AVAIL_DISK_MB}MB ($WORK)"
+if ((AVAIL_MEM_MB < NEED_MEM_MB || AVAIL_DISK_MB < NEED_DISK_MB)); then
+    echo "insufficient resources; lower SEGMENT_MB / NUM_KEYS / VALUE_MB or move WORK"
+    exit 1
+fi
 export MC_METADATA_SERVER=http://127.0.0.1:8080/metadata
 export MASTER_SERVER=127.0.0.1:50051
 export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
@@ -40,7 +65,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mooncake_master --enable_http_metadata_server=true --http_metadata_server_port=8080 \
+# MASTER_V=1 makes PutStart log why allocation failed.
+GLOG_v=${MASTER_V:-0} mooncake_master --enable_http_metadata_server=true --http_metadata_server_port=8080 \
     --enable_offload=true --default_kv_lease_ttl=500 \
     --eviction_high_watermark_ratio=0.8 --eviction_ratio=0.2 \
     >"$WORK/master.log" 2>&1 &
@@ -61,9 +87,22 @@ for i in $(seq 1 "$OWNERS"); do
 done
 echo "owners ready: $OWNERS"
 grep -h "Offload RPC server started" "$WORK"/owner*.log || true
+# Outlast the master's client_ttl (10s) so an owner that stopped pinging has
+# already been expired and its segment unmounted before we start writing.
+sleep 12
+grep -h "action=client_expired" "$WORK/master.log" && {
+    echo "owner clients expired; segments were unmounted"; exit 1
+}
+curl -s 127.0.0.1:9003/metrics \
+    | grep -E "^master_(total_capacity_bytes|allocated_bytes|mount_segment_(requests|failures)_total)" \
+    || echo "master metrics unavailable"
 
 $T write --hostname 127.0.0.1:17100 --settle-seconds "$SETTLE" "${COMMON[@]}" \
-    >"$WORK/write.log" 2>&1 || { tail -30 "$WORK/write.log"; exit 1; }
+    >"$WORK/write.log" 2>&1 || {
+    tail -30 "$WORK/write.log"
+    echo "== master.log"; tail -30 "$WORK/master.log"
+    exit 1
+}
 grep WRITE_DONE "$WORK/write.log"
 
 for c in 1 "$CONC"; do
