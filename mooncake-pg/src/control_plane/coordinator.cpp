@@ -52,6 +52,31 @@ bool groupSupportsOneShot(const GroupView& view) {
     return true;
 }
 
+// Direct two-shot needs every directed native-atomic P2P edge. Validate the
+// active set together so ranks never select incompatible collective paths.
+bool groupSupportsTwoShot(const GroupView& view) {
+    std::vector<const TwoShotEndpoint*> endpoints;
+    for (const auto& member : view.members) {
+        if (!member.isActive()) continue;
+        if (!member.endpoint) return false;
+        const auto& endpoint = member.endpoint->device_collective;
+        if (!endpoint.simple || !endpoint.two_shot ||
+            endpoint.two_shot->version != kTwoShotEndpointVersion)
+            return false;
+        endpoints.push_back(&*endpoint.two_shot);
+    }
+    for (const auto* source : endpoints) {
+        for (const auto* destination : endpoints) {
+            if (source == destination) continue;
+            const auto& peers = source->native_atomic_peer_uuids;
+            if (std::find(peers.begin(), peers.end(),
+                          destination->device_uuid) == peers.end())
+                return false;
+        }
+    }
+    return !endpoints.empty();
+}
+
 }  // namespace
 
 CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
@@ -1322,10 +1347,19 @@ void CentralizedCoordinatorStateMachine::resolveGpuCollectiveBackend(
     view.all_reduce_algorithm_choices.clear();
     if (selected != GpuCollectiveBackend::New) return;
 
+    // Keep auto's existing policy until two-shot has benchmarked thresholds.
+    const bool use_two_shot =
+        all_reduce_algorithm_ == DeviceAllReduceAlgorithm::TwoShot &&
+        groupSupportsTwoShot(view);
     const bool use_one_shot =
-        all_reduce_algorithm_ != DeviceAllReduceAlgorithm::Ring &&
+        (!all_reduce_algorithm_ ||
+         all_reduce_algorithm_ == DeviceAllReduceAlgorithm::OneShot) &&
         groupSupportsOneShot(view);
-    if (use_one_shot) {
+    if (use_two_shot) {
+        view.all_reduce_algorithm_choices.push_back(
+            {std::numeric_limits<uint64_t>::max(),
+             DeviceAllReduceAlgorithm::TwoShot});
+    } else if (use_one_shot) {
         const uint64_t max_bytes =
             all_reduce_algorithm_ == DeviceAllReduceAlgorithm::OneShot
                 ? std::numeric_limits<uint64_t>::max()
@@ -1335,11 +1369,19 @@ void CentralizedCoordinatorStateMachine::resolveGpuCollectiveBackend(
     }
     if (all_reduce_algorithm_.has_value()) {
         LOG(INFO) << "[PG] Coordinator selected AllReduce algorithm="
-                  << (use_one_shot ? "oneshot" : "ring")
+                  << (use_two_shot   ? "twoshot"
+                      : use_one_shot ? "oneshot"
+                                     : "ring")
                   << " group=" << view.group_id;
         if (all_reduce_algorithm_ == DeviceAllReduceAlgorithm::OneShot &&
             !use_one_shot) {
             LOG(WARNING) << "[PG] OneShot is unavailable on this group; "
+                            "falling back to Ring"
+                         << " group=" << view.group_id;
+        }
+        if (all_reduce_algorithm_ == DeviceAllReduceAlgorithm::TwoShot &&
+            !use_two_shot) {
+            LOG(WARNING) << "[PG] TwoShot is unavailable on this group; "
                             "falling back to Ring"
                          << " group=" << view.group_id;
         }

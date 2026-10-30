@@ -712,6 +712,126 @@ def _allgather_reduce_scatter_recovery_worker(
         ctx.record_result({"role": "replacement"})
 
 
+def _capture_allreduce_graph(ctx: MooncakePGWorkerContext):
+    # Uneven shards and more than one tile, including after membership changes.
+    tensor = torch.full(((1 << 22) + 3,), ctx.rank + 1, device=ctx.device)
+    dist.all_reduce(tensor)
+    torch.cuda.synchronize(ctx.device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        # A failed in-place operation may overwrite input: restore it on replay.
+        tensor.fill_(ctx.rank + 1)
+        work = dist.all_reduce(tensor, async_op=True)
+        work.wait()
+        # Obtain the CPU hint during capture. Read it only after replay has
+        # synchronized, without synchronizing the capture-time Work event.
+        hints = pg.get_failed_ranks_hint(work)
+    return tensor, graph, work, hints
+
+
+def _check_allreduce_graph(tensor, graph, hints, expected: int) -> None:
+    hints.zero_()
+    graph.replay()
+    torch.cuda.synchronize(tensor.device)
+    assert not bool(torch.any(hints)), hints.tolist()
+    assert bool(torch.all(tensor == expected)), expected
+
+
+def _graph_membership_worker(
+    ctx: MooncakePGWorkerContext,
+    start_joiner: mp.Event,
+    all_ranks: mp.Barrier,
+) -> None:
+    joiner = ctx.world_size - 1
+    original_sum = joiner * (joiner + 1) // 2
+    if ctx.rank == joiner:
+        if not start_joiner.wait(timeout=30):
+            raise TimeoutError("waiting for original ranks to capture their Graphs")
+        ctx.init_group(is_extension=True, max_group_size=ctx.world_size)
+    else:
+        ctx.init_group(world_size=joiner, max_group_size=ctx.world_size)
+    backend = ctx.get_backend()
+    tensor, graph, _work, hints = _capture_allreduce_graph(ctx)
+    if ctx.rank == joiner:
+        # The joiner's Graph is captured while it still executes locally.
+        _check_allreduce_graph(tensor, graph, hints, ctx.rank + 1)
+    else:
+        _check_allreduce_graph(tensor, graph, hints, original_sum)
+        if ctx.rank == 0:
+            start_joiner.set()
+    all_ranks.wait(timeout=30)
+
+    if ctx.rank == joiner:
+        pg.join_group(backend)
+    else:
+        wait_until(
+            lambda: all(pg.get_peer_state(backend, [joiner])),
+            description="joiner endpoint ready for Graph activation",
+        )
+        response = pg.recover_ranks(backend, [joiner])
+        assert response.status == pg.ProposalStatus.Applied, response.reject_reason
+    all_ranks.wait(timeout=30)
+    _check_allreduce_graph(
+        tensor, graph, hints, ctx.world_size * (ctx.world_size + 1) // 2
+    )
+    # Finish every GPU invocation before changing membership again.
+    all_ranks.wait(timeout=30)
+    if ctx.rank != joiner:
+        response = pg.deactivate_ranks(backend, [joiner])
+        assert response.status == pg.ProposalStatus.Applied, response.reject_reason
+        for _ in range(2):
+            _check_allreduce_graph(tensor, graph, hints, original_sum)
+    # Keep the inactive joiner alive while the original ranks reuse their Graphs.
+    all_ranks.wait(timeout=30)
+    graph.reset()
+    del _work
+    torch.cuda.synchronize(ctx.device)
+    ctx.record_result({"role": "joiner" if ctx.rank == joiner else "original"})
+
+
+def _graph_failure_worker(
+    ctx: MooncakePGWorkerContext,
+    before_failure: mp.Barrier,
+    broken_exited: mp.Event,
+) -> None:
+    ctx.init_group(auto_deactivate_on_failure=False, auto_sync_on_failure=False)
+    backend = ctx.get_backend()
+    tensor, graph, _work, hints = _capture_allreduce_graph(ctx)
+    expected = ctx.world_size * (ctx.world_size + 1) // 2
+    _check_allreduce_graph(tensor, graph, hints, expected)
+    before_failure.wait(timeout=30)
+    if ctx.rank == BROKEN_RANK:
+        ctx.record_result({"role": "broken"})
+        os._exit(0)
+    if not broken_exited.wait(timeout=30):
+        raise TimeoutError("waiting for the failed GPU process to exit")
+
+    hints.zero_()
+    graph.replay()
+    torch.cuda.synchronize(ctx.device)
+    assert bool(torch.any(hints)), "Graph must report failure before deactivation"
+    # Manual membership keeps the failed rank active until this reconciliation.
+    response = pg.sync_after_failure(backend)
+    assert response.status in (
+        pg.SyncAfterFailureStatus.Reconciled,
+        pg.SyncAfterFailureStatus.NoPending,
+    ), response.reject_reason
+    response = pg.deactivate_ranks(backend, [BROKEN_RANK])
+    assert response.status in (
+        pg.ProposalStatus.Applied,
+        pg.ProposalStatus.AppliedWithDroppedRanks,
+    ), response.reject_reason
+    if response.status == pg.ProposalStatus.AppliedWithDroppedRanks:
+        assert set(response.dropped_ranks) == {BROKEN_RANK}
+    # Neither the Graph nor its tensor/Work is replaced after recovery.
+    for _ in range(2):
+        _check_allreduce_graph(tensor, graph, hints, expected - BROKEN_RANK - 1)
+    graph.reset()
+    del _work
+    torch.cuda.synchronize(ctx.device)
+    ctx.record_result({"role": "survivor"})
+
+
 def _fault_detection_worker(
     ctx: MooncakePGWorkerContext,
     broken_exited: mp.Event,
@@ -1506,6 +1626,42 @@ class TestMooncakePGElasticCPU(_ElasticMixin, MooncakePGCPUBackendTestCase):
 
 
 class TestMooncakePGElasticCUDA(_ElasticMixin, MooncakePGCUDABackendTestCase):
+    def _require_graph_membership_test(self) -> None:
+        if os.getenv("MOONCAKE_PG_PREFERRED_GPU_COLLECTIVE_BACKEND") != "new":
+            self.skipTest("membership-changing Graphs require the new GPU backend")
+        if torch.cuda.device_count() < 3:
+            self.skipTest("membership-changing Graphs require three CUDA devices")
+
+    def test_same_graph_scale_up_and_shrink(self) -> None:
+        self._require_graph_membership_test()
+        spawn = mp.get_context("spawn")
+        rows = self.spawn_backend_and_collect(
+            _graph_membership_worker,
+            spawn.Event(),
+            spawn.Barrier(3),
+            world_size=3,
+            timeout_s=120,
+        )
+        self.assert_all_ok(rows)
+        self.assertEqual(sum(row["role"] == "original" for row in rows), 2)
+        self.assertEqual(sum(row["role"] == "joiner" for row in rows), 1)
+
+    def test_same_graph_after_rank_failure(self) -> None:
+        self._require_graph_membership_test()
+        spawn = mp.get_context("spawn")
+        broken_exited = spawn.Event()
+        rows = self.spawn_backend_and_collect(
+            _graph_failure_worker,
+            spawn.Barrier(3),
+            broken_exited,
+            world_size=3,
+            timeout_s=120,
+            process_exit_events={BROKEN_RANK: broken_exited},
+        )
+        self.assert_all_ok(rows)
+        self.assertEqual(sum(row["role"] == "survivor" for row in rows), 2)
+        self.assertEqual(sum(row["role"] == "broken" for row in rows), 1)
+
     @classmethod
     def configure_for_cuda_device_count(cls, device_count: int) -> None:
         if device_count < 2:
