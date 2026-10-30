@@ -169,6 +169,15 @@ struct OssAdapterEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MOONCAKE_OSS_UPLOAD_BUFFER_SIZE);
 };
 
+struct ValkeyAdapterEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_VALKEY_ADDR);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_VALKEY_USERNAME);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_VALKEY_PASSWORD);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_VALKEY_POOL_SIZE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_VALKEY_TIMEOUT_MS);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_VALKEY_TRANSPORT);
+};
+
 struct S3AdapterEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_S3_ENDPOINT);
     MC_DEFINE_ENV_VAR(std::string, AWS_ENDPOINT_URL);

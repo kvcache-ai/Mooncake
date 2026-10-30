@@ -62,6 +62,15 @@ class DistributedStorageBackend : public StorageBackendInterface {
         return storage_mode_ == DistributedStorageMode::kObjectStorage;
     }
 
+    // Forwards the owner's Transfer Engine segment to the object storage
+    // adapter, if there is one (see
+    // ObjectStorageAdapter::BindTransferEndpoint).
+    void BindTransferEndpoint(const std::string& segment_name) {
+        if (object_storage_adapter_) {
+            object_storage_adapter_->BindTransferEndpoint(segment_name);
+        }
+    }
+
     tl::expected<void, ErrorCode> Init() override;
 
     tl::expected<int64_t, ErrorCode> BatchOffload(
