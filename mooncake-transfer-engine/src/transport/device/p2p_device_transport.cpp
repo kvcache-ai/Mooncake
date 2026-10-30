@@ -37,7 +37,7 @@ namespace device {
 
 namespace {
 
-bool envEnabled(const char* name) {
+bool parseBoolEnv(const char* name) {
     const char* value = std::getenv(name);
     if (value == nullptr) return false;
     std::string s(value);
@@ -114,16 +114,6 @@ bool supportFabricMem() { return false; }
 
 #ifdef USE_MACA
 namespace {
-
-bool parseBoolEnv(const char* name) {
-    const char* value = std::getenv(name);
-    if (value == nullptr) return false;
-    std::string s(value);
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return s == "1" || s == "on" || s == "true" || s == "yes";
-}
 
 std::string getLowerEnv(const char* name) {
     const char* value = std::getenv(name);
@@ -818,7 +808,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
         available[rank] = 1;
         peer_ptrs_host_[rank] = local_ptr;
         const bool allow_cross_node_p2p =
-            envEnabled("MC_DEVICE_API_P2P_ALLOW_CROSS_LOGICAL_NODE");
+            parseBoolEnv("MC_DEVICE_API_P2P_ALLOW_CROSS_LOGICAL_NODE");
 
 #if defined(USE_CUDA)
         if (use_fabric_mem_) {
@@ -922,41 +912,54 @@ class P2pDeviceTransportImpl : public P2pTransport {
             if (active_ranks_mask[dst] == 0) continue;
             if (dst == rank) continue;
 
+            const bool is_local_group_peer =
+                dst >= group_start && dst < group_end;
             int dst_device = dst % device_count;
-            if (!allow_cross_node_p2p) {
+            cudaError_t err = cudaSuccess;
+            if (is_local_group_peer) {
                 int can_access = 0;
-                cudaDeviceCanAccessPeer(&can_access, device_id, dst_device);
+                err = cudaDeviceCanAccessPeer(&can_access, device_id,
+                                              dst_device);
+                if (err != cudaSuccess) {
+                    LOG(WARNING)
+                        << "[EP P2P] cudaDeviceCanAccessPeer failed for rank "
+                        << rank << " -> rank " << dst << ": "
+                        << cudaGetErrorString(err);
+                    cudaGetLastError();
+                    continue;
+                }
                 LOG(INFO) << "[EP P2P] rank " << rank << " (device "
                           << device_id << ") -> rank " << dst << " (device "
                           << dst_device << "): canAccessPeer=" << can_access;
                 if (!can_access) continue;
 
-                cudaError_t err = cudaDeviceEnablePeerAccess(dst_device, 0);
+#ifdef USE_MACA
+                int src_physical = physicalDeviceFromVisibleList(device_id);
+                int dst_physical = physicalDeviceFromVisibleList(dst_device);
+                if (!macaP2pPairAllowed(src_physical, dst_physical)) {
+                    LOG(INFO) << "[EP P2P] rank " << rank << " physical GPU"
+                              << src_physical << " -> rank " << dst
+                              << " physical GPU" << dst_physical
+                              << " disabled for MACA EP fast path; set "
+                                 "MOONCAKE_EP_MACA_ALLOW_NODE_P2P=1 or "
+                                 "MOONCAKE_EP_MACA_P2P_PAIRS to override";
+                    continue;
+                }
+#endif
+
+                err = cudaDeviceEnablePeerAccess(dst_device, 0);
                 if (err != cudaSuccess &&
                     err != cudaErrorPeerAccessAlreadyEnabled) {
                     LOG(WARNING)
                         << "[EP P2P] rank " << rank
                         << " failed to enable peer access to device "
                         << dst_device << ": " << cudaGetErrorString(err);
+                    cudaGetLastError();
                     continue;
                 }
                 if (err == cudaErrorPeerAccessAlreadyEnabled)
                     cudaGetLastError();
             }
-
-#ifdef USE_MACA
-            int src_physical = physicalDeviceFromVisibleList(device_id);
-            int dst_physical = physicalDeviceFromVisibleList(dst_device);
-            if (!macaP2pPairAllowed(src_physical, dst_physical)) {
-                LOG(INFO) << "[EP P2P] rank " << rank << " physical GPU"
-                          << src_physical << " -> rank " << dst
-                          << " physical GPU" << dst_physical
-                          << " disabled for MACA EP fast path; set "
-                             "MOONCAKE_EP_MACA_ALLOW_NODE_P2P=1 or "
-                             "MOONCAKE_EP_MACA_P2P_PAIRS to override";
-                continue;
-            }
-#endif
 
             if (dst >= static_cast<int>(remote_handles.size())) continue;
             const auto& h = remote_handles[dst];
@@ -965,7 +968,6 @@ class P2pDeviceTransportImpl : public P2pTransport {
             constexpr size_t kHandleBytes = sizeof(cudaIpcMemHandle_t);
             constexpr size_t kNumInt32s =
                 (kHandleBytes + sizeof(int32_t) - 1) / sizeof(int32_t);
-            cudaError_t err;
 #ifdef USE_MACA
             std::string ipc_mode = macaIpcMode();
             if (ipc_mode == "cross-v2" || ipc_mode == "cross_v2") {
@@ -984,6 +986,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
                         << "[EP P2P] rank " << rank
                         << " failed to open cross_v2 IPC handle for rank "
                         << dst << ": " << cudaGetErrorString(err);
+                    cudaGetLastError();
                     continue;
                 }
                 LOG(INFO) << "[EP P2P] rank " << rank
@@ -1014,6 +1017,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 LOG(WARNING) << "[EP P2P] rank " << rank
                              << " failed to open IPC handle for rank " << dst
                              << ": " << cudaGetErrorString(err);
+                cudaGetLastError();
                 continue;
             }
             LOG(INFO) << "[EP P2P] rank " << rank
