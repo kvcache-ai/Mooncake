@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <sys/mman.h>
@@ -30,11 +31,16 @@ constexpr int kBestEffortPercentStep = 10;
 
 std::atomic<uint32_t> g_agent_alloc_next{0};
 
-bool BindNextAgentDevice() {
+// logic_device_id is the standalone round-robin slot, or -1 when this alloc
+// stays on the caller's device. The caller passes it to the matching pool.
+bool BindNextAgentDevice(int32_t* logic_device_id) {
+    if (logic_device_id != nullptr) {
+        *logic_device_id = -1;
+    }
     if (!globalConfig().ascend_agent_mode) {
         return true;
     }
-    auto &mgr = ContextManager::getInstance();
+    auto& mgr = ContextManager::getInstance();
     if (!mgr.isInitialized()) {
         return true;
     }
@@ -43,6 +49,9 @@ bool BindNextAgentDevice() {
         return true;
     }
     const uint32_t idx = g_agent_alloc_next.load(std::memory_order_relaxed) % n;
+    if (logic_device_id != nullptr) {
+        *logic_device_id = static_cast<int32_t>(idx);
+    }
     if (!mgr.setCurrentContext(static_cast<int32_t>(idx))) {
         LOG(ERROR) << "Failed to set agent-mode alloc context for device "
                    << idx;
@@ -66,21 +75,21 @@ size_t align_down_1g(size_t n) {
 }
 
 struct StoreMemRange {
-    void *base;
+    void* base;
     size_t size;
 };
 std::mutex g_store_mem_mutex;
 std::vector<StoreMemRange> g_store_mem_ranges;
 
-void remove_store_memory_range(void *ptr) {
+void remove_store_memory_range(void* ptr) {
     std::lock_guard<std::mutex> store_lock(g_store_mem_mutex);
     auto it = std::remove_if(
         g_store_mem_ranges.begin(), g_store_mem_ranges.end(),
-        [ptr](const StoreMemRange &range) { return range.base == ptr; });
+        [ptr](const StoreMemRange& range) { return range.base == ptr; });
     g_store_mem_ranges.erase(it, g_store_mem_ranges.end());
 }
 
-void add_store_memory_range(void *ptr, size_t size) {
+void add_store_memory_range(void* ptr, size_t size) {
     std::lock_guard<std::mutex> store_lock(g_store_mem_mutex);
     g_store_mem_ranges.push_back({ptr, size});
 }
@@ -88,7 +97,7 @@ void add_store_memory_range(void *ptr, size_t size) {
 // ASCEND_USE_SHMEM. Opt-in: allocate a memfd a peer on this machine can map.
 // Parsed here so the store and GlobalConfig do not have to carry the switch.
 bool SharedHostMemRequested() {
-    const char *value = std::getenv("ASCEND_USE_SHMEM");
+    const char* value = std::getenv("ASCEND_USE_SHMEM");
     if (value == nullptr) {
         return false;
     }
@@ -106,14 +115,14 @@ bool SharedHostMemRequested() {
 // running process.
 bool IsA5Soc() {
     static const bool kIsA5 = []() -> bool {
-        const char *soc_name = aclrtGetSocName();
+        const char* soc_name = aclrtGetSocName();
         if (soc_name == nullptr || soc_name[0] == '\0') {
             LOG(WARNING) << "aclrtGetSocName returned no name; assuming the "
                             "SoC is not A5";
             return false;
         }
         const bool is_a5 = std::strstr(soc_name, "Ascend950") != nullptr;
-        LOG(INFO) << "Ascend SoC: " << soc_name << ", A5=" << is_a5;
+        LOG(INFO) << "Ascend SoC: " << soc_name;
         return is_a5;
     }();
     return kIsA5;
@@ -123,7 +132,7 @@ bool IsA5Soc() {
 // topology. A set path means this process will drive host memory from a NIC,
 // which is the same reason A5 cannot use aclrtMallocHost.
 bool CustomTopologyConfigured() {
-    const char *path = std::getenv("MC_CUSTOM_TOPO_JSON");
+    const char* path = std::getenv("MC_CUSTOM_TOPO_JSON");
     return path != nullptr && path[0] != '\0';
 }
 
@@ -135,7 +144,7 @@ bool HostMmapRequested() {
     if (CustomTopologyConfigured()) {
         return true;
     }
-    const char *config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+    const char* config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
     return HasRoceHostProtocolDescInGlobalResourceConfig(config);
 }
 
@@ -148,7 +157,7 @@ struct HostMappingRecord {
     size_t mapped_size;
 };
 std::mutex g_host_mapping_mutex;
-std::unordered_map<void *, HostMappingRecord> g_host_mappings;
+std::unordered_map<void*, HostMappingRecord> g_host_mappings;
 
 size_t align_up_to_thp(size_t total_size) {
     const uint64_t granularity = host_memfd::Granularity();
@@ -157,10 +166,10 @@ size_t align_up_to_thp(size_t total_size) {
 
 // Returns the exact requested size to the caller; the padding up to the THP
 // granularity is left unused but stays mapped until the segment is freed.
-void *allocate_host_mapping(size_t total_size, bool shared) {
+void* allocate_host_mapping(size_t total_size, bool shared) {
     const size_t mapped_size = align_up_to_thp(total_size);
     int fd = -1;
-    void *addr = nullptr;
+    void* addr = nullptr;
     std::string error;
     const bool ok = shared
                         ? host_memfd::Create(mapped_size, fd, addr, error)
@@ -187,7 +196,7 @@ void *allocate_host_mapping(size_t total_size, bool shared) {
 
 // Returns true when `ptr` was an mmap-backed host allocation and has been
 // released.
-bool free_host_mapping(void *ptr) {
+bool free_host_mapping(void* ptr) {
     HostMappingRecord record{};
     {
         std::lock_guard<std::mutex> lock(g_host_mapping_mutex);
@@ -217,9 +226,9 @@ struct AllocRecord {
     size_t size;
 };
 std::mutex g_vmm_alloc_mutex;
-std::unordered_map<void *, AllocRecord> g_vmm_alloc_records;
+std::unordered_map<void*, AllocRecord> g_vmm_alloc_records;
 
-int allocate_physical_memory(size_t total_size, aclrtDrvMemHandle &handle,
+int allocate_physical_memory(size_t total_size, aclrtDrvMemHandle& handle,
                              bool quiet) {
     int32_t user_dev_id;
     auto ret = aclrtGetDevice(&user_dev_id);
@@ -281,7 +290,7 @@ int allocate_physical_memory(size_t total_size, aclrtDrvMemHandle &handle,
 // adxl::MallocMem grants it internally for its own allocations, so the direct
 // ACL VMM path has to do the same. location.id is a driver logical id while
 // aclrtGetDevice returns a user id (ASCEND_RT_VISIBLE_DEVICES), so convert.
-int grant_current_device_access(void *va, size_t total_size, bool quiet) {
+int grant_current_device_access(void* va, size_t total_size, bool quiet) {
     int32_t user_dev_id = -1;
     auto ret = aclrtGetDevice(&user_dev_id);
     if (ret != ACL_ERROR_NONE) {
@@ -316,12 +325,12 @@ int grant_current_device_access(void *va, size_t total_size, bool quiet) {
 
 // Direct ACL VMM allocation (always bypasses adxl MallocMem).
 // Used by shm_helper when ascend_agent_mode && ascend_use_fabric_mem.
-void *allocate_vmm_memory_direct_impl(size_t total_size, bool quiet = false) {
+void* allocate_vmm_memory_direct_impl(size_t total_size, bool quiet = false) {
     aclrtDrvMemHandle handle = nullptr;
     if (allocate_physical_memory(total_size, handle, quiet) != 0) {
         return nullptr;
     }
-    void *va = nullptr;
+    void* va = nullptr;
     auto ret = aclrtReserveMemAddress(&va, total_size, 0, nullptr, 1);
     if (ret != ACL_ERROR_NONE) {
         if (!quiet) {
@@ -354,8 +363,8 @@ void *allocate_vmm_memory_direct_impl(size_t total_size, bool quiet = false) {
 // direct VMM. Matches original ascend_allocate_memory behavior — adxl failure
 // does not fall back to direct VMM. When quiet=true, skip failure ERROR logs
 // (used by best-effort percentile probes).
-void *allocate_fabric_exact(size_t total_size, bool quiet = false) {
-    void *va = nullptr;
+void* allocate_fabric_exact(size_t total_size, bool quiet = false) {
+    void* va = nullptr;
     if (&adxl::AdxlEngine::MallocMem != nullptr) {
         auto status = adxl::AdxlEngine::MallocMem(adxl::MemType::MEM_HOST,
                                                   total_size, &va);
@@ -381,7 +390,37 @@ void *allocate_fabric_exact(size_t total_size, bool quiet = false) {
 }
 #endif
 
-void *AllocateStoreMemoryImpl(size_t total_size, const std::string &protocol) {
+void* RunNonFabricAlloc(const std::function<void*()>& alloc,
+                        int32_t logic_device_id) {
+    aclrtContext ctx = nullptr;
+    const bool have_ctx =
+        aclrtGetCurrentContext(&ctx) == ACL_ERROR_NONE && ctx != nullptr;
+    void* ptr = nullptr;
+    auto run = [&] {
+        if (have_ctx) {
+            const auto ret = aclrtSetCurrentContext(ctx);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(WARNING)
+                    << "[affinity] aclrtSetCurrentContext before host alloc "
+                       "failed, ret="
+                    << ret;
+            }
+        }
+        ptr = alloc();
+    };
+    // Standalone selected a device. Run the alloc on that device's transfer
+    // pool so the first touch follows that device's CPU affinity. No
+    // per-device pool (single device, or the dispatcher is not installed)
+    // keeps the shared runner.
+    if (logic_device_id >= 0) {
+        RunOnDeviceBoundAffinityThread(logic_device_id, run);
+    } else {
+        RunOnBoundAffinityThread(run);
+    }
+    return ptr;
+}
+
+void* AllocateStoreMemoryImpl(size_t total_size, const std::string& protocol) {
     if (globalConfig().ascend_use_fabric_mem) {
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
         return allocate_fabric_exact(total_size);
@@ -409,7 +448,7 @@ void *AllocateStoreMemoryImpl(size_t total_size, const std::string &protocol) {
         return allocate_host_mapping(total_size, /*shared=*/false);
     }
 
-    void *buffer = nullptr;
+    void* buffer = nullptr;
     auto ret = aclrtMallocHost(&buffer, total_size);
     if (ret != ACL_ERROR_NONE) {
         LOG(ERROR) << "Failed to allocate memory: " << ret;
@@ -422,12 +461,12 @@ void *AllocateStoreMemoryImpl(size_t total_size, const std::string &protocol) {
     return buffer;
 }
 
-void *AllocateExactOnBoundDevice(size_t total_size, const std::string &protocol,
-                                 size_t *actual_size,
+void* AllocateExactOnBoundDevice(size_t total_size, const std::string& protocol,
+                                 size_t* actual_size,
                                  AscendHostAllocFn host_alloc,
                                  size_t host_alignment,
                                  bool defer_hugetlb_population) {
-    void *ptr =
+    void* ptr =
         host_alloc != nullptr
             ? host_alloc(total_size, host_alignment, defer_hugetlb_population)
             : AllocateStoreMemoryImpl(total_size, protocol);
@@ -440,7 +479,7 @@ void *AllocateExactOnBoundDevice(size_t total_size, const std::string &protocol,
 }
 
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
-void *AllocateFabricBestEffort(size_t target_size, size_t *actual_size) {
+void* AllocateFabricBestEffort(size_t target_size, size_t* actual_size) {
     // Try 100%, 90%, ... down to 50% of configured size (1G-aligned).
     // Skip candidates that fall below the unaligned 50% floor after round-down
     // (e.g. 2.1 GiB target → 50% is 1.05 GiB → 1 GiB must not be accepted).
@@ -458,7 +497,7 @@ void *AllocateFabricBestEffort(size_t target_size, size_t *actual_size) {
             continue;
         }
         last_tried = sz;
-        void *ptr = allocate_fabric_exact(sz, /*quiet=*/true);
+        void* ptr = allocate_fabric_exact(sz, /*quiet=*/true);
         if (ptr != nullptr) {
             *actual_size = sz;
             CommitAgentDeviceSlot();
@@ -476,7 +515,7 @@ void *AllocateFabricBestEffort(size_t target_size, size_t *actual_size) {
 #endif
 }  // namespace
 
-void *ascend_allocate_vmm_memory_direct(size_t total_size) {
+void* ascend_allocate_vmm_memory_direct(size_t total_size) {
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
     return allocate_vmm_memory_direct_impl(total_size);
 #else
@@ -485,7 +524,7 @@ void *ascend_allocate_vmm_memory_direct(size_t total_size) {
 #endif
 }
 
-aclrtDrvMemHandle ascend_get_physical_handle_from_va(void *va) {
+aclrtDrvMemHandle ascend_get_physical_handle_from_va(void* va) {
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
     std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
     auto it = g_vmm_alloc_records.find(va);
@@ -499,20 +538,28 @@ aclrtDrvMemHandle ascend_get_physical_handle_from_va(void *va) {
 #endif
 }
 
-void *ascend_allocate_memory(size_t total_size, const std::string &protocol) {
-    if (!BindNextAgentDevice()) {
+void* ascend_allocate_memory(size_t total_size, const std::string& protocol) {
+    int32_t logic_device_id = -1;
+    if (!BindNextAgentDevice(&logic_device_id)) {
         return nullptr;
     }
-    void *ptr = AllocateStoreMemoryImpl(total_size, protocol);
+    void* ptr = nullptr;
+    if (globalConfig().ascend_use_fabric_mem) {
+        ptr = AllocateStoreMemoryImpl(total_size, protocol);
+    } else {
+        ptr = RunNonFabricAlloc(
+            [&] { return AllocateStoreMemoryImpl(total_size, protocol); },
+            logic_device_id);
+    }
     if (ptr) {
         CommitAgentDeviceSlot();
     }
     return ptr;
 }
 
-void *ascend_allocate_memory_best_effort(size_t target_size,
-                                         const std::string &protocol,
-                                         size_t *actual_size,
+void* ascend_allocate_memory_best_effort(size_t target_size,
+                                         const std::string& protocol,
+                                         size_t* actual_size,
                                          AscendHostAllocFn host_alloc,
                                          size_t host_alignment,
                                          bool defer_hugetlb_population) {
@@ -521,13 +568,18 @@ void *ascend_allocate_memory_best_effort(size_t target_size,
         return nullptr;
     }
     *actual_size = 0;
-    if (!BindNextAgentDevice()) {
+    int32_t logic_device_id = -1;
+    if (!BindNextAgentDevice(&logic_device_id)) {
         return nullptr;
     }
     if (!globalConfig().ascend_use_fabric_mem) {
-        return AllocateExactOnBoundDevice(target_size, protocol, actual_size,
-                                          host_alloc, host_alignment,
-                                          defer_hugetlb_population);
+        return RunNonFabricAlloc(
+            [&] {
+                return AllocateExactOnBoundDevice(
+                    target_size, protocol, actual_size, host_alloc,
+                    host_alignment, defer_hugetlb_population);
+            },
+            logic_device_id);
     }
     (void)protocol;
     (void)host_alloc;
@@ -542,7 +594,7 @@ void *ascend_allocate_memory_best_effort(size_t target_size,
 #endif
 }
 
-bool ascend_get_shared_host_handle(void *addr, std::string *handle) {
+bool ascend_get_shared_host_handle(void* addr, std::string* handle) {
     if (addr == nullptr || handle == nullptr) {
         return false;
     }
@@ -558,12 +610,12 @@ bool ascend_get_shared_host_handle(void *addr, std::string *handle) {
     return true;
 }
 
-bool ascend_is_store_memory(void *addr, size_t length) {
+bool ascend_is_store_memory(void* addr, size_t length) {
     if (!addr || length == 0) return false;
     auto addr_start = reinterpret_cast<uintptr_t>(addr);
     uintptr_t addr_end = addr_start + length;
     std::lock_guard<std::mutex> lock(g_store_mem_mutex);
-    for (const auto &range : g_store_mem_ranges) {
+    for (const auto& range : g_store_mem_ranges) {
         auto range_start = reinterpret_cast<uintptr_t>(range.base);
         uintptr_t range_end = range_start + range.size;
         if (addr_start < range_end && addr_end > range_start) {
@@ -573,12 +625,12 @@ bool ascend_is_store_memory(void *addr, size_t length) {
     return false;
 }
 
-bool ascend_is_direct_vmm_memory(void *addr, size_t length) {
+bool ascend_is_direct_vmm_memory(void* addr, size_t length) {
     if (!addr || length == 0) return false;
     const auto addr_start = reinterpret_cast<uintptr_t>(addr);
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
     std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
-    for (const auto &[base, record] : g_vmm_alloc_records) {
+    for (const auto& [base, record] : g_vmm_alloc_records) {
         if (!record.is_direct_alloc) {
             continue;
         }
@@ -598,7 +650,7 @@ bool ascend_is_direct_vmm_memory(void *addr, size_t length) {
     return false;
 }
 
-void ascend_free_memory(const std::string &protocol, void *ptr) {
+void ascend_free_memory(const std::string& protocol, void* ptr) {
     // Route by the per-allocation record. Fabric mode is a process-global
     // toggled during TE init, and the shared-memfd choice is an environment
     // read at alloc time; neither can be trusted at free time.

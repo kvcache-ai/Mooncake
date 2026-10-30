@@ -40,6 +40,7 @@
 #include "topology.h"
 #include "char_util.h"
 #ifdef USE_EFA
+#include "transport/efa_transport/efa_discovery.h"
 #include "transport/efa_transport/efa_neuron.h"
 #endif
 #ifdef USE_UB
@@ -324,6 +325,83 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
     return devices;
 #endif
 }
+
+#if defined(USE_EFA) && !defined(USE_CXI)
+// Replaces the EFA NICs in `devices` with the ones libfabric reports. Those
+// are exactly the devices the EFA transport can open (EfaContext uses the same
+// fi_getinfo() hints), so EFA discovery does not depend on how a device looks
+// through libibverbs and sysfs. Existing entries keep their position, which
+// keeps NIC indices unchanged; NICs only libfabric reports are appended.
+//
+// Hosts whose verbs devices are all non-EFA (e.g. Mellanox) are left alone,
+// so RDMA-only processes never initialize libfabric.
+static void useLibfabricEfaNics(std::vector<InfinibandDevice> &devices,
+                                const std::vector<std::string> &filter) {
+    bool verbs_has_efa = false;
+    for (const auto &device : devices) {
+        if (isEfaDevice(device.name)) {
+            verbs_has_efa = true;
+            break;
+        }
+    }
+    if (!devices.empty() && !verbs_has_efa) return;
+
+    std::vector<EfaNic> nics;
+    std::string error;
+    if (!listEfaNics(nics, &error)) {
+        if (verbs_has_efa) {
+            LOG(INFO) << "Using the EFA devices found through libibverbs: "
+                         "cannot list them through libfabric ("
+                      << error << ")";
+        }
+        return;
+    }
+
+    const auto whitelist = getIbvDeviceWhitelist();
+    std::map<std::string, const EfaNic *> wanted;
+    for (const auto &nic : nics) {
+        if (!filter.empty() &&
+            std::find(filter.begin(), filter.end(), nic.name) == filter.end())
+            continue;
+        if (!whitelist.empty() && !whitelist.count(nic.name)) continue;
+        wanted[nic.name] = &nic;
+    }
+
+    auto to_device = [](const EfaNic &nic, const InfinibandDevice *verbs) {
+        InfinibandDevice device{.name = nic.name,
+                                .pci_bus_id = nic.pci_bus_id,
+                                .numa_node = nic.numa_node};
+        if (device.pci_bus_id.empty() && verbs) {
+            device.pci_bus_id = verbs->pci_bus_id;
+            device.numa_node = verbs->numa_node;
+        }
+        return device;
+    };
+
+    std::vector<InfinibandDevice> merged;
+    std::set<std::string> placed;
+    for (const auto &device : devices) {
+        if (!isEfaDevice(device.name)) {
+            merged.push_back(device);
+            continue;
+        }
+        auto it = wanted.find(device.name);
+        if (it == wanted.end()) {
+            LOG(INFO) << "Skipping EFA device " << device.name
+                      << ": libfabric does not offer it";
+            continue;
+        }
+        merged.push_back(to_device(*it->second, &device));
+        placed.insert(device.name);
+    }
+    for (const auto &entry : wanted) {
+        if (placed.count(entry.first)) continue;
+        merged.push_back(to_device(*entry.second, nullptr));
+        LOG(INFO) << "EFA device " << entry.first << " found through libfabric";
+    }
+    devices = std::move(merged);
+}
+#endif
 
 static void precomputeResolvedHcaPeerAffinity(
     const TopologyMatrix &matrix, const std::map<std::string, int> &hca_id_map,
@@ -748,6 +826,9 @@ int Topology::discover(const std::vector<std::string> &filter,
     matrix_.clear();
     resolved_hca_peer_affinity_by_local_.clear();
     auto all_hca = listInfiniBandDevices(filter, exclude_efa);
+#if defined(USE_EFA) && !defined(USE_CXI)
+    if (!exclude_efa) useLibfabricEfaNics(all_hca, filter);
+#endif
     for (auto &ent : discoverCpuTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }

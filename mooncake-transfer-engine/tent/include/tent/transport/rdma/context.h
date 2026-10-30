@@ -40,6 +40,10 @@
 namespace mooncake {
 namespace tent {
 
+// Historical default for the configured QP depth. An explicit setting may be
+// higher; the device limit is applied separately.
+constexpr int kIdealRdAtomicDepth = 16;
+
 class RdmaCQ;
 class RdmaEndPoint;
 class EndpointStore;
@@ -199,10 +203,33 @@ class RdmaContext {
     // PCIe Relaxed Ordering support
     bool isRelaxedOrderingEnabled() const { return relaxed_ordering_enabled_; }
 
+    // False when the HCA reports IBV_ATOMIC_NONE. Host data QPs then omit
+    // IBV_ACCESS_REMOTE_ATOMIC. Transfers stay RDMA READ/WRITE.
+    bool supportsRdmaAtomic() const { return supports_rdma_atomic_; }
+
+    // min(configured depth, this NIC's real max_qp_rd_atom). Explicit 0 stays
+    // 0. A non-positive device report is floored at 1 so ibv_modify_qp() fails
+    // at setup instead of every later READ.
+    uint8_t clampDestRdAtomic(uint8_t requested) const {
+        return clampRdAtomicRequest(requested, max_qp_rd_atom_);
+    }
+
+    uint8_t clampInitRdAtomic(uint8_t requested) const {
+        return clampRdAtomicRequest(requested, max_qp_init_rd_atom_);
+    }
+
     // Notification CQ (dedicated for notification QPs)
     RdmaCQ *notifyCq() { return notify_cq_; }
 
    private:
+    static uint8_t clampRdAtomicRequest(uint8_t requested, int device_max) {
+        if (requested == 0) return 0;
+        if (device_max <= 0) return 1;
+        if (static_cast<int>(requested) > device_max)
+            return static_cast<uint8_t>(device_max);
+        return requested;
+    }
+
     int openDevice(const std::string &device_name, uint8_t port);
     // Decode one ibv_query_port result into active_speed_/active_width_.
     void recordPortSpeed(const ibv_port_attr &port_attr);
@@ -250,6 +277,9 @@ class RdmaContext {
     std::atomic<uint64_t> effective_speed_query_failures_{0};
     // Whether the last query errored; drives the transition logging.
     std::atomic<bool> effective_speed_query_failing_{false};
+    bool supports_rdma_atomic_ = true;
+    int max_qp_rd_atom_ = kIdealRdAtomicDepth;
+    int max_qp_init_rd_atom_ = kIdealRdAtomicDepth;
     int gid_index_ = -1;
     ibv_gid gid_;
 

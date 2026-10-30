@@ -167,6 +167,7 @@ deployment/store-rs/index
 deployment/kubernetes-deployment-guide/index
 deployment/integrations/sglang/index
 deployment/integrations/vllm/index
+deployment/mooncake-ep-jit
 Mooncake x LMCache Integration<deployment/integrations/lmcache/index>
 Mooncake x LMDeploy Integration<deployment/integrations/lmdeploy>
 :::
@@ -240,4 +241,5 @@ troubleshooting/store-rs-key-access
 
 community/governance
 community/ecosystem-prs
+community/pypi-downloads
 :::

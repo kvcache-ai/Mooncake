@@ -307,12 +307,25 @@ endif()
 if(WITH_EP)
   install(TARGETS _ep LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
                               COMPONENT python)
-  install(
-    DIRECTORY "${EP_PG_STAGING_DIR}/"
-    DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}"
-    COMPONENT python
-    FILES_MATCHING
-    PATTERN "*.so")
+  # XPU builds no Mooncake PG, so EP_PG_STAGING_DIR is unset there.
+  if(NOT USE_XPU)
+    install(
+      DIRECTORY "${EP_PG_STAGING_DIR}/"
+      DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}"
+      COMPONENT python
+      FILES_MATCHING
+      PATTERN "*.so")
+
+    # The CUDA EP JIT runs nvcc on the user's machine, so nvcc needs the kernel
+    # headers there too. Put them in the wheel, in a mooncake_ep_jit/ directory
+    # next to libmooncake_ep_device.so.
+    if(USE_CUDA)
+      install(
+        DIRECTORY "${CMAKE_BINARY_DIR}/mooncake_ep_jit/"
+        DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}/mooncake_ep_jit"
+        COMPONENT python)
+    endif()
+  endif()
   install(
     FILES
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/ep.py"
@@ -379,7 +392,7 @@ if(SKBUILD)
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()
 
-  if(WITH_EP)
+  if(WITH_EP AND NOT USE_XPU)
     install(TARGETS mooncake_pg
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()

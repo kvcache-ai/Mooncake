@@ -16,13 +16,16 @@
 // just the standalone transport. Two P2P engines need no external metadata
 // server. The same-host peer has a non-local segment ID, just like another
 // process; the test never shares the peer's device address with a local copy.
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <tuple>
@@ -1023,6 +1026,140 @@ TEST_P(XpuDirectRdmaTest, HostOnlyPolicyKeepsStaging) {
 }
 
 INSTANTIATE_TEST_SUITE_P(SelectionModes, XpuDirectRdmaTest, ::testing::Bool());
+
+// XPU device memory <-> file over io_uring alone. The kernel cannot DMA to or
+// from a USM device address, so io_uring has to stage through host memory.
+// Skips when the temp directory does not support O_DIRECT.
+class XpuIoUringFileTest : public ::testing::TestWithParam<bool> {  // legacy
+   protected:
+    static constexpr uint64_t kFileOffset = 4096;
+
+    std::shared_ptr<Config> config() {
+        auto c = std::make_shared<Config>();
+        c->set("metadata_type", "p2p");
+        c->set("metadata_servers", "");
+        c->set("rpc_server_hostname", "127.0.0.1");
+        c->set("rpc_server_port", "0");
+        c->set("log_level", "warning");
+        c->set("transports/tcp/enable", true);
+        c->set("transports/rdma/enable", false);
+        c->set("transports/shm/enable", false);
+        c->set("transports/mpcomm/enable", false);
+        c->set("transports/gds/enable", false);
+        c->set("transports/io_uring/enable", true);
+        c->set("transports/xpu/enable", true);
+        c->set("use_legacy_transport_selection", GetParam());
+        return c;
+    }
+    void SetUp() override {
+        auto& platform = Platform::getLoader(config());
+        MemoryOptions opts;
+        opts.location = "xpu:0";
+        void* probe = nullptr;
+        if (!platform.allocate(&probe, 4096, opts).ok())
+            GTEST_SKIP() << "No SYCL device available";
+        ASSERT_TRUE(platform.free(probe, 4096).ok());
+
+        std::string name =
+            ::testing::TempDir() + "mooncake_tent_xpu_iouring_XXXXXX";
+        int fd = mkstemp(name.data());
+        ASSERT_GE(fd, 0);
+        path_ = name;
+        EXPECT_EQ(ftruncate(fd, kFileOffset + kLength), 0);
+        close(fd);
+        fd = open(path_.c_str(), O_RDWR | O_DIRECT);
+        if (fd < 0)
+            GTEST_SKIP() << ::testing::TempDir()
+                         << " does not support O_DIRECT";
+        close(fd);
+
+        engine_ = std::make_unique<TransferEngineImpl>(config());
+        ASSERT_TRUE(engine_->available());
+        ASSERT_TRUE(
+            engine_->openSegment(file_, kLocalFileSegmentPrefix + path_).ok());
+        ASSERT_TRUE(engine_->allocateLocalMemory(&device_, kLength, opts).ok());
+    }
+    void TearDown() override {
+        if (engine_ && batch_) EXPECT_TRUE(engine_->freeBatch(batch_).ok());
+        engine_.reset();
+        if (!path_.empty()) unlink(path_.c_str());
+    }
+    Request request(Request::OpCode opcode) const {
+        Request r{};
+        r.opcode = opcode;
+        r.source = device_;
+        r.target_id = file_;
+        r.target_offset = kFileOffset;
+        r.length = kLength;
+        return r;
+    }
+    // False when the kernel or a seccomp profile does not allow io_uring.
+    bool routedToIoUring(const Request& r) {
+        return TransferEngineImplTestPeer::route(*engine_, r).transport ==
+               IOURING;
+    }
+    void run(const Request& r) {
+        batch_ = engine_->allocateBatch(1);
+        ASSERT_NE(batch_, 0u);
+        ASSERT_TRUE(engine_->submitTransfer(batch_, {r}).ok());
+        TransferStatus status{};
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        do {
+            auto s = engine_->progressBatch(batch_, status);
+            ASSERT_TRUE(s.ok()) << s.ToString();
+            if (status.s != PENDING) break;
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        ASSERT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kLength);
+    }
+    static std::vector<uint8_t> pattern(uint8_t seed) {
+        std::vector<uint8_t> data(kLength);
+        for (size_t i = 0; i < data.size(); ++i)
+            data[i] = static_cast<uint8_t>(i * 131 + seed);
+        return data;
+    }
+
+    std::unique_ptr<TransferEngineImpl> engine_;
+    std::string path_;
+    SegmentID file_ = 0;
+    void* device_ = nullptr;
+    BatchID batch_ = 0;
+};
+
+TEST_P(XpuIoUringFileTest, DeviceWriteReachesFile) {
+    auto r = request(Request::WRITE);
+    if (!routedToIoUring(r)) GTEST_SKIP() << "io_uring is not available";
+    auto data = pattern(1);
+    ASSERT_TRUE(Platform::getLoader().copy(device_, data.data(), kLength).ok());
+    ASSERT_NO_FATAL_FAILURE(run(r));
+    std::vector<uint8_t> file(kLength);
+    int fd = open(path_.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+    EXPECT_EQ(pread(fd, file.data(), kLength, kFileOffset),
+              static_cast<ssize_t>(kLength));
+    close(fd);
+    EXPECT_TRUE(file == data);
+}
+
+TEST_P(XpuIoUringFileTest, DeviceReadReturnsFileContents) {
+    auto r = request(Request::READ);
+    if (!routedToIoUring(r)) GTEST_SKIP() << "io_uring is not available";
+    auto data = pattern(7);
+    int fd = open(path_.c_str(), O_WRONLY);
+    ASSERT_GE(fd, 0);
+    EXPECT_EQ(pwrite(fd, data.data(), kLength, kFileOffset),
+              static_cast<ssize_t>(kLength));
+    close(fd);
+    ASSERT_NO_FATAL_FAILURE(run(r));
+    std::vector<uint8_t> device(kLength);
+    ASSERT_TRUE(
+        Platform::getLoader().copy(device.data(), device_, kLength).ok());
+    EXPECT_TRUE(device == data);
+}
+
+INSTANTIATE_TEST_SUITE_P(SelectionModes, XpuIoUringFileTest, ::testing::Bool());
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

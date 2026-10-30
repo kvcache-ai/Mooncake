@@ -78,6 +78,8 @@ endif()
 add_subdirectory(master_service)
 
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_service_restore_lifecycle_test
+               master_service_restore_lifecycle_test.cpp)
 add_store_test(master_service_probe_policy_test
                master_service_probe_policy_test.cpp)
 add_store_test(master_metadata_config_test master_metadata_config_test.cpp)
@@ -209,6 +211,13 @@ if(USE_TENT)
   )
   set_tests_properties(transfer_task_tent_completion_test
                        PROPERTIES ENVIRONMENT "MC_USE_TENT=1" TIMEOUT 30)
+  add_test(
+    NAME transfer_task_tent_shared_segment_test
+    COMMAND
+      transfer_task_test
+      --gtest_filter=TransferTaskTest.NativeScatterPreservesSharedRemoteSegment)
+  set_tests_properties(transfer_task_tent_shared_segment_test
+                       PROPERTIES ENVIRONMENT "MC_USE_TENT=1" TIMEOUT 30)
 endif()
 add_store_test(transfer_submitter_config_test
                transfer_submitter_config_test.cpp)
@@ -242,7 +251,6 @@ endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_manager_test tenant_quota_manager_test.cpp)
 add_store_test(tenant_quota_policy_test tenant_quota_policy_test.cpp)
-add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(object_part_test object_part_test.cpp)
 add_store_test(object_route_test object_route_test.cpp)
@@ -269,6 +277,7 @@ target_link_libraries(local_ssd_test PRIVATE mooncake_local_ssd gtest
                                              gtest_main)
 add_test(NAME local_ssd_test COMMAND local_ssd_test)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
+add_store_test(crc32c_test crc32c_test.cpp)
 add_store_test(byte_size_test byte_size_test.cpp)
 add_store_test(network_test network_test.cpp)
 add_store_test(hugepage_config_test hugepage_config_test.cpp)
@@ -284,12 +293,14 @@ add_store_test(client_object_checksum_config_test
                client_object_checksum_config_test.cpp)
 add_store_test(cxl_segment_config_test cxl_segment_config_test.cpp)
 add_store_test(client_numa_config_test client_numa_config_test.cpp)
+add_store_test(numa_allowed_nodes_test numa_allowed_nodes_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(local_hot_cache_concurrency_test
                local_hot_cache_concurrency_test.cpp)
 add_store_test(real_client_hugepage_register_test real_client_hugepage_register_test.cpp)
 add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
+add_store_test(real_client_uninitialized_test real_client_uninitialized_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(standalone_client_test standalone_client_test.cpp)

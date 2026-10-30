@@ -98,7 +98,11 @@ def test_structured_object_storage_has_one_authoritative_source() -> None:
     legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
     legacy_test_root = REPOSITORY_ROOT / "mooncake-wheel" / "tests"
 
-    for module in ("structured_object_store.py", "_fast_copy.c"):
+    for module in (
+        "structured_object_store.py",
+        "_structured_ranges.py",
+        "_fast_copy.c",
+    ):
         assert (package_root / module).is_file()
         assert not (legacy_package_root / module).exists()
 
@@ -115,7 +119,11 @@ def test_structured_object_storage_has_one_authoritative_source() -> None:
         .split(")", 1)[0]
         .split()
     )
-    assert {"structured_object_store.py", "_fast_copy.c"} <= set(migrated_modules)
+    assert {
+        "structured_object_store.py",
+        "_structured_ranges.py",
+        "_fast_copy.c",
+    } <= set(migrated_modules)
 
 
 def test_http_metadata_service_has_one_authoritative_source(

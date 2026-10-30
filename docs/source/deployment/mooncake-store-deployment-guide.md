@@ -43,6 +43,8 @@ Master service started on port 50051, max_threads=4, ...
 
 The master's default RPC port is `50051`. (To embed an HTTP metadata server instead of using P2P, add `--enable_http_metadata_server=true --http_metadata_server_port=8080`.)
 
+When the metadata backend is the Python HTTP server (`python -m mooncake.http_metadata_server`, the `http://host:8080/metadata` conn strings in this guide), it answers unauthenticated GET/PUT/DELETE on the bind address. Use `--host 127.0.0.1` for a single-host setup. Anywhere beyond a single trusted host, set `MC_METADATA_HTTP_TOKEN` on the server and on every engine: the server then requires `Authorization: Bearer <token>` on each metadata request, and the Transfer Engine's HTTP storage plugin attaches the same token automatically. A server asked to bind a non-loopback address with no token refuses to start; on a trusted network you can export `MC_METADATA_HTTP_ALLOW_INSECURE=1` to keep the legacy open behavior (it still logs a loud startup warning). Its in-memory store is capped by `MC_METADATA_MAX_KEYS` and `MC_METADATA_MAX_TOTAL_BYTES` (64K entries and 1 GiB by default), with the byte total covering UTF-8 key bytes and value bytes but not Python object overhead. `MC_METADATA_MAX_BODY_BYTES` and `MC_METADATA_MAX_CONCURRENT_PUTS` (1 MiB and 8 by default) bound each PUT body and the number read concurrently. These limits bound stored payload bytes and concurrent body reads, not connections waiting for a PUT slot or total process RSS; they are not a complete process-level memory or DoS limit. All four quota settings must be positive integers at startup.
+
 (start-a-store-client)=
 ### 3. Start a Store Client
 
@@ -425,6 +427,55 @@ When the Primary fails, the Standby is promoted through the following steps:
 6. **Invalid Endpoint Filtering**: During restoration, any replica endpoints that correspond to segments no longer in the registry are automatically filtered out from `GetReplicaList` results.
 
 This fail-closed behavior is intentional. Older versions could log a restoration error and continue serving from empty or partially restored metadata. That behavior was a correctness bug, not a supported availability fallback: the serving state could disagree with the durable OpLog and poison later recovery attempts. Mooncake does not automatically discard snapshots, OpLog records, or metadata after a recovery error.
+
+### Graceful Shutdown
+
+An HA master (`--enable_ha=true`) handles SIGTERM and SIGINT with an ordered drain. The steps and timings below are for the etcd backend, which the tests cover.
+
+On the first signal the master:
+
+1. Stops accepting RPCs: readiness goes off, removal of the leader label is scheduled, and the RPC listener stops.
+2. Waits for the RPC handlers that were already admitted.
+3. Stops the leadership monitor.
+4. Stops the batch OpLog writer after it commits the entries already queued. A writer that is already retrying leaves its batch, as it does on lease loss.
+5. Stops the admin HTTP server and standby replication, and stops the remote metadata cleanup worker (its in-flight request finishes or times out) before the lease is released.
+6. Releases the leadership lease once.
+7. Exits.
+
+A standby or candidate skips the steps for resources it does not have, and it holds no lease to release.
+
+The whole shutdown, including the release, is bounded to 15 seconds from the first observation of the request. When the bound expires the process exits with status 1 without logging, and a lease that was not yet released expires by TTL. A second SIGTERM or SIGINT exits at once with status 143 or 130 and skips the remaining steps, including the release.
+
+| Exit status | Meaning |
+| --- | --- |
+| 0 | The selected drain completed and the release succeeded or was not needed (released, already released, or no lease held). It does not claim that all work is durable or that every task in the process was drained. |
+| 2 | The drain completed but the release was not confirmed. If the lease remains, it expires by TTL. A timeout can also mean that the lease had already expired, or that the release reached etcd and its reply was lost, so a nonzero status does not prove that the lease is still held. |
+| 1 | The 15 second bound expired. |
+| 130, 143 | A second SIGINT or SIGTERM arrived during the shutdown. |
+| 255 | A request was seen only after a fatal backend error made the supervisor return. |
+
+The confirmed-release semantics and the exit statuses 0 and 2 above describe the etcd backend; the Kubernetes backend reports only that the cancel request was accepted.
+
+With `T` the lease TTL and `W` the successor's warmup (`W = T`), a planned stop changes how long the old key lives:
+
+| Leader stop | Old key removed | Successor serves after about |
+| --- | --- | --- |
+| SIGKILL or crash | When the lease expires: up to `T` after the last successful keepalive, with no fixed minimum after the kill. | remaining TTL + acquisition + OpLog takeover + `W` + serve start |
+| SIGTERM without the release step (earlier versions) | After the drain, then as for SIGKILL. | drain + remaining TTL + acquisition + OpLog takeover + `W` + serve start |
+| SIGTERM with a confirmed release | During the shutdown, after the drain and before the process exits. | drain + release + acquisition + OpLog takeover + `W` + serve start |
+
+`T` is `--ha_leader_lease_ttl_sec` (default 5, range 2 to 60). Acquisition is the standby noticing the deletion through its watch, then granting a lease and creating the key; its retry loop uses a one-second watch timeout, and in local tests, with the standby already watching, the whole step took 4 to 20 ms. OpLog takeover applies when the OpLog is enabled: it is the producer claim, catch-up and promotion that run before warmup, and it is zero without the OpLog. Serve start is restore, preflight and serving activation. With `T` = 5 s in a healthy local setup, a confirmed release saves roughly the remaining TTL, typically 3 to 5 seconds per planned leader restart, minus the drain and release time; an unconfirmed release falls back to TTL expiry. This is an estimate, not a guarantee: with a slow drain or a slow release the saving is smaller, and it can be negative compared with a kill.
+
+On Kubernetes, keep `terminationGracePeriodSeconds` greater than any preStop time plus the 15 second bound plus a few seconds. The default of 30 seconds leaves room for a preStop of about 10 seconds, and the master needs no preStop hook. If the grace period is shorter, the kubelet's SIGKILL can arrive during the shutdown: a kill before the release is confirmed can leave the lease to TTL expiry, as in the crash row above, while a kill after the release does not. The leader-label removal is only scheduled, so the process can exit before it is applied. `/health` and metrics stop answering during the shutdown, because the admin server stops before the release.
+
+Limits:
+
+- Independent lease loss, external revocation and keepalive failure keep their earlier behavior.
+- A client can lose the response to a request that completed during the drain.
+- The successor still warms up for `T` after a clean release.
+- With the OpLog off there is no producer-view fence.
+- The Kubernetes backend's release runs on SIGTERM but has no test coverage, and it reports only that the cancel request was accepted: the wrapper returns no release result, and when no election monitor thread is running it does not wait for the election goroutine. A status of 0 therefore does not confirm a Kubernetes release.
+- The timings above were measured on etcd only.
 
 ### Example: HA Deployment with etcd
 

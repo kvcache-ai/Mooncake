@@ -1,6 +1,13 @@
 import importlib
 
 try:
+    # The XPU module links against the SYCL and Intel compiler runtimes that
+    # PyTorch XPU loads, so load torch first when it is installed.
+    import torch  # noqa: F401
+except ImportError:
+    pass
+
+try:
     backend_module = importlib.import_module("mooncake._ep")
 except ModuleNotFoundError:
     raise ImportError(

@@ -262,9 +262,17 @@ tl::expected<std::vector<Slice>, ErrorCode> StageWriteSlices(
     return staged_slices;
 }
 
+// prefer_alloc_in_same_node on the multi-buffer APIs selects group-by-target.
+// Ascend protocols group by default when the caller leaves that flag false.
+bool GroupMultiBufferTransfers(const std::string &protocol,
+                               bool prefer_alloc_in_same_node) {
+    return prefer_alloc_in_same_node || protocol == "ascend" ||
+           protocol == "ascend_direct";
+}
+
 using BatchWriteMethod = std::vector<tl::expected<void, ErrorCode>> (Client::*)(
     const std::vector<ObjectKey> &, std::vector<std::vector<Slice>> &,
-    const ReplicateConfig &, const Client::WriteBufferStager &);
+    const ReplicateConfig &, const Client::WriteBufferStager &, bool);
 
 std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     const std::shared_ptr<Client> &client, const std::vector<std::string> &keys,
@@ -293,7 +301,10 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
             return StageWriteSlices(allocator, slices, staging_handles);
         };
     }
-    return ((*client).*write)(keys, batched_slices.value(), config, stager);
+    const bool group_by_target = GroupMultiBufferTransfers(
+        client->GetProtocol(), config.prefer_alloc_in_same_node);
+    return ((*client).*write)(keys, batched_slices.value(), config, stager,
+                              group_by_target);
 }
 
 // Backing slot for RealClient::SetNofRuntimeFactoryForTesting.
@@ -1311,10 +1322,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 if (!split_limit.has_value() || cap < *split_limit) {
                     split_limit = cap;
                 }
-                LOG(INFO) << "Agent-mode store chunk cap: " << cap
-                          << " bytes across "
+                LOG(INFO) << "Agent mode splits the store segment of "
+                          << global_segment_size << " bytes across "
                           << ContextManager::getInstance().getDeviceCount()
-                          << " device(s)";
+                          << " devices, at most " << cap
+                          << " bytes on each device";
             }
         }
 #endif
@@ -1326,7 +1338,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             ReplicaSelectionConfig::FromEnvironment().hca_numa_segments_enabled;
         std::vector<int> seg_numa_nodes;
         if (protocol == "rdma") {
-            seg_numa_nodes = client_->GetNicNumaNodes();
+            // Only the NIC nodes this process may allocate from: binding a
+            // region to a node outside its cpuset fails setup with EINVAL.
+            seg_numa_nodes =
+                FilterNumaNodesToAllowed(client_->GetNicNumaNodes());
             if (seg_numa_nodes.size() > 1 ||
                 (partition_numa && !seg_numa_nodes.empty())) {
                 std::string nodes_str;
@@ -1839,8 +1854,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     ssd_prefetch_dedup_ttl_sec_ =
         static_cast<int64_t>(prefetch_dedup_ttl_opt.value());
 
-    auto egm_config = ParseEgmStorePoolConfig(
-        config, protocol, global_segment_size, local_buffer_size);
+    auto egm_config =
+        ParseEgmStorePoolConfig(config, protocol, global_segment_size);
     if (!egm_config) return tl::unexpected(egm_config.error());
     try {
         auto result = setup_internal(
@@ -4709,7 +4724,7 @@ std::vector<std::shared_ptr<BufferHandle>> RealClient::batch_get_buffer(
     const std::vector<std::string> &keys) {
     return execute_timed_operation<std::vector<std::shared_ptr<BufferHandle>>>(
         [&]() { return batch_get_buffer_internal(keys); },
-        [](const auto &) { return true; },
+        [this](const auto &) { return client_ != nullptr; },
         [&](uint64_t latency_us, const auto &buffers) {
             client_->ObserveTransferOperation(
                 TransferOperationKind::kRead, "batch_get_buffer",
@@ -5578,7 +5593,7 @@ std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
                     buffers, all_keys, all_dst_offsets, all_src_offsets,
                     all_sizes, nullptr, query_result_cache));
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 client_->ObserveTransferOperation(
                     TransferOperationKind::kRead, "get_into_ranges",
@@ -5640,7 +5655,7 @@ std::vector<int> RealClient::batch_put_from(
             [&]() {
                 return batch_put_from_internal(keys, buffers, sizes, config);
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int> py_results;
                 py_results.reserve(ret.size());
@@ -5931,7 +5946,7 @@ std::vector<int> RealClient::batch_upsert_from(
             [&]() {
                 return batch_upsert_from_internal(keys, buffers, sizes, config);
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int> py_results;
                 py_results.reserve(ret.size());
@@ -6210,7 +6225,7 @@ std::vector<int64_t> RealClient::batch_get_into(
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
             [&]() { return batch_get_into_internal(keys, buffers, sizes); },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int64_t> py_results;
                 py_results.reserve(ret.size());
@@ -7161,7 +7176,7 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
                 return batch_put_from_multi_buffers_internal(
                     keys, all_buffers, sizes, config, stage_nonlocal);
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int> py_results;
                 py_results.reserve(ret.size());
@@ -8237,7 +8252,7 @@ std::vector<int> RealClient::batch_upsert_from_multi_buffers(
                 return batch_upsert_from_multi_buffers_internal(
                     keys, all_buffers, sizes, config, stage_nonlocal);
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 auto py_results = ToPyResults(ret);
                 client_->ObserveTransferOperation(
@@ -8281,7 +8296,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
                 return batch_get_into_multi_buffers_internal(
                     keys, all_buffers, all_sizes, prefer_alloc_in_same_node);
             },
-            [](const auto &) { return true; },
+            [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int> py_results;
                 py_results.reserve(ret.size());
@@ -8343,6 +8358,8 @@ RealClient::batch_get_into_multi_buffers_internal(
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
+    const bool group_by_target = GroupMultiBufferTransfers(
+        client_->GetProtocol(), prefer_alloc_in_same_node);
 
     if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size()) {
         LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
@@ -8516,9 +8533,8 @@ RealClient::batch_get_into_multi_buffers_internal(
             batch_slices[op.key] = op.slices;
         }
 
-        auto batch_get_results =
-            client_->BatchGet(batch_keys, batch_query_results, batch_slices,
-                              prefer_alloc_in_same_node);
+        auto batch_get_results = client_->BatchGet(
+            batch_keys, batch_query_results, batch_slices, group_by_target);
 
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
             const auto &op = valid_operations[dedup.primaries[j]];
@@ -8713,9 +8729,9 @@ RealClient::batch_get_into_multi_buffers_internal(
             }
 
             if (!disk_batch_keys.empty()) {
-                auto disk_results = client_->BatchGet(
-                    disk_batch_keys, disk_batch_qrs, disk_batch_slices,
-                    prefer_alloc_in_same_node);
+                auto disk_results =
+                    client_->BatchGet(disk_batch_keys, disk_batch_qrs,
+                                      disk_batch_slices, group_by_target);
 
                 for (size_t di = 0; di < disk_key_order.size(); ++di) {
                     const auto &key = disk_key_order[di];

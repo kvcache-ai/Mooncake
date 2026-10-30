@@ -61,8 +61,11 @@ sudo make install
 ### Build with Intel XPU
 
 Intel XPU support requires TENT and a native oneAPI SYCL build with the Intel
-DPC++ compiler (`icpx`), not GCC. Install the common dependencies above and
-the Intel GPU driver, Level Zero runtime, and oneAPI compiler separately.
+DPC++ compiler (`icpx`), not GCC. A Mooncake EP-only build on XPU
+(`-DWITH_EP=ON -DWITH_STORE=OFF`) does not need TENT; see the EP build notes in
+[Mooncake EP & Mooncake PG](../api-reference/python/ep-backend.md). Install the
+common dependencies above and the Intel GPU driver, Level Zero runtime, and
+oneAPI compiler separately.
 From the repository root, use a fresh build directory:
 
 ```bash
@@ -268,18 +271,16 @@ device-code model, which is not cross-version compatible.
 ```{admonition} GPU-Direct RDMA
 :class: note
 Mooncake can use the DMA-BUF path for GPU-Direct RDMA, which does **not**
-require the `nvidia-peermem` kernel module. Set `WITH_NVIDIA_PEERMEM=0` before
-starting Mooncake to use DMA-BUF. Set `WITH_NVIDIA_PEERMEM=1` to use the legacy
-`ibv_reg_mr` path, which requires `nvidia-peermem`. See Section 3.7 of
-https://docs.nvidia.com/cuda/gpudirect-rdma/ for `nvidia-peermem` installation
-instructions.
-
-When `WITH_NVIDIA_PEERMEM` is **unset**, Mooncake uses the legacy `ibv_reg_mr`
-path. On hosts without `nvidia-peermem` (for example the NVIDIA open kernel
-modules with the inbox RDMA stack and no MLNX_OFED), GPU memory registration
-then fails with `Failed to register memory 0x...: Bad address [14]`; set
-`WITH_NVIDIA_PEERMEM=0` there. DMA-BUF needs the NVIDIA open kernel modules and
-Linux 5.12 or later.
+require the `nvidia-peermem` kernel module. When `WITH_NVIDIA_PEERMEM` is
+**unset**, Mooncake uses the legacy `ibv_reg_mr` path if a peer-memory module
+(`nvidia-peermem`, or `nv_peer_mem` from MLNX_OFED) is loaded and DMA-BUF
+otherwise (for example the NVIDIA open kernel modules with the inbox RDMA stack
+and no MLNX_OFED, where `ibv_reg_mr` on GPU memory would fail with
+`Failed to register memory 0x...: Bad address [14]`). Set
+`WITH_NVIDIA_PEERMEM=0` to force DMA-BUF, or `WITH_NVIDIA_PEERMEM=1` to force
+`ibv_reg_mr`. DMA-BUF needs the NVIDIA open kernel modules and Linux 5.12 or
+later; see Section 3.7 of https://docs.nvidia.com/cuda/gpudirect-rdma/ for
+`nvidia-peermem` installation instructions.
 
 Intel XPU builds (`-DUSE_XPU=ON`) use DMA-BUF for direct RDMA: when a USM
 device allocation is registered, TENT asks the Level Zero runtime to export it
@@ -403,6 +404,7 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_SUPA=ON/OFF` | `OFF` | Enable Biren GPU support via the SUPA SDK. Uses a CUDA-compatible runtime. Set `BIREN_HOME` to the SDK root. |
 | `-DUSE_MLU=ON/OFF` | `OFF` | Enable Cambricon MLU memory support via Neuware, including memory detection, topology discovery, and RDMA registration. |
 | `-DUSE_XPU=ON/OFF` | `OFF` | Enable Intel XPU memory support in TENT via SYCL/Level Zero: memory detection, host staging, intra-node PCIe P2P copies between XPUs, and dma-buf GPUDirect RDMA registration. Requires `-DUSE_TENT=ON` and the `icpx` compiler. |
+| `-DUSE_XPU_GDS=ON/OFF` | `OFF` | Enable the TENT GDS transport for Intel XPU memory through a cuFile-compatible library (for example Intel xFile) that provides `cufile.h` and `libcufile.so`. Requires `-DUSE_XPU=ON`; cannot be combined with `-DUSE_CUDA=ON`. Pass `-DCUFILE_INCLUDE=<dir>` and `-DCUFILE_LIB=<path>` when they are outside the default search paths. Enable at runtime with `transports/gds/enable`. Only XPU-to-file transfers use GDS; DRAM-to-file transfers use io_uring. |
 | `-DUSE_RISCV=ON/OFF` | `OFF` | Enable RISC-V build compatibility settings, including disabling full IPO/LTO for Python extensions. |
 | `-DUSE_SHCA=ON/OFF` | `OFF` | Enable ScaleFabric SHCA InfiniBand support for Transfer Engine/TENT RDMA paths only. Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
 | `-DUSE_ASCEND_DIRECT=ON/OFF` | `OFF` | Enable Ascend Direct transport and HCCS support via the ADXL engine. Recommended for Ascend builds. |
