@@ -80,6 +80,7 @@ option(USE_CUDA "option for enabling gpu features for NVIDIA GPU" OFF)
 option(USE_NCCL_DEVICE "option for enabling the NCCL DeviceTransport backend"
        OFF)
 option(USE_NCCL_HOST "option for enabling the NCCL host RMA transport" OFF)
+option(USE_PXN "option for enabling PXN (PCIe X-node NVLink) optimization; requires USE_CUDA" OFF)
 option(USE_MLU "option for enabling Cambricon MLU features" OFF)
 option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
 option(USE_MACA "option for enabling gpu features for MUXI GPU with MACA" OFF)
@@ -343,6 +344,12 @@ if(USE_SUPA)
   endif()
 endif()
 
+if (USE_CUDA AND USE_PXN)
+  add_compile_definitions(MOONCAKE_ENABLE_PXN)
+  message(STATUS "PXN support is enabled")
+elseif (USE_PXN AND NOT USE_CUDA)
+  message(STATUS "USE_PXN=ON ignored because USE_CUDA=OFF (PXN currently requires CUDA)")
+endif()
 if(USE_TPU)
   # Every TPU source file lives under mooncake-transfer-engine/tent, which is
   # only added when USE_TENT is ON. Without this guard -DUSE_TPU=ON configures

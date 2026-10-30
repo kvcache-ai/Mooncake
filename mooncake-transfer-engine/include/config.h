@@ -236,6 +236,11 @@ struct GlobalConfig {
     uint64_t max_seg_size = 0x10000000000;
     size_t max_jfc_e = 4096;  // urma is temporarily using this default value.
     size_t num_jetty_per_ep = 1;
+#ifdef MOONCAKE_ENABLE_PXN
+    size_t pxn_slot_size = (1 * 1024 * 1024);
+    int pxn_slot_count_per_worker = 16;
+    bool without_pxn = false;
+#endif
 };
 
 struct RpcCommunicatorConfig {
