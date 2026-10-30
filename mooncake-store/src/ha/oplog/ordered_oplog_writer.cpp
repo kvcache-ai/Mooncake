@@ -1,5 +1,9 @@
 #include "ha/oplog/ordered_oplog_writer.h"
 
+#include <glog/logging.h>
+
+#include "ha/oplog/oplog_batch_codec.h"
+
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -32,6 +36,9 @@ struct OrderedOpLogWriter::Impl {
         // Entries committed together via CommitBatch share a non-zero group
         // id and must be sealed into the same batch record.
         uint64_t group{0};
+        // The group must start a new batch record instead of being merged
+        // with entries committed before it.
+        bool starts_new_record{false};
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
         Clock::time_point committed_at{};
         Clock::time_point durable_at{};
@@ -93,6 +100,25 @@ struct OrderedOpLogWriter::Impl {
                committed_entries[count].group ==
                    committed_entries[count - 1].group) {
             ++count;
+        }
+        // Do not merge a record boundary into the entries before it.
+        for (size_t i = 1; i < count; ++i) {
+            if (committed_entries[i].starts_new_record) {
+                count = i;
+                break;
+            }
+        }
+        // A boundary group owns the whole record: do not append entries
+        // committed after it.
+        if (count > 0 && committed_entries.front().starts_new_record &&
+            committed_entries.front().group != 0) {
+            const uint64_t first_group = committed_entries.front().group;
+            size_t group_end = 1;
+            while (group_end < committed_entries.size() &&
+                   committed_entries[group_end].group == first_group) {
+                ++group_end;
+            }
+            count = std::min(count, group_end);
         }
         ready_entries.reserve(count);
         for (size_t i = 0; i < count; ++i) {
@@ -270,7 +296,7 @@ OrderedOpLogWriter::Reserve() {
 }
 
 tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
-OrderedOpLogWriter::ReserveBatch(size_t entry_count) {
+OrderedOpLogWriter::ReserveBatch(size_t entry_count, bool allow_oversize) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->terminal_state.has_value()) {
         return tl::make_unexpected(impl_->terminal_state->error);
@@ -281,9 +307,12 @@ OrderedOpLogWriter::ReserveBatch(size_t entry_count) {
     if (entry_count == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (entry_count > impl_->config.max_entries_per_batch ||
-        impl_->open_waiting_slots >
-            impl_->config.max_entries_per_batch - entry_count) {
+    if (entry_count > impl_->config.max_entries_per_batch) {
+        if (!allow_oversize) {
+            return tl::make_unexpected(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+        }
+    } else if (impl_->open_waiting_slots >
+               impl_->config.max_entries_per_batch - entry_count) {
         return tl::make_unexpected(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
     }
     const uint64_t id = impl_->next_reservation_id++;
@@ -350,12 +379,15 @@ OrderedOpLogWriter::CommitBatch(Reservation&& reservation,
                                 DurableCallback callback) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (reservation.writer_ != this ||
-        impl_->active_reservations.erase(reservation.id_) == 0) {
+        impl_->active_reservations.find(reservation.id_) ==
+            impl_->active_reservations.end()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto reject_reservation = [&](ErrorCode error)
         -> tl::expected<std::vector<PendingHandle>, ErrorCode> {
-        impl_->open_waiting_slots -= reservation.slots_;
+        if (impl_->active_reservations.erase(reservation.id_) != 0) {
+            impl_->open_waiting_slots -= reservation.slots_;
+        }
         reservation.writer_ = nullptr;
         reservation.id_ = 0;
         reservation.slots_ = 0;
@@ -377,13 +409,41 @@ OrderedOpLogWriter::CommitBatch(Reservation&& reservation,
             return reject_reservation(ErrorCode::INVALID_PARAMS);
         }
     }
+    // Reject an indivisible group that cannot fit in one backend record before
+    // queueing it, so it fails here instead of retrying forever.
+    if (entries.size() > impl_->config.max_entries_per_batch &&
+        impl_->config.max_batch_record_bytes != 0) {
+        // Use the widest possible ids so the probe never undercounts the
+        // final record's decimal encoding.
+        OpLogBatchRecord probe;
+        probe.batch_id = std::numeric_limits<uint64_t>::max();
+        probe.first_seq = probe.batch_id - entries.size() + 1;
+        probe.last_seq = probe.batch_id;
+        probe.entries = entries;
+        for (size_t i = 0; i < probe.entries.size(); ++i) {
+            probe.entries[i].sequence_id = probe.first_seq + i;
+        }
+        const size_t encoded_bytes = EncodeOpLogBatchRecord(probe).size();
+        if (encoded_bytes > impl_->config.max_batch_record_bytes) {
+            LOG(ERROR) << "OrderedOpLogWriter: indivisible group of "
+                       << entries.size() << " entries encodes to "
+                       << encoded_bytes << " bytes, over the "
+                       << impl_->config.max_batch_record_bytes
+                       << "-byte batch record limit";
+            return reject_reservation(ErrorCode::INVALID_PARAMS);
+        }
+    }
+    impl_->active_reservations.erase(reservation.id_);
     reservation.writer_ = nullptr;
     reservation.id_ = 0;
     reservation.slots_ = 0;
     const uint64_t group = impl_->next_group_id++;
+    const bool separate_record =
+        entries.size() > impl_->config.max_entries_per_batch;
     std::vector<PendingHandle> handles;
     handles.reserve(entries.size());
     for (auto& entry : entries) {
+        const bool first_entry = handles.empty();
         entry.timestamp_ms = 0;
         entry.checksum = ComputeOpLogChecksum(entry.payload);
         entry.prefix_hash = 0;
@@ -392,6 +452,7 @@ OrderedOpLogWriter::CommitBatch(Reservation&& reservation,
         Impl::PendingEntry pending{.entry = std::move(entry),
                                    .callback = callback};
         pending.group = group;
+        pending.starts_new_record = separate_record && first_entry;
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
         pending.committed_at = Impl::Clock::now();
 #endif

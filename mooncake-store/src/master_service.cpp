@@ -4142,27 +4142,28 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         }
 
         const size_t total = repair_entries.size();
-        auto remaining = std::make_shared<std::atomic<size_t>>(total);
-        auto done = std::make_shared<std::promise<void>>();
-        std::future<void> durable_future = done->get_future();
-        auto on_durable = [remaining, done](const OpLogEntry&) {
-            if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                done->set_value();
-            }
-        };
-
         ErrorCode repair_err = ErrorCode::OK;
+        // The repair set is one indivisible group and may exceed the writer's
+        // admission target. CommitBatch rejects an over-limit record before it
+        // is queued; AwaitDurable reports a terminal writer instead of waiting
+        // for callbacks that never run.
         auto appended = AppendOpLogBatchWithDurableFinalize(
-            std::move(repair_entries), on_durable);
+            std::move(repair_entries), nullptr, /*allow_oversize=*/true);
         if (!appended) {
             repair_err = appended.error();
-        }
-        if (repair_err == ErrorCode::OK) {
-            // Wait on the writer's durability callback. 0 means no cap: a
-            // slow backend should not turn a recoverable delay into a
-            // promotion failure. A positive timeout still fail-closes, and
-            // a later durable completion is left in the log for the retry
-            // to observe rather than rolling it back locally.
+        } else {
+            auto durable_done = std::make_shared<std::promise<ErrorCode>>();
+            std::future<ErrorCode> durable_future = durable_done->get_future();
+            [[maybe_unused]] auto durable_notification =
+                ordered_oplog_writer_->AwaitDurable(appended.value())
+                    .thenValue([durable_done](ErrorCode error) {
+                        durable_done->set_value(error);
+                    });
+            // 0 means no cap: a slow backend should not turn a recoverable
+            // delay into a promotion failure. A positive timeout still
+            // fail-closes, and a later durable completion is left in the
+            // log for the retry to observe rather than rolling it back
+            // locally.
             std::future_status durable_status = std::future_status::ready;
             if (restore_repair_durable_timeout_ms_ == 0) {
                 durable_future.wait();
@@ -4177,6 +4178,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                            << restore_repair_durable_timeout_ms_
                            << "ms, failing the restore";
                 repair_err = ErrorCode::INTERNAL_ERROR;
+            } else if (ErrorCode durable_error = durable_future.get();
+                       durable_error != ErrorCode::OK) {
+                repair_err = durable_error;
             }
         }
         if (repair_err != ErrorCode::OK) {
@@ -11626,7 +11630,8 @@ MasterService::ReserveBatchOpLogSlot() {
 
 tl::expected<uint64_t, ErrorCode>
 MasterService::AppendOpLogBatchWithDurableFinalize(
-    std::vector<OpLogEntry> entries, DurableFinalizeCallback callback) {
+    std::vector<OpLogEntry> entries, DurableFinalizeCallback callback,
+    bool allow_oversize) {
     if (!enable_oplog_) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -11645,7 +11650,8 @@ MasterService::AppendOpLogBatchWithDurableFinalize(
         }
         entry.tenant_id = resolved_tenant.value();
     }
-    auto reservation = ordered_oplog_writer_->ReserveBatch(entries.size());
+    auto reservation =
+        ordered_oplog_writer_->ReserveBatch(entries.size(), allow_oversize);
     if (!reservation) {
         return tl::unexpected(reservation.error());
     }

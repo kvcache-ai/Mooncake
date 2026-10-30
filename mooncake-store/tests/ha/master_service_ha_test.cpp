@@ -171,9 +171,16 @@ class FailingBatchHaKvBackend : public FakeBatchHaKvBackend {
 
 class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
    public:
+    // Safe: the base constructor stores the callback without invoking it.
     GatedOrderedOpLogWriter(OrderedOpLogWriterConfig config,
                             WriteBatchFn write_batch)
-        : OrderedOpLogWriter(std::move(config), std::move(write_batch)) {}
+        : OrderedOpLogWriter(
+              std::move(config),
+              [this, write_batch = std::move(write_batch)](
+                  const OpLogBatchRecord& batch, const DurablePrefix& prefix) {
+                  WaitForWrites();
+                  return write_batch(batch, prefix);
+              }) {}
 
     ~GatedOrderedOpLogWriter() override { Stop(); }
 
@@ -279,13 +286,32 @@ class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
         released_through_ = 0;
     }
 
+    void HoldWrites() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        hold_writes_ = true;
+    }
+
+    void ResumeWrites() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            hold_writes_ = false;
+        }
+        cv_.notify_all();
+    }
+
    private:
+    void WaitForWrites() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] { return stopping_ || !hold_writes_; });
+    }
+
     std::mutex mutex_;
     std::condition_variable cv_;
     uint64_t released_through_{UINT64_MAX};
     uint64_t completed_through_{0};
     size_t submitted_count_{0};
     bool stopping_{false};
+    bool hold_writes_{false};
 };
 
 class RejectingOrderedOpLogWriter : public OrderedOpLogWriter {
@@ -712,6 +738,40 @@ class MasterServiceHATest : public ::testing::Test {
             MasterServiceTestPeer::OrderedOplogWriter(service).get());
     }
 
+    static OrderedOpLogWriter* InstallSizeLimitedWriter(
+        MasterService& service, std::shared_ptr<HaKvBackend> backend,
+        size_t max_batch_record_bytes) {
+        MasterServiceTestPeer(service).SetBatchOpLogWriterFactoryForTesting(
+            [max_batch_record_bytes](
+                OrderedOpLogWriterConfig config,
+                OrderedOpLogWriter::WriteBatchFn write_batch) {
+                config.max_batch_record_bytes = max_batch_record_bytes;
+                return std::make_unique<OrderedOpLogWriter>(
+                    std::move(config), std::move(write_batch));
+            });
+        EXPECT_EQ(ErrorCode::OK,
+                  MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+                      std::move(backend)));
+        return MasterServiceTestPeer::OrderedOplogWriter(service).get();
+    }
+
+    static OrderedOpLogWriter* InstallFailingWriteWriter(
+        MasterService& service, std::shared_ptr<HaKvBackend> backend) {
+        MasterServiceTestPeer(service).SetBatchOpLogWriterFactoryForTesting(
+            [](OrderedOpLogWriterConfig config,
+               OrderedOpLogWriter::WriteBatchFn) {
+                return std::make_unique<OrderedOpLogWriter>(
+                    std::move(config),
+                    [](const OpLogBatchRecord&, const DurablePrefix&) {
+                        return ErrorCode::INVALID_PARAMS;
+                    });
+            });
+        EXPECT_EQ(ErrorCode::OK,
+                  MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+                      std::move(backend)));
+        return MasterServiceTestPeer::OrderedOplogWriter(service).get();
+    }
+
     static uint64_t TenantUsedBytes(MasterService& service) {
         auto snapshot =
             service.tenant_quota_policy()->GetSnapshot(kDefaultTenant);
@@ -816,6 +876,39 @@ class MasterServiceHATest : public ::testing::Test {
         metadata.size = size;
         metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint, size));
         return StandbyObjectEntry{"default", key, std::move(metadata)};
+    }
+
+    std::vector<StandbyObjectEntry> MakeStandbyRepairConflicts(
+        const std::string& prefix, const std::string& endpoint, int count,
+        std::vector<std::string>& lost_keys,
+        std::vector<std::string>& survivor_keys) const {
+        std::vector<StandbyObjectEntry> objects;
+        for (int i = 0; i < count; ++i) {
+            const size_t base =
+                kDefaultSegmentBase + static_cast<size_t>(i) * 16384;
+            const std::string survivor_key =
+                prefix + "_survivor_" + std::to_string(i);
+            const std::string lost_key = prefix + "_lost_" + std::to_string(i);
+            auto survivor = MakeStandbyObject(survivor_key, endpoint);
+            auto lost = MakeStandbyObject(lost_key, endpoint);
+            survivor.metadata.replicas.push_back(
+                MakeStandbyMemoryReplica(endpoint));
+            survivor.metadata.replicas[1].id = 2;
+            survivor.metadata.replicas[0]
+                .get_memory_descriptor()
+                .buffer_descriptor.buffer_address_ = base;
+            survivor.metadata.replicas[1]
+                .get_memory_descriptor()
+                .buffer_descriptor.buffer_address_ = base + 8192;
+            lost.metadata.replicas.front()
+                .get_memory_descriptor()
+                .buffer_descriptor.buffer_address_ = base;
+            objects.push_back(std::move(survivor));
+            objects.push_back(std::move(lost));
+            survivor_keys.push_back(survivor_key);
+            lost_keys.push_back(lost_key);
+        }
+        return objects;
     }
 
     StandbySegmentInfo MakeStandbyMemorySegment(
@@ -2808,6 +2901,204 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairWritesDurableRecords) {
     EXPECT_EQ(2u, prefix.last_seq);
 }
 
+TEST_F(MasterServiceHATest,
+       RestoreDiscardRepairExceedingBatchCapWritesOneRecord) {
+    const std::string cluster_id = "test_restore_repair_over_cap";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    ASSERT_TRUE(HasOpLogWriter(service));
+
+    const std::string endpoint = "standby_repair_over_cap_segment";
+    std::vector<StandbyObjectEntry> objects;
+    std::vector<std::string> lost_keys;
+    std::vector<std::string> survivor_keys;
+    for (int i = 0; i < 3; ++i) {
+        const size_t base =
+            kDefaultSegmentBase + static_cast<size_t>(i) * 16384;
+        const std::string survivor_key =
+            "standby_repair_over_cap_survivor_" + std::to_string(i);
+        const std::string lost_key =
+            "standby_repair_over_cap_lost_" + std::to_string(i);
+        auto survivor = MakeStandbyObject(survivor_key, endpoint);
+        auto lost = MakeStandbyObject(lost_key, endpoint);
+        survivor.metadata.replicas.push_back(
+            MakeStandbyMemoryReplica(endpoint));
+        survivor.metadata.replicas[1].id = 2;
+        survivor.metadata.replicas[0]
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = base;
+        survivor.metadata.replicas[1]
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = base + 8192;
+        lost.metadata.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = base;
+        objects.push_back(std::move(survivor));
+        objects.push_back(std::move(lost));
+        survivor_keys.push_back(survivor_key);
+        lost_keys.push_back(lost_key);
+    }
+
+    // Six repair entries against a cap of two: the group still commits as one
+    // record instead of failing admission.
+    auto result = service.RestoreFromStandbySnapshot(
+        objects, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(result.has_value())
+        << "error=" << static_cast<int>(result.error());
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord repair_batch;
+    ReadBatchEventually(storage, 1, repair_batch);
+    ASSERT_EQ(6u, repair_batch.entries.size());
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(OpType::REMOVE, repair_batch.entries[i].op_type);
+        EXPECT_EQ(lost_keys[i], repair_batch.entries[i].object_key);
+    }
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(OpType::PUT_END, repair_batch.entries[3 + i].op_type);
+        EXPECT_EQ(survivor_keys[i], repair_batch.entries[3 + i].object_key);
+    }
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(1u, prefix.batch_id);
+    EXPECT_EQ(6u, prefix.last_seq);
+
+    for (const auto& key : lost_keys) {
+        EXPECT_EQ(0, ReplicaCountForTesting(service, kDefaultTenant, key))
+            << key;
+    }
+    for (const auto& key : survivor_keys) {
+        EXPECT_EQ(1, ReplicaCountForTesting(service, kDefaultTenant, key))
+            << key;
+    }
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreDiscardRepairRecordOverLimitFailsClosedWithoutWriterWedge) {
+    const std::string cluster_id = "test_restore_repair_record_limit";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallSizeLimitedWriter(service, backend, 1);
+    ASSERT_TRUE(HasOpLogWriter(service));
+    ASSERT_TRUE(writer->IsAccepting());
+
+    const std::string endpoint = "standby_repair_record_limit_segment";
+    std::vector<std::string> lost_keys;
+    std::vector<std::string> survivor_keys;
+    auto objects = MakeStandbyRepairConflicts(
+        "standby_repair_record_limit", endpoint, 3, lost_keys, survivor_keys);
+
+    auto result = service.RestoreFromStandbySnapshot(
+        std::move(objects), 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    EXPECT_TRUE(writer->IsAccepting());
+    EXPECT_FALSE(writer->GetTerminalState().has_value());
+    for (const auto& key : lost_keys) {
+        EXPECT_EQ(0, ReplicaCountForTesting(service, kDefaultTenant, key))
+            << key;
+    }
+    for (const auto& key : survivor_keys) {
+        EXPECT_EQ(0, ReplicaCountForTesting(service, kDefaultTenant, key))
+            << key;
+    }
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    EXPECT_NE(ErrorCode::OK, storage.ReadBatch(1, batch));
+}
+
+TEST_F(MasterServiceHATest, RestoreDiscardRepairSurvivesBlockedCallbacks) {
+    const std::string cluster_id = "test_restore_repair_blocked_callbacks";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_restore_repair_durable_timeout_ms(200)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallGatedWriter(service, backend);
+    writer->HoldCallbacks();
+
+    const std::string endpoint = "standby_repair_blocked_segment";
+    std::vector<std::string> lost_keys;
+    std::vector<std::string> survivor_keys;
+    auto objects = MakeStandbyRepairConflicts(
+        "standby_repair_blocked", endpoint, 1, lost_keys, survivor_keys);
+
+    // Durability is the durable prefix, not callback completion: callbacks
+    // stay blocked, yet the restore must succeed within the timeout.
+    auto result = service.RestoreFromStandbySnapshot(
+        std::move(objects), 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(result.has_value())
+        << "error=" << static_cast<int>(result.error());
+    EXPECT_EQ(1, ReplicaCountForTesting(service, kDefaultTenant,
+                                        survivor_keys.front()));
+    EXPECT_EQ(
+        0, ReplicaCountForTesting(service, kDefaultTenant, lost_keys.front()));
+    writer->ResumeCallbacks();
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreDiscardRepairTerminalWriterReturnsWithoutHanging) {
+    const std::string cluster_id = "test_restore_repair_terminal";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_restore_repair_durable_timeout_ms(0)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallFailingWriteWriter(service, backend);
+    ASSERT_TRUE(HasOpLogWriter(service));
+
+    const std::string endpoint = "standby_repair_terminal_segment";
+    std::vector<std::string> lost_keys;
+    std::vector<std::string> survivor_keys;
+    auto objects = MakeStandbyRepairConflicts(
+        "standby_repair_terminal", endpoint, 1, lost_keys, survivor_keys);
+
+    auto restore = std::async(std::launch::async, [&] {
+        return service.RestoreFromStandbySnapshot(
+            std::move(objects), 7, {MakeStandbyMemorySegment(endpoint)});
+    });
+    if (restore.wait_for(std::chrono::seconds(5)) !=
+        std::future_status::ready) {
+        writer->Stop();
+        restore.wait();
+        FAIL() << "restore hung waiting on a terminal writer";
+    }
+    auto result = restore.get();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    EXPECT_TRUE(writer->GetTerminalState().has_value());
+    EXPECT_EQ(
+        0, ReplicaCountForTesting(service, kDefaultTenant, lost_keys.front()));
+    EXPECT_EQ(0, ReplicaCountForTesting(service, kDefaultTenant,
+                                        survivor_keys.front()));
+}
+
 TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
     const std::string cluster_id = "test_restore_repair_rejected";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
@@ -2961,11 +3252,11 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairTimeoutThenRetrySucceeds) {
                               .set_enable_oplog(true)
                               .set_cluster_id(cluster_id)
                               .set_oplog_batch_max_entries(2)
-                              .set_restore_repair_durable_timeout_ms(50)
+                              .set_restore_repair_durable_timeout_ms(200)
                               .build();
     MasterService service(service_config);
     auto* writer = InstallGatedWriter(service, backend);
-    writer->HoldCallbacks();
+    writer->HoldWrites();
 
     const std::string endpoint = "standby_repair_timeout_segment";
     auto survivor =
@@ -3002,8 +3293,9 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairTimeoutThenRetrySucceeds) {
     EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
 
     // The first repair may still become durable after the local restore
-    // has rolled back. Resume the writer, then retry the same snapshot.
-    writer->ResumeCallbacks();
+    // has rolled back. Resume the blocked durability write, then retry the
+    // same snapshot.
+    writer->ResumeWrites();
     auto retry = service.RestoreFromStandbySnapshot(
         {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
     ASSERT_TRUE(retry.has_value());

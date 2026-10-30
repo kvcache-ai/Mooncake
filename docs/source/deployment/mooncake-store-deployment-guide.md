@@ -373,7 +373,7 @@ HA leadership and metadata replication are configured separately:
 - Before enabling this mode, every standby that may be promoted must support compaction-floor rebootstrap. Once pruning has started, rollback requires a binary that understands the batch snapshot and floor protocol. This maintenance does not perform etcd MVCC compaction/defragmentation or delete legacy snapshot/OpLog data.
 - `--snapshot_chunk_object_count`: Maximum objects written to one batch OpLog snapshot chunk. Defaults to `1000000`; must be greater than zero when `enable_oplog_snapshot=true`.
 - `--oplog_poll_interval_ms`: Base polling and retry delay for the batch standby, in milliseconds.
-- `--oplog_batch_max_entries`: Maximum number of entries admitted to an ordered batch. Defaults to `1024`.
+- `--oplog_batch_max_entries`: Maximum number of entries admitted to an ordered batch. Defaults to `1024`. The standby restore repair group is one indivisible record and may exceed this admission target; oversized groups are additionally bounded by the writer's 1 MiB encoded-record limit.
 - `--batch_oplog_retry_timeout_sec`: Maximum consecutive retryable batch-standby failure window in seconds (default `180`).
 
 For the new batch OpLog snapshot path, configure:
@@ -801,7 +801,7 @@ mooncake_master \
 | `--enable_oplog_snapshot` | `false` | Enable standby-generated batch OpLog snapshots; requires batch OpLog, HA/etcd, valid object-store configuration, and persistent local snapshot storage when applicable |
 | `--snapshot_chunk_object_count` | `1000000` | Maximum objects per batch OpLog snapshot chunk; must be positive when the new snapshot path is enabled |
 | `--oplog_poll_interval_ms` | `1000` | Base polling and retry delay for the batch standby, in milliseconds |
-| `--oplog_batch_max_entries` | `1024` | Maximum number of entries admitted to an ordered batch |
+| `--oplog_batch_max_entries` | `1024` | Maximum number of entries admitted to an ordered batch; the standby restore repair group is exempt and bounded by the writer's 1 MiB encoded-record limit |
 | `--batch_oplog_retry_timeout_sec` | `180` | Maximum consecutive retryable batch-standby failure window in seconds |
 
 **Batch OpLog Snapshot**
