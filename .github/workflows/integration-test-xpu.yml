@@ -1,0 +1,106 @@
+name: Integration test (XPU core)
+
+on:
+  workflow_call:
+    inputs:
+      checkout_sha:
+        type: string
+        required: true
+      source_sha:
+        type: string
+        required: true
+      artifact_id:
+        type: string
+        required: true
+      artifact_digest:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  core:
+    runs-on: [self-hosted, Linux, X64, xpu]
+    timeout-minutes: 90
+    env:
+      XPU_IMAGE: intel/pytorch:xpu-2.13.0-ubuntu24.04-20260907@sha256:7366f264bd7aaa7f0df7d1bfba43be7c84c126df21ba448ae5445a34c2def4f9
+    steps:
+      - name: Check out trusted harness
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: xpu-control
+          persist-credentials: false
+
+      - name: Allocate run directory
+        id: run
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "directory=$(mktemp -d "$RUNNER_TEMP/xpu-core.XXXXXX")" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact build artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          RUN_DIRECTORY: ${{ steps.run.outputs.directory }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]] || { echo "::error::Invalid artifact ID"; exit 1; }
+          [[ "$CHECKOUT_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Invalid source SHA"; exit 1; }
+          [ "$SOURCE_SHA" = "$CHECKOUT_SHA" ] || { echo "::error::Build SHA differs from authorized SHA"; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" > "$RUN_DIRECTORY/artifact.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$RUN_DIRECTORY/artifact.zip"
+          python3 xpu-control/scripts/ci/xpu_core.py unpack \
+            "$RUN_DIRECTORY" "$CHECKOUT_SHA" "$ARTIFACT_ID" "$ARTIFACT_DIGEST"
+
+      - name: Check out authorized test source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_sha }}
+          path: xpu-tested-source
+          persist-credentials: false
+
+      - name: Execute isolated two-B60 core
+        shell: bash
+        env:
+          RUN_DIRECTORY: ${{ steps.run.outputs.directory }}
+          CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git -C xpu-tested-source rev-parse HEAD)" = "$CHECKOUT_SHA" ] || {
+            echo "::error::Checked out source differs from authorized SHA"; exit 1;
+          }
+          bash xpu-control/scripts/ci/run_xpu_core.sh \
+            "$RUN_DIRECTORY" "$GITHUB_WORKSPACE/xpu-tested-source" \
+            "$GITHUB_WORKSPACE/xpu-control/scripts"
+
+      - name: Recheck current-run container cleanup
+        if: always() && steps.run.outputs.directory != ''
+        shell: bash
+        env:
+          RUN_DIRECTORY: ${{ steps.run.outputs.directory }}
+        run: |
+          mkdir -p "$RUN_DIRECTORY/output"
+          bash xpu-control/scripts/ci/run_xpu_core.sh --cleanup "$RUN_DIRECTORY"
+
+      - name: Preserve hardware diagnostics
+        if: always() && steps.run.outputs.directory != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpu-core-${{ inputs.checkout_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.run.outputs.directory }}/output/*.json
+            ${{ steps.run.outputs.directory }}/output/*.xml
+            ${{ steps.run.outputs.directory }}/output/*.log
+            ${{ steps.run.outputs.directory }}/output/*.list
+            ${{ steps.run.outputs.directory }}/output/*.ldd
+            ${{ steps.run.outputs.directory }}/artifact.json
+          if-no-files-found: error
+          retention-days: 14

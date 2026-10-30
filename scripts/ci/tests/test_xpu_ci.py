@@ -358,6 +358,8 @@ class NativeBundleTest(unittest.TestCase):
         self.out.parent.mkdir()
         (self.out.parent / "provenance.txt").write_text("source_sha=test\n")
         (self.out.parent / "fixture.whl").write_bytes(b"wheel artifact")
+        (self.out.parent / "python-deps").mkdir()
+        (self.out.parent / "python-deps" / "fixture-dep.whl").write_bytes(b"dependency")
         self.build.mkdir()
         (self.build / "CMakeCache.txt").write_text("USE_XPU:BOOL=ON\n")
         self.library = self.root / "libfixture.so"
