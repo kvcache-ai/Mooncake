@@ -4240,9 +4240,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     // unrepaired, so the restore fails explicitly instead.
     const bool have_conflict_repairs =
         !repair_remove_keys.empty() || !repair_canonical_keys.empty();
-    const bool have_stale_repairs =
-        !repair_stale_remove_keys.empty() ||
-        !repair_stale_canonical_keys.empty();
+    const bool have_stale_repairs = !repair_stale_remove_keys.empty() ||
+                                    !repair_stale_canonical_keys.empty();
     if ((have_conflict_repairs || have_stale_repairs) && enable_oplog_ &&
         !ordered_oplog_writer_) {
         LOG(ERROR) << "RestoreFromStandbySnapshot: conflict discards need "
@@ -4257,10 +4256,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         // record serializes the installed metadata, and a later batch must not
         // observe a state an earlier batch changed.
         const auto build_entries =
-            [this](const std::vector<std::pair<TenantId, std::string>>&
-                       removals,
-                   const std::vector<std::pair<TenantId, std::string>>&
-                       canonicals) {
+            [this](
+                const std::vector<std::pair<TenantId, std::string>>& removals,
+                const std::vector<std::pair<TenantId, std::string>>&
+                    canonicals) {
                 std::vector<OpLogEntry> entries;
                 entries.reserve(removals.size() + canonicals.size());
                 for (const auto& [tenant, key] : removals) {
@@ -4315,8 +4314,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
             if (restore_repair_durable_timeout_ms_ == 0) {
                 durable_future.wait();
             } else {
-                durable_status = durable_future.wait_for(
-                    std::chrono::milliseconds(
+                durable_status =
+                    durable_future.wait_for(std::chrono::milliseconds(
                         restore_repair_durable_timeout_ms_));
             }
             if (durable_status != std::future_status::ready) {
@@ -4331,9 +4330,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
 
         auto conflict_entries =
             build_entries(repair_remove_keys, repair_canonical_keys);
-        auto stale_entries =
-            build_entries(repair_stale_remove_keys,
-                          repair_stale_canonical_keys);
+        auto stale_entries = build_entries(repair_stale_remove_keys,
+                                           repair_stale_canonical_keys);
         const size_t total = conflict_entries.size() + stale_entries.size();
         size_t durable_records = 0;
         size_t durable_batches = 0;
