@@ -184,24 +184,24 @@ TEST_F(RpcHandlerIsolationTest, FunctionRegisteredAfterStartIsServed) {
     EXPECT_EQ(response, "late");
 }
 
-TEST(ControlRpcCompatibility, LegacyWireIdsPreserved) {
+TEST(ControlRpcCompatibility, CurrentWireIdsPreserved) {
     static_assert(GetSegmentDesc == 1);
     static_assert(BootstrapRdma == 2);
     static_assert(SendData == 3);
     static_assert(RecvData == 4);
     static_assert(Notify == 5);
-    static_assert(Delegate == 6);
-    static_assert(Pin == 7);
-    static_assert(Unpin == 8);
-    static_assert(Probe == 9);
+    static_assert(Delegate == 7);
+    static_assert(Pin == 8);
+    static_assert(Unpin == 9);
+    static_assert(Probe == 6);
     static_assert(SubscribeSegmentUpdate == 10);
     static_assert(NotifySegmentUpdated == 11);
     static_assert(BootstrapUb == 12);
 
-    constexpr int kLegacyDelegate = 6;
-    constexpr int kLegacyPin = 7;
-    constexpr int kLegacyUnpin = 8;
-    constexpr int kProbe = 9;
+    constexpr int kCurrentDelegate = 7;
+    constexpr int kCurrentPin = 8;
+    constexpr int kCurrentUnpin = 9;
+    constexpr int kProbe = 6;
 
     CoroRpcAgent server;
     std::atomic<int> probe_calls{0};
@@ -239,15 +239,15 @@ TEST(ControlRpcCompatibility, LegacyWireIdsPreserved) {
 
     CoroRpcAgent client;
     std::string response;
-    ASSERT_TRUE(client.call(addr, kLegacyDelegate, "{}", response).ok());
+    ASSERT_TRUE(client.call(addr, kCurrentDelegate, "{}", response).ok());
     EXPECT_EQ(delegate_calls.load(), 1);
     EXPECT_EQ(probe_calls.load(), 0);
 
-    ASSERT_TRUE(client.call(addr, kLegacyPin, "\"remote\"", response).ok());
+    ASSERT_TRUE(client.call(addr, kCurrentPin, "\"remote\"", response).ok());
     EXPECT_EQ(pin_calls.load(), 1);
     EXPECT_EQ(delegate_calls.load(), 1);
 
-    ASSERT_TRUE(client.call(addr, kLegacyUnpin, "1234", response).ok());
+    ASSERT_TRUE(client.call(addr, kCurrentUnpin, "1234", response).ok());
     EXPECT_EQ(unpin_calls.load(), 1);
     EXPECT_EQ(pin_calls.load(), 1);
 
