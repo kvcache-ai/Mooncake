@@ -138,10 +138,18 @@ after failure or cancellation.
 CPU-only regression validation:
 
 ```sh
-python3 -m unittest discover -s scripts/ci/tests -p 'test_xpu*.py' -v
+python3 -m unittest scripts.ci.tests.test_xpu_ci -v
 bash -n scripts/ci/run_xpu_core.sh
 ```
 
-These regressions validate orchestration contracts, not actual B60 behavior.
+All XPU CI regressions share this one test module and common workflow/module
+loaders; they validate packaging and orchestration contracts, not actual B60
+behavior. The runtime entry points have different roles:
+
+- `scripts/ci/run_xpu_core.sh` owns host Docker launch and cleanup.
+- `scripts/ci/xpu_core.py` verifies artifacts and executes the container suites.
+- `scripts/e2e/python/verify_xpu_wheel.py` checks the installed wheel and is
+  reused by both hosted builds and hardware runs.
+
 Enable hardware only after provisioning and successfully running the exact
 core workflow; record real queue/runtime measurements during rollout.
