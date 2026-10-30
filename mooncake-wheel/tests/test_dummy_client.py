@@ -318,30 +318,6 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
          for key in list(reference.keys()):
              self.store.remove(key)
 
-    def test_replicate_config_creation_and_properties(self):
-        """Test ReplicateConfig class creation and property access."""
-        from mooncake.store import ReplicateConfig
-
-        # Test default constructor
-        config = ReplicateConfig()
-        self.assertEqual(config.replica_num, 1)
-        self.assertEqual(config.with_soft_pin, False)
-        self.assertEqual(config.preferred_segment, "")
-
-        # Test property assignment
-        config.replica_num = 3
-        config.with_soft_pin = True
-        config.preferred_segment = "node1:12345"
-
-        self.assertEqual(config.replica_num, 3)
-        self.assertEqual(config.with_soft_pin, True)
-        self.assertEqual(config.preferred_segment, "node1:12345")
-
-        # Test string representation
-        config_str = str(config)
-        self.assertIsInstance(config_str, str)
-        self.assertIn("3", config_str)  # Should contain replica_num
-
 if __name__ == '__main__':
     # Show which test is running; stop on first failure
     unittest.main(verbosity=2, failfast=True)

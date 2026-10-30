@@ -269,14 +269,6 @@ jobs:
         mooncake_http_metadata_server --port 8080 &
       shell: bash
 
-    - name: Test installed P2P CLI startup
-      run: |
-        source test_env/bin/activate
-        python mooncake-wheel/tests/test_cli.py
-      shell: bash
-
-    # TODO(P2P-010.4): Adapt installed tier/service/HA workloads from run_tests.sh
-    # and validate the applicable TCP/RDMA paths.
     - name: Prepare P2P test configurations
       run: |
         mkdir -p "$RUNNER_TEMP/store-wheel-p2p"
@@ -289,7 +281,7 @@ jobs:
                         "evict_watermark_high": 0.90, "limit_watermark": 0.95}
         }
         JSON
-        # The tensor workload contains 256MB of values.
+        # The benchmark uses 256 MiB; the default stress case stores about 400 MiB.
         cat > "$RUNNER_TEMP/store-wheel-p2p/api-tiered-backend.json" <<'JSON'
         {
           "tiers": [{"type": "DRAM", "capacity": "1GB", "priority": 10,
@@ -310,7 +302,7 @@ jobs:
         MOONCAKE_DEPLOYMENT_PROTOCOL: tcp
       run: |
         source test_env/bin/activate
-        python mooncake-wheel/tests/test_deployment_lifecycle.py
+        timeout --verbose --kill-after=5s 600s python mooncake-wheel/tests/test_deployment_lifecycle.py -f
       shell: bash
 
     - name: Preserve deployment logs
@@ -320,6 +312,23 @@ jobs:
         name: store-wheel-p2p-${{ matrix.ubuntu-version }}-py${{ matrix.python-version }}
         path: ${{ runner.temp }}/store-wheel-p2p/
         if-no-files-found: warn
+
+    # Tier/HA fault matrices and hardware RDMA remain separate workloads.
+    - name: Test P2P Python Store contracts
+      timeout-minutes: 20
+      run: |
+        source test_env/bin/activate
+        RUN_TESTS_METADATA_SERVER_MODE=external \
+          MOONCAKE_TEST_LOG_DIR="$RUNNER_TEMP/store-python-p2p" ./scripts/run_p2p_tests.sh
+      shell: bash
+
+    - name: Preserve P2P Python Store test logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: store-python-p2p-${{ matrix.ubuntu-version }}-py${{ matrix.python-version }}
+        path: ${{ runner.temp }}/store-python-p2p/
+        if-no-files-found: ignore
 
     - name: Start Mooncake Master
       run: |

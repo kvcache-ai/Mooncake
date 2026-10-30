@@ -143,7 +143,6 @@ def setUpModule():
                     client_rpc_port=0,
                     enable_http_server=False,
                     enable_metric_collection=False,
-                    runtime_config='{"write":{"remote_weight":0.0}}',
                 )
             return GLOBAL_STORE.setup(
                 GLOBAL_CONFIG.local_hostname,
@@ -191,9 +190,8 @@ class MooncakeAsyncTestBase(unittest.IsolatedAsyncioTestCase):
         self.store = GLOBAL_STORE
         self.config = GLOBAL_CONFIG
 
-        # TODO: Enable P2P cleanup once global remove_all is implemented.
-        if not IS_P2P:
-            await self.store.async_remove_all()
+        removed = await self.store.async_remove_all(force=True)
+        self.assertGreaterEqual(removed, 0, f"Test storage cleanup failed: {removed}")
 
 # ==========================================
 #  Basic Bytes I/O & Auxiliary Tests
@@ -254,28 +252,27 @@ class TestMooncakeBasicFunctional(MooncakeAsyncTestBase):
         self.assertEqual(results[1], 0)
         self.assertEqual(results[2], 1)
 
-    # TODO: Enable P2P coverage once global remove/remove_all is implemented.
-    @unittest.skipIf(IS_P2P, "P2P global remove/remove_all is not implemented yet")
     async def test_04_remove(self):
         """Test remove and remove_all."""
         key = "test_remove_key"
-        await self.store.async_put(key, b"data")
-
-        self.assertTrue(await self.store.async_is_exist(key))
-
+        self.assertEqual(await self.store.async_put(key, b"data"), 0)
+        self.assertEqual(await self.store.async_get(key), b"data")
         await asyncio.sleep(6)
-        # Remove single
-        await self.store.async_remove(key)
-        self.assertFalse(await self.store.async_is_exist(key))
+
+        self.assertEqual(await self.store.async_remove(key), 0)
+        self.assertEqual(await self.store.async_get(key), b"")
 
         # Test Remove All (implicitly tested in setup, but explicit here)
         keys = ["rm_all_1", "rm_all_2"]
-        await self.store.async_put_batch(keys, [b"1", b"2"])
-        self.assertTrue(await self.store.async_is_exist(keys[0]))
+        values = [b"1", b"2"]
+        self.assertEqual(await self.store.async_put_batch(keys, values), 0)
+        self.assertEqual(await self.store.async_get_batch(keys), values)
         await asyncio.sleep(6)
-        await self.store.async_remove_all()
-        self.assertFalse(await self.store.async_is_exist(keys[0]))
-        self.assertFalse(await self.store.async_is_exist(keys[1]))
+
+        removed = await self.store.async_remove_all()
+        self.assertGreaterEqual(removed, len(keys), f"Remove all failed: {removed}")
+        self.assertEqual(await self.store.async_get_batch(keys), [b"", b""])
+        self.assertEqual(await self.store.async_remove_all(), 0)
 
     # TODO: Enable P2P coverage once global remove_by_regex is implemented.
     @unittest.skipIf(IS_P2P, "P2P global remove_by_regex is not implemented yet")

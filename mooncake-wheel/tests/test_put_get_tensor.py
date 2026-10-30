@@ -7,6 +7,8 @@ import threading
 import random
 from mooncake.store import MooncakeDistributedStore
 
+IS_P2P = hasattr(MooncakeDistributedStore, "setup_p2p_real_client")
+
 # The lease time of the kv object, should be set equal to
 # the master's value.
 DEFAULT_DEFAULT_KV_LEASE_TTL = 5000 # 5000 milliseconds
@@ -43,16 +45,29 @@ def get_client(store):
     local_buffer_size = 512 * 1024 * 1024     # 512 MB
     master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
     
-    retcode = store.setup(
-        local_hostname, 
-        metadata_server, 
-        global_segment_size,
-        local_buffer_size, 
-        protocol, 
-        device_name,
-        master_server_address
-    )
-    
+    if IS_P2P:
+        retcode = store.setup_p2p_real_client(
+            local_hostname=local_hostname,
+            metadata_server=metadata_server,
+            tiered_backend_config_json=os.environ["MOONCAKE_TIERED_BACKEND_CONFIG"],
+            local_buffer_size=local_buffer_size,
+            protocol=protocol,
+            rdma_devices=device_name,
+            master_server_addr=master_server_address,
+            client_rpc_port=0,
+            enable_http_server=False,
+            enable_metric_collection=False,
+        )
+    else:
+        retcode = store.setup(
+            local_hostname,
+            metadata_server,
+            global_segment_size,
+            local_buffer_size,
+            protocol,
+            device_name,
+            master_server_address,
+        )
     if retcode:
         raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
 
@@ -114,10 +129,10 @@ class TestDistributedObjectStore(unittest.TestCase):
 
         # Clean up
         time.sleep(default_kv_lease_ttl / 1000)
-        self.store.remove(key)
-        self.store.remove(key_int)
-        self.store.remove(key_bool)
-        self.store.remove(key_rand)
+        self.assertEqual(self.store.remove(key), 0)
+        self.assertEqual(self.store.remove(key_int), 0)
+        self.assertEqual(self.store.remove(key_bool), 0)
+        self.assertEqual(self.store.remove(key_rand), 0)
 
     def test_put_get_tensor_with_metadata(self):
         """Test storing and retrieving PyTorch tensors with metadata using put_tensor_with_metadata/get_tensor_with_metadata."""
@@ -149,8 +164,9 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertTrue(torch.equal(tensor_3d, retrieved_tensor_3d))
 
         # Clean up
-        self.store.remove(key_2d)
-        self.store.remove(key_3d)
+        time.sleep(default_kv_lease_ttl / 1000)
+        self.assertEqual(self.store.remove(key_2d), 0)
+        self.assertEqual(self.store.remove(key_3d), 0)
 
              
 if __name__ == '__main__':
