@@ -7,6 +7,7 @@
 #include <climits>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <sys/mman.h>
 #include <sys/uio.h>
@@ -22,17 +23,89 @@
 
 namespace mooncake {
 
+// liburing 2.9 added io_uring_clone_buffers().
+#if defined(IO_URING_VERSION_MAJOR) && \
+    (IO_URING_VERSION_MAJOR > 2 ||     \
+     (IO_URING_VERSION_MAJOR == 2 && IO_URING_VERSION_MINOR >= 9))
+#define MC_HAVE_URING_CLONE_BUFFERS 1
+#endif
+
+// The kernel rejects a fixed buffer larger than 1 GiB with EFAULT
+// (io_buffer_validate), so a larger buffer is registered as consecutive
+// pieces of at most this size, and an I/O uses the piece it falls in.
+static constexpr size_t kMaxFixedBufBytes = 1ULL << 30;
+
 // ============================================================================
 // GlobalBufInfo — process-wide buffer registration state.
 //
-// register_buffer() is called once from the storage-backend init path.
-// Each thread-local ring picks up the registration lazily on first I/O.
+// register_buffer() is called once from the storage-backend init path. The
+// buffer is registered (and its pages pinned) once, on a source ring that does
+// no I/O. Each thread-local ring clones that buffer table lazily on first I/O,
+// which shares the pinned pages instead of pinning the buffer again: with
+// hundreds of I/O threads, registering per ring pinned the buffer once per
+// thread and stalled the first read on every thread. Without clone support
+// (liburing < 2.9 or kernel < 6.13) the rings use unfixed I/O.
 // ============================================================================
 struct GlobalBufInfo {
     std::atomic<void*> base{nullptr};
     std::atomic<size_t> size{0};
+    std::mutex source_mu;  // guards source and source_ready
+    struct io_uring source{};
+    bool source_ready = false;
 };
 static GlobalBufInfo g_buf;
+
+// Unpins the source registration and closes the source ring. Unregistering
+// first makes the unpin synchronous: io_uring_queue_exit() alone leaves it to
+// the kernel's deferred ring teardown.
+static void release_source_registration() {
+    std::lock_guard<std::mutex> lock(g_buf.source_mu);
+    if (!g_buf.source_ready) return;
+    io_uring_unregister_buffers(&g_buf.source);
+    io_uring_queue_exit(&g_buf.source);
+    g_buf.source_ready = false;
+}
+
+// Registers [buffer, buffer + length) on the source ring, replacing any
+// previous registration. Returns false if fixed buffers cannot be shared.
+static bool register_source_buffer(void* buffer, size_t length) {
+    release_source_registration();
+#ifdef MC_HAVE_URING_CLONE_BUFFERS
+    std::lock_guard<std::mutex> lock(g_buf.source_mu);
+    int ret = io_uring_queue_init(1, &g_buf.source, 0);
+    if (ret < 0) {
+        LOG(WARNING) << "[UringFile] source ring init failed: "
+                     << strerror(-ret) << " — using unfixed I/O";
+        return false;
+    }
+    std::vector<struct iovec> iovs;
+    iovs.reserve((length + kMaxFixedBufBytes - 1) / kMaxFixedBufBytes);
+    for (size_t off = 0; off < length; off += kMaxFixedBufBytes) {
+        iovs.push_back({static_cast<char*>(buffer) + off,
+                        std::min(kMaxFixedBufBytes, length - off)});
+    }
+    ret = io_uring_register_buffers(&g_buf.source, iovs.data(),
+                                    static_cast<unsigned>(iovs.size()));
+    if (ret < 0) {
+        LOG(WARNING) << "[UringFile] io_uring_register_buffers failed"
+                     << " errno=" << -ret << " (" << strerror(-ret) << ")"
+                     << " buf=" << buffer << " size=" << length
+                     << " pieces=" << iovs.size() << " — using unfixed I/O";
+        io_uring_queue_exit(&g_buf.source);
+        return false;
+    }
+    g_buf.source_ready = true;
+    LOG(INFO) << "[UringFile] registered fixed buffer addr=" << buffer
+              << " size=" << length << " pieces=" << iovs.size();
+    return true;
+#else
+    (void)buffer;
+    (void)length;
+    LOG(INFO) << "[UringFile] liburing lacks io_uring_clone_buffers(); "
+                 "using unfixed I/O";
+    return false;
+#endif
+}
 
 // ============================================================================
 // SharedUringRing — per-thread io_uring ring.
@@ -70,8 +143,9 @@ class SharedUringRing {
     // Buffer registration
     // -----------------------------------------------------------------
 
-    // Register a buffer on THIS thread's ring.  Called lazily from each
-    // thread before the first fixed-buffer I/O.
+    // Give THIS thread's ring the global fixed buffer by cloning the source
+    // ring's buffer table.  Called lazily from each thread before the first
+    // fixed-buffer I/O.
     bool ensure_buf_registered() {
         if (buf_registered_) return true;
         if (buf_register_failed_) return false;  // don't retry after failure
@@ -79,24 +153,37 @@ class SharedUringRing {
         void* b = g_buf.base.load(std::memory_order_acquire);
         size_t s = g_buf.size.load(std::memory_order_acquire);
         if (!b || !s) return false;
-        struct iovec iov{b, s};
-        int ret = io_uring_register_buffers(&ring_, &iov, 1);
+#ifdef MC_HAVE_URING_CLONE_BUFFERS
+        int ret;
+        {
+            std::lock_guard<std::mutex> lock(g_buf.source_mu);
+            if (!g_buf.source_ready) {
+                buf_register_failed_ = true;
+                return false;
+            }
+            ret = io_uring_clone_buffers(&ring_, &g_buf.source);
+        }
         if (ret < 0) {
-            int err = -ret;
-            LOG(WARNING) << "[SharedUringRing] io_uring_register_buffers failed"
-                         << " errno=" << err << " (" << strerror(err) << ")"
-                         << " buf=" << b << " size=" << s
-                         << " pages=" << (s >> 12)
-                         << " — falling back to non-fixed-buffer I/O";
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                LOG(WARNING) << "[SharedUringRing] io_uring_clone_buffers "
+                                "failed errno="
+                             << -ret << " (" << strerror(-ret)
+                             << ") — using unfixed I/O";
+            }
             buf_register_failed_ = true;
             return false;
         }
         buf_registered_ = true;
         buf_base_ = b;
         buf_size_ = s;
-        LOG(INFO) << "[SharedUringRing] tid registered buffer addr=" << b
-                  << " size=" << s;
+        VLOG(1) << "[SharedUringRing] cloned fixed buffer addr=" << b
+                << " size=" << s;
         return true;
+#else
+        buf_register_failed_ = true;
+        return false;
+#endif
     }
 
     void unregister_buf_local() {
@@ -176,8 +263,10 @@ class SharedUringRing {
                     return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
                 auto& d = descs[idx + i];
-                if (buf_registered_ && in_registered_buf(d.buf, d.len))
-                    io_uring_prep_read_fixed(sqe, fd, d.buf, d.len, d.off, 0);
+                int buf_index = fixed_buf_index(d.buf, d.len);
+                if (buf_index >= 0)
+                    io_uring_prep_read_fixed(sqe, fd, d.buf, d.len, d.off,
+                                             buf_index);
                 else
                     io_uring_prep_read(sqe, fd, d.buf, d.len, d.off);
                 sqe->user_data = op | static_cast<uint64_t>(i + 1);
@@ -313,6 +402,20 @@ class SharedUringRing {
         uintptr_t buf_addr = reinterpret_cast<uintptr_t>(buf);
         uintptr_t rb = reinterpret_cast<uintptr_t>(buf_base_);
         return buf_addr >= rb && (buf_addr + len) <= (rb + buf_size_);
+    }
+
+    // Index of the registered piece holding [buf, buf + len), or -1 if the
+    // range is not registered or crosses a piece boundary (a fixed I/O must
+    // lie within one registered buffer; such an I/O goes unfixed).
+    int fixed_buf_index(const void* buf, size_t len) const {
+        if (len == 0 || !in_registered_buf(buf, len)) return -1;
+        size_t first = (reinterpret_cast<uintptr_t>(buf) -
+                        reinterpret_cast<uintptr_t>(buf_base_)) /
+                       kMaxFixedBufBytes;
+        size_t last = (reinterpret_cast<uintptr_t>(buf) + len - 1 -
+                       reinterpret_cast<uintptr_t>(buf_base_)) /
+                      kMaxFixedBufBytes;
+        return first == last ? static_cast<int>(first) : -1;
     }
 
     static size_t next_pow2(size_t n) {
@@ -468,14 +571,17 @@ class SharedUringRing {
                     return tl::make_unexpected(err_code);
                 }
 
+                int buf_index = fix_buf ? fixed_buf_index(ptr, chunk) : -1;
                 if (is_write) {
-                    if (fix_buf)
-                        io_uring_prep_write_fixed(sqe, fd, ptr, chunk, cur, 0);
+                    if (buf_index >= 0)
+                        io_uring_prep_write_fixed(sqe, fd, ptr, chunk, cur,
+                                                  buf_index);
                     else
                         io_uring_prep_write(sqe, fd, ptr, chunk, cur);
                 } else {
-                    if (fix_buf)
-                        io_uring_prep_read_fixed(sqe, fd, ptr, chunk, cur, 0);
+                    if (buf_index >= 0)
+                        io_uring_prep_read_fixed(sqe, fd, ptr, chunk, cur,
+                                                 buf_index);
                     else
                         io_uring_prep_read(sqe, fd, ptr, chunk, cur);
                 }
@@ -976,6 +1082,17 @@ tl::expected<void, ErrorCode> UringFile::datasync() {
 // Buffer registration
 // ---------------------------------------------------------------------------
 
+// Registers the buffer on the source ring and clones it onto the calling
+// thread's ring. If the clone fails (kernels before 6.13 reject it), no ring
+// can use the source registration, so its pinned pages are released now
+// instead of at unregister.
+static bool register_and_clone(void* buffer, size_t length) {
+    if (!register_source_buffer(buffer, length)) return false;
+    if (SharedUringRing::instance().ensure_buf_registered()) return true;
+    release_source_registration();
+    return false;
+}
+
 bool UringFile::register_global_buffer(void* buffer, size_t length) {
     if (!buffer || length == 0) {
         LOG(ERROR)
@@ -996,11 +1113,10 @@ bool UringFile::register_global_buffer(void* buffer, size_t length) {
     }
     g_buf.base.store(buffer, std::memory_order_release);
     g_buf.size.store(length, std::memory_order_release);
-    bool ok = SharedUringRing::instance().ensure_buf_registered();
+    bool ok = register_and_clone(buffer, length);
     if (ok) {
         LOG(INFO) << "[UringFile::register_global_buffer] registered"
-                  << " addr=" << buffer << " size=" << length
-                  << " pages=" << (length >> 12);
+                  << " addr=" << buffer << " size=" << length;
     } else {
         LOG(WARNING)
             << "[UringFile::register_global_buffer] registration failed"
@@ -1015,6 +1131,7 @@ void UringFile::unregister_global_buffer() {
     g_buf.base.store(nullptr, std::memory_order_release);
     g_buf.size.store(0, std::memory_order_release);
     SharedUringRing::instance().unregister_buf_local();
+    release_source_registration();
 }
 
 bool UringFile::register_buffer(void* buffer, size_t length) {
@@ -1032,11 +1149,11 @@ bool UringFile::register_buffer(void* buffer, size_t length) {
             return false;
         }
     }
-    // Publish globally; each thread-local ring registers lazily on first I/O.
+    // Publish globally; each thread-local ring clones it lazily on first I/O.
     g_buf.base.store(buffer, std::memory_order_release);
     g_buf.size.store(length, std::memory_order_release);
-    // Register on the calling thread's ring immediately.
-    bool ok = SharedUringRing::instance().ensure_buf_registered();
+    // Register once, then clone onto the calling thread's ring immediately.
+    bool ok = register_and_clone(buffer, length);
     LOG(INFO) << "[UringFile::register_buffer] addr=" << buffer
               << " size=" << length << " calling-thread-registered=" << ok;
     return ok;
@@ -1048,6 +1165,7 @@ void UringFile::unregister_buffer() {
     g_buf.size.store(0, std::memory_order_release);
     // Unregister on the calling thread's ring.
     SharedUringRing::instance().unregister_buf_local();
+    release_source_registration();
 }
 
 bool UringFile::is_buffer_registered() const {
