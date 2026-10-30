@@ -78,9 +78,12 @@ loadCollectiveAlgorithmFromEnvironment() {
     if (value == "oneshot") {
         return std::optional{DeviceAllReduceAlgorithm::OneShot};
     }
+    if (value == "twoshot") {
+        return std::optional{DeviceAllReduceAlgorithm::TwoShot};
+    }
     return makePGError(PGErrorCode::InvalidArgument,
                        "MOONCAKE_PG_COLLECTIVE_ALGORITHM must be 'auto', "
-                       "'ring', or 'oneshot'");
+                       "'ring', 'oneshot', or 'twoshot'");
 }
 
 void copyDeviceToDevice(void* dst, const void* src, size_t bytes,
@@ -1890,7 +1893,7 @@ void MooncakeCommunicator::applyGroupState(
         switch (next_mode) {
             case CollectiveExtensionState::Isolated:
             case CollectiveExtensionState::Quiescing:
-                PG_ASSERT_OK(device_collective_->useLocalOnly(view.epoch));
+                PG_ASSERT_OK(device_collective_->useLocalOnly(view));
                 break;
             case CollectiveExtensionState::Normal:
                 PG_ASSERT_OK(device_collective_->applyGroupView(view));

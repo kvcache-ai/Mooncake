@@ -276,6 +276,82 @@ def _collective_payload(
     raise ValueError(f"unsupported collective case_name: {case_name}")
 
 
+def _allreduce_boundaries_worker(ctx: MooncakePGWorkerContext) -> None:
+    ctx.init_group()
+    cases = 0
+    for dtype in (
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int32,
+        torch.int64,
+    ):
+        for count in (0, 1, 3, 17, 2049, 65539):
+            # Offset by one element to exercise unaligned packs and guard both
+            # ends, including empty owner shards and nonuniform channel tails.
+            storage = torch.full((count + 2,), -7, dtype=dtype, device=ctx.device)
+            tensor = storage[1:-1]
+            base = (torch.arange(count, device=ctx.device) % 3 + 1).to(dtype)
+            for op in (
+                dist.ReduceOp.SUM,
+                dist.ReduceOp.PRODUCT,
+                dist.ReduceOp.MIN,
+                dist.ReduceOp.MAX,
+            ):
+                if op == dist.ReduceOp.PRODUCT:
+                    tensor.fill_(2)
+                    expected = torch.full_like(base, 2**ctx.world_size)
+                else:
+                    tensor.copy_(base + ctx.rank)
+                    if op == dist.ReduceOp.SUM:
+                        expected = (
+                            base * ctx.world_size
+                            + ctx.world_size * (ctx.world_size - 1) // 2
+                        )
+                    elif op == dist.ReduceOp.MIN:
+                        expected = base
+                    else:
+                        expected = base + ctx.world_size - 1
+                dist.all_reduce(tensor, op=op)
+                assert torch.equal(tensor, expected), (dtype, count, op, ctx.rank)
+                assert storage[0].item() == storage[-1].item() == -7
+                cases += 1
+
+    # Cross a complete 32-channel tile at 2/8 ranks with the default workspace.
+    large = torch.empty((1 << 22) + 3, device=ctx.device)
+    for _ in range(3):
+        large.fill_(ctx.rank + 1)
+        dist.all_reduce(large)
+        assert bool(torch.all(large == ctx.world_size * (ctx.world_size + 1) // 2))
+    ctx.record_result({"cases": cases})
+
+
+def _allreduce_graph_replay_worker(ctx: MooncakePGWorkerContext) -> None:
+    ctx.init_group()
+    tensor = torch.full((131073,), ctx.rank + 1, device=ctx.device)
+    dist.all_reduce(tensor)
+    torch.cuda.synchronize(ctx.device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        tensor.fill_(ctx.rank + 1)
+        dist.all_reduce(tensor)
+    expected = ctx.world_size * (ctx.world_size + 1) // 2
+    for iteration in range(12):
+        # Interleave different launch/channel sizes with replay on the same
+        # communicator so protocol progress cannot be captured as constants.
+        graph.replay()
+        other = torch.full(
+            (1 if iteration % 2 else 8193,), ctx.rank + 1, device=ctx.device
+        )
+        dist.all_reduce(other)
+        torch.cuda.synchronize(ctx.device)
+        assert bool(torch.all(tensor == expected))
+        assert bool(torch.all(other == expected))
+    graph.reset()
+    torch.cuda.synchronize(ctx.device)
+    ctx.record_result({"replays": 12})
+
+
 def _collective_worker(
     ctx: MooncakePGWorkerContext,
     case_name: str,
@@ -438,6 +514,18 @@ class TestMooncakePGCollectivesCUDA(
     _CollectiveTestMixin, MooncakePGCUDABackendTestCase
 ):
     world_size = 2
+
+    def test_allreduce_unaligned_tails_and_slot_reuse(self) -> None:
+        rows = self.spawn_backend_and_collect(_allreduce_boundaries_worker)
+        self.assert_all_ok(rows)
+        for row in rows:
+            self.assertEqual(row["cases"], 120)
+
+    def test_allreduce_graph_replay_with_changing_sizes(self) -> None:
+        rows = self.spawn_backend_and_collect(_allreduce_graph_replay_worker)
+        self.assert_all_ok(rows)
+        for row in rows:
+            self.assertEqual(row["replays"], 12)
 
     def test_async_ops_on_independent_streams(self) -> None:
         spawn_ctx = mp.get_context("spawn")
