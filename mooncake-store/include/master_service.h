@@ -300,7 +300,8 @@ class MasterService {
      * path, so a client-to-target partition is invisible to them; without
      * this report the master keeps handing the partitioned client handles it
      * cannot write to. Reported endpoints are excluded from that client's NoF
-     * allocations until the report expires.
+     * allocations until the report expires. Reports from a client without a
+     * live liveness record are rejected with UNAVAILABLE_IN_CURRENT_STATUS.
      * @param client_id The client that observed the I/O failure.
      * @param te_endpoints Transfer engine endpoints of the failed targets.
      */

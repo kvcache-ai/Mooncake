@@ -3010,6 +3010,14 @@ auto MasterService::ReportNoFTargetUnreachable(
     (void)te_endpoints;
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
+    // Only a live client may steer its own allocations. Rejecting unknown
+    // reporters also keeps arbitrary UUIDs out of the map.
+    const auto record = FindClientRecord(client_id);
+    auto retaining_guard =
+        record ? record->TryAcquireRetainingGuard() : std::nullopt;
+    if (!retaining_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     const auto now = std::chrono::steady_clock::now();
     const auto expires_at = now + nof_unreachable_ttl_;
     size_t recorded = 0;
