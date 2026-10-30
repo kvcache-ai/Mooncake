@@ -1,5 +1,6 @@
 """Strict artifact and result contract for the two-B60 hardware core."""
 
+from collections import deque
 import hashlib
 import importlib.util
 import json
@@ -311,10 +312,21 @@ def validate_report(path: Path, expected: set[str]) -> None:
 
 
 def command(args: list[str], log: Path, timeout: int = 600) -> str:
-    with log.open("w") as stream:
-        subprocess.run(
-            args, stdout=stream, stderr=subprocess.STDOUT, check=True, timeout=timeout
-        )
+    try:
+        with log.open("w") as stream:
+            subprocess.run(
+                args,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                check=True,
+                timeout=timeout,
+            )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        print(f"XPU command failed; last 40 lines of {log}:", file=sys.stderr)
+        with log.open() as stream:
+            for line in deque(stream, maxlen=40):
+                print(line, end="", file=sys.stderr)
+        raise
     return log.read_text()
 
 

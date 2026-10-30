@@ -348,11 +348,35 @@ class ReportTest(unittest.TestCase):
     def test_command_exit_and_timeout_propagate(self):
         with tempfile.TemporaryDirectory() as temporary:
             log = Path(temporary) / "command.log"
-            with self.assertRaises(subprocess.CalledProcessError):
+            diagnostics = io.StringIO()
+            with (
+                patch.object(CORE.sys, "stderr", diagnostics),
+                self.assertRaises(subprocess.CalledProcessError),
+            ):
                 CORE.command(["bash", "-c", "echo failed; exit 2"], log)
             self.assertIn("failed", log.read_text())
-            with self.assertRaises(subprocess.TimeoutExpired):
+            self.assertIn(str(log), diagnostics.getvalue())
+            self.assertIn("failed", diagnostics.getvalue())
+            diagnostics = io.StringIO()
+            with (
+                patch.object(CORE.sys, "stderr", diagnostics),
+                self.assertRaises(subprocess.TimeoutExpired),
+            ):
                 CORE.command(["sleep", "2"], log, timeout=0.01)
+            self.assertIn(str(log), diagnostics.getvalue())
+
+    def test_command_failure_diagnostics_are_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "command.log"
+            diagnostics = io.StringIO()
+            with (
+                patch.object(CORE.sys, "stderr", diagnostics),
+                self.assertRaises(subprocess.CalledProcessError),
+            ):
+                CORE.command(["bash", "-c", "seq 1 100; exit 2"], log)
+            lines = diagnostics.getvalue().splitlines()
+            self.assertEqual(len(lines), 41)
+            self.assertEqual(lines[1:], [str(i) for i in range(61, 101)])
 
     def test_device_preflight_rejects_missing_wrong_and_unexecuted_devices(self):
         from types import SimpleNamespace
@@ -411,6 +435,53 @@ class ReportTest(unittest.TestCase):
 
 
 class ShellLifecycleTest(unittest.TestCase):
+    def test_network_isolation_sets_the_tent_rpc_loopback_address(self):
+        script = (ROOT / "scripts/ci/run_xpu_core.sh").read_text()
+        start = script.index("container_id=$(docker create")
+        stop = script.index("timeout --signal=TERM", start)
+        docker_command = script[start:stop]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            docker = root / "docker"
+            docker.write_text("""#!/bin/bash
+set -eu
+printf '%s\\n' "$@" > "$DOCKER_ARGUMENTS"
+echo container-id
+""")
+            docker.chmod(0o755)
+            arguments = root / "arguments"
+            result = subprocess.run(
+                ["bash", "-ec", "device_args=()\n" + docker_command],
+                env={
+                    **os.environ,
+                    "PATH": f"{root}:{os.environ['PATH']}",
+                    "DOCKER_ARGUMENTS": str(arguments),
+                    "GITHUB_RUN_ID": "123",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "XPU_IMAGE": "image",
+                    "ZE_AFFINITY_MASK": "4,5",
+                    "CHECKOUT_SHA": "a" * 40,
+                    "run_directory": str(root),
+                    "source_directory": str(ROOT),
+                    "control_directory": str(ROOT / "scripts"),
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = arguments.read_text().splitlines()
+            self.assertEqual(args[args.index("--network") + 1], "none")
+            for variable in (
+                "MOONCAKE_LOCAL_HOSTNAME=127.0.0.1",
+                "LOCAL_HOSTNAME=127.0.0.1",
+                "MASTER_SERVER=127.0.0.1:50051",
+                "ZE_AFFINITY_MASK=4,5",
+            ):
+                self.assertIn(variable, args)
+                self.assertEqual(args[args.index(variable) - 1], "--env")
+            self.assertNotIn("--privileged", args)
+
     def test_fixed_runner_masks_need_no_lock_or_profile_variables(self):
         script = (ROOT / "scripts/ci/run_xpu_core.sh").read_text()
         start = script.index(': "${ZE_AFFINITY_MASK:')

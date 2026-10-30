@@ -47,6 +47,12 @@ Host Yama `ptrace_scope` must be 0 or 1,
 Level Zero IPC/P2P must work, and the run's output filesystem must support
 `O_DIRECT` and io_uring. Missing permissions/capabilities fail core, not skip it.
 
+The container keeps `--network none`: Store and EP peers communicate only
+inside its private loopback network. CI sets both the Python Store's
+`LOCAL_HOSTNAME` and TENT's distinct `MOONCAKE_LOCAL_HOSTNAME` to `127.0.0.1`.
+TENT's automatic address discovery skips loopback, so the latter must be
+explicit even when Store setup already supplies a local segment name.
+
 The runtime uses the same digest-pinned Intel PyTorch image as Stage 1.
 Provision compatible Intel GPU drivers and matching SYCL/Level Zero runtimes;
 dependency loading, wheel RECORD/native capabilities, and real GPU arithmetic
@@ -110,8 +116,10 @@ GDS, multi-node, more than two EP ranks, and vLLM are not claimed as coverage.
 
 Artifacts retain runner/container cleanup state, device/runtime identity,
 selection, XML, logs, inventories, dependency diagnostics, artifact metadata,
-source SHA, and elapsed suite time, including on failure. Only the current
-container is stopped/removed; its PID namespace owns all test descendants.
+source SHA, and elapsed suite time, including on failure. A failed/timed-out
+command's final 40 log lines are also printed so nested test errors appear in
+the Actions step; full logs remain in the artifact. Only the current container
+is stopped/removed; its PID namespace owns all test descendants.
 Cleanup failure fails the hardware job. Runner reimaging remains mandatory
 after failure or cancellation.
 
