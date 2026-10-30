@@ -173,6 +173,21 @@ TEST_F(MasterServiceTest, HcaHintFallsBackForLargeOffsetObject) {
     EXPECT_LT(buffer.buffer_address_, original.base + original.size);
 }
 
+TEST_F(MasterServiceTest, ReplicaDescriptorCarriesTheMountedProtocol) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    const auto owner = generate_uuid();
+    auto segment = MakeSegment("nvlink-provider");
+    segment.protocol = "nvlink";
+    ASSERT_TRUE(service.MountSegment(segment, owner));
+    const auto result =
+        service.PutStart(owner, "nvlink-object", TenantId::Default(), 1024, {});
+    ASSERT_TRUE(result) << toString(result.error());
+    EXPECT_EQ((*result)[0].get_memory_descriptor().buffer_descriptor.protocol_,
+              "nvlink");
+}
+
 TEST_F(MasterServiceTest, MixedGpuBatchUsesEachKeysHcaHint) {
     if (!StoreHcaAffinityEnabled()) GTEST_SKIP();
     MasterService service(MasterServiceConfig::builder()
@@ -1707,6 +1722,32 @@ TEST_F(MasterServiceTest, StandbyRemountFindsSameEndpointRangeByAddress) {
                       .buffer_descriptor.buffer_address_,
                   address);
     }
+}
+
+TEST_F(MasterServiceTest,
+       RemountedReplicaAdvertisesTheSegmentsCurrentProtocol) {
+    // A snapshot taken before the segment changed protocol, or by a master
+    // that stamped every replica "tcp", must not outlive the remount.
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    auto segment = MakeSegment("egm-provider");
+    segment.protocol = "nvlink";
+    auto entry =
+        MakeStandbyEntry("egm-object", 1024, segment.base, segment.te_endpoint);
+    std::get<MemoryDescriptor>(entry.metadata.replicas[0].descriptor_variant)
+        .buffer_descriptor.protocol_ = "tcp";
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        {entry}, 1,
+        {MakeStandbySegment(segment.name, segment.te_endpoint, segment.size)}));
+    ASSERT_TRUE(service.ReMountSegment({segment}, generate_uuid()));
+
+    auto result = service.GetReplicaList("egm-object", TenantId::Default());
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.protocol_,
+              "nvlink");
 }
 
 TEST_F(MasterServiceTest, StandbyRestoreSkipsInvalidObjectAndRestoresTheRest) {
