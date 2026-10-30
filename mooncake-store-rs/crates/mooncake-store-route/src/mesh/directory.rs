@@ -9,7 +9,7 @@ use mooncake_store_core::{
     AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
     ClientLease, ClientRuntimeId, ClientStableId, MetadataBackend, NamespaceScope, ObjectKey,
     ObjectRoute, ReplicaRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory,
-    RouteReplicaReference, RouteState, RouteVersion, StoreError,
+    RouteOwnerScanStatus, RouteReplicaReference, RouteState, RouteVersion, StoreError,
     ROUTE_OWNER_LIST_PAGINATION_CAPABILITY, ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
 };
 use tracing::{debug, trace, warn};

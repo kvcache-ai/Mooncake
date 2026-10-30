@@ -44,4 +44,7 @@ pub use route::{
     TenantQuotaReservationOutcome, TenantQuotaReservationRequest, TenantQuotaReservationState,
     TenantQuotaState, TenantRoutePolicy,
 };
-pub use traits::{MetadataBackend, PlacementStrategy, RouteDirectory, RouteReplicaReference};
+pub use traits::{
+    MetadataBackend, PlacementStrategy, RouteDirectory, RouteOwnerScanStatus,
+    RouteReplicaReference,
+};

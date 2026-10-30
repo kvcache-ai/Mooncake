@@ -6,7 +6,7 @@ use mooncake_store_core::{
     AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
     ClientLease, ClientRuntimeId, ColdBackingRouteFilter, MetadataBackend, NamespaceScope,
     ObjectKey, ObjectRoute, ReplicaRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory,
-    RouteReplicaReference, RouteState, RouteVersion,
+    RouteOwnerScanStatus, RouteReplicaReference, RouteState, RouteVersion,
 };
 
 pub trait RouteHitReporter {
@@ -226,6 +226,15 @@ impl RouteOperations {
     ) -> Result<()> {
         self.directory
             .visit_routes_by_replica_owner_consistent(&self.observer, owner, visitor)
+    }
+
+    pub fn visit_routes_by_replica_owner_with_status(
+        &self,
+        owner: &ClientRuntimeId,
+        visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
+    ) -> Result<RouteOwnerScanStatus> {
+        self.directory
+            .visit_routes_by_replica_owner_with_status(&self.observer, owner, visitor)
     }
 
     pub fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {

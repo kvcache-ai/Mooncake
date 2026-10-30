@@ -99,7 +99,8 @@ continuation exists. Custom authority services keep source compatibility and fai
 implement the paginated service method. `MetadataOnly` applies the same fixed compatibility limit.
 An unreachable mirrored authority is marked suspect and omitted from the owner scan while the
 remaining authorities continue; the scan returns the last authority error when every candidate is
-unreachable.
+unreachable. The scan reports incomplete coverage when any authority fails, and storage-owner
+evacuation stops before stale allocation reclamation while that status is incomplete.
 
 Route authority policy is bootstrap-validated through metadata:
 
