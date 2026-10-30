@@ -101,6 +101,8 @@ struct ObjectMetadata {
     UUID client_id;
     // Updated by UpsertStart (Case B) to reset the discard timeout.
     std::chrono::system_clock::time_point put_start_time;
+    // Fence completion/revocation even after the shared replica is removed.
+    uint64_t shared_kv_allocation_id = 0;
     const ObjectDataType data_type{ObjectDataType::UNKNOWN};
     const std::string group_id;
     const TenantId tenant_id;
