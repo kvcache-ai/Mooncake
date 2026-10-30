@@ -82,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--prompt-repeats", type=int, default=12)
     parser.add_argument("--save-timeout", type=float, default=60.0)
+    parser.add_argument("--report", help="Write a successful CI result as JSON")
     return parser.parse_args()
 
 
@@ -128,6 +129,15 @@ def store_counter(metrics, name: str, operation: str) -> tuple[int, int]:
         elif metric.name == f"vllm:{name}_failed_keys":
             failed += int(metric.value)
     return ok, failed
+
+
+def memory_report() -> dict:
+    torch.xpu.synchronize()
+    return {
+        "device": torch.xpu.get_device_properties(0).name,
+        "peak_allocated_bytes": torch.xpu.max_memory_allocated(0),
+        "peak_reserved_bytes": torch.xpu.max_memory_reserved(0),
+    }
 
 
 def _patch_vllm_kv_address_math() -> None:
@@ -254,6 +264,22 @@ def main() -> int:
             print(f"connector metrics seen: {names}", file=sys.stderr)
             print("FAIL: " + "; ".join(failures), file=sys.stderr)
             return 1
+        if args.report:
+            with open(args.report, "w") as report:
+                json.dump(
+                    {
+                        "scenario": "store",
+                        "tokens": list(second.token_ids),
+                        "reference_tokens": list(first.token_ids),
+                        "saved": saved,
+                        "loaded": loaded,
+                        "save_failed": save_failed,
+                        "load_failed": load_failed,
+                        "memory": memory_report(),
+                    },
+                    report,
+                    indent=2,
+                )
         print("PASS: vLLM-XPU prefill -> Mooncake Store -> decode")
         return 0
     finally:

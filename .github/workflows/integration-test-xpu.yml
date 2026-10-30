@@ -15,6 +15,10 @@ on:
       artifact_digest:
         type: string
         required: true
+      suite:
+        description: core (PR), nightly (expanded EP), or applications (both vLLM scenarios)
+        type: string
+        default: core
 
 permissions:
   contents: read
@@ -22,10 +26,13 @@ permissions:
 
 jobs:
   core:
+    name: XPU ${{ inputs.suite }}
     runs-on: xpu
     timeout-minutes: 90
     env:
-      XPU_IMAGE: intel/pytorch:xpu-2.13.0-ubuntu24.04-20260907@sha256:7366f264bd7aaa7f0df7d1bfba43be7c84c126df21ba448ae5445a34c2def4f9
+      XPU_BUILD_IMAGE: intel/pytorch:xpu-2.13.0-ubuntu24.04-20260907@sha256:7366f264bd7aaa7f0df7d1bfba43be7c84c126df21ba448ae5445a34c2def4f9
+      XPU_IMAGE: ${{ inputs.suite == 'applications' && 'vllm/vllm-openai-xpu:v0.29.0@sha256:1db27a8b75ae1d6b3cbf16ebbb88310c2b5548221c8df1335082b2a54dba209a' || 'intel/pytorch:xpu-2.13.0-ubuntu24.04-20260907@sha256:7366f264bd7aaa7f0df7d1bfba43be7c84c126df21ba448ae5445a34c2def4f9' }}
+      XPU_SUITE: ${{ inputs.suite }}
     steps:
       - name: Check out trusted harness
         uses: actions/checkout@v4
@@ -62,6 +69,41 @@ jobs:
           }
           SH
 
+      - name: Record scheduling measurements
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_DIRECTORY: ${{ steps.run.outputs.directory }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUN_DIRECTORY/output"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
+            --jq '.jobs[]' | jq -s . > "$RUN_DIRECTORY/output/jobs.json"
+          python3 - <<'PY'
+          from datetime import datetime
+          import json
+          import os
+          from pathlib import Path
+          output = Path(os.environ["RUN_DIRECTORY"]) / "output"
+          jobs = json.loads((output / "jobs.json").read_text())
+          matches = [job for job in jobs
+                     if job["runner_name"] == os.environ["RUNNER_NAME"]
+                     and job["name"].endswith("XPU " + os.environ["XPU_SUITE"])
+                     and job["status"] == "in_progress"]
+          if len(matches) != 1:
+              raise RuntimeError("Cannot identify the current XPU job for queue measurements")
+          job = matches[0]
+          queued = datetime.fromisoformat(job["created_at"].replace("Z", "+00:00"))
+          started = datetime.fromisoformat(job["started_at"].replace("Z", "+00:00"))
+          seconds = (started - queued).total_seconds()
+          if seconds < 0:
+              raise RuntimeError("Negative XPU queue time")
+          (output / "scheduling.json").write_text(json.dumps({
+              "job_id": job["id"], "runner": job["runner_name"],
+              "created_at": job["created_at"], "started_at": job["started_at"],
+              "queue_seconds": seconds, "suite": os.environ["XPU_SUITE"],
+          }, indent=2))
+          PY
+
       - name: Download exact build artifact
         shell: bash
         env:
@@ -73,6 +115,7 @@ jobs:
           RUN_DIRECTORY: ${{ steps.run.outputs.directory }}
         run: |
           set -euo pipefail
+          case "${XPU_SUITE:-core}" in core|nightly|applications) ;; *) echo "::error::Invalid XPU suite"; exit 1 ;; esac
           [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]] || { echo "::error::Invalid artifact ID"; exit 1; }
           [[ "$CHECKOUT_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Invalid source SHA"; exit 1; }
           [ "$SOURCE_SHA" = "$CHECKOUT_SHA" ] || { echo "::error::Build SHA differs from authorized SHA"; exit 1; }
@@ -149,7 +192,7 @@ jobs:
           docker pull "$XPU_IMAGE"
           docker image inspect "$XPU_IMAGE" > "$run_directory/output/image.json"
           container_id=$(docker create \
-            --label "mooncake.xpu.run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --label "mooncake.xpu.run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-${XPU_SUITE:-core}" \
             --user "$(id -u):$(id -g)" --cap-drop ALL \
             --security-opt no-new-privileges \
             --security-opt "seccomp=$run_directory/output/seccomp.json" \
@@ -171,6 +214,7 @@ jobs:
             --env PYTHONOPTIMIZE=0 --env PYTHONDONTWRITEBYTECODE=1 \
             --env TEST_TMPDIR=/output \
             --env "XPU_SOURCE_SHA=$CHECKOUT_SHA" --env "XPU_IMAGE=$XPU_IMAGE" \
+            --env "XPU_SUITE=${XPU_SUITE:-core}" \
             --env HOME=/tmp/home --workdir /tmp \
             --entrypoint /bin/bash "$XPU_IMAGE" -c '
               set -eo pipefail
@@ -190,7 +234,7 @@ jobs:
           source "$run_directory/cleanup.sh"
           mkdir -p "$run_directory/output"
           remaining=$(docker ps -aq --no-trunc \
-            --filter "label=mooncake.xpu.run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT")
+            --filter "label=mooncake.xpu.run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-${XPU_SUITE:-core}")
           docker info >/dev/null
           if [ -n "$remaining" ]; then
             while read -r container_id; do
@@ -204,13 +248,14 @@ jobs:
         if: always() && steps.run.outputs.directory != ''
         uses: actions/upload-artifact@v4
         with:
-          name: xpu-core-${{ inputs.checkout_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: xpu-${{ inputs.suite }}-${{ inputs.checkout_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ steps.run.outputs.directory }}/output/*.json
             ${{ steps.run.outputs.directory }}/output/*.xml
             ${{ steps.run.outputs.directory }}/output/*.log
             ${{ steps.run.outputs.directory }}/output/*.list
             ${{ steps.run.outputs.directory }}/output/*.ldd
+            ${{ steps.run.outputs.directory }}/output/mooncake-xpu-pd-*/*.log
             ${{ steps.run.outputs.directory }}/artifact.json
           if-no-files-found: error
           retention-days: 14

@@ -360,7 +360,7 @@ echo dependency > xpu-ci-output/python-deps/dependency.whl
         self.assertEqual(job["runs-on"], "xpu")
         build = yaml.safe_load((ROOT / ".github/workflows/ci_xpu.yml").read_text())
         self.assertEqual(
-            job["env"]["XPU_IMAGE"], build["jobs"]["build-wheel-xpu"]["container"]
+            job["env"]["XPU_BUILD_IMAGE"], build["jobs"]["build-wheel-xpu"]["container"]
         )
         self.assertIn("github.workflow_sha", job["steps"][0]["with"]["ref"])
         self.assertTrue(
@@ -590,6 +590,11 @@ class CommandLineTest(unittest.TestCase):
             (
                 ["suite", "native", "source", "output"],
                 "suite",
+                [Path("native"), Path("source"), Path("output")],
+            ),
+            (
+                ["applications", "native", "source", "output"],
+                "applications",
                 [Path("native"), Path("source"), Path("output")],
             ),
             (
@@ -849,7 +854,8 @@ class ArtifactTest(unittest.TestCase):
             environment = {
                 "GITHUB_RUN_ID": "123",
                 "GITHUB_RUN_ATTEMPT": "2",
-                "XPU_IMAGE": image,
+                "XPU_IMAGE": VERIFY.APPLICATION_IMAGE,
+                "XPU_BUILD_IMAGE": image,
             }
             for change in (
                 {"id": 43},
@@ -991,14 +997,23 @@ class ReportTest(unittest.TestCase):
                 for identity in sorted(identities)
             )
 
-        for store_report, ep_complete, valid in (
-            (True, True, True),
-            (False, True, False),
-            (True, False, False),
+        for selected_suite, store_report, ep_complete, valid in (
+            ("core", True, True, True),
+            ("core", False, True, False),
+            ("core", True, False, False),
+            ("nightly", True, True, True),
+            ("nightly", True, False, False),
         ):
-            with self.subTest(store_report=store_report, ep_complete=ep_complete):
+            with self.subTest(
+                suite=selected_suite, store_report=store_report, ep_complete=ep_complete
+            ):
                 with tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)
+                    rounds, hidden, experts, topk = (
+                        (24, 4096, 16, 4)
+                        if selected_suite == "nightly"
+                        else (8, 1024, 8, 2)
+                    )
                     for name, (inventory, _) in VERIFY.SUITES.items():
                         (root / f"{name}.list").write_text(inventory_text(inventory))
 
@@ -1019,15 +1034,25 @@ class ReportTest(unittest.TestCase):
                                 Path(args[4]), {"StorePython.test_xpu_local_copy_paths"}
                             )
                         if "test_mooncake_ep_xpu.py" in args[1]:
+                            self.assertEqual(
+                                args[args.index("--rounds") + 1], str(rounds - 3)
+                            )
+                            self.assertEqual(
+                                args[args.index("--hidden") + 1], str(hidden)
+                            )
+                            self.assertEqual(
+                                args[args.index("--max-tokens") + 1],
+                                "128" if selected_suite == "nightly" else "32",
+                            )
                             if not ep_complete:
                                 return ""
                             return "".join(
-                                f"round {i}: tokens=0 ok\n" for i in range(8)
+                                f"round {i}: tokens=0 ok\n" for i in range(rounds)
                             ) + (
-                                "PASSED: 8 rounds + 2 empty-rank rounds + 4 two-batch rounds"
+                                f"PASSED: {rounds} rounds + 2 empty-rank rounds + 4 two-batch rounds"
                                 " + duplicate experts + reused src_info + rejected handle"
                                 " + cross-stream + fallback agreement"
-                                " on 2 ranks (hidden=1024, experts=8, topk=2)\n"
+                                f" on 2 ranks (hidden={hidden}, experts={experts}, topk={topk})\n"
                             )
                         return ""
 
@@ -1039,7 +1064,10 @@ class ReportTest(unittest.TestCase):
                         patch.object(
                             importlib.metadata, "distribution"
                         ) as distribution,
-                        patch.dict(os.environ, {"XPU_SOURCE_SHA": "a" * 40}),
+                        patch.dict(
+                            os.environ,
+                            {"XPU_SOURCE_SHA": "a" * 40, "XPU_SUITE": selected_suite},
+                        ),
                     ):
                         distribution.return_value.locate_file.return_value = root
                         process.return_value.__enter__.return_value.poll.return_value = None
@@ -1047,7 +1075,9 @@ class ReportTest(unittest.TestCase):
                             VERIFY.suite(root, ROOT, root)
                             result = json.loads((root / "result.json").read_text())
                             self.assertEqual(result["cpp_cases"], 149)
-                            self.assertEqual(result["ep_rounds"], 8)
+                            self.assertEqual(result["ep_rounds"], rounds)
+                            self.assertEqual(result["ep_hidden"], hidden)
+                            self.assertEqual(result["suite"], selected_suite)
                         else:
                             with self.assertRaises((RuntimeError, FileNotFoundError)):
                                 VERIFY.suite(root, ROOT, root)
@@ -1633,6 +1663,459 @@ class SeccompTest(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "deny-by-default"):
                         VERIFY.prepare_seccomp(output)
             self.assertFalse(output.exists())
+
+
+class NightlyXpuTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.jobs = yaml.safe_load((ROOT / ".github/workflows/nightly.yml").read_text())[
+            "jobs"
+        ]
+
+    def test_exact_artifact_shared_by_two_independently_required_jobs(self):
+        for name, suite in (
+            ("xpu-nightly-core", "nightly"),
+            ("xpu-nightly-applications", "applications"),
+        ):
+            job = self.jobs[name]
+            self.assertEqual(
+                job["permissions"], {"contents": "read", "actions": "read"}
+            )
+            self.assertEqual(job["needs"], ["version-stamp", "build-wheel-xpu"])
+            self.assertEqual(
+                job["if"],
+                "${{ needs.version-stamp.outputs.run_xpu_integration == 'true' }}",
+            )
+            self.assertEqual(
+                job["uses"], "./.github/workflows/integration-test-xpu.yml"
+            )
+            for key in ("source_sha", "artifact_id", "artifact_digest"):
+                self.assertEqual(
+                    job["with"][key], "${{ needs.build-wheel-xpu.outputs." + key + " }}"
+                )
+            self.assertEqual(job["with"]["checkout_sha"], "${{ github.sha }}")
+            self.assertEqual(job["with"]["suite"], suite)
+            self.assertIn(name, self.jobs["nightly-gate"]["needs"])
+            self.assertNotIn(name, self.jobs["publish-testpypi"]["needs"])
+        self.assertIn("run_xpu_integration", self.jobs["version-stamp"]["outputs"])
+        self.assertEqual(
+            self.jobs["build-wheel-xpu"]["with"]["include_application_model"],
+            "${{ needs.version-stamp.outputs.run_xpu_integration == 'true' }}",
+        )
+        self.assertIn(
+            VERIFY.APPLICATION_IMAGE, INTEGRATION["jobs"]["core"]["env"]["XPU_IMAGE"]
+        )
+        model = next(
+            step
+            for step in WORKFLOW["jobs"]["build-wheel-xpu"]["steps"]
+            if step.get("name") == "Download pinned application model (hosted CPU)"
+        )
+        self.assertEqual(model["if"], "inputs.include_application_model")
+        self.assertIn("revision=MODEL_REVISION", model["run"])
+        self.assertIn(
+            'cp -R xpu-ci-output/model "$out/"', workflow_step("Package native tests")
+        )
+        self.assertNotIn("huggingface", hardware_step("Execute isolated two-B60 core"))
+
+    def test_selection_and_strict_gate_including_missing_results(self):
+        gate = self.jobs["nightly-gate"]["steps"][0]
+        self.assertEqual(
+            gate["env"]["ALLOW_XPU_SKIP"],
+            "${{ needs.version-stamp.outputs.run_xpu_integration == 'false' }}",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            summary = Path(temporary) / "summary"
+            for enabled in (False, True):
+                for job in ("xpu-nightly-core", "xpu-nightly-applications"):
+                    for status in (
+                        "success",
+                        "skipped",
+                        "failure",
+                        "cancelled",
+                        "missing",
+                        "",
+                    ):
+                        with self.subTest(enabled=enabled, job=job, status=status):
+                            needs = {
+                                key: {"result": "success"}
+                                for key in self.jobs["nightly-gate"]["needs"]
+                            }
+                            if status == "missing":
+                                del needs[job]
+                            else:
+                                needs[job]["result"] = status
+                            result = subprocess.run(
+                                ["bash", "-ec", gate["run"]],
+                                env={
+                                    **os.environ,
+                                    "GITHUB_STEP_SUMMARY": str(summary),
+                                    "NEEDS_JSON": json.dumps(needs),
+                                    "ALLOW_ROCM_SKIP": "false",
+                                    "ALLOW_PUBLISH_SKIP": "false",
+                                    "ALLOW_XPU_SKIP": str(not enabled).lower(),
+                                },
+                                capture_output=True,
+                                text=True,
+                                timeout=10,
+                            )
+                            self.assertEqual(
+                                result.returncode == 0,
+                                status == "success"
+                                or (not enabled and status == "skipped"),
+                                result.stdout + result.stderr,
+                            )
+            selection = next(
+                step
+                for step in self.jobs["version-stamp"]["steps"]
+                if step.get("name") == "Select XPU hardware tests"
+            )
+            self.assertIn(
+                "vars.NIGHTLY_XPU_INTEGRATION", selection["env"]["RUN_XPU_INTEGRATION"]
+            )
+            for enabled in ("true", "false"):
+                output = Path(temporary) / enabled
+                result = subprocess.run(
+                    ["bash", "-ec", selection["run"]],
+                    env={
+                        **os.environ,
+                        "RUN_XPU_INTEGRATION": enabled,
+                        "GITHUB_OUTPUT": str(output),
+                        "GITHUB_STEP_SUMMARY": str(summary),
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(output.read_text(), f"run_xpu_integration={enabled}\n")
+            self.assertIn("coverage is absent", summary.read_text())
+
+    def test_parallel_suites_have_distinct_cleanup_labels_and_diagnostics(self):
+        launch = hardware_step("Execute isolated two-B60 core")
+        cleanup = hardware_step("Recheck current-run container cleanup")
+        label = "mooncake.xpu.run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-${XPU_SUITE:-core}"
+        self.assertIn(label, launch)
+        self.assertIn(label, cleanup)
+        self.assertIn('--env "XPU_SUITE=${XPU_SUITE:-core}"', launch)
+        upload = INTEGRATION["jobs"]["core"]["steps"][-1]
+        self.assertIn("inputs.suite", upload["with"]["name"])
+        self.assertIn("mooncake-xpu-pd-*/*.log", upload["with"]["path"])
+
+    def test_queue_measurement_uses_current_job_created_and_started_times(self):
+        code = (
+            hardware_step("Record scheduling measurements")
+            .split("python3 - <<'PY'\n")[1]
+            .rsplit("\nPY", 1)[0]
+        )
+        job = {
+            "id": 42,
+            "runner_name": "pair-45",
+            "name": "xpu-nightly-core / XPU nightly",
+            "status": "in_progress",
+            "created_at": "2026-10-30T00:00:00Z",
+            "started_at": "2026-10-30T00:00:12Z",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "output"
+            output.mkdir()
+            for jobs, valid in (
+                ([job], True),
+                ([], False),
+                ([job, job], False),
+                ([{**job, "started_at": "2026-10-29T00:00:00Z"}], False),
+            ):
+                (output / "jobs.json").write_text(json.dumps(jobs))
+                result = subprocess.run(
+                    [sys.executable, "-c", code],
+                    env={
+                        **os.environ,
+                        "RUN_DIRECTORY": temporary,
+                        "RUNNER_NAME": "pair-45",
+                        "XPU_SUITE": "nightly",
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode == 0, valid, result.stderr)
+                if valid:
+                    self.assertEqual(
+                        json.loads((output / "scheduling.json").read_text())[
+                            "queue_seconds"
+                        ],
+                        12,
+                    )
+
+
+class ApplicationTest(unittest.TestCase):
+    def test_artifact_install_dispatches_only_the_selected_suite(self):
+        for selected, mode in (
+            ("core", "suite"),
+            ("nightly", "suite"),
+            ("applications", "applications"),
+        ):
+            with self.subTest(
+                selected=selected
+            ), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "mooncake_transfer_engine_xpu.whl").touch()
+                with (
+                    patch.dict(os.environ, {"XPU_SUITE": selected}),
+                    patch.object(VERIFY, "verify_hashes") as hashes,
+                    patch.object(
+                        VERIFY, "extract_native", return_value=root
+                    ) as extract,
+                    patch.object(VERIFY, "command") as command,
+                ):
+                    VERIFY.run(root, ROOT, root)
+                    hashes.assert_called_once_with(root, {"provenance.txt"})
+                    extract.assert_called_once_with(root, root)
+                    calls = command.call_args_list
+                    self.assertIn("--no-index", calls[0].args[0])
+                    self.assertEqual(
+                        calls[1].args[0],
+                        [
+                            sys.executable,
+                            VERIFY.__file__,
+                            mode,
+                            str(root),
+                            str(ROOT),
+                            str(root),
+                        ],
+                    )
+        with patch.dict(os.environ, {"XPU_SUITE": "unsupported"}):
+            with self.assertRaisesRegex(RuntimeError, "Invalid XPU suite"):
+                VERIFY.run(Path("missing"), ROOT, Path("missing"))
+
+    @staticmethod
+    def report(scenario):
+        memory = {
+            "device": "Intel Arc Pro B60",
+            "peak_allocated_bytes": 100,
+            "peak_reserved_bytes": 200,
+        }
+        return {
+            "scenario": scenario,
+            "tokens": [1, 2],
+            "reference_tokens": [1, 2],
+            "saved": 3,
+            "loaded": 3,
+            "save_failed": 0,
+            "load_failed": 0,
+            "memory": memory,
+            "prefill_memory": memory,
+        }
+
+    def test_reports_require_tokens_keys_failures_and_memory(self):
+        for scenario in ("store", "pd"):
+            for change in (
+                {},
+                {"scenario": "wrong"},
+                {"tokens": []},
+                {"tokens": [99]},
+                {"saved": 0},
+                {"loaded": 0},
+                {"save_failed": 1},
+                {"load_failed": 1},
+                {
+                    "memory": {
+                        "device": "CPU",
+                        "peak_allocated_bytes": 1,
+                        "peak_reserved_bytes": 2,
+                    }
+                },
+            ):
+                with self.subTest(
+                    scenario=scenario, change=change
+                ), tempfile.TemporaryDirectory() as temporary:
+                    path = Path(temporary) / "report.json"
+                    path.write_text(json.dumps({**self.report(scenario), **change}))
+                    if change:
+                        with self.assertRaises(RuntimeError):
+                            VERIFY.validate_application_report(path, scenario)
+                    else:
+                        self.assertEqual(
+                            VERIFY.validate_application_report(path, scenario)[
+                                "loaded"
+                            ],
+                            3,
+                        )
+            if scenario == "pd":
+                with tempfile.TemporaryDirectory() as temporary:
+                    path = Path(temporary) / "pd.json"
+                    path.write_text(json.dumps({**self.report("pd"), "loaded": 2}))
+                    with self.assertRaisesRegex(RuntimeError, "key counts"):
+                        VERIFY.validate_application_report(path, "pd")
+
+    def test_both_offline_scenarios_required_before_success(self):
+        for bad in (
+            None,
+            "store",
+            "pd",
+            "missing-report",
+            "wrong-model",
+            "wrong-image",
+        ):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                model = root / "model"
+                model.mkdir()
+                (model / "model.safetensors").write_bytes(b"weights")
+                (model / "model-provenance.json").write_text(
+                    json.dumps(
+                        {
+                            "model": VERIFY.MODEL_ID,
+                            "revision": "wrong"
+                            if bad == "wrong-model"
+                            else VERIFY.MODEL_REVISION,
+                        }
+                    )
+                )
+                executed = []
+
+                def command(args, log, timeout=600):
+                    if log.stem not in ("store", "pd"):
+                        return ""
+                    scenario = log.stem
+                    executed.append(scenario)
+                    self.assertEqual(args[args.index("--model") + 1], str(model))
+                    self.assertEqual(args[args.index("--protocol") + 1], "tcp")
+                    self.assertEqual(os.environ["MC_FORCE_TCP"], "1")
+                    self.assertTrue(
+                        json.loads(os.environ["MC_TENT_CONF"])["transports"]["xpu"][
+                            "disable_ipc"
+                        ]
+                    )
+                    self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
+                    self.assertEqual(os.environ["TRANSFORMERS_OFFLINE"], "1")
+                    if bad == scenario:
+                        raise subprocess.CalledProcessError(1, args)
+                    if bad != "missing-report":
+                        Path(args[args.index("--report") + 1]).write_text(
+                            json.dumps(self.report(scenario))
+                        )
+                    return (
+                        "PASS: vLLM-XPU prefill -> Mooncake Store -> decode\n"
+                        if scenario == "store"
+                        else "PASS: vLLM-XPU prefill (XPU A) -> Mooncake Store -> decode (XPU B)\n"
+                    )
+
+                with (
+                    patch.object(VERIFY, "preflight"),
+                    patch.object(VERIFY, "command", side_effect=command),
+                    patch.object(VERIFY.metadata, "version", return_value="0.29.0"),
+                    patch.object(VERIFY.metadata, "distribution") as distribution,
+                    patch.dict(
+                        os.environ,
+                        {
+                            "XPU_SOURCE_SHA": "a" * 40,
+                            "XPU_IMAGE": "wrong"
+                            if bad == "wrong-image"
+                            else VERIFY.APPLICATION_IMAGE,
+                        },
+                    ),
+                ):
+                    distribution.return_value.locate_file.return_value = (
+                        root / "mooncake_master"
+                    )
+                    if bad is None:
+                        VERIFY.applications(root, ROOT, root)
+                        self.assertEqual(executed, ["store", "pd"])
+                        result = json.loads((root / "result.json").read_text())
+                        self.assertEqual(set(result["scenarios"]), {"store", "pd"})
+                        self.assertEqual(result["source_sha"], "a" * 40)
+                        self.assertEqual(
+                            result["model_revision"], VERIFY.MODEL_REVISION
+                        )
+                    else:
+                        with self.assertRaises(
+                            (
+                                RuntimeError,
+                                FileNotFoundError,
+                                subprocess.CalledProcessError,
+                            )
+                        ):
+                            VERIFY.applications(root, ROOT, root)
+                        self.assertFalse((root / "result.json").exists())
+
+    def test_smoke_json_reports_are_produced_by_existing_entry_points(self):
+        xpu = SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: 1,
+            synchronize=lambda: None,
+            get_device_properties=lambda index: SimpleNamespace(name="Intel B60"),
+            max_memory_allocated=lambda index: 100,
+            max_memory_reserved=lambda index: 200,
+        )
+        torch = SimpleNamespace(
+            xpu=xpu, cuda=SimpleNamespace(is_available=lambda: True)
+        )
+        with patch.dict(sys.modules, {"torch": torch}):
+            base = load_script("xpu_smoke", "scripts/xpu/vllm_store_smoke.py")
+        with (
+            patch.dict(sys.modules, {"vllm_store_smoke": base}),
+            patch.object(sys, "path", list(sys.path)),
+        ):
+            pd = load_script("xpu_pd_smoke", "scripts/xpu/vllm_store_pd_smoke.py")
+        llm = SimpleNamespace(
+            generate=lambda *args: [
+                SimpleNamespace(outputs=[SimpleNamespace(token_ids=[1, 2])])
+            ],
+            get_metrics=lambda: [],
+            get_tokenizer=lambda: SimpleNamespace(encode=lambda prompt: [1, 2]),
+        )
+        vllm = SimpleNamespace(
+            LLM=lambda **kwargs: llm, SamplingParams=lambda **kwargs: None
+        )
+        config = SimpleNamespace(KVTransferConfig=lambda **kwargs: None)
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "store.json"
+            with (
+                patch.dict(sys.modules, {"vllm": vllm, "vllm.config": config}),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["smoke", "--model", "offline", "--report", str(report)],
+                ),
+                patch.object(base, "_patch_vllm_kv_address_math"),
+                patch.object(base, "store_counter", return_value=(3, 0)),
+            ):
+                self.assertEqual(base.main(), 0)
+                VERIFY.validate_application_report(report, "store")
+                reference = Path(temporary) / "prefill.json"
+                reference.write_text(
+                    json.dumps(
+                        {
+                            "tokens": [1, 2],
+                            "saved": 3,
+                            "save_failed": 0,
+                            "memory": base.memory_report(),
+                        }
+                    )
+                )
+                args = SimpleNamespace(
+                    report=str(report),
+                    reference=str(reference),
+                    done_file=None,
+                    wait_timeout=1,
+                    max_tokens=2,
+                    model="offline",
+                    master="127.0.0.1:50051",
+                    metadata_server="P2PHANDSHAKE",
+                    protocol="tcp",
+                    device_name="",
+                    global_segment_size="2GB",
+                    local_buffer_size="512MB",
+                    prompt_repeats=1,
+                )
+                with patch.object(pd, "install_shims"), patch.object(
+                    pd, "build_llm", return_value=llm
+                ):
+                    self.assertEqual(pd.run_decode(args), 0)
+                    VERIFY.validate_application_report(report, "pd")
+            args = SimpleNamespace(prefill_xpu=0, decode_xpu=0)
+            with self.assertRaisesRegex(ValueError, "distinct XPUs"):
+                pd.run_local(args)
 
 
 if __name__ == "__main__":

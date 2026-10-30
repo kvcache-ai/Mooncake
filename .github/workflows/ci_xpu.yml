@@ -11,6 +11,10 @@ on:
         description: Optional wheel version override for nightly snapshots
         type: string
         default: ''
+      include_application_model:
+        description: Bundle the pinned offline model for nightly application tests
+        type: boolean
+        default: false
     outputs:
       source_sha:
         value: ${{ jobs.build-wheel-xpu.outputs.source_sha }}
@@ -175,7 +179,35 @@ jobs:
             rm "$out/$(basename "$wheel")"
           done
 
+      - name: Download pinned application model (hosted CPU)
+        if: inputs.include_application_model
+        run: |
+          set -euo pipefail
+          python -m pip install huggingface-hub==0.36.0
+          PYTHONPATH=scripts/e2e/python python - <<'PY'
+          import json
+          from pathlib import Path
+          import shutil
+          from huggingface_hub import hf_hub_download, list_repo_files
+          from verify_xpu_wheel import MODEL_ID, MODEL_REVISION
+
+          destination = Path("xpu-ci-output/model")
+          destination.mkdir()
+          files = list_repo_files(MODEL_ID, revision=MODEL_REVISION)
+          for name in files:
+              if "/" not in name and name.endswith((".json", ".safetensors", ".txt", ".model")):
+                  cached = hf_hub_download(MODEL_ID, name, revision=MODEL_REVISION)
+                  shutil.copyfile(cached, destination / name)
+          if not list(destination.glob("*.safetensors")):
+              raise RuntimeError("Pinned model has no safetensors weights")
+          (destination / "model-provenance.json").write_text(json.dumps({
+              "model": MODEL_ID, "revision": MODEL_REVISION,
+          }, indent=2))
+          PY
+
       - name: Package native tests
+        env:
+          INCLUDE_APPLICATION_MODEL: ${{ inputs.include_application_model }}
         run: |
           set -eo pipefail
           source /opt/intel/oneapi/setvars.sh >/dev/null
@@ -184,6 +216,9 @@ jobs:
           out=xpu-ci-output/native-tests
           mkdir -p "$out/lib"
           cp -R xpu-ci-output/python-deps "$out/"
+          if [ "$INCLUDE_APPLICATION_MODEL" = "true" ]; then
+            cp -R xpu-ci-output/model "$out/"
+          fi
           cp xpu-ci-output/provenance.txt "$out/"
           for binary in \
             "$BUILD_DIR"/mooncake-transfer-engine/tent/tests/tent_xpu_{platform,transport,engine,ipc_process}_test \

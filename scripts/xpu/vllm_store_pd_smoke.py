@@ -82,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--prompt-repeats", type=int, default=12)
     parser.add_argument("--save-timeout", type=float, default=60.0)
+    parser.add_argument("--report", help="Write the successful PD CI result as JSON")
     parser.add_argument(
         "--prefill-xpu", type=int, default=0, help="local: Level Zero index"
     )
@@ -139,6 +140,8 @@ def build_llm(args: argparse.Namespace, kv_role: str):
     from vllm import LLM
     from vllm.config import KVTransferConfig
 
+    if args.report and torch.xpu.device_count() != 1:
+        raise RuntimeError("CI requires exactly one visible XPU per PD role")
     return LLM(
         model=args.model,
         max_model_len=args.max_model_len,
@@ -205,6 +208,7 @@ def run_prefill(args: argparse.Namespace) -> int:
             "tokens": list(out.token_ids),
             "saved": saved,
             "save_failed": save_failed,
+            "memory": base.memory_report(),
         }
         print(f"[prefill] prompt tokens : {result['prompt_tokens']}", flush=True)
         print(f"[prefill] reference     : {result['tokens']}", flush=True)
@@ -280,6 +284,23 @@ def run_decode(args: argparse.Namespace) -> int:
         if failures:
             print("FAIL: " + "; ".join(failures), file=sys.stderr)
             return 1
+        if args.report:
+            with open(args.report, "w") as report:
+                json.dump(
+                    {
+                        "scenario": "pd",
+                        "tokens": list(out.token_ids),
+                        "reference_tokens": reference["tokens"],
+                        "saved": reference["saved"],
+                        "loaded": loaded,
+                        "save_failed": reference["save_failed"],
+                        "load_failed": load_failed,
+                        "memory": base.memory_report(),
+                        "prefill_memory": reference["memory"],
+                    },
+                    report,
+                    indent=2,
+                )
         print("PASS: vLLM-XPU prefill (XPU A) -> Mooncake Store -> decode (XPU B)")
         return 0
     finally:
@@ -291,6 +312,8 @@ def run_decode(args: argparse.Namespace) -> int:
 
 
 def run_local(args: argparse.Namespace) -> int:
+    if args.prefill_xpu == args.decode_xpu:
+        raise ValueError("Prefill and decode must use distinct XPUs")
     if torch.xpu.device_count() < 2:
         print(f"FAIL: need 2 XPUs, found {torch.xpu.device_count()}", file=sys.stderr)
         return 2
@@ -314,6 +337,7 @@ def run_local(args: argparse.Namespace) -> int:
         "save_timeout",
         "hold_timeout",
         "wait_timeout",
+        "report",
     ):
         value = getattr(args, name)
         if value is not None:

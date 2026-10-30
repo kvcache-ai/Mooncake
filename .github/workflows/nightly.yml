@@ -13,6 +13,10 @@ on:
         description: 'Run MI350X hardware tests (requires the configured self-hosted runner)'
         type: boolean
         default: false
+      run_xpu_integration:
+        description: 'Run expanded XPU core AND both vLLM scenarios on two-B60 runners'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -46,6 +50,7 @@ jobs:
     outputs:
       nightly_version: ${{ steps.version.outputs.nightly_version }}
       run_rocm_integration: ${{ steps.hardware.outputs.run_rocm_integration }}
+      run_xpu_integration: ${{ steps.xpu.outputs.run_xpu_integration }}
     steps:
       - uses: actions/checkout@v4
       - name: Select hardware tests
@@ -58,6 +63,20 @@ jobs:
             echo "ROCm MI350X hardware integration: enabled and required." >> "$GITHUB_STEP_SUMMARY"
           else
             message="ROCm MI350X hardware integration was not requested and will not run. Set the repository variable NIGHTLY_ROCM_INTEGRATION=true after provisioning its runner, or select run_rocm_integration for a manual run. ROCm wheel builds and smoke tests remain required."
+            echo "::warning::$message"
+            echo "$message" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Select XPU hardware tests
+        id: xpu
+        env:
+          RUN_XPU_INTEGRATION: ${{ vars.NIGHTLY_XPU_INTEGRATION == 'true' || (github.event_name == 'workflow_dispatch' && inputs.run_xpu_integration) }}
+        run: |
+          echo "run_xpu_integration=$RUN_XPU_INTEGRATION" >> "$GITHUB_OUTPUT"
+          if [ "$RUN_XPU_INTEGRATION" = "true" ]; then
+            echo "XPU expanded core and BOTH vLLM Store/PD scenarios: enabled and required." >> "$GITHUB_STEP_SUMMARY"
+          else
+            message="XPU hardware coverage is absent: expanded core and both vLLM scenarios will not run. Set NIGHTLY_XPU_INTEGRATION=true after provisioning two-B60 runners, or select run_xpu_integration for a manual run. Hosted XPU build and wheel checks remain required."
             echo "::warning::$message"
             echo "$message" >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -136,12 +155,41 @@ jobs:
     with:
       version_override: ${{ needs.version-stamp.outputs.nightly_version }}
 
-  # Stage 1 is host-only and artifact-only: no GPU reservation or publication.
+  # Build once on CPU; both hardware jobs consume this exact artifact.
   build-wheel-xpu:
     needs: version-stamp
     uses: ./.github/workflows/ci_xpu.yml
     with:
       version_override: ${{ needs.version-stamp.outputs.nightly_version }}
+      include_application_model: ${{ needs.version-stamp.outputs.run_xpu_integration == 'true' }}
+
+  xpu-nightly-core:
+    needs: [version-stamp, build-wheel-xpu]
+    if: ${{ needs.version-stamp.outputs.run_xpu_integration == 'true' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/integration-test-xpu.yml
+    with:
+      checkout_sha: ${{ github.sha }}
+      source_sha: ${{ needs.build-wheel-xpu.outputs.source_sha }}
+      artifact_id: ${{ needs.build-wheel-xpu.outputs.artifact_id }}
+      artifact_digest: ${{ needs.build-wheel-xpu.outputs.artifact_digest }}
+      suite: nightly
+
+  xpu-nightly-applications:
+    needs: [version-stamp, build-wheel-xpu]
+    if: ${{ needs.version-stamp.outputs.run_xpu_integration == 'true' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/integration-test-xpu.yml
+    with:
+      checkout_sha: ${{ github.sha }}
+      source_sha: ${{ needs.build-wheel-xpu.outputs.source_sha }}
+      artifact_id: ${{ needs.build-wheel-xpu.outputs.artifact_id }}
+      artifact_digest: ${{ needs.build-wheel-xpu.outputs.artifact_digest }}
+      suite: applications
 
   rocm-integration-test:
     needs: [version-stamp, build-wheel-rocm]
@@ -694,6 +742,8 @@ jobs:
       - tone-sglang-integration-tent
       - build-wheel-rocm
       - build-wheel-xpu
+      - xpu-nightly-core
+      - xpu-nightly-applications
       - rocm-integration-test
       - build-musa
       - build-docker
@@ -706,13 +756,23 @@ jobs:
     steps:
       - name: Check results
         run: |
+          set -euo pipefail
           echo "=== Nightly Gate Summary ==="
+          for job in build-wheel-xpu xpu-nightly-core xpu-nightly-applications; do
+            echo "$NEEDS_JSON" | jq -e --arg job "$job" 'has($job)' >/dev/null || {
+              echo "::error::Missing required XPU result: $job"
+              exit 1
+            }
+          done
           echo "$NEEDS_JSON" | jq -r '
             to_entries[] | "\(.key): \(.value.result)"'
           echo "$NEEDS_JSON" | jq -r '
             to_entries[] | "- \(.key): \(.value.result)"' >> "$GITHUB_STEP_SUMMARY"
           if [ "$ALLOW_ROCM_SKIP" = "true" ]; then
             echo "ROCm MI350X hardware integration was not requested; its coverage is absent from this run." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$ALLOW_XPU_SKIP" = "true" ]; then
+            echo "XPU hardware coverage is absent: expanded core and both vLLM scenarios were not requested." >> "$GITHUB_STEP_SUMMARY"
           fi
 
           failing=$(echo "$NEEDS_JSON" | jq -r \
@@ -726,7 +786,10 @@ jobs:
                  $allow_publish_skip != "true") and
                 (.key != "rocm-integration-test" or
                  .value.result != "skipped" or
-                 $allow_rocm_skip != "true")
+                 $allow_rocm_skip != "true") and
+                ((.key != "xpu-nightly-core" and .key != "xpu-nightly-applications") or
+                 .value.result != "skipped" or
+                 env.ALLOW_XPU_SKIP != "true")
               ) |
               "\(.key): \(.value.result)"')
           if [ -n "$failing" ]; then
@@ -739,6 +802,7 @@ jobs:
           NEEDS_JSON: ${{ toJSON(needs) }}
           ALLOW_PUBLISH_SKIP: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true' }}
           ALLOW_ROCM_SKIP: ${{ needs.version-stamp.outputs.run_rocm_integration == 'false' }}
+          ALLOW_XPU_SKIP: ${{ needs.version-stamp.outputs.run_xpu_integration == 'false' }}
 
   notify-failure:
     if: ${{ always() && needs.nightly-gate.result == 'failure' }}

@@ -1,9 +1,10 @@
-# XPU hardware core (Stage 2)
+# XPU hardware CI (Stages 2 and 3)
 
 Stage 1 builds a CPython 3.12 wheel and matching native tests on hosted CPU
 runners. Stage 2 consumes that exact artifact on a fixed two-B60 allocation.
-It does not build while holding GPUs, use models, publish wheels, or enable
-nightly hardware/application coverage (Stage 3).
+It does not build while holding GPUs or publish wheels. Stage 3 adds opt-in
+nightly expanded core and a separate application job, reusing this builder,
+artifact contract, runner allocation, and isolated hardware workflow.
 
 ## Runner contract
 
@@ -97,8 +98,67 @@ The existing E2E concurrency policy cancels older runs for the same PR;
 an interrupted controller can leave an in-progress check, never a successful
 check. Other platforms retain their existing jobs and gate policy.
 The normal Stage 1 hosted build remains independent and required by the
-existing PR CI gate. Nightly still builds only the XPU artifact, without
-running XPU hardware tests.
+existing PR CI gate. PR core remains model-free and unchanged by the nightly
+profiles below.
+
+## Stage 3: nightly hardware and applications
+
+The official repository's **Nightly Build & Test** always builds and checks the
+XPU wheel on CPU. After provisioning the runners, set the repository variable
+`NIGHTLY_XPU_INTEGRATION=true` to require hardware coverage each night.
+Alternatively select `run_xpu_integration` when manually dispatching Nightly
+Build & Test. The same selection enables **both** jobs:
+
+- `xpu-nightly-core`: all 149 non-RDMA C++ cases, Python Store, and expanded
+  two-rank native EP. EP uses 128 maximum tokens, hidden size 4096, 16 experts,
+  top-k 4, and 24 fixed-seed rounds, plus the existing empty-rank, overlap,
+  duplicate-expert, handle, stream, and fallback checks. PR core retains its
+  32-token, hidden-1024, 8-expert, top-k-2, eight-round profile.
+- `xpu-nightly-applications`: one two-B60 allocation runs the existing
+  `vllm_store_smoke.py`, then `vllm_store_pd_smoke.py`. Single-instance Store
+  must save and load real KV and reproduce nonempty greedy output with zero
+  failed keys. PD uses separate producer/consumer processes on distinct local
+  device indices 0 and 1 within the runner's host-owned mask; each role must
+  see exactly one XPU. It must load exactly the producer's saved keys and
+  reproduce its tokens, with zero save/load failures. Local prefix caching is
+  disabled in both scenarios.
+
+The hardware jobs can run independently on different runner pairs. Both use
+the nightly commit's **same artifact ID and digest**, not a rebuilt or indexed
+wheel. The hosted builder optionally downloads
+`Qwen/Qwen2.5-0.5B-Instruct` at revision
+`7ae557604adf67be50417f59c2c2f167def9a775` into the native bundle, with model
+provenance and the bundle's complete SHA256 inventory. No model download or
+Mooncake build runs on a GPU runner. Disabled nightly hardware and PR builds do
+not download this model.
+
+Core uses Stage 1's Intel PyTorch runtime. Applications use
+`vllm/vllm-openai-xpu:v0.29.0@sha256:1db27a8b75ae1d6b3cbf16ebbb88310c2b5548221c8df1335082b2a54dba209a`
+(CPython 3.12, PyTorch 2.13.0). Builder-image provenance is checked separately
+from this application runtime. Both containers verify the installed wheel's
+native extensions and packaged master; applications also check vLLM's version
+and the model revision. Runtime execution stays offline (`--network none`,
+Hugging Face/Transformers offline mode). `MC_FORCE_TCP=1` and
+`MC_TENT_CONF={"transports":{"xpu":{"disable_ipc":true}}}` prevent RDMA or
+same-node XPU IPC shortcuts in the application path. Native EP/IPC coverage
+remains enabled in core.
+
+Nightly Gate requires the builder and both selected hardware jobs to succeed.
+Missing results, unexpected skips, cancellation, test errors, absent completion
+records, invalid JSON results, or cleanup failures cannot pass. Hardware jobs
+may be skipped **only** when the recorded selection is explicitly false.
+That state emits a warning and an explicit absent-coverage summary, not a
+hardware pass. Fork nightly runs remain disabled. XPU artifacts are not added
+to TestPyPI or release publishing; release integration remains a later stage.
+
+Diagnostics additionally retain job creation/start times and measured queue
+seconds, suite elapsed time, the pinned image/model identity, scenario JSON
+results with per-process peak XPU allocated/reserved memory, and full PD child
+logs even on failure. These are measurements from actual runs, not runtime or
+concurrency guarantees. Core and application containers have suite-specific
+labels and diagnostic artifact names, so same-run cleanup cannot stop another
+suite's container on a shared eight-GPU host. Existing current-container
+cleanup checks and mandatory ephemeral-runner reimaging still apply.
 
 ## Required coverage and diagnostics
 
@@ -124,7 +184,8 @@ results. Ten parameter combinations that unconditionally skip because they
 are inapplicable are excluded *before* execution, with reasons in
 `selection.json`. No runtime skips are allowed. The eight direct-RDMA
 parameterizations are explicitly excluded; dma-buf export itself needs no NIC.
-GDS, multi-node, more than two EP ranks, and vLLM are not claimed as coverage.
+GDS, multi-node, and more than two EP ranks are not claimed as coverage.
+vLLM belongs only to the separate nightly application job.
 
 Artifacts retain runner/container cleanup state, device/runtime identity,
 selection, XML, logs, inventories, dependency diagnostics, artifact metadata,

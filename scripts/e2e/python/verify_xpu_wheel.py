@@ -24,6 +24,14 @@ import zipfile
 from verify_rocm_wheel import find_extension_record, record_digest
 
 
+MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+MODEL_REVISION = "7ae557604adf67be50417f59c2c2f167def9a775"
+APPLICATION_IMAGE = (
+    "vllm/vllm-openai-xpu:v0.29.0@sha256:"
+    "1db27a8b75ae1d6b3cbf16ebbb88310c2b5548221c8df1335082b2a54dba209a"
+)
+
+
 def main() -> None:
     os.environ["MC_USE_TENT"] = "1"
     os.environ["MOONCAKE_STORE_BACKEND"] = "cpp"
@@ -227,7 +235,9 @@ def unpack(directory: Path, sha: str, artifact_id: str, checksum: str) -> None:
     wheels = list(bundle.glob("mooncake_transfer_engine_xpu-*-cp312-cp312-*.whl"))
     require(len(wheels) == 1, "Expected one CPython 3.12 XPU wheel")
     verify_hashes(bundle, {"provenance.txt"})
-    verify_provenance(bundle, sha, os.environ["XPU_IMAGE"], run)
+    verify_provenance(
+        bundle, sha, os.environ.get("XPU_BUILD_IMAGE", os.environ["XPU_IMAGE"]), run
+    )
 
 
 def extract_native(bundle: Path, output: Path) -> Path:
@@ -503,6 +513,8 @@ def store_test(source: Path, report: Path) -> None:
 
 
 def run(bundle: Path, source: Path, output: Path) -> None:
+    selected_suite = os.environ.get("XPU_SUITE", "core")
+    require(selected_suite in {"core", "nightly", "applications"}, "Invalid XPU suite")
     verify_hashes(bundle, {"provenance.txt"})
     native = extract_native(bundle, output)
     # Intel PyTorch ships SYCL/UR in its interpreter prefix, not ldconfig.
@@ -529,7 +541,14 @@ def run(bundle: Path, source: Path, output: Path) -> None:
     )
     os.environ["PYTHONPATH"] = "/tmp/xpu-installed"
     command(
-        [python, __file__, "suite", str(native), str(source), str(output)],
+        [
+            python,
+            __file__,
+            "applications" if selected_suite == "applications" else "suite",
+            str(native),
+            str(source),
+            str(output),
+        ],
         output / "suite.log",
         timeout=4000,
     )
@@ -556,7 +575,6 @@ def suite(native: Path, source: Path, output: Path) -> None:
                     "multi-node",
                     "EP > 2 ranks",
                     "vLLM",
-                    "nightly E2E",
                 ],
             },
             indent=2,
@@ -631,6 +649,10 @@ def suite(native: Path, source: Path, output: Path) -> None:
                 master.kill()
                 master.wait()
                 raise
+    nightly = os.environ.get("XPU_SUITE", "core") == "nightly"
+    max_tokens, hidden, experts, topk, rounds = (
+        (128, 4096, 16, 4, 24) if nightly else (32, 1024, 8, 2, 8)
+    )
     ep = command(
         [
             python,
@@ -638,28 +660,28 @@ def suite(native: Path, source: Path, output: Path) -> None:
             "--num-ranks",
             "2",
             "--max-tokens",
-            "32",
+            str(max_tokens),
             "--hidden",
-            "1024",
+            str(hidden),
             "--num-experts",
-            "8",
+            str(experts),
             "--num-topk",
-            "2",
+            str(topk),
             "--rounds",
-            "5",
+            str(rounds - 3),
         ],
         output / "ep.log",
         timeout=1200,
     )
     require(
         re.findall(r"^round (\d+): .* ok$", ep, re.MULTILINE)
-        == [str(i) for i in range(8)],
+        == [str(i) for i in range(rounds)],
         "Missing EP correctness rounds",
     )
     expected = (
-        "PASSED: 8 rounds + 2 empty-rank rounds + 4 two-batch rounds + duplicate experts"
+        f"PASSED: {rounds} rounds + 2 empty-rank rounds + 4 two-batch rounds + duplicate experts"
         " + reused src_info + rejected handle + cross-stream + fallback agreement"
-        " on 2 ranks (hidden=1024, experts=8, topk=2)"
+        f" on 2 ranks (hidden={hidden}, experts={experts}, topk={topk})"
     )
     require(
         ep.splitlines().count(expected) == 1, "Missing native two-rank EP completion"
@@ -672,7 +694,117 @@ def suite(native: Path, source: Path, output: Path) -> None:
                 "cpp_cases": sum(len(selected) for _, selected in SUITES.values()),
                 "store_python_cases": 1,
                 "ep_ranks": 2,
-                "ep_rounds": 8,
+                "suite": "nightly" if nightly else "core",
+                "ep_rounds": rounds,
+                "ep_max_tokens": max_tokens,
+                "ep_hidden": hidden,
+                "ep_experts": experts,
+                "ep_topk": topk,
+                "elapsed_seconds": time.monotonic() - started,
+            },
+            indent=2,
+        )
+    )
+
+
+def validate_application_report(path: Path, scenario: str) -> dict:
+    report = json.loads(path.read_text())
+    require(report["scenario"] == scenario, "Wrong application scenario")
+    require(
+        bool(report["tokens"]) and report["tokens"] == report["reference_tokens"],
+        "Application returned empty or mismatched tokens",
+    )
+    require(
+        report["saved"] > 0
+        and report["loaded"] > 0
+        and report["save_failed"] == report["load_failed"] == 0,
+        "Missing KV save/load or failed keys",
+    )
+    if scenario == "pd":
+        require(report["saved"] == report["loaded"], "PD key counts differ")
+    memory = [report["memory"]]
+    if scenario == "pd":
+        memory.append(report["prefill_memory"])
+    for item in memory:
+        require(
+            "B60" in item["device"]
+            and item["peak_reserved_bytes"] >= item["peak_allocated_bytes"] > 0,
+            "Missing B60 memory measurements",
+        )
+    return report
+
+
+def applications(native: Path, source: Path, output: Path) -> None:
+    started = time.monotonic()
+    preflight(output)
+    require(os.environ["XPU_IMAGE"] == APPLICATION_IMAGE, "Unexpected vLLM image")
+    require(metadata.version("vllm") == "0.29.0", "Unexpected vLLM version")
+    command([sys.executable, "-m", "pip", "freeze"], output / "runtime-packages.log")
+    command([sys.executable, __file__], output / "wheel.log")
+    model = native / "model"
+    require(
+        json.loads((model / "model-provenance.json").read_text())
+        == {"model": MODEL_ID, "revision": MODEL_REVISION},
+        "Unexpected model revision",
+    )
+    require(bool(list(model.glob("*.safetensors"))), "Missing model weights")
+    os.environ.update(
+        HF_HUB_OFFLINE="1",
+        TRANSFORMERS_OFFLINE="1",
+        HF_HOME="/tmp/huggingface",
+        VLLM_CACHE_ROOT="/tmp/vllm",
+        MC_FORCE_TCP="1",
+        MC_TENT_CONF=json.dumps({"transports": {"xpu": {"disable_ipc": True}}}),
+        TMPDIR=str(output),
+    )
+    master = Path(
+        metadata.distribution("mooncake-transfer-engine-xpu").locate_file(
+            "mooncake/mooncake_master"
+        )
+    )
+    results = {}
+    for scenario, script, completion in (
+        (
+            "store",
+            "vllm_store_smoke.py",
+            "PASS: vLLM-XPU prefill -> Mooncake Store -> decode",
+        ),
+        (
+            "pd",
+            "vllm_store_pd_smoke.py",
+            "PASS: vLLM-XPU prefill (XPU A) -> Mooncake Store -> decode (XPU B)",
+        ),
+    ):
+        report = output / f"{scenario}.json"
+        args = [
+            sys.executable,
+            str(source / "scripts/xpu" / script),
+            "--model",
+            str(model),
+            "--master-bin",
+            str(master),
+            "--protocol",
+            "tcp",
+            "--report",
+            str(report),
+        ]
+        if scenario == "pd":
+            args += ["--prefill-xpu", "0", "--decode-xpu", "1"]
+        log = command(args, output / f"{scenario}.log", timeout=1500)
+        require(
+            log.splitlines().count(completion) == 1, f"Missing {scenario} completion"
+        )
+        results[scenario] = validate_application_report(report, scenario)
+    (output / "result.json").write_text(
+        json.dumps(
+            {
+                "source_sha": os.environ["XPU_SOURCE_SHA"],
+                "status": "passed",
+                "suite": "applications",
+                "image": APPLICATION_IMAGE,
+                "model": MODEL_ID,
+                "model_revision": MODEL_REVISION,
+                "scenarios": results,
                 "elapsed_seconds": time.monotonic() - started,
             },
             indent=2,
@@ -692,6 +824,8 @@ def cli() -> None:
         run(*(Path(arg) for arg in args))
     elif mode == "suite":
         suite(*(Path(arg) for arg in args))
+    elif mode == "applications":
+        applications(*(Path(arg) for arg in args))
     elif mode == "store":
         store_test(*(Path(arg) for arg in args))
     elif mode == "seccomp":
