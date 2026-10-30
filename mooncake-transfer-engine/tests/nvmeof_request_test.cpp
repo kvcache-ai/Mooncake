@@ -340,4 +340,33 @@ TEST_F(NVMeoFRequestTest, RejectsSliceOverflowAfterAcceptedSubmission) {
     ASSERT_TRUE(transport_->submitTransfer(batch_id_, {Request(127, 1)}).ok());
     EXPECT_EQ(NVMeoFTransportTestPeer::sliceCount(*transport_, batch_id_), 128);
 }
+TEST_F(NVMeoFRequestTest, AcceptedSubmissionsDoNotReplayPendingSlices) {
+    ASSERT_TRUE(transport_->submitTransfer(batch_id_, {Request(0, 4096)}).ok());
+    ASSERT_TRUE(
+        transport_->submitTransfer(batch_id_, {Request(4096, 4096)}).ok());
+    ASSERT_EQ(submitted.size(), 2);
+    EXPECT_NE(submitted[0].cookie, submitted[1].cookie);
+    EXPECT_EQ(submit_calls, 2);
+    for (size_t i = 0; i < 2; ++i) {
+        Transport::TransferStatus status;
+        ASSERT_TRUE(transport_->getTransferStatus(batch_id_, i, status).ok());
+        EXPECT_EQ(status.s, Transport::COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, 4096);
+    }
+}
+TEST_F(NVMeoFRequestTest, AcceptedSubmissionsDoNotReplayCompletedSlices) {
+    ASSERT_TRUE(transport_->submitTransfer(batch_id_, {Request(0, 4096)}).ok());
+    Transport::TransferStatus status;
+    ASSERT_TRUE(transport_->getTransferStatus(batch_id_, 0, status).ok());
+    ASSERT_EQ(status.s, Transport::COMPLETED);
+    ASSERT_TRUE(
+        transport_->submitTransfer(batch_id_, {Request(4096, 4096)}).ok());
+    ASSERT_EQ(submitted.size(), 2);
+    EXPECT_NE(submitted[0].cookie, submitted[1].cookie);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_id_, 1, status).ok());
+    EXPECT_EQ(status.s, Transport::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, 4096);
+    ASSERT_TRUE(transport_->submitTransfer(batch_id_, {}).ok());
+    EXPECT_EQ(submit_calls, 2);
+}
 }  // namespace mooncake
