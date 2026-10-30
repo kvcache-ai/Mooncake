@@ -31,6 +31,13 @@ APPLICATION_IMAGE = (
     "1db27a8b75ae1d6b3cbf16ebbb88310c2b5548221c8df1335082b2a54dba209a"
 )
 APPLICATION_VLLM_VERSION = "0.29.0+xpu"
+APPLICATION_THREAD_ENV = {
+    "OMP_NUM_THREADS": "2",
+    "MKL_NUM_THREADS": "2",
+    "OPENBLAS_NUM_THREADS": "2",
+    "NUMEXPR_NUM_THREADS": "2",
+    "RAYON_NUM_THREADS": "2",
+}
 
 
 def main() -> None:
@@ -737,6 +744,17 @@ def validate_application_report(path: Path, scenario: str) -> dict:
 
 def applications(native: Path, source: Path, output: Path) -> None:
     started = time.monotonic()
+    os.environ.update(APPLICATION_THREAD_ENV)
+    (output / "cpu-resources.json").write_text(
+        json.dumps(
+            {
+                "logical_cpus": os.cpu_count(),
+                "cpu_affinity": sorted(os.sched_getaffinity(0)),
+                "thread_environment": APPLICATION_THREAD_ENV,
+            },
+            indent=2,
+        )
+    )
     preflight(output)
     require(os.environ["XPU_IMAGE"] == APPLICATION_IMAGE, "Unexpected vLLM image")
     command([sys.executable, "-m", "pip", "freeze"], output / "runtime-packages.log")

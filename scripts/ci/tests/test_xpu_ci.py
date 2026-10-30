@@ -1848,6 +1848,32 @@ class NightlyXpuTest(unittest.TestCase):
 
 
 class ApplicationTest(unittest.TestCase):
+    def test_application_thread_budget_precedes_preflight_and_is_recorded(self):
+        expected = {
+            "OMP_NUM_THREADS": "2",
+            "MKL_NUM_THREADS": "2",
+            "OPENBLAS_NUM_THREADS": "2",
+            "NUMEXPR_NUM_THREADS": "2",
+            "RAYON_NUM_THREADS": "2",
+        }
+
+        def preflight(output):
+            self.assertEqual({name: os.environ[name] for name in expected}, expected)
+            resources = json.loads((output / "cpu-resources.json").read_text())
+            self.assertEqual(resources["thread_environment"], expected)
+            self.assertEqual(resources["cpu_affinity"], sorted(os.sched_getaffinity(0)))
+            raise RuntimeError("preflight stopped")
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.dict(os.environ, dict.fromkeys(expected, "512")),
+            patch.object(VERIFY, "preflight", side_effect=preflight),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "preflight stopped"):
+                VERIFY.applications(Path(temporary), ROOT, Path(temporary))
+        launch = hardware_step("Execute isolated two-B60 core")
+        self.assertIn("--pids-limit 1024", launch)
+
     def test_artifact_install_dispatches_only_the_selected_suite(self):
         for selected, mode in (
             ("core", "suite"),
@@ -1989,6 +2015,14 @@ class ApplicationTest(unittest.TestCase):
                     )
                     self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
                     self.assertEqual(os.environ["TRANSFORMERS_OFFLINE"], "1")
+                    for name in (
+                        "OMP_NUM_THREADS",
+                        "MKL_NUM_THREADS",
+                        "OPENBLAS_NUM_THREADS",
+                        "NUMEXPR_NUM_THREADS",
+                        "RAYON_NUM_THREADS",
+                    ):
+                        self.assertEqual(os.environ[name], "2")
                     if bad == scenario:
                         raise subprocess.CalledProcessError(1, args)
                     if bad != "missing-report":

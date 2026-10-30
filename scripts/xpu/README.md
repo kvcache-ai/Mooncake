@@ -147,6 +147,14 @@ Hugging Face/Transformers offline mode). `MC_FORCE_TCP=1` and
 same-node XPU IPC shortcuts in the application path. Native EP/IPC coverage
 remains enabled in core.
 
+Applications set `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
+`NUMEXPR_NUM_THREADS`, and `RAYON_NUM_THREADS` to 2 **before** preflight imports
+PyTorch. Both PD children inherit these settings. This prevents host-sized
+Torch/BLAS and tokenizer Rayon pools from exhausting the shared container
+thread budget on large CPU hosts. Tokenizer parallelism remains enabled,
+the container's 1024-PID limit and the core profile remain unchanged.
+`cpu-resources.json` retains CPU visibility and the enforced thread settings.
+
 Nightly Gate requires the builder and both selected hardware jobs to succeed.
 Missing results, unexpected skips, cancellation, test errors, absent completion
 records, invalid JSON results, or cleanup failures cannot pass. Hardware jobs
