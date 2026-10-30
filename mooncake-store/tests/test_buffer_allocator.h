@@ -12,8 +12,7 @@
 namespace mooncake::test {
 
 class TestBufferAllocator final
-    : public BufferAllocatorBase,
-      public std::enable_shared_from_this<TestBufferAllocator> {
+    : public BufferAllocatorBase {
    public:
     TestBufferAllocator(std::string name, std::string endpoint, size_t capacity,
                         uintptr_t base = 0x100000000ULL)
