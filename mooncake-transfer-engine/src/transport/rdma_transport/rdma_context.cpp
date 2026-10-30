@@ -779,6 +779,23 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
     defined(USE_HIP_DMABUF) || defined(USE_SUPA)
     if (exp.method == DmabufExport::Method::kDmabufReg) {
+        // #5015: a DMA-BUF MR whose start is 2^k-aligned (k >= 32) and whose
+        // length reaches 2^k wraps every 2^k bytes, so an RDMA READ/WRITE at
+        // offset X silently lands at X mod 2^k. The wrap is below Mooncake
+        // (kernel DMA-BUF umem / mlx5 page-size selection / driver export), but
+        // it corrupts Mooncake transfers and reports rc = 0. Warn so it is not
+        // silent; MC_MAX_MR_SIZE at or below 4 GiB, or the nvidia-peermem
+        // ibv_reg_mr path, avoids it.
+        uintptr_t start = (uintptr_t)addr;
+        size_t align = start & (~start + 1);  // largest 2^k dividing start
+        if (align >= (size_t(1) << 32) && length >= align) {
+            LOG(WARNING) << "DMA-BUF MR at " << addr << " length " << length
+                         << " starts on a " << align
+                         << "-byte boundary and may wrap every " << align
+                         << " bytes, corrupting RDMA offsets past that point "
+                            "(#5015). Set MC_MAX_MR_SIZE <= 4GiB or register "
+                            "through nvidia-peermem (ibv_reg_mr) instead.";
+        }
         // Import the shared dma_buf fd into this NIC's PD. The fd is kept open
         // by the caller until every NIC has registered; this MR takes its own
         // reference, so all NICs share one dma_buf object (and one BAR1
