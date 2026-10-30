@@ -1822,5 +1822,49 @@ TEST(S3ObjectStorageAdapterEngineTest,
     EXPECT_EQ(putv, kAttempts);
 }
 
+TEST(S3ObjectStorageAdapterEngineTest,
+     PreservesLarge416WithoutMaskingTruncatedResponses) {
+    using Server = test::OssFaultHttpServer;
+    Server server(
+        {{"large-range", Server::Reply(416, std::string(512, 'x'))},
+         {"truncated-range",
+          Server::Raw("HTTP/1.1 416 Test\r\nContent-Length: 512\r\n"
+                      "Connection: close\r\n\r\nxx")},
+         {"present",
+          Server::Reply(206, "12345678", "Content-Range: bytes 0-7/8\r\n")}});
+    ScopedEnvironment environment;
+    ConfigureFaultEndpoint(environment, server.port());
+    S3ObjectStorageAdapter adapter("/range-errors/");
+    ASSERT_TRUE(adapter.Init());
+    std::array<char, 10> output;
+    for (const char* key : {"large-range", "truncated-range"}) {
+        SCOPED_TRACE(key);
+        output.fill('!');
+        const auto expected = std::string(key) == "large-range"
+                                  ? ErrorCode::FILE_READ_FAIL
+                                  : ErrorCode::DFS_SERVICE_UNAVAILABLE;
+        const auto single = adapter.GetRange(key, output.data() + 1, 8, 0);
+        ASSERT_FALSE(single);
+        EXPECT_EQ(single.error(), expected);
+        const auto batch = adapter.GetBatch({{key, output.data() + 1, 8}});
+        ASSERT_EQ(batch.size(), 1U);
+        ASSERT_FALSE(batch[0]);
+        EXPECT_EQ(batch[0].error(), expected);
+        EXPECT_EQ(output.front(), '!');
+        EXPECT_EQ(output.back(), '!');
+    }
+    ASSERT_TRUE(adapter.GetRange("present", output.data() + 1, 8, 0));
+    EXPECT_EQ(std::string(output.data(), output.size()), "!12345678!");
+    server.Stop();
+    EXPECT_TRUE(server.error().empty()) << server.error();
+    const auto requests = server.requests();
+    EXPECT_EQ(std::count_if(requests.begin(), requests.end(),
+                            [](const auto& request) {
+                                return request.find("/large-range HTTP/") !=
+                                       std::string::npos;
+                            }),
+              2);
+}
+
 }  // namespace
 }  // namespace mooncake

@@ -546,12 +546,12 @@ OssObjectStorageAdapter::Request(
     curl_easy_getinfo(context.curl, CURLINFO_RESPONSE_CODE, &response.status);
     response.transferred = context.download_context.transferred;
     response.body = std::move(context.error_body);
-    // A 404 error body may exceed the caller's object buffer. Preserve the
-    // HTTP error only for this local abort, not for other transfer failures.
-    const bool missing_object = method == "GET" && response.status == 404 &&
-                                result == CURLE_WRITE_ERROR &&
-                                context.download_context.overflow;
-    if (result != CURLE_OK && !missing_object) {
+    // Preserve 404/416 when receiving their oversized bodies was aborted
+    // locally. Other transfer failures must still report a transport error.
+    const bool range_error =
+        method == "GET" && (response.status == 404 || response.status == 416) &&
+        result == CURLE_WRITE_ERROR && context.download_context.overflow;
+    if (result != CURLE_OK && !range_error) {
         LOG(ERROR) << "OSS " << method
                    << " request failed: " << curl_easy_strerror(result);
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
@@ -673,12 +673,13 @@ OssObjectStorageAdapter::RequestBatch(
             long status = 0;
             curl_easy_getinfo(message->easy_handle, CURLINFO_RESPONSE_CODE,
                               &status);
-            if (!context->upload && status == 404 &&
+            if (!context->upload && (status == 404 || status == 416) &&
                 (message->data.result == CURLE_OK ||
                  (message->data.result == CURLE_WRITE_ERROR &&
                   context->download_context.overflow))) {
-                results[context->index] =
-                    tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
+                results[context->index] = tl::make_unexpected(
+                    status == 404 ? ErrorCode::FILE_NOT_FOUND
+                                  : ErrorCode::FILE_READ_FAIL);
             } else if (message->data.result != CURLE_OK) {
                 LOG(ERROR) << "OSS batch " << (context->upload ? "PUT" : "GET")
                            << " failed: "
