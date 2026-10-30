@@ -74,7 +74,7 @@ if(BUILD_UNIT_TESTS)
     add_executable(
       tebench_metrics_integration_test
       tests/metrics_integration_test.cpp te_backend.cpp utils.cpp
-      split_output.cpp)
+      split_output.cpp numa_first_touch.cpp)
     # Use the same backend dependencies as tebench, including device runtimes.
     target_link_libraries(
       tebench_metrics_integration_test
