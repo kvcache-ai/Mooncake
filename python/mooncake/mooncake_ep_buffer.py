@@ -632,6 +632,21 @@ class Buffer:
 
     def connect(self, is_update: bool = False):
         device = self._bootstrap_device()
+        coordinated_fallback = False
+        # XPU has no IBGDA QPNs; its peers use Level Zero IPC.
+        if is_update and self.device_type != "xpu":
+            if not self._use_fallback:
+                self.runtime.update_local_qpns()
+            ibgda_failed = torch.tensor(
+                [int(self._use_fallback or self.runtime.ibgda_disabled())],
+                dtype=torch.int32,
+                device=device,
+            )
+            dist.all_reduce(ibgda_failed, op=dist.ReduceOp.MAX, group=self.group)
+            if bool(ibgda_failed.item()):
+                self._use_fallback = True
+                coordinated_fallback = True
+
         # XPU has no RDMA path: peers are reached over Level Zero IPC only.
         if self.device_type != "xpu" and not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
@@ -652,9 +667,6 @@ class Buffer:
             ]
             dist.all_gather(rkeys, rkey, self.group)
             rkeys = torch.cat(rkeys).tolist()
-
-            if is_update:
-                self.runtime.update_local_qpns()
 
             local_qpns = self.runtime.get_local_qpns()
             all_to_all_size = len(local_qpns) // self.group_size
@@ -769,7 +781,7 @@ class Buffer:
             )
             dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=self.group)
             use_fast_path = bool(agreed.item())
-        self._use_fallback = not use_fast_path
+        self._use_fallback = coordinated_fallback or not use_fast_path
 
     def update_ep_member(self):
         self.connect(True)
