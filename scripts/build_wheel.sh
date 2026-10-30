@@ -158,11 +158,12 @@ CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
 # Kernel header tree the CUDA EP JIT compiles against at runtime.
 CUDA_EP_JIT_DIR="${BUILD_DIR_ABS}/mooncake_ep_jit"
 
-# CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
+# CI only: remove build/ to free disk before python -m build.
+# FREE_BUILD_DIR=1 enables local cleanup; 0 preserves build dependencies and tests.
 # If EP/PG .so files were staged inside the build directory, preserve them in a
 # temporary location so they survive the cleanup.
 CUDA_EP_STAGING_TEMP=""
-if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
+if [ "$FREE_BUILD_DIR" != "0" ] && { [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; }; then
     if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
         CUDA_EP_STAGING_TEMP=$(mktemp -d)
         cp "$CUDA_EP_STAGING_DIR"/*.so "$CUDA_EP_STAGING_TEMP/"
@@ -268,7 +269,7 @@ cleanup_wheel_metadata_state() {
 }
 trap cleanup_wheel_metadata_state EXIT
 
-BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD EFA_BUILD EFA_CU13_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD HIP_BUILD"
+BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD EFA_BUILD EFA_CU13_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD HIP_BUILD XPU_BUILD"
 BUILD_VARIANT_COUNT=0
 for build_variant in $BUILD_VARIANTS; do
     if [ "${!build_variant}" = "1" ]; then
@@ -371,6 +372,14 @@ elif [ "$HIP_BUILD" = "1" ]; then
     sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "rocm", "amd", "hip"]/' pyproject.toml
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-rocm"
+elif [ "$XPU_BUILD" = "1" ]; then
+    echo "Modifying package name for Intel XPU build"
+    cp pyproject.toml pyproject.toml.backup
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-xpu"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (Intel XPU version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "intel", "xpu", "sycl"]/' pyproject.toml
+    sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-xpu"
 else
     echo "Using standard package name: mooncake-transfer-engine"
 fi

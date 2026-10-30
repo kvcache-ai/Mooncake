@@ -1741,6 +1741,18 @@ void bind_coro_rpc_interface(py::module_& m) {
 }
 
 PYBIND11_MODULE(engine, m) {
+#ifdef USE_XPU
+    m.attr("SUPPORT_XPU") = true;
+#else
+    m.attr("SUPPORT_XPU") = false;
+#endif
+
+#ifdef USE_TENT
+    m.attr("SUPPORT_TENT") = true;
+#else
+    m.attr("SUPPORT_TENT") = false;
+#endif
+
 #ifdef USE_EFA
     m.attr("SUPPORT_EFA") = true;
 #else
