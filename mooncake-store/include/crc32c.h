@@ -4,7 +4,9 @@
 #include <cstddef>
 #include <cstdint>
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+// SYCL's device pass cannot query x86 CPU features.
+#if defined(__x86_64__) && !defined(__SYCL_DEVICE_ONLY__) && \
+    (defined(__GNUC__) || defined(__clang__))
 #include <nmmintrin.h>
 #define MOONCAKE_CRC32C_HAVE_SSE42 1
 #endif
