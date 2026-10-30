@@ -45,6 +45,8 @@ struct RpcHandlerScope {
 
 class ClientPool {
    public:
+    using Clock = std::chrono::steady_clock;
+
     struct Lease {
         std::unique_ptr<coro_rpc_client> client;
         // Which generation the client was drawn from. Flushing is keyed on
@@ -54,8 +56,12 @@ class ClientPool {
 
     Lease acquire() {
         std::lock_guard<std::mutex> guard(lock_);
+        last_activity_ = Clock::now();
         if (!idle_clients_.empty()) {
-            auto client = std::move(idle_clients_.back());
+            // Take the most recently parked client. The ones at the front
+            // keep aging, so evictIdle() below reclaims exactly the
+            // connections that no burst has needed since.
+            auto client = std::move(idle_clients_.back().client);
             idle_clients_.pop_back();
             return Lease{std::move(client), generation_};
         }
@@ -67,7 +73,36 @@ class ClientPool {
     void release(std::unique_ptr<coro_rpc_client> client) {
         if (!client) return;
         std::lock_guard<std::mutex> guard(lock_);
-        idle_clients_.push_back(std::move(client));
+        last_activity_ = Clock::now();
+        idle_clients_.push_back(IdleClient{std::move(client), last_activity_});
+    }
+
+    // Detaches every client parked before `deadline` and hands it to the
+    // caller, which destroys it outside lock_. Dropping an idle client is
+    // transparent: the next call for this address simply reconnects, the same
+    // as after clearIfCurrent().
+    void evictIdle(Clock::time_point deadline,
+                   std::vector<std::unique_ptr<coro_rpc_client>>& dropped) {
+        std::lock_guard<std::mutex> guard(lock_);
+        auto it = idle_clients_.begin();
+        while (it != idle_clients_.end() && it->parked_at < deadline) {
+            dropped.push_back(std::move(it->client));
+            ++it;
+        }
+        idle_clients_.erase(idle_clients_.begin(), it);
+    }
+
+    // True when nothing is pooled and nothing has used this pool since
+    // `deadline`, so the map entry can go too. A call in flight has stamped
+    // last_activity_ at acquire time, which keeps its pool alive.
+    bool unusedSince(Clock::time_point deadline) {
+        std::lock_guard<std::mutex> guard(lock_);
+        return idle_clients_.empty() && last_activity_ < deadline;
+    }
+
+    size_t idleCount() {
+        std::lock_guard<std::mutex> guard(lock_);
+        return idle_clients_.size();
     }
 
     // Drop every idle client, but only on behalf of a caller that is still
@@ -89,9 +124,17 @@ class ClientPool {
     }
 
    private:
+    struct IdleClient {
+        std::unique_ptr<coro_rpc_client> client;
+        Clock::time_point parked_at;
+    };
+
     std::mutex lock_;
     uint64_t generation_ = 0;
-    std::vector<std::unique_ptr<coro_rpc_client>> idle_clients_;
+    // Oldest first: acquire() takes from the back and release() appends, so
+    // the vector stays ordered by parked_at.
+    std::vector<IdleClient> idle_clients_;
+    Clock::time_point last_activity_ = Clock::now();
 };
 
 struct ClientLease {
@@ -211,8 +254,73 @@ Lazy<void> CoroRpcAgent::process(int func_id) {
     ctx->set_response_attachment(std::move(response));
 }
 
+namespace {
+// How long a pooled connection may sit unused before it is dropped. Long
+// enough that a peer which is merely between bursts keeps its connections,
+// short enough that a peer which has left stops holding descriptors.
+constexpr auto kClientIdleTimeout = std::chrono::minutes(5);
+// Bounds how often the sweep walks every pool; it runs under pools_mutex_,
+// which the call path takes anyway.
+constexpr auto kIdleSweepInterval = std::chrono::seconds(10);
+}  // namespace
+
+size_t CoroRpcAgent::evictIdleClients(std::chrono::nanoseconds idle_timeout) {
+    const auto deadline = ClientPool::Clock::now() - idle_timeout;
+    // Both lists outlive the critical section below on purpose: closing a
+    // connection runs on the client io_context, and this sweep is itself
+    // reached from a coroutine on that pool, so no destructor may run while
+    // pools_mutex_ is held.
+    std::vector<std::unique_ptr<coro_rpc_client>> dropped;
+    std::vector<std::shared_ptr<ClientPool>> drained;
+    {
+        std::lock_guard<std::mutex> lock(pools_mutex_);
+        last_idle_sweep_ = ClientPool::Clock::now();
+        for (auto it = pools_.begin(); it != pools_.end();) {
+            it->second->evictIdle(deadline, dropped);
+            if (it->second->unusedSince(deadline)) {
+                // A concurrent caller may still hold this shared_ptr, so the
+                // erase below is not necessarily the last reference; keeping
+                // one here makes the release point explicit either way.
+                drained.push_back(it->second);
+                it = pools_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    const size_t count = dropped.size();
+    dropped.clear();
+    drained.clear();
+    return count;
+}
+
+size_t CoroRpcAgent::idleClientCountForTest(const std::string& server_addr) {
+    std::lock_guard<std::mutex> lock(pools_mutex_);
+    auto it = pools_.find(server_addr);
+    return it == pools_.end() ? 0 : it->second->idleCount();
+}
+
+size_t CoroRpcAgent::poolCountForTest() {
+    std::lock_guard<std::mutex> lock(pools_mutex_);
+    return pools_.size();
+}
+
 std::shared_ptr<ClientPool> CoroRpcAgent::getOrCreatePool(
     const std::string& server_addr) {
+    {
+        std::lock_guard<std::mutex> lock(pools_mutex_);
+        auto it = pools_.find(server_addr);
+        if (it != pools_.end() &&
+            ClientPool::Clock::now() - last_idle_sweep_ <= kIdleSweepInterval) {
+            return it->second;
+        }
+    }
+    // Sweep on the two events worth paying for: the first call of each sweep
+    // interval, and any call to an address with no pool yet - in a deployment
+    // where peers keep being replaced, a new address is the event that
+    // recurs. Run outside pools_mutex_ so the dropped clients' destructors do
+    // not execute under it.
+    evictIdleClients(kClientIdleTimeout);
     std::lock_guard<std::mutex> lock(pools_mutex_);
     auto it = pools_.find(server_addr);
     if (it == pools_.end()) {
