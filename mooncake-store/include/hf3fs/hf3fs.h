@@ -15,8 +15,8 @@ struct Hf3fsConfig {
 
     // USRBIO related parameters
     std::string mount_root = "/";  // Mount point root directory
-    size_t iov_size = 32 << 20;    // Shared memory size (32MB)
-    size_t ior_entries = 16;       // Maximum number of requests in IO ring
+    size_t iov_size = 16 << 20;    // Staging bytes per ring entry (16 MiB)
+    size_t ior_entries = 8;        // Maximum number of requests in IO ring
     //`0` for no control with I/O depth.
     // If greater than 0, then only when `io_depth` I/O requests are in queue,
     // they will be issued to server as a batch. If smaller than 0, then USRBIO
