@@ -828,26 +828,155 @@ TEST_F(P2PClientIntegrationTest, RemoveLocalNonExistent) {
 }
 
 // ============================================================================
-// Remove / RemoveAll / RemoveByRegex should return NOT_IMPLEMENTED
+// Remove / RemoveAll
 // ============================================================================
 
-// TEST_F(P2PClientIntegrationTest, RemoveNotImplemented) {
-//     auto r = client_->Remove("any_key");
-//     ASSERT_FALSE(r.has_value());
-//     EXPECT_EQ(r.error(), ErrorCode::NOT_IMPLEMENTED);
-// }
+TEST_F(P2PClientIntegrationTest, RemoveLocalObject) {
+    const std::string key = "p2p_remove_local_object";
+    const std::string data = "local-remove-data";
+    auto allocator = client_->GetBufferAllocator();
+    auto source = allocator->allocate(data.size());
+    ASSERT_TRUE(source.has_value());
+    std::memcpy(source->ptr(), data.data(), data.size());
+    std::vector<Slice> slices{{source->ptr(), data.size()}};
+    P2PWriteRouteConfig local;
+    local.remote_weight = 0.0;
 
-// TEST_F(P2PClientIntegrationTest, RemoveAllNotImplemented) {
-//     auto r = client_->RemoveAll();
-//     ASSERT_FALSE(r.has_value());
-//     EXPECT_EQ(r.error(), ErrorCode::NOT_IMPLEMENTED);
-// }
+    for (bool force : {false, true}) {
+        ASSERT_TRUE(client_->Put(key, slices, local).has_value());
+        auto read = client_->Get(key, allocator);
+        ASSERT_TRUE(read.has_value()) << read.error();
+        EXPECT_EQ(std::string(static_cast<const char*>((*read)->ptr()),
+                              (*read)->size()),
+                  data);
 
-// TEST_F(P2PClientIntegrationTest, RemoveByRegexNotImplemented) {
-//     auto r = client_->RemoveByRegex(".*");
-//     ASSERT_FALSE(r.has_value());
-//     EXPECT_EQ(r.error(), ErrorCode::NOT_IMPLEMENTED);
-// }
+        auto removed = client_->Remove(key, force);
+        ASSERT_TRUE(removed.has_value()) << removed.error();
+        auto missing = client_->Get(key, allocator);
+        ASSERT_FALSE(missing.has_value());
+        EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+        auto again = client_->Remove(key, force);
+        ASSERT_FALSE(again.has_value());
+        EXPECT_EQ(again.error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+}
+
+TEST_F(P2PClientIntegrationTest, RemoveRemoteObject) {
+    const std::string key = "p2p_remove_remote_object";
+    const std::string data = "remote-remove-data";
+    auto allocator = client2_->GetBufferAllocator();
+    auto source = allocator->allocate(data.size());
+    ASSERT_TRUE(source.has_value());
+    std::memcpy(source->ptr(), data.data(), data.size());
+    std::vector<Slice> slices{{source->ptr(), data.size()}};
+    P2PWriteRouteConfig local;
+    local.remote_weight = 0.0;
+
+    for (bool force : {false, true}) {
+        // B owns the only replica; A initiates the global deletion.
+        ASSERT_TRUE(client2_->Put(key, slices, local).has_value());
+        auto read = client2_->Get(key, allocator);
+        ASSERT_TRUE(read.has_value()) << read.error();
+        EXPECT_EQ(std::string(static_cast<const char*>((*read)->ptr()),
+                              (*read)->size()),
+                  data);
+
+        auto removed = client_->Remove(key, force);
+        EXPECT_TRUE(removed.has_value()) << removed.error();
+        auto missing = client2_->Get(key, allocator);
+        ASSERT_FALSE(missing.has_value());
+        EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+}
+
+TEST_F(P2PClientIntegrationTest, RemoveAllReplicasOfOneKey) {
+    const std::string key = "p2p_remove_replicated_object";
+    const std::string data = "replicated-remove-data";
+    P2PWriteRouteConfig local;
+    local.remote_weight = 0.0;
+
+    for (const auto& client : {client_, client2_}) {
+        auto allocator = client->GetBufferAllocator();
+        auto source = allocator->allocate(data.size());
+        ASSERT_TRUE(source.has_value());
+        std::memcpy(source->ptr(), data.data(), data.size());
+        std::vector<Slice> slices{{source->ptr(), data.size()}};
+        ASSERT_TRUE(client->Put(key, slices, local).has_value());
+        auto read = client->Get(key, allocator);
+        ASSERT_TRUE(read.has_value()) << read.error();
+        EXPECT_EQ(std::string(static_cast<const char*>((*read)->ptr()),
+                              (*read)->size()),
+                  data);
+    }
+
+    auto owners = client_->GetMasterClient().GetKeyClients(key);
+    ASSERT_TRUE(owners.has_value());
+    ASSERT_EQ(owners->size(), 2u);
+    ASSERT_TRUE(client_->Remove(key).has_value());
+    for (const auto& client : {client_, client2_}) {
+        auto missing = client->Get(key, client->GetBufferAllocator());
+        ASSERT_FALSE(missing.has_value());
+        EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+}
+
+TEST_F(P2PClientIntegrationTest, RemoveMissingAndInvalidKeys) {
+    auto missing = client_->Remove("p2p_remove_never_written_key");
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+    auto invalid = client_->Remove("");
+    ASSERT_FALSE(invalid.has_value());
+    EXPECT_EQ(invalid.error(), ErrorCode::INVALID_PARAMS);
+    auto regex = client_->RemoveByRegex(".*");
+    ASSERT_FALSE(regex.has_value());
+    EXPECT_EQ(regex.error(), ErrorCode::NOT_IMPLEMENTED);
+}
+
+TEST_F(P2PClientIntegrationTest, RemoveAllCountsKeysOnBothClients) {
+    // The existing fixture shares clients between cases.
+    ASSERT_TRUE(client_->RemoveAllLocal().has_value());
+    ASSERT_TRUE(client2_->RemoveAllLocal().has_value());
+    const std::string shared_key = "p2p_remove_all_shared";
+    const std::string a_key = "p2p_remove_all_only_a";
+    const std::string b_key = "p2p_remove_all_only_b";
+    const std::string data = "remove-all-data";
+    P2PWriteRouteConfig local;
+    local.remote_weight = 0.0;
+
+    for (bool force : {false, true}) {
+        for (const auto& client : {client_, client2_}) {
+            auto allocator = client->GetBufferAllocator();
+            auto source = allocator->allocate(data.size());
+            ASSERT_TRUE(source.has_value());
+            std::memcpy(source->ptr(), data.data(), data.size());
+            std::vector<Slice> slices{{source->ptr(), data.size()}};
+            const auto& own_key = client == client_ ? a_key : b_key;
+            for (const auto& key : {shared_key, own_key}) {
+                ASSERT_TRUE(client->Put(key, slices, local).has_value());
+                auto read = client->Get(key, allocator);
+                ASSERT_TRUE(read.has_value()) << read.error();
+                EXPECT_EQ(std::string(static_cast<const char*>((*read)->ptr()),
+                                      (*read)->size()),
+                          data);
+            }
+        }
+
+        auto removed = client_->RemoveAll(force);
+        ASSERT_TRUE(removed.has_value()) << removed.error();
+        // The shared key counts once on each client: 2 + 1 + 1.
+        EXPECT_EQ(*removed, 4);
+        for (const auto& client : {client_, client2_}) {
+            for (const auto& key : {shared_key, a_key, b_key}) {
+                auto missing = client->Get(key, client->GetBufferAllocator());
+                ASSERT_FALSE(missing.has_value());
+                EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+            }
+        }
+        auto empty = client_->RemoveAll(force);
+        ASSERT_TRUE(empty.has_value());
+        EXPECT_EQ(*empty, 0);
+    }
+}
 
 // ============================================================================
 // Query non-existent key should fail
@@ -1300,15 +1429,37 @@ TEST_F(P2PClientIntegrationTest, UnregisterSwitchesToLocalOnly) {
     // Local read/write still works in local-only mode.
     const std::string key = "p2p_local_only_rw";
     const std::string data = "local-only-data";
-    std::vector<Slice> put_slices;
-    put_slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+    auto allocator = c->GetBufferAllocator();
+    auto source = allocator->allocate(data.size());
+    ASSERT_TRUE(source.has_value());
+    std::memcpy(source->ptr(), data.data(), data.size());
+    std::vector<Slice> put_slices{{source->ptr(), data.size()}};
     ASSERT_TRUE(c->Put(key, put_slices, P2PWriteRouteConfig{}).has_value());
 
-    std::vector<char> buf(data.size(), 0);
-    auto get_res = c->Get(key, {(void*)buf.data()}, {buf.size()});
-    ASSERT_TRUE(get_res.has_value())
-        << "local Get failed: " << static_cast<int>(get_res.error());
-    EXPECT_EQ(std::string(buf.data(), buf.size()), data);
+    auto get_res = c->Get(key, allocator);
+    ASSERT_TRUE(get_res.has_value()) << get_res.error();
+    EXPECT_EQ(std::string(static_cast<const char*>((*get_res)->ptr()),
+                          (*get_res)->size()),
+              data);
+
+    ASSERT_TRUE(c->Remove(key).has_value());
+    auto missing = c->Get(key, allocator);
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+    auto again = c->Remove(key);
+    ASSERT_FALSE(again.has_value());
+    EXPECT_EQ(again.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    ASSERT_TRUE(c->Put(key, put_slices, P2PWriteRouteConfig{}).has_value());
+    auto removed_all = c->RemoveAll();
+    ASSERT_TRUE(removed_all.has_value());
+    EXPECT_EQ(*removed_all, 1);
+    missing = c->Get(key, allocator);
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+    auto empty = c->RemoveAll();
+    ASSERT_TRUE(empty.has_value());
+    EXPECT_EQ(*empty, 0);
 
     // (Re-registration back to FULL is driven via the public HTTP /register
     // endpoint and is covered by

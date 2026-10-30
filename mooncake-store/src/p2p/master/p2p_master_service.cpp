@@ -191,6 +191,45 @@ auto P2PMasterService::BatchQueryIp(const std::vector<UUID>& client_ids)
     return results;
 }
 
+auto P2PMasterService::GetKeyClients(std::string_view key)
+    -> tl::expected<std::vector<P2PClientInfo>, ErrorCode> {
+    if (key.empty()) {
+        LOG(ERROR) << "GetKeyClients: empty key";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto route = GetRouteSnapshot(key);
+    if (!route) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    const auto owners = CollectRouteOwnerClients(*route);
+    std::vector<P2PClientInfo> result;
+    result.reserve(owners.size());
+    for (const auto& client_id : owners) {
+        auto client = client_manager_->GetClient(client_id);
+        if (!client) {
+            LOG(ERROR) << "GetKeyClients: route references missing client"
+                       << ", key=" << key << ", client_id=" << client_id;
+            return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
+        }
+        result.push_back(
+            {client_id, client->get_ip_address(), client->get_rpc_port()});
+    }
+    return result;
+}
+
+auto P2PMasterService::ListClients()
+    -> tl::expected<std::vector<P2PClientInfo>, ErrorCode> {
+    const auto clients = client_manager_->GetAllClients();
+    std::vector<P2PClientInfo> result;
+    result.reserve(clients.size());
+    for (const auto& client : clients) {
+        result.push_back({client->get_client_id(), client->get_ip_address(),
+                          client->get_rpc_port()});
+    }
+    return result;
+}
+
 auto P2PMasterService::GetReadRouteByRegex(std::string_view regex_pattern)
     -> tl::expected<
         std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,

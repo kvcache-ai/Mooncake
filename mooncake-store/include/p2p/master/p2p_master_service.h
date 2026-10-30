@@ -77,6 +77,11 @@ class P2PMasterService final {
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode>;
 
+    // Return all owners/registered clients, including unavailable clients.
+    auto GetKeyClients(std::string_view key)
+        -> tl::expected<std::vector<P2PClientInfo>, ErrorCode>;
+    auto ListClients() -> tl::expected<std::vector<P2PClientInfo>, ErrorCode>;
+
     auto GetReadRouteByRegex(std::string_view regex_pattern) -> tl::expected<
         std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
         ErrorCode>;

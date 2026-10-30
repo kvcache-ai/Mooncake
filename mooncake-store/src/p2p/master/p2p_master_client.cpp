@@ -27,6 +27,16 @@ struct RpcNameTraits<&P2PMasterRpcService::GetReadRouteByRegex> {
 };
 
 template <>
+struct RpcNameTraits<&P2PMasterRpcService::GetKeyClients> {
+    static constexpr const char* value = "GetKeyClients";
+};
+
+template <>
+struct RpcNameTraits<&P2PMasterRpcService::ListClients> {
+    static constexpr const char* value = "ListClients";
+};
+
+template <>
 struct RpcNameTraits<&P2PMasterRpcService::GetReadRoute> {
     static constexpr const char* value = "GetReadRoute";
 };
@@ -238,6 +248,25 @@ P2PMasterClient::BatchQueryIp(const std::vector<UUID>& client_ids) {
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>>(
         client_ids);
 
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<P2PClientInfo>, ErrorCode>
+P2PMasterClient::GetKeyClients(std::string_view key) {
+    ScopedVLogTimer timer(1, "P2PMasterClient::GetKeyClients");
+    timer.LogRequest("key=", key);
+    auto result = invoke_rpc<&P2PMasterRpcService::GetKeyClients,
+                             std::vector<P2PClientInfo>>(key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<P2PClientInfo>, ErrorCode>
+P2PMasterClient::ListClients() {
+    ScopedVLogTimer timer(1, "P2PMasterClient::ListClients");
+    auto result = invoke_rpc<&P2PMasterRpcService::ListClients,
+                             std::vector<P2PClientInfo>>();
     timer.LogResponseExpected(result);
     return result;
 }

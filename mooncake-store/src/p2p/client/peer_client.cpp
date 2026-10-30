@@ -200,6 +200,55 @@ PeerClient::AsyncUnPinKey(const UnPinKeyRequest& request) {
     co_return result->result();
 }
 
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+PeerClient::AsyncRemoveRemoteData(const RemoteRemoveRequest& request) {
+    if (!client_pool_) {
+        LOG(ERROR) << "AsyncRemoveRemoteData: client pool is not initialized";
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+    auto ret = co_await client_pool_->send_request(
+        [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
+            return client.send_request<&ClientRpcService::RemoveRemoteData>(
+                request);
+        });
+    if (!ret.has_value()) {
+        LOG(ERROR) << "AsyncRemoveRemoteData: client not available";
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+    auto result = co_await std::move(ret.value());
+    if (!result) {
+        LOG(ERROR) << "AsyncRemoveRemoteData: RPC failed: "
+                   << result.error().msg;
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+    co_return result->result();
+}
+
+async_simple::coro::Lazy<tl::expected<long, ErrorCode>>
+PeerClient::AsyncRemoveAllRemoteData(const RemoteRemoveAllRequest& request) {
+    if (!client_pool_) {
+        LOG(ERROR)
+            << "AsyncRemoveAllRemoteData: client pool is not initialized";
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+    auto ret = co_await client_pool_->send_request(
+        [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
+            return client.send_request<&ClientRpcService::RemoveAllRemoteData>(
+                request);
+        });
+    if (!ret.has_value()) {
+        LOG(ERROR) << "AsyncRemoveAllRemoteData: client not available";
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+    auto result = co_await std::move(ret.value());
+    if (!result) {
+        LOG(ERROR) << "AsyncRemoveAllRemoteData: RPC failed: "
+                   << result.error().msg;
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+    co_return result->result();
+}
+
 tl::expected<void, ErrorCode> PeerClient::ReadRemoteData(
     const RemoteReadRequest& request) {
     return async_simple::coro::syncAwait(AsyncReadRemoteData(request));
@@ -208,6 +257,11 @@ tl::expected<void, ErrorCode> PeerClient::ReadRemoteData(
 tl::expected<UUID, ErrorCode> PeerClient::WriteRemoteData(
     const RemoteWriteRequest& request) {
     return async_simple::coro::syncAwait(AsyncWriteRemoteData(request));
+}
+
+tl::expected<void, ErrorCode> PeerClient::RemoveRemoteData(
+    const RemoteRemoveRequest& request) {
+    return async_simple::coro::syncAwait(AsyncRemoveRemoteData(request));
 }
 
 tl::expected<PreWriteResponse, ErrorCode> PeerClient::PreWrite(

@@ -14,6 +14,7 @@
 #include <thread>
 
 #include <async_simple/Try.h>
+#include <async_simple/coro/Collect.h>
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 #include <ylt/coro_io/coro_io.hpp>
@@ -508,7 +509,7 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
 
     // 5. Start P2P client RPC service
     // Bind the peer listener before publishing its port to Master.
-    client_rpc_service_.emplace(*data_manager_, metrics_);
+    client_rpc_service_.emplace(*data_manager_, client_id_, metrics_);
     client_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
         config.rpc_thread_num, config.client_rpc_port);
     RegisterClientRpcService(*client_rpc_server_, *client_rpc_service_);
@@ -2897,8 +2898,6 @@ tl::expected<P2PRouteDescriptor, ErrorCode> P2PClientService::QueryLocalRoute(
     return route;
 }
 
-// Global remove operations are unsupported; clients evict local replicas.
-
 tl::expected<void, ErrorCode> P2PClientService::Remove(const ObjectKey& key,
                                                        bool force) {
     auto guard = AcquireInflightGuard();
@@ -2906,8 +2905,71 @@ tl::expected<void, ErrorCode> P2PClientService::Remove(const ObjectKey& key,
         LOG(ERROR) << "client is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
-    LOG(WARNING) << "Remove is not supported in P2P mode";
-    return tl::unexpected(ErrorCode::NOT_IMPLEMENTED);
+    (void)force;
+    if (key.empty()) {
+        LOG(ERROR) << "Remove: empty key";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!data_manager_) {
+        LOG(ERROR) << "Remove: data manager is not initialized";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (IsLocalService()) {
+        auto result = data_manager_->Delete(key);
+        if (!result) {
+            LOG(ERROR) << "Remove: local deletion failed, key=" << key
+                       << ", error=" << result.error();
+        }
+        return result;
+    }
+
+    auto clients = master_client_.GetKeyClients(key);
+    if (!clients) {
+        if (clients.error() == ErrorCode::OBJECT_NOT_FOUND) {
+            auto result = data_manager_->Delete(key);
+            if (!result) {
+                LOG(ERROR) << "Remove: local deletion failed, key=" << key
+                           << ", error=" << result.error();
+            }
+            return result;
+        }
+        LOG(ERROR) << "Remove: failed to discover clients, key=" << key
+                   << ", error=" << clients.error();
+        return tl::unexpected(clients.error());
+    }
+    // Master already returns distinct clients. Include any unpublished local
+    // replica without adding this client a second time.
+    if (std::none_of(clients->begin(), clients->end(),
+                     [this](const auto& client) {
+                         return client.client_id == client_id_;
+                     })) {
+        clients->push_back({.client_id = client_id_});
+    }
+
+    ErrorCode first_error = ErrorCode::OK;
+    for (const auto& client : *clients) {
+        tl::expected<void, ErrorCode> result;
+        if (client.client_id == client_id_) {
+            result = data_manager_->Delete(key);
+            if (!result && result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                data_manager_->RectifyReadRoute(key);
+                continue;
+            }
+        } else {
+            auto& peer = GetOrCreatePeerClient(client.ip_address + ":" +
+                                               std::to_string(client.rpc_port));
+            RemoteRemoveRequest request{key, client.client_id};
+            result = peer.RemoveRemoteData(request);
+        }
+        if (!result) {
+            LOG(ERROR) << "Remove failed, key=" << key
+                       << ", client_id=" << client.client_id
+                       << ", error=" << result.error();
+            if (first_error == ErrorCode::OK) first_error = result.error();
+        }
+    }
+    if (first_error != ErrorCode::OK) return tl::unexpected(first_error);
+    return {};
 }
 
 tl::expected<long, ErrorCode> P2PClientService::RemoveByRegex(
@@ -2927,8 +2989,73 @@ tl::expected<long, ErrorCode> P2PClientService::RemoveAll(bool force) {
         LOG(ERROR) << "client is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
-    LOG(WARNING) << "RemoveAll is not supported in P2P mode";
-    return tl::unexpected(ErrorCode::NOT_IMPLEMENTED);
+    (void)force;
+    if (!data_manager_) {
+        LOG(ERROR) << "RemoveAll: data manager is not initialized";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (IsLocalService()) {
+        auto result = data_manager_->RemoveAll();
+        if (!result) {
+            LOG(ERROR) << "RemoveAll: local deletion failed, error="
+                       << result.error();
+        }
+        return result;
+    }
+
+    auto clients = master_client_.ListClients();
+    if (!clients) {
+        LOG(ERROR) << "RemoveAll: failed to discover clients, error="
+                   << clients.error();
+        return tl::unexpected(clients.error());
+    }
+
+    // Reserve before taking references: requests must outlive all RPC tasks.
+    std::vector<RemoteRemoveAllRequest> requests;
+    std::vector<async_simple::coro::Lazy<tl::expected<long, ErrorCode>>> tasks;
+    requests.reserve(clients->size());
+    tasks.reserve(clients->size());
+    for (const auto& client : *clients) {
+        if (client.client_id == client_id_) continue;
+        auto& peer = GetOrCreatePeerClient(client.ip_address + ":" +
+                                           std::to_string(client.rpc_port));
+        requests.push_back({client.client_id});
+        tasks.push_back(peer.AsyncRemoveAllRemoteData(requests.back()));
+    }
+    auto results = async_simple::coro::syncAwait(
+        async_simple::coro::collectAllPara(std::move(tasks))
+            .via(GetCoroExecutor()));
+    ErrorCode first_error = ErrorCode::OK;
+    long removed = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        auto& result = results[i];
+        auto error =
+            result.hasError()
+                ? ErrorCode::INTERNAL_ERROR
+                : (result.value() ? ErrorCode::OK : result.value().error());
+        if (error != ErrorCode::OK) {
+            LOG(ERROR) << "RemoveAll failed, client_id="
+                       << requests[i].client_id << ", error=" << error;
+            if (first_error == ErrorCode::OK) first_error = error;
+        } else {
+            removed += result.value().value();
+        }
+    }
+
+    auto local_result = data_manager_->RemoveAll();
+    if (local_result) {
+        removed += local_result.value();
+    } else {
+        LOG(ERROR) << "RemoveAll: local deletion failed, error="
+                   << local_result.error();
+        if (first_error == ErrorCode::OK) first_error = local_result.error();
+    }
+    if (first_error != ErrorCode::OK) {
+        LOG(ERROR) << "RemoveAll partially completed, removed_local_keys="
+                   << removed << ", error=" << first_error;
+        return tl::unexpected(first_error);
+    }
+    return removed;
 }
 
 tl::expected<long, ErrorCode> P2PClientService::RemoveAllLocal() {

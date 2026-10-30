@@ -55,6 +55,10 @@ class P2PMasterRpcService final {
         ErrorCode>
     BatchQueryIp(const std::vector<UUID>& client_ids);
 
+    tl::expected<std::vector<P2PClientInfo>, ErrorCode> GetKeyClients(
+        std::string_view key);
+    tl::expected<std::vector<P2PClientInfo>, ErrorCode> ListClients();
+
     tl::expected<
         std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
         ErrorCode>

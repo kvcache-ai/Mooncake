@@ -5,6 +5,7 @@
 #include <exception>
 
 #include <glog/logging.h>
+#include <async_simple/coro/Dispatch.h>
 #include <async_simple/coro/Lazy.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include "utils.h"
@@ -55,8 +56,10 @@ bool IsValidRequest(const RemoteWriteRequest& request) {
 }  // anonymous namespace
 
 ClientRpcService::ClientRpcService(DataManager& data_manager,
+                                   const UUID& client_id,
                                    std::shared_ptr<P2PClientMetric> metrics)
     : data_manager_(data_manager),
+      client_id_(client_id),
       metrics_(metrics),
       normal_op_tracker_(
           "new peer operations", [this] { RecordPeerInflight(true); },
@@ -509,10 +512,83 @@ tl::expected<void, ErrorCode> ClientRpcService::UnPinKey(
     return {};
 }
 
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+ClientRpcService::RemoveRemoteData(const RemoteRemoveRequest& request) {
+    auto inflight_handle = normal_op_tracker_.Enter();
+    if (!inflight_handle.is_valid() ||
+        !ready_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "RemoveRemoteData: client is not ready or is stopping";
+        co_return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (request.client_id != client_id_) {
+        LOG(ERROR) << "RemoveRemoteData: client identity mismatch, expected="
+                   << request.client_id << ", actual=" << client_id_;
+        co_return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
+    }
+    if (request.key.empty()) {
+        LOG(ERROR) << "RemoveRemoteData: empty key";
+        co_return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    try {
+        // Delete may wait for metadata queue space. Keep the request guard
+        // across the handoff and do this work on the business executor.
+        co_await async_simple::coro::dispatch(data_manager_.GetCoroExecutor());
+        auto result = data_manager_.Delete(request.key);
+        if (!result && result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+            data_manager_.RectifyReadRoute(request.key);
+            co_return tl::expected<void, ErrorCode>{};
+        }
+        if (!result) {
+            LOG(ERROR) << "RemoveRemoteData failed, key=" << request.key
+                       << ", error=" << result.error();
+        }
+        co_return result;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "RemoveRemoteData exception, key=" << request.key
+                   << ", what=" << e.what();
+    } catch (...) {
+        LOG(ERROR) << "RemoveRemoteData unknown exception, key=" << request.key;
+    }
+    co_return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+}
+
+async_simple::coro::Lazy<tl::expected<long, ErrorCode>>
+ClientRpcService::RemoveAllRemoteData(const RemoteRemoveAllRequest& request) {
+    auto inflight_handle = normal_op_tracker_.Enter();
+    if (!inflight_handle.is_valid() ||
+        !ready_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "RemoveAllRemoteData: client is not ready or is stopping";
+        co_return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (request.client_id != client_id_) {
+        LOG(ERROR) << "RemoveAllRemoteData: client identity mismatch, expected="
+                   << request.client_id << ", actual=" << client_id_;
+        co_return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
+    }
+
+    try {
+        co_await async_simple::coro::dispatch(data_manager_.GetCoroExecutor());
+        auto result = data_manager_.RemoveAll();
+        if (!result) {
+            LOG(ERROR) << "RemoveAllRemoteData failed, error="
+                       << result.error();
+        }
+        co_return result;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "RemoveAllRemoteData exception: " << e.what();
+    } catch (...) {
+        LOG(ERROR) << "RemoveAllRemoteData unknown exception";
+    }
+    co_return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+}
+
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
                               ClientRpcService& service) {
     server.register_handler<&ClientRpcService::ReadRemoteData>(&service);
     server.register_handler<&ClientRpcService::WriteRemoteData>(&service);
+    server.register_handler<&ClientRpcService::RemoveRemoteData>(&service);
+    server.register_handler<&ClientRpcService::RemoveAllRemoteData>(&service);
     server.register_handler<&ClientRpcService::PreWrite>(&service);
     server.register_handler<&ClientRpcService::WriteCommit>(&service);
     server.register_handler<&ClientRpcService::WriteRevoke>(&service);

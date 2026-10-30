@@ -82,7 +82,8 @@ class ClientRpcServiceTest : public ::testing::Test {
             /*lock_shard_count=*/1024, transfer_config);
 
         // Create ClientRpcService
-        rpc_service_ = std::make_unique<ClientRpcService>(*data_manager_);
+        rpc_service_ =
+            std::make_unique<ClientRpcService>(*data_manager_, client_id_);
         rpc_service_->SetReady();
     }
 
@@ -119,6 +120,7 @@ class ClientRpcServiceTest : public ::testing::Test {
         return desc;
     }
 
+    const UUID client_id_ = generate_uuid();
     std::unique_ptr<DataManager> data_manager_;
     std::unique_ptr<TieredBackend> tiered_backend_;
     std::shared_ptr<TransferEngine> transfer_engine_;
@@ -131,7 +133,7 @@ class ClientRpcServiceTest : public ::testing::Test {
 // ============================================================================
 
 TEST_F(ClientRpcServiceTest, RejectsPeerRequestsUntilReadyAndAfterStop) {
-    ClientRpcService pending(*data_manager_);
+    ClientRpcService pending(*data_manager_, client_id_);
     const auto unavailable = [](const auto& result) {
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
@@ -140,6 +142,10 @@ TEST_F(ClientRpcServiceTest, RejectsPeerRequestsUntilReadyAndAfterStop) {
         pending.ReadRemoteData(RemoteReadRequest{})));
     unavailable(async_simple::coro::syncAwait(
         pending.WriteRemoteData(RemoteWriteRequest{})));
+    unavailable(async_simple::coro::syncAwait(
+        pending.RemoveRemoteData(RemoteRemoveRequest{"key", client_id_})));
+    unavailable(async_simple::coro::syncAwait(
+        pending.RemoveAllRemoteData(RemoteRemoveAllRequest{client_id_})));
     unavailable(pending.PreWrite(PreWriteRequest{}));
     unavailable(pending.WriteCommit(WriteCommitRequest{}));
     unavailable(pending.WriteRevoke(WriteRevokeRequest{}));
@@ -157,6 +163,10 @@ TEST_F(ClientRpcServiceTest, RejectsPeerRequestsUntilReadyAndAfterStop) {
     unavailable(pending.WriteRevoke(WriteRevokeRequest{}));
     unavailable(pending.UnPinKey(UnPinKeyRequest{}));
     EXPECT_FALSE(pending.IsReady());
+    unavailable(async_simple::coro::syncAwait(
+        pending.RemoveRemoteData(RemoteRemoveRequest{"key", client_id_})));
+    unavailable(async_simple::coro::syncAwait(
+        pending.RemoveAllRemoteData(RemoteRemoveAllRequest{client_id_})));
 }
 
 // Test ReadRemoteData - success case (without initialized TransferEngine)
