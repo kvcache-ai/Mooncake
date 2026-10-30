@@ -994,8 +994,8 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
-    // Lock order: snapshot_mutex_ (3) before segment_mutex_ (6).
-    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    // Same order as MountSegment: master_state_mutex_ before segment access.
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     if (IsNoFSegmentQuarantined(segment)) {
         // A standby restore left replicas pointing into this namespace whose
         // ranges this mount would treat as free. Fail closed: serving the
@@ -1409,8 +1409,8 @@ auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
-    // Lock order: snapshot_mutex_ (3) before segment_mutex_ (6).
-    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    // Same order as MountSegment: master_state_mutex_ before segment access.
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     for (const auto& segment : segments) {
         if (IsNoFSegmentQuarantined(segment)) {
             LOG(ERROR) << "NoF segment remount: client_id=" << client_id

@@ -2394,7 +2394,8 @@ class MasterService {
 
     // True when a standby restore quarantined this NoF namespace, i.e. the
     // metadata still holds restored replicas whose (offset, size) ranges the
-    // fresh mount allocator would consider free. Caller holds snapshot_mutex_.
+    // fresh mount allocator would consider free. Caller holds
+    // master_state_mutex_.
     bool IsNoFSegmentQuarantined(const NoFSegment& segment) const;
 
     bool IsReplicaReadable(const Replica& replica) const;
