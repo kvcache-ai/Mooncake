@@ -2951,6 +2951,10 @@ tl::expected<void, ErrorCode> P2PClientService::Remove(const ObjectKey& key,
         tl::expected<void, ErrorCode> result;
         if (client.client_id == client_id_) {
             result = data_manager_->Delete(key);
+            if (!result && result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                data_manager_->RectifyReadRoute(key);
+                continue;
+            }
         } else {
             auto& peer = GetOrCreatePeerClient(client.ip_address + ":" +
                                                std::to_string(client.rpc_port));
