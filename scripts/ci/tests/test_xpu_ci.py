@@ -89,6 +89,56 @@ class HostReportTest(unittest.TestCase):
             )
 
 
+class BuildDirectoryTest(unittest.TestCase):
+    def test_cleanup_defaults_and_explicit_override(self):
+        script = (ROOT / "scripts/build_wheel.sh").read_text()
+        code = script[
+            script.index('CUDA_EP_STAGING_TEMP=""') : script.index(
+                "# Make the post-repair device library discoverable"
+            )
+        ]
+        wheel_step = next(
+            step
+            for step in WORKFLOW["jobs"]["build-wheel-xpu"]["steps"]
+            if step.get("name") == "Build Python wheel"
+        )
+        self.assertEqual(wheel_step["env"]["FREE_BUILD_DIR"], "0")
+        for ci, free_build_dir, preserved in (
+            ("true", None, False),
+            ("true", "1", False),
+            ("true", wheel_step["env"]["FREE_BUILD_DIR"], True),
+            ("false", None, True),
+            ("false", "1", False),
+            ("false", "0", True),
+        ):
+            with self.subTest(ci=ci, free_build_dir=free_build_dir):
+                with tempfile.TemporaryDirectory() as directory:
+                    build = Path(directory) / "build-xpu-ci"
+                    build.mkdir()
+                    library = build / "libtent_metrics.so"
+                    library.write_bytes(b"shared dependency")
+                    binary = build / "tent_xpu_platform_test"
+                    binary.write_bytes(b"native test")
+                    environment = {**os.environ, "CI": ci, "BUILD_DIR": str(build)}
+                    environment.pop("FREE_BUILD_DIR", None)
+                    if free_build_dir is not None:
+                        environment["FREE_BUILD_DIR"] = free_build_dir
+                    environment["CUDA_EP_STAGING_DIR"] = str(build / "ep_pg_staging")
+                    environment["CUDA_EP_JIT_DIR"] = str(build / "mooncake_ep_jit")
+                    result = subprocess.run(
+                        ["bash", "-ec", code],
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(build.exists(), preserved)
+                    if preserved:
+                        self.assertEqual(library.read_bytes(), b"shared dependency")
+                        self.assertEqual(binary.read_bytes(), b"native test")
+
+
 class WheelVariantTest(unittest.TestCase):
     def test_xpu_metadata_and_mutual_exclusion(self):
         script = (ROOT / "scripts/build_wheel.sh").read_text()

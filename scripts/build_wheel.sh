@@ -158,11 +158,12 @@ CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
 # Kernel header tree the CUDA EP JIT compiles against at runtime.
 CUDA_EP_JIT_DIR="${BUILD_DIR_ABS}/mooncake_ep_jit"
 
-# CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
+# CI only: remove build/ to free disk before python -m build.
+# FREE_BUILD_DIR=1 enables local cleanup; 0 preserves build dependencies and tests.
 # If EP/PG .so files were staged inside the build directory, preserve them in a
 # temporary location so they survive the cleanup.
 CUDA_EP_STAGING_TEMP=""
-if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
+if [ "$FREE_BUILD_DIR" != "0" ] && { [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; }; then
     if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
         CUDA_EP_STAGING_TEMP=$(mktemp -d)
         cp "$CUDA_EP_STAGING_DIR"/*.so "$CUDA_EP_STAGING_TEMP/"

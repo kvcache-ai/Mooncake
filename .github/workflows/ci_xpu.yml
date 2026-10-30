@@ -142,6 +142,9 @@ jobs:
           sed -i "s/^version = .*/version = \"${VERSION_OVERRIDE}\"/" mooncake-wheel/pyproject.toml
 
       - name: Build Python wheel
+        env:
+          # auditwheel and the native test bundle still need the build tree.
+          FREE_BUILD_DIR: "0"
         run: |
           set -eo pipefail
           source /opt/intel/oneapi/setvars.sh >/dev/null
