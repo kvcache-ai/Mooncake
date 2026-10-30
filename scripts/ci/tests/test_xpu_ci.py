@@ -1955,6 +1955,7 @@ class ApplicationTest(unittest.TestCase):
             "missing-report",
             "wrong-model",
             "wrong-image",
+            "wrong-version",
         ):
             with self.subTest(bad=bad), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -2003,7 +2004,13 @@ class ApplicationTest(unittest.TestCase):
                 with (
                     patch.object(VERIFY, "preflight"),
                     patch.object(VERIFY, "command", side_effect=command),
-                    patch.object(VERIFY.metadata, "version", return_value="0.29.0"),
+                    patch.object(
+                        VERIFY.metadata,
+                        "version",
+                        return_value="0.29.0+cpu"
+                        if bad == "wrong-version"
+                        else "0.29.0+xpu",
+                    ),
                     patch.object(VERIFY.metadata, "distribution") as distribution,
                     patch.dict(
                         os.environ,
@@ -2024,6 +2031,7 @@ class ApplicationTest(unittest.TestCase):
                         result = json.loads((root / "result.json").read_text())
                         self.assertEqual(set(result["scenarios"]), {"store", "pd"})
                         self.assertEqual(result["source_sha"], "a" * 40)
+                        self.assertEqual(result["vllm"], "0.29.0+xpu")
                         self.assertEqual(
                             result["model_revision"], VERIFY.MODEL_REVISION
                         )
@@ -2037,6 +2045,33 @@ class ApplicationTest(unittest.TestCase):
                         ):
                             VERIFY.applications(root, ROOT, root)
                         self.assertFalse((root / "result.json").exists())
+
+    def test_wrong_vllm_versions_retain_inventory_and_report_actual_version(self):
+        for version in (
+            "0.29.0",
+            "0.29.0+cpu",
+            "0.29.1+xpu",
+            "0.29.0.dev1+xpu",
+            "0.29.0+xpu.modified",
+        ):
+            with (
+                self.subTest(version=version),
+                tempfile.TemporaryDirectory() as temporary,
+                patch.object(VERIFY, "preflight"),
+                patch.object(VERIFY.metadata, "version", return_value=version),
+                patch.object(VERIFY, "command") as command,
+                patch.dict(os.environ, {"XPU_IMAGE": VERIFY.APPLICATION_IMAGE}),
+            ):
+                root = Path(temporary)
+                with self.assertRaises(RuntimeError) as raised:
+                    VERIFY.applications(root, ROOT, root)
+                self.assertIn(version, str(raised.exception))
+                self.assertIn("expected 0.29.0+xpu", str(raised.exception))
+                command.assert_called_once_with(
+                    [sys.executable, "-m", "pip", "freeze"],
+                    root / "runtime-packages.log",
+                )
+                self.assertFalse((root / "result.json").exists())
 
     def test_smoke_json_reports_are_produced_by_existing_entry_points(self):
         xpu = SimpleNamespace(

@@ -30,6 +30,7 @@ APPLICATION_IMAGE = (
     "vllm/vllm-openai-xpu:v0.29.0@sha256:"
     "1db27a8b75ae1d6b3cbf16ebbb88310c2b5548221c8df1335082b2a54dba209a"
 )
+APPLICATION_VLLM_VERSION = "0.29.0+xpu"
 
 
 def main() -> None:
@@ -738,8 +739,12 @@ def applications(native: Path, source: Path, output: Path) -> None:
     started = time.monotonic()
     preflight(output)
     require(os.environ["XPU_IMAGE"] == APPLICATION_IMAGE, "Unexpected vLLM image")
-    require(metadata.version("vllm") == "0.29.0", "Unexpected vLLM version")
     command([sys.executable, "-m", "pip", "freeze"], output / "runtime-packages.log")
+    vllm_version = metadata.version("vllm")
+    require(
+        vllm_version == APPLICATION_VLLM_VERSION,
+        f"Unexpected vLLM version: {vllm_version}; expected {APPLICATION_VLLM_VERSION}",
+    )
     command([sys.executable, __file__], output / "wheel.log")
     model = native / "model"
     require(
@@ -802,6 +807,7 @@ def applications(native: Path, source: Path, output: Path) -> None:
                 "status": "passed",
                 "suite": "applications",
                 "image": APPLICATION_IMAGE,
+                "vllm": vllm_version,
                 "model": MODEL_ID,
                 "model_revision": MODEL_REVISION,
                 "scenarios": results,

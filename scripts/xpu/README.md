@@ -134,7 +134,11 @@ not download this model.
 
 Core uses Stage 1's Intel PyTorch runtime. Applications use
 `vllm/vllm-openai-xpu:v0.29.0@sha256:1db27a8b75ae1d6b3cbf16ebbb88310c2b5548221c8df1335082b2a54dba209a`
-(CPython 3.12, PyTorch 2.13.0). Builder-image provenance is checked separately
+(CPython 3.12, PyTorch 2.13.0, installed vLLM `0.29.0+xpu`). The full XPU
+package version, including its local suffix, is checked exactly; the image
+tag's `v0.29.0` is not the installed distribution version. Package inventory
+is retained before this check, and mismatches report actual/expected versions.
+Builder-image provenance is checked separately
 from this application runtime. Both containers verify the installed wheel's
 native extensions and packaged master; applications also check vLLM's version
 and the model revision. Runtime execution stays offline (`--network none`,
