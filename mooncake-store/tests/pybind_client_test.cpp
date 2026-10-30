@@ -2,7 +2,6 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <barrier>
 #include <chrono>
 #include <cstdio>
@@ -28,6 +27,7 @@
 #endif
 
 #include "config.h"
+#include "master_config.h"
 #include "real_client.h"
 #include "nof/dma_buffer_allocator.h"
 #include "nof/nvmeof_initiator.h"
@@ -5061,6 +5061,158 @@ TEST_F(RealClientTest,
 }
 
 }  // namespace testing
+
+}  // namespace mooncake
+
+namespace mooncake {
+
+// File-window reads retain the selected replica lease.
+class RangedDiskLeaseTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        tmp_dir_ = std::filesystem::temp_directory_path() /
+                   ("mc_ranged_disk_lease_" + std::to_string(::getpid()));
+        std::filesystem::create_directories(tmp_dir_);
+
+        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                      .set_root_fs_dir(tmp_dir_.string())
+                                      .set_enable_disk_eviction(true)
+                                      .set_quota_bytes(64 * 1024)
+                                      .build()));
+        master_address_ = master_.master_address();
+
+        client_ = RealClient::create();
+        ASSERT_EQ(client_->setup_real("localhost:17831", "P2PHANDSHAKE",
+                                      16 * 1024 * 1024, 16 * 1024 * 1024,
+                                      FLAGS_protocol, "", master_address_),
+                  0);
+    }
+
+    void TearDown() override {
+        if (client_) {
+            client_->tearDownAll();
+            client_.reset();
+        }
+        master_.Stop();
+        std::error_code ec;
+        std::filesystem::remove_all(tmp_dir_, ec);
+    }
+
+    std::optional<Replica::Descriptor> WaitForDiskReplica(
+        const std::string& key, std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : client_->get_replica_desc(key)) {
+                if (replica.is_disk_replica()) return replica;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return std::nullopt;
+    }
+
+    testing::InProcMaster master_;
+    std::string master_address_;
+    std::filesystem::path tmp_dir_;
+    std::shared_ptr<RealClient> client_;
+};
+
+TEST_F(RangedDiskLeaseTest, FileWindowsRejectExpiredLease) {
+    constexpr size_t kObjectSize = 4096;
+    constexpr size_t kRangeOffset = 512;
+    constexpr size_t kRangeSize = 1024;
+    static_assert(kRangeOffset + kRangeSize < kObjectSize);
+
+    std::string payload(kObjectSize, '\0');
+    for (size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<char>(i % 251);
+    }
+    const std::string key = "ranged_disk_lease_expired";
+    ASSERT_EQ(client_->put(key, std::span<const char>(payload)), 0);
+    auto disk = WaitForDiskReplica(key, std::chrono::seconds(10));
+    ASSERT_TRUE(disk.has_value()) << "DISK replica did not appear";
+
+    auto queries = client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1u);
+    ASSERT_TRUE(queries[0].has_value());
+
+    // Force the DISK/DFS BatchReadFileReplicaRanges path even when a MEMORY
+    // replica is still present: pass a disk-only QueryResult with an
+    // explicit expired deadline (same shape as the BatchGet lease regression).
+    RealClient::RangedReadMetadata metadata{
+        .query_result = QueryResult(
+            std::vector<Replica::Descriptor>{*disk},
+            std::chrono::steady_clock::now() - std::chrono::seconds(1),
+            queries[0]->object_checksum),
+        .replica = *disk,
+        .total_size = kObjectSize,
+    };
+
+    auto destination = client_->allocate_client_buffer(kRangeSize);
+    ASSERT_TRUE(destination.has_value());
+    std::memset(destination->ptr(), 0, kRangeSize);
+
+    auto windows = client_->read_file_ranges({{&key,
+                                               &metadata.query_result,
+                                               &metadata.replica,
+                                               {destination->ptr(), kRangeSize},
+                                               kRangeOffset}});
+    ASSERT_EQ(windows.size(), 1);
+    ASSERT_FALSE(windows[0]);
+    EXPECT_EQ(windows[0].error(), ErrorCode::LEASE_EXPIRED);
+}
+
+TEST_F(RangedDiskLeaseTest, DiskRangeReadSucceedsWithLiveLease) {
+    constexpr size_t kObjectSize = 4096;
+    constexpr size_t kRangeOffset = 256;
+    constexpr size_t kRangeSize = 768;
+    static_assert(kRangeOffset + kRangeSize < kObjectSize);
+
+    std::string payload(kObjectSize, '\0');
+    for (size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<char>((i * 17) % 251);
+    }
+    const std::string key = "ranged_disk_lease_live";
+    ASSERT_EQ(client_->put(key, std::span<const char>(payload)), 0);
+    auto disk = WaitForDiskReplica(key, std::chrono::seconds(10));
+    ASSERT_TRUE(disk.has_value()) << "DISK replica did not appear";
+
+    auto queries = client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1u);
+    ASSERT_TRUE(queries[0].has_value());
+
+    RealClient::RangedReadMetadata metadata{
+        .query_result =
+            QueryResult(std::vector<Replica::Descriptor>{*disk},
+                        queries[0]->lease_timeout, queries[0]->object_checksum),
+        .replica = *disk,
+        .total_size = kObjectSize,
+    };
+
+    auto destination = client_->allocate_client_buffer(kRangeSize);
+    ASSERT_TRUE(destination.has_value());
+    std::memset(destination->ptr(), 0, kRangeSize);
+
+    auto windows = client_->read_file_ranges({{&key,
+                                               &metadata.query_result,
+                                               &metadata.replica,
+                                               {destination->ptr(), kRangeSize},
+                                               kRangeOffset}});
+    ASSERT_EQ(windows.size(), 1);
+    ASSERT_TRUE(windows[0]);
+    EXPECT_EQ(*windows[0], static_cast<int64_t>(kRangeSize));
+    const std::string oversized_key(16 * 1024 * 1024, 'k');
+    auto oversized =
+        client_->read_file_ranges({{&oversized_key,
+                                    &metadata.query_result,
+                                    &metadata.replica,
+                                    {destination->ptr(), kRangeSize},
+                                    kRangeOffset}});
+    ASSERT_FALSE(oversized[0]);
+    EXPECT_EQ(oversized[0].error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(std::memcmp(destination->ptr(), payload.data() + kRangeOffset,
+                          kRangeSize),
+              0);
+}
 
 }  // namespace mooncake
 

@@ -1,3 +1,4 @@
+#include <span>
 #include "serializer.h"
 #include "storage_backend.h"
 
@@ -355,8 +356,67 @@ tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
     return evicted_keys;
 }
 
+namespace {
+std::span<StorageValueSpan> ValueSpanView(StorageValueSpan& value) {
+    return {&value, 1};
+}
+std::span<StorageValueSpan> ValueSpanView(
+    std::vector<StorageValueSpan>& values) {
+    return values;
+}
+}  // namespace
+
+tl::expected<void, ErrorCode> StorageBackendInterface::BatchLoadSpans(
+    std::unordered_map<std::string, StorageValueSpan>& spans) {
+    bool partial = false;
+    std::unordered_map<std::string, Slice> full;
+    full.reserve(spans.size());
+    for (const auto& [key, span] : spans) {
+        if (span.offset != 0 ||
+            (span.object_size != 0 && span.object_size != span.slice.size)) {
+            partial = true;
+            break;
+        }
+        full.emplace(key, span.slice);
+    }
+    if (!partial) {
+        auto loaded = BatchLoad(full);
+        if (!loaded) return loaded;
+        for (auto& [key, slice] : full) {
+            spans.at(key).slice.ptr = slice.ptr;
+        }
+        return {};
+    }
+
+    // Backends without a seek override still return the requested window.
+    // They read the whole value first; bucket and offset-allocator overrides
+    // avoid that.
+    for (auto& [key, span] : spans) {
+        if (span.slice.ptr == nullptr || span.object_size == 0 ||
+            span.offset > span.object_size ||
+            span.slice.size > span.object_size - span.offset) {
+            LOG(ERROR) << "Invalid value span for key: " << key;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        std::vector<char> object(static_cast<size_t>(span.object_size));
+        std::unordered_map<std::string, Slice> one{
+            {key, Slice{object.data(), object.size()}}};
+        auto loaded = BatchLoad(one);
+        if (!loaded) return loaded;
+        std::memcpy(span.slice.ptr,
+                    static_cast<const char*>(one.at(key).ptr) + span.offset,
+                    span.slice.size);
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode> StorageBackend::LoadObject(
-    const std::string& path, std::vector<Slice>& slices, int64_t length) {
+    const std::string& path, std::vector<Slice>& slices, int64_t length,
+    int64_t file_offset, std::optional<uint64_t> object_size) {
+    if (file_offset < 0) {
+        LOG(ERROR) << "Negative file offset for: " << path;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     ResolvePath(path);
     auto file = create_file(path, FileMode::Read);
     if (!file) {
@@ -364,7 +424,13 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
-    off_t current_offset = 0;
+    if (object_size) {
+        auto actual_size = file->GetSize();
+        if (!actual_size || *actual_size < *object_size) {
+            return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+    }
+    off_t current_offset = static_cast<off_t>(file_offset);
     int64_t total_bytes_processed = 0;
 
     std::vector<iovec> iovs_chunk;
@@ -1754,6 +1820,32 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {
+    std::unordered_map<std::string, StorageValueSpan> spans;
+    spans.reserve(batch_object.size());
+    for (const auto& [key, slice] : batch_object) {
+        spans.emplace(key, StorageValueSpan{0, slice.size, slice});
+    }
+    auto loaded = ReadBucketValues(spans, true);
+    if (!loaded) return loaded;
+    for (const auto& [key, span] : spans) {
+        batch_object.at(key).ptr = span.slice.ptr;
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadSpans(
+    std::unordered_map<std::string, StorageValueSpan>& spans) {
+    return ReadBucketValues(spans, false);
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadSpans(
+    StorageValueSpans& spans) {
+    return ReadBucketValues(spans, false);
+}
+
+template <typename SpanMap>
+tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
+    SpanMap& spans, bool require_exact_size) {
     // Step 1: Build read plan by copying metadata under lock
     // BucketReadGuard increments inflight_reads_ to prevent deletion during IO.
     // When the guard goes out of scope, it decrements the counter.
@@ -1763,7 +1855,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         int64_t offset;
         int64_t key_size;
         int64_t data_size;
+        int64_t value_offset;
         Slice dest_slice;
+        StorageValueSpan* span;
     };
 
     // Group by bucket for efficient file access
@@ -1773,7 +1867,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
 
     {
         SharedMutexLocker lock(&mutex_, shared_lock);
-        for (const auto& [key, dest_slice] : batch_object) {
+        for (auto& [key, values] : spans) {
             // Lookup key -> metadata
             auto object_it = object_bucket_map_.find(key);
             if (object_it == object_bucket_map_.end()) {
@@ -1790,35 +1884,67 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
             }
 
-            // Validate size
-            if (metadata.data_size != static_cast<int64_t>(dest_slice.size)) {
-                LOG(ERROR) << "Size mismatch for key: " << key
-                           << ", expected: " << metadata.data_size
-                           << ", got: " << dest_slice.size;
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            }
-
-            // Create guard for this bucket if not already guarded
-            // (one guard per bucket is sufficient - increments refcount once)
-            if (bucket_read_plans.find(metadata.bucket_id) ==
-                bucket_read_plans.end()) {
-                bucket_guards.emplace_back(bucket_it->second);
-
-                // Update LRU timestamp for this bucket.
-                if (bucket_backend_config_.eviction_policy ==
-                    BucketEvictionPolicy::LRU) {
-                    auto now = std::chrono::steady_clock::now()
-                                   .time_since_epoch()
-                                   .count();
-                    bucket_it->second->last_access_ns_.store(
-                        now, std::memory_order_relaxed);
+            for (auto& span : ValueSpanView(values)) {
+                const Slice& dest_slice = span.slice;
+                if (span.object_size != 0 &&
+                    span.object_size !=
+                        static_cast<uint64_t>(metadata.data_size)) {
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
                 }
-            }
+                if (span.offset > static_cast<uint64_t>(
+                                      std::numeric_limits<int64_t>::max()) ||
+                    dest_slice.size >
+                        static_cast<uint64_t>(
+                            std::numeric_limits<int64_t>::max()) ||
+                    metadata.data_size < 0) {
+                    LOG(ERROR) << "Invalid span for key: " << key;
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                const auto value_offset = static_cast<int64_t>(span.offset);
+                // A full BatchLoad still requires the destination to be the
+                // whole value. A span read may be any window inside it.
+                if (require_exact_size) {
+                    if (value_offset != 0 ||
+                        metadata.data_size !=
+                            static_cast<int64_t>(dest_slice.size)) {
+                        LOG(ERROR) << "Size mismatch for key: " << key
+                                   << ", expected: " << metadata.data_size
+                                   << ", got: " << dest_slice.size;
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                } else if (value_offset > metadata.data_size ||
+                           static_cast<int64_t>(dest_slice.size) >
+                               metadata.data_size - value_offset) {
+                    LOG(ERROR) << "Span out of range for key: " << key
+                               << ", offset=" << value_offset
+                               << ", length=" << dest_slice.size
+                               << ", data_size=" << metadata.data_size;
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
 
-            // Copy metadata into read plan
-            bucket_read_plans[metadata.bucket_id].push_back(
-                ReadPlan{key, metadata.bucket_id, metadata.offset,
-                         metadata.key_size, metadata.data_size, dest_slice});
+                // Create guard for this bucket if not already guarded
+                // (one guard per bucket is sufficient - increments refcount
+                // once)
+                if (bucket_read_plans.find(metadata.bucket_id) ==
+                    bucket_read_plans.end()) {
+                    bucket_guards.emplace_back(bucket_it->second);
+
+                    // Update LRU timestamp for this bucket.
+                    if (bucket_backend_config_.eviction_policy ==
+                        BucketEvictionPolicy::LRU) {
+                        auto now = std::chrono::steady_clock::now()
+                                       .time_since_epoch()
+                                       .count();
+                        bucket_it->second->last_access_ns_.store(
+                            now, std::memory_order_relaxed);
+                    }
+                }
+
+                // Copy metadata into read plan
+                bucket_read_plans[metadata.bucket_id].push_back(ReadPlan{
+                    key, metadata.bucket_id, metadata.offset, metadata.key_size,
+                    metadata.data_size, value_offset, dest_slice, &span});
+            }
         }
     }
     // Lock released here - bucket files protected by BucketReadGuards
@@ -1843,6 +1969,22 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         }
         auto& file = file_res.value();
 
+        if (!require_exact_size) {
+            auto file_size = file->GetSize();
+            if (!file_size) return tl::unexpected(file_size.error());
+            for (const auto& plan : read_plans) {
+                if (plan.offset < 0 || plan.key_size < 0 ||
+                    plan.data_size < 0 ||
+                    static_cast<uint64_t>(plan.offset) > *file_size ||
+                    static_cast<uint64_t>(plan.key_size) >
+                        *file_size - plan.offset ||
+                    static_cast<uint64_t>(plan.data_size) >
+                        *file_size - plan.offset - plan.key_size) {
+                    return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+            }
+        }
+
 #ifdef USE_URING
         UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
         if (uring_file != nullptr) {
@@ -1858,7 +2000,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             batch_read_plans.reserve(read_plans.size());
 
             for (const auto& plan : read_plans) {
-                int64_t actual_offset = plan.offset + plan.key_size;
+                int64_t actual_offset =
+                    plan.offset + plan.key_size + plan.value_offset;
                 int64_t aligned_offset =
                     align_down(actual_offset, kDirectIOAlignment);
                 int64_t data_end =
@@ -1911,16 +2054,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                         << "), got: " << desc.bytes_read;
                     return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
-                batch_object.at(plan.key).ptr =
-                    static_cast<char*>(plan.dest_slice.ptr) +
-                    batch_plan.offset_in_buffer;
+                plan.span->slice.ptr = static_cast<char*>(plan.dest_slice.ptr) +
+                                       batch_plan.offset_in_buffer;
             }
             continue;
         }
 #endif
 
         for (const auto& plan : read_plans) {
-            int64_t actual_offset = plan.offset + plan.key_size;
+            int64_t actual_offset =
+                plan.offset + plan.key_size + plan.value_offset;
             iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
             auto read_result = file->vector_read(&iov, 1, actual_offset);
             if (!read_result) {
@@ -5338,6 +5481,27 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
+    std::unordered_map<std::string, StorageValueSpan> spans;
+    spans.reserve(batched_slices.size());
+    for (const auto& [key, slice] : batched_slices) {
+        spans.emplace(key, StorageValueSpan{0, slice.size, slice});
+    }
+    return ReadOffsetValues(spans, true);
+}
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoadSpans(
+    std::unordered_map<std::string, StorageValueSpan>& spans) {
+    return ReadOffsetValues(spans, false);
+}
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoadSpans(
+    StorageValueSpans& spans) {
+    return ReadOffsetValues(spans, false);
+}
+
+template <typename SpanMap>
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ReadOffsetValues(
+    SpanMap& spans, bool require_exact_size) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -5351,7 +5515,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         uint64_t offset;
         uint32_t value_size;
         AllocationPtr allocation;  // Refcounted handle keeps allocation alive
-        Slice dest_slice;
+        std::span<StorageValueSpan> spans;
         // Pin the data file so a concurrent RemoveAll() rebuild (which rebinds
         // the data_file_ member) cannot destroy this file while we still have
         // pending I/O on it in phase 2 (no shard lock held there).
@@ -5359,9 +5523,9 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     };
 
     std::vector<ReadPlan> read_plans;
-    read_plans.reserve(batched_slices.size());
+    read_plans.reserve(spans.size());
 
-    for (const auto& [key, dest_slice] : batched_slices) {
+    for (auto& [key, values] : spans) {
         size_t shard_idx = ShardForKey(key);
         auto& shard = shards_[shard_idx];
         SharedMutexLocker lock(&shard.mutex, /*shared_mode=*/shared_lock);
@@ -5375,12 +5539,26 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
 
         const auto& entry = it->second;
 
-        // Validate destination size matches stored value size
-        if (dest_slice.size != entry.value_size) {
-            LOG(ERROR) << "Size mismatch for key: " << key
-                       << ", expected: " << entry.value_size
-                       << ", got: " << dest_slice.size;
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        for (const auto& span : ValueSpanView(values)) {
+            const Slice& dest_slice = span.slice;
+            if (span.object_size != 0 && span.object_size != entry.value_size) {
+                return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            if (span.offset > entry.value_size ||
+                dest_slice.size > entry.value_size - span.offset) {
+                LOG(ERROR) << "Span out of range for key: " << key
+                           << ", offset=" << span.offset
+                           << ", length=" << dest_slice.size
+                           << ", value_size=" << entry.value_size;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            if (require_exact_size &&
+                (span.offset != 0 || dest_slice.size != entry.value_size)) {
+                LOG(ERROR) << "Size mismatch for key: " << key
+                           << ", expected: " << entry.value_size
+                           << ", got: " << dest_slice.size;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
         }
 
         // Copy metadata and increment refcount on allocation
@@ -5390,7 +5568,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         read_plans.push_back(
             ReadPlan{key, entry.offset, entry.value_size,
                      entry.allocation,  // shared_ptr copy, increments refcount
-                     dest_slice, data_file_});
+                     ValueSpanView(values), data_file_});
 
         // Lock released here; allocation + data_file stay alive via shared_ptr
     }
@@ -5448,22 +5626,40 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
             return tl::make_unexpected(validate_result.error());
         }
 
-        // Read value into destination slice (at its aligned offset)
-        iovec value_iov = {plan.dest_slice.ptr, plan.dest_slice.size};
-        auto read_value_result = plan.data_file->vector_read(
-            &value_iov, 1,
-            plan.offset + RecordHeader::ValueOffsetInRecord(header.key_len));
-        if (!read_value_result) {
-            LOG(ERROR) << "Failed to read value for key: " << plan.key
-                       << ", error: " << read_value_result.error();
-            return tl::make_unexpected(read_value_result.error());
+        if (!require_exact_size) {
+            const uint64_t value_offset =
+                RecordHeader::ValueOffsetInRecord(header.key_len);
+            auto file_size = plan.data_file->GetSize();
+            if (!file_size || plan.offset > *file_size ||
+                value_offset > *file_size - plan.offset ||
+                plan.value_size > *file_size - plan.offset - value_offset) {
+                return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+            }
         }
 
-        if (read_value_result.value() != header.value_len) {
-            LOG(ERROR) << "Value read size mismatch for key: " << plan.key
-                       << ", expected: " << header.value_len
-                       << ", got: " << read_value_result.value();
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        for (const auto& span : plan.spans) {
+            const auto& destination = span.slice;
+            // Read only the requested value window. The header and key are
+            // still checked so a span read cannot return bytes from the wrong
+            // record.
+            iovec value_iov = {destination.ptr, destination.size};
+            const uint64_t value_pos =
+                plan.offset +
+                RecordHeader::ValueOffsetInRecord(header.key_len) + span.offset;
+            auto read_value_result =
+                plan.data_file->vector_read(&value_iov, 1, value_pos);
+            if (!read_value_result) {
+                LOG(ERROR) << "Failed to read value for key: " << plan.key
+                           << ", error: " << read_value_result.error();
+                return tl::make_unexpected(read_value_result.error());
+            }
+
+            if (read_value_result.value() != destination.size) {
+                LOG(ERROR) << "Value read size mismatch for key: " << plan.key
+                           << ", expected: " << destination.size
+                           << ", got: " << read_value_result.value();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
         }
     }
 

@@ -185,9 +185,10 @@ case. The native C++ ranged overloads return an `expected` status and can
 distinguish successful empty selections from failures.
 
 Range reads use one metadata snapshot per distinct key and bypass the full-value
-hot cache. They reuse the existing memory scatter and file-window read paths.
-File requests currently execute one window at a time; bounded multi-window
-batching is a separate follow-up.
+hot cache. MEMORY, DISK, DFS and bucket/offset-allocator LOCAL_DISK replicas are
+supported. Unsupported range backends fail without loading the full object. Remote SSD
+owners must expose the new window-read handler; the existing range handler and
+its backend fallback remain available to legacy callers.
 Dummy clients, Store-RS and NoF range reads are not implemented by these new
 keywords; their existing full-read APIs retain their behavior.
 
@@ -195,7 +196,8 @@ When object checksums are enabled, a selection covering the complete object is
 verified in source order. Complete coverage with overlaps uses one canonical
 full-object scratch buffer before packing. Partial selections cannot validate a
 full-object checksum and skip that check; they do not silently read the rest of
-the object. Existing caller-owned `get_into_ranges()` bounds and return
+the object. File windows use bounded staging batches rather than reading gaps
+between windows. Existing caller-owned `get_into_ranges()` bounds and return
 conventions are unchanged.
 
 ## Structured Object Store Helper

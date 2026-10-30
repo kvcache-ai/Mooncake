@@ -724,6 +724,17 @@ class RealClient : public PyClient {
         uint64_t total_size;
     };
 
+    struct FileRangeRead {
+        const std::string *key;
+        const QueryResult *query;
+        const Replica::Descriptor *replica;
+        Slice destination;
+        uint64_t source_offset;
+    };
+
+    std::vector<tl::expected<int64_t, ErrorCode>> read_file_ranges(
+        const std::vector<FileRangeRead> &requests);
+
     tl::expected<RangedReadMetadata, ErrorCode>
     build_ranged_read_metadata_from_query_result(
         const std::string &key,
@@ -753,7 +764,7 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const std::vector<size_t> *buffer_capacities = nullptr,
         const QueryResultCache *query_result_cache = nullptr,
-        bool allow_query_refresh = true);
+        bool allow_query_refresh = true, bool strict_file_windows = false);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
@@ -934,6 +945,13 @@ class RealClient : public PyClient {
         tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
     batch_get_offload_object(const std::vector<std::string> &keys,
                              const std::vector<int64_t> &sizes);
+
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
+    batch_get_offload_object_windows(const std::vector<std::string> &keys,
+                                     const std::vector<int64_t> &offsets,
+                                     const std::vector<int64_t> &sizes,
+                                     const std::vector<int64_t> &object_sizes);
 
     /**
      * @brief Releases buffer associated with a specific batch_id.
@@ -1451,6 +1469,7 @@ class RealClient : public PyClient {
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;
+    friend class RangedDiskLeaseTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,
                                     void *buffer, size_t size) const;

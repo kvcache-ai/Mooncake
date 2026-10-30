@@ -75,6 +75,15 @@ class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
 
+    tl::expected<int64_t, ErrorCode> SeedRangedObject(FileStorage& storage,
+                                                      const std::string& key,
+                                                      std::string& data) {
+        auto initialized = storage.storage_backend_->Init();
+        if (!initialized) return tl::unexpected(initialized.error());
+        return storage.storage_backend_->BatchOffload(
+            {{key, {{data.data(), data.size()}}}}, nullptr);
+    }
+
     static uintmax_t StoredFileBytes(const std::string& path) {
         uintmax_t bytes = 0;
         for (const auto& entry : fs::recursive_directory_iterator(path)) {
@@ -1144,6 +1153,75 @@ TEST_F(FileStorageTest, DistributedBackendSelectsControlPlaneFromStorageMode) {
     ASSERT_TRUE(enable_offloading);
     EXPECT_TRUE(*enable_offloading);
 #endif
+}
+
+TEST_F(FileStorageTest, RangedRestoreKeepsDuplicateKeyWindowsAndReleasesBatch) {
+#ifdef USE_URING
+    const std::vector<bool> io_modes{false, true};
+#else
+    const std::vector<bool> io_modes{false};
+#endif
+    for (const bool offset_allocator : {false, true}) {
+        for (const bool use_uring : io_modes) {
+            SCOPED_TRACE(::testing::Message() << "offset=" << offset_allocator
+                                              << ", uring=" << use_uring);
+            auto config = FileStorageConfig::FromEnvironment();
+            config.storage_filepath = data_path + "/ranged-restore-" +
+                                      std::to_string(offset_allocator) + "-" +
+                                      std::to_string(use_uring);
+            std::filesystem::create_directories(config.storage_filepath);
+            config.storage_backend_type =
+                offset_allocator ? StorageBackendType::kOffsetAllocator
+                                 : StorageBackendType::kBucket;
+            config.local_buffer_size = 4 * 1024 * 1024;
+            config.use_uring = use_uring;
+            FileStorage storage(config, nullptr, "localhost:9003");
+            std::string data(65536, '\0');
+            for (size_t i = 0; i < data.size(); ++i)
+                data[i] = static_cast<char>(i % 251);
+            ASSERT_TRUE(SeedRangedObject(storage, "ranged", data));
+            auto read = storage.BatchGetRanges(
+                {"ranged", "ranged", "ranged", "ranged"},
+                {65024, 0, 1000, 65535}, {512, 512, 1024, 1},
+                {65536, 65536, 65536, 65536}, true);
+            ASSERT_TRUE(read) << toString(read.error());
+            ASSERT_EQ(read->pointers.size(), 4);
+            const std::vector<size_t> offsets{65024, 0, 1000, 65535};
+            const std::vector<size_t> sizes{512, 512, 1024, 1};
+            for (size_t i = 0; i < sizes.size(); ++i) {
+                EXPECT_EQ(
+                    std::string(reinterpret_cast<char*>(read->pointers[i]),
+                                sizes[i]),
+                    data.substr(offsets[i], sizes[i]));
+            }
+            EXPECT_NE(read->pointers[0], read->pointers[1]);
+            EXPECT_TRUE(storage.ReleaseBuffer(read->batch_id));
+            EXPECT_FALSE(storage.ReleaseBuffer(read->batch_id));
+        }
+    }
+}
+
+TEST_F(FileStorageTest, RangedFallbackRemainsLegacyOnly) {
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path + "/legacy-ranges";
+    std::filesystem::create_directories(config.storage_filepath);
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.local_buffer_size = 4 * 1024 * 1024;
+    config.use_uring = false;
+    FileStorage storage(config, nullptr, "localhost:9003");
+    std::string data = "abcdefghijklmnop";
+    ASSERT_TRUE(SeedRangedObject(storage, "fallback", data));
+    auto legacy = storage.BatchGetRanges({"fallback", "fallback"}, {8, 0},
+                                         {4, 4}, {16, 16});
+    ASSERT_TRUE(legacy);
+    EXPECT_EQ(std::string(reinterpret_cast<char*>(legacy->pointers[0]), 4),
+              "ijkl");
+    EXPECT_EQ(std::string(reinterpret_cast<char*>(legacy->pointers[1]), 4),
+              "abcd");
+    EXPECT_TRUE(storage.ReleaseBuffer(legacy->batch_id));
+    auto strict = storage.BatchGetRanges({"fallback"}, {8}, {4}, {16}, true);
+    ASSERT_FALSE(strict);
+    EXPECT_EQ(strict.error(), ErrorCode::NOT_SUPPORTED);
 }
 
 TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {

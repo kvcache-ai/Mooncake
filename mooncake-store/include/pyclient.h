@@ -160,6 +160,14 @@ class ClientRequester {
                              const std::vector<std::string> &keys,
                              const std::vector<int64_t> &sizes);
 
+    // Restore exact value windows without a full-object fallback.
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    batch_get_offload_object_windows(const std::string &client_addr,
+                                     const std::vector<std::string> &keys,
+                                     const std::vector<int64_t> &offsets,
+                                     const std::vector<int64_t> &sizes,
+                                     const std::vector<int64_t> &object_sizes);
+
     /**
      * @brief Notifies remote FileStorage to release buffer after transfer
      * completion. This is a fire-and-forget call - errors are logged but not
@@ -167,8 +175,12 @@ class ClientRequester {
      * @param client_addr Network address of the remote FileStorage service.
      * @param batch_id The batch_id returned from batch_get_offload_object.
      */
+
     void release_offload_buffer(const std::string &client_addr,
                                 uint64_t batch_id);
+
+    tl::expected<bool, ErrorCode> release_offload_buffer_checked(
+        const std::string &client_addr, uint64_t batch_id);
 
     /**
      * @brief Asks a remote holder node to prefetch (promote SSD->DRAM) the

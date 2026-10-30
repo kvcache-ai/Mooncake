@@ -449,6 +449,7 @@ struct DistributedStorageBackend::DfsIoOp {
     const DistributedFSDescriptor& descriptor;
     std::vector<iovec> iovs;
     uint64_t size;
+    int64_t file_offset = 0;
 };
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::ExecuteSingleIo(
@@ -457,8 +458,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ExecuteSingleIo(
         auto fd = OpenBucket(op.descriptor);
         if (!fd) return tl::make_unexpected(fd.error());
         auto result = TransferAll(*fs_adapter_, *fd, std::move(op.iovs),
-                                  static_cast<int64_t>(op.descriptor.offset),
-                                  op.size, 0, write);
+                                  op.file_offset, op.size, 0, write);
         auto close_result = fs_adapter_->CloseFile(*fd);
         if (!result) return result;
         return close_result;
@@ -472,7 +472,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ExecuteSingleIo(
     }
     std::lock_guard lock((*shard)->mutex);
     const auto count = static_cast<int>(op.iovs.size());
-    const auto offset = static_cast<int64_t>(op.descriptor.offset);
+    const auto offset = op.file_offset;
     auto result =
         write
             ? fs_adapter_->WriteAt((*shard)->fd, op.iovs.data(), count, offset)
@@ -531,7 +531,7 @@ void DistributedStorageBackend::ExecuteShardBatchIo(
         }
         io_requests.push_back({(*shard)->fd, op.iovs.data(),
                                static_cast<int>(op.iovs.size()),
-                               static_cast<int64_t>(op.descriptor.offset)});
+                               op.file_offset});
         io_ops.push_back(&op);
     }
     // Shard I/O fails short transfers.
@@ -568,9 +568,9 @@ void DistributedStorageBackend::ExecuteBucketBatchIo(
             }
             opened.emplace_back(*fd, &bucket_ops);
             for (auto* op : bucket_ops) {
-                io_requests.push_back(
-                    {*fd, op->iovs.data(), static_cast<int>(op->iovs.size()),
-                     static_cast<int64_t>(op->descriptor.offset)});
+                io_requests.push_back({*fd, op->iovs.data(),
+                                       static_cast<int>(op->iovs.size()),
+                                       op->file_offset});
                 io_ops.push_back(op);
             }
         }
@@ -702,7 +702,9 @@ DistributedStorageBackend::BatchWrite(
             results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
-        DfsIoOp op{i, request.key, desc, std::move(iovs), total_size};
+        DfsIoOp op{i,          request.key,
+                   desc,       std::move(iovs),
+                   total_size, static_cast<int64_t>(desc.offset)};
         if (batch_io) {
             ops.push_back(std::move(op));
         } else {
@@ -775,27 +777,78 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
 
         std::vector<iovec> iovs;
         iovs.reserve(request.slices.size());
-        size_t remaining = static_cast<size_t>(desc.object_size);
         bool invalid = false;
-        for (const auto& slice : request.slices) {
-            if (!slice.ptr && slice.size > 0) {
+        uint64_t io_bytes = desc.object_size;
+        uint64_t value_offset = 0;
+        if (request.range_read) {
+            value_offset = request.value_offset;
+            if (value_offset > desc.object_size) {
                 invalid = true;
-                break;
             }
-            if (remaining == 0 || slice.size == 0) {
-                continue;
+            size_t remaining =
+                invalid ? 0
+                        : static_cast<size_t>(desc.object_size - value_offset);
+            size_t window_bytes = 0;
+            for (const auto& slice : request.slices) {
+                if (invalid) break;
+                if ((!slice.ptr && slice.size > 0) || slice.size > remaining) {
+                    invalid = true;
+                    break;
+                }
+                if (slice.size == 0) continue;
+                iovs.push_back({slice.ptr, slice.size});
+                window_bytes += slice.size;
+                remaining -= slice.size;
             }
-            const size_t read_size = std::min(slice.size, remaining);
-            iovs.push_back({slice.ptr, read_size});
-            remaining -= read_size;
+            io_bytes = window_bytes;
+        } else {
+            size_t remaining = static_cast<size_t>(desc.object_size);
+            for (const auto& slice : request.slices) {
+                if (!slice.ptr && slice.size > 0) {
+                    invalid = true;
+                    break;
+                }
+                if (remaining == 0 || slice.size == 0) {
+                    continue;
+                }
+                const size_t read_size = std::min(slice.size, remaining);
+                iovs.push_back({slice.ptr, read_size});
+                remaining -= read_size;
+            }
+            invalid = invalid || remaining != 0;
         }
-        if (invalid || remaining != 0) {
+        if (invalid ||
+            desc.offset > std::numeric_limits<uint64_t>::max() - value_offset ||
+            desc.offset + value_offset >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
             LOG(WARNING) << "Invalid DFS read request for key " << request.key
-                         << ", expected capacity at least=" << desc.object_size;
+                         << ", expected capacity at least=" << desc.object_size
+                         << ", value_offset=" << value_offset;
             results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
-        DfsIoOp op{i, request.key, desc, std::move(iovs), desc.object_size};
+        // A window can sit entirely inside a truncated object. Reading only
+        // that window would report success. Reject the read when the file no
+        // longer holds the whole value, without reading the tail.
+        if (request.range_read) {
+            auto file_size = fs_adapter_->GetFileSize(desc.file_path);
+            if (!file_size) {
+                results[i] = tl::make_unexpected(file_size.error());
+                continue;
+            }
+            const uint64_t object_end = desc.offset + desc.object_size;
+            if (static_cast<uint64_t>(*file_size) < object_end) {
+                LOG(WARNING)
+                    << "DFS range read object extends past end of file, key="
+                    << request.key << ", file_size=" << *file_size
+                    << ", object_end=" << object_end;
+                results[i] = tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                continue;
+            }
+        }
+        DfsIoOp op{i,        request.key,
+                   desc,     std::move(iovs),
+                   io_bytes, static_cast<int64_t>(desc.offset + value_offset)};
         if (batch_io) {
             ops.push_back(std::move(op));
         } else {

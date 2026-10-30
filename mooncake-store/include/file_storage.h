@@ -77,6 +77,15 @@ class FileStorage {
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
 
+    // Reads [offset, offset + length) of each value. Returned pointers address
+    // the first requested byte, not the start of the object.
+    tl::expected<BatchGetResult, ErrorCode> BatchGetRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& offsets,
+        const std::vector<int64_t>& lengths,
+        const std::vector<int64_t>& object_sizes,
+        bool strict_file_windows = false);
+
     tl::expected<LocalBatchResult, ErrorCode> BatchGetLocal(
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
@@ -257,6 +266,16 @@ class FileStorage {
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batch_object);
+
+    tl::expected<void, ErrorCode> BatchLoadSpans(StorageValueSpans& spans,
+                                                 bool strict_file_windows);
+
+    tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& offsets,
+        const std::vector<int64_t>& lengths,
+        const std::vector<int64_t>& object_sizes, bool prefer_pinned,
+        bool strict_file_windows = false);
 
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
         const std::vector<std::string>& keys, const std::string& tenant_id,
