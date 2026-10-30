@@ -1,0 +1,119 @@
+--- a/include/ylt/coro_rpc/impl/coro_rpc_client.hpp
++++ b/include/ylt/coro_rpc/impl/coro_rpc_client.hpp
+@@ -240,6 +240,11 @@
+     std::string host;
+     std::string port;
+     std::string local_ip;
++    // 0 keeps the historical behavior: the response is allocated at the
++    // declared size. Mooncake handshake clients set a finite limit.
++    uint64_t max_response_body_bytes = 0;
++    uint64_t max_response_attachment_bytes = 0;
++    uint64_t max_response_total_bytes = 0;
+     std::variant<tcp_config
+ #ifdef YLT_ENABLE_SSL
+                  ,
+@@ -281,6 +286,10 @@
+       : timer_(std::make_unique<coro_io::period_timer>(
+             executor->get_asio_executor())),
+         control_(std::make_shared<control_t>(executor, false, conf.local_ip)) {
++    control_->max_response_body_bytes = conf.max_response_body_bytes;
++    control_->max_response_attachment_bytes =
++        conf.max_response_attachment_bytes;
++    control_->max_response_total_bytes = conf.max_response_total_bytes;
+     if (!init_config(conf)) [[unlikely]] {
+       close();
+     }
+@@ -1434,6 +1443,9 @@
+     resp_body resp_buffer_;
+     std::atomic<uint32_t> recving_cnt_ = 0;
+     uint64_t client_id = 0;
++    uint64_t max_response_body_bytes = 0;
++    uint64_t max_response_attachment_bytes = 0;
++    uint64_t max_response_total_bytes = 0;
+     control_t(coro_io::ExecutorWrapper<> *executor, bool is_timeout,
+               const std::string &local_ip)
+         : is_timeout_(is_timeout),
+@@ -1567,6 +1579,23 @@
+       ELOG_TRACE << "find request ID: " << header.seq_num
+                  << ". start notify response handler"
+                  << ", client_id: " << controller->client_id;
++      {
++        const uint64_t body = header.length;
++        const uint64_t attach = header.attach_length;
++        const uint64_t total = body + attach;
++        const auto exceeds = [](uint64_t n, uint64_t limit) {
++          return limit != 0 && n > limit;
++        };
++        if (exceeds(body, controller->max_response_body_bytes) ||
++            exceeds(attach, controller->max_response_attachment_bytes) ||
++            exceeds(total, controller->max_response_total_bytes)) {
++          ELOG_ERROR << "response exceeds configured size limit, body=" << body
++                     << " attach=" << attach
++                     << ", client_id: " << controller->client_id;
++          ret.first = std::make_error_code(std::errc::message_size);
++          break;
++        }
++      }
+       uint32_t body_len = header.length;
+       struct_pack::detail::resize(
+           controller->resp_buffer_.read_buf_,
+@@ -1700,6 +1729,10 @@
+         co_return coro_rpc::unexpected<rpc_error>{
+             rpc_error{errc::timed_out, ret.message()}};
+       }
++      else if (ret.value() == static_cast<int>(std::errc::message_size)) {
++        co_return coro_rpc::unexpected<rpc_error>{
++            rpc_error{errc::message_too_large, "response too large"}};
++      }
+       else {
+         co_return coro_rpc::unexpected<rpc_error>{
+             rpc_error{errc::io_error, ret.message()}};
+--- a/include/ylt/coro_rpc/impl/coro_rpc_server.hpp
++++ b/include/ylt/coro_rpc/impl/coro_rpc_server.hpp
+@@ -472,6 +472,15 @@
+     client_filter_ = std::move(filter);
+   }
+
++  // Optional per-server admission. Unset leaves every connection accepted.
++  // admit() returns false to close the socket before a connection object is
++  // created. finished() runs once when that connection closes.
++  void set_connection_admission(std::function<bool()> admit,
++                                std::function<void()> finished) {
++    connection_admit_ = std::move(admit);
++    connection_finished_ = std::move(finished);
++  }
++
+  private:
+   async_simple::coro::Lazy<coro_rpc::err_code> accept() {
+     std::vector<async_simple::coro::Lazy<coro_rpc::err_code>> tasks;
+@@ -542,6 +551,12 @@
+                   << " allowed by client filter";
+       }
+
++      if (connection_admit_ && !connection_admit_()) {
++        ELOG_WARN << "connection rejected by admission control";
++        wrapper.close();
++        continue;
++      }
++
+       uint64_t conn_id = get_global_conn_id();
+       ELOG_INFO << "new client conn_id " << conn_id << " coming, peer addr["
+                 << wrapper.remote_endpoint() << "], local addr["
+@@ -565,6 +580,9 @@
+           [this](const uint64_t& id) {
+             std::unique_lock lock(conns_mtx_);
+             conns_.erase(id);
++            if (connection_finished_) {
++              connection_finished_();
++            }
+           },
+           conn_id);
+       {
+@@ -681,5 +699,7 @@
+ #endif
+
+   std::function<bool(const asio::ip::tcp::endpoint&)> client_filter_;
++  std::function<bool()> connection_admit_;
++  std::function<void()> connection_finished_;
+ };
+ }  // namespace coro_rpc
