@@ -1,6 +1,7 @@
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/../include)
 
-file(GLOB ENGINE_SOURCES "*.cpp" "shared_segment/*.cpp")
+# coro_handshake/*.cpp is the coro P2P handshake implementation.
+file(GLOB ENGINE_SOURCES "*.cpp" "shared_segment/*.cpp" "coro_handshake/*.cpp")
 set(TRANSFER_METADATA_PLUGIN_SOURCES config.cpp transfer_metadata_plugin.cpp)
 list(REMOVE_ITEM ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/config.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/transfer_metadata_plugin.cpp")
