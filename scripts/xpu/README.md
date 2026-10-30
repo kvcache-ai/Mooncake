@@ -71,27 +71,34 @@ Level Zero runtime is added to the Mooncake wheel.
 ## Trigger and revision binding
 
 After these workflows are available on upstream `main`, a maintainer with
-write/maintain/admin permission can add `run-xpu-ci` to an open PR targeting
-`main`. Remove/re-add the label to rerun. A new PR head needs new authorization;
-leaving the label attached does not authorize later pushes.
+write/maintain/admin permission can add `run-e2e-ci` to an open PR targeting
+`main`. The shared **E2E CI** entry point runs XPU alongside the existing ROCm,
+Ascend and other integration jobs; XPU is required, not an optional selection.
+The existing E2E label cleanup removes the label after the gate; add it again
+to rerun. A new PR head needs new authorization; leaving the label attached
+does not authorize later pushes.
 
-Alternatively dispatch **XPU Hardware Core** on trusted `main`, supplying
-`pr_number` (current head) and optionally `checkout_sha` (must match), or a full
-40-character `checkout_sha` without a PR. No branch names or implicit latest
-artifacts are accepted. Fork PR heads are supported through their commit SHA.
+Alternatively dispatch **E2E CI** on trusted `main`, supplying `pr_number`
+(current head) and optionally `pr_sha` (must match), or a full 40-character
+`pr_sha` without a PR. With neither input, XPU tests the dispatch's `main`
+commit. No branch names or implicit latest artifacts are accepted.
+Fork PR heads are supported through their commit SHA.
 
 The hosted builder receives that exact SHA. Hardware downloads its artifact
 by ID in the same run and verifies the API identity, run/attempt, ZIP digest,
 payload/native hashes, source/image provenance, and build/runtime inventories.
 The host runs the trusted workflow-revision harness, not PR host scripts.
 
-`XPU Core Gate` requires authorization, build, hardware tests, and cleanup to
-succeed. A hosted-only job publishes the `XPU Core` check on the authorized
-commit, rechecking the PR head before success. Failed, cancelled, skipped,
-missing, or stale required results cannot pass. An interrupted controller can
-leave an in-progress check, never a successful check. This label workflow does
-not start/cancel Linux, ROCm, or other accelerator CI. The normal Stage 1
-hosted build remains independent and required by the existing CI gate.
+The shared `E2E Gate` requires XPU authorization, build, hardware tests and
+cleanup to succeed. Its hosted-only XPU step publishes the `XPU Core` check
+on the authorized commit, rechecking the PR head and build SHA before success.
+Failed, cancelled, skipped, missing or stale required XPU results cannot pass.
+The existing E2E concurrency policy cancels older runs for the same PR;
+an interrupted controller can leave an in-progress check, never a successful
+check. Other platforms retain their existing jobs and gate policy.
+The normal Stage 1 hosted build remains independent and required by the
+existing PR CI gate. Nightly still builds only the XPU artifact, without
+running XPU hardware tests.
 
 ## Required coverage and diagnostics
 
