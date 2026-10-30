@@ -14,6 +14,8 @@
 
 #include "transfer_metadata_plugin.h"
 
+#include "handshake_rpc.h"
+
 #include <arpa/inet.h>
 #include <bits/stdint-uintn.h>
 #include <fcntl.h>
@@ -24,6 +26,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 
+#include <cstdlib>
 #include <random>
 
 #ifdef USE_REDIS
@@ -1463,7 +1466,22 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
 std::shared_ptr<HandShakePlugin> HandShakePlugin::Create(
     const std::string &conn_string) {
-    return std::make_shared<SocketHandShakePlugin>();
+    (void)conn_string;
+    const char *configured = std::getenv("MC_HANDSHAKE_TRANSPORT");
+    const std::string mode = (configured == nullptr || configured[0] == '\0')
+                                 ? "socket"
+                                 : configured;
+    if (mode == "socket") {
+        LOG(INFO) << "Handshake transport: socket";
+        return std::make_shared<SocketHandShakePlugin>();
+    }
+    if (mode == "coro") {
+        LOG(INFO) << "Handshake transport: coro";
+        return CreateCoroHandshakePlugin();
+    }
+    LOG(ERROR) << "Invalid MC_HANDSHAKE_TRANSPORT=\"" << mode
+               << "\", allowed values: socket, coro";
+    return CreateInvalidHandshakePlugin(mode);
 }
 
 std::vector<std::string> findLocalIpAddresses() {
