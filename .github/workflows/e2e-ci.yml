@@ -28,6 +28,92 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  xpu-authorize:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'run-e2e-ci'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    outputs:
+      sha: ${{ steps.select.outputs.sha }}
+      pr: ${{ steps.select.outputs.pr }}
+      check_id: ${{ steps.select.outputs.check_id }}
+    steps:
+      - name: Authorize exact XPU revision
+        id: select
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          CHECKOUT_SHA: ${{ inputs.pr_sha }}
+        with:
+          script: |
+            const repo = context.repo;
+            if (context.eventName === 'workflow_dispatch' &&
+                context.ref !== 'refs/heads/main') {
+              throw new Error('Dispatch the trusted main workflow, not a PR branch');
+            }
+            const {data: actor} = await github.rest.repos.getCollaboratorPermissionLevel({
+              ...repo, username: context.actor
+            });
+            if (!['admin', 'maintain', 'write'].includes(actor.permission)) {
+              throw new Error('XPU hardware execution requires maintainer authorization');
+            }
+            const rawPr = context.payload.pull_request?.number || process.env.PR_NUMBER;
+            if (rawPr && !/^[1-9][0-9]*$/.test(String(rawPr))) {
+              throw new Error('Invalid PR number');
+            }
+            const pr = rawPr ? Number(rawPr) : null;
+            let sha = process.env.CHECKOUT_SHA;
+            if (pr) {
+              const {data: pull} = await github.rest.pulls.get({...repo, pull_number: pr});
+              if (pull.state !== 'open' || pull.base.ref !== 'main') {
+                throw new Error('Expected an open PR targeting main');
+              }
+              const authorized = context.payload.pull_request?.head.sha || sha || pull.head.sha;
+              if (authorized !== pull.head.sha) {
+                throw new Error('PR head changed; authorize the new SHA again');
+              }
+              sha = authorized;
+            } else if (!sha) {
+              sha = context.sha;
+            }
+            if (!/^[0-9a-f]{40}$/.test(sha)) {
+              throw new Error('A full 40-character commit SHA is required');
+            }
+            const {data: commit} = await github.rest.repos.getCommit({...repo, ref: sha});
+            if (commit.sha !== sha) throw new Error('Commit identity mismatch');
+            const {data: check} = await github.rest.checks.create({
+              ...repo, name: 'XPU Core', head_sha: sha, status: 'in_progress',
+              details_url: `${context.serverUrl}/${repo.owner}/${repo.repo}/actions/runs/${context.runId}`
+            });
+            core.setOutput('sha', sha);
+            core.setOutput('pr', pr || '');
+            core.setOutput('check_id', String(check.id));
+            await core.summary.addRaw(`Authorized XPU core revision: ${sha}\n`).write();
+
+  build-wheel-xpu:
+    needs: xpu-authorize
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci_xpu.yml
+    with:
+      checkout_ref: ${{ needs.xpu-authorize.outputs.sha }}
+
+  xpu-integration-test:
+    needs: [xpu-authorize, build-wheel-xpu]
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/integration-test-xpu.yml
+    with:
+      checkout_sha: ${{ needs.xpu-authorize.outputs.sha }}
+      source_sha: ${{ needs.build-wheel-xpu.outputs.source_sha }}
+      artifact_id: ${{ needs.build-wheel-xpu.outputs.artifact_id }}
+      artifact_digest: ${{ needs.build-wheel-xpu.outputs.artifact_digest }}
+
   ascend-test:
     if: >
       github.event_name == 'workflow_dispatch' ||
@@ -93,8 +179,51 @@ jobs:
       - integration-test
       - rocm-integration-test
       - integration-test-tent
+      - xpu-authorize
+      - build-wheel-xpu
+      - xpu-integration-test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
     steps:
+      - name: Check XPU results on the authorized head
+        uses: actions/github-script@v7
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const needs = JSON.parse(process.env.NEEDS_JSON);
+            const authorization = needs['xpu-authorize'];
+            if (authorization?.result !== 'success') {
+              core.setFailed('XPU authorization did not succeed');
+              return;
+            }
+            const selected = authorization.outputs;
+            const required = ['xpu-authorize', 'build-wheel-xpu', 'xpu-integration-test'];
+            const failed = required
+              .filter(name => needs[name]?.result !== 'success')
+              .map(name => `${name}: ${needs[name]?.result || 'missing'}`);
+            if (needs['build-wheel-xpu']?.outputs?.source_sha !== selected.sha) {
+              failed.push('XPU build SHA differs from authorized SHA');
+            }
+            if (selected.pr) {
+              const {data: pr} = await github.rest.pulls.get({
+                ...context.repo, pull_number: Number(selected.pr)
+              });
+              if (pr.head.sha !== selected.sha) failed.push('PR head changed; retrigger required');
+            }
+            const summary = failed.length ? failed.join('\n') :
+              `C++ non-RDMA, Store Python and native two-rank EP passed on ${selected.sha}`;
+            await github.rest.checks.update({
+              ...context.repo, check_run_id: Number(selected.check_id),
+              status: 'completed', conclusion: failed.length ? 'failure' : 'success',
+              output: {title: 'XPU Core', summary}
+            });
+            await core.summary.addRaw(summary).write();
+            if (failed.length) core.setFailed(summary);
+
       - name: Check E2E results
         run: |
           echo "PR: #${{ inputs.pr_number || github.event.pull_request.number }}"
