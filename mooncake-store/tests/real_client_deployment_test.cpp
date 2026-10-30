@@ -143,6 +143,7 @@ class PausedReadMaster {
             &Service::ServiceReady, &Service::GetStorageConfig,
             &Service::GetFsdir, &Service::Ping, &Service::MountSegment,
             &Service::ReMountSegment, &Service::UnmountSegment,
+            &Service::PutStart, &Service::PutEnd, &Service::PutRevoke,
             &Service::BatchPutStart, &Service::BatchPutEnd,
             &Service::BatchPutRevoke, &Service::ExistKey,
             &Service::BatchExistKey>(&service_);
