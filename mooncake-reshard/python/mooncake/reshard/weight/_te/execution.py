@@ -378,10 +378,11 @@ def executor_requirements_for_operation_indices(
             continue
         key = (executor.instance_id, executor.participant_id)
         fragment_ids = requirements.setdefault(key, set())
+        executor_fragment_ids = frozenset(executor.fragment_ids)
         for index in executor_indices:
             operation = require_live_transfer_operation(plan.operations[index])
             fragment = operation.source if side == "source" else operation.target
-            if fragment.fragment_id not in executor.fragment_ids:
+            if fragment.fragment_id not in executor_fragment_ids:
                 raise TransferEngineError(
                     f"{side} executor does not own planned fragment: "
                     f"{fragment.fragment_id}"

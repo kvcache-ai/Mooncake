@@ -698,15 +698,17 @@ def _index_executors_by_fragment(
     executors: Sequence[Union[ExecutorTransferPlan, PlacementExecutorPlan]],
 ) -> tuple[
     dict[ExecutorProjectionKey, list[int]],
-    dict[FragmentProjectionKey, list[ExecutorProjectionKey]],
+    dict[FragmentProjectionKey, list[list[int]]],
 ]:
     indices_by_executor: dict[ExecutorProjectionKey, list[int]] = {}
-    executors_by_fragment: dict[FragmentProjectionKey, list[ExecutorProjectionKey]] = {}
+    executors_by_fragment: dict[FragmentProjectionKey, list[list[int]]] = {}
     for executor in executors:
         executor_key = _executor_projection_key(executor)
         if executor_key in indices_by_executor:
             raise ValueError("transfer plan has duplicate executor projection key")
-        indices_by_executor[executor_key] = []
+        # Share the accumulator so each operation avoids hashing the full key.
+        executor_indices: list[int] = []
+        indices_by_executor[executor_key] = executor_indices
         fragment_ids: Sequence[str]
         fragment_kind: str
         if isinstance(executor, PlacementExecutorPlan):
@@ -717,7 +719,7 @@ def _index_executors_by_fragment(
             fragment_kind = "runtime"
         for fragment_id in fragment_ids:
             executors_by_fragment.setdefault((fragment_kind, fragment_id), []).append(
-                executor_key
+                executor_indices
             )
     return indices_by_executor, executors_by_fragment
 
@@ -732,12 +734,12 @@ def _build_operation_views(
     for index, operation in enumerate(operations):
         source_key = _fragment_projection_key(operation.source)
         if source_key is not None:
-            for executor_key in source_by_fragment.get(source_key, ()):
-                source_indices[executor_key].append(index)
+            for executor_indices in source_by_fragment.get(source_key, ()):
+                executor_indices.append(index)
         target_key = _fragment_projection_key(operation.target)
         if target_key is not None:
-            for executor_key in target_by_fragment.get(target_key, ()):
-                target_indices[executor_key].append(index)
+            for executor_indices in target_by_fragment.get(target_key, ()):
+                executor_indices.append(index)
     return _OperationViews(
         source_indices=MappingProxyType(
             {key: tuple(indices) for key, indices in source_indices.items()}
