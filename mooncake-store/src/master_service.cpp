@@ -50,6 +50,8 @@
 #include "storage/distributed/shard_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
+#include "storage/distributed/kvcs/kvcs_capacity_provider.h"
+#include "storage/distributed/kvcs/kvcs_efc_target.h"
 #include "random.h"
 #include "kv_event/kv_event_config.h"
 #include "ha_metric_manager.h"
@@ -400,6 +402,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
               ClearInvalidHandles();
           }
       }),
+      kvcs_capacity_refresh_worker_([this] { RefreshKvcsDfsUsage(); }),
       enable_async_segment_cleanup_(!config.enable_ha && !config.enable_cxl),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
@@ -668,6 +671,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     // normally instead of encountering joinable thread destructors.
     client_offboarding_worker_.Start();
     VLOG(1) << "action=start_client_offboarding_worker";
+    if (dfs_kvcs_capacity_provider_) kvcs_capacity_refresh_worker_.Start();
 
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
@@ -757,22 +761,73 @@ tl::expected<int, ErrorCode> MasterService::ExpandDfsShards(int shard_count) {
 
 void MasterService::InitDfsAllocatorFromEnvironment(
     const MasterServiceConfig& config) {
-    enable_dfs_ = DfsEnablementConfig::FromEnvironment().enabled;
+    const auto dfs_config = DistributedStorageConfig::FromEnvironment();
+    // KVCS is an object-storage backend and does not use the filesystem DFS
+    // allocator, but it still enables the distributed-storage path.
+    enable_dfs_ =
+        DfsEnablementConfig::FromEnvironment().enabled || dfs_config.UsesKvcs();
     if (!enable_dfs_) return;
 
-    if (enable_oplog_) {
-        LOG(ERROR) << "DFS cannot be enabled with snapshot or oplog recovery "
-                      "until DFS allocator state restoration is supported";
-        throw std::invalid_argument(
-            "DFS is incompatible with snapshot/oplog recovery");
+    const bool recovery_enabled = enable_oplog_;
+    if (!dfs_config.Validate()) {
+        LOG(ERROR) << "Invalid distributed storage config: {"
+                   << dfs_config.FormatStr() << "}";
+        enable_dfs_ = false;
+        if (recovery_enabled) {
+            throw std::invalid_argument(
+                "Invalid distributed storage config in recovery mode");
+        }
+        return;
     }
-
-    const auto dfs_config = DistributedStorageConfig::FromEnvironment();
     if (!dfs_config.single_tenant) {
         LOG(ERROR) << "Currently, DFS backend is not supported in "
                       "multi-tenant mode";
         enable_dfs_ = false;
+        if (recovery_enabled) {
+            throw std::invalid_argument(
+                "Distributed storage recovery requires single-tenant mode");
+        }
         return;
+    }
+
+    if (dfs_config.UsesKvcs()) {
+        use_kvcs_ = true;
+        auto target = LoadKvcsEfcTarget(dfs_config.object_storage_config_path);
+        if (!target) {
+            LOG(ERROR) << "Failed to load KVCS target capacity source";
+            enable_dfs_ = false;
+            use_kvcs_ = false;
+            return;
+        }
+        auto provider = CreateKvcsCapacityProvider(*target);
+        if (!provider) {
+            if (provider.error() == ErrorCode::NOT_SUPPORTED) {
+                LOG(WARNING) << "KVCS SDK is unavailable; capacity refresh "
+                                "is disabled";
+                LOG(INFO) << "KVCS distributed object storage initialized "
+                             "without DFS extent allocator, config={"
+                          << dfs_config.FormatStr() << "}";
+                return;
+            }
+            LOG(ERROR) << "Failed to create KVCS capacity provider: "
+                       << toString(provider.error());
+            enable_dfs_ = false;
+            use_kvcs_ = false;
+            return;
+        }
+        dfs_kvcs_capacity_provider_ = std::move(*provider);
+        dfs_kvcs_capacity_check_interval_ = dfs_config.eviction_check_interval;
+        LOG(INFO) << "KVCS distributed object storage initialized without "
+                     "DFS extent allocator, config={"
+                  << dfs_config.FormatStr() << "}";
+        return;
+    }
+
+    if (recovery_enabled) {
+        LOG(ERROR) << "Filesystem DFS cannot be enabled with snapshot or oplog "
+                      "recovery until allocator state restoration is supported";
+        throw std::invalid_argument(
+            "Filesystem DFS is incompatible with snapshot/oplog recovery");
     }
 
     shard_allocator_ = nullptr;
@@ -828,6 +883,7 @@ MasterService::~MasterService() {
     }
     graceful_unmount_scheduler_.Stop();
     replica_cleanup_worker_.Stop();
+    kvcs_capacity_refresh_worker_.Stop();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
 #endif
@@ -898,6 +954,7 @@ TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
     TieredStorageUsageSnapshot snapshot{
         .memory = segment_manager_.GetMemoryUsageSnapshot(),
         .nof = nof_segment_manager_.GetUsageSnapshot(),
+        .dfs = {},
     };
     if (enable_dfs_ && dfs_allocator_ && dfs_allocator_->IsInitialized()) {
         snapshot.dfs = {
@@ -906,6 +963,9 @@ TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
             .capacity_bytes = dfs_allocator_->GetTotalCapacity(),
             .file_count = dfs_allocator_->GetFileCount(),
         };
+    } else if (enable_dfs_ && dfs_kvcs_capacity_provider_) {
+        std::lock_guard lock(dfs_kvcs_usage_mutex_);
+        snapshot.dfs = dfs_kvcs_usage_;
     }
     return snapshot;
 }
@@ -3385,6 +3445,15 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     local_disk_desc.transport_endpoint, desc.status,
                     RecordRestoreKnownOwner(ctx.new_known_owner_records,
                                             local_disk_desc.client_id)));
+            } else if (desc.is_dfs_replica()) {
+                const auto& dfs_desc = desc.get_dfs_descriptor();
+                if (!use_kvcs_ || dfs_desc.object_size != standby_meta.size) {
+                    NoteLegacyStandbyRejection(
+                        ctx, entry, "invalid_dfs_descriptor");
+                    construction_ok = false;
+                    break;
+                }
+                replicas.push_back(Replica(desc.id, dfs_desc, desc.status));
             } else {
                 LOG(ERROR) << "RestoreFromStandbySnapshot: unsupported replica "
                            << "descriptor, tenant="
@@ -3669,7 +3738,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     const std::vector<StandbySegmentInfo>& segments, size_t chunk_object_count,
     std::optional<ReplicaID> expected_max_replica_id,
     const WeightMetadataSnapshot* legacy_weight_metadata) {
-    if (enable_dfs_) {
+    if (dfs_allocator_) {
         LOG(ERROR) << "RestoreFromStandbySnapshot: DFS allocator state "
                       "restoration is not supported";
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
@@ -3960,6 +4029,19 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                         local_disk_desc.object_size,
                         local_disk_desc.transport_endpoint, desc.status,
                         record_for_known_owner(local_disk_desc.client_id)));
+                } else if (desc.is_dfs_replica()) {
+                    const auto& dfs_desc = desc.get_dfs_descriptor();
+                    if (!use_kvcs_ ||
+                        dfs_desc.object_size != standby_meta.size) {
+                        LOG(ERROR)
+                            << "RestoreFromStandbySnapshot: invalid DFS "
+                               "descriptor, tenant="
+                            << tenant_id.value() << ", key=" << user_key
+                            << ", descriptor_size=" << dfs_desc.object_size
+                            << ", expected_size=" << standby_meta.size;
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                    replicas.push_back(Replica(desc.id, dfs_desc, desc.status));
                 } else {
                     LOG(ERROR)
                         << "RestoreFromStandbySnapshot: unsupported replica "
@@ -4921,30 +5003,39 @@ auto MasterService::AllocateReplicas(const std::string& key,
     }
 
     if (config.dfs_replica_num > 0) {
-        if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
+        if (use_kvcs_) {
+            DistributedFSDescriptor descriptor;
+            descriptor.object_size = value_length;
+            descriptor.aligned_size = value_length;
+            descriptor.shard_idx = -1;
+            replicas.emplace_back(std::move(descriptor),
+                                  ReplicaStatus::PROCESSING);
+        } else if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
             LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
                        << ", error=dfs_allocator_not_initialized";
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-        }
-        auto alloc = dfs_allocator_->Allocate(key, value_length);
-        if (!alloc) {
-            // NO_AVAILABLE_HANDLE is a capacity failure that can repeat for
-            // every PutStart and is returned to the caller, so log it like
-            // memory exhaustion above.
-            if (alloc.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
-                VLOG(1) << "Failed to allocate DFS replica for key=" << key
+        } else {
+            auto alloc = dfs_allocator_->Allocate(key, value_length);
+            if (!alloc) {
+                // NO_AVAILABLE_HANDLE is a capacity failure that can repeat
+                // for every PutStart and is returned to the caller, so log it
+                // like memory exhaustion above.
+                if (alloc.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
+                    VLOG(1) << "Failed to allocate DFS replica for key=" << key
+                            << ", error=" << alloc.error();
+                } else {
+                    LOG(ERROR)
+                        << "Failed to allocate DFS replica for key=" << key
                         << ", error=" << alloc.error();
-            } else {
-                LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
-                           << ", error=" << alloc.error();
+                }
+                if (dfs_allocation_failed != nullptr) {
+                    *dfs_allocation_failed =
+                        alloc.error() == ErrorCode::NO_AVAILABLE_HANDLE;
+                }
+                return tl::make_unexpected(alloc.error());
             }
-            if (dfs_allocation_failed != nullptr) {
-                *dfs_allocation_failed =
-                    alloc.error() == ErrorCode::NO_AVAILABLE_HANDLE;
-            }
-            return tl::make_unexpected(alloc.error());
+            replicas.emplace_back(std::move(*alloc), ReplicaStatus::PROCESSING);
         }
-        replicas.emplace_back(std::move(*alloc), ReplicaStatus::PROCESSING);
     }
 
     return replicas;
@@ -5070,8 +5161,9 @@ auto MasterService::PrepareWriteStart(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (config.dfs_replica_num > 0 &&
-        (!enable_dfs_ || dfs_allocator_ == nullptr ||
-         !dfs_allocator_->IsInitialized())) {
+        (!enable_dfs_ ||
+         (!use_kvcs_ &&
+          (!dfs_allocator_ || !dfs_allocator_->IsInitialized())))) {
         LOG(ERROR) << "key=" << key
                    << ", dfs_replica_num=" << config.dfs_replica_num
                    << ", error=dfs_service_unavailable";
@@ -6233,20 +6325,27 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
     }
     const auto previous_kv_media = KvMediaSnapshot(metadata);
 
+    const bool supports_dfs_condition = replica_type == ReplicaType::DFS &&
+                                        expected_replica_id != nullptr &&
+                                        use_kvcs_;
     if (replica_type != ReplicaType::DISK &&
-        replica_type != ReplicaType::LOCAL_DISK) {
+        replica_type != ReplicaType::LOCAL_DISK && !supports_dfs_condition) {
         LOG(ERROR) << "key=" << key
                    << ", error=invalid_replica_type_for_eviction";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto target_pred = [replica_type, &client_id](const Replica& r) {
+    auto target_pred = [this, replica_type, &client_id,
+                        expected_replica_id](const Replica& r) {
         if (replica_type == ReplicaType::DISK) {
             return r.is_disk_replica();
         } else if (replica_type == ReplicaType::LOCAL_DISK) {
             return r.is_local_disk_replica() &&
                    r.get_descriptor().get_local_disk_descriptor().client_id ==
                        client_id;
+        } else if (replica_type == ReplicaType::DFS) {
+            return use_kvcs_ && expected_replica_id != nullptr &&
+                   r.is_dfs_replica() && r.id() == *expected_replica_id;
         }
         return false;
     };
@@ -6322,7 +6421,7 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
         }
     }
 
-    if (replica_type == ReplicaType::DISK) {
+    if (replica_type == ReplicaType::DISK || replica_type == ReplicaType::DFS) {
         EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
     } else if (replica_type == ReplicaType::LOCAL_DISK) {
         EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
@@ -7759,6 +7858,21 @@ void MasterService::RunDfsEviction() {
         return;
     }
     RunShardDfsEviction();
+}
+
+void MasterService::RefreshKvcsDfsUsage() {
+    if (!dfs_kvcs_capacity_provider_) return;
+
+    auto capacity = dfs_kvcs_capacity_provider_->GetCapacity();
+    std::lock_guard lock(dfs_kvcs_usage_mutex_);
+    if (capacity) {
+        dfs_kvcs_usage_ = std::move(*capacity);
+    } else {
+        // Do not let a stale success drive a later watermark decision.
+        dfs_kvcs_usage_ = {};
+        VLOG(1) << "KVCS DFS capacity is unknown: "
+                << toString(capacity.error());
+    }
 }
 
 void MasterService::RunShardDfsEviction() {
@@ -9435,13 +9549,21 @@ void MasterService::EvictionThreadFunc() {
         }
 #endif
 
-        if (dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) {
+        if ((dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) ||
+            dfs_kvcs_capacity_provider_) {
             const auto steady_now = std::chrono::steady_clock::now();
             if (steady_now >= next_dfs_eviction_time) {
-                RunDfsEviction();
+                const auto interval =
+                    dfs_kvcs_capacity_provider_
+                        ? dfs_kvcs_capacity_check_interval_
+                        : dfs_allocator_->GetEvictionCheckInterval();
+                if (dfs_kvcs_capacity_provider_) {
+                    kvcs_capacity_refresh_worker_.Schedule();
+                } else {
+                    RunDfsEviction();
+                }
                 next_dfs_eviction_time =
-                    std::chrono::steady_clock::now() +
-                    dfs_allocator_->GetEvictionCheckInterval();
+                    std::chrono::steady_clock::now() + interval;
             }
         }
 

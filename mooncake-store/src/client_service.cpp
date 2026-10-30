@@ -581,6 +581,13 @@ Client::~Client() {
 
 ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
     ReplicateConfig client_cfg = config;
+    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs()) {
+        // KVCS is represented by one Mooncake DFS descriptor. The adapter
+        // independently handles target placement and provider replicas, so a
+        // Mooncake replica count greater than one must not create a policy the
+        // single target descriptor cannot satisfy.
+        client_cfg.dfs_replica_num = 1;
+    }
     if (!host_id_.empty()) {
         client_cfg.host_id = host_id_;
     }
@@ -1615,6 +1622,9 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     if (err != ErrorCode::OK) {
+        if (err == ErrorCode::OBJECT_NOT_FOUND) {
+            ReconcileMissingKvcsReplica(object_key, query_result, replica);
+        }
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
         return tl::unexpected(err);
     }
@@ -1757,6 +1767,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     std::unordered_map<std::string, TargetReadGroup> target_groups;
     std::vector<DfsReadRequest> dfs_read_requests;
     std::vector<size_t> dfs_read_indices;
+    std::vector<Replica::Descriptor> dfs_read_replicas;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
     // Record batch get transfer latency (Submit + Wait)
     auto t0_batch_get = std::chrono::steady_clock::now();
@@ -1813,6 +1824,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             dfs_read_requests.push_back(
                 DfsReadRequest{key, desc, slices_it->second});
             dfs_read_indices.push_back(i);
+            dfs_read_replicas.push_back(replica);
             continue;
         } else if (replica.is_nof_replica()) {
             auto contiguous_range = GetContiguousSliceRange(slices_it->second);
@@ -1920,6 +1932,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                             toString(dfs_results[i].error()));
                     }
                     results[index] = tl::unexpected(dfs_results[i].error());
+                    if (dfs_results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
+                        ReconcileMissingKvcsReplica(request.key,
+                                                    query_results[index],
+                                                    dfs_read_replicas[i]);
+                    }
                     continue;
                 }
                 // The I/O itself delivered these bytes, so they count even if
@@ -2181,7 +2198,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     const auto finalize_decision =
-        DetermineFinalizeDecision(config, transfer_summary);
+        DetermineFinalizeDecision(client_cfg, transfer_summary);
 
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.PutEnd(
@@ -2388,7 +2405,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     const auto finalize_decision =
-        DetermineFinalizeDecision(config, transfer_summary);
+        DetermineFinalizeDecision(client_cfg, transfer_summary);
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.UpsertEnd(
             ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
@@ -3793,10 +3810,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
 }
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
+    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs()) {
+        auto results = BatchRemove({key}, force);
+        if (results.size() != 1)
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        return std::move(results.front());
+    }
+
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);
     }
-
     auto result = master_client_.Remove(key, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
@@ -3807,12 +3830,15 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
     }
-
     return {};
 }
 
 tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
                                                     bool force) {
+    // KVCS has no provider-side key listing or conditional bulk delete yet.
+    // Removing only Master metadata would skip provider cleanup.
+    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs())
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     if (hot_cache_) {
         hot_cache_->BumpCacheEpoch();
     }
@@ -3832,6 +3858,8 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
+    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs())
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     if (hot_cache_) {
         hot_cache_->BumpCacheEpoch();
     }
@@ -3853,18 +3881,36 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
 
     auto results = master_client_.BatchRemove(keys, force);
 
-    if (hot_cache_) {
-        std::vector<std::string> removed_keys;
-        removed_keys.reserve(std::min(keys.size(), results.size()));
-        for (size_t i = 0; i < keys.size(); ++i) {
-            if (i < results.size() && results[i].has_value()) {
-                removed_keys.emplace_back(keys[i]);
-            }
-        }
-        if (!removed_keys.empty()) {
-            hot_cache_->RemoveHotKeys(removed_keys);
+    const size_t result_count = std::min(keys.size(), results.size());
+    std::vector<std::string> removed_keys;
+    std::vector<size_t> removed_indices;
+    removed_keys.reserve(result_count);
+    removed_indices.reserve(result_count);
+    for (size_t i = 0; i < result_count; ++i) {
+        if (results[i]) {
+            removed_keys.emplace_back(keys[i]);
+            removed_indices.push_back(i);
         }
     }
+
+    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs() &&
+        !removed_keys.empty()) {
+        const auto deleted =
+            dfs_storage_backend_->BatchDeleteObjects(removed_keys);
+        if (deleted.size() != removed_keys.size()) {
+            for (size_t index : removed_indices) {
+                results[index] =
+                    tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        } else {
+            for (size_t i = 0; i < deleted.size(); ++i) {
+                if (!deleted[i]) results[removed_indices[i]] = deleted[i];
+            }
+        }
+    }
+
+    if (hot_cache_ && !removed_keys.empty())
+        hot_cache_->RemoveHotKeys(removed_keys);
 
     return results;
 }
@@ -5240,6 +5286,33 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
             << ", offset=" << desc.offset << ", size=" << desc.object_size
             << ", latency_us=" << read_latency_us;
     return ErrorCode::OK;
+}
+
+void Client::ReconcileMissingKvcsReplica(
+    const std::string& key, const QueryResult& query_result,
+    const Replica::Descriptor& replica_descriptor) {
+    if (!dfs_storage_backend_ || !dfs_storage_backend_->UsesKvcs() ||
+        !replica_descriptor.is_dfs_replica()) {
+        return;
+    }
+    if (!query_result.resolved_tenant_id.has_value()) {
+        LOG(WARNING) << "Cannot reconcile missing KVCS replica without "
+                        "resolved tenant, key="
+                     << key;
+        return;
+    }
+
+    auto evicted = master_client_.EvictDiskReplicaIfCurrent(
+        key, *query_result.resolved_tenant_id, ReplicaType::DFS,
+        replica_descriptor.id);
+    if (!evicted) {
+        LOG(WARNING) << "Failed to reconcile missing KVCS replica, key=" << key
+                     << ", replica_id=" << replica_descriptor.id
+                     << ", error=" << toString(evicted.error());
+    } else if (!*evicted) {
+        VLOG(1) << "KVCS replica was replaced before miss reconciliation, key="
+                << key << ", replica_id=" << replica_descriptor.id;
+    }
 }
 
 ErrorCode Client::TransferReadRange(

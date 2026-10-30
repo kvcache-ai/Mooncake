@@ -174,6 +174,17 @@ class MasterServiceTestPeer {
         return service.enable_dfs_;
     }
 
+    static auto& DfsAllocator(MasterService& service) {
+        return service.dfs_allocator_;
+    }
+    static const auto& DfsAllocator(const MasterService& service) {
+        return service.dfs_allocator_;
+    }
+
+    static bool UsesKvcs(const MasterService& service) {
+        return service.use_kvcs_;
+    }
+
     static auto& EnableOplog(MasterService& service) {
         return service.enable_oplog_;
     }
