@@ -54,7 +54,12 @@ std::string UrmaContext::toString() {
     return ss.str();
 }
 
-int UrmaContext::getAsyncFd() { return urma_context_->async_fd; }
+int UrmaContext::getAsyncFd() {
+    // doConstruct() logs toString() on the failure path, and toString()
+    // reads this fd: opening a device can fail, so the context may be
+    // null. Dereferencing it there turns a clean error into a SIGSEGV.
+    return urma_context_ ? urma_context_->async_fd : -1;
+}
 
 int UrmaContext::submitPostSend(
     const std::vector<Transport::Slice*>& slice_list) {
