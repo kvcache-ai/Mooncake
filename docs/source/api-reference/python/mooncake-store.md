@@ -151,6 +151,53 @@ store.close()
 
 </details>
 
+### Reading selected byte ranges (C++ backend)
+
+`get(key, ranges=[(offset, length), ...])` returns the requested windows packed
+into one `bytes` value in caller order. `get_batch(keys,
+ranges_per_key=[ranges_or_none, ...])` applies the same rule independently to each
+entry; `None` reads the full object. Omitting either keyword preserves the
+existing full-read behavior. `get_buffer()` and `batch_get_buffer()` accept the
+same optional keywords and return owned buffers instead of copying to Python
+`bytes`. Reuse a tuple of tuple pairs across keys when the layout is identical
+to avoid repeated parameter conversion within a batch.
+
+```python
+assert store.put("range-example", b"abcdefghijklmnop") == 0
+assert store.get("range-example", ranges=[(8, 4), (0, 4)]) == b"ijklabcd"
+assert store.get("range-example", ranges=[(14, 10)]) == b"op"
+assert store.get_batch(
+    ["range-example", "range-example"],
+    ranges_per_key=[[(0, 2), (1, 2)], None],
+) == [b"abbc", b"abcdefghijklmnop"]
+```
+
+Offsets and lengths are nonnegative integers representable as unsigned 64-bit
+values. Negative values, malformed pairs and mismatched batch shapes raise
+Python exceptions. Output-size overflow raises `OverflowError`. Windows are
+clipped at the object boundary; zero-length and fully out-of-bounds windows
+contribute no bytes. Overlaps and repeated keys preserve caller order. An empty
+selection still checks the key and its metadata lease.
+
+The `bytes` APIs retain the existing empty-result error convention: `b""` can
+mean an empty selection or a failed read. Buffer APIs return `None` for either
+case. The native C++ ranged overloads return an `expected` status and can
+distinguish successful empty selections from failures.
+
+Range reads use one metadata snapshot per distinct key and bypass the full-value
+hot cache. They reuse the existing memory scatter and file-window read paths.
+File requests currently execute one window at a time; bounded multi-window
+batching is a separate follow-up.
+Dummy clients, Store-RS and NoF range reads are not implemented by these new
+keywords; their existing full-read APIs retain their behavior.
+
+When object checksums are enabled, a selection covering the complete object is
+verified in source order. Complete coverage with overlaps uses one canonical
+full-object scratch buffer before packing. Partial selections cannot validate a
+full-object checksum and skip that check; they do not silently read the rest of
+the object. Existing caller-owned `get_into_ranges()` bounds and return
+conventions are unchanged.
+
 ## Structured Object Store Helper
 
 `mooncake.structured_object_store` provides a higher-level helper for one logical object that contains multiple named members.
@@ -1272,7 +1319,7 @@ store.put("important_data", b"Critical information", config)
 Retrieve binary data from distributed storage.
 
 ```python
-def get(self, key: str) -> bytes
+def get(self, key: str, *, ranges=None) -> bytes
 ```
 
 **Parameters:**
@@ -1449,7 +1496,7 @@ result = store.upsert_batch(keys, values)
 Retrieve multiple objects in a single batch operation.
 
 ```python
-def get_batch(self, keys: List[str]) -> List[bytes]
+def get_batch(self, keys: List[str], *, ranges_per_key=None) -> List[bytes]
 ```
 
 **Parameters:**
@@ -1767,7 +1814,7 @@ else:
 Get object data as a buffer that implements Python's buffer protocol.
 
 ```python
-def get_buffer(self, key: str) -> BufferHandle
+def get_buffer(self, key: str, *, ranges=None) -> BufferHandle
 ```
 
 **Parameters:**
@@ -1816,7 +1863,7 @@ result = store.put_parts("greeting", part1, part2, part3)
 Get multiple objects as buffers that implement Python's buffer protocol.
 
 ```python
-def batch_get_buffer(self, keys: List[str]) -> List[BufferHandle]
+def batch_get_buffer(self, keys: List[str], *, ranges_per_key=None) -> List[BufferHandle]
 ```
 
 **Parameters:**

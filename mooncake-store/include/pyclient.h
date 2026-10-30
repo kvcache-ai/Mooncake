@@ -17,6 +17,7 @@
 #include "mutex.h"
 #include "common/result.h"
 #include "file_storage.h"
+#include "ranged_read_plan.h"
 
 namespace mooncake {
 
@@ -252,6 +253,10 @@ class ClientRequester {
 // Python-specific wrapper class for client interface
 class PyClient {
    public:
+    using RangeReadResult =
+        tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>;
+    using OptionalRanges = std::optional<std::vector<ByteRange>>;
+
     // Request-scoped cache of fresh batch_query() results that can be reused by
     // subsequent ranged reads in the same operation. Callers should not retain
     // entries across independent requests.
@@ -500,6 +505,20 @@ class PyClient {
 
     virtual std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys) = 0;
+
+    // A successful null handle is an empty selection; an unexpected value is
+    // a read failure. Old backends retain their existing whole-read behavior.
+    virtual RangeReadResult get_buffer(const std::string &key,
+                                       std::span<const ByteRange> ranges) {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    virtual std::vector<RangeReadResult> batch_get_buffer(
+        const std::vector<std::string> &keys,
+        const std::vector<OptionalRanges> &ranges) {
+        return std::vector<RangeReadResult>(
+            keys.size(), tl::unexpected(ErrorCode::NOT_SUPPORTED));
+    }
 
     virtual int put_parts(
         const std::string &key, std::vector<std::span<const char>> values,

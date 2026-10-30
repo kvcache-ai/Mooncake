@@ -874,6 +874,7 @@ class Client {
      * @return true if hot cache is enabled, false otherwise
      */
     bool IsHotCacheEnabled() const { return hot_cache_ != nullptr; }
+    bool IsObjectChecksumEnabled() const { return object_checksum_enabled_; }
 
     /**
      * @brief Get the local hot cache instance.

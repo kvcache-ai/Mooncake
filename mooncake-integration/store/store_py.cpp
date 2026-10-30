@@ -653,7 +653,131 @@ class MooncakeStorePyWrapper {
         return base_key + "_tp_" + std::to_string(rank);
     }
 
-    pybind11::bytes get(const std::string &key) {
+    static std::vector<ByteRange> parse_read_ranges(py::handle value) {
+        if (!PySequence_Check(value.ptr()) || py::isinstance<py::str>(value) ||
+            py::isinstance<py::bytes>(value)) {
+            throw py::type_error(
+                "ranges must be a sequence of (offset, length)");
+        }
+        auto sequence = py::reinterpret_borrow<py::sequence>(value);
+        std::vector<ByteRange> ranges;
+        ranges.reserve(sequence.size());
+        auto unsigned_value = [](py::handle number) -> uint64_t {
+            if (!PyLong_Check(number.ptr()) || PyBool_Check(number.ptr())) {
+                throw py::type_error(
+                    "range offsets and lengths must be integers");
+            }
+            int overflow = 0;
+            const auto value =
+                PyLong_AsLongLongAndOverflow(number.ptr(), &overflow);
+            if (PyErr_Occurred()) throw py::error_already_set();
+            if (overflow < 0 || (overflow == 0 && value < 0)) {
+                throw py::value_error(
+                    "range offsets and lengths must be nonnegative");
+            }
+            if (overflow == 0) return static_cast<uint64_t>(value);
+            const auto result = PyLong_AsUnsignedLongLong(number.ptr());
+            if (PyErr_Occurred()) throw py::error_already_set();
+            return result;
+        };
+        for (py::handle item : sequence) {
+            if (!PySequence_Check(item.ptr()) ||
+                py::isinstance<py::str>(item) ||
+                py::isinstance<py::bytes>(item)) {
+                throw py::type_error(
+                    "each range must be an (offset, length) pair");
+            }
+            auto pair = py::reinterpret_steal<py::object>(PySequence_Fast(
+                item.ptr(), "each range must be an (offset, length) pair"));
+            if (!pair) throw py::error_already_set();
+            if (PySequence_Fast_GET_SIZE(pair.ptr()) != 2) {
+                throw py::value_error(
+                    "each range must contain offset and length");
+            }
+            ranges.emplace_back(unsigned_value(py::handle(
+                                    PySequence_Fast_GET_ITEM(pair.ptr(), 0))),
+                                unsigned_value(py::handle(
+                                    PySequence_Fast_GET_ITEM(pair.ptr(), 1))));
+        }
+        return ranges;
+    }
+
+    static std::vector<PyClient::OptionalRanges> parse_batch_read_ranges(
+        py::handle value, size_t count) {
+        if (!PySequence_Check(value.ptr()) || py::isinstance<py::str>(value) ||
+            py::isinstance<py::bytes>(value)) {
+            throw py::type_error("ranges_per_key must be a sequence");
+        }
+        auto sequence = py::reinterpret_borrow<py::sequence>(value);
+        if (static_cast<size_t>(sequence.size()) != count) {
+            throw py::value_error("ranges_per_key must match keys");
+        }
+        std::vector<PyClient::OptionalRanges> ranges;
+        ranges.reserve(count);
+        py::object previous;
+        bool reusable = false;
+        for (py::handle item : sequence) {
+            if (reusable && item.is(previous)) {
+                ranges.push_back(ranges.back());
+                continue;
+            }
+            reusable = false;
+            if (item.is_none()) {
+                ranges.emplace_back(std::nullopt);
+            } else {
+                ranges.emplace_back(parse_read_ranges(item));
+                // Reuse only immutable pairs. Lists and custom sequences can
+                // change between visits even within a single batch call.
+                if (PyTuple_CheckExact(item.ptr())) {
+                    auto tuple = py::reinterpret_borrow<py::tuple>(item);
+                    reusable = std::all_of(
+                        tuple.begin(), tuple.end(), [](py::handle pair) {
+                            return PyTuple_CheckExact(pair.ptr());
+                        });
+                }
+            }
+            if (reusable) previous = py::reinterpret_borrow<py::object>(item);
+        }
+        return ranges;
+    }
+
+    static py::bytes ranged_bytes(const PyClient::RangeReadResult &result) {
+        if (!result) {
+            if (result.error() == ErrorCode::BUFFER_OVERFLOW) {
+                throw std::overflow_error(
+                    "range output size exceeds supported limits");
+            }
+            LOG(ERROR) << "Ranged get failed: " << toString(result.error());
+            return py::bytes("", 0);
+        }
+        if (!*result) return py::bytes("", 0);
+        const auto &handle = *result;
+        auto accelerator =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
+        if (accelerator.FindDeviceForPointer(handle->ptr())) {
+            std::string host(handle->size(), '\0');
+            if (!accelerator.CopyToHost(host.data(), handle->ptr(),
+                                        handle->size())) {
+                LOG(ERROR) << "Failed to copy ranged output to host";
+                return py::bytes("", 0);
+            }
+            return py::bytes(host);
+        }
+        return py::bytes(static_cast<const char *>(handle->ptr()),
+                         handle->size());
+    }
+
+    pybind11::bytes get(const std::string &key,
+                        py::object ranges = py::none()) {
+        if (!ranges.is_none()) {
+            auto parsed = parse_read_ranges(ranges);
+            if (!is_client_initialized()) return py::bytes("", 0);
+            auto result = [&] {
+                py::gil_scoped_release release;
+                return store_->get_buffer(key, parsed);
+            }();
+            return ranged_bytes(result);
+        }
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::bytes("\\0", 0);
@@ -690,7 +814,23 @@ class MooncakeStorePyWrapper {
     }
 
     std::vector<pybind11::bytes> get_batch(
-        const std::vector<std::string> &keys) {
+        const std::vector<std::string> &keys,
+        py::object ranges_per_key = py::none()) {
+        if (!ranges_per_key.is_none()) {
+            auto parsed = parse_batch_read_ranges(ranges_per_key, keys.size());
+            if (!is_client_initialized()) {
+                return std::vector<py::bytes>(keys.size(), py::bytes("", 0));
+            }
+            auto buffers = [&] {
+                py::gil_scoped_release release;
+                return store_->batch_get_buffer(keys, parsed);
+            }();
+            std::vector<py::bytes> results;
+            results.reserve(buffers.size());
+            for (const auto &buffer : buffers)
+                results.push_back(ranged_bytes(buffer));
+            return results;
+        }
         const auto kNullString = pybind11::bytes("\\0", 0);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
@@ -2587,8 +2727,11 @@ PYBIND11_MODULE(_store, m) {
                  py::gil_scoped_release release;
                  return self.store_->alloc_from_mem_pool(size);
              })
-        .def("get", &mooncake::MooncakeStorePyWrapper::get)
-        .def("get_batch", &mooncake::MooncakeStorePyWrapper::get_batch)
+        .def("get", &mooncake::MooncakeStorePyWrapper::get, py::arg("key"),
+             py::kw_only(), py::arg("ranges") = py::none())
+        .def("get_batch", &mooncake::MooncakeStorePyWrapper::get_batch,
+             py::arg("keys"), py::kw_only(),
+             py::arg("ranges_per_key") = py::none())
         .def("get_offload_rpc_read_count",
              [](MooncakeStorePyWrapper &self) -> int64_t {
                  auto real_client =
@@ -2598,18 +2741,59 @@ PYBIND11_MODULE(_store, m) {
              })
         .def(
             "get_buffer",
-            [](MooncakeStorePyWrapper &self, const std::string &key) {
-                py::gil_scoped_release release;
-                return self.store_->get_buffer(key);
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               py::object ranges) -> std::shared_ptr<BufferHandle> {
+                if (ranges.is_none()) {
+                    py::gil_scoped_release release;
+                    return self.store_->get_buffer(key);
+                }
+                auto parsed = MooncakeStorePyWrapper::parse_read_ranges(ranges);
+                if (!self.is_client_initialized()) return nullptr;
+                auto result = [&] {
+                    py::gil_scoped_release release;
+                    return self.store_->get_buffer(key, parsed);
+                }();
+                if (!result && result.error() == ErrorCode::BUFFER_OVERFLOW) {
+                    throw std::overflow_error(
+                        "range output size exceeds supported limits");
+                }
+                return result ? *result : nullptr;
             },
+            py::arg("key"), py::kw_only(), py::arg("ranges") = py::none(),
             py::return_value_policy::take_ownership)
         .def(
             "batch_get_buffer",
             [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
-                py::gil_scoped_release release;
-                return self.store_->batch_get_buffer(keys);
+               const std::vector<std::string> &keys,
+               py::object ranges_per_key) {
+                if (ranges_per_key.is_none()) {
+                    py::gil_scoped_release release;
+                    return self.store_->batch_get_buffer(keys);
+                }
+                auto parsed = MooncakeStorePyWrapper::parse_batch_read_ranges(
+                    ranges_per_key, keys.size());
+                if (!self.is_client_initialized()) {
+                    return std::vector<std::shared_ptr<BufferHandle>>(
+                        keys.size());
+                }
+                auto read = [&] {
+                    py::gil_scoped_release release;
+                    return self.store_->batch_get_buffer(keys, parsed);
+                }();
+                std::vector<std::shared_ptr<BufferHandle>> buffers;
+                buffers.reserve(read.size());
+                for (auto &result : read) {
+                    if (!result &&
+                        result.error() == ErrorCode::BUFFER_OVERFLOW) {
+                        throw std::overflow_error(
+                            "range output size exceeds supported limits");
+                    }
+                    buffers.push_back(result ? std::move(*result) : nullptr);
+                }
+                return buffers;
             },
+            py::arg("keys"), py::kw_only(),
+            py::arg("ranges_per_key") = py::none(),
             py::return_value_policy::take_ownership)
         .def(
             "remove",

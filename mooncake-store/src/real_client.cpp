@@ -3995,6 +3995,220 @@ RealClient::DiskReadHealResult RealClient::heal_disk_replica_for_read(
     return DiskReadHealResult::kEvicted;
 }
 
+PyClient::RangeReadResult RealClient::get_buffer(
+    const std::string &key, std::span<const ByteRange> ranges) {
+    auto results = batch_get_buffer(
+        {key}, {std::vector<ByteRange>(ranges.begin(), ranges.end())});
+    return std::move(results.front());
+}
+
+std::vector<PyClient::RangeReadResult> RealClient::batch_get_buffer(
+    const std::vector<std::string> &keys,
+    const std::vector<OptionalRanges> &ranges) {
+    std::vector<RangeReadResult> results(
+        keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (!client_ || !client_buffer_allocator_ || ranges.size() != keys.size()) {
+        return results;
+    }
+    if (std::all_of(ranges.begin(), ranges.end(),
+                    [](const auto &r) { return !r.has_value(); })) {
+        auto buffers = batch_get_buffer(keys);
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            results[i] =
+                buffers[i]
+                    ? RangeReadResult(std::move(buffers[i]))
+                    : RangeReadResult(tl::unexpected(ErrorCode::INVALID_READ));
+        }
+        return results;
+    }
+
+    std::vector<std::string> unique_keys;
+    std::unordered_set<std::string> seen;
+    for (const auto &key : keys) {
+        if (seen.insert(key).second) unique_keys.push_back(key);
+    }
+    auto queried = client_->BatchQuery(unique_keys);
+    if (queried.size() != unique_keys.size()) {
+        return std::vector<RangeReadResult>(
+            keys.size(), tl::unexpected(ErrorCode::RPC_FAIL));
+    }
+    QueryResultCache cache;
+    cache.reserve(unique_keys.size());
+    for (size_t i = 0; i < unique_keys.size(); ++i) {
+        // Do not let an unsupported preferred replica hide a usable memory or
+        // file replica. The original addresses, lease and checksum are
+        // retained.
+        if (queried[i]) {
+            auto replicas = queried[i]->replicas;
+            std::erase_if(replicas, [](const auto &r) {
+                return !r.is_memory_replica() && !r.is_disk_replica() &&
+                       !r.is_dfs_replica() && !r.is_local_disk_replica();
+            });
+            if (replicas.empty()) {
+                cache.emplace(unique_keys[i],
+                              tl::unexpected(ErrorCode::NOT_SUPPORTED));
+            } else {
+                cache.emplace(
+                    unique_keys[i],
+                    QueryResult(std::move(replicas), queried[i]->lease_timeout,
+                                queried[i]->object_checksum,
+                                queried[i]->resolved_tenant_id));
+            }
+            continue;
+        }
+        cache.emplace(unique_keys[i], std::move(queried[i]));
+    }
+    std::unordered_map<std::string, tl::expected<RangedReadMetadata, ErrorCode>>
+        metadata;
+    metadata.reserve(unique_keys.size());
+    for (const auto &key : unique_keys) {
+        metadata.emplace(key, resolve_ranged_read_metadata(key, &cache, false));
+    }
+
+    struct OwnedRead {
+        ReadRangePlan plan;
+        const RangedReadMetadata *metadata = nullptr;
+    };
+    std::vector<OwnedRead> owned(keys.size());
+    std::vector<void *> read_buffers;
+    std::vector<size_t> capacities, output_indices;
+    std::vector<std::vector<std::string>> read_keys;
+    std::vector<std::vector<std::vector<size_t>>> destinations, sources, sizes;
+    read_buffers.reserve(keys.size());
+    capacities.reserve(keys.size());
+    output_indices.reserve(keys.size());
+    read_keys.reserve(keys.size());
+    destinations.reserve(keys.size());
+    sources.reserve(keys.size());
+    sizes.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto &resolved = metadata.at(keys[i]);
+        if (!resolved) {
+            results[i] = tl::unexpected(resolved.error());
+            continue;
+        }
+        const auto &info = *resolved;
+        const std::vector<ByteRange> whole{{0, info.total_size}};
+        auto plan =
+            PlanReadRanges(info.total_size, ranges[i] ? *ranges[i] : whole,
+                           client_->IsObjectChecksumEnabled() &&
+                               info.query_result.object_checksum.has_value());
+        if (!plan) {
+            results[i] = tl::unexpected(plan.error());
+            continue;
+        }
+        owned[i] = {std::move(*plan), &info};
+        if (info.query_result.IsLeaseExpired()) {
+            results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+            continue;
+        }
+        if (owned[i].plan.output_size == 0) {
+            results[i] = std::shared_ptr<BufferHandle>{};
+            continue;
+        }
+        auto allocation =
+            client_buffer_allocator_->allocate(owned[i].plan.output_size);
+        if (!allocation) {
+            results[i] = tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            continue;
+        }
+        results[i] = std::make_shared<BufferHandle>(std::move(*allocation));
+        if (owned[i].plan.canonical_read) continue;
+        output_indices.push_back(i);
+        read_buffers.push_back((*results[i])->ptr());
+        capacities.push_back((*results[i])->size());
+        read_keys.push_back({keys[i]});
+        destinations.push_back({{}});
+        sources.push_back({{}});
+        sizes.push_back({{}});
+        const size_t fragment_count = owned[i].plan.fragments.size();
+        destinations.back()[0].reserve(fragment_count);
+        sources.back()[0].reserve(fragment_count);
+        sizes.back()[0].reserve(fragment_count);
+        for (const auto &fragment : owned[i].plan.fragments) {
+            destinations.back()[0].push_back(fragment.destination_offset);
+            sources.back()[0].push_back(fragment.source_offset);
+            sizes.back()[0].push_back(fragment.length);
+        }
+    }
+
+    if (!read_buffers.empty()) {
+        auto reads = get_into_ranges_internal(read_buffers, read_keys,
+                                              destinations, sources, sizes,
+                                              &capacities, &cache, false);
+        for (size_t j = 0; j < reads.size(); ++j) {
+            for (size_t k = 0; k < reads[j][0].size(); ++k) {
+                if (!reads[j][0][k] ||
+                    *reads[j][0][k] != static_cast<int64_t>(sizes[j][0][k])) {
+                    results[output_indices[j]] =
+                        tl::unexpected(reads[j][0][k] ? ErrorCode::INVALID_READ
+                                                      : reads[j][0][k].error());
+                }
+            }
+        }
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!results[i]) continue;
+        const auto &info = *owned[i].metadata;
+        const auto &plan = owned[i].plan;
+        if (plan.canonical_read) {
+            auto allocation =
+                client_buffer_allocator_->allocate(info.total_size);
+            if (!allocation) {
+                results[i] = tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                continue;
+            }
+            BufferHandle original(std::move(*allocation));
+            tl::expected<int64_t, ErrorCode> read =
+                tl::unexpected(ErrorCode::INVALID_READ);
+            const std::vector<size_t> capacity{original.size()};
+            auto got = get_into_ranges_internal(
+                {original.ptr()}, {{keys[i]}}, {{{0}}}, {{{0}}},
+                {{{original.size()}}}, &capacity, &cache, false);
+            read = got[0][0][0];
+            auto verified =
+                read ? client_->VerifyObjectChecksum(
+                           keys[i], {{original.ptr(), original.size()}},
+                           info.total_size, info.query_result.object_checksum)
+                     : tl::expected<void, ErrorCode>(
+                           tl::unexpected(read.error()));
+            if (!verified) {
+                results[i] = tl::unexpected(verified.error());
+                continue;
+            }
+            for (const auto &fragment : plan.fragments) {
+                auto copy = scatter_host_to_maybe_device(
+                    static_cast<char *>((*results[i])->ptr()) +
+                        fragment.destination_offset,
+                    static_cast<char *>(original.ptr()) +
+                        fragment.source_offset,
+                    fragment.length, "complete overlapping ranged read");
+                if (!copy) {
+                    results[i] = tl::unexpected(copy.error());
+                    break;
+                }
+            }
+        } else if (!plan.checksum_order.empty()) {
+            std::vector<Slice> views;
+            views.reserve(plan.checksum_order.size());
+            for (size_t j : plan.checksum_order) {
+                const auto &fragment = plan.fragments[j];
+                views.push_back({static_cast<char *>((*results[i])->ptr()) +
+                                     fragment.destination_offset,
+                                 fragment.length});
+            }
+            auto verified = client_->VerifyObjectChecksum(
+                keys[i], views, info.total_size,
+                info.query_result.object_checksum);
+            if (!verified) results[i] = tl::unexpected(verified.error());
+        }
+        if (results[i] && info.query_result.IsLeaseExpired()) {
+            results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+        }
+    }
+    return results;
+}
+
 // Implementation of get_buffer_internal method
 std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const std::string &key,
