@@ -435,7 +435,7 @@ class ReportTest(unittest.TestCase):
 
 
 class ShellLifecycleTest(unittest.TestCase):
-    def test_network_isolation_sets_the_tent_rpc_loopback_address(self):
+    def test_network_isolation_sets_store_and_ep_loopback_interfaces(self):
         script = (ROOT / "scripts/ci/run_xpu_core.sh").read_text()
         start = script.index("container_id=$(docker create")
         stop = script.index("timeout --signal=TERM", start)
@@ -474,6 +474,8 @@ echo container-id
             self.assertEqual(args[args.index("--network") + 1], "none")
             for variable in (
                 "MOONCAKE_LOCAL_HOSTNAME=127.0.0.1",
+                "CCL_KVS_IFACE=lo",
+                "GLOO_SOCKET_IFNAME=lo",
                 "LOCAL_HOSTNAME=127.0.0.1",
                 "MASTER_SERVER=127.0.0.1:50051",
                 "ZE_AFFINITY_MASK=4,5",

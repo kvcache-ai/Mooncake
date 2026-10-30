@@ -52,6 +52,11 @@ inside its private loopback network. CI sets both the Python Store's
 `LOCAL_HOSTNAME` and TENT's distinct `MOONCAKE_LOCAL_HOSTNAME` to `127.0.0.1`.
 TENT's automatic address discovery skips loopback, so the latter must be
 explicit even when Store setup already supplies a local segment name.
+EP's oneCCL KVS also excludes loopback during automatic discovery, so CI sets
+`CCL_KVS_IFACE=lo`; the EP test's CPU process group uses
+`GLOO_SOCKET_IFNAME=lo`. These are container-local interface selections, not
+additional runner-service settings. XCCL and the native Level Zero IPC fast
+path remain enabled; no network access or fallback-only coverage is introduced.
 
 The runtime uses the same digest-pinned Intel PyTorch image as Stage 1.
 Provision compatible Intel GPU drivers and matching SYCL/Level Zero runtimes;
