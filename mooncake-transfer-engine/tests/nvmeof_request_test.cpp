@@ -312,4 +312,32 @@ TEST_F(NVMeoFRequestTest, IgnoresMissingPathInUntouchedBuffer) {
     segment->nvmeof_buffers[1].local_path_map.clear();
     ASSERT_TRUE(transport_->submitTransfer(batch_id_, {Request(0, 4096)}).ok());
 }
+TEST_F(NVMeoFRequestTest, AcceptsExactSliceCapacity) {
+    auto segment = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    auto buffer = segment->nvmeof_buffers.front();
+    buffer.length = 1;
+    segment->nvmeof_buffers.assign(128, buffer);
+    ASSERT_TRUE(transport_->submitTransfer(batch_id_, {Request(0, 128)}).ok());
+    EXPECT_EQ(submitted.size(), 128);
+}
+TEST_F(NVMeoFRequestTest, RejectsSliceOverflowAndAllowsRetry) {
+    auto segment = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    auto buffer = segment->nvmeof_buffers.front();
+    buffer.length = 1;
+    segment->nvmeof_buffers.assign(129, buffer);
+    ExpectRejected({Request(0, 129)});
+    ExpectRejected({Request(0, 64), Request(64, 65)});
+    ASSERT_TRUE(transport_->submitTransfer(batch_id_, {Request(0, 128)}).ok());
+    EXPECT_EQ(submitted.size(), 128);
+}
+TEST_F(NVMeoFRequestTest, RejectsSliceOverflowAfterAcceptedSubmission) {
+    auto segment = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    auto buffer = segment->nvmeof_buffers.front();
+    buffer.length = 1;
+    segment->nvmeof_buffers.assign(129, buffer);
+    ASSERT_TRUE(transport_->submitTransfer(batch_id_, {Request(0, 127)}).ok());
+    ExpectRejected({Request(127, 2)});
+    ASSERT_TRUE(transport_->submitTransfer(batch_id_, {Request(127, 1)}).ok());
+    EXPECT_EQ(NVMeoFTransportTestPeer::sliceCount(*transport_, batch_id_), 128);
+}
 }  // namespace mooncake

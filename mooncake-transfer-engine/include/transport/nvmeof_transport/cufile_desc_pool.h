@@ -86,6 +86,8 @@ class CUFileDescPool {
     // Prevent an unsafe batch handle from being returned to the reusable pool.
     void markUnreusable(int idx);
 
+    size_t getSliceCapacity() const { return max_batch_size_; }
+
     // Get current number of slices in the descriptor
     int getSliceNum(int idx);
 

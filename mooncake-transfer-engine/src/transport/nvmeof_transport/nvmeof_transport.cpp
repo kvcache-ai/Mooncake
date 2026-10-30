@@ -235,6 +235,15 @@ Status NVMeoFTransport::submitTransfer(
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
         segment_desc_map;
     std::unordered_map<SegmentID, uint64_t> segment_sizes;
+    const auto existing_slices = desc_pool_->getSliceNum(nvmeof_desc.desc_idx_);
+    const auto slice_capacity = desc_pool_->getSliceCapacity();
+    if (existing_slices < 0 ||
+        static_cast<size_t>(existing_slices) > slice_capacity) {
+        return Status::InvalidArgument(
+            "NVMeoFTransport: Invalid descriptor capacity");
+    }
+    size_t remaining_slices =
+        slice_capacity - static_cast<size_t>(existing_slices);
     for (const auto &request : entries) {
         const auto target_id = request.target_id;
         if (!segment_desc_map.count(target_id)) {
@@ -269,6 +278,11 @@ Status NVMeoFTransport::submitTransfer(
             const uint64_t buffer_end = buffer_start + buffer.length;
             if (buffer.length != 0 && request.target_offset < buffer_end &&
                 buffer_start < request_end) {
+                if (remaining_slices == 0) {
+                    return Status::InvalidArgument(
+                        "NVMeoFTransport: Exceed descriptor slice capacity");
+                }
+                --remaining_slices;
                 const auto path =
                     buffer.local_path_map.find(local_server_name_);
                 if (path == buffer.local_path_map.end() ||
