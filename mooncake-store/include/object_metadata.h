@@ -10,8 +10,9 @@
 //
 // It has no ownership lock: whoever owns the envelope decides how the
 // envelope as a whole is guarded. The `lock` member below is internal and
-// narrower — it protects only `lease_` and `soft_pin_timeout`, so a holder of
-// the envelope can read either without them tearing.
+// narrower — it protects only `own_lease_`, `group_lease_` and
+// `soft_pin_timeout`, so a holder of the envelope can read either without
+// them tearing.
 
 #include <algorithm>
 #include <chrono>
@@ -143,10 +144,11 @@ struct ObjectMetadata {
     }
 
     mutable SpinLock lock;
-    // Authoritative lease: ungrouped objects own one; grouped objects share
-    // the group's. Never null after construction.
-    mutable std::shared_ptr<Lease> lease_ GUARDED_BY(lock) =
-        std::make_shared<Lease>();
+    // Authoritative lease: an ungrouped object owns the one below and pays no
+    // allocation for it; a grouped object points at its group's shared lease
+    // instead, and the pointer is what keeps that lease alive.
+    mutable Lease own_lease_ GUARDED_BY(lock);
+    mutable std::shared_ptr<Lease> group_lease_ GUARDED_BY(lock);
     mutable std::optional<std::chrono::system_clock::time_point>
         soft_pin_timeout GUARDED_BY(lock);  // committed object soft-pin
                                             // deadline
@@ -308,28 +310,38 @@ struct ObjectMetadata {
         });
     }
 
+    // The authoritative lease: the group's for a grouped object, this
+    // object's own otherwise. Guarded by `lock`; every caller already holds it
+    // or reaches the lease through a method that takes it.
+    Lease& GetLease() const {
+        return group_lease_ ? *group_lease_ : own_lease_;
+    }
+
+    // The group's shared lease, or null when this object is on its own.
+    std::shared_ptr<const Lease> GroupLease() const { return group_lease_; }
+
     // Grant a read lease at now() + ttl. Grouped objects extend the shared
     // group TTL; a zero ttl is a no-op on a live lease (PutEnd cannot
     // expire a live group).
     void GrantReadLease(std::chrono::milliseconds ttl) const {
         SpinLocker locker(&lock);
-        lease_->GrantReadLease(ttl);
+        GetLease().GrantReadLease(ttl);
     }
 
     // Whether the authoritative lease is expired.
     bool IsLeaseExpired() const {
         SpinLocker locker(&lock);
-        return lease_->IsExpired(std::chrono::system_clock::now());
+        return GetLease().IsExpired(std::chrono::system_clock::now());
     }
 
     bool IsLeaseExpired(std::chrono::system_clock::time_point& now) const {
         SpinLocker locker(&lock);
-        return lease_->IsExpired(now);
+        return GetLease().IsExpired(now);
     }
 
     // Lease deadline eviction ranks the object by.
     std::chrono::system_clock::time_point EvictionDeadline() const {
-        return lease_->ExpiresAt();
+        return GetLease().ExpiresAt();
     }
 
     SoftPinEvaluation EvaluateSoftPin(

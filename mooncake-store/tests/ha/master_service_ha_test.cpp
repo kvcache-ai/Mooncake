@@ -1038,7 +1038,7 @@ class MasterServiceHATest : public ::testing::Test {
             &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         ASSERT_TRUE(accessor.Exists());
         SpinLocker locker(&accessor.Get().lock);
-        accessor.Get().lease_->SetDeadline(deadline);
+        accessor.Get().GetLease().SetDeadline(deadline);
     }
 
     static std::chrono::system_clock::time_point LeaseDeadlineForTesting(
@@ -1051,7 +1051,7 @@ class MasterServiceHATest : public ::testing::Test {
             return {};
         }
         SpinLocker locker(&accessor.Get().lock);
-        return accessor.Get().lease_->ExpiresAt();
+        return accessor.Get().GetLease().ExpiresAt();
     }
 
     static uint64_t EvictNamespaceMemoryForTesting(MasterService& service,
