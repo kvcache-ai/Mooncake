@@ -811,7 +811,7 @@ class WorkflowTest(unittest.TestCase):
             (ROOT / ".github/workflows/integration-test-xpu.yml").read_text()
         )
         job = integration["jobs"]["core"]
-        self.assertEqual(job["runs-on"], ["self-hosted", "Linux", "X64", "xpu"])
+        self.assertEqual(job["runs-on"], "xpu")
         build = yaml.safe_load((ROOT / ".github/workflows/ci_xpu.yml").read_text())
         self.assertEqual(
             job["env"]["XPU_IMAGE"], build["jobs"]["build-wheel-xpu"]["container"]

@@ -7,8 +7,8 @@ nightly hardware/application coverage (Stage 3).
 
 ## Runner contract
 
-Register dedicated, isolated, **non-root, ephemeral** runners with labels
-`self-hosted, Linux, X64, xpu`. PR code executes inside the runtime container;
+Register dedicated, isolated, **non-root, ephemeral** runners with the `xpu`
+label (`runs-on: xpu`). PR code executes inside the runtime container;
 do not place credentials, other tenants, or persistent trusted workloads on
 these runners. Destroy/reimage the runner after each job. Docker access is
 host administration capability: container flags are not a substitute for this
