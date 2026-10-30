@@ -680,6 +680,157 @@ TEST_F(MasterServiceTest, PutEndMemoryDoesNotCompleteNoFReplica) {
               ReplicaStatus::COMPLETE);
 }
 
+namespace {
+
+// Endpoint of the single NoF replica a PutStart handed out, or empty when no
+// NoF replica was allocated.
+std::string AllocatedNoFEndpoint(
+    const std::vector<Replica::Descriptor>& replicas) {
+    for (const auto& replica : replicas) {
+        if (replica.is_nof_replica()) {
+            return replica.get_nof_descriptor()
+                .buffer_descriptor.transport_endpoint_;
+        }
+    }
+    return {};
+}
+
+}  // namespace
+
+TEST_F(MasterServiceTest, NoFAllocationSkipsTargetUnreachableFromClient) {
+    std::unique_ptr<MasterService> service(new MasterService());
+    NoFSegment partitioned =
+        MakeNoFSegment("nof_partitioned", "nof_partitioned_endpoint");
+    NoFSegment reachable = MakeNoFSegment(
+        "nof_reachable", "nof_reachable_endpoint",
+        kDefaultSegmentBase + 2 * kDefaultSegmentSize, kDefaultSegmentSize);
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountNoFSegment(partitioned, client_id).has_value());
+    ASSERT_TRUE(service->MountNoFSegment(reachable, client_id).has_value());
+    ASSERT_TRUE(service->ReMountSegment({}, client_id).has_value());
+
+    ASSERT_TRUE(
+        service
+            ->ReportNoFTargetUnreachable(client_id, {partitioned.te_endpoint})
+            .has_value());
+    EXPECT_EQ(MasterServiceTestPeer(*service).GetNoFExcludedSegmentsForTesting(
+                  client_id),
+              std::set<std::string>{partitioned.name});
+
+    // The master still reaches the partitioned target, so only the client's
+    // report can steer allocation away from it.
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.nof_replica_num = 1;
+    for (int i = 0; i < 8; ++i) {
+        const std::string key = "nof_skip_key_" + std::to_string(i);
+        auto put_start_result = service->PutStart(
+            client_id, key, TenantId::Default(), 1024, config);
+        ASSERT_TRUE(put_start_result.has_value()) << "key=" << key;
+        EXPECT_EQ(AllocatedNoFEndpoint(put_start_result.value()),
+                  reachable.te_endpoint)
+            << "key=" << key;
+        ASSERT_TRUE(
+            service
+                ->PutEnd(client_id, key, TenantId::Default(), ReplicaType::ALL)
+                .has_value());
+    }
+}
+
+TEST_F(MasterServiceTest, NoFAllocationFailsWhenEveryTargetIsUnreachable) {
+    std::unique_ptr<MasterService> service(new MasterService());
+    NoFSegment nof_segment = MakeNoFSegment("nof_only", "nof_only_endpoint");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountNoFSegment(nof_segment, client_id).has_value());
+    ASSERT_TRUE(service->ReMountSegment({}, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.nof_replica_num = 1;
+    ASSERT_TRUE(service
+                    ->PutStart(client_id, "nof_before_report",
+                               TenantId::Default(), 1024, config)
+                    .has_value());
+
+    ASSERT_TRUE(
+        service
+            ->ReportNoFTargetUnreachable(client_id, {nof_segment.te_endpoint})
+            .has_value());
+
+    // Failing fast beats handing back a handle the client provably cannot
+    // write to.
+    auto put_start_result = service->PutStart(
+        client_id, "nof_after_report", TenantId::Default(), 1024, config);
+    ASSERT_FALSE(put_start_result.has_value());
+    EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+}
+
+TEST_F(MasterServiceTest, NoFUnreachableReportIsScopedToReportingClient) {
+    std::unique_ptr<MasterService> service(new MasterService());
+    NoFSegment nof_segment =
+        MakeNoFSegment("nof_shared", "nof_shared_endpoint");
+    const UUID owner_id = generate_uuid();
+    const UUID partitioned_client = generate_uuid();
+    const UUID healthy_client = generate_uuid();
+    ASSERT_TRUE(service->MountNoFSegment(nof_segment, owner_id).has_value());
+    ASSERT_TRUE(service->ReMountSegment({}, partitioned_client).has_value());
+
+    ASSERT_TRUE(service
+                    ->ReportNoFTargetUnreachable(partitioned_client,
+                                                 {nof_segment.te_endpoint})
+                    .has_value());
+    EXPECT_TRUE(MasterServiceTestPeer(*service)
+                    .GetNoFExcludedSegmentsForTesting(healthy_client)
+                    .empty());
+
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.nof_replica_num = 1;
+    auto put_start_result = service->PutStart(
+        healthy_client, "nof_other_client", TenantId::Default(), 1024, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    EXPECT_EQ(AllocatedNoFEndpoint(put_start_result.value()),
+              nof_segment.te_endpoint);
+}
+
+TEST_F(MasterServiceTest, NoFUnreachableReportIgnoresEmptyEndpoints) {
+    std::unique_ptr<MasterService> service(new MasterService());
+    NoFSegment nof_segment =
+        MakeNoFSegment("nof_empty_report", "nof_empty_report_endpoint");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountNoFSegment(nof_segment, client_id).has_value());
+    ASSERT_TRUE(service->ReMountSegment({}, client_id).has_value());
+
+    ASSERT_TRUE(service->ReportNoFTargetUnreachable(client_id, {}).has_value());
+    ASSERT_TRUE(
+        service->ReportNoFTargetUnreachable(client_id, {""}).has_value());
+    EXPECT_TRUE(MasterServiceTestPeer(*service)
+                    .GetNoFExcludedSegmentsForTesting(client_id)
+                    .empty());
+}
+
+TEST_F(MasterServiceTest, NoFUnreachableReportRejectsUnknownClient) {
+    std::unique_ptr<MasterService> service(new MasterService());
+    NoFSegment nof_segment =
+        MakeNoFSegment("nof_forged_report", "nof_forged_report_endpoint");
+    const UUID victim_id = generate_uuid();
+    ASSERT_TRUE(service->MountNoFSegment(nof_segment, victim_id).has_value());
+
+    // A UUID the master has no liveness record for must not be able to
+    // record exclusions, neither for itself nor for anyone else.
+    const UUID forged_id = generate_uuid();
+    auto result = service->ReportNoFTargetUnreachable(
+        forged_id, {nof_segment.te_endpoint});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_TRUE(MasterServiceTestPeer(*service)
+                    .GetNoFExcludedSegmentsForTesting(forged_id)
+                    .empty());
+    EXPECT_TRUE(MasterServiceTestPeer(*service)
+                    .GetNoFExcludedSegmentsForTesting(victim_id)
+                    .empty());
+}
+
 TEST_F(MasterServiceTest, PartialRevokePreservesPendingSoftPin) {
     std::unique_ptr<MasterService> service(new MasterService());
     [[maybe_unused]] const auto mem_context = PrepareSimpleSegment(*service);
