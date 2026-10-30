@@ -262,6 +262,23 @@ Status NVMeoFTransport::submitTransfer(
             return Status::InvalidArgument(
                 "NVMeoFTransport: Request must be nonempty and within segment");
         }
+        uint64_t buffer_start = 0;
+        const uint64_t request_end = request.target_offset + request.length;
+        for (const auto &buffer :
+             segment_desc_map.at(target_id)->nvmeof_buffers) {
+            const uint64_t buffer_end = buffer_start + buffer.length;
+            if (buffer.length != 0 && request.target_offset < buffer_end &&
+                buffer_start < request_end) {
+                const auto path =
+                    buffer.local_path_map.find(local_server_name_);
+                if (path == buffer.local_path_map.end() ||
+                    path->second.empty()) {
+                    return Status::InvalidArgument(
+                        "NVMeoFTransport: Missing or empty local buffer path");
+                }
+            }
+            buffer_start = buffer_end;
+        }
     }
 
     size_t task_id = batch_desc.task_list.size();
@@ -292,7 +309,7 @@ Status NVMeoFTransport::submitTransfer(
                 uint64_t slice_end = std::min(segment_end, buffer_end);
                 // 3. init slice and put into TransferTask
                 const char *file_path =
-                    buffer_desc.local_path_map[local_server_name_].c_str();
+                    buffer_desc.local_path_map.at(local_server_name_).c_str();
                 void *source_addr =
                     (char *)request.source + slice_start - segment_start;
                 uint64_t file_offset = slice_start - current_offset;

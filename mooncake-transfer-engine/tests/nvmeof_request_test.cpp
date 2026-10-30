@@ -287,4 +287,29 @@ TEST_F(NVMeoFRequestTest, PreservesExistingTaskOnRejection) {
     EXPECT_EQ(status.s, Transport::COMPLETED);
     EXPECT_EQ(status.transferred_bytes, 4096);
 }
+
+TEST_F(NVMeoFRequestTest, RejectsMissingPathWithoutChangingMetadata) {
+    auto segment = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    auto& paths = segment->nvmeof_buffers[1].local_path_map;
+    paths.clear();
+    ExpectRejected({Request(0, 4096), Request(4096, 4096)});
+    EXPECT_TRUE(paths.empty());
+    paths["nvmeof-request-test"] = path_;
+    ASSERT_TRUE(transport_->submitTransfer(batch_id_, {Request(0, 8192)}).ok());
+}
+TEST_F(NVMeoFRequestTest, RejectsEmptyPathPreservingExistingTask) {
+    ASSERT_TRUE(transport_->submitTransfer(batch_id_, {Request(0, 4096)}).ok());
+    auto segment = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    segment->nvmeof_buffers[1].local_path_map["nvmeof-request-test"] = "";
+    ExpectRejected({Request(4096, 4096)});
+    Transport::TransferStatus status;
+    ASSERT_TRUE(transport_->getTransferStatus(batch_id_, 0, status).ok());
+    EXPECT_EQ(status.s, Transport::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, 4096);
+}
+TEST_F(NVMeoFRequestTest, IgnoresMissingPathInUntouchedBuffer) {
+    auto segment = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    segment->nvmeof_buffers[1].local_path_map.clear();
+    ASSERT_TRUE(transport_->submitTransfer(batch_id_, {Request(0, 4096)}).ok());
+}
 }  // namespace mooncake
