@@ -3117,6 +3117,13 @@ struct MasterService::LegacyRestoreContext {
     size_t dropped_stale_object_count{0};
     std::vector<std::pair<TenantId, std::string>>& repair_remove_keys;
     std::vector<std::pair<TenantId, std::string>>& repair_canonical_keys;
+    // Repairs caused only by replicas whose endpoint the handoff no longer
+    // carries. They are re-derived by the next promotion from the same
+    // snapshot, so they may be submitted in several batches; the overlap
+    // repairs above must stay in one batch, since a durable prefix over a
+    // subset of them would leave the standby with a partial conflict fix.
+    std::vector<std::pair<TenantId, std::string>>& repair_stale_remove_keys;
+    std::vector<std::pair<TenantId, std::string>>& repair_stale_canonical_keys;
     std::vector<std::pair<TenantId, route::ObjectRef>>& installed;
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
                        boost::hash<UUID>>& new_known_owner_records;
@@ -3125,8 +3132,8 @@ struct MasterService::LegacyRestoreContext {
         const StandbyObjectEntry* entry;
         TenantId tenant_id;
         std::string user_key;
-        // At least one replica was dropped because its endpoint is gone.
-        bool lost_unknown_endpoint{false};
+        // How many replicas were dropped because their endpoint is gone.
+        size_t endpoint_dropped_count{0};
     };
     std::vector<AcceptedEntry> accepted;
     std::unordered_set<std::string> object_ids;
@@ -3182,7 +3189,7 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             continue;
         }
         bool valid = true;
-        bool lost_unknown_endpoint = false;
+        size_t endpoint_dropped_count = 0;
         std::vector<size_t> dropped_desc_idx;
         // (segment, address, size, descriptor index) for this object's
         // live memory replicas. They join ctx.pending_ranges only after the
@@ -3209,7 +3216,7 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
                     << "RestoreFromStandbySnapshot: dropping replica id="
                     << desc.id << " on unknown memory endpoint="
                     << buffer.transport_endpoint_ << ", key=" << user_key;
-                lost_unknown_endpoint = true;
+                ++endpoint_dropped_count;
                 dropped_desc_idx.push_back(desc_idx);
                 continue;
             }
@@ -3233,7 +3240,7 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
         }
         const size_t owner = ctx.accepted.size();
         ctx.accepted.push_back({&entry, std::move(tenant_id),
-                                std::move(user_key), lost_unknown_endpoint});
+                                std::move(user_key), endpoint_dropped_count});
         // Registering the drops here is what keeps the rest of the walk
         // honest: the reliable-replica count below and the construction phase
         // both skip them, instead of counting a gone endpoint as reliable or
@@ -3288,6 +3295,17 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             continue;
         }
         const auto discarded_it = ctx.discarded_replicas.find(owner);
+        const size_t discarded_count =
+            discarded_it == ctx.discarded_replicas.end()
+                ? 0
+                : discarded_it->second.size();
+        // True when every replica this walk discarded was dropped because its
+        // endpoint is gone, with no overlap ambiguity mixed in. Only then is
+        // the object's loss an expected consequence of the unloaded segment
+        // rather than a possibly-corrupt entry.
+        const bool only_endpoint_discards =
+            accepted_entry.endpoint_dropped_count > 0 &&
+            accepted_entry.endpoint_dropped_count == discarded_count;
         size_t reliable = 0;
         for (size_t desc_idx = 0;
              desc_idx < accepted_entry.entry->metadata.replicas.size();
@@ -3309,7 +3327,7 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             // object with no readable replica is dropped instead of lingering
             // as metadata-only, and the durable REMOVE below stops a later
             // promotion from replaying it.
-            if (accepted_entry.lost_unknown_endpoint) {
+            if (only_endpoint_discards) {
                 // The segment was unloaded before the handoff, so this is an
                 // expected loss of its contents rather than a corrupt entry
                 // and must not trip the all-rejected guard.
@@ -3318,18 +3336,25 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
                     << "RestoreFromStandbySnapshot: dropping object whose "
                        "replicas all sat on unloaded segments, key="
                     << accepted_entry.entry->key;
+                ctx.repair_stale_remove_keys.emplace_back(
+                    accepted_entry.tenant_id, accepted_entry.user_key);
             } else {
                 NoteLegacyStandbyRejection(ctx, *accepted_entry.entry,
                                            "no_reliable_replica");
+                ctx.repair_remove_keys.emplace_back(accepted_entry.tenant_id,
+                                                    accepted_entry.user_key);
             }
-            ctx.repair_remove_keys.emplace_back(accepted_entry.tenant_id,
-                                                accepted_entry.user_key);
             accepted_entry.entry = nullptr;
         } else if (discarded_it != ctx.discarded_replicas.end()) {
             // Survives with some descriptors discarded: the canonical
-            // repair record carries only the survivors.
-            ctx.repair_canonical_keys.emplace_back(accepted_entry.tenant_id,
-                                                   accepted_entry.user_key);
+            // repair record carries only the survivors. A pure endpoint loss
+            // goes to the chunkable set; anything the overlap pass also
+            // touched stays in the atomic conflict set.
+            auto& repairs = only_endpoint_discards
+                                ? ctx.repair_stale_canonical_keys
+                                : ctx.repair_canonical_keys;
+            repairs.emplace_back(accepted_entry.tenant_id,
+                                 accepted_entry.user_key);
         }
     }
 
@@ -3859,6 +3884,12 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     // the survivors.
     std::vector<std::pair<TenantId, std::string>> repair_remove_keys;
     std::vector<std::pair<TenantId, std::string>> repair_canonical_keys;
+    // Repairs caused only by replicas on unloaded segments. Unlike the
+    // conflict repairs above they are re-derived by the next promotion from
+    // the same snapshot, so they can be submitted in several batches when the
+    // OpLog batch cap is smaller than the set.
+    std::vector<std::pair<TenantId, std::string>> repair_stale_remove_keys;
+    std::vector<std::pair<TenantId, std::string>> repair_stale_canonical_keys;
     // The publications this call installed, so a failed restore can roll its
     // own state back before reporting the error.
     std::vector<std::pair<TenantId, route::ObjectRef>> installed;
@@ -4040,14 +4071,14 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                 // Persist the removal so a later promotion cannot replay
                 // these descriptors onto whatever segment reuses the
                 // endpoint.
-                repair_remove_keys.emplace_back(tenant_id, user_key);
+                repair_stale_remove_keys.emplace_back(tenant_id, user_key);
                 ++chunk_skipped_objects;
                 continue;
             }
             if (dropped_stale_replica) {
                 // Survives with some replicas dropped: persist the survivors
                 // so a later promotion cannot replay the unloaded ones.
-                repair_canonical_keys.emplace_back(tenant_id, user_key);
+                repair_stale_canonical_keys.emplace_back(tenant_id, user_key);
             }
             prepared.push_back({&entry, std::move(tenant_id),
                                 std::move(user_key), std::move(replicas)});
@@ -4088,6 +4119,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                                         /*dropped_stale_object_count=*/0,
                                         repair_remove_keys,
                                         repair_canonical_keys,
+                                        repair_stale_remove_keys,
+                                        repair_stale_canonical_keys,
                                         installed,
                                         new_known_owner_records};
         if (auto r = ValidateLegacyStandbyEntries(legacy_ctx); !r) {
@@ -4185,84 +4218,105 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Durable repair for conflict-derived discards: a later promotion must
-    // not replay what this one dropped. The whole repair set goes out as one
-    // indivisible batch record (REMOVE for full drops, canonical PUT_END
-    // carrying only the survivors for partial ones), and the restore fails
-    // unless that record becomes durable, so the candidate never serves an
-    // index whose discards could resurrect. Committing the entries one by
-    // one would let the set split across batch records, and a durable
-    // prefix covering only part of it leaves exactly one side of a conflict
-    // pair able to survive a later replay on its own. With no OpLog
-    // configured there is nothing to replay into, so the local filter
-    // stands alone. With OpLog enabled but no writer available (e.g. no HA
-    // backend connection string), a filtered discard would be silently
+    // Durable repairs for this promote's discards: a later promotion must not
+    // replay what this one dropped. They come in two classes with different
+    // ordering requirements:
+    //   - Conflict repairs (overlap ambiguity) go out as one indivisible
+    //     batch record (REMOVE for full drops, canonical PUT_END carrying
+    //     only the survivors for partial ones). Committing those one by one
+    //     would let the set split across batch records, and a durable prefix
+    //     covering only part of it leaves exactly one side of a conflict pair
+    //     able to survive a later replay on its own.
+    //   - Stale-endpoint repairs (replicas whose segment the handoff no
+    //     longer carries) are each a function of one object's metadata, and
+    //     the next promotion re-derives them from the same snapshot, so they
+    //     may span several batches when the OpLog batch cap is smaller than
+    //     the set.
+    // Either way the restore fails unless every record becomes durable, so
+    // the candidate never serves an index whose discards could resurrect.
+    // With no OpLog configured there is nothing to replay into, so the local
+    // filter stands alone. With OpLog enabled but no writer available (e.g.
+    // no HA backend connection string), a filtered discard would be silently
     // unrepaired, so the restore fails explicitly instead.
-    if ((!repair_remove_keys.empty() || !repair_canonical_keys.empty()) &&
-        enable_oplog_ && !ordered_oplog_writer_) {
+    const bool have_conflict_repairs =
+        !repair_remove_keys.empty() || !repair_canonical_keys.empty();
+    const bool have_stale_repairs =
+        !repair_stale_remove_keys.empty() ||
+        !repair_stale_canonical_keys.empty();
+    if ((have_conflict_repairs || have_stale_repairs) && enable_oplog_ &&
+        !ordered_oplog_writer_) {
         LOG(ERROR) << "RestoreFromStandbySnapshot: conflict discards need "
                       "durable repair but no OpLog writer is available; "
                       "failing the restore";
         rollback_restored_state();
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    if ((!repair_remove_keys.empty() || !repair_canonical_keys.empty()) &&
-        enable_oplog_ && ordered_oplog_writer_) {
-        std::vector<OpLogEntry> repair_entries;
-        repair_entries.reserve(repair_remove_keys.size() +
-                               repair_canonical_keys.size());
-        for (const auto& [tenant, key] : repair_remove_keys) {
-            OpLogEntry entry;
-            entry.op_type = OpType::REMOVE;
-            entry.tenant_id = tenant.value();
-            entry.object_key = key;
-            repair_entries.push_back(std::move(entry));
-        }
-        for (const auto& [tenant, key] : repair_canonical_keys) {
-            MetadataAccessorRO accessor(this, {tenant, key});
-            OpLogEntry entry;
-            entry.tenant_id = tenant.value();
-            entry.object_key = key;
-            if (!accessor.IsPublished()) {
-                // Survived the conflict but failed construction (e.g.
-                // capacity): nothing installed, so the canonical state is
-                // absence. Repudiate the key outright.
-                entry.op_type = OpType::REMOVE;
-            } else {
-                entry.op_type = OpType::PUT_END;
-                entry.payload = SerializeMetadataForOpLog(accessor.Get());
-            }
-            repair_entries.push_back(std::move(entry));
-        }
+    if ((have_conflict_repairs || have_stale_repairs) && enable_oplog_ &&
+        ordered_oplog_writer_) {
+        // Every payload is built before anything is submitted: the canonical
+        // record serializes the installed metadata, and a later batch must not
+        // observe a state an earlier batch changed.
+        const auto build_entries =
+            [this](const std::vector<std::pair<TenantId, std::string>>&
+                       removals,
+                   const std::vector<std::pair<TenantId, std::string>>&
+                       canonicals) {
+                std::vector<OpLogEntry> entries;
+                entries.reserve(removals.size() + canonicals.size());
+                for (const auto& [tenant, key] : removals) {
+                    OpLogEntry entry;
+                    entry.op_type = OpType::REMOVE;
+                    entry.tenant_id = tenant.value();
+                    entry.object_key = key;
+                    entries.push_back(std::move(entry));
+                }
+                for (const auto& [tenant, key] : canonicals) {
+                    MetadataAccessorRO accessor(this, {tenant, key});
+                    OpLogEntry entry;
+                    entry.tenant_id = tenant.value();
+                    entry.object_key = key;
+                    if (!accessor.IsPublished()) {
+                        // Survived the conflict but failed construction (e.g.
+                        // capacity): nothing installed, so the canonical state
+                        // is absence. Repudiate the key outright.
+                        entry.op_type = OpType::REMOVE;
+                    } else {
+                        entry.op_type = OpType::PUT_END;
+                        entry.payload =
+                            SerializeMetadataForOpLog(accessor.Get());
+                    }
+                    entries.push_back(std::move(entry));
+                }
+                return entries;
+            };
 
-        const size_t total = repair_entries.size();
-        auto remaining = std::make_shared<std::atomic<size_t>>(total);
-        auto done = std::make_shared<std::promise<void>>();
-        std::future<void> durable_future = done->get_future();
-        auto on_durable = [remaining, done](const OpLogEntry&) {
-            if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                done->set_value();
+        // Submits one indivisible batch and waits for it to become durable.
+        // 0 means no cap: a slow backend should not turn a recoverable delay
+        // into a promotion failure. A positive timeout still fail-closes, and
+        // a later durable completion is left in the log for the retry to
+        // observe rather than rolling it back locally.
+        const auto append_and_await =
+            [this](std::vector<OpLogEntry> entries) -> ErrorCode {
+            auto remaining =
+                std::make_shared<std::atomic<size_t>>(entries.size());
+            auto done = std::make_shared<std::promise<void>>();
+            std::future<void> durable_future = done->get_future();
+            auto on_durable = [remaining, done](const OpLogEntry&) {
+                if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    done->set_value();
+                }
+            };
+            auto appended = AppendOpLogBatchWithDurableFinalize(
+                std::move(entries), on_durable);
+            if (!appended) {
+                return appended.error();
             }
-        };
-
-        ErrorCode repair_err = ErrorCode::OK;
-        auto appended = AppendOpLogBatchWithDurableFinalize(
-            std::move(repair_entries), on_durable);
-        if (!appended) {
-            repair_err = appended.error();
-        }
-        if (repair_err == ErrorCode::OK) {
-            // Wait on the writer's durability callback. 0 means no cap: a
-            // slow backend should not turn a recoverable delay into a
-            // promotion failure. A positive timeout still fail-closes, and
-            // a later durable completion is left in the log for the retry
-            // to observe rather than rolling it back locally.
             std::future_status durable_status = std::future_status::ready;
             if (restore_repair_durable_timeout_ms_ == 0) {
                 durable_future.wait();
             } else {
-                durable_status =
-                    durable_future.wait_for(std::chrono::milliseconds(
+                durable_status = durable_future.wait_for(
+                    std::chrono::milliseconds(
                         restore_repair_durable_timeout_ms_));
             }
             if (durable_status != std::future_status::ready) {
@@ -4270,7 +4324,55 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                               "durable within "
                            << restore_repair_durable_timeout_ms_
                            << "ms, failing the restore";
-                repair_err = ErrorCode::INTERNAL_ERROR;
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            return ErrorCode::OK;
+        };
+
+        auto conflict_entries =
+            build_entries(repair_remove_keys, repair_canonical_keys);
+        auto stale_entries =
+            build_entries(repair_stale_remove_keys,
+                          repair_stale_canonical_keys);
+        const size_t total = conflict_entries.size() + stale_entries.size();
+        size_t durable_records = 0;
+        size_t durable_batches = 0;
+
+        ErrorCode repair_err = ErrorCode::OK;
+        if (!conflict_entries.empty()) {
+            // Conflict repairs stay in one indivisible batch: a durable prefix
+            // covering only part of them would leave one side of a conflict
+            // pair able to survive a later replay on its own.
+            durable_records += conflict_entries.size();
+            repair_err = append_and_await(std::move(conflict_entries));
+            if (repair_err == ErrorCode::OK) {
+                ++durable_batches;
+            }
+        }
+        if (repair_err == ErrorCode::OK && !stale_entries.empty()) {
+            // Stale-endpoint repairs carry no cross-key invariant: each one is
+            // a function of a single object's metadata and the next promotion
+            // re-derives it from the same snapshot, so they may span several
+            // batches when the OpLog batch cap is smaller than the set. Each
+            // batch is awaited before the next is reserved, which also keeps
+            // the writer's waiting-slot budget bounded.
+            const size_t batch_cap =
+                std::max<size_t>(1, oplog_batch_max_entries_);
+            for (size_t offset = 0; offset < stale_entries.size();
+                 offset += batch_cap) {
+                const size_t end =
+                    std::min(offset + batch_cap, stale_entries.size());
+                std::vector<OpLogEntry> chunk;
+                chunk.reserve(end - offset);
+                for (size_t i = offset; i < end; ++i) {
+                    chunk.push_back(std::move(stale_entries[i]));
+                }
+                repair_err = append_and_await(std::move(chunk));
+                if (repair_err != ErrorCode::OK) {
+                    break;
+                }
+                durable_records += end - offset;
+                ++durable_batches;
             }
         }
         if (repair_err != ErrorCode::OK) {
@@ -4281,7 +4383,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
             return tl::make_unexpected(repair_err);
         }
         LOG(INFO) << "RestoreFromStandbySnapshot: durable repair records="
-                  << total;
+                  << durable_records << ", batches=" << durable_batches
+                  << ", total=" << total;
     }
 
     // Publish the accounting swap only after nothing can fail anymore: the

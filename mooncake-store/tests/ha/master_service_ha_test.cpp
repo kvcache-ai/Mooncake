@@ -3472,6 +3472,100 @@ TEST_F(MasterServiceBatchRecordE2ETest,
               endpoint);
 }
 
+TEST_F(MasterServiceHATest, RestoreRepairSpansMultipleBatches) {
+    const std::string cluster_id = "test_restore_repair_chunks";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const std::string endpoint = "standby_repair_chunk_segment";
+    const std::string gone_endpoint = "standby_repair_chunk_gone_segment";
+    auto survivor =
+        MakeStandbyObject("standby_repair_chunk_survivor", endpoint);
+    survivor.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto gone = MakeStandbyMemoryReplica(gone_endpoint);
+    gone.id = 2;
+    gone.get_memory_descriptor().buffer_descriptor.buffer_address_ =
+        kDefaultSegmentBase + 4096;
+    survivor.metadata.replicas.push_back(std::move(gone));
+
+    std::vector<StandbyObjectEntry> objects{survivor};
+    for (int i = 0; i < 3; ++i) {
+        auto lost = MakeStandbyObject(
+            "standby_repair_chunk_lost_" + std::to_string(i), gone_endpoint);
+        lost.metadata.replicas.front().id = 10 + i;
+        objects.push_back(std::move(lost));
+    }
+
+    // Four repair records against a batch cap of two: the stale-endpoint
+    // repairs must span batches instead of being refused as one oversized
+    // batch.
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        objects, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+
+    auto replicas = ReplicaDescriptorsForTesting(
+        service, kDefaultTenant, "standby_repair_chunk_survivor");
+    ASSERT_EQ(1u, replicas.size());
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(ReplicaCountForTesting(
+                      service, kDefaultTenant,
+                      "standby_repair_chunk_lost_" + std::to_string(i)),
+                  0);
+    }
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    ASSERT_EQ(4u, prefix.last_seq);
+
+    // Replay the durable records onto a standby that still carries the
+    // unloaded descriptors: every batch has to land for the standby to match
+    // the promoted master.
+    MockMetadataStore standby_metadata;
+    for (const auto& object : objects) {
+        standby_metadata.PutMetadata(object.tenant_id, object.key,
+                                     object.metadata);
+    }
+    OpLogApplier applier(&standby_metadata, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+    size_t applied = 0;
+    for (int i = 0; i < 50 && applied < prefix.last_seq; ++i) {
+        auto poll = reader.PollOnce();
+        ASSERT_EQ(ErrorCode::OK, poll.error);
+        applied += poll.applied_entries;
+        if (applied < prefix.last_seq) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_EQ(prefix.last_seq, applied);
+
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_FALSE(standby_metadata.Exists(
+            kDefaultTenant.value(),
+            "standby_repair_chunk_lost_" + std::to_string(i)));
+    }
+    auto canonical = standby_metadata.GetMetadata(
+        kDefaultTenant.value(), "standby_repair_chunk_survivor");
+    ASSERT_TRUE(canonical.has_value());
+    ASSERT_EQ(1u, canonical->replicas.size());
+    EXPECT_EQ(canonical->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              endpoint);
+}
+
 TEST_F(MasterServiceHATest, RestoreRejectionLeavesNoStaleRange) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
