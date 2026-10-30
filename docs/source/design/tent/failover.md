@@ -79,8 +79,8 @@ Submit-stage failures (`submitTransferTasks` returning non-OK) are **not** retri
 
 Inside `RdmaTransport`, each completion drives the rail monitor:
 
-* Bad completion → `rail.markFailed(local_nic, remote_nic)`
-* Good completion → `rail.markRecovered(local_nic, remote_nic)`
+* Bad completion → `rail.markFailed(local_nic, remote_nic, probe_token)`
+* Good completion → `rail.markRecovered(local_nic, remote_nic, probe_token)`
 
 `markFailed` bumps `error_count` inside `error_window_`. Once the count hits `error_threshold_` the rail is paused until `now + cooldown_`; the cooldown escalates only when a *fresh* pause arms (`was_paused == false`), never within one burst — a single outage of N error WQEs in one window is one trip, not N. On a repeat failure across recovery cycles it doubles up to `kMaxCooldown` (300 s).
 
@@ -89,9 +89,45 @@ Inside `RdmaTransport`, each completion drives the rail monitor:
 The admission gate is split into a pure predicate and a mutating admit:
 
 * `isAvailable(local, remote) const` returns true only for a Closed/healthy rail. It never mutates state and never calls `updateBestMapping`, so it is safe to call from `updateBestMapping` (the mapping rebuild) without the recursion the old single `available()` had.
-* `admit(local, remote)` is the only path that arms a probe/trial. For a Closed rail it returns true with no mutation. While a rail is Open (cooldown running) it admits one exploratory probe every `probe_interval_`; a probe success closes the rail early (transient-fault recovery in seconds rather than the full cooldown), a probe failure is a no-op for escalation (the rail was already paused, so defect A holds). When the cooldown expires without a probe proving the rail healthy, `admit` transitions to Half-Open and admits exactly ONE trial — it does not fully reopen. Escalation happens only if that trial fails (`markFailed` doubles the cooldown and re-arms); a trial success closes the rail. Elapsed time alone never proves the path is healthy, so clock expiry alone never escalates and never floods a still-dead peer with every slice. `probe_in_flight` gates a second probe/trial from racing the first while it is on the wire (single-threaded per-worker ownership makes a bool sufficient); a pre-wire failure that armed a probe but never reached the wire calls `cancelProbe` to roll the admission back.
+* `admit(local, remote, probe_token)` is the only path that arms a probe/trial and always writes the token output. A healthy rail returns true with token `0`; a paused rail returns a nonzero token when admitting a probe/trial. The owner must pass that token to `markFailed`, `markRecovered`, or `cancelProbe`; ordinary completions pass `0`. While a rail is Open (cooldown running) it admits one exploratory probe every `probe_interval_`; a probe success closes the rail early (transient-fault recovery in seconds rather than the full cooldown), a probe failure is a no-op for escalation (the rail was already paused, so defect A holds). When the cooldown expires without a probe proving the rail healthy, `admit` transitions to Half-Open and admits exactly ONE trial — it does not fully reopen. Escalation happens only if that trial fails (`markFailed` doubles the cooldown and re-arms); a trial success closes the rail. Elapsed time alone never proves the path is healthy, so clock expiry alone never escalates and never floods a still-dead peer with every slice. `probe_in_flight` gates a second probe/trial from racing the first while it is on the wire; a pre-wire failure that armed a probe but never reached the wire calls `cancelProbe` to roll the admission back.
 
 This produces two recovery signals — a probe/trial result, and a live success on a posted transfer — so a flaky rail returns to service at the first good completion instead of waiting for the full cooldown, and a still-dead peer is probed at one trial per `probe_interval_` rather than slammed every cycle.
+
+### UB rail recovery
+
+UB rails have their own monitor, `RailMonitor`, keyed by the physical rail
+(`UbRailKey`: local topology id, remote segment id, remote device id) rather
+than by the endpoint incarnation, so health and learned bandwidth survive an
+endpoint rebuild. Posting paths read it the same way RDMA reads its rail state:
+
+* Bad completion → `recordError` / `recordTimeout`; good completion →
+  `recordSuccess`, which also feeds the EWMA used to rank paths.
+* `error_threshold` (3) errors inside `error_window_ns` (10 s) pause the rail
+  for `cooldown_ns`, which is bound to `transports/ub/endpoint_cooldown_ms`
+  (default 1000 ms).
+* Path selection skips paused rails and ranks the rest by quota availability,
+  topology locality and learned bandwidth *before* resolving endpoints, so a
+  paused or loaded rail is avoided without paying a bootstrap round trip.
+* `recordEndpointRebuild` records at most one rebuild per endpoint generation
+  per rail and is safe to call from converging or retried rebuild paths. The
+  first generation to become ready establishes the rail's baseline, so the
+  initial bootstrap is not counted as a rebuild; only later generation
+  increases advance `endpoint_rebuilds`.
+
+Local device failure is handled separately from rail health. A failed local
+device marks its context unavailable, and the transport then calls
+`EndpointStore::retireLocalDevice`, which unpublishes every endpoint backed by
+that device and quarantines any whose native cleanup has not completed. The
+context only returns to service once every one of them reaches `Destroyed`,
+because reactivating JFC health before that barrier would post onto Jetty sets
+that still lack their flush fence. The cache-capacity path retries quarantined
+endpoints only when the store actually needs a slot, and at most once per sweep
+interval, so a still-failing device cannot turn every posting call into a
+serialized provider call. Device-failure cleanup and shutdown retry retirement
+independently of that cache-capacity throttle.
+
+When UB cannot resolve or post a slice, the generic submit-stage failover
+described above moves the owner to the remaining candidate transports.
 
 ## Configuration
 
@@ -166,3 +202,4 @@ Submit-stage recovery is exercised through the same FakeTransport harness with `
 * A Closed rail resets its backoff memory entirely on recovery (`markRecovered`, or expiry reopen in `isAvailable`'s predecessor behavior). Escalation across cycles now happens via a Half-Open trial failure (`markFailed` doubles the cooldown and re-arms), not via clock expiry — so a rail that flaps does back off harder when its trial probes keep failing, while a proven-healthy recovery starts fresh. If this ever proves too aggressive the fix is to decay rather than escalate on trial failure.
 * Cross-transport failover is driven purely by return status; there is no latency-based "this transport is healthy but too slow, try another" signal. That belongs to the scheduler, not this document.
 * Runtime-layer failover is covered by FakeTransport tests in the `tent-ci` `cuda-off` legs. DMA integrity, real WC errors, and staging under NVLink still need hardware runners; see {ref}`TENT Testing <tent-testing>`.
+* UB rail health, endpoint-rebuild telemetry and device-failure cleanup are covered by fake-URMA-adapter tests (`tent_ub_core_test`, `tent_ub_teardown_test`, `tent_ub_native_data_path_test`, `tent_rail_monitor_test`). Real provider errors, bonding-device failover and the bootstrap fan-out of a cold multi-rail peer still need Kunpeng/URMA hardware runners.

@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <barrier>
 #include <cstdint>
 #include <map>
 #include <optional>
 #include <set>
 #include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -15,6 +17,7 @@
 
 namespace {
 
+using mooncake::conductor::common::PublisherKind;
 using mooncake::conductor::prefixindex::BlockPresenceSnapshot;
 using mooncake::conductor::prefixindex::CacheHitResult;
 using mooncake::conductor::prefixindex::ContextKey;
@@ -93,19 +96,21 @@ HashProfile SglangBigramProfile() {
 }
 
 EngineRegistration Registration(const std::string& instance_id = "instance-a",
-                                int64_t dp_rank = 0) {
+                                int64_t dp_rank = 0,
+                                PublisherKind kind = PublisherKind::kVllm) {
     const ContextKey context = TestContext();
     return {.context = context,
             .profile = TestProfile(),
             .instance_id = instance_id,
             .dp_rank = dp_rank,
             .effective_block_size = context.block_size,
-            .cache_group = 0};
+            .cache_group = 0,
+            .publisher_kind = kind};
 }
 
-EngineOwner GpuOwner(const std::string& instance_id = "instance-a",
-                     int64_t dp_rank = 0,
-                     const std::string& stream = "stream-a") {
+EngineOwner DeviceOwner(const std::string& instance_id = "instance-a",
+                        int64_t dp_rank = 0,
+                        const std::string& stream = "stream-a") {
     return {.source_stream = stream,
             .instance_id = instance_id,
             .dp_rank = dp_rank};
@@ -128,8 +133,8 @@ RankCacheHitResult RankMatch(int64_t device, int64_t local, int64_t shared,
             .disk = disk};
 }
 
-EngineMutation Gpu(const std::vector<ProjectedPrefix>& prefixes,
-                   EngineOwner owner = GpuOwner()) {
+EngineMutation Device(const std::vector<ProjectedPrefix>& prefixes,
+                      EngineOwner owner = DeviceOwner()) {
     const ContextKey context = TestContext();
     return {.context = context,
             .prefixes = prefixes,
@@ -150,7 +155,7 @@ SharedMutation Shared(const std::vector<ProjectedPrefix>& prefixes,
             .cache_group = 0};
 }
 
-EngineClear ClearFor(EngineOwner owner = GpuOwner()) {
+EngineClear ClearFor(EngineOwner owner = DeviceOwner()) {
     const ContextKey context = TestContext();
     return {.context = context,
             .owner = std::move(owner),
@@ -281,6 +286,10 @@ TEST(Registration, InvalidInputsDoNotCreateContextState) {
     negative_rank.dp_rank = -1;
     invalid.push_back(negative_rank);
 
+    auto pool_publisher = Registration();
+    pool_publisher.publisher_kind = PublisherKind::kMooncake;
+    invalid.push_back(pool_publisher);
+
     auto malformed_profile = Registration();
     malformed_profile.profile.root_digest = "not-a-digest";
     invalid.push_back(malformed_profile);
@@ -330,9 +339,11 @@ TEST(Registration, SglangSeedVariantsShareContextAndBinding) {
         PrefixCacheTable table;
         auto first = Registration();
         first.profile = profile;
+        first.publisher_kind = PublisherKind::kSglang;
         ASSERT_TRUE(table.Register(first).error.empty());
         auto second = Registration("instance-b", 1);
         second.profile = profile;
+        second.publisher_kind = PublisherKind::kSglang;
         second.profile.python_hash_seed = "different-unused-seed";
         ASSERT_TRUE(table.Register(second).error.empty());
         EXPECT_TRUE(table.ValidateProfileBinding(TestContext(), second.profile)
@@ -382,13 +393,39 @@ TEST(Registration, TracksEveryInstanceAndRankIdempotently) {
     EXPECT_EQ(state.profile, TestProfile());
     EXPECT_EQ(state.instance_ranks.at("instance-a"), (std::set<int64_t>{0, 2}));
     EXPECT_EQ(state.instance_ranks.at("instance-b"), (std::set<int64_t>{1}));
+    EXPECT_EQ(state.instance_publishers.at("instance-a").at(0),
+              PublisherKind::kVllm);
+    EXPECT_EQ(state.instance_publishers.at("instance-a").at(2),
+              PublisherKind::kVllm);
+    EXPECT_EQ(state.instance_publishers.at("instance-b").at(1),
+              PublisherKind::kVllm);
     EXPECT_TRUE(state.blocks.empty());
+}
+
+TEST(Registration, PublisherKindConflictPreservesStateAndUnregisterRemovesIt) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration("instance-a", 0));
+    const auto before = PrefixCacheTableTestPeer::Snapshot(table);
+    const auto conflict =
+        table.Register(Registration("instance-a", 0, PublisherKind::kSglang));
+    EXPECT_FALSE(conflict.inserted);
+    EXPECT_NE(conflict.error.find("publisher kind"), std::string::npos);
+    EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), before);
+
+    ASSERT_EQ(table.Unregister(TestContext(), "instance-a", 0), "");
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table)
+                    .contexts.at(TestContext())
+                    .instance_publishers.empty());
+    auto replacement =
+        table.Register(Registration("instance-a", 0, PublisherKind::kSglang));
+    EXPECT_TRUE(replacement.error.empty());
+    EXPECT_TRUE(replacement.inserted);
 }
 
 TEST(Registration, ConflictingProfilePreservesCompleteState) {
     PrefixCacheTable table;
     RegisterOrFail(table, Registration());
-    ASSERT_EQ(table.StoreEngine(Gpu({Prefix(1)})), "");
+    ASSERT_EQ(table.StoreEngine(Device({Prefix(1)})), "");
     const auto before = PrefixCacheTableTestPeer::Snapshot(table);
 
     auto conflicting = Registration("instance-b", 1);
@@ -454,17 +491,17 @@ TEST(Registration, MixedAlgorithmsUnderOneContextAreRejected) {
     }
 }
 
-TEST(Mutations, StoreRequiresKnownContextAndRegisteredGpuRank) {
+TEST(Mutations, StoreRequiresKnownContextAndRegisteredDeviceRank) {
     PrefixCacheTable table;
-    const auto gpu = Gpu({Prefix(1)});
+    const auto device = Device({Prefix(1)});
     const auto shared = Shared({Prefix(1)}, StorageTier::kCpuShare);
 
-    EXPECT_FALSE(table.StoreEngine(gpu).empty());
+    EXPECT_FALSE(table.StoreEngine(device).empty());
     EXPECT_FALSE(table.StoreShared(shared).empty());
     EXPECT_EQ(table.GetGlobalView().context_count, 0);
 
     RegisterOrFail(table, Registration("instance-a", 1));
-    EXPECT_FALSE(table.StoreEngine(gpu).empty());
+    EXPECT_FALSE(table.StoreEngine(device).empty());
     EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table)
                     .contexts.at(TestContext())
                     .blocks.empty());
@@ -473,14 +510,14 @@ TEST(Mutations, StoreRequiresKnownContextAndRegisteredGpuRank) {
 TEST(Mutations, InvalidGroupTierAndOwnersPreserveState) {
     PrefixCacheTable table;
     RegisterOrFail(table, Registration());
-    ASSERT_EQ(table.StoreEngine(Gpu({Prefix(1)})), "");
+    ASSERT_EQ(table.StoreEngine(Device({Prefix(1)})), "");
     const auto before = PrefixCacheTableTestPeer::Snapshot(table);
 
-    auto bad_group = Gpu({Prefix(2)});
+    auto bad_group = Device({Prefix(2)});
     bad_group.cache_group = 3;
     EXPECT_FALSE(table.StoreEngine(bad_group).empty());
 
-    auto bad_owner = Gpu({Prefix(2)});
+    auto bad_owner = Device({Prefix(2)});
     bad_owner.owner.source_stream.clear();
     EXPECT_FALSE(table.StoreEngine(bad_owner).empty());
 
@@ -490,21 +527,22 @@ TEST(Mutations, InvalidGroupTierAndOwnersPreserveState) {
     EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), before);
 }
 
-TEST(Mutations, DuplicateGpuStoreAndRemoveAreIdempotent) {
+TEST(Mutations, DuplicateDeviceStoreAndRemoveAreIdempotent) {
     PrefixCacheTable table;
     RegisterOrFail(table, Registration());
     const ProjectedPrefix prefix = Prefix(7);
-    const auto mutation = Gpu({prefix});
+    const auto mutation = Device({prefix});
 
     ASSERT_EQ(table.StoreEngine(mutation), "");
     ASSERT_EQ(table.StoreEngine(mutation), "");
     EXPECT_EQ(Presence(table, prefix).device_owners,
-              (std::set<EngineOwner>{GpuOwner()}));
+              (std::set<EngineOwner>{DeviceOwner()}));
 
-    auto absent_owner = Gpu({prefix}, GpuOwner("instance-b", 0, "stream-b"));
+    auto absent_owner =
+        Device({prefix}, DeviceOwner("instance-b", 0, "stream-b"));
     ASSERT_EQ(table.RemoveEngine(absent_owner), "");
     EXPECT_EQ(Presence(table, prefix).device_owners,
-              (std::set<EngineOwner>{GpuOwner()}));
+              (std::set<EngineOwner>{DeviceOwner()}));
 
     ASSERT_EQ(table.RemoveEngine(mutation), "");
     ASSERT_EQ(table.RemoveEngine(mutation), "");
@@ -550,15 +588,15 @@ TEST(Mutations, BlockLivesUntilEveryTierOwnerSetIsEmpty) {
     PrefixCacheTable table;
     RegisterOrFail(table, Registration());
     const ProjectedPrefix prefix = Prefix(11);
-    const auto gpu = Gpu({prefix});
+    const auto device = Device({prefix});
     const auto cpu =
         Shared({prefix}, StorageTier::kCpuShare, SharedOwner("cpu"));
     const auto disk = Shared({prefix}, StorageTier::kDisk, SharedOwner("disk"));
 
-    ASSERT_EQ(table.StoreEngine(gpu), "");
+    ASSERT_EQ(table.StoreEngine(device), "");
     ASSERT_EQ(table.StoreShared(cpu), "");
     ASSERT_EQ(table.StoreShared(disk), "");
-    ASSERT_EQ(table.RemoveEngine(gpu), "");
+    ASSERT_EQ(table.RemoveEngine(device), "");
     EXPECT_TRUE(Presence(table, prefix).device_owners.empty());
     EXPECT_FALSE(Presence(table, prefix).cpu_share_owners.empty());
     EXPECT_FALSE(Presence(table, prefix).disk_owners.empty());
@@ -573,21 +611,21 @@ TEST(Mutations, BlockLivesUntilEveryTierOwnerSetIsEmpty) {
                     .blocks.empty());
 }
 
-TEST(Mutations, GpuAndSharedClearAreExactlyOwnerScoped) {
+TEST(Mutations, DeviceAndSharedClearAreExactlyOwnerScoped) {
     PrefixCacheTable table;
     RegisterOrFail(table, Registration("instance-a", 0));
     RegisterOrFail(table, Registration("instance-b", 1));
     const ProjectedPrefix prefix = Prefix(21);
-    const EngineOwner engine_a = GpuOwner("instance-a", 0, "stream-a");
+    const EngineOwner engine_a = DeviceOwner("instance-a", 0, "stream-a");
     const EngineOwner engine_a_other_stream =
-        GpuOwner("instance-a", 0, "stream-a-other");
-    const EngineOwner engine_b = GpuOwner("instance-b", 1, "stream-b");
+        DeviceOwner("instance-a", 0, "stream-a-other");
+    const EngineOwner engine_b = DeviceOwner("instance-b", 1, "stream-b");
     const SharedObjectOwner shared_a = SharedOwner("object-a");
     const SharedObjectOwner shared_b = SharedOwner("object-b");
 
-    ASSERT_EQ(table.StoreEngine(Gpu({prefix}, engine_a)), "");
-    ASSERT_EQ(table.StoreEngine(Gpu({prefix}, engine_a_other_stream)), "");
-    ASSERT_EQ(table.StoreEngine(Gpu({prefix}, engine_b)), "");
+    ASSERT_EQ(table.StoreEngine(Device({prefix}, engine_a)), "");
+    ASSERT_EQ(table.StoreEngine(Device({prefix}, engine_a_other_stream)), "");
+    ASSERT_EQ(table.StoreEngine(Device({prefix}, engine_b)), "");
     ASSERT_EQ(
         table.StoreShared(Shared({prefix}, StorageTier::kCpuShare, shared_a)),
         "");
@@ -623,7 +661,7 @@ TEST(Mutations, UnknownRemoveClearAndUnregisterNeverCreateState) {
     PrefixCacheTable table;
     const ContextKey context = TestContext();
 
-    EXPECT_EQ(table.RemoveEngine(Gpu({Prefix(1)})), "");
+    EXPECT_EQ(table.RemoveEngine(Device({Prefix(1)})), "");
     EXPECT_EQ(table.ClearEngine(ClearFor()), "");
     EXPECT_EQ(table.RemoveShared(Shared({Prefix(1)}, StorageTier::kCpuShare)),
               "");
@@ -634,23 +672,23 @@ TEST(Mutations, UnknownRemoveClearAndUnregisterNeverCreateState) {
     EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table).contexts.empty());
 }
 
-TEST(Unregister, RemovesOnlySelectedRankGpuOwners) {
+TEST(Unregister, RemovesOnlySelectedRankDeviceOwners) {
     PrefixCacheTable table;
     RegisterOrFail(table, Registration("instance-a", 0));
     RegisterOrFail(table, Registration("instance-a", 1));
     RegisterOrFail(table, Registration("instance-b", 0));
     const ProjectedPrefix prefix = Prefix(31);
-    const EngineOwner a0 = GpuOwner("instance-a", 0, "stream-a0");
+    const EngineOwner a0 = DeviceOwner("instance-a", 0, "stream-a0");
     const EngineOwner a0_second_stream =
-        GpuOwner("instance-a", 0, "stream-a0-second");
-    const EngineOwner a1 = GpuOwner("instance-a", 1, "stream-a1");
-    const EngineOwner b0 = GpuOwner("instance-b", 0, "stream-b0");
+        DeviceOwner("instance-a", 0, "stream-a0-second");
+    const EngineOwner a1 = DeviceOwner("instance-a", 1, "stream-a1");
+    const EngineOwner b0 = DeviceOwner("instance-b", 0, "stream-b0");
     const SharedObjectOwner shared = SharedOwner();
 
-    ASSERT_EQ(table.StoreEngine(Gpu({prefix}, a0)), "");
-    ASSERT_EQ(table.StoreEngine(Gpu({prefix}, a0_second_stream)), "");
-    ASSERT_EQ(table.StoreEngine(Gpu({prefix}, a1)), "");
-    ASSERT_EQ(table.StoreEngine(Gpu({prefix}, b0)), "");
+    ASSERT_EQ(table.StoreEngine(Device({prefix}, a0)), "");
+    ASSERT_EQ(table.StoreEngine(Device({prefix}, a0_second_stream)), "");
+    ASSERT_EQ(table.StoreEngine(Device({prefix}, a1)), "");
+    ASSERT_EQ(table.StoreEngine(Device({prefix}, b0)), "");
     ASSERT_EQ(
         table.StoreShared(Shared({prefix}, StorageTier::kCpuShare, shared)),
         "");
@@ -685,9 +723,10 @@ TEST(Query, ExactTwoInstanceSharedCacheExample) {
     const auto hashes = Hashes(tokens);
     ASSERT_EQ(hashes.size(), 3u);
 
-    ASSERT_EQ(table.StoreEngine(Gpu({hashes[0], hashes[1]},
-                                    GpuOwner("instance-1", 0, "engine-1"))),
-              "");
+    ASSERT_EQ(
+        table.StoreEngine(Device({hashes[0], hashes[1]},
+                                 DeviceOwner("instance-1", 0, "engine-1"))),
+        "");
     ASSERT_EQ(table.StoreShared(Shared(hashes, StorageTier::kCpuShare,
                                        SharedOwner("cpu-object"))),
               "");
@@ -722,6 +761,7 @@ TEST(Query, TrailingPartialBlockNeverReportsMoreThanPromptTokens) {
     PrefixCacheTable table;
     auto registration = Registration();
     registration.profile = SglangProfile();
+    registration.publisher_kind = PublisherKind::kSglang;
     RegisterOrFail(table, registration);
 
     // 40 tokens over a 16-token block size: two whole blocks plus a trailing
@@ -730,7 +770,7 @@ TEST(Query, TrailingPartialBlockNeverReportsMoreThanPromptTokens) {
     const auto hashes = SglangHashes(tokens);
     ASSERT_EQ(hashes.size(), 3u);
 
-    ASSERT_EQ(table.StoreEngine(Gpu({hashes[0], hashes[1], hashes[2]})), "");
+    ASSERT_EQ(table.StoreEngine(Device({hashes[0], hashes[1], hashes[2]})), "");
     ASSERT_EQ(table.StoreShared(Shared(hashes, StorageTier::kCpuShare)), "");
     ASSERT_EQ(table.StoreShared(Shared(hashes, StorageTier::kDisk)), "");
 
@@ -748,6 +788,7 @@ TEST(Query, WholeBlockRunIsUnaffectedByThePromptLengthClamp) {
     PrefixCacheTable table;
     auto registration = Registration();
     registration.profile = SglangProfile();
+    registration.publisher_kind = PublisherKind::kSglang;
     RegisterOrFail(table, registration);
 
     const auto tokens = Tokens(40);
@@ -770,6 +811,7 @@ TEST(Query, BigramFullMatchReportsOneFewerPositionThanPromptTokens) {
     PrefixCacheTable table;
     auto registration = Registration();
     registration.profile = SglangBigramProfile();
+    registration.publisher_kind = PublisherKind::kSglang;
     RegisterOrFail(table, registration);
 
     // 40 raw tokens over a 16-token block size. The bigram chain covers 39
@@ -778,7 +820,7 @@ TEST(Query, BigramFullMatchReportsOneFewerPositionThanPromptTokens) {
     const auto hashes = SglangBigramHashes(tokens);
     ASSERT_EQ(hashes.size(), 3u);
 
-    ASSERT_EQ(table.StoreEngine(Gpu({hashes[0], hashes[1], hashes[2]})), "");
+    ASSERT_EQ(table.StoreEngine(Device({hashes[0], hashes[1], hashes[2]})), "");
     ASSERT_EQ(table.StoreShared(Shared(hashes, StorageTier::kCpuShare)), "");
     ASSERT_EQ(table.StoreShared(Shared(hashes, StorageTier::kDisk)), "");
 
@@ -797,6 +839,7 @@ TEST(Query, BigramWholeBlockRunIsUnaffectedByTheLogicalLengthClamp) {
     PrefixCacheTable table;
     auto registration = Registration();
     registration.profile = SglangBigramProfile();
+    registration.publisher_kind = PublisherKind::kSglang;
     RegisterOrFail(table, registration);
 
     const auto tokens = Tokens(40);
@@ -816,14 +859,14 @@ TEST(Query, BigramWholeBlockRunIsUnaffectedByTheLogicalLengthClamp) {
     EXPECT_EQ(result.disk, 32);
 }
 
-TEST(Query, GpuCpuAndDiskExtendOneCumulativePrefix) {
+TEST(Query, DeviceCpuAndDiskExtendOneCumulativePrefix) {
     PrefixCacheTable table;
     RegisterOrFail(table, Registration());
     const auto tokens = Tokens(64);
     const auto hashes = Hashes(tokens);
     ASSERT_EQ(hashes.size(), 4u);
 
-    ASSERT_EQ(table.StoreEngine(Gpu({hashes[0], hashes[1]})), "");
+    ASSERT_EQ(table.StoreEngine(Device({hashes[0], hashes[1]})), "");
     ASSERT_EQ(table.StoreShared(Shared({hashes[2]}, StorageTier::kCpuShare)),
               "");
     ASSERT_EQ(table.StoreShared(Shared({hashes[3]}, StorageTier::kDisk)), "");
@@ -845,7 +888,7 @@ TEST(Query, EmptyCpuPhaseFallsThroughToDiskAtSameBlock) {
     const auto hashes = Hashes(tokens);
     ASSERT_EQ(hashes.size(), 3u);
 
-    ASSERT_EQ(table.StoreEngine(Gpu({hashes[0]})), "");
+    ASSERT_EQ(table.StoreEngine(Device({hashes[0]})), "");
     ASSERT_EQ(
         table.StoreShared(Shared({hashes[1], hashes[2]}, StorageTier::kDisk)),
         "");
@@ -860,14 +903,14 @@ TEST(Query, EmptyCpuPhaseFallsThroughToDiskAtSameBlock) {
     EXPECT_EQ(result.disk, 48);
 }
 
-TEST(Query, CompleteGpuCoverageCarriesThroughLowerTierBoundaries) {
+TEST(Query, CompleteDeviceCoverageCarriesThroughLowerTierBoundaries) {
     PrefixCacheTable table;
     RegisterOrFail(table, Registration());
     const auto tokens = Tokens(48);
     const auto hashes = Hashes(tokens);
     ASSERT_EQ(hashes.size(), 3u);
 
-    ASSERT_EQ(table.StoreEngine(Gpu(hashes)), "");
+    ASSERT_EQ(table.StoreEngine(Device(hashes)), "");
 
     const auto result = table.Query(TestContext(), tokens).at("instance-a");
     EXPECT_EQ(result.longest_match_tokens, 48);
@@ -886,7 +929,7 @@ TEST(Query, DuplicateTierPresenceIsAttributedOnce) {
     const auto hashes = Hashes(tokens);
     ASSERT_EQ(hashes.size(), 3u);
 
-    ASSERT_EQ(table.StoreEngine(Gpu({hashes[0]})), "");
+    ASSERT_EQ(table.StoreEngine(Device({hashes[0]})), "");
     ASSERT_EQ(table.StoreShared(
                   Shared({hashes[0], hashes[1]}, StorageTier::kCpuShare)),
               "");
@@ -909,7 +952,7 @@ TEST(Query, CumulativeTierIncludesHigherTierAfterLowerTierBlocks) {
     const auto hashes = Hashes(tokens);
     ASSERT_EQ(hashes.size(), 4u);
 
-    ASSERT_EQ(table.StoreEngine(Gpu({hashes[0]})), "");
+    ASSERT_EQ(table.StoreEngine(Device({hashes[0]})), "");
     ASSERT_EQ(table.StoreShared(Shared({hashes[2]}, StorageTier::kCpuShare)),
               "");
     ASSERT_EQ(
@@ -926,7 +969,7 @@ TEST(Query, CumulativeTierIncludesHigherTierAfterLowerTierBlocks) {
     EXPECT_EQ(result.disk, 64);
 }
 
-TEST(Query, LocalAndSharedTiersRespectRankAndContinuousPrefix) {
+TEST(Query, VllmSharedCpuSupersedesLocalAcrossRanksAndPrefix) {
     PrefixCacheTable table;
     for (const auto& registration :
          {Registration(), Registration("instance-a", 1),
@@ -935,12 +978,12 @@ TEST(Query, LocalAndSharedTiersRespectRankAndContinuousPrefix) {
     }
     const auto tokens = Tokens(80);
     const auto hashes = Hashes(tokens);
-    auto host = Gpu({hashes[0], hashes[2]});
+    auto host = Device({hashes[0], hashes[2]});
     host.tier = StorageTier::kCpuLocal;
     ASSERT_EQ(table.StoreEngine(host), "");
     ASSERT_EQ(table.StoreEngine(host), "");
-    ASSERT_EQ(table.StoreEngine(Gpu({hashes[1]})), "");
-    auto disk = Gpu({hashes[3]});
+    ASSERT_EQ(table.StoreEngine(Device({hashes[1]})), "");
+    auto disk = Device({hashes[3]});
     disk.tier = StorageTier::kDisk;
     ASSERT_EQ(table.StoreEngine(disk), "");
     auto hits = table.Query(TestContext(), tokens);
@@ -952,9 +995,12 @@ TEST(Query, LocalAndSharedTiersRespectRankAndContinuousPrefix) {
     ASSERT_EQ(table.StoreShared(shared), "");
     EXPECT_EQ(table.Query(TestContext(), tokens).at("instance-b").cpu_share,
               80);
+    EXPECT_TRUE(Presence(table, hashes[0]).cpu_local_owners.empty());
+    EXPECT_EQ(
+        table.Query(TestContext(), tokens).at("instance-a").rank_matches.at(0),
+        RankMatch(0, 0, 80, 80));
     ASSERT_EQ(table.RemoveShared(shared), "");
-    EXPECT_EQ(table.Query(TestContext(), tokens).at("instance-a").cpu_share,
-              48);
+    EXPECT_EQ(table.Query(TestContext(), tokens).at("instance-a").cpu_share, 0);
     EXPECT_EQ(table.Query(TestContext(), tokens).at("instance-b").cpu_share, 0);
     ASSERT_EQ(table.Unregister(TestContext(), "instance-a", 0), "");
     RegisterOrFail(table, Registration());
@@ -990,7 +1036,7 @@ TEST(Query, FourTierInterleavedPrefixesAndGaps) {
                               Shared({hashes[i]}, StorageTier::kCpuShare)),
                           "");
             } else {
-                auto mutation = Gpu({hashes[i]});
+                auto mutation = Device({hashes[i]});
                 mutation.tier = tier == 'N'   ? StorageTier::kDevice
                                 : tier == 'L' ? StorageTier::kCpuLocal
                                               : StorageTier::kDisk;
@@ -1011,12 +1057,17 @@ TEST(Query, FourTierInterleavedPrefixesAndGaps) {
 
 TEST(Query, FourTierOwnersRemainIndependentAcrossRanksAndLifecycle) {
     PrefixCacheTable table;
-    RegisterOrFail(table, Registration());
-    RegisterOrFail(table, Registration("instance-a", 1));
-    RegisterOrFail(table, Registration("instance-b"));
+    for (const auto& [instance, rank] :
+         std::vector<std::pair<std::string, int64_t>>{
+             {"instance-a", 0}, {"instance-a", 1}, {"instance-b", 0}}) {
+        auto registration =
+            Registration(instance, rank, PublisherKind::kSglang);
+        registration.profile = SglangProfile();
+        RegisterOrFail(table, registration);
+    }
     const auto tokens = Tokens(48);
-    const auto hashes = Hashes(tokens);
-    auto local = Gpu(hashes);
+    const auto hashes = SglangHashes(tokens);
+    auto local = Device(hashes);
     local.tier = StorageTier::kCpuLocal;
     const auto shared = Shared(hashes, StorageTier::kCpuShare);
     ASSERT_EQ(table.StoreEngine(local), "");
@@ -1046,16 +1097,115 @@ TEST(Query, FourTierOwnersRemainIndependentAcrossRanksAndLifecycle) {
               RankMatch(0, 0, 48, 48));
     ASSERT_EQ(table.StoreEngine(local), "");
     ASSERT_EQ(table.Unregister(TestContext(), "instance-a", 0), "");
-    RegisterOrFail(table, Registration());
+    auto replacement = Registration("instance-a", 0, PublisherKind::kSglang);
+    replacement.profile = SglangProfile();
+    RegisterOrFail(table, replacement);
     EXPECT_EQ(
         table.Query(TestContext(), tokens).at("instance-a").rank_matches.at(0),
         RankMatch(0, 0, 48, 48));
 }
 
+TEST(Mutations, VllmCpuLocalYieldsToSharedAcrossInstancesAndRanks) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration("instance-a", 0));
+    RegisterOrFail(table, Registration("instance-a", 1));
+    RegisterOrFail(table, Registration("instance-b", 0));
+    const auto tokens = Tokens(32);
+    const auto hashes = Hashes(tokens);
+    ASSERT_EQ(hashes.size(), 2u);
+    const auto a0 = DeviceOwner("instance-a", 0, "stream-a0");
+    const auto a1 = DeviceOwner("instance-a", 1, "stream-a1");
+    const auto b0 = DeviceOwner("instance-b", 0, "stream-b0");
+    auto local_a0 = Device({hashes[0]}, a0);
+    local_a0.tier = StorageTier::kCpuLocal;
+    auto local_a1 = Device({hashes[0]}, a1);
+    local_a1.tier = StorageTier::kCpuLocal;
+    auto local_b0 = Device({hashes[0]}, b0);
+    local_b0.tier = StorageTier::kCpuLocal;
+    ASSERT_EQ(table.StoreEngine(local_a0), "");
+    ASSERT_EQ(table.StoreEngine(local_a1), "");
+    ASSERT_EQ(table.StoreEngine(local_b0), "");
+    ASSERT_EQ(table.StoreEngine(Device({hashes[0]}, a0)), "");
+    ASSERT_EQ(table.StoreShared(Shared({hashes[0]}, StorageTier::kDisk)), "");
+    EXPECT_EQ(Presence(table, hashes[0]).cpu_local_owners.size(), 3u);
+
+    const auto shared_a = Shared({hashes[0]}, StorageTier::kCpuShare);
+    const auto shared_b =
+        Shared({hashes[0]}, StorageTier::kCpuShare, SharedOwner("object-b"));
+    ASSERT_EQ(table.StoreShared(shared_a), "");
+    EXPECT_TRUE(Presence(table, hashes[0]).cpu_local_owners.empty());
+    EXPECT_EQ(Presence(table, hashes[0]).device_owners,
+              (std::set<EngineOwner>{a0}));
+    EXPECT_EQ(Presence(table, hashes[0]).disk_owners.size(), 1u);
+
+    const auto before = PrefixCacheTableTestPeer::Snapshot(table);
+    const auto order = PrefixCacheTableTestPeer::Order(table, TestContext());
+    ASSERT_EQ(table.StoreEngine(local_a0), "");
+    ASSERT_EQ(table.StoreEngine(local_b0), "");
+    EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), before);
+    EXPECT_EQ(PrefixCacheTableTestPeer::Order(table, TestContext()).write_order,
+              order.write_order);
+    ASSERT_EQ(table.StoreShared(shared_b), "");
+    ASSERT_EQ(table.RemoveShared(shared_a), "");
+    EXPECT_TRUE(Presence(table, hashes[0]).cpu_local_owners.empty());
+    ASSERT_EQ(table.RemoveShared(shared_b), "");
+    EXPECT_TRUE(Presence(table, hashes[0]).cpu_local_owners.empty());
+    ASSERT_EQ(table.StoreEngine(local_b0), "");
+    EXPECT_EQ(Presence(table, hashes[0]).cpu_local_owners,
+              (std::set<EngineOwner>{b0}));
+    ASSERT_EQ(table.RemoveEngine(local_b0), "");
+    EXPECT_TRUE(Presence(table, hashes[0]).cpu_local_owners.empty());
+
+    const auto shared_first = Shared({hashes[1]}, StorageTier::kCpuShare);
+    auto later_local = Device({hashes[1]}, a0);
+    later_local.tier = StorageTier::kCpuLocal;
+    ASSERT_EQ(table.StoreShared(shared_first), "");
+    ASSERT_EQ(table.StoreEngine(later_local), "");
+    EXPECT_TRUE(Presence(table, hashes[1]).cpu_local_owners.empty());
+    ASSERT_EQ(table.RemoveShared(shared_first), "");
+    EXPECT_FALSE(
+        PrefixCacheTableTestPeer::Presence(table, TestContext(), hashes[1])
+            .has_value());
+    ASSERT_EQ(table.StoreEngine(later_local), "");
+    EXPECT_EQ(Presence(table, hashes[1]).cpu_local_owners,
+              (std::set<EngineOwner>{a0}));
+}
+
+TEST(Mutations, ConcurrentVllmLocalAndSharedStoresKeepSharedOnly) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration());
+    for (uint64_t value = 100; value < 132; ++value) {
+        const auto prefix = Prefix(value);
+        auto local = Device({prefix});
+        local.tier = StorageTier::kCpuLocal;
+        const auto shared = Shared({prefix}, StorageTier::kCpuShare);
+        std::barrier start(3);
+        std::string local_error;
+        std::string shared_error;
+        std::thread local_writer([&] {
+            start.arrive_and_wait();
+            local_error = table.StoreEngine(local);
+        });
+        std::thread shared_writer([&] {
+            start.arrive_and_wait();
+            shared_error = table.StoreShared(shared);
+        });
+        start.arrive_and_wait();
+        local_writer.join();
+        shared_writer.join();
+        ASSERT_TRUE(local_error.empty()) << local_error;
+        ASSERT_TRUE(shared_error.empty()) << shared_error;
+        const auto presence = Presence(table, prefix);
+        EXPECT_TRUE(presence.cpu_local_owners.empty());
+        EXPECT_EQ(presence.cpu_share_owners,
+                  (std::set<SharedObjectOwner>{shared.owner}));
+    }
+}
+
 TEST(Mutations, FourTierMutationsRejectWrongOwnerFamily) {
     PrefixCacheTable table;
     RegisterOrFail(table, Registration());
-    auto engine = Gpu({Prefix(1)});
+    auto engine = Device({Prefix(1)});
     engine.tier = StorageTier::kCpuShare;
     EXPECT_FALSE(table.StoreEngine(engine).empty());
     EXPECT_FALSE(table.RemoveEngine(engine).empty());
@@ -1078,11 +1228,12 @@ TEST(Query, FourTierLocalPartialTailUsesProfileLogicalPositions) {
         PrefixCacheTable table;
         auto registration = Registration();
         registration.profile = bigram ? SglangBigramProfile() : SglangProfile();
+        registration.publisher_kind = PublisherKind::kSglang;
         RegisterOrFail(table, registration);
         const auto hashes =
             bigram ? SglangBigramHashes(tokens) : SglangHashes(tokens);
         ASSERT_EQ(hashes.size(), 3u);
-        auto local = Gpu(hashes);
+        auto local = Device(hashes);
         local.tier = StorageTier::kCpuLocal;
         ASSERT_EQ(table.StoreEngine(local), "");
         const int64_t positions = bigram ? 39 : 40;
@@ -1109,7 +1260,7 @@ TEST(Query, DiskKeepsLocalRankAndSharedOwnershipInFourTierResults) {
     const auto hashes = Hashes(tokens);
     ASSERT_EQ(table.StoreShared(Shared({hashes[0]}, StorageTier::kCpuShare)),
               "");
-    auto local_disk = Gpu({hashes[1]}, GpuOwner("instance-a", 1));
+    auto local_disk = Device({hashes[1]}, DeviceOwner("instance-a", 1));
     local_disk.tier = StorageTier::kDisk;
     ASSERT_EQ(table.StoreEngine(local_disk), "");
     ASSERT_EQ(table.StoreShared(Shared({hashes[2]}, StorageTier::kDisk)), "");
@@ -1127,10 +1278,10 @@ TEST(Mutations, ClearLocalTiersKeepsOtherSourcesAndSharedStore) {
     RegisterOrFail(table, Registration("instance-b"));
     const auto tokens = Tokens(16);
     const auto hashes = Hashes(tokens);
-    auto local = Gpu(hashes);
+    auto local = Device(hashes);
     local.tier = StorageTier::kCpuLocal;
     ASSERT_EQ(table.StoreEngine(local), "");
-    auto other = Gpu(hashes, GpuOwner("instance-b"));
+    auto other = Device(hashes, DeviceOwner("instance-b"));
     other.tier = StorageTier::kDisk;
     ASSERT_EQ(table.StoreEngine(other), "");
     const auto shared = Shared(hashes, StorageTier::kCpuShare);
@@ -1158,7 +1309,7 @@ TEST(Query, DiskMissIgnoresAllLaterIsolatedBlocks) {
     const auto hashes = Hashes(tokens);
     ASSERT_EQ(hashes.size(), 5u);
 
-    ASSERT_EQ(table.StoreEngine(Gpu({hashes[0], hashes[4]})), "");
+    ASSERT_EQ(table.StoreEngine(Device({hashes[0], hashes[4]})), "");
     ASSERT_EQ(table.StoreShared(
                   Shared({hashes[1], hashes[4]}, StorageTier::kCpuShare)),
               "");
@@ -1176,7 +1327,7 @@ TEST(Query, DiskMissIgnoresAllLaterIsolatedBlocks) {
     EXPECT_EQ(result.disk, 32);
 }
 
-TEST(Query, DifferentRanksNeverFabricateOneGpuPrefix) {
+TEST(Query, DifferentRanksNeverFabricateOneDevicePrefix) {
     PrefixCacheTable table;
     RegisterOrFail(table, Registration("instance-a", 0));
     RegisterOrFail(table, Registration("instance-a", 1));
@@ -1185,10 +1336,10 @@ TEST(Query, DifferentRanksNeverFabricateOneGpuPrefix) {
     ASSERT_EQ(hashes.size(), 2u);
 
     ASSERT_EQ(table.StoreEngine(
-                  Gpu({hashes[0]}, GpuOwner("instance-a", 0, "rank-0"))),
+                  Device({hashes[0]}, DeviceOwner("instance-a", 0, "rank-0"))),
               "");
     ASSERT_EQ(table.StoreEngine(
-                  Gpu({hashes[1]}, GpuOwner("instance-a", 1, "rank-1"))),
+                  Device({hashes[1]}, DeviceOwner("instance-a", 1, "rank-1"))),
               "");
 
     const auto result = table.Query(TestContext(), tokens).at("instance-a");
@@ -1203,7 +1354,7 @@ TEST(Query, DifferentRanksNeverFabricateOneGpuPrefix) {
     EXPECT_EQ(result.disk, 16);
 }
 
-TEST(Query, InstanceSummaryIsRealizedByMaximumGpuRank) {
+TEST(Query, InstanceSummaryIsRealizedByMaximumDeviceRank) {
     PrefixCacheTable table;
     RegisterOrFail(table, Registration("instance-a", 0));
     RegisterOrFail(table, Registration("instance-a", 1));
@@ -1211,11 +1362,11 @@ TEST(Query, InstanceSummaryIsRealizedByMaximumGpuRank) {
     const auto hashes = Hashes(tokens);
     ASSERT_EQ(hashes.size(), 4u);
 
-    ASSERT_EQ(table.StoreEngine(Gpu({hashes[0], hashes[1]},
-                                    GpuOwner("instance-a", 0, "rank-0"))),
+    ASSERT_EQ(table.StoreEngine(Device({hashes[0], hashes[1]},
+                                       DeviceOwner("instance-a", 0, "rank-0"))),
               "");
     ASSERT_EQ(table.StoreEngine(
-                  Gpu({hashes[0]}, GpuOwner("instance-a", 1, "rank-1"))),
+                  Device({hashes[0]}, DeviceOwner("instance-a", 1, "rank-1"))),
               "");
     ASSERT_EQ(table.StoreShared(Shared({hashes[2]}, StorageTier::kCpuShare)),
               "");
@@ -1227,9 +1378,9 @@ TEST(Query, InstanceSummaryIsRealizedByMaximumGpuRank) {
                                        {0, RankMatch(32, 32, 48, 64)},
                                        {1, RankMatch(16, 16, 16, 16)}}));
     EXPECT_EQ(result.dp.size(), result.rank_matches.size());
-    for (const auto& [rank, gpu] : result.dp) {
+    for (const auto& [rank, device] : result.dp) {
         ASSERT_TRUE(result.rank_matches.contains(rank));
-        EXPECT_EQ(gpu, result.rank_matches.at(rank).device);
+        EXPECT_EQ(device, result.rank_matches.at(rank).device);
     }
     EXPECT_EQ(result.device, result.rank_matches.at(0).device);
     EXPECT_EQ(result.cpu_share, result.rank_matches.at(0).cpu_share);
@@ -1281,7 +1432,7 @@ TEST(Query, CacheSaltChangesHashesWithoutChangingContextIdentity) {
     RegisterOrFail(table, Registration());
     const auto tokens = Tokens(16);
     const auto unsalted = Hashes(tokens);
-    ASSERT_EQ(table.StoreEngine(Gpu(unsalted)), "");
+    ASSERT_EQ(table.StoreEngine(Device(unsalted)), "");
 
     const auto hit = table.Query(TestContext(), tokens).at("instance-a");
     EXPECT_EQ(hit.longest_match_tokens, 16);
@@ -1297,7 +1448,7 @@ TEST(GlobalView, ReportsProfileRegistrationAndOwnerMapSize) {
     PrefixCacheTable table;
     RegisterOrFail(table, Registration("instance-a", 0));
     RegisterOrFail(table, Registration("instance-b", 1));
-    ASSERT_EQ(table.StoreEngine(Gpu({Prefix(1), Prefix(2)})), "");
+    ASSERT_EQ(table.StoreEngine(Device({Prefix(1), Prefix(2)})), "");
 
     const auto view = table.GetGlobalView();
     ASSERT_EQ(view.context_count, 1);
@@ -1316,7 +1467,7 @@ TEST(Capacity, EvictsOldestWrittenPrefixesWhenOverLimit) {
     RegisterOrFail(table, Registration());
 
     for (uint64_t i = 1; i <= 14; ++i) {
-        ASSERT_EQ(table.StoreEngine(Gpu({Prefix(i)})), "");
+        ASSERT_EQ(table.StoreEngine(Device({Prefix(i)})), "");
     }
 
     const auto snapshot = PrefixCacheTableTestPeer::Snapshot(table);
@@ -1330,7 +1481,7 @@ TEST(Capacity, UnlimitedWhenBlockLimitIsZero) {
     PrefixCacheTable table(0);
     RegisterOrFail(table, Registration());
     for (uint64_t i = 1; i <= 50; ++i) {
-        ASSERT_EQ(table.StoreEngine(Gpu({Prefix(i)})), "");
+        ASSERT_EQ(table.StoreEngine(Device({Prefix(i)})), "");
     }
     EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table)
                   .contexts.at(TestContext())
@@ -1344,7 +1495,7 @@ TEST(Capacity, OrderTrackingStaysInSyncWithBlocks) {
     const ContextKey context = TestContext();
 
     for (uint64_t i = 1; i <= 6; ++i) {
-        ASSERT_EQ(table.StoreEngine(Gpu({Prefix(i)})), "");
+        ASSERT_EQ(table.StoreEngine(Device({Prefix(i)})), "");
     }
     auto sizes = PrefixCacheTableTestPeer::Order(table, context);
     EXPECT_EQ(sizes.blocks, 6u);
@@ -1352,7 +1503,7 @@ TEST(Capacity, OrderTrackingStaysInSyncWithBlocks) {
     EXPECT_EQ(sizes.order_pos, 6u);
 
     for (uint64_t i = 1; i <= 3; ++i) {
-        ASSERT_EQ(table.RemoveEngine(Gpu({Prefix(i)})), "");
+        ASSERT_EQ(table.RemoveEngine(Device({Prefix(i)})), "");
     }
     sizes = PrefixCacheTableTestPeer::Order(table, context);
     EXPECT_EQ(sizes.blocks, 3u);
@@ -1366,7 +1517,7 @@ TEST(Capacity, OrderTrackingStaysInSyncWithBlocks) {
     EXPECT_EQ(sizes.order_pos, 0u);
 
     for (uint64_t i = 20; i <= 40; ++i) {
-        ASSERT_EQ(table.StoreEngine(Gpu({Prefix(i)})), "");
+        ASSERT_EQ(table.StoreEngine(Device({Prefix(i)})), "");
     }
     sizes = PrefixCacheTableTestPeer::Order(table, context);
     EXPECT_LE(sizes.blocks, 10u);

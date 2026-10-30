@@ -11,6 +11,9 @@ LOG_DIR=${LOG_DIR:-/tmp/mooncake_nof_heartbeat_e2e}
 MASTER_RPC=${MASTER_RPC:-127.0.0.1:50051}
 MASTER_HOST=${MASTER_RPC%:*}
 MASTER_PORT=${MASTER_RPC##*:}
+# A non-loopback METADATA_HOST requires MC_METADATA_HTTP_TOKEN on this process
+# and every engine, or an explicit test-only MC_METADATA_HTTP_ALLOW_INSECURE=1
+# on a trusted network.
 METADATA_HOST=${METADATA_HOST:-127.0.0.1}
 METADATA_PORT=${METADATA_PORT:-8080}
 METADATA_SERVER="http://$METADATA_HOST:$METADATA_PORT/metadata"
@@ -81,9 +84,9 @@ start_target() {
 
 register_nof_segment() {
   local log_suffix=$1
-  PYTHONPATH="$BUILD_DIR/mooncake-integration" MC_NOF_TRTYPE=TCP python3 - <<PY >"$LOG_DIR/register$log_suffix.log" 2>&1
-import store
-ret = store.MooncakeDistributedNoFRegister().real_register(
+  MOONCAKE_STORE_BACKEND=cpp MC_NOF_TRTYPE=TCP "${MOONCAKE_PYTHON_BIN:?MOONCAKE_PYTHON_BIN must point to the installed root-wheel virtualenv}" - <<PY >"$LOG_DIR/register$log_suffix.log" 2>&1
+from mooncake.store import MooncakeDistributedNoFRegister
+ret = MooncakeDistributedNoFRegister().real_register(
     "$TARGET_NQN",
     1,
     "$TARGET_HOST",
