@@ -21,7 +21,6 @@ endif()
 if(WITH_STORE)
   include_directories("../mooncake-store/include")
   include_directories("../mooncake-store/include/cachelib_memory_allocator")
-  include_directories("../mooncake-store/include/engram")
 
   include_directories(
     "../mooncake-store/include/cachelib_memory_allocator/include")
@@ -146,16 +145,15 @@ if(USE_UBSHMEM)
 endif()
 
 if(WITH_STORE)
+  if(USE_CUDA)
+    add_subdirectory(../mooncake-store/src/engram
+                     ${CMAKE_BINARY_DIR}/mooncake-store/src/engram)
+  endif()
   pybind11_add_module(
-    store
-    ${SOURCES}
-    ${CACHE_ALLOCATOR_SOURCES}
-    store/store_py.cpp
-    store/buffer_pool.cpp
-    store/engram_store_py.cpp
-    integration_utils.h)
-  set_target_properties(
-    store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH "$ORIGIN")
+    store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES} store/store_py.cpp
+    store/buffer_pool.cpp integration_utils.h)
+  set_target_properties(store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH
+                                                              "$ORIGIN")
   if(USE_TENT)
     target_link_libraries(store PRIVATE tent)
   endif()
@@ -296,8 +294,8 @@ if(WITH_TE)
                                  COMPONENT python)
   # Co-locate libtent_metrics.so with the Python C extensions so engine.so and
   # _store.so resolve it via $ORIGIN RPATH. The shared TentMetrics singleton
-  # must be loadable wherever the extensions are installed; otherwise
-  # `import mooncake.engine` / `mooncake.store` fails with a missing library.
+  # must be loadable wherever the extensions are installed; otherwise `import
+  # mooncake.engine` / `mooncake.store` fails with a missing library.
   if(TARGET tent_metrics)
     install(TARGETS tent_metrics
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)

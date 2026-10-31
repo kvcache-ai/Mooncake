@@ -37,6 +37,7 @@ _CPP_PUBLIC_NAMES = {
     "ObjectDataType",
     "SoftPinAction",
     "ReplicateConfig",
+    "ExistOptions",
     "ReplicaStatus",
     "MemoryDescriptor",
     "DiskDescriptor",
@@ -55,7 +56,6 @@ _CPP_PUBLIC_NAMES = {
     "MooncakeHostMemAllocator",
     "MooncakeDistributedNoFRegister",
     "MooncakeDistributedStore",
-    "EngramStoreConfig",
     "EngramStore",
     "bind_to_numa_node",
     "get_alloc_func_addr",
@@ -102,7 +102,10 @@ sys.modules[native.__name__] = native
 store = importlib.import_module("mooncake.store")
 assert store._BACKEND == "cpp"
 assert set(expected) == set(store.__all__)
-assert all(getattr(store, name) is getattr(native, name) for name in expected)
+assert all(getattr(store, name) is getattr(native, name) for name in expected if name != "EngramStore")
+from mooncake.engram import EngramStore
+assert store.EngramStore is EngramStore
+assert not hasattr(store, "EngramStoreConfig")
 
 import mooncake
 from mooncake.buffer_pool import BufferPool, RegisteredBufferPool
@@ -132,7 +135,6 @@ helpers = {
     "_serialize_tensor": lambda value: ("serialized", value),
     "_tensor_metadata_size": lambda: 304,
     "_deserialize_tensor": lambda value: ("deserialized", value),
-    "_get_pyclient_from_wrapper": lambda value: ("client", value),
 }
 for name, value in helpers.items():
     setattr(native, name, value)
@@ -145,7 +147,6 @@ assert not set(helpers) & set(store.__all__)
 assert store._serialize_tensor("tensor") == ("serialized", "tensor")
 assert store._tensor_metadata_size() == 304
 assert store._deserialize_tensor("payload") == ("deserialized", "payload")
-assert store._get_pyclient_from_wrapper("wrapper") == ("client", "wrapper")
 """,
         backend=backend,
     )
@@ -237,7 +238,6 @@ for name in (
     "_serialize_tensor",
     "_tensor_metadata_size",
     "_deserialize_tensor",
-    "_get_pyclient_from_wrapper",
 ):
     try:
         getattr(store, name)
