@@ -265,6 +265,55 @@ TEST(ToplogyTest, HcaPeerAffinityAppliesToGpuPrefixEntries) {
                            << " to P0 for local HCA L";
 }
 
+static const std::string kTwoNicTopologyJson =
+    "{\"cpu:0\" : [[\"mlx5_0\"],[\"mlx5_1\"]],"
+    "\"cpu:1\" : [[\"mlx5_1\"],[\"mlx5_0\"]]}";
+
+TEST(ToplogyTest, ParseWithEmptyDeviceFilterKeepsAllDevices) {
+    mooncake::Topology unfiltered;
+    ASSERT_EQ(unfiltered.parse(kTwoNicTopologyJson), 0);
+    mooncake::Topology filtered;
+    ASSERT_EQ(filtered.parse(kTwoNicTopologyJson, {}), 0);
+    EXPECT_TRUE(filtered == unfiltered);
+}
+
+TEST(ToplogyTest, ParseWithDeviceFilterKeepsOnlyListedDevices) {
+    mooncake::Topology topology;
+    // mlx5_9 is not in the JSON and is ignored.
+    ASSERT_EQ(topology.parse(kTwoNicTopologyJson, {"mlx5_0", "mlx5_9"}), 0);
+
+    const auto matrix = topology.getMatrix();
+    EXPECT_EQ(matrix.at("cpu:0").preferred_hca,
+              (std::vector<std::string>{"mlx5_0"}));
+    EXPECT_TRUE(matrix.at("cpu:0").avail_hca.empty());
+    EXPECT_TRUE(matrix.at("cpu:1").preferred_hca.empty());
+    EXPECT_EQ(matrix.at("cpu:1").avail_hca,
+              (std::vector<std::string>{"mlx5_0"}));
+    EXPECT_EQ(topology.getHcaList(), (std::vector<std::string>{"mlx5_0"}));
+}
+
+TEST(ToplogyTest, ParseWithDeviceFilterPreservesOrderAndClass) {
+    mooncake::Topology topology;
+    const std::string json_str =
+        "{\"cpu:0\" : [[\"mlx5_3\",\"mlx5_10\",\"mlx5_2\"],"
+        "[\"mlx5_0\",\"mlx5_4\"]]}";
+    // Matching is by exact name: mlx5_1 does not select mlx5_10.
+    ASSERT_EQ(
+        topology.parse(json_str, {"mlx5_2", "mlx5_0", "mlx5_3", "mlx5_1"}), 0);
+
+    const auto entry = topology.getMatrix().at("cpu:0");
+    EXPECT_EQ(entry.preferred_hca,
+              (std::vector<std::string>{"mlx5_3", "mlx5_2"}));
+    EXPECT_EQ(entry.avail_hca, (std::vector<std::string>{"mlx5_0"}));
+}
+
+TEST(ToplogyTest, ParseWithDeviceFilterMatchingNothing) {
+    mooncake::Topology topology;
+    ASSERT_EQ(topology.parse(kTwoNicTopologyJson, {"mlx5_9"}), 0);
+    EXPECT_TRUE(topology.getHcaList().empty());
+    EXPECT_TRUE(topology.empty());
+}
+
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
