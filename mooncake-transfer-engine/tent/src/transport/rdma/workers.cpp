@@ -78,7 +78,6 @@ void cancelSliceProbe(RdmaSlice* slice) {
     if (rail && token != 0)
         rail->cancelProbe(slice->source_dev_id, slice->target_dev_id, token);
 }
->>>>>>> origin/main
 }  // namespace
 
 Workers::Workers(RdmaTransport* transport)

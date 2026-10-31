@@ -29,7 +29,6 @@ struct DeviceDesc;
 // Each RDMA worker owns its own RailMonitor via WorkerContext::rails. Endpoint
 // teardown may cancel probes from the monitor thread, so rail state is guarded
 // for that lifecycle path.
->>>>>>> origin/main
 class RailMonitor {
     const static size_t kMaxNuma = 16;
 

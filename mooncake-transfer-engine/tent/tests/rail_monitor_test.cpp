@@ -773,7 +773,6 @@ TEST(RailMonitorProbeTest, CancelProbeRevertsArmedTrial) {
     EXPECT_TRUE(rail.isAvailable(0, 0)) << "cancelProbe no-op on a Closed rail";
 }
 
-<<<<<<< HEAD
 // ---------------------------------------------------------------------------
 // Remote NIC selection must not pair a rail NIC with a peer NIC it has no
 // path to. A front-end NIC on the management network and the rail NICs on
