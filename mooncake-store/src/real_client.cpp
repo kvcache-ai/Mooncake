@@ -7941,6 +7941,12 @@ std::vector<int> RealClient::batch_put_session_start(
                     break;
                 }
             }
+            put_sessions_[keys[i]] = PutSessionEntry{
+                .replicas = std::move(replicas),
+                .object_size = static_cast<uint64_t>(sizes[i]),
+                .write_mode = write_mode,
+                .writable = has_memory_replica,
+            };
             if (!has_memory_replica) {
                 hot_keys_to_remove.push_back(keys[i]);
                 keys_to_revoke.push_back(keys[i]);
@@ -7948,18 +7954,13 @@ std::vector<int> RealClient::batch_put_session_start(
                     static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
                 continue;
             }
-            put_sessions_[keys[i]] = PutSessionEntry{
-                .replicas = std::move(replicas),
-                .object_size = static_cast<uint64_t>(sizes[i]),
-                .write_mode = write_mode,
-            };
         }
     }
     if (client_->GetHotCache() && !hot_keys_to_remove.empty()) {
         client_->GetHotCache()->RemoveHotKeys(hot_keys_to_remove);
     }
     if (!keys_to_revoke.empty()) {
-        (void)client_->BatchPutRevoke(keys_to_revoke);
+        (void)batch_put_session_revoke(keys_to_revoke);
     }
     return results;
 }
@@ -8058,6 +8059,66 @@ std::vector<int> RealClient::batch_put_from_multi_buffer_ranges(
     return ToPyResults(results);
 }
 
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::prepare_put_session_finalize(const std::vector<std::string> &keys) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    std::vector<std::string> disk_keys;
+    std::vector<size_t> disk_indices;
+    {
+        std::unique_lock<std::mutex> lock(session_mutex_);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto it = put_sessions_.find(keys[i]);
+            if (it == put_sessions_.end()) {
+                continue;
+            }
+            it->second.writable = false;
+            results[i] = {};
+            if (std::any_of(it->second.replicas.begin(),
+                            it->second.replicas.end(),
+                            [](const Replica::Descriptor &replica) {
+                                return replica.is_disk_replica();
+                            })) {
+                disk_keys.push_back(keys[i]);
+                disk_indices.push_back(i);
+            }
+        }
+        wait_session_put_idle(lock, keys);
+    }
+    if (disk_keys.empty()) {
+        return results;
+    }
+
+    // PutStart may allocate DISK when root_fs_dir is configured, but ranged
+    // session writes only populate MEMORY. Revoke the unwritten reservation
+    // explicitly: PutRevoke(ALL) deliberately excludes asynchronous DISK puts.
+    // Do this before finalizing MEMORY so a failed cleanup remains retryable.
+    auto responses = client_->BatchPutRevoke(disk_keys, ReplicaType::DISK);
+    for (size_t j = 0; j < disk_keys.size(); ++j) {
+        const size_t i = disk_indices[j];
+        if (responses.size() != disk_keys.size()) {
+            results[i] = tl::unexpected(ErrorCode::RPC_FAIL);
+            continue;
+        }
+        if (!responses[j] &&
+            responses[j].error() != ErrorCode::OBJECT_NOT_FOUND) {
+            results[i] = tl::unexpected(responses[j].error());
+            continue;
+        }
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        auto it = put_sessions_.find(keys[i]);
+        if (it != put_sessions_.end()) {
+            // A later End/Revoke failure must not re-revoke a disk reservation
+            // already released by this attempt.
+            std::erase_if(it->second.replicas,
+                          [](const Replica::Descriptor &replica) {
+                              return replica.is_disk_replica();
+                          });
+        }
+    }
+    return results;
+}
+
 std::vector<int> RealClient::batch_put_session_end(
     const std::vector<std::string> &keys) {
     std::vector<tl::expected<void, ErrorCode>> results(
@@ -8067,12 +8128,16 @@ std::vector<int> RealClient::batch_put_session_end(
         return ToPyResults(results);
     }
 
+    results = prepare_put_session_finalize(keys);
     std::vector<std::string> end_keys;
     std::vector<size_t> end_indices;
     std::vector<char> has_nof;
     {
         std::unique_lock<std::mutex> lock(session_mutex_);
         for (size_t i = 0; i < keys.size(); ++i) {
+            if (!results[i]) {
+                continue;
+            }
             auto it = put_sessions_.find(keys[i]);
             if (it == put_sessions_.end()) {
                 results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -8085,7 +8150,6 @@ std::vector<int> RealClient::batch_put_session_end(
                     break;
                 }
             }
-            it->second.writable = false;
             if (nof && it->second.write_mode !=
                            ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
                 LOG(ERROR)
@@ -8098,9 +8162,6 @@ std::vector<int> RealClient::batch_put_session_end(
             end_keys.push_back(keys[i]);
             end_indices.push_back(i);
             has_nof.push_back(static_cast<char>(nof));
-        }
-        if (!end_keys.empty()) {
-            wait_session_put_idle(lock, end_keys);
         }
     }
     if (end_keys.empty()) {
@@ -8181,22 +8242,22 @@ std::vector<int> RealClient::batch_put_session_revoke(
         return ToPyResults(results);
     }
 
+    results = prepare_put_session_finalize(keys);
     std::vector<std::string> revoke_keys;
     std::vector<size_t> revoke_indices;
     {
         std::unique_lock<std::mutex> lock(session_mutex_);
         for (size_t i = 0; i < keys.size(); ++i) {
+            if (!results[i]) {
+                continue;
+            }
             auto it = put_sessions_.find(keys[i]);
             if (it == put_sessions_.end()) {
                 results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
-            it->second.writable = false;
             revoke_keys.push_back(keys[i]);
             revoke_indices.push_back(i);
-        }
-        if (!revoke_keys.empty()) {
-            wait_session_put_idle(lock, revoke_keys);
         }
     }
     if (revoke_keys.empty()) {
