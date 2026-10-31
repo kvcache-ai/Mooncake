@@ -221,6 +221,9 @@ class StrongStream {
     StrongStream& operator=(StrongStream&&) = delete;
 
     PGResult<Lease> acquire(const GpuCaptureInfo& capture);
+    // Record a completion event for work submitted so far, excluding later
+    // work. Return ResourceBusy while a Lease is outstanding.
+    PGResult<GpuEvent> tryRecordCompletionEvent();
     PGResult<void> waitUntilIdle();
 
    private:

@@ -3,11 +3,9 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
+#include <cuda.h>
 #include <map>
-#include <memory>
 #include <mutex>
-#include <utility>
 
 #include "error_types.h"
 
@@ -49,20 +47,6 @@ class DeviceTransferRegion {
    public:
     static PGResult<DeviceTransferRegion> create(int device_index, size_t size);
 
-    // Allocator is a byte-oriented allocation policy providing allocate(bytes)
-    // and deallocate(ptr, bytes).
-    template <typename Allocator>
-    static PGResult<DeviceTransferRegion> create(int device_index, size_t size,
-                                                 Allocator allocator) {
-        auto state = std::make_shared<Allocator>(std::move(allocator));
-        return createWithAllocator(
-            device_index, size,
-            [state](size_t bytes) { return state->allocate(bytes); },
-            [state](void* ptr, size_t bytes) {
-                state->deallocate(ptr, bytes);
-            });
-    }
-
     ~DeviceTransferRegion() noexcept;
 
     DeviceTransferRegion(const DeviceTransferRegion&) = delete;
@@ -74,26 +58,23 @@ class DeviceTransferRegion {
     PGResult<void> release();
 
     [[nodiscard]] void* addr() const noexcept;
+    // Full allocation size, including any alignment padding.
     [[nodiscard]] size_t size() const noexcept;
 
    private:
     friend class RegionSlice;
 
-    using Allocate = std::function<void*(size_t)>;
-    using Deallocate = std::function<void(void*, size_t)>;
+    explicit DeviceTransferRegion(int device_index) noexcept;
 
-    static PGResult<DeviceTransferRegion> createWithAllocator(
-        int device_index, size_t size, Allocate allocate,
-        Deallocate deallocate);
-
-    DeviceTransferRegion(int device_index, size_t size) noexcept;
-
+    PGResult<void> allocateBacking(size_t size);
     void releaseSlice(uint64_t offset) noexcept;
 
     int device_index_ = -1;
     void* addr_ = nullptr;
     size_t size_ = 0;
-    Deallocate deallocate_;
+    // Owned VMM allocation handle; zero for cudaMalloc backing.
+    CUmemGenericAllocationHandle handle_ = 0;
+    bool mapped_ = false;
 
     mutable std::mutex mutex_;
     std::map<uint64_t, uint64_t> free_ranges_;

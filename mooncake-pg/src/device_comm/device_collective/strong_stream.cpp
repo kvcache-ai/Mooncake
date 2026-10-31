@@ -308,17 +308,25 @@ PGResult<void> StrongStream::release(const GpuCaptureInfo& capture) {
     return {};
 }
 
-PGResult<void> StrongStream::waitUntilIdle() {
+PGResult<GpuEvent> StrongStream::tryRecordCompletionEvent() {
     std::lock_guard<std::mutex> lock(mutex_);
-    PG_ASSERT(!pending_release_.has_value(),
-              "StrongStream cannot wait before release");
+    if (pending_release_)
+        return makePGError(PGErrorCode::ResourceBusy,
+                           "StrongStream has an outstanding Lease");
 
+    // Graph launches publish their dependency tails through serial_event_.
+    // Import the current generation once; later replays may advance the shared
+    // event but cannot retarget this wait.
     if (ever_captured_) {
         PG_TRY(eager_order_stream_.waitEvent(serial_event_));
     }
     PG_TRY(auto idle, GpuEvent::create(device_index_));
     PG_TRY(idle.record(eager_order_stream_));
+    return idle;
+}
 
+PGResult<void> StrongStream::waitUntilIdle() {
+    PG_TRY(auto idle, tryRecordCompletionEvent());
     while (true) {
         PG_TRY(auto complete, idle.query());
         if (complete) return {};
