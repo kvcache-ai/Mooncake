@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/runtime/platform.h"
+#include "tent/common/config.h"
 
 #include <cstdlib>
 #include <mutex>
@@ -45,6 +46,10 @@ Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
     static std::shared_ptr<Platform> g_instance;
     static std::once_flag flag;
     std::call_once(flag, [&]() {
+        // Direct transport users may initialize the loader without a config
+        // before an engine probes topology. Keep the singleton's config valid
+        // from its first use; later calls cannot change it through call_once.
+        if (!conf) conf = std::make_shared<Config>();
 #ifdef USE_CUDA
         g_instance = std::make_shared<CudaPlatform>(conf);
 #elif defined(USE_HIP)

@@ -374,6 +374,11 @@ Status TransferEngineImpl::construct() {
     std::atomic_store_explicit(&runtime_config_snapshot_,
                                buildTentConfigBundle(*conf_).runtime,
                                std::memory_order_relaxed);
+    CHECK_STATUS(parseMnnvlConfig(*conf_, mnnvl_config_));
+#ifndef USE_CUDA
+    if (mnnvl_config_.require_fabric)
+        return Status::InvalidArgument("Strict MNNVL requires a CUDA build");
+#endif
     CHECK_STATUS(ParseHpTcpTransportConfig(*conf_, &hp_tcp_transport_config_));
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
@@ -460,7 +465,11 @@ Status TransferEngineImpl::construct() {
         LOG(INFO) << "Using legacy transport selection (original logic)";
     }
 
-    CHECK_STATUS(loadTransports());
+    auto load_status = loadTransports();
+    if (!load_status.ok()) {
+        (void)deconstruct();
+        return load_status;
+    }
 
     // A notification that arrives over the control plane - the RPC fallback
     // in sendNotification(), or a peer whose only notification path is RPC -
@@ -482,6 +491,12 @@ Status TransferEngineImpl::construct() {
             auto status = transport->install(local_segment_name_, metadata_,
                                              topology_, conf_);
             if (!status.ok()) {
+                if (mnnvl_config_.require_fabric && transport_index == MNNVL) {
+                    TentMetrics::instance().recordMnnvlEvent(
+                        TentMetrics::MnnvlEvent::StrictFailure);
+                    (void)deconstruct();
+                    return status;
+                }
                 if (hp_tcp_transport_config_.enabled &&
                     transport_index ==
                         static_cast<size_t>(TransportType::HP_TCP)) {
@@ -840,8 +855,12 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
         auto location_type = LocationParser(options.location).type();
         bool host_location =
             options.location == kWildcardLocation || location_type == "cpu";
-        if (host_location && transport_list_[MNNVL] &&
-            transport_list_[MNNVL]->capabilities().dram_to_dram)
+        if (mnnvl_config_.require_fabric &&
+            (location_type == "cuda" ||
+             (host_location && mnnvl_config_.egm_enabled)))
+            options.type = MNNVL;
+        else if (host_location && transport_list_[MNNVL] &&
+                 transport_list_[MNNVL]->capabilities().dram_to_dram)
             options.type = MNNVL;  // EGM: host memory NVLink peers can address
         else if (transport_list_[RDMA])
             options.type = RDMA;
@@ -859,6 +878,16 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             return Status::InvalidArgument(
                 "Not supported type in memory options" LOC_MARK);
     }
+    if (mnnvl_config_.require_fabric &&
+        (LocationParser(options.location).type() == "cuda" ||
+         (mnnvl_config_.egm_enabled &&
+          (options.location == kWildcardLocation ||
+           LocationParser(options.location).type() == "cpu"))) &&
+        options.type != MNNVL)
+        return Status::InvalidArgument(
+            "Strict MNNVL allocation cannot use another transport");
+    if (options.type < 0 || options.type >= kSupportedTransportTypes)
+        return Status::InvalidArgument("Invalid memory transport" LOC_MARK);
     auto& transport = transport_list_[options.type];
     if (!transport)
         return Status::InvalidArgument(
@@ -1030,10 +1059,50 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         desc_list.push_back(std::move(desc));
     }
 
+    auto needs_export = [&](const BufferDesc& desc) {
+        return mnnvl_config_.require_fabric &&
+               options.perm != kLocalReadWrite &&
+               (LocationParser(desc.location).type() == "cuda" ||
+                mnnvl_config_.egm_enabled);
+    };
+    auto valid_export = [](const BufferDesc& desc) {
+        return desc.permission != kLocalReadWrite &&
+               !desc.mnnvl_handle.empty() &&
+               std::find(desc.transports.begin(), desc.transports.end(),
+                         MNNVL) != desc.transports.end();
+    };
+    const bool required_export =
+        std::any_of(desc_list.begin(), desc_list.end(), needs_export);
+    const auto requested_descs =
+        required_export ? desc_list : std::vector<BufferDesc>{};
+    if (required_export && ((options.type != UNSPEC && options.type != MNNVL) ||
+                            !transport_list_[MNNVL]))
+        return Status::InvalidArgument(
+            "Strict MNNVL registration requires MNNVL");
     bool need_sync = false;
     auto status = local_segment_tracker_->addInBatch(
         desc_list,
         [&](std::vector<BufferDesc>& descs) -> Status {
+            // Duplicate ranges are pinned by SegmentTracker before this
+            // callback. Never turn an existing local-only registration into a
+            // successful remotely accessible strict registration without an
+            // actual export.
+            if (required_export) {
+                auto existing_status = local_segment_tracker_->forEach(
+                    [&](const BufferDesc& existing) {
+                        for (const auto& requested : requested_descs) {
+                            if (existing.addr == requested.addr &&
+                                existing.length == requested.length &&
+                                needs_export(requested) &&
+                                !valid_export(existing))
+                                return Status::InvalidArgument(
+                                    "Existing registration has no MNNVL fabric "
+                                    "export");
+                        }
+                        return Status::OK();
+                    });
+                if (!existing_status.ok()) return existing_status;
+            }
             const bool hp_tcp_required =
                 options.type == HP_TCP ||
                 (options.type == UNSPEC && transports.size() == 1 &&
@@ -1041,7 +1110,17 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             std::vector<TransportType> registered_transports;
             Status first_error = Status::OK();
             for (auto type : transports) {
+                const auto before = descs;
                 auto s = transport_list_[type]->addMemoryBuffer(descs, options);
+                if (s.ok() && type == MNNVL && required_export) {
+                    for (const auto& desc : descs) {
+                        if (needs_export(desc) && !valid_export(desc)) {
+                            s = Status::InvalidArgument(
+                                "MNNVL registration returned no fabric export");
+                            break;
+                        }
+                    }
+                }
                 if (!s.ok()) {
                     // addMemoryBuffer implementations are required to be
                     // transactional, but invoke remove on the failing
@@ -1052,7 +1131,18 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                             transport_list_[type]->removeMemoryBuffer(desc);
                         if (!cleanup.ok()) LOG(WARNING) << cleanup.ToString();
                     }
+                    descs = before;
                     if (first_error.ok()) first_error = s;
+                    if (type == MNNVL && required_export) {
+                        TentMetrics::instance().recordMnnvlEvent(
+                            TentMetrics::MnnvlEvent::StrictFailure);
+                        for (auto registered : registered_transports) {
+                            for (auto desc : descs)
+                                (void)transport_list_[registered]
+                                    ->removeMemoryBuffer(desc);
+                        }
+                        return s;
+                    }
                     if (type == HP_TCP && hp_tcp_required) return s;
                     LOG(WARNING) << s.ToString();
                     // Explicit transport registration is strict. UNSPEC keeps
@@ -1572,7 +1662,31 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
     }
     auto local_mtype = Platform::getLoader().getMemoryType(request.source);
 
-    const TransportType hint = request.transport_hint;
+    TransportType hint = request.transport_hint;
+    bool strict_route = false;
+    if (mnnvl_config_.require_fabric && desc->type == SegmentType::Memory) {
+        auto* peer = desc->findBuffer(request.target_offset, request.length);
+        strict_route =
+            hint == MNNVL || local_mtype == MTYPE_CUDA ||
+            (peer && LocationParser(peer->location).type() == "cuda") ||
+            mnnvl_config_.egm_enabled;
+        if (strict_route) {
+            if (transport_index != 0 || (hint != UNSPEC && hint != MNNVL) ||
+                !peer ||
+                (request.opcode == Request::WRITE &&
+                 peer->permission == kGlobalReadOnly) ||
+                (request.target_id != LOCAL_SEGMENT_ID &&
+                 (peer->permission == kLocalReadWrite ||
+                  peer->mnnvl_handle.empty() ||
+                  std::find(peer->transports.begin(), peer->transports.end(),
+                            MNNVL) == peer->transports.end()))) {
+                TentMetrics::instance().recordMnnvlEvent(
+                    TentMetrics::MnnvlEvent::StrictFailure);
+                return SelectionResult{};
+            }
+            hint = MNNVL;
+        }
+    }
 
     // Plan XPU/MLU staging before selecting a host-only network transport.
     // XPU can bypass staging through verified dma-buf RDMA, in which case
@@ -1665,7 +1779,9 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
     };
 
     // Legacy mode: use original logic (before TransportSelector)
-    if (transport_selector_ && transport_selector_->isLegacyMode() &&
+    // Strict routes must honor policy authorization even in legacy mode.
+    if (!strict_route && transport_selector_ &&
+        transport_selector_->isLegacyMode() &&
         !transport_selector_->isForceTcp()) {
         SelectionResult result;
         std::vector<TransportType> raw;
@@ -1727,6 +1843,7 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
 
     // Selector mode: build ctx, then defer everything to
     // TransportSelector::select().
+    std::vector<TransportType> local_copy_transports;
     SelectionContext ctx;
     ctx.transfer_size = request.length;
     ctx.priority_level =
@@ -1761,10 +1878,26 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
         ctx.buffer_transports = ipc_mixed      ? &mixed_transports
                                 : host_staging ? &staging_transports
                                                : &entry->transports;
+        if (strict_route && ctx.local_segment &&
+            std::find(entry->transports.begin(), entry->transports.end(),
+                      MNNVL) == entry->transports.end()) {
+            // Local-only registrations have no remote export tag, but MNNVL
+            // can copy directly to their process-local addresses. Supply a
+            // private fallback candidate without changing published metadata;
+            // explicit policy lists still take precedence in the selector.
+            local_copy_transports = entry->transports;
+            local_copy_transports.push_back(MNNVL);
+            ctx.buffer_transports = &local_copy_transports;
+        }
     }
 
     auto result = transport_selector_->select(ctx, transport_list_,
                                               transport_index, hint);
+    if (strict_route && result.transport != MNNVL) {
+        TentMetrics::instance().recordMnnvlEvent(
+            TentMetrics::MnnvlEvent::StrictFailure);
+        return SelectionResult{};
+    }
     if (result.transport != UNSPEC)
         result.staging_params = std::move(host_staging_params);
     return finish(std::move(result));
@@ -2585,6 +2718,9 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
                                                  const PreparedSubmit& prepared,
                                                  QueueOwnerKind owner_kind) {
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (mnnvl_config_.gpu_wait)
+        return Status::InvalidArgument(
+            "MNNVL gpu_wait prohibits deferred runtime dispatch");
     if (prepared.tasks.empty()) return Status::OK();
     if (prepared.tasks.size() > batch->max_size - batch->task_list.size()) {
         return Status::TooManyRequests(
@@ -3137,6 +3273,13 @@ Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& task = batch->task_list[task_id];
     auto prev_type = task.type;
+    if (mnnvl_config_.require_fabric && prev_type == MNNVL) {
+        task.suppress_failover = true;
+        TentMetrics::instance().recordMnnvlEvent(
+            TentMetrics::MnnvlEvent::StrictFailure);
+        return Status::InvalidEntry(
+            "Strict MNNVL prohibits transport failover");
+    }
 
     if (++task.failover_count > task.runtime_policy.max_failover_attempts) {
         LOG(WARNING) << "Task failover limit reached ("
@@ -3215,7 +3358,8 @@ bool TransferEngineImpl::attemptSubmitStageFailover(Batch* batch,
     // failover in updateTaskStatusAfterPoll, which sets task.status = FAILED
     // before calling resubmitTransferTask).
     task.status = FAILED;
-    for (int attempt = 0; attempt < task.runtime_policy.max_failover_attempts;
+    for (int attempt = 0; !task.suppress_failover &&
+                          attempt < task.runtime_policy.max_failover_attempts;
          ++attempt) {
         if (resubmitTransferTask(batch, task_id).ok()) {
             task.status = PENDING;
@@ -3349,7 +3493,8 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
     // A synchronous rejection dispatches no work, so keep trying candidates
     // within the original budget. An accepted attempt is polled on the next
     // progress step, rather than spinning here until it completes.
-    while (task.failover_count < task.runtime_policy.max_failover_attempts) {
+    while (!task.suppress_failover &&
+           task.failover_count < task.runtime_policy.max_failover_attempts) {
         if (resubmitTransferTask(batch, task_id).ok()) {
             task_status.s = PENDING;
             task.status = PENDING;
