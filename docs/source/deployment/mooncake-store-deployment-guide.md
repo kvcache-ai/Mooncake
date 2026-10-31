@@ -1093,6 +1093,8 @@ reads for that descriptor.
   their replication configuration does not expose `dfs_replica_num`, and their
   setup API cannot initialize the distributed `FileStorage` backend. Use the
   native C++ or Python/RealClient API.
+- Put sessions (`batch_put_session_start` and the ranged put APIs) write MEMORY
+  replicas only and reject `dfs_replica_num > 0` with `INVALID_PARAMS`.
 - A DFS object must fit in a single shard after alignment and allocator
   size-class rounding; objects are not striped across shards.
 - DFS allocator state is currently in memory. A master restart or HA leader

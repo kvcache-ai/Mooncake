@@ -7887,6 +7887,18 @@ std::vector<int> RealClient::batch_put_session_start(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
 
+    // Ranged session writes never reach DFS and session end finalizes MEMORY
+    // only, so a DFS reservation would stay PROCESSING until the put-start
+    // discard timeout while the object looks complete.
+    if (config.dfs_replica_num > 0) {
+        LOG(ERROR) << "batch_put_session_start rejects DFS configs: "
+                   << "session path never writes DFS "
+                   << "(dfs_replica_num=" << config.dfs_replica_num
+                   << ", replica_num=" << config.replica_num << ")";
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
     const auto write_mode = DetermineReplicaWriteMode(config);
     if (config.nof_replica_num > 0 &&
         write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
