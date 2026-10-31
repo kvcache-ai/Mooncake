@@ -282,17 +282,20 @@ empty: the transfer loop is unchanged, with no extra clocks or I/O.
 When set, each completed transfer appends one JSON line:
 
 ```json
-{"batch_size":207360,"submit_us":66874,"wait_us":556363,"polls":201}
+{"block_size":4096,"batch_size":1,"warmup":false,"submit_us":2.613,"wait_us":10.874,"polls":901}
 ```
 
 | Field | Meaning |
 | ----- | ------- |
-| `submit_us` | Time in `submitTransfer` |
+| `block_size`, `batch_size` | Shape of the transfer, identifying the sweep point |
+| `warmup` | `true` for transfers in the 1 s warmup before measurement |
+| `submit_us` | Time in `submitTransfer`, in microseconds with ns precision |
 | `wait_us` | Time from submit return until the batch reports COMPLETED |
 | `polls` | Number of status polls in that wait |
 
-The file is opened once as `std::ofstream` and written with stream buffering. Skip the first
-couple of lines when summarizing; they include warmup. This log is for
+The file is opened once as `std::ofstream` and written with stream buffering.
+Filter on `warmup` when summarizing; warmup includes one-time costs such as
+connection setup. This log is for
 control-path analysis. Do not treat `wait_us` or table `BW` as a substitute
 for an application poll interval.
 
