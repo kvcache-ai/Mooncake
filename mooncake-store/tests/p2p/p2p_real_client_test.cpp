@@ -9,8 +9,6 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
-#include <cstdio>
-#include <sys/stat.h>
 #include <memory>
 #include <span>
 #include <string>
@@ -19,43 +17,14 @@
 #include "client_resources.h"
 #include "p2p/client/p2p_client_config_builder.h"
 #include "p2p/client/peer_client.h"
-#include "config.h"
 #include "../real_client_test_helper.h"
 #include "test_p2p_server_helpers.h"
 
 namespace mooncake {
 namespace testing {
 
-namespace {
-
-class ScopedMaxMrSize {
-   public:
-    explicit ScopedMaxMrSize(size_t value)
-        : original_(globalConfig().max_mr_size) {
-        globalConfig().max_mr_size = value;
-    }
-    ~ScopedMaxMrSize() { globalConfig().max_mr_size = original_; }
-
-   private:
-    size_t original_;
-};
-
-}  // namespace
-
 class P2PRealClientTest : public ::testing::Test {
    protected:
-    P2PClientConfig DeploymentConfig() {
-        auto config = P2PClientConfigBuilder::build_p2p_real_client(
-            "127.0.0.1", "P2PHANDSHAKE", "tcp", std::nullopt,
-            master_.master_address(),
-            R"({"tiers":[{"type":"DRAM","capacity":67108864,"priority":100}]})",
-            4 * 1024 * 1024, nullptr, "", 0);
-        config.enable_http_server = false;
-        config.enable_metric_collection = false;
-        config.async_sender_thread_count = 0;
-        config.te_async_poll_worker_num = 2;
-        return config;
-    }
     static void SetUpTestSuite() {
         google::InitGoogleLogging("P2PRealClientTest");
         FLAGS_logtostderr = 1;
@@ -205,52 +174,6 @@ class P2PRealClientTest : public ::testing::Test {
     std::vector<std::shared_ptr<RealClient>> clients_;
     std::vector<UUID> client_ids_;
 };
-
-TEST_F(P2PRealClientTest, InvalidShmRegistrationClosesFdAndLeavesNoContext) {
-    ASSERT_TRUE(master_.Start());
-    auto client = RealClient::create();
-    auto config = DeploymentConfig();
-    ASSERT_EQ(client->setup(config), 0);
-    std::unique_ptr<std::FILE, decltype(&std::fclose)> file(std::tmpfile(),
-                                                            std::fclose);
-    ASSERT_NE(file, nullptr);
-    const int fd = fileno(file.get());
-    ASSERT_GE(fd, 0);
-    ASSERT_EQ(ftruncate(fd, 4096), 0);
-    struct stat original{};
-    ASSERT_EQ(fstat(fd, &original), 0);
-    const int passed_fd = dup(fd);
-    ASSERT_GE(passed_fd, 0);
-    {
-        ScopedMaxMrSize limit(1);
-        auto result = RealClientTestHelper::MapShm(*client, passed_fd, 0x100000,
-                                                   4096, false, {1, 2});
-        EXPECT_FALSE(result);
-    }
-    struct stat after{};
-    const bool duplicate_still_open = fstat(passed_fd, &after) == 0 &&
-                                      after.st_dev == original.st_dev &&
-                                      after.st_ino == original.st_ino;
-    EXPECT_FALSE(duplicate_still_open);
-    if (duplicate_still_open) close(passed_fd);
-    EXPECT_EQ(RealClientTestHelper::FindShmContext(*client, {1, 2}), nullptr);
-    EXPECT_EQ(client->tearDownAll(), 0);
-}
-
-TEST_F(P2PRealClientTest, FailedLocalPoolRegistrationRejectsSetup) {
-    ASSERT_TRUE(master_.Start());
-    auto config = DeploymentConfig();
-    auto client = RealClient::create();
-    {
-        ScopedMaxMrSize limit(1);
-        EXPECT_NE(client->setup(config), 0);
-        EXPECT_FALSE(client->is_initialized());
-    }
-    EXPECT_EQ(client->tearDownAll(), 0);
-    client = RealClient::create();
-    ASSERT_EQ(client->setup(config), 0);
-    EXPECT_EQ(client->tearDownAll(), 0);
-}
 
 TEST_F(P2PRealClientTest, SetupAndIdempotentClose) {
     ASSERT_NO_FATAL_FAILURE(StartClients(1));

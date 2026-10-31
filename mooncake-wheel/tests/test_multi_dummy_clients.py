@@ -59,7 +59,9 @@ class TestMultiDummyClients(unittest.TestCase):
             timeout = 10  # 10 seconds timeout
             while True:
                 time.sleep(0.1)
-                if self.store.is_exist(key2):
+                exists = self.store.is_exist(key2)
+                self.assertGreaterEqual(exists, 0, "Peer key lookup failed")
+                if exists == 1:
                     # Check key2 exists
                     self.assertEqual(self.store.get_size(key2), len(test_data))
                     self.assertEqual(self.store.get(key2), test_data)
@@ -76,7 +78,9 @@ class TestMultiDummyClients(unittest.TestCase):
             timeout = 10  # 10 seconds timeout
             while True:
                 time.sleep(0.1)
-                if self.store.is_exist(key1):
+                exists = self.store.is_exist(key1)
+                self.assertGreaterEqual(exists, 0, "Peer key lookup failed")
+                if exists == 1:
                     # Check key1 exists
                     self.assertEqual(self.store.get_size(key1), len(test_data))
                     self.assertEqual(self.store.get(key1), test_data)

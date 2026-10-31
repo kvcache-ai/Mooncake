@@ -14,7 +14,6 @@
 #include "p2p/client/p2p_client_metric.h"
 #include "p2p/client/tiered_cache/tiers/storage_tier.h"
 #include "p2p/client/tiered_cache/tiered_backend.h"
-#include "../utils/common.h"
 #include "allocator.h"
 #include "utils.h"
 
@@ -191,7 +190,8 @@ TEST_F(StorageTierTest, StorageTierBasic) {
 
     {
         TieredBackend backend;
-        auto init_res = InitTieredBackendForTest(backend, config);
+        auto init_res =
+            backend.Init(config, nullptr, nullptr, nullptr, nullptr);
         ASSERT_TRUE(init_res.has_value())
             << "Init failed: " << init_res.error();
 
@@ -269,7 +269,8 @@ TEST_F(StorageTierTest, StorageTierUsesConfiguredLocalBufferPool) {
 
     {
         TieredBackend backend;
-        auto init_res = InitTieredBackendForTest(backend, config);
+        auto init_res =
+            backend.Init(config, nullptr, nullptr, nullptr, nullptr);
         ASSERT_TRUE(init_res.has_value())
             << "Init failed: " << init_res.error();
 
@@ -331,7 +332,8 @@ TEST_F(StorageTierTest, StorageTierCapacityCountsUncommittedStaging) {
 
     {
         TieredBackend backend;
-        auto init_res = InitTieredBackendForTest(backend, config);
+        auto init_res =
+            backend.Init(config, nullptr, nullptr, nullptr, nullptr);
         ASSERT_TRUE(init_res.has_value())
             << "Init failed: " << init_res.error();
 
@@ -380,7 +382,7 @@ TEST_F(StorageTierTest,
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     auto backend = std::make_unique<TieredBackend>();
-    auto init_res = InitTieredBackendForTest(*backend, config);
+    auto init_res = backend->Init(config, nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(init_res.has_value()) << "Init failed: " << init_res.error();
 
     constexpr size_t kDataSize = 1024;
@@ -465,7 +467,7 @@ TEST_F(StorageTierTest, StorageTierBucket) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto init_res = InitTieredBackendForTest(backend, config);
+    auto init_res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(init_res.has_value());
 
     // Allocate and Write multiple small items
@@ -554,7 +556,8 @@ TEST_F(StorageTierTest, StorageTierWipesStoragePathOnStartupAndExit) {
 
     {
         TieredBackend backend;
-        auto init_res = InitTieredBackendForTest(backend, config);
+        auto init_res =
+            backend.Init(config, nullptr, nullptr, nullptr, nullptr);
         ASSERT_TRUE(init_res.has_value())
             << "Init failed: " << init_res.error();
 
@@ -758,7 +761,8 @@ TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
 
     {
         TieredBackend backend;
-        auto init_res = InitTieredBackendForTest(backend, config);
+        auto init_res =
+            backend.Init(config, nullptr, nullptr, nullptr, nullptr);
         ASSERT_TRUE(init_res.has_value());
 
         // Fill up the tier with data (~20KB)
@@ -858,8 +862,7 @@ TEST_F(StorageTierTest, AutoEvictionSyncsMetadataAndByteAccounting) {
 
     {
         TieredBackend backend;
-        ASSERT_TRUE(InitTieredBackendForTest(backend, config, nullptr, nullptr,
-                                             remove_cb)
+        ASSERT_TRUE(backend.Init(config, nullptr, nullptr, remove_cb, nullptr)
                         .has_value());
 
         auto tier_views = backend.GetTierViews();

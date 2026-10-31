@@ -17,7 +17,6 @@
 #define protected public
 #include "p2p/client/data_manager/v1/data_manager_v1.h"
 #include "p2p/client/tiered_cache/tiered_backend.h"
-#include "../utils/common.h"
 #include "topology.h"
 #include "transfer_engine.h"
 #include "types.h"
@@ -76,7 +75,8 @@ class DataManagerTest : public ::testing::Test {
         tiered_backend_ = std::make_unique<TieredBackend>(metadata_shard_count);
         // transfer_engine_ is nullptr when initializing tiered_backend_
         // only for local access test
-        auto init_result = InitTieredBackendForTest(*tiered_backend_, config);
+        auto init_result =
+            tiered_backend_->Init(config, nullptr, nullptr, nullptr, nullptr);
         ASSERT_TRUE(init_result.has_value())
             << "Failed to initialize TieredBackend: " << init_result.error();
 
@@ -2214,7 +2214,8 @@ std::unique_ptr<DataManagerV1> MakeDataManagerForTePollTest(
         return nullptr;
     }
     auto backend = std::make_unique<TieredBackend>(1024);
-    auto init_result = InitTieredBackendForTest(*backend, config);
+    auto init_result =
+        backend->Init(config, nullptr, nullptr, nullptr, nullptr);
     if (!init_result.has_value()) {
         return nullptr;
     }
@@ -2368,7 +2369,8 @@ std::optional<TieredDataManagerFixture> MakeDramPlusStorageDataManager(
     if (!parseJsonString(json_config_str, config)) return std::nullopt;
 
     auto backend = std::make_unique<TieredBackend>(64);
-    if (!InitTieredBackendForTest(*backend, config).has_value()) {
+    if (!backend->Init(config, nullptr, nullptr, nullptr, nullptr)
+             .has_value()) {
         return std::nullopt;
     }
 

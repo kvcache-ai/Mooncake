@@ -22,42 +22,44 @@ namespace mooncake {
 namespace testing {
 
 // Lightweight in-process master server for tests (non-HA).
-// Optionally starts embedded HTTP metadata server for transfer engine (default
-// off).
+// An explicit metadata port of zero disables the embedded HTTP metadata server.
 class InProcMaster {
    public:
     InProcMaster() = default;
     ~InProcMaster() { Stop(); }
 
     bool Start(InProcMasterConfig config) {
+        if (server_) {
+            LOG(ERROR) << "In-process test Master is already running on port "
+                       << rpc_port_;
+            return false;
+        }
         try {
-            // Bind the default RPC listener to a kernel-assigned port instead
-            // of selecting and releasing a port before the server owns it.
+            // Let each listener bind port zero so the kernel allocates and
+            // holds its port atomically. Probing free ports before binding
+            // races with other clients and processes.
             rpc_port_ = config.rpc_port.value_or(0);
-            http_metadata_port_ = config.http_metadata_port.has_value()
-                                      ? config.http_metadata_port.value()
-                                      : getFreeTcpPort();
+            http_metrics_port_ = config.http_metrics_port.value_or(0);
+            http_metadata_port_ = config.http_metadata_port.value_or(0);
 
-            // Optional HTTP metadata server
-            if (http_metadata_port_ > 0) {
+            // An explicit metadata port of zero disables this optional
+            // listener.
+            if (!config.http_metadata_port || http_metadata_port_ > 0) {
                 meta_server_ = std::make_unique<HttpMetadataServer>(
                     static_cast<uint16_t>(http_metadata_port_), "127.0.0.1");
                 if (!meta_server_->start()) {
                     LOG(ERROR)
                         << "Failed to start test HTTP metadata server on "
                         << http_metadata_port_;
+                    Stop();
                     return false;
                 }
+                http_metadata_port_ = meta_server_->port();
             }
-
-            // Select the metrics port after the metadata listener is bound.
-            http_metrics_port_ = config.http_metrics_port.has_value()
-                                     ? config.http_metrics_port.value()
-                                     : getFreeTcpPort();
 
             // RPC server + master service
             server_ = std::make_unique<coro_rpc::coro_rpc_server>(
-                /*thread_num=*/4, /*port=*/rpc_port_, /*address=*/"0.0.0.0",
+                /*thread_num=*/4, /*port=*/rpc_port_, /*address=*/"127.0.0.1",
                 std::chrono::seconds(0), /*tcp_no_delay=*/true);
             const char* value = std::getenv("MC_RPC_PROTOCOL");
             if (value && std::string_view(value) == "rdma") {
@@ -81,11 +83,13 @@ class InProcMaster {
             wms_cfg.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
             wms_cfg.allow_evict_soft_pinned_objects = true;
             wms_cfg.enable_metric_reporting = false;
-            wms_cfg.http_port = static_cast<uint16_t>(http_metrics_port_);
             wms_cfg.eviction_ratio = DEFAULT_EVICTION_RATIO;
             wms_cfg.eviction_high_watermark_ratio =
                 DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
             wms_cfg.view_version = 0;
+            wms_cfg.enable_ha = false;
+            wms_cfg.http_port = static_cast<uint16_t>(http_metrics_port_);
+            wms_cfg.cluster_id = DEFAULT_CLUSTER_ID;
             wms_cfg.root_fs_dir = DEFAULT_ROOT_FS_DIR;
             wms_cfg.memory_allocator = BufferAllocatorType::OFFSET;
 
@@ -112,29 +116,35 @@ class InProcMaster {
             }
 
             wrapped_ = std::make_unique<WrappedMasterService>(wms_cfg);
+            if (!wrapped_->http_server_started()) {
+                LOG(ERROR)
+                    << "Failed to start test Master HTTP metrics server on "
+                    << http_metrics_port_;
+                Stop();
+                return false;
+            }
+            http_metrics_port_ = wrapped_->http_port();
             RegisterRpcService(*server_, *wrapped_);
 
             auto ec = server_->async_start();
             if (ec.hasResult()) {
                 LOG(ERROR) << "Failed to start test Master RPC server on "
                            << rpc_port_;
+                Stop();
                 return false;
             }
-            // Allow server to bind
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
             rpc_port_ = server_->port();
-            if (rpc_port_ == 0) {
-                LOG(ERROR) << "Test Master RPC server did not publish its port";
-                return false;
-            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
             return true;
         } catch (const std::exception& e) {
             LOG(ERROR) << "Failed to start in-process test Master: "
                        << e.what();
+            Stop();
             return false;
         } catch (...) {
             LOG(ERROR)
                 << "Failed to start in-process test Master: unknown exception";
+            Stop();
             return false;
         }
     }
@@ -143,12 +153,14 @@ class InProcMaster {
         if (server_) {
             server_->stop();
             server_.reset();
-            wrapped_.reset();
         }
+        wrapped_.reset();
         if (meta_server_) {
             meta_server_->stop();
             meta_server_.reset();
         }
+        // Preserve the last bound addresses: callers use these accessors after
+        // Stop() to restart on the same ports for reconnection.
     }
 
     // Accessors

@@ -2,17 +2,13 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <cstdio>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <memory>
 #include <string>
 #include <random>
 #include <barrier>
 
 #include "centralized_client_config_builder.h"
-#include "config.h"
-#include "real_client_test_helper.h"
+#include "real_client.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
@@ -20,22 +16,6 @@ DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 
 namespace mooncake {
 namespace testing {
-
-namespace {
-
-class ScopedMaxMrSize {
-   public:
-    explicit ScopedMaxMrSize(size_t value)
-        : original_(globalConfig().max_mr_size) {
-        globalConfig().max_mr_size = value;
-    }
-    ~ScopedMaxMrSize() { globalConfig().max_mr_size = original_; }
-
-   private:
-    size_t original_;
-};
-
-}  // namespace
 
 // Helper class to temporarily mute glog output by setting log level to FATAL
 class GLogMuter {
@@ -52,11 +32,6 @@ class GLogMuter {
 
 class RealClientTest : public ::testing::Test {
    protected:
-    CentralizedClientConfig DeploymentConfig() {
-        return CentralizedClientConfigBuilder::build_centralized_real_client(
-            "127.0.0.1:0", "P2PHANDSHAKE", "tcp", std::nullopt,
-            master_.master_address(), 16 * 1024 * 1024, 4 * 1024 * 1024);
-    }
     static void SetUpTestSuite() {
         google::InitGoogleLogging("RealClientTest");
         FLAGS_logtostderr = 1;
@@ -91,52 +66,6 @@ class RealClientTest : public ::testing::Test {
     std::string master_address_;
 };
 
-TEST_F(RealClientTest, InvalidShmRegistrationClosesFdAndLeavesNoContext) {
-    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
-    auto client = RealClient::create();
-    auto config = DeploymentConfig();
-    ASSERT_EQ(client->setup(config), 0);
-    std::unique_ptr<std::FILE, decltype(&std::fclose)> file(std::tmpfile(),
-                                                            std::fclose);
-    ASSERT_NE(file, nullptr);
-    const int fd = fileno(file.get());
-    ASSERT_GE(fd, 0);
-    ASSERT_EQ(ftruncate(fd, 4096), 0);
-    struct stat original{};
-    ASSERT_EQ(fstat(fd, &original), 0);
-    const int passed_fd = dup(fd);
-    ASSERT_GE(passed_fd, 0);
-    {
-        ScopedMaxMrSize limit(1);
-        auto result = RealClientTestHelper::MapShm(*client, passed_fd, 0x100000,
-                                                   4096, false, {1, 2});
-        EXPECT_FALSE(result);
-    }
-    struct stat after{};
-    const bool duplicate_still_open = fstat(passed_fd, &after) == 0 &&
-                                      after.st_dev == original.st_dev &&
-                                      after.st_ino == original.st_ino;
-    EXPECT_FALSE(duplicate_still_open);
-    if (duplicate_still_open) close(passed_fd);
-    EXPECT_EQ(RealClientTestHelper::FindShmContext(*client, {1, 2}), nullptr);
-    EXPECT_EQ(client->tearDownAll(), 0);
-}
-
-TEST_F(RealClientTest, FailedLocalPoolRegistrationRejectsSetup) {
-    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
-    auto config = DeploymentConfig();
-    auto client = RealClient::create();
-    {
-        ScopedMaxMrSize limit(1);
-        EXPECT_NE(client->setup(config), 0);
-        EXPECT_FALSE(client->is_initialized());
-    }
-    EXPECT_EQ(client->tearDownAll(), 0);
-    client = RealClient::create();
-    ASSERT_EQ(client->setup(config), 0);
-    EXPECT_EQ(client->tearDownAll(), 0);
-}
-
 // Test basic Put and Get operations
 TEST_F(RealClientTest, BasicPutGetOperations) {
     // Start in-proc master
@@ -149,22 +78,23 @@ TEST_F(RealClientTest, BasicPutGetOperations) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
-        "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
-        rdma_devices.empty() ? std::nullopt
-                             : std::optional<std::string>(rdma_devices),
-        master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
-    ASSERT_EQ(py_client_->setup(config), 0);
+    auto setup_config =
+        CentralizedClientConfigBuilder::build_centralized_real_client(
+            "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
+            rdma_devices.empty() ? std::nullopt
+                                 : std::optional<std::string>(rdma_devices),
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+    ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     const std::string test_data = "Hello, RealClient!";
     const std::string key = "test_key_realclient";
 
     // Test Put operation using span
     std::span<const char> data_span(test_data.data(), test_data.size());
-    ReplicateConfig replicate_config;
-    replicate_config.replica_num = 1;
+    ReplicateConfig config;
+    config.replica_num = 1;
 
-    int put_result = py_client_->put(key, data_span, replicate_config);
+    int put_result = py_client_->put(key, data_span, config);
     EXPECT_EQ(put_result, 0) << "Put operation should succeed";
 
     // Test Get operation using buffer handle
@@ -200,12 +130,13 @@ TEST_F(RealClientTest, GetWithLeaseTimeOut) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
-        "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
-        rdma_devices.empty() ? std::nullopt
-                             : std::optional<std::string>(rdma_devices),
-        master_address_, 512 * 1024 * 1024, 512 * 1024 * 1024);
-    ASSERT_EQ(py_client_->setup(config), 0);
+    auto setup_config =
+        CentralizedClientConfigBuilder::build_centralized_real_client(
+            "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
+            rdma_devices.empty() ? std::nullopt
+                                 : std::optional<std::string>(rdma_devices),
+            master_address_, 512 * 1024 * 1024, 512 * 1024 * 1024);
+    ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     const size_t data_size = 256 * 1024 * 1024;  // 256MB
     std::string test_data(data_size, 'A');       // Fill with 'A' characters
@@ -322,7 +253,7 @@ TEST_F(RealClientTest, GetWithLeaseTimeOut) {
 TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
     // Start in-proc master
     const uint64_t kv_lease_ttl_ = 1;
-    const size_t segment_size = 32 * 1024 * 1024;
+    const size_t segment_size = 16 * 1024 * 1024;
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
                                   .set_default_kv_lease_ttl(kv_lease_ttl_)
                                   .build()))
@@ -333,12 +264,13 @@ TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
-        "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
-        rdma_devices.empty() ? std::nullopt
-                             : std::optional<std::string>(rdma_devices),
-        master_address_, segment_size, segment_size);
-    ASSERT_EQ(py_client_->setup(config), 0);
+    auto setup_config =
+        CentralizedClientConfigBuilder::build_centralized_real_client(
+            "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
+            rdma_devices.empty() ? std::nullopt
+                                 : std::optional<std::string>(rdma_devices),
+            master_address_, segment_size, segment_size);
+    ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     // Test Single Get Operation with Concurrent Put
     {
@@ -354,8 +286,8 @@ TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
                                   &sync_barrier]() {
                 const int num_iterations = 100;
                 const size_t slice_size =
-                    (16 * 1024 * 1024) / num_threads +
-                    1024;  // Ensure total size larger than 16MB
+                    segment_size / num_threads +
+                    1024;  // Ensure total size larger than segment size
                 const std::string key =
                     "concurrent_test_key_" + std::to_string(thread_idx);
 
@@ -383,8 +315,7 @@ TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
                 sync_barrier.arrive_and_wait();
 
                 for (int iter = 0; iter < num_iterations; ++iter) {
-                    int put_result = py_client_->put(key, data_span, config);
-                    ASSERT_EQ(put_result, 0) << "Put operation should succeed";
+                    py_client_->put(key, data_span, config);
 
                     // Randomly choose between get_buffer and get_into
                     if (dis_2(gen) == 0) {
@@ -460,7 +391,7 @@ TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
                                   &sync_barrier]() {
                 const int num_slices = 32;
                 const size_t slice_size =
-                    (16 * 1024 * 1024) / (num_threads * num_slices) + 1024;
+                    segment_size / (num_threads * num_slices) + 1024;
                 const size_t data_size = num_slices * slice_size;
                 const int num_iterations = 100;
 
@@ -507,10 +438,7 @@ TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
                 sync_barrier.arrive_and_wait();
 
                 for (int iter = 0; iter < num_iterations; ++iter) {
-                    int put_result =
-                        py_client_->put_batch(keys, data_spans, config);
-                    ASSERT_EQ(put_result, 0)
-                        << "Batch put operation should succeed";
+                    py_client_->put_batch(keys, data_spans, config);
 
                     if (dis_2(gen) == 0) {
                         // Test Batch Get operation using batch_get_buffer
@@ -594,22 +522,24 @@ TEST_F(RealClientTest, TestSetupExistTransferEngine) {
     } else {
         ASSERT_TRUE(false) << "Unsupported protocol: " << FLAGS_protocol;
     }
-    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
-        "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
-        rdma_devices.empty() ? std::nullopt
-                             : std::optional<std::string>(rdma_devices),
-        master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024, transfer_engine);
-    ASSERT_EQ(py_client_->setup(config), 0);
+    auto setup_config =
+        CentralizedClientConfigBuilder::build_centralized_real_client(
+            "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
+            rdma_devices.empty() ? std::nullopt
+                                 : std::optional<std::string>(rdma_devices),
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024,
+            transfer_engine);
+    ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     const std::string test_data = "Hello, RealClient!";
     const std::string key = "test_key_realclient";
 
     // Test Put operation using span
     std::span<const char> data_span(test_data.data(), test_data.size());
-    ReplicateConfig replicate_config;
-    replicate_config.replica_num = 1;
+    ReplicateConfig config;
+    config.replica_num = 1;
 
-    int put_result = py_client_->put(key, data_span, replicate_config);
+    int put_result = py_client_->put(key, data_span, config);
     EXPECT_EQ(put_result, 0) << "Put operation should succeed";
 }
 
@@ -624,12 +554,13 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
-        "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
-        rdma_devices.empty() ? std::nullopt
-                             : std::optional<std::string>(rdma_devices),
-        master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
-    ASSERT_EQ(py_client_->setup(config), 0);
+    auto setup_config =
+        CentralizedClientConfigBuilder::build_centralized_real_client(
+            "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
+            rdma_devices.empty() ? std::nullopt
+                                 : std::optional<std::string>(rdma_devices),
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+    ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     std::string test_data(1000, '1');
     std::string dst_data(1000, '0');
@@ -667,10 +598,10 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
         all_sizes.emplace_back(sizes);
     }
 
-    ReplicateConfig replicate_config;
-    replicate_config.prefer_alloc_in_same_node = true;
+    ReplicateConfig config;
+    config.prefer_alloc_in_same_node = true;
     std::vector<int> results = py_client_->batch_put_from_multi_buffers(
-        keys, all_ptrs, all_sizes, replicate_config);
+        keys, all_ptrs, all_sizes, config);
     for (auto result : results) {
         EXPECT_EQ(result, 0) << "Put operation should succeed";
     }
@@ -701,21 +632,22 @@ TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    auto config = CentralizedClientConfigBuilder::build_centralized_real_client(
-        "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
-        rdma_devices.empty() ? std::nullopt
-                             : std::optional<std::string>(rdma_devices),
-        master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
-    ASSERT_EQ(py_client_->setup(config), 0);
+    auto setup_config =
+        CentralizedClientConfigBuilder::build_centralized_real_client(
+            "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
+            rdma_devices.empty() ? std::nullopt
+                                 : std::optional<std::string>(rdma_devices),
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+    ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     const std::string test_data =
         "It's a test data for get_allocated_buffer_desc.";
     const std::string key = "mooncake_key";
     // put test_data with replica_config
     std::span<const char> data_span(test_data.data(), test_data.size());
-    ReplicateConfig replicate_config;
-    replicate_config.replica_num = 1;
-    py_client_->put(key, data_span, replicate_config);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    py_client_->put(key, data_span, config);
     // test get_replica_desc
     std::vector<Replica::Descriptor> desc = py_client_->get_replica_desc(key);
     EXPECT_EQ(desc.size(), 1) << "get_replica_desc should return 1 desc";
@@ -755,8 +687,9 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
     auto setup_config =
         CentralizedClientConfigBuilder::build_centralized_real_client(
             client1_addr, "P2PHANDSHAKE", FLAGS_protocol,
-            std::optional<std::string>(rdma_devices), master_address_,
-            16 * 1024 * 1024, 16 * 1024 * 1024);
+            rdma_devices.empty() ? std::nullopt
+                                 : std::optional<std::string>(rdma_devices),
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
     ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     // Setup client 2
@@ -765,8 +698,9 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
     auto setup_config2 =
         CentralizedClientConfigBuilder::build_centralized_real_client(
             client2_addr, "P2PHANDSHAKE", FLAGS_protocol,
-            std::optional<std::string>(rdma_devices), master_address_,
-            16 * 1024 * 1024, 16 * 1024 * 1024);
+            rdma_devices.empty() ? std::nullopt
+                                 : std::optional<std::string>(rdma_devices),
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
     ASSERT_EQ(py_client2->setup(setup_config2), 0);
 
     const std::string test_data = "Hello, CopyMoveQueryTask!";

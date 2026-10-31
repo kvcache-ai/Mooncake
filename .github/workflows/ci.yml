@@ -285,6 +285,27 @@ jobs:
         deactivate
       shell: bash
 
+    - name: Test installed centralized Store lifecycle
+      id: wheel_lifecycle
+      env:
+        TMPDIR: ${{ runner.temp }}/store-wheel-centralized
+        MOONCAKE_MASTER_COMMAND: mooncake_master
+        MOONCAKE_REAL_CLIENT_COMMAND: 'mooncake_client --global_segment_size="64 MB"'
+        MOONCAKE_DEPLOYMENT_PROTOCOL: tcp
+      run: |
+        source test_env/bin/activate
+        mkdir -p "$TMPDIR"
+        timeout --verbose --kill-after=5s 600s python mooncake-wheel/tests/test_deployment_lifecycle.py -f
+      shell: bash
+
+    - name: Preserve deployment logs
+      if: ${{ always() && steps.wheel_lifecycle.outcome == 'failure' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: store-wheel-centralized-${{ matrix.ubuntu-version }}-py${{ matrix.python-version }}
+        path: ${{ runner.temp }}/store-wheel-centralized/
+        if-no-files-found: warn
+
     - name: Start Mooncake Master
       run: |
         source test_env/bin/activate

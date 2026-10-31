@@ -341,6 +341,8 @@ struct P2PClientMetric {
 
     uint64_t GetReportingInterval() const { return metrics_interval_seconds_; }
     void StartMetricReporting(uint64_t interval_seconds);
+    // Stop and join the reporter, then clear the reporting interval.
+    void StopMetricReporting();
 
     ClientMetricSnapshot BuildSyncSnapshot();
 
@@ -353,7 +355,6 @@ struct P2PClientMetric {
     uint64_t metrics_interval_seconds_{0};
 
     void StartMetricsReportingThread();
-    void StopMetricsReportingThread();
 };
 
 }  // namespace mooncake

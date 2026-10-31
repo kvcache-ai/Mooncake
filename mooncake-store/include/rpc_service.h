@@ -26,6 +26,9 @@ class WrappedMasterService {
 
     void init_http_server();
 
+    bool http_server_started() const { return http_server_started_; }
+    uint16_t http_port() const { return http_server_.port(); }
+
     tl::expected<bool, ErrorCode> ExistKey(const std::string& key);
 
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
@@ -152,6 +155,7 @@ class WrappedMasterService {
     std::thread metric_report_thread_;
     coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
+    bool http_server_started_ = false;
 };
 
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,

@@ -13,7 +13,6 @@
 #include "p2p/client/p2p_client_metric.h"
 #include "p2p/client/tiered_cache/tiered_backend.h"
 #include "p2p/client/tiered_cache/tiers/cache_tier.h"  // TempDRAMBuffer
-#include "../utils/common.h"  // InitTieredBackendForTest
 
 namespace mooncake {
 namespace {
@@ -139,9 +138,10 @@ class EventDrivenSchedulerTest : public ::testing::Test {
 
 TEST_F(EventDrivenSchedulerTest, OffloadCreatesSlowReplicaKeepingFast) {
     TieredBackend backend;
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, MakeConfig(16 * kMB, 64 * kMB))
-            .has_value());
+    ASSERT_TRUE(backend
+                    .Init(MakeConfig(16 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr)
+                    .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
     ASSERT_NE(fast, slow);
@@ -159,9 +159,10 @@ TEST_F(EventDrivenSchedulerTest, OffloadCreatesSlowReplicaKeepingFast) {
 
 TEST_F(EventDrivenSchedulerTest, OnboardPromotesAndDropsSlow) {
     TieredBackend backend;
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, MakeConfig(16 * kMB, 64 * kMB))
-            .has_value());
+    ASSERT_TRUE(backend
+                    .Init(MakeConfig(16 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr)
+                    .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
 
@@ -177,7 +178,9 @@ TEST_F(EventDrivenSchedulerTest, OnboardPromotesAndDropsSlow) {
 TEST_F(EventDrivenSchedulerTest, OnboardCopyFailureKeepsSlowReplica) {
     TieredBackend backend;
     // Fast capacity is SMALLER than the item, so onboard's copy to fast fails.
-    ASSERT_TRUE(InitTieredBackendForTest(backend, MakeConfig(1 * kMB, 64 * kMB))
+    ASSERT_TRUE(backend
+                    .Init(MakeConfig(1 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr)
                     .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
@@ -197,11 +200,12 @@ TEST_F(EventDrivenSchedulerTest, OnboardCopyFailureKeepsSlowReplica) {
 TEST_F(EventDrivenSchedulerTest, EvictReclaimsFastTierAboveWatermark) {
     TieredBackend backend;
     // Low watermarks so the fill clearly exceeds the trigger.
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, MakeConfig(4 * kMB, 64 * kMB,
-                                                     /*evict_wm_high=*/0.50,
-                                                     /*evict_wm_low=*/0.40))
-            .has_value());
+    ASSERT_TRUE(backend
+                    .Init(MakeConfig(4 * kMB, 64 * kMB,
+                                     /*evict_wm_high=*/0.50,
+                                     /*evict_wm_low=*/0.40),
+                          nullptr, nullptr, nullptr, nullptr)
+                    .has_value());
     const UUID fast = FastTier(backend);
 
     std::vector<std::string> keys;
@@ -233,7 +237,9 @@ TEST_F(EventDrivenSchedulerTest,
     // strict allocation on a full SLOW tier must fail without evicting any of
     // its residents (slow tiers own their eviction inside their own Allocate).
     TieredBackend backend;
-    ASSERT_TRUE(InitTieredBackendForTest(backend, MakeConfig(16 * kMB, 1 * kMB))
+    ASSERT_TRUE(backend
+                    .Init(MakeConfig(16 * kMB, 1 * kMB), nullptr, nullptr,
+                          nullptr, nullptr)
                     .has_value());
     const UUID slow = SlowTier(backend);
 
@@ -261,11 +267,12 @@ TEST_F(EventDrivenSchedulerTest, StrictDramPutEvictsInsteadOfSpilling) {
     // Local puts must reclaim DRAM when full instead of spilling to a slow
     // tier.
     TieredBackend backend;
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, MakeConfig(2 * kMB, 64 * kMB,
-                                                     /*evict_wm_high=*/0.50,
-                                                     /*evict_wm_low=*/0.40))
-            .has_value());
+    ASSERT_TRUE(backend
+                    .Init(MakeConfig(2 * kMB, 64 * kMB,
+                                     /*evict_wm_high=*/0.50,
+                                     /*evict_wm_low=*/0.40),
+                          nullptr, nullptr, nullptr, nullptr)
+                    .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
     ASSERT_EQ(backend.GetDramTierId(), fast);  // fast role is the DRAM tier
@@ -290,7 +297,8 @@ TEST_F(EventDrivenSchedulerTest, GetHotKeyStatsZeroReturnsAllBeyondDefaultCap) {
     auto cfg = MakeConfig(16 * kMB, 64 * kMB);
     cfg["scheduler"]["hot_key_num"] = 64;  // explicit small cap for the test
     TieredBackend backend;
-    ASSERT_TRUE(InitTieredBackendForTest(backend, cfg).has_value());
+    ASSERT_TRUE(
+        backend.Init(cfg, nullptr, nullptr, nullptr, nullptr).has_value());
     const UUID fast = FastTier(backend);
 
     constexpr int kKeys = 100;  // > the configured cap of 64
@@ -313,7 +321,9 @@ TEST_F(EventDrivenSchedulerTest, StrictCopyDataDoesNotFallBackToOtherTier) {
     // A strict copy must fail if it cannot reach the requested tier.
     TieredBackend backend;
     // Fast tier is too small to ever hold the item, even after eviction.
-    ASSERT_TRUE(InitTieredBackendForTest(backend, MakeConfig(1 * kMB, 64 * kMB))
+    ASSERT_TRUE(backend
+                    .Init(MakeConfig(1 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr)
                     .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
@@ -334,9 +344,10 @@ TEST_F(EventDrivenSchedulerTest, StopUnderLoadIsClean) {
     // Exercises Stop()/teardown with the evict thread and pool busy. Under
     // ASAN/TSAN this guards against UAF / leaks on shutdown.
     TieredBackend backend;
-    ASSERT_TRUE(
-        InitTieredBackendForTest(backend, MakeConfig(16 * kMB, 64 * kMB))
-            .has_value());
+    ASSERT_TRUE(backend
+                    .Init(MakeConfig(16 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr)
+                    .has_value());
     const UUID fast = FastTier(backend);
     for (int i = 0; i < 50; ++i) {
         const std::string k = "s" + std::to_string(i);

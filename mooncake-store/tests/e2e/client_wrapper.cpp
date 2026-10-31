@@ -117,29 +117,34 @@ ErrorCode ClientTestWrapper::Unmount(const void* buffer) {
 }
 
 ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
-    uint64_t total_size;
     auto query_result = client_->Query(key);
     if (!query_result.has_value()) {
         return query_result.error();
     }
-    if (query_result->replicas.empty()) {
-        return ErrorCode::INVALID_REPLICA;
-    }
-    total_size = calculate_total_size(query_result->replicas[0]);
-    if (total_size == 0) {
-        value.clear();
-        return ErrorCode::OK;
+
+    const std::vector<Replica::Descriptor>& replica_list =
+        query_result.value().replicas;
+    if (replica_list.empty()) {
+        return ErrorCode::OBJECT_NOT_FOUND;
     }
 
-    SliceGuard buffer(total_size, allocator_);
-    auto get_result = client_->Get(key, *query_result, buffer.slices_);
-    if (!get_result.has_value()) {
-        return get_result.error();
+    // Create slices
+    const AllocatedBuffer::Descriptor& descriptor =
+        replica_list[0].get_memory_descriptor().buffer_descriptor;
+    SliceGuard slice_guard(descriptor.size_, allocator_);
+
+    // Perform get operation
+    auto get_result =
+        client_->Get(key, query_result.value(), slice_guard.slices_);
+    ErrorCode error_code =
+        get_result.has_value() ? ErrorCode::OK : get_result.error();
+    if (error_code != ErrorCode::OK) {
+        return error_code;
     }
 
+    // Fill value
     value.clear();
-    value.reserve(total_size);
-    for (const auto& slice : buffer.slices_) {
+    for (const auto& slice : slice_guard.slices_) {
         value.append(static_cast<const char*>(slice.ptr), slice.size);
     }
     return ErrorCode::OK;
@@ -155,10 +160,12 @@ ErrorCode ClientTestWrapper::Put(const std::string& key,
         offset += slice.size;
     }
 
+    // Configure replication
+    ReplicateConfig config;
+    config.replica_num = 1;
+
     // Perform put operation
-    ReplicateConfig replicate_config;
-    replicate_config.replica_num = 1;
-    auto put_result = client_->Put(key, slice_guard.slices_, replicate_config);
+    auto put_result = client_->Put(key, slice_guard.slices_, config);
     return put_result.has_value() ? ErrorCode::OK : put_result.error();
 }
 

@@ -18,7 +18,6 @@
 
 #include "allocator.h"
 #include "client_service.h"
-#include "client_config_builder.h"
 #include "types.h"
 #include "utils.h"
 #include "test_server_helpers.h"
@@ -32,9 +31,8 @@ DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
 DEFINE_string(cxl_device_name, "tmp_dax_sim", "Device name for cxl");
 DEFINE_uint64(cxl_device_size, 1073741824, "Device Size for cxl");
 DEFINE_bool(auto_disc, false, "Auto discover tcp devices");
-DEFINE_string(transfer_engine_metadata_url, "",
-              "Transfer engine metadata URL; empty uses the in-process HTTP "
-              "metadata server");
+DEFINE_string(transfer_engine_metadata_url, "127.0.0.1:2379",
+              "Metadata connection string for transfer engine");
 
 namespace mooncake {
 namespace testing {
@@ -94,12 +92,12 @@ class ClientIdCaptureSink : public google::LogSink {
 class ClientIntegrationTestCxl : public ::testing::Test {
    protected:
     static std::shared_ptr<Client> CreateClient(const std::string& host_name) {
-        auto client_opt =
-            Client::Create(host_name,
-                           FLAGS_transfer_engine_metadata_url.empty()
-                               ? master_.metadata_url()
-                               : FLAGS_transfer_engine_metadata_url,
-                           FLAGS_protocol, std::nullopt, master_address_);
+        auto client_opt = Client::Create(
+            host_name,                           // Local hostname
+            FLAGS_transfer_engine_metadata_url,  // Metadata connection string
+            FLAGS_protocol,                      // Transfer protocol
+            std::nullopt,  // RDMA device names (auto-discovery)
+            master_address_);
 
         EXPECT_TRUE(client_opt.has_value())
             << "Failed to create client with host_name: " << host_name;
@@ -289,12 +287,16 @@ TEST_F(ClientIntegrationTestCxl, BasicPutGetOperations) {
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
     buffer = client_buffer_allocator_->allocate(1 * 1024 * 1024);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, test_data.size()});
     // Verify data through Get operation
-    auto get_result = test_client_->Get(key, buffer, test_data.size());
+    auto get_result = test_client_->Get(key, slices);
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
-    ASSERT_EQ(get_result.value(), test_data.size());
-    ASSERT_EQ(memcmp(buffer, test_data.data(), test_data.size()), 0);
+    ASSERT_EQ(slices.size(), 1);
+    ASSERT_EQ(slices[0].size, test_data.size());
+    ASSERT_EQ(slices[0].ptr, buffer);
+    ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
     // Put again with the same key, should succeed
@@ -352,10 +354,11 @@ TEST_F(ClientIntegrationTestCxl, BatchPutGetOperations) {
 
     start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < batch_sz; i++) {
+        std::vector<Slice> slices;
         target_buffer =
             client_buffer_allocator_->allocate(test_data_list[i].size());
-        auto get_result =
-            test_client_->Get(keys[i], target_buffer, test_data_list[i].size());
+        slices.emplace_back(Slice{target_buffer, test_data_list[i].size()});
+        auto get_result = test_client_->Get(keys[i], slices);
         ASSERT_TRUE(get_result.has_value())
             << "Get operation failed: " << toString(get_result.error());
         client_buffer_allocator_->deallocate(target_buffer,
@@ -369,29 +372,19 @@ TEST_F(ClientIntegrationTestCxl, BatchPutGetOperations) {
               << "us";
 
     start = std::chrono::high_resolution_clock::now();
-    std::vector<std::string> batch_keys;
-    std::vector<std::vector<void*>> batch_buffers;
-    std::vector<std::vector<size_t>> batch_sizes;
-    std::vector<void*> batch_ptrs;
+    std::unordered_map<std::string, std::vector<Slice>> target_batched_slices;
     for (int i = 0; i < batch_sz; i++) {
+        std::vector<Slice> target_slices;
         target_buffer =
             client_buffer_allocator_->allocate(test_data_list[i].size());
-        batch_keys.push_back(keys[i]);
-        batch_buffers.push_back({target_buffer});
-        batch_sizes.push_back({test_data_list[i].size()});
-        batch_ptrs.push_back(target_buffer);
+        target_slices.emplace_back(
+            Slice{target_buffer, test_data_list[i].size()});
+        target_batched_slices.emplace(keys[i], target_slices);
     }
     auto batch_get_results =
-        test_client_->BatchGet(batch_keys, batch_buffers, batch_sizes);
-    for (size_t i = 0; i < batch_get_results.size(); i++) {
-        ASSERT_TRUE(batch_get_results[i].has_value())
-            << "BatchGet operation failed for key " << batch_keys[i];
-        ASSERT_EQ(batch_get_results[i].value(), test_data_list[i].size());
-        ASSERT_EQ(memcmp(batch_ptrs[i], test_data_list[i].data(),
-                         test_data_list[i].size()),
-                  0);
-        client_buffer_allocator_->deallocate(batch_ptrs[i],
-                                             test_data_list[i].size());
+        test_client_->BatchGet(keys, target_batched_slices);
+    for (const auto& result : batch_get_results) {
+        ASSERT_TRUE(result.has_value()) << "BatchGet operation failed";
     }
     end = std::chrono::high_resolution_clock::now();
     LOG(INFO) << "Time taken for BatchGet: "
@@ -399,6 +392,16 @@ TEST_F(ClientIntegrationTestCxl, BatchPutGetOperations) {
                                                                        start)
                      .count()
               << "us";
+
+    for (int i = 0; i < batch_sz; i++) {
+        ASSERT_EQ(target_batched_slices[keys[i]][0].size,
+                  test_data_list[i].size());
+        ASSERT_EQ(memcmp(target_batched_slices[keys[i]][0].ptr,
+                         test_data_list[i].data(), test_data_list[i].size()),
+                  0);
+        client_buffer_allocator_->deallocate(
+            target_batched_slices[keys[i]][0].ptr, test_data_list[i].size());
+    }
 }
 
 }  // namespace testing
