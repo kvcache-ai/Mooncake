@@ -5474,6 +5474,49 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     return AddReplicaForRetainedClient(client_id, key, tenant_id, replica);
 }
 
+tl::expected<void, ErrorCode> MasterService::PersistLocalDiskReplicaToOpLog(
+    const ObjectIdentity& object_id, const ObjectMetadata& metadata,
+    const UUID& client_id, const Replica& replica) {
+    if (!enable_oplog_ || !ordered_oplog_writer_) {
+        return {};
+    }
+    const bool replacing_existing =
+        metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+    std::vector<Replica::Descriptor> post;
+    for (const auto& existing : metadata.GetAllReplicas()) {
+        if (existing.status() != ReplicaStatus::COMPLETE) continue;
+        if (replacing_existing && existing.type() == ReplicaType::LOCAL_DISK &&
+            existing.get_descriptor().get_local_disk_descriptor().client_id ==
+                client_id) {
+            // Substitute with the updated descriptor.
+            Replica::Descriptor updated = existing.get_descriptor();
+            updated.get_local_disk_descriptor().transport_endpoint =
+                replica.get_descriptor()
+                    .get_local_disk_descriptor()
+                    .transport_endpoint;
+            updated.get_local_disk_descriptor().object_size =
+                replica.get_descriptor()
+                    .get_local_disk_descriptor()
+                    .object_size;
+            post.push_back(std::move(updated));
+        } else {
+            post.push_back(existing.get_descriptor());
+        }
+    }
+    if (!replacing_existing) {
+        // The new LOCAL_DISK replica is COMPLETE upon AddReplica.
+        post.push_back(replica.get_descriptor());
+    }
+
+    auto persist_result = AppendOpLogVisibleBeforeDurable(
+        OpType::PUT_END, object_id.tenant_id.value(), object_id.user_key,
+        SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post));
+    if (!persist_result) {
+        return tl::make_unexpected(persist_result.error());
+    }
+    return {};
+}
+
 auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
                                                 const std::string& key,
                                                 const TenantId& tenant_id,
@@ -5525,41 +5568,10 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     const bool replacing_existing =
         metadata.HasReplica(&Replica::fn_is_local_disk_replica);
 
-    if (enable_oplog_ && ordered_oplog_writer_) {
-        std::vector<Replica::Descriptor> post;
-        for (const auto& existing : metadata.GetAllReplicas()) {
-            if (existing.status() != ReplicaStatus::COMPLETE) continue;
-            if (replacing_existing &&
-                existing.type() == ReplicaType::LOCAL_DISK &&
-                existing.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .client_id == client_id) {
-                // Substitute with the updated descriptor.
-                Replica::Descriptor updated = existing.get_descriptor();
-                updated.get_local_disk_descriptor().transport_endpoint =
-                    replica.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .transport_endpoint;
-                updated.get_local_disk_descriptor().object_size =
-                    replica.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .object_size;
-                post.push_back(std::move(updated));
-            } else {
-                post.push_back(existing.get_descriptor());
-            }
-        }
-        if (!replacing_existing) {
-            // The new LOCAL_DISK replica is COMPLETE upon AddReplica.
-            post.push_back(replica.get_descriptor());
-        }
-
-        auto persist_result = AppendOpLogVisibleBeforeDurable(
-            OpType::PUT_END, object_id.tenant_id.value(), key,
-            SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post));
-        if (!persist_result) {
-            return tl::make_unexpected(persist_result.error());
-        }
+    if (auto persisted = PersistLocalDiskReplicaToOpLog(object_id, metadata,
+                                                        client_id, replica);
+        !persisted) {
+        return tl::make_unexpected(persisted.error());
     }
 
     if (!replacing_existing) {
@@ -8230,6 +8242,14 @@ auto MasterService::NotifyOffloadSuccess(
                         // The offload bookkeeping above still ran; only the
                         // registration is refused.
                         refused_unmounted = true;
+                    } else if (auto persisted = PersistLocalDiskReplicaToOpLog(
+                                   request_object_id, obj_metadata, client_id,
+                                   replica);
+                               !persisted) {
+                        // Record before registering, like the no-task path in
+                        // AddReplicaForRetainedClient: a standby must learn of
+                        // the disk copy, not only from a later eviction.
+                        return tl::make_unexpected(persisted.error());
                     } else if (!obj_metadata.HasReplica(
                                    &Replica::fn_is_local_disk_replica)) {
                         std::vector<Replica> replicas;
