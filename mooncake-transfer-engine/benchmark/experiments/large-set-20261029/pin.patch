@@ -1,0 +1,83 @@
+--- a/mooncake-transfer-engine/benchmark/te_backend.cpp
++++ b/mooncake-transfer-engine/benchmark/te_backend.cpp
+@@ -44,6 +44,27 @@
+ namespace mooncake {
+ namespace tent {
+ namespace {
++
++static void experimentalPinCpu(const char* env_name, size_t index) {
++    const char* value = std::getenv(env_name);
++    if (!value || !*value) return;
++    for (size_t i = 0; i < index; ++i) {
++        value = std::strchr(value, ',');
++        CHECK(value) << "Insufficient entries in " << env_name;
++        ++value;
++    }
++    char* end = nullptr;
++    const long cpu = std::strtol(value, &end, 10);
++    CHECK(end != value && (*end == ',' || *end == '\0'));
++    CHECK_GE(cpu, 0); CHECK_LT(cpu, CPU_SETSIZE);
++    cpu_set_t allowed, selected;
++    CHECK_EQ(sched_getaffinity(0, sizeof(allowed), &allowed), 0);
++    CHECK(CPU_ISSET(cpu, &allowed)) << "Requested CPU outside inherited NUMA budget";
++    CPU_ZERO(&selected); CPU_SET(cpu, &selected);
++    CHECK_EQ(sched_setaffinity(0, sizeof(selected), &selected), 0);
++    LOG(INFO) << "Experimental CPU pin " << env_name << " index=" << index << " cpu=" << cpu;
++}
++
+ thread_local int experimental_thread_nic_hint = -1;
+ }
+
+@@ -630,6 +651,7 @@
+         LOG(INFO) << "Experimental benchmark submitter CPU=" << cpu;
+     }
+
++    experimentalPinCpu("MC_EXPERIMENTAL_SUBMIT_CPUS", thread_id);
+ }
+
+ int TEBenchRunner::runner(int thread_id) {
+--- a/mooncake-transfer-engine/src/transport/rdma_transport/worker_pool.cpp
++++ b/mooncake-transfer-engine/src/transport/rdma_transport/worker_pool.cpp
+@@ -41,6 +41,27 @@
+ // #define CONFIG_CACHE_ENDPOINT
+
+ namespace mooncake {
++
++static void experimentalPinCpu(const char* env_name, size_t index) {
++    const char* value = std::getenv(env_name);
++    if (!value || !*value) return;
++    for (size_t i = 0; i < index; ++i) {
++        value = std::strchr(value, ',');
++        CHECK(value) << "Insufficient entries in " << env_name;
++        ++value;
++    }
++    char* end = nullptr;
++    const long cpu = std::strtol(value, &end, 10);
++    CHECK(end != value && (*end == ',' || *end == '\0'));
++    CHECK_GE(cpu, 0); CHECK_LT(cpu, CPU_SETSIZE);
++    cpu_set_t allowed, selected;
++    CHECK_EQ(sched_getaffinity(0, sizeof(allowed), &allowed), 0);
++    CHECK(CPU_ISSET(cpu, &allowed)) << "Requested CPU outside inherited NUMA budget";
++    CPU_ZERO(&selected); CPU_SET(cpu, &selected);
++    CHECK_EQ(sched_setaffinity(0, sizeof(selected), &selected), 0);
++    LOG(INFO) << "Experimental CPU pin " << env_name << " index=" << index << " cpu=" << cpu;
++}
++
+
+ static std::string resolveBufferLocation(
+     const TransferMetadata::BufferDesc &buffer, uint64_t offset) {
+@@ -1266,6 +1287,14 @@
+         LOG(INFO) << "Experimental RDMA worker CPU=" << cpu;
+     }
+
++    if (std::getenv("MC_EXPERIMENTAL_WORKER_CPUS")) {
++        CHECK_EQ(thread_id, 0) << "One worker per context required";
++        const auto name = context_.deviceName();
++        CHECK_EQ(name.substr(0, 5), "mlx5_");
++        const size_t nic = std::stoul(name.substr(5));
++        experimentalPinCpu("MC_EXPERIMENTAL_WORKER_CPUS", nic);
++    }
++
+     // Busy-poll this long after the pool goes idle before parking
+     // (MC_RDMA_WORKER_IDLE_SPIN_US, 100 ms by default).
+     const uint64_t idle_spin_ns =

@@ -1,0 +1,17 @@
+--- a/src/perftest_parameters.c
++++ b/src/perftest_parameters.c
+@@ -849,0 +850,14 @@
++	/* Task-local experiment: rotate small WRs across a larger region. */
++	const char *cycle_env = getenv("PERFTEST_EXPERIMENTAL_CYCLE_BYTES");
++	if (cycle_env) {
++		char *end = NULL;
++		unsigned long long value = strtoull(cycle_env, &end, 10);
++		if (!*cycle_env || *end || value < 4096 || value > 1073741824ULL ||
++		    (value & (value - 1))) {
++			fprintf(stderr, "Invalid experimental cycle buffer size\n");
++			exit(1);
++		}
++		user_param->cycle_buffer = (int)value;
++		printf("Experimental cycle buffer bytes: %d\n", user_param->cycle_buffer);
++	}
++

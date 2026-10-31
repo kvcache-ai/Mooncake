@@ -1,0 +1,38 @@
+--- a/mooncake-transfer-engine/benchmark/te_backend.cpp
++++ b/mooncake-transfer-engine/benchmark/te_backend.cpp
+@@ -952,6 +952,12 @@
+         CHECK_EQ(chunk_stride, 1u); CHECK_EQ(phase_chunks, 0u);
+         control = experimentalControlAddresses(local_addr, target_addr, target_id);
+     }
++    const char* every_env = std::getenv("MC_EXPERIMENTAL_PROGRESS_EVERY");
++    const uint64_t progress_every = every_env ? std::strtoull(every_env, nullptr, 10) : 1;
++    if (progress) {
++        CHECK_GT(progress_every, 0u); CHECK_LE(progress_every, 64u);
++        CHECK_EQ(chunk_count % progress_every, 0u);
++    }
+     uint64_t progress_posts = 0;
+     XferBenchTimer clock;
+     const char* initiator_warm_env = std::getenv("MC_EXPERIMENTAL_INITIATOR_WARM_US");
+@@ -977,7 +983,8 @@
+         if (!visited[slot.chunk]) { visited[slot.chunk] = true; ++visited_count; }
+         next_chunk = (next_chunk + chunk_stride) % chunk_count;
+         slot.submitted_us = clock.lap_us(false);
+-        slot.id = engine_->allocateBatchID(slot_batch_size + (progress ? 1 : 0));
++        const bool post_hint = progress && slot.chunk % progress_every == 0;
++        slot.id = engine_->allocateBatchID(slot_batch_size + (post_hint ? 1 : 0));
+         slot.active = true;
+         ++active;
+         std::vector<TransferRequest> temporary_requests;
+@@ -1006,7 +1013,11 @@
+                 requests[i].target_offset = target_addr + offset;
+             }
+         }
+-        if (progress) {
++        // A reused vector may have carried a hint on its previous submission.
++        // Remove it before a payload-only batch is submitted.
++        if (!post_hint && requests.size() > slot_batch_size)
++            requests.resize(slot_batch_size);
++        if (post_hint) {
+             // Per-slot source is not reused until all requests, including this
+             // hint, have completed. The cursor is outside the 8 GiB payload.
+             const uint64_t source = control.first + index * 64;
