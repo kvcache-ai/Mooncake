@@ -693,8 +693,16 @@ class TransferEngineImpl {
         std::unordered_set<BatchID> alive_batches;
     };
     BatchShard& batchShard(BatchID batch_id) {
-        return batch_shards_[reinterpret_cast<uintptr_t>(batch_id) %
-                             kBatchLockShards];
+        // Batches come from a slab in sizeof(Batch) steps, so the low address
+        // bits take only a few values. Mix all bits (MurmurHash3 fmix64) so
+        // batches spread over every shard.
+        uint64_t key = batch_id;
+        key ^= key >> 33;
+        key *= 0xff51afd7ed558ccdULL;
+        key ^= key >> 33;
+        key *= 0xc4ceb9fe1a85ec53ULL;
+        key ^= key >> 33;
+        return batch_shards_[key % kBatchLockShards];
     }
     std::recursive_mutex& batchShardMutex(BatchID batch_id) {
         return batchShard(batch_id).mtx;
