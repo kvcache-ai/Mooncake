@@ -3152,10 +3152,11 @@ are read into request-scoped host staging and then scattered to host or device
 destinations; for device destinations, staging first uses the fixed-capacity
 pinned restore arena configured by `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES`
 and falls back to the regular client buffer allocator if it is unavailable or
-exhausted. LOCAL_DISK replicas are restored on the owner via the offload RPC
-and then scatter object-byte ranges into already `register_buffer`'d
-destinations (the reader does not need a setup local buffer). DISK replicas
-`BatchGet` into a temporary host buffer and scatter by `src_offset`. If a key
+exhausted. LOCAL_DISK replicas restore only the requested byte window on the
+owner via the offload RPC and then scatter that window into already
+`register_buffer`'d destinations (the reader does not need a setup local
+buffer). DISK and DFS replicas read that same window into a temporary host
+buffer and scatter it. If a key
 has no complete MEMORY, DFS, LOCAL_DISK, or DISK replica — for example because
 it has only NOF replicas — `batch_get_session_start` returns
 `INVALID_REPLICA` for that key and does not open a session. Put sessions
