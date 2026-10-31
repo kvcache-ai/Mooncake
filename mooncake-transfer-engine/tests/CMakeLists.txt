@@ -254,6 +254,12 @@ if(USE_TCP)
 endif()
 
 if(USE_NVMEOF)
+  # cuFile entry points are faked by the executable; no GPU or SSD is needed.
+  add_executable(nvmeof_request_test ${WORKSPACE}/nvmeof_request_test.cpp)
+  target_link_libraries(nvmeof_request_test PUBLIC transfer_engine gtest
+                                                   gtest_main)
+  add_test(NAME nvmeof_request_test COMMAND nvmeof_request_test)
+
   add_executable(nvmeof_status_test ${WORKSPACE}/nvmeof_status_test.cpp)
   target_link_libraries(nvmeof_status_test PUBLIC transfer_engine gtest
                                                   gtest_main)
