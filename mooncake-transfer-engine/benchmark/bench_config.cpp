@@ -18,6 +18,7 @@
 #include "bench_config.h"
 
 #include <cmath>
+#include <limits>
 #include <sstream>
 
 namespace mooncake {
@@ -40,6 +41,13 @@ bool validateSweepBounds(const char* name, T start, T max, std::string* error) {
         std::ostringstream os;
         os << "--start_" << name << " (" << start << ") must not exceed --max_"
            << name << " (" << max << ")";
+        return fail(error, os.str());
+    }
+    // The sweep doubles the value while it is <= max, so 2 * max must fit.
+    const T limit = std::numeric_limits<T>::max() / 2;
+    if (max > limit) {
+        std::ostringstream os;
+        os << "--max_" << name << " (" << max << ") must be at most " << limit;
         return fail(error, os.str());
     }
     return true;
@@ -178,6 +186,14 @@ bool validateSweep(std::string* error) {
         !validateSweepBounds("batch_size", XferBenchConfig::start_batch_size,
                              XferBenchConfig::max_batch_size, error)) {
         return false;
+    }
+    const size_t max_block = XferBenchConfig::max_block_size;
+    const size_t max_batch = XferBenchConfig::max_batch_size;
+    if (max_block > std::numeric_limits<size_t>::max() / max_batch) {
+        std::ostringstream os;
+        os << "--max_block_size x --max_batch_size overflows (" << max_block
+           << " x " << max_batch << ")";
+        return fail(error, os.str());
     }
     if (XferBenchConfig::duration <= 0) {
         return fail(error, "--duration must be positive");

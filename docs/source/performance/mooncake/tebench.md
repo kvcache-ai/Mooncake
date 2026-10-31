@@ -167,6 +167,13 @@ Each output row corresponds to one benchmark configuration.
 | `P99 Tx (us)`  | P99 transfer latency                                |
 | `P999 Tx (us)` | P999 transfer latency                               |
 
+`BW` is the throughput of the requested workload: total bytes divided by the
+pooled average worker duration of the measurement phase. It therefore includes
+work done inside the loop on request, such as `--request_interval_us` pacing
+and the data fill and verify of `--check_consistency`. `Avg Tx`, `P99 Tx`,
+`P999 Tx`, and `Avg Inst GB/s` time only the transfer itself, from submit to
+completion.
+
 A short (~1 second) warmup phase is executed before measurements begin.
 
 ### 4.1 QoS Metrics Baseline
