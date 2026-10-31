@@ -4791,9 +4791,6 @@ auto MasterService::AllocateReplicas(const std::string& key,
         {
             ScopedAllocatorAccess allocator_access =
                 segment_manager_.getAllocatorAccess();
-            has_enough_memory_segments = allocator_access.getAllocatorManager()
-                                             .getServingNames()
-                                             .size() >= config.replica_num;
             if (!writer_host_id.empty()) {
                 auto host_ordered_segments =
                     allocator_access.GetHostOrderedSegments(writer_host_id,
@@ -4819,6 +4816,17 @@ auto MasterService::AllocateReplicas(const std::string& key,
         auto allocation_result = allocation_strategy_->Allocate(
             allocator_snapshot, value_length, config.replica_num,
             preferred_segments, std::set<std::string>(), ReplicaType::MEMORY);
+
+        // Only failed or short allocations need this eviction hint. Count on
+        // the retained snapshot after releasing the segment read lock.
+        if ((!allocation_result &&
+             allocation_result.error() != ErrorCode::INVALID_PARAMS) ||
+            (allocation_result &&
+             allocation_result->size() != config.replica_num)) {
+            has_enough_memory_segments =
+                allocator_snapshot.getServingNames().size() >=
+                config.replica_num;
+        }
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key
