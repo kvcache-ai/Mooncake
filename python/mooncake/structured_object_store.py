@@ -4037,7 +4037,7 @@ class _StructuredObjectLayer:
         )
         if read_plan.byte_length == 0:
             return target
-        destination_view = target.view(np.uint8).reshape(-1)
+        destination_view = target.reshape(-1).view(np.uint8)
         if read_plan.step == 1:
             self._bundle_store.read_payload_range_into_destination(
                 payload_spec,
@@ -6051,11 +6051,13 @@ def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
     if _torch is not None and isinstance(value, _torch.Tensor):
         return _encode_torch_tensor_field(value)
     if isinstance(value, np.ndarray):
+        # np.ascontiguousarray promotes 0-D inputs to shape (1,).
+        # Keep the original shape in metadata and use array for payload bytes.
         array = np.ascontiguousarray(value)
         return {
             "encoding": "ndarray",
             "dtype": array.dtype.str,
-            "shape": list(array.shape),
+            "shape": list(value.shape),
         }, array.view(np.uint8).reshape(-1)
     return {"encoding": "bytes"}, value
 
