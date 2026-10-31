@@ -3,6 +3,8 @@
 #include "config/replica_selection_config.h"
 #include "master_service/master_service_test_peer.h"
 #include "rpc_service.h"
+#include "storage/distributed/kvcs/kvcs_capacity_provider.h"
+#include "storage/distributed/kvcs/kvcs_driver.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -75,6 +77,252 @@ class ScopedEnvVar {
     std::string name_;
     std::optional<std::string> previous_value_;
 };
+
+struct KvcsWatermarkDriverState {
+    std::vector<ObjectKey> deleted_keys;
+    bool fail_delete{false};
+};
+
+class KvcsWatermarkDriver final : public KvcsDriver {
+   public:
+    explicit KvcsWatermarkDriver(
+        std::shared_ptr<KvcsWatermarkDriverState> state)
+        : state_(std::move(state)) {}
+
+    tl::expected<void, ErrorCode> Init() override { return {}; }
+    uint64_t MaxValueSize() const override { return 4 * 1024 * 1024; }
+    tl::expected<std::vector<KvcsMountpointStat>, ErrorCode>
+    GetMountpointStats() override {
+        return std::vector<KvcsMountpointStat>{{.index = 1,
+                                                .id = "target-mp",
+                                                .total_bytes = 100,
+                                                .used_bytes = 95}};
+    }
+    KvcsIoResults BatchPut(std::span<const KvcsIoRequest> requests) override {
+        return Errors(requests.size(), ErrorCode::NOT_SUPPORTED);
+    }
+    KvcsIoResults BatchGet(std::span<const KvcsIoRequest> requests) override {
+        return Errors(requests.size(), ErrorCode::NOT_SUPPORTED);
+    }
+    KvcsIoResults BatchDelete(std::span<const ObjectKey> keys) override {
+        KvcsIoResults results;
+        results.reserve(keys.size());
+        for (const auto& key : keys) {
+            state_->deleted_keys.push_back(key);
+            if (state_->fail_delete) {
+                results.emplace_back(tl::make_unexpected(ErrorCode::RPC_FAIL));
+            } else {
+                results.emplace_back();
+            }
+        }
+        return results;
+    }
+
+   private:
+    static KvcsIoResults Errors(size_t count, ErrorCode error) {
+        return KvcsIoResults(count, tl::make_unexpected(error));
+    }
+
+    std::shared_ptr<KvcsWatermarkDriverState> state_;
+};
+
+TEST_F(MasterServiceTest,
+       KvcsStorageModeSkipsFilesystemAllocatorRecoveryRestriction) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar kvcs_adapter("MOONCAKE_DFS_FS_ADAPTER", "kvcs-lowlevel");
+    MasterServiceConfig config;
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.ha_backend_type = "etcd";
+    MasterService service(config);
+    EXPECT_TRUE(MasterServiceTestPeer::EnableDfs(service));
+    EXPECT_EQ(MasterServiceTestPeer::DfsAllocator(service), nullptr);
+    EXPECT_TRUE(MasterServiceTestPeer::UsesKvcs(service));
+}
+
+TEST_F(MasterServiceTest,
+       KvcsCapacityWatermarkEvictsDfsReplicaAndProviderData) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar clear_adapter("MOONCAKE_DFS_FS_ADAPTER");
+
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 1;
+    config.default_kv_soft_pin_ttl = 1;
+    MasterService service(config);
+    const auto context = PrepareSimpleSegment(service);
+    MasterServiceTestPeer peer(service);
+    peer.EvictionRunning(service).store(false, std::memory_order_relaxed);
+    if (peer.EvictionThread(service).joinable()) {
+        peer.EvictionThread(service).join();
+    }
+
+    auto driver_state = std::make_shared<KvcsWatermarkDriverState>();
+    peer.ConfigureKvcsCapacityForTesting(
+        std::make_unique<KvcsCapacityProvider>(
+            1, "target-mp",
+            std::make_unique<KvcsWatermarkDriver>(driver_state)),
+        true, 0.9, 0.7);
+
+    ReplicateConfig replicate;
+    replicate.replica_num = 1;
+    replicate.dfs_replica_num = 1;
+    constexpr std::string_view key = "kvcs-watermark";
+    ASSERT_TRUE(service.PutStart(context.client_id, std::string(key),
+                                 TenantId::Default(), 64, replicate));
+    ASSERT_TRUE(service.PutEnd(context.client_id, std::string(key),
+                               TenantId::Default(), ReplicaType::ALL));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    driver_state->fail_delete = true;
+    peer.RefreshKvcsDfsUsageForTesting();
+    auto unchanged =
+        service.GetReplicaList(std::string(key), TenantId::Default());
+    ASSERT_TRUE(unchanged);
+    ASSERT_EQ(unchanged->replicas.size(), 2u);
+    ASSERT_EQ(driver_state->deleted_keys.size(), 1u);
+
+    driver_state->fail_delete = false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    peer.RefreshKvcsDfsUsageForTesting();
+
+    auto remaining =
+        service.GetReplicaList(std::string(key), TenantId::Default());
+    ASSERT_TRUE(remaining);
+    ASSERT_EQ(remaining->replicas.size(), 1u);
+    EXPECT_TRUE(remaining->replicas.front().is_memory_replica());
+    ASSERT_EQ(driver_state->deleted_keys.size(), 2u);
+    EXPECT_EQ(driver_state->deleted_keys.back(), EncodeKvcsKey(key));
+
+    const auto usage = service.GetStorageUsageSnapshot().dfs;
+    EXPECT_TRUE(usage.enabled);
+    EXPECT_EQ(usage.used_bytes, 95u);
+    EXPECT_EQ(usage.capacity_bytes, 100u);
+}
+
+TEST_F(MasterServiceTest,
+       FilesystemStorageModeRetainsAllocatorRecoveryRestriction) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_recovery_restriction_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    MasterServiceConfig config;
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.ha_backend_type = "etcd";
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+    std::filesystem::remove_all(dfs_root);
+}
+
+TEST_F(MasterServiceTest, KvcsStandbyRestoreAcceptsObjectStorageDfsReplica) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar kvcs_adapter("MOONCAKE_DFS_FS_ADAPTER", "kvcs-lowlevel");
+
+    MasterServiceConfig config;
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.ha_backend_type = "etcd";
+    MasterService service(config);
+
+    constexpr uint64_t kObjectSize = 128;
+    DistributedFSDescriptor dfs_descriptor;
+    dfs_descriptor.object_size = kObjectSize;
+    dfs_descriptor.aligned_size = kObjectSize;
+    dfs_descriptor.shard_idx = -1;
+    Replica replica(std::move(dfs_descriptor), ReplicaStatus::COMPLETE);
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = generate_uuid();
+    metadata.size = kObjectSize;
+    metadata.replicas.push_back(replica.get_descriptor());
+
+    const std::string key = "restored-kvcs-dfs-object";
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {{std::string(TenantId::kDefaultValue), key, metadata}},
+                        /*initial_oplog_sequence_id=*/0, {})
+                    .has_value());
+
+    auto response = service.GetReplicaListForAdmin(key, TenantId::Default());
+    ASSERT_TRUE(response);
+    ASSERT_EQ(response->replicas.size(), 1u);
+    ASSERT_TRUE(response->replicas[0].is_dfs_replica());
+    const auto& restored = response->replicas[0].get_dfs_descriptor();
+    EXPECT_EQ(restored.object_size, kObjectSize);
+}
+
+TEST_F(MasterServiceTest, KvcsMissEvictsOnlyTheObservedDfsReplica) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar kvcs_adapter("MOONCAKE_DFS_FS_ADAPTER", "kvcs-lowlevel");
+
+    MasterService service;
+    const UUID client_id = generate_uuid();
+    const std::string key = "missing-kvcs-value";
+    DistributedFSDescriptor descriptor;
+    descriptor.object_size = 128;
+    descriptor.aligned_size = 128;
+    descriptor.shard_idx = -1;
+    Replica first(descriptor, ReplicaStatus::COMPLETE);
+    Replica second(descriptor, ReplicaStatus::COMPLETE);
+    const ReplicaID first_id = first.id();
+    const ReplicaID second_id = second.id();
+    ASSERT_NE(first_id, second_id);
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = client_id;
+    metadata.size = descriptor.object_size;
+    metadata.replicas = {first.get_descriptor(), second.get_descriptor()};
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {{std::string(TenantId::kDefaultValue), key, metadata}},
+                        /*initial_oplog_sequence_id=*/0, {})
+                    .has_value());
+
+    auto unconditional = service.EvictDiskReplica(
+        client_id, key, TenantId::Default(), ReplicaType::DFS);
+    ASSERT_FALSE(unconditional.has_value());
+    EXPECT_EQ(unconditional.error(), ErrorCode::INVALID_PARAMS);
+
+    ReplicaID missing_id = 0;
+    while (missing_id == first_id || missing_id == second_id) ++missing_id;
+    auto stale = service.EvictDiskReplicaIfCurrent(
+        client_id, key, TenantId::Default(), ReplicaType::DFS, missing_id);
+    ASSERT_TRUE(stale.has_value());
+    EXPECT_FALSE(*stale);
+    ASSERT_TRUE(service.GetReplicaList(key, TenantId::Default()).has_value());
+
+    auto current = service.EvictDiskReplicaIfCurrent(
+        client_id, key, TenantId::Default(), ReplicaType::DFS, first_id);
+    ASSERT_TRUE(current.has_value());
+    EXPECT_TRUE(*current);
+    auto remaining = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(remaining.has_value());
+    ASSERT_EQ(remaining->replicas.size(), 1u);
+    EXPECT_EQ(remaining->replicas.front().id, second_id);
+
+    current = service.EvictDiskReplicaIfCurrent(
+        client_id, key, TenantId::Default(), ReplicaType::DFS, second_id);
+    ASSERT_TRUE(current.has_value());
+    EXPECT_TRUE(*current);
+    auto missing = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
 
 TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
     const auto scoped =
