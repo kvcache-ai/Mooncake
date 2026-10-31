@@ -290,6 +290,37 @@ TEST_F(PosixFileTest, FileLocking) {
     }
 }
 
+// Test dropping page cache after a synced write
+TEST_F(PosixFileTest, DropPageCache) {
+    {
+        PosixFile posix_file(test_filename, test_fd);
+        test_fd = -1;  // Owned by posix_file now
+
+        std::string test_data = "drop page cache data";
+        auto write_result = posix_file.write(test_data, test_data.size());
+        ASSERT_TRUE(write_result);
+        ASSERT_TRUE(posix_file.datasync());
+
+        EXPECT_TRUE(posix_file.drop_page_cache());
+        EXPECT_EQ(posix_file.get_error_code(), ErrorCode::OK);
+    }
+
+    // Data is still intact after the cached pages are dropped
+    int fd = open(test_filename.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+    PosixFile reader(test_filename, fd);
+    const std::string expected = "drop page cache data";
+    std::string buffer;
+    auto read_result = reader.read(buffer, expected.size());
+    ASSERT_TRUE(read_result);
+    EXPECT_EQ(buffer, expected);
+
+    // Failure is reported but does not mark the file as failed
+    PosixFile invalid_file("invalid.txt", -1);
+    EXPECT_FALSE(invalid_file.drop_page_cache());
+    EXPECT_EQ(invalid_file.get_error_code(), ErrorCode::FILE_INVALID_HANDLE);
+}
+
 #ifdef USE_URING
 TEST_F(PosixFileTest, UringBatchReadReportsPerRequestResultsAcrossQueueDepth) {
     constexpr size_t kBlockSize = 128;
