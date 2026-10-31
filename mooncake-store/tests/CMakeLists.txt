@@ -46,6 +46,18 @@ add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(replica_allocator_test replica_allocator_test.cpp)
 add_store_test(segment_pool_test segment_pool_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
+if(USE_MLU)
+  foreach(mlu_test mlu_accelerator_test mlu_store_test)
+    # These tests do not use master_service_test_peer, which would pull the
+    # production mooncake_store library back into shared builds.
+    add_executable(${mlu_test} ${mlu_test}.cpp mlu_test_hooks.cpp)
+    target_link_libraries(${mlu_test} PRIVATE mooncake_store_mlu_test gtest
+                                              gtest_main pthread)
+    target_link_options(${mlu_test} PRIVATE "-Wl,--wrap=cnrtMemcpy"
+                        "-Wl,--wrap=cnrtHostMalloc" "-Wl,--wrap=cnrtFreeHost")
+    add_test(NAME ${mlu_test} COMMAND ${mlu_test})
+  endforeach()
+endif()
 add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
 add_store_test(real_client_direct_read_test real_client_direct_read_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
