@@ -132,7 +132,8 @@ int processBatchSizes(
         }
     };
     size_t address_stride_bytes =
-        XferBenchConfig::max_block_size * XferBenchConfig::max_batch_size;
+        checkedMul(XferBenchConfig::max_block_size,
+                   XferBenchConfig::max_batch_size, "address stride");
     if (!workload_classes.empty()) {
         address_stride_bytes = 0;
         for (const auto& config : workload_classes) {
@@ -546,6 +547,7 @@ int main(int argc, char* argv[]) {
     }
     printStatsHeader();
     bool interrupted = false;
+    bool ran_any = false;
     for (int num_threads = XferBenchConfig::start_num_threads;
          !interrupted && num_threads <= XferBenchConfig::max_num_threads;
          num_threads *= 2) {
@@ -565,13 +567,21 @@ int main(int argc, char* argv[]) {
                     bytes_per_thread > XferBenchConfig::target_range_size) {
                     LOG(ERROR) << "target range is smaller than one operation";
                     interrupted = true;
-                } else if (processBatchSizes(*runner, block_size, batch_size,
-                                             num_threads, qos_classes) < 0) {
-                    interrupted = true;
+                } else {
+                    const int rc =
+                        processBatchSizes(*runner, block_size, batch_size,
+                                          num_threads, qos_classes);
+                    if (rc < 0) interrupted = true;
+                    if (rc == 0) ran_any = true;
                 }
             }
         }
         runner->stopInitiator();
+    }
+    if (!interrupted && !ran_any) {
+        // A run that measured nothing must not look like a pass.
+        LOG(ERROR) << "No benchmark case ran: every sweep point was skipped";
+        return EXIT_FAILURE;
     }
     return interrupted ? EXIT_FAILURE : EXIT_SUCCESS;
 }
