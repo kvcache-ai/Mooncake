@@ -11,8 +11,7 @@
 
 namespace mooncake::test {
 
-class TestBufferAllocator final
-    : public BufferAllocatorBase {
+class TestBufferAllocator final : public BufferAllocatorBase {
    public:
     TestBufferAllocator(std::string name, std::string endpoint, size_t capacity,
                         uintptr_t base = 0x100000000ULL)
