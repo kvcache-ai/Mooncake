@@ -437,7 +437,7 @@ void TENTBenchRunner::pinThread(int thread_id) {
         return;
     }
 #endif
-    uint64_t addr = getLocalBufferBase(thread_id, 0, 0);
+    uint64_t addr = *getLocalBufferBase(thread_id, 0);
     auto result = Platform::getLoader().getLocation((void*)addr, 1);
     if (result.empty()) return;
     LocationParser location(result[0].location);
