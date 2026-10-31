@@ -186,6 +186,13 @@ target_include_directories(segment_manager_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME segment_manager_test COMMAND segment_manager_test)
 
+add_executable(cpu_location_test cpu_location_test.cpp)
+target_link_libraries(cpu_location_test PRIVATE gtest gtest_main
+                                                tent_link_group)
+target_include_directories(cpu_location_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME cpu_location_test COMMAND cpu_location_test)
+
 add_executable(request_merge_test request_merge_test.cpp)
 target_link_libraries(request_merge_test PRIVATE gtest gtest_main
                                                  tent_link_group)
