@@ -12,9 +12,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <future>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -25,6 +27,7 @@
 #include <vector>
 
 #include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/object_storage_backend.h"
 #include "storage/distributed/oss_adapter.h"
 #include "storage_backend.h"
 #include "oss_fault_test_helpers.h"
@@ -333,11 +336,13 @@ std::string UniquePrefix(const std::string& suffix) {
            std::to_string(now) + "-" + suffix;
 }
 
-void ConfigureFaultEndpoint(ScopedEnvironment& environment, uint16_t port) {
+void ConfigureFaultEndpoint(ScopedEnvironment& environment, uint16_t port,
+                            const std::string& bucket = "fault-bucket",
+                            const std::string& region = "fault-region") {
     environment.Set("MOONCAKE_OSS_ENDPOINT",
                     "http://127.0.0.1:" + std::to_string(port));
-    environment.Set("MOONCAKE_OSS_BUCKET", "fault-bucket");
-    environment.Set("MOONCAKE_OSS_REGION", "fault-region");
+    environment.Set("MOONCAKE_OSS_BUCKET", bucket);
+    environment.Set("MOONCAKE_OSS_REGION", region);
     environment.Set("MOONCAKE_OSS_PATH_STYLE", "true");
     environment.Set("MOONCAKE_OSS_ANONYMOUS", "true");
     environment.Set("MOONCAKE_OSS_MAX_CONNECTIONS", "8");
@@ -356,7 +361,9 @@ void ConfigureFaultEndpoint(ScopedEnvironment& environment, uint16_t port) {
 void CheckMixedGetBatch(bool timeout) {
     using Server = test::OssFaultHttpServer;
     Server server(
-        {{"waiting", timeout ? Server::Stall() : Server::Gate(206, "first")},
+        {{"waiting", timeout ? Server::Stall()
+                             : Server::Gate(206, "first",
+                                            "Content-Range: bytes 0-4/5\r\n")},
          {"missing", Server::Reply(404, "")},
          {"reset", Server::Reset()},
          {"large-error", Server::Reply(404, std::string(512, 'x'))},
@@ -366,7 +373,8 @@ void CheckMixedGetBatch(bool timeout) {
          {"short", Server::Reply(206, "val")},
          {"oversized", Server::Reply(206, "too-long")},
          {"unavailable", Server::Reply(503, "busy!")},
-         {"tail", Server::Reply(206, "later")}},
+         {"tail",
+          Server::Reply(206, "later", "Content-Range: bytes 0-4/5\r\n")}},
         true);
     ScopedEnvironment environment;
     ConfigureFaultEndpoint(environment, server.port());
@@ -582,7 +590,9 @@ TEST(OssObjectStorageAdapterTest, BatchConnectionLimitAppliesToGetAndPut) {
             for (size_t i = 0; i < count; ++i) {
                 const auto key = std::to_string(i);
                 routes.emplace(
-                    key, Server::Gate(upload ? 200 : 206, upload ? "" : "x"));
+                    key, Server::Gate(
+                             upload ? 200 : 206, upload ? "" : "x",
+                             upload ? "" : "Content-Range: bytes 0-0/1\r\n"));
                 gets.push_back({key, &buffers[i], 1});
                 puts.push_back({key, &iov, 1});
             }
@@ -748,7 +758,8 @@ TEST(OssObjectStorageAdapterTest,
          Server::Reply(206, "val", "Content-Range: bytes 0-2/3\r\n")},
         {"unsatisfiable-range", Server::Reply(416, "error")},
         {"full-200", Server::Reply(200, "value")},
-        {"full-206", Server::Reply(206, "value")},
+        {"full-206",
+         Server::Reply(206, "value", "Content-Range: bytes 0-4/5\r\n")},
     });
     const std::array<const char*, 5> keys{"short-200", "clipped-range",
                                           "unsatisfiable-range", "full-200",
@@ -1033,7 +1044,9 @@ TEST(OssObjectStorageAdapterTest, BatchQueueDoesNotConsumeRequestTimeout) {
     }
     using Server = test::OssFaultHttpServer;
     Server server(
-        {{"stall", Server::Stall()}, {"healthy", Server::Reply(206, "value")}});
+        {{"stall", Server::Stall()},
+         {"healthy",
+          Server::Reply(206, "value", "Content-Range: bytes 0-4/5\r\n")}});
     ScopedEnvironment environment;
     ConfigureFaultEndpoint(environment, server.port());
     environment.Set("MOONCAKE_OSS_MAX_CONNECTIONS", "1");
@@ -1055,6 +1068,104 @@ TEST(OssObjectStorageAdapterTest, BatchQueueDoesNotConsumeRequestTimeout) {
     server.Stop();
     EXPECT_TRUE(server.error().empty()) << server.error();
     EXPECT_EQ(server.requests().size(), 2U);
+}
+
+TEST(OssObjectStorageAdapterTest, ValidatesContentRangeForSingleAndBatchReads) {
+    using Server = test::OssFaultHttpServer;
+    const std::vector<std::string> invalid{"",
+                                           "bytes 1-5/10",
+                                           "bytes 0-3/10",
+                                           "bytes 0-4/4",
+                                           "bytes 4-0/10",
+                                           "bytes 0-4/5junk",
+                                           "bytes 0-4/",
+                                           "bytes 0-4/-1",
+                                           "bytes 0-4/18446744073709551616",
+                                           "bytes 18446744073709551616-4/*",
+                                           "bytes +0-4/5",
+                                           "items 0-4/5"};
+    std::map<std::string, Server::Response> routes;
+    for (size_t i = 0; i < invalid.size(); ++i) {
+        routes.emplace(
+            "bad-" + std::to_string(i),
+            Server::Reply(206, "value",
+                          invalid[i].empty()
+                              ? ""
+                              : "Content-Range: " + invalid[i] + "\r\n"));
+    }
+    routes.emplace(
+        "known", Server::Reply(206, "value", "Content-Range: bytes 0-4/5\r\n"));
+    routes.emplace("unknown", Server::Reply(206, "value",
+                                            "Content-Range: bytes 0-4/*\r\n"));
+    routes.emplace("offset", Server::Reply(206, "value",
+                                           "Content-Range: bytes 5-9/10\r\n"));
+    Server server(std::move(routes));
+    ScopedEnvironment environment;
+    ConfigureFaultEndpoint(environment, server.port());
+    OssObjectStorageAdapter adapter("/range-validation/");
+    ASSERT_TRUE(adapter.Init());
+    ObjectStorageAdapter& generic = adapter;
+    std::array<char, 7> output;
+    for (size_t i = 0; i < invalid.size(); ++i) {
+        SCOPED_TRACE(invalid[i]);
+        const auto key = "bad-" + std::to_string(i);
+        output.fill('!');
+        const auto single = generic.GetRange(key, output.data() + 1, 5, 0);
+        ASSERT_FALSE(single);
+        EXPECT_EQ(single.error(), ErrorCode::FILE_READ_FAIL);
+        const auto batch = adapter.GetBatch({{key, output.data() + 1, 5}});
+        ASSERT_EQ(batch.size(), 1U);
+        ASSERT_FALSE(batch[0]);
+        EXPECT_EQ(batch[0].error(), ErrorCode::FILE_READ_FAIL);
+        EXPECT_EQ(output.front(), '!');
+        EXPECT_EQ(output.back(), '!');
+    }
+    for (const char* key : {"known", "unknown"}) {
+        EXPECT_TRUE(generic.GetRange(key, output.data() + 1, 5, 0));
+        const auto batch = adapter.GetBatch({{key, output.data() + 1, 5}});
+        ASSERT_EQ(batch.size(), 1U);
+        EXPECT_TRUE(batch[0]);
+    }
+    EXPECT_TRUE(generic.GetRange("offset", output.data() + 1, 5, 5));
+    const auto wrong_offset =
+        generic.GetRange("offset", output.data() + 1, 5, 4);
+    ASSERT_FALSE(wrong_offset);
+    EXPECT_EQ(wrong_offset.error(), ErrorCode::FILE_READ_FAIL);
+    server.Stop();
+    EXPECT_TRUE(server.error().empty()) << server.error();
+}
+
+TEST(OssObjectStorageAdapterTest, BackendGathersAndReadsRangesOverHttp) {
+    ScriptedOssServer server({{200, ""}, {206, "bcdefg"}, {204, ""}});
+    ScopedEnvironment environment;
+    ConfigureFaultEndpoint(environment, server.port());
+    auto adapter = std::make_shared<OssObjectStorageAdapter>("/backend-io/");
+    ASSERT_TRUE(adapter->Init());
+    ObjectStorageBackend backend({8, 8}, adapter);
+    const auto copy = [](void* dst, const void* src, size_t size) {
+        std::memcpy(dst, src, size);
+        return true;
+    };
+    std::string left = "abc", right = "defgh";
+    bool started = false;
+    ASSERT_EQ(backend.Write("key", 8, {{left.data(), 3}, {right.data(), 5}},
+                            copy, &started),
+              ErrorCode::OK);
+    EXPECT_TRUE(started);
+    std::array<char, 8> output;
+    output.fill('!');
+    ASSERT_EQ(
+        backend.Read("key", 8, {{output.data() + 1, 2}, {output.data() + 3, 4}},
+                     1, copy),
+        ErrorCode::OK);
+    EXPECT_EQ(std::string(output.data(), output.size()), "!bcdefg!");
+    ASSERT_TRUE(adapter->Delete("key"));
+    server.Wait();
+    ASSERT_EQ(server.requests().size(), 3U);
+    EXPECT_TRUE(server.requests()[0].starts_with("PUT "));
+    EXPECT_TRUE(server.requests()[0].ends_with("\r\n\r\nabcdefgh"));
+    EXPECT_NE(server.requests()[1].find("Range: bytes=1-6"), std::string::npos);
+    EXPECT_TRUE(server.requests()[2].starts_with("DELETE "));
 }
 
 TEST(OssObjectStorageAdapterTest, ValidatesVectorAndRangeArguments) {
@@ -1097,12 +1208,7 @@ TEST(OssObjectStorageAdapterTest, RejectsIgnoredRangeResponse) {
         {200, "abcd", ""},
     });
     ScopedEnvironment environment;
-    environment.Set("MOONCAKE_OSS_ENDPOINT",
-                    "http://127.0.0.1:" + std::to_string(server.port()));
-    environment.Set("MOONCAKE_OSS_BUCKET", "bucket");
-    environment.Set("MOONCAKE_OSS_REGION", "region");
-    environment.Set("MOONCAKE_OSS_PATH_STYLE", "true");
-    environment.Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    ConfigureFaultEndpoint(environment, server.port());
 
     OssObjectStorageAdapter adapter("/test-prefix/");
     ASSERT_TRUE(adapter.Init());
@@ -1165,12 +1271,7 @@ TEST(OssObjectStorageAdapterTest, ClearsHeadersAtResponseBoundaries) {
          "Connection: close\r\n\r\n"},
     });
     ScopedEnvironment environment;
-    environment.Set("MOONCAKE_OSS_ENDPOINT",
-                    "http://127.0.0.1:" + std::to_string(server.port()));
-    environment.Set("MOONCAKE_OSS_BUCKET", "bucket");
-    environment.Set("MOONCAKE_OSS_REGION", "region");
-    environment.Set("MOONCAKE_OSS_PATH_STYLE", "true");
-    environment.Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    ConfigureFaultEndpoint(environment, server.port(), "bucket", "region");
 
     OssObjectStorageAdapter adapter("/test-prefix/");
     ASSERT_TRUE(adapter.Init());
@@ -1213,12 +1314,7 @@ TEST(OssObjectStorageAdapterTest, DecodesPaginatedLogicalKeys) {
          "</ListBucketResult>"},
     });
     ScopedEnvironment environment;
-    environment.Set("MOONCAKE_OSS_ENDPOINT",
-                    "http://127.0.0.1:" + std::to_string(server.port()));
-    environment.Set("MOONCAKE_OSS_BUCKET", "bucket");
-    environment.Set("MOONCAKE_OSS_REGION", "region");
-    environment.Set("MOONCAKE_OSS_PATH_STYLE", "true");
-    environment.Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    ConfigureFaultEndpoint(environment, server.port(), "bucket", "region");
 
     OssObjectStorageAdapter adapter("/test-prefix/");
     ASSERT_TRUE(adapter.Init());
@@ -1246,12 +1342,7 @@ TEST(OssObjectStorageAdapterTest, HealthCheckWritesReadsAndDeletesProbe) {
         {204, ""},
     });
     ScopedEnvironment environment;
-    environment.Set("MOONCAKE_OSS_ENDPOINT",
-                    "http://127.0.0.1:" + std::to_string(server.port()));
-    environment.Set("MOONCAKE_OSS_BUCKET", "bucket");
-    environment.Set("MOONCAKE_OSS_REGION", "region");
-    environment.Set("MOONCAKE_OSS_PATH_STYLE", "true");
-    environment.Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    ConfigureFaultEndpoint(environment, server.port(), "bucket", "region");
 
     OssObjectStorageAdapter adapter("/test-prefix/");
     ASSERT_TRUE(adapter.Init());
@@ -1277,12 +1368,7 @@ TEST(OssObjectStorageAdapterTest, HealthCheckCleansUpAfterReadMismatch) {
         {204, ""},
     });
     ScopedEnvironment environment;
-    environment.Set("MOONCAKE_OSS_ENDPOINT",
-                    "http://127.0.0.1:" + std::to_string(server.port()));
-    environment.Set("MOONCAKE_OSS_BUCKET", "bucket");
-    environment.Set("MOONCAKE_OSS_REGION", "region");
-    environment.Set("MOONCAKE_OSS_PATH_STYLE", "true");
-    environment.Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    ConfigureFaultEndpoint(environment, server.port(), "bucket", "region");
 
     OssObjectStorageAdapter adapter("/test-prefix/");
     ASSERT_TRUE(adapter.Init());
@@ -1304,12 +1390,7 @@ TEST(OssObjectStorageAdapterTest,
         {206, "value"},
     });
     ScopedEnvironment environment;
-    environment.Set("MOONCAKE_OSS_ENDPOINT",
-                    "http://127.0.0.1:" + std::to_string(server.port()));
-    environment.Set("MOONCAKE_OSS_BUCKET", "bucket");
-    environment.Set("MOONCAKE_OSS_REGION", "region");
-    environment.Set("MOONCAKE_OSS_PATH_STYLE", "true");
-    environment.Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    ConfigureFaultEndpoint(environment, server.port(), "bucket", "region");
 
     OssObjectStorageAdapter adapter("/test-prefix/");
     ASSERT_TRUE(adapter.Init());
@@ -1334,14 +1415,16 @@ TEST(OssObjectStorageAdapterTest,
 TEST(OssObjectStorageAdapterTest,
      GetRangeAndBatchDistinguishNotFoundFromTransferFailures) {
     using Server = test::OssFaultHttpServer;
-    Server server({{"missing", Server::Reply(404, std::string(512, 'x'))},
-                   {"truncated-error",
-                    Server::Raw("HTTP/1.1 404 Test\r\nContent-Length: 5\r\n"
-                                "Connection: close\r\n\r\nxx")},
-                   {"large-error", Server::Reply(503, std::string(512, 'x'))},
-                   {"oversized", Server::Reply(206, "too-long")},
-                   {"present", Server::Reply(206, "value")}},
-                  true);
+    Server server(
+        {{"missing", Server::Reply(404, std::string(512, 'x'))},
+         {"truncated-error",
+          Server::Raw("HTTP/1.1 404 Test\r\nContent-Length: 5\r\n"
+                      "Connection: close\r\n\r\nxx")},
+         {"large-error", Server::Reply(503, std::string(512, 'x'))},
+         {"oversized", Server::Reply(206, "too-long")},
+         {"present",
+          Server::Reply(206, "value", "Content-Range: bytes 0-4/5\r\n")}},
+        true);
     ScopedEnvironment environment;
     ConfigureFaultEndpoint(environment, server.port());
     OssObjectStorageAdapter adapter("/get-error-mapping/");
@@ -1381,12 +1464,7 @@ TEST(OssObjectStorageAdapterTest,
         {206, "bad"},
     });
     ScopedEnvironment environment;
-    environment.Set("MOONCAKE_OSS_ENDPOINT",
-                    "http://127.0.0.1:" + std::to_string(server.port()));
-    environment.Set("MOONCAKE_OSS_BUCKET", "bucket");
-    environment.Set("MOONCAKE_OSS_REGION", "region");
-    environment.Set("MOONCAKE_OSS_PATH_STYLE", "true");
-    environment.Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    ConfigureFaultEndpoint(environment, server.port(), "bucket", "region");
     environment.Set("MOONCAKE_OSS_MAX_CONNECTIONS", "3");
 
     OssObjectStorageAdapter adapter("/test-prefix/");
@@ -1439,12 +1517,7 @@ TEST(OssObjectStorageAdapterTest,
      BatchPutStreamsIovecsAndPreservesPartialResults) {
     ScriptedOssServer server({{200, ""}, {503, "unavailable"}, {200, ""}});
     ScopedEnvironment environment;
-    environment.Set("MOONCAKE_OSS_ENDPOINT",
-                    "http://127.0.0.1:" + std::to_string(server.port()));
-    environment.Set("MOONCAKE_OSS_BUCKET", "bucket");
-    environment.Set("MOONCAKE_OSS_REGION", "region");
-    environment.Set("MOONCAKE_OSS_PATH_STYLE", "true");
-    environment.Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    ConfigureFaultEndpoint(environment, server.port(), "bucket", "region");
     environment.Set("MOONCAKE_OSS_MAX_CONNECTIONS", "3");
 
     OssObjectStorageAdapter adapter("/test-prefix/");
@@ -1577,12 +1650,7 @@ TEST(OssObjectStorageAdapterTest, StorageBackendFactoryRunsObjectHealthCheck) {
     });
     ScopedEnvironment environment;
     const std::string root = UniquePrefix("factory");
-    environment.Set("MOONCAKE_OSS_ENDPOINT",
-                    "http://127.0.0.1:" + std::to_string(server.port()));
-    environment.Set("MOONCAKE_OSS_BUCKET", "bucket");
-    environment.Set("MOONCAKE_OSS_REGION", "region");
-    environment.Set("MOONCAKE_OSS_PATH_STYLE", "true");
-    environment.Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    ConfigureFaultEndpoint(environment, server.port(), "bucket", "region");
     environment.Set("MOONCAKE_DISTRIBUTED_FS_TYPE", "oss");
     environment.Set("MOONCAKE_DISTRIBUTED_ROOT_DIR", root);
     environment.Set("MOONCAKE_DISTRIBUTED_HEALTH_CHECK", "true");
@@ -1608,6 +1676,107 @@ TEST(OssObjectStorageAdapterTest, StorageBackendFactoryRunsObjectHealthCheck) {
     EXPECT_EQ(server.requests()[0].rfind("PUT ", 0), 0U);
     EXPECT_EQ(server.requests()[1].rfind("GET ", 0), 0U);
     EXPECT_EQ(server.requests()[2].rfind("DELETE ", 0), 0U);
+}
+
+TEST(OssObjectStorageAdapterTest,
+     BackendWriteVBorrowsAndStagesBeforeSingleUpload) {
+    ScriptedOssServer server({{200, ""},
+                              {200, "", "", false, true},
+                              {200, ""},
+                              {200, ""},
+                              {200, ""}});
+    ScopedEnvironment environment;
+    ConfigureFaultEndpoint(environment, server.port());
+    auto adapter = std::make_shared<OssObjectStorageAdapter>("/backend-io/");
+    ASSERT_TRUE(adapter->Init());
+    ASSERT_TRUE(adapter->SupportsSinglePutVAttempt());
+    ObjectStorageBackend backend({16, 2}, adapter);
+    std::string first = "abc", device = "de", last = "fgh";
+    const std::vector<Slice> slices{
+        {first.data(), 3}, {nullptr, 0}, {device.data(), 2}, {last.data(), 3}};
+    const auto host = [&](const Slice& slice) {
+        return slice.ptr != device.data();
+    };
+    size_t copied = 0;
+    const auto copy = [&](void* dst, const void* src, size_t bytes) {
+        EXPECT_EQ(src, device.data());
+        copied += bytes;
+        return std::memcpy(dst, src, bytes) != nullptr;
+    };
+    bool started = false;
+    EXPECT_EQ(backend.WriteV("first", 8, slices, host, copy, &started),
+              ErrorCode::OK);
+    EXPECT_TRUE(started);
+    EXPECT_EQ(backend.WriteV("uncertain", 8, slices, host, copy, &started),
+              ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_TRUE(started);
+    EXPECT_EQ(backend.WriteV("fresh-attempt", 8, slices, host, copy, &started),
+              ErrorCode::OK);
+    EXPECT_TRUE(started);
+    EXPECT_EQ(copied, 6U);
+    std::string only = "host-only";
+    EXPECT_EQ(backend.WriteV(
+                  "host", only.size(), {{only.data(), only.size()}},
+                  [](const Slice&) { return true; }, {}, &started),
+              ErrorCode::OK);
+    EXPECT_TRUE(started);
+    EXPECT_EQ(backend.WriteV("empty", 0, {{nullptr, 0}}, {}, {}, &started),
+              ErrorCode::OK);
+    EXPECT_TRUE(started);
+    server.Wait();
+    EXPECT_TRUE(server.error().empty()) << server.error();
+    ASSERT_EQ(server.requests().size(), 5U);
+    for (size_t i = 0; i < 3; ++i) {
+        EXPECT_TRUE(server.requests()[i].starts_with("PUT "));
+        EXPECT_TRUE(server.requests()[i].ends_with("\r\n\r\nabcdefgh"));
+    }
+    EXPECT_TRUE(server.requests()[3].ends_with("\r\n\r\nhost-only"));
+    EXPECT_TRUE(server.requests()[4].starts_with("PUT "));
+    EXPECT_TRUE(server.requests()[4].ends_with("\r\n\r\n"));
+}
+
+TEST(OssObjectStorageAdapterTest,
+     PreservesLarge416WithoutMaskingTruncatedResponses) {
+    using Server = test::OssFaultHttpServer;
+    Server server(
+        {{"large-range", Server::Reply(416, std::string(512, 'x'))},
+         {"truncated-range",
+          Server::Raw("HTTP/1.1 416 Test\r\nContent-Length: 512\r\n"
+                      "Connection: close\r\n\r\nxx")},
+         {"present",
+          Server::Reply(206, "12345678", "Content-Range: bytes 0-7/8\r\n")}});
+    ScopedEnvironment environment;
+    ConfigureFaultEndpoint(environment, server.port());
+    OssObjectStorageAdapter adapter("/range-errors/");
+    ASSERT_TRUE(adapter.Init());
+    std::array<char, 10> output;
+    for (const char* key : {"large-range", "truncated-range"}) {
+        SCOPED_TRACE(key);
+        output.fill('!');
+        const auto expected = std::string(key) == "large-range"
+                                  ? ErrorCode::FILE_READ_FAIL
+                                  : ErrorCode::DFS_SERVICE_UNAVAILABLE;
+        const auto single = adapter.GetRange(key, output.data() + 1, 8, 0);
+        ASSERT_FALSE(single);
+        EXPECT_EQ(single.error(), expected);
+        const auto batch = adapter.GetBatch({{key, output.data() + 1, 8}});
+        ASSERT_EQ(batch.size(), 1U);
+        ASSERT_FALSE(batch[0]);
+        EXPECT_EQ(batch[0].error(), expected);
+        EXPECT_EQ(output.front(), '!');
+        EXPECT_EQ(output.back(), '!');
+    }
+    ASSERT_TRUE(adapter.GetRange("present", output.data() + 1, 8, 0));
+    EXPECT_EQ(std::string(output.data(), output.size()), "!12345678!");
+    server.Stop();
+    EXPECT_TRUE(server.error().empty()) << server.error();
+    const auto requests = server.requests();
+    EXPECT_EQ(std::count_if(requests.begin(), requests.end(),
+                            [](const auto& request) {
+                                return request.find("/large-range HTTP/") !=
+                                       std::string::npos;
+                            }),
+              2);
 }
 
 }  // namespace
