@@ -136,6 +136,11 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
         return status;
     }
 
+    // Every caller frees a busy batch only after it has given up on it
+    // (timeout, failure or cancellation), so slices that have not been sent
+    // yet must not reach the peer any more (#4491).
+    Transport::toBatchDesc(batch_id).abandoned.store(true,
+                                                     std::memory_order_release);
     deferred_cleanup_batches_.emplace(batch_id, before_delete);
     if (!deferred_cleanup_thread_.joinable()) {
         // Start the cleanup worker lazily after taking ownership of a busy
