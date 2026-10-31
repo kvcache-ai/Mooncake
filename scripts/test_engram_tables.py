@@ -95,6 +95,56 @@ def test_validation_is_before_writes(tmp_path):
         store.lookup(["a"], np.zeros((1, 1), np.int64), output[:, :1])
 
 
+@pytest.mark.parametrize("failure", ["missing", "layout", "size"])
+def test_later_table_open_failure_preserves_output(tmp_path, failure):
+    store, _, specs = make_store(tmp_path)
+    store.close()
+    if failure == "layout":
+        specs = dict(specs, b={"num_rows": 12, "row_bytes": 17})
+    with EngramStore(tables=specs, namespace="test/v1", local_dir=tmp_path) as reader:
+        if failure == "missing":
+            reader.remove("b")
+        elif failure == "size":
+            (reader._path("b") / "rows").write_bytes(b"")
+        output = np.full((2, 2, 17), 201, np.uint8)
+        error = FileNotFoundError if failure == "missing" else ValueError
+        with pytest.raises(error):
+            reader.lookup(["a", "b"], np.array([[0, 1], [2, 3]], np.int64), output)
+        assert np.all(output == 201)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_lookup_snapshots_table_name_generator(tmp_path, device):
+    if device == "cuda":
+        torch = pytest.importorskip("torch")
+        pytest.importorskip("mooncake._engram_cuda")
+        if not torch.cuda.is_available():
+            pytest.skip("requires CUDA")
+    store, rows, _ = make_store(tmp_path)
+    ids = np.array([[0, 12, 4], [10, -1, 9]], np.int64)
+    output = np.full((2, 3, 17), 201, np.uint8)
+    expected = np.stack([rows[[0, 10]], rows[[1, 0]] ^ 127, rows[[4, 9]]], axis=1)
+    expected[1, 1] = 201
+    try:
+        if device == "cuda":
+            ids = torch.from_numpy(ids).cuda()
+            output = torch.from_numpy(output).cuda()
+            stream = torch.cuda.current_stream().cuda_stream
+        else:
+            stream = None
+        store.lookup(
+            (name for name in ("a", "b", "a")),
+            ids,
+            output,
+            stream=stream,
+            offsets=[0, 11, 0],
+        )
+        actual = output.cpu().numpy() if device == "cuda" else output
+        np.testing.assert_array_equal(actual, expected)
+    finally:
+        store.close()
+
+
 def test_namespace_layout_and_empty_table(tmp_path):
     store, _, specs = make_store(tmp_path)
     store.close()

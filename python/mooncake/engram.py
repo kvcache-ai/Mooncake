@@ -179,11 +179,13 @@ class EngramStore:
 
         The innermost output dimension must be contiguous; token-major and
         table-major outer strides are accepted. All selected tables have the
-        same row width. IDs and output stay alive until the supplied CUDA
-        stream completes. Warm each table combination before graph capture;
-        destroy captured graphs before closing this Store.
+        same row width. Table names are snapshotted once. CPU lookup opens all
+        selected tables before writing output. IDs and output stay alive until
+        the supplied CUDA stream completes. Warm each table combination before
+        graph capture; destroy captured graphs before closing this Store.
         """
         with self._lock:
+            table_ids = tuple(table_ids)
             specs = [self._spec(name) for name in table_ids]
             if not specs or any(s["row_bytes"] != specs[0]["row_bytes"] for s in specs):
                 raise ValueError("Select nonempty tables of equal row_bytes")
@@ -197,9 +199,7 @@ class EngramStore:
             ):
                 raise ValueError("Expected one nonnegative int64 offset per table")
             if stream is not None:
-                self._lookup_cuda(
-                    tuple(table_ids), row_ids, output, int(stream), offsets
-                )
+                self._lookup_cuda(table_ids, row_ids, output, int(stream), offsets)
                 return
             ids, out = self._array(row_ids), self._array(output)
             if (
@@ -232,8 +232,9 @@ class EngramStore:
                 ):
                     raise IndexError(f"Row ID out of bounds in {table_ids[k]}")
                 columns.append((live, values - offset))
-            for k, (name, (live, values)) in enumerate(zip(table_ids, columns)):
-                out[live, k, :] = self._open(name)[values]
+            tables = [self._open(name) for name in table_ids]
+            for k, (table, (live, values)) in enumerate(zip(tables, columns)):
+                out[live, k, :] = table[values]
 
     @staticmethod
     def _validate_strides(out):
