@@ -1,7 +1,9 @@
 file(GLOB TCP_SOURCES "*.cpp")
-file(GLOB TCP_IMPL_HEADERS "*_impl.h")
+# gpu_staging_pool.h is included by tcp_transport_session_impl.h and must be
+# hipified along with the *_impl.h headers it accompanies.
+file(GLOB TCP_IMPL_HEADERS "*_impl.h" "gpu_staging_pool.h")
 
-if (USE_HIP)
+if(USE_HIP)
   list(APPEND TCP_SOURCES ${TCP_IMPL_HEADERS})
   hipify_files(TCP_SOURCES)
 endif()

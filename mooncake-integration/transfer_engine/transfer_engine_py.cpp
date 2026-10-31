@@ -22,6 +22,7 @@
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <thread>
 
 #include <pybind11/stl.h>
 
@@ -59,6 +60,10 @@
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
 #endif
+
+// Header-only pinned staging pool; lives with the TCP transport sources but
+// is used here for engine-side gather (submitGatherWrite).
+#include "../../mooncake-transfer-engine/src/transport/tcp_transport/gpu_staging_pool.h"
 
 static void* (*allocateMemory)(size_t) = nullptr;
 static void (*freeMemory)(void*) = nullptr;
@@ -957,6 +962,214 @@ batch_id_t TransferEnginePy::batchTransferAsyncReadArrays(
     return batchTransferAsync(target_hostname, arrays.buffers,
                               arrays.peer_buffer_addresses, arrays.lengths,
                               TransferOpcode::READ, transport_hint, nic_hint);
+}
+
+batch_id_t TransferEnginePy::submitGatherWrite(
+    const char* target_hostname, const std::vector<uintptr_t>& gpu_segments,
+    const std::vector<size_t>& lengths, uintptr_t remote_base, size_t split) {
+    pybind11::gil_scoped_release release;
+    Transport::SegmentHandle handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            if (handle == (Transport::SegmentHandle)-1) return 0;
+            handle_map_[target_hostname] = handle;
+        }
+    }
+
+    if (gpu_segments.size() != lengths.size()) {
+        LOG(ERROR) << "gpu_segments and lengths have different size";
+        return 0;
+    }
+    size_t total_length =
+        std::accumulate(lengths.begin(), lengths.end(), (size_t)0);
+    if (total_length == 0) return 0;
+
+#ifdef MOONCAKE_TCP_GPU_STAGING_AVAILABLE
+    auto t0 = std::chrono::steady_clock::now();
+    auto* pool = GpuStagingPool::instance();
+    auto* slot = pool->acquire(total_length);
+    if (!slot) return 0;  // caller falls back to the per-descriptor path
+
+    std::vector<const void*> srcs(gpu_segments.size());
+    for (size_t i = 0; i < gpu_segments.size(); ++i)
+        srcs[i] = reinterpret_cast<const void*>(gpu_segments[i]);
+    if (!pool->gatherDeviceToHost(slot, srcs, lengths)) {
+        pool->release(slot);
+        return 0;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+
+    // Split the staged bytes into `split` contiguous descriptors so the TCP
+    // transport spreads them across lanes. One descriptor would serialize
+    // the whole batch on a single connection. All descriptors target
+    // consecutive offsets of the same remote buffer; the consumer cannot
+    // tell the difference. The batch must be sized to the descriptor
+    // count: allocateBatchID(n) marks the batch complete after n tasks,
+    // so allocateBatchID(1) with n>1 would report completion after the
+    // first descriptor and the caller would release the slot under the
+    // remaining in-flight writes.
+    size_t n = std::max<size_t>(1, std::min(split, total_length));
+    batch_id_t batch_id = engine_->allocateBatchID(n);
+    std::vector<TransferRequest> entries;
+    entries.reserve(n);
+    size_t chunk = total_length / n;
+    size_t off = 0;
+    for (size_t i = 0; i < n; ++i) {
+        size_t len = (i + 1 == n) ? (total_length - off) : chunk;
+        TransferRequest entry;
+        entry.opcode = TransferRequest::WRITE;
+        entry.length = len;
+        entry.source = slot->buffer + off;
+        entry.target_id = handle;
+        entry.target_offset = remote_base + off;
+        entry.advise_retry_cnt = 0;
+        entries.push_back(entry);
+        off += len;
+    }
+    Status s = engine_->submitTransfer(batch_id, entries);
+    if (!s.ok()) {
+        engine_->freeBatchID(batch_id);
+        pool->release(slot);
+        return 0;
+    }
+    auto t2 = std::chrono::steady_clock::now();
+    LOG(INFO) << "submitGatherWrite: gather "
+              << std::chrono::duration<double>(t1 - t0).count() << " s, submit "
+              << std::chrono::duration<double>(t2 - t1).count()
+              << " s, bytes=" << total_length << " segs=" << gpu_segments.size()
+              << " descs=" << n;
+
+    // The slot stays checked out until the caller releases it with
+    // releaseGatherSlot after observing a terminal status. No internal
+    // monitor: polling this batch from another thread would race the
+    // caller's transferCheckStatus, which frees the batch on completion.
+    {
+        std::lock_guard<std::mutex> guard(gather_slot_mutex_);
+        gather_slots_[batch_id] = slot;
+    }
+    return batch_id;
+#else
+    (void)remote_base;
+    (void)split;
+    return 0;  // no GPU support in this build; caller falls back
+#endif
+}
+
+void TransferEnginePy::releaseGatherSlot(batch_id_t batch_id) {
+#ifdef MOONCAKE_TCP_GPU_STAGING_AVAILABLE
+    GpuStagingPool::Slot* slot = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(gather_slot_mutex_);
+        auto it = gather_slots_.find(batch_id);
+        if (it != gather_slots_.end()) {
+            slot = static_cast<GpuStagingPool::Slot*>(it->second);
+            gather_slots_.erase(it);
+        }
+    }
+    if (slot) {
+        GpuStagingPool::instance()->release(slot);
+    }
+#else
+    (void)batch_id;
+#endif
+}
+
+std::pair<uintptr_t, size_t> TransferEnginePy::acquireScatterSlot() {
+#ifdef MOONCAKE_TCP_GPU_STAGING_AVAILABLE
+    pybind11::gil_scoped_release release;
+    auto* pool = GpuStagingPool::instance();
+    // Any free slot; the caller advertises the returned capacity and the
+    // send side bounds its batch against it, so acquiring with size 1 only
+    // means "one slot, whatever its capacity".
+    auto* slot = pool->acquire(1);
+    if (!slot) return {0, 0};
+    uintptr_t addr = reinterpret_cast<uintptr_t>(slot->buffer);
+    {
+        std::lock_guard<std::mutex> guard(scatter_slot_mutex_);
+        if (!registered_scatter_slots_.count(addr)) {
+            // Register on first checkout so the peer's WRITE can target the
+            // slot; kept registered for the process lifetime (the buffers
+            // are intentionally never freed, like the pool itself).
+            if (engine_->registerLocalMemory(slot->buffer, slot->capacity,
+                                             kWildcardLocation) != 0) {
+                LOG(ERROR) << "acquireScatterSlot: registerLocalMemory "
+                              "failed; releasing the slot";
+                pool->release(slot);
+                return {0, 0};
+            }
+            registered_scatter_slots_.insert(addr);
+        }
+        scatter_slots_[addr] = slot;
+    }
+    return {addr, slot->capacity};
+#else
+    return {0, 0};
+#endif
+}
+
+int TransferEnginePy::submitScatterToDevice(
+    uintptr_t slot_addr, const std::vector<uintptr_t>& dst_segments,
+    const std::vector<size_t>& lengths) {
+    pybind11::gil_scoped_release release;
+    if (dst_segments.size() != lengths.size()) {
+        LOG(ERROR) << "dst_segments and lengths have different size";
+        return -1;
+    }
+    size_t total_length =
+        std::accumulate(lengths.begin(), lengths.end(), (size_t)0);
+    if (total_length == 0) return -1;
+#ifdef MOONCAKE_TCP_GPU_STAGING_AVAILABLE
+    GpuStagingPool::Slot* slot = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(scatter_slot_mutex_);
+        auto it = scatter_slots_.find(slot_addr);
+        if (it != scatter_slots_.end()) {
+            slot = static_cast<GpuStagingPool::Slot*>(it->second);
+        }
+    }
+    if (!slot) {
+        LOG(ERROR) << "submitScatterToDevice: unknown scatter slot "
+                   << slot_addr;
+        return -1;
+    }
+    if (total_length > slot->capacity) {
+        LOG(ERROR) << "submitScatterToDevice: " << total_length
+                   << " bytes exceeds slot capacity " << slot->capacity;
+        return -1;
+    }
+    std::vector<void*> dsts(dst_segments.size());
+    for (size_t i = 0; i < dst_segments.size(); ++i)
+        dsts[i] = reinterpret_cast<void*>(dst_segments[i]);
+    return GpuStagingPool::instance()->scatterHostToDevice(slot, dsts, lengths)
+               ? 0
+               : -1;
+#else
+    (void)slot_addr;
+    return -1;
+#endif
+}
+
+void TransferEnginePy::releaseScatterSlot(uintptr_t slot_addr) {
+#ifdef MOONCAKE_TCP_GPU_STAGING_AVAILABLE
+    GpuStagingPool::Slot* slot = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(scatter_slot_mutex_);
+        auto it = scatter_slots_.find(slot_addr);
+        if (it != scatter_slots_.end()) {
+            slot = static_cast<GpuStagingPool::Slot*>(it->second);
+            scatter_slots_.erase(it);
+        }
+    }
+    if (slot) {
+        GpuStagingPool::instance()->release(slot);
+    }
+#else
+    (void)slot_addr;
+#endif
 }
 
 int TransferEnginePy::transferSync(const char* target_hostname,
@@ -1940,6 +2153,18 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("dst_pages"), py::arg("fields"),
                  py::arg("max_batch_size") = 0, py::arg("transport_hint") = "",
                  py::arg("nic_hint") = "")
+            .def("submit_gather_write", &TransferEnginePy::submitGatherWrite,
+                 py::arg("target_hostname"), py::arg("gpu_segments"),
+                 py::arg("lengths"), py::arg("remote_base"),
+                 py::arg("split") = 1)
+            .def("release_gather_slot", &TransferEnginePy::releaseGatherSlot,
+                 py::arg("batch_id"))
+            .def("acquire_scatter_slot", &TransferEnginePy::acquireScatterSlot)
+            .def("submit_scatter_to_device",
+                 &TransferEnginePy::submitScatterToDevice, py::arg("slot_addr"),
+                 py::arg("dst_segments"), py::arg("lengths"))
+            .def("release_scatter_slot", &TransferEnginePy::releaseScatterSlot,
+                 py::arg("slot_addr"))
             .def("transfer_sync", &TransferEnginePy::transferSync,
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),
