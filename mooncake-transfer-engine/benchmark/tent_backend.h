@@ -89,6 +89,8 @@ class TENTBenchRunner : public BenchRunner {
 
     size_t getTargetCount() const;
 
+    Status getSelectionStats(SelectionStats& stats) const;
+
     size_t getTargetIndex(int thread_id) const {
         return targetIndex(thread_id);
     }
