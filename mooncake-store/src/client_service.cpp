@@ -2125,19 +2125,13 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         }
     }
 
-    for (const auto& replica : start_result.value()) {
-        if (replica.is_memory_replica() || replica.is_nof_replica()) {
-            // Transfer data using allocated handles from all replicas
-            const auto replica_type = replica.is_memory_replica()
-                                          ? ReplicaType::MEMORY
-                                          : ReplicaType::NOF_SSD;
-            ErrorCode transfer_err = TransferWrite(replica, slices);
-            if (transfer_err != ErrorCode::OK) {
-                transfer_summary.RecordFailure(replica_type, transfer_err);
-                continue;
-            }
-            transfer_summary.RecordSuccess(replica_type);
+    for (const auto& [replica_type, transfer_err] :
+         WriteMemoryAndNofReplicas(start_result.value(), slices)) {
+        if (transfer_err != ErrorCode::OK) {
+            transfer_summary.RecordFailure(replica_type, transfer_err);
+            continue;
         }
+        transfer_summary.RecordSuccess(replica_type);
     }
 
     if (transfer_summary.allocated_dfs_replicas > 0 &&
@@ -2334,18 +2328,13 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     // Transfer to memory and NoF replicas first.
-    for (const auto& replica : start_result.value()) {
-        if (replica.is_memory_replica() || replica.is_nof_replica()) {
-            const auto replica_type = replica.is_memory_replica()
-                                          ? ReplicaType::MEMORY
-                                          : ReplicaType::NOF_SSD;
-            ErrorCode transfer_err = TransferWrite(replica, slices);
-            if (transfer_err != ErrorCode::OK) {
-                transfer_summary.RecordFailure(replica_type, transfer_err);
-                continue;
-            }
-            transfer_summary.RecordSuccess(replica_type);
+    for (const auto& [replica_type, transfer_err] :
+         WriteMemoryAndNofReplicas(start_result.value(), slices)) {
+        if (transfer_err != ErrorCode::OK) {
+            transfer_summary.RecordFailure(replica_type, transfer_err);
+            continue;
         }
+        transfer_summary.RecordSuccess(replica_type);
     }
 
     if (transfer_summary.allocated_dfs_replicas > 0 &&
@@ -4828,13 +4817,12 @@ void Client::PutToLocalFile(const std::string& key,
     });
 }
 
-ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
-                               std::vector<Slice>& slices,
-                               TransferRequest::OpCode op_code,
-                               TransferIntent intent) {
+tl::expected<TransferFuture, ErrorCode> Client::SubmitSingleTransfer(
+    const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
+    TransferRequest::OpCode op_code, TransferIntent intent) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
-        return ErrorCode::INVALID_PARAMS;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     std::optional<TransferFuture> future;
@@ -4842,7 +4830,7 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         auto contiguous_range = GetContiguousSliceRange(slices);
         if (!contiguous_range.has_value()) {
             LOG(ERROR) << "NoF transfer requires contiguous slices";
-            return ErrorCode::INVALID_PARAMS;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         future = transfer_submitter_->submit(replica_descriptor, slices,
                                              op_code, contiguous_range->ptr,
@@ -4853,11 +4841,23 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     }
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
-        return ErrorCode::TRANSFER_FAIL;
+        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
     }
 
     VLOG(1) << "Using transfer strategy: " << future->strategy();
 
+    return std::move(*future);
+}
+
+ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
+                               std::vector<Slice>& slices,
+                               TransferRequest::OpCode op_code,
+                               TransferIntent intent) {
+    auto future =
+        SubmitSingleTransfer(replica_descriptor, slices, op_code, intent);
+    if (!future) {
+        return future.error();
+    }
     return future->get();
 }
 
@@ -5135,6 +5135,31 @@ ErrorCode Client::TransferReadInternal(
     VLOG(1) << "Using transfer strategy: " << future->strategy();
 
     return future->get();
+}
+
+std::vector<std::pair<ReplicaType, ErrorCode>>
+Client::WriteMemoryAndNofReplicas(
+    const std::vector<Replica::Descriptor>& replicas,
+    std::vector<Slice>& slices) {
+    // Submit all before waiting, as BatchPut does, so the writes overlap.
+    std::vector<std::pair<ReplicaType, tl::expected<TransferFuture, ErrorCode>>>
+        pending;
+    pending.reserve(replicas.size());
+    std::vector<std::pair<ReplicaType, ErrorCode>> results;
+    results.reserve(replicas.size());
+    for (const auto& replica : replicas) {
+        if (replica.is_memory_replica() || replica.is_nof_replica()) {
+            pending.emplace_back(
+                replica.is_memory_replica() ? ReplicaType::MEMORY
+                                            : ReplicaType::NOF_SSD,
+                SubmitSingleTransfer(replica, slices, TransferRequest::WRITE));
+        }
+    }
+    for (auto& [replica_type, future] : pending) {
+        results.emplace_back(replica_type,
+                             future ? future->get() : future.error());
+    }
+    return results;
 }
 
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,

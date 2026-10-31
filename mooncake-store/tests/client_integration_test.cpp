@@ -2,7 +2,9 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstdint>
@@ -745,6 +747,91 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
     ASSERT_TRUE(remove_result.has_value())
         << "Remove operation failed: " << toString(remove_result.error());
     client_buffer_allocator_->deallocate(buffer, test_data.size());
+}
+
+constexpr size_t kReplicaCheckSize = 256 * 1024;
+
+void FillReplicaCheckPattern(void* buffer, char seed) {
+    for (size_t i = 0; i < kReplicaCheckSize; ++i) {
+        static_cast<char*>(buffer)[i] = static_cast<char>(i * 31 + seed);
+    }
+}
+
+// Reads each replica of the key on its own and compares it with expected.
+void ExpectEveryReplicaHolds(Client& client, SimpleAllocator& allocator,
+                             const std::string& key, const void* expected,
+                             size_t expected_replicas) {
+    auto query_result = client.Query(key);
+    ASSERT_TRUE(query_result.has_value());
+    ASSERT_EQ(query_result->replicas.size(), expected_replicas);
+    void* buffer = allocator.allocate(kReplicaCheckSize);
+    ASSERT_NE(buffer, nullptr);
+    for (const auto& replica : query_result->replicas) {
+        ASSERT_TRUE(replica.is_memory_replica());
+        memset(buffer, 0, kReplicaCheckSize);
+        QueryResult one_replica({replica}, query_result->lease_timeout,
+                                query_result->object_checksum);
+        std::vector<Slice> slices{Slice{buffer, kReplicaCheckSize}};
+        auto get_result = client.Get(key, one_replica, slices);
+        ASSERT_TRUE(get_result.has_value())
+            << "Get failed: " << toString(get_result.error());
+        const char* got = static_cast<const char*>(buffer);
+        const char* want = static_cast<const char*>(expected);
+        auto [got_end, want_end] =
+            std::mismatch(got, got + kReplicaCheckSize, want);
+        EXPECT_EQ(got_end, got + kReplicaCheckSize)
+            << "replica " << replica.id << " differs at offset "
+            << (got_end - got);
+    }
+    allocator.deallocate(buffer, kReplicaCheckSize);
+}
+
+// Keys stay unique when the suite is repeated in one process.
+std::string UniqueReplicaCheckKey(const std::string& prefix) {
+    static std::atomic<int> counter{0};
+    return prefix + "_" + std::to_string(counter++);
+}
+
+TEST_F(ClientIntegrationTest, PutWritesEveryMemoryReplica) {
+    // The allocator places the two replicas on the two mounted segments.
+    const std::string key = UniqueReplicaCheckKey("put_every_replica");
+    void* buffer = client_buffer_allocator_->allocate(kReplicaCheckSize);
+    ASSERT_NE(buffer, nullptr);
+    FillReplicaCheckPattern(buffer, 7);
+    std::vector<Slice> slices{Slice{buffer, kReplicaCheckSize}};
+    ReplicateConfig config;
+    config.replica_num = 2;
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Put failed: " << toString(put_result.error());
+    ExpectEveryReplicaHolds(*test_client_, *client_buffer_allocator_, key,
+                            buffer, 2);
+    client_buffer_allocator_->deallocate(buffer, kReplicaCheckSize);
+}
+
+TEST_F(ClientIntegrationTest, UpsertSameSizeWritesEveryMemoryReplica) {
+    const std::string key = UniqueReplicaCheckKey("upsert_every_replica");
+    void* buffer = client_buffer_allocator_->allocate(kReplicaCheckSize);
+    ASSERT_NE(buffer, nullptr);
+    FillReplicaCheckPattern(buffer, 7);
+    std::vector<Slice> slices{Slice{buffer, kReplicaCheckSize}};
+    ReplicateConfig config;
+    config.replica_num = 2;
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Put failed: " << toString(put_result.error());
+
+    // Wait for the lease so the same-size Upsert rewrites both replicas in
+    // place.
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    FillReplicaCheckPattern(buffer, 91);
+    auto upsert_result = test_client_->Upsert(key, slices, config);
+    ASSERT_TRUE(upsert_result.has_value())
+        << "Upsert failed: " << toString(upsert_result.error());
+    ExpectEveryReplicaHolds(*test_client_, *client_buffer_allocator_, key,
+                            buffer, 2);
+    client_buffer_allocator_->deallocate(buffer, kReplicaCheckSize);
 }
 
 TEST_F(ClientIntegrationTest, ObjectChecksumRejectsCorruptedObject) {
