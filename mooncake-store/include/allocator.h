@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <ylt/util/tl/expected.hpp>
@@ -31,6 +32,20 @@ enum class ReplicaType {
     NOF_SSD = 3,     // Nvme-oF SSD replica
     ALL = 4,         // All synchronous replicas in put finalize path
     DFS = 100,       // Distributed filesystem page-offset replica
+};
+
+/**
+ * @brief How a reader transfers the contents of an allocated buffer.
+ *
+ * Only the CXL path needs per-buffer state beyond this tag, so this replaces
+ * the string member every buffer used to carry. `kOther` keeps the protocol of
+ * a descriptor this build does not know (a standby snapshot written by another
+ * version), so that the descriptor still round-trips unchanged.
+ */
+enum class BufferProtocol : uint8_t {
+    kTcp = 0,  // Regular segment memory, addressed by its allocator
+    kCxl = 1,  // CXL memory, addressed by the client's segment name
+    kOther = 2,
 };
 
 struct LiveAllocation {
@@ -155,7 +170,24 @@ class AllocatedBuffer {
     void* get_vaddr_from_cxl();
 
    private:
+    // The protocol of a buffer that is not plain TCP. Plain TCP is the null
+    // pointer: it is the common case, and everything it needs is already in
+    // the allocator.
+    struct ProtocolState {
+        // Never kTcp: plain TCP is the null pointer.
+        BufferProtocol kind;
+        // kCxl: the client segment name the buffer transfers from.
+        // kOther: the protocol of a descriptor this build does not know.
+        std::string value;
+    };
+
     bool copyTransferProtocolFrom(const AllocatedBuffer& source);
+
+    [[nodiscard]] BufferProtocol protocolKind() const noexcept {
+        return protocol_ ? protocol_->kind : BufferProtocol::kTcp;
+    }
+
+    [[nodiscard]] std::string_view protocolName() const noexcept;
 
     std::weak_ptr<BufferAllocatorBase> allocator_;
     // Both bindings are set before the buffer is published to readers and not
@@ -165,10 +197,10 @@ class AllocatedBuffer {
     // MasterService constructor, before any reader.
     SegmentLifetime segment_lifetime_;
     std::shared_ptr<ClientLivenessRecord> client_liveness_;
-    std::string segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
-    std::string protocol{"tcp"};
+    // Null for TCP; allocated only for a CXL buffer or an unknown protocol.
+    std::unique_ptr<ProtocolState> protocol_;
     // RAII handle for buffer allocated by offset allocator
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};
