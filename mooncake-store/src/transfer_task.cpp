@@ -78,14 +78,13 @@ static int CountNofQueuedTasks(const mooncake::NofTask* head) {
 }
 
 static inline void NofTaskCompletion(mooncake::NofTask* task) {
-    if (task->remaining_bytes == 0 && task->outstanding_sub_io == 0) {
+    if (!task->on_chain && task->remaining_bytes == 0 &&
+        task->outstanding_sub_io == 0) {
         task->state->set_completed(task->failed
                                        ? mooncake::ErrorCode::TRANSFER_FAIL
                                        : mooncake::ErrorCode::OK,
                                    std::move(task->error_detail));
-        if (!task->on_chain) {
-            delete task;
-        }
+        delete task;
     }
 }
 
@@ -591,6 +590,16 @@ void NofWorkerPool::workerThread(int work_idx) {
                         int ret = initiator_->SubmitIO(
                             task->seg_handle, submit_ptr, submit_off,
                             submit_bytes, task->op, &sub_task->adaptor);
+                        if (ret == -EAGAIN) {
+                            sub_task->sub_task_pool->push(sub_task);
+                            // break only exits the inner loop. Clear
+                            // this local budget to also stop the outer task
+                            // loop, so PollCompletion runs before retrying the
+                            // queued task. The next worker iteration recomputes
+                            // the budget; actual QoS counters are unchanged.
+                            avail_blocks = 0;
+                            break;
+                        }
                         if (ret != 0) {
 #ifdef USE_NOF
                             if (task->metric) {

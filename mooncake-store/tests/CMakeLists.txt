@@ -157,6 +157,8 @@ add_store_test(dynamic_replication_test dynamic_replication_test.cpp)
 add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
 if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
+endif()
+if(USE_NOF AND USE_NOF_SPDK)
   add_store_test(nof_env_reacquire_test nof_env_reacquire_test.cpp)
 endif()
 add_store_test(nof_register_config_test nof_register_config_test.cpp)
@@ -561,3 +563,9 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+if(USE_NOF AND USE_NOF_LINUX)
+  add_store_test(nof_linux_initiator_test nof_linux_initiator_test.cpp)
+  target_include_directories(nof_linux_initiator_test PRIVATE ../src)
+  target_link_libraries(nof_linux_initiator_test PUBLIC mooncake_nof_linux)
+endif()
