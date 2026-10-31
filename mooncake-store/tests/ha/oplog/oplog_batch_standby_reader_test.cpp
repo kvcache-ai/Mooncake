@@ -352,6 +352,27 @@ TEST(OpLogBatchStandbyReaderTest, RangeReadsBatchesWhenDurablePrefixAdvances) {
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
 }
 
+TEST(OpLogBatchStandbyReaderTest, ReportsEntriesSkippedBelowApplierWatermark) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 1, .last_seq = 3})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey("clusterA", 1),
+                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 3))));
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    applier.Recover(2);
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+
+    auto result = reader.PollOnce();
+
+    ASSERT_EQ(ErrorCode::OK, result.error);
+    EXPECT_EQ(2u, result.skipped_entries);
+    EXPECT_EQ(1u, result.applied_entries);
+    EXPECT_EQ(4u, applier.GetExpectedSequenceId());
+}
+
 TEST(OpLogBatchStandbyReaderTest, DoesNothingWhenDurablePrefixDoesNotAdvance) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,
