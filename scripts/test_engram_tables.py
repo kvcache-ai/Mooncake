@@ -8,9 +8,9 @@ import pytest
 from mooncake.engram import EngramStore
 
 
-def test_remote_backend_is_reserved_but_unsupported():
+def test_store_client_is_not_the_deepep_backend_selector():
     with pytest.raises(
-        NotImplementedError, match="Remote EngramStore is not supported"
+        NotImplementedError, match="store_client is not an Engram transport"
     ):
         EngramStore(
             tables={"a": {"num_rows": 11, "row_bytes": 17}},

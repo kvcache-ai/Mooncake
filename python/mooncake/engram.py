@@ -29,8 +29,8 @@ class EngramStore:
     Persistent local files survive close; anonymous tables (persistent=False)
     are released on close or process exit. CPU lookup is synchronous. CUDA
     lookup enqueues the complete operation on the supplied stream, including
-    completion, and returns None. ``store_client`` is reserved for a future
-    remote backend; remote tables are not supported yet.
+    completion, and returns None. ``initialize`` selects the node-sharded
+    DeepEP backend; ``store_client`` remains an unsupported reserved argument.
     """
 
     def __init__(
@@ -47,15 +47,19 @@ class EngramStore:
         self._mappings = {}
         self._cuda_tables = {}
         self._cuda_lookups = {}
+        self._remote = None
         if not isinstance(namespace, str) or not namespace:
             raise ValueError("A nonempty namespace is required")
         if (local_dir is None) == (store_client is None):
             raise ValueError("Choose exactly one of local_dir and store_client")
         if store_client is not None:
-            raise NotImplementedError("Remote EngramStore is not supported yet")
+            raise NotImplementedError(
+                "store_client is not an Engram transport; use initialize for DeepEP"
+            )
         if not isinstance(persistent, bool):
             raise ValueError("persistent must be a bool")
         self._persistent = persistent
+        self._namespace = namespace
         if not tables:
             raise ValueError("At least one table is required")
         self._specs = {}
@@ -81,6 +85,60 @@ class EngramStore:
     def get_table_spec(self, table_id):
         return dict(self._spec(table_id))
 
+    def initialize(
+        self,
+        local_tables,
+        *,
+        shard_id,
+        num_shards,
+        table_owners,
+        master_addr,
+        session_id,
+        caller_id,
+        max_lookup_rows,
+        rdma_device=None,
+        read_policy="auto",
+        opt_max_rows=12288,
+        native_qps=15,
+        opt_qps=32,
+        timeout=300,
+        num_callers=1,
+    ):
+        """Publish this node's tables and connect all node shards through Master.
+
+        Storage shard IDs are independent of model ranks. Each node supplies
+        only its owned tables; local callers share their backing CPU snapshot.
+        caller_id pairs one GPU caller on each node into a private rail group.
+        master_addr is the Master's HTTP metadata endpoint. session_id must be
+        unique per deployment. Returns after all shards have registered and
+        connected. Remote lookup keeps the existing stream-ordered byte API.
+        """
+        from ._engram_deepep import DeepEPBackend
+
+        with self._lock:
+            if self._closed or self._remote is not None or self._mappings:
+                raise RuntimeError("initialize requires a fresh EngramStore")
+            self._remote = DeepEPBackend(
+                tables=self._specs,
+                namespace=self._namespace,
+                local_tables=local_tables,
+                owners=table_owners,
+                shard_id=shard_id,
+                num_shards=num_shards,
+                master_addr=master_addr,
+                session_id=session_id,
+                caller_id=caller_id,
+                max_lookup_rows=max_lookup_rows,
+                local_dir=self._root,
+                rdma_device=rdma_device,
+                read_policy=read_policy,
+                opt_max_rows=opt_max_rows,
+                native_qps=native_qps,
+                opt_qps=opt_qps,
+                timeout=timeout,
+                num_callers=num_callers,
+            )
+
     def _path(self, name):
         return self._root / hashlib.sha256(name.encode()).hexdigest()
 
@@ -94,6 +152,8 @@ class EngramStore:
 
     def populate(self, table_id, rows):
         with self._lock:
+            if self._remote is not None:
+                raise RuntimeError("Remote snapshots are immutable after initialize")
             spec = self._spec(table_id)
             rows = self._array(rows)
             shape = (spec["num_rows"], spec["row_bytes"])
@@ -198,6 +258,9 @@ class EngramStore:
                 x < 0 or x > np.iinfo(np.int64).max for x in offsets
             ):
                 raise ValueError("Expected one nonnegative int64 offset per table")
+            if self._remote is not None:
+                self._remote.lookup(table_ids, row_ids, output, stream, offsets)
+                return
             if stream is not None:
                 self._lookup_cuda(table_ids, row_ids, output, int(stream), offsets)
                 return
@@ -267,6 +330,8 @@ class EngramStore:
     def remove(self, table_id):
         with self._lock:
             self._spec(table_id)
+            if self._remote is not None:
+                raise RuntimeError("Close the deployment before removing remote shards")
             if not self._persistent:
                 raise RuntimeError("Anonymous tables are released by close()")
             if table_id in self._mappings:
@@ -283,6 +348,9 @@ class EngramStore:
         with self._lock:
             if self._closed:
                 return
+            if self._remote is not None:
+                self._remote.close()
+                self._remote = None
             for lookup in self._cuda_lookups.values():
                 lookup.synchronize()
             lookup = None
