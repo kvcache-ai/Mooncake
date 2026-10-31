@@ -1188,8 +1188,16 @@ class MasterService {
     // tenant is first read to pick the objects that match, and only those are
     // cleaned, each under its own write lock, since a mass client expiry marks
     // handles stale table-wide.
+    //
+    // on_visited, when set, runs once per object during that read pass, under
+    // the stripe's shared lock. It lets a caller fold its own per-object
+    // question into the pass it already pays for instead of scanning again
+    // (client offboarding asks whether a PROCESSING replica of the offboarded
+    // client is still around). It must be cheap, must not take a lock, block,
+    // or throw, and must not rely on the object surviving the sweep.
     tl::expected<void, ErrorCode> ClearStaleHandles(
-        const std::function<bool(const Replica&)>& is_stale);
+        const std::function<bool(const Replica&)>& is_stale,
+        const std::function<void(const ObjectMetadata&)>& on_visited = {});
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
@@ -1626,9 +1634,9 @@ class MasterService {
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
-    const double eviction_ratio_;                 // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
-    const double nof_eviction_ratio_;             // in range [0.0, 1.0]
+    const double eviction_ratio_;                     // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
     // Memory eviction (see eviction::Evictor) and what it is built from: the
