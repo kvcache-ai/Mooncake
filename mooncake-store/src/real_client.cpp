@@ -377,7 +377,7 @@ void *AllocateMemFabricStoreSegment(size_t segment_size,
     MemFabricHostAllocFn host_alloc = nullptr;
     size_t host_align = 0;
     size_t alloc_size = segment_size;
-    if (use_hugepage) {
+    if (use_hugepage && !memfabric_use_fabric_mem(protocol)) {
         host_align = get_hugepage_size_from_env();
         alloc_size = align_up(segment_size, host_align);
         host_alloc =
@@ -1207,14 +1207,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
+    bool use_hugepage_for_client_buffer =
+        use_hugepage_ && !globalConfig().ascend_use_fabric_mem;
+#ifdef USE_MEMFABRIC
+    use_hugepage_for_client_buffer &= !memfabric_use_fabric_mem(this->protocol);
+#endif
     // Inject the SPDK DMA allocator only when NoF is actually available;
     // otherwise pass nullptr so allocate_buffer_allocator_memory falls
     // through to exactly the same path as use_spdk_dma=false today
     // (protocol-specific allocation -> VRAM -> aligned_alloc).
     try {
         client_buffer_allocator_ = ClientBufferAllocator::create(
-            local_buffer_size, this->protocol,
-            use_hugepage_ && !globalConfig().ascend_use_fabric_mem,
+            local_buffer_size, this->protocol, use_hugepage_for_client_buffer,
             nof_runtime_.initiator ? nof_runtime_.dma_allocator : nullptr);
     } catch (const std::bad_alloc &) {
         // The NoF DMA allocator yields nullptr when the SPDK env is
@@ -1472,7 +1476,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else if (this->protocol == "ascend" ||
                        this->protocol == "ubshmem") {
 #ifdef USE_MEMFABRIC
-                if (use_hugepage_) {
+                if (use_hugepage_ &&
+                    !memfabric_use_fabric_mem(this->protocol)) {
                     hugepage_segment_ptrs_.emplace_back(
                         ptr, HugepageSegmentDeleter{mapped_size});
                 } else {

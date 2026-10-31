@@ -392,7 +392,7 @@ std::string TransferEngine::showLinks(bool json) const {
 #include "tent/common/types.h"
 #include "tent/runtime/topology.h"
 #include "topology.h"
-#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_MEMFABRIC)
 #include "config.h"
 #endif
 
@@ -699,6 +699,10 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                 config->set("transports/ascend_direct/fabric_mem", true);
             }
         }
+#endif
+#ifdef USE_MEMFABRIC
+        config->set("transports/memfabric/store_te_init",
+                    globalConfig().ascend_store_te_init);
 #endif
         impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
         if (!impl_tent_->available()) return ERR_CONTEXT;
