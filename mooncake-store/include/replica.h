@@ -399,10 +399,10 @@ class Replica {
         if (status_ == ReplicaStatus::UNDEFINED) return;
         if (is_disk_replica()) {
             MasterMetricManager::instance().dec_allocated_file_size(
-                std::get<DiskReplicaData>(data_).object_size);
+                DiskData(data_).object_size);
         } else if (is_local_disk_replica()) {
             MasterMetricManager::instance().dec_allocated_file_size(
-                std::get<LocalDiskReplicaData>(data_).object_size);
+                LocalDiskData(data_).object_size);
         }
     }
 
@@ -431,10 +431,10 @@ class Replica {
         if (status_ != ReplicaStatus::UNDEFINED) {
             if (is_disk_replica()) {
                 MasterMetricManager::instance().dec_allocated_file_size(
-                    std::get<DiskReplicaData>(data_).object_size);
+                    DiskData(data_).object_size);
             } else if (is_local_disk_replica()) {
                 MasterMetricManager::instance().dec_allocated_file_size(
-                    std::get<LocalDiskReplicaData>(data_).object_size);
+                    LocalDiskData(data_).object_size);
             }
         }
 
@@ -464,8 +464,10 @@ class Replica {
         if (const auto* data = std::get_if<NoFReplicaData>(&data_)) {
             return data->buffer && data->buffer->isAvailable();
         }
-        if (const auto* data = std::get_if<LocalDiskReplicaData>(&data_)) {
-            const ClientLivenessRecord* record = data->client_liveness.get();
+        if (const auto* local =
+                std::get_if<std::unique_ptr<LocalDiskReplicaData>>(&data_)) {
+            const ClientLivenessRecord* record =
+                (*local)->client_liveness.get();
             return record != nullptr && record->IsServing();
         }
         return true;
@@ -528,7 +530,7 @@ class Replica {
     }
 
     [[nodiscard]] bool is_disk_replica() const {
-        return std::holds_alternative<DiskReplicaData>(data_);
+        return std::holds_alternative<std::unique_ptr<DiskReplicaData>>(data_);
     }
 
     [[nodiscard]] static bool fn_is_disk_replica(const Replica& replica) {
@@ -536,7 +538,8 @@ class Replica {
     }
 
     [[nodiscard]] bool is_local_disk_replica() const {
-        return std::holds_alternative<LocalDiskReplicaData>(data_);
+        return std::holds_alternative<std::unique_ptr<LocalDiskReplicaData>>(
+            data_);
     }
 
     [[nodiscard]] static bool fn_is_local_disk_replica(const Replica& replica) {
@@ -544,7 +547,7 @@ class Replica {
     }
 
     [[nodiscard]] bool is_dfs_replica() const {
-        return std::holds_alternative<DfsReplicaData>(data_);
+        return std::holds_alternative<std::unique_ptr<DfsReplicaData>>(data_);
     }
 
     [[nodiscard]] static bool fn_is_dfs_replica(const Replica& replica) {
@@ -552,11 +555,11 @@ class Replica {
     }
 
     [[nodiscard]] const DistributedFSDescriptor& get_dfs_descriptor() const {
-        return std::get<DfsReplicaData>(data_).descriptor;
+        return DfsData(data_).descriptor;
     }
 
     [[nodiscard]] DistributedFSDescriptor& get_dfs_descriptor() {
-        return std::get<DfsReplicaData>(data_).descriptor;
+        return DfsData(data_).descriptor;
     }
 
     [[nodiscard]] bool has_invalid_mem_handle() const {
@@ -615,8 +618,7 @@ class Replica {
      */
     [[nodiscard]] std::optional<UUID> get_local_disk_client_id() const {
         if (is_local_disk_replica()) {
-            const auto& disk_data = std::get<LocalDiskReplicaData>(data_);
-            return disk_data.client_id;
+            return LocalDiskData(data_).client_id;
         }
         return std::nullopt;
     }
@@ -629,8 +631,7 @@ class Replica {
                 data.buffer->bindClientLiveness(std::move(client_liveness));
             }
         } else if (is_local_disk_replica()) {
-            std::get<LocalDiskReplicaData>(data_).client_liveness =
-                std::move(client_liveness);
+            LocalDiskData(data_).client_liveness = std::move(client_liveness);
         }
     }
 
@@ -641,8 +642,7 @@ class Replica {
             return data.buffer ? data.buffer->getClientLiveness() : nullptr;
         }
         if (is_local_disk_replica()) {
-            const auto& data = std::get<LocalDiskReplicaData>(data_);
-            return data.client_liveness;
+            return LocalDiskData(data_).client_liveness;
         }
         return nullptr;
     }
@@ -655,8 +655,7 @@ class Replica {
                    data.buffer->getClientLiveness() == client_liveness;
         }
         if (is_local_disk_replica()) {
-            const auto& data = std::get<LocalDiskReplicaData>(data_);
-            return data.client_liveness == client_liveness;
+            return LocalDiskData(data_).client_liveness == client_liveness;
         }
         return false;
     }
@@ -726,13 +725,14 @@ class Replica {
         ReplicaType operator()(const NoFReplicaData&) const {
             return ReplicaType::NOF_SSD;
         }
-        ReplicaType operator()(const DiskReplicaData&) const {
+        ReplicaType operator()(const std::unique_ptr<DiskReplicaData>&) const {
             return ReplicaType::DISK;
         }
-        ReplicaType operator()(const LocalDiskReplicaData&) const {
+        ReplicaType operator()(
+            const std::unique_ptr<LocalDiskReplicaData>&) const {
             return ReplicaType::LOCAL_DISK;
         }
-        ReplicaType operator()(const DfsReplicaData&) const {
+        ReplicaType operator()(const std::unique_ptr<DfsReplicaData>&) const {
             return ReplicaType::DFS;
         }
     };
@@ -868,6 +868,47 @@ class Replica {
     };
 
    private:
+    // A memory or NoF replica keeps its buffer inline: one pointer, and the
+    // case every read goes through. The other kinds are rare and live behind a
+    // pointer so they do not size the variant (Disk 40 B, LocalDisk 72 B,
+    // DFS 64 B) for the replicas that never use them.
+    using Data = std::variant<
+        MemoryReplicaData, NoFReplicaData, std::unique_ptr<DiskReplicaData>,
+        std::unique_ptr<LocalDiskReplicaData>, std::unique_ptr<DfsReplicaData>>;
+
+    static Data MakeBufferedData(std::unique_ptr<AllocatedBuffer> buffer,
+                                 ReplicaType replica_type) {
+        if (replica_type == ReplicaType::MEMORY) {
+            return MemoryReplicaData{std::move(buffer)};
+        }
+        if (replica_type == ReplicaType::NOF_SSD) {
+            return NoFReplicaData{std::move(buffer)};
+        }
+        LOG(ERROR) << "Invalid buffered replica type: " << replica_type;
+        return MemoryReplicaData{nullptr};
+    }
+
+    // The out-of-line kinds. The pointer is never null for the kind the
+    // variant holds.
+    static const DiskReplicaData& DiskData(const Data& data) {
+        return *std::get<std::unique_ptr<DiskReplicaData>>(data);
+    }
+    static DiskReplicaData& DiskData(Data& data) {
+        return *std::get<std::unique_ptr<DiskReplicaData>>(data);
+    }
+    static const LocalDiskReplicaData& LocalDiskData(const Data& data) {
+        return *std::get<std::unique_ptr<LocalDiskReplicaData>>(data);
+    }
+    static LocalDiskReplicaData& LocalDiskData(Data& data) {
+        return *std::get<std::unique_ptr<LocalDiskReplicaData>>(data);
+    }
+    static const DfsReplicaData& DfsData(const Data& data) {
+        return *std::get<std::unique_ptr<DfsReplicaData>>(data);
+    }
+    static DfsReplicaData& DfsData(Data& data) {
+        return *std::get<std::unique_ptr<DfsReplicaData>>(data);
+    }
+
     // Restore-only constructors preserve IDs without consuming next_id_.
     Replica(ReplicaID id, std::unique_ptr<AllocatedBuffer> buffer,
             ReplicaStatus status)
@@ -878,20 +919,16 @@ class Replica {
 
     Replica(ReplicaID id, std::unique_ptr<AllocatedBuffer> buffer,
             ReplicaStatus status, ReplicaType replica_type)
-        : id_(id), status_(status), refcnt_(0) {
-        if (replica_type == ReplicaType::MEMORY) {
-            data_ = MemoryReplicaData{std::move(buffer)};
-        } else if (replica_type == ReplicaType::NOF_SSD) {
-            data_ = NoFReplicaData{std::move(buffer)};
-        } else {
-            LOG(ERROR) << "Invalid buffered replica type: " << replica_type;
-        }
-    }
+        : id_(id),
+          data_(MakeBufferedData(std::move(buffer), replica_type)),
+          status_(status),
+          refcnt_(0) {}
 
     Replica(ReplicaID id, std::string file_path, uint64_t object_size,
             ReplicaStatus status)
         : id_(id),
-          data_(DiskReplicaData{std::move(file_path), object_size}),
+          data_(std::make_unique<DiskReplicaData>(
+              DiskReplicaData{std::move(file_path), object_size})),
           status_(status),
           refcnt_(0) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
@@ -901,9 +938,9 @@ class Replica {
             std::string transport_endpoint, ReplicaStatus status,
             std::shared_ptr<ClientLivenessRecord> client_liveness = nullptr)
         : id_(id),
-          data_(LocalDiskReplicaData{client_id, object_size,
-                                     std::move(transport_endpoint),
-                                     std::move(client_liveness)}),
+          data_(std::make_unique<LocalDiskReplicaData>(LocalDiskReplicaData{
+              client_id, object_size, std::move(transport_endpoint),
+              std::move(client_liveness)})),
           status_(status),
           refcnt_(0) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
@@ -912,7 +949,8 @@ class Replica {
     Replica(ReplicaID id, DistributedFSDescriptor descriptor,
             ReplicaStatus status)
         : id_(id),
-          data_(DfsReplicaData{std::move(descriptor)}),
+          data_(std::make_unique<DfsReplicaData>(
+              DfsReplicaData{std::move(descriptor)})),
           status_(status),
           refcnt_(0) {}
 
@@ -922,9 +960,7 @@ class Replica {
     inline static std::atomic<ReplicaID> next_id_{1};
 
     ReplicaID id_;
-    std::variant<MemoryReplicaData, NoFReplicaData, DiskReplicaData,
-                 LocalDiskReplicaData, DfsReplicaData>
-        data_;
+    Data data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 
     friend class MasterService;  // Standby restore advances next_id_
@@ -961,20 +997,20 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         }
         desc.descriptor_variant = std::move(nof_desc);
     } else if (is_disk_replica()) {
-        const auto& disk_data = std::get<DiskReplicaData>(data_);
+        const auto& disk_data = DiskData(data_);
         DiskDescriptor disk_desc;
         disk_desc.file_path = disk_data.file_path;
         disk_desc.object_size = disk_data.object_size;
         desc.descriptor_variant = std::move(disk_desc);
     } else if (is_local_disk_replica()) {
-        const auto& disk_data = std::get<LocalDiskReplicaData>(data_);
+        const auto& disk_data = LocalDiskData(data_);
         LocalDiskDescriptor local_disk_desc;
         local_disk_desc.client_id = disk_data.client_id;
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
         desc.descriptor_variant = std::move(local_disk_desc);
     } else if (is_dfs_replica()) {
-        desc.descriptor_variant = std::get<DfsReplicaData>(data_).descriptor;
+        desc.descriptor_variant = DfsData(data_).descriptor;
     }
 
     return desc;
@@ -989,8 +1025,9 @@ inline std::optional<std::string> Replica::transport_endpoint() const {
         return data->buffer ? data->buffer->getTransportEndpoint()
                             : std::string();
     }
-    if (const auto* data = std::get_if<LocalDiskReplicaData>(&data_)) {
-        return data->transport_endpoint;
+    if (const auto* local =
+            std::get_if<std::unique_ptr<LocalDiskReplicaData>>(&data_)) {
+        return (*local)->transport_endpoint;
     }
     return std::nullopt;
 }
@@ -1038,16 +1075,16 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
         }
         os << "]";
     } else if (replica.is_disk_replica()) {
-        const auto& disk_data = std::get<DiskReplicaData>(replica.data_);
+        const auto& disk_data = Replica::DiskData(replica.data_);
         os << "type: DISK, file_path: " << disk_data.file_path
            << ", object_size: " << disk_data.object_size;
     } else if (replica.is_local_disk_replica()) {
-        const auto& disk_data = std::get<LocalDiskReplicaData>(replica.data_);
+        const auto& disk_data = Replica::LocalDiskData(replica.data_);
         os << "type: LOCAL_DISK, client_id: " << disk_data.client_id
            << ", object_size: " << disk_data.object_size
            << ", transport_endpoint: " << disk_data.transport_endpoint;
     } else if (replica.is_dfs_replica()) {
-        const auto& dfs_data = std::get<DfsReplicaData>(replica.data_);
+        const auto& dfs_data = Replica::DfsData(replica.data_);
         os << "type: DFS, file_path: " << dfs_data.descriptor.file_path
            << ", offset: " << dfs_data.descriptor.offset
            << ", object_size: " << dfs_data.descriptor.object_size
