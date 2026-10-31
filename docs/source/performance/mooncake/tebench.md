@@ -381,11 +381,14 @@ Example:
 * `--start_num_threads`, `--max_num_threads` : thread sweep (powers of two)
 * `--duration` : measurement time per case (seconds)
 
-A test case is skipped when:
-
-```
-block_size × batch_size × num_threads > total_buffer_size
-```
+Each thread owns one fixed region in its local buffer and one in its target
+buffer, sized for the largest operation (`max_block_size × max_batch_size`, or
+`--target_window_size` on the target side; see Section 5.5 for which buffer a
+thread uses). A test case is skipped when some thread's region does not fit in its local
+buffer (`--total_buffer_size`) or its target buffer (the buffer length after
+`--target_offset`, and `--target_range_size` if set). Because the layout only
+depends on the thread count, all block and batch sizes of a thread count either
+run or are skipped together.
 
 **Multi-target initiator**
 
@@ -535,14 +538,12 @@ An existing run directory is rejected; use a new `--run-id` when rerunning with
 
 ### 5.5 GPU Affinity
 
-* `--local_gpu_id`  : initiator base GPU ID
-* `--target_gpu_id` : target base GPU ID
+* `--local_gpu_id`  : initiator GPU; `-1` allocates a buffer on every GPU
+* `--target_gpu_id` : first target buffer used, as an index into the target's
+  buffer list
 
-Each worker thread uses:
-
-```
-gpu_id + thread_id
-```
+Worker thread `i` uses local buffer `i % local_buffers` and target buffer
+`(target_gpu_id + i / target_count) % target_buffers`.
 
 ---
 
@@ -633,8 +634,9 @@ through `MC_TENT_CONF`:
      --start_num_threads=8 --max_num_threads=8
    ```
 
-   Initiator threads round-robin across the listed seg_types by `thread_id`
-   (even→DRAM, odd→VRAM). The engine selects transport based on the target
+   Initiator threads round-robin across the listed seg_types by
+   `thread_id / target_count` (with one target: even→DRAM, odd→VRAM), and use
+   the same seg_type on the local and the target side. The engine selects transport based on the target
    buffer's location — SHM for `cpu:N` buffers, NVLink for `cuda:N` buffers —
    so `/metrics` will show both `transport="shm"` and `transport="nvlink"`
    labels with non-zero counts from a single metrics endpoint.
