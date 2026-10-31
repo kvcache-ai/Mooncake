@@ -30,7 +30,7 @@ CORE_PACKAGES = (
     "mooncake-transfer-engine-cuda13",
     "mooncake-transfer-engine-non-cuda",
 )
-PYTHON_TAGS = ("cp310", "cp311", "cp312", "cp313")
+PYTHON_TAGS = ("cp310", "cp311", "cp312", "cp313", "cp314")
 ARCHITECTURES = ("x86_64", "aarch64")
 DEFAULT_INDEX_URL = "https://test.pypi.org/simple"
 
