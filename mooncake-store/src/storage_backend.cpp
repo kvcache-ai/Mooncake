@@ -5484,7 +5484,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     std::unordered_map<std::string, StorageValueSpan> spans;
     spans.reserve(batched_slices.size());
     for (const auto& [key, slice] : batched_slices) {
-        spans.emplace(key, StorageValueSpan{0, slice.size, slice});
+        spans.emplace(key, StorageValueSpan{0, 0, slice});
     }
     return ReadOffsetValues(spans, true);
 }

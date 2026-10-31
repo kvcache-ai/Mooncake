@@ -1361,9 +1361,9 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_SizeMismatch) {
         ASSERT_TRUE(offload_res);
     }
 
-    // Try to load with wrong size - should fail
-    {
-        size_t wrong_size = value.size() + 10;  // Wrong size
+    // Full reads require an exact destination size in either direction.
+    for (const size_t wrong_size : {value.size() - 1, value.size() + 10}) {
+        SCOPED_TRACE(wrong_size);
         auto buf = std::make_unique<char[]>(wrong_size);
         std::unordered_map<std::string, Slice> load_slices;
         load_slices.emplace(key, Slice{buf.get(), wrong_size});

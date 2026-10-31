@@ -27,6 +27,7 @@
 #endif
 
 #include "config.h"
+#include "../src/config/client_object_checksum_config.h"
 #include "master_config.h"
 #include "real_client.h"
 #include "nof/dma_buffer_allocator.h"
@@ -310,7 +311,9 @@ TEST_F(RealClientTest,
 }
 
 TEST_F(RealClientTest, OwnedRangesVerifyFullCoverageButNotPartialReads) {
-    ScopedEnvVar checksum("MOONCAKE_STORE_CHECKSUM", "1");
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
+        GTEST_SKIP() << "Requires MOONCAKE_STORE_CHECKSUM=1 at process startup";
+    }
     StartMasterAndSetupClient();
     const std::string payload = "abcdefghijklmnop";
     ASSERT_EQ(

@@ -1174,6 +1174,8 @@ TEST_F(FileStorageTest, RangedRestoreKeepsDuplicateKeyWindowsAndReleasesBatch) {
                 offset_allocator ? StorageBackendType::kOffsetAllocator
                                  : StorageBackendType::kBucket;
             config.local_buffer_size = 4 * 1024 * 1024;
+            config.total_size_limit = 16 * 1024 * 1024;
+            config.total_keys_limit = 1000;
             config.use_uring = use_uring;
             FileStorage storage(config, nullptr, "localhost:9003");
             std::string data(65536, '\0');
