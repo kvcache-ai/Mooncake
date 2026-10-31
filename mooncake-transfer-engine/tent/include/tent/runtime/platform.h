@@ -42,17 +42,16 @@ inline bool isGpuMemoryType(MemoryType t) {
 }
 
 // A device allocation exported as a Linux dma-buf so a NIC can register it
-// with ibv_reg_dmabuf_mr. `fd` is owned by the exporting runtime and stays
-// valid for the lifetime of the allocation; callers must not close it. Level
-// Zero, for instance, caches one descriptor per allocation and returns that
-// same fd on every export, so a caller-side close would leave the driver
-// holding a stale number. The MR keeps its own reference to the dma-buf.
+// with ibv_reg_dmabuf_mr. Level Zero caches a borrowed descriptor per
+// allocation; CNDrv returns a new descriptor that the caller closes after
+// registration. The MR keeps its own reference to the dma-buf.
 // `offset` is the position of the requested address within the exported
-// buffer, which covers the whole underlying allocation, not just the
-// requested range.
+// buffer. The export must cover [offset, offset + requested length); the
+// exporter may use the whole allocation or a page-aligned subrange.
 struct DmabufExport {
     int fd = -1;
     uint64_t offset = 0;
+    bool close_fd = false;
 };
 
 class Platform {
@@ -90,8 +89,8 @@ class Platform {
     // platform has no dma-buf export path (the default), InvalidArgument when
     // `addr` is not device memory owned by this platform (register it as host
     // memory instead), and InternalError when the export itself failed. Only
-    // an OK status populates `out`; per the DmabufExport contract the fd stays
-    // owned by the exporting runtime and the caller must not close it.
+    // an OK status populates `out`. The caller closes the fd after registration
+    // only when `out.close_fd` is true.
     virtual Status exportDmabuf(void *addr, size_t length, DmabufExport &out);
 
     // Page-aligned host memory that this platform's device copies reach by

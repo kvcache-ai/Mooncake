@@ -21,6 +21,7 @@
 #include <fstream>
 #include <limits>
 #include <string_view>
+#include <unistd.h>
 
 namespace mooncake::tent {
 namespace {
@@ -211,6 +212,69 @@ const std::vector<RangeLocation> MluPlatform::getLocation(void* start,
     }
     if (!hostMemory(attr)) return {};
     return CpuPlatform::getLocation(start, len, skip_prefault);
+}
+
+Status MluPlatform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
+    out = DmabufExport{};
+    cnrtPointerAttributes_t attr{};
+    CHECK_STATUS(attributes(addr, attr));
+    if (attr.type != cnrtMemTypeDevice) {
+        return Status::InvalidArgument("Not MLU device memory" LOC_MARK);
+    }
+    if (!length)
+        return Status::InvalidArgument("Empty MLU DMA-BUF range" LOC_MARK);
+
+    ContextGuard guard;
+    CHECK_STATUS(guard.use(addr));
+    CNaddr base = 0;
+    cn_uint64_t allocation_size = 0;
+    CHECK_STATUS(checkedDriver(cnMemGetAddressRange(
+        &base, &allocation_size, reinterpret_cast<CNaddr>(addr))));
+    const auto address = reinterpret_cast<uintptr_t>(addr);
+    if (address < base || address - base >= allocation_size) {
+        return Status::InvalidArgument(
+            "MLU DMA-BUF address outside reported range" LOC_MARK);
+    }
+
+    // Match the classic TE export: avoid importing the whole allocation when
+    // only a subrange is registered, while keeping the DMA-BUF IOVA congruent
+    // with the requested address modulo the host page size. The requested
+    // range may span contiguous driver mappings beyond the one containing addr;
+    // let CNDrv validate the aligned export range.
+    CNaddr export_base = base;
+    if (allocation_size > std::numeric_limits<size_t>::max())
+        return Status::InvalidArgument("MLU allocation is too large" LOC_MARK);
+    size_t export_size = static_cast<size_t>(allocation_size);
+    uint64_t offset = address - base;
+    if (offset || length != allocation_size) {
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0)
+            return Status::InternalError("Unable to query page size" LOC_MARK);
+        const size_t page = static_cast<size_t>(page_size);
+        uintptr_t aligned = address - address % page;
+        if (aligned < base) aligned = base;
+        export_base = static_cast<CNaddr>(aligned);
+        offset = address - aligned;
+        if (offset > std::numeric_limits<size_t>::max() - length ||
+            offset + length > std::numeric_limits<size_t>::max() - (page - 1))
+            return Status::InvalidArgument(
+                "MLU DMA-BUF size overflow" LOC_MARK);
+        export_size = ((offset + length + page - 1) / page) * page;
+    }
+
+    int fd = -1;
+    auto result = cnMemGetHandleForAddressRange(
+        &fd, export_base, export_size, CN_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+    if (result != CN_SUCCESS) {
+        if (fd >= 0) close(fd);
+        return checkedDriver(result);
+    }
+    if (fd < 0)
+        return Status::InternalError("CNDrv returned no DMA-BUF fd" LOC_MARK);
+    out.fd = fd;
+    out.offset = offset;
+    out.close_fd = true;
+    return Status::OK();
 }
 
 Status MluPlatform::synchronizeDevices(const Topology* topology) {
