@@ -58,3 +58,24 @@ if(BUILD_SHARED_LIBS)
   set_target_properties(mooncake_common PROPERTIES INSTALL_RPATH "$ORIGIN")
   install(TARGETS mooncake_common DESTINATION lib)
 endif()
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/../FindPrometheusCpp.cmake)
+
+add_library(mooncake_metrics metrics/registry.cpp)
+
+target_include_directories(
+  mooncake_metrics
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+         $<INSTALL_INTERFACE:include>)
+
+target_link_libraries(mooncake_metrics PUBLIC prometheus-cpp::core)
+set_target_properties(mooncake_metrics PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+if(NOT WITH_METRICS)
+  target_compile_definitions(mooncake_metrics PUBLIC MOONCAKE_METRICS_NOOP)
+endif()
+
+if(BUILD_SHARED_LIBS)
+  set_target_properties(mooncake_metrics PROPERTIES INSTALL_RPATH "$ORIGIN")
+  install(TARGETS mooncake_metrics DESTINATION lib)
+endif()
