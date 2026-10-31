@@ -1100,8 +1100,20 @@ class BucketStorageBackend : public StorageBackendInterface {
         test_datasync_failure_.store(enabled, std::memory_order_relaxed);
     }
 
+    // Test-only: make WriteBucket see its first start_writeback call fail,
+    // as when ext4 drops the pages of a failed delayed allocation.
+    void SetWritebackFailureForTest(bool enabled) {
+        test_writeback_failure_.store(enabled, std::memory_order_relaxed);
+    }
+
+    // WriteBucket writes through the page cache in chunks that end at
+    // multiples of this size in the file, and starts writeback of each
+    // chunk when the write reaches its end.
+    static constexpr size_t kBucketWriteChunkBytes = 4 * 1024 * 1024;
+
    private:
     std::atomic<bool> test_datasync_failure_{false};
+    std::atomic<bool> test_writeback_failure_{false};
     // Alignment helper functions for O_DIRECT I/O
     static constexpr size_t kDirectIOAlignment = 4096;
 
