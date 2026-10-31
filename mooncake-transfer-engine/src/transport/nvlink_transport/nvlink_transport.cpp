@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -568,7 +569,11 @@ static int getNumDevices() {
 }
 
 static bool supportFabricMem() {
-    if (getenv("MC_USE_NVLINK_IPC")) return false;
+    // MC_USE_NVLINK_IPC=0 selects fabric memory and any other value selects
+    // IPC, as in the Device API P2P transport, PG and the HIP transport.
+    // Unset keeps this transport's default: fabric memory when supported.
+    const char *nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
+    if (nvlink_ipc && strcmp(nvlink_ipc, "0") != 0) return false;
 
     int num_devices = 0;
     cudaError_t err = cudaGetDeviceCount(&num_devices);
