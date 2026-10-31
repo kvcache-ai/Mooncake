@@ -251,10 +251,10 @@ class UbContext {
 
     int disconnectAllEndpoints() { return endpoint_store_->disconnect(); }
 
-    // Device name, such as `mlx5_3`
+    // Device name in ubcore, such as `udmac0d1e2`
     std::string deviceName() const { return device_name_; }
 
-    // NIC Path, such as `192.168.3.76@mlx5_3`
+    // NIC Path, such as `192.168.3.76:15365@udmac0d1e2`
     std::string nicPath() const {
         return MakeNicPath(engine_.local_server_name_, device_name_);
     }
