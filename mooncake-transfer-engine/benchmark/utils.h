@@ -127,13 +127,15 @@ struct XferMetricStats {
         return sum / samples.size();
     }
 
-    double p90() { return percentile(90.0); }
+    double p90() const { return percentile(90.0); }
 
-    double p95() { return percentile(95.0); }
+    double p95() const { return percentile(95.0); }
 
-    double p99() { return percentile(99.0); }
+    double p99() const { return percentile(99.0); }
 
-    double p999() { return percentile(99.9); }
+    double p999() const { return percentile(99.9); }
+
+    double percentile(double p) const;
 
     double fractionAtOrBelow(double threshold) const {
         if (samples.empty()) return 0.0;
@@ -143,21 +145,34 @@ struct XferMetricStats {
         return static_cast<double>(count) / samples.size();
     }
 
-    void add(double value) { samples.push_back(value); }
+    void add(double value) {
+        samples.push_back(value);
+        sorted_valid = false;
+    }
 
     void add(const std::vector<double>& values) {
         samples.insert(samples.end(), values.begin(), values.end());
+        sorted_valid = false;
     }
 
-    void clear() { samples.clear(); }
+    void clear() {
+        samples.clear();
+        sorted_samples.clear();
+        sorted_valid = false;
+    }
 
-    size_t count() { return samples.size(); }
+    size_t count() const { return samples.size(); }
 
    private:
-    double percentile(double p);
+    const std::vector<double>& sortedSamples() const;
 
    private:
     std::vector<double> samples;
+    // Sorted copy of samples, built on the first percentile() call and
+    // invalidated by every mutator. Not synchronized: stats are filled under
+    // the caller's mutex and only read from a single thread afterwards.
+    mutable std::vector<double> sorted_samples;
+    mutable bool sorted_valid = false;
 };
 
 struct XferBenchStats {
@@ -191,11 +206,11 @@ class XferBenchTimer {
 
 void printStatsHeader();
 
-void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
-                int num_threads);
+void printStats(size_t block_size, size_t batch_size,
+                const XferBenchStats& stats, int num_threads);
 
 void printDeadlineGroupStats(const char* group, size_t block_size,
-                             size_t batch_size, XferBenchStats& stats,
+                             size_t batch_size, const XferBenchStats& stats,
                              int num_threads, uint64_t deadline_us);
 
 std::vector<std::string> splitCommaSeparated(const std::string& value);
