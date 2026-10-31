@@ -769,6 +769,67 @@ TEST_F(SegmentTest,
     EXPECT_FALSE(existing_buffer->isAvailable());
 }
 
+TEST_F(SegmentTest, SnapshotsKeepDirectoryVersionsButObserveUnmount) {
+    for (const auto type :
+         {BufferAllocatorType::CACHELIB, BufferAllocatorType::OFFSET}) {
+        SegmentManager manager(type);
+        const UUID first_owner = generate_uuid();
+        const UUID second_owner = generate_uuid();
+        Segment first;
+        first.id = generate_uuid();
+        first.name = "shared_snapshot_name";
+        first.base = DEFAULT_CXL_BASE;
+        first.size = 64 * 1024 * 1024;
+        first.te_endpoint = first.name;
+        Segment second = first;
+        second.id = generate_uuid();
+        second.name = "other_snapshot_name";
+        second.base += first.size;
+        Segment same_name = first;
+        same_name.id = generate_uuid();
+        same_name.base += 2 * first.size;
+        {
+            auto access = manager.getSegmentAccess();
+            ASSERT_EQ(access.MountSegment(first, first_owner, client_liveness_),
+                      ErrorCode::OK);
+        }
+        auto before = manager.getAllocatorAccess().SnapshotAllocatorManager();
+        {
+            auto access = manager.getSegmentAccess();
+            ASSERT_EQ(
+                access.MountSegment(second, second_owner, client_liveness_),
+                ErrorCode::OK);
+            ASSERT_EQ(
+                access.MountSegment(same_name, second_owner, client_liveness_),
+                ErrorCode::OK);
+        }
+        auto during = manager.getAllocatorAccess().SnapshotAllocatorManager();
+        EXPECT_EQ(before.getNames().size(), 1u);
+        EXPECT_EQ(before.getAllocators(second.name), nullptr);
+        EXPECT_EQ(before.GetOwnerClientId(first.name), first_owner);
+        ASSERT_EQ(during.getNames().size(), 2u);
+        EXPECT_EQ(during.GetOwnerClientId(first.name), second_owner);
+        ASSERT_EQ(during.getAllocators(first.name)->size(), 2u);
+        size_t metrics_dec_capacity = 0;
+        {
+            auto access = manager.getSegmentAccess();
+            ASSERT_EQ(access.PrepareUnmountSegment(same_name.id,
+                                                   metrics_dec_capacity),
+                      ErrorCode::OK);
+            ASSERT_EQ(access.CommitUnmountSegment(same_name.id, second_owner,
+                                                  metrics_dec_capacity),
+                      ErrorCode::OK);
+        }
+        auto after = manager.getAllocatorAccess().SnapshotAllocatorManager();
+        EXPECT_EQ(after.GetOwnerClientId(first.name), first_owner);
+        ASSERT_EQ(after.getAllocators(first.name)->size(), 1u);
+        EXPECT_EQ(during.GetOwnerClientId(first.name), second_owner);
+        const auto& retained = *during.getAllocators(first.name);
+        EXPECT_TRUE(retained[0]->IsServing());
+        EXPECT_FALSE(retained[1]->IsServing());
+    }
+}
+
 TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
     SegmentManager segment_manager;
 

@@ -154,14 +154,7 @@ void SegmentManager::AttachMountedUsageTrackers() {
 
 std::optional<UUID> ScopedAllocatorAccess::GetOwnerClientId(
     const std::string& segment_name) const {
-    if (client_by_name_ == nullptr) {
-        return std::nullopt;
-    }
-    auto it = client_by_name_->find(segment_name);
-    if (it == client_by_name_->end()) {
-        return std::nullopt;
-    }
-    return it->second;
+    return allocator_manager_.GetOwnerClientId(segment_name);
 }
 
 ErrorCode ScopedSegmentAccess::MountSegment(
@@ -232,7 +225,8 @@ ErrorCode ScopedSegmentAccess::MountSegment(
             segment_manager_->client_segments_[client_id].push_back(segment.id);
             segment_manager_->mounted_segments_[segment.id] = {
                 segment, SegmentStatus::OK, allocator, registration};
-            segment_manager_->client_by_name_[segment.name] = client_id;
+            segment_manager_->allocator_manager_.SetOwnerClientId(segment.name,
+                                                                  client_id);
             segment_manager_->segment_id_by_name_[segment.name] = segment.id;
             AddHostSegment(segment_manager_->segments_by_host_, segment);
 
@@ -275,7 +269,8 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     segment_manager_->client_segments_[client_id].push_back(segment.id);
     segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator), registration};
-    segment_manager_->client_by_name_[segment.name] = client_id;
+    segment_manager_->allocator_manager_.SetOwnerClientId(segment.name,
+                                                          client_id);
     segment_manager_->segment_id_by_name_[segment.name] = segment.id;
     AddHostSegment(segment_manager_->segments_by_host_, segment);
     MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
@@ -528,7 +523,7 @@ void ScopedSegmentAccess::ReindexSegmentNameAfterRemoval(
     }
 
     segment_manager_->segment_id_by_name_.erase(indexed);
-    segment_manager_->client_by_name_.erase(segment_name);
+    segment_manager_->allocator_manager_.RemoveOwnerClientId(segment_name);
 
     const auto bind_remaining = [&](bool require_ok) {
         for (const auto& [candidate_id, mounted] :
@@ -544,7 +539,8 @@ void ScopedSegmentAccess::ReindexSegmentNameAfterRemoval(
                               candidate_id) != segment_ids.end()) {
                     segment_manager_->segment_id_by_name_[segment_name] =
                         candidate_id;
-                    segment_manager_->client_by_name_[segment_name] = owner;
+                    segment_manager_->allocator_manager_.SetOwnerClientId(
+                        segment_name, owner);
                     return true;
                 }
             }
@@ -647,9 +643,9 @@ ErrorCode ScopedSegmentAccess::GetAllSegments(
 
     for (auto& segment_pair : segment_manager_->mounted_segments_) {
         UUID client_id{0, 0};
-        // client_by_name_ is intentionally lossy because several Clients may
-        // mount Segments with the same hostname. Resolve exact ownership from
-        // the canonical client_id -> segment_ids relation.
+        // The owner-by-name index is intentionally lossy because several
+        // Clients may mount Segments with the same hostname. Resolve exact
+        // ownership from the canonical client_id -> segment_ids relation.
         for (const auto& [owner, segment_ids] :
              segment_manager_->client_segments_) {
             if (std::find(segment_ids.begin(), segment_ids.end(),
@@ -715,10 +711,9 @@ ErrorCode ScopedSegmentAccess::GetUnreadySegments(
         }
 
         UUID client_id{0, 0};
-        auto client_it = segment_manager_->client_by_name_.find(
-            mounted_segment.segment.name);
-        if (client_it != segment_manager_->client_by_name_.end()) {
-            client_id = client_it->second;
+        if (auto owner = segment_manager_->allocator_manager_.GetOwnerClientId(
+                mounted_segment.segment.name)) {
+            client_id = *owner;
         }
 
         unready_segments.emplace_back(mounted_segment.segment, client_id);
@@ -729,20 +724,21 @@ ErrorCode ScopedSegmentAccess::GetUnreadySegments(
 
 ErrorCode ScopedSegmentAccess::GetClientIdBySegmentName(
     const std::string& segment_name, UUID& client_id) const {
-    auto it = segment_manager_->client_by_name_.find(segment_name);
-    if (it == segment_manager_->client_by_name_.end()) {
+    auto owner =
+        segment_manager_->allocator_manager_.GetOwnerClientId(segment_name);
+    if (!owner) {
         LOG(ERROR) << "segment_name=" << segment_name
                    << ", error=segment_not_found";
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
-    client_id = it->second;
+    client_id = *owner;
     return ErrorCode::OK;
 }
 
 bool ScopedSegmentAccess::ExistsSegmentName(
     const std::string& segment_name) const {
-    auto it = segment_manager_->client_by_name_.find(segment_name);
-    return it != segment_manager_->client_by_name_.end();
+    return segment_manager_->allocator_manager_.GetOwnerClientId(segment_name)
+        .has_value();
 }
 
 bool ScopedSegmentAccess::IsSegmentAllocatable(
