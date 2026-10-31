@@ -80,6 +80,35 @@ const char* operationName(Request::OpCode operation) {
     return operation == Request::READ ? "read" : "write";
 }
 
+size_t outcomeIndex(TransferStatusEnum status) {
+    switch (status) {
+        case COMPLETED:
+            return 0;
+        case FAILED:
+            return 1;
+        case TIMEOUT:
+            return 2;
+        case CANCELED:
+            return 3;
+        default:
+            return 1;
+    }
+}
+
+const char* outcomeName(TransferStatusEnum status) {
+    switch (outcomeIndex(status)) {
+        case 0:
+            return "success";
+        case 1:
+            return "failed";
+        case 2:
+            return "timeout";
+        case 3:
+            return "canceled";
+    }
+    return "failed";
+}
+
 const char* taskFailureReasonName(TentMetrics::TaskFailureReason reason) {
     switch (reason) {
         case TentMetrics::TaskFailureReason::Submit:
@@ -93,7 +122,164 @@ const char* taskFailureReasonName(TentMetrics::TaskFailureReason reason) {
     }
     return "unknown";
 }
+
+const char* failurePhaseName(TentMetrics::FailurePhase phase) {
+    switch (phase) {
+        case TentMetrics::FailurePhase::Metadata:
+            return "metadata";
+        case TentMetrics::FailurePhase::Admission:
+            return "admission";
+        case TentMetrics::FailurePhase::Selection:
+            return "selection";
+        case TentMetrics::FailurePhase::Connect:
+            return "connect";
+        case TentMetrics::FailurePhase::Register:
+            return "register";
+        case TentMetrics::FailurePhase::Submit:
+            return "submit";
+        case TentMetrics::FailurePhase::Queue:
+            return "queue";
+        case TentMetrics::FailurePhase::Post:
+            return "post";
+        case TentMetrics::FailurePhase::Poll:
+            return "poll";
+        case TentMetrics::FailurePhase::Completion:
+            return "completion";
+        case TentMetrics::FailurePhase::Retry:
+            return "retry";
+        case TentMetrics::FailurePhase::Failover:
+            return "failover";
+        case TentMetrics::FailurePhase::Notify:
+            return "notify";
+        case TentMetrics::FailurePhase::Cleanup:
+            return "cleanup";
+        case TentMetrics::FailurePhase::Shutdown:
+            return "shutdown";
+    }
+    return "internal";
+}
+
+const char* failureReasonName(TentMetrics::FailureReason reason) {
+    switch (reason) {
+        case TentMetrics::FailureReason::Timeout:
+            return "timeout";
+        case TentMetrics::FailureReason::Unavailable:
+            return "unavailable";
+        case TentMetrics::FailureReason::QueueFull:
+            return "queue_full";
+        case TentMetrics::FailureReason::ResourceExhausted:
+            return "resource_exhausted";
+        case TentMetrics::FailureReason::Protocol:
+            return "protocol";
+        case TentMetrics::FailureReason::StaleGeneration:
+            return "stale_generation";
+        case TentMetrics::FailureReason::WcError:
+            return "wc_error";
+        case TentMetrics::FailureReason::CqError:
+            return "cq_error";
+        case TentMetrics::FailureReason::MrError:
+            return "mr_error";
+        case TentMetrics::FailureReason::PeerClosed:
+            return "peer_closed";
+        case TentMetrics::FailureReason::Canceled:
+            return "canceled";
+        case TentMetrics::FailureReason::Internal:
+            return "internal";
+    }
+    return "internal";
+}
+
+const char* memoryOperationName(TentMetrics::MemoryOperation operation) {
+    switch (operation) {
+        case TentMetrics::MemoryOperation::Register:
+            return "register";
+        case TentMetrics::MemoryOperation::Unregister:
+            return "unregister";
+    }
+    return "unknown";
+}
+
+const char* operationOutcomeName(TentMetrics::OperationOutcome outcome) {
+    switch (outcome) {
+        case TentMetrics::OperationOutcome::Success:
+            return "success";
+        case TentMetrics::OperationOutcome::Failure:
+            return "failure";
+    }
+    return "unknown";
+}
+
+const char* workerKindName(TentMetrics::WorkerKind worker) {
+    switch (worker) {
+        case TentMetrics::WorkerKind::EngineProgress:
+            return "engine_progress";
+        case TentMetrics::WorkerKind::Staging:
+            return "staging";
+    }
+    return "unknown";
+}
+
+const char* stagingCleanupKindName(TentMetrics::StagingCleanupKind kind) {
+    switch (kind) {
+        case TentMetrics::StagingCleanupKind::Group:
+            return "group";
+        case TentMetrics::StagingCleanupKind::Batch:
+            return "batch";
+        case TentMetrics::StagingCleanupKind::RemoteOperation:
+            return "remote_operation";
+    }
+    return "unknown";
+}
+
+const char* rpcMethodName(TentMetrics::RpcMethod method) {
+    switch (method) {
+        case TentMetrics::RpcMethod::GetSegmentDesc:
+            return "get_segment_desc";
+        case TentMetrics::RpcMethod::BootstrapRdma:
+            return "bootstrap_rdma";
+        case TentMetrics::RpcMethod::SendData:
+            return "send_data";
+        case TentMetrics::RpcMethod::RecvData:
+            return "recv_data";
+        case TentMetrics::RpcMethod::Notify:
+            return "notify";
+        case TentMetrics::RpcMethod::Probe:
+            return "probe";
+        case TentMetrics::RpcMethod::Delegate:
+            return "delegate";
+        case TentMetrics::RpcMethod::Pin:
+            return "pin";
+        case TentMetrics::RpcMethod::Unpin:
+            return "unpin";
+        case TentMetrics::RpcMethod::SubscribeSegmentUpdate:
+            return "subscribe_segment_update";
+        case TentMetrics::RpcMethod::NotifySegmentUpdated:
+            return "notify_segment_updated";
+        case TentMetrics::RpcMethod::BootstrapUb:
+            return "bootstrap_ub";
+        case TentMetrics::RpcMethod::Unknown:
+            return "unknown";
+    }
+    return "unknown";
+}
+
+const char* rpcOutcomeName(TentMetrics::RpcOutcome outcome) {
+    switch (outcome) {
+        case TentMetrics::RpcOutcome::Success:
+            return "success";
+        case TentMetrics::RpcOutcome::ConnectionError:
+            return "connection_error";
+        case TentMetrics::RpcOutcome::RpcError:
+            return "rpc_error";
+    }
+    return "unknown";
+}
 }  // namespace
+
+size_t TentMetrics::outcomeSlot(TransportType tp, Request::OpCode op,
+                                TransferStatusEnum status) {
+    return attemptSlot(tp, op) * kOutcomeValueDomain + outcomeIndex(status);
+}
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
     // Validate configuration before touching initialized_. An invalid config
@@ -294,14 +480,25 @@ void TentMetrics::registerMetrics() {
         &failover_total_,
         &transport_attempts_total_,
         &transport_attempt_failures_total_,
+        &logical_requests_started_total_,
+        &logical_request_outcomes_total_,
+        &transport_attempt_outcomes_total_,
         &task_failures_total_,
+        &terminal_failures_total_,
+        &memory_operations_total_,
+        &memory_operation_bytes_total_,
         &deadline_infeasible_total_,
         &quarantined_batches_total_,
+        &staging_cleanup_timeouts_total_,
+        &rpc_attempts_total_,
+        &rpc_retries_total_,
     };
 
     gauges_ = {
-        &inflight_attempts_,
-        &registered_buffer_bytes_,
+        &inflight_attempts_,       &logical_requests_inflight_,
+        &registered_buffer_bytes_, &worker_last_progress_timestamp_seconds_,
+        &staging_inflight_tasks_,  &staging_inflight_bytes_,
+        &staging_cleanup_pending_,
     };
 
     // Register the N=1 per-transport histograms for unified serialization.
@@ -354,6 +551,47 @@ void TentMetrics::recordWriteCompleted(TransportType tp, size_t bytes,
     }
 }
 
+bool TentMetrics::recordLogicalRequestStarted(Request::OpCode operation) {
+    if (!initialized_) return false;
+    const size_t slot = operationSlot(operation);
+    auto label = [operation] {
+        return std::array<std::string, 1>{operationName(operation)};
+    };
+    // Current-state accounting must survive runtime sampling transitions.
+    logical_requests_inflight_.incCached(slot, label);
+    if (runtime_enabled_.load(std::memory_order_relaxed)) {
+        logical_requests_started_total_.incCached(slot, label);
+    }
+    return true;
+}
+
+void TentMetrics::recordLogicalRequestFinished(TransportType tp,
+                                               Request::OpCode operation,
+                                               TransferStatusEnum status,
+                                               double latency_us) {
+    if (!initialized_) return;
+    const size_t operation_slot = operationSlot(operation);
+    logical_requests_inflight_.incCached(
+        operation_slot,
+        [operation] {
+            return std::array<std::string, 1>{operationName(operation)};
+        },
+        -1);
+    if (!runtime_enabled_.load(std::memory_order_relaxed)) return;
+
+    const size_t slot = outcomeSlot(tp, operation, status);
+    auto labels = [tp, operation, status] {
+        return std::array<std::string, 3>{transportTypeName(tp),
+                                          operationName(operation),
+                                          outcomeName(status)};
+    };
+    logical_request_outcomes_total_.incCached(slot, labels);
+    if (latency_us >= 0.0) {
+        logical_request_outcome_latency_.observeCached(
+            slot, labels, static_cast<int64_t>(latency_us));
+    }
+}
+
 void TentMetrics::recordDeadlineMLU(TransportType tp, double mlu) {
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
@@ -387,6 +625,119 @@ void TentMetrics::recordTaskFailure(TransportType tp,
     task_failures_total_.incCached(taskFailureSlot(tp, reason), [tp, reason] {
         return std::array<std::string, 2>{transportTypeName(tp),
                                           taskFailureReasonName(reason)};
+    });
+
+    switch (reason) {
+        case TaskFailureReason::Submit:
+            recordTerminalFailure(tp, FailurePhase::Submit,
+                                  FailureReason::Internal);
+            break;
+        case TaskFailureReason::Poll:
+            recordTerminalFailure(tp, FailurePhase::Poll,
+                                  FailureReason::Internal);
+            break;
+        case TaskFailureReason::Timeout:
+            recordTerminalFailure(tp, FailurePhase::Completion,
+                                  FailureReason::Timeout);
+            break;
+        case TaskFailureReason::Canceled:
+            recordTerminalFailure(tp, FailurePhase::Completion,
+                                  FailureReason::Canceled);
+            break;
+    }
+}
+
+void TentMetrics::recordTerminalFailure(TransportType tp, FailurePhase phase,
+                                        FailureReason reason) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    terminal_failures_total_.inc(std::array<std::string, 3>{
+        transportTypeName(tp), failurePhaseName(phase),
+        failureReasonName(reason)});
+}
+
+void TentMetrics::recordMemoryOperation(TransportType tp,
+                                        MemoryOperation operation,
+                                        OperationOutcome outcome,
+                                        size_t bytes) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    const std::array<std::string, 3> labels{transportTypeName(tp),
+                                            memoryOperationName(operation),
+                                            operationOutcomeName(outcome)};
+    memory_operations_total_.inc(labels);
+    memory_operation_bytes_total_.inc(labels, static_cast<int64_t>(bytes));
+}
+
+void TentMetrics::recordWorkerProgress(WorkerKind worker) {
+    if (!initialized_) return;
+    worker_last_progress_timestamp_seconds_.setCached(
+        static_cast<size_t>(worker),
+        [worker] { return std::array<std::string, 1>{workerKindName(worker)}; },
+        static_cast<int64_t>(unixTimestampSeconds()));
+}
+
+void TentMetrics::recordStagingTaskStarted(Request::OpCode operation,
+                                           size_t bytes) {
+    if (!initialized_) return;
+    const size_t slot = operationSlot(operation);
+    auto label = [operation] {
+        return std::array<std::string, 1>{operationName(operation)};
+    };
+    staging_inflight_tasks_.incCached(slot, label);
+    staging_inflight_bytes_.incCached(slot, label, static_cast<int64_t>(bytes));
+}
+
+void TentMetrics::recordStagingTaskFinished(Request::OpCode operation,
+                                            size_t bytes) {
+    if (!initialized_) return;
+    const size_t slot = operationSlot(operation);
+    auto label = [operation] {
+        return std::array<std::string, 1>{operationName(operation)};
+    };
+    staging_inflight_tasks_.incCached(slot, label, -1);
+    staging_inflight_bytes_.incCached(slot, label,
+                                      -static_cast<int64_t>(bytes));
+}
+
+void TentMetrics::recordStagingCleanupPending(StagingCleanupKind kind,
+                                              int64_t delta) {
+    if (!initialized_) return;
+    staging_cleanup_pending_.incCached(
+        static_cast<size_t>(kind),
+        [kind] {
+            return std::array<std::string, 1>{stagingCleanupKindName(kind)};
+        },
+        delta);
+}
+
+void TentMetrics::recordStagingCleanupTimeout() {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    staging_cleanup_timeouts_total_.inc();
+}
+
+void TentMetrics::recordRpcAttempt(RpcMethod method, RpcOutcome outcome,
+                                   double latency_us) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    const size_t slot = rpcAttemptSlot(method, outcome);
+    auto label = [method, outcome] {
+        return std::array<std::string, 2>{rpcMethodName(method),
+                                          rpcOutcomeName(outcome)};
+    };
+    rpc_attempts_total_.incCached(slot, label);
+    if (latency_us >= 0.0) {
+        rpc_attempt_latency_.observeCached(slot, label,
+                                           static_cast<int64_t>(latency_us));
+    }
+}
+
+void TentMetrics::recordRpcRetry(RpcMethod method) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    rpc_retries_total_.incCached(static_cast<size_t>(method), [method] {
+        return std::array<std::string, 1>{rpcMethodName(method)};
     });
 }
 
@@ -494,12 +845,21 @@ void TentMetrics::recordTransportAttemptFinished(TransportType tp,
         return std::array<std::string, 2>{transportTypeName(tp),
                                           operationName(operation)};
     };
-    if (status == FAILED) {
+    if (status != COMPLETED) {
         transport_attempt_failures_total_.incCached(slot, label);
     }
+    const size_t outcome_slot = outcomeSlot(tp, operation, status);
+    auto outcome_labels = [tp, operation, status] {
+        return std::array<std::string, 3>{transportTypeName(tp),
+                                          operationName(operation),
+                                          outcomeName(status)};
+    };
+    transport_attempt_outcomes_total_.incCached(outcome_slot, outcome_labels);
     if (latency_us >= 0.0) {
         auto latency_val = static_cast<int64_t>(latency_us);
         transport_attempt_latency_.observeCached(slot, label, latency_val);
+        transport_attempt_outcome_latency_.observeCached(
+            outcome_slot, outcome_labels, latency_val);
     }
 }
 
@@ -568,6 +928,11 @@ bool TentMetrics::tryGetPrometheusMetrics(std::string& result) {
             // N=2 transport-attempt latency histogram (labels: transport,
             // operation) goes through the same helper, instantiated for N=2.
             serializeHistogramPrometheus(transport_attempt_latency_, output);
+            serializeHistogramPrometheus(logical_request_outcome_latency_,
+                                         output);
+            serializeHistogramPrometheus(transport_attempt_outcome_latency_,
+                                         output);
+            serializeHistogramPrometheus(rpc_attempt_latency_, output);
 
             // Gauges: current value per label.
             for (auto* gauge : gauges_) {
@@ -594,6 +959,15 @@ int64_t sumCounterValues(CounterPtr counter) {
         total += e->value.load(std::memory_order_relaxed);
     }
     return total;
+}
+
+template <typename CounterPtr>
+int64_t maxCounterValue(CounterPtr counter) {
+    int64_t maximum = 0;
+    for (auto& e : counter->copy()) {
+        maximum = std::max(maximum, e->value.load(std::memory_order_relaxed));
+    }
+    return maximum;
 }
 
 template <uint8_t N>
@@ -882,20 +1256,48 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&transport_attempts_total_);
             root[transport_attempt_failures_total_.str_name()] =
                 sumCounterValues(&transport_attempt_failures_total_);
+            root[logical_requests_started_total_.str_name()] =
+                sumCounterValues(&logical_requests_started_total_);
+            root[logical_request_outcomes_total_.str_name()] =
+                sumCounterValues(&logical_request_outcomes_total_);
+            root[transport_attempt_outcomes_total_.str_name()] =
+                sumCounterValues(&transport_attempt_outcomes_total_);
             root[task_failures_total_.str_name()] =
                 sumCounterValues(&task_failures_total_);
+            root[terminal_failures_total_.str_name()] =
+                sumCounterValues(&terminal_failures_total_);
+            root[memory_operations_total_.str_name()] =
+                sumCounterValues(&memory_operations_total_);
+            root[memory_operation_bytes_total_.str_name()] =
+                sumCounterValues(&memory_operation_bytes_total_);
             root[deadline_infeasible_total_.str_name()] =
                 sumCounterValues(&deadline_infeasible_total_);
             root[quarantined_batches_total_.str_name()] =
                 static_cast<int64_t>(quarantined_batches_total_.value());
+            root[staging_cleanup_timeouts_total_.str_name()] =
+                static_cast<int64_t>(staging_cleanup_timeouts_total_.value());
+            root[rpc_attempts_total_.str_name()] =
+                sumCounterValues(&rpc_attempts_total_);
+            root[rpc_retries_total_.str_name()] =
+                sumCounterValues(&rpc_retries_total_);
 
             // Gauges: aggregate across transport labels (total in-flight
             // attempts / total registered bytes). Per-transport breakdown is
             // via the Prometheus endpoint.
             root[inflight_attempts_.str_name()] =
                 sumCounterValues(&inflight_attempts_);
+            root[logical_requests_inflight_.str_name()] =
+                sumCounterValues(&logical_requests_inflight_);
             root[registered_buffer_bytes_.str_name()] =
                 sumCounterValues(&registered_buffer_bytes_);
+            root[worker_last_progress_timestamp_seconds_.str_name()] =
+                maxCounterValue(&worker_last_progress_timestamp_seconds_);
+            root[staging_inflight_tasks_.str_name()] =
+                sumCounterValues(&staging_inflight_tasks_);
+            root[staging_inflight_bytes_.str_name()] =
+                sumCounterValues(&staging_inflight_bytes_);
+            root[staging_cleanup_pending_.str_name()] =
+                sumCounterValues(&staging_cleanup_pending_);
 
             // Histograms: sum bucket counts across all transport labels. The
             // templated helper also reads back the histogram's sum counter so
@@ -910,6 +1312,9 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
             serializeHistogramToJson(root, stage_dispatch_);
             serializeHistogramToJson(root, stage_transport_);
             serializeHistogramToJson(root, transport_attempt_latency_);
+            serializeHistogramToJson(root, logical_request_outcome_latency_);
+            serializeHistogramToJson(root, transport_attempt_outcome_latency_);
+            serializeHistogramToJson(root, rpc_attempt_latency_);
 
             root["tent_metrics_build_info"] = {
                 {"version", TENT_BUILD_VERSION},
@@ -1026,6 +1431,9 @@ void TentMetrics::recordReadCompleted(TransportType, size_t, double) {}
 void TentMetrics::recordWriteCompleted(TransportType, size_t, double) {}
 void TentMetrics::recordReadFailed(TransportType) {}
 void TentMetrics::recordWriteFailed(TransportType) {}
+bool TentMetrics::recordLogicalRequestStarted(Request::OpCode) { return false; }
+void TentMetrics::recordLogicalRequestFinished(TransportType, Request::OpCode,
+                                               TransferStatusEnum, double) {}
 void TentMetrics::recordTransportFailover(TransportType, TransportType) {}
 void TentMetrics::recordTransportAttemptStarted(TransportType,
                                                 Request::OpCode) {}
@@ -1035,6 +1443,17 @@ void TentMetrics::recordDeadlineMLU(TransportType, double) {}
 void TentMetrics::recordDeadlineInfeasible(TransportType) {}
 void TentMetrics::recordBatchQuarantined() {}
 void TentMetrics::recordTaskFailure(TransportType, TaskFailureReason) {}
+void TentMetrics::recordTerminalFailure(TransportType, FailurePhase,
+                                        FailureReason) {}
+void TentMetrics::recordMemoryOperation(TransportType, MemoryOperation,
+                                        OperationOutcome, size_t) {}
+void TentMetrics::recordWorkerProgress(WorkerKind) {}
+void TentMetrics::recordStagingTaskStarted(Request::OpCode, size_t) {}
+void TentMetrics::recordStagingTaskFinished(Request::OpCode, size_t) {}
+void TentMetrics::recordStagingCleanupPending(StagingCleanupKind, int64_t) {}
+void TentMetrics::recordStagingCleanupTimeout() {}
+void TentMetrics::recordRpcAttempt(RpcMethod, RpcOutcome, double) {}
+void TentMetrics::recordRpcRetry(RpcMethod) {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}

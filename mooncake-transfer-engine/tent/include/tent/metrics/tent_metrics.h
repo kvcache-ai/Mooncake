@@ -100,6 +100,16 @@ class TentMetrics {
                               double latency_seconds = 0.0);
     void recordReadFailed(TransportType tp);
     void recordWriteFailed(TransportType tp);
+
+    // Conservation metrics for accepted logical requests. Started/finished
+    // calls must be paired exactly once per non-derived TaskInfo. The return
+    // value says whether the in-flight gauge was incremented and therefore
+    // needs a matching finish call.
+    bool recordLogicalRequestStarted(Request::OpCode operation);
+    void recordLogicalRequestFinished(TransportType tp,
+                                      Request::OpCode operation,
+                                      TransferStatusEnum status,
+                                      double latency_us);
     // Failover counter is labeled with both the source and destination
     // transport types so failover flows (e.g. rdma->tcp) are queryable.
     void recordTransportFailover(TransportType from, TransportType to);
@@ -107,8 +117,8 @@ class TentMetrics {
     // Record physical transport attempts separately from logical requests.
     // "Started" means the engine is about to call submitTransferTasks (or the
     // staging equivalent). "Finished" records the observed attempt duration
-    // and, for a FAILED status (including synchronous submit failure),
-    // increments the attempt-failure counter.
+    // and records its bounded terminal outcome. Every non-success terminal
+    // outcome also increments the compatibility attempt-failure counter.
     void recordTransportAttemptStarted(TransportType tp,
                                        Request::OpCode operation);
     void recordTransportAttemptFinished(TransportType tp,
@@ -143,6 +153,92 @@ class TentMetrics {
     // read/write_failures_total counters (which stay label-compatible); also
     // the only failure metric that records TIMEOUT/CANCELED outcomes.
     void recordTaskFailure(TransportType tp, TaskFailureReason reason);
+
+    // Stable public failure taxonomy. Native transport details (errno, WC
+    // status, peer identity, etc.) belong in logs/traces; metric labels stay
+    // within these bounded enums.
+    enum class FailurePhase {
+        Metadata,
+        Admission,
+        Selection,
+        Connect,
+        Register,
+        Submit,
+        Queue,
+        Post,
+        Poll,
+        Completion,
+        Retry,
+        Failover,
+        Notify,
+        Cleanup,
+        Shutdown,
+    };
+    enum class FailureReason {
+        Timeout,
+        Unavailable,
+        QueueFull,
+        ResourceExhausted,
+        Protocol,
+        StaleGeneration,
+        WcError,
+        CqError,
+        MrError,
+        PeerClosed,
+        Canceled,
+        Internal,
+    };
+
+    // Record one terminal logical task failure. Callers must use the phase
+    // where the failure originated when known, and Internal rather than
+    // guessing a more specific native cause.
+    void recordTerminalFailure(TransportType tp, FailurePhase phase,
+                               FailureReason reason);
+
+    enum class MemoryOperation { Register, Unregister };
+    enum class OperationOutcome { Success, Failure };
+
+    // Record one physical backend memory lifecycle call and the bytes covered
+    // by that call. A batched register counts as one operation whose bytes are
+    // the sum of the descriptors in the batch.
+    void recordMemoryOperation(TransportType tp, MemoryOperation operation,
+                               OperationOutcome outcome, size_t bytes);
+
+    enum class WorkerKind { EngineProgress, Staging };
+    enum class StagingCleanupKind { Group, Batch, RemoteOperation };
+
+    // Worker timestamps and staging gauges are current state, so updates stay
+    // visible across runtime enable/disable transitions. Staging add/sub
+    // updates must remain paired.
+    void recordWorkerProgress(WorkerKind worker);
+    void recordStagingTaskStarted(Request::OpCode operation, size_t bytes);
+    void recordStagingTaskFinished(Request::OpCode operation, size_t bytes);
+    void recordStagingCleanupPending(StagingCleanupKind kind, int64_t delta);
+    void recordStagingCleanupTimeout();
+
+    enum class RpcMethod {
+        GetSegmentDesc,
+        BootstrapRdma,
+        SendData,
+        RecvData,
+        Notify,
+        Probe,
+        Delegate,
+        Pin,
+        Unpin,
+        SubscribeSegmentUpdate,
+        NotifySegmentUpdated,
+        BootstrapUb,
+        Unknown,
+    };
+    enum class RpcOutcome { Success, ConnectionError, RpcError };
+
+    // Record physical client RPC attempts at the CoroRpcAgent attempt loop.
+    // One logical call may produce two attempts when its idempotent retry is
+    // enabled; recordRpcRetry counts the second attempt when it is issued.
+    void recordRpcAttempt(RpcMethod method, RpcOutcome outcome,
+                          double latency_us);
+    void recordRpcRetry(RpcMethod method);
 
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
@@ -264,8 +360,20 @@ class TentMetrics {
                                                                    "to"};
     static inline const std::array<std::string, 2> kAttemptLabels{"transport",
                                                                   "operation"};
+    static inline const std::array<std::string, 3> kOutcomeLabels{
+        "transport", "operation", "outcome"};
     static inline const std::array<std::string, 2> kTaskFailureLabels{
         "transport", "reason"};
+    static inline const std::array<std::string, 3> kTerminalFailureLabels{
+        "transport", "phase", "reason"};
+    static inline const std::array<std::string, 3> kMemoryOperationLabels{
+        "transport", "operation", "outcome"};
+    static inline const std::array<std::string, 1> kWorkerLabel{"worker"};
+    static inline const std::array<std::string, 1> kOperationLabel{"operation"};
+    static inline const std::array<std::string, 1> kCleanupKindLabel{"kind"};
+    static inline const std::array<std::string, 2> kRpcAttemptLabels{"method",
+                                                                     "outcome"};
+    static inline const std::array<std::string, 1> kRpcMethodLabel{"method"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -274,7 +382,17 @@ class TentMetrics {
     static constexpr size_t kTransportDomain =
         static_cast<size_t>(kNumTransportTypes);
     static constexpr size_t kAttemptDomain = kTransportDomain * 2;
+    static constexpr size_t kOutcomeValueDomain = 4;
+    static constexpr size_t kOutcomeDomain =
+        kAttemptDomain * kOutcomeValueDomain;
     static constexpr size_t kTaskFailureDomain = kTransportDomain * 4;
+    static constexpr size_t kWorkerDomain = 2;
+    static constexpr size_t kOperationDomain = 2;
+    static constexpr size_t kCleanupKindDomain = 3;
+    static constexpr size_t kRpcMethodDomain = 13;
+    static constexpr size_t kRpcOutcomeDomain = 3;
+    static constexpr size_t kRpcAttemptDomain =
+        kRpcMethodDomain * kRpcOutcomeDomain;
 
     // Stable slot indices into the cached-cell label domain.
     static size_t transportSlot(TransportType tp) {
@@ -283,8 +401,17 @@ class TentMetrics {
     static size_t attemptSlot(TransportType tp, Request::OpCode op) {
         return static_cast<size_t>(tp) * 2 + (op == Request::READ ? 0u : 1u);
     }
+    static size_t outcomeSlot(TransportType tp, Request::OpCode op,
+                              TransferStatusEnum status);
     static size_t taskFailureSlot(TransportType tp, TaskFailureReason reason) {
         return static_cast<size_t>(tp) * 4 + static_cast<size_t>(reason);
+    }
+    static size_t operationSlot(Request::OpCode operation) {
+        return operation == Request::READ ? 0u : 1u;
+    }
+    static size_t rpcAttemptSlot(RpcMethod method, RpcOutcome outcome) {
+        return static_cast<size_t>(method) * kRpcOutcomeDomain +
+               static_cast<size_t>(outcome);
     }
 
     // Per-transport counters (label: transport). Values are int64_t.
@@ -317,8 +444,19 @@ class TentMetrics {
         kAttemptLabels, kAttemptDomain};
     metrics::CachedDynamicCounter<2> transport_attempt_failures_total_{
         "tent_transport_attempt_failures_total",
-        "Physical transport attempts that terminated with FAILED",
+        "Physical transport attempts that terminated unsuccessfully",
         kAttemptLabels, kAttemptDomain};
+    metrics::CachedDynamicCounter<1> logical_requests_started_total_{
+        "tent_logical_requests_started_total",
+        "Accepted logical requests by operation", kOperationLabel,
+        kOperationDomain};
+    metrics::CachedDynamicCounter<3> logical_request_outcomes_total_{
+        "tent_logical_request_outcomes_total",
+        "Terminal logical request outcomes", kOutcomeLabels, kOutcomeDomain};
+    metrics::CachedDynamicCounter<3> transport_attempt_outcomes_total_{
+        "tent_transport_attempt_outcomes_total",
+        "Terminal physical transport attempt outcomes", kOutcomeLabels,
+        kOutcomeDomain};
     // Task-level failures with a reason label, so Grafana can alert on the
     // failure signature (submit vs poll vs timeout vs canceled) without log
     // scraping. Additive to the legacy read/write_failures_total counters.
@@ -326,6 +464,22 @@ class TentMetrics {
         "tent_task_failures_total",
         "Task-level failures by terminal transport and failure reason",
         kTaskFailureLabels, kTaskFailureDomain};
+    // Terminal failures and memory lifecycle operations are rare control-path
+    // events, so they use the plain dynamic counter instead of reserving the
+    // full bounded-label cross product in cached cells.
+    ylt::metric::basic_dynamic_counter<int64_t, 3> terminal_failures_total_{
+        "tent_terminal_failures_total",
+        "Terminal logical task failures by transport, phase and reason",
+        kTerminalFailureLabels};
+    ylt::metric::basic_dynamic_counter<int64_t, 3> memory_operations_total_{
+        "tent_memory_operations_total",
+        "Physical backend memory lifecycle calls by outcome",
+        kMemoryOperationLabels};
+    ylt::metric::basic_dynamic_counter<int64_t, 3>
+        memory_operation_bytes_total_{
+            "tent_memory_operation_bytes_total",
+            "Bytes covered by physical backend memory lifecycle calls",
+            kMemoryOperationLabels};
     metrics::CachedDynamicCounter<1> deadline_infeasible_total_{
         "tent_deadline_infeasible_total",
         "Transfers whose deadline was already in the past at submit",
@@ -336,6 +490,17 @@ class TentMetrics {
         "tent_quarantined_batches_total",
         "Batches abandoned by lazyFreeBatch after repeated failed reclaim "
         "attempts; reclaimed only at engine teardown"};
+    ylt::metric::counter_t staging_cleanup_timeouts_total_{
+        "tent_staging_cleanup_timeouts_total",
+        "Staging shutdown drains that reached their configured deadline"};
+    metrics::CachedDynamicCounter<2> rpc_attempts_total_{
+        "tent_rpc_attempts_total",
+        "Physical TENT client RPC attempts by method and transport outcome",
+        kRpcAttemptLabels, kRpcAttemptDomain};
+    metrics::CachedDynamicCounter<1> rpc_retries_total_{
+        "tent_rpc_retries_total",
+        "Physical TENT client RPC retry attempts actually issued",
+        kRpcMethodLabel, kRpcMethodDomain};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_
@@ -344,9 +509,29 @@ class TentMetrics {
         "tent_inflight_attempts",
         "In-flight transport attempts (submitted, not yet finished)",
         kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> logical_requests_inflight_{
+        "tent_logical_requests_inflight",
+        "Accepted logical requests without a terminal outcome", kOperationLabel,
+        kOperationDomain};
     metrics::CachedDynamicCounter<1> registered_buffer_bytes_{
         "tent_registered_buffer_bytes", "Registered local buffer bytes",
         kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> worker_last_progress_timestamp_seconds_{
+        "tent_worker_last_progress_timestamp_seconds",
+        "Unix timestamp of the last observed worker progress", kWorkerLabel,
+        kWorkerDomain};
+    metrics::CachedDynamicCounter<1> staging_inflight_tasks_{
+        "tent_staging_inflight_tasks",
+        "Parent staging tasks currently executing in staging workers",
+        kOperationLabel, kOperationDomain};
+    metrics::CachedDynamicCounter<1> staging_inflight_bytes_{
+        "tent_staging_inflight_bytes",
+        "Parent request bytes currently executing in staging workers",
+        kOperationLabel, kOperationDomain};
+    metrics::CachedDynamicCounter<1> staging_cleanup_pending_{
+        "tent_staging_cleanup_pending",
+        "Deferred staging cleanup resources still awaiting safe release",
+        kCleanupKindLabel, kCleanupKindDomain};
     std::vector<metrics::CachedDynamicCounter<1>*> gauges_;
 
     // Latency histograms use microseconds (us) as unit
@@ -405,10 +590,23 @@ class TentMetrics {
         "tent_transport_attempt_latency_us",
         "Observed physical transport attempt latency in microseconds",
         kLatencyBuckets, kAttemptLabels, kAttemptDomain};
+    metrics::CachedDynamicHistogram<3> logical_request_outcome_latency_{
+        "tent_logical_request_outcome_latency_us",
+        "Logical request latency by terminal outcome in microseconds",
+        kLatencyBuckets, kOutcomeLabels, kOutcomeDomain};
+    metrics::CachedDynamicHistogram<3> transport_attempt_outcome_latency_{
+        "tent_transport_attempt_outcome_latency_us",
+        "Physical transport attempt latency by terminal outcome in "
+        "microseconds",
+        kLatencyBuckets, kOutcomeLabels, kOutcomeDomain};
+    metrics::CachedDynamicHistogram<2> rpc_attempt_latency_{
+        "tent_rpc_attempt_latency_us",
+        "Physical TENT client RPC attempt latency in microseconds",
+        kLatencyBuckets, kRpcAttemptLabels, kRpcAttemptDomain};
 
     // Per-transport (N=1) histograms for unified serialization; the N=2
-    // transport_attempt_latency_ histogram is serialized separately (see
-    // getPrometheusMetrics / getJsonMetrics) via the same templated helpers.
+    // attempt histograms are serialized separately (see getPrometheusMetrics /
+    // getJsonMetrics) via the same templated helpers.
     std::vector<metrics::CachedDynamicHistogram<1>*> histograms_;
 
     // Serialize a gauge backed by a cached-cell counter: emits the current

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "tent/common/status.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/runtime/transfer_engine_impl.h"
 
 namespace mooncake {
@@ -72,6 +73,10 @@ void ProgressWorker::notifyRuntimeQueueReady() {
 }
 
 void ProgressWorker::runner() {
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordWorkerProgress(
+        TentMetrics::WorkerKind::EngineProgress);
+#endif
     // An explicit zero disables runtime-queue scans, but must not strand a
     // transport that requires polling to produce its only completion wake.
     const auto interval = fallback_interval_.count() > 0
@@ -160,6 +165,10 @@ void ProgressWorker::runner() {
                 (void)impl_->progressRuntimeQueue();
             (void)impl_->lazyFreeBatch();
         }
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordWorkerProgress(
+            TentMetrics::WorkerKind::EngineProgress);
+#endif
     }
 }
 

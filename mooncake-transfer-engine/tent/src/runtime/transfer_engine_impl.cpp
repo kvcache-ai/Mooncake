@@ -1040,8 +1040,15 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                  transports.front() == HP_TCP);
             std::vector<TransportType> registered_transports;
             Status first_error = Status::OK();
+            size_t total_bytes = 0;
+            for (const auto& desc : descs) total_bytes += desc.length;
             for (auto type : transports) {
                 auto s = transport_list_[type]->addMemoryBuffer(descs, options);
+                TentMetrics::instance().recordMemoryOperation(
+                    type, TentMetrics::MemoryOperation::Register,
+                    s.ok() ? TentMetrics::OperationOutcome::Success
+                           : TentMetrics::OperationOutcome::Failure,
+                    total_bytes);
                 if (!s.ok()) {
                     // addMemoryBuffer implementations are required to be
                     // transactional, but invoke remove on the failing
@@ -1050,6 +1057,12 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                     for (auto& desc : descs) {
                         auto cleanup =
                             transport_list_[type]->removeMemoryBuffer(desc);
+                        TentMetrics::instance().recordMemoryOperation(
+                            type, TentMetrics::MemoryOperation::Unregister,
+                            cleanup.ok()
+                                ? TentMetrics::OperationOutcome::Success
+                                : TentMetrics::OperationOutcome::Failure,
+                            desc.length);
                         if (!cleanup.ok()) LOG(WARNING) << cleanup.ToString();
                     }
                     if (first_error.ok()) first_error = s;
@@ -1148,6 +1161,11 @@ Status TransferEngineImpl::deregisterRemovedBuffer(BufferDesc& desc) {
         if (!advertised && !transport->tracksLocalBuffer(transport_desc))
             continue;
         auto status = transport->removeMemoryBuffer(transport_desc);
+        TentMetrics::instance().recordMemoryOperation(
+            transport_type, TentMetrics::MemoryOperation::Unregister,
+            status.ok() ? TentMetrics::OperationOutcome::Success
+                        : TentMetrics::OperationOutcome::Failure,
+            original_desc.length);
         if (!status.ok()) {
             if (first_error.ok()) first_error = status;
             continue;
@@ -2402,6 +2420,10 @@ Status TransferEngineImpl::commitPreparedSubmit(
             task = merged_task_id_map[merged_task_id];
             task.derived = true;
             task.public_length = task_plan.public_length;
+#if TENT_METRICS_ENABLED
+            task.logical_observability_active = false;
+            task.terminal_observability_recorded = false;
+#endif
             auto owner_it = owner_task_id_by_merged_task.find(merged_task_id);
             if (owner_it != owner_task_id_by_merged_task.end()) {
                 task.physical_owner_task_id = owner_it->second;
@@ -2423,6 +2445,9 @@ Status TransferEngineImpl::commitPreparedSubmit(
         task.start_time =
             prepared.submit_time;  // Record start time for latency tracking
         task.dispatch_time = prepared.submit_time;  // No queue wait on direct
+#if TENT_METRICS_ENABLED
+        startLogicalRequestObservability(task);
+#endif
         task.type = owner.route.transport;
         task.device_mask = owner.route.device_mask;
         if (owner.route.qp_pool) task.qp_pool = *owner.route.qp_pool;
@@ -2641,6 +2666,9 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         task.device_mask = owner.route.device_mask;
         if (owner.route.qp_pool) task.qp_pool = *owner.route.qp_pool;
         task.derived = task_plan.task_id != owner.owner_task_id;
+#if TENT_METRICS_ENABLED
+        if (!task.derived) startLogicalRequestObservability(task);
+#endif
     }
 
     for (size_t i = 0; i < admitted_owner_ids.size(); ++i) {
@@ -2678,6 +2706,11 @@ Status TransferEngineImpl::finishQueuedOwner(
         dispatch_inflight_bytes_ -= queued.byte_charge;
         queued.in_dispatch_window = false;
     }
+    auto& owner_task = queued.batch->task_list[queued.owner_task_id];
+    // updateTaskStatusAfterPoll may already have copied the terminal status
+    // into TaskInfo. The queue settlement itself is still the one terminal
+    // edge, and the idempotence flag prevents a second observation.
+    recordTaskCompletionMetrics(owner_task, PENDING, terminal_status);
     for (const auto task_id : queued.public_task_ids) {
         queued.batch->task_list[task_id].status = terminal_status;
     }
@@ -2695,6 +2728,9 @@ Status TransferEngineImpl::cancelQueuedOwner(QueueOwnerId owner_id) {
             "queued owner is already dispatching" LOC_MARK);
     }
     CHECK_STATUS(runtime_queue_->cancel(owner_id));
+    auto& owner_task =
+        queued_it->second.batch->task_list[queued_it->second.owner_task_id];
+    recordTaskCompletionMetrics(owner_task, owner_task.status, CANCELED);
     for (const auto task_id : queued_it->second.public_task_ids) {
         auto& task = queued_it->second.batch->task_list[task_id];
         task.cancel_requested = true;
@@ -2716,6 +2752,8 @@ Status TransferEngineImpl::finishDroppedOwner(QueueOwnerId owner_id) {
     }
     // No complete(): the queue turned the owner terminal when it dropped it,
     // and complete() only accepts a dispatching owner.
+    auto& owner_task = queued.batch->task_list[queued.owner_task_id];
+    recordTaskCompletionMetrics(owner_task, owner_task.status, CANCELED);
     for (const auto task_id : queued.public_task_ids) {
         queued.batch->task_list[task_id].status = CANCELED;
     }
@@ -3108,6 +3146,7 @@ Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
     }
     if (owner.type == UNSPEC) {
         owner.cancel_requested = true;
+        recordTaskCompletionMetrics(owner, owner.status, CANCELED);
         owner.status = CANCELED;
         return Status::OK();
     }
@@ -3846,8 +3885,27 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
     TaskInfo& task, TransferStatusEnum prev_status,
     TransferStatusEnum new_status) {
 #if TENT_METRICS_ENABLED
-    if (prev_status == PENDING && new_status != PENDING && !task.derived) {
-        auto end_time = std::chrono::steady_clock::now();
+    if (prev_status != PENDING || new_status == PENDING || task.derived ||
+        task.terminal_observability_recorded)
+        return;
+    task.terminal_observability_recorded = true;
+
+    {
+        const auto end_time = std::chrono::steady_clock::now();
+        int64_t duration_us = -1;
+        if (task.start_time != std::chrono::steady_clock::time_point{}) {
+            duration_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                              end_time - task.start_time)
+                              .count();
+        }
+        const auto attributed_type =
+            task.type != UNSPEC ? task.type : task.attempt_type;
+        if (task.logical_observability_active) {
+            TentMetrics::instance().recordLogicalRequestFinished(
+                attributed_type, task.request.opcode, new_status,
+                static_cast<double>(duration_us));
+            task.logical_observability_active = false;
+        }
         // Failure reason: task.failure_stage marks where the first failure
         // originated (0 = submit, 1 = poll), set at the failure site — a
         // poll-observed failure stays "poll" even when the failover resubmit
@@ -3917,7 +3975,8 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                                                   task.type, transport_us);
                     }
                 }
-            } else if (new_status == FAILED) {
+            } else if (new_status == FAILED || new_status == TIMEOUT ||
+                       new_status == CANCELED) {
                 // A task whose type is UNSPEC (no candidate ever resolved,
                 // or a legacy submit-stage failure clobbered it) has lost its
                 // transport attribution; fall back to the last physical
@@ -3961,6 +4020,17 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
         }
     }
 #endif  // TENT_METRICS_ENABLED
+}
+
+void TransferEngineImpl::startLogicalRequestObservability(TaskInfo& task) {
+#if TENT_METRICS_ENABLED
+    if (task.derived || task.logical_observability_active) return;
+    task.logical_observability_active =
+        TentMetrics::instance().recordLogicalRequestStarted(
+            task.request.opcode);
+#else
+    (void)task;
+#endif
 }
 
 void TransferEngineImpl::startTransportAttempt(
