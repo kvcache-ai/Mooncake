@@ -7,6 +7,7 @@
 #include <mutex>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <glog/logging.h>
 
@@ -194,17 +195,115 @@ PGResult<void> StrongStream::release(const GpuCaptureInfo& capture) {
     pending_release_.reset();
 
     if (capture.active) {
-        PG_TRY(serial_event_.recordExternal(graph_order->stream));
+        PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index_));
+        cudaStreamCaptureStatus status;
+        const cudaGraphNode_t* dependencies = nullptr;
+        size_t count = 0;
+        // capture.origin is this call's user stream.
+#if CUDART_VERSION >= 13000
+        PG_TRY_CUDA(cudaStreamGetCaptureInfo(capture.origin, &status, nullptr,
+                                             nullptr, &dependencies, nullptr,
+                                             &count));
+#else
+        PG_TRY_CUDA(cudaStreamGetCaptureInfo_v2(
+            capture.origin, &status, nullptr, nullptr, &dependencies, &count));
+#endif
+        PG_VALIDATE_STATE(status == cudaStreamCaptureStatusActive,
+                          "StrongStream release capture is not active");
 
-        // The external record adds a node on the order stream. Make the user
-        // stream depend on that node through an ordinary event; otherwise,
-        // cudaStreamEndCapture fails with unjoined work after the last
-        // collective.
-        auto user_stream = GpuStream::borrow(capture.origin, device_index_);
-        PG_TRY(auto joined, GpuEvent::create(device_index_));
-        PG_TRY(joined.record(graph_order->stream));
-        return user_stream.waitEvent(joined);
+        // Copy the CUDA-owned frontier before updating capture dependencies.
+        std::vector<cudaGraphNode_t> frontier;
+        if (count) frontier.assign(dependencies, dependencies + count);
+
+        // CUDA maintains a capture frontier for each stream: the nodes its next
+        // captured node must depend on. `frontier` above is a copy of the USER
+        // stream's frontier, queried from capture.origin.
+        //
+        // In enqueueAllReduce(), handoff_event_.record(user_stream) captures
+        // that user frontier. order_stream.waitEvent(handoff_event_) then adds
+        // those nodes to the ORDER stream's capture frontier. Its old nodes can
+        // remain there: for a single kernel, the order frontier can contain
+        // {old nodes, kernel}, while the user frontier is just {kernel}.
+        //
+        // SET below replaces graph_order->stream's frontier with `frontier`,
+        // i.e. {kernel} in that example. It does not modify the user frontier
+        // or delete existing graph nodes/edges. The entry handoff already made
+        // the kernel depend on the old nodes, so those remain indirect
+        // dependencies of subsequent work even after removal from the order
+        // frontier.
+        //
+        // This direct SET supplies the return dependency in capture, making
+        // the caller's return record/wait redundant. But eager still needs it.
+#if CUDART_VERSION >= 13000
+        PG_TRY_CUDA(cudaStreamUpdateCaptureDependencies(
+            graph_order->stream.get(), frontier.data(), nullptr, count,
+            cudaStreamSetCaptureDependencies));
+#else
+        PG_TRY_CUDA(cudaStreamUpdateCaptureDependencies(
+            graph_order->stream.get(), frontier.data(), count,
+            cudaStreamSetCaptureDependencies));
+#endif
+        // tail is a graph node that records the CUDA event serial_event_. Its
+        // input edges come from the user frontier above. On each replay, it
+        // records completion after those predecessors finish, for subsequent
+        // graphs/eager calls to wait on. Adding it directly to the graph leaves
+        // every stream's frontier unchanged: the next collective inherits the
+        // current kernel, not tail. Keep one record for this GraphOrder region.
+        auto& tail = graph_order->completion_node;
+        if (!tail) {
+            PG_TRY_CUDA(cudaGraphAddEventRecordNode(&tail, capture.graph,
+                                                    frontier.data(), count,
+                                                    serial_event_.get()));
+            return {};
+        }
+
+        // Read tail's old predecessors, independently of stream frontiers.
+        // The new predecessors are in frontier, queried from the user stream;
+        // serial_event_ only names the event to record. Capture forbids node
+        // removal, so keep tail and replace its incoming edges.
+        size_t previous_count = 0;
+        const auto get_dependencies = [&](cudaGraphNode_t* nodes,
+                                          size_t* node_count) {
+#if CUDART_VERSION >= 13000
+            return cudaGraphNodeGetDependencies(tail, nodes, nullptr,
+                                                node_count);
+#else
+            return cudaGraphNodeGetDependencies(tail, nodes, node_count);
+#endif
+        };
+        PG_TRY_CUDA(get_dependencies(nullptr, &previous_count));
+        std::vector<cudaGraphNode_t> previous(previous_count);
+        PG_TRY_CUDA(get_dependencies(previous.data(), &previous_count));
+        if (previous == frontier) return {};
+
+        // For two collective kernels:
+        //   first release:          collective1 -> tail
+        //   second kernel captured: collective1 -> {collective2, tail}
+        //   second release:         collective1 -> collective2 -> tail
+        // These edits happen during capture, before the graph executes. No
+        // collective depends on tail, so moving it cannot introduce a cycle.
+        for (auto node : previous) {
+#if CUDART_VERSION >= 13000
+            PG_TRY_CUDA(cudaGraphRemoveDependencies(capture.graph, &node, &tail,
+                                                    nullptr, 1));
+#else
+            PG_TRY_CUDA(
+                cudaGraphRemoveDependencies(capture.graph, &node, &tail, 1));
+#endif
+        }
+        for (auto node : frontier) {
+#if CUDART_VERSION >= 13000
+            PG_TRY_CUDA(cudaGraphAddDependencies(capture.graph, &node, &tail,
+                                                 nullptr, 1));
+#else
+            PG_TRY_CUDA(
+                cudaGraphAddDependencies(capture.graph, &node, &tail, 1));
+#endif
+        }
+        return {};
     }
+    // Eager's return handoff makes the order stream wait for the kernel.
+    // Also publish its completion once this domain has been used by graphs.
     if (ever_captured_) return serial_event_.record(eager_order_stream_);
     return {};
 }
