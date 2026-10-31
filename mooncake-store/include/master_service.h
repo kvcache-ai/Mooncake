@@ -71,6 +71,7 @@ class ImmutableBucketAllocator;
 class AllocationStrategy;
 class HaKvBackend;
 class HttpMetadataServer;
+class NVMeoFInitiator;
 class OpLogBatchStorage;
 class OrderedOpLogWriter;
 
@@ -108,6 +109,7 @@ class MasterService {
    public:
     using NoFProbeFn =
         std::function<bool(const std::string&, uint32_t, std::string*)>;
+    using NoFProbeReleaseFn = std::function<void(const std::string&)>;
     using DurableFinalizeCallback =
         std::function<void(const OpLogEntry& durable_entry)>;
     using BatchOpLogWriterFactory =
@@ -1548,6 +1550,12 @@ class MasterService {
         const std::string& error_reason);
     bool ProbeNoFSegment(const std::string& te_endpoint,
                          std::string* error_reason);
+    // Drops the heartbeat bookkeeping of an unmounted NoF segment and frees
+    // the probe resources its transport endpoint still holds. Both callers
+    // must hold `nof_heartbeat_mutex_`.
+    void EraseNoFHeartbeatStateLocked(const UUID& segment_id);
+    void ReleaseNoFProbeResourcesLocked(
+        const std::vector<std::string>& te_endpoints);
 
     // Pushes an offload mirror for `replica` onto its host client's LocalSSD
     // mailbox. When `mirror_clients` is non-null, the destination client is
@@ -1941,6 +1949,7 @@ class MasterService {
     static constexpr uint64_t kNoFHeartbeatThreadSleepMs = 100;
     mutable std::mutex nof_probe_fn_mutex_;
     NoFProbeFn nof_probe_fn_;
+    NoFProbeReleaseFn nof_probe_release_fn_;
 
     // Shared NoF probe default, used by both the constructor and the
     // test-seam reset. A single function-static initiator keeps the probe
@@ -1950,6 +1959,9 @@ class MasterService {
     static bool DefaultProbeNofSegment(const std::string& te_endpoint,
                                        uint32_t timeout_ms,
                                        std::string* error_reason);
+    // Frees the probe buffers DefaultProbeNofSegment cached for an endpoint.
+    static void DefaultReleaseNofProbeResources(const std::string& te_endpoint);
+    static const std::shared_ptr<NVMeoFInitiator>& DefaultNofInitiator();
 
     // if high availability features enabled
     const bool enable_ha_;

@@ -539,11 +539,14 @@ class SpdkInitiator::Impl {
         // exactly like the worker pool's pooled sub-tasks.
         probe_ctx->adaptor = {&ProbeReadComplete, probe_ctx};
         probe_ctx->seg = seg_handle;
+        probe_ctx->probe_buffer = probe_buffer;
         int ret = SubmitIO(seg_handle, probe_buffer->ptr, 0, block_size,
                            NofIOOp::kRead, &probe_ctx->adaptor);
         if (ret != 0) {
             // Nothing was submitted, so no completion can arrive.
+            probe_ctx->probe_buffer = nullptr;
             probe_pool_.Recycle(probe_ctx);
+            ReleaseProbeBufferRef(probe_buffer);
             if (error_reason) {
                 *error_reason = "submit_fail";
             }
@@ -584,10 +587,40 @@ class SpdkInitiator::Impl {
         return ok;
     }
 
+    void ReleaseProbeResources(const std::string& tr_str) {
+        std::lock_guard<std::mutex> lock(probe_buffers_mutex_);
+        auto it = probe_buffers_.find(tr_str);
+        if (it == probe_buffers_.end()) {
+            return;
+        }
+        if (it->second && it->second->outstanding > 0) {
+            // A probe read has not been reaped, so the controller may still
+            // DMA into this buffer. Free it once that completion comes back.
+            it->second->release_requested = true;
+            LOG(WARNING) << "endpoint=" << tr_str
+                         << ", action=defer_release_nof_probe_buffer"
+                         << ", reason=probe_in_flight";
+            return;
+        }
+        if (it->second && it->second->ptr) {
+            spdk_free(it->second->ptr);
+        }
+        probe_buffers_.erase(it);
+    }
+
    private:
     struct ProbeBuffer {
         void* ptr{nullptr};
         uint32_t size{0};
+        // Probe reads submitted against this buffer whose completion has not
+        // been reaped yet. A timed out read stays counted until a later poll
+        // of the qpair reaps it, so the buffer is never freed while the
+        // device may still DMA into it.
+        uint32_t outstanding{0};
+        // The endpoint was released while reads were outstanding. The last
+        // completion frees the buffer instead.
+        bool release_requested{false};
+        Impl* owner{nullptr};
 
         ProbeBuffer() = default;
         ProbeBuffer(const ProbeBuffer&) = delete;
@@ -624,6 +657,13 @@ class SpdkInitiator::Impl {
 
     static void ProbeReadComplete(void* ctx, const NofIOCompletion& c) {
         auto* probe_ctx = reinterpret_cast<NofProbeContext*>(ctx);
+        // Drop the read's buffer reference before publishing done: once done
+        // is set, ProbeSegment may recycle the context and a new probe may
+        // reset it.
+        if (auto* buffer = static_cast<ProbeBuffer*>(probe_ctx->probe_buffer)) {
+            probe_ctx->probe_buffer = nullptr;
+            buffer->owner->ReleaseProbeBufferRef(buffer);
+        }
         if (!c.success) {
             {
                 std::lock_guard<std::mutex> lock(probe_ctx->error_mutex);
@@ -720,13 +760,26 @@ class SpdkInitiator::Impl {
         auto& probe_buffer = probe_buffers_[tr_str];
         if (!probe_buffer) {
             probe_buffer = std::make_unique<ProbeBuffer>();
+            probe_buffer->owner = this;
         }
+        // The endpoint is being probed again, e.g. after a remount, so a
+        // release deferred by an earlier unmount no longer applies.
+        probe_buffer->release_requested = false;
 
         if (probe_buffer->ptr != nullptr && probe_buffer->size == block_size) {
+            ++probe_buffer->outstanding;
             return probe_buffer.get();
         }
 
         if (probe_buffer->ptr != nullptr) {
+            if (probe_buffer->outstanding > 0) {
+                // The block size changed under a read that has not been
+                // reaped, so the old buffer cannot be freed yet.
+                if (error_reason) {
+                    *error_reason = "probe_buffer_busy";
+                }
+                return nullptr;
+            }
             spdk_free(probe_buffer->ptr);
             probe_buffer->ptr = nullptr;
             probe_buffer->size = 0;
@@ -741,7 +794,32 @@ class SpdkInitiator::Impl {
             return nullptr;
         }
         probe_buffer->size = block_size;
+        probe_buffer->outstanding = 1;
         return probe_buffer.get();
+    }
+
+    void ReleaseProbeBufferRef(ProbeBuffer* buffer) {
+        std::lock_guard<std::mutex> lock(probe_buffers_mutex_);
+        if (buffer->outstanding > 0) {
+            --buffer->outstanding;
+        }
+        if (buffer->outstanding > 0 || !buffer->release_requested) {
+            return;
+        }
+        // The endpoint was released while this read was in flight, and
+        // nothing references the buffer any more.
+        for (auto it = probe_buffers_.begin(); it != probe_buffers_.end();
+             ++it) {
+            if (it->second.get() == buffer) {
+                if (buffer->ptr) {
+                    spdk_free(buffer->ptr);
+                }
+                LOG(INFO) << "endpoint=" << it->first
+                          << ", action=release_deferred_nof_probe_buffer";
+                probe_buffers_.erase(it);
+                return;
+            }
+        }
     }
 
     // Bounded grace period for timed-out probes at teardown: SPDK requires a
@@ -802,6 +880,10 @@ NofSegmentHandle* SpdkInitiator::OpenSegment(const std::string& tr_str) {
 bool SpdkInitiator::ProbeSegment(const std::string& tr_str, uint32_t timeout_ms,
                                  std::string* error_reason) {
     return impl_->ProbeSegment(tr_str, timeout_ms, error_reason);
+}
+
+void SpdkInitiator::ReleaseProbeResources(const std::string& tr_str) {
+    impl_->ReleaseProbeResources(tr_str);
 }
 
 uint32_t SpdkInitiator::GetBlockSize(const NofSegmentHandle* handle) {

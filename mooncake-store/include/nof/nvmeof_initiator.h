@@ -72,6 +72,16 @@ class NVMeoFInitiator {
                               uint32_t timeout_ms,
                               std::string* error_reason) = 0;
 
+    // Releases the probe resources cached for an endpoint. Called once the
+    // last NoF segment behind @p transport_str is unmounted, so the probe
+    // buffer does not outlive the segment. Idempotent. A buffer with a probe
+    // read still outstanding is freed when that read completes instead,
+    // because the device may still write into it until then. Initiators that
+    // cache nothing per endpoint keep the default no-op.
+    virtual void ReleaseProbeResources(const std::string& transport_str) {
+        (void)transport_str;
+    }
+
     // kInvalidBlockSize on invalid handle.
     virtual uint32_t GetBlockSize(const NofSegmentHandle* handle) = 0;
 

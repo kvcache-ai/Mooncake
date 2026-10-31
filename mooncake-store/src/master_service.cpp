@@ -120,11 +120,16 @@ tl::expected<std::string, ErrorCode> GetGroupIdForKey(
 // Defined unconditionally (CreateNofRuntime() exists in every build and
 // returns a null initiator without USE_NOF); the constructor wires it up only
 // under USE_NOF. See the declaration in master_service.h for the rationale.
+const std::shared_ptr<NVMeoFInitiator>& MasterService::DefaultNofInitiator() {
+    static const std::shared_ptr<NVMeoFInitiator> initiator =
+        CreateNofRuntime().initiator;
+    return initiator;
+}
+
 bool MasterService::DefaultProbeNofSegment(const std::string& te_endpoint,
                                            uint32_t timeout_ms,
                                            std::string* error_reason) {
-    static const std::shared_ptr<NVMeoFInitiator> initiator =
-        CreateNofRuntime().initiator;
+    const auto& initiator = DefaultNofInitiator();
     if (!initiator) {
         if (error_reason) {
             *error_reason = "nof_unavailable";
@@ -132,6 +137,16 @@ bool MasterService::DefaultProbeNofSegment(const std::string& te_endpoint,
         return false;
     }
     return initiator->ProbeSegment(te_endpoint, timeout_ms, error_reason);
+}
+
+void MasterService::DefaultReleaseNofProbeResources(
+    const std::string& te_endpoint) {
+    // Same initiator as DefaultProbeNofSegment: that is where the probe
+    // buffers were allocated.
+    const auto& initiator = DefaultNofInitiator();
+    if (initiator) {
+        initiator->ReleaseProbeResources(te_endpoint);
+    }
 }
 
 // Memory eviction's ties to this service: memory replicas are what it takes,
@@ -559,6 +574,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     nof_probe_fn_ = &DefaultProbeNofSegment;
+    nof_probe_release_fn_ = &DefaultReleaseNofProbeResources;
 #endif
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
@@ -2815,7 +2831,7 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
     }
     {
         std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
-        nof_heartbeat_states_.erase(segment_id);
+        EraseNoFHeartbeatStateLocked(segment_id);
     }
     return {};
 #endif
@@ -10070,6 +10086,49 @@ bool MasterService::ProbeNoFSegment(const std::string& te_endpoint,
 #endif
 }
 
+void MasterService::EraseNoFHeartbeatStateLocked(const UUID& segment_id) {
+    auto it = nof_heartbeat_states_.find(segment_id);
+    if (it == nof_heartbeat_states_.end()) {
+        return;
+    }
+    std::string te_endpoint = std::move(it->second.te_endpoint);
+    nof_heartbeat_states_.erase(it);
+    ReleaseNoFProbeResourcesLocked({te_endpoint});
+}
+
+void MasterService::ReleaseNoFProbeResourcesLocked(
+    const std::vector<std::string>& te_endpoints) {
+    NoFProbeReleaseFn release_fn;
+    {
+        std::lock_guard<std::mutex> lock(nof_probe_fn_mutex_);
+        release_fn = nof_probe_release_fn_;
+    }
+    if (!release_fn) {
+        return;
+    }
+
+    std::unordered_set<std::string> released;
+    for (const auto& te_endpoint : te_endpoints) {
+        if (te_endpoint.empty() || released.contains(te_endpoint)) {
+            continue;
+        }
+        // Several segments may share one transport endpoint; its probe
+        // resources stay alive until the last of them is unmounted.
+        const bool still_tracked =
+            std::any_of(nof_heartbeat_states_.begin(),
+                        nof_heartbeat_states_.end(), [&](const auto& entry) {
+                            return entry.second.te_endpoint == te_endpoint;
+                        });
+        if (still_tracked) {
+            continue;
+        }
+        released.insert(te_endpoint);
+        release_fn(te_endpoint);
+        VLOG(1) << "endpoint=" << te_endpoint
+                << ", action=release_nof_probe_resources";
+    }
+}
+
 bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     const MountedNoFSegmentSnapshot& snapshot,
     const std::string& error_reason) {
@@ -10085,7 +10144,7 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
         if (err == ErrorCode::SEGMENT_NOT_FOUND ||
             err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
             std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
-            nof_heartbeat_states_.erase(snapshot.segment_id);
+            EraseNoFHeartbeatStateLocked(snapshot.segment_id);
             VLOG(1) << "segment_id=" << snapshot.segment_id
                     << ", action=skip_nof_heartbeat_unmount"
                     << ", reason=" << toString(err);
@@ -10119,7 +10178,7 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
 
     {
         std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
-        nof_heartbeat_states_.erase(snapshot.segment_id);
+        EraseNoFHeartbeatStateLocked(snapshot.segment_id);
     }
     MasterMetricManager::instance()
         .inc_nof_segments_unmounted_by_heartbeat_total();
@@ -10182,14 +10241,21 @@ void MasterService::NofHeartbeatThreadFunc() {
                 }
             }
 
+            // Segments can also disappear without going through Unmount, e.g.
+            // when their owning client is offboarded. Collect the endpoints
+            // first and release them once the map no longer references them.
+            std::vector<std::string> stale_endpoints;
             for (auto it = nof_heartbeat_states_.begin();
                  it != nof_heartbeat_states_.end();) {
                 if (!live_segment_ids.contains(it->first)) {
+                    stale_endpoints.push_back(
+                        std::move(it->second.te_endpoint));
                     it = nof_heartbeat_states_.erase(it);
                 } else {
                     ++it;
                 }
             }
+            ReleaseNoFProbeResourcesLocked(stale_endpoints);
 
             if (!ok_segments.empty()) {
                 next_probe_index %= ok_segments.size();
