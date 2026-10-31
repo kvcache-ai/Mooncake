@@ -1202,6 +1202,119 @@ TEST(Mutations, ConcurrentVllmLocalAndSharedStoresKeepSharedOnly) {
     }
 }
 
+// In chunk mode, vLLM's OffloadingConnector announces an offloaded chunk with
+// all of its block hashes. Chunks that overlap a shared prefix which is not
+// chunk-aligned re-announce the shared hashes, and evicting a chunk removes
+// all of its hashes, so consumers must reference-count the announcements
+// (vllm/distributed/kv_transfer/kv_connector/v1/offloading/events.py).
+// One chunk is 4 blocks of 16 tokens here.
+TEST(Mutations, VllmCpuLocalOverlappingChunksSurviveOneChunkEviction) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration());
+
+    // Request A has 8 blocks. Request B shares A's first 6 blocks and then
+    // diverges, so B's second chunk is a different chunk that re-announces
+    // A's blocks 4 and 5.
+    const std::vector<int32_t> tokens_a = Tokens(128);
+    std::vector<int32_t> tokens_b = tokens_a;
+    for (size_t i = 96; i < tokens_b.size(); ++i) {
+        tokens_b[i] = 100000 + static_cast<int32_t>(i);
+    }
+    const auto ha = Hashes(tokens_a);
+    const auto hb = Hashes(tokens_b);
+    ASSERT_EQ(ha.size(), 8u);
+    ASSERT_EQ(hb.size(), 8u);
+    ASSERT_EQ(ha[5], hb[5]);
+    ASSERT_NE(ha[6], hb[6]);
+
+    auto chunk = [](const std::vector<ProjectedPrefix>& hashes, size_t first) {
+        auto mutation = Device(std::vector<ProjectedPrefix>(
+            hashes.begin() + first, hashes.begin() + first + 4));
+        mutation.tier = StorageTier::kCpuLocal;
+        return mutation;
+    };
+    const auto a_chunk0 = chunk(ha, 0);
+    const auto a_chunk1 = chunk(ha, 4);
+    const auto b_chunk1 = chunk(hb, 4);  // re-announces ha[4] and ha[5]
+    auto b_hit = [&] {
+        return table.Query(TestContext(), tokens_b)
+            .at("instance-a")
+            .rank_matches.at(0);
+    };
+    auto local_owners = [&](ProjectedPrefix prefix) {
+        const auto presence =
+            PrefixCacheTableTestPeer::Presence(table, TestContext(), prefix);
+        return presence ? presence->cpu_local_owners : std::set<EngineOwner>{};
+    };
+    ASSERT_EQ(table.StoreEngine(a_chunk0), "");
+    ASSERT_EQ(table.StoreEngine(a_chunk1), "");
+    ASSERT_EQ(table.StoreEngine(b_chunk1), "");
+    EXPECT_EQ(b_hit(), RankMatch(0, 128, 128, 128));
+
+    // vLLM evicts A's second chunk: BlockRemoved for ha[4..7]. Both of B's
+    // chunks are still in vLLM's CPU tier, so all of B's prompt can still be
+    // loaded from it.
+    ASSERT_EQ(table.RemoveEngine(a_chunk1), "");
+    EXPECT_EQ(b_hit(), RankMatch(0, 128, 128, 128));
+    EXPECT_EQ(local_owners(ha[4]), (std::set<EngineOwner>{a_chunk1.owner}));
+    EXPECT_EQ(local_owners(ha[5]), (std::set<EngineOwner>{a_chunk1.owner}));
+    EXPECT_TRUE(local_owners(ha[6]).empty());
+    EXPECT_TRUE(local_owners(ha[7]).empty());
+    // A's prompt is not checked here: vLLM looks up one key per chunk (the
+    // chunk's last block hash), so it can load only A's first chunk (64
+    // tokens), while this block-level index also sees ha[4] and ha[5]
+    // through B's chunk.
+
+    // Evicting B's second chunk removes the last announcement of ha[4] and
+    // ha[5]; only A's first chunk is left.
+    ASSERT_EQ(table.RemoveEngine(b_chunk1), "");
+    EXPECT_TRUE(local_owners(ha[4]).empty());
+    EXPECT_TRUE(local_owners(ha[5]).empty());
+    EXPECT_EQ(b_hit(), RankMatch(0, 64, 64, 64));
+}
+
+// A vLLM owner's announcement count must not outlive its ownership: after a
+// clear, an unregister, or a Mooncake shared CPU store drops the owner, one
+// new store and one removal leave no local owner.
+TEST(Mutations, VllmCpuLocalCountsResetWhenOwnershipIsDropped) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration());
+    const auto hashes = Hashes(Tokens(16));
+    ASSERT_EQ(hashes.size(), 1u);
+    auto local = Device(hashes);
+    local.tier = StorageTier::kCpuLocal;
+    // A disk copy keeps the block in the index through every step below.
+    ASSERT_EQ(table.StoreShared(Shared(hashes, StorageTier::kDisk)), "");
+    auto announce_twice = [&] {
+        ASSERT_EQ(table.StoreEngine(local), "");
+        ASSERT_EQ(table.StoreEngine(local), "");
+    };
+    auto store_and_remove_leave_no_owner = [&](const char* after) {
+        SCOPED_TRACE(after);
+        ASSERT_EQ(table.StoreEngine(local), "");
+        ASSERT_EQ(table.RemoveEngine(local), "");
+        EXPECT_TRUE(Presence(table, hashes[0]).cpu_local_owners.empty());
+    };
+
+    // A clear of every local tier, as vLLM's AllBlocksCleared is applied.
+    auto clear = ClearFor(local.owner);
+    clear.tier = std::nullopt;
+    announce_twice();
+    ASSERT_EQ(table.ClearEngine(clear), "");
+    store_and_remove_leave_no_owner("ClearEngine");
+
+    announce_twice();
+    ASSERT_EQ(table.Unregister(TestContext(), "instance-a", 0), "");
+    RegisterOrFail(table, Registration());
+    store_and_remove_leave_no_owner("Unregister");
+
+    const auto shared = Shared(hashes, StorageTier::kCpuShare);
+    announce_twice();
+    ASSERT_EQ(table.StoreShared(shared), "");
+    ASSERT_EQ(table.RemoveShared(shared), "");
+    store_and_remove_leave_no_owner("StoreShared");
+}
+
 TEST(Mutations, FourTierMutationsRejectWrongOwnerFamily) {
     PrefixCacheTable table;
     RegisterOrFail(table, Registration());
