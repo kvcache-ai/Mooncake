@@ -874,6 +874,45 @@ class Client {
      * @return true if hot cache is enabled, false otherwise
      */
     bool IsHotCacheEnabled() const { return hot_cache_ != nullptr; }
+    bool IsObjectChecksumEnabled() const { return object_checksum_enabled_; }
+
+    void EnterHaRuntimeMode();
+    ErrorCode InitTransferEngine(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
+        const std::optional<std::string>& device_names);
+    void InitTransferSubmitter();
+    ErrorCode TransferData(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code,
+        TransferIntent intent = TransferIntent::kUnspecified);
+    ErrorCode TransferReadInternal(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t src_offset);
+    // Internal async range submission helpers (return the transfer future).
+    // Used by the synchronous TransferReadRange/WriteRange and the batch
+    // range transfer methods; not part of the public API.
+    std::optional<TransferFuture> SubmitRangeRead(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t src_offset);
+    std::optional<TransferFuture> SubmitRangeWrite(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t dst_offset);
+    ErrorCode TransferWrite(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        TransferIntent intent = TransferIntent::kUnspecified);
+    ErrorCode TransferRead(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        TransferIntent intent = TransferIntent::kUnspecified);
+    // Reads one byte window of each DISK or DFS replica. `windows[i]` receives
+    // `windows[i].size` bytes starting at `value_offsets[i]` in the value.
+    std::vector<tl::expected<void, ErrorCode>> BatchReadFileReplicaRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<Slice>& windows,
+        const std::vector<uint64_t>& value_offsets);
 
     /**
      * @brief Get the local hot cache instance.
@@ -1002,36 +1041,6 @@ class Client {
         const std::vector<std::vector<uint64_t>>& slice_lengths,
         const ReplicateConfig& config);
 
-    void EnterHaRuntimeMode();
-    ErrorCode InitTransferEngine(
-        const std::string& local_hostname,
-        const std::string& metadata_connstring, const std::string& protocol,
-        const std::optional<std::string>& device_names);
-    void InitTransferSubmitter();
-    ErrorCode TransferData(
-        const Replica::Descriptor& replica_descriptor,
-        std::vector<Slice>& slices, TransferRequest::OpCode op_code,
-        TransferIntent intent = TransferIntent::kUnspecified);
-    ErrorCode TransferReadInternal(
-        const Replica::Descriptor& replica_descriptor,
-        std::vector<Slice>& slices, uint64_t src_offset);
-    // Internal async range submission helpers (return the transfer future).
-    // Used by the synchronous TransferReadRange/WriteRange and the batch
-    // range transfer methods; not part of the public API.
-    std::optional<TransferFuture> SubmitRangeRead(
-        const Replica::Descriptor& replica_descriptor,
-        std::vector<Slice>& slices, uint64_t src_offset);
-    std::optional<TransferFuture> SubmitRangeWrite(
-        const Replica::Descriptor& replica_descriptor,
-        std::vector<Slice>& slices, uint64_t dst_offset);
-    ErrorCode TransferWrite(
-        const Replica::Descriptor& replica_descriptor,
-        std::vector<Slice>& slices,
-        TransferIntent intent = TransferIntent::kUnspecified);
-    ErrorCode TransferRead(
-        const Replica::Descriptor& replica_descriptor,
-        std::vector<Slice>& slices,
-        TransferIntent intent = TransferIntent::kUnspecified);
     ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices,
                                 uint64_t src_offset);

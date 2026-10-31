@@ -1361,9 +1361,9 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_SizeMismatch) {
         ASSERT_TRUE(offload_res);
     }
 
-    // Try to load with wrong size - should fail
-    {
-        size_t wrong_size = value.size() + 10;  // Wrong size
+    // Full reads require an exact destination size in either direction.
+    for (const size_t wrong_size : {value.size() - 1, value.size() + 10}) {
+        SCOPED_TRACE(wrong_size);
         auto buf = std::make_unique<char[]>(wrong_size);
         std::unordered_map<std::string, Slice> load_slices;
         load_slices.emplace(key, Slice{buf.get(), wrong_size});
@@ -2766,6 +2766,100 @@ TEST_F(StorageBackendTest, BucketStorageBackend_BatchLoadWithMixedBuckets) {
     EXPECT_EQ(std::string(readA2.get(), valueA2.size()), valueA2);
     EXPECT_EQ(std::string(readB1.get(), valueB1.size()), valueB1);
     EXPECT_EQ(std::string(readB2.get(), valueB2.size()), valueB2);
+}
+
+TEST_F(StorageBackendTest, MultiWindowReadsKeepSameKeyFragments) {
+    for (bool offset_allocator : {false, true}) {
+        SCOPED_TRACE(offset_allocator);
+        FileStorageConfig config;
+        config.storage_filepath =
+            data_path +
+            (offset_allocator ? "/offset-windows" : "/bucket-windows");
+        config.use_uring = false;
+        std::unique_ptr<StorageBackendInterface> backend;
+        if (offset_allocator) {
+            backend = std::make_unique<OffsetAllocatorStorageBackend>(
+                config, OffsetAllocatorBackendConfig{});
+        } else {
+            backend = std::make_unique<BucketStorageBackend>(
+                config, BucketBackendConfig{});
+        }
+        ASSERT_TRUE(backend->Init());
+        std::string object(65536, '\0');
+        for (size_t i = 0; i < object.size(); ++i) {
+            object[i] = static_cast<char>((i * 17) % 251);
+        }
+        const std::string key = "multi-window-object";
+        std::unordered_map<std::string, std::vector<Slice>> put{
+            {key, {{object.data(), object.size()}}}};
+        ASSERT_TRUE(backend->BatchOffload(put, nullptr));
+        std::string output(3 * 1024, 'x');
+        StorageValueSpans spans{
+            {key,
+             {{64512, object.size(), {output.data(), 1024}},
+              {0, object.size(), {output.data() + 1024, 1024}},
+              {400, object.size(), {output.data() + 2048, 1024}}}}};
+        ASSERT_TRUE(backend->BatchLoadSpans(spans));
+        EXPECT_EQ(output, object.substr(64512, 1024) + object.substr(0, 1024) +
+                              object.substr(400, 1024));
+        spans.at(key)[1].object_size = object.size() - 1;
+        auto wrong_identity = backend->BatchLoadSpans(spans);
+        ASSERT_FALSE(wrong_identity);
+        EXPECT_EQ(wrong_identity.error(), offset_allocator
+                                              ? ErrorCode::FILE_READ_FAIL
+                                              : ErrorCode::INVALID_PARAMS);
+    }
+}
+
+TEST_F(StorageBackendTest, BucketStorageBackend_BatchLoadSpanReadsWindow) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    const std::string key = "layer_object";
+    std::string value(4096, '\0');
+    for (size_t i = 0; i < value.size(); ++i) {
+        value[i] = static_cast<char>(i & 0xff);
+    }
+    {
+        auto buf = std::make_unique<char[]>(value.size());
+        std::memcpy(buf.get(), value.data(), value.size());
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
+        auto stored = storage_backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(stored.has_value());
+    }
+
+    constexpr uint64_t kOffset = 1000;
+    constexpr size_t kLength = 144;
+    auto window = std::make_unique<char[]>(kLength);
+    std::memset(window.get(), 0x5a, kLength);
+    std::unordered_map<std::string, StorageValueSpan> spans;
+    spans.emplace(key, StorageValueSpan{kOffset, value.size(),
+                                        Slice{window.get(), kLength}});
+    ASSERT_TRUE(storage_backend.BatchLoadSpans(spans));
+    EXPECT_EQ(std::string(static_cast<char*>(spans.at(key).slice.ptr), kLength),
+              value.substr(kOffset, kLength));
+
+    auto past_end = std::make_unique<char[]>(8);
+    std::unordered_map<std::string, StorageValueSpan> overflow;
+    overflow.emplace(key, StorageValueSpan{value.size() - 4, value.size(),
+                                           Slice{past_end.get(), 8}});
+    auto rejected = storage_backend.BatchLoadSpans(overflow);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::INVALID_PARAMS);
+
+    auto wrong = std::make_unique<char[]>(value.size() - 1);
+    std::unordered_map<std::string, Slice> full;
+    full.emplace(key, Slice{wrong.get(), value.size() - 1});
+    auto mismatch = storage_backend.BatchLoad(full);
+    ASSERT_FALSE(mismatch.has_value());
+    EXPECT_EQ(mismatch.error(), ErrorCode::INVALID_PARAMS);
 }
 
 //-----------------------------------------------------------------------------

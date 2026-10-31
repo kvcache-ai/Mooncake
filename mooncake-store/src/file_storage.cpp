@@ -264,6 +264,64 @@ FileStorage::LoadBatch(const std::vector<std::string>& keys,
     return allocated_batch;
 }
 
+tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
+FileStorage::LoadRanges(const std::vector<std::string>& keys,
+                        const std::vector<int64_t>& offsets,
+                        const std::vector<int64_t>& lengths,
+                        const std::vector<int64_t>& object_sizes,
+                        bool prefer_pinned, bool strict_file_windows) {
+    if (keys.size() != offsets.size() || keys.size() != lengths.size() ||
+        keys.size() != object_sizes.size()) {
+        LOG(ERROR) << "Mismatched range load arguments";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (offsets[i] < 0 || lengths[i] < 0 || object_sizes[i] < 0 ||
+            offsets[i] > object_sizes[i] ||
+            lengths[i] > object_sizes[i] - offsets[i]) {
+            LOG(ERROR) << "Value span out of range for key " << keys[i];
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    const bool use_pinned = prefer_pinned && pinned_restore_arena_allocator_;
+    auto& allocator = use_pinned ? *pinned_restore_arena_allocator_
+                                 : *client_buffer_allocator_;
+    auto allocate_res = AllocateBatch(keys, lengths, allocator);
+    if (!allocate_res && use_pinned &&
+        allocate_res.error() == ErrorCode::BUFFER_OVERFLOW) {
+        VLOG(1) << "Pinned SSD restore arena exhausted; using default arena";
+        allocate_res = AllocateBatch(keys, lengths, *client_buffer_allocator_);
+    }
+    if (!allocate_res) {
+        LOG(ERROR) << "Failed to allocate ranged batch objects";
+        return tl::make_unexpected(allocate_res.error());
+    }
+    auto allocated_batch = std::move(allocate_res.value());
+
+    StorageValueSpans spans;
+    spans.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        spans[keys[i]].push_back(StorageValueSpan{
+            static_cast<uint64_t>(offsets[i]),
+            static_cast<uint64_t>(object_sizes[i]),
+            {reinterpret_cast<void*>(allocated_batch->pointers[i]),
+             static_cast<size_t>(lengths[i])}});
+    }
+    auto result = BatchLoadSpans(spans, strict_file_windows);
+    if (!result) {
+        LOG(ERROR) << "Batch load span failed, err_code = " << result.error();
+        return tl::make_unexpected(result.error());
+    }
+    std::unordered_map<std::string, size_t> next;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& span = spans.at(keys[i])[next[keys[i]]++];
+        allocated_batch->pointers[i] =
+            reinterpret_cast<uintptr_t>(span.slice.ptr);
+    }
+    return allocated_batch;
+}
+
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
@@ -347,6 +405,25 @@ FileStorage::BatchGetLocal(const std::vector<std::string>& keys,
     result.pointers = std::move(batch->pointers);
     result.owner = std::move(batch);
     return result;
+}
+
+tl::expected<FileStorage::BatchGetResult, ErrorCode>
+FileStorage::BatchGetRanges(const std::vector<std::string>& keys,
+                            const std::vector<int64_t>& offsets,
+                            const std::vector<int64_t>& lengths,
+                            const std::vector<int64_t>& object_sizes,
+                            bool strict_file_windows) {
+    auto load_result = LoadRanges(keys, offsets, lengths, object_sizes, false,
+                                  strict_file_windows);
+    if (!load_result) return tl::make_unexpected(load_result.error());
+
+    auto allocated_batch = std::move(load_result.value());
+    uint64_t batch_id = allocated_batch->batch_id;
+    BatchGetResult batch_result{batch_id, allocated_batch->pointers};
+    MutexLocker locker(&client_buffer_mutex_);
+    client_buffer_allocated_batches_.emplace(batch_id,
+                                             std::move(allocated_batch));
+    return batch_result;
 }
 
 bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
@@ -1242,6 +1319,59 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
         ssd_metric_->ssd_read_latency_us.observe(elapsed_time);
         ssd_metric_->ssd_read_latency_summary.observe(elapsed_time);
         ssd_metric_->ssd_total_ops.inc(batch_object.size());
+        ssd_metric_->ssd_total_bytes.inc(total_bytes);
+        ssd_metric_->ssd_total_latency_us.observe(elapsed_time);
+        ssd_metric_->ssd_total_latency_summary.observe(elapsed_time);
+    }
+    return result;
+}
+
+tl::expected<void, ErrorCode> FileStorage::BatchLoadSpans(
+    StorageValueSpans& spans, bool strict_file_windows) {
+    auto start_time = std::chrono::steady_clock::now();
+    auto result = storage_backend_->BatchLoadSpans(spans);
+    if (!result && result.error() == ErrorCode::NOT_SUPPORTED &&
+        !strict_file_windows) {
+        // Only legacy callers retain whole-value fallback on non-seek backends.
+        size_t window = 0;
+        while (true) {
+            std::unordered_map<std::string, StorageValueSpan> single;
+            for (auto& [key, values] : spans) {
+                if (window < values.size()) single.emplace(key, values[window]);
+            }
+            if (single.empty()) {
+                result = {};
+                break;
+            }
+            result = storage_backend_->BatchLoadSpans(single);
+            if (!result) break;
+            for (const auto& [key, value] : single)
+                spans.at(key)[window] = value;
+            ++window;
+        }
+    }
+    auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - start_time)
+                            .count();
+    if (!result) {
+        LOG(ERROR) << "Batch load span failed, err_code = " << result.error();
+        return result;
+    }
+    if (ssd_metric_) {
+        int64_t total_bytes = 0;
+        size_t operations = 0;
+        for (const auto& [key, windows] : spans) {
+            (void)key;
+            operations += windows.size();
+            for (const auto& span : windows) {
+                total_bytes += static_cast<int64_t>(span.slice.size);
+            }
+        }
+        ssd_metric_->ssd_read_ops.inc(operations);
+        ssd_metric_->ssd_read_bytes.inc(total_bytes);
+        ssd_metric_->ssd_read_latency_us.observe(elapsed_time);
+        ssd_metric_->ssd_read_latency_summary.observe(elapsed_time);
+        ssd_metric_->ssd_total_ops.inc(operations);
         ssd_metric_->ssd_total_bytes.inc(total_bytes);
         ssd_metric_->ssd_total_latency_us.observe(elapsed_time);
         ssd_metric_->ssd_total_latency_summary.observe(elapsed_time);
