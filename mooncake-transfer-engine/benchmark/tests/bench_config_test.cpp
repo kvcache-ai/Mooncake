@@ -14,6 +14,9 @@
 
 #include "bench_config.h"
 
+#include <limits>
+#include <string>
+
 #include <gtest/gtest.h>
 
 namespace mooncake {
@@ -164,6 +167,51 @@ TEST_F(BenchConfigTest, RejectsSweepStartAboveMax) {
     XferBenchConfig::max_batch_size = 1;
     EXPECT_EQ(validateError(),
               "--start_batch_size (2) must not exceed --max_batch_size (1)");
+}
+
+TEST_F(BenchConfigTest, RejectsSweepMaxThatOverflowsDoubling) {
+    constexpr int kThreadLimit = std::numeric_limits<int>::max() / 2;
+    XferBenchConfig::max_num_threads = kThreadLimit;
+    validateOk();
+    XferBenchConfig::max_num_threads = kThreadLimit + 1;
+    EXPECT_EQ(validateError(),
+              "--max_num_threads (" + std::to_string(kThreadLimit + 1) +
+                  ") must be at most " + std::to_string(kThreadLimit));
+    XferBenchConfig::max_num_threads = 1;
+
+    constexpr size_t kSizeLimit = std::numeric_limits<size_t>::max() / 2;
+    XferBenchConfig::max_block_size = kSizeLimit;
+    validateOk();
+    XferBenchConfig::max_block_size = kSizeLimit + 1;
+    EXPECT_EQ(validateError(),
+              "--max_block_size (" + std::to_string(kSizeLimit + 1) +
+                  ") must be at most " + std::to_string(kSizeLimit));
+    XferBenchConfig::max_block_size = 1UL << 26;
+
+    XferBenchConfig::max_batch_size = kSizeLimit;
+    EXPECT_EQ(validateError(),
+              "--max_block_size x --max_batch_size overflows "
+              "(67108864 x " +
+                  std::to_string(kSizeLimit) + ")");
+    XferBenchConfig::max_block_size = 4096;
+    XferBenchConfig::max_batch_size = kSizeLimit + 1;
+    EXPECT_EQ(validateError(),
+              "--max_batch_size (" + std::to_string(kSizeLimit + 1) +
+                  ") must be at most " + std::to_string(kSizeLimit));
+}
+
+TEST_F(BenchConfigTest, RejectsBlockTimesBatchOverflow) {
+    // Each max is within its doubling limit, but the product overflows.
+    XferBenchConfig::max_block_size = 1UL << 32;
+    XferBenchConfig::max_batch_size = 1UL << 32;
+    EXPECT_EQ(validateError(),
+              "--max_block_size x --max_batch_size overflows (4294967296 x "
+              "4294967296)");
+
+    // A product just below 2^64 is accepted.
+    XferBenchConfig::max_block_size = 1UL << 31;
+    XferBenchConfig::max_batch_size = (1UL << 33) - 1;
+    validateOk();
 }
 
 TEST_F(BenchConfigTest, RejectsNonPositiveDuration) {
