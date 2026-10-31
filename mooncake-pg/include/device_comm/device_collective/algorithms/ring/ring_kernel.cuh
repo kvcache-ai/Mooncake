@@ -1,7 +1,10 @@
 #ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_KERNEL_CUH
 #define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_KERNEL_CUH
 
+#include <type_traits>
+
 #include "device_comm/device_collective/algorithms/ring/ring_algorithm.cuh"
+#include "device_comm/device_primitives/value_primitives.cuh"
 #include "device_comm/device_utils/device_utils.cuh"
 
 namespace mooncake {
@@ -72,6 +75,38 @@ struct RingChannelPartition {
     index %= static_cast<int64_t>(participant_count);
     if (index < 0) index += participant_count;
     return static_cast<uint32_t>(index);
+}
+
+// Transforms for Ring's first send, intermediate reductions, and final
+// reduction.
+template <typename SendOp, typename ReduceTransform, typename FinalOp>
+struct RingReductionOps {
+    SendOp send_op;
+    ReduceTransform reduce_op;
+    FinalOp final_op;
+};
+
+template <typename T, ReduceOp Op>
+[[nodiscard]] __device__ __forceinline__ auto makeRingReductionOps(
+    uint32_t participant_count) {
+    if constexpr (Op == ReduceOp::Avg && !std::is_integral_v<T>) {
+        // The received partial is already scaled; scale only local input.
+        const T factor = reciprocal<T>(participant_count);
+        return RingReductionOps<Mul<T>, MulAdd<T>, MulAdd<T>>{
+            .send_op = {factor},
+            .reduce_op = {factor},
+            .final_op = {factor},
+        };
+    } else if constexpr (Op == ReduceOp::Avg) {
+        // Divide only after the last contribution has been added.
+        return RingReductionOps<Identity, Reduce<T, ReduceOp::Sum>, SumDiv<T>>{
+            .send_op = {},
+            .reduce_op = {},
+            .final_op = {participant_count},
+        };
+    } else {
+        return RingReductionOps<Identity, Reduce<T, Op>, Reduce<T, Op>>{};
+    }
 }
 
 }  // namespace mooncake

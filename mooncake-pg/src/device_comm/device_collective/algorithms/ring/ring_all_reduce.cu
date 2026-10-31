@@ -74,13 +74,15 @@ template <typename T, ReduceOp Op>
 runRingRound(const DeviceGroupView& view, SimplePrimitives<T>& primitives,
              const AllReduceLayout<T>& layout, uint64_t chunk_index,
              cooperative_groups::thread_block block) {
+    const auto [send_op, reduce_op, final_op] =
+        makeRingReductionOps<T, Op>(view.participant_count);
     const uint64_t ring_steps = view.participant_count - 1;
     // Start reduce-scatter by injecting this rank's contribution for its own
     // shard into the ring.
     const uint32_t first_shard_index =
         ringIndexAtDistance(view.self_active_index, view.participant_count, 0);
     const auto first_chunk = layout.chunk(first_shard_index, chunk_index);
-    PG_COLL_TRY(primitives.send(first_chunk, block));
+    PG_COLL_TRY(primitives.transformSend(first_chunk, block, send_op));
 
     // Each intermediate reduce-scatter step receives a partially reduced
     // shard, adds this rank's contribution, and forwards the new partial.
@@ -88,7 +90,7 @@ runRingRound(const DeviceGroupView& view, SimplePrimitives<T>& primitives,
         const uint32_t shard_index = ringIndexAtDistance(
             view.self_active_index, view.participant_count, distance);
         const auto chunk = layout.chunk(shard_index, chunk_index);
-        PG_COLL_TRY(primitives.template recvReduceSend<Op>(chunk, block));
+        PG_COLL_TRY(primitives.recvTransformSend(chunk, block, reduce_op));
     }
 
     // The final reduce-scatter receive completes one shard. Store the reduced
@@ -98,7 +100,7 @@ runRingRound(const DeviceGroupView& view, SimplePrimitives<T>& primitives,
     const auto completed_chunk =
         layout.chunk(completed_shard_index, chunk_index);
     PG_COLL_TRY(
-        primitives.template recvReduceCopySend<Op>(completed_chunk, block));
+        primitives.recvTransformCopySend(completed_chunk, block, final_op));
 
     // The remaining all-gather steps receive fully reduced shards, copy them
     // into local output, and forward them without another reduction.
@@ -194,55 +196,12 @@ PGResult<void> launchKernel(const AllReduceRequest& request,
     return {};
 }
 
-template <typename T>
-PGResult<void> launchForType(const AllReduceRequest& request,
-                             RingDeviceState* state, cudaStream_t stream) {
-    switch (request.op) {
-        case ReduceOp::Sum:
-            return launchKernel<T, ReduceOp::Sum>(request, state, stream);
-        case ReduceOp::Product:
-            return launchKernel<T, ReduceOp::Product>(request, state, stream);
-        case ReduceOp::Min:
-            return launchKernel<T, ReduceOp::Min>(request, state, stream);
-        case ReduceOp::Max:
-            return launchKernel<T, ReduceOp::Max>(request, state, stream);
-        default:
-            return makePGError(
-                PGErrorCode::NotSupported,
-                "Ring AllReduce reduction operation is not supported");
-    }
-}
-
 }  // namespace
 
 PGResult<void> launchRingAllReduceKernel(const AllReduceRequest& request,
                                          RingDeviceState* state,
                                          cudaStream_t stream) {
-    switch (request.datatype) {
-        case DataType::Float16:
-            return launchForType<__half>(request, state, stream);
-        case DataType::Uint8:
-            return launchForType<uint8_t>(request, state, stream);
-        case DataType::Int8:
-            return launchForType<int8_t>(request, state, stream);
-        case DataType::Int16:
-            return launchForType<int16_t>(request, state, stream);
-        case DataType::Int32:
-            return launchForType<int32_t>(request, state, stream);
-        case DataType::Int64:
-            return launchForType<int64_t>(request, state, stream);
-        case DataType::Bfloat16:
-            return launchForType<__nv_bfloat16>(request, state, stream);
-        case DataType::Float32:
-            return launchForType<float>(request, state, stream);
-        case DataType::Float64:
-            return launchForType<double>(request, state, stream);
-        case DataType::Bool:
-            return launchForType<bool>(request, state, stream);
-        default:
-            return makePGError(PGErrorCode::NotSupported,
-                               "Ring AllReduce datatype is not supported");
-    }
+    PG_DISPATCH_REDUCTION(launchKernel, request, state, stream);
 }
 
 }  // namespace mooncake

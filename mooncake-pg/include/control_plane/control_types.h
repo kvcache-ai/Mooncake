@@ -163,6 +163,8 @@ struct DeviceTransferInstallResult {
 enum class DeviceCollectiveAlgorithm : uint8_t {
     Ring = 1,
     OneShot = 2,
+    Pairwise = 3,
+    Star = 4,
 };
 
 // Runtime, protocol and algorithm endpoints owned by one communicator.
