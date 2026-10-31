@@ -22,6 +22,7 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -60,8 +61,10 @@ class BenchRunner {
 
     virtual std::string getSegmentName() const = 0;
 
-    virtual uint64_t getLocalBufferBase(int thread_id, uint64_t block_size,
-                                        uint64_t batch_size) const = 0;
+    // Start of worker thread_id's `stride`-byte region in its local buffer,
+    // or nullopt if the region does not fit in that buffer.
+    virtual std::optional<uint64_t> getLocalBufferBase(
+        int thread_id, uint64_t stride) const = 0;
 
     size_t getTargetCount() const {
         return std::max<size_t>(target_handles_.size(), 1);
@@ -71,8 +74,11 @@ class BenchRunner {
 
     uint64_t getTargetSegmentId(int thread_id) const;
 
-    virtual uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,
-                                         uint64_t batch_size) const = 0;
+    // Start of worker thread_id's `window`-byte region in its target buffer,
+    // after --target_offset and --target_gpu_id, or nullopt if the region
+    // does not fit in that buffer or in --target_range_size.
+    virtual std::optional<uint64_t> getTargetBufferBase(
+        int thread_id, uint64_t window) const = 0;
 
     // Returns elapsed microseconds on success, or a negative value if the
     // transfer failed or the run stopped. Implementations must not call
@@ -102,15 +108,21 @@ class BenchRunner {
 
     void startWorkers(int num_threads);
 
-    // Index of this thread among the threads that share its target.
+    // Index of this worker among the workers that share its target, shifted
+    // by --target_gpu_id so target buffers are used round-robin from there.
     int localTargetThreadId(int thread_id) const;
 
-    // Address of the slot-th `bytes`-sized region after --target_offset in a
-    // target buffer [base, base + length). LOG(FATAL)s if it does not fit
-    // the buffer or --target_range_size.
-    static uint64_t targetSlotAddress(int thread_id, uint64_t base,
-                                      uint64_t length, uint64_t bytes,
-                                      uint64_t slot);
+    // base + slot * bytes if the slot-th `bytes`-sized region fits in
+    // [base, base + length), else nullopt.
+    static std::optional<uint64_t> slotAddress(uint64_t base, uint64_t length,
+                                               uint64_t bytes, uint64_t slot);
+
+    // slotAddress() for a target buffer: regions start after --target_offset
+    // and must also fit in --target_range_size.
+    static std::optional<uint64_t> targetSlotAddress(uint64_t base,
+                                                     uint64_t length,
+                                                     uint64_t bytes,
+                                                     uint64_t slot);
 
     // Opened target segments, in --target_seg_name order.
     std::vector<uint64_t> target_handles_;

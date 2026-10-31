@@ -114,32 +114,34 @@ size_t BenchRunner::getTargetIndex(int thread_id) const {
 
 int BenchRunner::localTargetThreadId(int thread_id) const {
     LOG_ASSERT(!target_handles_.empty());
-    return thread_id / static_cast<int>(target_handles_.size());
+    return std::max(0, XferBenchConfig::target_gpu_id) +
+           thread_id / static_cast<int>(target_handles_.size());
 }
 
 uint64_t BenchRunner::getTargetSegmentId(int thread_id) const {
     return target_handles_[getTargetIndex(thread_id)];
 }
 
-uint64_t BenchRunner::targetSlotAddress(int thread_id, uint64_t base,
-                                        uint64_t length, uint64_t bytes,
-                                        uint64_t slot) {
-    const uint64_t relative_offset =
-        checkedMul(bytes, slot, "target relative offset");
+std::optional<uint64_t> BenchRunner::slotAddress(uint64_t base, uint64_t length,
+                                                 uint64_t bytes,
+                                                 uint64_t slot) {
+    const uint64_t offset = checkedMul(bytes, slot, "buffer slot offset");
+    if (!rangeContains(offset, bytes, length)) return std::nullopt;
+    return checkedAdd(base, offset, "buffer slot address");
+}
+
+std::optional<uint64_t> BenchRunner::targetSlotAddress(uint64_t base,
+                                                       uint64_t length,
+                                                       uint64_t bytes,
+                                                       uint64_t slot) {
     if (XferBenchConfig::target_range_size != 0 &&
-        !rangeContains(relative_offset, bytes,
-                       XferBenchConfig::target_range_size)) {
-        LOG(FATAL) << "Target range too small for thread " << thread_id;
+        !slotAddress(0, XferBenchConfig::target_range_size, bytes, slot)) {
+        return std::nullopt;
     }
-    if (XferBenchConfig::target_offset > length ||
-        !rangeContains(relative_offset, bytes,
-                       length - XferBenchConfig::target_offset)) {
-        LOG(FATAL) << "Target buffer too small for thread " << thread_id;
-    }
-    return checkedAdd(base,
-                      checkedAdd(XferBenchConfig::target_offset,
-                                 relative_offset, "target address offset"),
-                      "target address");
+    if (XferBenchConfig::target_offset > length) return std::nullopt;
+    return slotAddress(
+        checkedAdd(base, XferBenchConfig::target_offset, "target address"),
+        length - XferBenchConfig::target_offset, bytes, slot);
 }
 
 }  // namespace tent
