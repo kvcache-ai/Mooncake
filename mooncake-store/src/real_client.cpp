@@ -7882,7 +7882,8 @@ std::vector<int> RealClient::batch_put_session_start(
         return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
     }
     if (!config.HasValidKeyHints(keys.size())) {
-        LOG(ERROR) << "batch_put_session_start: invalid per-key hint count";
+        LOG(ERROR) << "batch_put_session_start: invalid group, affinity or HCA "
+                      "per-key hint count";
         return std::vector<int>(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
