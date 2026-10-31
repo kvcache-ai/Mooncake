@@ -177,6 +177,12 @@ struct Request {
     // and docs/source/design/tent/deadline-scheduling.md.
     uint64_t deadline_ns = 0;
     IntentType intent_type = IntentType::INTENT_UNSPEC;
+    // Internal runtime fence for staging sub-transfers that are covered by
+    // their parent request's receiver-credit reservation. Public callers
+    // leave these fields zero.
+    uint64_t receiver_credit_session_high = 0;
+    uint64_t receiver_credit_session_low = 0;
+    uint64_t receiver_credit_epoch = 0;
 };
 
 enum TransferStatusEnum {

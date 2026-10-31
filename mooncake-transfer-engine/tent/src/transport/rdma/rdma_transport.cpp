@@ -557,6 +557,11 @@ Status RdmaTransport::submitTransferTasks(
         task->request = request;
         task->device_mask = rdma_batch->device_mask;
         task->qp_pool = rdma_batch->qp_pool;  // RFC #2568 step 3
+        task->receiver_credit_session_high =
+            rdma_batch->receiver_credit_session_high;
+        task->receiver_credit_session_low =
+            rdma_batch->receiver_credit_session_low;
+        task->receiver_credit_epoch = rdma_batch->receiver_credit_epoch;
         task->num_slices = 0;
         task->status_word = PENDING;
         task->transferred_bytes = 0;

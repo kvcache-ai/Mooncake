@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -33,6 +34,7 @@
 #include "tent/common/concurrent/rw_spinlock.h"
 #include "tent/common/concurrent/thread_local_storage.h"
 #include "tent/runtime/metastore.h"
+#include "tent/runtime/receiver_credit.h"
 #include "tent/rpc/rpc.h"
 #include "tent/runtime/topology.h"
 #include "tent/thirdparty/nlohmann/json.h"
@@ -107,6 +109,11 @@ struct MemorySegmentDesc {
     // int maps to TransportType enum
     std::unordered_map<int, std::string> transport_attrs;
 
+    // Optional runtime-level receiver-credit advertisement.  Per-sender
+    // grants are never published in SegmentDesc; they are obtained through
+    // the credit exchange RPC.
+    std::optional<ReceiverCreditAdvertV1> receiver_credit;
+
    public:
     // Get transport attributes for a specific transport type
     std::string& getTransportAttrs(int transport_type) {
@@ -129,6 +136,7 @@ inline void to_json(json& j, const MemorySegmentDesc& m) {
              {"devices", m.devices},
              {"topology", m.topology.toString()},
              {"transport_attrs", m.transport_attrs}};
+    if (m.receiver_credit) j["receiver_credit"] = *m.receiver_credit;
 }
 
 inline void from_json(const json& j, MemorySegmentDesc& m) {
@@ -141,6 +149,11 @@ inline void from_json(const json& j, MemorySegmentDesc& m) {
     }
     if (j.contains("transport_attrs")) {
         j.at("transport_attrs").get_to(m.transport_attrs);
+    }
+    m.receiver_credit.reset();
+    if (j.contains("receiver_credit")) {
+        m.receiver_credit =
+            j.at("receiver_credit").get<ReceiverCreditAdvertV1>();
     }
 }
 

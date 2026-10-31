@@ -17,6 +17,7 @@
 
 #include <cassert>
 #include <exception>
+#include <limits>
 #include <optional>
 #include <set>
 #include <utility>
@@ -57,6 +58,113 @@ thread_local const ControlService* ControlService::active_bootstrap_service_ =
 thread_local const ControlService* ControlService::active_notify_service_ =
     nullptr;
 thread_local CoroRpcAgent tl_rpc_agent;
+
+namespace {
+
+constexpr uint64_t kDelegatedCreditProtocolMagic = 0x54454e54444c4732ULL;
+
+struct ParsedXferData {
+    uint64_t peer_mem_addr{0};
+    size_t length{0};
+    size_t header_size{0};
+    bool version_two{false};
+    uint64_t receiver_credit_session_high{0};
+    uint64_t receiver_credit_session_low{0};
+    uint64_t receiver_credit_epoch{0};
+};
+
+Status parseXferData(const std::string_view& request, bool carries_payload,
+                     ParsedXferData& parsed) {
+    if (request.size() < sizeof(LegacyXferDataDesc)) {
+        return Status::InvalidArgument("request too short" LOC_MARK);
+    }
+    LegacyXferDataDesc legacy;
+    memcpy(&legacy, request.data(), sizeof(legacy));
+    const uint64_t length = le64toh(legacy.length);
+    if (length > std::numeric_limits<size_t>::max()) {
+        return Status::InvalidArgument("transfer length overflow" LOC_MARK);
+    }
+
+    parsed = ParsedXferData{};
+    parsed.peer_mem_addr = le64toh(legacy.peer_mem_addr);
+    parsed.length = static_cast<size_t>(length);
+    parsed.header_size = sizeof(LegacyXferDataDesc);
+
+    if (request.size() >= sizeof(XferDataDesc)) {
+        XferDataDesc current;
+        memcpy(&current, request.data(), sizeof(current));
+        const bool magic_matches =
+            le64toh(current.protocol_magic) == kXferDataProtocolMagic;
+        const bool size_matches =
+            carries_payload
+                ? parsed.length <= std::numeric_limits<size_t>::max() -
+                                       sizeof(XferDataDesc) &&
+                      request.size() == sizeof(XferDataDesc) + parsed.length
+                : request.size() == sizeof(XferDataDesc);
+        if (magic_matches && size_matches) {
+            parsed.header_size = sizeof(XferDataDesc);
+            parsed.version_two = true;
+            parsed.peer_mem_addr = le64toh(current.peer_mem_addr);
+            parsed.receiver_credit_session_high =
+                le64toh(current.receiver_credit_session_high);
+            parsed.receiver_credit_session_low =
+                le64toh(current.receiver_credit_session_low);
+            parsed.receiver_credit_epoch =
+                le64toh(current.receiver_credit_epoch);
+        }
+    }
+
+    if (carries_payload) {
+        if (parsed.length >
+                std::numeric_limits<size_t>::max() - parsed.header_size ||
+            request.size() != parsed.header_size + parsed.length) {
+            return Status::InvalidArgument(
+                "invalid transfer request size" LOC_MARK);
+        }
+    } else if (request.size() != parsed.header_size) {
+        return Status::InvalidArgument(
+            "invalid transfer request header size" LOC_MARK);
+    }
+    return Status::OK();
+}
+
+Status validateXferReceiverCreditFence(const SegmentDescRef& local_desc,
+                                       const ParsedXferData& request) {
+    const bool has_fence = request.receiver_credit_session_high != 0 ||
+                           request.receiver_credit_session_low != 0 ||
+                           request.receiver_credit_epoch != 0;
+    if (!local_desc || local_desc->type != SegmentType::Memory) {
+        return has_fence ? Status::InvalidEntry(
+                               "receiver-credit target is not memory" LOC_MARK)
+                         : Status::OK();
+    }
+
+    const auto& advert = local_desc->getMemory().receiver_credit;
+    if (!advert) {
+        return has_fence
+                   ? Status::InvalidEntry(
+                         "receiver-credit session is unavailable" LOC_MARK)
+                   : Status::OK();
+    }
+    if (advert->schema_version != kReceiverCreditProtocolVersion ||
+        advert->flags != kReceiverCreditRequired ||
+        advert->receiver_session_id.empty() || advert->epoch == 0) {
+        return Status::InvalidEntry(
+            "invalid local receiver-credit advertisement" LOC_MARK);
+    }
+    if (!request.version_two ||
+        request.receiver_credit_session_high !=
+            advert->receiver_session_id.high ||
+        request.receiver_credit_session_low !=
+            advert->receiver_session_id.low ||
+        request.receiver_credit_epoch != advert->epoch) {
+        return Status::InvalidEntry(
+            "receiver-credit session fence mismatch" LOC_MARK);
+    }
+    return Status::OK();
+}
+
+}  // namespace
 
 Status ControlClient::getSegmentDesc(const std::string& server_addr,
                                      std::string& response) {
@@ -119,29 +227,83 @@ Status ControlClient::bootstrapUb(const std::string& server_addr,
     return Status::OK();
 }
 
+Status ControlClient::exchangeReceiverCredit(
+    const std::string& server_addr,
+    const ReceiverCreditExchangeRequestV1& request,
+    ReceiverCreditExchangeReplyV1& response) {
+    std::string request_raw, response_raw;
+    json encoded = request;
+    request_raw = encoded.dump();
+    CHECK_STATUS(tl_rpc_agent.call(server_addr, ExchangeReceiverCredit,
+                                   request_raw, response_raw));
+    try {
+        response =
+            json::parse(response_raw).get<ReceiverCreditExchangeReplyV1>();
+    } catch (const std::exception& error) {
+        return Status::MalformedJson(
+            std::string("Malformed receiver-credit response: ") + error.what() +
+            LOC_MARK);
+    }
+    if (response.schema_version != kReceiverCreditProtocolVersion ||
+        response.flags != 0) {
+        return Status::RpcServiceError(
+            "Unsupported receiver-credit response version" LOC_MARK);
+    }
+    if (!response.reply_msg.empty()) {
+        return Status::RpcServiceError(response.reply_msg);
+    }
+    return Status::OK();
+}
+
 Status ControlClient::sendData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
-                               size_t length) {
-    // Check before addition/allocation or reading the caller's source buffer.
+                               size_t length,
+                               uint64_t receiver_credit_session_high,
+                               uint64_t receiver_credit_session_low,
+                               uint64_t receiver_credit_epoch) {
     if (length > kTcpMaxWriteBytes)
         return Status::InvalidArgument("TCP WRITE exceeds RPC payload limit");
-    std::string response;
-    XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
-    std::string request;
+    std::string request, response;
+    const bool has_any_fence = receiver_credit_session_high != 0 ||
+                               receiver_credit_session_low != 0 ||
+                               receiver_credit_epoch != 0;
+    const bool has_complete_fence = (receiver_credit_session_high != 0 ||
+                                     receiver_credit_session_low != 0) &&
+                                    receiver_credit_epoch != 0;
+    if (has_any_fence && !has_complete_fence) {
+        return Status::InvalidArgument(
+            "partial SendData receiver-credit fence" LOC_MARK);
+    }
+    if (length > std::numeric_limits<size_t>::max() - sizeof(XferDataDesc)) {
+        return Status::InvalidArgument(
+            "SendData request size overflow" LOC_MARK);
+    }
+    size_t header_size = sizeof(LegacyXferDataDesc);
     request.reserve(sizeof(XferDataDesc) + length);
-    request.resize(sizeof(XferDataDesc));
-    memcpy(request.data(), &desc, sizeof(desc));
+    if (has_complete_fence) {
+        const XferDataDesc desc{htole64(kXferDataV2LegacyRejectAddress),
+                                htole64(static_cast<uint64_t>(length)),
+                                htole64(kXferDataProtocolMagic),
+                                htole64(peer_mem_addr),
+                                htole64(receiver_credit_session_high),
+                                htole64(receiver_credit_session_low),
+                                htole64(receiver_credit_epoch)};
+        header_size = sizeof(desc);
+        request.resize(header_size);
+        memcpy(request.data(), &desc, sizeof(desc));
+    } else {
+        const LegacyXferDataDesc desc{htole64(peer_mem_addr),
+                                      htole64(static_cast<uint64_t>(length))};
+        request.resize(header_size);
+        memcpy(request.data(), &desc, sizeof(desc));
+    }
     auto& loader = Platform::getLoader();
     if (loader.getMemoryType(local_mem_addr) == MTYPE_CPU) {
-        // Single copy into the RPC attachment; avoids the resize() zero-fill
-        // and the extra copy in call().
         request.append(reinterpret_cast<const char*>(local_mem_addr), length);
     } else {
-        // resize() zero-fills the payload, so an unchecked copy failure would
-        // ship zeros that the peer stores successfully and reports COMPLETED.
-        request.resize(sizeof(XferDataDesc) + length);
+        request.resize(header_size + length);
         CHECK_STATUS(
-            loader.copy(request.data() + sizeof(desc), local_mem_addr, length));
+            loader.copy(request.data() + header_size, local_mem_addr, length));
     }
     auto status = tl_rpc_agent.callOwned(server_addr, SendData,
                                          std::move(request), response);
@@ -152,19 +314,70 @@ Status ControlClient::sendData(const std::string& server_addr,
 
 Status ControlClient::recvData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
-                               size_t length) {
+                               size_t length,
+                               uint64_t receiver_credit_session_high,
+                               uint64_t receiver_credit_session_low,
+                               uint64_t receiver_credit_epoch) {
     if (length > kTcpMaxReadBytes)
         return Status::InvalidArgument("TCP READ exceeds RPC payload limit");
     std::string request, response;
-    XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
-    request.resize(sizeof(XferDataDesc));
-    memcpy(&request[0], &desc, sizeof(desc));
+    const bool has_any_fence = receiver_credit_session_high != 0 ||
+                               receiver_credit_session_low != 0 ||
+                               receiver_credit_epoch != 0;
+    const bool has_complete_fence = (receiver_credit_session_high != 0 ||
+                                     receiver_credit_session_low != 0) &&
+                                    receiver_credit_epoch != 0;
+    if (has_any_fence && !has_complete_fence) {
+        return Status::InvalidArgument(
+            "partial RecvData receiver-credit fence" LOC_MARK);
+    }
+    if (has_complete_fence) {
+        const XferDataDesc desc{htole64(kXferDataV2LegacyRejectAddress),
+                                htole64(static_cast<uint64_t>(length)),
+                                htole64(kXferDataProtocolMagic),
+                                htole64(peer_mem_addr),
+                                htole64(receiver_credit_session_high),
+                                htole64(receiver_credit_session_low),
+                                htole64(receiver_credit_epoch)};
+        request.resize(sizeof(desc));
+        memcpy(request.data(), &desc, sizeof(desc));
+    } else {
+        const LegacyXferDataDesc desc{htole64(peer_mem_addr),
+                                      htole64(static_cast<uint64_t>(length))};
+        request.resize(sizeof(desc));
+        memcpy(request.data(), &desc, sizeof(desc));
+    }
     auto status = tl_rpc_agent.call(server_addr, RecvData, request, response);
     if (!status.ok()) return status;
-    if (response.size() != length)
+    // A short reply is an error, not payload: surface the server's message so
+    // callers keep the rejection reason (e.g. "permission denied") instead of
+    // a generic string, matching the pre-v2 client behavior. An empty or
+    // unpadded reply still gets a descriptive fallback.
+    if (!has_complete_fence) {
+        if (response.size() != length) {
+            return Status::RpcServiceError(
+                response.empty()
+                    ? "RecvData failed: invalid or rejected legacy response"
+                    : response);
+        }
+        return Platform::getLoader().copy(local_mem_addr, response.data(),
+                                          length);
+    }
+    if (length >
+            std::numeric_limits<size_t>::max() - sizeof(XferDataReplyHeader) ||
+        response.size() != sizeof(XferDataReplyHeader) + length) {
         return Status::RpcServiceError(
-            response.empty() ? "RecvData failed: empty response" : response);
-    return Platform::getLoader().copy(local_mem_addr, response.data(), length);
+            response.empty() ? "RecvData failed: invalid or rejected response"
+                             : response);
+    }
+    XferDataReplyHeader header;
+    memcpy(&header, response.data(), sizeof(header));
+    if (le64toh(header.protocol_magic) != kXferDataProtocolMagic) {
+        return Status::RpcServiceError(
+            "RecvData failed: unsupported response version");
+    }
+    return Platform::getLoader().copy(
+        local_mem_addr, response.data() + sizeof(XferDataReplyHeader), length);
 }
 
 inline void to_json(nlohmann::json& j, const Notification& n) {
@@ -196,11 +409,26 @@ Status ControlClient::probe(const std::string& server_addr) {
 }
 
 inline void to_json(json& j, const Request& r) {
-    j = json{{"opcode", r.opcode == Request::READ ? "READ" : "WRITE"},
-             {"source", reinterpret_cast<uintptr_t>(r.source)},
-             {"target_id", r.target_id},
-             {"target_offset", r.target_offset},
-             {"length", r.length}};
+    const bool has_complete_fence = (r.receiver_credit_session_high != 0 ||
+                                     r.receiver_credit_session_low != 0) &&
+                                    r.receiver_credit_epoch != 0;
+    j = json{
+        {"opcode", r.opcode == Request::READ ? "READ" : "WRITE"},
+        {"source", reinterpret_cast<uintptr_t>(r.source)},
+        {"target_id", has_complete_fence ? std::numeric_limits<SegmentID>::max()
+                                         : r.target_id},
+        {"target_offset", has_complete_fence
+                              ? std::numeric_limits<uint64_t>::max()
+                              : r.target_offset},
+        {"length", r.length},
+        {"receiver_credit_session_high", r.receiver_credit_session_high},
+        {"receiver_credit_session_low", r.receiver_credit_session_low},
+        {"receiver_credit_epoch", r.receiver_credit_epoch}};
+    if (has_complete_fence) {
+        j["delegate_protocol_magic"] = kDelegatedCreditProtocolMagic;
+        j["actual_target_id"] = r.target_id;
+        j["actual_target_offset"] = r.target_offset;
+    }
 }
 
 inline void from_json(const json& j, Request& r) {
@@ -213,13 +441,35 @@ inline void from_json(const json& j, Request& r) {
         throw std::runtime_error("Invalid opcode");
 
     r.source = reinterpret_cast<void*>(j.at("source").get<uintptr_t>());
-    r.target_id = j.at("target_id").get<int>();
-    r.target_offset = j.at("target_offset").get<uint64_t>();
+    const bool fenced_delegate =
+        j.value("delegate_protocol_magic", uint64_t{0}) ==
+        kDelegatedCreditProtocolMagic;
+    r.target_id = fenced_delegate ? j.at("actual_target_id").get<SegmentID>()
+                                  : j.at("target_id").get<SegmentID>();
+    r.target_offset = fenced_delegate
+                          ? j.at("actual_target_offset").get<uint64_t>()
+                          : j.at("target_offset").get<uint64_t>();
     r.length = j.at("length").get<size_t>();
+    r.receiver_credit_session_high =
+        j.value("receiver_credit_session_high", uint64_t{0});
+    r.receiver_credit_session_low =
+        j.value("receiver_credit_session_low", uint64_t{0});
+    r.receiver_credit_epoch = j.value("receiver_credit_epoch", uint64_t{0});
 }
 
 Status ControlClient::delegate(const std::string& server_addr,
                                const Request& request) {
+    const bool has_any_fence = request.receiver_credit_session_high != 0 ||
+                               request.receiver_credit_session_low != 0 ||
+                               request.receiver_credit_epoch != 0;
+    const bool has_complete_fence =
+        (request.receiver_credit_session_high != 0 ||
+         request.receiver_credit_session_low != 0) &&
+        request.receiver_credit_epoch != 0;
+    if (has_any_fence && !has_complete_fence) {
+        return Status::InvalidArgument(
+            "partial delegated receiver-credit fence" LOC_MARK);
+    }
     std::string request_raw, response_raw;
     json j = request;
     request_raw = j.dump();
@@ -322,6 +572,11 @@ ControlService::ControlService(const std::string& type,
             onBootstrapUb(request, response);
         });
     rpc_server_->registerFunction(
+        ExchangeReceiverCredit,
+        [this](const std::string_view& request, std::string& response) {
+            onExchangeReceiverCredit(request, response);
+        });
+    rpc_server_->registerFunction(
         SendData,
         [this](const std::string_view& request, std::string& response) {
             onSendData(request, response);
@@ -375,6 +630,10 @@ ControlService::~ControlService() {
     {
         std::lock_guard<std::mutex> lock(ub_bootstrap_callback_mutex_);
         ub_bootstrap_callback_ = {};
+    }
+    {
+        std::lock_guard<std::mutex> lock(receiver_credit_callback_mutex_);
+        receiver_credit_callback_ = {};
     }
     rpc_server_.reset();
 }
@@ -519,37 +778,62 @@ void ControlService::onBootstrapUb(const std::string_view& request,
     response = j.dump();
 }
 
+void ControlService::onExchangeReceiverCredit(const std::string_view& request,
+                                              std::string& response) {
+    ReceiverCreditExchangeReplyV1 reply;
+    try {
+        auto parsed = json::parse(std::string(request))
+                          .get<ReceiverCreditExchangeRequestV1>();
+        Status status = Status::InvalidEntry(
+            "receiver credit callback is not registered" LOC_MARK);
+        {
+            // Serialize callback replacement with invocation so teardown
+            // cannot destroy the authority while an exchange is in flight.
+            std::lock_guard<std::mutex> lock(receiver_credit_callback_mutex_);
+            if (receiver_credit_callback_) {
+                status = receiver_credit_callback_(parsed, reply);
+            }
+        }
+        if (!status.ok()) reply.reply_msg = status.ToString();
+    } catch (const std::exception& error) {
+        reply.reply_msg =
+            std::string("Malformed receiver-credit request: ") + error.what();
+    }
+    json encoded = reply;
+    response = encoded.dump();
+}
+
 void ControlService::onSendData(const std::string_view& request,
                                 std::string& response) {
-    if (request.size() < sizeof(XferDataDesc)) {
-        response = "SendData failed: request too short";
+    ParsedXferData parsed;
+    auto status = parseXferData(request, true, parsed);
+    if (!status.ok()) {
+        response = "SendData failed: " + status.ToString();
         return;
     }
-    XferDataDesc* desc = (XferDataDesc*)request.data();
     auto local_desc = manager_->getLocal();
-    auto peer_mem_addr = le64toh(desc->peer_mem_addr);
-    auto length = le64toh(desc->length);
+    status = validateXferReceiverCreditFence(local_desc, parsed);
+    if (!status.ok()) {
+        response = "SendData failed: " + status.ToString();
+        return;
+    }
 
-    // Validate request size to prevent buffer over-read
-    if (length > kTcpMaxWriteBytes ||
-        length > request.size() - sizeof(XferDataDesc)) {
+    if (parsed.length > kTcpMaxWriteBytes) {
         response = "SendData failed: invalid request size";
         return;
     }
-
-    if (auto* buffer = local_desc->findBuffer(peer_mem_addr, length)) {
+    if (auto* buffer =
+            local_desc->findBuffer(parsed.peer_mem_addr, parsed.length)) {
         if (buffer->permission != kGlobalReadWrite) {
             response = "SendData failed: remote write permission denied";
             return;
         }
-        auto status =
-            Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
-        if (!status.ok()) {
-            // A non-empty response is interpreted as an RPC error by the
-            // client (see ControlClient::sendData). Without this the sender's
-            // transfer would be reported COMPLETED even though the destination
-            // buffer was never written.
-            response = "SendData failed: copy: " + status.ToString();
+        auto copy_status = Platform::getLoader().copy(
+            reinterpret_cast<void*>(parsed.peer_mem_addr),
+            const_cast<char*>(request.data() + parsed.header_size),
+            parsed.length);
+        if (!copy_status.ok()) {
+            response = "SendData failed: copy: " + copy_status.ToString();
         }
     } else {
         response = "SendData failed: target address not in registered buffer";
@@ -558,46 +842,59 @@ void ControlService::onSendData(const std::string_view& request,
 
 void ControlService::onRecvData(const std::string_view& request,
                                 std::string& response) {
-    if (request.size() < sizeof(XferDataDesc)) {
-        response = "RecvData failed: request too short";
+    ParsedXferData parsed;
+    auto status = parseXferData(request, false, parsed);
+    // Legacy readers accept any response of exactly the requested length.
+    // Fenced readers also require the reply magic; pad errors to keep both
+    // response formats unambiguous, including parse and session failures.
+    const size_t reply_header_size =
+        parsed.version_two ? sizeof(XferDataReplyHeader) : 0;
+    auto fail = [&response, &parsed, reply_header_size](std::string message) {
+        response = std::move(message);
+        if (parsed.length <=
+                std::numeric_limits<size_t>::max() - reply_header_size &&
+            response.size() == reply_header_size + parsed.length) {
+            response.push_back(' ');
+        }
+    };
+    if (!status.ok()) {
+        fail("RecvData failed: " + status.ToString());
         return;
     }
-    XferDataDesc* desc = (XferDataDesc*)request.data();
     auto local_desc = manager_->getLocal();
-    auto peer_mem_addr = le64toh(desc->peer_mem_addr);
-    auto length = le64toh(desc->length);
-
-    // The client accepts any response of exactly `length` bytes as payload (see
-    // ControlClient::recvData), so an error of that size must be padded or it
-    // would be copied into the caller's buffer and reported as success.
-    auto fail = [&response, length](std::string message) {
-        response = std::move(message);
-        if (response.size() == length) response.push_back(' ');
-    };
-
-    // Validate length to prevent DoS via excessive memory allocation
-    if (length > kTcpMaxReadBytes) {
+    status = validateXferReceiverCreditFence(local_desc, parsed);
+    if (!status.ok()) {
+        fail("RecvData failed: " + status.ToString());
+        return;
+    }
+    if (parsed.length > kTcpMaxReadBytes) {
         fail("RecvData failed: length exceeds maximum allowed");
         return;
     }
-
-    if (auto* buffer = local_desc->findBuffer(peer_mem_addr, length)) {
+    if (auto* buffer =
+            local_desc->findBuffer(parsed.peer_mem_addr, parsed.length)) {
         if (buffer->permission != kGlobalReadOnly &&
             buffer->permission != kGlobalReadWrite) {
             fail("RecvData failed: remote read permission denied");
             return;
         }
         auto& loader = Platform::getLoader();
-        if (loader.getMemoryType((void*)peer_mem_addr) == MTYPE_CPU) {
-            // assign() skips the resize() zero-fill pass.
-            response.assign(reinterpret_cast<const char*>(peer_mem_addr),
-                            length);
+        auto* source = reinterpret_cast<void*>(parsed.peer_mem_addr);
+        response.clear();
+        if (parsed.version_two) {
+            const XferDataReplyHeader reply{htole64(kXferDataProtocolMagic)};
+            response.assign(reinterpret_cast<const char*>(&reply),
+                            sizeof(reply));
+        }
+        if (loader.getMemoryType(source) == MTYPE_CPU) {
+            response.append(reinterpret_cast<const char*>(source),
+                            parsed.length);
         } else {
-            response.resize(length);
-            auto status =
-                loader.copy(response.data(), (void*)peer_mem_addr, length);
-            if (!status.ok()) {
-                fail("RecvData failed: copy: " + status.ToString());
+            response.resize(reply_header_size + parsed.length);
+            auto copy_status = loader.copy(response.data() + reply_header_size,
+                                           source, parsed.length);
+            if (!copy_status.ok()) {
+                fail("RecvData failed: copy: " + copy_status.ToString());
             }
         }
     } else {

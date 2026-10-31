@@ -12,6 +12,7 @@
 #include <new>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -36,6 +37,8 @@
 namespace mooncake::tent {
 namespace {
 
+constexpr std::string_view kReceiverCreditCapability = "receiver_credit_v1";
+
 bool filterAllows(const std::vector<std::string>& filter,
                   const ub::DeviceInfo& device) {
     if (filter.empty()) return true;
@@ -43,6 +46,43 @@ bool filterAllows(const std::vector<std::string>& filter,
                filter.end() ||
            std::find(filter.begin(), filter.end(), device.native_device_name) !=
                filter.end();
+}
+
+bool receiverCreditRequired(const SegmentDesc* segment) {
+    if (!segment || segment->type != SegmentType::Memory) return false;
+    const auto& advert = segment->getMemory().receiver_credit;
+    return advert && advert->schema_version == kReceiverCreditProtocolVersion &&
+           advert->flags == kReceiverCreditRequired &&
+           !advert->receiver_session_id.empty() && advert->epoch != 0;
+}
+
+const ReceiverCreditAdvertV1* receiverCreditAdvert(const SegmentDesc* segment) {
+    if (!receiverCreditRequired(segment)) return nullptr;
+    return &*segment->getMemory().receiver_credit;
+}
+
+void bindReceiverCreditIdentity(const SegmentDesc* segment,
+                                UbBootstrapDesc& bootstrap) {
+    const auto* advert = receiverCreditAdvert(segment);
+    if (!advert) return;
+    bootstrap.receiver_credit_session_high = advert->receiver_session_id.high;
+    bootstrap.receiver_credit_session_low = advert->receiver_session_id.low;
+    bootstrap.receiver_credit_epoch = advert->epoch;
+}
+
+bool matchesReceiverCredit(const UbBootstrapDesc& bootstrap,
+                           const ReceiverCreditAdvertV1& advert) {
+    return bootstrap.receiver_credit_session_high ==
+               advert.receiver_session_id.high &&
+           bootstrap.receiver_credit_session_low ==
+               advert.receiver_session_id.low &&
+           bootstrap.receiver_credit_epoch == advert.epoch;
+}
+
+bool supportsReceiverCredit(const UbBootstrapDesc& bootstrap) {
+    return std::find(bootstrap.capabilities.begin(),
+                     bootstrap.capabilities.end(),
+                     kReceiverCreditCapability) != bootstrap.capabilities.end();
 }
 
 uint64_t generationSeed() {
@@ -510,7 +550,22 @@ struct UbTransport::Impl {
                               request.remote_topology_id, peer_path};
         CHECK_STATUS(
             endpoints->getOrCreate(key, request.local_context, endpoint));
+        const auto* credit_advert =
+            receiverCreditAdvert(request.remote_segment);
+        const bool credit_required = credit_advert != nullptr;
         if (endpoint->ready()) {
+            if (credit_required &&
+                (!endpoint->peerSupportsCapability(kReceiverCreditCapability) ||
+                 !endpoint->peerMatchesReceiverCredit(
+                     credit_advert->receiver_session_id.high,
+                     credit_advert->receiver_session_id.low,
+                     credit_advert->epoch))) {
+                (void)endpoints->retire(endpoint);
+                endpoint.reset();
+                return Status::InvalidArgument(
+                    "Remote UB endpoint lacks required receiver-credit "
+                    "support" LOC_MARK);
+            }
             recordReadyEndpoint(endpoint);
             return Status::OK();
         }
@@ -527,9 +582,20 @@ struct UbTransport::Impl {
             endpoint.reset();
             return status;
         }
+        auto local_segment =
+            metadata ? metadata->segmentManager().getLocal() : SegmentDescRef{};
+        bindReceiverCreditIdentity(local_segment.get(), bootstrap);
         UbBootstrapDesc response;
         status = ControlClient::bootstrapUb(
             request.remote_segment->rpc_server_addr, bootstrap, response);
+        if (status.ok() && credit_required) {
+            if (!supportsReceiverCredit(response) ||
+                !matchesReceiverCredit(response, *credit_advert)) {
+                status = Status::InvalidArgument(
+                    "Remote UB bootstrap receiver-credit identity "
+                    "mismatch" LOC_MARK);
+            }
+        }
         if (status.ok()) status = endpoint->bind(response);
         if (!status.ok()) {
             (void)endpoints->retire(endpoint);
@@ -543,6 +609,14 @@ struct UbTransport::Impl {
     int onBootstrap(const UbBootstrapDesc& request, UbBootstrapDesc& response) {
         if (shutting_down.load(std::memory_order_acquire) || !endpoints) {
             response.reply_msg = "UB transport is shutting down";
+            return -1;
+        }
+        auto local_segment =
+            metadata ? metadata->segmentManager().getLocal() : SegmentDescRef{};
+        if (receiverCreditRequired(local_segment.get()) &&
+            !supportsReceiverCredit(request)) {
+            response.reply_msg =
+                "UB bootstrap peer lacks required receiver-credit support";
             return -1;
         }
         const std::string local_name =
@@ -571,6 +645,7 @@ struct UbTransport::Impl {
                 request.local_nic_path, currentSegmentGeneration(), response);
         }
         if (status.ok()) {
+            bindReceiverCreditIdentity(local_segment.get(), response);
             recordReadyEndpoint(endpoint);
         }
         if (!status.ok()) {
@@ -705,6 +780,7 @@ Status UbTransport::submitTransferTasks(
 
     const auto notify_progress = ub_batch->notify_progress;
     const auto progress_batch_id = ub_batch->progress_batch_id;
+    auto progress_armed = std::make_shared<std::atomic<bool>>(false);
     std::vector<ub::UbTask::Ptr> new_tasks;
     new_tasks.reserve(request_list.size());
     for (const auto& request : request_list) {
@@ -717,9 +793,12 @@ Status UbTransport::submitTransferTasks(
                 "transports/ub/max_slices_per_task" LOC_MARK);
         }
         auto task = ub::UbTask::create(
-            request,
-            [notify_progress, progress_batch_id](const TransferStatus&) {
-                if (notify_progress) notify_progress(progress_batch_id);
+            request, [notify_progress, progress_batch_id,
+                      progress_armed](const TransferStatus&) {
+                if (progress_armed->load(std::memory_order_acquire) &&
+                    notify_progress) {
+                    notify_progress(progress_batch_id);
+                }
             });
         size_t offset = 0;
         while (offset < request.length) {
@@ -731,6 +810,11 @@ Status UbTransport::submitTransferTasks(
             spec.length = length;
             spec.request_offset = offset;
             spec.max_retries = impl_->params.max_retries;
+            spec.receiver_credit_session_high =
+                ub_batch->receiver_credit_session_high;
+            spec.receiver_credit_session_low =
+                ub_batch->receiver_credit_session_low;
+            spec.receiver_credit_epoch = ub_batch->receiver_credit_epoch;
             if (!task->addSlice(spec)) {
                 return Status::InternalError(
                     "Unable to construct UB slice" LOC_MARK);
@@ -741,15 +825,15 @@ Status UbTransport::submitTransferTasks(
         new_tasks.push_back(std::move(task));
     }
 
-    for (auto& task : new_tasks) {
-        ub_batch->task_list.push_back(task);
-        auto status = impl_->workers->submit(task, ub_batch->device_mask);
-        if (!status.ok()) {
-            for (auto& queued : new_tasks) {
-                if (queued) queued->requestCancellation();
-            }
-            return status;
-        }
+    CHECK_STATUS(impl_->workers->submitBatch(new_tasks, ub_batch->device_mask));
+    ub_batch->task_list.insert(ub_batch->task_list.end(), new_tasks.begin(),
+                               new_tasks.end());
+    progress_armed->store(true, std::memory_order_release);
+    // A very small task can finish between worker publication and the batch
+    // append above. Its callback intentionally stays disarmed until the task
+    // is queryable; this notification closes that race.
+    if (!new_tasks.empty() && notify_progress) {
+        notify_progress(progress_batch_id);
     }
     return Status::OK();
 }

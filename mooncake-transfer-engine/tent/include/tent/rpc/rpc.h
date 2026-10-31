@@ -49,6 +49,7 @@ enum RpcFuncID {
     NotifySegmentUpdated,
     // Appended to preserve the numeric values of the existing RPCs.
     BootstrapUb,
+    ExchangeReceiverCredit,
 };
 
 class ClientPool;

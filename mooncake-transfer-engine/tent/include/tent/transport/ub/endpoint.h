@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "tent/common/status.h"
@@ -116,6 +117,11 @@ class UbEndpoint final : public std::enable_shared_from_this<UbEndpoint> {
     [[nodiscard]] uint64_t peerGeneration() const noexcept {
         return peer_generation_.load(std::memory_order_acquire);
     }
+    [[nodiscard]] bool peerSupportsCapability(
+        std::string_view capability) const;
+    [[nodiscard]] bool peerMatchesReceiverCredit(uint64_t session_high,
+                                                 uint64_t session_low,
+                                                 uint64_t epoch) const;
     [[nodiscard]] uint64_t outstandingWrs() const noexcept {
         return outstanding_wrs_.load(std::memory_order_relaxed);
     }

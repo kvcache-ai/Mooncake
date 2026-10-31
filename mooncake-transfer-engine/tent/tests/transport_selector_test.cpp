@@ -411,6 +411,9 @@ TEST(ControlPlaneTest, UbBootstrapJsonRoundTripsNativeIdentity) {
     source.jetty_uasids = {21, 22};
     source.endpoint_generation = 41;
     source.segment_generation = 42;
+    source.receiver_credit_session_high = 43;
+    source.receiver_credit_session_low = 44;
+    source.receiver_credit_epoch = 45;
     source.capabilities = {"read", "write"};
     source.reply_msg = "ok";
 
@@ -427,6 +430,11 @@ TEST(ControlPlaneTest, UbBootstrapJsonRoundTripsNativeIdentity) {
     EXPECT_EQ(parsed.jetty_uasids, source.jetty_uasids);
     EXPECT_EQ(parsed.endpoint_generation, source.endpoint_generation);
     EXPECT_EQ(parsed.segment_generation, source.segment_generation);
+    EXPECT_EQ(parsed.receiver_credit_session_high,
+              source.receiver_credit_session_high);
+    EXPECT_EQ(parsed.receiver_credit_session_low,
+              source.receiver_credit_session_low);
+    EXPECT_EQ(parsed.receiver_credit_epoch, source.receiver_credit_epoch);
     EXPECT_EQ(parsed.capabilities, source.capabilities);
     EXPECT_EQ(parsed.reply_msg, source.reply_msg);
 }
@@ -445,6 +453,9 @@ TEST(ControlPlaneTest, UbBootstrapJsonDefaultsOptionalFields) {
     EXPECT_TRUE(parsed.jetty_uasids.empty());
     EXPECT_EQ(parsed.endpoint_generation, 0u);
     EXPECT_EQ(parsed.segment_generation, 0u);
+    EXPECT_EQ(parsed.receiver_credit_session_high, 0u);
+    EXPECT_EQ(parsed.receiver_credit_session_low, 0u);
+    EXPECT_EQ(parsed.receiver_credit_epoch, 0u);
     EXPECT_TRUE(parsed.capabilities.empty());
     EXPECT_TRUE(parsed.reply_msg.empty());
 }
@@ -470,6 +481,7 @@ TEST(ControlPlaneTest, UbBootstrapRpcIdIsAppendedWithoutRenumbering) {
     EXPECT_EQ(static_cast<int>(SubscribeSegmentUpdate), 10);
     EXPECT_EQ(static_cast<int>(NotifySegmentUpdated), 11);
     EXPECT_EQ(static_cast<int>(BootstrapUb), 12);
+    EXPECT_EQ(static_cast<int>(ExchangeReceiverCredit), 13);
 }
 
 // ---------------------------------------------------------------------------

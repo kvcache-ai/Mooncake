@@ -555,9 +555,9 @@ gpu_id + thread_id
 **Transport (TENT only)**
 
 * `--xport_type` : selects the benchmark transport, such as `tcp`, `hp_tcp`,
-  `rdma`, `shm`, or `nvlink`, and disables the other selectable transports.
-  MLU VRAM runs also enable the local-copy transport needed for host staging.
-  Empty means no transport
+  `rdma`, `shm`, `nvlink`, `ub`, or `sunrise_link`, and disables the other
+  selectable transports. MLU VRAM runs also enable the local-copy transport
+  needed for host staging. Empty means no transport
   is explicitly enabled or disabled by tebench — the engine reads the
   transport enable list from the `MC_TENT_CONF` config file (see Section
   5.8 for multi-transport scenarios).

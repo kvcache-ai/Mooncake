@@ -264,6 +264,86 @@ Status WaitForTransportResult(HighPerformanceTcpTransport& transport,
     return Status::InternalError("HP TCP test transfer did not finish");
 }
 
+TEST(HighPerformanceTcpTransportTest, ReceiverCreditFenceTracksPinnedMetadata) {
+    auto metadata = MakeLocalMetadata();
+    HighPerformanceTcpTransport transport(MakeParams());
+    std::string name = "hp_transport_test";
+    ASSERT_TRUE(transport.install(name, metadata, nullptr, nullptr).ok());
+    std::array<uint8_t, 64> source{};
+    std::array<uint8_t, 64> target{};
+    source.fill(0x5a);
+    BufferDesc source_desc{};
+    source_desc.addr = reinterpret_cast<uint64_t>(source.data());
+    source_desc.length = source.size();
+    source_desc.location = "cpu:0";
+    BufferDesc target_desc{};
+    target_desc.addr = reinterpret_cast<uint64_t>(target.data());
+    target_desc.length = target.size();
+    target_desc.location = "cpu:0";
+    MemoryOptions options;
+    options.type = HP_TCP;
+    options.perm = kGlobalReadWrite;
+    ASSERT_TRUE(transport.addMemoryBuffer(source_desc, options).ok());
+    ASSERT_TRUE(transport.addMemoryBuffer(target_desc, options).ok());
+    ASSERT_TRUE(PublishBuffers(metadata, {source_desc, target_desc}).ok());
+
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = target_desc.addr;
+    request.length = source.size();
+    ReceiverCreditAdvertV1 advert;
+    advert.receiver_session_id = {1, 2};
+    advert.epoch = 7;
+    // No advert, wrong session, wrong epoch, and unsupported protocol must
+    // reject before worker handoff; a matching pinned advert must still work.
+    for (int scenario = 0; scenario < 6; ++scenario) {
+        SCOPED_TRACE(scenario);
+        auto current = advert;
+        if (scenario == 1) ++current.receiver_session_id.low;
+        if (scenario == 2) ++current.epoch;
+        if (scenario == 3) ++current.schema_version;
+        if (scenario == 4) current.flags = 0;
+        ASSERT_TRUE(metadata->segmentManager()
+                        .updateLocal([&](SegmentDesc& segment) -> Status {
+                            auto& published =
+                                std::get<MemorySegmentDesc>(segment.detail)
+                                    .receiver_credit;
+                            if (scenario == 0)
+                                published.reset();
+                            else
+                                published = current;
+                            return Status::OK();
+                        })
+                        .ok());
+        Transport::SubBatchRef batch = nullptr;
+        ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+        batch->receiver_credit_session_high = advert.receiver_session_id.high;
+        batch->receiver_credit_session_low = advert.receiver_session_id.low;
+        batch->receiver_credit_epoch = advert.epoch;
+        const Status submitted =
+            transport.submitTransferTasks(batch, {request});
+        if (scenario < 5) {
+            EXPECT_TRUE(submitted.IsInvalidEntry()) << submitted.ToString();
+            EXPECT_EQ(batch->size(), 0u);
+            EXPECT_TRUE(std::all_of(target.begin(), target.end(),
+                                    [](uint8_t byte) { return byte == 0; }));
+        } else {
+            ASSERT_TRUE(submitted.ok()) << submitted.ToString();
+            TransferStatus status{};
+            ASSERT_TRUE(WaitForTransportResult(transport, batch, status).ok());
+            EXPECT_EQ(status.s, COMPLETED);
+            EXPECT_EQ(source, target);
+        }
+        EXPECT_TRUE(transport.freeSubBatch(batch).ok());
+    }
+    EXPECT_TRUE(transport.quiesce().ok());
+    EXPECT_TRUE(transport.removeMemoryBuffer(source_desc).ok());
+    EXPECT_TRUE(transport.removeMemoryBuffer(target_desc).ok());
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
 // Test-only relay: observe the wire request and forward it to the real server.
 // Pumped by the test thread; no transport worker waits for another callback.
 class RailRelay {

@@ -34,7 +34,11 @@ bool samePeer(const UbBootstrapDesc& lhs, const UbBootstrapDesc& rhs) {
     return lhs.protocol_version == rhs.protocol_version &&
            lhs.local_eid == rhs.local_eid && lhs.jetty_ids == rhs.jetty_ids &&
            lhs.jetty_uasids == rhs.jetty_uasids &&
-           lhs.endpoint_generation == rhs.endpoint_generation;
+           lhs.endpoint_generation == rhs.endpoint_generation &&
+           lhs.receiver_credit_session_high ==
+               rhs.receiver_credit_session_high &&
+           lhs.receiver_credit_session_low == rhs.receiver_credit_session_low &&
+           lhs.receiver_credit_epoch == rhs.receiver_credit_epoch;
 }
 
 }  // namespace
@@ -340,8 +344,24 @@ Status UbEndpoint::makeBootstrapDesc(const std::string& segment_name,
     }
     output.endpoint_generation = generation_;
     output.segment_generation = segment_generation;
-    output.capabilities = {"read", "write", "endpoint_generation"};
+    output.capabilities = {"read", "write", "endpoint_generation",
+                           "receiver_credit_v1"};
     return Status::OK();
+}
+
+bool UbEndpoint::peerSupportsCapability(std::string_view capability) const {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    return std::find(peer_.capabilities.begin(), peer_.capabilities.end(),
+                     capability) != peer_.capabilities.end();
+}
+
+bool UbEndpoint::peerMatchesReceiverCredit(uint64_t session_high,
+                                           uint64_t session_low,
+                                           uint64_t epoch) const {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    return peer_.receiver_credit_session_high == session_high &&
+           peer_.receiver_credit_session_low == session_low &&
+           peer_.receiver_credit_epoch == epoch;
 }
 
 bool UbEndpoint::tryAcquireOutstanding(uint64_t bytes) noexcept {
