@@ -44,6 +44,15 @@ class PopulateLifetimeTests(unittest.TestCase):
     def test_unsupported_client_fails_before_registration(self):
         self.assertEqual(native.unsupported_client_result(), (-1, 0, True))
 
+    def test_native_owner_is_released_outside_layer_lock(self):
+        for mode, rc in (
+            ("success", 0),
+            ("mixed_conflict", -1),
+            ("competing_success", -1),
+        ):
+            with self.subTest(mode=mode):
+                self.assertEqual(native.populate_with_reentrant_owner(mode), (rc, 2))
+
     def test_preflight_failure_does_not_retain_owner(self):
         client, table = self.make_store("preflight")
         refs = self.populate_temporaries(table)

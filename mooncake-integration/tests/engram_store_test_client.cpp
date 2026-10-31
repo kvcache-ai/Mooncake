@@ -11,6 +11,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -262,6 +263,29 @@ std::tuple<int, int, bool> unsupported_client_result() {
     return {rc, client->registrations, weak.expired()};
 }
 
+std::tuple<int, int> populate_with_reentrant_owner(const std::string& mode) {
+    auto client = std::make_shared<FaultClient>(mode);
+    mooncake::engram::EngramStoreConfig config;
+    config.table_vocab_sizes = {4, 4};
+    config.row_bytes = 8;
+    mooncake::engram::EngramStore store({{1, config}}, client);
+    int removed = -1;
+    auto owner = std::shared_ptr<std::vector<uint8_t>>(
+        new std::vector<uint8_t>(64), [&](std::vector<uint8_t>* data) {
+            std::unique_ptr<std::vector<uint8_t>> cleanup(data);
+            try {
+                removed = store.remove_from_store(1, true);
+            } catch (const std::system_error&) {
+                // Report recursive locking without throwing from the deleter.
+            }
+        });
+    const std::vector<void*> buffers{owner->data(), owner->data() + 32};
+    const std::vector<size_t> sizes{32, 32};
+    // Transfer the last reference so populate itself runs the deleter.
+    const int rc = store.populate(1, buffers, sizes, {}, std::move(owner));
+    return {rc, removed};
+}
+
 std::tuple<int, int, int, bool> verify_real_create_only(
     const std::string& master, const std::string& metadata) {
     auto client = mooncake::RealClient::create();
@@ -302,6 +326,7 @@ std::tuple<int, int, int, bool> verify_real_create_only(
 }  // namespace
 
 PYBIND11_MODULE(engram_store_test_client, m) {
+    m.def("populate_with_reentrant_owner", &populate_with_reentrant_owner);
     m.def("unsupported_client_result", &unsupported_client_result);
     m.attr("OBJECT_ALREADY_EXISTS") =
         static_cast<int>(mooncake::ErrorCode::OBJECT_ALREADY_EXISTS);

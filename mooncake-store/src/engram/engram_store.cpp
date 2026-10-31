@@ -412,6 +412,8 @@ int EngramStore::populate(int layer_id,
         }
     }
 
+    // Safe exits must unlock before releasing owners whose deleters may
+    // reenter.
     PopulateOwnerGuard owner_guard(std::move(owner));
     size_t registered_count = 0;
     auto cleanup_registered_buffers = [&]() {
@@ -475,6 +477,7 @@ int EngramStore::populate(int layer_id,
             // Strict creation conflicts never start a source transfer. Success
             // entries completed all required transfers (flexible mode is
             // rejected).
+            lock.unlock();
             owner_guard.release_safe = true;
             return -1;
         }
@@ -499,6 +502,7 @@ int EngramStore::populate(int layer_id,
                       "keep them alive until process exit";
         return -2;
     }
+    lock.unlock();
     owner_guard.release_safe = true;
     return 0;
 }
