@@ -151,6 +151,82 @@ mooncake_master \
 
 Each instance must specify its own reachable `--rpc_address`. `--etcd_endpoints` is still accepted as a backward-compatible alias for the etcd HA backend connection string when `--ha_backend_connstring` is empty. The etcd cluster used for HA can be shared with or separate from the Transfer Engine's metadata etcd.
 
+**etcd TLS support:**
+
+When the HA etcd cluster requires TLS client authentication, enable TLS and provide certificate paths with the following flags:
+
+```bash
+mooncake_master \
+  --enable_ha=true \
+  --etcd_endpoints="https://10.0.0.1:2379;https://10.0.0.2:2379;https://10.0.0.3:2379" \
+  --etcd_tls_enabled=true \
+  --etcd_ca_file=/etc/etcd/ca.pem \
+  --etcd_cert_file=/etc/etcd/client.pem \
+  --etcd_key_file=/etc/etcd/client-key.pem \
+  --rpc_address=10.0.0.1
+```
+
+- `--etcd_tls_enabled`: Enable TLS authentication for etcd connections. When `true`, all three certificate paths below must be provided.
+- `--etcd_ca_file`: Path to the CA certificate file (required when `etcd_tls_enabled=true`).
+- `--etcd_cert_file`: Path to the client certificate file (required when `etcd_tls_enabled=true`).
+- `--etcd_key_file`: Path to the client private key file (required when `etcd_tls_enabled=true`).
+
+These flags may also be specified via the master's configuration file (see `etcd_tls_enabled` / `etcd_ca_file` / `etcd_cert_file` / `etcd_key_file` keys). When `etcd_tls_enabled=false` (the default), the connection falls back to plain-text (non-TLS), preserving backward compatibility. TLS configuration takes effect before the first etcd connection is established.
+
+**`mooncake_client` TLS support:**
+
+When running a `mooncake_client` in HA mode with TLS-protected etcd, enable TLS and supply the same certificate flags:
+
+```bash
+mooncake_client \
+  --global_segment_size="4GB" \
+  --master_server_address="etcd://10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379" \
+  --metadata_server="etcd://10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379" \
+  --port=50052 \
+  --etcd_tls_enabled=true \
+  --etcd_ca_file=/etc/etcd/ca.pem \
+  --etcd_cert_file=/etc/etcd/client.pem \
+  --etcd_key_file=/etc/etcd/client-key.pem
+```
+
+> **Important:** The `--etcd_tls_enabled`, `--etcd_ca_file`, `--etcd_cert_file`, and `--etcd_key_file` flags are **only available when mooncake is built with `STORE_USE_ETCD=ON`**. The TLS configuration is applied to **both** the HA backend (leader election) and the Transfer Engine's metadata etcd connection. When `etcd_tls_enabled=true`, all three certificate paths must be provided; otherwise the client will refuse to start.
+
+**Python / C API TLS support:**
+
+The Python `MooncakeDistributedStore` and the C API (`mooncake_store_*`) also support etcd TLS. Configure it **before** calling `setup()`:
+
+```python
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.set_etcd_tls_config(
+    enabled=True,
+    ca_file="/etc/etcd/ca.pem",
+    cert_file="/etc/etcd/client.pem",
+    key_file="/etc/etcd/client-key.pem"
+)
+store.setup(
+    local_hostname="node1",
+    metadata_server="etcd://10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379",
+    global_segment_size=1073741824,
+    local_buffer_size=1073741824,
+    protocol="tcp",
+    rdma_devices="",
+    master_server_addr="etcd://10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379"
+)
+```
+
+Alternatively, set environment variables to avoid code changes:
+```bash
+export MC_ETCD_TLS_ENABLED=true
+export MC_ETCD_CA_FILE=/etc/etcd/ca.pem
+export MC_ETCD_CERT_FILE=/etc/etcd/client.pem
+export MC_ETCD_KEY_FILE=/etc/etcd/client-key.pem
+python my_client_script.py
+```
+
+The `set_etcd_tls_config()` call is optional — if you skip it, the code falls back to the `MC_ETCD_TLS_ENABLED`, `MC_ETCD_CA_FILE`, `MC_ETCD_CERT_FILE`, and `MC_ETCD_KEY_FILE` environment variables, preserving backward compatibility.
+
 **Client addressing:** to reach an HA cluster, clients must use the `etcd://` master-address form (so they can discover the current leader) instead of a single `IP:Port` — set `master_server_addr` (Method A) / `MOONCAKE_MASTER` (Method B) / `--master_server_address` (Method C) to `etcd://10.0.0.1:2379;10.0.0.2:2379;...`.
 
 ---
@@ -795,6 +871,10 @@ mooncake_master \
 | `--ha_backend_type` | `etcd` | HA backend: `etcd`, `redis`, or `k8s` |
 | `--ha_backend_connstring` | empty | HA backend connection string |
 | `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
+| `--etcd_tls_enabled` | `false` | Enable TLS authentication for etcd connections; when `true`, all three cert paths below must be provided |
+| `--etcd_ca_file` | empty | Path to CA certificate file for etcd TLS connections |
+| `--etcd_cert_file` | empty | Path to client certificate file for etcd TLS connections |
+| `--etcd_key_file` | empty | Path to client key file for etcd TLS connections |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
 | `--ha_leader_lease_ttl_sec` | `5` | Leadership lease TTL in seconds for `ha_backend_type=etcd` (range `2`-`60`; the JSON config key `ha_leader_lease_ttl_sec` is also accepted). Raise it to ride out etcd apply stalls longer than the default. A longer TTL delays failover: a new leader waits one full TTL before serving, and a standby waits for a crashed leader's lease to expire. Ignored by the Redis and k8s backends |
 | `--enable_oplog` | `false` | Enable the batch OpLog writer and reader; requires `enable_ha=true` and `ha_backend_type=etcd` or `redis`. etcd uses it for Primary-Standby promotion. Redis uses it as an experimental HA log store: a successful write only means Redis accepted the record |
@@ -1234,6 +1314,10 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER` | `enable_client_http_server` | `false` | Enable client-side `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `MOONCAKE_CLIENT_HTTP_PORT` | `client_http_port` | `9300` | Client-side HTTP endpoint port |
 | `MOONCAKE_CONFIG_PATH` | — | unset | Path to a JSON config file (takes precedence over the variables above) |
+| `MC_ETCD_TLS_ENABLED` | `etcd_tls_enabled` | `false` | Enable TLS authentication for etcd connections |
+| `MC_ETCD_CA_FILE` | `etcd_ca_file` | empty | etcd CA certificate path (TLS). Also read directly by the engine at setup time |
+| `MC_ETCD_CERT_FILE` | `etcd_cert_file` | empty | etcd client certificate path (TLS) |
+| `MC_ETCD_KEY_FILE` | `etcd_key_file` | empty | etcd client key path (TLS) |
 
 ```{note}
 `MooncakeConfig` (Method B) defaults `global_segment_size`/`local_buffer_size` to 3.125 GiB / 1 GiB. A direct `setup()` (Method A) has **no** default for these — they are required arguments. Unlike `MC_STORE_LOCAL_HOT_CACHE_SIZE` (raw bytes only), `MOONCAKE_GLOBAL_SEGMENT_SIZE` / `MOONCAKE_LOCAL_BUFFER_SIZE` accept human-readable suffixes (`kb`/`mb`/`gb`/…) because they are parsed by `MooncakeConfig`.
@@ -1299,6 +1383,10 @@ mooncake_client \
 | `--threads` | `1` | Client worker thread count |
 | `--tenant_id` | `default` | Tenant identifier |
 | `--enable_offload` | `false` | Enable client-side SSD offload |
+| `--etcd_tls_enabled` | `false` | Enable TLS authentication for etcd connections; when `true`, all three cert paths below must be provided |
+| `--etcd_ca_file` | empty | CA certificate file path for etcd TLS (HA mode) |
+| `--etcd_cert_file` | empty | Client certificate file path for etcd TLS (HA mode) |
+| `--etcd_key_file` | empty | Client key file path for etcd TLS (HA mode) |
 | `--start_offload_rpc_server` | `true` | Start the offload RPC server for dummy clients |
 | `--enable_http_server` | `false` | Enable client-side `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `--http_port` | `9300` | Client-side HTTP endpoint port |

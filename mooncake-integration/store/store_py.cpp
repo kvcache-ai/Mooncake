@@ -16,6 +16,7 @@
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
+#include "store_c.h"
 #include "device/accelerator_registry.h"
 #include "device/cuda_ipc_buffer.h"
 
@@ -2424,6 +2425,33 @@ PYBIND11_MODULE(_store, m) {
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
         .def(
+            "set_etcd_tls_config",
+            [](MooncakeStorePyWrapper &self, bool enabled,
+               const std::string &ca_file, const std::string &cert_file,
+               const std::string &key_file) {
+                mooncake_store_set_etcd_tls_config(
+                    nullptr, enabled ? 1 : 0,
+                    ca_file.empty() ? nullptr : ca_file.c_str(),
+                    cert_file.empty() ? nullptr : cert_file.c_str(),
+                    key_file.empty() ? nullptr : key_file.c_str());
+            },
+            py::arg("enabled"), py::arg("ca_file") = "",
+            py::arg("cert_file") = "", py::arg("key_file") = "",
+            "Configure etcd TLS certificates.\n\n"
+            "Must be called BEFORE setup().\n"
+            "When enabled=True, all three certificate paths must be\n"
+            "provided; otherwise TLS is rejected.\n"
+            "When enabled=False, TLS is disabled and cert paths are\n"
+            "ignored.\n\n"
+            "If not explicitly called, environment variables\n"
+            "MC_ETCD_CA_FILE, MC_ETCD_CERT_FILE, MC_ETCD_KEY_FILE are\n"
+            "used as fallback during setup().\n\n"
+            "Args:\n"
+            "    enabled: Whether to enable TLS for etcd connections.\n"
+            "    ca_file: Path to etcd CA certificate file.\n"
+            "    cert_file: Path to etcd client certificate file.\n"
+            "    key_file: Path to etcd client key file.")
+        .def(
             "begin_weight_snapshot",
             [](MooncakeStorePyWrapper &self, py::object snapshot,
                py::object adapter) -> py::object {
@@ -2458,6 +2486,11 @@ PYBIND11_MODULE(_store, m) {
                int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
                bool enable_embedded_master = false) {
                 auto real_client = self.init_real_client();
+                // Apply MC_ETCD_* env-var fallback if TLS was not explicitly
+                // configured via set_etcd_tls_config().  This ensures the
+                // pybind setup() path behaves the same as
+                // mooncake_store_setup().
+                mooncake_store_apply_etcd_tls_env_fallback();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
                 if (!engine.is_none()) {
@@ -2492,6 +2525,9 @@ PYBIND11_MODULE(_store, m) {
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
                 auto real_client = self.init_real_client();
+                // Apply MC_ETCD_* env-var fallback if TLS was not explicitly
+                // configured via set_etcd_tls_config().
+                mooncake_store_apply_etcd_tls_env_fallback();
 
                 // Convert py::dict to ConfigDict (all values as strings)
                 ConfigDict config;

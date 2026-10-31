@@ -14,6 +14,7 @@
 
 #include "store_c.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -25,6 +26,11 @@
 #include "real_client.h"
 #include "replica.h"
 #include "types.h"
+
+#ifdef STORE_USE_ETCD
+#include "etcd_helper.h"
+#include "libetcd_wrapper.h"
+#endif
 
 namespace {
 
@@ -87,6 +93,74 @@ mooncake::ExistOptions to_exist_options(
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// TLS helpers (internal)
+// ---------------------------------------------------------------------------
+
+#ifdef STORE_USE_ETCD
+namespace {
+
+// Tracks whether set_etcd_tls_config_internal was called with explicit
+// (non-null) parameters.  When false, mooncake_store_setup() automatically
+// triggers an env-var fallback so MC_ETCD_CA_FILE / MC_ETCD_CERT_FILE /
+// MC_ETCD_KEY_FILE are honoured without an explicit C API call.
+bool etcd_tls_explicitly_set = false;
+
+void set_etcd_tls_config_internal(int enabled, const char *ca_file,
+                                  const char *cert_file, const char *key_file) {
+    bool use_fallback = (ca_file == nullptr && cert_file == nullptr &&
+                         key_file == nullptr && enabled == 0);
+    std::string ca = ca_file ? ca_file : "";
+    std::string cert = cert_file ? cert_file : "";
+    std::string key = key_file ? key_file : "";
+
+    if (!use_fallback) {
+        etcd_tls_explicitly_set = true;
+    }
+
+    if (use_fallback) {
+        const char *env_ca = std::getenv("MC_ETCD_CA_FILE");
+        if (env_ca) ca = env_ca;
+        const char *env_cert = std::getenv("MC_ETCD_CERT_FILE");
+        if (env_cert) cert = env_cert;
+        const char *env_key = std::getenv("MC_ETCD_KEY_FILE");
+        if (env_key) key = env_key;
+        // If env vars provide values, treat as enabled
+        if (!ca.empty() && !cert.empty() && !key.empty()) {
+            enabled = 1;
+        }
+    }
+
+    if (!enabled || (ca.empty() && cert.empty() && key.empty())) {
+        // Clear existing TLS state so that a later setup() starts from a
+        // clean slate (fixes set-then-clear semantics and test isolation).
+        SetGlobalTLSConfig(0, nullptr, nullptr, nullptr);
+        mooncake::EtcdHelper::SetTLSConfig(false, "", "", "");
+        etcd_tls_explicitly_set = false;
+        LOG(INFO) << "etcd TLS configuration cleared";
+        return;
+    }
+
+    // When enabled, all three cert paths must be provided
+    if (ca.empty() || cert.empty() || key.empty()) {
+        LOG(ERROR) << "etcd TLS enabled but missing certificate files "
+                   << "(ca=" << ca << ", cert=" << cert << ", key=" << key
+                   << ")";
+        return;
+    }
+
+    // Configure TLS for both etcd clients
+    SetGlobalTLSConfig(1, const_cast<char *>(ca.c_str()),
+                       const_cast<char *>(cert.c_str()),
+                       const_cast<char *>(key.c_str()));
+    mooncake::EtcdHelper::SetTLSConfig(true, ca, cert, key);
+
+    LOG(INFO) << "etcd TLS configured via C API / env vars (ca=" << ca << ")";
+}
+
+}  // anonymous namespace
+#endif  // STORE_USE_ETCD
+
 extern "C" {
 
 // ---------------------------------------------------------------------------
@@ -117,6 +191,27 @@ void mooncake_store_destroy(mooncake_store_t store) {
     delete handle;
 }
 
+void mooncake_store_set_etcd_tls_config(mooncake_store_t store, int enabled,
+                                        const char *ca_file,
+                                        const char *cert_file,
+                                        const char *key_file) {
+    (void)store;  // Store handle is not needed (TLS is global)
+#ifdef STORE_USE_ETCD
+    set_etcd_tls_config_internal(enabled, ca_file, cert_file, key_file);
+#endif
+}
+
+void mooncake_store_apply_etcd_tls_env_fallback() {
+#ifdef STORE_USE_ETCD
+    // Forward to the internal helper (defined in anonymous namespace above).
+    // The anonymous-namespace function is visible within this TU.
+    // enabled=0 triggers env-var fallback internally.
+    if (!etcd_tls_explicitly_set) {
+        set_etcd_tls_config_internal(0, nullptr, nullptr, nullptr);
+    }
+#endif
+}
+
 int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
                          const char *metadata_server,
                          uint64_t global_segment_size,
@@ -124,6 +219,14 @@ int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
                          const char *device_name,
                          const char *master_server_addr) {
     if (!store) return -1;
+#ifdef STORE_USE_ETCD
+    // Auto-load MC_ETCD_CA_FILE / MC_ETCD_CERT_FILE / MC_ETCD_KEY_FILE from
+    // environment if set_etcd_tls_config_internal was never called with
+    // explicit parameters.
+    if (!etcd_tls_explicitly_set) {
+        set_etcd_tls_config_internal(0, nullptr, nullptr, nullptr);
+    }
+#endif
     try {
         return as_client(store)->setup_real(
             c_str_or(local_hostname, ""), c_str_or(metadata_server, ""),
