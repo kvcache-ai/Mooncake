@@ -1,6 +1,7 @@
 #include "gpu_runtime.h"
 
 #include <algorithm>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <string>
@@ -18,9 +19,120 @@ void warnCleanupFailure(const char* operation, const char* error) noexcept {
                  << ": " << (error ? error : "unknown error");
 }
 
+template <typename Release>
+void cleanupGpuResource(const char* operation, Release release) noexcept {
+    try {
+        auto result = release();
+        if (!result.has_value()) {
+            warnCleanupFailure(operation, result.error().message.c_str());
+        }
+    } catch (const std::exception& error) {
+        warnCleanupFailure(operation, error.what());
+    } catch (...) {
+        warnCleanupFailure(operation, "unknown error");
+    }
+}
+
 }  // namespace
 
+namespace detail {
+
+PGResult<size_t> gpuBufferBytes(size_t count, size_t element_size) {
+    PG_VALIDATE_ARG(count <= std::numeric_limits<size_t>::max() / element_size,
+                    "GPU buffer size overflows");
+    return count * element_size;
+}
+
+PGResult<void*> allocateGpuBuffer(int device, size_t bytes) {
+    PG_TRY(auto device_guard, GpuDeviceGuard::create(device));
+    void* pointer = nullptr;
+    if (bytes != 0) PG_TRY_CUDA(cudaMalloc(&pointer, bytes));
+    return pointer;
+}
+
+PGResult<void> releaseGpuBuffer(int device, void* pointer) {
+    if (!pointer) return {};
+    PG_TRY(auto device_guard, GpuDeviceGuard::create(device));
+    PG_TRY_CUDA(cudaFree(pointer));
+    return {};
+}
+
+void resetGpuBuffer(int device, void* pointer) noexcept {
+    if (!pointer) return;
+    cleanupGpuResource("free device buffer",
+                       [&] { return releaseGpuBuffer(device, pointer); });
+}
+
+PGResult<void*> allocatePinnedHostBuffer(size_t bytes, unsigned int flags) {
+    void* pointer = nullptr;
+    if (bytes != 0) PG_TRY_CUDA(cudaHostAlloc(&pointer, bytes, flags));
+    return pointer;
+}
+
+PGResult<void> releasePinnedHostBuffer(void* pointer) {
+    if (pointer) PG_TRY_CUDA(cudaFreeHost(pointer));
+    return {};
+}
+
+void resetPinnedHostBuffer(void* pointer) noexcept {
+    if (!pointer) return;
+    cleanupGpuResource("free pinned host buffer",
+                       [&] { return releasePinnedHostBuffer(pointer); });
+}
+
+PGResult<void*> mappedHostPointer(void* pointer) {
+    void* device_pointer = nullptr;
+    if (pointer)
+        PG_TRY_CUDA(cudaHostGetDevicePointer(&device_pointer, pointer, 0));
+    return device_pointer;
+}
+
+}  // namespace detail
+
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
+PGResult<GpuUuid> queryGpuUuid(int device_index) {
+    cudaDeviceProp properties{};
+    PG_TRY_CUDA(cudaGetDeviceProperties(&properties, device_index));
+    GpuUuid uuid{};
+    static_assert(sizeof(properties.uuid.bytes) == sizeof(uuid));
+    std::memcpy(uuid.data(), properties.uuid.bytes, uuid.size());
+    return uuid;
+}
+
+PGResult<bool> gpuPeerSupportsNativeAtomics(const GpuUuid& source,
+                                            const GpuUuid& destination) {
+    // Accesses within one GPU use local atomic semantics; CUDA's peer
+    // query requires distinct GPUs.
+    if (source == destination) return true;
+
+    int source_device = -1;
+    int destination_device = -1;
+    int device_count = 0;
+    PG_TRY_CUDA(cudaGetDeviceCount(&device_count));
+    for (int candidate = 0; candidate < device_count; ++candidate) {
+        PG_TRY(auto uuid, queryGpuUuid(candidate));
+        if (uuid == source) source_device = candidate;
+        if (uuid == destination) destination_device = candidate;
+        if (source_device >= 0 && destination_device >= 0) break;
+    }
+
+    if (source_device < 0 || destination_device < 0) {
+        // FIXME: Query native atomics for peers hidden by CUDA_VISIBLE_DEVICES
+        // and for MNNVL peers, e.g. via NVML. Until then, report no support.
+        return false;
+    }
+
+    int accessible = 0;
+    PG_TRY_CUDA(cudaDeviceCanAccessPeer(&accessible, source_device,
+                                        destination_device));
+    if (!accessible) return false;
+    int native_atomics = 0;
+    PG_TRY_CUDA(cudaDeviceGetP2PAttribute(&native_atomics,
+                                          cudaDevP2PAttrNativeAtomicSupported,
+                                          source_device, destination_device));
+    return native_atomics != 0;
+}
+
 PGResult<uint64_t> gpuTimeoutTicks(int device_index, size_t timeout_us) {
     if (timeout_us == 0) return uint64_t{0};
     PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
@@ -132,24 +244,11 @@ GpuStream::GpuStream(cudaStream_t stream, int device, bool owns_stream) noexcept
 
 void GpuStream::reset() noexcept {
     if (owns_stream_ && stream_) {
-        try {
-            auto guard_result = GpuDeviceGuard::create(device_index_);
-            if (!guard_result.has_value()) {
-                warnCleanupFailure("select device before destroying stream",
-                                   guard_result.error().message.c_str());
-            } else {
-                auto device_guard = std::move(guard_result).value();
-                const auto error = cudaStreamDestroy(stream_);
-                if (error != cudaSuccess) {
-                    warnCleanupFailure("destroy stream",
-                                       cudaGetErrorString(error));
-                }
-            }
-        } catch (const std::exception& error) {
-            warnCleanupFailure("destroy stream", error.what());
-        } catch (...) {
-            warnCleanupFailure("destroy stream", "unknown error");
-        }
+        cleanupGpuResource("destroy stream", [&]() -> PGResult<void> {
+            PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index_));
+            PG_TRY_CUDA(cudaStreamDestroy(stream_));
+            return {};
+        });
     }
     stream_ = nullptr;
     device_index_ = -1;
@@ -207,24 +306,11 @@ PGResult<bool> GpuEvent::query() const {
 
 void GpuEvent::reset() noexcept {
     if (event_) {
-        try {
-            auto guard_result = GpuDeviceGuard::create(device_index_);
-            if (!guard_result.has_value()) {
-                warnCleanupFailure("select device before destroying CUDA event",
-                                   guard_result.error().message.c_str());
-            } else {
-                auto device_guard = std::move(guard_result).value();
-                const auto error = cudaEventDestroy(event_);
-                if (error != cudaSuccess) {
-                    warnCleanupFailure("destroy CUDA event",
-                                       cudaGetErrorString(error));
-                }
-            }
-        } catch (const std::exception& error) {
-            warnCleanupFailure("destroy CUDA event", error.what());
-        } catch (...) {
-            warnCleanupFailure("destroy CUDA event", "unknown error");
-        }
+        cleanupGpuResource("destroy CUDA event", [&]() -> PGResult<void> {
+            PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index_));
+            PG_TRY_CUDA(cudaEventDestroy(event_));
+            return {};
+        });
     }
     event_ = nullptr;
     device_index_ = -1;
@@ -357,25 +443,12 @@ PGResult<void> GpuGraphUserObject::transferToGraph(
 
 void GpuGraphUserObject::reset() noexcept {
     if (!object_) return;
-    try {
-        auto guard_result = GpuDeviceGuard::create(device_index_);
-        if (!guard_result.has_value()) {
-            warnCleanupFailure(
-                "select device before releasing CUDA Graph user object",
-                guard_result.error().message.c_str());
-        } else {
-            auto device_guard = std::move(guard_result).value();
-            const auto error = cudaUserObjectRelease(object_, 1);
-            if (error != cudaSuccess) {
-                warnCleanupFailure("release CUDA Graph user object",
-                                   cudaGetErrorString(error));
-            }
-        }
-    } catch (const std::exception& error) {
-        warnCleanupFailure("release CUDA Graph user object", error.what());
-    } catch (...) {
-        warnCleanupFailure("release CUDA Graph user object", "unknown error");
-    }
+    cleanupGpuResource(
+        "release CUDA Graph user object", [&]() -> PGResult<void> {
+            PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index_));
+            PG_TRY_CUDA(cudaUserObjectRelease(object_, 1));
+            return {};
+        });
     object_ = nullptr;
     device_index_ = -1;
 }

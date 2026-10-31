@@ -1,8 +1,9 @@
-#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_ONE_SHOT_TYPES_CUH
-#define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_ONE_SHOT_TYPES_CUH
+#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_ONE_SHOT_ALGORITHM_CUH
+#define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_ONE_SHOT_ALGORITHM_CUH
 
 #include "device_comm/device_collective/device_collective_types.cuh"
 #include "device_comm/device_collective/protocols/ll/ll_types.cuh"
+#include "error_types.h"
 
 namespace mooncake {
 
@@ -36,44 +37,29 @@ struct OneShotBufferLayout {
     }
 };
 
-struct OneShotAllReducePlan {
+struct OneShotPlan {
     DevicePlanStatus status = DevicePlanStatus::Unavailable;
-    uint64_t view_epoch = kInvalidViewEpoch;
     OneShotBufferLayout layout;
     LLPacket* packets = nullptr;
-    InGroupRank self_rank = kInvalidInGroupRank;
-    uint32_t self_active_index = 0;
-    uint32_t participant_count = 0;
-    // Active-rank order with self removed; offsets address one-shot packets.
-    CollectivePeer remote_peers[kMaxNumRanks - 1] = {};
-
-    [[nodiscard]] __device__ __forceinline__ RemotePeerList
-    remotePeers() const {
-        return {remote_peers,
-                participant_count == 0 ? 0 : participant_count - 1};
-    }
-
-    // Map a non-local active index into remote_peers.
-    [[nodiscard]] __device__ __forceinline__ const CollectivePeer&
-    remoteParticipant(uint32_t active_index) const {
-        return remote_peers[active_index < self_active_index
-                                ? active_index
-                                : active_index - 1];
-    }
+    // Remote packet-buffer offsets, indexed by DeviceGroupView active index.
+    uint64_t packet_offsets[kMaxNumRanks] = {};
 };
 
-struct alignas(64) OneShotAllReduceDeviceState {
-    OneShotAllReducePlan plan;
+// Local device state owned by OneShotAlgorithm and shared by its kernels.
+struct alignas(64) OneShotDeviceState {
+    OneShotPlan plan;
     CollectiveRuntimeBindings collective;
-    // Borrowed control bindings and progress from the communicator's LL
-    // resources.
+    // Borrowed state from the communicator's LL protocol.
     LLState* ll = nullptr;
 };
 
-cudaError_t launchOneShotAllReduceKernel(const AllReduceRequest& request,
-                                         OneShotAllReduceDeviceState* state,
-                                         cudaStream_t stream);
+PGResult<void> launchOneShotAllReduceKernel(const AllReduceRequest& request,
+                                            OneShotDeviceState* state,
+                                            cudaStream_t stream);
+PGResult<void> launchOneShotAllGatherKernel(const AllGatherRequest& request,
+                                            OneShotDeviceState* state,
+                                            cudaStream_t stream);
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_ONE_SHOT_TYPES_CUH
+#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_ONE_SHOT_ALGORITHM_CUH

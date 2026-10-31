@@ -238,6 +238,8 @@ struct TransferEndpointUpdateAck {
     // may replenish bootstrap metadata, such as the next NCCL unique ID.
     // The Coordinator saves this endpoint for future snapshots.
     std::optional<DeviceTransferEndpoint> updated_endpoint;
+    // Outgoing routes installed by this snapshot, indexed by GlobalRank.
+    std::vector<DeviceTransferRouteInfo> routes;
 };
 
 struct ViewUpdateAck {

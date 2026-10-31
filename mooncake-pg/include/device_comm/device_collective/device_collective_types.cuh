@@ -2,6 +2,7 @@
 #define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_DEVICE_COLLECTIVE_TYPES_CUH
 
 #include <cstdint>
+#include <variant>
 
 #include <cuda_alike.h>
 
@@ -13,7 +14,7 @@
 
 namespace mooncake {
 
-struct CollectiveStepResult {
+struct CollectiveResult {
     InGroupRank failed_rank = kInvalidInGroupRank;
 
     [[nodiscard]] __device__ __forceinline__ bool succeeded() const {
@@ -21,7 +22,19 @@ struct CollectiveStepResult {
     }
 };
 
+// Evaluate a collective step once and return its failure unchanged.
+#define PG_COLL_TRY(...)                                             \
+    do {                                                             \
+        const ::mooncake::CollectiveResult pg_coll_result_internal = \
+            (__VA_ARGS__);                                           \
+        if (!pg_coll_result_internal.succeeded()) {                  \
+            return pg_coll_result_internal;                          \
+        }                                                            \
+    } while (false)
+
 struct AllReduceRequest {
+    static constexpr OpType kOperation = OpType::AllReduce;
+
     const void* send_buffer = nullptr;
     void* recv_buffer = nullptr;
     uint64_t count = 0;
@@ -30,8 +43,22 @@ struct AllReduceRequest {
     int32_t* failed_ranks_hint = nullptr;
 };
 
-// One remote participant selected by an algorithm. Workspace and signal offsets
-// are relative to that peer's DTS region.
+struct AllGatherRequest {
+    static constexpr OpType kOperation = OpType::AllGather;
+
+    const void* send_buffer = nullptr;
+    void* recv_buffer = nullptr;
+    // Number of input elements contributed by each participant.
+    uint64_t count = 0;
+    DataType datatype = DataType::Float32;
+    int32_t* failed_ranks_hint = nullptr;
+};
+
+using DeviceCollectiveRequest =
+    std::variant<AllReduceRequest, AllGatherRequest>;
+
+// Identity and shared addressing for one participant. Offsets are relative to
+// that participant's DTS region.
 struct CollectivePeer {
     GlobalRank global_rank = kInvalidGlobalRank;
     InGroupRank in_group_rank = kInvalidInGroupRank;
@@ -39,40 +66,22 @@ struct CollectivePeer {
     uint64_t view_epoch_signal_offset = 0;
 };
 
-// Non-owning compact list of remote peers selected by an algorithm, excluding
-// self. Shared by communication, the View handshake, and failure drain.
-// Entries are indexed by list position, not by global or in-group rank.
-class RemotePeerList {
-   public:
-    __host__ __device__ constexpr RemotePeerList(
-        const CollectivePeer* entries = nullptr, uint32_t count = 0)
-        : entries_(entries), count_(count) {
-        PG_ASSERT(entries_ || count_ == 0, "Remote peer list has no storage");
-    }
+// Device membership shared by the runtime, algorithms and protocols.
+struct DeviceGroupView {
+    uint64_t epoch = kInvalidViewEpoch;
+    int32_t self_active_index = -1;
+    uint32_t participant_count = 0;
+    CollectivePeer participants[kMaxNumRanks] = {};
+    // Set by the startup CTA after the handshake; reset when a view is
+    // installed.
+    bool synchronized = false;
 
-    [[nodiscard]] __host__ __device__ constexpr const CollectivePeer* begin()
+    [[nodiscard]] __device__ __forceinline__ const CollectivePeer& self()
         const {
-        return entries_;
+        PG_ASSERT(self_active_index >= 0 &&
+                  static_cast<uint32_t>(self_active_index) < participant_count);
+        return participants[self_active_index];
     }
-
-    [[nodiscard]] __host__ __device__ constexpr const CollectivePeer* end()
-        const {
-        return count_ == 0 ? entries_ : entries_ + count_;
-    }
-
-    [[nodiscard]] __host__ __device__ constexpr uint32_t size() const {
-        return count_;
-    }
-
-    [[nodiscard]] __host__ __device__ constexpr const CollectivePeer& atIndex(
-        uint64_t peer_index) const {
-        PG_ASSERT(peer_index < count_, "Remote peer index is out of range");
-        return entries_[peer_index];
-    }
-
-   private:
-    const CollectivePeer* entries_;
-    uint32_t count_;
 };
 
 // Local data operands for one collective step.
@@ -87,10 +96,11 @@ struct CollectiveChunk {
 
 inline constexpr uint32_t kMaxDeviceCollectiveChannels = 32;
 static_assert(kMaxDeviceCollectiveChannels <= kTransferLaneCount);
-inline constexpr uint32_t kMaxDeviceControlUpdateOperations = 8;
+// Reserve capacity for additional protocol and algorithm updates.
+inline constexpr uint32_t kMaxDeviceControlUpdateOperations = 128;
 inline constexpr uint32_t kDeviceControlUpdatePayloadBytes = 8192;
 
-inline constexpr bool isDeviceAllReduceCombinationSupported(
+inline constexpr bool isDeviceReductionCombinationSupported(
     DataType datatype, ReduceOp op) noexcept {
     switch (op) {
         case ReduceOp::Sum:
@@ -125,8 +135,7 @@ enum class DevicePlanStatus : uint8_t {
 
 enum class ControlUpdateOpKind : uint32_t {
     CopyBytes = 0,
-    FillBytes = 1,
-    FillU64 = 2,
+    Fill = 1,
 };
 
 struct alignas(16) ControlUpdateOp {
@@ -136,29 +145,23 @@ struct alignas(16) ControlUpdateOp {
         uint32_t payload_offset;
     };
 
-    struct FillBytes {
+    struct Fill {
         uint64_t destination;
-        uint8_t value;
+        uint32_t element_size;
         uint32_t count;
-    };
-
-    struct FillU64 {
-        uint64_t destination;
-        uint64_t value;
-        uint32_t count;
+        uint32_t payload_offset;
     };
 
     union Payload {
         CopyBytes copy_bytes;
-        FillBytes fill_bytes;
-        FillU64 fill_u64;
+        Fill fill;
     };
 
     ControlUpdateOpKind kind = ControlUpdateOpKind::CopyBytes;
     Payload payload = {};
 };
 
-// One complete, idempotent update for device-resident control-plane state.
+// One complete update for device-resident control-plane state.
 // The host constructs it locally before briefly acquiring the mapped slot for
 // publication.
 struct alignas(16) ControlUpdate {
@@ -169,7 +172,7 @@ struct alignas(16) ControlUpdate {
 };
 
 struct CollectiveFailureReport {
-    InGroupRank failed_rank = kInvalidInGroupRank;
+    CollectiveResult result;
     uint64_t failed_hint_address = 0;
 };
 
@@ -207,16 +210,16 @@ struct alignas(64) InvocationState {
     uint32_t startup_complete = 0;
     uint32_t completion_arrival_count = 0;
     uint32_t failure_latched = 0;
-    InGroupRank failed_rank = kInvalidInGroupRank;
+    CollectiveResult result;
     uint64_t failed_hint_address = 0;
 };
 
 // Stable runtime bindings borrowed by every collective algorithm. Per-call
-// operands live in AllReduceRequest; topology and protocol bindings live in the
-// algorithm's device state.
+// operands live in requests.
 struct CollectiveRuntimeBindings {
     const DeviceTransferHandle* transfer_handle = nullptr;
     uint64_t timeout_ticks = 0;
+    DeviceGroupView* group_view = nullptr;
     const uint64_t* view_epoch_signals = nullptr;
     InvocationState* invocation_state = nullptr;
     ControlMailbox* control_mailbox = nullptr;

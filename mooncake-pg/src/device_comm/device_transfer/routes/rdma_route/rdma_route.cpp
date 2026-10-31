@@ -38,6 +38,18 @@ struct RdmaRoute::State {
         std::vector<uint8_t> endpoint_metadata;
     };
 
+    struct ConnectionUpdate {
+        std::vector<GlobalRank> ranks;
+        std::vector<std::vector<uint8_t>> endpoint_metadata;
+        std::vector<int64_t> remote_addrs;
+        std::vector<int32_t> remote_keys;
+        std::vector<int32_t> remote_qpns;
+        std::vector<int32_t> remote_lids;
+        std::vector<int64_t> subnet_prefixes;
+        std::vector<int64_t> interface_ids;
+        std::vector<int> active;
+    };
+
     ~State() noexcept {
         auto guard_result = GpuDeviceGuard::create(device_index);
         if (!guard_result.has_value()) {
@@ -52,26 +64,22 @@ struct RdmaRoute::State {
         // The transport destroys QPs and any remaining registrations before
         // route-owned CUDA allocations are released.
         transport.reset();
-        if (atomic_sink) {
-            const auto result = cudaFree(atomic_sink);
-            if (result != cudaSuccess) {
-                LOG(ERROR) << "Failed to release RDMA atomic sink: "
-                           << cudaGetErrorString(result);
-            }
-        }
+        atomic_sink.reset();
     }
 
+    GpuBuffer<uint64_t> atomic_sink;
     std::unique_ptr<device::RdmaTransport> transport;
     device::RdmaMemoryRegion peer_accessible_region;
     device::RdmaMemoryRegion local_staging_region;
     device::RdmaMemoryRegion atomic_sink_region;
-    uint64_t* atomic_sink = nullptr;
     int device_index = -1;
     cudaStream_t stream = nullptr;
     uint32_t qps_per_rank = 0;
     uint32_t num_qps = 0;
     std::vector<PeerConnection> peers;
-    std::vector<std::optional<DeviceTransferEndpoint>> endpoints;
+    // installEndpoints() fills these parameters; updateRoutes() changes QPs
+    // only while DTS users are paused.
+    ConnectionUpdate pending;
 };
 
 RdmaRoute::RdmaRoute(GlobalRank self_rank, uint32_t max_world_size,
@@ -102,11 +110,10 @@ PGResult<std::unique_ptr<RdmaRoute>> RdmaRoute::create(
     PG_TRY_TE(state->transport->allocateControlBuffer());
     PG_TRY_TE(state->transport->createQueuePairs(stream));
 
-    constexpr size_t atomic_sink_bytes = sizeof(uint64_t);
-    PG_TRY_CUDA(cudaMalloc(reinterpret_cast<void**>(&state->atomic_sink),
-                           atomic_sink_bytes));
-    PG_TRY_TE(state->transport->registerMemory(
-        state->atomic_sink, atomic_sink_bytes, state->atomic_sink_region));
+    PG_TRY(state->atomic_sink, GpuBuffer<uint64_t>::allocate(device_index));
+    PG_TRY_TE(state->transport->registerMemory(state->atomic_sink.get(),
+                                               state->atomic_sink.sizeBytes(),
+                                               state->atomic_sink_region));
     LOG(INFO) << "[PG] Device-initiated RDMA route initialized with "
               << state->qps_per_rank << " QPs per rank";
     return std::unique_ptr<RdmaRoute>(
@@ -146,52 +153,43 @@ std::optional<RouteEndpoint> RdmaRoute::localEndpoint() {
     if (!state_) return std::nullopt;
     const auto metadata =
         state_->transport->localMetadata(state_->peer_accessible_region);
-    return RouteEndpoint{
-        .route_key = std::string(kRouteKey),
-        .version = routeVersion(),
-        .metadata = encodeEndpointMetadata(RdmaEndpointMetadata{
-            .is_roce = state_->transport->isRoce(),
-            .qps_per_rank = state_->qps_per_rank,
-            .remote_key = metadata.rkey,
-            .subnet_prefix = metadata.subnet_prefix,
-            .interface_id = metadata.interface_id,
-            .qpns = metadata.qpns,
-            .lids = metadata.lids,
-        }),
-    };
+    return encodeEndpoint(RdmaEndpointMetadata{
+        .is_roce = state_->transport->isRoce(),
+        .qps_per_rank = state_->qps_per_rank,
+        .remote_key = metadata.rkey,
+        .subnet_prefix = metadata.subnet_prefix,
+        .interface_id = metadata.interface_id,
+        .qpns = metadata.qpns,
+        .lids = metadata.lids,
+    });
 }
 
-PGResult<void> RdmaRoute::installEndpoints(
+PGResult<std::vector<DeviceTransferRoute>> RdmaRoute::installEndpoints(
     const DeviceTransferSnapshot& snapshot, uint64_t) {
-    if (state_) state_->endpoints = snapshot.endpoints;
-    return {};
-}
-
-PGResult<std::vector<DeviceTransferRoute>> RdmaRoute::updateRoutes() {
     std::vector<DeviceTransferRoute> routes(max_world_size_);
     if (!state_) return routes;
-    const auto& endpoints = state_->endpoints;
+    const auto& endpoints = snapshot.endpoints;
 
     const auto local_metadata =
         state_->transport->localMetadata(state_->peer_accessible_region);
     // Prepare TE's per-rank memory/GID tables and per-QP QPN/LID tables.
-    std::vector<const RouteEndpoint*> route_endpoints(max_world_size_, nullptr);
-    std::vector<int64_t> remote_addrs(max_world_size_);
-    std::vector<int32_t> remote_keys(max_world_size_);
-    std::vector<int32_t> remote_qpns(state_->num_qps);
-    std::vector<int32_t> remote_lids(state_->num_qps);
-    std::vector<int64_t> subnet_prefixes(max_world_size_);
-    std::vector<int64_t> interface_ids(max_world_size_);
-    std::vector<int> active(max_world_size_);
-    std::vector<GlobalRank> pending;
+    State::ConnectionUpdate pending;
+    pending.endpoint_metadata.resize(max_world_size_);
+    pending.remote_addrs.resize(max_world_size_);
+    pending.remote_keys.resize(max_world_size_);
+    pending.remote_qpns.resize(state_->num_qps);
+    pending.remote_lids.resize(state_->num_qps);
+    pending.subnet_prefixes.resize(max_world_size_);
+    pending.interface_ids.resize(max_world_size_);
+    pending.active.resize(max_world_size_);
 
     for (GlobalRank rank = 0; rank < static_cast<GlobalRank>(max_world_size_);
          ++rank) {
         // Decode this peer once and check link/QP layout compatibility.
-        PG_TRY(auto endpoint, findEndpoint(endpoints[rank]));
+        if (!endpoints[rank]) continue;
+        const auto* endpoint = findEndpoint(endpoints[rank]->routes);
         if (!endpoint) continue;
-        PG_TRY(auto candidate,
-               decodeEndpointMetadata<RdmaEndpointMetadata>(*endpoint));
+        PG_TRY(auto candidate, decodeEndpoint<RdmaEndpointMetadata>(*endpoint));
         const bool compatible =
             candidate.is_roce == state_->transport->isRoce() &&
             (candidate.is_roce ||
@@ -202,17 +200,17 @@ PGResult<std::vector<DeviceTransferRoute>> RdmaRoute::updateRoutes() {
             candidate.remote_key != 0;
         if (!compatible) continue;
 
-        auto& peer = state_->peers[rank];
+        const auto& peer = state_->peers[rank];
         if (!peer.connected || peer.endpoint_metadata != endpoint->metadata) {
             // Collect new and changed peers for the connect batch.
-            route_endpoints[rank] = endpoint;
-            remote_addrs[rank] =
+            pending.endpoint_metadata[rank] = endpoint->metadata;
+            pending.remote_addrs[rank] =
                 static_cast<int64_t>(endpoints[rank]->region_address);
-            remote_keys[rank] = candidate.remote_key;
-            subnet_prefixes[rank] = candidate.subnet_prefix;
-            interface_ids[rank] = candidate.interface_id;
-            active[rank] = 1;
-            pending.push_back(rank);
+            pending.remote_keys[rank] = candidate.remote_key;
+            pending.subnet_prefixes[rank] = candidate.subnet_prefix;
+            pending.interface_ids[rank] = candidate.interface_id;
+            pending.active[rank] = 1;
+            pending.ranks.push_back(rank);
 
             // QP groups are indexed by destination rank: our group for this
             // peer connects to its group for self_rank_.
@@ -221,8 +219,8 @@ PGResult<std::vector<DeviceTransferRoute>> RdmaRoute::updateRoutes() {
                     static_cast<size_t>(rank) * state_->qps_per_rank + q;
                 const size_t remote_index =
                     static_cast<size_t>(self_rank_) * state_->qps_per_rank + q;
-                remote_qpns[local_index] = candidate.qpns[remote_index];
-                remote_lids[local_index] = candidate.lids[remote_index];
+                pending.remote_qpns[local_index] = candidate.qpns[remote_index];
+                pending.remote_lids[local_index] = candidate.lids[remote_index];
             }
         }
 
@@ -240,32 +238,37 @@ PGResult<std::vector<DeviceTransferRoute>> RdmaRoute::updateRoutes() {
         };
     }
 
-    if (!pending.empty()) {
-        PG_TRY(auto device_guard, GpuDeviceGuard::create(state_->device_index));
-        // Peer reset: reuse our advertised QPNs when a peer restarts.
-        for (const auto rank : pending) {
-            if (!state_->peers[rank].connected) continue;
-            PG_TRY_TE(state_->transport->resetQueuePairs(
-                rank * state_->qps_per_rank, state_->qps_per_rank,
-                state_->stream));
-            LOG(INFO) << "[PG] Device RDMA QPs reset for peer=" << rank;
-        }
+    state_->pending = std::move(pending);
+    return routes;
+}
 
-        // Connect the pending QP groups in one batch.
-        PG_TRY_TE(state_->transport->connectPeers(
-            self_rank_, state_->transport->isRoce(),
-            state_->peer_accessible_region.lkey, remote_addrs, remote_keys,
-            remote_qpns, remote_lids, subnet_prefixes, interface_ids, active));
-
-        // Save connection state only after the batch reports success.
-        for (const auto rank : pending) {
-            auto& peer = state_->peers[rank];
-            peer.connected = true;
-            peer.endpoint_metadata = route_endpoints[rank]->metadata;
-        }
+PGResult<void> RdmaRoute::updateRoutes() {
+    if (!state_ || state_->pending.ranks.empty()) return {};
+    auto& pending = state_->pending;
+    PG_TRY(auto device_guard, GpuDeviceGuard::create(state_->device_index));
+    // Peer reset: reuse our advertised QPNs when a peer restarts.
+    for (const auto rank : pending.ranks) {
+        if (!state_->peers[rank].connected) continue;
+        PG_TRY_TE(state_->transport->resetQueuePairs(
+            rank * state_->qps_per_rank, state_->qps_per_rank, state_->stream));
+        LOG(INFO) << "[PG] Device RDMA QPs reset for peer=" << rank;
     }
 
-    return routes;
+    // Connect the pending QP groups in one batch.
+    PG_TRY_TE(state_->transport->connectPeers(
+        self_rank_, state_->transport->isRoce(),
+        state_->peer_accessible_region.lkey, pending.remote_addrs,
+        pending.remote_keys, pending.remote_qpns, pending.remote_lids,
+        pending.subnet_prefixes, pending.interface_ids, pending.active));
+
+    // Save connection state only after the batch reports success.
+    for (const auto rank : pending.ranks) {
+        auto& peer = state_->peers[rank];
+        peer.connected = true;
+        peer.endpoint_metadata = std::move(pending.endpoint_metadata[rank]);
+    }
+    pending = {};
+    return {};
 }
 
 void RdmaRoute::fillDeviceContext(DeviceRouteContext& context) const noexcept {
@@ -285,7 +288,7 @@ void RdmaRoute::fillDeviceContext(DeviceRouteContext& context) const noexcept {
         .peer_accessible_lkey = state_->peer_accessible_region.lkey,
         .local_staging_lkey = state_->local_staging_region.lkey,
         .qps_per_rank = state_->qps_per_rank,
-        .atomic_sink = state_->atomic_sink,
+        .atomic_sink = state_->atomic_sink.get(),
         .atomic_sink_lkey = state_->atomic_sink_region.lkey,
     };
 }
