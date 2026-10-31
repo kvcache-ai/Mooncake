@@ -227,19 +227,13 @@ Status IOUringTransport::uninstall() {
         installed_ = false;
     }
     std::lock_guard<std::mutex> lock(ring_cache_mutex_);
-    for (auto& ring : ring_cache_) io_uring_queue_exit(&ring);
+    for (auto& cached : ring_cache_) io_uring_queue_exit(&cached.ring);
     ring_cache_.clear();
     return Status::OK();
 }
 
 // Bounds the rings (one fd and mapping each) parked by freeSubBatch().
 static constexpr size_t kMaxCachedRings = 64;
-
-// SQ ring size, read through kring_entries: liburing 2.2 and older (Ubuntu
-// 22.04 ships 2.1) have no ring_entries field.
-static unsigned sqEntries(const struct io_uring& ring) {
-    return *ring.sq.kring_entries;
-}
 
 Status IOUringTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     auto io_uring_batch = Slab<IOUringSubBatch>::Get().allocate();
@@ -253,26 +247,30 @@ Status IOUringTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
         std::lock_guard<std::mutex> lock(ring_cache_mutex_);
         auto best = ring_cache_.end();
         for (auto it = ring_cache_.begin(); it != ring_cache_.end(); ++it) {
-            if (sqEntries(*it) >= max_size &&
+            if (it->sq_entries >= max_size &&
                 (best == ring_cache_.end() ||
-                 sqEntries(*it) < sqEntries(*best)))
+                 it->sq_entries < best->sq_entries))
                 best = it;
         }
         if (best != ring_cache_.end()) {
-            io_uring_batch->ring = *best;
+            io_uring_batch->ring = best->ring;
+            io_uring_batch->sq_entries = best->sq_entries;
             *best = ring_cache_.back();
             ring_cache_.pop_back();
             reused = true;
         }
     }
     if (!reused) {
-        int rc = io_uring_queue_init(max_size, &io_uring_batch->ring, 0);
+        struct io_uring_params params{};
+        int rc = io_uring_queue_init_params(max_size, &io_uring_batch->ring,
+                                            &params);
         if (rc) {
             Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
             return Status::InternalError(
-                std::string("io_uring_queue_init failed: ") + strerror(-rc) +
-                LOC_MARK);
+                std::string("io_uring_queue_init_params failed: ") +
+                strerror(-rc) + LOC_MARK);
         }
+        io_uring_batch->sq_entries = params.sq_entries;
     }
     batch = io_uring_batch;
     return Status::OK();
@@ -332,7 +330,7 @@ Status IOUringTransport::freeSubBatch(SubBatchRef& batch) {
     if (drained && !io_uring_batch->pageable_device_write) {
         std::lock_guard<std::mutex> lock(ring_cache_mutex_);
         if (ring_cache_.size() < kMaxCachedRings) {
-            ring_cache_.push_back(ring);
+            ring_cache_.push_back({ring, io_uring_batch->sq_entries});
             cached = true;
         }
     }

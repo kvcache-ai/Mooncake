@@ -950,8 +950,9 @@ class RingCacheIOUringTransport : public IOUringTransport {
 };
 
 // A freed sub-batch parks its drained ring; the next sub-batch takes the
-// smallest cached ring that fits and still carries I/O on it. A ring with an
-// unreaped completion is destroyed instead of cached.
+// smallest cached ring that fits, judged by the size the kernel rounded the
+// ring up to, and still carries I/O on it. A ring with an unreaped completion
+// is destroyed instead of cached.
 TEST(IOUringTransportTest, ReusesOnlyDrainedRings) {
     const size_t kFileLength = 2 * kPageSize;
     ScopedTempFile file(kFileLength);
@@ -983,8 +984,10 @@ TEST(IOUringTransportTest, ReusesOnlyDrainedRings) {
     EXPECT_EQ(pollUntilSettled(transport, small, 0).s,
               TransferStatusEnum::COMPLETED);
     Transport::SubBatchRef large = nullptr;
-    ASSERT_TRUE(transport.allocateSubBatch(large, 8).ok());
-    EXPECT_NE(ring_fd(large), small_fd);
+    ASSERT_TRUE(transport.allocateSubBatch(large, 5).ok());
+    const int large_fd = ring_fd(large);
+    EXPECT_NE(large_fd, small_fd);
+    EXPECT_EQ(static_cast<IOUringSubBatch*>(large)->sq_entries, 8u);
     // Larger ring cached first: a first-fit lookup would hand it out next.
     ASSERT_TRUE(transport.freeSubBatch(large).ok());
     ASSERT_TRUE(transport.freeSubBatch(small).ok());
@@ -992,6 +995,13 @@ TEST(IOUringTransportTest, ReusesOnlyDrainedRings) {
 
     ASSERT_TRUE(transport.allocateSubBatch(small, 1).ok());
     EXPECT_EQ(ring_fd(small), small_fd);
+    EXPECT_EQ(transport.cachedRingCount(), 1u);
+    // Requested 5 SQEs, holds 8: an 8-entry sub-batch reuses it.
+    ASSERT_TRUE(transport.allocateSubBatch(large, 8).ok());
+    EXPECT_EQ(ring_fd(large), large_fd);
+    EXPECT_EQ(static_cast<IOUringSubBatch*>(large)->sq_entries, 8u);
+    EXPECT_EQ(transport.cachedRingCount(), 0u);
+    ASSERT_TRUE(transport.freeSubBatch(large).ok());
     EXPECT_EQ(transport.cachedRingCount(), 1u);
     std::memset(allocation, 0x22, kPageSize);
     write.target_offset = kPageSize;
