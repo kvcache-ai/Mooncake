@@ -246,17 +246,17 @@ TEST(CoroHandshake, ConnectionCallbackCanBeRegisteredAfterListen) {
     CoroServer server;
     server.Start();
     Json::Value response;
-    EXPECT_NE(server.plugin().send("127.0.0.1", server.port(), Object(),
-                                   response),
-              0);
+    EXPECT_NE(
+        server.plugin().send("127.0.0.1", server.port(), Object(), response),
+        0);
     server.plugin().registerOnConnectionCallBack(
         [](const Json::Value &, Json::Value &local) {
             local["reply_msg"] = "";
             return 0;
         });
-    EXPECT_EQ(server.plugin().send("127.0.0.1", server.port(), Object(),
-                                   response),
-              0);
+    EXPECT_EQ(
+        server.plugin().send("127.0.0.1", server.port(), Object(), response),
+        0);
 }
 
 TEST(CoroHandshake, RepeatedStartRequiresTheSameEndpoint) {
@@ -266,8 +266,7 @@ TEST(CoroHandshake, RepeatedStartRequiresTheSameEndpoint) {
     uint16_t other = 0;
     int fd = ListenLoopback(other);
     ASSERT_GE(fd, 0);
-    EXPECT_EQ(server.plugin().startDaemon(other, fd),
-              ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(server.plugin().startDaemon(other, fd), ERR_INVALID_ARGUMENT);
     close(fd);
 }
 
@@ -301,7 +300,7 @@ TEST(CoroHandshake, LocalOversizeDoesNotConnect) {
     const std::string payload(mooncake::getHandshakeMaxLength() + 1, 'x');
     const auto started = std::chrono::steady_clock::now();
     EXPECT_EQ(mooncake::CallRawHandshakeForTest(client.get(), "127.0.0.1", port,
-                                               1, payload, response),
+                                                1, payload, response),
               ERR_INVALID_ARGUMENT);
     EXPECT_LT(std::chrono::steady_clock::now() - started,
               std::chrono::seconds(1));
@@ -319,8 +318,9 @@ TEST(CoroHandshake, OversizedHeaderIsClosedBeforeTheBody) {
     address.sin_family = AF_INET;
     address.sin_port = htons(server.port());
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    ASSERT_EQ(connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)),
-              0);
+    ASSERT_EQ(
+        connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)),
+        0);
 
     coro_rpc::protocol::coro_rpc_protocol::req_header header{};
     header.magic = coro_rpc::protocol::coro_rpc_protocol::magic_number;
@@ -387,9 +387,9 @@ TEST(CoroHandshake, BlockedConnectionDoesNotStallProbe) {
               std::chrono::milliseconds(1000));
 
     Json::Value ignored;
-    EXPECT_EQ(server.plugin().send("127.0.0.1", server.port(), Object(),
-                                   ignored),
-              ERR_TOO_MANY_REQUESTS);
+    EXPECT_EQ(
+        server.plugin().send("127.0.0.1", server.port(), Object(), ignored),
+        ERR_TOO_MANY_REQUESTS);
     release.set_value();
     EXPECT_EQ(first.get(), 0);
     EXPECT_EQ(second.get(), 0);
@@ -420,14 +420,14 @@ TEST(CoroHandshake, MalformedJsonIsRejected) {
             return 0;
         });
     std::string response;
-    EXPECT_EQ(mooncake::CallRawHandshakeForTest(server.shared().get(),
-                                               "127.0.0.1", server.port(), 1,
-                                               "{", response),
-              ERR_MALFORMED_JSON);
+    EXPECT_EQ(
+        mooncake::CallRawHandshakeForTest(server.shared().get(), "127.0.0.1",
+                                          server.port(), 1, "{", response),
+        ERR_MALFORMED_JSON);
     Json::Value probe;
-    EXPECT_EQ(server.plugin().sendProbe("127.0.0.1", server.port(), Object(),
-                                        probe),
-              0);
+    EXPECT_EQ(
+        server.plugin().sendProbe("127.0.0.1", server.port(), Object(), probe),
+        0);
 }
 
 TEST(CoroHandshake, RestartDropsTheStalePooledConnection) {
@@ -435,10 +435,11 @@ TEST(CoroHandshake, RestartDropsTheStalePooledConnection) {
     int fd = ListenLoopback(port);
     ASSERT_GE(fd, 0);
     auto server = mooncake::CreateCoroHandshakePlugin();
-    server->registerOnProbeCallBack([](const Json::Value &, Json::Value &local) {
-        local = Object();
-        return 0;
-    });
+    server->registerOnProbeCallBack(
+        [](const Json::Value &, Json::Value &local) {
+            local = Object();
+            return 0;
+        });
     ASSERT_EQ(server->startDaemon(port, fd), 0);
     auto client = mooncake::CreateCoroHandshakePlugin();
     Json::Value response;
@@ -448,10 +449,11 @@ TEST(CoroHandshake, RestartDropsTheStalePooledConnection) {
     fd = ListenLoopback(port);
     ASSERT_GE(fd, 0);
     server = mooncake::CreateCoroHandshakePlugin();
-    server->registerOnProbeCallBack([](const Json::Value &, Json::Value &local) {
-        local = Object();
-        return 0;
-    });
+    server->registerOnProbeCallBack(
+        [](const Json::Value &, Json::Value &local) {
+            local = Object();
+            return 0;
+        });
     ASSERT_EQ(server->startDaemon(port, fd), 0);
     EXPECT_EQ(client->sendProbe("127.0.0.1", port, Object(), response), 0);
 }
@@ -553,9 +555,9 @@ TEST(CoroHandshake, ByteBudgetRejectsASecondLargeFrame) {
                                           server.port(), 1, payload, again),
         0);
     Json::Value probe;
-    EXPECT_EQ(server.plugin().sendProbe("127.0.0.1", server.port(), Object(),
-                                        probe),
-              0);
+    EXPECT_EQ(
+        server.plugin().sendProbe("127.0.0.1", server.port(), Object(), probe),
+        0);
 }
 
 TEST(CoroHandshake, UnknownRouteReleasesTheByteBudget) {
@@ -713,10 +715,9 @@ TEST(CoroHandshake, OversizedResponseIsNotReturned) {
             return 0;
         });
     Json::Value response;
-    const int rc = server.plugin().exchangeMetadata(
-        "127.0.0.1", server.port(), Object(), response);
-    EXPECT_TRUE(rc == ERR_INVALID_ARGUMENT ||
-                rc == ERR_SOCKET);
+    const int rc = server.plugin().exchangeMetadata("127.0.0.1", server.port(),
+                                                    Object(), response);
+    EXPECT_TRUE(rc == ERR_INVALID_ARGUMENT || rc == ERR_SOCKET);
     EXPECT_FALSE(response.isMember("blob"));
 }
 
