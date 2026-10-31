@@ -5650,10 +5650,24 @@ std::string RealClient::get_hostname() const { return local_hostname; }
 std::vector<int> RealClient::batch_put_from(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes, const ReplicateConfig &config) {
+    return batch_put_from_impl(keys, buffers, sizes, config, false);
+}
+
+std::vector<int> RealClient::batch_put_from_create_only(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes, const ReplicateConfig &config) {
+    return batch_put_from_impl(keys, buffers, sizes, config, true);
+}
+
+std::vector<int> RealClient::batch_put_from_impl(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes, const ReplicateConfig &config,
+    bool create_only) {
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
-                return batch_put_from_internal(keys, buffers, sizes, config);
+                return batch_put_from_internal(keys, buffers, sizes, config,
+                                               create_only);
             },
             [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
@@ -5712,7 +5726,8 @@ RealClient::batch_put_from_dummy_helper(
 
 std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
-    const std::vector<size_t> &sizes, const ReplicateConfig &config) {
+    const std::vector<size_t> &sizes, const ReplicateConfig &config,
+    bool create_only) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -5755,7 +5770,10 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     }
 
     // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, ordered_batched_slices, config);
+    return create_only
+               ? client_->BatchPutCreateOnly(keys, ordered_batched_slices,
+                                             config)
+               : client_->BatchPut(keys, ordered_batched_slices, config);
 }
 
 tl::expected<void, ErrorCode> RealClient::put_from_internal(

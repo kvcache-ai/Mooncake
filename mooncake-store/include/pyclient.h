@@ -249,6 +249,22 @@ class ClientRequester {
         const std::string &client_addr, Args &&...args);
 };
 
+// Optional capability, separate from the existing PyClient vtable. Custom
+// backends opt in explicitly; ordinary idempotent Put is not a fallback.
+class StrictCreateClient {
+   public:
+    virtual ~StrictCreateClient() = default;
+
+    // One result per key: 0 means completed writes; OBJECT_ALREADY_EXISTS
+    // means this call never started a transfer for that key. Other failures
+    // may leave source transfers pending. Flexible dual-replica success is
+    // excluded from the completion guarantee; Engram rejects that mode.
+    virtual std::vector<int> batch_put_from_create_only(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config) = 0;
+};
+
 // Python-specific wrapper class for client interface
 class PyClient {
    public:

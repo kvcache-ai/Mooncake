@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -13,6 +14,7 @@
 namespace mooncake {
 
 class PyClient;
+class StrictCreateClient;
 
 namespace engram {
 
@@ -40,13 +42,22 @@ class EngramStore {
     int bind_local(int layer_id, const std::vector<const void*>& buffers,
                    const std::vector<size_t>& sizes);
 
+    // Keeps owner alive until this Store is destroyed. owner must own every
+    // input allocation; its destructor runs on the Store-destroying thread.
+    int bind_local(int layer_id, const std::vector<const void*>& buffers,
+                   const std::vector<size_t>& sizes,
+                   std::shared_ptr<void> owner);
+
     /**
      * Lookup embedding rows for a batch of precomputed row IDs.
      * @param row_ids [B, L, H] precomputed row IDs, where H == num_heads
      * Store-backed lookup requires registered output; local lookup does not.
      * @param output [B, L, H, row_bytes] contiguous byte output buffer
      * @param output_size Size of output buffer in bytes
-     * @return 0 on success, negative on error
+     * @return 0 on success, negative on error. Pointer/size/dimension precheck
+     * failures leave output untouched. Invalid row IDs and reported read errors
+     * zero-fill [B, L, H, row_bytes]. Unknown layers throw before writing
+     * output.
      */
     int lookup_into(int layer_id, const int64_t* row_ids, int B, int L,
                     void* output, size_t output_size) const;
@@ -68,19 +79,43 @@ class EngramStore {
      * Populate Store with per-head embedding tensors.
      * @param embedding_buffers Byte buffers for each head [N_h, row_bytes]
      * @param buffer_sizes Size in bytes for each buffer
-     * @return 0 on success, negative on error
+     * @return 0 on success; -1 on failure with no retained input resources
+     * (pre-registration or terminal creation conflict after cleanup); -2 when
+     * tables were published but finalization could not be confirmed; -3 when
+     * populate failed with uncertain registration or transfer state. On -2/-3
+     * keep all input buffers alive, without resizing or remapping, until
+     * process exit. Failed writes may leave partial tables. No automatic key
+     * deletion is performed without an ownership/version token. Flexible
+     * dual-replica configurations are rejected before registration because
+     * write success does not prove that every source transfer has ended.
      */
     int populate(int layer_id, const std::vector<void*>& embedding_buffers,
                  const std::vector<size_t>& buffer_sizes,
                  const ReplicateConfig& config = ReplicateConfig{});
 
+    /**
+     * Owner-aware populate, with the same return codes as the raw-buffer API.
+     * owner must keep all input allocations alive. Its reference is retained
+     * independently of this Store until process exit on -2/-3, and released on
+     * 0/-1. Destruction runs on the calling thread; Python owners need a
+     * separate GIL-protected reference. Pre-registration exceptions may
+     * propagate without retention, because registration has not started.
+     */
+    int populate(int layer_id, const std::vector<void*>& embedding_buffers,
+                 const std::vector<size_t>& buffer_sizes,
+                 const ReplicateConfig& config, std::shared_ptr<void> owner);
+
    private:
     std::shared_ptr<PyClient> store_;
+    std::shared_ptr<StrictCreateClient> strict_store_;
     struct QueryCacheEntry;
     struct Layer {
         EngramStoreConfig config;
         std::vector<std::string> keys;
         std::vector<const void*> local_tables;
+        std::shared_ptr<void> local_owner;
+        // Prevent cache refill/read from racing same-layer mutation/removal.
+        mutable std::shared_mutex mutex;
     };
     const Layer& get_layer(int layer_id) const;
     std::shared_ptr<const QueryCacheEntry> get_query_cache(
