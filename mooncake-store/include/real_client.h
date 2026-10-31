@@ -47,6 +47,7 @@ struct EgmStorePoolConfig;
 class RegisteredPinnedRegion;
 class UdsAcceptor;
 class UdsConnection;
+class GpuReadStaging;
 
 // Global resource tracker to handle cleanup on abnormal termination
 class ResourceTracker {
@@ -1297,6 +1298,8 @@ class RealClient : public PyClient {
     // Latched when teardown's NoF buffer cleanup failed: repeat teardown
     // calls retry the cleanup and keep reporting the failure until it heals.
     std::atomic<bool> nof_buffer_cleanup_failed_{false};
+
+    std::unique_ptr<GpuReadStaging> gpu_read_staging_;
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
