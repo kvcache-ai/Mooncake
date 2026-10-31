@@ -1,0 +1,207 @@
+name: Release Memfabric
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag containing MEMFABRIC_BUILD packaging support (e.g. v0.1.0)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    if: ${{ (github.event_name == 'push' && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v') && !contains(inputs.tag, '-')) }}
+
+    strategy:
+      max-parallel: 2
+      matrix:
+        arch: [aarch64, x86_64]
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
+        include:
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            cann_arch: aarch64
+          - arch: x86_64
+            runner: ubuntu-22.04
+            cann_arch: x86_64
+
+    runs-on: ${{ matrix.runner }}
+
+    permissions:
+      contents: write
+
+    env:
+      MEMFABRIC_BUILD: "1"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set Python bin
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHON_BIN="$(command -v python${{ matrix.python-version }})"
+          "$PYTHON_BIN" --version
+          "$PYTHON_BIN" -m pip --version
+          echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
+
+      - name: Install CANN Toolkit
+        shell: bash
+        run: |
+          set -euo pipefail
+          CANN_BASE_URL="https://ascend.devcloud.huaweicloud.com/cann/run/software"
+          CANN_VERSION=$(curl -s "${CANN_BASE_URL}/" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+(?=/)' | sort -V | tail -1)
+          echo "Latest CANN version: ${CANN_VERSION}"
+          CANN_URL="${CANN_BASE_URL}/${CANN_VERSION}/${{ matrix.cann_arch }}/Ascend-cann-toolkit_${CANN_VERSION}_linux-${{ matrix.cann_arch }}.run"
+          echo "Downloading CANN ${CANN_VERSION} from ${CANN_URL}"
+          wget -q --show-progress -O /tmp/cann_toolkit.run "${CANN_URL}"
+          chmod +x /tmp/cann_toolkit.run
+          sudo /tmp/cann_toolkit.run --install --install-for-all --install-path=/usr/local/Ascend --quiet
+          rm -f /tmp/cann_toolkit.run
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          sudo bash -x dependencies.sh -y
+          sudo bash scripts/ascend/dependencies_ascend_installation.sh
+          sudo apt-get install -y file
+          echo "PATH=/usr/local/go/bin:${PATH}" >> "$GITHUB_ENV"
+
+      - name: Configure project
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          rm -rf build
+          cmake -S . -B build -G Ninja \
+            -DUSE_TENT=ON \
+            -DUSE_MEMFABRIC=ON \
+            -DUSE_ETCD=ON \
+            -DSTORE_USE_ETCD=ON \
+            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_UNIT_TESTS=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPython3_EXECUTABLE="${PYTHON_BIN}" \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF \
+            -DCMAKE_SKIP_INSTALL_RPATH=ON
+
+      - name: Build project
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          export PATH="/usr/local/go/bin:${PATH}"
+          # Limit parallelism for memory-heavy Store builds.
+          cmake --build build --parallel 2
+          sudo cmake --install build
+
+      - name: Generate Python version tag
+        id: generate_tag_release
+        shell: bash
+        run: |
+          echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+
+      - name: Add TENT artifacts to wheel staging
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${PYTHON_BIN}" - <<'PY'
+          from pathlib import Path
+
+          path = Path("scripts/build_wheel.sh")
+          source = path.read_text()
+          marker = "# Copy ascend_transport.so to mooncake directory (only when USE_ASCEND_DIRECT is set)"
+          block = '''# Copy TENT artifacts when built.
+          if [ -f "${BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so" ]; then
+              cp "${BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so" mooncake-wheel/mooncake/
+              cp "${BUILD_DIR}/mooncake-transfer-engine/tent/src/metrics/libtent_metrics.so" mooncake-wheel/mooncake/
+              cp "${BUILD_DIR}"/mooncake-transfer-engine/tent/src/python/tent.cpython-*.so mooncake-wheel/mooncake/
+          fi
+
+          '''
+          if source.count(marker) != 1:
+              raise SystemExit("Cannot locate the TENT wheel staging insertion point")
+          if block not in source:
+              path.write_text(source.replace(marker, block + marker, 1))
+          PY
+          bash -n scripts/build_wheel.sh
+
+      - name: Build Python wheel
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-memfabric-py${{ steps.generate_tag_release.outputs.python_version_tag }} bash scripts/build_wheel.sh
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-wheel-memfabric-${{ matrix.arch }}-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          path: mooncake-wheel/dist-memfabric-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
+          if-no-files-found: error
+
+  publish-release:
+    if: ${{ (github.event_name == 'push' && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v') && !contains(inputs.tag, '-')) }}
+    needs: build
+    runs-on: ubuntu-22.04
+    environment: pypi
+
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: mooncake-wheel/dist-all
+          pattern: mooncake-wheel-memfabric-*
+
+      - name: Prepare wheels for release
+        run: |
+          mkdir -p mooncake-wheel/dist-release
+          find mooncake-wheel/dist-all -name "*.whl" -exec cp {} mooncake-wheel/dist-release/ \;
+          echo "Collected wheels for release:"
+          ls -la mooncake-wheel/dist-release/
+
+      - name: Upload wheels to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          files: mooncake-wheel/dist-release/*.whl
+
+      - name: Publish package to PyPI
+        if: github.repository == 'kvcache-ai/Mooncake'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: mooncake-wheel/dist-release/
