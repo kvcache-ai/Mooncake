@@ -91,18 +91,51 @@ class DistributedStorageBackend : public StorageBackendInterface {
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
 
+    // Upper bound on bucket files one BatchWrite/BatchRead holds open at once.
+    static constexpr size_t kMaxOpenBucketsPerBatch = 64;
+
    private:
     struct ShardFile {
         std::string path;
         int fd = -1;
         std::mutex mutex;
     };
+    struct DfsIoOp;
 
     tl::expected<ShardFile*, ErrorCode> GetOrOpenShard(
         const DistributedFSDescriptor& descriptor);
+    // Validates that file_path is a shard file of the expected capacity located
+    // directly under root_dir_, then opens it and returns the descriptor.
+    tl::expected<int, ErrorCode> ValidateAndOpenShardFile(
+        const std::string& file_path);
+    // Reopens a shard's descriptor after an I/O failure. The caller must hold
+    // shard.mutex, which serializes all I/O on the shard, so no other thread
+    // can be using the old descriptor concurrently. On failure the descriptor
+    // is reset to -1 so a later GetOrOpenShard reinitializes it.
+    tl::expected<void, ErrorCode> ReopenShardLocked(ShardFile& shard);
     tl::expected<int, ErrorCode> OpenBucket(
         const DistributedFSDescriptor& descriptor);
     bool UsesBucketAllocator() const;
+    // Preserve per-request bucket handles and shard I/O locking for adapters
+    // that do not opt in to batching.
+    tl::expected<void, ErrorCode> ExecuteSingleIo(DfsIoOp& op, bool write);
+    // Resolve fds for validated ops and submit them through SubmitBatchIo.
+    // Both write failures into results[op.index]. Shard fds come from the
+    // shard cache; bucket fds are opened per batch, at most
+    // kMaxOpenBucketsPerBatch at a time, and closed after their submission.
+    void ExecuteShardBatchIo(
+        std::vector<DfsIoOp>& ops,
+        std::vector<tl::expected<void, ErrorCode>>& results, bool write);
+    void ExecuteBucketBatchIo(
+        std::vector<DfsIoOp>& ops,
+        std::vector<tl::expected<void, ErrorCode>>& results, bool write);
+    // Submits io_requests (io_requests[i] belongs to *io_ops[i]) to the
+    // adapter as one batch. Short transfers are completed when
+    // complete_short_io is set and reported as failures otherwise.
+    void SubmitBatchIo(const std::vector<FdIoRequest>& io_requests,
+                       const std::vector<DfsIoOp*>& io_ops,
+                       std::vector<tl::expected<void, ErrorCode>>& results,
+                       bool write, bool complete_short_io);
 
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
@@ -110,9 +143,12 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::string root_dir_;
     // Create shard entries only from descriptors published by the master.
     // The cache lock protects lookup/insertion; each shard's mutex protects
-    // initialization (fd stays -1 until opening succeeds) and positional I/O.
-    // Entries are never erased while the backend is running, so callers can
-    // retain a ShardFile pointer after releasing the cache lock.
+    // initialization (fd stays -1 until opening succeeds) and, for adapters
+    // without batching, positional I/O and reopen-on-failure. fd changes only
+    // under the shard mutex (open or ReopenShardLocked), so adapters that opt
+    // in to batching never reopen and can use the fd concurrently. Entries are
+    // never erased while the backend is running, so callers can retain a
+    // ShardFile pointer after releasing the cache lock.
     std::mutex shard_files_mutex_;
     std::unordered_map<int, std::unique_ptr<ShardFile>> shard_files_;
     DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;

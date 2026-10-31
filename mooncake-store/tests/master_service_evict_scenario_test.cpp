@@ -20,7 +20,8 @@
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/oplog_batch_types.h"
-#include "tenant_quota_policy_store.h"
+#include "metadata/lease_eviction_index.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -336,10 +337,13 @@ TEST_F(MasterServiceEvictScenarioTest, EvictsWholeGroupTogether) {
                    .CompleteOn("memory")
                    .InGroup("group")
                    .ExpiredFrom(base))
-        .Given(IndexedObjects(kGroupSize, kObjectCount)
-                   .Size(kObjectSize)
-                   .CompleteOn("memory")
-                   .ExpiredFrom(base + std::chrono::nanoseconds(kGroupSize)))
+        // A bucket of the eviction index later: leases within one bucket
+        // are not ranked against each other.
+        .Given(
+            IndexedObjects(kGroupSize, kObjectCount)
+                .Size(kObjectSize)
+                .CompleteOn("memory")
+                .ExpiredFrom(base + metadata::LeaseEvictionIndex::kBucketWidth))
         .When(EvictMemory(0.10))
         .Then(ReadableCount(IndexedObjects(0, kObjectCount),
                             kObjectCount - kGroupSize))
@@ -370,6 +374,31 @@ TEST_F(MasterServiceEvictScenarioTest, ActiveGroupMemberBlocksWholeGroup) {
         .Then(ReadableCount(IndexedObjects(0, kObjectCount), kObjectCount - 1))
         .Then(IndexedObjects(0, kGroupSize).AreReadable())
         .Then(Object(Key(kGroupSize)).DoesNotExist());
+}
+
+TEST_F(MasterServiceEvictScenarioTest,
+       ProbedObjectsStayEvictableWhileLeasedObjectsSurvive) {
+    auto config = EvictConfig();
+    config.default_kv_lease_ttl = 60 * 60 * 1000;
+    MasterScenario scenario("batch probe grants no lease", config);
+    scenario.Given(MemoryNode("memory"))
+        .Given(Objects({"leased_a", "leased_b", "probed_a", "probed_b"})
+                   .Size(kObjectSize)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase()))
+        // BatchExistence grants every hit a fresh lease. BatchProbe reports
+        // the same hits and leaves their expired leases untouched.
+        .Then(BatchExistence({"leased_a", "leased_b"}).Returns({true, true}))
+        .Then(BatchProbe({"probed_a", "missing", "probed_b", "probed_a"})
+                  .Returns({true, false, true, true}))
+        .When(EvictMemory(1.0))
+        .Then(Objects({"leased_a", "leased_b"}).AreReadable())
+        .Then(Objects({"probed_a", "probed_b"}).DoNotExist())
+        // Once those leases expire, the same pass reclaims the leased objects.
+        .When(ExpireAt("leased_a", ExpiredBase()))
+        .When(ExpireAt("leased_b", ExpiredBase()))
+        .When(EvictMemory(1.0))
+        .Then(Objects({"leased_a", "leased_b"}).DoNotExist());
 }
 
 TEST_F(MasterServiceEvictScenarioTest, EvictsExactOldestObjectsAtHighRatio) {
@@ -613,8 +642,7 @@ TEST_F(MasterServiceEvictScenarioTest,
                   .ForTenant("tenant-a")
                   .ExpectReplicas(1))
         .When(PutEnd("tenant-a-new").ForTenant("tenant-a"))
-        // tenant-b has nothing evictable, so it keeps rejecting -- now
-        // without a shard scan per attempt.
+        // tenant-b has nothing evictable, so it keeps rejecting.
         .When(PutStart("tenant-b-overflow", 1)
                   .ForTenant("tenant-b")
                   .ExpectError(ErrorCode::TENANT_QUOTA_EXCEEDED));
@@ -792,7 +820,7 @@ TEST_F(MasterServiceEvictScenarioTest, PressureEvictionExpandsToWholeGroup) {
         .Given(Objects({"grouped_evict_a", "grouped_evict_b"})
                    .Size(kGroupObject)
                    .CompleteOn("memory")
-                   .InGroup(GroupOnDifferentShard("grouped_evict_a"))
+                   .InGroup("grouped_evict_a_group")
                    .ExpiredFrom(ExpiredBase()))
         .When(PutStart("grouped_evict_trigger", kGroupObject)
                   .Eventually(std::chrono::seconds(10)))
@@ -813,7 +841,7 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Given(Objects({"grouped_leased_a", "grouped_leased_b"})
                    .Size(kGroupObject)
                    .CompleteOn("memory")
-                   .InGroup(GroupOnDifferentShard("grouped_leased_a"))
+                   .InGroup("grouped_leased_a_group")
                    .ExpiredFrom(ExpiredBase()))
         // Reading one member grants it a fresh lease, which shields the whole
         // group from the eviction armed by the failing writes below.

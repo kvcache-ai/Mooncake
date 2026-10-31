@@ -1,5 +1,6 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <sys/stat.h>
 
 #include <chrono>
 #include <cstring>
@@ -73,6 +74,357 @@ class ConcurrentOffloadBackend : public BucketStorageBackend {
 class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
+
+    static uintmax_t StoredFileBytes(const std::string& path) {
+        uintmax_t bytes = 0;
+        for (const auto& entry : fs::recursive_directory_iterator(path)) {
+            if (!entry.is_regular_file()) continue;
+            struct stat info{};
+            EXPECT_EQ(0, ::stat(entry.path().c_str(), &info));
+            bytes += static_cast<uintmax_t>(info.st_blocks) * 512;
+        }
+        return bytes;
+    }
+
+    void RunOrdinaryRemoveAllReclaimScenario(StorageBackendType backend_type) {
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_default_kv_lease_ttl(0)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+        std::unique_ptr<void, decltype(&std::free)> segment(
+            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+        ASSERT_NE(segment, nullptr);
+        SimpleAllocator allocator(kSegmentSize);
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                      std::nullopt, master.master_address());
+        ASSERT_TRUE(created);
+        auto client = *created;
+        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+        ASSERT_TRUE(client->RegisterLocalMemory(
+            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+        auto* buffer = allocator.allocate(128);
+        ASSERT_NE(buffer, nullptr);
+        std::memset(buffer, 'o', 128);
+        ReplicateConfig replicate;
+        replicate.replica_num = 1;
+        std::vector<Slice> slices{{buffer, 128}};
+        ASSERT_TRUE(client->Put("ordinary-reclaim", slices, replicate));
+        allocator.deallocate(buffer, 128);
+        std::vector<OffloadTaskItem> tasks;
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
+        ASSERT_EQ(1, tasks.size());
+
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_filepath = data_path + "/ordinary_reclaim";
+        config.local_buffer_size = 1024 * 1024;
+        config.storage_backend_type = backend_type;
+        config.disk_eviction_high_watermark_ratio = 0.99;
+        config.disk_eviction_low_watermark_ratio = 0.98;
+        fs::create_directories(config.storage_filepath);
+        FileStorage storage(config, client, endpoint);
+        if (backend_type == StorageBackendType::kBucket) {
+            BucketBackendConfig bucket_config;
+            bucket_config.bucket_keys_limit = 1;
+            bucket_config.max_total_size = 1024 * 1024;
+            bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+            storage.storage_backend_ =
+                std::make_shared<BucketStorageBackend>(config, bucket_config);
+        }
+        ASSERT_TRUE(storage.storage_backend_->Init());
+        const auto baseline = StoredFileBytes(config.storage_filepath);
+        ASSERT_TRUE(storage.OffloadObjects(tasks));
+        const auto populated = StoredFileBytes(config.storage_filepath);
+        ASSERT_GT(populated, baseline);
+        auto removed = client->RemoveAll(true);
+        ASSERT_TRUE(removed);
+        ASSERT_EQ(1, *removed);
+        EXPECT_FALSE(client->Query("ordinary-reclaim"));
+        ASSERT_TRUE(storage.Heartbeat());
+        EXPECT_EQ(populated, StoredFileBytes(config.storage_filepath));
+
+        // Physical reclamation follows configured pressure, even without
+        // another write; metadata removal alone does not wipe the backend.
+        storage.config_.disk_eviction_high_watermark_ratio = 1e-12;
+        storage.config_.disk_eviction_low_watermark_ratio = 0.5e-12;
+        ASSERT_TRUE(storage.Heartbeat());
+        EXPECT_EQ(baseline, StoredFileBytes(config.storage_filepath));
+        EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+        EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
+    }
+
+    void RunManagedRemoveAllScenario(bool file_per_key = false,
+                                     bool protected_prefix = false) {
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_default_kv_lease_ttl(0)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+        std::unique_ptr<void, decltype(&std::free)> segment(
+            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+        ASSERT_NE(segment, nullptr);
+        SimpleAllocator allocator(kSegmentSize);
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                      std::nullopt, master.master_address());
+        ASSERT_TRUE(created);
+        auto client = *created;
+        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+        ASSERT_TRUE(client->RegisterLocalMemory(
+            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+
+        const WeightRevisionIdentity identity{.tenant_id = "default",
+                                              .name_space = "production",
+                                              .resource_id = "ssd-weight",
+                                              .revision = "v1",
+                                              .weight_generation = 1};
+        auto begin = client->BeginWeightImport({.identity = identity,
+                                                .payload_group_id = {},
+                                                .expected_payload_count = 1,
+                                                .expected_logical_bytes = 128});
+        ASSERT_TRUE(begin && *begin);
+        const auto manifest_key = MakeWeightManifestKey(identity);
+        const std::vector<std::string> keys{"ordinary-ssd", "managed-payload",
+                                            manifest_key};
+        const std::vector<std::string> values{std::string(128, 'o'),
+                                              std::string(128, 'w'),
+                                              std::string(128, 'm')};
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto* buffer = allocator.allocate(values[i].size());
+            ASSERT_NE(buffer, nullptr);
+            std::memcpy(buffer, values[i].data(), values[i].size());
+            ReplicateConfig config;
+            config.replica_num = 1;
+            if (i != 0) {
+                config.group_ids = {(*begin)->manifest.payload_group_id};
+                config.data_type =
+                    i == 1 ? ObjectDataType::WEIGHT : ObjectDataType::METADATA;
+            }
+            std::vector<Slice> slices{{buffer, values[i].size()}};
+            ASSERT_TRUE(client->Put(keys[i], slices, config));
+            allocator.deallocate(buffer, values[i].size());
+        }
+        std::vector<OffloadTaskItem> tasks;
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
+        ASSERT_EQ(keys.size(), tasks.size());
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_filepath = data_path + "/managed_ssd";
+        config.local_buffer_size = 1024 * 1024;
+        config.storage_backend_type = file_per_key
+                                          ? StorageBackendType::kFilePerKey
+                                          : StorageBackendType::kBucket;
+        fs::create_directories(config.storage_filepath);
+        FileStorage storage(config, client, endpoint);
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = keys.size();
+        bucket_config.max_total_size = 1024 * 1024;
+        bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+        if (!file_per_key) {
+            storage.storage_backend_ =
+                std::make_shared<BucketStorageBackend>(config, bucket_config);
+        }
+        ASSERT_TRUE(storage.storage_backend_->Init());
+        const auto baseline = StoredFileBytes(config.storage_filepath);
+        if (protected_prefix) {
+            for (const auto index : {1, 2, 0}) {
+                for (const auto& task : tasks) {
+                    if (task.key != keys[index]) continue;
+                    std::vector<OffloadTaskItem> single{task};
+                    ASSERT_TRUE(storage.OffloadObjects(single));
+                }
+            }
+        } else {
+            ASSERT_TRUE(storage.OffloadObjects(tasks));
+        }
+        const auto populated = StoredFileBytes(config.storage_filepath);
+        ASSERT_GT(populated, baseline);
+        auto ready = client->CommitWeightImport(
+            {.identity = identity,
+             .expected_metadata_generation = (*begin)->metadata_generation,
+             .manifest = {
+                 .manifest_key = manifest_key,
+                 .manifest_sha256 = std::string(64, 'a'),
+                 .payload_group_id = (*begin)->manifest.payload_group_id,
+                 .payload_keys_sha256 =
+                     ComputeWeightPayloadKeysSha256({keys[1]}),
+                 .payload_count = 1,
+                 .logical_bytes = 128}});
+        ASSERT_TRUE(ready && *ready);
+
+        auto check_payload = [&] {
+            std::string actual(values[1].size(), '\0');
+            std::unordered_map<std::string, Slice> read{
+                {TenantId::Default().MakeScopedKey(keys[1]),
+                 {actual.data(), actual.size()}}};
+            ASSERT_TRUE(storage.storage_backend_->BatchLoad(read));
+            EXPECT_EQ(values[1], actual);
+        };
+        ASSERT_NO_FATAL_FAILURE(check_payload());
+        auto removed = client->RemoveAll(true);
+        ASSERT_TRUE(removed);
+        EXPECT_EQ(1, *removed);
+        ASSERT_TRUE(storage.Heartbeat());
+        EXPECT_TRUE(client->Query(keys[1]));
+        EXPECT_TRUE(client->Query(manifest_key));
+        ASSERT_NO_FATAL_FAILURE(check_payload());
+        storage.config_.disk_eviction_high_watermark_ratio = 1e-12;
+        storage.config_.disk_eviction_low_watermark_ratio = 0.5e-12;
+        if (protected_prefix) {
+            uintmax_t logical_bytes = 0;
+            for (const auto& entry :
+                 fs::recursive_directory_iterator(config.storage_filepath)) {
+                if (entry.is_regular_file()) logical_bytes += entry.file_size();
+            }
+            const auto capacity = static_cast<uint64_t>(
+                fs::space(config.storage_filepath).capacity * 0.9);
+            // One oldest protected file suffices for the projected target.
+            // Repeated heartbeats must still reach the later ordinary orphan.
+            storage.config_.disk_eviction_high_watermark_ratio =
+                static_cast<double>(logical_bytes - 32) / capacity;
+            storage.config_.disk_eviction_low_watermark_ratio =
+                static_cast<double>(logical_bytes - 64) / capacity;
+        }
+        for (int tick = 0; tick < (protected_prefix ? 4 : 1); ++tick) {
+            ASSERT_TRUE(storage.Heartbeat());
+        }
+        if (file_per_key) {
+            EXPECT_LT(StoredFileBytes(config.storage_filepath), populated);
+            auto ordinary_exists = storage.storage_backend_->IsExist(
+                TenantId::Default().MakeScopedKey(keys[0]));
+            ASSERT_TRUE(ordinary_exists);
+            EXPECT_FALSE(*ordinary_exists);
+        } else {
+            EXPECT_EQ(populated, StoredFileBytes(config.storage_filepath));
+        }
+        ASSERT_NO_FATAL_FAILURE(check_payload());
+
+        // A mixed bucket must remain intact while managed objects are live.
+        // Once the revision is deleted, all its bytes become reclaimable.
+        auto deleted = client->DeleteWeightRevision(
+            {.identity = identity,
+             .expected_metadata_generation = (*ready)->metadata_generation});
+        ASSERT_TRUE(deleted && *deleted);
+        EXPECT_FALSE(client->Query(keys[1]));
+        EXPECT_FALSE(client->Query(manifest_key));
+        storage.config_.disk_eviction_high_watermark_ratio = 1e-12;
+        storage.config_.disk_eviction_low_watermark_ratio = 0.5e-12;
+        ASSERT_TRUE(storage.Heartbeat());
+        EXPECT_EQ(baseline, StoredFileBytes(config.storage_filepath));
+        EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+        EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
+    }
+
+    void RunDeferredOffloadFailureScenario(bool capacity_limit) {
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_default_kv_lease_ttl(0)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+        std::unique_ptr<void, decltype(&std::free)> segment(
+            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+        ASSERT_NE(segment, nullptr);
+        SimpleAllocator allocator(kSegmentSize);
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto client_result =
+            Client::Create(endpoint, master.metadata_url(), "tcp", std::nullopt,
+                           master.master_address());
+        ASSERT_TRUE(client_result.has_value());
+        auto client = client_result.value();
+        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+        ASSERT_TRUE(client->RegisterLocalMemory(
+            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+
+        ReplicateConfig replicate;
+        replicate.replica_num = 1;
+        constexpr size_t kValueSize = 128;
+        void* buffer = allocator.allocate(kValueSize);
+        ASSERT_NE(buffer, nullptr);
+        std::memset(buffer, 'a', kValueSize);
+        std::vector<Slice> slices{{buffer, kValueSize}};
+        for (size_t i = 0; i < 5; ++i) {
+            ASSERT_TRUE(client->Put("deferred_" + std::to_string(i), slices,
+                                    replicate));
+        }
+        std::vector<OffloadTaskItem> tasks;
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
+        ASSERT_EQ(tasks.size(), 5u);
+
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_backend_type = StorageBackendType::kBucket;
+        config.storage_filepath = data_path + "/deferred_failure";
+        config.local_buffer_size = 1024 * 1024;
+        // Two-key buckets: the first fits, the second exceeds capacity, and
+        // the final key is deferred before either write starts.
+        config.total_keys_limit = 2;
+        fs::create_directories(config.storage_filepath);
+        FileStorage file_storage(config, client, endpoint);
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = 2;
+        bucket_config.flush_partial_buckets = false;
+        std::shared_ptr<BucketStorageBackend> backend;
+        if (capacity_limit) {
+            backend =
+                std::make_shared<BucketStorageBackend>(config, bucket_config);
+        } else {
+            backend = std::make_shared<ConcurrentOffloadBackend>(
+                config, bucket_config, std::unordered_set<std::string>{}, true);
+        }
+        file_storage.storage_backend_ = backend;
+        file_storage.enable_offloading_ = true;
+        ASSERT_TRUE(backend->Init());
+
+        // Carry one real master task across a heartbeat boundary first.
+        ASSERT_TRUE(file_storage.OffloadObjects({tasks.front()}));
+        ASSERT_EQ(file_storage.deferred_task_by_storage_key_.size(), 1u);
+        ASSERT_EQ(backend->UngroupedOffloadingObjectsSize(), 1u);
+        auto blocked = client->Upsert(tasks.front().key, slices, replicate);
+        ASSERT_FALSE(blocked.has_value());
+        EXPECT_EQ(blocked.error(), ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+
+        auto result = file_storage.OffloadObjects(
+            std::vector<OffloadTaskItem>(tasks.begin() + 1, tasks.end()));
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), capacity_limit ? ErrorCode::KEYS_ULTRA_LIMIT
+                                                 : ErrorCode::FILE_WRITE_FAIL);
+        EXPECT_EQ(file_storage.enable_offloading_, !capacity_limit);
+        EXPECT_EQ(file_storage.deferred_task_by_storage_key_.size(),
+                  capacity_limit ? 0u : 1u);
+        EXPECT_EQ(backend->UngroupedOffloadingObjectsSize(),
+                  capacity_limit ? 0u : 1u);
+
+        size_t persisted_count = 0;
+        for (const auto& task : tasks) {
+            const auto storage_key =
+                TenantId(task.tenant_id).MakeScopedKey(task.key);
+            auto exists = backend->IsExist(storage_key);
+            ASSERT_TRUE(exists.has_value());
+            persisted_count += exists.value();
+            // A transient write error must keep the tail pinned for retry;
+            // a capacity shutdown must release every task immediately.
+            auto overwritten = client->Upsert(task.key, slices, replicate);
+            if (file_storage.deferred_task_by_storage_key_.count(storage_key)) {
+                ASSERT_FALSE(overwritten.has_value());
+                EXPECT_EQ(overwritten.error(),
+                          ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+            } else {
+                EXPECT_TRUE(overwritten.has_value()) << task.key;
+            }
+        }
+        EXPECT_EQ(persisted_count, capacity_limit ? 2u : 0u);
+        allocator.deallocate(buffer, kValueSize);
+        EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+        EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
+    }
 
     void RunSkippedOffloadScenario(
         size_t duplicate_count, bool fail_write,
@@ -207,6 +559,7 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES");
+        UnsetEnv("MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
@@ -283,14 +636,42 @@ class FileStorageTest : public ::testing::Test {
     tl::expected<void, ErrorCode> FileStorageGroupOffloadingKeysByBucket(
         FileStorage& fileStorage,
         const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys) {
+        std::vector<std::vector<std::string>>& buckets_keys,
+        std::vector<std::string>* deferred_keys = nullptr) {
         auto bucket_backend = std::dynamic_pointer_cast<BucketStorageBackend>(
             fileStorage.storage_backend_);
         if (!bucket_backend) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
-        return bucket_backend->AllocateOffloadingBuckets(offloading_objects,
-                                                         buckets_keys);
+        return bucket_backend->AllocateOffloadingBuckets(
+            offloading_objects, buckets_keys, deferred_keys);
+    }
+
+    tl::expected<void, ErrorCode> FileStorageOffloadObjects(
+        FileStorage& fileStorage,
+        const std::vector<OffloadTaskItem>& offloading_objects) {
+        return fileStorage.OffloadObjects(offloading_objects);
+    }
+
+    std::unordered_map<std::string, OffloadTaskItem>
+    GetDeferredTaskByStorageKey(FileStorage& fileStorage) {
+        return fileStorage.deferred_task_by_storage_key_;
+    }
+
+    static void FileStoragePartitionUnbucketedTasks(
+        const std::unordered_map<std::string, OffloadTaskItem>&
+            task_by_storage_key,
+        const std::unordered_set<std::string>& all_bucket_keys,
+        const std::vector<std::string>& deferred_keys,
+        const std::unordered_map<std::string, OffloadTaskItem>&
+            previously_carried,
+        const std::unordered_set<std::string>& redrained_carried_keys,
+        std::vector<OffloadTaskItem>& failed_tasks,
+        std::unordered_map<std::string, OffloadTaskItem>& carried_tasks) {
+        FileStorage::PartitionUnbucketedTasks(
+            task_by_storage_key, all_bucket_keys, deferred_keys,
+            previously_carried, redrained_carried_keys, failed_tasks,
+            carried_tasks);
     }
 
     size_t GetUngroupedOffloadingObjectsSize(FileStorage& fileStorage) {
@@ -540,7 +921,8 @@ class FileStorageTest : public ::testing::Test {
         EXPECT_TRUE(unmount.has_value());
         std::free(seg_ptr);
     }
-    void RunBatchPutHealWipeScenario(const std::string& data_path) {
+    void RunBatchPutHealWipeScenario(const std::string& data_path,
+                                     bool with_key_metadata = false) {
         std::filesystem::path master_root =
             std::filesystem::path(data_path) / "heal_master_batch";
         std::filesystem::create_directories(master_root);
@@ -624,7 +1006,7 @@ class FileStorageTest : public ::testing::Test {
         // One batch with both wiped keys and a fresh key.
         const std::string fresh_key = "heal_batch_fresh";
         const std::string updated(512, 'y');
-        std::vector<ObjectKey> keys = {wiped_keys[0], wiped_keys[1], fresh_key};
+        std::vector<ObjectKey> keys = {fresh_key, wiped_keys[0], wiped_keys[1]};
         std::vector<std::vector<Slice>> batched_slices;
         std::vector<void*> buffers;
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -636,6 +1018,15 @@ class FileStorageTest : public ::testing::Test {
         }
         ReplicateConfig cfg;
         cfg.replica_num = 1;
+        if (with_key_metadata) {
+            cfg.session_ids =
+                std::vector<std::string>{"fresh", "wiped-a", "wiped-b"};
+            cfg.group_ids =
+                std::vector<std::string>{"fresh-group", "a-group", "b-group"};
+            cfg.per_key_preferred_hca_names =
+                std::vector<std::vector<std::string>>{
+                    {"mlx5_0"}, {}, {"mlx5_1"}};
+        }
         auto results = client.value()->BatchPut(keys, batched_slices, cfg);
         ASSERT_EQ(results.size(), keys.size());
         for (size_t i = 0; i < results.size(); ++i) {
@@ -964,6 +1355,272 @@ TEST_F(FileStorageTest,
     }
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
+}
+
+TEST_F(FileStorageTest, OffloadObjects_capacity_limit_releases_deferred_tasks) {
+    RunDeferredOffloadFailureScenario(true);
+}
+
+TEST_F(FileStorageTest, OffloadObjects_write_failure_preserves_deferred_tasks) {
+    RunDeferredOffloadFailureScenario(false);
+}
+
+// Regression (upstream #3006): keys deferred to the ungrouped pool must be
+// reported to the caller so their offload tasks can be carried across the
+// deferral. Before this, deferred keys were NACKed on deferral and then
+// silently dropped on re-emission (no task) — never written to SSD.
+TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_reports_deferred_keys) {
+    std::unordered_map<std::string, int64_t> offloading_objects;
+    for (size_t i = 0; i < 35; i++) {
+        offloading_objects.emplace("test" + std::to_string(i), 1);
+    }
+    std::vector<std::vector<std::string>> buckets_keys;
+    std::vector<std::string> deferred_keys;
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    // 35 keys / limit 10: 3 full buckets, the 5-key tail is deferred.
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys, &deferred_keys));
+    ASSERT_EQ(buckets_keys.size(), 3);
+    ASSERT_EQ(deferred_keys.size(), 5);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 5);
+    // Deferred keys are exactly the keys in no bucket.
+    std::unordered_set<std::string> bucketed;
+    for (const auto& bucket : buckets_keys) {
+        bucketed.insert(bucket.begin(), bucket.end());
+    }
+    for (const auto& key : deferred_keys) {
+        EXPECT_EQ(bucketed.count(key), 0u) << key;
+        EXPECT_EQ(offloading_objects.count(key), 1u) << key;
+    }
+
+    // Empty input: the grouping loop never runs, so the pool is untouched —
+    // nothing is emitted, nothing re-reported. The caller must therefore
+    // RETAIN its carried tasks rather than rebuild from deferred_keys alone.
+    buckets_keys.clear();
+    deferred_keys.clear();
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, {}, buckets_keys, &deferred_keys));
+    ASSERT_EQ(buckets_keys.size(), 0);
+    ASSERT_EQ(deferred_keys.size(), 0);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 5);
+
+    // Input too small to fill the bucket: pool + new input are all
+    // RE-deferred, and all must be RE-reported.
+    offloading_objects.clear();
+    for (size_t i = 100; i < 102; i++) {
+        offloading_objects.emplace("late" + std::to_string(i), 1);
+    }
+    buckets_keys.clear();
+    deferred_keys.clear();
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys, &deferred_keys));
+    ASSERT_EQ(buckets_keys.size(), 0);
+    ASSERT_EQ(deferred_keys.size(), 7);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 7);
+
+    // Enough new input to fill one exact bucket: pool + new input are
+    // emitted; the pool empties and nothing is deferred.
+    offloading_objects.clear();
+    for (size_t i = 200; i < 203; i++) {
+        offloading_objects.emplace("fill" + std::to_string(i), 1);
+    }
+    buckets_keys.clear();
+    deferred_keys.clear();
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys, &deferred_keys));
+    ASSERT_EQ(buckets_keys.size(), 1);
+    ASSERT_EQ(buckets_keys[0].size(), 10);
+    ASSERT_EQ(deferred_keys.size(), 0);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
+}
+
+// Regression (upstream #3006): the NACK sweep must exempt deferred keys —
+// carrying their tasks to the next cycle — while still NACKing keys the
+// backend deliberately skipped.
+TEST_F(FileStorageTest, PartitionUnbucketedTasks_carries_deferred_not_nacked) {
+    auto make_task = [](const std::string& key) {
+        return OffloadTaskItem{.tenant_id = "default", .key = key, .size = 1};
+    };
+    std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key{
+        {"bucketed", make_task("bucketed")},
+        {"deferred", make_task("deferred")},
+        {"skipped_a", make_task("skipped_a")},
+        {"skipped_b", make_task("skipped_b")},
+    };
+    // "pooled_waiting" was carried from an earlier cycle; this cycle the
+    // backend neither emitted nor re-reported it (empty effective input
+    // leaves the pool untouched), so it must be RETAINED, not NACKed.
+    task_by_storage_key.emplace("pooled_waiting", make_task("pooled_waiting"));
+    const std::unordered_map<std::string, OffloadTaskItem> previously_carried{
+        {"pooled_waiting", make_task("pooled_waiting")}};
+    const std::unordered_set<std::string> all_bucket_keys{"bucketed"};
+    const std::vector<std::string> deferred_keys{"deferred"};
+
+    std::vector<OffloadTaskItem> failed_tasks;
+    std::unordered_map<std::string, OffloadTaskItem> carried_tasks;
+    FileStoragePartitionUnbucketedTasks(task_by_storage_key, all_bucket_keys,
+                                        deferred_keys, previously_carried, {},
+                                        failed_tasks, carried_tasks);
+
+    // The deferred key is carried with its original task; the un-emitted
+    // previously carried key is retained. Neither is NACKed.
+    ASSERT_EQ(carried_tasks.size(), 2u);
+    ASSERT_EQ(carried_tasks.count("deferred"), 1u);
+    ASSERT_EQ(carried_tasks.count("pooled_waiting"), 1u);
+    EXPECT_EQ(carried_tasks.at("deferred").key, "deferred");
+    for (const auto& task : failed_tasks) {
+        EXPECT_NE(task.key, "deferred");
+        EXPECT_NE(task.key, "pooled_waiting");
+        EXPECT_NE(task.key, "bucketed");
+    }
+    // Deliberately skipped keys are still NACKed.
+    ASSERT_EQ(failed_tasks.size(), 2u);
+}
+
+// Regression (review follow-up on the re-drain collision path): a carried key
+// re-drained this cycle and then skipped outright by the backend — re-PUT at a
+// size over bucket_size_limit, which GroupOffloadingKeysByBucket drops without
+// bucketing OR deferring — must NACK the FRESH task and must not retain the
+// stale one. Retention here would be doubly wrong: the stale task is stranded
+// forever (its pooled copy was dropped on collision, so the pool can never
+// re-emit it) and its presence in carried_tasks suppresses the fresh task's
+// NACK, losing the task and leaking its source-replica refcount.
+TEST_F(FileStorageTest, PartitionUnbucketedTasks_redrained_then_skipped) {
+    OffloadTaskItem stale{.tenant_id = "default", .key = "x", .size = 1};
+    OffloadTaskItem fresh{.tenant_id = "default", .key = "x", .size = 5};
+    // The carry merge already resolved the collision: the fresh task won the
+    // task map, the pooled copy was removed, and "x" was recorded as
+    // re-drained.
+    const std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key{
+        {"x", fresh}};
+    const std::unordered_map<std::string, OffloadTaskItem> previously_carried{
+        {"x", stale}};
+    const std::unordered_set<std::string> redrained_carried_keys{"x"};
+    // Over the size limit: neither bucketed nor deferred.
+    const std::unordered_set<std::string> all_bucket_keys{};
+    const std::vector<std::string> deferred_keys{};
+
+    std::vector<OffloadTaskItem> failed_tasks;
+    std::unordered_map<std::string, OffloadTaskItem> carried_tasks;
+    FileStoragePartitionUnbucketedTasks(
+        task_by_storage_key, all_bucket_keys, deferred_keys, previously_carried,
+        redrained_carried_keys, failed_tasks, carried_tasks);
+
+    EXPECT_TRUE(carried_tasks.empty())
+        << "a re-drained key has no pooled copy left to wait for; retaining "
+           "the stale task strands it and suppresses the fresh NACK";
+    ASSERT_EQ(failed_tasks.size(), 1u);
+    EXPECT_EQ(failed_tasks[0].key, "x");
+    EXPECT_EQ(failed_tasks[0].size, 5)
+        << "the fresh task must be the one NACKed";
+}
+
+// The exclusion must be keyed on "re-drained this cycle", NOT on "present in
+// task_by_storage_key": the carry merge inserts every non-collision carried
+// task into that map, so testing membership there would void retention for
+// every carried key and re-introduce the task-less drop this PR fixes. This
+// pins the distinction — same shape as above but WITHOUT the collision.
+TEST_F(FileStorageTest, PartitionUnbucketedTasks_merged_carry_still_retained) {
+    OffloadTaskItem carried{.tenant_id = "default", .key = "y", .size = 1};
+    // Post-merge state for a non-collision carried key: it IS in
+    // task_by_storage_key, but it was not re-drained.
+    const std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key{
+        {"y", carried}};
+    const std::unordered_map<std::string, OffloadTaskItem> previously_carried{
+        {"y", carried}};
+    const std::unordered_set<std::string> all_bucket_keys{};
+    const std::vector<std::string> deferred_keys{};
+
+    std::vector<OffloadTaskItem> failed_tasks;
+    std::unordered_map<std::string, OffloadTaskItem> carried_tasks;
+    FileStoragePartitionUnbucketedTasks(task_by_storage_key, all_bucket_keys,
+                                        deferred_keys, previously_carried, {},
+                                        failed_tasks, carried_tasks);
+
+    ASSERT_EQ(carried_tasks.size(), 1u);
+    EXPECT_EQ(carried_tasks.count("y"), 1u);
+    EXPECT_TRUE(failed_tasks.empty())
+        << "the pool still holds this key; NACKing it re-introduces #3006";
+}
+
+// Regression (upstream #3006, integration): drive the deferral carry through
+// OffloadObjects itself. A cycle in which every key defers emits no bucket,
+// so nothing touches the master client — which makes the integrated path
+// (carry merge, deferral report plumbing, partition, carry assignment)
+// testable without a client. Phases 3 and 4 exercise re-drained keys: their
+// pooled copies are removed and the fresh tasks and sizes are re-deferred.
+TEST_F(FileStorageTest, OffloadObjects_deferred_tail_tasks_carried) {
+    auto make_task = [](const std::string& key) {
+        return OffloadTaskItem{.tenant_id = "default", .key = key, .size = 1};
+    };
+    auto carried_user_keys =
+        [](const std::unordered_map<std::string, OffloadTaskItem>& carry) {
+            std::unordered_set<std::string> keys;
+            for (const auto& [_, task] : carry) keys.insert(task.key);
+            return keys;
+        };
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    // Phase 1: two tasks, far below bucket capacity -> the whole drain is
+    // the tail: no bucket emitted, both tasks carried, none NACKed (no
+    // client call happens -- client_ is null, so reaching it would crash).
+    ASSERT_TRUE(FileStorageOffloadObjects(fileStorage,
+                                          {make_task("d1"), make_task("d2")}));
+    auto carry = GetDeferredTaskByStorageKey(fileStorage);
+    ASSERT_EQ(carry.size(), 2u);
+    EXPECT_EQ(carried_user_keys(carry),
+              (std::unordered_set<std::string>{"d1", "d2"}));
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 2);
+
+    // Phase 2: one more task; pool + new input still cannot fill a bucket,
+    // so all three are re-deferred and re-carried.
+    ASSERT_TRUE(FileStorageOffloadObjects(fileStorage, {make_task("d3")}));
+    carry = GetDeferredTaskByStorageKey(fileStorage);
+    ASSERT_EQ(carry.size(), 3u);
+    EXPECT_EQ(carried_user_keys(carry),
+              (std::unordered_set<std::string>{"d1", "d2", "d3"}));
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 3);
+
+    // Phase 3: re-drain a carried key. The fresh entry replaces its pooled
+    // copy and is grouped with the other carried keys. All are re-deferred,
+    // so every task survives without a NACK.
+    ASSERT_TRUE(FileStorageOffloadObjects(fileStorage, {make_task("d1")}));
+    carry = GetDeferredTaskByStorageKey(fileStorage);
+    ASSERT_EQ(carry.size(), 3u);
+    EXPECT_EQ(carried_user_keys(carry),
+              (std::unordered_set<std::string>{"d1", "d2", "d3"}));
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 3);
+
+    // Phase 4 (re-drain collision semantics): a carried key re-PUT with a
+    // DIFFERENT size while deferred. The fresh drain must win entirely —
+    // pooled copy (stale size) removed, fresh task carried — rather than
+    // the fresh task winning the task map while the stale size wins the
+    // packing accounting.
+    OffloadTaskItem d2_fresh{.tenant_id = "default", .key = "d2", .size = 2};
+    ASSERT_TRUE(FileStorageOffloadObjects(fileStorage, {d2_fresh}));
+    carry = GetDeferredTaskByStorageKey(fileStorage);
+    ASSERT_EQ(carry.size(), 3u);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 3);
+    for (const auto& [_, task] : carry) {
+        if (task.key == "d2") {
+            EXPECT_EQ(task.size, 2) << "fresh drained task must supersede "
+                                       "the stale carried/pooled copy";
+        }
+    }
+
+    // The remaining collision corner — a re-drained key the backend then skips
+    // outright (re-PUT over bucket_size_limit) — cannot be driven here: by
+    // construction it produces a NACK, and the NACK path dereferences the null
+    // client_ this fixture relies on. It is covered at unit level by
+    // PartitionUnbucketedTasks_redrained_then_skipped.
 }
 
 TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {
@@ -1344,6 +2001,26 @@ TEST_F(FileStorageTest, NullSsdMetricDoesNotCrash) {
 // evicts the dangling replica and retries PutStart, so the new data is
 // actually written.
 
+TEST_F(FileStorageTest, RemoveAllPreservesManagedSsdPayload) {
+    RunManagedRemoveAllScenario();
+}
+
+TEST_F(FileStorageTest, RemoveAllOrdinarySsdReclaimedAtWatermark) {
+    RunOrdinaryRemoveAllReclaimScenario(StorageBackendType::kFilePerKey);
+}
+
+TEST_F(FileStorageTest, RemoveAllOrdinaryBucketReclaimedAtWatermark) {
+    RunOrdinaryRemoveAllReclaimScenario(StorageBackendType::kBucket);
+}
+
+TEST_F(FileStorageTest, RemoveAllReclaimsOrdinaryFileBesideManagedFiles) {
+    RunManagedRemoveAllScenario(true);
+}
+
+TEST_F(FileStorageTest, RemoveAllReclaimsOrdinaryFileAfterProtectedPrefix) {
+    RunManagedRemoveAllScenario(true, true);
+}
+
 TEST_F(FileStorageTest, PutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
     // The per-key file backend reports the wiped file as OBJECT_NOT_FOUND /
     // FILE_OPEN_FAIL, the original proof set.
@@ -1365,6 +2042,11 @@ TEST_F(FileStorageTest,
     // backing file is gone. Two wiped keys and one fresh key go through one
     // batch; every key must really store.
     RunBatchPutHealWipeScenario(data_path);
+}
+
+TEST_F(FileStorageTest,
+       SessionAndHcaBatchPutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
+    RunBatchPutHealWipeScenario(data_path, true);
 }
 
 }  // namespace mooncake

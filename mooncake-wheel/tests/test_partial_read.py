@@ -120,6 +120,32 @@ def test_contiguous_full_rows_use_one_range() -> None:
 
 
 @pytest.mark.parametrize(
+    ("rows", "columns", "max_ranges", "expected_ranges"),
+    [
+        (range(8), slice(None), 1, ((0, 0, 64),)),
+        (range(2, 6), slice(-99, 99), 1, ((16, 0, 32),)),
+        (range(7, 8), slice(None), 1, ((56, 0, 8),)),
+        (range(2, 6), slice(None), 0, None),
+        (range(2, 6), slice(None), -1, None),
+        (range(3, 3), slice(None), 0, ()),
+        (range(2, 7, 2), slice(None), 1, None),
+        (range(2, 7, 2), slice(None), 3, ((16, 0, 8), (32, 8, 8), (48, 16, 8))),
+        (range(2, 4), slice(1, 3), 2, ((18, 0, 4), (26, 4, 4))),
+    ],
+)
+def test_full_row_range_boundaries(rows, columns, max_ranges, expected_ranges) -> None:
+    source = np.arange(32, dtype=np.int16).reshape(8, 4)
+    expected = source[list(rows), columns]
+    plan = plan_matrix_read(source.shape, source.itemsize, rows, columns, max_ranges)
+
+    assert plan.shape == expected.shape
+    assert plan.nbytes == expected.nbytes
+    assert plan.ranges == expected_ranges
+    if plan.ranges is not None:
+        np.testing.assert_array_equal(_execute_plan(source, plan), expected)
+
+
+@pytest.mark.parametrize(
     ("shape", "rows", "columns", "error"),
     [
         ((3,), (), slice(None), ValueError),

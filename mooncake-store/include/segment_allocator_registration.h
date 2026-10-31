@@ -8,9 +8,6 @@ namespace mooncake {
 
 class ScopedNoFSegmentAccess;
 class ScopedSegmentAccess;
-class SegmentSerializer;
-template <typename T>
-class Serializer;
 class SegmentAllocatorRegistration {
    public:
     [[nodiscard]] bool IsServing() const;
@@ -35,8 +32,6 @@ class SegmentAllocatorRegistration {
     friend class AllocatorManager;
     friend class ScopedNoFSegmentAccess;
     friend class ScopedSegmentAccess;
-    friend class SegmentSerializer;
-    friend class Serializer<AllocatedBuffer>;
 };
 
 }  // namespace mooncake
