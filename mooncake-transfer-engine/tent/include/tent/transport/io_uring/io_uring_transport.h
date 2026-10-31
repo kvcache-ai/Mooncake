@@ -79,6 +79,19 @@ class IOUringStagingPool {
     std::vector<void *> free_slots_;
 };
 
+struct IOUringTask;
+
+// One SQE of a staged request split by submitTransferTasks(), so that the
+// staging copy of each chunk overlaps with the I/O of the others.
+struct IOUringChunk {
+    IOUringTask *task = nullptr;
+    size_t offset = 0;  // from the start of the request
+    size_t length = 0;
+    int result = 0;  // the CQE result, once completed
+    // Read by the kernel at execution time, like IOUringTask::iov.
+    struct iovec iov{};
+};
+
 struct IOUringTask {
     Request request;
     volatile TransferStatusEnum status_word;
@@ -90,6 +103,10 @@ struct IOUringTask {
     // The kernel may read the iovec asynchronously at execution time, so it
     // must live as long as the task (i.e. until the completion is reaped).
     struct iovec iov{};
+    // Empty unless the request was split; the task then completes when the
+    // last of its chunks does.
+    std::vector<IOUringChunk> chunks;
+    size_t chunks_pending = 0;
 
     void releaseBuffer() {
         if (!buffer) return;
@@ -103,6 +120,9 @@ struct IOUringTask {
 
 struct IOUringSubBatch : public Transport::SubBatch {
     size_t max_size;
+    // Set when a write staged device memory through a pageable buffer; the
+    // ring is then not reused (see freeSubBatch()).
+    bool pageable_device_write = false;
     std::vector<IOUringTask> task_list;
     struct io_uring ring;
     virtual size_t size() const { return task_list.size(); }
@@ -149,6 +169,11 @@ class IOUringTransport : public Transport {
 
     IOUringStagingPool *stagingPool() const { return staging_pool_.get(); }
 
+    size_t cachedRingCount() const {
+        std::lock_guard<std::mutex> lock(ring_cache_mutex_);
+        return ring_cache_.size();
+    }
+
    private:
     std::string getIOUringFilePath(SegmentID handle);
 
@@ -175,6 +200,11 @@ class IOUringTransport : public Transport {
     // posix_memalign() only when no slot is free or the request exceeds the
     // slot size.
     std::shared_ptr<IOUringStagingPool> staging_pool_;
+    // Drained rings of freed sub-batches, reused by allocateSubBatch() so the
+    // transfer path does not pay io_uring_queue_init()/io_uring_queue_exit()
+    // per batch.
+    mutable std::mutex ring_cache_mutex_;
+    std::vector<struct io_uring> ring_cache_;
 };
 }  // namespace tent
 }  // namespace mooncake
