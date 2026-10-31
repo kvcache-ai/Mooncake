@@ -129,6 +129,24 @@ if(BUILD_UNIT_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
   add_test(NAME tebench_qos_metrics_test COMMAND tebench_qos_metrics_test)
 
+  add_executable(
+    tebench_bench_config_test tests/bench_config_test.cpp bench_config.cpp
+                              workload_config.cpp utils.cpp)
+  if(NOT USE_TENT)
+    target_sources(tebench_bench_config_test
+                   PRIVATE ../tent/src/common/qos_metrics.cpp)
+  endif()
+  target_link_libraries(tebench_bench_config_test PRIVATE transfer_engine gtest
+                                                          gtest_main)
+  if(USE_TENT)
+    target_link_libraries(tebench_bench_config_test PRIVATE tent_common)
+  endif()
+  target_include_directories(
+    tebench_bench_config_test
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+  add_test(NAME tebench_bench_config_test COMMAND tebench_bench_config_test)
+
   add_executable(tebench_target_metrics_test tests/target_metrics_test.cpp
                                              target_metrics.cpp utils.cpp)
   target_link_libraries(tebench_target_metrics_test PRIVATE transfer_engine
