@@ -52,16 +52,21 @@ class QueryResult {
     /** @brief Tenant scope the master resolved the query to, when the master
      * reports it; readers forward it to disk-replica verify requests */
     const std::optional<std::string> resolved_tenant_id;
+    /** @brief Object write version at query time, when the master reports
+     * it; lets a read that outlived its lease be revalidated */
+    const std::optional<uint64_t> write_version;
 
     QueryResult(
         std::vector<Replica::Descriptor>&& replicas_param,
         std::chrono::steady_clock::time_point lease_timeout_param,
         std::optional<uint64_t> object_checksum_param = std::nullopt,
-        std::optional<std::string> resolved_tenant_id_param = std::nullopt)
+        std::optional<std::string> resolved_tenant_id_param = std::nullopt,
+        std::optional<uint64_t> write_version_param = std::nullopt)
         : replicas(std::move(replicas_param)),
           lease_timeout(lease_timeout_param),
           object_checksum(object_checksum_param),
-          resolved_tenant_id(std::move(resolved_tenant_id_param)) {}
+          resolved_tenant_id(std::move(resolved_tenant_id_param)),
+          write_version(write_version_param) {}
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
@@ -1088,6 +1093,28 @@ class Client {
     ErrorCode FindFirstCompleteReplica(
         const std::vector<Replica::Descriptor>& replica_list,
         Replica::Descriptor& replica) const;
+
+    /**
+     * @brief For reads that completed after their lease expired: whether the
+     * master confirms that the replica each key was read from
+     * (read_replicas[i], may be null) is unchanged since the query. A key
+     * that cannot be checked (no replica, old master, other replica type, RPC
+     * error) is reported as not live.
+     */
+    std::vector<bool> CheckLeaseExpiredReads(
+        const std::vector<std::string>& keys,
+        const std::vector<const QueryResult*>& query_results,
+        const std::vector<const Replica::Descriptor*>& read_replicas);
+
+    /**
+     * @brief Sets LEASE_EXPIRED on each successful read whose lease expired
+     * and that CheckLeaseExpiredReads does not confirm.
+     */
+    void FailLeaseExpiredReads(
+        const std::vector<std::string>& keys,
+        const std::vector<QueryResult>& query_results,
+        const std::vector<const Replica::Descriptor*>& read_replicas,
+        std::vector<tl::expected<void, ErrorCode>>& results);
 
     /**
      * @brief Batch put helper methods for structured approach

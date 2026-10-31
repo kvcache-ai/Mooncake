@@ -1337,6 +1337,63 @@ TEST_F(ClientIntegrationTest, BatchGetChecksLeasesWithPreferredNode) {
     }
 }
 
+TEST_F(ClientIntegrationTest, LeaseExpiredReadSucceedsWhileReplicaUnchanged) {
+    const std::string key = "lease_expired_revalidate";
+    const std::string value = "lease expired revalidation";
+    void* buffer = client_buffer_allocator_->allocate(value.size() * 2);
+    ASSERT_NE(buffer, nullptr);
+    auto release_buffer = [&value](void* ptr) {
+        client_buffer_allocator_->deallocate(ptr, value.size() * 2);
+    };
+    std::unique_ptr<void, decltype(release_buffer)> buffer_owner(
+        buffer, release_buffer);
+    memcpy(buffer, value.data(), value.size());
+    std::vector<Slice> source{{buffer, value.size()}};
+    std::vector<Slice> dst{
+        {static_cast<char*>(buffer) + value.size(), value.size()}};
+    std::unordered_map<std::string, std::vector<Slice>> batch_dst{{key, dst}};
+
+    ASSERT_TRUE(test_client_->Put(key, source, ReplicateConfig{}).has_value());
+    const auto query = test_client_->Query(key);
+    ASSERT_TRUE(query.has_value());
+    ASSERT_TRUE(query->write_version.has_value());
+    // Python's query-result cache round-trips through the RPC form.
+    const auto now = std::chrono::steady_clock::now();
+    EXPECT_EQ(from_cached_query_result_response(
+                  to_cached_query_result_response(query, now), now)
+                  ->write_version,
+              query->write_version);
+    // Same query with its lease already over, as after a slow transfer.
+    const auto expired = [&] {
+        auto replicas = query->replicas;
+        return QueryResult(
+            std::move(replicas),
+            std::chrono::steady_clock::now() - std::chrono::seconds(1),
+            query->object_checksum, query->resolved_tenant_id,
+            query->write_version);
+    };
+    const auto read_all = [&] {
+        std::vector<ErrorCode> errors;
+        auto single = test_client_->Get(key, expired(), dst);
+        errors.push_back(single ? ErrorCode::OK : single.error());
+        for (bool prefer_same_node : {false, true}) {
+            auto batch = test_client_->BatchGet({key}, {expired()}, batch_dst,
+                                                prefer_same_node);
+            errors.push_back(batch.at(0) ? ErrorCode::OK : batch[0].error());
+        }
+        return errors;
+    };
+
+    EXPECT_EQ(read_all(), std::vector<ErrorCode>(3, ErrorCode::OK));
+    EXPECT_EQ(memcmp(dst[0].ptr, value.data(), value.size()), 0);
+
+    // A replaced object gets new replica IDs, so the old read is rejected.
+    ASSERT_TRUE(test_client_->Remove(key, true).has_value());
+    ASSERT_TRUE(test_client_->Put(key, source, ReplicateConfig{}).has_value());
+    EXPECT_EQ(read_all(), std::vector<ErrorCode>(3, ErrorCode::LEASE_EXPIRED));
+    ASSERT_TRUE(test_client_->Remove(key, true).has_value());
+}
+
 TEST_F(ClientIntegrationTest, BatchGetPreservesTransferErrorWithExpiredLease) {
     const std::string key = "batch_lease_transfer_failure";
     const std::string value = "batch read transfer error";

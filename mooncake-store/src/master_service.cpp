@@ -4654,9 +4654,11 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
         }
     }
 
-    return GetReplicaListResponse(std::move(replica_list),
-                                  default_kv_lease_ttl_,
-                                  metadata.GetPart(0).checksum());
+    GetReplicaListResponse response(std::move(replica_list),
+                                    default_kv_lease_ttl_,
+                                    metadata.GetPart(0).checksum());
+    response.write_version = metadata.WriteVersion();
+    return response;
 }
 
 void MasterService::ReadFollowUps::Run(MasterService& service) const {
@@ -4751,6 +4753,36 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
         if (accessor.Exists()) {
             results[i] = ReadReplicaListForAdmin(accessor.Get());
         }
+    }
+    return results;
+}
+
+std::vector<tl::expected<bool, ErrorCode>>
+MasterService::BatchCheckReplicasLive(
+    const std::vector<std::string>& keys,
+    const std::vector<ReplicaReadToken>& tokens, const TenantId& tenant_id) {
+    if (tokens.size() != keys.size()) {
+        return std::vector<tl::expected<bool, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
+    std::vector<tl::expected<bool, ErrorCode>> results(keys.size(), false);
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        MetadataAccessorRO accessor(this, normalized_tenant, keys[i]);
+        if (!accessor.Exists()) {
+            continue;
+        }
+        const auto& metadata = accessor.Get();
+        const auto& token = tokens[i];
+        // Disk replicas are excluded: they are read by key, and a LOCAL_DISK
+        // replica can be re-registered under its existing ID.
+        results[i] = metadata.WriteVersion() == token.write_version &&
+                     metadata.HasReplica([&](const Replica& replica) {
+                         return replica.id() == token.replica_id &&
+                                replica.is_memory_replica() &&
+                                IsReplicaReadable(replica);
+                     });
     }
     return results;
 }

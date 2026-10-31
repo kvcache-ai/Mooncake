@@ -688,6 +688,9 @@ inline CachedQueryResultResponse to_cached_query_result_response(
     if (query_result->resolved_tenant_id) {
         value.resolved_tenant_id = *query_result->resolved_tenant_id;
     }
+    if (query_result->write_version) {
+        value.write_version = *query_result->write_version;
+    }
     return CachedQueryResultResponse(std::move(value));
 }
 
@@ -703,7 +706,8 @@ inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
                                          cached_result.value.replicas.end()),
         now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),
         cached_result.value.object_checksum,
-        cached_result.value.resolved_tenant_id);
+        cached_result.value.resolved_tenant_id,
+        cached_result.value.write_version);
 }
 
 inline PyClient::QueryResultCache build_query_result_cache_from_cached_results(
