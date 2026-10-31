@@ -216,13 +216,15 @@ void TenantQuotaPolicy::OnReplace(const PolicyContext& ctx) {
 
 void TenantQuotaPolicy::OnTearDown(const PolicyContext& ctx) {
     // The object goes for good, and with it any charge it carried for a
-    // replaced one.
+    // replaced one. The key owes nothing from here, so the account lets go of
+    // it now rather than when the lock is: a new write of the key under this
+    // same lock, such as an upsert taking over a write that completed
+    // nothing, is not charged on top of the object it took over.
     Carried(ctx) = 0;
+    Settle(ctx, 0);
 }
 
 void TenantQuotaPolicy::OnWriteRelease(const PolicyContext& ctx) {
-    TenantQuotaAccount& account = AccountOf(ctx);
-    const uint64_t held = Held(ctx);
     uint64_t& carried = Carried(ctx);
     uint64_t owed = 0;
     if (ctx.guard.has_object()) {
@@ -234,6 +236,18 @@ void TenantQuotaPolicy::OnWriteRelease(const PolicyContext& ctx) {
     } else {
         carried = 0;
     }
+    Settle(ctx, owed);
+    // Ends only now, with what the write leaves settled and its object, if
+    // any, published.
+    if (WriteBegun(ctx)) {
+        SetWriteBegun(ctx, false);
+        AccountOf(ctx).EndWrite();
+    }
+}
+
+void TenantQuotaPolicy::Settle(const PolicyContext& ctx, uint64_t owed) {
+    TenantQuotaAccount& account = AccountOf(ctx);
+    const uint64_t held = Held(ctx);
     if (owed > held) {
         // Growth the core did not ask for up front, such as a write that
         // completed more than it reserved: charged regardless of the quota,
@@ -247,12 +261,6 @@ void TenantQuotaPolicy::OnWriteRelease(const PolicyContext& ctx) {
         }
     }
     SetHeld(ctx, owed);
-    // Ends only now, with what the write leaves settled and its object, if
-    // any, published.
-    if (WriteBegun(ctx)) {
-        SetWriteBegun(ctx, false);
-        account.EndWrite();
-    }
 }
 
 void TenantQuotaPolicy::OnRestored() {
