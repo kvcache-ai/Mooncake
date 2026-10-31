@@ -222,8 +222,8 @@ The fault-injection regression test compiles the real implementation and Python
 binding against a test client, including exception and object-destruction cases:
 
 Both Engram CTests require NumPy in the interpreter selected by
-`Python3_EXECUTABLE`. Test-enabled configuration checks this dependency; install
-it with that interpreter's `-m pip install numpy` before configuring.
+`Python3_EXECUTABLE`. Install it with that interpreter's `-m pip install numpy`
+before running these tests; the CI unit-test job installs it explicitly.
 
 ```bash
 cmake --build build --target engram_store_test_client
