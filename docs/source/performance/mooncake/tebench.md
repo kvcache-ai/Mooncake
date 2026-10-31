@@ -388,7 +388,8 @@ thread uses). A test case is skipped when some thread's region does not fit in i
 buffer (`--total_buffer_size`) or its target buffer (the buffer length after
 `--target_offset`, and `--target_range_size` if set). Because the layout only
 depends on the thread count, all block and batch sizes of a thread count either
-run or are skipped together.
+run or are skipped together. If every case is skipped, tebench exits
+with an error so that a misconfigured run does not look like a pass.
 
 **Multi-target initiator**
 

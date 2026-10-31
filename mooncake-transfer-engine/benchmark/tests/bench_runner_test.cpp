@@ -34,10 +34,10 @@ class FakeRunner : public BenchRunner {
         return 0;
     }
     std::string getSegmentName() const override { return "fake"; }
-    uint64_t getLocalBufferBase(int, uint64_t, uint64_t) const override {
+    std::optional<uint64_t> getLocalBufferBase(int, uint64_t) const override {
         return 0;
     }
-    uint64_t getTargetBufferBase(int, uint64_t, uint64_t) const override {
+    std::optional<uint64_t> getTargetBufferBase(int, uint64_t) const override {
         return 0;
     }
     double runSingleTransfer(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
