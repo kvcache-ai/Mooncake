@@ -1,3 +1,8 @@
+if (USE_ASCEND_DIRECT OR USE_UBSHMEM)
+    # Shared allocator/affinity library, linked by the classic transport and TENT.
+    add_subdirectory(ascend_allocator)
+endif ()
+
 if (USE_ASCEND)
     file(GLOB ASCEND_SOURCES "hccl_transport/*.cpp")
     add_subdirectory(hccl_transport/ascend_transport_c)
@@ -24,6 +29,9 @@ if (USE_ASCEND_DIRECT OR USE_UBSHMEM)
     else()
         message(WARNING "Acl runtime header file is not exist")
     endif()
+endif()
+
+if (USE_ASCEND_DIRECT OR USE_UBSHMEM)
     add_library(ascend_transport SHARED ${ASCEND_SOURCES})
     find_library(
             FOUND_METADEF
@@ -38,6 +46,11 @@ if (USE_ASCEND_DIRECT OR USE_UBSHMEM)
     else()
         target_link_libraries(ascend_transport PRIVATE ascendcl llm_datadist graph_base graph)
     endif()
+    # utils.cpp parses ASCEND_GLOBAL_RESOURCE_CONFIG, and the host allocator
+    # calls into it, so the shared transport carries the jsoncpp include dirs
+    # and library (classic has no TENT vendored JSON).
+    target_link_libraries(ascend_transport PRIVATE JsonCpp::JsonCpp
+                                                  ascend_allocator)
     install(TARGETS ascend_transport DESTINATION lib)
 else()
     add_library(ascend_transport OBJECT ${ASCEND_SOURCES})

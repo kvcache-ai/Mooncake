@@ -27,7 +27,7 @@
 
 #include <acl/acl.h>
 #include "transport/transport.h"
-#include "utils.h"
+#include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
 namespace mooncake {
 
@@ -52,8 +52,14 @@ class ISliceDispatcher {
  * One local device keeps one transfer pool and one memcpy pool. Both pin to
  * the shared NPU CPU affinity when that device resolves a cpulist.
  * Several local devices (standalone) keep one transfer pool and one memcpy
- * pool per device. Each pool pins to that device's NUMA cpulist. Non-fabric
- * host allocation for a device runs on that device's transfer pool.
+ * pool per device. Each pool pins to that device's NUMA cpulist. When that
+ * node cannot be read, devices are spread across the machine's CPU nodes.
+ * Non-fabric host allocation for a device runs on that device's transfer pool.
+ * Slices that share a target segment are split by target adxl engine and each
+ * group is queued on its own, so those engines transfer together. A single
+ * worker per pool (buffer-pool mode) keeps the historical layout instead: one
+ * task per segment group, so a batch that targeted one segment is not split
+ * into one task per engine on a queue that can only run them one at a time.
  */
 class DefaultSliceDispatcher : public ISliceDispatcher {
    public:
@@ -70,6 +76,9 @@ class DefaultSliceDispatcher : public ISliceDispatcher {
     void enqueuePerDevice(std::vector<Transport::Slice*> slice_list);
 
     TransferExecutorBase* transfer_executor_;
+    // True when a pool has more than one worker, so splitting one segment group
+    // into per-engine tasks actually lets them run concurrently.
+    bool split_target_engines_{true};
     std::unique_ptr<AscendThreadPool> thread_pool_;
     std::unique_ptr<AscendThreadPool> memcpy_thread_pool_;
     // Standalone, one entry per logic device. Empty means the shared pools.
@@ -84,6 +93,9 @@ class DefaultSliceDispatcher : public ISliceDispatcher {
  * Device copies run on a separate pool of 6 threads. Each engine thread
  * pins to that NPU's affinity CPUs. The memcpy pool pins only when every
  * NPU shares one CPU set.
+ * Selected only for a standalone holder with HCCL_INTRA_ROCE_ENABLE=1.
+ * This path is being retired. roce:device and roce:host use
+ * DefaultSliceDispatcher.
  */
 class RoceDummyRealSliceDispatcher : public ISliceDispatcher {
    public:
