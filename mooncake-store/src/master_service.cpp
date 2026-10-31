@@ -2324,6 +2324,17 @@ bool MasterService::IsSoftPinActive(
     return evaluation.active;
 }
 
+bool MasterService::MayEvictObject(const ObjectMetadata& metadata,
+                                   std::chrono::system_clock::time_point now,
+                                   bool allow_soft_pinned) const {
+    if (metadata.IsGrouped() &&
+        weight_manager_.IsManagedGroup(metadata.group_id)) {
+        return false;
+    }
+    return !metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
+           (!IsSoftPinActive(metadata, now) || allow_soft_pinned);
+}
+
 void MasterService::CleanupExpiredSoftPins(
     const std::chrono::system_clock::time_point& now) {
     auto expired_entries = soft_pin_deadline_index_.PopExpired(now);
@@ -7674,9 +7685,8 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                                replica.is_processing();
                     });
                 if (processing || accessor.InProcessing() ||
-                    metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
-                    (IsSoftPinActive(metadata, now) &&
-                     !allow_evict_soft_pinned_objects_)) {
+                    !MayEvictObject(metadata, now,
+                                    allow_evict_soft_pinned_objects_)) {
                     all_accepted = false;
                     break;
                 }
@@ -7836,14 +7846,10 @@ void MasterService::RunShardDfsEviction() {
                         return matches_candidate(replica, candidate) &&
                                replica.is_processing();
                     });
-                const bool managed_weight =
-                    weight_manager_.IsManagedGroup(metadata.group_id);
-                accepted[i] = !managed_weight && !candidate_is_processing &&
+                accepted[i] = !candidate_is_processing &&
                               !accessor.InProcessing() &&
-                              !metadata.IsHardPinned() &&
-                              metadata.IsLeaseExpired(now) &&
-                              (!IsSoftPinActive(metadata, now) ||
-                               allow_evict_soft_pinned_objects_);
+                              MayEvictObject(metadata, now,
+                                             allow_evict_soft_pinned_objects_);
                 if (!accepted[i]) continue;
 
                 // A missing descriptor was accepted above and is already
@@ -9784,10 +9790,10 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
         return replica.is_nof_replica() && replica.is_completed() &&
                replica.get_refcnt() == 0;
     };
+    // NoF eviction keeps soft-pinned objects even when soft pins may be
+    // evicted elsewhere.
     auto may_evict = [&](const ObjectMetadata& metadata) {
-        return !weight_manager_.IsManagedGroup(metadata.group_id) &&
-               !metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
-               !IsSoftPinActive(metadata, now) &&
+        return MayEvictObject(metadata, now, /*allow_soft_pinned=*/false) &&
                metadata.HasReplica(is_evictable_nof_replica);
     };
 
