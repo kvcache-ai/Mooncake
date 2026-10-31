@@ -66,6 +66,20 @@ TransferOpcode.WRITE  # Write operation
 - `drained`: whether the native operation reached a terminal state.
 - `drain(timeout_ms)`: wait again for an unknown operation to become terminal.
 
+### Synchronous Transfer Results
+
+`transfer_sync*()` and `batch_transfer_sync*()` (including the `_arrays` and
+`_pages` forms) return:
+
+- `0`: every request completed.
+- `-1`: the transfer failed, and no request still reads or writes the buffers.
+- `-2`: the deadline passed while some requests were still in flight. As with
+  `COMPLETION_UNKNOWN`, keep the local and remote buffers alive.
+
+A failed attempt is retried only after all of its requests have finished.
+With `MC_USE_TENT`, `-1` keeps its earlier meaning (failed) and `-2` is not
+returned.
+
 ### Initialization Methods
 
 #### initialize()
