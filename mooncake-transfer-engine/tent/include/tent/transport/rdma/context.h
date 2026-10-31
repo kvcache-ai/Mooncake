@@ -134,6 +134,10 @@ class RdmaContext {
 
     const std::string name() const { return device_name_; }
 
+    // The configured path MTU capped by this NIC's active MTU, set once when
+    // the device is opened.
+    ibv_mtu pathMtu() const { return path_mtu_; }
+
    public:
     // Take lid/gid/index under one lock so a bootstrap never mixes values from
     // two address generations while the monitor thread refreshes the port.
@@ -257,6 +261,7 @@ class RdmaContext {
     ibv_context *native_context_ = nullptr;
     ibv_pd *native_pd_ = nullptr;
     int event_fd_ = -1;
+    ibv_mtu path_mtu_ = IBV_MTU_4096;
 
     size_t num_comp_channel_ = 0;
     std::vector<ibv_comp_channel *> comp_channel_;

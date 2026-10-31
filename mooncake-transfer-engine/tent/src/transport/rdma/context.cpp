@@ -903,6 +903,7 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
         return -1;
     }
     MIN(params_->endpoint.path_mtu, port_attr.active_mtu);
+    path_mtu_ = std::min(params_->endpoint.max_path_mtu, port_attr.active_mtu);
     MIN(params_->endpoint.max_sge, device_attr.max_sge);
     MIN(params_->endpoint.max_qp_wr, device_attr.max_qp_wr);
 
