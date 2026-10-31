@@ -35,14 +35,15 @@ class InProcMaster {
             return false;
         }
         try {
-            // Let each listener bind port zero so the kernel allocates and holds
-            // its port atomically. Probing free ports before binding races with
-            // other clients and processes.
+            // Let each listener bind port zero so the kernel allocates and
+            // holds its port atomically. Probing free ports before binding
+            // races with other clients and processes.
             rpc_port_ = config.rpc_port.value_or(0);
             http_metrics_port_ = config.http_metrics_port.value_or(0);
             http_metadata_port_ = config.http_metadata_port.value_or(0);
 
-            // An explicit metadata port of zero disables this optional listener.
+            // An explicit metadata port of zero disables this optional
+            // listener.
             if (!config.http_metadata_port || http_metadata_port_ > 0) {
                 meta_server_ = std::make_unique<HttpMetadataServer>(
                     static_cast<uint16_t>(http_metadata_port_), "127.0.0.1");
@@ -116,8 +117,9 @@ class InProcMaster {
 
             wrapped_ = std::make_unique<WrappedMasterService>(wms_cfg);
             if (!wrapped_->http_server_started()) {
-                LOG(ERROR) << "Failed to start test Master HTTP metrics server on "
-                           << http_metrics_port_;
+                LOG(ERROR)
+                    << "Failed to start test Master HTTP metrics server on "
+                    << http_metrics_port_;
                 Stop();
                 return false;
             }

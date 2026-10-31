@@ -254,8 +254,8 @@ TEST(InflightTrackerTest, ConcurrentEnterAndClosePreservesAccounting) {
         std::atomic<int> entered{0};
         std::atomic<int> left{0};
         std::atomic<int> admitted{0};
-        InflightTracker tracker("concurrent close", [&] { ++entered; },
-                                [&] { ++left; });
+        InflightTracker tracker(
+            "concurrent close", [&] { ++entered; }, [&] { ++left; });
         std::barrier start(kEntrants + 1);
         std::array<std::thread, kEntrants> entrants;
         for (auto& entrant : entrants) {
@@ -268,7 +268,8 @@ TEST(InflightTrackerTest, ConcurrentEnterAndClosePreservesAccounting) {
             });
         }
 
-        // Race public operations; this does not force the internal rollback path.
+        // Race public operations; this does not force the internal rollback
+        // path.
         start.arrive_and_wait();
         EXPECT_TRUE(tracker.Close());
         for (auto& entrant : entrants) {

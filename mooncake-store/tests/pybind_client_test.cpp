@@ -527,7 +527,8 @@ TEST_F(RealClientTest, TestSetupExistTransferEngine) {
             "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
             rdma_devices.empty() ? std::nullopt
                                  : std::optional<std::string>(rdma_devices),
-            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024, transfer_engine);
+            master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024,
+            transfer_engine);
     ASSERT_EQ(py_client_->setup(setup_config), 0);
 
     const std::string test_data = "Hello, RealClient!";

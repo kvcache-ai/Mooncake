@@ -449,7 +449,8 @@ void CheckUnmapWaitsForContext(Config config, const WriteConfig& write_config,
     ASSERT_NO_FATAL_FAILURE(
         observer.ExpectStatus(id, DummyClientStatus::HEALTH, 1));
     // Observe the old context after detachment without holding its lock.
-    const auto context = RealClientTestHelper::FindShmContext(*owner.client, id);
+    const auto context =
+        RealClientTestHelper::FindShmContext(*owner.client, id);
     ASSERT_NE(context, nullptr);
     auto read = std::async(std::launch::async, [&] {
         return reader.Read({"paused_read"}, {0x100000}, {SharedFile::kSize},

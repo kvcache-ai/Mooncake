@@ -22,7 +22,8 @@ TEST(UtilsTest, MergeLabelsPreservesClusterPrecedence) {
     const std::map<std::string, std::string> labels = {
         {"cluster_id", "caller-cluster"}, {"instance", "test-instance"}};
     const auto merged = merge_labels(labels);
-    // The helper caches the cluster ID at process startup; do not change it here.
+    // The helper caches the cluster ID at process startup; do not change it
+    // here.
     const char* cluster = std::getenv("MC_STORE_CLUSTER_ID");
     EXPECT_EQ(merged.at("cluster_id"),
               cluster && *cluster ? cluster : "caller-cluster");
@@ -221,13 +222,13 @@ TEST(UtilsTest, AutoPortBinderRebindRecoversAndReleasesPort) {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(0);
-    ASSERT_EQ(bind(occupied.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
-              0)
+    ASSERT_EQ(
+        bind(occupied.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0)
         << "bind failed, errno=" << errno;
     socklen_t addr_len = sizeof(addr);
-    ASSERT_EQ(getsockname(occupied.fd, reinterpret_cast<sockaddr*>(&addr),
-                          &addr_len),
-              0)
+    ASSERT_EQ(
+        getsockname(occupied.fd, reinterpret_cast<sockaddr*>(&addr), &addr_len),
+        0)
         << "getsockname failed, errno=" << errno;
     const int port = ntohs(addr.sin_port);
     ASSERT_GT(port, 0);
@@ -249,8 +250,8 @@ TEST(UtilsTest, AutoPortBinderRebindRecoversAndReleasesPort) {
             ASSERT_EQ(binder.rebind(), port);
             EXPECT_EQ(binder.getPort(), port);
 
-            const int bind_result =
-                bind(probe.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+            const int bind_result = bind(
+                probe.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
             const int bind_error = errno;
             ASSERT_EQ(bind_result, -1);
             EXPECT_EQ(bind_error, EADDRINUSE);
@@ -258,6 +259,7 @@ TEST(UtilsTest, AutoPortBinderRebindRecoversAndReleasesPort) {
     }
 
     // Destruction must release the socket acquired by the last rebind.
-    EXPECT_EQ(bind(probe.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0)
+    EXPECT_EQ(bind(probe.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
+              0)
         << "port was not released, errno=" << errno;
 }
