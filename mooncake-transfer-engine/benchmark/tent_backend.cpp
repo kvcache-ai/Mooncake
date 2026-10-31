@@ -576,44 +576,7 @@ double TENTBenchRunner::runSingleTransfer(
                                 : intent_type;
         requests.emplace_back(entry);
     }
-    if (!splitOutputEnabled()) {
-        XferBenchTimer timer;
-        Status submitted;
-        if (XferBenchConfig::notifi) {
-            Notification notifi{"benchmark", std::to_string(target_addr)};
-            submitted = engine_->submitTransfer(batch_id, requests, notifi);
-        } else {
-            submitted = engine_->submitTransfer(batch_id, requests);
-        }
-        if (!submitted.ok()) {
-            LOG(ERROR) << "Failed to submit transfer: " << submitted.ToString();
-            noteTransferFailed();
-            return finish(-1.0);
-        }
-        while (g_tent_running.load()) {
-            TransferStatus overall_status;
-            auto polled = engine_->getTransferStatus(batch_id, overall_status);
-            if (!polled.ok()) {
-                LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
-                noteTransferFailed();
-                return finish(-1.0);
-            }
-            if (overall_status.s == TransferStatusEnum::COMPLETED) {
-                return finish(timer.lap_us());
-            }
-            if (overall_status.s == TransferStatusEnum::FAILED ||
-                overall_status.s == TransferStatusEnum::TIMEOUT ||
-                overall_status.s == TransferStatusEnum::CANCELED ||
-                overall_status.s == TransferStatusEnum::INVALID) {
-                LOG(ERROR) << "Failed transfer detected";
-                noteTransferFailed();
-                return finish(-1.0);
-            }
-        }
-        return finish(-1.0);
-    }
-
-    XferBenchTimer submit_timer;
+    XferBenchTimer timer;
     Status submitted;
     if (XferBenchConfig::notifi) {
         Notification notifi{"benchmark", std::to_string(target_addr)};
@@ -626,8 +589,7 @@ double TENTBenchRunner::runSingleTransfer(
         noteTransferFailed();
         return finish(-1.0);
     }
-    const uint64_t submit_us = submit_timer.lap_us();
-    XferBenchTimer wait_timer;
+    const uint64_t submit_ns = splitOutputEnabled() ? timer.lap_ns(false) : 0;
     uint64_t polls = 0;
     while (g_tent_running.load()) {
         TransferStatus overall_status;
@@ -639,9 +601,12 @@ double TENTBenchRunner::runSingleTransfer(
             return finish(-1.0);
         }
         if (overall_status.s == TransferStatusEnum::COMPLETED) {
-            const uint64_t wait_us = wait_timer.lap_us();
-            logSplitXfer({batch_size, submit_us, wait_us, polls});
-            return finish(static_cast<double>(submit_us + wait_us));
+            const uint64_t total_ns = timer.lap_ns(false);
+            if (splitOutputEnabled()) {
+                logSplitXfer({block_size, batch_size, splitWarmup(), submit_ns,
+                              total_ns - submit_ns, polls});
+            }
+            return finish(static_cast<double>(total_ns) / 1000.0);
         }
         if (overall_status.s == TransferStatusEnum::FAILED ||
             overall_status.s == TransferStatusEnum::TIMEOUT ||

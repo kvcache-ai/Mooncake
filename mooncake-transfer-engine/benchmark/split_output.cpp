@@ -30,17 +30,25 @@ namespace {
 
 std::unique_ptr<std::ofstream> g_split_output;
 std::mutex g_split_output_mu;
+thread_local bool t_split_warmup = false;
 
 }  // namespace
+
+void setSplitWarmup(bool warmup) noexcept { t_split_warmup = warmup; }
+
+bool splitWarmup() noexcept { return t_split_warmup; }
 
 bool formatSplitXferLine(char* buf, size_t cap, const SplitXferSample& sample,
                          size_t* written) {
     if (buf == nullptr || written == nullptr || cap == 0) return false;
     const int n = std::snprintf(
         buf, cap,
-        "{\"batch_size\":%" PRIu64 ",\"submit_us\":%" PRIu64
-        ",\"wait_us\":%" PRIu64 ",\"polls\":%" PRIu64 "}\n",
-        sample.batch_size, sample.submit_us, sample.wait_us, sample.polls);
+        "{\"block_size\":%" PRIu64 ",\"batch_size\":%" PRIu64
+        ",\"warmup\":%s,\"submit_us\":%" PRIu64 ".%03" PRIu64
+        ",\"wait_us\":%" PRIu64 ".%03" PRIu64 ",\"polls\":%" PRIu64 "}\n",
+        sample.block_size, sample.batch_size, sample.warmup ? "true" : "false",
+        sample.submit_ns / 1000, sample.submit_ns % 1000, sample.wait_ns / 1000,
+        sample.wait_ns % 1000, sample.polls);
     if (n < 0 || static_cast<size_t>(n) >= cap) return false;
     *written = static_cast<size_t>(n);
     return true;
@@ -78,7 +86,7 @@ void closeSplitOutput() {
 
 void logSplitXfer(const SplitXferSample& sample) {
     if (!g_split_output_enabled) return;
-    char buf[160];
+    char buf[256];
     size_t n = 0;
     if (!formatSplitXferLine(buf, sizeof(buf), sample, &n)) return;
     std::lock_guard<std::mutex> lock(g_split_output_mu);
