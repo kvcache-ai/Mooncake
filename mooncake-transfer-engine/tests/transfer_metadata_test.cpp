@@ -20,6 +20,8 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -29,10 +31,14 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
+#include <future>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "common.h"
 #include "config.h"
@@ -1147,6 +1153,343 @@ TEST(HandshakeNotifyTest, BoundedQueueEvictsOldestUnderFlood) {
     // The oldest 64 frames were evicted; the survivors keep arrival order.
     EXPECT_EQ(drained.front().notify_msg, "m64");
     EXPECT_EQ(drained.back().notify_msg, "m" + std::to_string(total - 1));
+}
+
+namespace {
+
+using SteadyClock = std::chrono::steady_clock;
+
+// A handshake that arrives behind stalled connections must still finish
+// within kHandshakeBound. Served one connection at a time, the daemon spends
+// seconds on each stalled connection; served concurrently, a handshake takes
+// milliseconds.
+constexpr auto kHandshakeBound = std::chrono::milliseconds(2000);
+// How long the test client waits for a reply before it gives up.
+constexpr auto kClientWait = std::chrono::milliseconds(20000);
+
+std::chrono::milliseconds msSince(SteadyClock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        SteadyClock::now() - start);
+}
+
+template <typename Pred>
+bool waitUntil(Pred pred, std::chrono::milliseconds limit) {
+    const auto start = SteadyClock::now();
+    while (!pred()) {
+        if (msSince(start) >= limit) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return true;
+}
+
+// Connects to the daemon on the loopback address, or returns -1 after
+// `limit`. The connect is non-blocking: once a daemon stops accepting, its
+// backlog fills up and a blocking connect() sits in SYN retries for minutes.
+int connectToDaemon(uint16_t port,
+                    std::chrono::milliseconds limit = std::chrono::seconds(2)) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    const int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+        pollfd pfd{fd, POLLOUT, 0};
+        int err = 0;
+        socklen_t err_len = sizeof(err);
+        if (errno != EINPROGRESS ||
+            poll(&pfd, 1, static_cast<int>(limit.count())) != 1 ||
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &err_len) != 0 ||
+            err != 0) {
+            close(fd);
+            return -1;
+        }
+    }
+    fcntl(fd, F_SETFL, flags);
+    return fd;
+}
+
+// Sends one request of `type` and waits up to `limit` for the reply. Returns
+// the round-trip time, or nullopt if no reply of that type arrived.
+std::optional<std::chrono::milliseconds> timedRequest(
+    uint16_t port, HandShakeRequestType type,
+    const Json::Value &request = Json::Value(Json::objectValue),
+    std::chrono::milliseconds limit = kClientWait) {
+    const auto start = SteadyClock::now();
+    int fd = connectToDaemon(port);
+    if (fd < 0) return std::nullopt;
+    timeval timeout{};
+    timeout.tv_sec = limit.count() / 1000;
+    timeout.tv_usec = (limit.count() % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    const bool ok =
+        writeString(fd, type, Json::FastWriter{}.write(request)) == 0 &&
+        readString(fd).first == type;
+    close(fd);
+    if (!ok) return std::nullopt;
+    return msSince(start);
+}
+
+void expectProbeWithinBound(uint16_t port) {
+    auto rtt = timedRequest(port, HandShakeRequestType::Probe);
+    ASSERT_TRUE(rtt.has_value())
+        << "no probe reply within " << kClientWait.count() << " ms";
+    EXPECT_LT(rtt->count(), kHandshakeBound.count()) << "probe round trip, ms";
+    LOG(INFO) << "probe round trip: " << rtt->count() << " ms";
+}
+
+// Whether the peer closes `fd` (FIN or RST) within `limit`.
+bool closedByPeerWithin(int fd, std::chrono::milliseconds limit) {
+    pollfd pfd{fd, POLLIN, 0};
+    if (poll(&pfd, 1, static_cast<int>(limit.count())) != 1) return false;
+    char byte;
+    ssize_t rc = recv(fd, &byte, 1, MSG_DONTWAIT);
+    return rc == 0 || (rc < 0 && errno == ECONNRESET);
+}
+
+// Releases callbacks that a test keeps blocked; opening it twice is fine.
+class Gate {
+   public:
+    void open() {
+        std::call_once(opened_, [this] { promise_.set_value(); });
+    }
+    void wait() const { future_.wait_for(std::chrono::seconds(30)); }
+
+   private:
+    std::promise<void> promise_;
+    std::shared_future<void> future_ = promise_.get_future().share();
+    std::once_flag opened_;
+};
+
+}  // namespace
+
+// A handshake daemon on a free loopback port that answers probes at once.
+// Tests may register other callbacks before start().
+class HandshakeDaemonTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        daemon_ = HandShakePlugin::Create(P2PHANDSHAKE);
+        daemon_->registerOnProbeCallBack(
+            [](const Json::Value &, Json::Value &local) {
+                local["status"] = "success";
+                return 0;
+            });
+    }
+
+    void TearDown() override {
+        gate_.open();     // let blocked callbacks finish
+        daemon_.reset();  // and wait for them
+    }
+
+    void start() {
+        int sockfd = -1;
+        port_ = findAvailableTcpPort(sockfd);
+        ASSERT_NE(port_, 0);
+        ASSERT_EQ(daemon_->startDaemon(port_, sockfd), 0);
+    }
+
+    Gate gate_;
+    std::atomic<int> in_callback_{0};
+    std::shared_ptr<HandShakePlugin> daemon_;
+    uint16_t port_ = 0;
+};
+
+// A connection that sends nothing holds whoever reads it for the 5 s
+// SO_RCVTIMEO. Served in line on the listener thread, N such connections
+// put N * 5 s in front of every later handshake.
+TEST_F(HandshakeDaemonTest, SilentConnectionsDoNotDelayHandshakes) {
+    start();
+    std::vector<int> silent;
+    for (int i = 0; i < 3; ++i) {
+        int fd = connectToDaemon(port_);
+        ASSERT_GE(fd, 0);
+        silent.push_back(fd);
+    }
+    expectProbeWithinBound(port_);
+    for (int fd : silent) close(fd);
+}
+
+// A peer that sends a frame header and then one byte at a time restarts
+// SO_RCVTIMEO with every byte. Its whole request now has to arrive within
+// 5 s, so its handler gives up even though bytes keep coming.
+TEST_F(HandshakeDaemonTest, DribblingConnectionDoesNotDelayHandshakes) {
+    start();
+    int fd = connectToDaemon(port_);
+    ASSERT_GE(fd, 0);
+    const uint64_t length = 1000;  // never completed below
+    const uint8_t type = static_cast<uint8_t>(HandShakeRequestType::Metadata);
+    ASSERT_EQ(writeFully(fd, &length, sizeof(length)),
+              static_cast<ssize_t>(sizeof(length)));
+    ASSERT_EQ(writeFully(fd, &type, sizeof(type)),
+              static_cast<ssize_t>(sizeof(type)));
+
+    // One byte every 200 ms for up to 12 s, or until the daemon drops us.
+    const auto dribble_start = SteadyClock::now();
+    std::atomic<int64_t> dropped_after_ms{0};
+    std::thread dribbler([&] {
+        while (msSince(dribble_start) < std::chrono::seconds(12)) {
+            const char byte = ' ';
+            if (send(fd, &byte, 1, MSG_NOSIGNAL) != 1) break;
+            if (closedByPeerWithin(fd, std::chrono::milliseconds(200))) break;
+        }
+        dropped_after_ms = msSince(dribble_start).count();
+    });
+    expectProbeWithinBound(port_);
+    dribbler.join();
+    close(fd);
+    // The 5 s request deadline plus slack, well short of the 12 s it would
+    // keep dribbling.
+    EXPECT_LT(dropped_after_ms.load(), 8000)
+        << "the daemon kept reading the dribbling connection";
+    LOG(INFO) << "dribbling connection dropped after "
+              << dropped_after_ms.load() << " ms";
+}
+
+// Garbage is rejected as soon as it is recognized, but a frame cut short (a
+// valid header, then silence) holds its reader for the 5 s SO_RCVTIMEO.
+TEST_F(HandshakeDaemonTest, MalformedConnectionsDoNotDelayHandshakes) {
+    start();
+    std::vector<int> fds;
+    auto send_raw = [&](const void *data, size_t len) {
+        int fd = connectToDaemon(port_);
+        ASSERT_GE(fd, 0);
+        fds.push_back(fd);
+        ASSERT_EQ(writeFully(fd, data, len), static_cast<ssize_t>(len));
+    };
+    const std::string http = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    send_raw(http.data(), http.size());
+    const uint8_t tls[] = {0x16, 0x03, 0x01, 0x05, 0xc2, 0x01, 0x00, 0x05};
+    send_raw(tls, sizeof(tls));
+    // A frame cut short: the header claims 64 payload bytes, 10 arrive.
+    std::string truncated(sizeof(uint64_t), '\0');
+    const uint64_t length = 64;
+    memcpy(truncated.data(), &length, sizeof(length));
+    truncated += static_cast<char>(HandShakeRequestType::Metadata);
+    truncated += "{\"name\":\"";
+    send_raw(truncated.data(), truncated.size());
+    // A complete frame that is not JSON.
+    int not_json = connectToDaemon(port_);
+    ASSERT_GE(not_json, 0);
+    fds.push_back(not_json);
+    ASSERT_EQ(writeString(not_json, HandShakeRequestType::Probe, "not json"),
+              0);
+
+    expectProbeWithinBound(port_);
+    for (int fd : fds) close(fd);
+}
+
+// jsoncpp throws when a request field has the wrong JSON type, here a notify
+// whose "name" is an object. On the daemon's thread that exception terminated
+// the process; now it only drops that connection.
+TEST_F(HandshakeDaemonTest, ThrowingRequestDoesNotStopTheDaemon) {
+    TransferMetadata server(P2PHANDSHAKE);
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_NE(port, 0);
+    TransferMetadata::RpcMetaDesc rpc{};
+    rpc.ip_or_host_name = "127.0.0.1";
+    rpc.rpc_port = port;
+    rpc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry("throwing-request-test", rpc), 0);
+
+    Json::Value notify;
+    notify["name"] = Json::Value(Json::objectValue);
+    notify["notify_msg"] = "m";
+    EXPECT_FALSE(
+        timedRequest(port, HandShakeRequestType::Notify, notify).has_value());
+    expectProbeWithinBound(port);
+}
+
+// A callback that blocks, e.g. on transport state that another handshake
+// holds, held up every handshake behind it.
+TEST_F(HandshakeDaemonTest, BlockedCallbackDoesNotDelayOtherHandshakes) {
+    daemon_->registerOnConnectionCallBack(
+        [this](const Json::Value &peer, Json::Value &local) {
+            if (peer["block"].asBool()) {
+                ++in_callback_;
+                gate_.wait();
+            }
+            local["status"] = "success";
+            return 0;
+        });
+    start();
+
+    Json::Value blocking;
+    blocking["block"] = true;
+    auto blocked = std::async(std::launch::async, [&] {
+        return timedRequest(port_, HandShakeRequestType::Connection, blocking,
+                            2 * kClientWait);
+    });
+    EXPECT_TRUE(
+        waitUntil([&] { return in_callback_ == 1; }, std::chrono::seconds(5)));
+
+    auto rtt = timedRequest(port_, HandShakeRequestType::Connection);
+    gate_.open();
+    EXPECT_TRUE(blocked.get().has_value()) << "the blocked handshake failed";
+    ASSERT_TRUE(rtt.has_value())
+        << "no handshake reply within " << kClientWait.count() << " ms";
+    EXPECT_LT(rtt->count(), kHandshakeBound.count())
+        << "handshake round trip, ms";
+    LOG(INFO) << "handshake round trip: " << rtt->count() << " ms";
+}
+
+// Up to MC_HANDSHAKE_MAX_CONNECTIONS (256 by default) connections are served
+// at once; past that, a new connection is closed instead of getting a thread.
+TEST_F(HandshakeDaemonTest, ConnectionsBeyondTheCapAreClosed) {
+    if (std::getenv("MC_HANDSHAKE_MAX_CONNECTIONS"))
+        GTEST_SKIP() << "expects the default connection cap";
+    constexpr int kCap = 256;
+    daemon_->registerOnProbeCallBack(
+        [this](const Json::Value &, Json::Value &local) {
+            ++in_callback_;
+            gate_.wait();
+            local["status"] = "success";
+            return 0;
+        });
+    start();
+
+    std::vector<int> fds;
+    for (int i = 0; i < kCap; ++i) {
+        int fd = connectToDaemon(port_);
+        if (fd < 0) break;
+        fds.push_back(fd);
+        timeval timeout{};
+        timeout.tv_sec = 10;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        ASSERT_EQ(writeString(fd, HandShakeRequestType::Probe, "{}"), 0);
+    }
+    EXPECT_TRUE(waitUntil([&] { return in_callback_ == kCap; },
+                          std::chrono::seconds(10)))
+        << in_callback_.load() << " of " << kCap << " requests served at once";
+
+    int extra = connectToDaemon(port_);
+    EXPECT_GE(extra, 0);
+    if (extra >= 0) {
+        const auto start = SteadyClock::now();
+        EXPECT_TRUE(closedByPeerWithin(extra, kHandshakeBound))
+            << "a connection past the cap was not closed";
+        LOG(INFO) << "connection past the cap closed after "
+                  << msSince(start).count() << " ms";
+        close(extra);
+    }
+    EXPECT_LE(in_callback_.load(), kCap);
+
+    gate_.open();
+    for (int fd : fds) {
+        EXPECT_EQ(readString(fd).first, HandShakeRequestType::Probe);
+        close(fd);
+    }
+    // Slots free up as the handlers finish; then probes get through again.
+    EXPECT_TRUE(waitUntil(
+        [&] {
+            return timedRequest(port_, HandShakeRequestType::Probe,
+                                Json::Value(Json::objectValue), kHandshakeBound)
+                .has_value();
+        },
+        std::chrono::seconds(10)));
 }
 
 namespace {

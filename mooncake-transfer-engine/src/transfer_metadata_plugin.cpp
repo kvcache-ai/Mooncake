@@ -24,7 +24,10 @@
 #include <poll.h>
 #include <sys/socket.h>
 
+#include <condition_variable>
+#include <mutex>
 #include <random>
+#include <thread>
 
 #ifdef USE_REDIS
 #include <hiredis/hiredis.h>
@@ -814,10 +817,17 @@ static inline const std::string getNetworkAddress(struct sockaddr *addr) {
     return "";
 }
 
+// How long an accepted handshake connection has to deliver its whole request.
+// It bounds the read as a whole: SO_RCVTIMEO restarts on every byte, so a peer
+// that sends a byte every few seconds could otherwise hold a handler for
+// minutes.
+static constexpr std::chrono::seconds kHandshakeRequestTimeout(5);
+
 struct SocketHandShakePlugin : public HandShakePlugin {
     SocketHandShakePlugin() : listener_running_(false), listen_fd_(-1) {
         auto &config = globalConfig();
         listen_backlog_ = config.handshake_listen_backlog;
+        max_connections_ = config.handshake_max_connections;
     }
 
     void closeListen() {
@@ -834,6 +844,10 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             listener_.join();
         }
         closeListen();
+        // Connection handlers run detached and call back into this object, so
+        // wait for them to finish.
+        std::unique_lock<std::mutex> lock(handlers_mutex_);
+        handlers_cv_.wait(lock, [this] { return active_handlers_ == 0; });
     }
 
     virtual void registerOnConnectionCallBack(OnReceiveCallBack callback) {
@@ -927,17 +941,25 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
         listener_running_ = true;
         listener_ = std::thread([this]() {
+            // This thread only accepts. Each connection is served on its own
+            // short-lived thread, so a peer that stalls, or a callback that
+            // blocks, cannot keep later handshakes from being served.
             while (listener_running_) {
-                sockaddr_in addr;
-                socklen_t addr_len = sizeof(sockaddr_in);
+                sockaddr_storage addr;
+                socklen_t addr_len = sizeof(addr);
                 int conn_fd = accept(listen_fd_, (sockaddr *)&addr, &addr_len);
                 if (conn_fd < 0) {
-                    if (errno != EWOULDBLOCK && errno != EINTR)
-                        PLOG(ERROR) << "SocketHandShakePlugin: accept()";
+                    if (errno == EWOULDBLOCK || errno == EAGAIN ||
+                        errno == EINTR)
+                        continue;
+                    PLOG_EVERY_N(ERROR, 100)
+                        << "SocketHandShakePlugin: accept()";
+                    // E.g. EMFILE: back off instead of spinning on the error.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     continue;
                 }
 
-                if (addr.sin_family != AF_INET && addr.sin_family != AF_INET6) {
+                if (addr.ss_family != AF_INET && addr.ss_family != AF_INET6) {
                     LOG(ERROR) << "SocketHandShakePlugin: unsupported socket "
                                   "type, should be AF_INET or AF_INET6";
                     close(conn_fd);
@@ -962,84 +984,122 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     continue;
                 }
 
-                auto peer_hostname =
-                    getNetworkAddress((struct sockaddr *)&addr);
-
-                Json::Value local, peer;
-
-                auto [type, json_str] = readString(conn_fd);
-                if (type == HandShakeRequestType::Invalid) {
+                if (!acquireHandlerSlot()) {
+                    LOG_EVERY_N(WARNING, 100)
+                        << "SocketHandShakePlugin: " << max_connections_
+                        << " handshake connections in flight, closing "
+                        << getNetworkAddress((struct sockaddr *)&addr);
                     close(conn_fd);
                     continue;
                 }
-
-                std::string errs;
-                if (!parseJsonString(json_str, peer, &errs)) {
-                    LOG(ERROR)
-                        << "SocketHandShakePlugin: failed to receive "
-                           "handshake message, "
-                           "malformed json format: "
-                        << errs << ", json string length: " << json_str.size()
-                        << ", json string content: " << json_str;
+                try {
+                    std::thread([this, conn_fd, addr]() {
+                        serveConnection(conn_fd, addr);
+                        releaseHandlerSlot();
+                    }).detach();
+                } catch (const std::system_error &e) {
+                    LOG(ERROR) << "SocketHandShakePlugin: cannot start a "
+                                  "connection handler: "
+                               << e.what();
                     close(conn_fd);
-                    continue;
+                    releaseHandlerSlot();
                 }
-
-                // old protocol equals Connection type
-                if (type == HandShakeRequestType::Connection ||
-                    type == HandShakeRequestType::OldProtocol) {
-                    if (on_connection_callback_)
-                        on_connection_callback_(peer, local);
-                } else if (type == HandShakeRequestType::Metadata) {
-                    if (on_metadata_callback_)
-                        on_metadata_callback_(peer, local);
-                } else if (type == HandShakeRequestType::Notify) {
-                    if (on_notify_callback_) on_notify_callback_(peer, local);
-                } else if (type == HandShakeRequestType::Probe) {
-                    if (on_probe_callback_) on_probe_callback_(peer, local);
-                } else {
-                    LOG(ERROR) << "SocketHandShakePlugin: unexpected handshake "
-                                  "message type";
-                    close(conn_fd);
-                    continue;
-                }
-
-                int ret =
-                    writeString(conn_fd, type, Json::FastWriter{}.write(local));
-                if (ret) {
-                    LOG(ERROR) << "SocketHandShakePlugin: failed to send "
-                                  "message: "
-                                  "malformed json format, check tcp connection";
-                    close(conn_fd);
-                    continue;
-                }
-
-                ret = shutdown(conn_fd, SHUT_WR);
-                if (ret) {
-                    PLOG(ERROR) << "SocketHandShakePlugin: shutdown() failed, "
-                                   "connection may be incomplete";
-                    close(conn_fd);
-                    continue;
-                }
-
-                // Wait for the client to close the connection
-                char byte;
-                ssize_t rc = read(conn_fd, &byte, sizeof(byte));
-                if (rc > 0) {
-                    LOG(ERROR) << "Unexpected socket read result: " << rc
-                               << ", byte: " << int(byte);
-                } else if (rc < 0) {
-                    PLOG(ERROR)
-                        << "Socket read failed while waiting client to close";
-                }
-                // else rc == 0, client close the connection, safe to close.
-
-                close(conn_fd);
             }
             return;
         });
 
         return 0;
+    }
+
+    bool acquireHandlerSlot() {
+        std::lock_guard<std::mutex> lock(handlers_mutex_);
+        if (active_handlers_ >= max_connections_) return false;
+        ++active_handlers_;
+        return true;
+    }
+
+    void releaseHandlerSlot() {
+        std::lock_guard<std::mutex> lock(handlers_mutex_);
+        if (--active_handlers_ == 0) handlers_cv_.notify_all();
+    }
+
+    // Serves one accepted connection, then closes it. Nothing thrown here may
+    // leave the thread, or the process terminates; jsoncpp, for one, throws
+    // when a request field has an unexpected JSON type.
+    void serveConnection(int conn_fd, const sockaddr_storage &addr) {
+        try {
+            serveRequest(conn_fd);
+        } catch (const std::exception &e) {
+            LOG(ERROR) << "SocketHandShakePlugin: dropped handshake from "
+                       << getNetworkAddress((struct sockaddr *)&addr) << ": "
+                       << e.what();
+        } catch (...) {
+            LOG(ERROR) << "SocketHandShakePlugin: dropped handshake from "
+                       << getNetworkAddress((struct sockaddr *)&addr);
+        }
+        close(conn_fd);
+    }
+
+    // Reads one request, runs its callback and writes the reply.
+    void serveRequest(int conn_fd) {
+        Json::Value local, peer;
+
+        auto [type, json_str] =
+            readString(conn_fd, std::chrono::steady_clock::now() +
+                                    kHandshakeRequestTimeout);
+        if (type == HandShakeRequestType::Invalid) return;
+
+        std::string errs;
+        if (!parseJsonString(json_str, peer, &errs)) {
+            LOG(ERROR) << "SocketHandShakePlugin: failed to receive "
+                          "handshake message, "
+                          "malformed json format: "
+                       << errs << ", json string length: " << json_str.size()
+                       << ", json string content: " << json_str;
+            return;
+        }
+
+        // old protocol equals Connection type
+        if (type == HandShakeRequestType::Connection ||
+            type == HandShakeRequestType::OldProtocol) {
+            if (on_connection_callback_) on_connection_callback_(peer, local);
+        } else if (type == HandShakeRequestType::Metadata) {
+            if (on_metadata_callback_) on_metadata_callback_(peer, local);
+        } else if (type == HandShakeRequestType::Notify) {
+            if (on_notify_callback_) on_notify_callback_(peer, local);
+        } else if (type == HandShakeRequestType::Probe) {
+            if (on_probe_callback_) on_probe_callback_(peer, local);
+        } else {
+            LOG(ERROR) << "SocketHandShakePlugin: unexpected handshake "
+                          "message type";
+            return;
+        }
+
+        int ret = writeString(conn_fd, type, Json::FastWriter{}.write(local));
+        if (ret) {
+            LOG(ERROR) << "SocketHandShakePlugin: failed to send "
+                          "message: "
+                          "malformed json format, check tcp connection";
+            return;
+        }
+
+        ret = shutdown(conn_fd, SHUT_WR);
+        if (ret) {
+            PLOG(ERROR) << "SocketHandShakePlugin: shutdown() failed, "
+                           "connection may be incomplete";
+            return;
+        }
+
+        // Wait for the client to close the connection
+        char byte;
+        ssize_t rc = read(conn_fd, &byte, sizeof(byte));
+        if (rc > 0) {
+            LOG(ERROR) << "Unexpected socket read result: " << rc
+                       << ", byte: " << int(byte);
+        } else if (rc < 0) {
+            PLOG(ERROR) << "Socket read failed while waiting client to close";
+        }
+        // else rc == 0, client close the connection, safe to close.
     }
 
     virtual int sendNotify(std::string ip_or_host_name, uint16_t rpc_port,
@@ -1454,6 +1514,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     std::thread listener_;
     int listen_fd_;
     int listen_backlog_;
+    int max_connections_;
+
+    std::mutex handlers_mutex_;
+    std::condition_variable handlers_cv_;
+    int active_handlers_ = 0;  // connection handlers running
 
     OnReceiveCallBack on_connection_callback_;
     OnReceiveCallBack on_metadata_callback_;
