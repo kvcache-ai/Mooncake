@@ -142,6 +142,19 @@ if(BUILD_UNIT_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
   add_test(NAME tebench_target_metrics_test COMMAND tebench_target_metrics_test)
 
+  add_executable(tebench_bench_runner_test tests/bench_runner_test.cpp
+                                           bench_runner.cpp utils.cpp)
+  target_link_libraries(tebench_bench_runner_test PRIVATE transfer_engine gtest
+                                                          gtest_main)
+  if(USE_TENT)
+    target_link_libraries(tebench_bench_runner_test PRIVATE tent_common)
+  endif()
+  target_include_directories(
+    tebench_bench_runner_test
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+  add_test(NAME tebench_bench_runner_test COMMAND tebench_bench_runner_test)
+
   add_executable(tebench_split_output_test tests/split_output_test.cpp
                                            split_output.cpp)
   target_link_libraries(tebench_split_output_test PRIVATE gtest gtest_main)
