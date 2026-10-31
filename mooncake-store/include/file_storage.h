@@ -1,6 +1,8 @@
 #pragma once
 
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <unordered_set>
 
@@ -293,6 +295,11 @@ class FileStorage {
     mutable Mutex client_buffer_mutex_;
     std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
         client_buffer_mutex_) client_buffer_allocated_batches_;
+    // Signals that a staging batch was released (ReleaseBuffer, or the GC
+    // reaped an expired one), so readers waiting on arena space in
+    // AllocateBatch can retry promptly instead of polling.
+    std::mutex client_buffer_release_mu_;
+    std::condition_variable client_buffer_release_cv_;
     std::atomic<uint64_t> next_batch_id_{1};
 
     /**
