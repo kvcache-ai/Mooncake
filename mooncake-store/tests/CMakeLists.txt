@@ -561,3 +561,22 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+# A small client/master boundary suite, not the complete client test sweep.
+add_test(
+  NAME client_master_contract_test
+  COMMAND
+    client_integration_test
+    --gtest_filter=ClientIntegrationTest.BasicPutGetOperations:ClientIntegrationTest.RemoveOperation:ClientIntegrationTest.BatchPutGetOperations
+)
+# These aliases share fixed client listen ports in ClientIntegrationTest.
+set_tests_properties(
+  client_integration_test object_checksum_client_test
+  client_master_contract_test PROPERTIES RESOURCE_LOCK store_client_integration)
+if(COMMAND mooncake_label_tests)
+  mooncake_label_tests(store)
+  add_dependencies(mooncake-tests-store-master mooncake_master)
+  add_dependencies(mooncake-tests-store-client mooncake_client)
+  add_dependencies(mooncake-tests-client-master-contract
+                   client_integration_test)
+endif()

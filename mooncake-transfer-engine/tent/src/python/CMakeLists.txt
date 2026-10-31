@@ -37,3 +37,8 @@ if(BUILD_UNIT_TESTS)
       ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/test_python_guards.py)
 endif()
+
+if(BUILD_UNIT_TESTS AND COMMAND mooncake_label_tests)
+  mooncake_label_tests(tent)
+  add_dependencies(mooncake-tests-tent tentpy)
+endif()

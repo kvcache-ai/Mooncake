@@ -5,3 +5,7 @@ target_include_directories(ep_dispatch_slots_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 target_link_libraries(ep_dispatch_slots_test PRIVATE gtest gtest_main pthread)
 add_test(NAME ep_dispatch_slots_test COMMAND ep_dispatch_slots_test)
+
+if(COMMAND mooncake_label_tests)
+  mooncake_label_tests(ep)
+endif()

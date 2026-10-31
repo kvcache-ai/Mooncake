@@ -44,7 +44,7 @@ jobs:
       version-override: 0.0.0.dev0
 
   test-wheel-ubuntu:
-    needs: [build-wheel]
+    needs: [build-wheel, check-paths]
     strategy:
       matrix:
         include:
@@ -144,7 +144,7 @@ jobs:
       shell: bash
 
     - name: Run all PG CPU tests with installed PyTorch
-      if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
+      if: needs.check-paths.outputs.pg_tests == 'true' && matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
         MC_FORCE_TCP: "true"
         # The runner has CUDA headers/nvcc but no usable GPU for arch detection.
@@ -248,30 +248,39 @@ jobs:
     - name: Configure CUDA driver runtime
       uses: ./.github/actions/setup-cuda-runtime
 
-    - name: Build project and unit tests
+    - name: Build selected unit-test targets
+      env:
+        UNIT_TEST_TARGETS: ${{ needs.check-paths.outputs.unit_test_targets }}
       run: |
-        cmake --build build --parallel 128
-        sudo -E cmake --install build
+        if [ -n "$UNIT_TEST_TARGETS" ]; then
+          read -r -a targets <<< "$UNIT_TEST_TARGETS"
+          cmake --build build --parallel 128 --target "${targets[@]}"
+        else
+          cmake --build build --parallel 128
+          sudo -E cmake --install build
+        fi
       shell: bash
 
     - name: Run Mooncake Store Rust unit tests
+      if: needs.check-paths.outputs.store_client_tests == 'true'
       env:
         MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build
         MOONCAKE_STORE_LIB_DIR: ${{ github.workspace }}/build/mooncake-store/src
         MOONCAKE_STORE_INCLUDE_DIR: ${{ github.workspace }}/mooncake-store/include
       run: |
-        export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+        export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/build/mooncake-common:$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:/usr/local/lib:${LD_LIBRARY_PATH:-}"
         cargo test --manifest-path mooncake-store/rust/Cargo.toml --lib
       shell: bash
 
     - name: Start Metadata Server
       uses: ./.github/actions/setup-metadata-server
 
-    - name: Run all CTest unit tests
+    - name: Run selected CTest unit tests
       id: ctest
       uses: ./.github/actions/run-ctest
       with:
         junit-report: build/test-results/ctest.xml
+        label-include: ${{ needs.check-paths.outputs.unit_test_labels }}
         label-exclude: '^nvlink_gpu$'
 
     - name: Preserve CTest diagnostics
@@ -286,7 +295,7 @@ jobs:
 
   build-flags:
     needs: [check-paths]
-    if: *run-ci-for-source-changes
+    if: needs.check-paths.outputs.src == 'true' && needs.check-paths.outputs.te_tests == 'true'
     runs-on: ubuntu-22.04
     env:
       CI: "true"
@@ -550,12 +559,16 @@ jobs:
       pull-requests: read
     outputs:
       src: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.src }}
-      tent: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.tent }}
+      tent: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.src == 'true' && steps.tests.outputs.te_tests == 'true' && 'true' || steps.filter.outputs.tent }}
       store_rs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.store_rs }}
       docs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.docs }}
+      unit_test_labels: ${{ steps.tests.outputs.unit_test_labels }}
+      unit_test_targets: ${{ steps.tests.outputs.unit_test_targets }}
+      te_tests: ${{ steps.tests.outputs.te_tests }}
+      pg_tests: ${{ steps.tests.outputs.pg_tests }}
+      store_client_tests: ${{ steps.tests.outputs.store_client_tests }}
     steps:
       - uses: actions/checkout@v4
-        if: github.event_name != 'workflow_dispatch'
         with:
           fetch-depth: 2
           persist-credentials: false
@@ -566,12 +579,15 @@ jobs:
           # PRs use their base branch; pushes compare against the previous push
           # on this ref, including release branches.
           base: ${{ github.event_name == 'push' && github.ref || '' }}
+          list-files: json
           filters: |
             src:
               - 'mooncake-*/**'
               - 'extern/**'
               - 'cmake/**'
               - 'CMakeLists.txt'
+              - 'pyproject.toml'
+              - 'python/**'
               - 'dependencies.sh'
               - 'scripts/**'
               - '.github/actions/**'
@@ -605,6 +621,18 @@ jobs:
             docs:
               - 'docs/**'
               - '.github/workflows/ci.yml'
+      - name: Select affected unit-test components
+        id: tests
+        env:
+          CHANGED_FILES: ${{ steps.filter.outputs.src_files || '[]' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          args=()
+          if [ "$EVENT_NAME" != pull_request ]; then
+            args+=(--full)
+          fi
+          python3 scripts/ci/select_test_components.py \
+            --files-json "$CHANGED_FILES" "${args[@]}"
 
   build-wheel-cu13:
     needs: [spell-check, clang-format, check-paths]
@@ -1027,7 +1055,6 @@ jobs:
           RESULTS: >-
             ${{ needs.build-wheel.result }}
             ${{ needs.unit-tests.result }}
-            ${{ needs.build-flags.result }}
             ${{ needs.test-wheel-ubuntu.result }}
             ${{ needs.build-wheel-cu13.result }}
             ${{ needs.build-wheel-cu13-arm64.result }}
@@ -1037,6 +1064,12 @@ jobs:
           for result in $RESULTS; do
             test "$result" = "$EXPECTED" || exit 1
           done
+
+      - name: Check Transfer Engine build job
+        env:
+          EXPECTED: ${{ needs.check-paths.outputs.src == 'true' && needs.check-paths.outputs.te_tests == 'true' && 'success' || 'skipped' }}
+          RESULT: ${{ needs.build-flags.result }}
+        run: test "$RESULT" = "$EXPECTED"
 
       - name: Check TENT jobs
         env:

@@ -933,3 +933,7 @@ if(USE_MLU)
     "-Wl,--wrap=cnQueryNotifier"
     "-Wl,--wrap=cnQueryQueue")
 endif()
+
+if(COMMAND mooncake_label_tests)
+  mooncake_label_tests(tent)
+endif()

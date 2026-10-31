@@ -141,6 +141,38 @@ enabled. To activate, add the repository in the pre-commit.ci dashboard; no
 further changes are needed.
 
 
+## Selective PR Unit Tests
+
+PR CI selects native tests by component, while branch pushes, manual runs, and
+nightly retain the full sweep. TE implementation changes exercise TE, Store
+client, and PG tests (PG CPU tests run over the TE TCP transport), not master
+internals. Master implementation changes exercise master tests plus a small
+client/master contract suite, not TE/TENT or PG tests. PG and EP select only
+their own tests; PG has no CTest targets, so its selection gates the Python PG
+step in the wheel job.
+Multiple-component changes take the union. Public headers, shared code, build
+configuration, and unclassified source changes conservatively select all.
+
+Store source ownership follows the master/client/shared lists in
+`mooncake-store/src/CMakeLists.txt`. Test ownership is explicit in
+`cmake/StoreTestComponents.cmake`; update it when adding or moving Store tests.
+Component labels are appended to existing hardware labels. Unclassified tests
+are included in every selective profile. Selection affects both test targets
+built and CTest execution; required dependency libraries may still be compiled.
+
+Inspect a selection locally:
+
+```bash
+python3 scripts/ci/select_test_components.py \
+  --files-json '["mooncake-store/src/master_service.cpp"]'
+```
+
+After configuring the usual root unit-test build, the emitted
+`unit_test_targets` can be passed to `cmake --build build --target ...`, and
+`unit_test_labels` to `ctest --test-dir build -L '...' --no-tests=error`.
+Selective CI runs use build-tree binaries rather than installing unbuilt targets.
+The CI job summary records the selected components.
+
 ## Store-RS Test Entry Point
 
 Run the root Store-RS smoke entry point from the repository root after building

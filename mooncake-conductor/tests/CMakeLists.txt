@@ -34,3 +34,7 @@ target_compile_definitions(
   PRIVATE CONDUCTOR_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 
 add_test(NAME conductor_test COMMAND conductor_test)
+
+if(COMMAND mooncake_label_tests)
+  mooncake_label_tests(conductor)
+endif()

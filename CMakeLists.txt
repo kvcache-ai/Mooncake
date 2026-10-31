@@ -14,6 +14,7 @@ include(mooncake-common/common.cmake)
 # unit test
 if(BUILD_UNIT_TESTS)
   enable_testing()
+  include(cmake/TestComponents.cmake)
 endif()
 
 option(WITH_TE "build mooncake transfer engine and sample code" ON)
