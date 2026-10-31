@@ -14,6 +14,7 @@
 namespace mooncake {
 
 class PyClient;
+class StrictCreateClient;
 
 namespace engram {
 
@@ -78,14 +79,15 @@ class EngramStore {
      * Populate Store with per-head embedding tensors.
      * @param embedding_buffers Byte buffers for each head [N_h, row_bytes]
      * @param buffer_sizes Size in bytes for each buffer
-     * @return 0 on success; -1 on failure before registration; -2 when tables
-     * were published but finalization could not be confirmed; -3 when populate
-     * failed with uncertain registration or transfer state. On -2/-3 keep all
-     * input buffers alive, without resizing or remapping, until process exit.
-     * Failed writes may leave partial tables. No automatic key deletion is
-     * performed without an ownership/version token. Flexible dual-replica
-     * configurations are rejected before registration because write success
-     * does not prove that every source transfer has ended.
+     * @return 0 on success; -1 on failure with no retained input resources
+     * (pre-registration or terminal creation conflict after cleanup); -2 when
+     * tables were published but finalization could not be confirmed; -3 when
+     * populate failed with uncertain registration or transfer state. On -2/-3
+     * keep all input buffers alive, without resizing or remapping, until
+     * process exit. Failed writes may leave partial tables. No automatic key
+     * deletion is performed without an ownership/version token. Flexible
+     * dual-replica configurations are rejected before registration because
+     * write success does not prove that every source transfer has ended.
      */
     int populate(int layer_id, const std::vector<void*>& embedding_buffers,
                  const std::vector<size_t>& buffer_sizes,
@@ -105,6 +107,7 @@ class EngramStore {
 
    private:
     std::shared_ptr<PyClient> store_;
+    std::shared_ptr<StrictCreateClient> strict_store_;
     struct QueryCacheEntry;
     struct Layer {
         EngramStoreConfig config;

@@ -254,7 +254,7 @@ class RealClient : public PyClient {
     std::vector<int> batch_put_from_create_only(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
-        const ReplicateConfig &config) override;
+        const ReplicateConfig &config);
 
     /**
      * @brief Put object data directly from multiple pre-allocated buffers for

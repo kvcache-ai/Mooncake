@@ -3594,6 +3594,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
         // With the new structure, result is always set (never nullopt)
         results.emplace_back(op.result);
 
+        // Reserve strict creation conflicts for starts that allocated no
+        // replicas. A later error with the same code does not prove that
+        // transfers have ended; callers must retain uncertain source buffers.
+        if (create_only && !op.result.has_value() &&
+            op.result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
+            !op.replicas.empty()) {
+            results.back() = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+        }
+
         // Additional validation and logging for debugging
         if (!op.result.has_value()) {
             // If error == object already exist, consider as ok (Put semantics).

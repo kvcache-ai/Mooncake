@@ -26,7 +26,8 @@ void bind_engram_store(py::module&);
 
 namespace {
 
-class FaultClient : public mooncake::RealClient {
+class FaultClient : public mooncake::RealClient,
+                    public mooncake::StrictCreateClient {
    public:
     explicit FaultClient(std::string mode) : mode_(std::move(mode)) {
         if (mode_ == "remove_fail" || mode_ == "remove_throw" ||
@@ -68,7 +69,7 @@ class FaultClient : public mooncake::RealClient {
         ++unregister_calls;
         if (mode_ == "unregister_throw") throw std::runtime_error("unregister");
         if (mode_ == "cleanup_fail" || mode_ == "register_fail" ||
-            mode_ == "upload_cleanup_fail")
+            mode_ == "upload_cleanup_fail" || mode_ == "conflict_cleanup_fail")
             return -1;
         registered.erase(buffer);
         return 0;
@@ -172,6 +173,11 @@ class FaultClient : public mooncake::RealClient {
         }
         if (mode_ == "upload_throw") throw std::runtime_error("upload");
         std::vector<int> results(keys.size(), 0);
+        if (mode_ == "mixed_conflict" || mode_ == "conflict_cleanup_fail") {
+            published.insert(keys.back());
+            results.back() =
+                static_cast<int>(mooncake::ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
         if (mode_ == "upload_fail" || mode_ == "upload_cleanup_fail") {
             results.back() = -1;
         }
@@ -223,6 +229,39 @@ bool read_excludes_remove() {
            client->query_calls == 2;
 }
 
+std::tuple<int, int, bool> unsupported_client_result() {
+    // A legacy subclass has no strict-create capability. Neither registration
+    // nor its ordinary write path may be used as an implicit fallback.
+    struct LegacyClient : mooncake::RealClient {
+        int registrations = 0;
+        std::vector<int> batchIsExist(
+            const std::vector<std::string>& keys) override {
+            return std::vector<int>(keys.size(), 0);
+        }
+        int register_buffer(void*, size_t) override {
+            ++registrations;
+            return 0;
+        }
+        int unregister_buffer(void*) override { return 0; }
+        std::vector<int> batch_put_from(
+            const std::vector<std::string>&, const std::vector<void*>&,
+            const std::vector<size_t>&,
+            const mooncake::ReplicateConfig&) override {
+            throw std::runtime_error("must not fall back to ordinary Put");
+        }
+    };
+    auto client = std::make_shared<LegacyClient>();
+    mooncake::engram::EngramStoreConfig config;
+    config.table_vocab_sizes = {4};
+    config.row_bytes = 8;
+    mooncake::engram::EngramStore store({{1, config}}, client);
+    auto data = std::make_shared<std::vector<uint8_t>>(32);
+    std::weak_ptr<std::vector<uint8_t>> weak = data;
+    int rc = store.populate(1, {data->data()}, {data->size()}, {}, data);
+    data.reset();
+    return {rc, client->registrations, weak.expired()};
+}
+
 std::tuple<int, int, int, bool> verify_real_create_only(
     const std::string& master, const std::string& metadata) {
     auto client = mooncake::RealClient::create();
@@ -263,6 +302,7 @@ std::tuple<int, int, int, bool> verify_real_create_only(
 }  // namespace
 
 PYBIND11_MODULE(engram_store_test_client, m) {
+    m.def("unsupported_client_result", &unsupported_client_result);
     m.attr("OBJECT_ALREADY_EXISTS") =
         static_cast<int>(mooncake::ErrorCode::OBJECT_ALREADY_EXISTS);
     m.def("read_excludes_remove", &read_excludes_remove,

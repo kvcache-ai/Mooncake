@@ -177,10 +177,15 @@ partial tables. They do **not** automatically delete keys: without an object
 version/write token, a cleanup cannot prove that the current object belongs to
 this attempt. Explicit removal and reuse require coordination with other writers.
 
-The strict write path is a new `PyClient` virtual method. Adding it changes the
-`PyClient` vtable layout: out-of-tree C++ subclasses must be recompiled, and
-backends that do not implement strict creation fail closed through the default
-implementation instead of falling back to idempotent writes.
+The strict write path uses a separate `StrictCreateClient` capability, preserving
+the existing `PyClient` and `RealClient` vtables and client object layouts.
+Engram adapts an exact `RealClient` instance through its non-virtual strict-write
+method. Custom backends, including `RealClient` subclasses, must explicitly
+implement `StrictCreateClient`; otherwise populate fails before registration.
+Ordinary idempotent writes are never used as a fallback. Capability results must
+contain one entry per key: `OBJECT_ALREADY_EXISTS` means no transfer started for
+that key, and success means the required writes completed, subject to the
+flexible-replica restriction below.
 
 Flexible dual-replica configurations (`replica_num=1`, `nof_replica_num=1`,
 `dfs_replica_num=0`) are rejected before registration. Their successful result
@@ -190,8 +195,11 @@ that all accesses to the source buffers have ended.
 If upload succeeds but finalization cannot be confirmed, the published tables
 are **kept**: deleting data does not release buffer registrations. The C++ API
 returns `-2`; failed registration or upload with uncertain resource state returns
-`-3`. Failures before registration return `-1`. Failed uploads do not guarantee
-an empty destination.
+`-3`. Failures before registration return `-1`. A complete batch containing only
+successes and creation conflicts also returns `-1` if any key conflicted and all
+unregister operations succeeded: the inputs are safe to release. This includes
+mixed success/conflict batches; partially created tables remain. Failed uploads
+do not guarantee an empty destination.
 
 Python raises an exception for each failure. Before registration it takes an
 independent reference to every input array and copies the replication settings
@@ -201,8 +209,9 @@ are deliberately retained until process exit, independently of the EngramStore
 and Client lifetimes. A failed registration may leave partial registrations, and
 an upload timeout may leave DMA pending even if unregister succeeds; therefore
 later successful cleanup does not reclaim these retained references. Repeated
-failures can accumulate retained memory. Normal successful populate and
-pre-registration failures do not retain arrays beyond the call.
+uncertain failures can accumulate retained memory. Normal successful populate,
+pre-registration failures, and terminal creation conflicts with successful
+cleanup do not retain arrays beyond the call.
 
 C++ callers can use the owner-aware overload to obtain the same retention
 behavior. Raw-buffer callers must themselves keep all inputs alive on `-2` or
@@ -211,6 +220,10 @@ explicitly unmap retained inputs.
 
 The fault-injection regression test compiles the real implementation and Python
 binding against a test client, including exception and object-destruction cases:
+
+Both Engram CTests require NumPy in the interpreter selected by
+`Python3_EXECUTABLE`. Test-enabled configuration checks this dependency; install
+it with that interpreter's `-m pip install numpy` before configuring.
 
 ```bash
 cmake --build build --target engram_store_test_client

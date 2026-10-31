@@ -41,11 +41,25 @@ class PopulateLifetimeTests(unittest.TestCase):
         self.assertEqual(client.published_count, 2)
         self.assertTrue(all(ref() is None for ref in refs))
 
+    def test_unsupported_client_fails_before_registration(self):
+        self.assertEqual(native.unsupported_client_result(), (-1, 0, True))
+
     def test_preflight_failure_does_not_retain_owner(self):
         client, table = self.make_store("preflight")
         refs = self.populate_temporaries(table)
         self.assertEqual(client.register_calls, 0)
         self.assertTrue(all(ref() is None for ref in refs))
+
+    def test_terminal_conflicts_release_owners_without_deleting_tables(self):
+        for mode in ("competing_success", "mixed_conflict"):
+            with self.subTest(mode=mode):
+                client, table = self.make_store(mode)
+                for _ in range(2):
+                    refs = self.populate_temporaries(table)
+                    self.assertEqual(client.registered_count, 0)
+                    self.assertEqual(client.published_count, 2)
+                    self.assertEqual(client.remove_calls, 0)
+                    self.assertTrue(all(ref() is None for ref in refs))
 
     def test_failed_upload_with_successful_unregister_retains_owner(self):
         client, table = self.make_store("upload_fail")
@@ -83,6 +97,7 @@ class PopulateLifetimeTests(unittest.TestCase):
             "upload_throw_after_publish",
             "unregister_throw",
             "malformed",
+            "conflict_cleanup_fail",
         ):
             with self.subTest(mode=mode):
                 client, table = self.make_store(mode)
@@ -108,6 +123,9 @@ class PopulateLifetimeTests(unittest.TestCase):
             ("upload_throw", -3, 0),
             ("upload_throw_after_publish", -3, 2),
             ("malformed", -3, 2),
+            ("mixed_conflict", -1, 2),
+            ("competing_success", -1, 2),
+            ("conflict_cleanup_fail", -3, 2),
         ):
             with self.subTest(mode=mode):
                 client, table = self.make_store(mode)

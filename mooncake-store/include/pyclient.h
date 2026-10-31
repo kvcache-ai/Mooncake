@@ -249,6 +249,22 @@ class ClientRequester {
         const std::string &client_addr, Args &&...args);
 };
 
+// Optional capability, separate from the existing PyClient vtable. Custom
+// backends opt in explicitly; ordinary idempotent Put is not a fallback.
+class StrictCreateClient {
+   public:
+    virtual ~StrictCreateClient() = default;
+
+    // One result per key: 0 means completed writes; OBJECT_ALREADY_EXISTS
+    // means this call never started a transfer for that key. Other failures
+    // may leave source transfers pending. Flexible dual-replica success is
+    // excluded from the completion guarantee; Engram rejects that mode.
+    virtual std::vector<int> batch_put_from_create_only(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config) = 0;
+};
+
 // Python-specific wrapper class for client interface
 class PyClient {
    public:
@@ -437,18 +453,6 @@ class PyClient {
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
-
-    // Existing keys must return OBJECT_ALREADY_EXISTS, not idempotent success.
-    // Backends without strict creation support must fail rather than fall back.
-    // Adding this virtual changes the PyClient vtable layout: out-of-tree C++
-    // subclasses must be recompiled, and subclasses that only override
-    // batch_put_from fail closed through this default until they implement it.
-    virtual std::vector<int> batch_put_from_create_only(
-        const std::vector<std::string> &keys, const std::vector<void *> &,
-        const std::vector<size_t> &, const ReplicateConfig &) {
-        return std::vector<int>(keys.size(),
-                                static_cast<int>(ErrorCode::INVALID_PARAMS));
-    }
 
     virtual std::vector<int> batch_put_from_multi_buffers(
         const std::vector<std::string> &keys,

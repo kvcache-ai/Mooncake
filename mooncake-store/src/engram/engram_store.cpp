@@ -8,15 +8,33 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
 #include "pyclient.h"
+#include "real_client.h"
 
 namespace mooncake {
 namespace engram {
 
 namespace {
+
+// Composition keeps both existing client classes' layouts unchanged.
+class RealClientStrictCreate final : public StrictCreateClient {
+   public:
+    explicit RealClientStrictCreate(RealClient& client) : client_(client) {}
+
+    std::vector<int> batch_put_from_create_only(
+        const std::vector<std::string>& keys, const std::vector<void*>& buffers,
+        const std::vector<size_t>& sizes,
+        const ReplicateConfig& config) override {
+        return client_.batch_put_from_create_only(keys, buffers, sizes, config);
+    }
+
+   private:
+    RealClient& client_;
+};
 
 struct PopulateOwnerGuard {
     explicit PopulateOwnerGuard(std::shared_ptr<void> value)
@@ -43,6 +61,13 @@ struct EngramStore::QueryCacheEntry {
 EngramStore::EngramStore(const std::map<int, EngramStoreConfig>& layers,
                          std::shared_ptr<PyClient> store)
     : store_(std::move(store)) {
+    strict_store_ = std::dynamic_pointer_cast<StrictCreateClient>(store_);
+    // Do not silently bypass a subclass's storage implementation. Custom
+    // backends (including RealClient subclasses) must opt into the capability.
+    if (!strict_store_ && store_ && typeid(*store_) == typeid(RealClient)) {
+        strict_store_ = std::make_shared<RealClientStrictCreate>(
+            static_cast<RealClient&>(*store_));
+    }
     if (layers.empty()) {
         throw std::invalid_argument("EngramStore requires at least one layer");
     }
@@ -334,7 +359,7 @@ int EngramStore::populate(int layer_id,
     std::unique_lock<std::shared_mutex> lock(layer.mutex);
     const auto& table_vocab_sizes = layer.config.table_vocab_sizes;
     const auto& embed_keys = layer.keys;
-    if (store_ == nullptr) {
+    if (strict_store_ == nullptr) {
         return -1;
     }
     if (DetermineReplicaWriteMode(config) ==
@@ -421,7 +446,7 @@ int EngramStore::populate(int layer_id,
             }
         }
         if (registered_count == embedding_buffers.size()) {
-            put_results = store_->batch_put_from_create_only(
+            put_results = strict_store_->batch_put_from_create_only(
                 embed_keys, embedding_buffers, buffer_sizes, config);
         }
     } catch (...) {
@@ -439,6 +464,20 @@ int EngramStore::populate(int layer_id,
         // No object-version token proves that a key still belongs to this
         // attempt. Even a successful creation may have been replaced remotely.
         // Never force-delete another writer's objects during failed populate.
+        const bool terminal_results =
+            put_results.size() == embed_keys.size() &&
+            std::all_of(put_results.begin(), put_results.end(), [](int result) {
+                return result == 0 ||
+                       result ==
+                           static_cast<int>(ErrorCode::OBJECT_ALREADY_EXISTS);
+            });
+        if (terminal_results && !unregister_failed) {
+            // Strict creation conflicts never start a source transfer. Success
+            // entries completed all required transfers (flexible mode is
+            // rejected).
+            owner_guard.release_safe = true;
+            return -1;
+        }
         // Failed registration can leave partial MRs; a failed upload can time
         // out before DMA completes. Unregister alone cannot prove release safe.
         return -3;

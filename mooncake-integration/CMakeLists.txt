@@ -169,6 +169,16 @@ if(WITH_STORE)
                    cachelib_memory_allocator)
   endif()
   if(BUILD_UNIT_TESTS)
+    execute_process(
+      COMMAND ${Python3_EXECUTABLE} -c "import numpy"
+      RESULT_VARIABLE ENGRAM_NUMPY_IMPORT_RESULT
+      ERROR_QUIET)
+    if(NOT ENGRAM_NUMPY_IMPORT_RESULT EQUAL 0)
+      message(
+        FATAL_ERROR
+          "Engram tests require NumPy. Install it with: ${Python3_EXECUTABLE} -m pip install numpy"
+      )
+    endif()
     pybind11_add_module(
       engram_store_test_client tests/engram_store_test_client.cpp
       store/engram_store_py.cpp)
