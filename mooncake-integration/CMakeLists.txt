@@ -172,6 +172,14 @@ if(WITH_STORE)
     pybind11_add_module(
       engram_store_test_client tests/engram_store_test_client.cpp
       store/engram_store_py.cpp)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID STREQUAL
+                                              "GNU")
+      # Keep GCC's unwinder ahead of libunwind exported by older glog packages.
+      # Mixing them can abort before pybind11 translates a C++ exception.
+      target_link_libraries(
+        engram_store_test_client PRIVATE "-Wl,--push-state,--no-as-needed"
+                                         gcc_s "-Wl,--pop-state")
+    endif()
     target_link_libraries(
       engram_store_test_client PRIVATE mooncake_store transfer_engine
                                        cachelib_memory_allocator glog::glog)
