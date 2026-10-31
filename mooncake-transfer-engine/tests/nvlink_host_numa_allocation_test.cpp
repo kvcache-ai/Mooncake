@@ -5,7 +5,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -66,6 +68,26 @@ struct ThrowingDeviceCount {
         *count = 3;
         return CUDA_SUCCESS;
     }
+};
+
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        const char* current = std::getenv(name);
+        if (current) old_value_ = current;
+        setenv(name, value, 1);
+    }
+
+    ~ScopedEnvVar() {
+        if (old_value_)
+            setenv(name_.c_str(), old_value_->c_str(), 1);
+        else
+            unsetenv(name_.c_str());
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> old_value_;
 };
 
 class FakeCudaDriver {
@@ -229,6 +251,25 @@ TEST(NvlinkHostNumaAllocationTest, DiscoversSortedGpuLocalNodes) {
     EXPECT_TRUE(NvlinkHostNumaAllocationTestPeer::Discover(driver.api(), nodes)
                     .IsNotSupportedTransport());
     EXPECT_TRUE(nodes.empty());
+}
+
+TEST(NvlinkHostNumaAllocationTest, NvlinkIpcZeroKeepsFabricAllocations) {
+    FakeCudaDriver driver;
+    std::vector<int> nodes;
+    {
+        ScopedEnvVar env("MC_USE_NVLINK_IPC", "0");
+        ASSERT_TRUE(
+            NvlinkHostNumaAllocationTestPeer::Discover(driver.api(), nodes)
+                .ok());
+        EXPECT_EQ(nodes, (std::vector<int>{0, 2}));
+    }
+    {
+        ScopedEnvVar env("MC_USE_NVLINK_IPC", "1");
+        EXPECT_TRUE(
+            NvlinkHostNumaAllocationTestPeer::Discover(driver.api(), nodes)
+                .IsNotSupportedTransport());
+        EXPECT_TRUE(nodes.empty());
+    }
 }
 
 TEST(NvlinkHostNumaAllocationTest, AlignsAndGrantsCpuAndGpuAccess) {
