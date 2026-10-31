@@ -13,9 +13,14 @@
 
 #include <array>
 #include <cctype>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <regex>
+#include <set>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include <algorithm>
@@ -24,6 +29,7 @@
 
 #include <ylt/struct_pb.hpp>
 
+#include "ascii_string.h"
 #include "mutex.h"
 #include "nvme_kv/backend.h"
 #include "common/timestamp.h"
@@ -1533,8 +1539,34 @@ BucketStorageBackend::BucketStorageBackend(
     const FileStorageConfig& file_storage_config_,
     const BucketBackendConfig& bucket_backend_config_)
     : StorageBackendInterface(file_storage_config_),
-      storage_path_(file_storage_config_.storage_filepath),
       bucket_backend_config_(bucket_backend_config_) {
+    // Direct construction (tests, benchmarks) may bypass Validate(), which is
+    // what normally populates storage_filepaths. Split lightly in that case.
+    storage_paths_ = file_storage_config_.storage_filepaths;
+    if (storage_paths_.empty()) {
+        std::string_view raw(file_storage_config_.storage_filepath);
+        size_t start = 0;
+        while (true) {
+            const size_t comma = raw.find(',', start);
+            const std::string_view token =
+                TrimAsciiWhitespace(comma == std::string_view::npos
+                                        ? raw.substr(start)
+                                        : raw.substr(start, comma - start));
+            if (!token.empty()) {
+                storage_paths_.emplace_back(token);
+            }
+            if (comma == std::string_view::npos) {
+                break;
+            }
+            start = comma + 1;
+        }
+        if (storage_paths_.empty()) {
+            storage_paths_.push_back(file_storage_config_.storage_filepath);
+        }
+    }
+    owner_lock_fds_.assign(storage_paths_.size(), -1);
+    total_size_by_root_.assign(storage_paths_.size(), 0);
+
     // Allocate aligned buffer for O_DIRECT I/O operations
     void* buf = nullptr;
     int ret = posix_memalign(&buf, kDirectIOAlignment, kAlignedBufferSize);
@@ -1556,11 +1588,7 @@ BucketStorageBackend::~BucketStorageBackend() {
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
     ClearFileCache();
-    if (owner_lock_fd_ >= 0) {
-        ::flock(owner_lock_fd_, LOCK_UN);
-        ::close(owner_lock_fd_);
-        owner_lock_fd_ = -1;
-    }
+    ReleaseOwnerLocks();
 }
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
@@ -1600,7 +1628,11 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // Phase 1: eviction — remove oldest buckets from metadata maps to make
     // room. Must notify master BEFORE deleting files (Phase 2).
     const int64_t required_size = bucket->data_size + bucket->meta_size;
-    auto prepare_result = PrepareEviction(required_size, bucket->keys);
+    // Choose the target root before preparing eviction: a physically full disk
+    // only frees space by evicting buckets from that same root.
+    bucket->root_index_ = SelectWriteRoot(required_size);
+    auto prepare_result =
+        PrepareEviction(required_size, bucket->keys, bucket->root_index_);
     if (!prepare_result) {
         return tl::make_unexpected(prepare_result.error());
     }
@@ -1681,7 +1713,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             // Every key was already persisted: nothing new to commit or
             // notify, the written bucket file is redundant.
             lock.unlock();
-            CleanupOrphanedBucket(bucket_id);
+            CleanupOrphanedBucket(bucket_id, bucket->root_index_);
             return bucket_id;
         }
 
@@ -1699,6 +1731,9 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             committed_metadatas.push_back(metadatas[i]);
         }
         total_size_ += committed_data_size;
+        if (bucket->root_index_ >= 0) {
+            total_size_by_root_[bucket->root_index_] += committed_data_size;
+        }
         auto ts = 0LL;
         // Update LRU timestamp for in case of eviction.
         if (bucket_backend_config_.eviction_policy ==
@@ -1760,6 +1795,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     struct ReadPlan {
         std::string key;
         int64_t bucket_id;
+        int32_t root_index;
         int64_t offset;
         int64_t key_size;
         int64_t data_size;
@@ -1817,7 +1853,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
 
             // Copy metadata into read plan
             bucket_read_plans[metadata.bucket_id].push_back(
-                ReadPlan{key, metadata.bucket_id, metadata.offset,
+                ReadPlan{key, metadata.bucket_id,
+                         bucket_it->second->root_index_, metadata.offset,
                          metadata.key_size, metadata.data_size, dest_slice});
         }
     }
@@ -1827,8 +1864,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
 
     // Step 2: Perform IO without holding any locks
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
-        // Open file for this bucket (cheap syscall, no lock needed)
-        auto filepath_res = GetBucketDataPath(bucket_id);
+        // Open file for this bucket (cheap syscall, no lock needed). All plans
+        // for a bucket share the same root.
+        auto filepath_res =
+            GetBucketDataPath(bucket_id, read_plans.front().root_index);
         if (!filepath_res) {
             LOG(ERROR) << "Failed to get bucket data path, bucket_id="
                        << bucket_id;
@@ -1955,6 +1994,219 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GetBucketKeys(
     return {};
 }
 
+bool BucketStorageBackend::AcquireOwnerLocks() {
+    namespace fs = std::filesystem;
+    for (size_t i = 0; i < storage_paths_.size(); ++i) {
+        if (owner_lock_fds_[i] >= 0) {
+            continue;  // Already held (Init retried after a failed attempt).
+        }
+        const auto& root = storage_paths_[i];
+        std::error_code ec;
+        fs::create_directories(root, ec);
+        if (ec) {
+            LOG(ERROR) << "Failed to create storage root " << root << ": "
+                       << ec.message();
+            ReleaseOwnerLocks();
+            return false;
+        }
+        const auto lock_path =
+            (fs::path(root) / ".mooncake_local_disk.lock").string();
+        const int fd =
+            ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+        if (fd < 0) {
+            LOG(ERROR) << "Failed to open storage root lock: " << lock_path
+                       << ", errno=" << errno;
+            ReleaseOwnerLocks();
+            return false;
+        }
+        owner_lock_fds_[i] = fd;
+        if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+            LOG(ERROR) << "storage root already held by another live client: "
+                       << root
+                       << ". LOCAL_DISK requires one client per storage root "
+                          "(use standalone store or disjoint per-client "
+                          "directories).";
+            ReleaseOwnerLocks();
+            return false;
+        }
+    }
+    return true;
+}
+
+void BucketStorageBackend::ReleaseOwnerLocks() {
+    for (auto& fd : owner_lock_fds_) {
+        if (fd >= 0) {
+            ::flock(fd, LOCK_UN);
+            ::close(fd);
+            fd = -1;
+        }
+    }
+}
+
+bool BucketStorageBackend::CheckStorageRootManifest() {
+    namespace fs = std::filesystem;
+
+    // Collect the union of roots recorded by every manifest. A root that was
+    // used before but is gone from the current configuration would make its
+    // buckets silently unreachable, so it is treated as a hard error unless
+    // the operator explicitly opts in.
+    std::set<std::string> recorded;
+    for (const auto& root : storage_paths_) {
+        const auto manifest_path = fs::path(root) / STORAGE_ROOTS_MANIFEST;
+        std::error_code ec;
+        const bool exists = fs::exists(manifest_path, ec);
+        if (ec) {
+            LOG(ERROR) << "Failed to inspect storage root manifest "
+                       << manifest_path.string() << ": " << ec.message();
+            return false;
+        }
+        if (!exists) {
+            continue;
+        }
+        std::ifstream in(manifest_path);
+        if (!in) {
+            LOG(ERROR) << "Failed to open storage root manifest "
+                       << manifest_path.string();
+            return false;
+        }
+        std::string line;
+        if (!std::getline(in, line) ||
+            TrimAsciiWhitespace(line) != STORAGE_ROOTS_MANIFEST_HEADER) {
+            LOG(ERROR) << "Invalid storage root manifest header in "
+                       << manifest_path.string();
+            return false;
+        }
+        while (std::getline(in, line)) {
+            const auto trimmed = TrimAsciiWhitespace(line);
+            if (!trimmed.empty()) {
+                recorded.emplace(trimmed);
+            }
+        }
+        if (in.bad()) {
+            LOG(ERROR) << "Failed to read storage root manifest "
+                       << manifest_path.string();
+            return false;
+        }
+    }
+
+    const std::set<std::string> configured(storage_paths_.begin(),
+                                           storage_paths_.end());
+    std::vector<std::string> missing;
+    std::set_difference(recorded.begin(), recorded.end(), configured.begin(),
+                        configured.end(), std::back_inserter(missing));
+    if (!missing.empty()) {
+        std::string missing_list;
+        for (const auto& path : missing) {
+            missing_list += "\n  " + path;
+        }
+        if (!file_storage_config_.allow_storage_path_change) {
+            LOG(ERROR) << "Storage root(s) used by a previous run are missing "
+                          "from MOONCAKE_OFFLOAD_FILE_STORAGE_PATH:"
+                       << missing_list
+                       << "\nTheir buckets would become unreachable. Add them "
+                          "back, or set "
+                          "MOONCAKE_OFFLOAD_ALLOW_STORAGE_PATH_CHANGE=true to "
+                          "start without them (their data stays invisible).";
+            return false;
+        }
+        LOG(WARNING) << "Storage root(s) used by a previous run are missing "
+                        "from the current configuration:"
+                     << missing_list
+                     << "\nContinuing because "
+                        "MOONCAKE_OFFLOAD_ALLOW_STORAGE_PATH_CHANGE is set; "
+                        "buckets on those roots will not be served.";
+    }
+
+    return true;
+}
+
+bool BucketStorageBackend::WriteStorageRootManifest() {
+    namespace fs = std::filesystem;
+
+    // Rewrite manifests where the configured set differs (new root added, or
+    // escape hatch taken).
+    std::string content = STORAGE_ROOTS_MANIFEST_HEADER;
+    content += '\n';
+    for (const auto& root : storage_paths_) {
+        content += root;
+        content += '\n';
+    }
+    for (const auto& root : storage_paths_) {
+        const auto manifest_path = fs::path(root) / STORAGE_ROOTS_MANIFEST;
+        {
+            std::error_code ec;
+            if (fs::exists(manifest_path, ec) && !ec) {
+                std::ifstream in(manifest_path);
+                std::stringstream buffer;
+                buffer << in.rdbuf();
+                if (in && buffer.str() == content) {
+                    continue;  // Up to date.
+                }
+            }
+        }
+        // Write a sibling temp file first, fsync it, then rename so a crash
+        // can never leave a truncated manifest behind.
+        const auto tmp_path = manifest_path.string() + ".tmp";
+        {
+            std::ofstream out(tmp_path, std::ios::trunc);
+            out << content;
+            out.flush();
+            if (!out) {
+                LOG(ERROR) << "Failed to write storage root manifest "
+                           << tmp_path;
+                std::error_code ec;
+                fs::remove(tmp_path, ec);
+                return false;
+            }
+        }
+        const int fd = ::open(tmp_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            LOG(ERROR) << "Failed to open storage root manifest for fsync: "
+                       << tmp_path << ", errno=" << errno;
+            std::error_code ec;
+            fs::remove(tmp_path, ec);
+            return false;
+        }
+        const int sync_ret = ::fsync(fd);
+        ::close(fd);
+        if (sync_ret != 0) {
+            LOG(ERROR) << "Failed to fsync storage root manifest " << tmp_path
+                       << ", errno=" << errno;
+            std::error_code ec;
+            fs::remove(tmp_path, ec);
+            return false;
+        }
+        std::error_code ec;
+        fs::rename(tmp_path, manifest_path, ec);
+        if (ec) {
+            LOG(ERROR) << "Failed to install storage root manifest "
+                       << manifest_path.string() << ": " << ec.message();
+            fs::remove(tmp_path, ec);
+            return false;
+        }
+        // fsync the containing directory so the rename itself is durable: the
+        // file fsync above only covers the temp file's contents, not the
+        // directory entry. Without this a crash right after Init could bring
+        // back the previous manifest. Filesystems that reject fsync on a
+        // directory (e.g. EINVAL) have still applied the rename, so only warn
+        // instead of failing startup.
+        const int dir_fd =
+            ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dir_fd < 0) {
+            LOG(WARNING) << "Failed to open storage root for fsync: " << root
+                         << ", errno=" << errno;
+        } else {
+            const int dir_sync_ret = ::fsync(dir_fd);
+            ::close(dir_fd);
+            if (dir_sync_ret != 0) {
+                LOG(WARNING) << "Failed to fsync storage root directory "
+                             << root << ", errno=" << errno;
+            }
+        }
+    }
+    return true;
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
     namespace fs = std::filesystem;
     try {
@@ -1963,30 +2215,19 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
 
-        // One live client per storage_path (standalone contract). Fail fast
+        // One live client per storage root (standalone contract). Fail fast
         // instead of silently colliding on bucket ids (#3528).
-        if (owner_lock_fd_ < 0) {
-            fs::create_directories(storage_path_);
-            const auto lock_path =
-                (fs::path(storage_path_) / ".mooncake_local_disk.lock")
-                    .string();
-            owner_lock_fd_ =
-                ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
-            if (owner_lock_fd_ < 0) {
-                LOG(ERROR) << "Failed to open storage_path lock: " << lock_path
-                           << ", errno=" << errno;
-                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-            }
-            if (::flock(owner_lock_fd_, LOCK_EX | LOCK_NB) != 0) {
-                LOG(ERROR)
-                    << "storage_path already held by another live client: "
-                    << storage_path_
-                    << ". LOCAL_DISK requires one client per storage_path "
-                       "(use standalone store or per-client directories).";
-                ::close(owner_lock_fd_);
-                owner_lock_fd_ = -1;
-                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-            }
+        if (!AcquireOwnerLocks()) {
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+
+        // Refuse to start when a root that previously held buckets dropped out
+        // of the configuration: its data would silently become unreachable.
+        // The manifest is only rewritten once Init has fully succeeded (see
+        // below), so a failed start cannot forget a dropped root.
+        if (!CheckStorageRootManifest()) {
+            ReleaseOwnerLocks();
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
         }
 
         SharedMutexLocker lock(&mutex_);
@@ -1994,12 +2235,17 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         buckets_.clear();
         lru_index_.clear();
         total_size_ = 0;
+        total_size_by_root_.assign(storage_paths_.size(), 0);
         int64_t max_bucket_id = BucketIdGenerator::INIT_NEW_START_ID;
 
-        for (const auto& entry :
-             fs::recursive_directory_iterator(storage_path_)) {
-            if (entry.is_regular_file() &&
-                entry.path().extension() == BUCKET_METADATA_FILE_SUFFIX) {
+        for (size_t root = 0; root < storage_paths_.size(); ++root) {
+            const int32_t root_index = static_cast<int32_t>(root);
+            for (const auto& entry :
+                 fs::recursive_directory_iterator(storage_paths_[root])) {
+                if (!entry.is_regular_file() ||
+                    entry.path().extension() != BUCKET_METADATA_FILE_SUFFIX) {
+                    continue;
+                }
                 const auto& bucket_id_str = entry.path().stem();
                 int64_t bucket_id = 0;
                 try {
@@ -2013,27 +2259,40 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 }
                 auto [metadata_it, success] = buckets_.try_emplace(
                     bucket_id, std::make_shared<BucketMetadata>());
-                if (success) lru_index_.emplace(0LL, bucket_id);
                 if (!success) {
-                    LOG(ERROR) << "Failed to load bucket " << bucket_id_str;
+                    // Two roots holding the same bucket id means a copy (or a
+                    // partially migrated directory). Refuse to guess which
+                    // copy is authoritative: serving the wrong one silently
+                    // corrupts reads.
+                    LOG(ERROR)
+                        << "Duplicate bucket id " << bucket_id
+                        << " found under multiple storage roots: "
+                        << entry.path().string() << " and root["
+                        << metadata_it->second->root_index_ << "]="
+                        << storage_paths_[metadata_it->second->root_index_]
+                        << ". Remove one copy before restarting.";
+                    ReleaseOwnerLocks();
                     return tl::make_unexpected(
                         ErrorCode::BUCKET_ALREADY_EXISTS);
                 }
-                auto load_bucket_metadata_result =
-                    LoadBucketMetadata(bucket_id, metadata_it->second);
+                metadata_it->second->root_index_ = root_index;
+                lru_index_.emplace(0LL, bucket_id);
+                auto load_bucket_metadata_result = LoadBucketMetadata(
+                    bucket_id, root_index, metadata_it->second);
                 if (!load_bucket_metadata_result) {
                     LOG(ERROR)
                         << "Failed to load metadata for bucket: "
                         << bucket_id_str
                         << ", will delete the bucket's data and metadata";
 
-                    auto bucket_data_path_res = GetBucketDataPath(bucket_id);
+                    auto bucket_data_path_res =
+                        GetBucketDataPath(bucket_id, root_index);
                     if (bucket_data_path_res) {
                         fs::remove(bucket_data_path_res.value());
                     }
 
                     auto bucket_meta_path_res =
-                        GetBucketMetadataPath(bucket_id);
+                        GetBucketMetadataPath(bucket_id, root_index);
                     if (bucket_meta_path_res) {
                         fs::remove(bucket_meta_path_res.value());
                     }
@@ -2042,10 +2301,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                     buckets_.erase(bucket_id);
                     continue;
                 }
-                auto bucket_data_path_res = GetBucketDataPath(bucket_id);
+                auto bucket_data_path_res =
+                    GetBucketDataPath(bucket_id, root_index);
                 if (!bucket_data_path_res) {
                     LOG(ERROR) << "Failed to get data path for bucket: "
                                << bucket_id_str;
+                    ReleaseOwnerLocks();
                     return tl::make_unexpected(bucket_data_path_res.error());
                 }
 
@@ -2057,6 +2318,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                     LOG(ERROR) << "Failed to inspect bucket data file: "
                                << bucket_data_path_res.value()
                                << ", error: " << bucket_data_ec.message();
+                    ReleaseOwnerLocks();
                     return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
                 if (bucket_data_ec == std::errc::no_such_file_or_directory ||
@@ -2064,7 +2326,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                     LOG(ERROR) << "Bucket metadata has no valid data file: "
                                << entry.path().string()
                                << ", will delete the bucket's remaining files";
-                    CleanupOrphanedBucket(bucket_id);
+                    CleanupOrphanedBucket(bucket_id, root_index);
                     lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
                     continue;
@@ -2089,13 +2351,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         << "  keys.size(): " << meta.keys.size()
                         << " (empty: " << (meta.keys.empty() ? "true" : "false")
                         << ")";
-                    auto bucket_data_path_res = GetBucketDataPath(bucket_id);
+                    auto bucket_data_path_res =
+                        GetBucketDataPath(bucket_id, root_index);
                     if (bucket_data_path_res) {
                         fs::remove(bucket_data_path_res.value());
                     }
 
                     auto bucket_meta_path_res =
-                        GetBucketMetadataPath(bucket_id);
+                        GetBucketMetadataPath(bucket_id, root_index);
                     if (bucket_meta_path_res) {
                         fs::remove(bucket_meta_path_res.value());
                     }
@@ -2107,78 +2370,85 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 if (bucket_id > max_bucket_id) {
                     max_bucket_id = bucket_id;
                 }
-                total_size_ += metadata_it->second->data_size +
-                               metadata_it->second->meta_size;
-                for (size_t i = 0; i < metadata_it->second->keys.size(); i++) {
+                total_size_ += meta.data_size + meta.meta_size;
+                total_size_by_root_[root] += meta.data_size + meta.meta_size;
+                for (size_t i = 0; i < meta.keys.size(); i++) {
                     object_bucket_map_.emplace(
-                        metadata_it->second->keys[i],
-                        StorageObjectMetadata{
-                            metadata_it->first,
-                            metadata_it->second->metadatas[i].offset,
-                            metadata_it->second->metadatas[i].key_size,
-                            metadata_it->second->metadatas[i].data_size, ""});
+                        meta.keys[i],
+                        StorageObjectMetadata{metadata_it->first,
+                                              meta.metadatas[i].offset,
+                                              meta.metadatas[i].key_size,
+                                              meta.metadatas[i].data_size, ""});
                 }
             }
         }
 
         // Clean up orphaned bucket files (.bucket files without corresponding
         // .meta files) This handles the crash consistency case where data write
-        // succeeded but metadata write failed
-        std::unordered_set<int64_t> valid_bucket_ids;
-        for (const auto& [id, _] : buckets_) {
-            valid_bucket_ids.insert(id);
-        }
-
+        // succeeded but metadata write failed. Each root is independent: a
+        // bucket id is valid only if its metadata lives on the same root.
         uint64_t orphaned_files_count = 0;
         uint64_t orphaned_space_freed = 0;
 
-        for (const auto& entry :
-             fs::recursive_directory_iterator(storage_path_)) {
-            if (!entry.is_regular_file()) {
-                continue;
+        for (size_t root = 0; root < storage_paths_.size(); ++root) {
+            const int32_t root_index = static_cast<int32_t>(root);
+            std::unordered_set<int64_t> valid_bucket_ids;
+            for (const auto& [id, meta] : buckets_) {
+                if (meta->root_index_ == root_index) {
+                    valid_bucket_ids.insert(id);
+                }
             }
 
-            std::string extension = entry.path().extension().string();
+            for (const auto& entry :
+                 fs::recursive_directory_iterator(storage_paths_[root])) {
+                if (!entry.is_regular_file()) {
+                    continue;
+                }
 
-            // Only process .bucket files
-            if (extension != BUCKET_DATA_FILE_SUFFIX) {
-                continue;
-            }
+                std::string extension = entry.path().extension().string();
 
-            // Extract bucket ID from filename (e.g., "12345.bucket" ->
-            // "12345")
-            auto bucket_id_str = entry.path().stem();
-            int64_t bucket_id = 0;
-            try {
-                bucket_id = std::stoll(bucket_id_str);
-            } catch (const std::exception& e) {
-                LOG(WARNING)
-                    << "Skipping orphan-scan file with a non-numeric "
-                       "bucket id: "
-                    << entry.path().string() << " (" << e.what() << ")";
-                continue;
-            }
+                // Only process .bucket files
+                if (extension != BUCKET_DATA_FILE_SUFFIX) {
+                    continue;
+                }
 
-            // Check if this bucket has valid metadata
-            if (valid_bucket_ids.find(bucket_id) != valid_bucket_ids.end()) {
-                // Valid bucket, skip it
-                continue;
-            }
+                // Extract bucket ID from filename (e.g., "12345.bucket" ->
+                // "12345")
+                auto bucket_id_str = entry.path().stem();
+                int64_t bucket_id = 0;
+                try {
+                    bucket_id = std::stoll(bucket_id_str);
+                } catch (const std::exception& e) {
+                    LOG(WARNING)
+                        << "Skipping orphan-scan file with a non-numeric "
+                           "bucket id: "
+                        << entry.path().string() << " (" << e.what() << ")";
+                    continue;
+                }
 
-            // This is an orphaned .bucket file without metadata
-            std::error_code cleanup_ec;
-            uint64_t file_size = entry.file_size(cleanup_ec);
-            if (!cleanup_ec && fs::remove(entry.path(), cleanup_ec)) {
-                orphaned_files_count++;
-                orphaned_space_freed += file_size;
-                LOG(WARNING) << "Removed orphaned bucket file (no metadata): "
-                             << entry.path().string() << " (size: " << file_size
-                             << " bytes, "
-                             << "bucket_id: " << bucket_id << ")";
-            } else if (cleanup_ec) {
-                LOG(ERROR) << "Failed to remove orphaned bucket file: "
-                           << entry.path().string()
-                           << ", error: " << cleanup_ec.message();
+                // Check if this bucket has valid metadata on this root
+                if (valid_bucket_ids.find(bucket_id) !=
+                    valid_bucket_ids.end()) {
+                    // Valid bucket, skip it
+                    continue;
+                }
+
+                // This is an orphaned .bucket file without metadata
+                std::error_code cleanup_ec;
+                uint64_t file_size = entry.file_size(cleanup_ec);
+                if (!cleanup_ec && fs::remove(entry.path(), cleanup_ec)) {
+                    orphaned_files_count++;
+                    orphaned_space_freed += file_size;
+                    LOG(WARNING)
+                        << "Removed orphaned bucket file (no metadata): "
+                        << entry.path().string() << " (size: " << file_size
+                        << " bytes, "
+                        << "bucket_id: " << bucket_id << ")";
+                } else if (cleanup_ec) {
+                    LOG(ERROR) << "Failed to remove orphaned bucket file: "
+                               << entry.path().string()
+                               << ", error: " << cleanup_ec.message();
+                }
             }
         }
 
@@ -2190,15 +2460,52 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         }
 
         // When max_total_size is not explicitly set (<= 0), default to 90% of
-        // the physical disk capacity to match FilePerKey backend behavior.
+        // the combined physical capacity of all storage roots to match
+        // FilePerKey backend behavior. fs::space() reports whole filesystems,
+        // so roots that live on the same device (e.g. several directories on
+        // one SSD) must contribute their shared capacity only once; otherwise
+        // the default quota is multiplied and no longer bounds the store.
         if (bucket_backend_config_.max_total_size <= 0) {
             constexpr double kDefaultQuotaPercentage = 0.9;
-            const auto space_info = fs::space(storage_path_);
+            uint64_t total_capacity = 0;
+            std::set<dev_t> counted_devices;
+            for (const auto& path : storage_paths_) {
+                struct stat stat_buf;
+                if (::stat(path.c_str(), &stat_buf) != 0) {
+                    LOG(ERROR) << "Failed to stat storage root " << path
+                               << ", errno=" << errno;
+                    ReleaseOwnerLocks();
+                    return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+                }
+                if (!counted_devices.insert(stat_buf.st_dev).second) {
+                    LOG(INFO) << "Storage root " << path
+                              << " shares a filesystem with an earlier root; "
+                                 "counting its capacity once";
+                    continue;
+                }
+                std::error_code ec;
+                const auto space_info = fs::space(path, ec);
+                if (ec) {
+                    LOG(ERROR) << "Failed to get disk capacity for storage "
+                               << "root " << path << ": " << ec.message();
+                    ReleaseOwnerLocks();
+                    return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+                }
+                total_capacity += space_info.capacity;
+            }
             bucket_backend_config_.max_total_size = static_cast<int64_t>(
-                space_info.capacity * kDefaultQuotaPercentage);
+                static_cast<double>(total_capacity) * kDefaultQuotaPercentage);
             LOG(INFO) << "Bucket backend max_total_size not set; using "
-                      << kDefaultQuotaPercentage * 100 << "% of disk capacity: "
+                      << kDefaultQuotaPercentage * 100
+                      << "% of combined disk capacity: "
                       << bucket_backend_config_.max_total_size << " bytes";
+        }
+
+        LOG(INFO) << "Bucket backend storage roots (" << storage_paths_.size()
+                  << "):";
+        for (size_t i = 0; i < storage_paths_.size(); ++i) {
+            LOG(INFO) << "  [root " << i << "] " << storage_paths_[i]
+                      << " used=" << total_size_by_root_[i] << " bytes";
         }
 
         bucket_id_generator_.emplace(max_bucket_id);
@@ -2210,10 +2517,21 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             LOG(INFO) << "Initialized BucketIdGenerator from existing state. "
                       << "Last used bucket ID was " << max_bucket_id;
         }
+
+        // Persist the root set only after the scan succeeded. Writing it any
+        // earlier would let a later Init failure (duplicate bucket ids, I/O
+        // errors) permanently drop a root that was skipped under
+        // MOONCAKE_OFFLOAD_ALLOW_STORAGE_PATH_CHANGE, so the next start would
+        // no longer warn about its data.
+        if (!WriteStorageRootManifest()) {
+            ReleaseOwnerLocks();
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
         initialized_.store(true, std::memory_order_release);
     } catch (const std::exception& e) {
         LOG(ERROR) << "Bucket storage backend initialize error: " << e.what()
                    << std::endl;
+        ReleaseOwnerLocks();
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
@@ -2230,7 +2548,12 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
     // The index alone cannot see an externally wiped bucket file: writes
     // commit file-then-index, so an index hit with no file behind it means
     // the backing data is gone and the answer must be false, not "present".
-    auto path = GetBucketDataPath(it->second.bucket_id);
+    auto bucket_it = buckets_.find(it->second.bucket_id);
+    if (bucket_it == buckets_.end()) {
+        return false;
+    }
+    auto path =
+        GetBucketDataPath(it->second.bucket_id, bucket_it->second->root_index_);
     if (!path) {
         return tl::make_unexpected(path.error());
     }
@@ -2519,7 +2842,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
     std::vector<iovec>& iovs) {
     namespace fs = std::filesystem;
-    auto bucket_data_path_res = GetBucketDataPath(bucket_id);
+    auto bucket_data_path_res =
+        GetBucketDataPath(bucket_id, bucket_metadata->root_index_);
     if (!bucket_data_path_res) {
         LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -2627,7 +2951,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     }
     if (!sync_result) {
         LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
-        CleanupOrphanedBucket(bucket_id);
+        CleanupOrphanedBucket(bucket_id, bucket_metadata->root_index_);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
@@ -2660,11 +2984,25 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     return {};
 }
 
-void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
+void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id,
+                                                 int32_t root_index) {
     namespace fs = std::filesystem;
+    if (root_index < 0) {
+        // Bucket no longer registered: its files can only be on one root, but
+        // we do not know which. Try them all.
+        for (size_t i = 0; i < storage_paths_.size(); ++i) {
+            CleanupOrphanedBucket(bucket_id, static_cast<int32_t>(i));
+        }
+        return;
+    }
+    if (static_cast<size_t>(root_index) >= storage_paths_.size()) {
+        LOG(ERROR) << "CleanupOrphanedBucket: invalid root index " << root_index
+                   << " for bucket " << bucket_id;
+        return;
+    }
     std::error_code ec;
 
-    auto data_path_res = GetBucketDataPath(bucket_id);
+    auto data_path_res = GetBucketDataPath(bucket_id, root_index);
     if (data_path_res) {
         // Evict the cached file handle before deleting the file, matching
         // the pattern in FinalizeEviction. Without this, a subsequent open
@@ -2684,7 +3022,7 @@ void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
         }
     }
 
-    auto meta_path_res = GetBucketMetadataPath(bucket_id);
+    auto meta_path_res = GetBucketMetadataPath(bucket_id, root_index);
     if (meta_path_res) {
         ec.clear();
         if (fs::remove(meta_path_res.value(), ec)) {
@@ -2720,18 +3058,20 @@ void BucketStorageBackend::RollbackCommittedBucket(
         bucket_meta = bucket_it->second;
 
         // Remove all keys from object_bucket_map_
+        int64_t removed_size = bucket_meta->meta_size;
         for (const auto& key : keys) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
                 obj_it->second.bucket_id == bucket_id) {
-                total_size_ -=
+                removed_size +=
                     obj_it->second.data_size + obj_it->second.key_size;
                 object_bucket_map_.erase(obj_it);
             }
         }
-
-        // Remove bucket metadata
-        total_size_ -= bucket_meta->meta_size;
+        total_size_ -= removed_size;
+        if (bucket_meta->root_index_ >= 0) {
+            total_size_by_root_[bucket_meta->root_index_] -= removed_size;
+        }
         lru_index_.erase(
             {bucket_meta->last_access_ns_.load(std::memory_order_relaxed),
              bucket_id});
@@ -2785,20 +3125,28 @@ void BucketStorageBackend::RollbackCommittedBucket(
     }
 
     // Phase 3: Delete on-disk files now that no readers remain.
-    CleanupOrphanedBucket(bucket_id);
+    CleanupOrphanedBucket(bucket_id, bucket_meta->root_index_);
 
     LOG(INFO) << "RollbackCommittedBucket: rolled back bucket " << bucket_id
               << " with " << keys.size() << " keys";
 }
 
 std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
-BucketStorageBackend::SelectEvictionCandidate() {
+BucketStorageBackend::SelectEvictionCandidate(
+    std::optional<int32_t> root_filter) {
     // Must be called with mutex_ held (exclusive).
     switch (bucket_backend_config_.eviction_policy) {
-        case BucketEvictionPolicy::FIFO:
+        case BucketEvictionPolicy::FIFO: {
             // buckets_ is ordered by bucket_id (monotonically increasing),
             // so begin() is always the oldest bucket.
-            return buckets_.begin();
+            if (!root_filter) {
+                return buckets_.begin();
+            }
+            return std::find_if(
+                buckets_.begin(), buckets_.end(), [&](const auto& entry) {
+                    return entry.second->root_index_ == *root_filter;
+                });
+        }
 
         case BucketEvictionPolicy::LRU:
             // Use lru_index_ (a std::set ordered by {last_access_ns_,
@@ -2811,25 +3159,69 @@ BucketStorageBackend::SelectEvictionCandidate() {
             //     last_access_ns_, it is the true LRU candidate.
             //   - If stale, re-insert with the correct timestamp and retry.
             //   - If the bucket no longer exists, discard the entry.
-            while (!lru_index_.empty()) {
-                auto top_it = lru_index_.begin();
-                auto [ts, id] = *top_it;
-                auto bucket_it = buckets_.find(id);
-                if (bucket_it == buckets_.end()) {
+            if (!root_filter) {
+                while (!lru_index_.empty()) {
+                    auto top_it = lru_index_.begin();
+                    auto [ts, id] = *top_it;
+                    auto bucket_it = buckets_.find(id);
+                    if (bucket_it == buckets_.end()) {
+                        lru_index_.erase(top_it);
+                        continue;
+                    }
+                    int64_t actual_ts = bucket_it->second->last_access_ns_.load(
+                        std::memory_order_relaxed);
+                    if (actual_ts == ts) {
+                        // Correct entry: remove from index (bucket is about to
+                        // be evicted) and return.
+                        lru_index_.erase(top_it);
+                        return bucket_it;
+                    }
+                    // Stale: repair and retry to find the true minimum.
                     lru_index_.erase(top_it);
-                    continue;
+                    lru_index_.emplace(actual_ts, id);
                 }
-                int64_t actual_ts = bucket_it->second->last_access_ns_.load(
-                    std::memory_order_relaxed);
-                if (actual_ts == ts) {
-                    // Correct entry: remove from index (bucket is about to be
-                    // evicted) and return.
-                    lru_index_.erase(top_it);
-                    return bucket_it;
+                return buckets_.end();
+            }
+            // Filtered (disk-full on one root): walk the index in LRU order,
+            // repairing stale entries as we go and skipping buckets on other
+            // roots. A repair re-inserts the entry under its real timestamp,
+            // which can move it *before* the current position, so the walk
+            // restarts from the beginning after each repair instead of
+            // silently skipping the true candidate. Loads cannot introduce
+            // new stale entries while the exclusive lock is held, so every
+            // bucket is repaired at most once and the loop terminates; the
+            // counter is only a safety net.
+            {
+                size_t repairs_left = lru_index_.size();
+                while (repairs_left > 0) {
+                    bool repaired = false;
+                    for (auto it = lru_index_.begin(); it != lru_index_.end();) {
+                        auto [ts, id] = *it;
+                        auto bucket_it = buckets_.find(id);
+                        if (bucket_it == buckets_.end()) {
+                            it = lru_index_.erase(it);
+                            continue;
+                        }
+                        int64_t actual_ts =
+                            bucket_it->second->last_access_ns_.load(
+                                std::memory_order_relaxed);
+                        if (actual_ts != ts) {
+                            lru_index_.erase(it);
+                            lru_index_.emplace(actual_ts, id);
+                            repaired = true;
+                            break;
+                        }
+                        if (bucket_it->second->root_index_ == *root_filter) {
+                            lru_index_.erase(it);
+                            return bucket_it;
+                        }
+                        ++it;
+                    }
+                    if (!repaired) {
+                        break;
+                    }
+                    --repairs_left;
                 }
-                // Stale: repair and retry to find the true minimum.
-                lru_index_.erase(top_it);
-                lru_index_.emplace(actual_ts, id);
             }
             return buckets_.end();
 
@@ -2848,39 +3240,42 @@ int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
         return cached_disk_bytes_;
     }
     int64_t total = 0;
-    std::error_code ec;
-    // Recursive scan: matches Init()'s recursive_directory_iterator and the
-    // du/kubelet accounting basis (the whole subtree, not just top-level
-    // entries), so nested content can never be silently missed.
-    fs::recursive_directory_iterator it(storage_path_, ec), end;
-    if (ec) {
-        // Cannot even open storage_path_. This is a hard safety cap, so fail
-        // CLOSED: report the cap as reached so eviction/rejection engages
-        // instead of letting the disk overflow, and do NOT cache the result
-        // (next call re-scans once the directory is readable again).
-        LOG(WARNING) << "[Bucket] physcap disk scan could not open "
-                     << storage_path_ << ": " << ec.message()
-                     << ", failing closed";
-        return bucket_backend_config_.max_physical_bytes;
-    }
-    for (; it != end; it.increment(ec)) {
+    // Sum every storage root. The physical cap is global, like max_total_size.
+    for (const auto& root : storage_paths_) {
+        std::error_code ec;
+        // Recursive scan: matches Init()'s recursive_directory_iterator and the
+        // du/kubelet accounting basis (the whole subtree, not just top-level
+        // entries), so nested content can never be silently missed.
+        fs::recursive_directory_iterator it(root, ec), end;
         if (ec) {
-            // Iteration errored partway. Returning the partial total would
-            // under-count and silently open the cap; fail closed and skip
-            // caching so the next call re-scans.
-            LOG(WARNING) << "[Bucket] physcap disk scan error under "
-                         << storage_path_ << ": " << ec.message()
-                         << ", failing closed";
+            // Cannot even open the root. This is a hard safety cap, so fail
+            // CLOSED: report the cap as reached so eviction/rejection engages
+            // instead of letting the disk overflow, and do NOT cache the result
+            // (next call re-scans once the directory is readable again).
+            LOG(WARNING) << "[Bucket] physcap disk scan could not open " << root
+                         << ": " << ec.message() << ", failing closed";
             return bucket_backend_config_.max_physical_bytes;
         }
-        struct stat st;
-        // st_blocks counts 512-byte blocks actually allocated on disk — the
-        // same basis as du / kubelet's emptyDir accounting (handles block
-        // rounding; ignores apparent size). A per-entry stat failure (e.g. a
-        // file concurrently deleted during eviction) is skipped best-effort:
-        // that only under-counts by ~one file and avoids spurious fail-closed.
-        if (::stat(it->path().c_str(), &st) == 0) {
-            total += static_cast<int64_t>(st.st_blocks) * 512;
+        for (; it != end; it.increment(ec)) {
+            if (ec) {
+                // Iteration errored partway. Returning the partial total would
+                // under-count and silently open the cap; fail closed and skip
+                // caching so the next call re-scans.
+                LOG(WARNING)
+                    << "[Bucket] physcap disk scan error under " << root << ": "
+                    << ec.message() << ", failing closed";
+                return bucket_backend_config_.max_physical_bytes;
+            }
+            struct stat st;
+            // st_blocks counts 512-byte blocks actually allocated on disk — the
+            // same basis as du / kubelet's emptyDir accounting (handles block
+            // rounding; ignores apparent size). A per-entry stat failure (e.g.
+            // a file concurrently deleted during eviction) is skipped
+            // best-effort: that only under-counts by ~one file and avoids
+            // spurious fail-closed.
+            if (::stat(it->path().c_str(), &st) == 0) {
+                total += static_cast<int64_t>(st.st_blocks) * 512;
+            }
         }
     }
     cached_disk_bytes_ = total;
@@ -2890,9 +3285,20 @@ int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
 
 tl::expected<BucketStorageBackend::PendingEviction, ErrorCode>
 BucketStorageBackend::PrepareEviction(
-    int64_t required_size, const std::vector<std::string>& write_keys) {
+    int64_t required_size, const std::vector<std::string>& write_keys,
+    int32_t target_root) {
     PendingEviction result;
+    result.target_root = target_root;
     SharedMutexLocker lock(&mutex_);
+
+    const bool has_valid_target_root =
+        target_root >= 0 &&
+        static_cast<size_t>(target_root) < storage_paths_.size();
+    if (target_root >= 0 && !has_valid_target_root) {
+        LOG(ERROR) << "[Evict] Invalid target root " << target_root
+                   << " (roots=" << storage_paths_.size() << ")";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
 
     if (!write_keys.empty()) {
         for (const auto& key : write_keys) {
@@ -2935,10 +3341,18 @@ BucketStorageBackend::PrepareEviction(
     // meta_size, so this is a safe lower bound -- we will not under-evict.
     bool initial_disk_full = false;
     uint64_t deficit = 0;
-    {
+    // With multiple roots only the target root's free space matters for a
+    // write. Watermark eviction (target_root < 0) has no incoming write, so on
+    // multi-root deployments there is no single disk to probe; single-root
+    // behavior is unchanged.
+    const bool check_disk_space =
+        has_valid_target_root || storage_paths_.size() == 1;
+    if (check_disk_space) {
         namespace fs = std::filesystem;
+        const std::string& space_root =
+            storage_paths_[has_valid_target_root ? target_root : 0];
         std::error_code ec;
-        auto space_info = fs::space(storage_path_, ec);
+        auto space_info = fs::space(space_root, ec);
         if (!ec) {
             uint64_t actual_available = space_info.available;
             constexpr uint64_t kMinFreeSpace = 256 * kMB;
@@ -2951,14 +3365,16 @@ BucketStorageBackend::PrepareEviction(
             initial_disk_full = actual_available < req_sz + kMinFreeSpace;
             if (initial_disk_full) {
                 deficit = req_sz + kMinFreeSpace - actual_available;
-                LOG(WARNING) << "[Evict] Actual disk space too low: available="
-                             << actual_available << ", required=" << req_sz
-                             << ", deficit=" << deficit
-                             << ". Will evict buckets to free space.";
+                LOG(WARNING)
+                    << "[Evict] Actual disk space too low on root["
+                    << (has_valid_target_root ? target_root : 0)
+                    << "]=" << space_root << ": available=" << actual_available
+                    << ", required=" << req_sz << ", deficit=" << deficit
+                    << ". Will evict buckets to free space.";
             }
         } else {
             LOG(WARNING) << "[Evict] Failed to get disk space info for "
-                         << storage_path_ << ": " << ec.message();
+                         << space_root << ": " << ec.message();
         }
     }
 
@@ -3019,7 +3435,13 @@ BucketStorageBackend::PrepareEviction(
                       << " disk_full=" << initial_disk_full;
         }
 
-        auto evict_it = SelectEvictionCandidate();
+        // A physically full disk is only freed by evicting buckets from that
+        // same root; quota/physical-cap eviction may pick any root.
+        const std::optional<int32_t> root_filter =
+            (disk_still_full && has_valid_target_root)
+                ? std::optional<int32_t>(target_root)
+                : std::nullopt;
+        auto evict_it = SelectEvictionCandidate(root_filter);
         if (evict_it == buckets_.end()) break;
 
         int64_t evict_id = evict_it->first;
@@ -3047,6 +3469,9 @@ BucketStorageBackend::PrepareEviction(
         }
         total_size_ -= evict_meta->meta_size;
         result.evicted_size += evicted_size;
+        if (evict_meta->root_index_ >= 0) {
+            total_size_by_root_[evict_meta->root_index_] -= evicted_size;
+        }
 
         accumulated_freed_space +=
             static_cast<uint64_t>(evict_meta->data_size) +
@@ -3063,8 +3488,14 @@ BucketStorageBackend::PrepareEviction(
     // reject the write (FILE_WRITE_FAIL, handled as an offload miss upstream)
     // rather than overrun the disk quota and get OOM-evicted.
     const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
+    // Target-root disk still too full (either there were no more buckets on
+    // that root or the cap of kMaxEvictionBuckets was hit): reject the write
+    // instead of attempting it and failing with ENOSPC mid-write.
+    const bool disk_exceeded =
+        initial_disk_full && accumulated_freed_space < deficit;
     pending_eviction_size_ += result.evicted_size;
-    if (!result.write_keys.empty() && (quota_exceeded || phys_exceeded)) {
+    if (!result.write_keys.empty() &&
+        (quota_exceeded || phys_exceeded || disk_exceeded)) {
         RestorePreparedEvictionLocked(std::move(result));
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -3072,7 +3503,8 @@ BucketStorageBackend::PrepareEviction(
     if (!result.buckets.empty()) {
         LOG(INFO) << "[Evict] prepared: buckets=" << result.buckets.size()
                   << " keys=" << result.keys.size()
-                  << " total_after=" << total_size_;
+                  << " total_after=" << total_size_
+                  << " target_root=" << result.target_root;
     }
 
     return result;
@@ -3099,6 +3531,7 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
             continue;
         }
 
+        int64_t restored_size = bucket_meta->meta_size;
         for (size_t i = 0; i < bucket_meta->keys.size(); ++i) {
             const auto& key = bucket_meta->keys[i];
             if (restore_keys.find(key) == restore_keys.end()) {
@@ -3110,9 +3543,12 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
             object_bucket_map_[key] = StorageObjectMetadata{
                 bucket_id, object_meta.offset, object_meta.key_size,
                 object_meta.data_size, ""};
-            total_size_ += object_meta.data_size + object_meta.key_size;
+            restored_size += object_meta.data_size + object_meta.key_size;
         }
-        total_size_ += bucket_meta->meta_size;
+        total_size_ += restored_size;
+        if (bucket_meta->root_index_ >= 0) {
+            total_size_by_root_[bucket_meta->root_index_] += restored_size;
+        }
         if (bucket_backend_config_.eviction_policy ==
             BucketEvictionPolicy::LRU) {
             lru_index_.emplace(
@@ -3172,7 +3608,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
         // succeeds, a later timeout or data-file deletion failure leaves an
         // orphan data file instead of a bucket that Init() could recover.
         std::error_code ec;
-        auto meta_path = GetBucketMetadataPath(bucket_id);
+        auto meta_path =
+            GetBucketMetadataPath(bucket_id, bucket_meta->root_index_);
         if (meta_path) {
             fs::remove(meta_path.value(), ec);
             if (ec && ec != std::errc::no_such_file_or_directory) {
@@ -3214,7 +3651,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
         }
 
         ec.clear();
-        auto data_path = GetBucketDataPath(bucket_id);
+        auto data_path = GetBucketDataPath(bucket_id, bucket_meta->root_index_);
         if (data_path) {
             // Evict the cached file handle before deleting the file to prevent
             // stale handles from accumulating in the cache.
@@ -3334,18 +3771,20 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
 
         // Collect keys to remove (they reference this bucket)
         keys_to_remove = bucket_metadata->keys;
+        int64_t removed_size = bucket_metadata->meta_size;
         for (const auto& key : keys_to_remove) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
                 obj_it->second.bucket_id == bucket_id) {
-                total_size_ -=
+                removed_size +=
                     obj_it->second.data_size + obj_it->second.key_size;
                 object_bucket_map_.erase(obj_it);
             }
         }
-
-        // Subtract metadata size
-        total_size_ -= bucket_metadata->meta_size;
+        total_size_ -= removed_size;
+        if (bucket_metadata->root_index_ >= 0) {
+            total_size_by_root_[bucket_metadata->root_index_] -= removed_size;
+        }
     }
     // Lock released - new readers can't find this bucket anymore
 
@@ -3381,7 +3820,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
     // Step 3: Safe to delete files now - no readers are using them
     std::error_code ec;
 
-    auto data_path_res = GetBucketDataPath(bucket_id);
+    auto data_path_res =
+        GetBucketDataPath(bucket_id, bucket_metadata->root_index_);
     if (data_path_res) {
         fs::remove(data_path_res.value(), ec);
         if (ec && ec != std::errc::no_such_file_or_directory) {
@@ -3391,7 +3831,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
         }
     }
 
-    auto meta_path_res = GetBucketMetadataPath(bucket_id);
+    auto meta_path_res =
+        GetBucketMetadataPath(bucket_id, bucket_metadata->root_index_);
     if (meta_path_res) {
         ec.clear();
         fs::remove(meta_path_res.value(), ec);
@@ -3433,7 +3874,7 @@ void BucketStorageBackend::RemoveAll() {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
     int64_t id, std::shared_ptr<BucketMetadata> metadata) {
-    auto meta_path_res = GetBucketMetadataPath(id);
+    auto meta_path_res = GetBucketMetadataPath(id, metadata->root_index_);
     if (!meta_path_res) {
         LOG(ERROR) << "Failed to get bucket metadata path, bucket_id=" << id;
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -3464,8 +3905,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
-    int64_t id, std::shared_ptr<BucketMetadata> metadata) {
-    auto meta_path_res = GetBucketMetadataPath(id);
+    int64_t id, int32_t root_index, std::shared_ptr<BucketMetadata> metadata) {
+    auto meta_path_res = GetBucketMetadataPath(id, root_index);
     if (!meta_path_res) {
         LOG(ERROR) << "Failed to get bucket metadata path, bucket_id=" << id;
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -3494,6 +3935,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
     try {
         struct_pb::from_pb(*metadata, str);
         metadata->meta_size = size;
+        metadata->root_index_ = root_index;
     } catch (const std::exception& e) {
         LOG(ERROR) << "Metadata parsing failed with exception: " << e.what();
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
@@ -3504,19 +3946,78 @@ tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
     return {};
 }
 
+int32_t BucketStorageBackend::SelectWriteRoot(int64_t required_size) {
+    namespace fs = std::filesystem;
+    const size_t n = storage_paths_.size();
+    if (n <= 1) {
+        return 0;
+    }
+    constexpr uint64_t kMinFreeSpace = 256 * kMB;
+    const uint64_t needed =
+        static_cast<uint64_t>(std::max<int64_t>(required_size, 0)) +
+        kMinFreeSpace;
+
+    const size_t start = next_root_.fetch_add(1, std::memory_order_relaxed) % n;
+    int32_t best = -1;
+    uint64_t best_available = 0;
+    for (size_t offset = 0; offset < n; ++offset) {
+        const size_t idx = (start + offset) % n;
+        std::error_code ec;
+        const auto space_info = fs::space(storage_paths_[idx], ec);
+        if (ec) {
+            LOG(WARNING) << "SelectWriteRoot: failed to stat storage root "
+                         << storage_paths_[idx] << ": " << ec.message();
+            continue;
+        }
+        if (space_info.available >= needed) {
+            return static_cast<int32_t>(idx);
+        }
+        if (space_info.available > best_available) {
+            best_available = space_info.available;
+            best = static_cast<int32_t>(idx);
+        }
+    }
+    if (best < 0) {
+        // No root could be stat'ed: fall back to the round-robin slot and let
+        // the write path surface the real I/O error.
+        best = static_cast<int32_t>(start);
+    }
+    LOG(WARNING) << "SelectWriteRoot: no root has " << needed
+                 << " bytes free; targeting root[" << best
+                 << "]=" << storage_paths_[best]
+                 << " (available=" << best_available
+                 << ") and evicting from it.";
+    return best;
+}
+
 tl::expected<std::string, ErrorCode> BucketStorageBackend::GetBucketDataPath(
-    int64_t bucket_id) {
+    int64_t bucket_id, int32_t root_index) const {
+    if (root_index < 0 ||
+        static_cast<size_t>(root_index) >= storage_paths_.size()) {
+        LOG(ERROR) << "Invalid storage root index " << root_index
+                   << " for bucket " << bucket_id;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    const std::string& storage_path = storage_paths_[root_index];
     std::string sep =
-        storage_path_.empty() || storage_path_.back() == '/' ? "" : "/";
-    return storage_path_ + sep + std::to_string(bucket_id) +
+        storage_path.empty() || storage_path.back() == '/' ? "" : "/";
+    return storage_path + sep + std::to_string(bucket_id) +
            BUCKET_DATA_FILE_SUFFIX;
 }
 
 tl::expected<std::string, ErrorCode>
-BucketStorageBackend::GetBucketMetadataPath(int64_t bucket_id) {
+BucketStorageBackend::GetBucketMetadataPath(int64_t bucket_id,
+                                            int32_t root_index) const {
+    if (root_index < 0 ||
+        static_cast<size_t>(root_index) >= storage_paths_.size()) {
+        LOG(ERROR) << "Invalid storage root index " << root_index
+                   << " for bucket " << bucket_id;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    const std::string& storage_path = storage_paths_[root_index];
     std::string sep =
-        storage_path_.empty() || storage_path_.back() == '/' ? "" : "/";
-    return storage_path_ + sep + std::to_string(bucket_id) +
+        storage_path.empty() || storage_path.back() == '/' ? "" : "/";
+    return storage_path + sep + std::to_string(bucket_id) +
            BUCKET_METADATA_FILE_SUFFIX;
 }
 
@@ -3635,7 +4136,7 @@ BucketStorageBackend::GetFileInstance() const {
     namespace fs = std::filesystem;
 
     std::string temp_path =
-        (fs::path(storage_path_) / "temp_for_registration").string();
+        (fs::path(storage_paths_.front()) / "temp_for_registration").string();
     std::error_code temp_ec;
     fs::remove(temp_path, temp_ec);
 
