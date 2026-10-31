@@ -262,6 +262,7 @@ class XpuSyclBackend {
                 }
                 uuids_.push_back(uuid);
             }
+            idle_copy_queues_.assign(queues_.size(), {});
             enablePeerAccessLocked();
             initialized_ = true;
             return 0;
@@ -269,6 +270,7 @@ class XpuSyclBackend {
             // Leave no partially-built state: a later init() retry must start
             // from an empty queue list, not resume with duplicate ordinals.
             queues_.clear();
+            idle_copy_queues_.clear();
             contexts_.clear();
             uuids_.clear();
             peer_.clear();
@@ -428,50 +430,52 @@ class XpuSyclBackend {
         return copy(device_dst, host_src, len, /*to_host=*/false);
     }
 
-    // Device-to-device copy. Same device: a plain memcpy on its queue. Two
-    // devices with peer access (see enablePeerAccessLocked): one memcpy on the
-    // source device's queue, which pushes the bytes to the destination over
-    // PCIe (or Xe Link) without touching host memory; if only the reverse
-    // direction is enabled, the destination's queue pulls instead. Devices
-    // that cannot reach each other fall back to a chunked bounce through a
-    // host buffer, so the copy is always correct and callers never need to
-    // stage device<->device traffic themselves.
+    // Device-to-device copy. Same device: a plain memcpy on a queue of that
+    // device. Two devices with peer access (see enablePeerAccessLocked): one
+    // memcpy on a queue of the source device, which pushes the bytes to the
+    // destination over PCIe (or Xe Link) without touching host memory; if
+    // only the reverse direction is enabled, a queue of the destination pulls
+    // instead. Devices that cannot reach each other fall back to a chunked
+    // bounce through a host buffer, so the copy is always correct and callers
+    // never need to stage device<->device traffic themselves. Like copy(),
+    // every queue used here comes from acquireCopyQueue().
     int copyD2D(void *dst, const void *src, size_t len) {
-        std::optional<sycl::queue> direct, src_q, dst_q;
+        int src_dev, dst_dev, direct = -1;
         {
             std::lock_guard<std::mutex> lock(mu_);
-            const int src_dev = resolveLocked(src, len);
-            const int dst_dev = resolveLocked(dst, len);
+            src_dev = resolveLocked(src, len);
+            dst_dev = resolveLocked(dst, len);
             if (src_dev < 0 || dst_dev < 0) return 1;
-            if (src_dev == dst_dev || peerLocked(src_dev, dst_dev)) {
-                direct = queues_[src_dev];
-            } else if (peerLocked(dst_dev, src_dev)) {
-                direct = queues_[dst_dev];
-            } else {
-                src_q = queues_[src_dev];
-                dst_q = queues_[dst_dev];
-            }
+            if (src_dev == dst_dev || peerLocked(src_dev, dst_dev))
+                direct = src_dev;
+            else if (peerLocked(dst_dev, src_dev))
+                direct = dst_dev;
         }
         try {
-            if (direct) {
-                direct->memcpy(dst, src, len).wait();
+            if (direct >= 0) {
+                sycl::queue q = acquireCopyQueue(direct);
+                q.memcpy(dst, src, len).wait();
+                releaseCopyQueue(direct, std::move(q));
                 return 0;
             }
+            sycl::queue src_q = acquireCopyQueue(src_dev);
+            sycl::queue dst_q = acquireCopyQueue(dst_dev);
             std::vector<uint8_t> bounce(std::min(len, kBounceChunk));
             for (size_t off = 0; off < len; off += bounce.size()) {
                 const size_t n = std::min(bounce.size(), len - off);
                 src_q
-                    ->memcpy(bounce.data(),
-                             static_cast<const uint8_t *>(src) + off, n)
+                    .memcpy(bounce.data(),
+                            static_cast<const uint8_t *>(src) + off, n)
                     .wait();
                 dst_q
-                    ->memcpy(static_cast<uint8_t *>(dst) + off, bounce.data(),
-                             n)
+                    .memcpy(static_cast<uint8_t *>(dst) + off, bounce.data(), n)
                     .wait();
             }
+            releaseCopyQueue(src_dev, std::move(src_q));
+            releaseCopyQueue(dst_dev, std::move(dst_q));
             return 0;
         } catch (const sycl::exception &) {
-            return 1;
+            return 1;  // a queue that saw an error is not reused
         }
     }
 
@@ -946,24 +950,47 @@ class XpuSyclBackend {
     }
 
     int copy(void *dst, const void *src, size_t len, bool to_host) {
-        // Validate and resolve the target queue under the lock, but run the
-        // blocking memcpy().wait() outside it so copies on different devices
-        // are not serialized against one another. queues_ is only appended
-        // during init() and never erased, so the queue handle stays valid after
-        // the lock is released.
-        std::optional<sycl::queue> q;
+        int device_index;
         {
             std::lock_guard<std::mutex> lock(mu_);
-            const int device_index = resolveLocked(to_host ? src : dst, len);
+            device_index = resolveLocked(to_host ? src : dst, len);
             if (device_index < 0) return 1;  // not device memory / past end
-            q = queues_[device_index];
         }
         try {
-            q->memcpy(dst, src, len).wait();
-            return 0;
+            sycl::queue q = acquireCopyQueue(device_index);
+            q.memcpy(dst, src, len).wait();
+            releaseCopyQueue(device_index, std::move(q));
         } catch (const sycl::exception &) {
-            return 1;
+            return 1;  // a queue that saw an error is not reused
         }
+        return 0;
+    }
+
+    // Each copy takes a queue of its own from the device's idle list (or
+    // creates one) and runs the blocking memcpy().wait() outside the lock.
+    // Concurrent copies to or from one device then do not queue behind each
+    // other on the device's single in-order queue. The list grows to the peak
+    // number of concurrent copies per device. Throws sycl::exception if a new
+    // queue cannot be created.
+    sycl::queue acquireCopyQueue(int device_index) {
+        std::optional<sycl::queue> proto;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            auto &idle = idle_copy_queues_[device_index];
+            if (!idle.empty()) {
+                sycl::queue q = std::move(idle.back());
+                idle.pop_back();
+                return q;
+            }
+            proto = queues_[device_index];
+        }
+        return sycl::queue(proto->get_context(), proto->get_device(),
+                           sycl::property::queue::in_order());
+    }
+
+    void releaseCopyQueue(int device_index, sycl::queue &&q) {
+        std::lock_guard<std::mutex> lock(mu_);
+        idle_copy_queues_[device_index].push_back(std::move(q));
     }
 
     // Host bounce granularity for device pairs without peer access.
@@ -973,6 +1000,9 @@ class XpuSyclBackend {
     bool initialized_ = false;
     std::vector<sycl::context> contexts_;
     std::vector<sycl::queue> queues_;
+    // Per queues_ entry: in-order queues on the same context and device that
+    // no copy is using (see acquireCopyQueue).
+    std::vector<std::vector<sycl::queue>> idle_copy_queues_;
     // Hardware UUID per queues_ entry, when the device reports one.
     std::vector<std::optional<DeviceUuid>> uuids_;
     // Row-major queues_.size() x queues_.size(): peer_[i*n+j] is true when
