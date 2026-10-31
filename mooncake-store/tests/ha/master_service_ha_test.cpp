@@ -1602,20 +1602,28 @@ TEST_F(MasterServiceHATest, FailedRestoreDoesNotAdvanceReplicaIdCounter) {
         ReplicaDescriptorsForTesting(service, kDefaultTenant, first_key);
     ASSERT_EQ(first.size(), 1);
 
-    // With the tolerant restore, a whole-restore failure only happens when
-    // nothing lands at all. Give both entries unknown endpoints so neither
-    // can land, then the counter must stay exactly where it was.
-    auto valid = MakeStandbyObject("replica_id_counter_valid",
-                                   "unknown_replica_id_endpoint_a");
-    valid.metadata.replicas.front().id = first.front().id + 1000;
-    valid.metadata.replicas.front()
+    // With the tolerant restore, replicas on unloaded segments are expected
+    // losses rather than a failure, so a whole-restore failure now needs
+    // entries the master cannot interpret at all. Give both entries a
+    // zero-length buffer against the mounted segment so neither can land, then
+    // the counter must stay exactly where it was.
+    auto first_entry =
+        MakeStandbyObject("replica_id_counter_valid", "replica_id_counter");
+    first_entry.metadata.replicas.front().id = first.front().id + 1000;
+    auto& first_buffer = first_entry.metadata.replicas.front()
+                             .get_memory_descriptor()
+                             .buffer_descriptor;
+    first_buffer.buffer_address_ = kDefaultSegmentBase + 4096;
+    first_buffer.size_ = 0;
+    auto second_entry =
+        MakeStandbyObject("replica_id_counter_invalid", "replica_id_counter");
+    second_entry.metadata.replicas.front().id = first.front().id + 2000;
+    second_entry.metadata.replicas.front()
         .get_memory_descriptor()
-        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
-    auto invalid = MakeStandbyObject("replica_id_counter_invalid",
-                                     "unknown_replica_id_endpoint_b");
-    invalid.metadata.replicas.front().id = first.front().id + 2000;
+        .buffer_descriptor.size_ = 0;
     auto result = service.RestoreFromStandbySnapshot(
-        {valid, invalid}, 7, {MakeStandbyMemorySegment("replica_id_counter")});
+        {first_entry, second_entry}, 7,
+        {MakeStandbyMemorySegment("replica_id_counter")});
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
@@ -1778,9 +1786,13 @@ TEST_F(MasterServiceHATest, RestoreSkipsBadObjectAndKeepsExistingState) {
 
     // #3760: a bad entry is skipped and the previously restored state is
     // untouched, but a snapshot in which nothing lands at all is a failed
-    // restore, not a successful empty one.
-    auto invalid =
-        MakeStandbyObject("standby_restore_invalid", "unknown_endpoint");
+    // restore, not a successful empty one. A replica on an unloaded segment
+    // is not "bad" any more (see RestoreDropsReplicaOnUnloadedEndpoint*), so
+    // this uses a descriptor that cannot be trusted at all.
+    auto invalid = MakeStandbyObject("standby_restore_invalid", endpoint);
+    invalid.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.size_ = 0;
     auto result = service.RestoreFromStandbySnapshot(
         {invalid}, 7, {MakeStandbyMemorySegment(endpoint)});
 
@@ -1808,8 +1820,8 @@ TEST_F(MasterServiceHATest, RestoreToleratesBadObjectAlongsideGoodOnes) {
     auto bad = MakeStandbyObject("standby_mixed_bad", "unknown_endpoint");
 
     // Per-object tolerance holds for a mixed snapshot: the good entry lands,
-    // the bad one is skipped, and the restore succeeds because something
-    // actually restored.
+    // the entry that only had a replica on an unloaded segment is dropped,
+    // and the restore succeeds because something actually restored.
     auto result = service.RestoreFromStandbySnapshot(
         {good, bad}, 7, {MakeStandbyMemorySegment(endpoint)});
 
@@ -1820,6 +1832,57 @@ TEST_F(MasterServiceHATest, RestoreToleratesBadObjectAlongsideGoodOnes) {
     EXPECT_EQ(
         ReplicaCountForTesting(service, kDefaultTenant, "standby_mixed_bad"),
         0);
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreDropsReplicaOnUnloadedEndpointAndKeepsSurvivor) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_drop_survivor_segment";
+    auto object = MakeStandbyObject("standby_drop_survivor", endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto gone = MakeStandbyMemoryReplica("standby_drop_gone_segment");
+    gone.id = 2;
+    gone.get_memory_descriptor().buffer_descriptor.buffer_address_ =
+        kDefaultSegmentBase + 4096;
+    object.metadata.replicas.push_back(std::move(gone));
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {object}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(result.has_value());
+
+    // The replica on the unloaded segment is dropped; the object survives on
+    // the replica whose segment the handoff still carries. Construction never
+    // looks the dropped endpoint up, so it cannot throw.
+    auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                 "standby_drop_survivor");
+    ASSERT_EQ(1u, replicas.size());
+    EXPECT_EQ(replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              endpoint);
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreSucceedsWhenEveryObjectOnlyHadUnloadedReplicas) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    auto a = MakeStandbyObject("standby_all_gone_a", "standby_all_gone_seg_a");
+    auto b = MakeStandbyObject("standby_all_gone_b", "standby_all_gone_seg_b");
+
+    // Losing one segment's contents before the handoff is not a corrupt
+    // snapshot: the restore succeeds with those objects gone instead of
+    // failing on an empty result.
+    auto result = service.RestoreFromStandbySnapshot({a, b}, 7, {});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(HasMetadataEntryForTesting(service, kDefaultTenant,
+                                            "standby_all_gone_a"));
+    EXPECT_FALSE(HasMetadataEntryForTesting(service, kDefaultTenant,
+                                            "standby_all_gone_b"));
 }
 
 TEST_F(MasterServiceHATest, RestoreSkipsUngroupedObjectDuplicatedIntoAGroup) {
@@ -3314,6 +3377,195 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     EXPECT_EQ(1u, canonical->replicas.size());
 }
 
+TEST_F(MasterServiceBatchRecordE2ETest,
+       RestoreRepairsReplicasOnUnloadedSegments) {
+    const std::string cluster_id = "test_restore_batch_drop_repair";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const std::string endpoint = "standby_batch_drop_segment";
+    const std::string gone_endpoint = "standby_batch_drop_gone_segment";
+    auto survivor = MakeStandbyObject("standby_batch_drop_survivor", endpoint);
+    survivor.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto gone = MakeStandbyMemoryReplica(gone_endpoint);
+    gone.id = 2;
+    gone.get_memory_descriptor().buffer_descriptor.buffer_address_ =
+        kDefaultSegmentBase + 4096;
+    survivor.metadata.replicas.push_back(std::move(gone));
+    auto lost = MakeStandbyObject("standby_batch_drop_lost", gone_endpoint);
+    lost.metadata.replicas.front().id = 3;
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(source->PutMetadata(survivor.tenant_id, survivor.key,
+                                    survivor.metadata));
+    ASSERT_TRUE(source->PutMetadata(lost.tenant_id, lost.key, lost.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = 3;
+
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
+                    .has_value());
+
+    auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                 "standby_batch_drop_survivor");
+    ASSERT_EQ(1u, replicas.size());
+    EXPECT_EQ(replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              endpoint);
+    EXPECT_FALSE(HasMetadataEntryForTesting(service, kDefaultTenant,
+                                            "standby_batch_drop_lost"));
+
+    // A standby that trusted the unfiltered snapshot still carries the
+    // replicas on the unloaded segment. The durable repair rewrites the
+    // survivor to its live replica and removes the object that lost all of
+    // them, so a later promotion cannot replay those descriptors onto
+    // whatever segment reuses the endpoint.
+    MockMetadataStore standby_metadata;
+    standby_metadata.PutMetadata(kDefaultTenant.value(),
+                                 "standby_batch_drop_survivor",
+                                 survivor.metadata);
+    standby_metadata.PutMetadata(kDefaultTenant.value(),
+                                 "standby_batch_drop_lost", lost.metadata);
+    OpLogApplier applier(&standby_metadata, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    ASSERT_EQ(2u, prefix.last_seq);
+
+    size_t applied = 0;
+    for (int i = 0; i < 50 && applied < prefix.last_seq; ++i) {
+        auto poll = reader.PollOnce();
+        ASSERT_EQ(ErrorCode::OK, poll.error);
+        applied += poll.applied_entries;
+        if (applied < prefix.last_seq) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_EQ(prefix.last_seq, applied);
+
+    EXPECT_FALSE(standby_metadata.Exists(kDefaultTenant.value(),
+                                         "standby_batch_drop_lost"));
+    auto canonical = standby_metadata.GetMetadata(
+        kDefaultTenant.value(), "standby_batch_drop_survivor");
+    ASSERT_TRUE(canonical.has_value());
+    ASSERT_EQ(1u, canonical->replicas.size());
+    EXPECT_EQ(canonical->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              endpoint);
+}
+
+TEST_F(MasterServiceHATest, RestoreRepairSpansMultipleBatches) {
+    const std::string cluster_id = "test_restore_repair_chunks";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const std::string endpoint = "standby_repair_chunk_segment";
+    const std::string gone_endpoint = "standby_repair_chunk_gone_segment";
+    auto survivor =
+        MakeStandbyObject("standby_repair_chunk_survivor", endpoint);
+    survivor.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto gone = MakeStandbyMemoryReplica(gone_endpoint);
+    gone.id = 2;
+    gone.get_memory_descriptor().buffer_descriptor.buffer_address_ =
+        kDefaultSegmentBase + 4096;
+    survivor.metadata.replicas.push_back(std::move(gone));
+
+    std::vector<StandbyObjectEntry> objects{survivor};
+    for (int i = 0; i < 3; ++i) {
+        auto lost = MakeStandbyObject(
+            "standby_repair_chunk_lost_" + std::to_string(i), gone_endpoint);
+        lost.metadata.replicas.front().id = 10 + i;
+        objects.push_back(std::move(lost));
+    }
+
+    // Four repair records against a batch cap of two: the stale-endpoint
+    // repairs must span batches instead of being refused as one oversized
+    // batch.
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        objects, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+
+    auto replicas = ReplicaDescriptorsForTesting(
+        service, kDefaultTenant, "standby_repair_chunk_survivor");
+    ASSERT_EQ(1u, replicas.size());
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(ReplicaCountForTesting(
+                      service, kDefaultTenant,
+                      "standby_repair_chunk_lost_" + std::to_string(i)),
+                  0);
+    }
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    ASSERT_EQ(4u, prefix.last_seq);
+
+    // Replay the durable records onto a standby that still carries the
+    // unloaded descriptors: every batch has to land for the standby to match
+    // the promoted master.
+    MockMetadataStore standby_metadata;
+    for (const auto& object : objects) {
+        standby_metadata.PutMetadata(object.tenant_id, object.key,
+                                     object.metadata);
+    }
+    OpLogApplier applier(&standby_metadata, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+    size_t applied = 0;
+    for (int i = 0; i < 50 && applied < prefix.last_seq; ++i) {
+        auto poll = reader.PollOnce();
+        ASSERT_EQ(ErrorCode::OK, poll.error);
+        applied += poll.applied_entries;
+        if (applied < prefix.last_seq) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_EQ(prefix.last_seq, applied);
+
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_FALSE(standby_metadata.Exists(
+            kDefaultTenant.value(),
+            "standby_repair_chunk_lost_" + std::to_string(i)));
+    }
+    auto canonical = standby_metadata.GetMetadata(
+        kDefaultTenant.value(), "standby_repair_chunk_survivor");
+    ASSERT_TRUE(canonical.has_value());
+    ASSERT_EQ(1u, canonical->replicas.size());
+    EXPECT_EQ(canonical->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              endpoint);
+}
+
 TEST_F(MasterServiceHATest, RestoreRejectionLeavesNoStaleRange) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
@@ -3325,9 +3577,10 @@ TEST_F(MasterServiceHATest, RestoreRejectionLeavesNoStaleRange) {
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
     // The first replica records a valid range, then the second descriptor
     // fails validation and the object is rejected mid-loop.
-    auto stale_unknown = MakeStandbyMemoryReplica("unknown_endpoint");
-    stale_unknown.id = 2;
-    rejected.metadata.replicas.push_back(std::move(stale_unknown));
+    auto invalid_second = MakeStandbyMemoryReplica(endpoint);
+    invalid_second.id = 2;
+    invalid_second.get_memory_descriptor().buffer_descriptor.size_ = 0;
+    rejected.metadata.replicas.push_back(std::move(invalid_second));
     auto clean = MakeStandbyObject("standby_stale_range_clean", endpoint);
     clean.metadata.replicas.front()
         .get_memory_descriptor()
