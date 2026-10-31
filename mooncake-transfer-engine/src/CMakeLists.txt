@@ -1,6 +1,7 @@
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/../include)
 
-file(GLOB ENGINE_SOURCES "*.cpp" "shared_segment/*.cpp")
+# coro_handshake/*.cpp is the coro P2P handshake implementation.
+file(GLOB ENGINE_SOURCES "*.cpp" "shared_segment/*.cpp" "coro_handshake/*.cpp")
 set(TRANSFER_METADATA_PLUGIN_SOURCES config.cpp transfer_metadata_plugin.cpp)
 list(REMOVE_ITEM ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/config.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/transfer_metadata_plugin.cpp")
@@ -75,7 +76,11 @@ target_include_directories(
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
          $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/../include>
          $<INSTALL_INTERFACE:include>
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shared_segment)
+  # hipify copies these .cpp files into the build tree. Their quoted
+  # sibling headers stay in the source tree, so the source directory has
+  # to be on the include path.
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shared_segment
+          ${CMAKE_CURRENT_SOURCE_DIR}/coro_handshake)
 target_compile_definitions(transfer_engine PRIVATE MOONCAKE_USE_ETCD
                                                    CMAKE_INCLUDE)
 target_link_libraries(
