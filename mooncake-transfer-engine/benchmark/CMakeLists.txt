@@ -73,7 +73,7 @@ if(BUILD_UNIT_TESTS)
   if(USE_TENT)
     add_executable(
       tebench_tent_config_test tests/tent_config_test.cpp tent_backend.cpp
-                               split_output.cpp utils.cpp)
+                               bench_runner.cpp split_output.cpp utils.cpp)
     target_link_libraries(
       tebench_tent_config_test PRIVATE transfer_engine tent_link_group gtest
                                        gtest_main)
