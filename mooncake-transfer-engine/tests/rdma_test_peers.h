@@ -19,8 +19,11 @@
 #ifndef MOONCAKE_TESTS_RDMA_TEST_PEERS_H
 #define MOONCAKE_TESTS_RDMA_TEST_PEERS_H
 
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "transfer_metadata.h"
 #include "transport/rdma_transport/rdma_context.h"
@@ -42,6 +45,13 @@ class RdmaTransportTestPeer {
     static void addContext(RdmaTransport &transport,
                            std::shared_ptr<RdmaContext> context) {
         transport.context_list_.push_back(std::move(context));
+    }
+
+    static void seedChunks(RdmaTransport &transport, void *base,
+                           std::vector<uint64_t> chunks) {
+        std::lock_guard<std::mutex> lock(transport.chunk_map_mutex_);
+        transport.chunk_map_[reinterpret_cast<uint64_t>(base)] =
+            std::move(chunks);
     }
 
     static void bindTopology(RdmaTransport &transport,

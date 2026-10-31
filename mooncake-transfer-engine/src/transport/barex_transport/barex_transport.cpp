@@ -196,7 +196,8 @@ int BarexTransport::registerLocalMemory(void *addr, size_t length,
             LOG(ERROR) << "registerLocalMemoryBase failed, ret " << ret;
             for (auto it = registered_chunks.rbegin();
                  it != registered_chunks.rend(); ++it) {
-                metadata_->removeLocalMemoryBuffer(*it, update_metadata);
+                metadata_->removeLocalMemoryBuffer(*it, update_metadata,
+                                                   "barex");
                 BarexResult rollback_result = mempool_->DeregUserMr(*it, dtype);
                 if (rollback_result != BAREX_SUCCESS) {
                     LOG(ERROR) << "Failed to roll back registered memory at "
@@ -226,6 +227,9 @@ int BarexTransport::registerLocalMemoryBase(void *addr, size_t length,
                                             bool update_metadata, bool is_gpu) {
     (void)remote_accessible;
     BufferDesc buffer_desc;
+#ifdef ENABLE_MULTI_PROTOCOL
+    buffer_desc.protocol = "barex";
+#endif
     memp_t mem;
     BarexResult result;
     device_type dtype = is_gpu ? GPU : CPU;
@@ -265,8 +269,8 @@ int BarexTransport::registerLocalMemoryBase(void *addr, size_t length,
                 metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
             if (rc) {
                 for (auto *added_addr : added_buffers) {
-                    metadata_->removeLocalMemoryBuffer(added_addr,
-                                                       update_metadata);
+                    metadata_->removeLocalMemoryBuffer(
+                        added_addr, update_metadata, "barex");
                 }
                 rollback_registration();
                 return rc;
@@ -288,7 +292,7 @@ int BarexTransport::registerLocalMemoryBase(void *addr, size_t length,
 }
 
 int BarexTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
-    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata, "barex");
     if (rc) return rc;
 
     auto &config = globalConfig();
@@ -311,8 +315,8 @@ int BarexTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
     while (remaining > 0) {
         size_t buffer_len = std::min(buffer_size, remaining);
         if (current_ptr > addr) {
-            int rc = metadata_->removeLocalMemoryBuffer(current_ptr,
-                                                        update_metadata);
+            int rc = metadata_->removeLocalMemoryBuffer(
+                current_ptr, update_metadata, "barex");
             if (rc) {
                 LOG(WARNING) << "unregisterLocalMemory, "
                                 "removeLocalMemoryBuffer failed, addr "

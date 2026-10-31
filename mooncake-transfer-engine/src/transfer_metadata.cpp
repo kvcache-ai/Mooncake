@@ -1853,32 +1853,70 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
 
 int TransferMetadata::removeLocalMemoryBuffer(void *addr,
                                               bool update_metadata) {
-    bool addr_exist = false;
+    return removeLocalMemoryBuffer(addr, update_metadata, "");
+}
+
+int TransferMetadata::removeLocalMemoryBuffer(void *addr, bool update_metadata,
+                                              const std::string &protocol) {
+#ifndef ENABLE_MULTI_PROTOCOL
+    (void)protocol;
+#endif
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
         auto new_segment_desc = std::make_shared<SegmentDesc>(*segment_desc);
+        auto match = new_segment_desc->buffers.end();
+
         for (auto iter = new_segment_desc->buffers.begin();
              iter != new_segment_desc->buffers.end(); ++iter) {
-            if (iter->addr == (uint64_t)addr
 #ifdef USE_CXL
-                || (iter->offset + new_segment_desc->cxl_base_addr) ==
-                       (uint64_t)addr
+#ifdef ENABLE_MULTI_PROTOCOL
+            // Only CXL descriptors may use the shared CXL base+offset.
+            // Retain direct-address matching for existing callers.
+            bool address_matches =
+                iter->addr == (uint64_t)addr ||
+                (iter->protocol == "cxl" &&
+                 (iter->offset + new_segment_desc->cxl_base_addr) ==
+                     (uint64_t)addr);
+#else
+            bool address_matches =
+                iter->addr == (uint64_t)addr ||
+                (iter->offset + new_segment_desc->cxl_base_addr) ==
+                    (uint64_t)addr;
 #endif
-            ) {
-                new_segment_desc->buffers.erase(iter);
-                addr_exist = true;
-                new_segment_desc->rebuildBufferRangeIndex();
-                segment_desc = new_segment_desc;
-                break;
+#else
+            bool address_matches = iter->addr == (uint64_t)addr;
+#endif
+            if (!address_matches) continue;
+#ifdef ENABLE_MULTI_PROTOCOL
+            if (iter->protocol != protocol) continue;
+#endif
+            // Reject duplicate descriptors within the selected protocol,
+            // including the empty tag used by legacy callers.
+#ifdef ENABLE_MULTI_PROTOCOL
+            if (match != new_segment_desc->buffers.end()) {
+                LOG(ERROR) << "Ambiguous local buffer metadata removal at "
+                           << addr;
+                return ERR_INVALID_ARGUMENT;
             }
+#endif
+            match = iter;
+#ifndef ENABLE_MULTI_PROTOCOL
+            // Preserve the original first-match behavior without MP support.
+            break;
+#endif
         }
+
+        if (match == new_segment_desc->buffers.end())
+            return ERR_ADDRESS_NOT_REGISTERED;
+
+        new_segment_desc->buffers.erase(match);
+        new_segment_desc->rebuildBufferRangeIndex();
+        segment_desc = new_segment_desc;
     }
-    if (addr_exist) {
-        if (update_metadata) return updateLocalSegmentDesc();
-        return 0;
-    }
-    return ERR_ADDRESS_NOT_REGISTERED;
+    // Existing contract: local removal stays committed on publish failure.
+    if (update_metadata) return updateLocalSegmentDesc();
+    return 0;
 }
 
 int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
