@@ -320,9 +320,9 @@ class Guard {
     // arguments, and wires its group membership and the group's shared lease;
     // the state starts empty. Returns the new publication's generation.
     //
-    // Two caller bugs abort in every build rather than corrupt the route: a
-    // key that already holds an object, whose group membership and count the
-    // new one would strand, and metadata whose user_key is not this key.
+    // A caller bug aborts in every build rather than corrupt the route: a key
+    // that already holds an object, whose group membership and count the new
+    // one would strand.
     //
     // Nobody else can reach the object until the guard is released, so the
     // caller finishes setting it up through metadata() and state().
@@ -808,10 +808,6 @@ Generation ObjectRoute::PublishLocked(KeySlot& slot, Args&&... metadata_args) {
         slot.record_.emplace(generation, std::forward<Args>(metadata_args)...)
             .metadata;
     slot.state_.fetch_or(KeySlot::kOccupied, std::memory_order_relaxed);
-    if (metadata.user_key != slot.key()) {
-        LOG(FATAL) << "Publish under key " << slot.key()
-                   << " of an object keyed " << metadata.user_key;
-    }
     if (!metadata.group_id.empty()) {
         // AddMember returns null only for an empty group_id.
         auto lease = groups_.AddMember(metadata.group_id, slot.key());

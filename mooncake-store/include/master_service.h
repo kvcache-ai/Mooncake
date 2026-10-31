@@ -1295,7 +1295,7 @@ class MasterService {
     std::vector<Replica> PopReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata);
     size_t EraseReplicasWithCacheTotalAccounting(
-        ObjectMetadata& metadata,
+        ObjectMetadata& metadata, const std::string& key,
         const std::function<bool(const Replica&)>& pred_fn,
         std::vector<ReplicaID>* erased_replica_ids = nullptr);
 
@@ -1410,10 +1410,12 @@ class MasterService {
         const std::function<bool(const std::string& key)>& matches_key);
     static void ApplySoftPinMetricDelta(int metric_delta);
     void ApplySoftPinEvaluation(
-        const ObjectMetadata& metadata,
+        const ObjectMetadata& metadata, const std::string& key,
+        const TenantId& tenant_id,
         const ObjectMetadata::SoftPinEvaluation& result) const;
     bool IsSoftPinActive(
-        const ObjectMetadata& metadata,
+        const ObjectMetadata& metadata, const std::string& key,
+        const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) const;
     void CleanupExpiredSoftPins(
         const std::chrono::system_clock::time_point& now);
@@ -1611,7 +1613,8 @@ class MasterService {
         }
     }
     void CancelPromotionTaskForRemovedReplicas(
-        ObjectMetadata& metadata, route::ObjectState& state,
+        ObjectMetadata& metadata, const std::string& key,
+        const TenantId& tenant_id, route::ObjectState& state,
         const std::vector<ReplicaID>& removed_replica_ids)
         NO_THREAD_SAFETY_ANALYSIS;
 
@@ -1626,9 +1629,9 @@ class MasterService {
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
-    const double eviction_ratio_;                 // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
-    const double nof_eviction_ratio_;             // in range [0.0, 1.0]
+    const double eviction_ratio_;                     // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
     // Memory eviction (see eviction::Evictor) and what it is built from: the

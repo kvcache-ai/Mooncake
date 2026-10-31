@@ -154,7 +154,8 @@ struct MasterService::MemoryEviction {
                 return tl::make_unexpected(
                     eviction::SkipReason::kExternalEvict);
             }
-            if (service_.IsSoftPinActive(candidate.metadata, candidate.now)) {
+            if (service_.IsSoftPinActive(candidate.metadata, candidate.key,
+                                         candidate.tenant_id, candidate.now)) {
                 if (!allow_soft_pinned_) {
                     return tl::make_unexpected(
                         eviction::SkipReason::kSoftPinned);
@@ -1636,7 +1637,7 @@ void MasterService::EvictManagedWeightMembersToCold(
                        IsReplicaReadable(replica);
             });
         if (!has_cold || !metadata.IsLeaseExpired(now) ||
-            IsSoftPinActive(metadata, now)) {
+            IsSoftPinActive(metadata, member_key, tenant_id, now)) {
             continue;
         }
         eviction::Plan plan;
@@ -1729,7 +1730,7 @@ std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
 }
 
 size_t MasterService::EraseReplicasWithCacheTotalAccounting(
-    ObjectMetadata& metadata,
+    ObjectMetadata& metadata, const std::string& key,
     const std::function<bool(const Replica&)>& pred_fn,
     std::vector<ReplicaID>* erased_replica_ids) {
     auto erased_replicas =
@@ -1750,7 +1751,7 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
     // Release SSD/local-disk usage for any local-disk replicas being removed.
     // No-op for memory/noF replicas, so it is safe to call unconditionally.
     ReleaseLocalDiskUsage(erased_replicas);
-    FreeDfsReplicas(metadata.user_key, erased_replicas);
+    FreeDfsReplicas(key, erased_replicas);
     return erased_replicas.size();
 }
 
@@ -1792,8 +1793,9 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     }
     dynamic_replication_.RecordReplicaRemoval(metadata, erased_replica_ids);
     ReleaseLocalDiskUsage(erased_replicas);
-    FreeDfsReplicas(metadata.user_key, erased_replicas);
-    CancelPromotionTaskForRemovedReplicas(metadata, accessor.GetState(),
+    FreeDfsReplicas(durable_entry.object_key, erased_replicas);
+    CancelPromotionTaskForRemovedReplicas(metadata, durable_entry.object_key,
+                                          tenant_id, accessor.GetState(),
                                           erased_replica_ids);
     if (!metadata.IsValid()) {
         accessor.Erase(previous_media);
@@ -1841,7 +1843,7 @@ void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
     auto replicas = PopReplicasWithCacheTotalAccounting(
         metadata, &Replica::fn_is_processing);
     if (!replicas.empty()) {
-        FreeDfsReplicas(metadata.user_key, replicas);
+        FreeDfsReplicas(accessor.GetKey(), replicas);
         std::lock_guard lock(discarded_replicas_mutex_);
         discarded_replicas_.emplace_back(std::move(replicas), ttl);
     }
@@ -1904,7 +1906,7 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
                               dynamic_replication_version_epoch != 0;
     dynamic_replication_.RecordReplicaRemoval(metadata, erased_replica_ids);
     if (!replicas.empty()) {
-        FreeDfsReplicas(metadata.user_key, replicas);
+        FreeDfsReplicas(accessor.GetKey(), replicas);
         std::lock_guard lock(discarded_replicas_mutex_);
         discarded_replicas_.emplace_back(std::move(replicas), ttl);
     }
@@ -2032,10 +2034,11 @@ void MasterService::CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor) {
     // client_mutex_ needed since we only check memory replicas.
     std::vector<ReplicaID> removed_replica_ids;
     EraseReplicasWithCacheTotalAccounting(
-        metadata,
+        metadata, accessor.GetKey(),
         [](const Replica& replica) { return replica.has_invalid_mem_handle(); },
         &removed_replica_ids);
-    CancelPromotionTaskForRemovedReplicas(metadata, accessor.GetState(),
+    CancelPromotionTaskForRemovedReplicas(metadata, accessor.GetKey(),
+                                          tenant_id, accessor.GetState(),
                                           removed_replica_ids);
     SyncKvObjectState(accessor.GetKey(), metadata, tenant_id,
                       previous_kv_media);
@@ -2283,7 +2286,7 @@ auto MasterService::BatchUpdateSoftPin(const std::vector<std::string>& keys,
             continue;
         }
         ApplySoftPinEvaluation(
-            metadata,
+            metadata, key, normalized_tenant,
             metadata.ApplySoftPin(*request, std::chrono::system_clock::now()));
         results.emplace_back();
     }
@@ -2299,14 +2302,15 @@ void MasterService::ApplySoftPinMetricDelta(int metric_delta) {
 }
 
 void MasterService::ApplySoftPinEvaluation(
-    const ObjectMetadata& metadata,
+    const ObjectMetadata& metadata, const std::string& key,
+    const TenantId& tenant_id,
     const ObjectMetadata::SoftPinEvaluation& result) const {
     if (!result.deadline_to_index && !result.removed_deadline) {
         ApplySoftPinMetricDelta(result.metric_delta);
         return;
     }
 
-    const auto scoped_key = metadata.tenant_id.MakeScopedKey(metadata.user_key);
+    const auto scoped_key = tenant_id.MakeScopedKey(key);
     if (result.deadline_to_index) {
         soft_pin_deadline_index_.Upsert(scoped_key, *result.deadline_to_index);
     } else if (result.removed_deadline) {
@@ -2317,10 +2321,11 @@ void MasterService::ApplySoftPinEvaluation(
 }
 
 bool MasterService::IsSoftPinActive(
-    const ObjectMetadata& metadata,
+    const ObjectMetadata& metadata, const std::string& key,
+    const TenantId& tenant_id,
     const std::chrono::system_clock::time_point& now) const {
     const auto evaluation = metadata.EvaluateSoftPin(now);
-    ApplySoftPinEvaluation(metadata, evaluation);
+    ApplySoftPinEvaluation(metadata, key, tenant_id, evaluation);
     return evaluation.active;
 }
 
@@ -2955,8 +2960,7 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id)
         if (!HasReadableReplica(metadata)) {
             continue;
         }
-        all_keys.push_back(metadata.user_key.empty() ? object.key()
-                                                     : metadata.user_key);
+        all_keys.push_back(object.key());
     }
     return all_keys;
 }
@@ -3450,11 +3454,11 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
             // writer held off, so this is a key the objects name twice.
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
-        const route::Generation generation = accessor.Publish(
-            standby_meta.client_id, now, standby_meta.size,
-            std::move(object.replicas), std::nullopt,
-            standby_meta.hard_pinned.value_or(false), standby_meta.data_type,
-            standby_meta.group_id, object.tenant_id, object.user_key);
+        const route::Generation generation =
+            accessor.Publish(standby_meta.client_id, now, standby_meta.size,
+                             std::move(object.replicas), std::nullopt,
+                             standby_meta.hard_pinned.value_or(false),
+                             standby_meta.data_type, standby_meta.group_id);
         auto& metadata = accessor.Get();
         metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         metadata.session_id = standby_meta.session_id.value_or("");
@@ -4446,7 +4450,7 @@ auto MasterService::BatchReplicaClear(
                 }
             }
 
-            EraseReplicasWithCacheTotalAccounting(metadata,
+            EraseReplicasWithCacheTotalAccounting(metadata, key,
                                                   match_replica_on_segment);
 
             // If no valid replicas remain, erase the entire metadata
@@ -4998,8 +5002,7 @@ auto MasterService::InsertMetadata(
 
     accessor.Publish(client_id, now, value_length, std::move(replicas),
                      std::move(committed_soft_pin_timeout),
-                     config.with_hard_pin, config.data_type, group_id,
-                     tenant_id, key);
+                     config.with_hard_pin, config.data_type, group_id);
     auto& metadata = accessor.Get();
     metadata.BeginSessionTag(config.SessionId(), eligible_replica_ids);
     metadata.BeginSoftPinAction(soft_pin_request,
@@ -5396,7 +5399,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         metadata.HasReplica(&Replica::fn_is_completed)) {
         const auto soft_pin_result =
             metadata.CommitPendingSoftPin(std::chrono::system_clock::now());
-        ApplySoftPinEvaluation(metadata, soft_pin_result);
+        ApplySoftPinEvaluation(metadata, key, tenant_id, soft_pin_result);
     }
 
     if (object_meta.object_checksum.has_value() ||
@@ -5512,7 +5515,7 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
             client_id, std::chrono::system_clock::now(),
             replica.get_descriptor().get_local_disk_descriptor().object_size,
             std::vector<Replica>{}, std::nullopt, false,
-            ObjectDataType::UNKNOWN, std::string{}, object_id.tenant_id, key);
+            ObjectDataType::UNKNOWN, std::string{});
     }
     auto& metadata = accessor.Get();
     const auto previous_kv_media = KvMediaSnapshot(metadata);
@@ -5686,7 +5689,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return {};
     }
 
-    EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
+    EraseReplicasWithCacheTotalAccounting(metadata, key, target_pred);
     metadata.ClearPendingSoftPinIfNoViableReplica();
     metadata.ClearSessionTagIfNoViableReplica();
     if (!metadata.IsValid()) {
@@ -6282,7 +6285,7 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
             if (remaining.empty()) {
                 persist_result = AppendReservedOpLogWithDurableFinalize(
                     std::move(reservation.value()), OpType::REMOVE,
-                    metadata.tenant_id.value(), key, {},
+                    object_id.tenant_id.value(), key, {},
                     [this, removed_ids = std::move(removed_ids)](
                         const OpLogEntry& durable_entry) {
                         FinalizeRemovedReplicasAfterDurable(durable_entry,
@@ -6291,7 +6294,7 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
             } else {
                 persist_result = AppendReservedOpLogWithDurableFinalize(
                     std::move(reservation.value()), OpType::PUT_END,
-                    metadata.tenant_id.value(), key,
+                    object_id.tenant_id.value(), key,
                     SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
                                                                     remaining),
                     [this, removed_ids = std::move(removed_ids)](
@@ -6309,10 +6312,10 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
             persist_result = AppendOpLogWithDurableFinalize(
-                OpType::REMOVE, metadata.tenant_id.value(), key, {}, nullptr);
+                OpType::REMOVE, object_id.tenant_id.value(), key, {}, nullptr);
         } else {
             persist_result = AppendOpLogWithDurableFinalize(
-                OpType::PUT_END, metadata.tenant_id.value(), key,
+                OpType::PUT_END, object_id.tenant_id.value(), key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
                                                                 remaining),
                 nullptr);
@@ -6323,9 +6326,9 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
     }
 
     if (replica_type == ReplicaType::DISK) {
-        EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
+        EraseReplicasWithCacheTotalAccounting(metadata, key, target_pred);
     } else if (replica_type == ReplicaType::LOCAL_DISK) {
-        EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
+        EraseReplicasWithCacheTotalAccounting(metadata, key, target_pred);
     }
 
     SyncKvObjectState(key, metadata, object_id.tenant_id, previous_kv_media);
@@ -6623,7 +6626,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         }
         // Discard target replicas and clear the replication task.
         EraseReplicasWithCacheTotalAccounting(
-            metadata, [&task](const Replica& replica) {
+            metadata, key, [&task](const Replica& replica) {
                 return std::find(task.replica_ids.begin(),
                                  task.replica_ids.end(),
                                  replica.id()) != task.replica_ids.end();
@@ -6681,7 +6684,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         std::unordered_set<ReplicaID> failed_ids(failed_target_ids.begin(),
                                                  failed_target_ids.end());
         EraseReplicasWithCacheTotalAccounting(
-            metadata, [&failed_ids](const Replica& replica) {
+            metadata, key, [&failed_ids](const Replica& replica) {
                 return failed_ids.contains(replica.id());
             });
     }
@@ -6788,7 +6791,7 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     // Erase all replica_ids
     for (const auto& replica_id : replica_ids) {
         EraseReplicasWithCacheTotalAccounting(
-            metadata, [&replica_id](const Replica& replica) {
+            metadata, key, [&replica_id](const Replica& replica) {
                 return replica.id() == replica_id;
             });
     }
@@ -6977,7 +6980,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         }
         // Discard target replica and clear the replication task.
         EraseReplicasWithCacheTotalAccounting(
-            metadata, [&task](const Replica& replica) {
+            metadata, key, [&task](const Replica& replica) {
                 return std::find(task.replica_ids.begin(),
                                  task.replica_ids.end(),
                                  replica.id()) != task.replica_ids.end();
@@ -7006,7 +7009,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             source->dec_refcnt();
             // Discard target replica and clear the replication task.
             EraseReplicasWithCacheTotalAccounting(
-                metadata, [&task](const Replica& replica) {
+                metadata, key, [&task](const Replica& replica) {
                     return std::find(task.replica_ids.begin(),
                                      task.replica_ids.end(),
                                      replica.id()) != task.replica_ids.end();
@@ -7044,7 +7047,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             source->mark_removed();
             persist_result = AppendReservedOpLogWithDurableFinalize(
                 std::move(reservation.value()), OpType::PUT_END,
-                metadata.tenant_id.value(), key,
+                accessor.GetTenantId().value(), key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post),
                 [this, removed_ids = std::vector<ReplicaID>{source_id}](
                     const OpLogEntry& durable_entry) {
@@ -7053,7 +7056,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
                 });
         } else {
             persist_result = AppendOpLogWithDurableFinalize(
-                OpType::PUT_END, metadata.tenant_id.value(), key,
+                OpType::PUT_END, accessor.GetTenantId().value(), key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post),
                 nullptr);
         }
@@ -7140,7 +7143,7 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     // Erase all replica_ids (in MOVE operation, there should be at most one)
     for (const auto& replica_id : task.replica_ids) {
         EraseReplicasWithCacheTotalAccounting(
-            metadata, [&replica_id](const Replica& replica) {
+            metadata, key, [&replica_id](const Replica& replica) {
                 return replica.id() == replica_id;
             });
     }
@@ -7362,28 +7365,28 @@ long MasterService::RemoveAll(bool force) {
     std::unordered_set<std::string> tenants_with_remaining_objects;
 
     // Remove per object so managed weights and concurrent imports survive.
-    VisitNamespaces([&](const TenantId& tenant_id,
-                        metadata::Namespace& /*ns*/) {
-        const RemoveResult result =
-            RemoveTenantObjects(tenant_id, force, now, nullptr);
-        removed_count += result.removed_count;
-        total_freed_size += result.freed_bytes;
-        // Record the tenant only once the walk actually reached an object. A
-        // tenant row can outlive its objects, and recording it unconditionally
-        // made every empty-but-present tenant look like a fresh wipe and emit
-        // a spurious `cleared`. Under HA+oplog the erase is deferred to the
-        // durable callback, so only a skipped object means the tenant is not
-        // empty.
-        if (track_cleared_tenants && result.saw_object) {
-            tenants_seen.insert(tenant_id.value());
-            if (result.skipped_object) {
-                tenants_with_remaining_objects.insert(tenant_id.value());
+    VisitNamespaces(
+        [&](const TenantId& tenant_id, metadata::Namespace& /*ns*/) {
+            const RemoveResult result =
+                RemoveTenantObjects(tenant_id, force, now, nullptr);
+            removed_count += result.removed_count;
+            total_freed_size += result.freed_bytes;
+            // Record the tenant only once the walk actually reached an object.
+            // A tenant row can outlive its objects, and recording it
+            // unconditionally made every empty-but-present tenant look like a
+            // fresh wipe and emit a spurious `cleared`. Under HA+oplog the
+            // erase is deferred to the durable callback, so only a skipped
+            // object means the tenant is not empty.
+            if (track_cleared_tenants && result.saw_object) {
+                tenants_seen.insert(tenant_id.value());
+                if (result.skipped_object) {
+                    tenants_with_remaining_objects.insert(tenant_id.value());
+                }
             }
-        }
-        if (kv_remove_all_tenant_hook_) {
-            kv_remove_all_tenant_hook_(tenant_id);
-        }
-    });
+            if (kv_remove_all_tenant_hook_) {
+                kv_remove_all_tenant_hook_(tenant_id);
+            }
+        });
 
     // tenants_seen holds only tenants that actually held an object, so this
     // difference is "held objects and lost all of them" — a real wipe. Both
@@ -7520,7 +7523,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 }
 
 void MasterService::CancelPromotionTaskForRemovedReplicas(
-    ObjectMetadata& metadata, route::ObjectState& state,
+    ObjectMetadata& metadata, const std::string& key, const TenantId& tenant_id,
+    route::ObjectState& state,
     const std::vector<ReplicaID>& removed_replica_ids) {
     if (removed_replica_ids.empty()) {
         return;
@@ -7541,8 +7545,7 @@ void MasterService::CancelPromotionTaskForRemovedReplicas(
     ErasePromotionTaskIfPresent(state);
 
     // Best-effort cleanup of a task that may still be queued on the holder.
-    local_ssd_manager_.RemovePromotion(holder_id, metadata.tenant_id,
-                                       metadata.user_key);
+    local_ssd_manager_.RemovePromotion(holder_id, tenant_id, key);
 }
 
 bool MasterService::CleanupStaleHandles(
@@ -7571,9 +7574,10 @@ bool MasterService::CleanupStaleHandles(
     const std::function<bool(const Replica&)>& is_stale) {
     const auto previous_kv_media = KvMediaSnapshot(metadata);
     std::vector<ReplicaID> removed_replica_ids;
-    EraseReplicasWithCacheTotalAccounting(metadata, is_stale,
+    EraseReplicasWithCacheTotalAccounting(metadata, key, is_stale,
                                           &removed_replica_ids);
-    CancelPromotionTaskForRemovedReplicas(metadata, state, removed_replica_ids);
+    CancelPromotionTaskForRemovedReplicas(metadata, key, tenant_id, state,
+                                          removed_replica_ids);
     SyncKvObjectState(key, metadata, tenant_id, previous_kv_media);
 
     // Return true if no valid replicas remain after cleanup
@@ -7675,7 +7679,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                     });
                 if (processing || accessor.InProcessing() ||
                     metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
-                    (IsSoftPinActive(metadata, now) &&
+                    (IsSoftPinActive(metadata, candidate.key, tenant_id, now) &&
                      !allow_evict_soft_pinned_objects_)) {
                     all_accepted = false;
                     break;
@@ -7842,7 +7846,8 @@ void MasterService::RunShardDfsEviction() {
                               !accessor.InProcessing() &&
                               !metadata.IsHardPinned() &&
                               metadata.IsLeaseExpired(now) &&
-                              (!IsSoftPinActive(metadata, now) ||
+                              (!IsSoftPinActive(metadata, accessor.GetKey(),
+                                                tenant_id, now) ||
                                allow_evict_soft_pinned_objects_);
                 if (!accepted[i]) continue;
 
@@ -8677,7 +8682,7 @@ MasterService::SubmitReplicaActionProposalLocked(
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
         plan = dynamic_replication_.SelectPlan(
-            segment_access, metadata,
+            segment_access, metadata, object_id.user_key,
             [this](const Replica& replica) {
                 return IsReplicaReadable(replica);
             },
@@ -9301,7 +9306,7 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     if (promotion_task->alloc_id != 0) {
         const ReplicaID alloc_id = promotion_task->alloc_id;
         EraseReplicasWithCacheTotalAccounting(
-            metadata, [alloc_id](const Replica& replica) {
+            metadata, key, [alloc_id](const Replica& replica) {
                 return replica.id() == alloc_id;
             });
     }
@@ -9679,7 +9684,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
         if (task->alloc_id != 0) {
             const ReplicaID alloc_id = task->alloc_id;
             EraseReplicasWithCacheTotalAccounting(
-                metadata, [alloc_id](const Replica& replica) {
+                metadata, key, [alloc_id](const Replica& replica) {
                     return replica.id() == alloc_id;
                 });
         }
@@ -9784,10 +9789,11 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
         return replica.is_nof_replica() && replica.is_completed() &&
                replica.get_refcnt() == 0;
     };
-    auto may_evict = [&](const ObjectMetadata& metadata) {
+    auto may_evict = [&](const ObjectMetadata& metadata, const std::string& key,
+                         const TenantId& tenant_id) {
         return !weight_manager_.IsManagedGroup(metadata.group_id) &&
                !metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
-               !IsSoftPinActive(metadata, now) &&
+               !IsSoftPinActive(metadata, key, tenant_id, now) &&
                metadata.HasReplica(is_evictable_nof_replica);
     };
 
@@ -9801,7 +9807,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
         DiscardExpiredProcessingReplicas(ns, now);
         for (auto object : ns.objects.ReadCursor()) {
             object_count++;
-            if (may_evict(object.metadata())) {
+            if (may_evict(object.metadata(), object.key(), tenant_id)) {
                 candidates.emplace_back(tenant_id, object.ref());
             }
         }
@@ -9824,7 +9830,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
             continue;
         }
         auto& metadata = accessor.Get();
-        if (!may_evict(metadata)) {
+        if (!may_evict(metadata, key, tenant_id)) {
             continue;
         }
 
