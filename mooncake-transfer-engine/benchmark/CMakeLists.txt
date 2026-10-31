@@ -73,7 +73,7 @@ if(BUILD_UNIT_TESTS)
   if(USE_TENT)
     add_executable(
       tebench_tent_config_test tests/tent_config_test.cpp tent_backend.cpp
-                               split_output.cpp utils.cpp)
+                               bench_runner.cpp split_output.cpp utils.cpp)
     target_link_libraries(
       tebench_tent_config_test PRIVATE transfer_engine tent_link_group gtest
                                        gtest_main)
@@ -83,7 +83,7 @@ if(BUILD_UNIT_TESTS)
 
     add_executable(
       tebench_tent_teardown_test tests/tent_teardown_test.cpp tent_backend.cpp
-                                 split_output.cpp utils.cpp)
+                                 bench_runner.cpp split_output.cpp utils.cpp)
     target_link_libraries(
       tebench_tent_teardown_test
       PRIVATE $<TARGET_PROPERTY:tebench,LINK_LIBRARIES> gtest gtest_main)
@@ -125,8 +125,8 @@ if(BUILD_UNIT_TESTS)
   if(WITH_METRICS AND USE_TCP)
     add_executable(
       tebench_metrics_integration_test
-      tests/metrics_integration_test.cpp te_backend.cpp utils.cpp
-      split_output.cpp numa_first_touch.cpp)
+      tests/metrics_integration_test.cpp te_backend.cpp bench_runner.cpp
+      utils.cpp split_output.cpp numa_first_touch.cpp)
     # Use the same backend dependencies as tebench, including device runtimes.
     target_link_libraries(
       tebench_metrics_integration_test
