@@ -2996,6 +2996,24 @@ TEST_F(ClientServerModeTest, UserEnvOverridesAutoInject) {
     EXPECT_EQ(it->second, R"({"version":"1.2"})");
 }
 
+TEST_F(ClientServerModeTest, RejectNonzeroBufferPoolInClientServerMode) {
+    // HIXL CS mode only supports BufferPool=0:0; a nonzero ASCEND_BUFFER_POOL
+    // must be rejected before initialization instead of failing inside HIXL.
+    adxl_mock::set_capability_result(adxl::SUCCESS, 1);
+    setenv("ASCEND_BUFFER_POOL", "4:8", 1);
+    auto transport = createTransport();
+    EXPECT_EQ(transport, nullptr);
+    unsetenv("ASCEND_BUFFER_POOL");
+}
+
+TEST_F(ClientServerModeTest, AcceptZeroBufferPoolInClientServerMode) {
+    adxl_mock::set_capability_result(adxl::SUCCESS, 1);
+    setenv("ASCEND_BUFFER_POOL", "0:0", 1);
+    auto transport = createTransport();
+    EXPECT_NE(transport, nullptr);
+    unsetenv("ASCEND_BUFFER_POOL");
+}
+
 // Bind the real transport without a remote server; only device resolution
 // fails.
 namespace mooncake {
