@@ -80,6 +80,28 @@ turn a compact N-D plan into an unbounded number of operations.
 The logical planner is copy-only. It does not infer model semantics from tensor
 names or transform dtype, quantization, packing, swizzle, or checkpoint format.
 
+### Stored-source geometry
+
+For an already published source, use `StoredWeightManifest` and
+`plan_stored_transfer_to_target_placement(source_manifest, target_placement)`.
+Each `StoredFragmentSnapshot` identifies a logical box by `global_offset` and
+`local_shape`, and its bytes by `object_key`, `object_offset`, and `nbytes`.
+There is no source rank, training mesh, or framework runtime object in this
+fragment contract. Source fragment count, boundaries, and dimensions can differ
+from the target placement.
+
+The framework adapter determines the logical boxes and which consistent source
+copy to publish. It must decompose any nonrectangular local allocation into
+valid boxes. Mooncake validates the declared snapshot and geometry, computes
+source/target intersections, and lowers them to byte ranges; it does not infer
+training sharding or select a training replica from runtime state.
+
+The stored-source planner tests reconstruct exact bytes for nonuniform 4-to-8
+and 8-to-4 layouts, both tensor dimensions, shuffled fragments, and padded
+object offsets. These are CPU planning regressions, not transport or throughput
+measurements. This path does not replace sparse coordinate planning or change
+its wire format.
+
 ## Tiled COO Partial Reads
 
 `TiledCOOLayout` and `plan_tiled_coo_read` provide a CPU-only, two-dimensional
@@ -144,6 +166,17 @@ This plan records runtime evidence but neither submits a copy nor retains the
 underlying allocation. A Transfer Engine executor must acquire allocation
 guards and revalidate bindings atomically with the submission that consumes
 the plan.
+
+### Shared allocation validation
+
+Runtime binding checks every fragment's logical geometry and physical view
+range. Many disjoint model-weight views may share one backing allocation;
+identical `(storage_address, storage_nbytes)` pairs are collapsed only for the
+backing-allocation overlap sweep. Distinct overlapping allocations still fail,
+including a partial overlap hidden behind repeated aliases of another arena.
+The sweep sorts unique allocations once instead of repeatedly comparing every
+pair of views in the same arena. View-overlap and declared-alias checks are
+unchanged; no persistent validation cache or new lifetime owner is introduced.
 
 ## Transfer Engine Execution
 

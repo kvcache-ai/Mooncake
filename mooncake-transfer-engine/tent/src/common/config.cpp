@@ -223,6 +223,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
               "transports/rdma/endpoint/qp_mul_factor");
     setConfig(config, "MC_MAX_SGE", "transports/rdma/endpoint/max_sge");
     setConfig(config, "MC_MAX_WR", "transports/rdma/endpoint/max_qp_wr");
+    setConfig(config, "MC_TENT_RDMA_SIGNAL_INTERVAL",
+              "transports/rdma/endpoint/signal_interval");
     setConfig(config, "MC_MAX_INLINE",
               "transports/rdma/endpoint/max_inline_bytes");
     setConfig(config, "MC_PKEY_INDEX", "transports/rdma/endpoint/pkey_index");
@@ -260,6 +262,15 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     // defaults to several threads so concurrent bulk transfers are not
     // serialized on one io_context.
     setConfig(config, "MC_TENT_RPC_THREADS", "rpc_server_threads");
+    // io_uring staging pool: pinned host slots allocated once at install()
+    // for requests that need a bounce buffer (device memory or unaligned
+    // host memory). The size keys only apply when pinned_staging is on.
+    setBoolConfig(config, "MC_IOURING_PINNED_STAGING",
+                  "transports/io_uring/pinned_staging");
+    setConfig(config, "MC_IOURING_STAGING_SLOT_KB",
+              "transports/io_uring/staging_slot_kb");
+    setConfig(config, "MC_IOURING_STAGING_SLOTS",
+              "transports/io_uring/staging_slots");
     return status;
 }
 

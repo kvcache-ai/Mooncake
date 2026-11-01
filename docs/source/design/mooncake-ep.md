@@ -143,6 +143,24 @@ It provides the P2P / IPC fast path only:
 - Kernels run on the caller's `torch.xpu` stream. Zero-copy combine and the
   elastic buffer are not supported.
 
+## JIT kernel compilation
+
+On NVIDIA GPUs, Mooncake EP compiles its dispatch and combine kernels, including
+the elastic buffer kernels, at runtime. Parameters such as `hidden`,
+`num_experts`, and `num_topk` are compile-time template arguments of these
+kernels. Without JIT, the library can only contain a fixed set of
+instantiations (for example, `hidden` in {2048, 2560, 3072, 3584, 4096, 5120,
+6144, 7168, 8192}), and any other value fails with an "Unsupported" error. With
+JIT, the first call with a new combination of values runs nvcc to build that
+instantiation and caches the cubin on disk; later calls and later runs reuse it.
+
+JIT is currently not supported on other backends.
+
+At runtime this needs nvcc, the kernel headers, and a writable cache directory.
+Installed wheels ship the kernel headers, so they usually need no setup. See
+[JIT kernel compilation](../deployment/mooncake-ep-jit.md) for path lookup,
+cache behavior, and environment variables.
+
 ## Metadata exchange
 
 During `Buffer.connect()`, ranks exchange:
@@ -279,3 +297,4 @@ Adapt launch commands to the target environment and number of GPUs.
 - [Mooncake PG design](mooncake-backend-pg.md)
 - [Python API reference](../api-reference/python/ep-backend.md)
 - [PG/EP troubleshooting](../troubleshooting/pg-ep-troubleshooting.md)
+- [Mooncake EP JIT kernel compilation](../deployment/mooncake-ep-jit.md)

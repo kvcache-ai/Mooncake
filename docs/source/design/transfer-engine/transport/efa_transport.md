@@ -198,7 +198,7 @@ Use `transfer_engine_bench` to measure EFA transport throughput between two node
 
 The following commands are the GPU-to-GPU shape used for the [Benchmark Results](#benchmark-results) tables below, which top out at 780 GB/s write on a p6-b300.48xlarge pair and 365 GB/s on p5en.48xlarge — see each table for the `threads`/`batch_size` that peaked on that host. Two things matter the most:
 
-- `--gpu_id=-1` on **both** sides — this fans buffers across every GPU, which in turn lets both NUMA nodes' NICs saturate. Pinning a single GPU (the default `--gpu_id=0`) halves throughput because half the NICs end up cross-NUMA.
+- `--gpu_id=-1` on **both** sides — this fans buffers across every GPU, which in turn lets both NUMA nodes' NICs saturate. Pinning a single GPU (the default `--gpu_id=0`) caps throughput at that GPU's topology-local NICs — about 95 GB/s on p6-b300.48xlarge, which has two per GPU — because a device buffer is always served by its preferred NICs.
 - `--block_size=1048576` (1MB, not the 64 KB default) — each block becomes one `fi_write` / `fi_read`, so larger blocks amortize per-op overhead and are the main knob for hitting line rate.
 
 ### 1. Target Node (receiver)
@@ -451,7 +451,7 @@ For reference, a cross-host `put_from` of the same payload (device RDMA, 1 NIC) 
 - **Use `--block_size=1048576` (1MB)** — the single most important knob. The 64 KB default reaches only ~26% of peak. 1 MB is within a few percent of the 2 MB plateau while leaving headroom for `batch_size` under the shared-endpoint WR cap.
 - **Keep `threads × batch_size ≤ num_nics × max_wr`** — under the SRD shared endpoint each NIC carries one `fid_ep` whose WR cap is the provider's transmit queue depth (`fi_tx_attr: size`: 4096 on p5, 2048 on p6-b300). Exceeding it trips "timed out waiting for CQ drain". In practice this is no longer the binding constraint — a 16-NIC b300 allows `16 × 2048 = 32768` in-flight slices, far more than any sane `threads × batch` — so pick `threads` and `batch_size` from the measurements above (`threads=16, batch=128` on 16-NIC hosts; `threads=32, batch=128` on 32-NIC p5) and treat this as a sanity check. Read your host's depth from the `provider tx queue=` field in Mooncake's per-device startup log, or with `fi_info -p efa -t FI_EP_RDM -v | grep -A9 fi_tx_attr`.
 - **Write vs read:** write benefits from larger batches (peak at `batch=128`); on 16-NIC p5en read prefers smaller queues (peak at `batch=32`), but on 32-NIC p5 reads scale up to `batch=128` because the wider fabric absorbs larger in-flight queues.
-- For **GPU-to-GPU**: pass `--gpu_id=-1` on **both** sides so buffers fan out across every GPU. Pinning a single GPU halves throughput because half the NICs end up cross-NUMA.
+- For **GPU-to-GPU**: pass `--gpu_id=-1` on **both** sides so buffers fan out across every GPU. Pinning a single GPU caps throughput at that GPU's topology-local NICs.
 - For **CPU-to-CPU**: DRAM bandwidth is the ceiling. NUMA-split (separate initiator/target instances per NUMA node) can help reduce contention when one instance can't saturate both nodes.
 - `--buffer_size` only needs `≥ block × batch × threads`; larger values do not improve throughput. The example commands use 4 GB because that is safe for any reasonable config.
 - **Leave the `MC_EFA_*` environment variables alone** — the defaults are what every number above was measured with. [Environment Variables](#efa-env-vars) explains what each one does and why overriding `MC_MAX_WR` in particular causes transfer *failures*, not slowdowns.
@@ -736,8 +736,9 @@ These apply to any Mooncake caller — the framework sections below only add the
 |---|---|---|
 | `MOONCAKE_PROTOCOL` | `rdma` | Set to `efa` to select this transport. Read by the vLLM / SGLang connectors |
 | `MC_MAX_WR` | provider's transmit depth | Per-NIC in-flight WR cap. **Do not set** — see below |
+| `MC_EFA_STALL_MIN_MS` | `1000` | How long a peer must refuse every post (unbroken `FI_EAGAIN`, at least 1024 waves) before its slices fail. A new connection's first completions take 50–100 ms, so much lower values fail healthy peers. `<= 0` restores the count-only check |
 | `MC_EFA_CQ_THREADS` | `1` | CQ polling threads. **Leave alone** — see below |
-| `MC_EFA_NIC_SELECTION` | `all` | `local` registers each device buffer only on its topology-local NICs — see below |
+| `MC_EFA_NIC_SELECTION` | `local` | `local` registers each device buffer only on its topology-local NICs; `all` registers it on every NIC — see below |
 | `MC_EFA_DISABLE_NEURON` | unset | `1` skips Neuron HBM registration and stages through host memory — see [AWS Neuron](#efa-neuron) |
 | `MC_MS_AUTO_DISC`, `MC_MS_FILTERS` | on / unset | Mooncake Store device auto-discovery — see [Verification](#verification) |
 | `FI_PROVIDER`, `FI_EFA_USE_DEVICE_RDMA`, `LD_LIBRARY_PATH` | set by the EFA installer | libfabric-side, not Mooncake's. Only needed if a container image drops them |
@@ -747,7 +748,7 @@ These apply to any Mooncake caller — the framework sections below only add the
 > Overriding it desynchronizes the counter from the queue it paces, and **both directions of error are real transfer failures, not just slowdowns** — EFA has no transport-level retransmit, so the affected slices are reported up as `FAILED`:
 >
 > - **Too small** (e.g. the old fixed default of 256): the counter saturates while the queue is mostly empty, so submitters spin in the credit-wait loop and give up — `timed out waiting for CQ drain (wr_depth=256, max=256)` — with thousands of slots the NIC would have accepted.
-> - **Too large** (e.g. `MC_MAX_WR=16384`): the counter hands out credit the queue cannot honor, so `fi_write` refuses with `-FI_EAGAIN` while `wr_depth` sits pinned at the provider's real depth and the rest of the credit is nominally free — `1024 consecutive FI_EAGAIN waves posted nothing`.
+> - **Too large** (e.g. `MC_MAX_WR=16384`): the counter hands out credit the queue cannot honor, so `fi_write` refuses with `-FI_EAGAIN` while `wr_depth` sits pinned at the provider's real depth and the rest of the credit is nominally free — `N consecutive FI_EAGAIN waves over X ms posted nothing` once the refusals have lasted `MC_EFA_STALL_MIN_MS`.
 >
 > A value **below** the provider's depth is still honored, as a deliberate per-NIC throttle; a value above it is clamped with a warning. Verify what took effect from the per-device startup line — no probe needed:
 >
@@ -764,7 +765,37 @@ These apply to any Mooncake caller — the framework sections below only add the
 > export MC_EFA_CQ_THREADS=0   # lift cap: one poller per EFA device (legacy)
 > ```
 
-> **`MC_EFA_NIC_SELECTION`** — `all` (default) registers every buffer on every NIC, so any NIC can serve any transfer. `local` narrows a device buffer to the NICs the topology reports as closest to its GPU, which trades bandwidth for registration time: fewer NICs can serve a transfer touching that buffer, but registering one buffer on N NICs costs roughly N registrations, and for device memory a per-domain cost is paid on top. Measured on p5.48xlarge with 48 × 391 MB GPU buffers registered serially: **123.7 s across 32 NICs, 17.6 s across 4, 4.4 s on 1.** Use it when startup registration time dominates, not to chase throughput. Host (`cpu:N`) buffers are deliberately never narrowed — a NUMA node's NIC set is half the machine, not a rail group. This knob is unrelated to the Neuron switch-locality win, which comes from the topology's transfer-time NIC preference and needs no configuration.
+> **`MC_EFA_NIC_SELECTION`** — `local` (default) registers each device buffer only on the NICs the topology reports as closest to its GPU; `all` registers every buffer on every NIC. Registering one device buffer on N NICs costs roughly N registrations, plus a per-domain cost on top, while it buys no steady-state bandwidth: `Topology::selectDevice()` picks a device buffer's NIC from `preferred_hca` — the same topology-local set — on every first attempt, so keys on the other NICs are only used by retries. What `local` gives up is retrying a device buffer over a non-local NIC after its local NICs fail; set `all` if you need that. Host (`cpu:N`) buffers are never narrowed — a NUMA node's NIC set is half the machine, not a rail group.
+>
+> | Measured | `all` | `local` |
+> |---|---|---|
+> | p5.48xlarge, 48 × 391 MB GPU buffers registered serially | 123.7 s (32 NICs) | 17.6 s (4 NICs) |
+> | p6-b300.48xlarge, vLLM TP8 KV cache, slowest rank | 274 s (16 NICs) | 9 s (2 NICs) |
+> | p6-b300.48xlarge, vLLM engine start to all KV caches registered | 546 s | 283 s |
+> | p6-b300.48xlarge, vLLM 1P1D PD, both sides ready | 822 s | 308 s |
+> | p6-b300.48xlarge GPU-to-GPU write / read, `--gpu_id=-1` (8 GPUs) | 761.8 / 763.4 GB/s | 762.3 / 757.6 GB/s |
+> | p6-b300.48xlarge GPU-to-GPU write / read, `--gpu_id=0` (1 GPU) | 95.7 / 94.6 GB/s | 95.2 / 94.1 GB/s |
+>
+> This knob is unrelated to the Neuron switch-locality win, which comes from the topology's transfer-time NIC preference and needs no configuration.
+
+(efa-large-memory)=
+## Registering Large Memory: Use Huge Pages
+
+Back large buffers with huge pages, either THP or hugetlb. This is a requirement, not a tuning option. Which kind to use depends on whether you can change host settings:
+
+- **You control the host:** use hugetlb. Reserve the pages up front (`vm.nr_hugepages`, sized for every buffer you register) and set `MC_STORE_USE_HUGEPAGE`. The pages are guaranteed once reserved, and this is the only way to back `memfd` buffers (below).
+- **You run in a container and cannot change the host:** use THP. It needs no reservation; the Store asks for it on its segment. `memfd` buffers stay on 4 KB pages in this case.
+
+An EFA NIC maps a registered buffer through a page table of about 22 million entries. With 4 KB pages, one registration covers at most about 88 GiB. With 2 MB pages the same entries cover about 44 TB, so the device's `max_mr_size` becomes the limit instead. For a 4 KB-backed buffer larger than that, the transport splits it into chunks and plans each NIC against the same budget:
+
+- With several NICs, each chunk is registered on only some of them (`Disjoint NIC partition` in the log). Transfers that touch a chunk then use only those NICs.
+- With one NIC, for example r8i.48xlarge, a 4 KB-backed buffer above about 88 GiB is rejected (`per-NIC PTE budget ... is exceeded even with round-robin`).
+
+The `Auto-split params: page_size=...` log line shows which budget a registration was planned with.
+
+**Store segments.** The Store allocates its segment with `MADV_HUGEPAGE`, so THP with `enabled=madvise`, the common default, is enough. Check that the backing actually happened: `AnonHugePages` in `/proc/meminfo` should grow by the segment size. For example, a 1 TB segment on a single-NIC r8i.48xlarge registers in about a minute, with `AnonHugePages` at 1 TiB. THP faults compact memory directly, so on a host with fragmented memory, compact it first (`echo 1 > /proc/sys/vm/compact_memory`). Set `MC_STORE_USE_HUGEPAGE` only together with a reserved hugetlb pool: it switches the segment to hugetlb, and allocation fails if the pool is too small.
+
+**Shared-memory buffers.** These buffers come from `memfd`, for example the HiCache host pool that SGLang allocates for its `mooncake` storage backend. `MADV_HUGEPAGE` THP does not apply to `memfd`. Such buffers use 2 MB pages only with `MC_STORE_USE_HUGEPAGE` set and enough hugetlb pages reserved (`vm.nr_hugepages`). Otherwise they are 4 KB-backed, and the limits above apply to each of them.
 
 ## Usage with vLLM
 
@@ -979,6 +1010,12 @@ Solution: Verify `/opt/amazon/efa/lib` is in the library path:
 ```bash
 export LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
 ```
+
+### Large buffer registration fails or is split across NICs
+
+`fi_mr_reg ... Cannot allocate memory`, `Disjoint NIC partition`, or `per-NIC PTE budget ... is exceeded` on a large buffer means it is backed by 4 KB pages. Back it with huge pages; see [Registering Large Memory](#efa-large-memory).
+
+`Cannot allocate memory` can also mean the host is out of memory to pin. Check `MemAvailable` before shrinking anything. On GPU hosts, inference engines' host caches can already hold most of the DRAM.
 
 ### Workers hang under high concurrency
 

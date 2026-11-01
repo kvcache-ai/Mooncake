@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <array>
-#include <algorithm>
 #include <cassert>
 #include <cctype>
 #include <cmath>
@@ -62,13 +61,6 @@
 namespace mooncake {
 
 namespace {
-
-uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
-    if (lhs > std::numeric_limits<uint64_t>::max() - rhs) {
-        return std::numeric_limits<uint64_t>::max();
-    }
-    return lhs + rhs;
-}
 
 uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
     if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs) {
@@ -401,7 +393,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
                       << ", error=" << toString(result.error());
               }
           }),
-      replica_cleanup_worker_([this] { ClearInvalidHandles(); }),
+      replica_cleanup_worker_([this] {
+          // RFC #4700 slice 1: no metadata sweep while a promotion restore
+          // is in flight; the restore itself owns the metadata transition.
+          if (AdmitsBusinessWorkers()) {
+              ClearInvalidHandles();
+          }
+      }),
       enable_async_segment_cleanup_(!config.enable_ha && !config.enable_cxl),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
@@ -712,6 +710,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     dynamic_replication_.Start([this](const TenantId& tenant_id,
                                       const std::string& key) {
+        // RFC #4700 slice 1: dynamic replica proposals mutate business
+        // metadata, so they stay out of the restore window.
+        if (!AdmitsBusinessWorkers()) {
+            return;
+        }
         std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
         TrySubmitDynamicReplicaProposal(ObjectIdentity{tenant_id, key});
     });
@@ -964,9 +967,9 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         op.is_memory_segment = true;
         op.file_path.clear();
         auto bytes = struct_pack::serialize(op);
-        PersistSegmentOpForHAOrEnqueue("MountSegment", OpType::SEGMENT_MOUNT,
-                                       segment.te_endpoint,
-                                       std::string(bytes.begin(), bytes.end()));
+        PersistSegmentOpForHA("MountSegment", OpType::SEGMENT_MOUNT,
+                              segment.te_endpoint,
+                              std::string(bytes.begin(), bytes.end()));
     }
     if (mount_result == ErrorCode::OK) {
         UpdateClientHostId(client_id, segment.host_id);
@@ -1361,9 +1364,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             op.is_memory_segment = true;
             op.file_path.clear();
             auto bytes = struct_pack::serialize(op);
-            PersistSegmentOpForHAOrEnqueue(
-                "ReMountSegment", OpType::SEGMENT_MOUNT, seg.name,
-                std::string(bytes.begin(), bytes.end()));
+            PersistSegmentOpForHA("ReMountSegment", OpType::SEGMENT_MOUNT,
+                                  seg.name,
+                                  std::string(bytes.begin(), bytes.end()));
         }
     }
     NotifyPolicyCapacityChanged();
@@ -2628,6 +2631,12 @@ void MasterService::TaskCleanupThreadFunc() {
             break;
         }
 
+        // RFC #4700 slice 1: task pruning, soft-pin expiry and dynamic
+        // replication cleanup all mutate business metadata.
+        if (!AdmitsBusinessWorkers()) {
+            continue;
+        }
+
         std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
         {
             auto write_access = task_manager_.get_write_access();
@@ -2716,9 +2725,9 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     if (enable_oplog_ && ordered_oplog_writer_ && !te_endpoint.empty()) {
         SegmentUnmountOp op{te_endpoint};
         auto bytes = struct_pack::serialize(op);
-        PersistSegmentOpForHAOrEnqueue("UnmountSegment",
-                                       OpType::SEGMENT_UNMOUNT, te_endpoint,
-                                       std::string(bytes.begin(), bytes.end()));
+        PersistSegmentOpForHA("UnmountSegment", OpType::SEGMENT_UNMOUNT,
+                              te_endpoint,
+                              std::string(bytes.begin(), bytes.end()));
     }
     NotifyPolicyCapacityChanged();
     return {};
@@ -3526,7 +3535,134 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromBatchOpLogPromotion(
                                    chunk_object_count, max_replica_id, nullptr);
 }
 
+// Restore lifecycle (RFC #4700, slice 1). Defined next to the restore
+// implementation it guards.
+namespace {
+
+const char* RestoreLifecycleStateToString(
+    MasterService::RestoreLifecycleState state) {
+    switch (state) {
+        case MasterService::RestoreLifecycleState::kConstructed:
+            return "Constructed";
+        case MasterService::RestoreLifecycleState::kRecovering:
+            return "Recovering";
+        case MasterService::RestoreLifecycleState::kReady:
+            return "Ready";
+        case MasterService::RestoreLifecycleState::kServing:
+            return "Serving";
+        case MasterService::RestoreLifecycleState::kFailed:
+            return "Failed";
+    }
+    return "Unknown";
+}
+
+}  // namespace
+
 tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
+    const std::vector<StandbyObjectEntry>* legacy_objects,
+    const StandbyMetadataStore* metadata_store,
+    uint64_t initial_oplog_sequence_id,
+    const std::vector<StandbySegmentInfo>& segments, size_t chunk_object_count,
+    std::optional<ReplicaID> expected_max_replica_id,
+    const WeightMetadataSnapshot* legacy_weight_metadata) {
+    // Lifecycle bookkeeping around the restore (RFC #4700, slice 1). The
+    // restore itself keeps its existing retry semantics: a replacement
+    // restore from Ready or Failed is still allowed and is exercised by
+    // the HA tests (allocator rebind, discard-repair retry). The one
+    // refused entry is Serving: the RFC's proposed no-cycles-out-of-
+    // Serving constraint. master_state_mutex_ stays in place, so this
+    // slice adds no locking behavior.
+    //
+    // Admission is single-flight: the state transition into Recovering is
+    // the admission token, so a second restore that overlaps an in-flight
+    // one is refused instead of running. Without that, two overlapping
+    // callers could each publish their own outcome and the first one to
+    // finish would return the lifecycle to Ready while the other is still
+    // rewriting metadata. Overlapping restores are not a supported way to
+    // retry -- a retry starts after the previous attempt returned.
+    RestoreLifecycleState expected =
+        lifecycle_state_.load(std::memory_order_acquire);
+    if (expected == RestoreLifecycleState::kServing) {
+        LOG(ERROR) << "RestoreFromStandbyState: refusing restore of a "
+                      "serving service (lifecycle state="
+                   << RestoreLifecycleStateToString(expected) << ")";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (expected == RestoreLifecycleState::kRecovering) {
+        LOG(ERROR) << "RestoreFromStandbyState: refusing a second restore "
+                      "while one is already in flight";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (!lifecycle_state_.compare_exchange_strong(
+            expected, RestoreLifecycleState::kRecovering,
+            std::memory_order_acq_rel)) {
+        LOG(ERROR) << "RestoreFromStandbyState: lost the admission race "
+                      "(lifecycle state="
+                   << RestoreLifecycleStateToString(expected) << ")";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    auto result = RestoreFromStandbyStateCore(
+        legacy_objects, metadata_store, initial_oplog_sequence_id, segments,
+        chunk_object_count, expected_max_replica_id, legacy_weight_metadata);
+
+    lifecycle_state_.store(result.has_value() ? RestoreLifecycleState::kReady
+                                              : RestoreLifecycleState::kFailed,
+                           std::memory_order_release);
+    LOG(INFO) << "Restore lifecycle -> "
+              << RestoreLifecycleStateToString(lifecycle_state_.load());
+    return result;
+}
+
+MasterService::RestoreLifecycleState MasterService::GetRestoreLifecycleState()
+    const {
+    return lifecycle_state_.load(std::memory_order_acquire);
+}
+
+void MasterService::MarkReadyForServing() {
+    RestoreLifecycleState expected = RestoreLifecycleState::kConstructed;
+    if (!lifecycle_state_.compare_exchange_strong(
+            expected, RestoreLifecycleState::kReady)) {
+        LOG(ERROR) << "MarkReadyForServing: refusing transition from "
+                   << RestoreLifecycleStateToString(lifecycle_state_.load());
+        return;
+    }
+    LOG(INFO) << "Restore lifecycle -> Ready (non-HA initialization)";
+}
+
+void MasterService::ActivateServing() {
+    RestoreLifecycleState expected = RestoreLifecycleState::kReady;
+    if (!lifecycle_state_.compare_exchange_strong(
+            expected, RestoreLifecycleState::kServing)) {
+        LOG(ERROR) << "ActivateServing: refusing transition from "
+                   << RestoreLifecycleStateToString(lifecycle_state_.load());
+        return;
+    }
+    LOG(INFO) << "Restore lifecycle -> Serving";
+}
+
+bool MasterService::AdmitsBusinessWorkers() const {
+    // Admission is evaluated once per worker iteration, so it gates the
+    // start of business work, not work already in progress: a worker that
+    // passed this check before the restore window opened runs its current
+    // iteration to completion. In this slice that is safe because the
+    // restore core still holds master_state_mutex_ exclusively, which is
+    // what actually excludes in-flight business work. A slice that removes
+    // that lock from these paths must add an explicit quiesce step
+    // (drain or epoch) instead of relying on this predicate.
+    switch (lifecycle_state_.load(std::memory_order_acquire)) {
+        case RestoreLifecycleState::kRecovering:
+        case RestoreLifecycleState::kFailed:
+            return false;
+        case RestoreLifecycleState::kConstructed:
+        case RestoreLifecycleState::kReady:
+        case RestoreLifecycleState::kServing:
+            return true;
+    }
+    return false;
+}
+
+tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     const std::vector<StandbyObjectEntry>* legacy_objects,
     const StandbyMetadataStore* metadata_store,
     uint64_t initial_oplog_sequence_id,
@@ -3649,12 +3785,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         }
     }
 
-    const bool bounded_restore = metadata_store != nullptr;
-    // Batch restore spans chunks, so it needs an ordered cross-chunk index;
-    // legacy restore keeps its contiguous vector-and-sort validation path.
-    std::unordered_map<const StandbySegmentInfo*,
-                       std::vector<std::pair<uintptr_t, uint64_t>>>
-        legacy_memory_ranges;
+    // Batch restore spans chunks, so it needs an ordered cross-chunk index.
     std::unordered_map<const StandbySegmentInfo*, std::map<uintptr_t, uint64_t>>
         bounded_memory_ranges;
     std::unordered_map<std::string, uint64_t> restored_accounted_memory_bytes;
@@ -3756,29 +3887,21 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                             return tl::make_unexpected(
                                 ErrorCode::INVALID_PARAMS);
                         }
-                        if (bounded_restore) {
-                            auto& ranges = bounded_memory_ranges[segment];
-                            auto next =
-                                ranges.lower_bound(buffer.buffer_address_);
-                            const uintptr_t end =
-                                buffer.buffer_address_ + buffer.size_;
-                            if ((next != ranges.end() && end > next->first) ||
-                                (next != ranges.begin() &&
-                                 std::prev(next)->first +
-                                         std::prev(next)->second >
-                                     buffer.buffer_address_)) {
-                                LOG(ERROR) << "RestoreFromStandbySnapshot: "
-                                              "overlapping "
-                                              "memory descriptors";
-                                return tl::make_unexpected(
-                                    ErrorCode::INVALID_PARAMS);
-                            }
-                            ranges.emplace(buffer.buffer_address_,
-                                           buffer.size_);
-                        } else {
-                            legacy_memory_ranges[segment].emplace_back(
-                                buffer.buffer_address_, buffer.size_);
+                        auto& ranges = bounded_memory_ranges[segment];
+                        auto next = ranges.lower_bound(buffer.buffer_address_);
+                        const uintptr_t end =
+                            buffer.buffer_address_ + buffer.size_;
+                        if ((next != ranges.end() && end > next->first) ||
+                            (next != ranges.begin() &&
+                             std::prev(next)->first + std::prev(next)->second >
+                                 buffer.buffer_address_)) {
+                            LOG(ERROR) << "RestoreFromStandbySnapshot: "
+                                          "overlapping "
+                                          "memory descriptors";
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_PARAMS);
                         }
+                        ranges.emplace(buffer.buffer_address_, buffer.size_);
                         bytes += buffer.size_;
                     }
 
@@ -3855,22 +3978,6 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             }
             prepared.push_back({&entry, std::move(tenant_id),
                                 std::move(user_key), std::move(replicas)});
-        }
-
-        if (!bounded_restore) {
-            for (auto& [segment, ranges] : legacy_memory_ranges) {
-                (void)segment;
-                std::sort(ranges.begin(), ranges.end());
-                for (size_t i = 1; i < ranges.size(); ++i) {
-                    if (ranges[i].first <
-                        ranges[i - 1].first + ranges[i - 1].second) {
-                        LOG(ERROR)
-                            << "RestoreFromStandbySnapshot: overlapping memory "
-                               "descriptors";
-                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                    }
-                }
-            }
         }
 
         if (auto published = PublishRestoredObjects(prepared, installed);
@@ -4159,13 +4266,6 @@ auto MasterService::BatchQueryIp(const std::vector<UUID>& client_ids)
         }
     }
     return results;
-}
-
-auto MasterService::BatchReplicaClear(
-    const std::vector<std::string>& object_keys, const UUID& client_id,
-    const std::string& segment_name)
-    -> tl::expected<std::vector<std::string>, ErrorCode> {
-    return BatchReplicaClear(object_keys, client_id, segment_name, "default");
 }
 
 auto MasterService::BatchReplicaClear(
@@ -8509,13 +8609,6 @@ void MasterService::CleanupExpiredDynamicReplicationState() {
 }
 
 tl::expected<ReplicaActionLease, ErrorCode>
-MasterService::SubmitReplicaActionProposal(
-    const ReplicaActionProposal& proposal) {
-    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    return SubmitReplicaActionProposalLocked(proposal);
-}
-
-tl::expected<ReplicaActionLease, ErrorCode>
 MasterService::SubmitReplicaActionProposalLocked(
     const ReplicaActionProposal& proposal) {
     const int64_t now_ms = DynamicReplicationController::NowMs();
@@ -9278,6 +9371,16 @@ void MasterService::EvictionThreadFunc() {
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
+        // RFC #4700 slice 1: eviction, tenant watermark eviction, DFS/NoF
+        // eviction, expired-processing discard and promotion retry all
+        // mutate business metadata, so none of them runs while a promotion
+        // restore is in flight.
+        if (!AdmitsBusinessWorkers()) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kEvictionThreadSleepMs));
+            continue;
+        }
+
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
@@ -9814,6 +9917,14 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
 
 void MasterService::ClientMonitorFunc() {
     while (client_monitor_running_) {
+        // RFC #4700 slice 1: liveness transitions retire clients and drive
+        // offboarding, so the monitor stays out of the restore window too.
+        if (!AdmitsBusinessWorkers()) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kClientMonitorSleepMs));
+            continue;
+        }
+
         const auto now = ClientLivenessRecord::Clock::now();
         std::vector<std::pair<UUID, std::shared_ptr<ClientLivenessRecord>>>
             clients;
@@ -10024,6 +10135,14 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
 void MasterService::NofHeartbeatThreadFunc() {
     size_t next_probe_index = 0;
     while (nof_heartbeat_running_) {
+        // RFC #4700 slice 1: heartbeat-driven NoF unmounts mutate segment
+        // and replica state.
+        if (!AdmitsBusinessWorkers()) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kNoFHeartbeatThreadSleepMs));
+            continue;
+        }
+
         auto now = std::chrono::steady_clock::now();
         std::vector<MountedNoFSegmentSnapshot> mounted_segments;
         nof_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
@@ -10051,9 +10170,6 @@ void MasterService::NofHeartbeatThreadFunc() {
                 auto [it, inserted] =
                     nof_heartbeat_states_.try_emplace(snapshot.segment_id);
                 auto& state = it->second;
-                state.owner_client_id = snapshot.client_id;
-                state.segment_name = snapshot.segment.name;
-                state.te_endpoint = snapshot.segment.te_endpoint;
                 if (inserted) {
                     int64_t spread_ms = 0;
                     if (!ok_segments.empty()) {
@@ -10121,7 +10237,6 @@ void MasterService::NofHeartbeatThreadFunc() {
                 if (it != nof_heartbeat_states_.end()) {
                     it->second.consecutive_failures = 0;
                     it->second.last_success_at = success_time;
-                    it->second.last_error_reason.clear();
                     it->second.next_probe_at =
                         success_time + nof_heartbeat_interval_sec_;
                 }
@@ -10151,7 +10266,6 @@ void MasterService::NofHeartbeatThreadFunc() {
             if (it != nof_heartbeat_states_.end()) {
                 it->second.consecutive_failures++;
                 failure_count = it->second.consecutive_failures;
-                it->second.last_error_reason = error_reason;
                 it->second.next_probe_at =
                     failure_time + nof_heartbeat_interval_sec_;
                 should_unmount =
@@ -10491,12 +10605,6 @@ tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
         return tl::make_unexpected(err);
     }
     return {};
-}
-
-tl::expected<void, ErrorCode> MasterService::ValidateDrainRequest(
-    const CreateDrainJobRequest& request) {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    return ValidateDrainRequestLocked(segment_access, request);
 }
 
 tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
@@ -11007,6 +11115,13 @@ void MasterService::ProcessDrainJobs() {
 
 void MasterService::JobDispatchThreadFunc() {
     while (job_dispatch_running_) {
+        // RFC #4700 slice 1: drain jobs mutate business metadata.
+        if (!AdmitsBusinessWorkers()) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kJobDispatchThreadSleepMs));
+            continue;
+        }
+
         ProcessDrainJobs();
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kJobDispatchThreadSleepMs));
@@ -11356,59 +11471,20 @@ void MasterService::HttpMetadataCleanupThreadFunc() {
 
 std::string MasterService::SerializeMetadataForOpLog(
     const ObjectMetadata& metadata) const {
-    MetadataPayload payload;
-    payload.client_id = metadata.client_id;
-    payload.size = metadata.TotalLength();
-    payload.group_id = metadata.group_id;
-    payload.session_id = metadata.session_id;
-    payload.data_type = metadata.data_type;
-    payload.hard_pinned = metadata.IsHardPinned();
-    payload.object_checksum = metadata.GetPart(0).checksum();
-
-    // Extract replica descriptors - get them all at once
-    const auto& replicas = metadata.GetAllReplicas();
-    payload.replicas.reserve(replicas.size());
-    for (const auto& replica : replicas) {
-        payload.replicas.push_back(replica.get_descriptor());
+    const auto all_replicas = metadata.GetAllReplicas();
+    std::vector<Replica::Descriptor> replicas;
+    replicas.reserve(all_replicas.size());
+    for (const auto& replica : all_replicas) {
+        replicas.push_back(replica.get_descriptor());
     }
-
-    // NOTE: Lease information is NOT serialized because:
-    // 1. Standby does not perform eviction, so lease info is not used
-    // 2. After promotion, new Primary should grant fresh leases, not restore
-    // old ones
-
-    // Serialize using struct_pack (msgpack binary format)
-    auto result = struct_pack::serialize(payload);
-    return std::string(result.begin(), result.end());
-}
-
-std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
-    const ObjectMetadata& metadata) const {
-    MetadataPayload payload;
-    payload.client_id = metadata.client_id;
-    payload.size = metadata.TotalLength();
-    payload.group_id = metadata.group_id;
-    payload.session_id = metadata.session_id;
-    payload.data_type = metadata.data_type;
-    payload.hard_pinned = metadata.IsHardPinned();
-    payload.object_checksum = metadata.GetPart(0).checksum();
-
-    const auto& replicas = metadata.GetAllReplicas();
-    payload.replicas.reserve(replicas.size());
-    for (const auto& replica : replicas) {
-        if (replica.type() == ReplicaType::MEMORY) {
-            continue;
-        }
-        payload.replicas.push_back(replica.get_descriptor());
-    }
-
-    auto result = struct_pack::serialize(payload);
-    return std::string(result.begin(), result.end());
+    return SerializeMetadataForOpLogFromReplicaDescriptors(metadata, replicas);
 }
 
 std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     const ObjectMetadata& metadata,
     const std::vector<Replica::Descriptor>& replicas) const {
+    // Leases are not serialized: a standby does not evict, and a promoted
+    // primary grants fresh leases instead of restoring old ones.
     MetadataPayload payload;
     payload.client_id = metadata.client_id;
     payload.size = metadata.TotalLength();
@@ -11611,11 +11687,6 @@ MasterService::AppendReservedOpLogWithDurableFinalize(
 }
 
 tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
-    const char* why, const std::string& key) {
-    return PersistRemoveForHA(why, TenantId::Default(), key);
-}
-
-tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
     const char* why, const TenantId& tenant_id, const std::string& key) {
     auto result = AppendOpLogWithDurableFinalize(
         OpType::REMOVE, tenant_id.value(), key, {}, nullptr);
@@ -11627,19 +11698,11 @@ tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
     return {};
 }
 
-void MasterService::PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
-                                                   const std::string& key,
-                                                   const std::string& payload) {
-    PersistSegmentOpForHAOrEnqueue(why, type, TenantId::Default(), key,
-                                   payload);
-}
-
-void MasterService::PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
-                                                   const TenantId& tenant_id,
-                                                   const std::string& key,
-                                                   const std::string& payload) {
-    auto result =
-        AppendOpLogVisibleBeforeDurable(type, tenant_id.value(), key, payload);
+void MasterService::PersistSegmentOpForHA(const char* why, OpType type,
+                                          const std::string& key,
+                                          const std::string& payload) {
+    auto result = AppendOpLogVisibleBeforeDurable(
+        type, TenantId::Default().value(), key, payload);
     if (!result) {
         LOG(WARNING) << why << ": segment OpLog queue failed for key=" << key
                      << ", type=" << static_cast<int>(type)

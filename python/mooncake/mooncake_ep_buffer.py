@@ -1,5 +1,9 @@
 import functools
 import os
+import pickle
+import socket
+from contextlib import contextmanager
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
@@ -117,6 +121,7 @@ class Buffer:
         num_ep_buffer_bytes: int,
         disable_p2p: bool = False,
     ):
+        self._is_elastic = False
         from mooncake import ep
 
         # Initialize the CPP runtime
@@ -147,6 +152,413 @@ class Buffer:
         self._maca_phase_recv_tokens: Optional[List[torch.Tensor]] = None
         self._warned_active_ranks_without_mooncake_backend = False
         self.connect()
+
+    @classmethod
+    def create_elastic(
+        cls,
+        disable_ll_nvlink: bool = False,
+        explicitly_destroy: bool = False,
+        rank: int = 0,
+        tcp_store_group: Optional[dist.TCPStore] = None,
+        timeout_ms: int = 30000,
+        metadata_timeout_ms: int = 300000,
+    ) -> "Buffer":
+        """Create an opt-in rank buffer without joining a ProcessGroup.
+
+        Native allocation and rank connection are deferred until
+        ``update_memory_buffers`` and ``connect_ranks``. ``timeout_ms`` sets
+        the native GPU communication timeout in milliseconds. The separate
+        ``metadata_timeout_ms`` sets the TCPStore peer-metadata wait timeout
+        in milliseconds and defaults to 300000 (300 seconds). The legacy
+        constructor keeps its eager ProcessGroup setup path.
+        """
+        if timeout_ms < 0:
+            raise ValueError("timeout_ms must be non-negative")
+        if metadata_timeout_ms <= 0:
+            raise ValueError("metadata_timeout_ms must be positive")
+        instance = cls.__new__(cls)
+        instance._initialize_elastic_fields(
+            disable_ll_nvlink=disable_ll_nvlink,
+            explicitly_destroy=explicitly_destroy,
+            rank=rank,
+            tcp_store_group=tcp_store_group,
+            timeout_ms=timeout_ms,
+            metadata_timeout_ms=metadata_timeout_ms,
+        )
+        return instance
+
+    def _initialize_elastic_fields(
+        self,
+        disable_ll_nvlink: bool,
+        explicitly_destroy: bool,
+        rank: int,
+        tcp_store_group: Optional[dist.TCPStore],
+        timeout_ms: int,
+        metadata_timeout_ms: int,
+    ) -> None:
+        """Initialize wrapper state for the deferred, no-ProcessGroup path."""
+        self.device_type = _device_type()
+        self.rank = rank
+        self.group_size = 0
+        self.group = None
+        self.num_ep_buffer_bytes = None
+        self.backend = None
+        self.runtime = None
+        self._use_fallback = False
+        self._fallback_next_combine_buffer = None
+        self._maca_phase_token = None
+        self._maca_phase_recv_tokens = None
+        self._warned_active_ranks_without_mooncake_backend = False
+        self._is_elastic = True
+        self.disable_ll_nvlink = disable_ll_nvlink
+        self.explicitly_destroy = explicitly_destroy
+        self.tcp_store_group = tcp_store_group
+        self.timeout_ms = timeout_ms
+        self.metadata_timeout_ms = metadata_timeout_ms
+        self.num_rdma_bytes = None
+        self._num_experts_per_rank = None
+        self._destroyed = False
+
+    @staticmethod
+    def _wrap_hook_with_resources(
+        hook: Optional[Callable], resources: Tuple[Any, ...]
+    ) -> Optional[Callable]:
+        if hook is None:
+            return None
+        keepalive = [resources]
+
+        def wrapped_hook() -> None:
+            try:
+                hook()
+            finally:
+                keepalive.clear()
+
+        return wrapped_hook
+
+    def _require_elastic_runtime(self) -> None:
+        if not self._is_elastic:
+            raise RuntimeError("This operation requires Buffer.create_elastic().")
+        if self.runtime is None:
+            raise RuntimeError(
+                "Call update_memory_buffers() before using the elastic buffer."
+            )
+
+    def update_memory_buffers(
+        self,
+        num_ranks: int,
+        num_experts_per_rank: int,
+        num_rdma_bytes: int,
+    ) -> None:
+        """Allocate the fixed-capacity native buffer for an elastic instance."""
+        if not self._is_elastic:
+            raise RuntimeError("update_memory_buffers() requires an elastic buffer.")
+        if self._destroyed:
+            raise RuntimeError("Destroyed elastic buffers cannot be reinitialized.")
+        if self.runtime is not None:
+            raise RuntimeError(
+                "Elastic buffer capacity is fixed after update_memory_buffers()."
+            )
+        if num_ranks <= 0 or not 0 <= self.rank < num_ranks:
+            raise ValueError("rank must be within the positive rank capacity.")
+        if num_experts_per_rank <= 0 or num_rdma_bytes <= 0:
+            raise ValueError("expert and RDMA capacities must be positive.")
+        if (
+            _USE_MACA
+            or getattr(torch.version, "maca", None)
+            or getattr(torch.version, "musa", None)
+            or getattr(torch.version, "hip", None)
+            or torch.version.cuda is None
+            or not torch.cuda.is_available()
+        ):
+            raise RuntimeError("The elastic EP buffer requires a CUDA native build.")
+
+        from mooncake import ep
+
+        self.group_size = num_ranks
+        self.num_ep_buffer_bytes = num_rdma_bytes
+        self.num_rdma_bytes = num_rdma_bytes
+        self._num_experts_per_rank = num_experts_per_rank
+        self._active_ranks = torch.zeros(
+            (num_ranks,),
+            dtype=torch.int32,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+        self._active_ranks[self.rank] = 1
+        self.runtime = ep.Buffer(
+            self.rank,
+            num_ranks,
+            num_rdma_bytes,
+            self.disable_ll_nvlink,
+        )
+        self.runtime._set_explicit_destroy(self.explicitly_destroy)
+        self._use_fallback = False
+        self.runtime._configure_elastic(
+            num_experts_per_rank, self._active_ranks.data_ptr()
+        )
+
+    def set_tcp_store_group(self, tcp_store_group: Optional[dist.TCPStore]) -> None:
+        if not self._is_elastic:
+            raise RuntimeError("set_tcp_store_group() requires an elastic buffer.")
+        self.tcp_store_group = tcp_store_group
+
+    def _get_local_peer_metadata(self) -> Tuple[Any, ...]:
+        self._require_elastic_runtime()
+        raddr, rkey = self.runtime.get_mr_info()
+        subnet_prefix, interface_id = self.runtime.get_gid()
+        return (
+            int(raddr),
+            int(rkey),
+            int(subnet_prefix),
+            int(interface_id),
+            tuple(int(value) for value in self.runtime.get_local_qpns()),
+            tuple(int(value) for value in self.runtime.get_local_lids()),
+            tuple(int(value) for value in self.runtime.get_ipc_handle()),
+        )
+
+    @contextmanager
+    def _fetch_remote_metadata_from_tcp_store(self, remote_ranks: List[int]):
+        if self.tcp_store_group is None:
+            raise RuntimeError("Mooncake peer metadata exchange requires a TCPStore.")
+        store = self.tcp_store_group
+        outgoing_keys = [f"MOONCAKE_EP/{self.rank}/{rank}" for rank in remote_ranks]
+        incoming_keys = [f"MOONCAKE_EP/{rank}/{self.rank}" for rank in remote_ranks]
+        envelope = pickle.dumps((socket.gethostname(), self._get_local_peer_metadata()))
+        consumed_incoming_keys = []
+        try:
+            for key in outgoing_keys:
+                store.set(key, envelope)
+            if incoming_keys:
+                store.wait(
+                    incoming_keys,
+                    timedelta(milliseconds=self.metadata_timeout_ms),
+                )
+                remote_metadata = store.multi_get(incoming_keys)
+                consumed_incoming_keys.extend(incoming_keys)
+            else:
+                remote_metadata = []
+            yield [pickle.loads(metadata) for metadata in remote_metadata]
+        finally:
+            for key in consumed_incoming_keys:
+                store.delete_key(key)
+
+    def connect_ranks(self, remote_ranks: List[int], activate: bool = True) -> None:
+        """Exchange peer metadata and optionally activate the connections.
+
+        A peer can be connected while inactive. ``activate=False`` still
+        stages and connects its metadata, so that peer slot is occupied.
+        Masking a rank with ``update_mask_buffer`` changes activity; it does
+        not disconnect the peer. To replace a locally connected peer, first
+        call ``disconnect_ranks`` for that slot. Both peers must then
+        coordinate a fresh metadata exchange with ``connect_ranks``; a newly
+        created replacement has no old local connection to disconnect. A
+        connection prepared with ``activate=False`` can be activated later by
+        calling ``update_mask_buffer(rank, False)``.
+
+        Calls to ``connect_ranks`` and ``disconnect_ranks`` on the same Buffer
+        must be serialized by the caller.
+        """
+        self._require_elastic_runtime()
+        ranks = [int(rank) for rank in remote_ranks if int(rank) != self.rank]
+        if not ranks:
+            return
+        if len(set(ranks)) != len(ranks):
+            raise ValueError("remote_ranks must not contain duplicates.")
+        if any(rank < 0 or rank >= self.group_size for rank in ranks):
+            raise ValueError("remote rank is outside the configured capacity.")
+        self.runtime._validate_connect_ranks(ranks)
+        local_hostname = socket.gethostname()
+        with self._fetch_remote_metadata_from_tcp_store(ranks) as metadata:
+            for rank, (peer_hostname, peer_metadata) in zip(ranks, metadata):
+                peer_metadata = list(peer_metadata)
+                qpns, lids = tuple(peer_metadata[4]), tuple(peer_metadata[5])
+                if qpns or lids:
+                    if (
+                        not qpns
+                        or len(qpns) != len(lids)
+                        or len(qpns) % self.group_size
+                    ):
+                        raise RuntimeError(
+                            "Peer QP/LID metadata has an invalid capacity."
+                        )
+                    qps_per_rank = len(qpns) // self.group_size
+                    start = self.rank * qps_per_rank
+                    stop = start + qps_per_rank
+                    peer_metadata[4] = qpns[start:stop]
+                    peer_metadata[5] = lids[start:stop]
+                if peer_hostname != local_hostname:
+                    peer_metadata[6] = ()
+                self.runtime._stage_peer(rank, *peer_metadata)
+        if activate:
+            for rank in ranks:
+                self.runtime._update_mask_buffer(
+                    rank, False, _native_current_stream_ptr()
+                )
+
+    def disconnect_ranks(self, remote_ranks: List[int]) -> None:
+        self._require_elastic_runtime()
+        ranks = [int(rank) for rank in remote_ranks if int(rank) != self.rank]
+        if not ranks:
+            return
+        if len(set(ranks)) != len(ranks):
+            raise ValueError("remote_ranks must not contain duplicates.")
+        if any(rank < 0 or rank >= self.group_size for rank in ranks):
+            raise ValueError("remote rank is outside the configured capacity.")
+        self.runtime._disconnect_ranks(ranks)
+
+    def update_mask_buffer(self, rank_to_mask: int, mask: bool = False) -> None:
+        self._require_elastic_runtime()
+        if rank_to_mask == self.rank and mask:
+            raise ValueError("The local rank cannot be masked.")
+        if not 0 <= rank_to_mask < self.group_size:
+            raise ValueError("rank_to_mask is outside the configured capacity.")
+        self.runtime._update_mask_buffer(
+            rank_to_mask, mask, _native_current_stream_ptr()
+        )
+
+    def query_mask_buffer(self, mask_status: torch.Tensor) -> None:
+        self._require_elastic_runtime()
+        if (
+            mask_status.dtype != torch.int32
+            or not mask_status.is_contiguous()
+            or mask_status.numel() != self.group_size
+            or mask_status.device != self._active_ranks.device
+        ):
+            raise ValueError("mask_status must be a capacity-sized CUDA int32 tensor.")
+        self.runtime._query_mask_buffer(
+            mask_status.data_ptr(), _native_current_stream_ptr()
+        )
+
+    def clean_mask_buffer(self) -> None:
+        self._require_elastic_runtime()
+        self.runtime._clean_mask_buffer(_native_current_stream_ptr())
+
+    def barrier(self) -> None:
+        self._require_elastic_runtime()
+        self.runtime._barrier(self.timeout_ms * 1000, _native_current_stream_ptr())
+
+    def destroy(self) -> None:
+        self._require_elastic_runtime()
+        assert self.explicitly_destroy, "explicitly_destroy flag must be set"
+        self.runtime.destroy()
+        self.runtime = None
+        self._destroyed = True
+
+    @staticmethod
+    def capture() -> EventOverlap:
+        from mooncake import ep
+
+        return EventOverlap(ep.EventHandle(_native_current_stream_ptr()))
+
+    def get_comm_stream(self) -> torch.Stream:
+        self._require_elastic_runtime()
+        stream_ptr = self.runtime._get_comm_stream()
+        return torch.cuda.ExternalStream(stream_ptr, device=self._active_ranks.device)
+
+    @staticmethod
+    def _tensor_from_native_storage(
+        data_ptr: int,
+        logical_bytes: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        size: Tuple[int, ...],
+        stride: Tuple[int, ...],
+        owner: "Buffer",
+    ) -> torch.Tensor:
+        if data_ptr <= 0 or logical_bytes <= 0:
+            raise RuntimeError("Native buffer returned an invalid memory descriptor.")
+        construct_storage = getattr(
+            torch._C, "_construct_storage_from_data_pointer", None
+        )
+        if construct_storage is None:
+            raise RuntimeError(
+                "This PyTorch build cannot wrap a native buffer without a copy."
+            )
+        storage = construct_storage(data_ptr, device, logical_bytes)
+        tensor = torch.empty(0, dtype=dtype, device=device).set_(
+            storage, 0, size, stride
+        )
+        tensor._mooncake_buffer_owner = owner
+        return tensor
+
+    def get_local_buffer_tensor(
+        self,
+        dtype: torch.dtype,
+        size: Optional[torch.Size] = None,
+        offset: int = 0,
+        use_rdma_buffer: bool = True,
+    ) -> torch.Tensor:
+        """Return a zero-copy RDMA-buffer view.
+
+        ``offset`` is measured in bytes. The view remains valid while this
+        Buffer is alive and has not been destroyed.
+        """
+        self._require_elastic_runtime()
+        if not use_rdma_buffer:
+            raise ValueError("Only the RDMA buffer is supported.")
+        if offset < 0:
+            raise ValueError("offset must be nonnegative.")
+        descriptor = self.runtime._get_local_buffer_descriptor()
+        if len(descriptor) != 2:
+            raise RuntimeError("Native local-buffer descriptor must be (ptr, nbytes).")
+        data_ptr, logical_bytes = (int(value) for value in descriptor)
+        if offset > logical_bytes:
+            raise ValueError("offset exceeds the native RDMA payload.")
+        element_size = torch.empty(0, dtype=dtype).element_size()
+        if offset % element_size:
+            raise ValueError("offset must be aligned to the requested dtype.")
+        data_ptr += offset
+        logical_bytes -= offset
+        if logical_bytes % element_size:
+            raise RuntimeError("Native RDMA payload is not dtype aligned.")
+        if size is None:
+            shape = (logical_bytes // element_size,)
+            strides = (1,)
+        else:
+            shape = tuple(int(dim) for dim in size)
+            if size.numel() > logical_bytes // element_size:
+                raise ValueError("Requested RDMA buffer view exceeds the allocation.")
+            strides_list = [1] * len(shape)
+            for index in range(len(shape) - 2, -1, -1):
+                strides_list[index] = strides_list[index + 1] * shape[index + 1]
+            strides = tuple(strides_list)
+        return self._tensor_from_native_storage(
+            data_ptr,
+            logical_bytes,
+            self._active_ranks.device,
+            dtype,
+            shape,
+            strides,
+            self,
+        )
+
+    @staticmethod
+    def get_low_latency_buffer_size_hint(
+        num_max_dispatch_tokens_per_rank: int,
+        hidden: int,
+        num_ranks: int,
+        num_experts: int,
+    ) -> int:
+        if num_ranks <= 0 or num_experts % num_ranks:
+            raise ValueError("num_experts must divide evenly across rank capacity.")
+        from mooncake import ep
+
+        return ep.get_ep_elastic_buffer_size_hint(
+            num_max_dispatch_tokens_per_rank,
+            hidden,
+            num_ranks,
+            num_experts // num_ranks,
+        )
+
+    @staticmethod
+    def get_rdma_size_hint(
+        num_max_dispatch_tokens_per_rank: int,
+        hidden: int,
+        num_ranks: int,
+        num_experts: int,
+    ) -> int:
+        return Buffer.get_low_latency_buffer_size_hint(
+            num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts
+        )
 
     def _maca_phase_fence(self, send_event: Optional[Any] = None) -> None:
         if not _USE_MACA:
@@ -371,6 +783,12 @@ class Buffer:
     def _active_ranks_tensor(
         self, device: torch.device, dtype: torch.dtype = torch.int32
     ) -> torch.Tensor:
+        if self._is_elastic:
+            if device != self._active_ranks.device or dtype != torch.int32:
+                raise ValueError(
+                    "Elastic active mask must use its fixed CUDA int32 tensor."
+                )
+            return self._active_ranks
         if not self._is_mooncake_backend():
             # XPU builds have no Mooncake PG, so there is nothing to switch to.
             if (
@@ -416,8 +834,76 @@ class Buffer:
             num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts
         )
 
+    def dispatch(self, *args, **kwargs):
+        if self._is_elastic:
+            return self._dispatch_elastic(*args, **kwargs)
+        return self._dispatch_legacy(*args, **kwargs)
+
+    def _dispatch_elastic(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        num_max_dispatch_tokens_per_rank: int,
+        num_experts: Optional[int] = None,
+        cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+        dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None,
+        use_fp8: bool = True,
+        round_scale: bool = False,
+        async_finish: bool = False,
+        return_recv_hook: bool = False,
+    ):
+        self._require_elastic_runtime()
+        if round_scale:
+            raise NotImplementedError(
+                "Mooncake EP does not implement NIXL round_scale."
+            )
+        if dispatch_wait_recv_cost_stats is not None:
+            raise NotImplementedError(
+                "Mooncake EP does not expose dispatch wait-cost statistics."
+            )
+        active_bound = int(self.runtime._get_active_rank_bound())
+        experts_per_rank = self._num_experts_per_rank
+        if num_experts is None:
+            num_experts = active_bound * experts_per_rank
+        elif num_experts % experts_per_rank:
+            raise ValueError("num_experts must be a multiple of experts per rank.")
+        rank_bound = num_experts // experts_per_rank
+        if not active_bound <= rank_bound <= self.group_size:
+            raise ValueError("num_experts is outside the active rank capacity.")
+        if self._active_ranks.device != x.device:
+            raise ValueError("Dispatch input must use the configured rank-mask device.")
+        if cumulative_local_expert_recv_stats is not None:
+            stats = cumulative_local_expert_recv_stats
+            if (
+                stats.dtype != torch.int32
+                or stats.dim() != 1
+                or not stats.is_contiguous()
+                or stats.numel() != experts_per_rank
+                or stats.device != x.device
+            ):
+                raise ValueError(
+                    "cumulative_local_expert_recv_stats must be a contiguous "
+                    "CUDA int32 vector with one value per local expert."
+                )
+        result = self._dispatch_legacy(
+            x,
+            topk_idx,
+            self._active_ranks,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            self.timeout_ms * 1000,
+            use_fp8,
+            async_finish,
+            return_recv_hook,
+            _cumulative_local_expert_recv_stats=(cumulative_local_expert_recv_stats),
+            _rank_bound=rank_bound,
+        )
+        recv_x, recv_count, handle, event, hook = result
+        hook = self._wrap_hook_with_resources(hook, (self, result))
+        return recv_x, recv_count, handle[:4], event, hook
+
     # noinspection PyTypeChecker
-    def dispatch(
+    def _dispatch_legacy(
         self,
         x: torch.Tensor,
         topk_idx: torch.Tensor,
@@ -429,6 +915,9 @@ class Buffer:
         async_finish: bool = False,
         return_recv_hook: bool = False,
         topk_weights: Optional[torch.Tensor] = None,
+        *,
+        _cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+        _rank_bound: Optional[int] = None,
     ) -> Tuple[
         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
         torch.Tensor,
@@ -447,7 +936,20 @@ class Buffer:
         assert x.size(0) == topk_idx.size(0)
         assert x.size(0) <= num_max_dispatch_tokens_per_rank
         assert x.size(1) % 16 == 0 and x.size(1) % 128 == 0
-        assert num_experts % self.group_size == 0
+        elastic = self._is_elastic
+        if elastic:
+            self._require_elastic_runtime()
+            if self._use_fallback:
+                raise RuntimeError("Elastic EP does not use the Python fallback.")
+            if _rank_bound is None or _rank_bound <= 0:
+                raise ValueError("Elastic dispatch requires a positive phase bound.")
+            assert num_experts == _rank_bound * self._num_experts_per_rank
+            num_local_experts = self._num_experts_per_rank
+            rank_bound = _rank_bound
+        else:
+            assert num_experts % self.group_size == 0
+            num_local_experts = num_experts // self.group_size
+            rank_bound = self.group_size
         if topk_weights is not None:
             assert topk_weights.shape == topk_idx.shape
             assert topk_weights.dtype == torch.float32
@@ -459,6 +961,10 @@ class Buffer:
             assert active_ranks.dim() == 1 and active_ranks.is_contiguous()
             assert active_ranks.dtype == torch.int32
             if active_ranks.numel() != self.group_size:
+                if self._is_elastic:
+                    raise ValueError(
+                        "active_ranks length must equal the fixed rank capacity."
+                    )
                 active_ranks = torch.ones(
                     (self.group_size,), dtype=torch.int32, device=x.device
                 )
@@ -513,45 +1019,40 @@ class Buffer:
             ):
                 active_ranks.copy_(backend_active_ranks)
         else:
-            num_local_experts = num_experts // self.group_size
             packed_recv_x = torch.empty(
                 (
                     num_local_experts,
-                    self.group_size * num_max_dispatch_tokens_per_rank,
+                    rank_bound * num_max_dispatch_tokens_per_rank,
                     x.size(1),
                 ),
                 dtype=torch.float8_e4m3fn if use_fp8 else torch.bfloat16,
                 device=x.device,
             )
-            # The dispatch SEND phase resets every local-expert counter before
-            # the RECV phase reads it, so this output need not be pre-cleared.
-            # The legacy kernel accumulates receive offsets with atomicAdd.
-            # Rank 1's local-expert counters are not reset by the send phase,
-            # so they must start from zero on every dispatch.
+            # The kernel clears these too; keep the historical zero-initialization.
             packed_recv_count = torch.zeros(
                 (num_local_experts,), dtype=torch.int32, device=x.device
             )
             packed_recv_src_info = torch.empty(
                 (
                     num_local_experts,
-                    self.group_size * num_max_dispatch_tokens_per_rank,
+                    rank_bound * num_max_dispatch_tokens_per_rank,
                 ),
                 dtype=torch.int32,
                 device=x.device,
             )
             packed_recv_layout_range = torch.empty(
-                (num_local_experts, self.group_size),
+                (num_local_experts, rank_bound),
                 dtype=torch.int64,
                 device=x.device,
             )
             packed_recv_x_scales = None
             if use_fp8:
-                assert (self.group_size * num_max_dispatch_tokens_per_rank) % 4 == 0
+                assert (rank_bound * num_max_dispatch_tokens_per_rank) % 4 == 0
                 packed_recv_x_scales = torch.empty(
                     (
                         num_local_experts,
                         x.size(1) // 128,
-                        self.group_size * num_max_dispatch_tokens_per_rank,
+                        rank_bound * num_max_dispatch_tokens_per_rank,
                     ),
                     dtype=torch.float32,
                     device=x.device,
@@ -570,7 +1071,7 @@ class Buffer:
                     0 if topk_weights is None else topk_weights.data_ptr(),
                     topk_weights is not None,
                 )
-            event, hook = self.runtime.dispatch(
+            native_dispatch_args = (
                 x.data_ptr(),
                 topk_idx.data_ptr(),
                 active_ranks.data_ptr(),
@@ -589,8 +1090,16 @@ class Buffer:
                 native_async_finish,
                 runtime_return_recv_hook,
                 _native_current_stream_ptr(),
-                *native_weights,
             )
+            native_dispatch_args += native_weights
+            if (
+                self.device_type != "xpu"
+                and _cumulative_local_expert_recv_stats is not None
+            ):
+                native_dispatch_args += (
+                    _cumulative_local_expert_recv_stats.data_ptr(),
+                )
+            event, hook = self.runtime.dispatch(*native_dispatch_args)
             if _USE_SPLIT_SEND_RECV:
                 hook = self._wrap_maca_recv_hook(hook, event)
                 if not return_recv_hook:
@@ -612,6 +1121,7 @@ class Buffer:
             packed_recv_count,
             packed_recv_src_info,
             packed_recv_layout_range,
+            _cumulative_local_expert_recv_stats,
         )
         return (
             (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x,
@@ -623,8 +1133,72 @@ class Buffer:
             hook,
         )
 
+    def combine(self, *args, **kwargs):
+        if self._is_elastic:
+            return self._combine_elastic(*args, **kwargs)
+        return self._combine_legacy(*args, **kwargs)
+
+    def _combine_elastic(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        handle: tuple,
+        use_logfmt: bool = False,
+        zero_copy: bool = False,
+        async_finish: bool = False,
+        return_recv_hook: bool = False,
+        out: Optional[torch.Tensor] = None,
+        combine_wait_recv_cost_stats: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
+        if zero_copy:
+            raise NotImplementedError(_ZERO_COPY_COMBINE_UNSUPPORTED)
+        self._require_elastic_runtime()
+        if use_logfmt:
+            raise NotImplementedError(
+                "Mooncake EP does not implement the NIXL LogFMT combine format."
+            )
+        if combine_wait_recv_cost_stats is not None:
+            raise NotImplementedError(
+                "Mooncake EP does not expose combine wait-cost statistics."
+            )
+        if len(handle) != 4:
+            raise ValueError("Elastic dispatch handle must contain four items.")
+        src_info, layout_range, max_tokens, hidden = handle
+        if layout_range.dim() != 2 or not layout_range.is_contiguous():
+            raise ValueError("layout_range must be a contiguous rank-by-expert matrix.")
+        rank_bound = layout_range.size(1)
+        active_bound = int(self.runtime._get_active_rank_bound())
+        experts_per_rank = self._num_experts_per_rank
+        if not active_bound <= rank_bound <= self.group_size:
+            raise ValueError("Dispatch handle rank bound is outside active capacity.")
+        if self._active_ranks.device != x.device:
+            raise ValueError("Combine input must use the configured rank-mask device.")
+        legacy_handle = (
+            src_info,
+            layout_range,
+            max_tokens,
+            hidden,
+            rank_bound * experts_per_rank,
+        )
+        result = self._combine_legacy(
+            x,
+            topk_idx,
+            topk_weights,
+            self._active_ranks,
+            self.timeout_ms * 1000,
+            legacy_handle,
+            zero_copy=zero_copy,
+            async_finish=async_finish,
+            return_recv_hook=return_recv_hook,
+            out=out,
+        )
+        combined_x, event, hook = result
+        hook = self._wrap_hook_with_resources(hook, (self, result))
+        return combined_x, event, hook
+
     # noinspection PyTypeChecker
-    def combine(
+    def _combine_legacy(
         self,
         x: torch.Tensor,
         topk_idx: torch.Tensor,
@@ -639,12 +1213,17 @@ class Buffer:
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
         if zero_copy:
             raise NotImplementedError(_ZERO_COPY_COMBINE_UNSUPPORTED)
+        elastic = self._is_elastic
 
         if _USE_MACA:
             assert not (
                 async_finish and return_recv_hook
             ), "MACA does not support async_finish and return_recv_hook together"
 
+        if elastic:
+            self._require_elastic_runtime()
+            if self._use_fallback:
+                raise RuntimeError("Elastic EP does not use the Python fallback.")
         assert x.dim() == 3 and x.is_contiguous()
         assert x.dtype == torch.bfloat16
         assert topk_idx.dim() == 2 and topk_idx.is_contiguous()
@@ -658,6 +1237,10 @@ class Buffer:
             assert active_ranks.dim() == 1 and active_ranks.is_contiguous()
             assert active_ranks.dtype == torch.int32
             if active_ranks.numel() != self.group_size:
+                if self._is_elastic:
+                    raise ValueError(
+                        "active_ranks length must equal the fixed rank capacity."
+                    )
                 active_ranks = torch.ones(
                     (self.group_size,), dtype=torch.int32, device=x.device
                 )
@@ -679,6 +1262,10 @@ class Buffer:
             hidden,
             num_experts,
         ) = handle
+        rank_bound = layout_range.size(1) if elastic else self.group_size
+        num_local_experts = (
+            self._num_experts_per_rank if elastic else num_experts // self.group_size
+        )
         runtime_return_recv_hook = return_recv_hook or (
             _USE_SPLIT_SEND_RECV and not self._use_fallback
         )
@@ -705,8 +1292,8 @@ class Buffer:
             ):
                 active_ranks.copy_(backend_active_ranks)
         else:
-            assert x.size(0) == num_experts // self.group_size
-            assert x.size(1) == self.group_size * num_max_dispatch_tokens_per_rank
+            assert x.size(0) == num_local_experts
+            assert x.size(1) == rank_bound * num_max_dispatch_tokens_per_rank
             assert x.size(2) == hidden
             assert x.size(2) % 16 == 0 and x.size(2) % 128 == 0
             assert topk_idx.size() == topk_weights.size()
@@ -716,8 +1303,8 @@ class Buffer:
             assert src_info.size(0) == x.size(0)
             assert layout_range.dim() == 2 and layout_range.is_contiguous()
             assert layout_range.dtype == torch.int64
-            assert layout_range.size(0) == num_experts // self.group_size
-            assert layout_range.size(1) == self.group_size
+            assert layout_range.size(0) == num_local_experts
+            assert layout_range.size(1) == rank_bound
             combined_x = (
                 out
                 if out is not None

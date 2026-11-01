@@ -448,7 +448,9 @@ if(TARGET tent_xport_gds)
     "-Wl,--wrap=cuFileBatchIOCancel"
     "-Wl,--wrap=cuFileBatchIOSubmit"
     "-Wl,--wrap=cuFileHandleRegister"
-    "-Wl,--wrap=cuFileHandleDeregister")
+    "-Wl,--wrap=cuFileHandleDeregister"
+    "-Wl,--wrap=cuFileBufRegister"
+    "-Wl,--wrap=cuFileBufDeregister")
   target_include_directories(tent_gds_transport_status_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_gds_transport_status_test
@@ -798,6 +800,18 @@ if(USE_XPU)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_xpu_ipc_process_test COMMAND tent_xpu_ipc_process_test)
   set_tests_properties(tent_xpu_ipc_process_test PROPERTIES TIMEOUT 300)
+
+  # XPU <-> file through GDS on the cuFile-compatible library. Skips unless
+  # MC_TENT_XPU_GDS_DIR names a directory on a file system the library supports.
+  if(USE_XPU_GDS)
+    add_executable(tent_xpu_gds_file_test xpu/xpu_gds_file_test.cpp)
+    target_link_libraries(tent_xpu_gds_file_test PRIVATE gtest gtest_main
+                                                         tent_link_group)
+    target_include_directories(tent_xpu_gds_file_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    add_test(NAME tent_xpu_gds_file_test COMMAND tent_xpu_gds_file_test)
+    set_tests_properties(tent_xpu_gds_file_test PROPERTIES TIMEOUT 300)
+  endif()
 endif()
 
 # NOT registered via add_test: the test needs a real CUDA device (it exports a

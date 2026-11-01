@@ -26,6 +26,11 @@ struct RegistrationResult {
 struct BlockPresence {
     std::set<EngineOwner> device_owners;
     std::set<EngineOwner> cpu_local_owners;
+    // vLLM CPU-tier store announcements per owner. vLLM's offloading
+    // connector re-announces a hash once per chunk that contains it and fans a
+    // chunk eviction out to all of the chunk's hashes, so an owner leaves
+    // cpu_local_owners only when its last announcement is removed.
+    std::map<EngineOwner, uint32_t> cpu_local_refs;
     std::set<SharedObjectOwner> cpu_share_owners;
     std::set<TierOwner> disk_owners;
 
@@ -35,7 +40,8 @@ struct BlockPresence {
     }
 };
 
-// Maximum number of prefixes tracked for each context.
+// Default maximum number of prefixes tracked for each context; the service
+// configuration (max_blocks_per_context) may override it.
 constexpr size_t kDefaultMaxBlocks = 200000;
 // Target occupancy ratio for a batched capacity eviction.
 constexpr double kEvictTargetRatio = 0.9;
@@ -50,6 +56,8 @@ struct ContextState {
     mutable std::shared_mutex mutex;
     const HashProfile profile;
     std::map<std::string, std::set<int64_t>> instance_ranks;
+    std::map<std::string, std::map<int64_t, common::PublisherKind>>
+        instance_publishers;
     std::unordered_map<ProjectedPrefix, BlockPresence> blocks;
 
     // Store order: newest prefix at the front, oldest at the back. Query does
@@ -135,7 +143,7 @@ class PrefixCacheTable {
 
     mutable std::shared_mutex context_map_mutex_;
     std::unordered_map<ContextKey, std::shared_ptr<ContextState>> contexts_;
-    // Fixed for production; tests may set it before any context is registered.
+    // Set at construction and copied into each context when it is registered.
     size_t block_limit_ = kDefaultMaxBlocks;
 };
 

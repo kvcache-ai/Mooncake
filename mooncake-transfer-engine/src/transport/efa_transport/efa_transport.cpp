@@ -29,10 +29,12 @@
 #include <thread>
 
 #include <dlfcn.h>
+#include <infiniband/verbs.h>
 
 #include "common.h"
 #include "config.h"
 #include "memory_location.h"
+#include "transport/efa_transport/efa_discovery.h"
 #include "transport/efa_transport/efa_neuron.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
@@ -226,12 +228,11 @@ int EfaTransport::registerLocalMemory(void* addr, size_t length,
 int EfaTransport::registerLocalMemoryInternal(
     void* addr, size_t length, const std::string& name, bool remote_accessible,
     bool update_metadata, bool force_sequential, ThpPlan thp_plan) {
-    (void)remote_accessible;
-    const int kBaseAccessRights = IBV_ACCESS_LOCAL_WRITE |
-                                  IBV_ACCESS_REMOTE_WRITE |
-                                  IBV_ACCESS_REMOTE_READ;
-
-    int access_rights = kBaseAccessRights;
+    // Like RdmaTransport: a buffer that is not remote-accessible gets an MR
+    // without remote rights and publishes no rkey, so peers cannot target it.
+    int access_rights = IBV_ACCESS_LOCAL_WRITE;
+    if (remote_accessible)
+        access_rights |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
     size_t max_mr = (size_t)globalConfig().max_mr_size;
 
     // Compute chunk limit based on EFA PTE (page table entry) constraints.
@@ -338,16 +339,22 @@ int EfaTransport::registerLocalMemoryInternal(
     bool use_full_coverage = (total_pages_per_nic <= getMaxPteEntries()) &&
                              thp_plan != ThpPlan::kThpPartitioned;
 
-    // Optionally narrow a single-chunk DEVICE buffer to the NICs the topology
-    // reports as closest to its GPU. See buildLocalNicMap() for where the set
-    // comes from, and the MC_EFA_NIC_SELECTION docs for the trade-off: fewer
-    // NICs can serve a transfer touching this buffer, so this is registration
-    // time bought with potential per-buffer bandwidth, not a free win.
+    // Narrow a single-chunk DEVICE buffer to the NICs the topology reports as
+    // closest to its GPU (MC_EFA_NIC_SELECTION=local, the default). See
+    // buildLocalNicMap() for where the set comes from. Steady-state bandwidth
+    // is unchanged: Topology::selectDevice() picks only from preferred_hca on
+    // a first attempt, which is exactly this set, so keys on the other NICs
+    // are used only by retries. What `local` gives up is retrying a device
+    // buffer over a non-local NIC; MC_EFA_NIC_SELECTION=all restores that.
     //
     // Registering one buffer on N NICs costs ~N times one registration, and for
     // device memory the per-domain accumulation described above is paid once
     // per domain, so the two multiply. Measured on p5.48xlarge, 48 x 391 MB GPU
     // buffers registered serially: 123.7 s on 32 NICs, 17.6 s on 4, 4.4 s on 1.
+    // On p6-b300.48xlarge (16 NICs, 2 per GPU) with vLLM TP8 registering its KV
+    // cache, the slowest rank took 274 s on all NICs and 9 s on its local pair,
+    // while GPU-to-GPU bandwidth was unchanged (8 GPUs: ~762 GB/s write either
+    // way; 1 GPU: ~95 GB/s either way, i.e. its two local NICs).
     //
     // Host memory is deliberately excluded. It has no accumulation to amplify,
     // it is ~4x cheaper to register in the first place, and a host buffer has
@@ -576,11 +583,23 @@ int EfaTransport::registerLocalMemoryInternal(
                       << ", duration=" << reg_duration_ms << "ms";
         }
 
-        // Collect keys: assigned NICs have valid keys, others get 0
+        // Collect keys: assigned NICs have valid keys, others get 0.
+        // On EFA lkey() and rkey() are the same fi_mr_key(), and the segment
+        // descriptor (lkeys included) goes to every peer that opens it. So a
+        // buffer without remote_accessible publishes only a non-zero
+        // placeholder lkey: the post path takes the local MR from mrDesc(),
+        // and selectDevice() only checks which NICs hold a non-zero key.
+        // Libfabric before 2.6 registers every EFA MR with remote access
+        // whatever fi_mr_reg is asked for, so the real key must not leak.
         BufferDesc buffer_desc;
         for (auto& context : context_list_) {
-            buffer_desc.lkey.push_back(context->lkey(chunk_addr));
-            buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+            uint64_t key = context->lkey(chunk_addr);
+            if (remote_accessible) {
+                buffer_desc.lkey.push_back(key);
+                buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+            } else {
+                buffer_desc.lkey.push_back(key ? kLocalOnlyKey : 0);
+            }
         }
 
         buffer_desc.name = resolved_name;
@@ -1039,6 +1058,7 @@ Status EfaTransport::submitTransferTask(
         slices_to_post;
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
         target_segment_descs;
+    std::unordered_set<SegmentID> refreshed_targets;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     assert(local_segment_desc.get());
     const int kMaxRetryCount = globalConfig().retry_cnt;
@@ -1069,6 +1089,21 @@ Status EfaTransport::submitTransferTask(
                              metadata_->getSegmentDescByID(request.target_id))
                     .first;
         }
+        // The cached descriptor can predate buffers the peer registered since,
+        // e.g. a Store client that mounts its segment in several chunks and
+        // takes traffic for the first ones while it registers the rest. Fetch
+        // it again, once per target in this call, when it does not cover the
+        // destination.
+        size_t probe_idx = SIZE_MAX;
+        if (!refreshed_targets.count(request.target_id) &&
+            efaBytesUntilChunkEnd(
+                target_desc_it->second.get(), request.target_offset,
+                /*require_remote_key=*/true, probe_idx) == 0) {
+            refreshed_targets.insert(request.target_id);
+            auto fresh = metadata_->getSegmentDescByID(request.target_id,
+                                                       /*force_update=*/true);
+            if (fresh) target_desc_it->second = std::move(fresh);
+        }
         const auto& target_segment_desc = target_desc_it->second;
 
         // Find which buffer and preferred device covers this request.  This can
@@ -1077,15 +1112,16 @@ Status EfaTransport::submitTransferTask(
         // per-slice selection in the loop below.
         int request_buffer_id = -1, request_device_id = -1;
         if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
-                         request.length, request_buffer_id,
-                         request_device_id)) {
+                         request.length, request_buffer_id, request_device_id,
+                         0,
+                         /*require_remote_key=*/false)) {
             request_buffer_id = -1;
             request_device_id = -1;
         }
         // selectDevice() returns an index into the HCA space and validates it
-        // against buffer.rkey only, so bound it before indexing context_list_.
-        // Dropping to the retry path is the right recovery: it re-selects, and
-        // its own check covers context_list_ as well.
+        // against the buffer keys only, so bound it before indexing
+        // context_list_. Dropping to the retry path is the right recovery: it
+        // re-selects, and its own check covers context_list_ as well.
         if (request_device_id >= 0 &&
             (static_cast<size_t>(request_device_id) >= context_list_.size() ||
              !context_list_[request_device_id] ||
@@ -1115,7 +1151,8 @@ Status EfaTransport::submitTransferTask(
             while (retry_cnt < kMaxRetryCount && !found_device) {
                 if (selectDevice(local_segment_desc.get(),
                                  (uint64_t)source_addr, slice_length, buffer_id,
-                                 device_id, retry_cnt++))
+                                 device_id, retry_cnt++,
+                                 /*require_remote_key=*/false))
                     continue;
                 if (device_id >= 0 &&
                     static_cast<size_t>(device_id) < context_list_.size() &&
@@ -1251,6 +1288,82 @@ int EfaTransport::onSetupEfaConnections(const HandShakeDesc& peer_desc,
     return endpoint->setupConnectionsByPassive(peer_desc, local_desc);
 }
 
+// EFA devices come from libfabric, or from libibverbs if libfabric cannot be
+// loaded (see Topology::discover). Both share the libibverbs that this process
+// loaded first, so fi_info in another shell can list devices this process
+// cannot see. Say which libraries this process uses.
+static void logNoEfaDevices(const std::vector<std::string>& hca_list) {
+    std::string devices;
+    for (const auto& name : hca_list) {
+        devices += (devices.empty() ? "" : ",") + name;
+    }
+    std::vector<EfaNic> nics;
+    std::string error;
+    if (listEfaNics(nics, &error) && !nics.empty()) {
+        std::string names;
+        for (const auto& nic : nics) {
+            names += (names.empty() ? "" : ",") + nic.name;
+        }
+        LOG(ERROR)
+            << "EfaTransport: no EFA devices selected. libfabric offers ["
+            << names << "], but the device filter (MC_TE_FILTERS or "
+            << "the configured device names) excludes them; other "
+            << "devices: [" << devices << "]";
+        return;
+    }
+    std::string verbs = loadedLibibverbsPath();
+    LOG(ERROR) << "EfaTransport: no EFA devices found. Other devices: ["
+               << devices << "]; libfabric: "
+               << (error.empty() ? std::string("no EFA NICs")
+                                 : "unavailable (" + error + ")")
+               << "; libibverbs: " << (verbs.empty() ? "unknown" : verbs)
+               << ". If fi_info lists EFA devices in another shell, that "
+                  "shell uses a different libibverbs or provider set: install "
+                  "the EFA verbs provider (libefa) for this libibverbs, or put "
+                  "the libibverbs that libfabric uses first on "
+                  "LD_LIBRARY_PATH.";
+}
+
+// libfabric does not expose the device's maximum MR size, so query it through
+// libibverbs when the device is visible there. Otherwise assume the smallest
+// limit measured on EFA devices (192 GiB on 0xefa2; 0xefa3 allows 384 GiB),
+// so that large registrations are split rather than rejected. An explicit
+// MC_MAX_MR_SIZE is kept.
+static void clampMaxMrSize(const std::string& device_name) {
+    constexpr uint64_t kSmallestEfaMaxMrSize = 192ull << 30;
+    auto& config = globalConfig();
+    uint64_t device_limit = 0;
+    int num_devices = 0;
+    struct ibv_device** dev_list = ibv_get_device_list(&num_devices);
+    for (int i = 0; dev_list && i < num_devices; ++i) {
+        if (device_name != ibv_get_device_name(dev_list[i])) continue;
+        struct ibv_context* ctx = ibv_open_device(dev_list[i]);
+        if (ctx) {
+            struct ibv_device_attr attr;
+            if (ibv_query_device(ctx, &attr) == 0) {
+                device_limit = attr.max_mr_size;
+            }
+            ibv_close_device(ctx);
+        }
+        break;
+    }
+    if (dev_list) ibv_free_device_list(dev_list);
+
+    if (device_limit == 0) {
+        if (std::getenv("MC_MAX_MR_SIZE")) return;
+        device_limit = kSmallestEfaMaxMrSize;
+        LOG(WARNING) << "EfaTransport: cannot query max_mr_size of "
+                     << device_name << " through libibverbs; assuming "
+                     << device_limit
+                     << " bytes. Set MC_MAX_MR_SIZE to override.";
+    }
+    if (config.max_mr_size > device_limit) {
+        config.max_mr_size = device_limit;
+        LOG(INFO) << "EfaTransport: Clamped max_mr_size to device limit: "
+                  << config.max_mr_size;
+    }
+}
+
 int EfaTransport::initializeEfaResources() {
     auto hca_list = local_topology_->getHcaList();
 
@@ -1267,10 +1380,8 @@ int EfaTransport::initializeEfaResources() {
     }
 
     if (efa_devices.empty()) {
-        LOG(WARNING) << "EfaTransport: No EFA devices found, falling back to "
-                        "all devices";
-        efa_devices = hca_list;
-        non_efa_devices.clear();
+        logNoEfaDevices(hca_list);
+        return ERR_DEVICE_NOT_FOUND;
     }
 
     // Disable non-EFA devices (e.g. ibp* IB devices) in the topology so that
@@ -1298,7 +1409,7 @@ int EfaTransport::initializeEfaResources() {
         }
     }
     if (context_list_.empty()) {
-        LOG(ERROR) << "EfaTransport: No available EFA devices";
+        LOG(ERROR) << "EfaTransport: none of the EFA devices could be opened";
         return ERR_DEVICE_NOT_FOUND;
     }
 
@@ -1325,37 +1436,7 @@ int EfaTransport::initializeEfaResources() {
         }
     }
 
-    // Query EFA device max_mr_size via ibverbs and clamp globalConfig.
-    // libfabric does not expose max_mr_size, so we go through the ibverbs
-    // layer.
-    {
-        int num_devices = 0;
-        struct ibv_device** dev_list = ibv_get_device_list(&num_devices);
-        if (dev_list) {
-            const std::string& first_efa = efa_devices[0];
-            for (int i = 0; i < num_devices; ++i) {
-                if (first_efa == ibv_get_device_name(dev_list[i])) {
-                    struct ibv_context* ctx = ibv_open_device(dev_list[i]);
-                    if (ctx) {
-                        struct ibv_device_attr attr;
-                        if (ibv_query_device(ctx, &attr) == 0) {
-                            auto& config = globalConfig();
-                            if (config.max_mr_size >
-                                (uint64_t)attr.max_mr_size) {
-                                config.max_mr_size = attr.max_mr_size;
-                                LOG(INFO) << "EfaTransport: Clamped "
-                                             "max_mr_size to device limit: "
-                                          << config.max_mr_size;
-                            }
-                        }
-                        ibv_close_device(ctx);
-                    }
-                    break;
-                }
-            }
-            ibv_free_device_list(dev_list);
-        }
-    }
+    clampMaxMrSize(efa_devices[0]);
 
     return 0;
 }
@@ -1369,13 +1450,16 @@ int EfaTransport::startHandshakeDaemon(std::string& local_server_name) {
 
 int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
                                size_t length, std::string_view hint,
-                               int& buffer_id, int& device_id,
-                               int retry_count) {
+                               int& buffer_id, int& device_id, int retry_count,
+                               bool require_remote_key) {
     if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
     const auto& buffers = desc->buffers;
     for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size());
          ++buffer_id) {
         const auto& buffer = buffers[buffer_id];
+        // A peer's buffer must carry an rkey; a local one only an lkey (buffers
+        // registered without remote_accessible publish no rkey).
+        const auto& keys = require_remote_key ? buffer.rkey : buffer.lkey;
 
         if (offset < buffer.addr || length > buffer.length ||
             offset - buffer.addr > buffer.length - length) {
@@ -1384,7 +1468,7 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
 
         // Try multiple attempts to find a device with valid MR registration.
         // With per-NIC partition, not all devices have all buffers registered,
-        // so rkey[device_id] may be 0 for unassigned NICs.
+        // so the key for an unassigned NIC is 0.
         // Topology::selectDevice() draws a random preferred HCA for try 0 and
         // returns entry (try - 1) of preferred + available for try > 0, so
         // num_devices + 1 attempts are needed for the deterministic part of the
@@ -1397,8 +1481,8 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
                     ? desc->topology.selectDevice(buffer.name, try_count)
                     : desc->topology.selectDevice(buffer.name, hint, try_count);
             if (device_id >= 0 &&
-                static_cast<size_t>(device_id) < buffer.rkey.size() &&
-                buffer.rkey[device_id] != 0) {
+                static_cast<size_t>(device_id) < keys.size() &&
+                keys[device_id] != 0) {
                 return 0;
             }
             device_id = hint.empty() ? desc->topology.selectDevice(
@@ -1406,8 +1490,8 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
                                      : desc->topology.selectDevice(
                                            kWildcardLocation, hint, try_count);
             if (device_id >= 0 &&
-                static_cast<size_t>(device_id) < buffer.rkey.size() &&
-                buffer.rkey[device_id] != 0) {
+                static_cast<size_t>(device_id) < keys.size() &&
+                keys[device_id] != 0) {
                 return 0;
             }
         }
@@ -1418,11 +1502,11 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
         // the rest. Under the disjoint per-NIC partition a chunk is registered
         // on a single NIC, so a miss fails a transfer that a registered NIC
         // could serve. Fall back to any NIC that holds a key for this buffer.
-        const size_t num_keys = buffer.rkey.size();
+        const size_t num_keys = keys.size();
         for (size_t i = 0; i < num_keys; ++i) {
             const size_t candidate =
                 (static_cast<size_t>(retry_count) + i) % num_keys;
-            if (buffer.rkey[candidate] != 0) {
+            if (keys[candidate] != 0) {
                 device_id = static_cast<int>(candidate);
                 LOG_EVERY_N(WARNING, 1000)
                     << "selectDevice: topology walk found no keyed NIC for "
@@ -1439,9 +1523,9 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
 
 int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
                                size_t length, int& buffer_id, int& device_id,
-                               int retry_count) {
+                               int retry_count, bool require_remote_key) {
     return selectDevice(desc, offset, length, "", buffer_id, device_id,
-                        retry_count);
+                        retry_count, require_remote_key);
 }
 
 }  // namespace mooncake

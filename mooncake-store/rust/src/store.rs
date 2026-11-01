@@ -567,6 +567,140 @@ impl MooncakeStore {
         Ok(results)
     }
 
+    // -----------------------------------------------------------------------
+    // Multi-buffer batch operations
+    // -----------------------------------------------------------------------
+
+    /// Store one object per key from several registered buffers each: the
+    /// value of `keys[i]` is the bytes of `buffers[i]`'s `(pointer, size)`
+    /// pairs in order (a KV block's per-layer slices, say).
+    ///
+    /// Returns a `Vec<i32>` where each element is the result code for the
+    /// corresponding key (0 = success, non-zero = error).
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as `put_from`: each buffer must be registered.
+    pub unsafe fn batch_put_from_multi_buffers(
+        &self,
+        keys: &[&str],
+        buffers: &[&[(*mut c_void, usize)]],
+        config: Option<&ReplicateConfig>,
+    ) -> Result<Vec<i32>, StoreError> {
+        let count = keys.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let (_key_strings, key_ptrs, flat, sizes, counts) = Self::flatten(keys, buffers)?;
+
+        let (_c_config, _strings, _ptrs) = Self::prepare_config(config)?;
+        let cfg_ptr = _c_config
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c as *const _);
+
+        let mut results = vec![0i32; count];
+
+        let rc = ffi::mooncake_store_batch_put_from_multi_buffers(
+            self.handle,
+            key_ptrs.as_ptr() as *mut *const libc::c_char,
+            flat.as_ptr() as *mut *mut c_void,
+            sizes.as_ptr(),
+            counts.as_ptr(),
+            count,
+            cfg_ptr,
+            results.as_mut_ptr(),
+        );
+
+        if rc != 0 {
+            return Err(StoreError::OperationFailed(rc));
+        }
+
+        Ok(results)
+    }
+
+    /// Retrieve one object per key into several registered buffers each,
+    /// filled in order; `prefer_alloc_in_same_node` sends the buffers of a
+    /// key that live in one segment as one transfer.
+    ///
+    /// Returns a `Vec<i64>` where each element is the number of bytes written
+    /// for the key (≥ 0, the sum of its buffers' sizes) or an error code
+    /// (< 0).
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as `get_into`: each buffer must be registered
+    /// and writable for its size.
+    pub unsafe fn batch_get_into_multi_buffers(
+        &self,
+        keys: &[&str],
+        buffers: &[&[(*mut c_void, usize)]],
+        prefer_alloc_in_same_node: bool,
+    ) -> Result<Vec<i64>, StoreError> {
+        let count = keys.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let (_key_strings, key_ptrs, flat, sizes, counts) = Self::flatten(keys, buffers)?;
+
+        let mut results = vec![0i64; count];
+
+        let rc = ffi::mooncake_store_batch_get_into_multi_buffers(
+            self.handle,
+            key_ptrs.as_ptr() as *mut *const libc::c_char,
+            flat.as_ptr() as *mut *mut c_void,
+            sizes.as_ptr(),
+            counts.as_ptr(),
+            count,
+            prefer_alloc_in_same_node as libc::c_int,
+            results.as_mut_ptr(),
+        );
+
+        if rc != 0 {
+            return Err(StoreError::OperationFailed(rc));
+        }
+
+        Ok(results)
+    }
+
+    /// The flat arrays the multi-buffer C functions take: the keys as C
+    /// strings (kept alive by the first element), every key's buffers and
+    /// sizes back to back, and how many each key owns.
+    #[allow(clippy::type_complexity)]
+    fn flatten(
+        keys: &[&str],
+        buffers: &[&[(*mut c_void, usize)]],
+    ) -> Result<
+        (
+            Vec<CString>,
+            Vec<*const libc::c_char>,
+            Vec<*mut c_void>,
+            Vec<usize>,
+            Vec<usize>,
+        ),
+        StoreError,
+    > {
+        if buffers.len() != keys.len() {
+            return Err(StoreError::InvalidArgument(
+                "keys and buffers must have the same length".to_string(),
+            ));
+        }
+        let key_strings: Vec<CString> = keys
+            .iter()
+            .map(|k| CString::new(*k))
+            .collect::<Result<_, _>>()?;
+        let key_ptrs: Vec<*const libc::c_char> = key_strings.iter().map(|s| s.as_ptr()).collect();
+        let flat: Vec<*mut c_void> = buffers
+            .iter()
+            .flat_map(|b| b.iter().map(|&(p, _)| p))
+            .collect();
+        let sizes: Vec<usize> = buffers
+            .iter()
+            .flat_map(|b| b.iter().map(|&(_, n)| n))
+            .collect();
+        let counts: Vec<usize> = buffers.iter().map(|b| b.len()).collect();
+        Ok((key_strings, key_ptrs, flat, sizes, counts))
+    }
+
     /// Batch check existence of multiple keys.
     pub fn batch_is_exist(&self, keys: &[&str]) -> Result<Vec<bool>, StoreError> {
         let count = keys.len();

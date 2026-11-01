@@ -39,6 +39,12 @@ enum class EfaNicSelection {
     LOCAL = 1,  // device memory only on that GPU's topology-local NICs
 };
 
+enum class HipKfdPinFix {
+    OFF = 0,    // never hold a KFD pin anchor
+    PROBE = 1,  // hold anchors if a probe shows the driver needs them
+    FORCE = 2,  // hold anchors without probing
+};
+
 struct GlobalConfig {
     size_t num_cq_per_ctx = 1;
     size_t num_comp_channels_per_ctx = 1;
@@ -118,6 +124,16 @@ struct GlobalConfig {
     // MC_EFA_CQ_DRAIN_TIMEOUT_MS; <= 0 waits forever (the stalled-wave escape
     // hatch still bounds a provider that refuses every post).
     int64_t efa_cq_drain_timeout_ms = 1000;
+    // Minimum wall time, in milliseconds, that EfaContext::submitSlicesOnPeer
+    // must see unbroken FI_EAGAIN waves before it gives up on a peer.  The
+    // wave count alone (kMaxStalledWaves) passes in microseconds when the
+    // provider is merely busy -- many submitters on one NIC, or the RDM
+    // handshake to a new peer still in flight -- and fails live transfers.
+    // The default matches efa_cq_drain_timeout_ms: on a fresh cross-host
+    // connection the first completions take 50-100 ms, so a floor much below
+    // that still fails healthy peers.  Override with MC_EFA_STALL_MIN_MS;
+    // <= 0 restores the count-only check.
+    int64_t efa_stall_min_ms = 1000;
     // Context-level circuit-breaker pause. Repeated local WC failures
     // deactivate the local RNIC context for this many milliseconds. The
     // monitor then reactivates it with a reset failure count. Must be positive
@@ -139,16 +155,19 @@ struct GlobalConfig {
     // MC_MAX_CONCURRENT_REG_MR; the best value is platform-specific, see the
     // measured tables in efa_transport.cpp before choosing one.
     size_t max_concurrent_reg_mr = 0;
-    // Which NICs a buffer is registered on in the EFA transport. ALL (default)
-    // registers every buffer on every NIC; LOCAL restricts device memory to the
-    // NICs the topology reports as closest to that GPU. Set via
+    // Which NICs a buffer is registered on in the EFA transport. LOCAL
+    // (default) restricts device memory to the NICs the topology reports as
+    // closest to that GPU -- the only NICs selectDevice() picks for it on a
+    // first attempt anyway; ALL registers every buffer on every NIC. Host
+    // memory is always registered on every NIC. Set via
     // MC_EFA_NIC_SELECTION=all|local; see efa_transport.cpp for the trade-off.
-    EfaNicSelection efa_nic_selection = EfaNicSelection::ALL;
+    EfaNicSelection efa_nic_selection = EfaNicSelection::LOCAL;
     // Cap on EFA CQ poller threads. Set via MC_EFA_CQ_THREADS; 0 disables the
     // cap.
     int efa_cq_threads = 1;
     // Register GPU memory with ibv_reg_mr() through the nvidia-peermem kernel
-    // module instead of exporting a dma_buf. Set via WITH_NVIDIA_PEERMEM.
+    // module instead of exporting a dma_buf. loadGlobalConfig() sets it to
+    // whether a peer-memory module is loaded; WITH_NVIDIA_PEERMEM overrides.
     bool with_nvidia_peermem = true;
     // Register dma_buf MRs with mlx5 Data Direct. Set via MC_RDMA_DATA_DIRECT.
     bool rdma_data_direct = false;
@@ -159,6 +178,10 @@ struct GlobalConfig {
     // memory). Set via MC_RDMA_DATA_DIRECT_PAIRING; requires
     // MC_RDMA_DATA_DIRECT.
     bool rdma_data_direct_pairing = false;
+    // Hold one peer-memory pin per HIP allocation registered through dma-buf
+    // so that amdgpu before 6.19.14 does not charge it to KFD free VRAM twice.
+    // Set via MC_HIP_KFD_PIN_FIX=0|1|force.
+    HipKfdPinFix hip_kfd_pin_fix = HipKfdPinFix::PROBE;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;

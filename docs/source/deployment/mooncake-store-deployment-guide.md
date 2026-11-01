@@ -43,6 +43,8 @@ Master service started on port 50051, max_threads=4, ...
 
 The master's default RPC port is `50051`. (To embed an HTTP metadata server instead of using P2P, add `--enable_http_metadata_server=true --http_metadata_server_port=8080`.)
 
+When the metadata backend is the Python HTTP server (`python -m mooncake.http_metadata_server`, the `http://host:8080/metadata` conn strings in this guide), it answers unauthenticated GET/PUT/DELETE on the bind address. Use `--host 127.0.0.1` for a single-host setup. Anywhere beyond a single trusted host, set `MC_METADATA_HTTP_TOKEN` on the server and on every engine: the server then requires `Authorization: Bearer <token>` on each metadata request, and the Transfer Engine's HTTP storage plugin attaches the same token automatically. A server asked to bind a non-loopback address with no token refuses to start; on a trusted network you can export `MC_METADATA_HTTP_ALLOW_INSECURE=1` to keep the legacy open behavior (it still logs a loud startup warning). Its in-memory store is capped by `MC_METADATA_MAX_KEYS` and `MC_METADATA_MAX_TOTAL_BYTES` (64K entries and 1 GiB by default), with the byte total covering UTF-8 key bytes and value bytes but not Python object overhead. `MC_METADATA_MAX_BODY_BYTES` and `MC_METADATA_MAX_CONCURRENT_PUTS` (1 MiB and 8 by default) bound each PUT body and the number read concurrently. These limits bound stored payload bytes and concurrent body reads, not connections waiting for a PUT slot or total process RSS; they are not a complete process-level memory or DoS limit. All four quota settings must be positive integers at startup.
+
 (start-a-store-client)=
 ### 3. Start a Store Client
 
@@ -150,6 +152,61 @@ mooncake_master \
 Each instance must specify its own reachable `--rpc_address`. `--etcd_endpoints` is still accepted as a backward-compatible alias for the etcd HA backend connection string when `--ha_backend_connstring` is empty. The etcd cluster used for HA can be shared with or separate from the Transfer Engine's metadata etcd.
 
 **Client addressing:** to reach an HA cluster, clients must use the `etcd://` master-address form (so they can discover the current leader) instead of a single `IP:Port` — set `master_server_addr` (Method A) / `MOONCAKE_MASTER` (Method B) / `--master_server_address` (Method C) to `etcd://10.0.0.1:2379;10.0.0.2:2379;...`.
+
+**etcd TLS and mutual TLS:** the Go etcd wrapper accepts the following environment
+variables. They apply to the Store HA, snapshot, and dedicated lease keepalive
+clients, as well as Transfer Engine metadata clients built with `USE_ETCD=ON`
+and `USE_ETCD_LEGACY=OFF`.
+
+| Variable | Meaning |
+|---|---|
+| `MOONCAKE_ETCD_CA_CERT` | PEM CA bundle used to verify the etcd server. If omitted, TLS uses the system trust store. |
+| `MOONCAKE_ETCD_CLIENT_CERT` | PEM client certificate chain for mutual TLS. Requires `MOONCAKE_ETCD_CLIENT_KEY`. |
+| `MOONCAKE_ETCD_CLIENT_KEY` | Client private key. Requires `MOONCAKE_ETCD_CLIENT_CERT`. |
+| `MOONCAKE_ETCD_SERVER_NAME` | Optional server name for SNI and certificate hostname verification, for example when connecting by IP. Requires a CA bundle or client certificate configuration. |
+
+Set only the CA bundle for server-authenticated TLS, or also set the client
+certificate and key for mutual TLS. Server certificate verification remains
+enabled, and configured TLS requires TLS 1.2 or newer. Use `https://` or bare
+`host:port` endpoints with these variables. An `http://` endpoint is rejected
+when TLS is configured because the etcd Go client would otherwise discard the
+TLS credentials for that endpoint.
+
+For Transfer Engine `metadata_server`, use bare `host:port` endpoints or the
+`etcd://host:port` backend selector with these variables. A top-level `https://`
+metadata URL selects Mooncake's HTTP metadata service instead of etcd. Store
+leader discovery also keeps its `etcd://` backend selector, for example
+`etcd://10.0.0.1:2379;10.0.0.2:2379` for `master_server_addr`.
+
+For example, start an HA master against an etcd cluster requiring mutual TLS:
+
+```bash
+export MOONCAKE_ETCD_CA_CERT=/etc/etcd/ca.pem
+export MOONCAKE_ETCD_CLIENT_CERT=/etc/etcd/client.pem
+export MOONCAKE_ETCD_CLIENT_KEY=/etc/etcd/client-key.pem
+# Optional: use the DNS name on the server certificate when connecting by IP.
+export MOONCAKE_ETCD_SERVER_NAME=etcd.example.com
+
+mooncake_master \
+  --enable_ha=true \
+  --ha_backend_type=etcd \
+  --ha_backend_connstring="https://10.0.0.1:2379;https://10.0.0.2:2379" \
+  --rpc_address=10.0.0.10
+```
+
+Set the same variables in client processes that connect to these etcd endpoints.
+Python applications can set them using `os.environ` after importing Mooncake,
+before calling `setup()`. No additional Python or C API calls are required.
+The variables configure all Go etcd clients in the process; configure them before
+initializing clients and keep them stable during use. Existing connections do
+not reload certificates automatically.
+
+If all four variables are unset, existing endpoint behavior is preserved.
+Incomplete certificate/key pairs, unreadable or invalid certificate files,
+and a server-name override without TLS configuration return client initialization
+errors. Server trust, hostname, and client-authentication checks occur when the
+connection is established; the first etcd operation reports a handshake failure
+if those checks fail.
 
 ---
 

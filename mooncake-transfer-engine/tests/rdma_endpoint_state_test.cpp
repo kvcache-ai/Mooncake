@@ -332,7 +332,6 @@ void initFakePeer(FakeRdmaPeer &peer, const std::string &server_name,
 void queueHandshakeSlice(FakeRdmaPeer &peer, const std::string &peer_nic_path,
                          Transport::Slice &slice,
                          Transport::TransferTask &task) {
-    slice = Transport::Slice();
     task = Transport::TransferTask();
     slice.task = &task;
     slice.status = Transport::Slice::PENDING;
@@ -387,6 +386,22 @@ TEST_F(RdmaEndPointStateTest, ConnectedIsReadyToSend) {
     EXPECT_TRUE(endpoint_->connected());
     EXPECT_TRUE(endpoint_->readyToSend());
 }
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+TEST_F(RdmaEndPointStateTest, LimitedSubmitLeavesDeferredSuffixQueued) {
+    Transport::Slice first{};
+    Transport::Slice deferred{};
+    std::vector<Transport::Slice *> queued{&first, &deferred};
+    std::vector<Transport::Slice *> failed;
+
+    endpoint_->submitPostSendLimited(queued, failed, 1);
+
+    ASSERT_EQ(failed.size(), 1u);
+    EXPECT_EQ(failed.front(), &first);
+    ASSERT_EQ(queued.size(), 1u);
+    EXPECT_EQ(queued.front(), &deferred);
+}
+#endif
 
 TEST_F(RdmaEndPointStateTest, ReadyAckTimeoutOnlyAppliesToWaitingState) {
     RdmaEndPointTestPeer::setReadyWaitStartTs(*endpoint_, 1);
@@ -663,8 +678,8 @@ TEST(RdmaEndpointLifecycleGateTest,
     ASSERT_NO_FATAL_FAILURE(installZeroQpEndpoint(peer_a, a_to_b));
     ASSERT_NO_FATAL_FAILURE(installZeroQpEndpoint(peer_b, b_to_a));
 
-    Transport::Slice slice_a;
-    Transport::Slice slice_b;
+    Transport::Slice slice_a{};
+    Transport::Slice slice_b{};
     Transport::TransferTask task_a;
     Transport::TransferTask task_b;
     queueHandshakeSlice(peer_a, a_to_b, slice_a, task_a);
@@ -716,7 +731,7 @@ TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
     RdmaContextTestPeer::clearNativeCompletionQueue(*peer.context, 0);
     peer.context->cqOutstandingCount(0)->store(1, std::memory_order_relaxed);
 
-    Transport::Slice slice;
+    Transport::Slice slice{};
     Transport::TransferTask task;
     queueHandshakeSlice(peer, peer_nic_path, slice, task);
     slice.rdma.max_retry_cnt = 1;

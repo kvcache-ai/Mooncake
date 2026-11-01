@@ -35,6 +35,7 @@
 
 namespace mooncake {
 
+struct DmabufExport;
 class RdmaContext;
 class RdmaEndPoint;
 class TransferMetadata;
@@ -94,6 +95,15 @@ class RdmaTransport : public Transport {
     int unregisterLocalMemoryInternal(void *addr, bool update_metadata,
                                       bool force_sequential);
 
+    // amdgpu before 6.19.14 charges a NIC's dma-buf pin of KFD-allocated VRAM
+    // against the KFD free pool a second time; only pins taken through its
+    // peer-memory client are offset. Holding one such pin per allocation keeps
+    // hipMemGetInfo and later device allocations exact while the data MRs stay
+    // on dma-buf. MC_HIP_KFD_PIN_FIX and a probe at the first registration
+    // decide whether the driver needs it.
+    bool acquireKfdPinAnchor(void *addr, const DmabufExport &exp);
+    void releaseKfdPinAnchor(void *addr);
+
    public:
     // TRANSFER
     Status submitTransfer(BatchID batch_id,
@@ -101,6 +111,11 @@ class RdmaTransport : public Transport {
 
     Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) override;
+
+    // Submit fresh tasks without an external submission seal owner. No slices
+    // may have been published before this call; all return statuses seal tasks.
+    Status submitTransferTaskWithSeal(
+        const std::vector<TransferTask *> &task_list);
 
     bool supportsGroupedScatter() const override { return true; }
 
@@ -184,6 +199,14 @@ class RdmaTransport : public Transport {
     // MR lookup.
     std::mutex pending_dereg_mutex_;
     std::unordered_set<uint64_t> pending_dereg_;
+
+    struct KfdPinAnchor {
+        ibv_mr *mr = nullptr;
+        size_t refs = 0;
+    };
+    std::mutex kfd_pin_anchor_mutex_;
+    std::unordered_map<uintptr_t, KfdPinAnchor> kfd_pin_anchors_;
+    std::unordered_map<uintptr_t, uintptr_t> kfd_pin_anchor_of_buffer_;
 };
 
 using TransferRequest = Transport::TransferRequest;
