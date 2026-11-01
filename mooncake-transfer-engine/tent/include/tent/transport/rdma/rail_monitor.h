@@ -74,6 +74,11 @@ class RailMonitor {
         return ready_;
     }
 
+    // Shares failure counts and pauses with the other monitors of
+    // `machine_id`, one per RDMA worker, through a process-wide table with its
+    // own lock. A monitor without a peer machine shares nothing.
+    void setPeerMachine(const std::string &machine_id);
+
     bool isAvailable(int local_nic, int remote_nic) const;
 
     // Static compatibility only: a configured pair must reach an RDMA NIC in
@@ -123,6 +128,13 @@ class RailMonitor {
 
     void updateBestMapping();
 
+    // Takes over what the other monitors of this peer paused or withdrew.
+    void syncSharedPauses();
+
+    bool sharing() const { return !machine_id_.empty(); }
+
+    std::string railKey(int local_nic, int remote_nic) const;
+
     bool isAvailableUnlocked(int local_nic, int remote_nic) const;
 
     uint64_t allocateProbeToken();
@@ -130,6 +142,8 @@ class RailMonitor {
    private:
     mutable std::mutex mutex_;
     bool ready_{false};
+    std::string machine_id_;
+    uint64_t synced_generation_{0};
     std::shared_ptr<const Topology> local_;
     std::shared_ptr<const Topology> remote_;
 
