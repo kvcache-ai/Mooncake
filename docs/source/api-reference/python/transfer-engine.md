@@ -72,7 +72,8 @@ TransferOpcode.WRITE  # Write operation
 `_pages` forms) return:
 
 - `0`: every request completed.
-- `-1`: the transfer failed, and no request still reads or writes the buffers.
+- `-1`: the transfer failed. If it failed after submission, no request still
+  reads or writes the buffers.
 - `-2`: the deadline passed while some requests were still in flight. As with
   `COMPLETION_UNKNOWN`, keep the local and remote buffers alive.
 

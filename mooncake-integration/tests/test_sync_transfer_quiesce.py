@@ -1,11 +1,27 @@
 import ctypes
+import os
+import signal
+import subprocess
+import sys
 import time
 import unittest
+from unittest import mock
 
 import engine
 
 LENGTH = 16 << 20
 REJECTED_LENGTH = 4096
+# More than the loopback socket buffers hold, so a stopped target stalls it.
+STALLED_LENGTH = 64 << 20
+TARGET = """
+import sys
+import engine
+target = engine.TransferEngine()
+assert target.initialize("", "P2PHANDSHAKE", "tcp", "") == 0
+destination = target.allocate_managed_buffer(int(sys.argv[1]))
+print(target.get_rpc_port(), destination, flush=True)
+sys.stdin.read()
+"""
 
 
 class SyncTransferQuiesceTest(unittest.TestCase):
@@ -49,6 +65,45 @@ class SyncTransferQuiesceTest(unittest.TestCase):
         time.sleep(0.5)  # give a late sibling write time to land
         late_bytes = ctypes.string_at(self.destination, LENGTH).count(b"\xbb")
         self.assertEqual(late_bytes, 0)
+
+
+class StoppedTargetTest(unittest.TestCase):
+    def test_write_to_a_stopped_target_returns_minus_two(self):
+        target = subprocess.Popen(
+            [sys.executable, "-c", TARGET, str(STALLED_LENGTH)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(target.communicate)
+        self.addCleanup(target.kill)
+        port, destination = target.stdout.readline().split()
+        target_name = f"127.0.0.1:{port}"
+        destination = int(destination)
+
+        with mock.patch.dict(os.environ, {"MC_TRANSFER_TIMEOUT": "5"}):
+            self.initiator = engine.TransferEngine()
+        assert self.initiator.initialize("", "P2PHANDSHAKE", "tcp", "") == 0
+        source = self.initiator.allocate_managed_buffer(STALLED_LENGTH)
+        assert source != 0
+        ret = self.initiator.transfer_sync_write(
+            target_name, source, destination, REJECTED_LENGTH
+        )
+        self.assertEqual(ret, 0)
+
+        os.kill(target.pid, signal.SIGSTOP)
+        self.assertEqual(
+            self.initiator.transfer_sync_write(
+                target_name, source, destination, STALLED_LENGTH
+            ),
+            -2,
+        )
+        self.assertEqual(
+            self.initiator.batch_transfer_sync_write(
+                target_name, [source], [destination], [STALLED_LENGTH]
+            ),
+            -2,
+        )
 
 
 if __name__ == "__main__":
