@@ -944,6 +944,91 @@ TEST(IOUringPinnedStagingTest, FreeSubBatchDrainsWhenWaitFails) {
     rmdir(dir_template);
 }
 
+class RingCacheIOUringTransport : public IOUringTransport {
+   public:
+    using IOUringTransport::cachedRingCount;
+};
+
+// A freed sub-batch parks its drained ring; the next sub-batch takes the
+// smallest cached ring that fits, judged by the size the kernel rounded the
+// ring up to, and still carries I/O on it. A ring with an unreaped completion
+// is destroyed instead of cached.
+TEST(IOUringTransportTest, ReusesOnlyDrainedRings) {
+    const size_t kFileLength = 2 * kPageSize;
+    ScopedTempFile file(kFileLength);
+    ASSERT_GE(file.fd(), 0);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(
+        installLocalFileSegment(*metadata, file.path(), kFileLength).ok());
+    RingCacheIOUringTransport transport;
+    auto installed = installTransport(transport, metadata);
+    if (!installed.ok()) GTEST_SKIP() << installed.message();
+
+    void* allocation = nullptr;
+    ASSERT_EQ(posix_memalign(&allocation, kPageSize, kPageSize), 0);
+    std::unique_ptr<void, decltype(&free)> memory(allocation, free);
+    Request write{};
+    write.opcode = Request::WRITE;
+    write.source = allocation;
+    write.target_id = LOCAL_SEGMENT_ID;
+    write.length = kPageSize;
+    auto ring_fd = [](Transport::SubBatchRef batch) {
+        return static_cast<IOUringSubBatch*>(batch)->ring.ring_fd;
+    };
+
+    Transport::SubBatchRef small = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(small, 1).ok());
+    const int small_fd = ring_fd(small);
+    std::memset(allocation, 0x11, kPageSize);
+    ASSERT_TRUE(transport.submitTransferTasks(small, {write}).ok());
+    EXPECT_EQ(pollUntilSettled(transport, small, 0).s,
+              TransferStatusEnum::COMPLETED);
+    Transport::SubBatchRef large = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(large, 5).ok());
+    const int large_fd = ring_fd(large);
+    EXPECT_NE(large_fd, small_fd);
+    EXPECT_EQ(static_cast<IOUringSubBatch*>(large)->sq_entries, 8u);
+    // Larger ring cached first: a first-fit lookup would hand it out next.
+    ASSERT_TRUE(transport.freeSubBatch(large).ok());
+    ASSERT_TRUE(transport.freeSubBatch(small).ok());
+    EXPECT_EQ(transport.cachedRingCount(), 2u);
+
+    ASSERT_TRUE(transport.allocateSubBatch(small, 1).ok());
+    EXPECT_EQ(ring_fd(small), small_fd);
+    EXPECT_EQ(transport.cachedRingCount(), 1u);
+    // Requested 5 SQEs, holds 8: an 8-entry sub-batch reuses it.
+    ASSERT_TRUE(transport.allocateSubBatch(large, 8).ok());
+    EXPECT_EQ(ring_fd(large), large_fd);
+    EXPECT_EQ(static_cast<IOUringSubBatch*>(large)->sq_entries, 8u);
+    EXPECT_EQ(transport.cachedRingCount(), 0u);
+    ASSERT_TRUE(transport.freeSubBatch(large).ok());
+    EXPECT_EQ(transport.cachedRingCount(), 1u);
+    std::memset(allocation, 0x22, kPageSize);
+    write.target_offset = kPageSize;
+    ASSERT_TRUE(transport.submitTransferTasks(small, {write}).ok());
+    EXPECT_EQ(pollUntilSettled(transport, small, 0).s,
+              TransferStatusEnum::COMPLETED);
+    ASSERT_TRUE(transport.freeSubBatch(small).ok());
+    EXPECT_EQ(transport.cachedRingCount(), 2u);
+
+    std::vector<uint8_t> expected(kFileLength, 0x11);
+    std::memset(expected.data() + kPageSize, 0x22, kPageSize);
+    std::vector<uint8_t> actual(kFileLength, 0);
+    ASSERT_EQ(pread(file.fd(), actual.data(), kFileLength, 0),
+              (ssize_t)kFileLength);
+    EXPECT_EQ(actual, expected);
+
+    // Freed without reaping its completion: not cached.
+    ASSERT_TRUE(transport.allocateSubBatch(small, 1).ok());
+    EXPECT_EQ(ring_fd(small), small_fd);
+    ASSERT_TRUE(transport.submitTransferTasks(small, {write}).ok());
+    ASSERT_TRUE(transport.freeSubBatch(small).ok());
+    EXPECT_EQ(transport.cachedRingCount(), 1u);
+
+    ASSERT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(transport.cachedRingCount(), 0u);
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

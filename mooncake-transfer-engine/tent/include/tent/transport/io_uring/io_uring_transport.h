@@ -103,8 +103,13 @@ struct IOUringTask {
 
 struct IOUringSubBatch : public Transport::SubBatch {
     size_t max_size;
+    // Set when a write staged device memory through a pageable buffer; the
+    // ring is then not reused (see freeSubBatch()).
+    bool pageable_device_write = false;
     std::vector<IOUringTask> task_list;
     struct io_uring ring;
+    // SQ size the kernel gave the ring (max_size rounded up to a power of 2).
+    unsigned sq_entries = 0;
     virtual size_t size() const { return task_list.size(); }
 };
 
@@ -149,6 +154,11 @@ class IOUringTransport : public Transport {
 
     IOUringStagingPool *stagingPool() const { return staging_pool_.get(); }
 
+    size_t cachedRingCount() const {
+        std::lock_guard<std::mutex> lock(ring_cache_mutex_);
+        return ring_cache_.size();
+    }
+
    private:
     std::string getIOUringFilePath(SegmentID handle);
 
@@ -175,6 +185,15 @@ class IOUringTransport : public Transport {
     // posix_memalign() only when no slot is free or the request exceeds the
     // slot size.
     std::shared_ptr<IOUringStagingPool> staging_pool_;
+    struct CachedRing {
+        struct io_uring ring;
+        unsigned sq_entries;
+    };
+    // Drained rings of freed sub-batches, reused by allocateSubBatch() so the
+    // transfer path does not pay io_uring_queue_init()/io_uring_queue_exit()
+    // per batch.
+    mutable std::mutex ring_cache_mutex_;
+    std::vector<CachedRing> ring_cache_;
 };
 }  // namespace tent
 }  // namespace mooncake
