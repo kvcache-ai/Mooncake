@@ -417,6 +417,16 @@ class MasterService {
                                 const TenantId& tenant_id);
 
     /**
+     * @brief For reads whose lease expired mid-transfer: true when the token's
+     * memory replica is still readable and the object has not been rewritten
+     * since the query. A live master never reuses a replica ID, so the buffer
+     * was not freed in between. Grants no lease.
+     */
+    std::vector<tl::expected<bool, ErrorCode>> BatchCheckReplicasLive(
+        const std::vector<std::string>& keys,
+        const std::vector<ReplicaReadToken>& tokens, const TenantId& tenant_id);
+
+    /**
      * @brief Start a put operation for an object
      * @param[out] replica_list Vector to store replica information for the
      * slice

@@ -1406,6 +1406,65 @@ TEST_F(MasterServiceTest, LeasedUpsertAllocationFailurePreservesObject) {
                   .buffer_descriptor.buffer_address_);
 }
 
+TEST_F(MasterServiceTest, CheckReplicasLiveRejectsRewrittenOrReplacedObjects) {
+    // A zero TTL lets the in-place upsert below run right after the query.
+    MasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 0;
+    MasterService service(service_config);
+    const auto context = PrepareSimpleSegment(service);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string key = "revalidate_key";
+    const auto put = [&] {
+        ASSERT_TRUE(service.PutStart(context.client_id, key,
+                                     TenantId::Default(), 1024, config));
+        ASSERT_TRUE(service.PutEnd(context.client_id, key, TenantId::Default(),
+                                   ReplicaType::MEMORY));
+    };
+    const auto query = [&] {
+        const auto response =
+            service.GetReplicaList(key, TenantId::Default()).value();
+        return ReplicaReadToken{response.replicas.at(0).id,
+                                response.write_version.value()};
+    };
+    const auto live = [&](const ReplicaReadToken& token) {
+        auto result =
+            service.BatchCheckReplicasLive({key}, {token}, TenantId::Default());
+        return result.at(0).value();
+    };
+
+    put();
+    const auto token = query();
+    EXPECT_TRUE(live(token));
+    EXPECT_FALSE(live({token.replica_id + 1, token.write_version}));
+
+    // In-place upsert keeps the replica ID but rewrites its bytes.
+    ASSERT_TRUE(service.UpsertStart(context.client_id, key, TenantId::Default(),
+                                    1024, config));
+    ASSERT_TRUE(service.UpsertEnd(context.client_id, key, TenantId::Default(),
+                                  ReplicaType::MEMORY));
+    EXPECT_FALSE(live(token));
+    const auto upserted = query();
+    EXPECT_EQ(upserted.replica_id, token.replica_id);
+    EXPECT_TRUE(live(upserted));
+
+    ASSERT_TRUE(service.Remove(key, TenantId::Default()));
+    EXPECT_FALSE(live(upserted));
+    put();
+    EXPECT_FALSE(live(upserted));
+
+    auto mismatched =
+        service.BatchCheckReplicasLive({key}, {}, TenantId::Default());
+    ASSERT_EQ(mismatched.size(), 1u);
+    EXPECT_EQ(mismatched[0].error(), ErrorCode::INVALID_PARAMS);
+
+    // Unmounting frees the segment memory behind the replica.
+    const auto replaced = query();
+    EXPECT_TRUE(live(replaced));
+    ASSERT_TRUE(service.UnmountSegment(context.segment_id, context.client_id));
+    EXPECT_FALSE(live(replaced));
+}
+
 // DFS replicas live in their own variant branch, so is_disk_replica() does not
 // match them. KV subscribers still expect one logical tier per storage class,
 // which is what these assertions pin down.

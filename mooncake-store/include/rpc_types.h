@@ -91,6 +91,10 @@ struct GetReplicaListResponse {
     // the exact scope the write path used. Empty when the master predates
     // this field.
     struct_pack::compatible<std::string, 1> resolved_tenant_id;
+    // Identifies the object write the replicas belong to, so a reader whose
+    // lease expired mid-transfer can ask BatchCheckReplicasLive whether the
+    // bytes it read were left untouched. Empty when the master predates it.
+    struct_pack::compatible<uint64_t, 2> write_version;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(
@@ -102,7 +106,15 @@ struct GetReplicaListResponse {
           object_checksum(object_checksum_param) {}
 };
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum,
-         resolved_tenant_id);
+         resolved_tenant_id, write_version);
+
+// The replica a read transferred from and the write version it was queried
+// at.
+struct ReplicaReadToken {
+    ReplicaID replica_id{0};
+    uint64_t write_version{0};
+};
+YLT_REFL(ReplicaReadToken, replica_id, write_version);
 
 struct CachedQueryResultResponse {
     bool success;

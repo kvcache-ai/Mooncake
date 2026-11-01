@@ -2050,6 +2050,32 @@ TEST_F(MasterServiceHATest, UnreadableRestoredMemoryReplicaIsNotEvictable) {
     EXPECT_EQ(get.error(), ErrorCode::REPLICA_IS_NOT_READY);
 }
 
+TEST_F(MasterServiceHATest,
+       CheckReplicasLiveRejectsAnUnreadableRestoredReplica) {
+    MasterService service{MasterServiceConfig{}};
+    const std::string key = "unreadable_restored_live_key";
+    const std::string endpoint = "unreadable_restored_live_segment";
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot({MakeStandbyObject(key, endpoint)}, 7,
+                                        {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
+    ReplicaReadToken token;
+    {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{kDefaultTenant, key});
+        ASSERT_TRUE(accessor.Exists());
+        token = {accessor.Get().GetAllReplicas()[0].id(),
+                 accessor.Get().WriteVersion()};
+    }
+
+    const auto live =
+        service.BatchCheckReplicasLive({key}, {token}, kDefaultTenant);
+    ASSERT_TRUE(live.at(0).has_value());
+    EXPECT_FALSE(live.at(0).value());
+}
+
 TEST_F(MasterServiceHATest, SuccessfulRemountGrantsEvictionLease) {
     MasterService service(MasterServiceConfig::builder()
                               .set_enable_ha(false)

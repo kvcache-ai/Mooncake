@@ -1391,7 +1391,8 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     return tl::expected<QueryResult, ErrorCode>(
         tl::in_place, std::move(result.value().replicas),
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
-        result.value().object_checksum, result.value().resolved_tenant_id);
+        result.value().object_checksum, result.value().resolved_tenant_id,
+        result.value().write_version);
 }
 
 tl::expected<QueryResult, ErrorCode> Client::QueryReadOnly(
@@ -1440,7 +1441,8 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
                 start_time +
                     std::chrono::milliseconds(response[i].value().lease_ttl_ms),
                 response[i].value().object_checksum,
-                response[i].value().resolved_tenant_id);
+                response[i].value().resolved_tenant_id,
+                response[i].value().write_version);
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -1638,7 +1640,8 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         ProcessSlicesAsync(object_key, slices, replica);
     }
 
-    if (query_result.IsLeaseExpired()) {
+    if (query_result.IsLeaseExpired() &&
+        !CheckLeaseExpiredReads({object_key}, {&query_result}, {&replica})[0]) {
         LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
                      << object_key;
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
@@ -1684,7 +1687,8 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         LOG(ERROR) << "transfer_read_range_failed key=" << object_key;
         return tl::unexpected(err);
     }
-    if (query_result.IsLeaseExpired()) {
+    if (query_result.IsLeaseExpired() &&
+        !CheckLeaseExpiredReads({object_key}, {&query_result}, {&replica})[0]) {
         LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
                      << object_key;
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
@@ -1954,9 +1958,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << ", latency_us=" << dfs_read_latency_us;
     }
 
+    std::vector<const Replica::Descriptor*> read_replicas(object_keys.size(),
+                                                          nullptr);
     // Wait for all transfers to complete
     for (auto& [index, key, future, stored_replica, cache_used] :
          pending_transfers) {
+        read_replicas[index] = &stored_replica;
         ErrorCode result = future.get();
 
         // Release the cache block after transfer completes (memcpy is done)
@@ -1996,17 +2003,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
     }
 
-    // As lease expired is a rare case, we check all the results with the same
-    // time_point to avoid too many syscalls
-    std::chrono::steady_clock::time_point now =
-        std::chrono::steady_clock::now();
-    for (size_t i = 0; i < object_keys.size(); ++i) {
-        if (results[i].has_value() && query_results[i].IsLeaseExpired(now)) {
-            LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
-                         << object_keys[i];
-            results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
-        }
-    }
+    FailLeaseExpiredReads(object_keys, query_results, read_replicas, results);
 
     auto us_batch_get = std::chrono::duration_cast<std::chrono::microseconds>(
                             std::chrono::steady_clock::now() - t0_batch_get)
@@ -5619,6 +5616,76 @@ ErrorCode Client::FindFirstCompleteReplica(
 
     // No complete replica found
     return ErrorCode::INVALID_REPLICA;
+}
+
+std::vector<bool> Client::CheckLeaseExpiredReads(
+    const std::vector<std::string>& keys,
+    const std::vector<const QueryResult*>& query_results,
+    const std::vector<const Replica::Descriptor*>& read_replicas) {
+    struct Checks {
+        std::vector<std::string> keys;
+        std::vector<ReplicaReadToken> tokens;
+        std::vector<size_t> indexes;
+    };
+    // One RPC per tenant scope; the keys of one BatchQuery share a scope.
+    std::unordered_map<std::string, Checks> by_tenant;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const QueryResult& query = *query_results[i];
+        const Replica::Descriptor* replica = read_replicas[i];
+        if (!query.write_version || !query.resolved_tenant_id || !replica ||
+            !replica->is_memory_replica()) {
+            continue;
+        }
+        auto& checks = by_tenant[*query.resolved_tenant_id];
+        checks.keys.push_back(keys[i]);
+        checks.tokens.push_back({replica->id, *query.write_version});
+        checks.indexes.push_back(i);
+    }
+
+    std::vector<bool> live(keys.size(), false);
+    for (const auto& [tenant_id, checks] : by_tenant) {
+        auto results = master_client_.BatchCheckReplicasLive(
+            checks.keys, checks.tokens, tenant_id);
+        for (size_t j = 0; j < results.size() && j < checks.indexes.size();
+             ++j) {
+            live[checks.indexes[j]] = results[j].value_or(false);
+        }
+    }
+    return live;
+}
+
+void Client::FailLeaseExpiredReads(
+    const std::vector<std::string>& keys,
+    const std::vector<QueryResult>& query_results,
+    const std::vector<const Replica::Descriptor*>& read_replicas,
+    std::vector<tl::expected<void, ErrorCode>>& results) {
+    // Lease expiry is rare, so read the clock once for the whole batch.
+    auto now = std::chrono::steady_clock::now();
+    std::vector<size_t> expired;
+    std::vector<std::string> expired_keys;
+    std::vector<const QueryResult*> expired_queries;
+    std::vector<const Replica::Descriptor*> expired_replicas;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i].has_value() && query_results[i].IsLeaseExpired(now)) {
+            expired.push_back(i);
+            expired_keys.push_back(keys[i]);
+            expired_queries.push_back(&query_results[i]);
+            expired_replicas.push_back(read_replicas[i]);
+        }
+    }
+    if (expired.empty()) {
+        return;
+    }
+
+    const auto live =
+        CheckLeaseExpiredReads(expired_keys, expired_queries, expired_replicas);
+    for (size_t j = 0; j < expired.size(); ++j) {
+        if (!live[j]) {
+            LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
+                         << keys[expired[j]];
+            results[expired[j]] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+        }
+    }
 }
 
 tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
