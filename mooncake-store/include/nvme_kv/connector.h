@@ -6,6 +6,7 @@
 
 #include <ylt/util/tl/expected.hpp>
 
+#include "nvme_kv/connector_config.h"
 #include "nvme_kv/executor.h"
 #include "types.h"
 
@@ -13,14 +14,20 @@ namespace mooncake {
 
 struct FileStorageConfig;
 
+namespace test {
+class NvmeKvConnectorTestPeer;
+}  // namespace test
+
 class NvmeKvConnector {
    public:
     using PhysicalKey = NvmeKvCommandExecutor::PhysicalKey;
     using Capabilities = NvmeKvCommandExecutor::Capabilities;
 
+    NvmeKvConnector() = default;
     explicit NvmeKvConnector(const FileStorageConfig &file_storage_config);
 
     tl::expected<void, ErrorCode> Init();
+    tl::expected<void, ErrorCode> Init(const NvmeKvConnectorConfig &config);
     tl::expected<void, ErrorCode> Store(const PhysicalKey &key,
                                         std::string value);
     void StoreBatch(std::vector<NvmeKvCommandExecutor::StoreRequest> &requests);
@@ -36,7 +43,8 @@ class NvmeKvConnector {
     const Capabilities &GetCapabilities() const;
 
    private:
-    tl::expected<void, ErrorCode> InitRealExecutor();
+    friend class test::NvmeKvConnectorTestPeer;
+
     std::string storage_path_;
     std::unique_ptr<NvmeKvCommandExecutor> executor_;
 };
