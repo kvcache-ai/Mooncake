@@ -50,6 +50,8 @@ uint64_t pickTargetSlot(std::mt19937_64& rng, uint64_t slots, uint64_t prev) {
     return slot >= prev ? slot + 1 : slot;
 }
 
+// Returns 0 on success, 1 if the sweep point is skipped because the buffer
+// layout does not fit, and -1 on failure.
 int processBatchSizes(
     BenchRunner& runner, size_t block_size, size_t batch_size, int num_threads,
     const std::vector<QosClassConfig>& qos_classes,
@@ -130,7 +132,8 @@ int processBatchSizes(
         }
     };
     size_t address_stride_bytes =
-        XferBenchConfig::max_block_size * XferBenchConfig::max_batch_size;
+        checkedMul(XferBenchConfig::max_block_size,
+                   XferBenchConfig::max_batch_size, "address stride");
     if (!workload_classes.empty()) {
         address_stride_bytes = 0;
         for (const auto& config : workload_classes) {
@@ -150,19 +153,36 @@ int processBatchSizes(
                    << address_stride_bytes << ")";
         exit(EXIT_FAILURE);
     }
+    // Every worker's regions must fit before any transfer starts; the layout
+    // depends on the thread count and the largest operation, not on the
+    // current block and batch size.
+    for (int thread_id = 0; thread_id < num_threads; ++thread_id) {
+        const char* side = nullptr;
+        uint64_t bytes = 0;
+        if (!runner.getLocalBufferBase(thread_id, address_stride_bytes)) {
+            side = "local";
+            bytes = address_stride_bytes;
+        } else if (!runner.getTargetBufferBase(thread_id,
+                                               target_window_bytes)) {
+            side = "target";
+            bytes = target_window_bytes;
+        }
+        if (side != nullptr) {
+            LOG(INFO) << "Skipped for block_size " << block_size
+                      << " batch_size " << batch_size << ": the " << side
+                      << " region of thread " << thread_id << " (" << bytes
+                      << " bytes per thread) does not fit in its buffer";
+            return 1;
+        }
+    }
     int rc = runner.runInitiatorTasks([&](int thread_id) -> int {
         runner.pinThread(thread_id);
-        auto local_gpu_offset = std::max(0, XferBenchConfig::local_gpu_id);
-        auto target_gpu_offset = std::max(0, XferBenchConfig::target_gpu_id);
-        const int target_thread_id =
-            static_cast<int>(target_gpu_offset * runner.getTargetCount()) +
-            thread_id;
-        uint64_t local_addr = runner.getLocalBufferBase(
-            local_gpu_offset + thread_id, address_stride_bytes, 1);
-        uint64_t target_addr = runner.getTargetBufferBase(
-            target_thread_id, target_window_bytes, 1);
-        uint64_t target_id = runner.getTargetSegmentId(target_thread_id);
-        const size_t target_index = runner.getTargetIndex(target_thread_id);
+        const uint64_t local_addr =
+            *runner.getLocalBufferBase(thread_id, address_stride_bytes);
+        const uint64_t target_addr =
+            *runner.getTargetBufferBase(thread_id, target_window_bytes);
+        uint64_t target_id = runner.getTargetSegmentId(thread_id);
+        const size_t target_index = runner.getTargetIndex(thread_id);
         const bool qos_enabled = !qos_classes.empty();
         const size_t qos_class =
             qos_enabled ? qosClassForThread(qos_classes, thread_id) : 0;
@@ -527,6 +547,7 @@ int main(int argc, char* argv[]) {
     }
     printStatsHeader();
     bool interrupted = false;
+    bool ran_any = false;
     for (int num_threads = XferBenchConfig::start_num_threads;
          !interrupted && num_threads <= XferBenchConfig::max_num_threads;
          num_threads *= 2) {
@@ -546,20 +567,21 @@ int main(int argc, char* argv[]) {
                     bytes_per_thread > XferBenchConfig::target_range_size) {
                     LOG(ERROR) << "target range is smaller than one operation";
                     interrupted = true;
-                } else if (num_threads != 0 &&
-                           bytes_per_thread >
-                               XferBenchConfig::total_buffer_size /
-                                   num_threads) {
-                    LOG(INFO) << "Skipped for block_size " << block_size
-                              << " batch_size " << batch_size;
                 } else {
-                    if (processBatchSizes(*runner, block_size, batch_size,
-                                          num_threads, qos_classes) != 0)
-                        interrupted = true;
+                    const int rc =
+                        processBatchSizes(*runner, block_size, batch_size,
+                                          num_threads, qos_classes);
+                    if (rc < 0) interrupted = true;
+                    if (rc == 0) ran_any = true;
                 }
             }
         }
         runner->stopInitiator();
+    }
+    if (!interrupted && !ran_any) {
+        // A run that measured nothing must not look like a pass.
+        LOG(ERROR) << "No benchmark case ran: every sweep point was skipped";
+        return EXIT_FAILURE;
     }
     return interrupted ? EXIT_FAILURE : EXIT_SUCCESS;
 }

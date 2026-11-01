@@ -34,20 +34,6 @@
 namespace mooncake {
 namespace tent {
 
-std::atomic<bool> g_tent_running{true};
-std::atomic<bool> g_tent_triggered_sig{false};
-
-void signalHandlerV1(int signum) {
-    if (g_tent_triggered_sig.load()) {
-        LOG(ERROR) << "Received signal " << signum
-                   << " again, forcefully terminating...";
-        std::exit(EXIT_FAILURE);
-    }
-    LOG(INFO) << "Received signal " << signum << ", stopping target server...";
-    g_tent_running.store(false);
-    g_tent_triggered_sig.store(true);
-}
-
 // Parse a comma-separated list (e.g. "dram,vram") into a vector of lowercased
 // seg_type names. Empty input returns an empty vector.
 static std::vector<std::string> parseSegTypeMix(const std::string& mix) {
@@ -349,8 +335,6 @@ int TENTBenchRunner::freeBuffers() {
 }
 
 TENTBenchRunner::TENTBenchRunner() {
-    signal(SIGINT, signalHandlerV1);
-    signal(SIGTERM, signalHandlerV1);
     engine_ = std::make_unique<TransferEngine>(loadConfig());
     transport_hint_ = parseTransportType(XferBenchConfig::tent_transport_hint);
     intent_type_ = getIntentType(XferBenchConfig::tent_intent_type);
@@ -361,26 +345,8 @@ TENTBenchRunner::TENTBenchRunner() {
 TENTBenchRunner::~TENTBenchRunner() { freeBuffers(); }
 
 int TENTBenchRunner::runTarget() {
-    while (g_tent_running.load()) sleep(1);
+    while (!stopRequested()) sleep(1);
     return 0;
-}
-
-size_t TENTBenchRunner::targetIndex(int thread_id) const {
-    LOG_ASSERT(!target_handles_.empty());
-    return static_cast<size_t>(thread_id) % target_handles_.size();
-}
-
-int TENTBenchRunner::localTargetThreadId(int thread_id) const {
-    LOG_ASSERT(!target_handles_.empty());
-    return thread_id / static_cast<int>(target_handles_.size());
-}
-
-uint64_t TENTBenchRunner::getTargetSegmentId(int thread_id) const {
-    return target_handles_[targetIndex(thread_id)];
-}
-
-size_t TENTBenchRunner::getTargetCount() const {
-    return std::max<size_t>(target_handles_.size(), 1);
 }
 
 int TENTBenchRunner::startInitiator(int num_threads) {
@@ -407,24 +373,7 @@ int TENTBenchRunner::startInitiator(int num_threads) {
         target_infos_.push_back(std::move(info));
     }
     LOG(INFO) << "Opened " << target_handles_.size() << " target segments";
-    threads_.resize(num_threads);
-    current_task_.resize(threads_.size());
-    g_tent_running.store(true);
-    for (size_t i = 0; i < threads_.size(); ++i)
-        threads_[i] = std::thread(&TENTBenchRunner::runner, this, i);
-    return 0;
-}
-
-int TENTBenchRunner::stopInitiator() {
-    {
-        std::unique_lock<std::mutex> lk(mtx_);
-        g_tent_running.store(false);
-        cv_task_.notify_all();
-        cv_done_.notify_all();
-    }
-    for (auto& thread : threads_) {
-        thread.join();
-    }
+    startWorkers(num_threads);
     return 0;
 }
 
@@ -488,7 +437,7 @@ void TENTBenchRunner::pinThread(int thread_id) {
         return;
     }
 #endif
-    uint64_t addr = getLocalBufferBase(thread_id, 0, 0);
+    uint64_t addr = *getLocalBufferBase(thread_id, 0);
     auto result = Platform::getLoader().getLocation((void*)addr, 1);
     if (result.empty()) return;
     LocationParser location(result[0].location);
@@ -503,49 +452,11 @@ void TENTBenchRunner::pinThread(int thread_id) {
     }
 }
 
-int TENTBenchRunner::runner(int thread_id) {
-    while (g_tent_running.load()) {
-        std::function<int(int)> task;
-        {
-            std::unique_lock<std::mutex> lk(mtx_);
-            cv_task_.wait(lk, [&] {
-                return !g_tent_running.load() || current_task_[thread_id];
-            });
-            if (!g_tent_running.load()) break;
-            std::swap(task, current_task_[thread_id]);
-        }
-        if (task) task(thread_id);
-        {
-            std::unique_lock<std::mutex> lk(mtx_);
-            if (--pending_ == 0) cv_done_.notify_all();
-        }
-    }
-    return 0;
-}
-
-int TENTBenchRunner::runInitiatorTasks(
-    const std::function<int(int /* thread_id */)>& func) {
-    std::unique_lock<std::mutex> lk(mtx_);
-    for (size_t id = 0; id < current_task_.size(); ++id)
-        current_task_[id] = func;
-    pending_ = (int)threads_.size();
-    cv_task_.notify_all();
-    cv_done_.wait(lk, [&] { return !g_tent_running.load() || pending_ == 0; });
-    return g_tent_running.load() ? 0 : -1;
-}
-
-void TENTBenchRunner::noteTransferFailed() {
-    std::lock_guard<std::mutex> lk(mtx_);
-    g_tent_running.store(false);
-    cv_task_.notify_all();
-    cv_done_.notify_all();
-}
-
 double TENTBenchRunner::runSingleTransfer(
     uint64_t local_addr, uint64_t target_id, uint64_t target_addr,
     uint64_t block_size, uint64_t batch_size, OpCode opcode,
     uint64_t deadline_ns, IntentType intent_type) {
-    if (!g_tent_running.load()) return -1.0;
+    if (!running()) return -1.0;
 
     auto abortTransfer = [&](const char* why) {
         LOG(ERROR) << why;
@@ -590,7 +501,7 @@ double TENTBenchRunner::runSingleTransfer(
             noteTransferFailed();
             return finish(-1.0);
         }
-        while (g_tent_running.load()) {
+        while (running()) {
             TransferStatus overall_status;
             auto polled = engine_->getTransferStatus(batch_id, overall_status);
             if (!polled.ok()) {
@@ -629,7 +540,7 @@ double TENTBenchRunner::runSingleTransfer(
     const uint64_t submit_us = submit_timer.lap_us();
     XferBenchTimer wait_timer;
     uint64_t polls = 0;
-    while (g_tent_running.load()) {
+    while (running()) {
         TransferStatus overall_status;
         auto polled = engine_->getTransferStatus(batch_id, overall_status);
         polls++;
