@@ -24,10 +24,11 @@ struct DistributedStorageConfig {
     std::chrono::seconds eviction_check_interval{5};
 
     bool Validate() const;
-    // True for adapters backed by an object store ("oss", "s3") rather
-    // than a filesystem.
+    // True for adapters backed by an object store ("oss", "s3", "valkey")
+    // rather than a filesystem.
     bool UsesObjectStorage() const {
-        return fs_adapter_type == "oss" || fs_adapter_type == "s3";
+        return fs_adapter_type == "oss" || fs_adapter_type == "s3" ||
+               fs_adapter_type == "valkey";
     }
     bool ValidateForAllocator() const;
     static DistributedStorageConfig FromEnvironment();

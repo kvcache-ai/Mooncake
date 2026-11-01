@@ -2,22 +2,26 @@
 
 ## Overview
 
-Object storage services, such as OSS and S3, provide key-based storage.
+Object storage services, such as OSS and S3, provide key-based storage, and
+so does Valkey with the
+[valkey-large-object](https://github.com/valkey-io/valkey-large-object)
+module.
 Mooncake Store integrates object storage through `ObjectStorageAdapter` in the
 existing `FileStorage` offload path. As with local SSD and NVMe KV backends,
 the master records `LOCAL_DISK` replicas owned by a real client; readers still
 access the payload through that owner.
 
-Two adapters are available:
+Three adapters are available:
 
 | Adapter | `MOONCAKE_DISTRIBUTED_FS_TYPE` | Services |
 |---------|--------------------------------|----------|
 | OSS | `oss` | Alibaba Cloud OSS |
 | S3-compatible | `s3` | AWS S3, SeaweedFS, MinIO, Ceph RGW and other services that accept AWS Signature V4 |
+| Valkey | `valkey` | Valkey with the valkey-large-object module loaded |
 
-The two adapters are independent and are configured with separate variables,
-described in the "OSS configuration" and "S3-compatible configuration" sections
-below.
+The adapters are independent and are configured with separate variables,
+described in the "OSS configuration", "S3-compatible configuration" and
+"Valkey configuration" sections below.
 
 For implementation details, see [OSS Backend Design](../design/store/oss-backend.md).
 
@@ -34,6 +38,9 @@ For implementation details, see [OSS Backend Design](../design/store/oss-backend
   initialization. This does not enable a local SSD cache for object storage.
 - libcurl and OpenSSL development libraries and headers.
 
+The Valkey adapter needs a reachable Valkey server instead of a bucket, and
+hiredis instead of libcurl and OpenSSL; see "Valkey configuration".
+
 ## Build Support
 
 The build enables both adapters when libcurl and OpenSSL are available. No
@@ -44,6 +51,9 @@ on its own line (`Alibaba Cloud OSS adapter: Enabled`,
 
 Batch I/O uses `curl_multi_wait`; libcurl 7.66.0 is not required. Upload-buffer
 tuning is optional: with headers older than 7.62.0, the library default is used.
+
+The Valkey adapter is built when Mooncake Store is configured with
+`-DSTORE_USE_REDIS=ON`, which also links hiredis for the Redis HA backend.
 
 ## Topology
 
@@ -166,6 +176,60 @@ HTTP 429 and 5xx) up to three attempts with backoff. A request that was sent
 and then timed out is not retried, and client errors such as 403 and 404 are
 not retried.
 
+### Valkey configuration
+
+The Valkey adapter stores each object as one large object of the
+[valkey-large-object](https://github.com/valkey-io/valkey-large-object)
+module, under the key `<prefix>/<logical key>`, where the prefix is
+`MOONCAKE_DISTRIBUTED_ROOT_DIR` without leading and trailing slashes. Objects
+are written with `BLOB.TCP_SET` and read with `BLOB.TCP_GET`; keys are listed
+with `SCAN` and sized with `BLOB.INFO`.
+
+```bash
+valkey-server --loadmodule /path/to/libvalkey_large_object.so
+
+export MOONCAKE_DISTRIBUTED_FS_TYPE=valkey
+export MOONCAKE_VALKEY_ADDR=valkey-host:6379
+# Supply MOONCAKE_VALKEY_PASSWORD through your credential-management
+# mechanism, not checked-in scripts.
+```
+
+| Environment variable | Default | Description |
+|----------------------|---------|-------------|
+| `MOONCAKE_VALKEY_ADDR` | `127.0.0.1:6379` | Server address as `host:port`. |
+| `MOONCAKE_VALKEY_USERNAME` | Empty | ACL user; sent with `AUTH` only when a password is set. |
+| `MOONCAKE_VALKEY_PASSWORD` | Empty | Password; `AUTH` is skipped when empty. |
+| `MOONCAKE_VALKEY_POOL_SIZE` | `8` | Connections per adapter. Batch requests are spread across them and pipelined per connection. |
+| `MOONCAKE_VALKEY_TIMEOUT_MS` | `30000` | Connect and per-command timeout. |
+| `MOONCAKE_VALKEY_TRANSPORT` | `tcp` | `tcp`, or `rdma` to let the server move object bytes with RDMA (see below). |
+
+With `MOONCAKE_VALKEY_TRANSPORT=rdma`, the Valkey server reads offloaded
+objects straight out of the owner's mounted segment, and writes loaded objects
+into FileStorage's registered buffers, with one-sided RDMA (`BLOB.RDMA_SET`,
+`BLOB.RDMA_GET`). The owner sends its Transfer Engine segment name in
+`BLOB.RDMA_HELLO`, once per connection. This path requires:
+
+- the module's Transfer Engine backend on the server
+  (`fabric-provider MooncakeTe`), which is not in a valkey-large-object release
+  yet;
+- a Transfer Engine transport on the owner, such as `efa` or `rdma`, the same
+  one the server uses;
+- that the server can open the owner's segment: `P2PHANDSHAKE` on both sides,
+  or the same metadata service.
+
+A request the server cannot carry over RDMA, for example one whose buffer is
+not registered with the owner's Transfer Engine, is redone over TCP. On hosts
+with several NICs, Transfer Engine sends a host buffer's traffic over the NICs
+local to its NUMA node, so spread the server's pool across nodes (the module's
+`te-locations`) to use every NIC.
+
+Initialization fails if the server does not have `BLOB.TCP_SET`. The module
+rejects empty objects and objects larger than its `max-object-size` (512 MiB by
+default), so offloading such objects fails. Valkey evicts keys under its own
+`maxmemory-policy`; an evicted object reads as missing. Use `noeviction`, or
+size the server for the offloaded data, when offloaded objects must stay
+readable.
+
 ### Concurrency and buffers
 
 Each adapter has its own tuning variables with the same meaning and bounds.
@@ -224,6 +288,10 @@ Check build dependencies, required endpoint/region/credential settings, and the
 local directory. Check for stale `MOONCAKE_DFS_*` overrides. The optional health
 check exercises access to the bucket; it does not test the complete Store read
 path.
+
+For the Valkey adapter, check `MOONCAKE_VALKEY_ADDR`, that the server is
+reachable, and that the valkey-large-object module is loaded (`COMMAND INFO
+BLOB.TCP_SET` returns a command).
 
 ### Requests fail with authentication or permission errors
 

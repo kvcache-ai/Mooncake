@@ -58,6 +58,9 @@ struct FdGuard {
 #ifdef HAVE_S3_ADAPTER
 #include "storage/distributed/s3_adapter.h"
 #endif
+#ifdef STORE_USE_REDIS
+#include "storage/distributed/valkey_adapter.h"
+#endif
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
@@ -5722,6 +5725,15 @@ CreateStorageBackend(const FileStorageConfig& config) {
                         distributed_config.fsdir);
 #else
                 LOG(ERROR) << "S3 adapter requires libcurl and OpenSSL";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+            } else if (distributed_config.fs_adapter_type == "valkey") {
+#ifdef STORE_USE_REDIS
+                object_storage_adapter =
+                    std::make_unique<ValkeyObjectStorageAdapter>(
+                        distributed_config.fsdir);
+#else
+                LOG(ERROR) << "Valkey adapter requires STORE_USE_REDIS=ON";
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 #endif
             } else {
