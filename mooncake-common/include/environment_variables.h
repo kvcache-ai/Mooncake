@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -147,6 +148,11 @@ struct DistributedStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(double, MOONCAKE_DFS_EVICTION_LOW_WATERMARK);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_DEFERRED_FREE_SECONDS);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_EVICTION_CHECK_INTERVAL);
+};
+
+struct Hf3fsAdapterEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(size_t, MOONCAKE_HF3FS_IOV_SIZE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_HF3FS_IOR_ENTRIES);
 };
 
 struct OssAdapterEnvironmentVariables {
