@@ -396,7 +396,7 @@ if(SKBUILD)
   endif()
 
   if(USE_ASCEND_DIRECT OR USE_UBSHMEM)
-    install(TARGETS ascend_transport
+    install(TARGETS ascend_transport ascend_allocator
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()
 

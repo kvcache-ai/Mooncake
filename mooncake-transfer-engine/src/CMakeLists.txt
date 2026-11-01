@@ -193,11 +193,17 @@ if(USE_ASCEND)
 endif()
 
 if(USE_ASCEND_DIRECT)
-  target_link_libraries(transfer_engine PUBLIC ascend_transport)
+  # ascend_allocator.so carries the store host allocator, ContextManager and the
+  # shared bound-runner registry. PUBLIC so the store and TENT resolve
+  # allocator/ContextManager symbols through the transfer engine without extra
+  # link wiring.
+  target_link_libraries(transfer_engine PUBLIC ascend_transport
+                                               ascend_allocator)
 endif()
 
 if(USE_UBSHMEM)
-  target_link_libraries(transfer_engine PUBLIC ascend_transport)
+  target_link_libraries(transfer_engine PUBLIC ascend_transport
+                                               ascend_allocator)
 endif()
 
 if(USE_ASCEND_HETEROGENEOUS)

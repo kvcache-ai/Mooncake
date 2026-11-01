@@ -625,6 +625,16 @@ target_link_libraries(common_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME common_test COMMAND common_test)
 
 if(USE_ASCEND_DIRECT)
+  # ascend_allocator.so API: config provider precedence, runtime flags, host
+  # allocation/free, ASCEND_USE_SHMEM handle publication. ACL calls are mocked
+  # in the test file.
+  add_executable(ascend_allocator_test ${WORKSPACE}/ascend_allocator_test.cpp)
+  target_link_libraries(ascend_allocator_test PUBLIC ascend_allocator gtest
+                                                     gtest_main)
+  add_test(NAME ascend_allocator_test COMMAND ascend_allocator_test)
+endif()
+
+if(USE_ASCEND_DIRECT)
   # AscendDirectTransport unit test with mock implementations Mock
   # implementations are included in the test file via anonymous namespace
   add_executable(ascend_direct_transport_test

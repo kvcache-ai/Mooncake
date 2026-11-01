@@ -78,11 +78,30 @@ class TransferExecutorBase {
         adxl::TransferOp operation,
         const std::vector<Transport::Slice*>& slice_list) = 0;
 
+    // Splits by target engine (see below) and processes each group on the
+    // calling thread. Used by the dispatcher's single-worker (buffer-pool)
+    // path, which keeps the historical one-task-per-segment layout.
     void processSliceList(const std::vector<Transport::Slice*>& slice_list);
+
+    // Runs one list whose slices already share a target engine. Dispatchers
+    // that split the list themselves use this so the segment lookup and the
+    // split are not repeated on the worker thread.
+    void processGroupedSliceList(
+        const std::vector<Transport::Slice*>& slice_list);
+
+    // Splits slices that share a target segment into one group per target
+    // adxl engine. A store process that owns several NPUs publishes them all
+    // under one segment, so a dispatcher that stops at the segment would drive
+    // those engines one after another from a single thread.
+    std::vector<std::vector<Transport::Slice*>> splitByTargetEngine(
+        const std::vector<Transport::Slice*>& slice_list);
 
     // Forwards to LocalCopyEngine::SetTaskRunner.
     void setLocalCopyTaskRunner(
         std::function<void(std::function<void()>)> runner);
+
+    // Polls pending local-copy groups from the transport's status path.
+    void pollLocalCopies();
 
     int registerMem(void* addr, size_t length, adxl::MemType mem_type,
                     bool use_buffer_pool, bool remote_accessible);
@@ -129,6 +148,9 @@ class TransferExecutorBase {
     // Installed for non-fabric engines. A transfer uses it only when the
     // destination buffer advertises a shared memfd handle.
     std::unique_ptr<SharedHostMapper> shared_host_mapper_;
+    // ASCEND_USE_SHMEM is read once. When off, no buffer carries a memfd
+    // handle, so the per-slice mapper probe can be skipped entirely.
+    bool use_shmem_{false};
     std::vector<std::shared_ptr<adxl::AdxlEngine>> adxl_engines_;
     std::vector<aclrtContext> local_engine_contexts_;
     std::mutex mem_handle_mutex_;

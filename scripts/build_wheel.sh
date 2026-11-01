@@ -110,6 +110,13 @@ if [ -f ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/asc
     cp ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so mooncake-wheel/mooncake/ascend_transport.so
 fi
 
+# Copy ascend_allocator.so (classic store allocator, ContextManager and the
+# shared bound-runner registry). TENT links the same library.
+if [ -f ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_allocator/ascend_allocator.so ]; then
+    echo "Copying ascend_allocator.so..."
+    cp ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_allocator/ascend_allocator.so mooncake-wheel/mooncake/ascend_allocator.so
+fi
+
 # Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
 if [ -f ${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ] \
    || [ -f /usr/lib/libaccl_barex.so ] \
@@ -637,6 +644,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libmetadef*.so \
     --exclude libllm_datadist*.so \
     --exclude ascend_transport*.so \
+    --exclude ascend_allocator*.so \
     --exclude libaccl_barex.so* \
     --exclude liburma.so* \
     --exclude libmpcomm.so* \

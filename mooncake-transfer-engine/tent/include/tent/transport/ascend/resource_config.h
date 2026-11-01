@@ -29,7 +29,6 @@ namespace tent {
 
 constexpr int32_t kAscendDefaultTransferTimeoutMs = 10000;
 constexpr int32_t kAscendDefaultBasePort = 20000;
-constexpr int32_t kAscendTimeoutDisconnectMs = 1000;
 constexpr const char* kDefaultLocalCommRes = R"({"version":"1.3"})";
 constexpr const char* kHixlNameAttr = "hixl_name";
 constexpr const char* kHixlNamesAttr = "hixl_names";
