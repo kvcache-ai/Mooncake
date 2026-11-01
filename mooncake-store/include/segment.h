@@ -305,14 +305,11 @@ class ScopedAllocatorAccess {
                                    std::shared_mutex& mutex)
         : allocator_manager_(allocator_manager), lock_(mutex) {}
 
-    explicit ScopedAllocatorAccess(
-        const AllocatorManager& allocator_manager,
-        const HostSegmentIndex& segments_by_host,
-        const std::unordered_map<std::string, UUID>& client_by_name,
-        std::shared_mutex& mutex)
+    explicit ScopedAllocatorAccess(const AllocatorManager& allocator_manager,
+                                   const HostSegmentIndex& segments_by_host,
+                                   std::shared_mutex& mutex)
         : allocator_manager_(allocator_manager),
           segments_by_host_(&segments_by_host),
-          client_by_name_(&client_by_name),
           lock_(mutex) {}
 
     const AllocatorManager& getAllocatorManager() const {
@@ -320,7 +317,7 @@ class ScopedAllocatorAccess {
     }
 
     AllocatorManager SnapshotAllocatorManager() const {
-        return allocator_manager_.Snapshot(client_by_name_);
+        return allocator_manager_.Snapshot();
     }
 
     std::vector<std::string> GetHostOrderedSegments(
@@ -331,7 +328,6 @@ class ScopedAllocatorAccess {
    private:
     const AllocatorManager& allocator_manager_;
     const HostSegmentIndex* segments_by_host_{nullptr};
-    const std::unordered_map<std::string, UUID>* client_by_name_{nullptr};
     std::shared_lock<std::shared_mutex> lock_;
 };
 
@@ -372,7 +368,7 @@ class SegmentManager {
      */
     ScopedAllocatorAccess getAllocatorAccess() {
         return ScopedAllocatorAccess(allocator_manager_, segments_by_host_,
-                                     client_by_name_, segment_mutex_);
+                                     segment_mutex_);
     }
 
     /**
@@ -416,14 +412,13 @@ class SegmentManager {
     // Used for unified allocation and recycling of CXL shared memory.
     const bool enable_cxl_;
     std::shared_ptr<BufferAllocatorBase> cxl_global_allocator_;
-    // allocator_manager_ only contains allocators whose segment status is OK.
+    // Only OK segments have allocator registrations. The owner-by-name index
+    // also retains non-OK segments until their name registration is released.
     AllocatorManager allocator_manager_;
     std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>
         mounted_segments_;  // segment_id -> mounted segment
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
         client_segments_;  // client_id -> segment_ids
-    std::unordered_map<std::string, UUID>
-        client_by_name_;  // segment name -> client_id
     std::unordered_map<std::string, UUID>
         segment_id_by_name_;             // segment name -> segment_id
     HostSegmentIndex segments_by_host_;  // host_id -> segment name -> segment
