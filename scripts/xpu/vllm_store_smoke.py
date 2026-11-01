@@ -17,7 +17,7 @@ Engine's registration of PyTorch XPU tensors (``register_buffer`` on the KV
 cache) and the store client's XPU host-staging copies (``batch_put_from`` /
 ``batch_get_into`` on device pointers).
 
-Two small in-process shims work around vLLM (<= 0.29) connector code that is
+Two small in-process shims work around vLLM (0.29 to 0.31) connector code that is
 CUDA-specific rather than Mooncake-specific (see the comments in ``main()`` and
 ``_patch_vllm_kv_address_math()``); drop them once vLLM is device-generic there.
 
@@ -133,8 +133,10 @@ def store_counter(metrics, name: str, operation: str) -> tuple[int, int]:
 def _patch_vllm_kv_address_math() -> None:
     """Make the connector's KV address arithmetic 64-bit unsigned.
 
-    ``ChunkedTokenDatabase.prepare_values`` in vLLM (<= 0.29) vectorises
-    ``base_addr + block_id * block_len`` with ``np.int64``. CUDA device
+    The rank-local ``prepare_values`` of vLLM's Mooncake store connector
+    vectorises ``base_addr + block_id * block_len`` with ``np.int64``: in
+    ``ChunkedTokenDatabase`` up to vLLM 0.29, in ``RankLocalStoreLayout``
+    (which also takes the chunks' store shard ids) since. CUDA device
     pointers fit, but Level Zero maps XPU device USM into the upper canonical
     half (``0xffff8...``), so ``np.asarray(addrs, dtype=np.int64)`` raises
     ``OverflowError``. Mooncake's bindings take ``uintptr_t``, so computing in
@@ -143,7 +145,7 @@ def _patch_vllm_kv_address_math() -> None:
     import numpy as np
     from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import data
 
-    def prepare_values(self, chunks, block_ids):
+    def uint64_values(self, chunks, block_ids):
         if not chunks:
             return [], [], []
         base = np.asarray(self.kv_caches_base_addr, dtype=np.uint64)
@@ -166,7 +168,17 @@ def _patch_vllm_kv_address_math() -> None:
         sizes = blen[None, :] * block_counts.astype(np.uint64)[:, None]
         return addrs.tolist(), sizes.tolist(), bids.tolist()
 
-    data.ChunkedTokenDatabase.prepare_values = prepare_values
+    layout = getattr(data, "RankLocalStoreLayout", None)
+    if layout is None:
+        data.ChunkedTokenDatabase.prepare_values = uint64_values
+        return
+
+    def prepare_values(self, chunks, block_ids, shard_ids):
+        # The rank-local layout stores every chunk as shard 0.
+        assert len(chunks) == len(shard_ids) and all(s == 0 for s in shard_ids)
+        return uint64_values(self, chunks, block_ids)
+
+    layout.prepare_values = prepare_values
 
 
 def main() -> int:
