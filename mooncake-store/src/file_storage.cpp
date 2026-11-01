@@ -1,8 +1,15 @@
 #include "file_storage.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -19,6 +26,14 @@
 namespace mooncake {
 
 namespace {
+
+// syncfs for every failure except a data or metadata read: reads leave the
+// log nothing to write (measured: they alone never shut XFS down), and one
+// bad file would otherwise flush the whole filesystem on every failed read.
+bool CheckNeedsSyncfs(const char* op) {
+    const std::string_view op_name(op);
+    return op_name != "preadv" && op_name != "read";
+}
 
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
@@ -37,6 +52,27 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
 }
 
 }  // namespace
+
+FileStorage::DiskErrorAction FileStorage::ClassifyDiskErrno(int err) {
+    switch (err) {
+        case ENODEV:
+        case ENXIO:
+        case EROFS:
+        case ESHUTDOWN:
+            return DiskErrorAction::kFence;
+        case EIO:
+        case EUCLEAN:
+        case EBADMSG:
+        case ENODATA:
+        case EREMOTEIO:
+        case EILSEQ:
+        case ETIMEDOUT:
+        case ENOLINK:
+            return DiskErrorAction::kCheckFilesystem;
+        default:
+            return DiskErrorAction::kIgnore;
+    }
+}
 
 FileStorage::FileStorage(const FileStorageConfig& config,
                          std::shared_ptr<Client> client,
@@ -92,6 +128,14 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         }
     }
 
+    disk_dir_fd_ = ::open(config_.storage_filepath.c_str(),
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    PLOG_IF(WARNING, disk_dir_fd_ < 0) << "open " << config_.storage_filepath;
+    storage_backend_->SetDiskErrorObserver(
+        [this](int err, const char* op) { OnDiskError(err, op); });
+    // Export 0 from the start: an unset gauge has no series at all.
+    if (ssd_metric_) ssd_metric_->ssd_disk_fenced.update(0);
+
     // Register the client buffer with the process-wide io_uring fixed-buffer
     // mechanism. This must happen before any I/O threads start so that they
     // can lazily pick up the registration on their first I/O call.
@@ -117,6 +161,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 FileStorage::~FileStorage() {
     LOG(INFO) << "Shutdown FileStorage...";
     heartbeat_running_ = false;
+    WakeHeartbeat();
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
     }
@@ -124,6 +169,7 @@ FileStorage::~FileStorage() {
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
     }
+    if (disk_dir_fd_ >= 0) ::close(disk_dir_fd_);
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {
@@ -217,8 +263,13 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
                   << "s, running is: " << heartbeat_running_.load();
         while (heartbeat_running_.load()) {
             Heartbeat();
-            std::this_thread::sleep_for(
-                std::chrono::seconds(config_.heartbeat_interval_seconds));
+            // Wake early for a fence the heartbeat has not applied yet.
+            std::unique_lock<std::mutex> lock(heartbeat_wake_mutex_);
+            heartbeat_wake_cv_.wait_for(
+                lock, std::chrono::seconds(config_.heartbeat_interval_seconds),
+                [this] {
+                    return !heartbeat_running_ || (disk_fenced_ && !draining_);
+                });
         }
     });
     client_buffer_gc_running_.store(true);
@@ -457,6 +508,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     std::optional<ErrorCode> abort_error;
 
     for (const auto& keys : buckets_keys) {
+        if (disk_fenced_.load()) {
+            // Not yet in all_bucket_keys, so the sweep below NACKs the rest,
+            // except carried keys (this cycle's deferrals and the pool's
+            // carryover in the first bucket): those stay carried, and
+            // ApplyDiskFence NACKs every carried task on the next tick.
+            abort_error = ErrorCode::FILE_WRITE_FAIL;
+            break;
+        }
         for (const auto& k : keys) all_bucket_keys.insert(k);
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         std::unordered_map<std::string, std::vector<std::string>>
@@ -767,13 +826,16 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    ApplyDiskFence();
+
     // A drain deregistered the disk tier on purpose. Skipping the whole tick
     // matters for the SEGMENT_NOT_FOUND branch below, which would re-mount the
     // segment and re-register every object; there is also no point taking new
     // offload work for a store that is leaving. The client TTL is renewed by
     // Ping on the storage heartbeat thread, not here, so the client stays
-    // alive for its memory segments.
+    // alive for its memory segments. A disk fence latches the same way.
     if (draining_.load()) {
+        UnmountLocalDiskIfPending();
         return {};
     }
 
@@ -942,13 +1004,14 @@ tl::expected<void, ErrorCode> FileStorage::DrainLocalDiskSegment(
         MutexLocker locker(&offloading_mutex_);
         draining_.store(true);
 
+        // On failure the latch stays and the heartbeat retries the unmount.
         auto result = client_->UnmountLocalDiskSegment();
         if (!result) {
             LOG(ERROR) << "action=drain_local_disk_segment, error="
                        << result.error();
-            draining_.store(false);
             return result;
         }
+        local_disk_unmounted_ = true;
     }
 
     LOG(INFO) << "action=drain_local_disk_segment, grace_period_ms="
@@ -957,6 +1020,147 @@ tl::expected<void, ErrorCode> FileStorage::DrainLocalDiskSegment(
         std::this_thread::sleep_for(std::chrono::milliseconds(grace_period_ms));
     }
     return {};
+}
+
+void FileStorage::WakeHeartbeat() {
+    // Locking orders the state change before the waiter's predicate check,
+    // so the wakeup cannot be lost.
+    {
+        std::lock_guard<std::mutex> lock(heartbeat_wake_mutex_);
+    }
+    heartbeat_wake_cv_.notify_all();
+}
+
+int FileStorage::CheckFilesystem(bool sync_first) const {
+    if (test_filesystem_check_) return test_filesystem_check_(sync_first);
+    // On XFS, fstat fails with EIO exactly when the filesystem is shut down,
+    // without device I/O (statfs keeps succeeding). XFS shuts down only when
+    // a log write fails, which usually comes after the first EIO a store
+    // sees, so sync_first forces the log with syncfs; its own result is
+    // ignored (it also reports a single bad file's writeback error once).
+    // stat on the path gives the same signal if the dir fd failed to open.
+    // syncfs runs on the failing I/O thread. A device that fails the
+    // triggering call quickly but wedges writeback can park it here; that
+    // thread is already stuck on that device, and hang detection is out of
+    // scope.
+    if (sync_first && disk_dir_fd_ >= 0) (void)::syncfs(disk_dir_fd_);
+    struct stat st;
+    const int rc = disk_dir_fd_ >= 0
+                       ? ::fstat(disk_dir_fd_, &st)
+                       : ::stat(config_.storage_filepath.c_str(), &st);
+    return rc == 0 ? 0 : errno;
+}
+
+std::optional<FileStorage::DiskFailure> FileStorage::RunFilesystemChecks(
+    DiskFailure failure, int& check_err) {
+    {
+        MutexLocker locker(&filesystem_check_mutex_);
+        if (filesystem_check_running_) {
+            // The running check may have looked before this failure, so the
+            // failure gets a check of its own after it. Queued failures share
+            // that check, which runs syncfs if any of them needs it.
+            if (!queued_disk_failure_ || CheckNeedsSyncfs(failure.op)) {
+                queued_disk_failure_ = failure;
+            }
+            return std::nullopt;
+        }
+        filesystem_check_running_ = true;
+    }
+    while (true) {
+        const bool sync_first = CheckNeedsSyncfs(failure.op);
+        check_err = CheckFilesystem(sync_first);
+        const bool filesystem_down =
+            ClassifyDiskErrno(check_err) != DiskErrorAction::kIgnore;
+        if (!filesystem_down) {
+            LOG(WARNING) << "action=disk_error_not_fenced, op=" << failure.op
+                         << ", errno=" << failure.err << " ("
+                         << strerror(failure.err) << "), check="
+                         << (sync_first ? "syncfs+fstat" : "fstat");
+        }
+        MutexLocker locker(&filesystem_check_mutex_);
+        if (filesystem_down || !queued_disk_failure_ || disk_fenced_.load()) {
+            // Released under the same lock that queues, so no failure is
+            // queued after the last look.
+            filesystem_check_running_ = false;
+            queued_disk_failure_.reset();
+            if (filesystem_down) return failure;
+            return std::nullopt;
+        }
+        failure = *queued_disk_failure_;
+        queued_disk_failure_.reset();
+    }
+}
+
+void FileStorage::OnDiskError(int err, const char* op) {
+    const DiskErrorAction action = ClassifyDiskErrno(err);
+    if (disk_fenced_.load() || action == DiskErrorAction::kIgnore) return;
+    DiskFailure failure{err, op};
+    int check_err = 0;
+    if (action == DiskErrorAction::kCheckFilesystem) {
+        auto fencing = RunFilesystemChecks(failure, check_err);
+        if (!fencing) return;
+        failure = *fencing;
+    }
+    if (disk_fenced_.exchange(true)) return;
+    LOG(ERROR) << "action=disk_fence, op=" << failure.op
+               << ", errno=" << failure.err << " (" << strerror(failure.err)
+               << "), fs_check_errno=" << check_err
+               << ", path=" << config_.storage_filepath;
+    if (ssd_metric_) ssd_metric_->ssd_disk_fenced.update(1);
+    WakeHeartbeat();
+}
+
+void FileStorage::ApplyDiskFence() {
+    if (!disk_fenced_.load() || draining_.load()) return;
+    MutexLocker locker(&offloading_mutex_);
+    enable_offloading_ = false;
+    draining_.store(true);
+    NackCarriedOffloadTasks();
+    if (local_disk_unmounted_) return;  // a drain already deregistered
+    // Unmounting drops the master's queue of offload tasks for this store but
+    // not the source-replica references those tasks hold, which would pin the
+    // memory replicas until the master's TTL reaper. A heartbeat with
+    // offloading disabled releases both. Best effort: the TTL is the backstop.
+    std::vector<OffloadTaskItem> discarded;
+    auto result = client_->OffloadObjectHeartbeat(false, discarded);
+    LOG(INFO) << "action=release_offload_queue, result="
+              << (result ? ErrorCode::OK : result.error());
+}
+
+void FileStorage::NackCarriedOffloadTasks() {
+    // No OffloadObjects call follows a fence, so nothing would re-emit the
+    // pool's keys; their carried tasks would pin the source replicas until
+    // the master's TTL reaper. A NACK is handled whether or not the segment
+    // is still mounted.
+    if (auto bucket_backend =
+            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
+        bucket_backend->ClearUngroupedOffloadingObjects();
+    }
+    if (deferred_task_by_storage_key_.empty()) return;
+    std::vector<OffloadTaskItem> tasks;
+    tasks.reserve(deferred_task_by_storage_key_.size());
+    for (const auto& [_, task] : deferred_task_by_storage_key_) {
+        tasks.push_back(task);
+    }
+    deferred_task_by_storage_key_.clear();
+    std::vector<StorageObjectMetadata> nacks(
+        tasks.size(), StorageObjectMetadata{-1, 0, 0, -1, ""});
+    auto result = client_->NotifyOffloadSuccess(tasks, nacks);
+    LOG(INFO) << "action=nack_carried_offload_tasks, count=" << tasks.size()
+              << ", result=" << (result ? ErrorCode::OK : result.error());
+}
+
+void FileStorage::UnmountLocalDiskIfPending() {
+    MutexLocker locker(&offloading_mutex_);
+    if (local_disk_unmounted_) return;
+    auto result = client_->UnmountLocalDiskSegment();
+    if (result) {
+        LOG(INFO) << "action=unmount_local_disk_segment, result=OK";
+    } else {
+        LOG(WARNING) << "action=unmount_local_disk_segment, result="
+                     << result.error();
+    }
+    local_disk_unmounted_ = result.has_value();
 }
 
 namespace {
@@ -1222,6 +1426,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
 
 tl::expected<void, ErrorCode> FileStorage::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {
+    if (disk_fenced_) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     auto start_time = std::chrono::steady_clock::now();
     auto result = storage_backend_->BatchLoad(batch_object);
     auto end_time = std::chrono::steady_clock::now();

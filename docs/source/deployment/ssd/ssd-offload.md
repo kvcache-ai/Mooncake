@@ -382,3 +382,15 @@ To raise it permanently, add the following to `/etc/security/limits.conf`:
 ```
 
 Alternatively, reduce `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` to a value within the existing limit. Note that the warning does not abort startup — the client falls back to non-fixed-buffer I/O — but performance may be lower than expected.
+
+### `action=disk_fence` in the logs: the SSD tier stopped on a disk error
+
+A client fences its SSD tier when a disk call fails in a way that retrying cannot fix. It decides on the first failure, from the errno of the failed call:
+
+- `ENODEV`, `ENXIO`, `EROFS`, `ESHUTDOWN`: fence at once.
+- `EIO` and similar device errors: check the filesystem first (`syncfs` unless the failed call was a read, then `fstat` on the offload directory), and fence only if the check also fails. A single bad file on a healthy filesystem does not fence.
+- Anything else, including `ENOSPC`: no fence.
+
+After a fence, the client stops reading from and offloading to that disk, hands its queued offload tasks back to the master, and unmounts its `LOCAL_DISK` segment so the master stops handing out its disk replicas. The memory segment and other clients keep working. The fence lasts until the client restarts; the gauge `mooncake_ssd_disk_fenced` is `1` while it holds. Fix or replace the disk, then restart the client.
+
+Only `bucket_storage_backend` (the default) reports disk errors; with the other backends the fence never triggers.
