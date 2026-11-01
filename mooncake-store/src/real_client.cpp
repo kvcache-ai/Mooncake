@@ -3258,6 +3258,16 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // Reject a second local buffer before mapping or registering its memory.
+    // The exclusive lock also keeps this check valid through installation.
+    if (is_local_buffer && context_it != shm_contexts_.end() &&
+        context_it->second.client_buffer_allocator) {
+        LOG(ERROR) << "A local buffer is already mapped for this "
+                      "client shared memory.";
+        close(fd);
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+
 #ifdef USE_ASCEND_DIRECT
     auto context_result = set_context_if_needed(protocol, physical_device_id,
                                                 "POSIX shm registration");
@@ -3332,12 +3342,6 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     }
 
     if (is_local_buffer) {
-        if (context.client_buffer_allocator) {
-            LOG(ERROR) << "A local buffer is already mapped for this "
-                          "client shared memory.";
-            munmap(shm_buffer, shm_size);
-            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-        }
         context.client_buffer_allocator =
             ClientBufferAllocator::create(shm_buffer, shm_size, this->protocol);
     }
