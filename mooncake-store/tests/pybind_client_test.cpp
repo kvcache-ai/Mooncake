@@ -2,7 +2,6 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <barrier>
 #include <chrono>
 #include <cstdio>
@@ -28,6 +27,8 @@
 #endif
 
 #include "config.h"
+#include "../src/config/client_object_checksum_config.h"
+#include "master_config.h"
 #include "real_client.h"
 #include "nof/dma_buffer_allocator.h"
 #include "nof/nvmeof_initiator.h"
@@ -185,6 +186,175 @@ class RealClientTest : public ::testing::Test {
     }
 };
 
+TEST(ReadRangePlanTest, ClampsAndPreservesOrderWithoutOverflow) {
+    const std::vector<ByteRange> ranges{
+        {8, 4}, {0, 4}, {14, UINT64_MAX}, {UINT64_MAX, UINT64_MAX}, {0, 0}};
+    auto plan = PlanReadRanges(16, ranges, true);
+    ASSERT_TRUE(plan);
+    ASSERT_EQ(plan->fragments.size(), 3);
+    EXPECT_EQ(plan->output_size, 10);
+    EXPECT_EQ(plan->fragments[0].source_offset, 8);
+    EXPECT_EQ(plan->fragments[1].destination_offset, 4);
+    EXPECT_EQ(plan->fragments[2].length, 2);
+    EXPECT_TRUE(plan->checksum_order.empty());
+    EXPECT_FALSE(plan->canonical_read);
+}
+
+TEST(ReadRangePlanTest, CompleteCoverageUsesOrderedViewsExceptForOverlap) {
+    auto ordered =
+        PlanReadRanges(16, std::vector<ByteRange>{{0, 8}, {8, 8}}, true);
+    ASSERT_TRUE(ordered);
+    EXPECT_EQ(ordered->fragments.size(), 1);
+    auto reordered =
+        PlanReadRanges(16, std::vector<ByteRange>{{8, 8}, {0, 8}}, true);
+    ASSERT_TRUE(reordered);
+    EXPECT_EQ(reordered->checksum_order, (std::vector<size_t>{1, 0}));
+    EXPECT_FALSE(reordered->canonical_read);
+    auto overlapping =
+        PlanReadRanges(16, std::vector<ByteRange>{{0, 12}, {8, 8}}, true);
+    ASSERT_TRUE(overlapping);
+    EXPECT_TRUE(overlapping->canonical_read);
+    auto hole =
+        PlanReadRanges(16, std::vector<ByteRange>{{0, 8}, {0, 8}}, true);
+    ASSERT_TRUE(hole);
+    EXPECT_TRUE(hole->checksum_order.empty());
+}
+
+TEST(ReadRangePlanTest, RejectsOutputOverflowAndSkipsUnneededChecksumPlanning) {
+    const uint64_t n = static_cast<uint64_t>(INT64_MAX);
+    const std::vector<ByteRange> huge{{0, n}, {0, 1}};
+    auto rejected = PlanReadRanges(n, huge, false);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::BUFFER_OVERFLOW);
+    const std::vector<ByteRange> repeated{{0, 16}, {0, 16}};
+    auto unchecked = PlanReadRanges(16, repeated, false);
+    ASSERT_TRUE(unchecked);
+    EXPECT_FALSE(unchecked->canonical_read);
+    EXPECT_TRUE(unchecked->checksum_order.empty());
+}
+
+TEST_F(RealClientTest, OwnedRangeReadsPreserveBytesAndEmptySuccess) {
+    StartMasterAndSetupClient();
+    const std::string payload = "abcdefghijklmnop";
+    ASSERT_EQ(py_client_->put("owned-range", std::span<const char>(payload)),
+              0);
+    const std::vector<std::vector<ByteRange>> cases{{{8, 4}, {0, 4}},
+                                                    {{14, UINT64_MAX}},
+                                                    {{0, 4}, {2, 4}},
+                                                    {{8, 8}, {0, 8}},
+                                                    {{0, 12}, {8, 8}},
+                                                    {{0, 16}, {0, 16}},
+                                                    {},
+                                                    {{16, 4}},
+                                                    {{0, 0}},
+                                                    {{0, 8}, {8, 8}}};
+    for (const auto& ranges : cases) {
+        std::string expected;
+        for (const auto& [offset, length] : ranges) {
+            if (offset < payload.size()) {
+                expected += payload.substr(
+                    offset,
+                    std::min<uint64_t>(length, payload.size() - offset));
+            }
+        }
+        auto read = py_client_->get_buffer("owned-range", ranges);
+        ASSERT_TRUE(read) << toString(read.error());
+        if (expected.empty()) {
+            EXPECT_EQ(*read, nullptr);
+        } else {
+            ASSERT_NE(*read, nullptr);
+            EXPECT_EQ(std::string(static_cast<char*>((*read)->ptr()),
+                                  (*read)->size()),
+                      expected);
+        }
+    }
+    auto missing =
+        py_client_->get_buffer("missing-range", std::vector<ByteRange>{});
+    ASSERT_FALSE(missing);
+    EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(RealClientTest,
+       OwnedBatchRangesKeepDuplicateOutputsAndFailuresSeparate) {
+    StartMasterAndSetupClient();
+    const std::string payload = "abcdefghijklmnop";
+    ASSERT_EQ(py_client_->put("batch-range", std::span<const char>(payload)),
+              0);
+    const std::vector<std::string> keys{"batch-range", "batch-range",
+                                        "missing-range", "batch-range"};
+    std::vector<PyClient::OptionalRanges> ranges{
+        std::vector<ByteRange>{{8, 4}, {0, 4}}, std::nullopt,
+        std::vector<ByteRange>{{0, 4}}, std::vector<ByteRange>{}};
+    auto reads = py_client_->batch_get_buffer(keys, ranges);
+    ASSERT_EQ(reads.size(), keys.size());
+    ASSERT_TRUE(reads[0]);
+    ASSERT_NE(*reads[0], nullptr);
+    ASSERT_TRUE(reads[1]);
+    ASSERT_NE(*reads[1], nullptr);
+    EXPECT_EQ(std::string(static_cast<char*>((*reads[0])->ptr()),
+                          (*reads[0])->size()),
+              "ijklabcd");
+    EXPECT_EQ(std::string(static_cast<char*>((*reads[1])->ptr()),
+                          (*reads[1])->size()),
+              payload);
+    ASSERT_FALSE(reads[2]);
+    EXPECT_EQ(reads[2].error(), ErrorCode::OBJECT_NOT_FOUND);
+    ASSERT_TRUE(reads[3]);
+    EXPECT_EQ(*reads[3], nullptr);
+    EXPECT_TRUE(
+        py_client_
+            ->batch_get_buffer({}, std::vector<PyClient::OptionalRanges>{})
+            .empty());
+    auto malformed = py_client_->batch_get_buffer(keys, {});
+    ASSERT_EQ(malformed.size(), keys.size());
+    for (const auto& entry : malformed) EXPECT_FALSE(entry);
+}
+
+TEST_F(RealClientTest, OwnedRangesVerifyFullCoverageButNotPartialReads) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
+        GTEST_SKIP() << "Requires MOONCAKE_STORE_CHECKSUM=1 at process startup";
+    }
+    StartMasterAndSetupClient();
+    const std::string payload = "abcdefghijklmnop";
+    ASSERT_EQ(
+        py_client_->put("checksum-ranges", std::span<const char>(payload)), 0);
+    auto replicas = py_client_->get_replica_desc("checksum-ranges");
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas[0].is_memory_replica());
+    auto address =
+        replicas[0].get_memory_descriptor().buffer_descriptor.buffer_address_;
+    reinterpret_cast<char*>(address)[12] ^= 1;
+    for (const auto& ranges : std::vector<std::vector<ByteRange>>{
+             {{8, 8}, {0, 8}}, {{0, 12}, {8, 8}}}) {
+        auto got = py_client_->get_buffer("checksum-ranges", ranges);
+        ASSERT_FALSE(got);
+        EXPECT_EQ(got.error(), ErrorCode::CHECKSUM_MISMATCH);
+    }
+    // Partial data cannot validate a checksum defined over the whole object.
+    auto partial = py_client_->get_buffer("checksum-ranges",
+                                          std::vector<ByteRange>{{0, 4}});
+    ASSERT_TRUE(partial);
+    ASSERT_NE(*partial, nullptr);
+    EXPECT_EQ(std::string(static_cast<char*>((*partial)->ptr()), 4), "abcd");
+}
+
+TEST_F(RealClientTest, OwnedPartialReadDoesNotAllocateTheFullObject) {
+    StartMasterAndSetupClient();
+    const std::string payload(8 * 1024 * 1024, 'x');
+    ASSERT_EQ(py_client_->put("pool-ranges", std::span<const char>(payload)),
+              0);
+    auto reserved = py_client_->allocate_client_buffer(15 * 1024 * 1024);
+    ASSERT_TRUE(reserved);
+    EXPECT_EQ(py_client_->get_buffer("pool-ranges"), nullptr);
+    auto partial = py_client_->get_buffer(
+        "pool-ranges", std::vector<ByteRange>{{1024, 65536}});
+    ASSERT_TRUE(partial);
+    ASSERT_NE(*partial, nullptr);
+    EXPECT_EQ((*partial)->size(), 65536);
+    EXPECT_EQ(std::string(static_cast<char*>((*partial)->ptr()), 65536),
+              std::string(65536, 'x'));
+}
+
 TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
     StartMasterAndSetupClient();
 
@@ -309,6 +479,14 @@ TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
     ASSERT_TRUE(replicas.front().is_dfs_replica());
     const auto dfs_descriptor = replicas.front().get_dfs_descriptor();
 
+    auto owned = py_client_->get_buffer(
+        key, std::vector<ByteRange>{{2048, 777}, {127, 512}});
+    ASSERT_TRUE(owned);
+    ASSERT_NE(*owned, nullptr);
+    EXPECT_EQ(
+        std::string(static_cast<char*>((*owned)->ptr()), (*owned)->size()),
+        source.substr(2048, 777) + source.substr(127, 512));
+
     std::string first(512, '\0');
     std::string second(777, '\0');
     ASSERT_EQ(py_client_->register_buffer(first.data(), first.size()), 0);
@@ -337,6 +515,10 @@ TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
         {key}, {{first.data()}}, {{first.size()}}, {{0}});
     ASSERT_EQ(results.size(), 1);
     EXPECT_EQ(results[0], static_cast<int>(toInt(ErrorCode::FILE_READ_FAIL)));
+    auto truncated =
+        py_client_->get_buffer(key, std::vector<ByteRange>{{0, 512}});
+    ASSERT_FALSE(truncated);
+    EXPECT_EQ(truncated.error(), ErrorCode::FILE_READ_FAIL);
 
     EXPECT_EQ(py_client_->batch_get_session_end({key}), 0);
     EXPECT_EQ(py_client_->unregister_buffer(first.data()), 0);
@@ -4882,6 +5064,158 @@ TEST_F(RealClientTest,
 }
 
 }  // namespace testing
+
+}  // namespace mooncake
+
+namespace mooncake {
+
+// File-window reads retain the selected replica lease.
+class RangedDiskLeaseTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        tmp_dir_ = std::filesystem::temp_directory_path() /
+                   ("mc_ranged_disk_lease_" + std::to_string(::getpid()));
+        std::filesystem::create_directories(tmp_dir_);
+
+        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                      .set_root_fs_dir(tmp_dir_.string())
+                                      .set_enable_disk_eviction(true)
+                                      .set_quota_bytes(64 * 1024)
+                                      .build()));
+        master_address_ = master_.master_address();
+
+        client_ = RealClient::create();
+        ASSERT_EQ(client_->setup_real("localhost:17831", "P2PHANDSHAKE",
+                                      16 * 1024 * 1024, 16 * 1024 * 1024,
+                                      FLAGS_protocol, "", master_address_),
+                  0);
+    }
+
+    void TearDown() override {
+        if (client_) {
+            client_->tearDownAll();
+            client_.reset();
+        }
+        master_.Stop();
+        std::error_code ec;
+        std::filesystem::remove_all(tmp_dir_, ec);
+    }
+
+    std::optional<Replica::Descriptor> WaitForDiskReplica(
+        const std::string& key, std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : client_->get_replica_desc(key)) {
+                if (replica.is_disk_replica()) return replica;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return std::nullopt;
+    }
+
+    testing::InProcMaster master_;
+    std::string master_address_;
+    std::filesystem::path tmp_dir_;
+    std::shared_ptr<RealClient> client_;
+};
+
+TEST_F(RangedDiskLeaseTest, FileWindowsRejectExpiredLease) {
+    constexpr size_t kObjectSize = 4096;
+    constexpr size_t kRangeOffset = 512;
+    constexpr size_t kRangeSize = 1024;
+    static_assert(kRangeOffset + kRangeSize < kObjectSize);
+
+    std::string payload(kObjectSize, '\0');
+    for (size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<char>(i % 251);
+    }
+    const std::string key = "ranged_disk_lease_expired";
+    ASSERT_EQ(client_->put(key, std::span<const char>(payload)), 0);
+    auto disk = WaitForDiskReplica(key, std::chrono::seconds(10));
+    ASSERT_TRUE(disk.has_value()) << "DISK replica did not appear";
+
+    auto queries = client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1u);
+    ASSERT_TRUE(queries[0].has_value());
+
+    // Force the DISK/DFS BatchReadFileReplicaRanges path even when a MEMORY
+    // replica is still present: pass a disk-only QueryResult with an
+    // explicit expired deadline (same shape as the BatchGet lease regression).
+    RealClient::RangedReadMetadata metadata{
+        .query_result = QueryResult(
+            std::vector<Replica::Descriptor>{*disk},
+            std::chrono::steady_clock::now() - std::chrono::seconds(1),
+            queries[0]->object_checksum),
+        .replica = *disk,
+        .total_size = kObjectSize,
+    };
+
+    auto destination = client_->allocate_client_buffer(kRangeSize);
+    ASSERT_TRUE(destination.has_value());
+    std::memset(destination->ptr(), 0, kRangeSize);
+
+    auto windows = client_->read_file_ranges({{&key,
+                                               &metadata.query_result,
+                                               &metadata.replica,
+                                               {destination->ptr(), kRangeSize},
+                                               kRangeOffset}});
+    ASSERT_EQ(windows.size(), 1);
+    ASSERT_FALSE(windows[0]);
+    EXPECT_EQ(windows[0].error(), ErrorCode::LEASE_EXPIRED);
+}
+
+TEST_F(RangedDiskLeaseTest, DiskRangeReadSucceedsWithLiveLease) {
+    constexpr size_t kObjectSize = 4096;
+    constexpr size_t kRangeOffset = 256;
+    constexpr size_t kRangeSize = 768;
+    static_assert(kRangeOffset + kRangeSize < kObjectSize);
+
+    std::string payload(kObjectSize, '\0');
+    for (size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<char>((i * 17) % 251);
+    }
+    const std::string key = "ranged_disk_lease_live";
+    ASSERT_EQ(client_->put(key, std::span<const char>(payload)), 0);
+    auto disk = WaitForDiskReplica(key, std::chrono::seconds(10));
+    ASSERT_TRUE(disk.has_value()) << "DISK replica did not appear";
+
+    auto queries = client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1u);
+    ASSERT_TRUE(queries[0].has_value());
+
+    RealClient::RangedReadMetadata metadata{
+        .query_result =
+            QueryResult(std::vector<Replica::Descriptor>{*disk},
+                        queries[0]->lease_timeout, queries[0]->object_checksum),
+        .replica = *disk,
+        .total_size = kObjectSize,
+    };
+
+    auto destination = client_->allocate_client_buffer(kRangeSize);
+    ASSERT_TRUE(destination.has_value());
+    std::memset(destination->ptr(), 0, kRangeSize);
+
+    auto windows = client_->read_file_ranges({{&key,
+                                               &metadata.query_result,
+                                               &metadata.replica,
+                                               {destination->ptr(), kRangeSize},
+                                               kRangeOffset}});
+    ASSERT_EQ(windows.size(), 1);
+    ASSERT_TRUE(windows[0]);
+    EXPECT_EQ(*windows[0], static_cast<int64_t>(kRangeSize));
+    const std::string oversized_key(16 * 1024 * 1024, 'k');
+    auto oversized =
+        client_->read_file_ranges({{&oversized_key,
+                                    &metadata.query_result,
+                                    &metadata.replica,
+                                    {destination->ptr(), kRangeSize},
+                                    kRangeOffset}});
+    ASSERT_FALSE(oversized[0]);
+    EXPECT_EQ(oversized[0].error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(std::memcmp(destination->ptr(), payload.data() + kRangeOffset,
+                          kRangeSize),
+              0);
+}
 
 }  // namespace mooncake
 

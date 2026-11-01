@@ -154,6 +154,14 @@ class StorageFile {
      */
     ErrorCode get_error_code() { return error_code_; }
 
+    tl::expected<uint64_t, ErrorCode> GetSize() const {
+        struct stat info{};
+        if (::fstat(fd_, &info) != 0 || info.st_size < 0) {
+            return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        return static_cast<uint64_t>(info.st_size);
+    }
+
    protected:
     bool delete_on_write_fail_ = true;
     std::string filename_;
