@@ -1476,6 +1476,10 @@ class RealClient : public PyClient {
     // must hold dummy_client_mutex_. Failures stay quarantined; returns OK
     // only when nothing remains quarantined.
     ErrorCode RetryQuarantinedShmsLocked();
+
+    // Serialize close/retry while closed_ continues to reject new work.
+    std::mutex teardown_mutex_;
+    bool offload_cleanup_pending_ = false;
 };
 
 }  // namespace mooncake

@@ -115,15 +115,42 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 }
 
 FileStorage::~FileStorage() {
+    auto result = Shutdown();
+    if (!result) {
+        LOG(ERROR) << "Offload buffer unregister failed: " << result.error()
+                   << "; retaining allocation until process exit";
+        // Destruction cannot be retried. Keep only the allocation, not the
+        // Client reference: that would prevent Client from joining its workers
+        // and unregistering Store segments before RealClient frees them.
+        (void)new std::shared_ptr<ClientBufferAllocator>(
+            std::move(client_buffer_allocator_));
+    }
+}
+
+tl::expected<void, ErrorCode> FileStorage::Shutdown() {
+    std::lock_guard<std::mutex> lock(shutdown_mutex_);
     LOG(INFO) << "Shutdown FileStorage...";
+    draining_.store(true);
     heartbeat_running_ = false;
+    client_buffer_gc_running_ = false;
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
     }
-    client_buffer_gc_running_ = false;
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
     }
+    if (rescan_future_.valid()) {
+        rescan_future_.wait();
+    }
+    if (local_memory_registered_) {
+        auto result =
+            client_->unregisterLocalMemory(client_buffer_allocator_->getBase());
+        if (!result && result.error() != ErrorCode::NOT_REGISTERED) {
+            return result;
+        }
+        local_memory_registered_ = false;
+    }
+    return {};
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {
@@ -1291,6 +1318,7 @@ tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
         LOG(ERROR) << "Failed to register local memory: " << error_code.error();
         return error_code;
     }
+    local_memory_registered_ = true;
     return {};
 }
 
