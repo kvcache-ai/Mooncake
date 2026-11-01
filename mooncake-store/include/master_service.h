@@ -1564,6 +1564,12 @@ class MasterService {
                                  route::ObjectState& state,
                                  const ObjectIdentity& object_id);
 
+    // Whether `client_id` is one of the clients the master enqueued `task`
+    // to. NotifyOffloadSuccess only lets such a client settle the task,
+    // either by completing it or by NACKing it (data_size < 0).
+    static bool IsOffloadTaskMirror(const OffloadingTask& task,
+                                    const UUID& client_id);
+
     struct GracefulUnmountDeadlineRecord {
         UUID segment_id;
         UUID client_id;
