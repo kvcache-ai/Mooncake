@@ -193,7 +193,7 @@ class BatchEvictBench {
             auto& metadata = hold->metadata();
             {
                 SpinLocker locker(&metadata.lock);
-                metadata.lease_->SetDeadline(
+                metadata.GetLease().SetDeadline(
                     base_expiration + std::chrono::nanoseconds(ordinal++));
             }
 
