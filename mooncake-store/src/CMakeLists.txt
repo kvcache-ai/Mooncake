@@ -746,6 +746,26 @@ if(USE_SUNRISE)
                            ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
 endif()
 
+if(BUILD_UNIT_TESTS AND USE_MLU)
+  # --wrap cannot intercept CNRT calls inside a shared mooncake_store. Reuse its
+  # objects in a test-only archive so those calls reach the final link. Keep
+  # this target here so directory-scoped dependency targets are visible.
+  add_library(
+    mooncake_store_mlu_test STATIC
+    $<TARGET_OBJECTS:mooncake_store_shared_objects>
+    $<TARGET_OBJECTS:mooncake_store_master_objects>
+    $<TARGET_OBJECTS:mooncake_store_client_objects>)
+  target_include_directories(
+    mooncake_store_mlu_test
+    PUBLIC $<TARGET_PROPERTY:mooncake_store,INTERFACE_INCLUDE_DIRECTORIES>)
+  target_compile_definitions(
+    mooncake_store_mlu_test
+    PUBLIC $<TARGET_PROPERTY:mooncake_store,INTERFACE_COMPILE_DEFINITIONS>)
+  get_target_property(mlu_test_store_dependencies mooncake_store LINK_LIBRARIES)
+  target_link_libraries(mooncake_store_mlu_test
+                        PUBLIC ${mlu_test_store_dependencies})
+endif()
+
 if(BUILD_SHARED_LIBS)
   set_target_properties(mooncake_store PROPERTIES INSTALL_RPATH "$ORIGIN")
   install(TARGETS mooncake_store DESTINATION lib)

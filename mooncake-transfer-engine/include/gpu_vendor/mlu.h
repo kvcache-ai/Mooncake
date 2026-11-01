@@ -8,6 +8,7 @@
 const static std::string GPU_PREFIX = "mlu:";
 
 using cudaError_t = cnrtRet_t;
+using cudaMemcpyKind = cnrtMemTransDir_t;
 using cudaPointerAttributes = cnrtPointerAttributes_t;
 using cudaStream_t = cnrtQueue_t;
 
