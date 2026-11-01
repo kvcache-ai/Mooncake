@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <memory>
 #include <stack>
+#include <unordered_set>
 #include <vector>
 
 #include "common/base/status.h"
@@ -197,6 +198,60 @@ class TransferEnginePy {
                                const std::string &transport_hint,
                                const std::string &nic_hint);
 
+    // Engine-side gather + write: gathers scattered GPU segments
+    // (gpu_segments[i], lengths[i]) into a pinned staging slot, then pushes
+    // the slot to remote_base at the target as one contiguous async WRITE.
+    // split > 1 splits that WRITE into `split` equal contiguous descriptors
+    // (target offsets remote_base + chunk boundaries) within one batch, so
+    // the TCP transport spreads them across lanes — a single multi-GB
+    // descriptor would be pinned to one lane (~2.3GB/s vs ~4.9GB/s
+    // aggregate). The remote bytes land identically either way, so the
+    // consumer needs no protocol change.
+    // Returns a batch_id to poll with transferCheckStatus, or 0 on failure
+    // (no slot available, gather or submit failed) — the caller is expected
+    // to fall back to a per-descriptor path. The slot stays in
+    // gather_slots_ until the caller releases it with releaseGatherSlot
+    // after observing a terminal transfer status; it is never released
+    // internally, because polling the batch from a second thread would race
+    // the caller's transferCheckStatus, which frees the batch on completion
+    // (a concurrent reader of the freed BatchDesc corrupts the heap).
+    batch_id_t submitGatherWrite(const char *target_hostname,
+                                 const std::vector<uintptr_t> &gpu_segments,
+                                 const std::vector<size_t> &lengths,
+                                 uintptr_t remote_base, size_t split);
+
+    // Hand the staging slot of a finished gather batch back to the pool.
+    // Must be called at most once per batch, after transferCheckStatus
+    // returned a terminal status (1/-1). Calling it while the transfer is
+    // still in flight (e.g. TIMEOUT) is unsafe: the session may still read
+    // from the slot.
+    void releaseGatherSlot(batch_id_t batch_id);
+
+    // Engine-side receive slot (the receive-side mirror of
+    // submitGatherWrite): check out a pinned staging slot for one merged
+    // remote WRITE to land in. The slot buffer is registered as local
+    // memory on first checkout so a peer can target it, and stays
+    // registered for the process lifetime. Returns (slot_addr, capacity),
+    // or (0, 0) when no slot is free — the caller then advertises addr 0
+    // and the producer falls back to per-descriptor transfers. The slot
+    // stays checked out until releaseScatterSlot.
+    std::pair<uintptr_t, size_t> acquireScatterSlot();
+
+    // Scatter the bytes sitting in scatter slot `slot_addr` out to GPU
+    // destinations: dst_segments[i] receives lengths[i] bytes, read
+    // contiguously from the slot starting at offset 0, in segment order
+    // (the exact mirror of the packing submitGatherWrite performs). Blocks
+    // until the scatter is applied to device memory. Returns 0 on success.
+    // Does not release the slot; call releaseScatterSlot when done.
+    int submitScatterToDevice(uintptr_t slot_addr,
+                              const std::vector<uintptr_t> &dst_segments,
+                              const std::vector<size_t> &lengths);
+
+    // Hand a scatter slot back to the pool. Must be called exactly once per
+    // acquireScatterSlot, after the slot bytes are no longer needed (i.e.
+    // after submitScatterToDevice returned, or the pull failed).
+    void releaseScatterSlot(uintptr_t slot_addr);
+
     int transferSync(const char *target_hostname, uintptr_t buffer,
                      uintptr_t peer_buffer_address, size_t length,
                      TransferOpcode opcode, TransferNotify *notify = nullptr,
@@ -330,6 +385,16 @@ class TransferEnginePy {
     std::vector<char *> buffer_list_;
     std::unordered_set<char *> large_buffer_list_;
     std::unordered_map<std::string, Transport::SegmentHandle> handle_map_;
+
+    // batch_id -> staging slot for in-flight submitGatherWrite batches
+    // (stored as void* to keep GpuStagingPool out of this header).
+    std::mutex gather_slot_mutex_;
+    std::unordered_map<batch_id_t, void *> gather_slots_;
+    // slot buffer addr -> staging slot for checked-out scatter slots, and
+    // the set of slot buffers already registered as local memory.
+    std::mutex scatter_slot_mutex_;
+    std::unordered_map<uintptr_t, void *> scatter_slots_;
+    std::unordered_set<uintptr_t> registered_scatter_slots_;
     bool auto_discovery_;
 
     uint64_t transfer_timeout_nsec_;
