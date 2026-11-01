@@ -561,3 +561,14 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+# Compile the production resource manager against a USRBIO test double, even
+# when USE_3FS is disabled. Keep it separate from mooncake_store's real client.
+add_executable(
+  hf3fs_resource_manager_test hf3fs_resource_manager_test.cpp
+                              ../src/hf3fs/hf3fs_resource_manager.cpp)
+target_include_directories(hf3fs_resource_manager_test BEFORE
+                           PRIVATE hf3fs_stub ${MOONCAKE_STORE_INCLUDE_ROOT})
+target_link_libraries(hf3fs_resource_manager_test PRIVATE gtest gtest_main
+                                                          pthread)
+add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)
