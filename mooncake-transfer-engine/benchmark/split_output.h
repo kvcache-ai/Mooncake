@@ -22,10 +22,14 @@
 namespace mooncake {
 namespace tent {
 
+// Durations are kept in nanoseconds and written as microseconds with three
+// decimals, so the log matches the table's unit without losing precision.
 struct SplitXferSample {
+    uint64_t block_size;
     uint64_t batch_size;
-    uint64_t submit_us;
-    uint64_t wait_us;
+    bool warmup;
+    uint64_t submit_ns;
+    uint64_t wait_ns;
     uint64_t polls;
 };
 
@@ -35,6 +39,12 @@ struct SplitXferSample {
 extern bool g_split_output_enabled;
 
 inline bool splitOutputEnabled() noexcept { return g_split_output_enabled; }
+
+// Whether transfers issued by the calling worker thread are warmup. The
+// benchmark loop sets this around its warmup phase; backends read it when
+// building a sample.
+void setSplitWarmup(bool warmup) noexcept;
+bool splitWarmup() noexcept;
 
 bool formatSplitXferLine(char* buf, size_t cap, const SplitXferSample& sample,
                          size_t* written);
