@@ -4,6 +4,8 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -328,6 +330,34 @@ TEST_F(MasterServiceSSDTest, EvictDiskReplicaDecrementsFileCacheNums) {
     // mem_cache_nums_ unchanged (MEMORY replica still present).
     EXPECT_EQ(metrics.get_file_cache_nums(), baseline);
     EXPECT_EQ(metrics.get_mem_cache_nums(), baseline_mem + 1);
+}
+
+// A disk eviction is a key write, so it waits while the master state is held
+// exclusively (restore, segment remount and unmount) instead of changing a
+// key under it.
+TEST_F(MasterServiceSSDTest, EvictDiskReplicaWaitsForMasterStateLock) {
+    auto service = CreateSsdAwareOffloadService();
+    UUID client_id = generate_uuid();
+    const std::string segment = "ssd_evict_state_lock_segment";
+    const std::string key = "ssd_evict_state_lock_key";
+    MountMemoryAndLocalDisk(*service, client_id, segment, 0x1500000000);
+    PutAndOffload(*service, client_id, key, 128, segment);
+
+    std::unique_lock<std::shared_mutex> state_lock(
+        MasterServiceTestPeer::MasterStateMutex(*service));
+    auto evicting = std::async(std::launch::async, [&] {
+        return service->EvictDiskReplica(client_id, key, TenantId::Default(),
+                                         ReplicaType::LOCAL_DISK);
+    });
+    EXPECT_EQ(std::future_status::timeout,
+              evicting.wait_for(std::chrono::milliseconds(250)));
+    state_lock.unlock();
+    ASSERT_TRUE(evicting.get().has_value());
+
+    auto replicas = service->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(1u, replicas.value().replicas.size());
+    EXPECT_TRUE(replicas.value().replicas[0].is_memory_replica());
 }
 
 // Real-path performance comparison: MasterService PutStart throughput for
