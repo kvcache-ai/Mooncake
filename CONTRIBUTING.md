@@ -168,3 +168,5 @@ The PR needs to meet the following code quality standards:
 
 **Finally, thank you for taking the time to read these guidelines and for your interest in contributing to Mooncake.
 All of your contributions help make Mooncake a great tool and community for everyone!**
+
+If Mooncake has been useful to you, you are welcome to leave a [star on GitHub](https://github.com/kvcache-ai/Mooncake). It helps others discover the project, and it means a lot to us.
