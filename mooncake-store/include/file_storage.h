@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <unordered_set>
 
@@ -21,6 +22,11 @@ class FileStorage {
     ~FileStorage();
 
     tl::expected<void, ErrorCode> Init();
+
+    // Callers must stop ingress and quiesce readers before shutdown. Joins
+    // workers and unregisters the offload buffer before its memory is freed.
+    // Idempotent; on failure the buffer remains owned for a later retry.
+    tl::expected<void, ErrorCode> Shutdown();
 
     void RemoveAll();
 
@@ -375,6 +381,9 @@ class FileStorage {
     // again under offloading_mutex_ before the heartbeat RPC, because a tick
     // parked on that lock passed the entry check before the drain latched.
     std::atomic<bool> draining_{false};
+
+    std::mutex shutdown_mutex_;
+    bool local_memory_registered_ = false;
 };
 
 }  // namespace mooncake

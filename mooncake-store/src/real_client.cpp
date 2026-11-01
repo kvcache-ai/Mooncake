@@ -945,6 +945,13 @@ RealClient::~RealClient() {
     // A destructor cannot propagate errors, but a teardown failure (e.g.
     // unconfirmed NoF cleanup) must still leave a trace.
     if (!tearDownAll_internal()) {
+        if (file_storage_) {
+            // Explicit close retains all resources for retry. Destruction
+            // cannot: FileStorage retains an unconfirmed offload allocation,
+            // but drops its Client reference so segment cleanup can finish.
+            file_storage_.reset();
+            (void)tearDownAll_internal();
+        }
         LOG(ERROR) << "RealClient teardown completed with cleanup failures; "
                       "some buffers must stay mapped until process exit";
     }
@@ -1896,10 +1903,12 @@ int RealClient::initAll(const std::string &protocol_,
 }
 
 tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
+    std::lock_guard<std::mutex> teardown_lock(teardown_mutex_);
     // Ensure cleanup executes once across destructor/close/signal paths
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
-                                         std::memory_order_acq_rel)) {
+                                         std::memory_order_acq_rel) &&
+        !offload_cleanup_pending_) {
         // A previous teardown's cleanup failure must not decay into success
         // on repeat calls: retry the idempotent cleanups and keep reporting
         // failure until they heal.
@@ -1933,16 +1942,28 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_dummy_client_monitor();
     stop_http_server();
 
+    // FileStorage owns Client and workers that access Store segments, in both
+    // EGM and ordinary DRAM setups. Stop its ingress and finish its cleanup
+    // before dropping Client or releasing any segment backing memory.
+    if (offload_rpc_server_) {
+        offload_rpc_server_->stop();
+        offload_rpc_server_.reset();
+    }
+    if (file_storage_) {
+        offload_cleanup_pending_ = true;
+        auto result = file_storage_->Shutdown();
+        if (!result) {
+            LOG(ERROR) << "Offload shutdown failed: " << result.error()
+                       << "; retaining client and segment memory for retry";
+            return result;
+        }
+        file_storage_.reset();
+    }
+    offload_cleanup_pending_ = false;
+
     ErrorCode cleanup_error = ErrorCode::OK;
     if (client_) {
         if (!egm_segment_ptrs_.empty()) {
-            // Callers must quiesce in-flight requests before close. FileStorage
-            // owns a Client reference and workers that access segments.
-            if (offload_rpc_server_) {
-                offload_rpc_server_->stop();
-                offload_rpc_server_.reset();
-            }
-            file_storage_.reset();
             for (auto it = egm_segment_ptrs_.rbegin();
                  it != egm_segment_ptrs_.rend(); ++it) {
                 auto &owner = *it;

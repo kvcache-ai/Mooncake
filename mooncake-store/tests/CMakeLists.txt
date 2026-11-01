@@ -48,6 +48,14 @@ add_store_test(segment_pool_test segment_pool_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
 add_store_test(real_client_direct_read_test real_client_direct_read_test.cpp)
+add_store_test(offload_teardown_test offload_teardown_test.cpp)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT BUILD_SHARED_LIBS)
+  target_compile_definitions(offload_teardown_test
+                             PRIVATE MOONCAKE_TEST_WRAP_UNREGISTER=1)
+  target_link_options(
+    offload_teardown_test PRIVATE
+    "LINKER:--wrap=_ZN8mooncake6Client21unregisterLocalMemoryEPvb")
+endif()
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
