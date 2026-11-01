@@ -119,6 +119,22 @@ if(WITH_TE)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_first_buffer.py)
     set_tests_properties(tent_python_first_buffer_test PROPERTIES TIMEOUT 60)
   endif()
+
+  if(BUILD_UNIT_TESTS AND USE_TCP)
+    # MC_FORCE_TCP keeps GPU builds without devices from auto-selecting the
+    # NVLink transport. engine only has an $ORIGIN runpath, so prepend to the
+    # inherited LD_LIBRARY_PATH instead of replacing it: CI puts optional
+    # dependencies such as libetcd_wrapper and CUDA there.
+    add_test(
+      NAME python_sync_quiesce_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env MC_FORCE_TCP=1
+        PYTHONPATH=$<TARGET_FILE_DIR:engine> sh -c
+        "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:asio_shared>:$LD_LIBRARY_PATH exec \"$0\" \"$1\""
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sync_transfer_quiesce.py)
+    set_tests_properties(python_sync_quiesce_test PROPERTIES TIMEOUT 60)
+  endif()
 endif()
 
 set(ALLOCATOR_SO_PATH
