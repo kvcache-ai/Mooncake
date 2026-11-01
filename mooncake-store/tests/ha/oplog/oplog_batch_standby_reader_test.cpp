@@ -24,6 +24,9 @@ class FakeHaKvBackend : public HaKvBackend {
     }
 
     ErrorCode Get(std::string_view key, std::string& value) override {
+        if (key.rfind("/oplog/clusterA/batches/", 0) == 0) {
+            ++batch_get_calls_;
+        }
         if (next_get_error_ != ErrorCode::OK) {
             auto error = next_get_error_;
             next_get_error_ = ErrorCode::OK;
@@ -65,6 +68,7 @@ class FakeHaKvBackend : public HaKvBackend {
     ErrorCode Txn(const KvTxn&) override { return ErrorCode::OK; }
 
     int range_calls() const { return range_calls_; }
+    int batch_get_calls() const { return batch_get_calls_; }
     std::function<void()> before_range;
     void Erase(std::string_view key) { values_.erase(std::string(key)); }
     void FailNextGet(ErrorCode error) { next_get_error_ = error; }
@@ -73,6 +77,7 @@ class FakeHaKvBackend : public HaKvBackend {
    private:
     std::map<std::string, std::string> values_;
     int range_calls_{0};
+    int batch_get_calls_{0};
     ErrorCode next_get_error_{ErrorCode::OK};
     ErrorCode next_range_error_{ErrorCode::OK};
 };
@@ -393,6 +398,7 @@ TEST(OpLogBatchStandbyReaderTest, FullPageContinuesOnNextPoll) {
     EXPECT_EQ(2u, first.applied_entries);
     EXPECT_EQ(2u, first.applied_batches);
     EXPECT_TRUE(first.has_more_pages);
+    EXPECT_EQ(0, backend.batch_get_calls());
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
     EXPECT_FALSE(reader.GetLastAppliedDurablePrefix().has_value());
 
@@ -401,11 +407,46 @@ TEST(OpLogBatchStandbyReaderTest, FullPageContinuesOnNextPoll) {
     EXPECT_EQ(1u, second.applied_entries);
     EXPECT_EQ(1u, second.applied_batches);
     EXPECT_FALSE(second.has_more_pages);
+    EXPECT_EQ(0, backend.batch_get_calls());
     EXPECT_EQ(4u, applier.GetExpectedSequenceId());
     auto applied_prefix = reader.GetLastAppliedDurablePrefix();
     ASSERT_TRUE(applied_prefix.has_value());
     EXPECT_EQ(3u, applied_prefix->batch_id);
     EXPECT_EQ(3u, applied_prefix->last_seq);
+}
+
+TEST(OpLogBatchStandbyReaderTest,
+     DoesNotAdvancePastPrefixObservedBeforeConcurrentAppend) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey("clusterA", 1),
+                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    backend.before_range = [&] {
+        backend.Put(BuildBatchRecordKey("clusterA", 2),
+                    EncodeOpLogBatchRecord(MakeBatch(2, 2, 2)));
+        backend.Put(BuildDurablePrefixKey("clusterA"),
+                    EncodeDurablePrefix({.batch_id = 2, .last_seq = 2}));
+    };
+
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+
+    const auto first = reader.PollOnce(/*max_batches=*/2);
+    ASSERT_EQ(ErrorCode::OK, first.error);
+    EXPECT_EQ(1u, first.applied_entries);
+    EXPECT_EQ(1u, first.applied_batches);
+    EXPECT_EQ(2u, applier.GetExpectedSequenceId());
+
+    const auto second = reader.PollOnce(/*max_batches=*/2);
+    ASSERT_EQ(ErrorCode::OK, second.error);
+    EXPECT_EQ(1u, second.applied_entries);
+    EXPECT_EQ(1u, second.applied_batches);
+    EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+    EXPECT_EQ(0, backend.batch_get_calls());
 }
 
 TEST(OpLogBatchStandbyReaderTest, ReportsValidZeroBoundaryAsComplete) {
