@@ -976,6 +976,26 @@ tl::expected<void, ErrorCode> UringFile::datasync() {
 // Buffer registration
 // ---------------------------------------------------------------------------
 
+// Publish @p buffer for all threads and register it on the calling thread's
+// ring. If that registration fails, unpublish the buffer again: every other
+// thread would otherwise retry on its first I/O and fail the same way (e.g.
+// one iovec larger than 1 GiB, or RLIMIT_MEMLOCK), and each failed
+// io_uring_register() call can block that thread for hundreds of
+// milliseconds.
+static bool publish_and_register_global_buffer(void* buffer, size_t length) {
+    g_buf.base.store(buffer, std::memory_order_release);
+    g_buf.size.store(length, std::memory_order_release);
+    auto& ring = SharedUringRing::instance();
+    if (ring.ensure_buf_registered()) return true;
+    // Only an attempted registration tells us the buffer cannot be
+    // registered; if this thread has no ring, let other threads try.
+    if (ring.is_initialized()) {
+        g_buf.base.store(nullptr, std::memory_order_release);
+        g_buf.size.store(0, std::memory_order_release);
+    }
+    return false;
+}
+
 bool UringFile::register_global_buffer(void* buffer, size_t length) {
     if (!buffer || length == 0) {
         LOG(ERROR)
@@ -994,9 +1014,7 @@ bool UringFile::register_global_buffer(void* buffer, size_t length) {
             << " failed errno=" << errno << " (" << strerror(errno)
             << ") — continuing anyway";
     }
-    g_buf.base.store(buffer, std::memory_order_release);
-    g_buf.size.store(length, std::memory_order_release);
-    bool ok = SharedUringRing::instance().ensure_buf_registered();
+    bool ok = publish_and_register_global_buffer(buffer, length);
     if (ok) {
         LOG(INFO) << "[UringFile::register_global_buffer] registered"
                   << " addr=" << buffer << " size=" << length
@@ -1032,11 +1050,9 @@ bool UringFile::register_buffer(void* buffer, size_t length) {
             return false;
         }
     }
-    // Publish globally; each thread-local ring registers lazily on first I/O.
-    g_buf.base.store(buffer, std::memory_order_release);
-    g_buf.size.store(length, std::memory_order_release);
-    // Register on the calling thread's ring immediately.
-    bool ok = SharedUringRing::instance().ensure_buf_registered();
+    // Publish globally and register on the calling thread's ring; other
+    // thread-local rings register lazily on first I/O.
+    bool ok = publish_and_register_global_buffer(buffer, length);
     LOG(INFO) << "[UringFile::register_buffer] addr=" << buffer
               << " size=" << length << " calling-thread-registered=" << ok;
     return ok;
