@@ -2333,22 +2333,43 @@ class MasterService {
     // Client has successfully remounted them.
     std::unordered_set<std::string> invalid_replica_endpoints_;
 
+    // NoF endpoints quarantined by a standby restore. Held separately from
+    // invalid_replica_endpoints_ because ReMountSegment clears that set per
+    // remounted memory segment, so a NoF te_endpoint that collides with a
+    // memory segment alias would otherwise be un-quarantined by an unrelated
+    // memory remount.
+    std::unordered_set<std::string> invalid_nof_replica_endpoints_;
+
     // Keep DummyBufferAllocator alive after standby restore.
     // Key: transport_endpoint, Value: allocator.
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
         standby_allocator_keepalive_;
+    // Same, for restored NoF replicas, and separate for the same reason:
+    // ReMountSegment erases standby_allocator_keepalive_ by endpoint, and a
+    // NoF placeholder must not be dropped by a memory remount.
+    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
+        standby_nof_allocator_keepalive_;
     std::vector<StandbySegmentInfo> standby_memory_segments_;
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
     // True while the replica sits on an endpoint in
-    // invalid_replica_endpoints_. The read path asks only this, never the set.
+    // invalid_replica_endpoints_, or is a NoF replica on an endpoint in
+    // invalid_nof_replica_endpoints_. The read path asks only this, never the
+    // sets.
     bool IsAwaitingRemount(const Replica& replica) const;
     bool TryGetReadableReplicaDescriptor(const Replica& replica,
                                          Replica::Descriptor& descriptor) const;
     std::vector<Replica::Descriptor> GetReadableReplicaDescriptors(
         const ObjectMetadata& metadata) const;
+
+    // True when a standby restore quarantined this NoF namespace, i.e. the
+    // metadata still holds restored replicas whose (offset, size) ranges the
+    // fresh mount allocator would consider free. Caller holds
+    // master_state_mutex_.
+    bool IsNoFSegmentQuarantined(const NoFSegment& segment) const;
+
     bool IsReplicaReadable(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
