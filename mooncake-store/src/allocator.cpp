@@ -410,6 +410,11 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         LOG(ERROR) << "allocator_status=not_initialized";
         return nullptr;
     }
+    auto allocator = weak_from_this();
+    if (allocator.expired()) {
+        LOG(ERROR) << "allocator_status=not_shared";
+        return nullptr;
+    }
 
     std::unique_ptr<AllocatedBuffer> allocated_buffer = nullptr;
     try {
@@ -428,7 +433,8 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         // Create a custom AllocatedBuffer that manages the
         // OffsetAllocationHandle
         allocated_buffer = std::make_unique<AllocatedBuffer>(
-            weak_from_this(), buffer_ptr, size, std::move(allocation_handle));
+            std::move(allocator), buffer_ptr, size,
+            std::move(allocation_handle));
         VLOG(1) << "allocation_succeeded size=" << size
                 << " segment=" << segment_name_ << " address=" << buffer_ptr;
     } catch (const std::exception& e) {
