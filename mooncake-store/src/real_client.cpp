@@ -947,6 +947,9 @@ RealClient::~RealClient() {
     if (!tearDownAll_internal()) {
         LOG(ERROR) << "RealClient teardown completed with cleanup failures; "
                       "some buffers must stay mapped until process exit";
+        if (mount_rollback_cleanup_failed_.load(std::memory_order_acquire)) {
+            LeakSegmentRecordsUntilProcessExit();
+        }
     }
 }
 
@@ -1069,6 +1072,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                           "create a new client instead";
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
+    }
+    // Likewise refuse when a previous teardown left segments whose rollback
+    // unmount is unconfirmed: their backing memory must stay mapped, and a
+    // re-initialized client could not retry the old master registrations.
+    if (mount_rollback_cleanup_failed_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "Cannot re-initialize: a previous teardown left "
+                      "segments with an unconfirmed rollback unmount; "
+                      "create a new client instead";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
     // Reset the teardown latch so this instance can be torn down again.
     closed_.store(false, std::memory_order_release);
@@ -1896,28 +1908,46 @@ int RealClient::initAll(const std::string &protocol_,
 }
 
 tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
+    // Serialize the destructor/close/signal entry points: a rollback retry
+    // must never race a concurrent full teardown of the same client.
+    std::lock_guard<std::mutex> teardown_guard(teardown_mutex_);
+
     // Ensure cleanup executes once across destructor/close/signal paths
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
                                          std::memory_order_acq_rel)) {
-        // A previous teardown's cleanup failure must not decay into success
-        // on repeat calls: retry the idempotent cleanups and keep reporting
-        // failure until they heal.
-        if (nof_buffer_cleanup_failed_.load(std::memory_order_acquire)) {
-            const ErrorCode rc = CleanupNofRegisteredBuffers();
-            if (rc != ErrorCode::OK) {
-                return tl::unexpected(rc);
+        if (mount_rollback_cleanup_failed_.load(std::memory_order_acquire)) {
+            // A previous teardown stopped background services but retained
+            // Client and segment owners because rollback unmounts failed.
+            // Retry the unmounts; on success continue into the cleanup body
+            // below with closed_ still latched, so concurrent callers keep
+            // taking this early path instead of racing the cleanup.
+            const ErrorCode rollback_rc = RetryPendingMountRollbacks();
+            if (rollback_rc != ErrorCode::OK) {
+                return tl::unexpected(rollback_rc);
             }
+            mount_rollback_cleanup_failed_.store(false,
+                                                 std::memory_order_release);
+        } else {
+            // A previous teardown's cleanup failure must not decay into
+            // success on repeat calls: retry the idempotent cleanups and
+            // keep reporting failure until they heal.
+            if (nof_buffer_cleanup_failed_.load(std::memory_order_acquire)) {
+                const ErrorCode rc = CleanupNofRegisteredBuffers();
+                if (rc != ErrorCode::OK) {
+                    return tl::unexpected(rc);
+                }
+            }
+            ErrorCode shm_rc;
+            {
+                std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+                shm_rc = RetryQuarantinedShmsLocked();
+            }
+            if (shm_rc != ErrorCode::OK) {
+                return tl::unexpected(shm_rc);
+            }
+            return {};
         }
-        ErrorCode shm_rc;
-        {
-            std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
-            shm_rc = RetryQuarantinedShmsLocked();
-        }
-        if (shm_rc != ErrorCode::OK) {
-            return tl::unexpected(shm_rc);
-        }
-        return {};
     }
 
     // Drain the prefetch pool before any resource release below. Pool jobs
@@ -1932,6 +1962,13 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_ipc_server();
     stop_dummy_client_monitor();
     stop_http_server();
+
+    const ErrorCode rollback_rc = RetryPendingMountRollbacks();
+    if (rollback_rc != ErrorCode::OK) {
+        mount_rollback_cleanup_failed_.store(true, std::memory_order_release);
+        return tl::unexpected(rollback_rc);
+    }
+    mount_rollback_cleanup_failed_.store(false, std::memory_order_release);
 
     ErrorCode cleanup_error = ErrorCode::OK;
     if (client_) {
@@ -2248,11 +2285,34 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
     if (remaining > 0) {
         for (size_t i = 0; i < mounted_ids.size(); ++i) {
             UUID id;
+            bool unmounted = false;
             if (StringToUuid(mounted_ids[i], id)) {
-                client_->UnmountSegmentById(id);
+                auto result = client_->UnmountSegmentById(id);
+                if (result) {
+                    unmounted = true;
+                } else {
+                    LOG(ERROR)
+                        << "Rollback unmount failed for " << mounted_ids[i]
+                        << ": " << toString(result.error())
+                        << "; retaining mapped memory for teardown retry";
+                }
+            } else {
+                LOG(ERROR) << "Could not parse mounted segment ID during "
+                              "rollback: "
+                           << mounted_ids[i]
+                           << "; retaining mapped memory until teardown";
             }
-            if (mounted_records[i].mmap_base) {
-                munmap(mounted_records[i].mmap_base, mounted_records[i].size);
+            if (unmounted) {
+                if (mounted_records[i].mmap_base) {
+                    munmap(mounted_records[i].mmap_base,
+                           mounted_records[i].size);
+                }
+            } else {
+                mounted_records[i].rollback_pending = true;
+                std::lock_guard<std::mutex> lock(
+                    mounted_segment_records_mutex_);
+                mounted_segment_records_[mounted_ids[i]] =
+                    std::move(mounted_records[i]);
             }
         }
         out_segment_ids.clear();
@@ -2335,6 +2395,96 @@ void RealClient::ReleaseAllAllocatedSegmentRecords() {
     }
     for (auto &entry : records) {
         FreeAllocatedStoreSegment(entry.second);
+    }
+}
+
+ErrorCode RealClient::RetryPendingMountRollbacks() {
+    const auto has_pending = [](const auto &records) {
+        for (const auto &entry : records) {
+            if (entry.second.rollback_pending) return true;
+        }
+        return false;
+    };
+
+    if (!client_) {
+        std::lock_guard<std::mutex> mounted_lock(
+            mounted_segment_records_mutex_);
+        std::lock_guard<std::mutex> allocated_lock(
+            allocated_segment_records_mutex_);
+        if (has_pending(mounted_segment_records_) ||
+            has_pending(allocated_segment_records_)) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        return ErrorCode::OK;
+    }
+
+    ErrorCode first_error = ErrorCode::OK;
+    const auto retry_records = [&](auto &records_mutex, auto &records,
+                                   auto release_record, const char *kind) {
+        std::vector<std::string> pending;
+        {
+            std::lock_guard<std::mutex> lock(records_mutex);
+            for (const auto &entry : records) {
+                if (entry.second.rollback_pending) {
+                    pending.push_back(entry.first);
+                }
+            }
+        }
+        for (const auto &segment_id : pending) {
+            UUID id;
+            if (!StringToUuid(segment_id, id)) {
+                LOG(ERROR) << "Invalid pending " << kind
+                           << " segment ID: " << segment_id;
+                if (first_error == ErrorCode::OK)
+                    first_error = ErrorCode::INVALID_PARAMS;
+                continue;
+            }
+            auto result = client_->UnmountSegmentById(id);
+            if (!result) {
+                LOG(ERROR) << "Pending " << kind
+                           << " segment unmount failed for " << segment_id
+                           << ": " << toString(result.error());
+                if (first_error == ErrorCode::OK) first_error = result.error();
+                continue;
+            }
+            release_record(segment_id);
+        }
+    };
+
+    retry_records(
+        mounted_segment_records_mutex_, mounted_segment_records_,
+        [this](const std::string &segment_id) {
+            ReleaseMountedSegmentRecord(segment_id);
+        },
+        "mounted");
+    retry_records(
+        allocated_segment_records_mutex_, allocated_segment_records_,
+        [this](const std::string &segment_id) {
+            ReleaseAllocatedSegmentRecord(segment_id);
+        },
+        "allocated");
+    return first_error;
+}
+
+void RealClient::LeakSegmentRecordsUntilProcessExit() noexcept {
+    auto *mounted_records = new (std::nothrow)
+        std::unordered_map<std::string, MountedSegmentRecord>();
+    if (mounted_records) {
+        std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
+        mounted_records->swap(mounted_segment_records_);
+    } else {
+        LOG(ERROR) << "Could not retain mounted segment records in the "
+                      "process-lifetime quarantine";
+    }
+
+    auto *allocated_records = new (std::nothrow)
+        std::unordered_map<std::string, AllocatedSegmentRecord>();
+    if (allocated_records) {
+        std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
+        allocated_records->swap(allocated_segment_records_);
+    } else {
+        LOG(ERROR) << "Could not retain allocated segment records in the "
+                      "process-lifetime quarantine";
     }
 }
 
@@ -2478,11 +2628,31 @@ int RealClient::allocateAndMountSegment(
     if (remaining > 0) {
         for (size_t i = 0; i < mounted_ids.size(); ++i) {
             UUID id;
+            bool unmounted = false;
             if (StringToUuid(mounted_ids[i], id)) {
-                client_->UnmountSegmentById(id);
+                auto result = client_->UnmountSegmentById(id);
+                if (result) {
+                    unmounted = true;
+                } else {
+                    LOG(ERROR)
+                        << "Rollback unmount failed for " << mounted_ids[i]
+                        << ": " << toString(result.error())
+                        << "; retaining allocated memory for teardown retry";
+                }
+            } else {
+                LOG(ERROR) << "Could not parse allocated segment ID during "
+                              "rollback: "
+                           << mounted_ids[i]
+                           << "; retaining allocation until teardown";
             }
-            if (allocated_records[i].base) {
+            if (unmounted) {
                 FreeAllocatedStoreSegment(allocated_records[i]);
+            } else {
+                allocated_records[i].rollback_pending = true;
+                std::lock_guard<std::mutex> lock(
+                    allocated_segment_records_mutex_);
+                allocated_segment_records_[mounted_ids[i]] =
+                    std::move(allocated_records[i]);
             }
         }
         out_segment_ids.clear();

@@ -42,6 +42,9 @@ class RealClient;
 namespace test {
 class PrefetchTeardownTest;
 }  // namespace test
+namespace testing {
+class RealClientTest;
+}  // namespace testing
 class NvlinkHostNumaAllocation;
 struct EgmStorePoolConfig;
 class RegisteredPinnedRegion;
@@ -1051,6 +1054,7 @@ class RealClient : public PyClient {
         void *mmap_base = nullptr;
         size_t size = 0;
         std::string path;
+        bool rollback_pending = false;
     };
 
     struct AllocatedSegmentRecord {
@@ -1058,6 +1062,7 @@ class RealClient : public PyClient {
         size_t size = 0;
         std::string protocol;
         std::shared_ptr<RegisteredPinnedRegion> pinned_region;
+        bool rollback_pending = false;
     };
 
     void FreeAllocatedStoreSegment(AllocatedSegmentRecord &record);
@@ -1294,9 +1299,19 @@ class RealClient : public PyClient {
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
 
+    // Serializes tearDownAll_internal() across the destructor/close/signal
+    // entry points so rollback retries never race a concurrent full
+    // teardown of the same client.
+    std::mutex teardown_mutex_;
+
     // Latched when teardown's NoF buffer cleanup failed: repeat teardown
     // calls retry the cleanup and keep reporting the failure until it heals.
     std::atomic<bool> nof_buffer_cleanup_failed_{false};
+
+    // Latched when a partially mounted chunk could not be unmounted during
+    // rollback or teardown. Repeat teardown retries before dropping Client or
+    // backing-memory ownership.
+    std::atomic<bool> mount_rollback_cleanup_failed_{false};
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
@@ -1444,6 +1459,7 @@ class RealClient : public PyClient {
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;
+    friend class testing::RealClientTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,
                                     void *buffer, size_t size) const;
@@ -1463,6 +1479,8 @@ class RealClient : public PyClient {
     void ReleaseAllMountedSegmentRecords();
     void ReleaseAllocatedSegmentRecord(const std::string &segment_id);
     void ReleaseAllAllocatedSegmentRecords();
+    ErrorCode RetryPendingMountRollbacks();
+    void LeakSegmentRecordsUntilProcessExit() noexcept;
 
     // MappedShm whose spdk_mem_unregister() (spdk_registered) or transfer
     // engine unregisterLocalMemory() (te_unregister_pending) failed during

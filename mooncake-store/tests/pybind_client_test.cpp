@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <barrier>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -39,6 +40,59 @@ DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 
 namespace mooncake {
 namespace testing {
+
+#ifdef MOONCAKE_TEST_STORE_MOUNT_ROLLBACK
+namespace {
+std::atomic<int> g_mount_calls{0};
+std::atomic<int> g_mount_failure_call{0};
+std::atomic<int> g_unmount_failures_remaining{0};
+}  // namespace
+
+using WrappedMountResult = tl::expected<UUID, ErrorCode>;
+using WrappedUnmountResult = tl::expected<void, ErrorCode>;
+
+extern "C" WrappedMountResult
+RealMountSegmentAndGetId(Client*, const void*, size_t, const std::string&, const std::string&) asm(
+    "__real__ZN8mooncake6Client20MountSegmentAndGetIdEPKvmRKNSt7__cxx1112basic_"
+    "stringIcSt11char_traitsIcESaIcEEESA_");
+extern "C" WrappedMountResult
+WrapMountSegmentAndGetId(Client*, const void*, size_t, const std::string&, const std::string&) asm(
+    "__wrap__ZN8mooncake6Client20MountSegmentAndGetIdEPKvmRKNSt7__cxx1112basic_"
+    "stringIcSt11char_traitsIcESaIcEEESA_");
+
+extern "C" WrappedUnmountResult
+RealUnmountSegmentById(Client*, const UUID&, uint64_t, std::function<void(const UUID&)>) asm(
+    "__real__"
+    "ZN8mooncake6Client18UnmountSegmentByIdERKSt4pairImmEmSt8functionIFvS4_EE");
+extern "C" WrappedUnmountResult
+WrapUnmountSegmentById(Client*, const UUID&, uint64_t, std::function<void(const UUID&)>) asm(
+    "__wrap__"
+    "ZN8mooncake6Client18UnmountSegmentByIdERKSt4pairImmEmSt8functionIFvS4_EE");
+
+extern "C" WrappedMountResult WrapMountSegmentAndGetId(
+    Client* client, const void* buffer, size_t size,
+    const std::string& protocol, const std::string& location) {
+    const int call = g_mount_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (call == g_mount_failure_call.load(std::memory_order_relaxed)) {
+        return tl::unexpected(ErrorCode::RPC_FAIL);
+    }
+    return RealMountSegmentAndGetId(client, buffer, size, protocol, location);
+}
+
+extern "C" WrappedUnmountResult WrapUnmountSegmentById(
+    Client* client, const UUID& segment_id, uint64_t grace_period_ms,
+    std::function<void(const UUID&)> cleanup_callback) {
+    int failures = g_unmount_failures_remaining.load(std::memory_order_relaxed);
+    while (failures > 0) {
+        if (g_unmount_failures_remaining.compare_exchange_weak(
+                failures, failures - 1, std::memory_order_relaxed)) {
+            return tl::unexpected(ErrorCode::RPC_FAIL);
+        }
+    }
+    return RealUnmountSegmentById(client, segment_id, grace_period_ms,
+                                  std::move(cleanup_callback));
+}
+#endif
 
 // Helper class to temporarily mute glog output by setting log level to FATAL
 class GLogMuter {
@@ -111,6 +165,11 @@ class RealClientTest : public ::testing::Test {
     static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
 
     void SetUp() override {
+#ifdef MOONCAKE_TEST_STORE_MOUNT_ROLLBACK
+        g_mount_calls.store(0, std::memory_order_relaxed);
+        g_mount_failure_call.store(0, std::memory_order_relaxed);
+        g_unmount_failures_remaining.store(0, std::memory_order_relaxed);
+#endif
         // Override flags from environment variables if present
         if (getenv("PROTOCOL")) FLAGS_protocol = getenv("PROTOCOL");
         if (getenv("DEVICE_NAME")) FLAGS_device_name = getenv("DEVICE_NAME");
@@ -123,6 +182,10 @@ class RealClientTest : public ::testing::Test {
     }
 
     void TearDown() override {
+#ifdef MOONCAKE_TEST_STORE_MOUNT_ROLLBACK
+        g_mount_failure_call.store(0, std::memory_order_relaxed);
+        g_unmount_failures_remaining.store(0, std::memory_order_relaxed);
+#endif
         if (py_client_) {
             py_client_->tearDownAll();
             if (!ssd_path_.empty()) py_client_.reset();
@@ -183,6 +246,34 @@ class RealClientTest : public ::testing::Test {
         close(fd);
         return path;
     }
+
+#ifdef MOONCAKE_TEST_STORE_MOUNT_ROLLBACK
+    size_t MountedRecordCount() const {
+        std::lock_guard<std::mutex> lock(
+            py_client_->mounted_segment_records_mutex_);
+        return py_client_->mounted_segment_records_.size();
+    }
+
+    size_t AllocatedRecordCount() const {
+        std::lock_guard<std::mutex> lock(
+            py_client_->allocated_segment_records_mutex_);
+        return py_client_->allocated_segment_records_.size();
+    }
+
+    void ArmRollbackFailure() {
+        g_mount_calls.store(0, std::memory_order_relaxed);
+        g_mount_failure_call.store(2, std::memory_order_relaxed);
+        g_unmount_failures_remaining.store(1, std::memory_order_relaxed);
+    }
+
+    void StartMasterAndSetupRollbackClient(const std::string& hostname) {
+        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+        master_address_ = master_.master_address();
+        ASSERT_EQ(py_client_->setup_real(hostname, "P2PHANDSHAKE", 0, 0, "tcp",
+                                         "", master_address_),
+                  0);
+    }
+#endif
 };
 
 TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
@@ -856,6 +947,128 @@ TEST_F(RealClientTest, DynamicMountApisDoNotSplitRdma) {
     EXPECT_EQ(py_client_->unmountSegment(mounted_ids), 0);
     EXPECT_EQ(std::remove(path.c_str()), 0);
 }
+
+#ifdef MOONCAKE_TEST_STORE_MOUNT_ROLLBACK
+TEST_F(RealClientTest,
+       FileMountRetainsChunkWhenRollbackUnmountFailsAndRetriesOnTeardown) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(4 * slab_size);
+    StartMasterAndSetupRollbackClient("localhost:17817");
+
+    const std::string path = CreateTempSegmentFile(6 * slab_size);
+    ASSERT_FALSE(path.empty());
+    std::vector<std::string> segment_ids;
+    ArmRollbackFailure();
+
+    EXPECT_EQ(py_client_->mountSegment(path, 0, 6 * slab_size, "efa", "",
+                                       segment_ids),
+              -1);
+    EXPECT_TRUE(segment_ids.empty());
+    EXPECT_EQ(MountedRecordCount(), 1u);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 1u);
+    EXPECT_EQ(details->front().size_bytes, 3 * slab_size);
+
+    g_unmount_failures_remaining.store(1, std::memory_order_relaxed);
+    EXPECT_NE(py_client_->tearDownAll(), 0);
+    EXPECT_EQ(MountedRecordCount(), 1u);
+
+    g_unmount_failures_remaining.store(0, std::memory_order_relaxed);
+    EXPECT_EQ(py_client_->tearDownAll(), 0);
+    EXPECT_EQ(MountedRecordCount(), 0u);
+    EXPECT_EQ(std::remove(path.c_str()), 0);
+}
+
+TEST_F(RealClientTest,
+       AllocatedMountRetainsChunkWhenRollbackUnmountFailsAndRetriesOnTeardown) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(4 * slab_size);
+    StartMasterAndSetupRollbackClient("localhost:17818");
+
+    std::vector<std::string> segment_ids;
+    size_t allocated_size = 0;
+    ArmRollbackFailure();
+
+    EXPECT_EQ(py_client_->allocateAndMountSegment(6 * slab_size, "efa", "",
+                                                  segment_ids, &allocated_size),
+              -1);
+    EXPECT_TRUE(segment_ids.empty());
+    EXPECT_EQ(AllocatedRecordCount(), 1u);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 1u);
+    EXPECT_EQ(details->front().size_bytes, 3 * slab_size);
+
+    g_unmount_failures_remaining.store(1, std::memory_order_relaxed);
+    EXPECT_NE(py_client_->tearDownAll(), 0);
+    EXPECT_EQ(AllocatedRecordCount(), 1u);
+
+    g_unmount_failures_remaining.store(0, std::memory_order_relaxed);
+    EXPECT_EQ(py_client_->tearDownAll(), 0);
+    EXPECT_EQ(AllocatedRecordCount(), 0u);
+}
+
+TEST_F(RealClientTest, ConcurrentTeardownAfterRollbackRetryIsSerialized) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(4 * slab_size);
+    StartMasterAndSetupRollbackClient("localhost:17819");
+
+    const std::string path = CreateTempSegmentFile(6 * slab_size);
+    ASSERT_FALSE(path.empty());
+    std::vector<std::string> segment_ids;
+    ArmRollbackFailure();
+
+    EXPECT_EQ(py_client_->mountSegment(path, 0, 6 * slab_size, "efa", "",
+                                       segment_ids),
+              -1);
+    EXPECT_EQ(MountedRecordCount(), 1u);
+
+    g_unmount_failures_remaining.store(1, std::memory_order_relaxed);
+    EXPECT_NE(py_client_->tearDownAll(), 0);
+
+    g_unmount_failures_remaining.store(0, std::memory_order_relaxed);
+    std::atomic<int> teardown_failures{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 4; ++i) {
+        threads.emplace_back([this, &teardown_failures]() {
+            if (py_client_->tearDownAll() != 0) {
+                teardown_failures.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    EXPECT_EQ(teardown_failures.load(), 0);
+    EXPECT_EQ(MountedRecordCount(), 0u);
+    EXPECT_EQ(std::remove(path.c_str()), 0);
+}
+
+TEST_F(RealClientTest, DestructorQuarantinesPendingRollbackWhenRetryFails) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(4 * slab_size);
+    StartMasterAndSetupRollbackClient("localhost:17820");
+
+    const std::string path = CreateTempSegmentFile(6 * slab_size);
+    ASSERT_FALSE(path.empty());
+    std::vector<std::string> segment_ids;
+    ArmRollbackFailure();
+
+    EXPECT_EQ(py_client_->mountSegment(path, 0, 6 * slab_size, "efa", "",
+                                       segment_ids),
+              -1);
+    EXPECT_EQ(MountedRecordCount(), 1u);
+
+    // Teardown fails and the destructor's retry keeps failing: the mapped
+    // chunk must be quarantined until process exit instead of released.
+    g_unmount_failures_remaining.store(100, std::memory_order_relaxed);
+    EXPECT_NE(py_client_->tearDownAll(), 0);
+    py_client_.reset();
+
+    EXPECT_EQ(std::remove(path.c_str()), 0);
+}
+#endif
 
 TEST_F(RealClientTest, AllocateAndMountSegmentRejectsOverflowSize) {
     StartMasterAndSetupClient();

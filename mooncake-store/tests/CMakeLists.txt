@@ -303,6 +303,16 @@ add_store_test(real_client_regular_page_register_test real_client_regular_page_r
 add_store_test(real_client_uninitialized_test real_client_uninitialized_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT BUILD_SHARED_LIBS)
+  target_compile_definitions(pybind_client_test
+                             PRIVATE MOONCAKE_TEST_STORE_MOUNT_ROLLBACK=1)
+  target_link_options(
+    pybind_client_test
+    PRIVATE
+    "-Wl,--wrap=_ZN8mooncake6Client20MountSegmentAndGetIdEPKvmRKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEESA_"
+    "-Wl,--wrap=_ZN8mooncake6Client18UnmountSegmentByIdERKSt4pairImmEmSt8functionIFvS4_EE"
+  )
+endif()
 add_store_test(standalone_client_test standalone_client_test.cpp)
 add_store_test(embedded_master_test embedded_master_test.cpp)
 if(USE_TENT)
