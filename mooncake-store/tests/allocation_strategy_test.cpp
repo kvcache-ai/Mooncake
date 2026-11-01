@@ -67,6 +67,28 @@ class AllocationStrategyParameterizedTest
         return std::move(*allocator);
     }
 
+    // Registrations bound to the returned record are not serving.
+    static std::shared_ptr<ClientLivenessRecord> MakeSuspectedRecord() {
+        const auto initial = ClientLivenessRecord::TimePoint{};
+        auto record = std::make_shared<ClientLivenessRecord>(initial);
+        EXPECT_EQ(
+            record->Evaluate(initial + std::chrono::seconds(1),
+                             std::chrono::seconds(1), std::chrono::seconds(10)),
+            ClientLivenessTransition::BECAME_SUSPECTED);
+        return record;
+    }
+
+    // Adds non-serving segments suspected<first> .. suspected<first+count-1>.
+    void AddSuspectedSegments(AllocatorManager& allocator_manager, size_t first,
+                              size_t count) {
+        const auto suspected = MakeSuspectedRecord();
+        for (size_t i = first; i < first + count; ++i) {
+            const auto name = "suspected" + std::to_string(i);
+            allocator_manager.addAllocator(
+                name, CreateTestAllocator(name, i * 64 * MiB), suspected);
+        }
+    }
+
     BufferAllocatorType allocator_type_;
     LocalSsdManager local_ssd_;
     std::shared_ptr<AllocationStrategy> strategy_;
@@ -595,6 +617,69 @@ TEST_P(AllocationStrategyParameterizedTest,
             "segment1");  // Should not be allocated from excluded segments
         EXPECT_TRUE(segment_ep == "segment2" || segment_ep == "segment3");
         EXPECT_EQ(mem_desc.buffer_descriptor.size_, 1024);
+    }
+}
+
+TEST_P(AllocationStrategyParameterizedTest,
+       NonServingSegmentsDoNotUseUpRetries) {
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("serving",
+                                   CreateTestAllocator("serving-suspected", 0),
+                                   MakeSuspectedRecord());
+    allocator_manager.addAllocator("serving",
+                                   CreateTestAllocator("serving", 64 * MiB));
+    AddSuspectedSegments(allocator_manager, 2, 200);
+    // These fill FreeRatioFirst's candidate sample, so it falls back to the
+    // random walk.
+    std::set<std::string> excluded;
+    for (size_t i = 0; i < 6; ++i) {
+        const auto name = "excluded" + std::to_string(i);
+        allocator_manager.addAllocator(
+            name, CreateTestAllocator(name, (i + 202) * 64 * MiB));
+        excluded.insert(name);
+    }
+
+    for (int i = 0; i < 20; ++i) {
+        auto result =
+            strategy_->Allocate(allocator_manager, 1024, 1, {}, excluded);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ((*result)[0]
+                      .get_descriptor()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  "serving");
+    }
+}
+
+TEST_P(AllocationStrategyParameterizedTest,
+       FreeRatioFirstRanksOnlyServingSegments) {
+    auto [strategy_type, allocator_type] = GetParam();
+    if (strategy_type != AllocationStrategyType::FREE_RATIO_FIRST) {
+        GTEST_SKIP();
+    }
+
+    auto busy = CreateTestAllocator("busy", 0);
+    std::vector<std::unique_ptr<AllocatedBuffer>> held;
+    for (int i = 0; i < 32; ++i) {
+        held.push_back(busy->allocate(MiB));
+        ASSERT_NE(held.back(), nullptr);
+    }
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("busy", busy);
+    AddSuspectedSegments(allocator_manager, 1, 100);
+    allocator_manager.addAllocator("idle",
+                                   CreateTestAllocator("idle", 101 * 64 * MiB));
+    AddSuspectedSegments(allocator_manager, 102, 100);
+
+    for (int i = 0; i < 20; ++i) {
+        auto result = strategy_->Allocate(allocator_manager, 1024);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ((*result)[0]
+                      .get_descriptor()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  "idle");
     }
 }
 
