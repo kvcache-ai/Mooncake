@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
@@ -627,6 +628,15 @@ class FileStorageTest : public ::testing::Test {
         return file_storage.config_.enable_dfs;
     }
 
+    bool HasRestoreAllocator(const FileStorage& file_storage) {
+        return file_storage.client_buffer_allocator_ != nullptr;
+    }
+
+    bool HasBackgroundThreads(const FileStorage& file_storage) {
+        return file_storage.heartbeat_thread_.joinable() ||
+               file_storage.client_buffer_gc_thread_.joinable();
+    }
+
     tl::expected<void, ErrorCode> FileStorageNotifyEvictedDiskReplicas(
         FileStorage& fileStorage,
         const std::vector<std::string>& evicted_keys) {
@@ -1133,17 +1143,114 @@ TEST_F(FileStorageTest, DistributedBackendSelectsControlPlaneFromStorageMode) {
     {
         FileStorage file_storage(config, nullptr, "localhost:9003");
         EXPECT_TRUE(FileStorageUsesDfsControlPlane(file_storage));
+        EXPECT_FALSE(HasRestoreAllocator(file_storage));
     }
+
+#ifdef USE_3FS
+    SetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE", "hf3fs");
+    {
+        FileStorage file_storage(config, nullptr, "localhost:9003");
+        EXPECT_TRUE(FileStorageUsesDfsControlPlane(file_storage));
+        EXPECT_FALSE(HasRestoreAllocator(file_storage));
+    }
+#endif
 
 #ifdef HAVE_OSS_ADAPTER
     SetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE", "oss");
     FileStorage file_storage(config, nullptr, "localhost:9003");
     EXPECT_FALSE(FileStorageUsesDfsControlPlane(file_storage));
+    EXPECT_TRUE(HasRestoreAllocator(file_storage));
 
     auto enable_offloading = FileStorageIsEnableOffloading(file_storage);
     ASSERT_TRUE(enable_offloading);
     EXPECT_TRUE(*enable_offloading);
 #endif
+
+#ifdef HAVE_S3_ADAPTER
+    SetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE", "s3");
+    FileStorage s3_storage(config, nullptr, "localhost:9003");
+    EXPECT_FALSE(FileStorageUsesDfsControlPlane(s3_storage));
+    EXPECT_TRUE(HasRestoreAllocator(s3_storage));
+
+    auto s3_offloading = FileStorageIsEnableOffloading(s3_storage);
+    ASSERT_TRUE(s3_offloading);
+    EXPECT_TRUE(*s3_offloading);
+#endif
+}
+
+TEST_F(FileStorageTest, DfsInitAndKeyOnlyReadsDoNotNeedRestoreAllocator) {
+    SetEnv("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    SetEnv("MOONCAKE_DFS_ROOT_DIR", data_path + "/dfs");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kDistributed;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 4 * 1024 * 1024;
+    FileStorage file_storage(config, nullptr, "localhost:9003");
+    ASSERT_FALSE(HasRestoreAllocator(file_storage));
+    // A null client proves DFS initialization never tries TE registration.
+    ASSERT_TRUE(file_storage.Init());
+
+    // Pinned staging remains available independently of LOCAL_DISK restores.
+    std::vector<char> pinned_arena(8192);
+    SetPinnedRestoreArena(file_storage, pinned_arena.data(),
+                          pinned_arena.size());
+    EXPECT_TRUE(file_storage.AllocatePinnedStagingBuffer(4096));
+    auto remote = file_storage.BatchGet({"key"}, {4096});
+    ASSERT_FALSE(remote);
+    EXPECT_EQ(remote.error(), ErrorCode::NOT_SUPPORTED);
+    auto local = file_storage.BatchGetLocal({"key"}, {4096});
+    ASSERT_FALSE(local);
+    EXPECT_EQ(local.error(), ErrorCode::NOT_SUPPORTED);
+}
+
+#ifdef USE_URING
+TEST_F(FileStorageTest, DfsInitWithUringDoesNotNeedRestoreAllocator) {
+    SetEnv("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    SetEnv("MOONCAKE_DFS_ROOT_DIR", data_path + "/dfs");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kDistributed;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 4 * 1024 * 1024;
+    config.use_uring = true;
+    FileStorage file_storage(config, nullptr, "localhost:9003");
+    ASSERT_FALSE(HasRestoreAllocator(file_storage));
+    ASSERT_TRUE(file_storage.Init());
+}
+#endif
+
+TEST_F(FileStorageTest, DfsInitFailureDoesNotStartBackgroundThreads) {
+    SetEnv("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    // A regular file cannot be used as the DFS root directory.
+    const auto root = data_path + "/not_a_directory";
+    FILE* file = std::fopen(root.c_str(), "w");
+    ASSERT_NE(file, nullptr);
+    std::fclose(file);
+    SetEnv("MOONCAKE_DFS_ROOT_DIR", root);
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kDistributed;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 4 * 1024 * 1024;
+    FileStorage file_storage(config, nullptr, "localhost:9003");
+    ASSERT_FALSE(HasRestoreAllocator(file_storage));
+    auto result = file_storage.Init();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_FALSE(HasBackgroundThreads(file_storage));
+}
+
+TEST_F(FileStorageTest, LocalBackendsKeepRestoreAllocator) {
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 4 * 1024 * 1024;
+    config.enable_dfs = true;  // The actual backend determines the mode.
+    for (auto type :
+         {StorageBackendType::kBucket, StorageBackendType::kFilePerKey,
+          StorageBackendType::kOffsetAllocator}) {
+        config.storage_backend_type = type;
+        FileStorage file_storage(config, nullptr, "localhost:9003");
+        EXPECT_TRUE(HasRestoreAllocator(file_storage));
+        EXPECT_FALSE(FileStorageUsesDfsControlPlane(file_storage));
+    }
 }
 
 TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
