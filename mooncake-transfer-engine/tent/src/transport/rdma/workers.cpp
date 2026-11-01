@@ -1548,6 +1548,17 @@ void Workers::reclaimEndpoints() {
     }
 }
 
+void Workers::evictIdleEndpoints() {
+    for (auto& context : transport_->context_set_) {
+        auto store = context->endpointStore();
+        if (!store) continue;  // inert context, never built a store
+        const int timeout_secs =
+            context->params().endpoint.endpoint_idle_timeout_secs;
+        if (timeout_secs <= 0) continue;
+        store->evictIdle(uint64_t(timeout_secs) * 1000000000ull);
+    }
+}
+
 void Workers::resumePausedContexts() {
     for (size_t dev_id = 0; dev_id < transport_->context_set_.size();
          ++dev_id) {
@@ -1583,6 +1594,10 @@ void Workers::monitorThread() {
                 .count();
 
         if (time_since_last_reclaim >= 1000) {  // 1 second = 1000 ms
+            // Retire first, then drain: an endpoint retired here needs its
+            // inflight WRs flushed before reclaim() can finish it, so it is
+            // released on a later tick, not this one.
+            evictIdleEndpoints();
             reclaimEndpoints();
             // An endpoint destroyed above settles its orphans right here.
             transport_->reapOrphanSlices(/*on_tick=*/true);

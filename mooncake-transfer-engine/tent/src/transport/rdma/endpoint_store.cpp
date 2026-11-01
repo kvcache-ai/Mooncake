@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "tent/common/status.h"
 #include "tent/transport/rdma/context.h"
@@ -31,7 +32,10 @@ namespace tent {
 std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::get(const std::string& key) {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(key);
-    if (iter != endpoint_map_.end()) return iter->second;
+    if (iter != endpoint_map_.end()) {
+        iter->second->noteUsed();
+        return iter->second;
+    }
     return nullptr;
 }
 
@@ -117,6 +121,38 @@ void FIFOEndpointStore::evictOne() {
     waiting_list_.insert(victim_endpoint);
     endpoint_map_.erase(victim);
     LOG(INFO) << victim << " evicted from FIFOEndpointStore";
+}
+
+size_t FIFOEndpointStore::evictIdle(uint64_t idle_timeout_ns) {
+    if (idle_timeout_ns == 0) return 0;
+    const uint64_t now = RdmaEndPoint::steadyNowNs();
+    std::vector<std::shared_ptr<RdmaEndPoint>> to_evict;
+    {
+        RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+        for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();) {
+            const uint64_t last_used = iter->second->lastUsedTs();
+            if (now < last_used || now - last_used < idle_timeout_ns ||
+                iter->second->getInflightSlices() > 0) {
+                ++iter;
+                continue;
+            }
+            LOG(INFO) << "Endpoint " << iter->first
+                      << " retired after being idle for "
+                      << (now - last_used) / 1000000000 << "s";
+            to_evict.push_back(iter->second);
+            // Published under the same lock as the removal, so reclaim() can
+            // never observe an endpoint that belongs to neither list.
+            waiting_list_.insert(iter->second);
+            auto fifo_iter = fifo_map_[iter->first];
+            fifo_list_.erase(fifo_iter);
+            fifo_map_.erase(iter->first);
+            iter = endpoint_map_.erase(iter);
+        }
+    }
+    // beginDestroy() may call back into reclaim() (which takes
+    // endpoint_map_lock_), so it must run after the lock is released.
+    for (auto& ep : to_evict) ep->beginDestroy();
+    return to_evict.size();
 }
 
 void FIFOEndpointStore::evictAll() {
@@ -211,6 +247,7 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::get(const std::string& key) {
     auto iter = endpoint_map_.find(key);
     if (iter != endpoint_map_.end()) {
         iter->second.second.store(true, std::memory_order_relaxed);
+        iter->second.first->noteUsed();
         return iter->second.first;
     }
     return nullptr;
@@ -323,6 +360,41 @@ void SIEVEEndpointStore::evictOne() {
     endpoint_map_.erase(victim);
     LOG(INFO) << "Endpoint " << victim << " has been evicted";
     return;
+}
+
+size_t SIEVEEndpointStore::evictIdle(uint64_t idle_timeout_ns) {
+    if (idle_timeout_ns == 0) return 0;
+    const uint64_t now = RdmaEndPoint::steadyNowNs();
+    std::vector<std::shared_ptr<RdmaEndPoint>> to_evict;
+    {
+        RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+        for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();) {
+            const uint64_t last_used = iter->second.first->lastUsedTs();
+            if (now < last_used || now - last_used < idle_timeout_ns ||
+                iter->second.first->getInflightSlices() > 0) {
+                ++iter;
+                continue;
+            }
+            LOG(INFO) << "Endpoint " << iter->first
+                      << " retired after being idle for "
+                      << (now - last_used) / 1000000000 << "s";
+            to_evict.push_back(iter->second.first);
+            waiting_list_len_++;
+            waiting_list_.insert(iter->second.first);
+            // Keep the SIEVE hand on a surviving entry, exactly as remove()
+            // does: it indexes into fifo_list_ and must not dangle.
+            auto fifo_iter = fifo_map_[iter->first];
+            if (hand_.has_value() && hand_.value() == fifo_iter) {
+                fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
+                                                : hand_ = std::prev(fifo_iter);
+            }
+            fifo_list_.erase(fifo_iter);
+            fifo_map_.erase(iter->first);
+            iter = endpoint_map_.erase(iter);
+        }
+    }
+    for (auto& ep : to_evict) ep->beginDestroy();
+    return to_evict.size();
 }
 
 void SIEVEEndpointStore::evictAll() {
