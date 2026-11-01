@@ -504,6 +504,33 @@ bool ShmTransport::getShmName(void* addr, std::string* name) const {
     return true;
 }
 
+int ShmTransport::lockAndValidateRegistrationRanges(
+    const std::vector<Transport::BufferEntry>& buffer_list,
+    std::unique_lock<std::mutex>* lock) {
+    if (!lock) return ERR_INVALID_ARGUMENT;
+    *lock = std::unique_lock<std::mutex>(shm_path_mutex_);
+    for (const auto& buffer : buffer_list) {
+        auto exact = shm_path_map_.find(buffer.addr);
+        if (exact != shm_path_map_.end()) {
+            if (buffer.length > exact->second.length)
+                return ERR_INVALID_ARGUMENT;
+            continue;
+        }
+
+        const uint64_t range_addr = reinterpret_cast<uint64_t>(buffer.addr);
+        for (const auto& entry : shm_path_map_) {
+            const uint64_t base = reinterpret_cast<uint64_t>(entry.first);
+            if (rangeContains(base, entry.second.length, range_addr,
+                              buffer.length) ||
+                rangesOverlap(range_addr, buffer.length, base,
+                              entry.second.length)) {
+                return ERR_INVALID_ARGUMENT;
+            }
+        }
+    }
+    return 0;
+}
+
 int ShmTransport::registerLocalMemory(void* addr, size_t length,
                                       const std::string& location,
                                       bool remote_accessible,
@@ -568,6 +595,12 @@ int ShmTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
 int ShmTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry>& buffer_list,
     const std::string& location) {
+    std::unique_lock<std::mutex> validation_lock;
+    int validation_ret =
+        lockAndValidateRegistrationRanges(buffer_list, &validation_lock);
+    if (validation_ret) return validation_ret;
+    validation_lock.unlock();
+
     bool exported = false;
     for (const auto& buffer : buffer_list) {
         std::string name;
