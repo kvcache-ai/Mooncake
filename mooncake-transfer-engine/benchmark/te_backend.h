@@ -20,9 +20,6 @@
 
 #include <string>
 #include <vector>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
 #include <functional>
 #include <fcntl.h>
 #include <gflags/gflags.h>
@@ -49,10 +46,6 @@ class TEBenchRunner : public BenchRunner {
 
     int startInitiator(int num_threads);
 
-    int stopInitiator();
-
-    int runInitiatorTasks(const std::function<int(int /* thread_id */)>& func);
-
     std::string getSegmentName() const { return engine_->getLocalIpAndPort(); }
 
     uint64_t getLocalBufferBase(int thread_id, uint64_t block_size,
@@ -62,40 +55,16 @@ class TEBenchRunner : public BenchRunner {
                block_size * batch_size * (thread_id / num_buffers);
     }
 
-    size_t getTargetCount() const;
-
-    size_t getTargetIndex(int thread_id) const {
-        return targetIndex(thread_id);
-    }
-
-    uint64_t getTargetSegmentId(int thread_id) const;
-
     uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,
                                  uint64_t batch_size) const {
-        const size_t target_idx = targetIndex(thread_id);
         const int local_thread_id = localTargetThreadId(thread_id);
-        const auto& info = target_infos_[target_idx];
-        const size_t buffer_idx = local_thread_id % info->buffers.size();
-        const uint64_t bytes =
-            checkedMul(block_size, batch_size, "target operation size");
-        const uint64_t relative_offset =
-            checkedMul(bytes, local_thread_id / info->buffers.size(),
-                       "target relative offset");
-        const auto& buffer = info->buffers[buffer_idx];
-        if (XferBenchConfig::target_range_size != 0 &&
-            !rangeContains(relative_offset, bytes,
-                           XferBenchConfig::target_range_size)) {
-            LOG(FATAL) << "Target range too small for thread " << thread_id;
-        }
-        if (XferBenchConfig::target_offset > buffer.length ||
-            !rangeContains(relative_offset, bytes,
-                           buffer.length - XferBenchConfig::target_offset)) {
-            LOG(FATAL) << "Target buffer too small for thread " << thread_id;
-        }
-        return checkedAdd(buffer.addr,
-                          checkedAdd(XferBenchConfig::target_offset,
-                                     relative_offset, "target address offset"),
-                          "target address");
+        const auto& info = target_infos_[getTargetIndex(thread_id)];
+        const auto& buffer =
+            info->buffers[local_thread_id % info->buffers.size()];
+        return targetSlotAddress(
+            thread_id, buffer.addr, buffer.length,
+            checkedMul(block_size, batch_size, "target operation size"),
+            local_thread_id / info->buffers.size());
     }
 
     double runSingleTransfer(uint64_t local_addr, uint64_t target_id,
@@ -108,12 +77,6 @@ class TEBenchRunner : public BenchRunner {
 
     int freeBuffers();
 
-    int runner(int thread_id);
-
-    // Stops the run from a worker thread; main then joins the workers and
-    // tears down normally. Workers must not call exit() (see BenchRunner).
-    void noteTransferFailed();
-
     // Polls batch_id until it is terminal. A stop does not end the wait
     // early: the transports may still be writing into the local buffers.
     // Returns with status PENDING only if the batch did not finish within the
@@ -122,10 +85,6 @@ class TEBenchRunner : public BenchRunner {
     mooncake::Status waitForBatch(BatchID batch_id,
                                   mooncake::TransferStatus& status,
                                   uint64_t& polls);
-
-    size_t targetIndex(int thread_id) const;
-
-    int localTargetThreadId(int thread_id) const;
 
    private:
     enum class DramBacking {
@@ -143,15 +102,7 @@ class TEBenchRunner : public BenchRunner {
     // saved at allocation so munmap does not recompute (and overflow).
     size_t mmap_guard_ = 0;
     size_t mmap_span_ = 0;
-    std::vector<SegmentID> target_handles_;
     std::vector<std::shared_ptr<TransferMetadata::SegmentDesc>> target_infos_;
-
-    std::vector<std::function<int(int)>> current_task_;
-    std::vector<std::thread> threads_;
-    std::mutex mtx_;
-    std::condition_variable cv_task_;
-    std::condition_variable cv_done_;
-    int pending_ = 0;
     bool init_ok_ = true;
     // Batches that may still be in flight (see waitForBatch); while non-zero
     // freeBuffers() leaves the local buffers allocated.
