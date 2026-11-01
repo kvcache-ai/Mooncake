@@ -570,7 +570,8 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
         const uint64_t expected_before =
             oplog_applier_->GetExpectedSequenceId();
         const auto cursor_before = reader->GetLastAppliedDurablePrefix();
-        auto result = reader->PollOnce();
+        auto result = reader->PollOnce(
+            config_.oplog_standby_max_batches_per_poll);
         const uint64_t expected_after = oplog_applier_->GetExpectedSequenceId();
         const auto cursor_after = reader->GetLastAppliedDurablePrefix();
         const bool made_progress =
@@ -1116,7 +1117,7 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
         if (!replication_loop_running_.load(std::memory_order_acquire)) {
             return ErrorCode::ETCD_CTX_CANCELLED;
         }
-        poll = reader->PollOnce();
+        poll = reader->PollOnce(config_.oplog_standby_max_batches_per_poll);
         if (poll.error != ErrorCode::OK) return poll.error;
     } while (poll.durable_prefix_present &&
              applier->GetExpectedSequenceId() - 1 <
@@ -1216,7 +1217,8 @@ void HotStandbyService::ReplicationLoop() {
         if (batch_standby_reader_) {
             const uint64_t expected_before =
                 oplog_applier_->GetExpectedSequenceId();
-            auto result = batch_standby_reader_->PollOnce();
+            auto result = batch_standby_reader_->PollOnce(
+                config_.oplog_standby_max_batches_per_poll);
             if (result.durable_prefix_present ||
                 result.disposition ==
                     OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED) {

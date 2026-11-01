@@ -154,6 +154,28 @@ TEST(MasterServiceConfigTest, OplogBatchMaxEntriesDefaultsTo1024) {
     EXPECT_EQ(1024u, service_config.oplog_batch_max_entries);
 }
 
+TEST(MasterServiceConfigTest, StandbyPollPageSizeDefaultsAndPropagates) {
+    MasterConfig master_config{};
+    EXPECT_EQ(1024u, master_config.oplog_standby_max_batches_per_poll);
+
+    MasterServiceSupervisorConfig defaults(master_config);
+    EXPECT_EQ(1024u, defaults.oplog_standby_max_batches_per_poll);
+
+    master_config.oplog_standby_max_batches_per_poll = 256;
+    MasterServiceSupervisorConfig configured(master_config);
+    EXPECT_EQ(256u, configured.oplog_standby_max_batches_per_poll);
+
+    WrappedMasterServiceConfig wrapped(configured, 1);
+    MasterServiceConfig service_config(wrapped);
+    EXPECT_EQ(256u, wrapped.oplog_standby_max_batches_per_poll);
+    EXPECT_EQ(256u, service_config.oplog_standby_max_batches_per_poll);
+
+    const auto built = MasterServiceConfig::builder()
+                           .set_oplog_standby_max_batches_per_poll(64)
+                           .build();
+    EXPECT_EQ(64u, built.oplog_standby_max_batches_per_poll);
+}
+
 TEST(MasterServiceConfigTest, OplogIsDisabledByDefault) {
     MasterConfig master_config;
     EXPECT_FALSE(master_config.enable_oplog);

@@ -37,6 +37,8 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
         .enable_snapshot_bootstrap = config.enable_oplog_snapshot,
         .enable_oplog_following = capabilities.has_oplog_following,
         .oplog_poll_interval_ms = config.oplog_poll_interval_ms,
+        .oplog_standby_max_batches_per_poll =
+            config.oplog_standby_max_batches_per_poll,
         .batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec,
     });
 }
@@ -141,7 +143,8 @@ class CapabilityDrivenStandbyController final : public StandbyController {
                 standby_service_->SetBatchOpLogSnapshotProvider(
                     std::make_unique<BatchOpLogSnapshotProvider>(
                         config_.cluster_id, *batch_backend_,
-                        *snapshot_object_store_, snapshot_root));
+                        *snapshot_object_store_, snapshot_root,
+                        config_.oplog_standby_max_batches_per_poll));
                 batch_oplog_snapshot_coordinator_ =
                     std::make_unique<BatchOpLogSnapshotCoordinator>(
                         *standby_service_, *batch_backend_,

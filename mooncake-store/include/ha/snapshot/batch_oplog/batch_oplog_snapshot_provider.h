@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -30,7 +31,8 @@ class BatchOpLogSnapshotProvider final {
    public:
     BatchOpLogSnapshotProvider(std::string cluster_id, HaKvBackend& backend,
                                SnapshotObjectStore& object_store,
-                               std::string snapshot_root);
+                               std::string snapshot_root,
+                               size_t max_batches_per_poll = 1024);
 
     tl::expected<BatchOpLogSnapshotRestoreResult, ErrorCode> RestoreBaseline(
         StandbyMetadataStore& metadata, StandbySegmentRegistry& registry,
@@ -42,6 +44,7 @@ class BatchOpLogSnapshotProvider final {
     HaKvBackend& backend_;
     SnapshotObjectStore& object_store_;
     std::string snapshot_root_;
+    size_t max_batches_per_poll_;
 };
 
 }  // namespace mooncake
