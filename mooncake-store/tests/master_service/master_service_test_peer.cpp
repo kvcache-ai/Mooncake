@@ -97,6 +97,21 @@ void MasterServiceTestPeer::SetNoFProbeFnForTesting(
 #endif
 }
 
+void MasterServiceTestPeer::SetNoFProbeReleaseFnForTesting(
+    MasterService::NoFProbeReleaseFn fn) {
+#ifdef USE_NOF
+    std::lock_guard<std::mutex> lock(service_.nof_probe_fn_mutex_);
+    if (fn) {
+        service_.nof_probe_release_fn_ = std::move(fn);
+        return;
+    }
+    service_.nof_probe_release_fn_ =
+        &MasterService::DefaultReleaseNofProbeResources;
+#else
+    (void)fn;
+#endif
+}
+
 size_t MasterServiceTestPeer::GetMountedNoFSegmentCountForTesting() {
     std::vector<MountedNoFSegmentSnapshot> mounted_segments;
     service_.nof_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
