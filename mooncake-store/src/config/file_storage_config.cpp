@@ -1,13 +1,16 @@
 #include "storage_backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <locale>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "ascii_string.h"
 #include "bool_parser.h"
 #include "environ.h"
 #include "environment_variables.h"
@@ -42,6 +45,19 @@ bool ParseStrictBoolOr(const std::string& raw_value, bool default_value) {
         .value_or(default_value);
 }
 
+// True when `prefix` is a whole-component prefix of `path` (or equal).
+bool IsPathPrefix(const std::filesystem::path& prefix,
+                  const std::filesystem::path& path) {
+    auto prefix_it = prefix.begin();
+    auto path_it = path.begin();
+    for (; prefix_it != prefix.end(); ++prefix_it, ++path_it) {
+        if (path_it == path.end() || *prefix_it != *path_it) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 FileStorageConfig FileStorageConfig::FromEnvironment() {
@@ -69,6 +85,10 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
 
     config.storage_filepath = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_FILE_STORAGE_PATH, config.storage_filepath);
+
+    config.allow_storage_path_change =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_ALLOW_STORAGE_PATH_CHANGE,
+                        config.allow_storage_path_change);
 
     config.local_buffer_size =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES,
@@ -204,8 +224,90 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
     return true;
 }
 
-bool FileStorageConfig::Validate() const {
-    if (!ValidatePath(storage_filepath)) {
+bool FileStorageConfig::ParseStoragePaths() {
+    namespace fs = std::filesystem;
+
+    if (storage_filepath.find(',') == std::string::npos) {
+        if (!ValidatePath(storage_filepath)) {
+            return false;
+        }
+        std::error_code ec;
+        const auto canonical =
+            fs::weakly_canonical(fs::path(storage_filepath), ec);
+        if (ec) {
+            LOG(ERROR) << "FileStorageConfig: failed to canonicalize storage "
+                          "path: "
+                       << storage_filepath << ", error: " << ec.message();
+            return false;
+        }
+        storage_filepaths = {canonical.string()};
+        return true;
+    }
+
+    std::vector<std::string> parsed;
+    std::string_view raw(storage_filepath);
+    size_t start = 0;
+    while (true) {
+        const size_t comma = raw.find(',', start);
+        const std::string_view token = TrimAsciiWhitespace(
+            comma == std::string_view::npos ? raw.substr(start)
+                                            : raw.substr(start, comma - start));
+        if (token.empty()) {
+            LOG(ERROR) << "FileStorageConfig: storage_filepath contains an "
+                          "empty path entry: \""
+                       << storage_filepath << "\"";
+            return false;
+        }
+        const std::string path(token);
+        if (!ValidatePath(path)) {
+            return false;
+        }
+        std::error_code ec;
+        const auto canonical = fs::weakly_canonical(fs::path(path), ec);
+        if (ec) {
+            LOG(ERROR) << "FileStorageConfig: failed to canonicalize storage "
+                          "path: "
+                       << path << ", error: " << ec.message();
+            return false;
+        }
+        parsed.push_back(canonical.string());
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+
+    std::sort(parsed.begin(), parsed.end());
+    for (size_t i = 0; i < parsed.size(); ++i) {
+        if (i > 0 && parsed[i] == parsed[i - 1]) {
+            LOG(ERROR) << "FileStorageConfig: duplicate storage path: "
+                       << parsed[i];
+            return false;
+        }
+        for (size_t j = i + 1; j < parsed.size(); ++j) {
+            if (IsPathPrefix(fs::path(parsed[i]), fs::path(parsed[j]))) {
+                LOG(ERROR) << "FileStorageConfig: storage paths must not be "
+                              "nested: "
+                           << parsed[i] << " contains " << parsed[j];
+                return false;
+            }
+        }
+    }
+
+    if (parsed.size() > 1 &&
+        storage_backend_type != StorageBackendType::kBucket) {
+        LOG(ERROR) << "FileStorageConfig: multiple storage directories are "
+                      "only supported by bucket_storage_backend; got "
+                   << parsed.size() << " paths";
+        return false;
+    }
+
+    storage_filepaths = std::move(parsed);
+    return true;
+}
+
+bool FileStorageConfig::Validate() {
+    if (!ParseStoragePaths()) {
         return false;
     }
     if (total_keys_limit <= 0) {

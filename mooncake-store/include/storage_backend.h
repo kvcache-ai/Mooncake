@@ -50,6 +50,9 @@ struct BucketMetadata {
     // Last access timestamp in nanoseconds; used by LRU eviction policy.
     // Updated on every read with relaxed ordering (approximate is sufficient).
     mutable std::atomic<int64_t> last_access_ns_{0};
+    // Index into BucketStorageBackend::storage_paths_ where this bucket's
+    // files live. Runtime-only: the root is rediscovered by Init()'s scan.
+    int32_t root_index_ = -1;
 
     // Default constructor
     BucketMetadata() = default;
@@ -61,7 +64,8 @@ struct BucketMetadata {
           keys(other.keys),
           metadatas(other.metadatas),
           inflight_reads_(0),
-          last_access_ns_(0) {}
+          last_access_ns_(0),
+          root_index_(other.root_index_) {}
 
     // Move constructor
     BucketMetadata(BucketMetadata&& other) noexcept
@@ -70,7 +74,8 @@ struct BucketMetadata {
           keys(std::move(other.keys)),
           metadatas(std::move(other.metadatas)),
           inflight_reads_(0),
-          last_access_ns_(0) {}
+          last_access_ns_(0),
+          root_index_(other.root_index_) {}
 
     // Copy assignment
     BucketMetadata& operator=(const BucketMetadata& other) {
@@ -79,6 +84,7 @@ struct BucketMetadata {
             data_size = other.data_size;
             keys = other.keys;
             metadatas = other.metadatas;
+            root_index_ = other.root_index_;
             // Don't copy runtime state
         }
         return *this;
@@ -91,6 +97,7 @@ struct BucketMetadata {
             data_size = other.data_size;
             keys = std::move(other.keys);
             metadatas = std::move(other.metadatas);
+            root_index_ = other.root_index_;
             // Don't move runtime state
         }
         return *this;
@@ -207,8 +214,19 @@ struct FileStorageConfig {
     // type of the storage backend
     StorageBackendType storage_backend_type = StorageBackendType::kBucket;
 
-    // Path where data files are stored on disk
+    // Raw disk path value (may contain a comma-separated list). The bucket
+    // backend supports several directories; other backends require exactly
+    // one. Parsed into storage_filepaths by Validate().
     std::string storage_filepath = "/data/file_storage";
+
+    // Parsed, canonicalized, sorted storage roots. Populated by
+    // ParseStoragePaths(); a single entry for the legacy single-path case.
+    std::vector<std::string> storage_filepaths;
+
+    // Allow Init() to start when a storage root recorded in the per-root
+    // manifest is no longer configured. Data on the missing root stays
+    // unreachable; default false (fail fast).
+    bool allow_storage_path_change = false;
 
     // Size of the local client-side buffer (used for caching or batching)
     int64_t local_buffer_size = 1280 * kMB;  // ~1.2 GB
@@ -243,10 +261,18 @@ struct FileStorageConfig {
     double disk_eviction_high_watermark_ratio = 0.90;
     double disk_eviction_low_watermark_ratio = 0.80;
 
-    // Validates the configuration for correctness and consistency
-    bool Validate() const;
+    // Validates the configuration for correctness and consistency.
+    // Also parses storage_filepath into storage_filepaths, so it must be
+    // called after any direct assignment to storage_filepath.
+    bool Validate();
 
     bool ValidatePath(std::string path) const;
+
+    // Splits storage_filepath on commas, trims whitespace, validates and
+    // canonicalizes every entry, then stores the sorted result in
+    // storage_filepaths. Rejects empty entries, duplicates, nested roots, and
+    // multiple roots for backends other than the bucket backend.
+    bool ParseStoragePaths();
 
     /**
      * @brief Creates a config instance by reading values from environment
@@ -953,14 +979,41 @@ class BucketStorageBackend : public StorageBackendInterface {
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
 
     tl::expected<void, ErrorCode> LoadBucketMetadata(
-        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+        int64_t bucket_id, int32_t root_index,
+        std::shared_ptr<BucketMetadata> bucket_metadata);
 
     tl::expected<int64_t, ErrorCode> CreateBucketId();
 
     tl::expected<std::string, ErrorCode> GetBucketMetadataPath(
-        int64_t bucket_id);
+        int64_t bucket_id, int32_t root_index) const;
 
-    tl::expected<std::string, ErrorCode> GetBucketDataPath(int64_t bucket_id);
+    tl::expected<std::string, ErrorCode> GetBucketDataPath(
+        int64_t bucket_id, int32_t root_index) const;
+
+    // Round-robin over storage_paths_, skipping roots without enough free
+    // space (required_size + kMinFreeSpace). Falls back to the root with the
+    // most available bytes. Single-root deployments always get 0.
+    int32_t SelectWriteRoot(int64_t required_size);
+
+    // Opens and locks .mooncake_local_disk.lock in every storage root.
+    // Returns false and releases any locks already taken on failure.
+    bool AcquireOwnerLocks();
+
+    void ReleaseOwnerLocks();
+
+    // Reads the root manifests from every root and validates them against the
+    // configured set. Must run before the roots are scanned; the manifests are
+    // written back separately, only after Init has succeeded.
+    bool CheckStorageRootManifest();
+
+    // Writes the configured root set to every root's manifest where it is out
+    // of date.
+    bool WriteStorageRootManifest();
+
+    static constexpr const char* STORAGE_ROOTS_MANIFEST =
+        ".mooncake_storage_roots";
+    static constexpr const char* STORAGE_ROOTS_MANIFEST_HEADER =
+        "mooncake_offload_roots_v1";
 
     tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
         const std::string& path, FileMode mode) const;
@@ -981,8 +1034,10 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @brief Remove any remaining data and metadata files for a bucket.
      * Used by write rollback and startup recovery of incomplete buckets.
      * @param bucket_id The bucket ID whose files should be deleted.
+     * @param root_index Root that owns the bucket. -1 searches every root
+     *        (used only when the bucket is no longer in buckets_).
      */
-    void CleanupOrphanedBucket(int64_t bucket_id);
+    void CleanupOrphanedBucket(int64_t bucket_id, int32_t root_index = -1);
 
     /**
      * @brief Rollback a committed bucket from the local index when
@@ -1016,6 +1071,8 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<std::string> skipped_keys;
         int64_t evicted_size = 0;
         int64_t write_size = 0;
+        // Root selected for the incoming write (-1 when not a real write).
+        int32_t target_root = -1;
     };
 
     /**
@@ -1027,7 +1084,8 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @return PendingEviction with all keys and bucket metadata removed.
      */
     tl::expected<PendingEviction, ErrorCode> PrepareEviction(
-        int64_t required_size, const std::vector<std::string>& write_keys = {});
+        int64_t required_size, const std::vector<std::string>& write_keys = {},
+        int32_t target_root = -1);
 
     void RestorePreparedEviction(PendingEviction&& pending);
 
@@ -1042,11 +1100,13 @@ class BucketStorageBackend : public StorageBackendInterface {
     /**
      * @brief Select the next bucket to evict according to the configured
      * eviction policy. Must be called with mutex_ held (exclusive).
+     * @param root_filter When set, only buckets stored on that root are
+     *        eligible (used when a specific disk is full).
      * @return Iterator into buckets_ pointing at the candidate, or
      *         buckets_.end() if no candidate is available.
      */
     std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
-    SelectEvictionCandidate();
+    SelectEvictionCandidate(std::optional<int32_t> root_filter = std::nullopt);
 
     /**
      * @brief Actual on-disk bytes of the offload directory, measured by
@@ -1093,6 +1153,18 @@ class BucketStorageBackend : public StorageBackendInterface {
         return lru_index_.size();
     }
 
+    // Test-only: force the next SelectWriteRoot() call to start from this
+    // root, making multi-root placement deterministic in tests.
+    void SetNextRootForTest(size_t root_index) {
+        next_root_.store(root_index, std::memory_order_relaxed);
+    }
+
+    // Test-only: resolved capacity quota (from config, or derived during
+    // Init when the config left it unset).
+    int64_t GetMaxTotalSizeForTest() const {
+        return bucket_backend_config_.max_total_size;
+    }
+
     // Test-only: inject datasync failure in WriteBucket to verify orphan
     // cleanup. SetDatasyncFailureForTest(true) makes WriteBucket fail its
     // datasync call and immediately call CleanupOrphanedBucket.
@@ -1115,8 +1187,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     std::atomic<bool> initialized_{false};
     std::optional<BucketIdGenerator> bucket_id_generator_;
-    // Held for process lifetime after Init(); enforces one client / path.
-    int owner_lock_fd_{-1};
+    // Held for process lifetime after Init(); one flock per storage root.
+    std::vector<int> owner_lock_fds_;
     static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
 
@@ -1136,8 +1208,12 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     mutable SharedMutex mutex_;
     mutable Mutex iterator_mutex_;
-    std::string storage_path_;
+    std::vector<std::string> storage_paths_;
+    // Round-robin cursor for SelectWriteRoot().
+    std::atomic<size_t> next_root_{0};
     int64_t total_size_ GUARDED_BY(mutex_) = 0;
+    // Logical bytes per root, mirrored with total_size_ under mutex_.
+    std::vector<int64_t> total_size_by_root_ GUARDED_BY(mutex_);
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_eviction_keys_;

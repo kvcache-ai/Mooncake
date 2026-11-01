@@ -13,6 +13,7 @@
 #include <new>
 #include <optional>
 #include <ranges>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -35,14 +36,29 @@
 namespace fs = std::filesystem;
 namespace mooncake::test {
 
-// Ignore the #3528 path lock when tests assert "empty" / file counts.
+// Ignore the #3528 path lock and the multi-root manifest when tests assert
+// "empty" / file counts.
 static int CountDataFiles(const std::string& dir) {
     int n = 0;
     if (!fs::exists(dir)) return 0;
     for (const auto& entry : fs::directory_iterator(dir)) {
         if (!entry.is_regular_file()) continue;
-        if (entry.path().filename() == ".mooncake_local_disk.lock") continue;
+        const auto name = entry.path().filename().string();
+        if (name == ".mooncake_local_disk.lock") continue;
+        if (name.rfind(".mooncake_storage_roots", 0) == 0) continue;
         ++n;
+    }
+    return n;
+}
+
+static int CountFilesWithSuffix(const std::string& dir,
+                                const std::string& suffix) {
+    int n = 0;
+    if (!fs::exists(dir)) return 0;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (entry.is_regular_file() && entry.path().extension() == suffix) {
+            ++n;
+        }
     }
     return n;
 }
@@ -645,6 +661,379 @@ TEST_F(StorageBackendTest, SplitStoragePathBothInitOk) {
     BucketStorageBackend b(config_b, bucket_config);
     ASSERT_TRUE(a.Init().has_value());
     ASSERT_TRUE(b.Init().has_value());
+}
+
+// ===== Multi-root bucket backend (comma-separated storage path) =====
+
+namespace {
+
+FileStorageConfig MakeTwoRootConfig(const std::string& root_a,
+                                    const std::string& root_b) {
+    FileStorageConfig config;
+    config.storage_filepath = root_a + "," + root_b;
+    return config;
+}
+
+tl::expected<int64_t, ErrorCode> OffloadOneKey(BucketStorageBackend& backend,
+                                               std::string key,
+                                               std::string value) {
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(std::move(key),
+                  std::vector<Slice>{Slice{value.data(), value.size()}});
+    return backend.BatchOffload(batch, [](const std::vector<std::string>&,
+                                          std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    });
+}
+
+bool LoadKeyInto(BucketStorageBackend& backend, const std::string& key,
+                 size_t size, std::string& out) {
+    out.assign(size, '\0');
+    std::unordered_map<std::string, Slice> batch;
+    batch.emplace(key, Slice{out.data(), out.size()});
+    return backend.BatchLoad(batch).has_value();
+}
+
+std::string ReadFile(const fs::path& path) {
+    std::ifstream in(path);
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    return buffer.str();
+}
+
+}  // namespace
+
+TEST_F(StorageBackendTest, MultiRootInitCreatesLockAndManifestInEachRoot) {
+    const std::string root_a = data_path + "/root_a";
+    const std::string root_b = data_path + "/root_b";
+    FileStorageConfig config = MakeTwoRootConfig(root_a, root_b);
+    BucketBackendConfig bucket_config;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    EXPECT_TRUE(fs::exists(root_a + "/.mooncake_local_disk.lock"));
+    EXPECT_TRUE(fs::exists(root_b + "/.mooncake_local_disk.lock"));
+    ASSERT_TRUE(fs::exists(root_a + "/.mooncake_storage_roots"));
+    ASSERT_TRUE(fs::exists(root_b + "/.mooncake_storage_roots"));
+    const auto a_manifest = ReadFile(root_a + "/.mooncake_storage_roots");
+    const auto b_manifest = ReadFile(root_b + "/.mooncake_storage_roots");
+    EXPECT_NE(a_manifest.find(root_a), std::string::npos);
+    EXPECT_NE(a_manifest.find(root_b), std::string::npos);
+    EXPECT_EQ(a_manifest, b_manifest);
+}
+
+TEST_F(StorageBackendTest, MultiRootRoundRobinPlacement) {
+    const std::string root_a = data_path + "/root_a";
+    const std::string root_b = data_path + "/root_b";
+    FileStorageConfig config = MakeTwoRootConfig(root_a, root_b);
+    BucketBackendConfig bucket_config;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init().has_value());
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(OffloadOneKey(backend, "rr_key_" + std::to_string(i),
+                                  "value_" + std::to_string(i))
+                        .has_value());
+    }
+    // Round-robin means two buckets per root, regardless of capacity.
+    EXPECT_EQ(CountFilesWithSuffix(root_a, ".bucket"), 2);
+    EXPECT_EQ(CountFilesWithSuffix(root_b, ".bucket"), 2);
+    EXPECT_EQ(CountFilesWithSuffix(root_a, ".meta"), 2);
+    EXPECT_EQ(CountFilesWithSuffix(root_b, ".meta"), 2);
+}
+
+TEST_F(StorageBackendTest, MultiRootRestartRecoversBuckets) {
+    const std::string root_a = data_path + "/root_a";
+    const std::string root_b = data_path + "/root_b";
+    FileStorageConfig config = MakeTwoRootConfig(root_a, root_b);
+    BucketBackendConfig bucket_config;
+
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init().has_value());
+        for (int i = 0; i < 4; ++i) {
+            ASSERT_TRUE(OffloadOneKey(backend,
+                                      "restart_key_" + std::to_string(i),
+                                      "restart_value_" + std::to_string(i))
+                            .has_value());
+        }
+    }
+
+    BucketStorageBackend restarted(config, bucket_config);
+    ASSERT_TRUE(restarted.Init().has_value());
+    for (int i = 0; i < 4; ++i) {
+        std::string value;
+        ASSERT_TRUE(LoadKeyInto(restarted, "restart_key_" + std::to_string(i),
+                                15, value))
+            << "failed to load restart_key_" << i;
+        EXPECT_EQ(value, "restart_value_" + std::to_string(i));
+    }
+}
+
+TEST_F(StorageBackendTest, MultiRootMissingDataFileCleanedUpOnRestart) {
+    const std::string root_a = data_path + "/root_a";
+    const std::string root_b = data_path + "/root_b";
+    FileStorageConfig config = MakeTwoRootConfig(root_a, root_b);
+    BucketBackendConfig bucket_config;
+
+    int64_t bucket_id = 0;
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init().has_value());
+        auto result = OffloadOneKey(backend, "gone_key", "gone_value");
+        ASSERT_TRUE(result.has_value());
+        bucket_id = result.value();
+    }
+
+    const std::string name = std::to_string(bucket_id);
+    const fs::path data_a = fs::path(root_a) / (name + ".bucket");
+    const fs::path data_b = fs::path(root_b) / (name + ".bucket");
+    const fs::path data_path_used = fs::exists(data_a) ? data_a : data_b;
+    ASSERT_TRUE(fs::exists(data_path_used));
+    ASSERT_TRUE(fs::remove(data_path_used));
+
+    BucketStorageBackend restarted(config, bucket_config);
+    ASSERT_TRUE(restarted.Init().has_value());
+    auto exists = restarted.IsExist("gone_key");
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
+    // The orphaned metadata file on the same root must be removed too.
+    const bool meta_removed =
+        !fs::exists(fs::path(root_a) / (name + ".meta")) &&
+        !fs::exists(fs::path(root_b) / (name + ".meta"));
+    EXPECT_TRUE(meta_removed);
+}
+
+TEST_F(StorageBackendTest, MultiRootManifestMissingRootFailsInit) {
+    const std::string root_a = data_path + "/root_a";
+    const std::string root_b = data_path + "/root_b";
+    BucketBackendConfig bucket_config;
+
+    {
+        BucketStorageBackend backend(MakeTwoRootConfig(root_a, root_b),
+                                     bucket_config);
+        ASSERT_TRUE(backend.Init().has_value());
+    }
+
+    FileStorageConfig reduced;
+    reduced.storage_filepath = root_a;
+    {
+        BucketStorageBackend blocked(reduced, bucket_config);
+        EXPECT_FALSE(blocked.Init().has_value())
+            << "dropping a previously used root must fail Init";
+    }
+
+    // The failed Init must have released its locks.
+    reduced.allow_storage_path_change = true;
+    BucketStorageBackend escaped(reduced, bucket_config);
+    ASSERT_TRUE(escaped.Init().has_value());
+}
+
+TEST_F(StorageBackendTest, MultiRootManifestAddRootSucceeds) {
+    const std::string root_a = data_path + "/root_a";
+    const std::string root_b = data_path + "/root_b";
+    BucketBackendConfig bucket_config;
+
+    FileStorageConfig single;
+    single.storage_filepath = root_a;
+    {
+        BucketStorageBackend backend(single, bucket_config);
+        ASSERT_TRUE(backend.Init().has_value());
+    }
+
+    FileStorageConfig both = MakeTwoRootConfig(root_a, root_b);
+    BucketStorageBackend grown(both, bucket_config);
+    ASSERT_TRUE(grown.Init().has_value());
+    const auto a_manifest = ReadFile(root_a + "/.mooncake_storage_roots");
+    const auto b_manifest = ReadFile(root_b + "/.mooncake_storage_roots");
+    EXPECT_NE(a_manifest.find(root_b), std::string::npos);
+    EXPECT_NE(b_manifest.find(root_a), std::string::npos);
+    EXPECT_NE(b_manifest.find(root_b), std::string::npos);
+}
+
+TEST_F(StorageBackendTest, MultiRootSameFilesystemCountsCapacityOnce) {
+    const std::string root_a = data_path + "/root_a";
+    const std::string root_b = data_path + "/root_b";
+    fs::create_directories(root_a);
+    fs::create_directories(root_b);
+    struct stat stat_a;
+    struct stat stat_b;
+    ASSERT_EQ(::stat(root_a.c_str(), &stat_a), 0);
+    ASSERT_EQ(::stat(root_b.c_str(), &stat_b), 0);
+    if (stat_a.st_dev != stat_b.st_dev) {
+        GTEST_SKIP() << "test roots landed on different filesystems";
+    }
+    std::error_code ec;
+    const auto capacity = fs::space(root_a, ec).capacity;
+    ASSERT_FALSE(ec);
+
+    // max_total_size is left unset, so Init derives it from free capacity.
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend backend(MakeTwoRootConfig(root_a, root_b),
+                                 bucket_config);
+    ASSERT_TRUE(backend.Init().has_value());
+    const int64_t max_total = backend.GetMaxTotalSizeForTest();
+    EXPECT_GT(max_total, 0);
+    EXPECT_LE(static_cast<uint64_t>(max_total), capacity)
+        << "capacity shared by two roots must be counted only once";
+}
+
+TEST_F(StorageBackendTest, MultiRootOverlappingOwnerLocksReleasedOnFailure) {
+    const std::string root_a = data_path + "/root_a";
+    const std::string root_b = data_path + "/root_b";
+    const std::string root_c = data_path + "/root_c";
+    BucketBackendConfig bucket_config;
+
+    BucketStorageBackend first(MakeTwoRootConfig(root_a, root_b),
+                               bucket_config);
+    ASSERT_TRUE(first.Init().has_value());
+
+    // Overlaps on root_b. root_c is acquired before the failure and must be
+    // released again.
+    FileStorageConfig overlapping;
+    overlapping.storage_filepath = root_c + "," + root_b;
+    {
+        BucketStorageBackend second(overlapping, bucket_config);
+        EXPECT_FALSE(second.Init().has_value());
+    }
+
+    FileStorageConfig only_c;
+    only_c.storage_filepath = root_c;
+    BucketStorageBackend third(only_c, bucket_config);
+    EXPECT_TRUE(third.Init().has_value())
+        << "root_c lock must be released when a later root fails to lock";
+}
+
+TEST_F(StorageBackendTest, MultiRootDuplicateBucketIdFailsInit) {
+    const std::string root_a = data_path + "/root_a";
+    const std::string root_b = data_path + "/root_b";
+    FileStorageConfig config = MakeTwoRootConfig(root_a, root_b);
+    BucketBackendConfig bucket_config;
+
+    int64_t bucket_id = 0;
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init().has_value());
+        auto result = OffloadOneKey(backend, "dup_key", "dup_value");
+        ASSERT_TRUE(result.has_value());
+        bucket_id = result.value();
+    }
+
+    const std::string name = std::to_string(bucket_id);
+    const bool in_a = fs::exists(fs::path(root_a) / (name + ".bucket"));
+    const fs::path from = fs::path(in_a ? root_a : root_b);
+    const fs::path to = fs::path(in_a ? root_b : root_a);
+    ASSERT_TRUE(
+        fs::copy_file(from / (name + ".bucket"), to / (name + ".bucket")));
+    ASSERT_TRUE(fs::copy_file(from / (name + ".meta"), to / (name + ".meta")));
+
+    BucketStorageBackend conflicted(config, bucket_config);
+    auto init_result = conflicted.Init();
+    ASSERT_FALSE(init_result.has_value());
+    EXPECT_EQ(init_result.error(), ErrorCode::BUCKET_ALREADY_EXISTS);
+}
+
+TEST_F(StorageBackendTest, MultiRootFailedInitKeepsManifestUnchanged) {
+    const std::string root_a = data_path + "/root_a";
+    const std::string root_b = data_path + "/root_b";
+    BucketBackendConfig bucket_config;
+
+    int64_t bucket_id = 0;
+    {
+        BucketStorageBackend backend(MakeTwoRootConfig(root_a, root_b),
+                                     bucket_config);
+        ASSERT_TRUE(backend.Init().has_value());
+        auto result = OffloadOneKey(backend, "kept_key", "kept_value");
+        ASSERT_TRUE(result.has_value());
+        bucket_id = result.value();
+    }
+
+    // The bucket lives on exactly one root; duplicate its files under a stem
+    // that parses to the same id ("01" -> 1) so the scan fails on the second
+    // copy. Both files are duplicated so neither copy is discarded as an
+    // orphan first, independent of directory iteration order. Init must reach
+    // the scan, i.e. it must have passed the manifest check first.
+    const std::string name = std::to_string(bucket_id);
+    const bool in_a = fs::exists(fs::path(root_a) / (name + ".meta"));
+    const std::string configured = in_a ? root_a : root_b;
+    const std::string dropped = in_a ? root_b : root_a;
+    for (const char* suffix : {".meta", ".bucket"}) {
+        ASSERT_TRUE(fs::copy_file(
+            fs::path(configured) / (name + suffix),
+            fs::path(configured) / ("0" + name + suffix)));
+    }
+    const auto manifest_before =
+        ReadFile(configured + "/.mooncake_storage_roots");
+    EXPECT_NE(manifest_before.find(dropped), std::string::npos);
+
+    // Dropping a root is only allowed with the escape hatch; the scan then
+    // fails on the duplicate id, i.e. after the manifest check ran.
+    FileStorageConfig reduced;
+    reduced.storage_filepath = configured;
+    reduced.allow_storage_path_change = true;
+    {
+        BucketStorageBackend failing(reduced, bucket_config);
+        auto init_result = failing.Init();
+        ASSERT_FALSE(init_result.has_value());
+        EXPECT_EQ(init_result.error(), ErrorCode::BUCKET_ALREADY_EXISTS);
+    }
+
+    // A failed Init must not rewrite the manifest, otherwise a later start
+    // would silently forget the dropped root.
+    EXPECT_EQ(ReadFile(configured + "/.mooncake_storage_roots"),
+              manifest_before);
+
+    FileStorageConfig strict;
+    strict.storage_filepath = configured;
+    BucketStorageBackend blocked(strict, bucket_config);
+    auto blocked_result = blocked.Init();
+    ASSERT_FALSE(blocked_result.has_value());
+    EXPECT_EQ(blocked_result.error(), ErrorCode::FILE_OPEN_FAIL)
+        << "the missing root must still be reported after the failed Init";
+}
+
+TEST_F(StorageBackendTest, MultiRootDeleteAndRemoveAll) {
+    const std::string root_a = data_path + "/root_a";
+    const std::string root_b = data_path + "/root_b";
+    FileStorageConfig config = MakeTwoRootConfig(root_a, root_b);
+    BucketBackendConfig bucket_config;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init().has_value());
+    std::vector<int64_t> bucket_ids;
+    for (int i = 0; i < 4; ++i) {
+        auto result =
+            OffloadOneKey(backend, "del_key_" + std::to_string(i), "value");
+        ASSERT_TRUE(result.has_value());
+        bucket_ids.push_back(result.value());
+    }
+
+    ASSERT_TRUE(backend.DeleteBucket(bucket_ids.front()).has_value());
+    backend.RemoveAll();
+
+    EXPECT_EQ(CountFilesWithSuffix(root_a, ".bucket"), 0);
+    EXPECT_EQ(CountFilesWithSuffix(root_b, ".bucket"), 0);
+    EXPECT_EQ(CountFilesWithSuffix(root_a, ".meta"), 0);
+    EXPECT_EQ(CountFilesWithSuffix(root_b, ".meta"), 0);
+    // The manifest is per-root state, not bucket data: it must survive.
+    EXPECT_TRUE(fs::exists(root_a + "/.mooncake_storage_roots"));
+    EXPECT_TRUE(fs::exists(root_b + "/.mooncake_storage_roots"));
+}
+
+TEST_F(StorageBackendTest, MultiRootSetNextRootForTestPinsPlacement) {
+    const std::string root_a = data_path + "/root_a";
+    const std::string root_b = data_path + "/root_b";
+    FileStorageConfig config = MakeTwoRootConfig(root_a, root_b);
+    BucketBackendConfig bucket_config;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init().has_value());
+    backend.SetNextRootForTest(1);
+    ASSERT_TRUE(
+        OffloadOneKey(backend, "pinned_key", "pinned_value").has_value());
+    EXPECT_EQ(CountFilesWithSuffix(root_a, ".bucket"), 0);
+    EXPECT_EQ(CountFilesWithSuffix(root_b, ".bucket"), 1);
 }
 
 TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {

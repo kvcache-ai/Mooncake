@@ -1,10 +1,12 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "storage_backend.h"
 
@@ -45,6 +47,8 @@ struct FileStorageEnvironment {
     ScopedEnvVar storage_backend_descriptor{
         "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR"};
     ScopedEnvVar storage_path{"MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"};
+    ScopedEnvVar allow_storage_path_change{
+        "MOONCAKE_OFFLOAD_ALLOW_STORAGE_PATH_CHANGE"};
     ScopedEnvVar local_buffer_size{"MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES"};
     ScopedEnvVar pinned_restore_arena_size{
         "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES"};
@@ -77,6 +81,8 @@ struct FileStorageEnvironment {
 void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_EQ(config.storage_backend_type, StorageBackendType::kBucket);
     EXPECT_EQ(config.storage_filepath, "/data/file_storage");
+    EXPECT_TRUE(config.storage_filepaths.empty());
+    EXPECT_FALSE(config.allow_storage_path_change);
     EXPECT_EQ(config.local_buffer_size, 1280 * 1024 * 1024);
     EXPECT_EQ(config.pinned_restore_arena_size, 0);
     EXPECT_EQ(config.scanmeta_iterator_keys_limit, 20000);
@@ -335,6 +341,85 @@ TEST_F(FileStorageConfigTest, ValidateFailsOnInvalidLimits) {
     config.disk_eviction_low_watermark_ratio = 0.8;
     config.disk_eviction_high_watermark_ratio = 1.1;
     EXPECT_FALSE(config.Validate());
+}
+
+TEST_F(FileStorageConfigTest, ParsesCommaSeparatedStoragePaths) {
+    const auto root_a = data_path / "disk_a";
+    const auto root_b = data_path / "disk_b";
+    std::filesystem::create_directories(root_a);
+    std::filesystem::create_directories(root_b);
+    // Written out of order and with whitespace to exercise sorting/trimming.
+    const std::string raw = root_b.string() + " , " + root_a.string();
+
+    FileStorageConfig config;
+    config.storage_filepath = raw;
+    ASSERT_TRUE(config.Validate());
+    ASSERT_EQ(config.storage_filepaths.size(), 2u);
+    std::error_code ec;
+    std::vector<std::string> expected = {
+        std::filesystem::weakly_canonical(root_a, ec).string(),
+        std::filesystem::weakly_canonical(root_b, ec).string()};
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(config.storage_filepaths, expected);
+    // The raw value is preserved for diagnostics.
+    EXPECT_EQ(config.storage_filepath, raw);
+}
+
+TEST_F(FileStorageConfigTest, ParsesSingleStoragePath) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path.string() + "/";
+    ASSERT_TRUE(config.Validate());
+    ASSERT_EQ(config.storage_filepaths.size(), 1u);
+    std::error_code ec;
+    EXPECT_EQ(config.storage_filepaths.front(),
+              std::filesystem::weakly_canonical(data_path, ec).string());
+}
+
+TEST_F(FileStorageConfigTest, RejectsMalformedStoragePathLists) {
+    const auto root_a = data_path / "disk_a";
+    const auto root_b = data_path / "disk_b";
+    const auto nested = root_a / "nested";
+    std::filesystem::create_directories(root_a);
+    std::filesystem::create_directories(root_b);
+    std::filesystem::create_directories(nested);
+    const std::string a = root_a.string();
+    const std::string b = root_b.string();
+
+    for (const std::string& raw : {
+             a + ",",
+             "," + a,
+             a + ",," + b,
+             a + "," + a,
+             a + ", ./" + b,
+             a + "," + (data_path / "does_not_exist").string(),
+             a + "," + nested.string(),
+         }) {
+        FileStorageConfig config;
+        config.storage_filepath = raw;
+        EXPECT_FALSE(config.Validate()) << "should reject: " << raw;
+    }
+}
+
+TEST_F(FileStorageConfigTest, MultipleStoragePathsRejectedForNonBucketBackend) {
+    const auto root_a = data_path / "disk_a";
+    const auto root_b = data_path / "disk_b";
+    std::filesystem::create_directories(root_a);
+    std::filesystem::create_directories(root_b);
+
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = root_a.string() + "," + root_b.string();
+    EXPECT_FALSE(config.Validate());
+}
+
+TEST_F(FileStorageConfigTest, ReadsAllowStoragePathChangeFlag) {
+    env.allow_storage_path_change.Set("true");
+    auto config = FileStorageConfig::FromEnvironment();
+    EXPECT_TRUE(config.allow_storage_path_change);
+
+    env.allow_storage_path_change.Set("false");
+    config = FileStorageConfig::FromEnvironment();
+    EXPECT_FALSE(config.allow_storage_path_change);
 }
 
 }  // namespace

@@ -130,7 +130,8 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `/data/file_storage` | Absolute path to the SSD storage directory |
+| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `/data/file_storage` | Absolute path to the SSD storage directory. With `bucket_storage_backend`, a comma-separated list of directories is accepted to spread buckets over several disks (see [Multiple SSD directories](#multiple-ssd-directories)). A literal comma in a path is therefore not expressible. |
+| `MOONCAKE_OFFLOAD_ALLOW_STORAGE_PATH_CHANGE` | `false` | Allow startup when a storage root recorded in a previous run's root manifest is no longer configured. Data on the missing root stays unreachable. Only applies to `bucket_storage_backend`. |
 | `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | Storage backend type (see below) |
 | `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | `1342177280` (1.25 GB) | Client-side staging buffer size |
 | `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES` | `0` | Size of the additional preallocated pinned-host arena for same-process SSD-to-GPU restores and DFS ranged-session reads into device memory. See the constraints below |
@@ -157,9 +158,9 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 |---|---|---|
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | `268435456` (256 MB) | Max size per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
-| `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
+| `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the combined physical capacity of all configured directories** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
-| `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
+| `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) summed over this backend's configured directories. `0` disables it. With per-rank directories (required), the cap is per-client — see below. |
 | `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
 
 ### File-per-key backend settings
@@ -182,13 +183,33 @@ Groups multiple objects into bucket files. Reduces filesystem overhead, supports
 **File layout:**
 ```
 /nvme/mooncake_offload/
-├── 1710000000000-0.bucket   # data file (multiple KV pairs)
-├── 1710000000000-0.meta     # metadata file
+├── .mooncake_local_disk.lock   # ownership lock (one live client per root)
+├── .mooncake_storage_roots     # root manifest (multi-directory deployments)
+├── 1710000000000-0.bucket      # data file (multiple KV pairs)
+├── 1710000000000-0.meta        # metadata file
 ├── 1710000000001-0.bucket
 └── ...
 ```
 
 Best for: general-purpose use, large-scale deployments.
+
+#### Multiple SSD directories
+
+Instead of RAID/LVM or one real-client rank per disk, a single `bucket_storage_backend` can spread buckets over several directories:
+
+```bash
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
+export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme01/mooncake,/nvme02/mooncake
+```
+
+- **Parsing:** the value is split on commas and whitespace is trimmed. Every entry must be an absolute, existing, writable directory without `..` or symlinks. Duplicate or nested entries (one root inside another) are rejected. The parsed list is canonicalized and sorted, so the order you write has no effect on placement.
+- **Placement:** new buckets are assigned round-robin, skipping a directory whose free space would fall below 256 MB; if none has room, the directory with the most free space is chosen and eviction runs against it. Reads and deletes use the directory recorded for the bucket at startup.
+- **Capacity:** `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` and `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` remain **global** across all directories. The default `MAX_TOTAL_SIZE` quota is 90% of the summed capacity.
+- **Disk-full eviction:** when the target directory is physically full, only buckets stored on that same directory are evicted; if enough space still cannot be freed, the write is rejected rather than attempted.
+- **Root manifest:** every directory stores `.mooncake_storage_roots`, the set of roots used by the client. On restart, all configured roots are scanned and buckets recovered. If a root named in a manifest is missing from the current configuration, `Init()` fails instead of silently hiding its buckets; set `MOONCAKE_OFFLOAD_ALLOW_STORAGE_PATH_CHANGE=true` to start without it (the missing root's data is not served). Adding a new root is always allowed and rewrites the manifests.
+- **Ownership:** each directory has its own `.mooncake_local_disk.lock`. Different live clients must use **disjoint** sets of roots; overlapping sets fail `Init()`.
+
+Only `bucket_storage_backend` accepts more than one directory; other backends reject a comma-separated value at startup.
 
 ### `file_per_key_storage_backend`
 
@@ -231,9 +252,9 @@ Eviction is two-phase: the bucket is removed from metadata and master is notifie
 
 `MAX_TOTAL_SIZE` bounds a *logical* in-memory counter (`data_size + meta_size` summed per object). It undercounts real disk usage: it ignores filesystem block rounding, and a bucket file stays on disk until *every* object in it is evicted while the counter drops per object. `MAX_PHYSICAL_BYTES` instead measures the *real* on-disk bytes (`du`-equivalent), so prefer it when you must not exceed a hard physical limit — most importantly a Kubernetes `emptyDir` with a `sizeLimit`, which the kubelet enforces by the volume's actual `du` usage and evicts the pod when exceeded.
 
-**Ownership and scope.** LOCAL_DISK allows **one live client per** `ssd_offload_path` / `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`. A second live client fails `Init()` with `storage_path already held by another live client`. Do **not** point several TP ranks at the same path — use **per-rank / per-client directories** (or separate disks). See the ownership contract in [SSD Offload design](../../design/store/ssd-offload.md).
+**Ownership and scope.** LOCAL_DISK allows **one live client per storage directory**. Every entry of `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` is locked; a second live client whose directories overlap fails `Init()` with `storage root already held by another live client`. Do **not** point several TP ranks at the same directory — use **per-rank / per-client directories** (or separate disks), with disjoint root sets for multi-directory clients. See the ownership contract in [SSD Offload design](../../design/store/ssd-offload.md).
 
-`MAX_PHYSICAL_BYTES` scans this backend's own path. With the required per-rank layout, the cap bounds **each rank individually**. Set it to the per-rank budget (e.g. `sizeLimit / N` when N ranks share one volume via separate subdirectories, or the disk capacity when each rank has its own disk). A shared offload directory across live clients is no longer a supported deployment shape.
+`MAX_PHYSICAL_BYTES` scans this backend's own directories and sums them. With the required per-rank layout, the cap bounds **each client individually**. Set it to the per-client budget (e.g. `sizeLimit / N` when N clients share one volume via separate subdirectories, or the disk capacity when each client has its own disk). A shared offload directory across live clients is no longer a supported deployment shape.
 
 > A cap on the *global* sum across ranks that holds under any layout (including ranks on separate disks) cannot be done by a per-directory scan and would require master-side aggregation; it is not part of this feature.
 
@@ -303,8 +324,8 @@ mooncake_client \
 
 ## Notes
 
-- `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` must be an absolute path to an existing, writable directory. Symbolic links and paths containing `..` are rejected.
-- Each live Real Client needs its **own** offload directory. Sharing one path across TP ranks fails at `Init()` under the LOCAL_DISK ownership lock.
+- `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` must be an absolute path (or comma-separated list of absolute paths for `bucket_storage_backend`) to existing, writable directories. Symbolic links and paths containing `..` are rejected.
+- Each live Real Client needs its **own** offload directories. Sharing a directory across TP ranks fails at `Init()` under the LOCAL_DISK ownership lock.
 - On real client restart, `bucket_storage_backend` and `file_per_key_storage_backend` scan existing SSD metadata and report it to the master, so previously offloaded objects remain accessible. `offset_allocator_storage_backend` does not support restart recovery.
 - Eviction only notifies the master and deletes local files; objects replicated on other nodes are unaffected.
 - Each machine requires its own real client process. In multi-node deployments, ensure `--host` and `--port` are correctly set so nodes can reach each other.
@@ -357,6 +378,15 @@ mooncake_client \
 - Confirm the process user has read/write access to the directory.
 - Symbolic links and paths containing `..` are rejected — use an absolute, canonical path.
 - The path must already exist and must be a directory. Passing a regular file path also causes setup to fail.
+- For a comma-separated list, every entry must be valid; one bad entry rejects the whole configuration.
+
+### `Init()` fails with "Storage root(s) used by a previous run are missing"
+
+A `.mooncake_storage_roots` manifest records the directories a client previously used. If the current `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` no longer contains one of them, startup fails so that the missing root's buckets are not silently lost. Add the directory back, or start with `MOONCAKE_OFFLOAD_ALLOW_STORAGE_PATH_CHANGE=true` to accept that those buckets stay unreachable.
+
+### `Init()` fails with "already held by another live client"
+
+Each storage directory has a `.mooncake_local_disk.lock`. Another live client — or a stale process — holds one of the directories in your list. Ensure root sets are disjoint between clients and stop the other process.
 
 ### "Failed to register buffer with UringFile" warning in logs
 
