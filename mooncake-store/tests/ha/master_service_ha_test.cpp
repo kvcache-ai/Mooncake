@@ -34,6 +34,7 @@
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/ordered_oplog_writer.h"
+#include "ha_metric_manager.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -5698,6 +5699,57 @@ TEST_F(MasterServiceHATest, PutEndVisibleBeforeBatchRecordDurable) {
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 2, batch);
+}
+
+TEST_F(MasterServiceHATest, PutEndCountsRecordRejectedByFullReservation) {
+    const std::string cluster_id = "test_put_end_dropped_metric";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "dropped_put_end_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"dropped_put_end_segment"};
+    const std::string key = "dropped_put_end_key";
+    ASSERT_TRUE(
+        service.PutStart(mounted.client_id, key, kDefaultTenant, 1024, config)
+            .has_value());
+
+    // Take the only entry the writer accepts, so the PutEnd append is rejected
+    // with TASK_PENDING_LIMIT_EXCEEDED.
+    auto reserved = ReserveBatchSlotForTesting(service);
+    ASSERT_TRUE(reserved.has_value()) << toString(reserved.error());
+    auto rejected = ReserveBatchSlotForTesting(service);
+    ASSERT_FALSE(rejected.has_value());
+    ASSERT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, rejected.error());
+
+    auto& metrics = HAMetricManager::instance();
+    const int64_t before = metrics.get_oplog_dropped_put_end_total();
+
+    ::testing::internal::CaptureStderr();
+    const auto put_end = service.PutEnd(mounted.client_id, key, kDefaultTenant,
+                                        ReplicaType::MEMORY);
+    const std::string logs = ::testing::internal::GetCapturedStderr();
+
+    // The caller still sees success: the drop is only visible in the counter.
+    EXPECT_TRUE(put_end.has_value());
+    EXPECT_NE(std::string::npos, logs.find("PutEnd: OpLog queue failed"))
+        << logs;
+    EXPECT_EQ(before + 1, metrics.get_oplog_dropped_put_end_total());
 }
 
 TEST_F(MasterServiceHATest, CopyEndVisibleBeforeBatchRecordDurable) {
