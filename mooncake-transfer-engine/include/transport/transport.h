@@ -546,6 +546,14 @@ class Transport {
         // this object while a pin is held.
         std::atomic<uint64_t> active_completion_callbacks{0};
 
+        // Set when freeBatchID() finds the batch still busy and defers its
+        // cleanup: the owner has stopped waiting and may already have handed
+        // the buffers to someone else. Transports must not start sending
+        // slices of an abandoned batch; slices already on the wire cannot be
+        // recalled. The BatchDesc stays alive until every slice is terminal,
+        // so a transport holding an unfinished slice may read this flag.
+        std::atomic<bool> abandoned{false};
+
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         // Synchronization primitives for direct notification
         std::mutex completion_mutex;
