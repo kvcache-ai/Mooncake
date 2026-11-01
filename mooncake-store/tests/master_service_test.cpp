@@ -4048,6 +4048,84 @@ TEST_F(MasterServiceTest, ClientOffboardingRetryPolicy) {
     EXPECT_TRUE(ClientOffboardingShouldAlertForTest(11));
 }
 
+TEST_F(MasterServiceTest,
+       UnmountInvalidatesRetainedSnapshotWithSameNameSurvivor) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    const auto owner = generate_uuid();
+    auto retired = MakeSegment("retained_same_name_unmount");
+    retired.protocol = "tcp";
+    ASSERT_TRUE(service.MountSegment(retired, owner));
+    std::vector<std::string> keys;
+    for (size_t i = 0; i < 4; ++i) {
+        keys.push_back(PutObjectOnSegment(service, owner, retired.name));
+    }
+    auto survivor = retired;
+    survivor.id = generate_uuid();
+    survivor.base += 2 * survivor.size;
+    ASSERT_TRUE(service.MountSegment(survivor, owner));
+    PauseReplicaCleanup(service);
+
+    std::shared_ptr<BufferAllocatorBase> retired_allocator;
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        retired_allocator = access.GetAllocator(retired.id);
+    }
+    AllocatorManager retained;
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getAllocatorAccess();
+        retained = access.SnapshotAllocatorManager();
+    }
+    const auto* registrations = retained.getAllocators(retired.name);
+    ASSERT_NE(registrations, nullptr);
+    ASSERT_EQ(registrations->size(), 2u);
+    const auto found = std::find_if(
+        registrations->begin(), registrations->end(),
+        [&](const auto& registration) {
+            return registration->GetAllocator() == retired_allocator;
+        });
+    ASSERT_NE(found, registrations->end());
+    const auto retired_registration = *found;
+    auto old_buffer = retired_registration->Allocate(1024);
+    ASSERT_NE(old_buffer, nullptr);
+    ASSERT_TRUE(old_buffer->isAvailable());
+    ASSERT_TRUE(service.UnmountSegment(retired.id, owner));
+    // Retirement invalidates old snapshots before metadata cleanup.
+    EXPECT_EQ(service.GetKeyCount(), keys.size());
+    EXPECT_FALSE(retired_registration->IsServing());
+    EXPECT_EQ(retired_registration->Allocate(1024), nullptr);
+    EXPECT_FALSE(old_buffer->isAvailable());
+    for (const auto& key : keys) {
+        const auto read = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_FALSE(read);
+        EXPECT_EQ(read.error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+    RandomAllocationStrategy strategy;
+    const auto allocated = strategy.AllocateFrom(retained, 1024, retired.name);
+    ASSERT_TRUE(allocated);
+    const auto descriptor = allocated->get_descriptor();
+    const auto& buffer = descriptor.get_memory_descriptor().buffer_descriptor;
+    EXPECT_GE(buffer.buffer_address_, survivor.base);
+    EXPECT_LE(buffer.buffer_address_ + buffer.size_,
+              survivor.base + survivor.size);
+    EXPECT_EQ(retained.getServingNames().size(), 1u);
+    const auto new_key = PutObjectOnSegment(service, owner, survivor.name);
+    const auto read = service.GetReplicaList(new_key, TenantId::Default());
+    ASSERT_TRUE(read);
+    ASSERT_EQ(read->replicas.size(), 1u);
+    const auto& fresh =
+        read->replicas.front().get_memory_descriptor().buffer_descriptor;
+    EXPECT_GE(fresh.buffer_address_, survivor.base);
+    EXPECT_LE(fresh.buffer_address_ + fresh.size_,
+              survivor.base + survivor.size);
+
+    ASSERT_TRUE(service.UnmountSegment(survivor.id, owner));
+    EXPECT_TRUE(retained.getServingNames().empty());
+}
+
 TEST_F(MasterServiceTest, ReMountDoesNotRecoverSuspectedClient) {
     MasterService service;
     auto segment = MakeSegment("suspected_remount_segment");
