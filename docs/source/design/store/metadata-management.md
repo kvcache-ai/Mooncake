@@ -49,8 +49,11 @@ All lookups go through RAII accessors (`MetadataAccessorRO` /
 `MetadataAccessorRW`) that resolve the namespace and hold the key for their
 scope; a thread holds one key at a time. Walks over a tenant's objects use the
 route's cursors (`ReadCursor()` / `WriteCursor()`), which hold one key at a
-time too. Next to the route, each namespace keeps the keys whose object has
-work in flight and the eviction index eviction walks.
+time too. Batch reads (`BatchGetReplicaList`, `BatchExistKey`, `BatchProbeKey`)
+go through `ReadBatch()`, which finds the batch's slots stripe by stripe,
+locking each stripe once for all of its keys, and then reads each key under its
+own lock in request order. Next to the route, each namespace keeps the keys
+whose object has work in flight and the eviction index eviction walks.
 
 ## ObjectMetadata and Replica Descriptors
 
