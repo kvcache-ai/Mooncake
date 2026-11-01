@@ -25,11 +25,14 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <barrier>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "tent/common/config.h"
@@ -145,6 +148,80 @@ TEST_F(XpuPlatformTest, DeviceAllocCopyFreeRoundTrip) {
     // Whether the freed address still classifies as device memory is up to the
     // SYCL runtime (Level Zero keeps freed USM cached and get_pointer_type
     // still reports it as device), so that is deliberately not asserted.
+}
+
+// Host<->device copies from many threads at once. Every copy draws an
+// in-order queue from a per-device idle pool and returns it afterwards. Each
+// thread writes its own slice, then reads back its neighbour's slice, so the
+// read usually runs on a different queue than the write did, and a copy that
+// returns before it has finished leaves stale or partial bytes. The pattern
+// changes every iteration, so leftovers from an earlier iteration are caught
+// too.
+TEST_F(XpuPlatformTest, ConcurrentHostDeviceCopiesKeepTheirData) {
+    const int kThreads = 16;
+    const int kIterations = 16;
+    const size_t kSlice = 4 << 20;
+    auto pattern = [](int owner, int it, size_t i) {
+        return static_cast<uint8_t>(i * 131 + owner * 17 + it * 7 + 1);
+    };
+
+    std::vector<void *> dev(device_count_, nullptr);
+    for (int d = 0; d < device_count_; ++d) {
+        MemoryOptions options;
+        options.location = "xpu:" + std::to_string(d);
+        Status alloc = platform_->allocate(&dev[d], kSlice * kThreads, options);
+        ASSERT_TRUE(alloc.ok()) << alloc;
+    }
+    auto slice = [&](int t) {
+        return static_cast<uint8_t *>(dev[t % device_count_]) + t * kSlice;
+    };
+
+    std::barrier sync(kThreads);
+    std::vector<std::string> errors(kThreads);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            const int peer = (t + 1) % kThreads;
+            std::vector<uint8_t> src(kSlice), dst(kSlice);
+            for (int it = 0; it < kIterations; ++it) {
+                for (size_t i = 0; i < kSlice; ++i) src[i] = pattern(t, it, i);
+                std::fill(dst.begin(), dst.end(), 0);
+                Status h2d = errors[t].empty()
+                                 ? platform_->copy(slice(t), src.data(), kSlice)
+                                 : Status::OK();
+                sync.arrive_and_wait();  // every slice written
+                Status d2h =
+                    errors[t].empty()
+                        ? platform_->copy(dst.data(), slice(peer), kSlice)
+                        : Status::OK();
+                sync.arrive_and_wait();  // every slice read before rewriting
+                if (!errors[t].empty()) continue;  // keep the barrier count
+                if (!h2d.ok() || !d2h.ok()) {
+                    errors[t] = "copy failed at iteration " +
+                                std::to_string(it) + ": " +
+                                (h2d.ok() ? d2h.ToString() : h2d.ToString());
+                    continue;
+                }
+                for (size_t i = 0; i < kSlice; ++i) {
+                    if (dst[i] != pattern(peer, it, i)) {
+                        errors[t] = "slice " + std::to_string(peer) +
+                                    " wrong at iteration " +
+                                    std::to_string(it) + ", byte " +
+                                    std::to_string(i);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    for (auto &th : threads) th.join();
+    for (int t = 0; t < kThreads; ++t)
+        EXPECT_TRUE(errors[t].empty()) << "thread " << t << ": " << errors[t];
+
+    for (int d = 0; d < device_count_; ++d) {
+        Status freed = platform_->free(dev[d], kSlice * kThreads);
+        EXPECT_TRUE(freed.ok()) << freed;
+    }
 }
 
 TEST_F(XpuPlatformTest, HostPointerClassifiesAsCpu) {
