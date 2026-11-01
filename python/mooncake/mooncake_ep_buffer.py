@@ -632,8 +632,33 @@ class Buffer:
 
     def connect(self, is_update: bool = False):
         device = self._bootstrap_device()
+        ibgda_ready = True
+        if self.device_type != "xpu" and is_update:
+            ibgda_ready_tensor = torch.tensor(
+                [int(not self.runtime.ibgda_disabled())],
+                dtype=torch.int32,
+                device=device,
+            )
+            dist.all_reduce(ibgda_ready_tensor, op=dist.ReduceOp.MIN, group=self.group)
+            ibgda_ready = bool(ibgda_ready_tensor.item())
+            if ibgda_ready:
+                self.runtime.update_local_qpns()
+                ibgda_ready_tensor.fill_(int(not self.runtime.ibgda_disabled()))
+                dist.all_reduce(
+                    ibgda_ready_tensor, op=dist.ReduceOp.MIN, group=self.group
+                )
+                ibgda_ready = bool(ibgda_ready_tensor.item())
+            if not ibgda_ready:
+                # A failed update on any rank invalidates the IBGDA exchange
+                # for the whole group. Keep every rank on the same path.
+                self._use_fallback = True
         # XPU has no RDMA path: peers are reached over Level Zero IPC only.
-        if self.device_type != "xpu" and not self._use_fallback:
+        if (
+            self.device_type != "xpu"
+            and ibgda_ready
+            and not self._use_fallback
+            and not self.runtime.ibgda_disabled()
+        ):
             (raddr, rkey) = self.runtime.get_mr_info()
             # torchada maps the CUDA device namespace to MUSA when enabled.
 
@@ -652,9 +677,6 @@ class Buffer:
             ]
             dist.all_gather(rkeys, rkey, self.group)
             rkeys = torch.cat(rkeys).tolist()
-
-            if is_update:
-                self.runtime.update_local_qpns()
 
             local_qpns = self.runtime.get_local_qpns()
             all_to_all_size = len(local_qpns) // self.group_size
@@ -759,16 +781,12 @@ class Buffer:
             ibgda_disabled = bool(self.runtime.ibgda_disabled())
             use_fast_path = not ibgda_disabled
 
-        if self.device_type == "xpu":
-            # Each rank maps its peers on its own, so one may reach them all
-            # while another cannot. Take the fast path only if every rank can;
-            # a rank in native kernels would wait forever on one that runs the
-            # fallback's collectives, and the other way round.
-            agreed = torch.tensor(
-                [int(use_fast_path)], dtype=torch.int32, device=device
-            )
-            dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=self.group)
-            use_fast_path = bool(agreed.item())
+        # Each rank maps its peers on its own, so one may reach them all while
+        # another cannot. Take the fast path only if every rank can; a rank in
+        # native kernels would wait forever on one that runs fallback collectives.
+        agreed = torch.tensor([int(use_fast_path)], dtype=torch.int32, device=device)
+        dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=self.group)
+        use_fast_path = bool(agreed.item())
         self._use_fallback = not use_fast_path
 
     def update_ep_member(self):
