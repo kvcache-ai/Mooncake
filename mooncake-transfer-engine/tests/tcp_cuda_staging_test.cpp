@@ -15,8 +15,10 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -69,6 +71,36 @@ class DeviceBuffer {
 
    private:
     void* data_ = nullptr;
+};
+
+// a host function blocked until release(), not a long kernel: this file builds
+// without nvcc, and the selected stream stays busy however long the copy takes
+class StreamGate {
+   public:
+    explicit StreamGate(cudaStream_t stream = cudaStreamLegacy)
+        : stream_(stream) {}
+
+    ~StreamGate() {
+        release();
+        cudaStreamSynchronize(stream_);
+    }
+
+    cudaError_t close() { return cudaLaunchHostFunc(stream_, &wait, this); }
+
+    void release() {
+        if (!released_) open_.set_value();
+        released_ = true;
+    }
+
+   private:
+    static void wait(void* gate) {
+        static_cast<StreamGate*>(gate)->opened_.wait();
+    }
+
+    cudaStream_t stream_;
+    std::promise<void> open_;
+    std::future<void> opened_ = open_.get_future();
+    bool released_ = false;
 };
 
 TransferStatusEnum runOne(TransferEngine* engine,
@@ -152,7 +184,7 @@ TEST(TcpCudaStagingTest, ReusesStagingAcrossChunksAndRequests) {
     write.target_id = segment_id;
     write.target_offset = remote_base + kTransferSize;
     ASSERT_EQ(runOne(engine.get(), write), TransferStatusEnum::COMPLETED);
-    EXPECT_EQ(tcpTransportStagingDeviceQueryCountForTest(), 2u);
+    EXPECT_EQ(tcpTransportStagingDeviceQueryCountForTest(), 3u);
     EXPECT_EQ(tcpTransportStagingBufferAllocationCountForTest(), 2u);
 
     std::vector<unsigned char> actual(kTransferSize);
@@ -169,7 +201,7 @@ TEST(TcpCudaStagingTest, ReusesStagingAcrossChunksAndRequests) {
     read.target_id = segment_id;
     read.target_offset = remote_base + kTransferSize;
     ASSERT_EQ(runOne(engine.get(), read), TransferStatusEnum::COMPLETED);
-    EXPECT_EQ(tcpTransportStagingDeviceQueryCountForTest(), 2u);
+    EXPECT_EQ(tcpTransportStagingDeviceQueryCountForTest(), 3u);
     // The client session is new; the persistent server session retains the
     // staging allocation used by the preceding WRITE.
     EXPECT_EQ(tcpTransportStagingBufferAllocationCountForTest(), 1u);
@@ -178,6 +210,136 @@ TEST(TcpCudaStagingTest, ReusesStagingAcrossChunksAndRequests) {
                          actual.size(), cudaMemcpyDeviceToHost),
               cudaSuccess);
     EXPECT_EQ(actual, pattern);
+
+    EXPECT_EQ(engine->unregisterLocalMemory(device_buffer.get()), 0);
+    engine.reset();
+}
+
+TEST(TcpCudaStagingTest, StagingDoesNotWaitForTheLegacyStream) {
+    int device_count = 0;
+    cudaError_t cuda_status = cudaGetDeviceCount(&device_count);
+    if (cuda_status != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device unavailable";
+    }
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    constexpr size_t kTransferSize = 64 * 1024;
+    constexpr size_t kBufferSize = 2 * kTransferSize;
+
+    DeviceBuffer device_buffer;
+    ASSERT_EQ(cudaMalloc(device_buffer.out(), kBufferSize), cudaSuccess);
+
+    auto engine = std::make_unique<TransferEngine>(false);
+    const std::string server_name = "127.0.0.2:17932";
+    const auto hostname_port = parseHostNameWithPort(server_name);
+    ASSERT_EQ(engine->init(P2PHANDSHAKE, server_name,
+                           hostname_port.first.c_str(), hostname_port.second),
+              0);
+    ASSERT_NE(engine->installTransport("tcp", nullptr), nullptr);
+    ASSERT_EQ(
+        engine->registerLocalMemory(device_buffer.get(), kBufferSize, "cuda:0"),
+        0);
+
+    const auto segment_id = engine->openSegment(engine->getLocalIpAndPort());
+    const auto segment_desc =
+        engine->getMetadata()->getSegmentDescByID(segment_id);
+    ASSERT_NE(segment_desc, nullptr);
+    ASSERT_FALSE(segment_desc->buffers.empty());
+    const uint64_t remote_base = segment_desc->buffers[0].addr;
+
+    StreamGate gate;
+    ASSERT_EQ(gate.close(), cudaSuccess);
+
+    TransferRequest write;
+    write.opcode = TransferRequest::WRITE;
+    write.length = kTransferSize;
+    write.source = device_buffer.get();
+    write.target_id = segment_id;
+    write.target_offset = remote_base + kTransferSize;
+    EXPECT_EQ(runOne(engine.get(), write), TransferStatusEnum::COMPLETED)
+        << "a WRITE of device memory waited for the legacy default stream";
+
+    TransferRequest read = write;
+    read.opcode = TransferRequest::READ;
+    EXPECT_EQ(runOne(engine.get(), read), TransferStatusEnum::COMPLETED)
+        << "a READ of device memory waited for the legacy default stream";
+
+    gate.release();
+    EXPECT_EQ(engine->unregisterLocalMemory(device_buffer.get()), 0);
+    engine.reset();
+}
+
+TEST(TcpCudaStagingTest, SubmissionWaitsForCallerProducerBeforeStaging) {
+    int device_count = 0;
+    cudaError_t cuda_status = cudaGetDeviceCount(&device_count);
+    if (cuda_status != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device unavailable";
+    }
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    constexpr size_t kTransferSize = 64 * 1024;
+    constexpr size_t kBufferSize = 2 * kTransferSize;
+
+    DeviceBuffer device_buffer;
+    ASSERT_EQ(cudaMalloc(device_buffer.out(), kBufferSize), cudaSuccess);
+    ASSERT_EQ(cudaMemset(device_buffer.get(), 0, kBufferSize), cudaSuccess);
+
+    auto engine = std::make_unique<TransferEngine>(false);
+    const std::string server_name = "127.0.0.2:17933";
+    const auto hostname_port = parseHostNameWithPort(server_name);
+    ASSERT_EQ(engine->init(P2PHANDSHAKE, server_name,
+                           hostname_port.first.c_str(), hostname_port.second),
+              0);
+    ASSERT_NE(engine->installTransport("tcp", nullptr), nullptr);
+    ASSERT_EQ(
+        engine->registerLocalMemory(device_buffer.get(), kBufferSize, "cuda:0"),
+        0);
+
+    const auto segment_id = engine->openSegment(engine->getLocalIpAndPort());
+    const auto segment_desc =
+        engine->getMetadata()->getSegmentDescByID(segment_id);
+    ASSERT_NE(segment_desc, nullptr);
+    ASSERT_FALSE(segment_desc->buffers.empty());
+    const uint64_t remote_base = segment_desc->buffers[0].addr;
+
+    std::vector<unsigned char> pattern(kTransferSize);
+    for (size_t i = 0; i < pattern.size(); ++i)
+        pattern[i] = static_cast<unsigned char>((i * 37 + 11) & 0xFF);
+
+    StreamGate gate(cudaStreamPerThread);
+    ASSERT_EQ(gate.close(), cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(device_buffer.get(), pattern.data(), pattern.size(),
+                        cudaMemcpyHostToDevice, cudaStreamPerThread),
+        cudaSuccess);
+
+    TransferRequest write;
+    write.opcode = TransferRequest::WRITE;
+    write.length = kTransferSize;
+    write.source = device_buffer.get();
+    write.target_id = segment_id;
+    write.target_offset = remote_base + kTransferSize;
+    std::atomic<bool> submission_returned{false};
+    std::atomic<bool> completed_before_release{false};
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        completed_before_release.store(submission_returned.load());
+        gate.release();
+    });
+    const auto result = runOne(engine.get(), write);
+    submission_returned.store(true);
+    releaser.join();
+    EXPECT_FALSE(completed_before_release.load())
+        << "submission completed before the caller's producer stream";
+    ASSERT_EQ(result, TransferStatusEnum::COMPLETED);
+
+    std::vector<unsigned char> actual(kTransferSize);
+    auto* device_bytes = static_cast<unsigned char*>(device_buffer.get());
+    ASSERT_EQ(cudaMemcpy(actual.data(), device_bytes + kTransferSize,
+                         actual.size(), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(actual, pattern)
+        << "staging read the source before the caller's producer finished";
 
     EXPECT_EQ(engine->unregisterLocalMemory(device_buffer.get()), 0);
     engine.reset();
