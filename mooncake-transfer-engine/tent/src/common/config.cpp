@@ -208,6 +208,27 @@ Status ConfigHelper::loadFromEnv(Config& config) {
             << "MC_FORCE_TCP is set, forcing TENT memory transfers to use TCP";
     }
     setBoolConfig(config, "MC_MNNVL_EGM", "transports/mnnvl/egm");
+    // Fail closed on malformed new controls instead of silently disabling them.
+    for (const auto& entry :
+         {std::pair{"MC_MNNVL_REQUIRE_FABRIC",
+                    "transports/mnnvl/require_fabric"},
+          std::pair{"MC_MNNVL_COMPLETION_EVENT_POOL",
+                    "transports/mnnvl/completion_event_pool"}}) {
+        const char* value = std::getenv(entry.first);
+        if (!value) continue;
+        std::string normalized(value);
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (normalized != "true" && normalized != "false" &&
+            normalized != "1" && normalized != "0" && normalized != "yes" &&
+            normalized != "no" && normalized != "on" && normalized != "off") {
+            return Status::InvalidArgument(std::string("Invalid boolean: ") +
+                                           entry.first);
+        }
+        config.set(entry.second, parseBool(normalized));
+    }
+    if (const char* mode = std::getenv("MC_MNNVL_SYNC_MODE"))
+        config.set("transports/mnnvl/sync_mode", std::string(mode));
     setConfig(config, "MC_RDMA_BIND_ADDRESS", "transports/rdma/bind_address");
     setConfig(config, "MC_NUM_CQ_PER_CTX",
               "transports/rdma/device/num_cq_list");
@@ -272,6 +293,78 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     setConfig(config, "MC_IOURING_STAGING_SLOTS",
               "transports/io_uring/staging_slots");
     return status;
+}
+
+Status parseMnnvlConfig(const Config& config, MnnvlConfig& options) {
+    MnnvlConfig parsed;
+    const auto paths = config.paths();
+    auto configured = [&](const char* key) {
+        return std::binary_search(paths.begin(), paths.end(), std::string(key));
+    };
+    auto read_bool = [&](const char* key, bool& value) -> Status {
+        std::string text;
+        if (!config.dumpSubtree(key, &text)) {
+            if (configured(key))
+                return Status::InvalidArgument(std::string(key) +
+                                               " must be boolean");
+            return Status::OK();
+        }
+        if (text != "true" && text != "false")
+            return Status::InvalidArgument(std::string(key) +
+                                           " must be boolean");
+        value = text == "true";
+        return Status::OK();
+    };
+    CHECK_STATUS(
+        read_bool("transports/mnnvl/require_fabric", parsed.require_fabric));
+    CHECK_STATUS(read_bool("transports/mnnvl/completion_event_pool",
+                           parsed.completion_event_pool));
+    std::string text;
+    if (config.dumpSubtree("transports/mnnvl/completion_event_pool_capacity",
+                           &text)) {
+        auto value = json::parse(text);
+        if (!value.is_number_integer() ||
+            (!value.is_number_unsigned() && value.get<int64_t>() < 0) ||
+            value.get<uint64_t>() > 1048576)
+            return Status::InvalidArgument(
+                "MNNVL event pool capacity must be an integer in [0, 1048576]");
+        parsed.completion_event_pool_capacity = value.get<size_t>();
+    } else if (configured("transports/mnnvl/completion_event_pool_capacity")) {
+        return Status::InvalidArgument(
+            "MNNVL event pool capacity must be an integer");
+    }
+    const auto mode = config.get("transports/mnnvl/sync_mode", "cpu_block");
+    if ((configured("transports/mnnvl/sync_mode") &&
+         config.get<json>("transports/mnnvl/sync_mode", json()).type() !=
+             json::value_t::string) ||
+        (mode != "cpu_block" && mode != "gpu_wait"))
+        return Status::InvalidArgument(
+            "MNNVL sync_mode must be cpu_block or gpu_wait");
+    parsed.gpu_wait = mode == "gpu_wait";
+    if (parsed.gpu_wait) {
+        bool queue_enabled = false;
+        CHECK_STATUS(read_bool("enable_runtime_queue", queue_enabled));
+        if (queue_enabled)
+            return Status::InvalidArgument(
+                "MNNVL gpu_wait requires direct caller-thread dispatch "
+                "(enable_runtime_queue=false)");
+    }
+    parsed.egm_enabled = config.get("transports/mnnvl/egm", false);
+    if (parsed.require_fabric) {
+        CHECK_STATUS(read_bool("transports/mnnvl/egm", parsed.egm_enabled));
+        bool enabled = true, force_tcp = false;
+        CHECK_STATUS(read_bool("transports/mnnvl/enable", enabled));
+        CHECK_STATUS(read_bool("transports/force_tcp", force_tcp));
+        if (!enabled || force_tcp ||
+            (configured("transports/nvlink/handle_type") &&
+             config.get<json>("transports/nvlink/handle_type", json()) !=
+                 json("fabric")))
+            return Status::InvalidArgument(
+                "Strict MNNVL requires enabled MNNVL and FABRIC handles "
+                "without force_tcp");
+    }
+    options = parsed;
+    return Status::OK();
 }
 
 bool ConfigHelper::parseBool(const std::string& str, bool default_value) {

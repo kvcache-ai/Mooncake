@@ -366,6 +366,10 @@ class TransferEngineImpl {
             return Status::InvalidArgument(
                 "Runtime config snapshot must not be null" LOC_MARK);
         }
+        // No gpu_wait guard is needed here: enable_runtime_queue is
+        // bootstrap-only (see classifyConfigPath), so a runtime generation can
+        // never carry it and deferred dispatch cannot be turned on after
+        // construct() validated the sync mode against it.
         std::atomic_store_explicit(&runtime_config_snapshot_,
                                    std::move(snapshot),
                                    std::memory_order_release);
@@ -625,6 +629,7 @@ class TransferEngineImpl {
    private:
     std::shared_ptr<Config> conf_;
     HpTcpTransportConfig hp_tcp_transport_config_;
+    MnnvlConfig mnnvl_config_;
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> topology_;
     std::unique_ptr<TransportSelector> transport_selector_;
