@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <new>
 #include <unordered_set>
 #include <utility>
 
@@ -275,44 +276,101 @@ Status UbWorkers::submit(const UbTask::Ptr& task, uint64_t device_mask) {
     if (!task) {
         return Status::InvalidArgument("Cannot submit a null UB task" LOC_MARK);
     }
+    return submitBatch({task}, device_mask);
+}
+
+Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
+                              uint64_t device_mask) {
     if (!accepting_.load(std::memory_order_acquire)) {
         return Status::InvalidArgument(
             "UB workers are not accepting work" LOC_MARK);
     }
-    const auto snapshot = task->snapshot();
-    if (!snapshot.sealed) {
-        return Status::InvalidArgument(
-            "UB task must be sealed before submission" LOC_MARK);
-    }
-    const int priority =
-        std::clamp(task->request().priority, static_cast<int>(PRIO_HIGH),
-                   static_cast<int>(PRIO_LOW));
 
     std::vector<PendingSlice> pending;
-    for (const auto& slice : task->slices()) {
-        if (slice && slice->markQueued()) {
+    std::unordered_set<const UbTask*> unique_tasks;
+    for (const auto& task : tasks) {
+        if (!task) {
+            return Status::InvalidArgument(
+                "Cannot submit a null UB task" LOC_MARK);
+        }
+        if (!unique_tasks.insert(task.get()).second) {
+            return Status::InvalidArgument(
+                "Cannot submit the same UB task twice in one batch" LOC_MARK);
+        }
+        const auto snapshot = task->snapshot();
+        if (!snapshot.sealed) {
+            return Status::InvalidArgument(
+                "UB task must be sealed before submission" LOC_MARK);
+        }
+        const int priority =
+            std::clamp(task->request().priority, static_cast<int>(PRIO_HIGH),
+                       static_cast<int>(PRIO_LOW));
+        for (const auto& slice : task->slices()) {
+            if (!slice || slice->snapshot().state != UbSliceState::kInitial) {
+                return Status::InvalidArgument(
+                    "UB task contains a slice that cannot be "
+                    "submitted" LOC_MARK);
+            }
             pending.push_back(PendingSlice{task, slice, device_mask, priority,
                                            task->request().target_id,
                                            task->request().opcode});
         }
     }
-    bool stopped_during_submit = false;
+
+    Status failure = Status::OK();
+    bool notify = false;
+    size_t marked_count = 0;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (!accepting_.load(std::memory_order_relaxed)) {
-            stopped_during_submit = true;
-        } else {
-            for (auto& item : pending) {
-                queues_[item.priority].push_back(std::move(item));
+            failure = Status::InvalidArgument(
+                "UB workers stopped during submission" LOC_MARK);
+        }
+
+        if (failure.ok()) {
+            for (const auto& item : pending) {
+                if (!item.slice->markQueued()) {
+                    failure = Status::InvalidArgument(
+                        "UB task changed while it was being "
+                        "submitted" LOC_MARK);
+                    break;
+                }
+                ++marked_count;
+            }
+        }
+
+        if (failure.ok()) {
+            std::array<size_t, PRIO_LOW + 1> inserted_counts{};
+            try {
+                for (const auto& item : pending) {
+                    queues_[item.priority].push_back(item);
+                    ++inserted_counts[item.priority];
+                }
+                notify = !pending.empty();
+            } catch (const std::bad_alloc&) {
+                for (size_t priority = 0; priority < queues_.size();
+                     ++priority) {
+                    while (inserted_counts[priority] != 0) {
+                        queues_[priority].pop_back();
+                        --inserted_counts[priority];
+                    }
+                }
+                failure = Status::InternalError(
+                    "Unable to enqueue UB task batch" LOC_MARK);
             }
         }
     }
-    if (stopped_during_submit) {
-        for (auto& item : pending) item.slice->requestCancellation();
-        return Status::InvalidArgument(
-            "UB workers stopped during submission" LOC_MARK);
+
+    if (!failure.ok()) {
+        // A markQueued() race or allocation failure may occur after earlier
+        // slices changed state. None of them are visible to posting workers;
+        // cancel the private tasks so no slice remains orphaned in kQueued.
+        for (size_t index = 0; index < marked_count; ++index) {
+            (void)pending[index].task->requestCancellation();
+        }
+        return failure;
     }
-    if (!pending.empty()) queue_cv_.notify_all();
+    if (notify) queue_cv_.notify_all();
     return Status::OK();
 }
 
@@ -472,9 +530,28 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
                 return Status::InvalidMetadataType(
                     "UB target is not a memory segment" LOC_MARK);
             }
+            const auto& spec = pending.slice->spec();
+            const bool has_credit_fence =
+                spec.receiver_credit_session_high != 0 ||
+                spec.receiver_credit_session_low != 0 ||
+                spec.receiver_credit_epoch != 0;
+            if (has_credit_fence) {
+                const auto& advert = segment->getMemory().receiver_credit;
+                if (!advert ||
+                    advert->schema_version != kReceiverCreditProtocolVersion ||
+                    advert->flags != kReceiverCreditRequired ||
+                    advert->receiver_session_id.high !=
+                        spec.receiver_credit_session_high ||
+                    advert->receiver_session_id.low !=
+                        spec.receiver_credit_session_low ||
+                    advert->epoch != spec.receiver_credit_epoch) {
+                    return Status::InvalidEntry(
+                        "UB receiver-credit session changed before "
+                        "post" LOC_MARK);
+                }
+            }
             auto* buffer =
-                segment->findBuffer(pending.slice->spec().remote_address,
-                                    pending.slice->spec().length);
+                segment->findBuffer(spec.remote_address, spec.length);
             if (!buffer) {
                 return Status::NeedsRefreshCache(
                     "UB target range is not registered" LOC_MARK);

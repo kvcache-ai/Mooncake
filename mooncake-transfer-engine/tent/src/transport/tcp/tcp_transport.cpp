@@ -178,6 +178,9 @@ Status TcpTransport::submitTransferTasks(
         task.request = request;
         task.progress_batch_id = batch->progress_batch_id;
         task.notify_progress = batch->notify_progress;
+        task.receiver_credit_session_high = batch->receiver_credit_session_high;
+        task.receiver_credit_session_low = batch->receiver_credit_session_low;
+        task.receiver_credit_epoch = batch->receiver_credit_epoch;
         task.status_word.store(TransferStatusEnum::PENDING,
                                std::memory_order_release);
     }
@@ -264,9 +267,7 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         return Status::InternalError("Transport shutting down");
 
     std::string rpc_server_addr;
-    auto status =
-        findRemoteSegment(task->request.target_offset, task->request.length,
-                          task->request.target_id, rpc_server_addr);
+    auto status = findRemoteSegment(*task, rpc_server_addr);
     if (!status.ok()) return status;
 
     Status last_error;
@@ -296,11 +297,15 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         if (task->request.opcode == Request::WRITE) {
             status = ControlClient::sendData(
                 rpc_server_addr, task->request.target_offset,
-                task->request.source, task->request.length);
+                task->request.source, task->request.length,
+                task->receiver_credit_session_high,
+                task->receiver_credit_session_low, task->receiver_credit_epoch);
         } else {
             status = ControlClient::recvData(
                 rpc_server_addr, task->request.target_offset,
-                task->request.source, task->request.length);
+                task->request.source, task->request.length,
+                task->receiver_credit_session_high,
+                task->receiver_credit_session_low, task->receiver_credit_epoch);
         }
 
         if (status.ok()) return Status::OK();
@@ -327,9 +332,7 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
             CHECK_STATUS(metadata_->segmentManager().invalidateRemote(
                 task->request.target_id));
             if (attempt == params_.max_retry_count) break;
-            auto resolve = findRemoteSegment(
-                task->request.target_offset, task->request.length,
-                task->request.target_id, rpc_server_addr);
+            auto resolve = findRemoteSegment(*task, rpc_server_addr);
             if (!resolve.ok()) return resolve;
         }
     }
@@ -337,12 +340,35 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
     return last_error;
 }
 
-Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
-                                       uint64_t target_id,
+Status TcpTransport::findRemoteSegment(const TcpTask &task,
                                        std::string &rpc_server_addr) {
     return metadata_->segmentManager().withCachedSegment(
-        target_id, [&](SegmentDesc *segment) {
-            auto buffer = segment->findBuffer(dest_addr, length);
+        task.request.target_id, [&](SegmentDesc *segment) {
+            const bool has_credit_fence =
+                task.receiver_credit_session_high != 0 ||
+                task.receiver_credit_session_low != 0 ||
+                task.receiver_credit_epoch != 0;
+            if (has_credit_fence) {
+                if (segment->type != SegmentType::Memory) {
+                    return Status::InvalidMetadataType(
+                        "TCP receiver-credit target is not memory" LOC_MARK);
+                }
+                const auto &advert = segment->getMemory().receiver_credit;
+                if (!advert ||
+                    advert->schema_version != kReceiverCreditProtocolVersion ||
+                    advert->flags != kReceiverCreditRequired ||
+                    advert->receiver_session_id.high !=
+                        task.receiver_credit_session_high ||
+                    advert->receiver_session_id.low !=
+                        task.receiver_credit_session_low ||
+                    advert->epoch != task.receiver_credit_epoch) {
+                    return Status::InvalidEntry(
+                        "TCP receiver-credit session changed before "
+                        "send" LOC_MARK);
+                }
+            }
+            auto buffer = segment->findBuffer(task.request.target_offset,
+                                              task.request.length);
             rpc_server_addr = segment->rpc_server_addr;
             if (!buffer) {
                 return Status::NeedsRefreshCache(

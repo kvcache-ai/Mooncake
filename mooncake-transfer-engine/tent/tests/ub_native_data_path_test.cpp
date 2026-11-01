@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -547,6 +548,30 @@ TEST(UbNativeDataPathTest,
                           (void)endpoints.retire(endpoint);
                       });
     ASSERT_TRUE(workers.start().ok());
+
+    Request invalid_batch_request{};
+    invalid_batch_request.opcode = Request::WRITE;
+    invalid_batch_request.source = source.data();
+    invalid_batch_request.target_id = LOCAL_SEGMENT_ID;
+    invalid_batch_request.target_offset =
+        reinterpret_cast<uint64_t>(target.data());
+    invalid_batch_request.length = 16;
+    auto valid_task = UbTask::create(invalid_batch_request);
+    auto valid_slice = valid_task->addSlice(UbSliceSpec{
+        source.data(), reinterpret_cast<uint64_t>(target.data()), 16, 0, 1});
+    ASSERT_NE(valid_slice, nullptr);
+    ASSERT_TRUE(valid_task->seal());
+    auto unsealed_task = UbTask::create(invalid_batch_request);
+    ASSERT_NE(unsealed_task->addSlice(UbSliceSpec{
+                  source.data(), reinterpret_cast<uint64_t>(target.data()), 16,
+                  0, 1}),
+              nullptr);
+
+    EXPECT_FALSE(workers.submitBatch({valid_task, unsealed_task}).ok());
+    EXPECT_EQ(workers.queuedCount(), 0U);
+    EXPECT_EQ(workers.inflightCount(), 0U);
+    EXPECT_EQ(valid_slice->snapshot().state, UbSliceState::kInitial);
+
     adapter->holdNextCompletion();
     adapter->dropNextQuiescedCompletion();
 
@@ -762,6 +787,15 @@ TEST(UbNativeDataPathTest, EndpointStoreNeverReusesRetiredGeneration) {
         EXPECT_EQ(concurrent[i], concurrent[0]);
     }
     auto first = concurrent[0];
+    UbBootstrapDesc local_bootstrap;
+    ASSERT_TRUE(first
+                    ->makeBootstrapDesc("local", "local@ub:fake0:eid0",
+                                        key.peer_nic_path, 1, local_bootstrap)
+                    .ok());
+    EXPECT_NE(
+        std::find(local_bootstrap.capabilities.begin(),
+                  local_bootstrap.capabilities.end(), "receiver_credit_v1"),
+        local_bootstrap.capabilities.end());
     const uint64_t old_generation = first->generation();
     EXPECT_TRUE(store.retire(key, old_generation));
     std::shared_ptr<UbEndpoint> replacement;
@@ -885,8 +919,13 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     ASSERT_TRUE(transport.addMemoryBuffer(descriptors, options).ok());
     ASSERT_TRUE(control->segmentManager()
                     .updateLocal([&](SegmentDesc& segment) {
-                        std::get<MemorySegmentDesc>(segment.detail).buffers =
-                            descriptors;
+                        auto& memory =
+                            std::get<MemorySegmentDesc>(segment.detail);
+                        memory.buffers = descriptors;
+                        ReceiverCreditAdvertV1 advert;
+                        advert.receiver_session_id = {1, 2};
+                        advert.epoch = 1;
+                        memory.receiver_credit = std::move(advert);
                         return Status::OK();
                     })
                     .ok());
@@ -904,6 +943,13 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
         transport.submitTransferTasks(rejected_batch, {oversized_request})
             .IsInvalidArgument());
     EXPECT_TRUE(transport.freeSubBatch(rejected_batch).ok());
+    UbBootstrapDesc unsupported_bootstrap;
+    UbBootstrapDesc rejected_bootstrap;
+    ASSERT_TRUE(ControlClient::bootstrapUb(segment_name, unsupported_bootstrap,
+                                           rejected_bootstrap)
+                    .ok());
+    EXPECT_NE(rejected_bootstrap.reply_msg.find("receiver-credit"),
+              std::string::npos);
 
     Transport::SubBatchRef batch = nullptr;
     ASSERT_TRUE(transport.allocateSubBatch(batch, 2).ok());
@@ -913,6 +959,11 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     request.target_id = LOCAL_SEGMENT_ID;
     request.target_offset = reinterpret_cast<uint64_t>(target.data());
     request.length = source.size();
+    auto invalid_request = request;
+    invalid_request.length = 0;
+    EXPECT_FALSE(
+        transport.submitTransferTasks(batch, {request, invalid_request}).ok());
+    EXPECT_EQ(batch->size(), 0U);
     ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
 
     TransferStatus transfer{PENDING, 0};

@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -77,25 +78,32 @@ struct UbBootstrapDesc {
     std::vector<uint32_t> jetty_uasids;
     uint64_t endpoint_generation = 0;
     uint64_t segment_generation = 0;
+    uint64_t receiver_credit_session_high = 0;
+    uint64_t receiver_credit_session_low = 0;
+    uint64_t receiver_credit_epoch = 0;
     std::vector<std::string> capabilities;
     std::string reply_msg;
 };
 
 inline void to_json(nlohmann::json& j, const UbBootstrapDesc& desc) {
-    j = nlohmann::json{{"protocol_version", desc.protocol_version},
-                       {"segment_name", desc.segment_name},
-                       {"local_nic_path", desc.local_nic_path},
-                       {"peer_nic_path", desc.peer_nic_path},
-                       {"local_device_name", desc.local_device_name},
-                       {"local_device_id", desc.local_device_id},
-                       {"local_eid_index", desc.local_eid_index},
-                       {"local_eid", desc.local_eid},
-                       {"jetty_ids", desc.jetty_ids},
-                       {"jetty_uasids", desc.jetty_uasids},
-                       {"endpoint_generation", desc.endpoint_generation},
-                       {"segment_generation", desc.segment_generation},
-                       {"capabilities", desc.capabilities},
-                       {"reply_msg", desc.reply_msg}};
+    j = nlohmann::json{
+        {"protocol_version", desc.protocol_version},
+        {"segment_name", desc.segment_name},
+        {"local_nic_path", desc.local_nic_path},
+        {"peer_nic_path", desc.peer_nic_path},
+        {"local_device_name", desc.local_device_name},
+        {"local_device_id", desc.local_device_id},
+        {"local_eid_index", desc.local_eid_index},
+        {"local_eid", desc.local_eid},
+        {"jetty_ids", desc.jetty_ids},
+        {"jetty_uasids", desc.jetty_uasids},
+        {"endpoint_generation", desc.endpoint_generation},
+        {"segment_generation", desc.segment_generation},
+        {"receiver_credit_session_high", desc.receiver_credit_session_high},
+        {"receiver_credit_session_low", desc.receiver_credit_session_low},
+        {"receiver_credit_epoch", desc.receiver_credit_epoch},
+        {"capabilities", desc.capabilities},
+        {"reply_msg", desc.reply_msg}};
 }
 
 inline void from_json(const nlohmann::json& j, UbBootstrapDesc& desc) {
@@ -114,14 +122,44 @@ inline void from_json(const nlohmann::json& j, UbBootstrapDesc& desc) {
     desc.jetty_uasids = j.value("jetty_uasids", std::vector<uint32_t>{});
     desc.endpoint_generation = j.value("endpoint_generation", uint64_t{0});
     desc.segment_generation = j.value("segment_generation", uint64_t{0});
+    desc.receiver_credit_session_high =
+        j.value("receiver_credit_session_high", uint64_t{0});
+    desc.receiver_credit_session_low =
+        j.value("receiver_credit_session_low", uint64_t{0});
+    desc.receiver_credit_epoch = j.value("receiver_credit_epoch", uint64_t{0});
     desc.capabilities = j.value("capabilities", std::vector<std::string>{});
     desc.reply_msg = j.value("reply_msg", "");
 }
 
-struct XferDataDesc {
+// SendData/RecvData v2 keeps the legacy address/length prefix, then adds a
+// magic discriminator and the receiver-credit session fence. A new receiver
+// can still parse legacy non-credit requests, while credit-required receivers
+// reject any request without an exact current fence.
+constexpr uint64_t kXferDataProtocolMagic = 0x54454e5458465232ULL;
+constexpr uint64_t kXferDataV2LegacyRejectAddress =
+    std::numeric_limits<uint64_t>::max();
+struct LegacyXferDataDesc {
     uint64_t peer_mem_addr;
-    size_t length;
+    uint64_t length;
 };
+struct XferDataDesc {
+    // An old receiver interprets the first two fields as the legacy header.
+    // The impossible address makes it reject v2 instead of copying the
+    // appended fence bytes into user memory.
+    uint64_t legacy_reject_addr;
+    uint64_t length;
+    uint64_t protocol_magic;
+    uint64_t peer_mem_addr;
+    uint64_t receiver_credit_session_high;
+    uint64_t receiver_credit_session_low;
+    uint64_t receiver_credit_epoch;
+};
+struct XferDataReplyHeader {
+    uint64_t protocol_magic;
+};
+static_assert(sizeof(LegacyXferDataDesc) == 16);
+static_assert(sizeof(XferDataDesc) == 56);
+static_assert(sizeof(XferDataReplyHeader) == 8);
 
 // Standard TCP RPC payload boundaries. READ retains the server's 1 GiB cap;
 // WRITE uses a 32-bit RPC attachment that includes XferDataDesc.
@@ -138,6 +176,10 @@ using OnReceiveBootstrap =
 
 using OnReceiveUbBootstrap = std::function<int(const UbBootstrapDesc& request,
                                                UbBootstrapDesc& response)>;
+
+using OnExchangeReceiverCredit =
+    std::function<Status(const ReceiverCreditExchangeRequestV1& request,
+                         ReceiverCreditExchangeReplyV1& response)>;
 
 using OnNotify = std::function<int(const Notification&)>;
 
@@ -164,13 +206,24 @@ class ControlClient {
                               const UbBootstrapDesc& request,
                               UbBootstrapDesc& response);
 
+    static Status exchangeReceiverCredit(
+        const std::string& server_addr,
+        const ReceiverCreditExchangeRequestV1& request,
+        ReceiverCreditExchangeReplyV1& response);
+
     static Status sendData(const std::string& server_addr,
                            uint64_t peer_mem_addr, void* local_mem_addr,
-                           size_t length);
+                           size_t length,
+                           uint64_t receiver_credit_session_high = 0,
+                           uint64_t receiver_credit_session_low = 0,
+                           uint64_t receiver_credit_epoch = 0);
 
     static Status recvData(const std::string& server_addr,
                            uint64_t peer_mem_addr, void* local_mem_addr,
-                           size_t length);
+                           size_t length,
+                           uint64_t receiver_credit_session_high = 0,
+                           uint64_t receiver_credit_session_low = 0,
+                           uint64_t receiver_credit_epoch = 0);
 
     static Status notify(const std::string& server_addr,
                          const Notification& message);
@@ -224,6 +277,11 @@ class ControlService {
         ub_bootstrap_callback_ = callback;
     }
 
+    void setReceiverCreditCallback(const OnExchangeReceiverCredit& callback) {
+        std::lock_guard<std::mutex> lock(receiver_credit_callback_mutex_);
+        receiver_credit_callback_ = callback;
+    }
+
     void setNotifyCallback(const OnNotify& callback);
 
     Status start(uint16_t& port, bool ipv6_ = false, size_t threads = 1);
@@ -236,6 +294,9 @@ class ControlService {
                          std::string& response);
 
     void onBootstrapUb(const std::string_view& request, std::string& response);
+
+    void onExchangeReceiverCredit(const std::string_view& request,
+                                  std::string& response);
 
     void onSendData(const std::string_view& request, std::string& response);
 
@@ -280,6 +341,8 @@ class ControlService {
     std::mutex notify_cb_mutex_;
     std::condition_variable notify_cb_cv_;
     size_t notify_callbacks_in_flight_ = 0;
+    std::mutex receiver_credit_callback_mutex_;
+    OnExchangeReceiverCredit receiver_credit_callback_;
     OnNotify notify_callback_;
     static thread_local const ControlService* active_notify_service_;
 

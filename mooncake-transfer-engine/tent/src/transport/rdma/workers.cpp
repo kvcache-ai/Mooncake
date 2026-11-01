@@ -1981,6 +1981,24 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
     auto target_id = slice->task->request.target_id;
     CHECK_STATUS(getRouteHint(target, target_id, (uint64_t)slice->target_addr,
                               slice->length));
+    const bool has_credit_fence =
+        slice->task->receiver_credit_session_high != 0 ||
+        slice->task->receiver_credit_session_low != 0 ||
+        slice->task->receiver_credit_epoch != 0;
+    if (has_credit_fence) {
+        const auto& advert = target.segment->getMemory().receiver_credit;
+        if (!advert ||
+            advert->schema_version != kReceiverCreditProtocolVersion ||
+            advert->flags != kReceiverCreditRequired ||
+            advert->receiver_session_id.high !=
+                slice->task->receiver_credit_session_high ||
+            advert->receiver_session_id.low !=
+                slice->task->receiver_credit_session_low ||
+            advert->epoch != slice->task->receiver_credit_epoch) {
+            return Status::InvalidEntry(
+                "RDMA receiver-credit session changed before post" LOC_MARK);
+        }
+    }
 
     if (slice->retry_count == 0)
         CHECK_STATUS(selectOptimalDevice(source, target, slice));

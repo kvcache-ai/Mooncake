@@ -24,6 +24,7 @@ struct RequestBoundaryInfo {
     std::optional<BufferKey> source_key;
     std::optional<BufferKey> target_key;
     uint64_t max_merge_bytes{std::numeric_limits<uint64_t>::max()};
+    std::optional<uint64_t> receiver_credit_data_capacity;
 };
 
 struct MergeResult {

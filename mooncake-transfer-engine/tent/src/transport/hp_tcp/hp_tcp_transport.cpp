@@ -536,6 +536,25 @@ Status HighPerformanceTcpTransport::planTask(
             if (segment == nullptr || segment->type != SegmentType::Memory) {
                 return NeedsRefresh("HP TCP target is not a memory segment");
             }
+            const bool has_credit_fence =
+                batch.receiver_credit_session_high != 0 ||
+                batch.receiver_credit_session_low != 0 ||
+                batch.receiver_credit_epoch != 0;
+            if (has_credit_fence) {
+                const auto& advert = segment->getMemory().receiver_credit;
+                if (!advert ||
+                    advert->schema_version != kReceiverCreditProtocolVersion ||
+                    advert->flags != kReceiverCreditRequired ||
+                    advert->receiver_session_id.high !=
+                        batch.receiver_credit_session_high ||
+                    advert->receiver_session_id.low !=
+                        batch.receiver_credit_session_low ||
+                    advert->epoch != batch.receiver_credit_epoch) {
+                    return Status::InvalidEntry(
+                        "HP TCP receiver-credit session changed before "
+                        "post" LOC_MARK);
+                }
+            }
             BufferDesc* buffer =
                 segment->findBuffer(request.target_offset, request.length);
             if (buffer == nullptr ||

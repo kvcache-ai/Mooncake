@@ -12,6 +12,16 @@
     "max_failover_attempts": 3,
     "enable_auto_failover_on_poll": true,
     "enable_progress_worker": false,
+    "receiver_credit": {
+        "enable": false,
+        "data_bytes": 1073741824,
+        "request_slots": 1024,
+        "freshness_ttl_ms": 1000,
+        "max_freshness_ttl_ms": 60000,
+        "max_senders": 1024,
+        "max_authority_entries": 4096,
+        "max_sender_entries": 4096
+    },
     "metrics": {
         "enabled": true,
         "http_port": 9100,
