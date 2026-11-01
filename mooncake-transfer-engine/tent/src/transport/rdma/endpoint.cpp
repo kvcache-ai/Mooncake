@@ -65,7 +65,8 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                                    const EndPointParams& params,
                                    int local_gid_index,
                                    const std::string& peer_gid_str,
-                                   uint32_t peer_lid, uint32_t peer_qp_num);
+                                   uint32_t peer_lid, uint32_t peer_qp_num,
+                                   ibv_mtu path_mtu);
 
 // A peer that reused the same nic path after restarting retires the stale
 // endpoint on the first bootstrap and expects a retry. Older peers also
@@ -480,6 +481,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         local_desc.notify_qp_num = notifyQpNum();
         local_desc.local_lid = local_address.lid;
         local_desc.local_gid = local_address.gid;
+        local_desc.path_mtu = pathMtuBytes(context_->pathMtu());
 
         same_nic = (local_desc.local_nic_path == local_desc.peer_nic_path);
         is_self =
@@ -596,7 +598,8 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         peer_server_name_ = peer_server_name;
         peer_nic_name_ = peer_nic_name;
         int rc =
-            setupAllQPs(peer_gid, peer_lid, qp_num, local_address.gid_index);
+            setupAllQPs(peer_gid, peer_lid, qp_num, local_address.gid_index,
+                        same_nic ? local_desc.path_mtu : peer_desc.path_mtu);
         if (rc) {
             beginDestroyNoLock();
             return mooncake::tent::Status::InternalError(
@@ -606,9 +609,9 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
 
         // Setup notification QP connection if peer supports it
         if (peer_desc.notify_qp_num != 0 && notify_qp_) {
-            rc = setupNotifyQpConnection(notify_qp_, context_, *params_,
-                                         local_address.gid_index, peer_gid,
-                                         peer_lid, peer_desc.notify_qp_num);
+            rc = setupNotifyQpConnection(
+                notify_qp_, context_, *params_, local_address.gid_index,
+                peer_gid, peer_lid, peer_desc.notify_qp_num, path_mtu_);
             if (rc) {
                 LOG(WARNING)
                     << "Failed to setup notification QP, notification disabled";
@@ -657,6 +660,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
             local_desc.local_lid = local_address_.lid;
             local_desc.local_gid = local_address_.gid;
             local_desc.notify_qp_num = notifyQpNum();
+            local_desc.path_mtu = pathMtuBytes(context_->pathMtu());
             return mooncake::tent::Status::OK();
         }
         // The bootstrap does not match the established connection: the peer
@@ -693,14 +697,16 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     local_desc.local_lid = local_address_.lid;
     local_desc.local_gid = local_address_.gid;
     local_desc.notify_qp_num = notifyQpNum();  // Pass notification QP number
+    local_desc.path_mtu = pathMtuBytes(context_->pathMtu());
     if (peer_desc.local_gid.empty()) {
         return mooncake::tent::Status::InvalidArgument(
             "Missing peer GID in bootstrap" LOC_MARK);
     }
     peer_server_name_ = peer_server_name;
     peer_nic_name_ = peer_nic_name;
-    int rc = setupAllQPs(peer_desc.local_gid, peer_desc.local_lid,
-                         peer_desc.qp_num, local_address_.gid_index);
+    int rc =
+        setupAllQPs(peer_desc.local_gid, peer_desc.local_lid, peer_desc.qp_num,
+                    local_address_.gid_index, peer_desc.path_mtu);
     if (rc) {
         beginDestroyNoLock();
         return mooncake::tent::Status::InternalError(
@@ -710,9 +716,10 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
 
     // Setup notification QP connection if peer supports it
     if (peer_desc.notify_qp_num != 0 && notify_qp_) {
-        rc = setupNotifyQpConnection(
-            notify_qp_, context_, *params_, local_address_.gid_index,
-            peer_desc.local_gid, peer_desc.local_lid, peer_desc.notify_qp_num);
+        rc = setupNotifyQpConnection(notify_qp_, context_, *params_,
+                                     local_address_.gid_index,
+                                     peer_desc.local_gid, peer_desc.local_lid,
+                                     peer_desc.notify_qp_num, path_mtu_);
         if (rc) {
             notify_connected_ = false;
         } else {
@@ -761,7 +768,8 @@ const QpPoolSegment* RdmaEndPoint::poolForQp(int qp_index) const {
 
 int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint32_t peer_lid,
                               std::vector<uint32_t> peer_qp_num_list,
-                              int local_gid_index, std::string* reply_msg) {
+                              int local_gid_index, uint32_t peer_path_mtu,
+                              std::string* reply_msg) {
     if (status_.load(std::memory_order_relaxed) == EP_READY) {
         return -1;
     }
@@ -776,6 +784,13 @@ int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint32_t peer_lid,
         return -1;
     }
 
+    path_mtu_ = negotiatedPathMtu(context_->pathMtu(), peer_path_mtu,
+                                  params_->path_mtu);
+    VLOG(1) << "Path MTU " << pathMtuBytes(path_mtu_) << " on "
+            << context_->name() << " for endpoint " << peer_nic_name_ << " of "
+            << peer_server_name_ << " (local "
+            << pathMtuBytes(context_->pathMtu()) << ", peer " << peer_path_mtu
+            << ")";
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
         int ret =
             setupOneQP(qp_index, peer_gid, peer_lid, peer_qp_num_list[qp_index],
@@ -1098,7 +1113,7 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
     // INIT -> RTR
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
-    attr.path_mtu = params_->path_mtu;
+    attr.path_mtu = path_mtu_;
     ibv_gid peer_gid_raw;
     std::istringstream iss(peer_gid);
     for (int i = 0; i < 16; ++i) {
@@ -1136,9 +1151,9 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
         std::stringstream ss;
         ss << "Failed to modify QP's state to RTR in endpoint "
            << peer_nic_name_ << " of " << peer_server_name_
-           << ", check peer endpoint reachability, MTU " << params_->path_mtu
-           << ", GID " << peer_gid << " and LID " << peer_lid << ", error code "
-           << errno << ":" << strerror(errno);
+           << ", check peer endpoint reachability, MTU "
+           << pathMtuBytes(path_mtu_) << ", GID " << peer_gid << " and LID "
+           << peer_lid << ", error code " << errno << ":" << strerror(errno);
         LOG(ERROR) << ss.str();
         if (reply_msg) *reply_msg = ss.str();
         return -1;
@@ -1246,8 +1261,8 @@ void RdmaEndPoint::repostAllNotifyRecvs() {
     }
 }
 
-// The path MTU, the RNR timer and the timeout/retry budget come from the
-// same EndPointParams the data QPs use (see setupOneQP), so a dead peer path
+// The RNR timer and the timeout/retry budget come from the same
+// EndPointParams the data QPs use (see setupOneQP), so a dead peer path
 // is reported on the notify QP in the time the data QPs take and tuning
 // send_timeout / the retry counts applies to both. The address-vector fields
 // (hop_limit, flow_label, src_path_bits, PSNs) deliberately keep the values
@@ -1256,7 +1271,8 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                                    const EndPointParams& params,
                                    int local_gid_index,
                                    const std::string& peer_gid_str,
-                                   uint32_t peer_lid, uint32_t peer_qp_num) {
+                                   uint32_t peer_lid, uint32_t peer_qp_num,
+                                   ibv_mtu path_mtu) {
     // Reconnect path may call this when QP is already in RTS; force a clean
     // state machine: RESET -> INIT -> RTR -> RTS.
     ibv_qp_attr qp_attr = {};
@@ -1291,7 +1307,8 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
     }
 
     // Modify to RTR
-    const NotifyQpRtrAttrs rtr = buildNotifyQpRtrAttrs(params);
+    NotifyQpRtrAttrs rtr = buildNotifyQpRtrAttrs(params);
+    rtr.path_mtu = path_mtu;
     memset(&qp_attr, 0, sizeof(qp_attr));
     qp_attr.qp_state = IBV_QPS_RTR;
     qp_attr.path_mtu = rtr.path_mtu;

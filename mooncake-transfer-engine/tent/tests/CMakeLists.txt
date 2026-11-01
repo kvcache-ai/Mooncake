@@ -405,6 +405,14 @@ target_link_libraries(tent_rdma_transport_test PRIVATE gtest gtest_main
                                                        tent_link_group ibverbs)
 target_include_directories(tent_rdma_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+# The notification QP's transitions call ibv_modify_qp directly; wrapping it
+# lets the path MTU tests see them on a fake device (GNU ld / lld only).
+if(UNIX AND NOT APPLE)
+  target_link_options(tent_rdma_transport_test PRIVATE
+                      "-Wl,--wrap=ibv_modify_qp")
+  target_compile_definitions(tent_rdma_transport_test
+                             PRIVATE TENT_TEST_WRAP_MODIFY_QP)
+endif()
 add_test(NAME tent_rdma_transport_test COMMAND tent_rdma_transport_test)
 
 # Regression test for the edge-triggered async event fd: one epoll wakeup must
