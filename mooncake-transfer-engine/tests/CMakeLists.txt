@@ -547,6 +547,17 @@ target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest
                                                     gtest_main)
 add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)
 
+add_executable(coro_handshake_test ${WORKSPACE}/coro_handshake_test.cpp)
+target_include_directories(
+  coro_handshake_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/coro_handshake)
+target_link_libraries(coro_handshake_test PUBLIC transfer_engine gtest
+                                                 gtest_main)
+add_test(NAME coro_handshake_test COMMAND coro_handshake_test)
+
+# Manual latency driver. Server mode does not exit, so it is not a unit test.
+add_executable(handshake_perf ${WORKSPACE}/handshake_perf.cpp)
+target_link_libraries(handshake_perf PUBLIC transfer_engine)
+
 add_executable(config_test ${WORKSPACE}/config_test.cpp)
 target_link_libraries(config_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME config_test COMMAND config_test)
