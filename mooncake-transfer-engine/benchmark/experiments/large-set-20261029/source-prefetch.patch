@@ -1,0 +1,35 @@
+--- a/mooncake-transfer-engine/benchmark/te_backend.cpp
++++ b/mooncake-transfer-engine/benchmark/te_backend.cpp
+@@ -823,6 +823,16 @@
+         std::strcmp(std::getenv("MC_EXPERIMENTAL_REUSE_REQUESTS"), "1") == 0;
+     const char* pause_env = std::getenv("MC_EXPERIMENTAL_POLL_PAUSE");
+     const unsigned poll_pause = pause_env ? std::min(65536ul, std::strtoul(pause_env, nullptr, 10)) : 0;
++    const char* stride_env = std::getenv("MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE");
++    const unsigned prefetch_stride = (stride_env && opcode == WRITE) ? std::strtoul(stride_env, nullptr, 10) : 0;
++    CHECK(prefetch_stride == 0 || prefetch_stride == 64 ||
++          prefetch_stride == 128 || prefetch_stride == 256 || prefetch_stride == 512);
++    const char* ahead_env = std::getenv("MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS");
++    const uint64_t prefetch_ahead = ahead_env ? std::strtoull(ahead_env, nullptr, 10) : 1;
++    if (prefetch_stride) {
++        CHECK_EQ(XferBenchConfig::seg_type, "DRAM");
++        CHECK_LT(prefetch_ahead, chunk_count);
++    }
+     const bool counter_poll = std::getenv("MC_EXPERIMENTAL_COUNTER_POLL") &&
+         std::strcmp(std::getenv("MC_EXPERIMENTAL_COUNTER_POLL"), "1") == 0;
+     // Experimental classic-RDMA-only observation. The batch stays owned by
+@@ -883,6 +893,15 @@
+                 requests[i].source = reinterpret_cast<void*>(local_addr + offset);
+                 requests[i].target_offset = target_addr + offset;
+             }
++        }
++        // Prefetch only inside this thread's unchanged source working set.
++        // No payload modification, repeated hot-range transfer, or extra RDMA
++        // bytes; the prefetch work is included in the timed submission path.
++        if (prefetch_stride) {
++            const uint64_t warm_chunk = (slot.chunk + prefetch_ahead) % chunk_count;
++            for (uint64_t off = 0; off < slot_bytes; off += prefetch_stride)
++                __builtin_prefetch(reinterpret_cast<const void*>(
++                    local_addr + warm_chunk * slot_bytes + off), 0, 1);
+         }
+         auto status = engine_->submitTransfer(slot.id, requests);
+         if (!status.ok()) {

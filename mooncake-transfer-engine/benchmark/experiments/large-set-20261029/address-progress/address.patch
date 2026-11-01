@@ -1,0 +1,116 @@
+--- a/mooncake-transfer-engine/benchmark/te_backend.cpp
++++ b/mooncake-transfer-engine/benchmark/te_backend.cpp
+@@ -17,6 +17,7 @@
+
+ #include <fstream>
+ #include <algorithm>
++#include <numeric>
+
+ #include "te_backend.h"
+ #include "config.h"
+@@ -808,7 +809,21 @@
+     if (total_batch_size % slot_batch_size) return -1;
+     const uint64_t chunk_count = total_batch_size / slot_batch_size;
+     std::vector<bool> busy(chunk_count, false), visited(chunk_count, false);
+-    uint64_t next_chunk = 0, visited_count = 0;
++    const char* walk_env = std::getenv("MC_EXPERIMENTAL_CHUNK_STRIDE");
++    const uint64_t chunk_stride = walk_env ? std::strtoull(walk_env, nullptr, 10) : 1;
++    const char* phase_env = std::getenv("MC_EXPERIMENTAL_PHASE_CHUNKS");
++    const uint64_t phase_chunks = phase_env ? std::strtoull(phase_env, nullptr, 10) : 0;
++    // A coprime address walk is a permutation of the entire original range.
++    // Only submission order changes: source/target offsets remain identical.
++    if (chunk_stride == 0 || chunk_stride > chunk_count ||
++        std::gcd(chunk_stride, chunk_count) != 1) return -1;
++    const uint64_t phase_rank = static_cast<uint64_t>(
++        std::max(0, experimental_thread_nic_hint));
++    uint64_t next_chunk = (phase_rank % chunk_count) *
++                         (phase_chunks % chunk_count) % chunk_count;
++    uint64_t visited_count = 0;
++    LOG(INFO) << "Experimental address walk stride=" << chunk_stride
++              << " phase=" << next_chunk << " chunks=" << chunk_count;
+     const uint64_t slot_bytes = checkedMul(block_size, slot_batch_size,
+                                            "rolling slot bytes");
+     struct Slot {
+@@ -859,11 +874,11 @@
+         auto& slot = slots[index];
+         // Keep normal per-batch construction unless request reuse is explicitly
+         // enabled. Each slot is resubmitted only after its batch completes.
+-        while (busy[next_chunk]) next_chunk = (next_chunk + 1) % chunk_count;
++        while (busy[next_chunk]) next_chunk = (next_chunk + chunk_stride) % chunk_count;
+         slot.chunk = next_chunk;
+         busy[slot.chunk] = true;
+         if (!visited[slot.chunk]) { visited[slot.chunk] = true; ++visited_count; }
+-        next_chunk = (next_chunk + 1) % chunk_count;
++        next_chunk = (next_chunk + chunk_stride) % chunk_count;
+         slot.submitted_us = clock.lap_us(false);
+         slot.id = engine_->allocateBatchID(slot_batch_size);
+         slot.active = true;
+--- a/mooncake-transfer-engine/benchmark/main.cpp
++++ b/mooncake-transfer-engine/benchmark/main.cpp
+@@ -26,6 +26,7 @@
+ #endif
+
+ #include <atomic>
++#include <cstdlib>
+ #include <mutex>
+ #include <thread>
+
+@@ -133,6 +134,22 @@
+                                     "workload address stride"));
+         }
+     }
++    // Experimental spacing changes placement, not the bytes transferred by
++    // each thread. Both paths still use the original full working-set size.
++    auto gapStride = [&](const char* name) -> uint64_t {
++        const char* value = std::getenv(name);
++        if (!value) return address_stride_bytes;
++        char* end = nullptr;
++        const uint64_t gap = std::strtoull(value, &end, 10);
++        CHECK(end && *end == '\0');
++        CHECK_LE(gap, 2097152u);
++        CHECK_EQ(gap % 64, 0u);
++        CHECK_EQ(XferBenchConfig::seg_type, "DRAM");
++        CHECK(dynamic_cast<TEBenchRunner*>(&runner));
++        return checkedAdd(address_stride_bytes, gap, "experimental thread spacing");
++    };
++    const uint64_t source_stride = gapStride("MC_EXPERIMENTAL_SOURCE_THREAD_GAP");
++    const uint64_t target_stride = gapStride("MC_EXPERIMENTAL_TARGET_THREAD_GAP");
+     int rc = runner.runInitiatorTasks([&](int thread_id) -> int {
+         runner.pinThread(thread_id);
+         auto local_gpu_offset = std::max(0, XferBenchConfig::local_gpu_id);
+@@ -141,9 +158,14 @@
+             static_cast<int>(target_gpu_offset * runner.getTargetCount()) +
+             thread_id;
+         uint64_t local_addr = runner.getLocalBufferBase(
+-            local_gpu_offset + thread_id, address_stride_bytes, 1);
++            local_gpu_offset + thread_id, source_stride, 1);
+         uint64_t target_addr = runner.getTargetBufferBase(
+-            target_thread_id, address_stride_bytes, 1);
++            target_thread_id, target_stride, 1);
++        LOG(INFO) << "Experimental region thread=" << thread_id
++                  << " local=" << local_addr << " target=" << target_addr
++                  << " active_bytes=" << address_stride_bytes
++                  << " source_stride=" << source_stride
++                  << " target_stride=" << target_stride;
+         uint64_t target_id = runner.getTargetSegmentId(target_thread_id);
+         const size_t target_index = runner.getTargetIndex(target_thread_id);
+         const bool qos_enabled = !qos_classes.empty();
+--- a/mooncake-transfer-engine/benchmark/te_backend.h
++++ b/mooncake-transfer-engine/benchmark/te_backend.h
+@@ -58,8 +58,14 @@
+     uint64_t getLocalBufferBase(int thread_id, uint64_t block_size,
+                                 uint64_t batch_size) const {
+         const size_t num_buffers = pinned_buffer_list_.size();
+-        return (uint64_t)pinned_buffer_list_[thread_id % num_buffers] +
+-               block_size * batch_size * (thread_id / num_buffers);
++        CHECK_GT(num_buffers, 0u);
++        CHECK_GE(thread_id, 0);
++        const uint64_t bytes = checkedMul(block_size, batch_size, "local thread span");
++        const uint64_t offset = checkedMul(bytes, thread_id / num_buffers,
++                                            "local relative offset");
++        CHECK(rangeContains(offset, bytes, XferBenchConfig::total_buffer_size));
++        return checkedAdd((uint64_t)pinned_buffer_list_[thread_id % num_buffers],
++                          offset, "local address");
+     }
+
+     size_t getTargetCount() const;

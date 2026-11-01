@@ -15,6 +15,9 @@
 #include "transport/rdma_transport/worker_pool.h"
 
 #include <sys/epoll.h>
+#include <sched.h>
+#include <cstdlib>
+#include <cstring>
 
 #include <algorithm>
 #include <cassert>
@@ -1063,7 +1066,8 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
     const uint64_t poll_ts = getCurrentTimeInNano();
     const uint64_t previous_poll_ts =
         last_poll_ts_ns_.exchange(poll_ts, std::memory_order_release);
-    last_poll_ts_ns_.notify_all();
+    // Diagnostic timestamp has no production waiters; keep CQ polling free
+    // of the global atomic-wait notification bookkeeping.
     if (previous_poll_ts > 0 && poll_ts > previous_poll_ts) {
         const uint64_t interval = poll_ts - previous_poll_ts;
         last_poll_interval_ns_.store(interval, std::memory_order_relaxed);
@@ -1534,6 +1538,24 @@ bool WorkerPool::hasOutstandingCq(int thread_id) {
 
 void WorkerPool::transferWorker(int thread_id) {
     bindToSocket(numa_socket_id_);
+    // Task-local experiment: split the two already-authorized CPUs by role.
+    // Never expand affinity; fail visibly if the process has a different mask.
+    const char *split_cpu = std::getenv("MC_EXPERIMENTAL_SPLIT_CPU");
+    if (split_cpu && std::strcmp(split_cpu, "1") == 0) {
+        cpu_set_t allowed, selected;
+        CHECK_EQ(sched_getaffinity(0, sizeof(allowed), &allowed), 0);
+        CHECK_EQ(CPU_COUNT(&allowed), 2);
+        int cpu = -1;
+        for (int i = 0; i < CPU_SETSIZE; ++i) {
+            if (CPU_ISSET(i, &allowed)) cpu = i;
+        }
+        CHECK_GE(cpu, 0);
+        CPU_ZERO(&selected);
+        CPU_SET(cpu, &selected);
+        CHECK_EQ(sched_setaffinity(0, sizeof(selected), &selected), 0);
+        LOG(INFO) << "Experimental RDMA worker CPU=" << cpu;
+    }
+
     // Busy-poll this long after the pool goes idle before parking
     // (MC_RDMA_WORKER_IDLE_SPIN_US, 100 ms by default).
     const uint64_t idle_spin_ns =
