@@ -211,6 +211,30 @@ Pre-allocates a single large file and manages offset-based allocation within it.
 
 Best for: high-concurrency scenarios with many small objects where restart durability is not required.
 
+#### Device-DAX / CXL memory arena
+
+Set `MOONCAKE_OFFSET_DAX_DEVICE_PATH` to place the arena on byte-addressable memory instead of a file: a device-DAX character device (`/dev/dax0.0`, backed by PMEM or CXL-attached memory), an fsdax file, or any regular file. The backend maps the first `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` bytes with `mmap(MAP_SHARED)` and copies records with `memcpy`. Device-DAX nodes do not support `read`/`write` syscalls, so this mode is the only way to use them. `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` is still required: it holds the metadata checkpoint when persistence is enabled.
+
+| Variable | Default | Description |
+|---|---|---|
+| `MOONCAKE_OFFSET_DAX_DEVICE_PATH` | unset | Path to map as the data arena. Unset keeps the file-based arena under `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`. |
+| `MOONCAKE_OFFSET_DAX_ALIGNMENT_BYTES` | `2097152` | Capacity is rounded down to a multiple of this. Device-DAX rejects mapping lengths that are not a multiple of the device alignment (2 MiB, or 1 GiB for some namespaces). |
+| `MOONCAKE_OFFSET_DAX_FLUSH_CPU_CACHE` | `false` | x86-64 only. Write each record's CPU cache lines back to the device (CLWB, else CLFLUSHOPT, else CLFLUSH, then SFENCE) before the write returns. Enable on persistent memory without eADR (for example Intel Optane PMem) when the arena must survive power loss. Leave it off for volatile CXL memory, where it only costs write throughput. |
+| `MOONCAKE_OFFSET_DAX_ZERO_COPY` | `false` | Serve remote reads of offloaded objects straight out of the DAX mapping. The mapping is registered with the Transfer Engine at startup and readers RDMA-read each value in place, with no copy into the staging buffer. Falls back to the copy path if registration fails or the pin limit is reached. No effect without `MOONCAKE_OFFSET_DAX_DEVICE_PATH`. |
+| `MOONCAKE_OFFSET_DAX_NUMA_NODE` | `-1` | NUMA node the zero-copy region is registered under, which decides which NICs serve it. `-1` reads the device's `numa_node` from sysfs: the closest CPU node, which for a CXL expander is the socket it hangs off, not its CPU-less memory node. Set it explicitly if the log reports no `numa_node` for the device. |
+
+Notes:
+
+- The process needs read/write permission on the device node, and the device must already exist; no `ndctl`/`daxctl` provisioning is performed.
+- Each DAX arena belongs to one live client. The backend takes an exclusive `flock` on the device, so a second client pointed at the same device fails to start instead of overwriting the first one's records.
+- `MOONCAKE_OFFLOAD_USE_URING` is ignored for the DAX arena.
+- Device memory outlives the process, so `MOONCAKE_OFFSET_PERSIST_MODE=strict` or `relaxed` restores the arena after a restart. Without `MOONCAKE_OFFSET_DAX_FLUSH_CPU_CACHE`, sync uses `msync`, which does not flush CPU caches to persistent media; treat the arena as volatile across power loss unless the platform has eADR. CXL memory expanders are volatile regardless, so their contents are lost on a host reboot or power loss.
+- The DAX arena is independent of the transfer engine's `cxl` protocol (`MC_CXL_DEV_PATH`). The backend refuses to start if both name the same device.
+- With `MOONCAKE_OFFSET_DAX_ZERO_COPY`, the whole arena is one memory registration. A device-DAX namespace can be pinned for RDMA; an fsdax file generally cannot without on-demand paging, in which case the client logs a warning and keeps copying. Values held by in-flight reads are pinned until `release_offload_buffer` or the buffer lease TTL (`MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS`), and are capped at `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`, the same bound as the copy path. Keep the TTL above the worst-case transfer time: once it expires the extent can be evicted and rewritten, as a reused staging slot can today.
+- Zero-copy registers the arena on every RDMA NIC at startup, so a multi-terabyte arena can take a while to register. The Transfer Engine's `MC_ENABLE_PARALLEL_REG_MR` and `MC_MAX_CONCURRENT_REG_MR` control how that work is parallelized; see [Transfer Engine runtime options](../../design/transfer-engine/index.md#advanced-runtime-options).
+- A restarted server registers the arena at a new address. Readers cache segment metadata, so set `MC_TE_METADATA_REFRESH_INTERVAL_SECONDS` on them to pick up the new registration without restarting.
+- On the reading clients, keep the Transfer Engine on the RDMA NICs that reach the server (`MC_TE_FILTERS`) and match the fabric's RoCEv2 settings (`MC_GID_INDEX`, `MC_MTU`, `MC_IB_TC`/`MC_IB_SL`). Transfers larger than 64 KB are sliced across all selected NICs.
+
 ---
 
 ## Eviction
