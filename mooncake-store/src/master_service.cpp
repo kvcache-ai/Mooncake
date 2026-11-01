@@ -341,16 +341,17 @@ struct MasterService::MemoryEviction {
         : policy(service, settings.allow_evict_soft_pinned),
           immediate(service),
           oplog(service),
+          removal(settings.through_oplog
+                      ? static_cast<eviction::Reclaimer&>(oplog)
+                      : static_cast<eviction::Reclaimer&>(immediate)),
           offload_queue(service),
-          offloading(immediate, offload_queue, settings.offload),
+          offloading(removal, offload_queue, settings.offload),
           kv_events(service),
           log(settings.offload.cap),
           evictor(service.namespaces_, policy,
-                  settings.through_oplog
-                      ? static_cast<eviction::Reclaimer&>(oplog)
-                  : settings.offload_on_evict
+                  settings.offload_on_evict
                       ? static_cast<eviction::Reclaimer&>(offloading)
-                      : static_cast<eviction::Reclaimer&>(immediate),
+                      : removal,
                   Observers(settings)) {}
 
     static bool InPlan(const eviction::Plan& plan, const Replica& replica) {
@@ -370,6 +371,10 @@ struct MasterService::MemoryEviction {
     Policy policy;
     ImmediateReclaimer immediate;
     OpLogReclaimer oplog;
+    // How a replica comes off, whatever decided it goes: through the OpLog
+    // under HA, otherwise on the spot. Offload-on-evict wraps it rather than
+    // standing in for it, so HA keeps the offload.
+    eviction::Reclaimer& removal;
     OffloadQueue offload_queue;
     eviction::OffloadingReclaimer offloading;
     KvEventObserver kv_events;
@@ -1611,12 +1616,9 @@ void MasterService::EvictManagedWeightMembersToCold(
     // Not const: ObjectMetadata::IsLeaseExpired takes it by reference.
     auto now = std::chrono::system_clock::now();
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    // Memory eviction's own reclaimer, without the offload: a member goes cold
-    // only when it holds a readable cold replica already.
-    eviction::Reclaimer& reclaimer =
-        enable_oplog_
-            ? static_cast<eviction::Reclaimer&>(memory_eviction_->oplog)
-            : memory_eviction_->immediate;
+    // Memory eviction's removal, without the offload: a member goes cold only
+    // when it holds a readable cold replica already.
+    eviction::Reclaimer& reclaimer = memory_eviction_->removal;
     for (const std::string& member_key :
          ns->objects.GroupMembers(revision.manifest.payload_group_id)) {
         if (!selected_members.contains(member_key)) {

@@ -371,6 +371,30 @@ TEST_F(TenantQuotaPolicyTest, TearingDownAReplacementDropsWhatItCarried) {
     EXPECT_TRUE(ns.Empty());
 }
 
+TEST_F(TenantQuotaPolicyTest, ATornDownObjectIsNotChargedAgainstItsSuccessor) {
+    Register(kTenantA, 100);
+    // A write that completed nothing.
+    Put(kTenantA, "k", 100, 100, {ReplicaStatus::PROCESSING});
+    ASSERT_EQ(Charged(kTenantA), 100u);
+    auto& ns = NamespaceOf(kTenantA);
+
+    // An upsert takes the write over under one lock: the old object goes
+    // first, so the new one fits in the quota the old one held.
+    {
+        auto guard = ns.objects.Write("k");
+        ASSERT_TRUE(guard.has_value());
+        ASSERT_EQ(guard->metadata().EraseReplicas(
+                      [](const Replica&) { return true; }),
+                  1u);
+        ns.BeforeTearDown(*guard);
+        guard->TearDown();
+        ASSERT_TRUE(ns.Grow(*guard, 100).has_value());
+        PublishUnder(*guard, 100, MemoryReplicas({ReplicaStatus::PROCESSING}));
+    }
+    EXPECT_EQ(Charged(kTenantA), 100u);
+    EXPECT_EQ(Words(kTenantA, "k"), (std::array<uint64_t, 2>{100, 0}));
+}
+
 TEST_F(TenantQuotaPolicyTest, RestoreRebuildsAccountsAndKeyWords) {
     Register(kTenantA, 1000);
     Register(kTenantB, 1000);
