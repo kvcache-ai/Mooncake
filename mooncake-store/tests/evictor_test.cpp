@@ -570,6 +570,26 @@ TEST_F(EvictorTest, ASkippedKeyWaitsOutTheBackoffUnlessWritten) {
                      .has_value());
 }
 
+TEST_F(EvictorTest, AKeyWithNothingToReleaseWaitsOutTheBackoff) {
+    Publish("a", "held", seconds(10));
+    metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId("a"));
+    {
+        auto hold = ns.objects.Write("held");
+        ASSERT_TRUE(hold.has_value());
+        hold->metadata()
+            .GetReplicaByID(hold->metadata().GetAllReplicas()[0].id())
+            ->inc_refcnt();
+    }
+    const ObjectGoal all{.target_ratio = 1.0, .min_ratio = 1.0};
+
+    Run(all);
+    ASSERT_EQ(observer_.skipped.size(), 1u);
+    EXPECT_EQ(observer_.skipped[0].second, SkipReason::kNothingToRelease);
+    observer_.skipped.clear();
+    Run(all);
+    EXPECT_TRUE(observer_.skipped.empty());
+}
+
 TEST_F(EvictorTest, ADeferredKeyIsNotPostponed) {
     Publish("a", "pinned", seconds(10));
     policy_.soft_pinned = {"pinned"};
