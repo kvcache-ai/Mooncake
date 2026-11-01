@@ -327,6 +327,13 @@ class Client {
         const ReplicateConfig& config, const WriteBufferStager& stager,
         bool group_by_target = false);
 
+    // Unlike BatchPut, never treats existing objects as successful writes or
+    // heals/removes them. Successful creation is still not a deletion token.
+    std::vector<tl::expected<void, ErrorCode>> BatchPutCreateOnly(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReplicateConfig& config);
+
     /**
      * @brief Write slices into a memory replica at an object-byte offset.
      */
@@ -1096,7 +1103,12 @@ class Client {
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& batched_slices);
     void StartBatchPut(std::vector<PutOperation>& ops,
-                       const ReplicateConfig& config);
+                       const ReplicateConfig& config, bool create_only = false);
+    std::vector<tl::expected<void, ErrorCode>> BatchPutInternal(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReplicateConfig& config, const WriteBufferStager& stager,
+        bool group_by_target, bool create_only);
     void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
     void StageWriteBuffersForRemoteReplicas(std::vector<PutOperation>& ops,
                                             const WriteBufferStager& stager);
@@ -1108,7 +1120,7 @@ class Client {
                           const ReplicateConfig& config);
     void FinalizeBatchUpsert(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
-        const std::vector<PutOperation>& ops);
+        const std::vector<PutOperation>& ops, bool create_only = false);
 
     std::vector<ErrorCode> WriteDfsReplicas(
         const std::vector<std::string>& keys,

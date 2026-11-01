@@ -1,16 +1,58 @@
 #include "engram/engram_store.h"
 
+#include <algorithm>
 #include <cstring>
 #include <chrono>
+#include <glog/logging.h>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <typeinfo>
+#include <utility>
 #include <vector>
 
 #include "pyclient.h"
+#include "real_client.h"
 
 namespace mooncake {
 namespace engram {
+
+namespace {
+
+// Composition keeps both existing client classes' layouts unchanged.
+class RealClientStrictCreate final : public StrictCreateClient {
+   public:
+    explicit RealClientStrictCreate(RealClient& client) : client_(client) {}
+
+    std::vector<int> batch_put_from_create_only(
+        const std::vector<std::string>& keys, const std::vector<void*>& buffers,
+        const std::vector<size_t>& sizes,
+        const ReplicateConfig& config) override {
+        return client_.batch_put_from_create_only(keys, buffers, sizes, config);
+    }
+
+   private:
+    RealClient& client_;
+};
+
+struct PopulateOwnerGuard {
+    explicit PopulateOwnerGuard(std::shared_ptr<void> value)
+        : owner(value.use_count()
+                    ? std::make_unique<std::shared_ptr<void>>(std::move(value))
+                    : nullptr) {}
+
+    ~PopulateOwnerGuard() noexcept {
+        // A shared TE or pending DMA may outlive the Store. Never reclaim an
+        // uncertain registration's owner, even during process teardown.
+        if (!release_safe) (void)owner.release();
+    }
+
+    std::unique_ptr<std::shared_ptr<void>> owner;
+    bool release_safe = false;
+};
+
+}  // namespace
 
 struct EngramStore::QueryCacheEntry {
     mooncake::PyClient::RangedReadSnapshot snapshot;
@@ -19,6 +61,13 @@ struct EngramStore::QueryCacheEntry {
 EngramStore::EngramStore(const std::map<int, EngramStoreConfig>& layers,
                          std::shared_ptr<PyClient> store)
     : store_(std::move(store)) {
+    strict_store_ = std::dynamic_pointer_cast<StrictCreateClient>(store_);
+    // Do not silently bypass a subclass's storage implementation. Custom
+    // backends (including RealClient subclasses) must opt into the capability.
+    if (!strict_store_ && store_ && typeid(*store_) == typeid(RealClient)) {
+        strict_store_ = std::make_shared<RealClientStrictCreate>(
+            static_cast<RealClient&>(*store_));
+    }
     if (layers.empty()) {
         throw std::invalid_argument("EngramStore requires at least one layer");
     }
@@ -29,7 +78,8 @@ EngramStore::EngramStore(const std::map<int, EngramStoreConfig>& layers,
                 "EngramStore requires nonnegative layer IDs, positive "
                 "row_bytes and nonempty tables");
         }
-        Layer layer{config, {}, {}};
+        auto& layer = layers_.try_emplace(layer_id).first->second;
+        layer.config = config;
         for (size_t h = 0; h < config.table_vocab_sizes.size(); ++h) {
             const int64_t vocab_size = config.table_vocab_sizes[h];
             if (vocab_size <= 0 ||
@@ -41,7 +91,6 @@ EngramStore::EngramStore(const std::map<int, EngramStoreConfig>& layers,
             key << "engram:l" << layer_id << ":h" << h;
             layer.keys.push_back(key.str());
         }
-        layers_.emplace(layer_id, std::move(layer));
     }
 }
 
@@ -68,8 +117,11 @@ EngramStore::get_query_cache(int layer_id,
     }
 
     auto entry = std::make_shared<QueryCacheEntry>();
-    entry->snapshot = store_->prepare_get_into_ranges_snapshot(keys);
-    if (!entry->snapshot.reusable(now)) return nullptr;
+    // RangedReadSnapshot::reset() stamps refresh_at with the in-call clock,
+    // so reusable() must not be probed with an earlier timestamp: a failed
+    // refresh (query error or expired lease) would still pass it.
+    if (!store_->refresh_get_into_ranges_snapshot(entry->snapshot, keys))
+        return nullptr;
 
     std::lock_guard<std::mutex> lock(query_cache_mutex_);
     query_cache_[layer_id] = entry;
@@ -84,9 +136,22 @@ void EngramStore::invalidate_query_cache(int layer_id) const {
 int EngramStore::bind_local(int layer_id,
                             const std::vector<const void*>& buffers,
                             const std::vector<size_t>& sizes) {
+    return bind_local(layer_id, buffers, sizes, nullptr);
+}
+
+int EngramStore::bind_local(int layer_id,
+                            const std::vector<const void*>& buffers,
+                            const std::vector<size_t>& sizes,
+                            std::shared_ptr<void> owner) {
     const auto& layer = get_layer(layer_id);
-    if (store_ || !layer.local_tables.empty() ||
-        buffers.size() != layer.keys.size() || sizes.size() != buffers.size()) {
+    // store_ is immutable after construction; reject before taking the layer
+    // lock so this doomed call cannot block behind an in-flight lookup.
+    if (store_) {
+        return -1;
+    }
+    std::unique_lock<std::shared_mutex> lock(layer.mutex);
+    if (!layer.local_tables.empty() || buffers.size() != layer.keys.size() ||
+        sizes.size() != buffers.size()) {
         return -1;
     }
     for (size_t h = 0; h < buffers.size(); ++h) {
@@ -96,12 +161,14 @@ int EngramStore::bind_local(int layer_id,
             return -1;
     }
     layers_.at(layer_id).local_tables = buffers;
+    layers_.at(layer_id).local_owner = std::move(owner);
     return 0;
 }
 
 int EngramStore::lookup_into(int layer_id, const int64_t* row_ids, int B, int L,
                              void* output_buffer, size_t output_size) const {
     const auto& layer = get_layer(layer_id);
+    std::shared_lock<std::shared_mutex> lock(layer.mutex);
     const auto& table_vocab_sizes = layer.config.table_vocab_sizes;
     const auto& embed_keys = layer.keys;
     if ((!store_ && layer.local_tables.empty()) || row_ids == nullptr ||
@@ -243,10 +310,16 @@ int EngramStore::get_row_bytes(int layer_id) const {
 }
 
 int EngramStore::remove_from_store(int layer_id, bool force) {
-    const auto& embed_keys = get_layer(layer_id).keys;
+    const auto& layer = get_layer(layer_id);
+    std::unique_lock<std::shared_mutex> lock(layer.mutex);
+    const auto& embed_keys = layer.keys;
     if (store_ == nullptr) {
         return static_cast<int>(ErrorCode::INVALID_PARAMS);
     }
+
+    // Invalidate before any deletion, including partial failure or exceptions.
+    // The layer lock excludes in-flight reads and old snapshot refills.
+    invalidate_query_cache(layer_id);
 
     constexpr int kObjectNotFound =
         static_cast<int>(ErrorCode::OBJECT_NOT_FOUND);
@@ -267,7 +340,6 @@ int EngramStore::remove_from_store(int layer_id, bool force) {
         }
     }
 
-    if (first_error == 0 && removed > 0) invalidate_query_cache(layer_id);
     return first_error != 0 ? first_error : removed;
 }
 
@@ -275,10 +347,26 @@ int EngramStore::populate(int layer_id,
                           const std::vector<void*>& embedding_buffers,
                           const std::vector<size_t>& buffer_sizes,
                           const ReplicateConfig& config) {
+    return populate(layer_id, embedding_buffers, buffer_sizes, config, nullptr);
+}
+
+int EngramStore::populate(int layer_id,
+                          const std::vector<void*>& embedding_buffers,
+                          const std::vector<size_t>& buffer_sizes,
+                          const ReplicateConfig& config,
+                          std::shared_ptr<void> owner) {
     const auto& layer = get_layer(layer_id);
+    std::unique_lock<std::shared_mutex> lock(layer.mutex);
     const auto& table_vocab_sizes = layer.config.table_vocab_sizes;
     const auto& embed_keys = layer.keys;
-    if (store_ == nullptr) {
+    if (strict_store_ == nullptr) {
+        return -1;
+    }
+    if (DetermineReplicaWriteMode(config) ==
+        ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+        LOG(ERROR) << "EngramStore populate does not support flexible dual "
+                      "replicas: write success cannot prove all source "
+                      "transfers have ended";
         return -1;
     }
     if (embedding_buffers.size() != embed_keys.size() ||
@@ -291,6 +379,16 @@ int EngramStore::populate(int layer_id,
             static_cast<size_t>(table_vocab_sizes[i]) * layer.config.row_bytes;
         if (embedding_buffers[i] == nullptr || buffer_sizes[i] != expected) {
             return -1;
+        }
+        const auto begin = reinterpret_cast<uintptr_t>(embedding_buffers[i]);
+        if (buffer_sizes[i] > std::numeric_limits<uintptr_t>::max() - begin)
+            return -1;
+        for (size_t j = 0; j < i; ++j) {
+            const auto other =
+                reinterpret_cast<uintptr_t>(embedding_buffers[j]);
+            if (begin >= other ? begin - other < buffer_sizes[j]
+                               : other - begin < buffer_sizes[i])
+                return -1;
         }
     }
 
@@ -314,10 +412,19 @@ int EngramStore::populate(int layer_id,
         }
     }
 
-    auto cleanup_registered_buffers = [&](size_t count) {
+    // Safe exits must unlock before releasing owners whose deleters may
+    // reenter.
+    PopulateOwnerGuard owner_guard(std::move(owner));
+    size_t registered_count = 0;
+    auto cleanup_registered_buffers = [&]() {
         bool cleanup_failed = false;
-        for (size_t i = 0; i < count; ++i) {
-            int rc = store_->unregister_buffer(embedding_buffers[i]);
+        for (size_t i = 0; i < registered_count; ++i) {
+            int rc = -1;
+            try {
+                rc = store_->unregister_buffer(embedding_buffers[i]);
+            } catch (...) {
+                // Continue cleaning the other buffers after an exception.
+            }
             if (rc != 0) {
                 cleanup_failed = true;
                 LOG(ERROR) << "Failed to unregister embedding buffer at index "
@@ -327,52 +434,76 @@ int EngramStore::populate(int layer_id,
         return cleanup_failed;
     };
 
-    for (size_t i = 0; i < embedding_buffers.size(); ++i) {
-        int ret =
-            store_->register_buffer(embedding_buffers[i], buffer_sizes[i]);
-        if (ret != 0) {
-            if (cleanup_registered_buffers(i)) {
-                LOG(ERROR) << "Failed to clean up registered embedding buffers "
-                              "after register_buffer error";
+    std::vector<int> put_results;
+    try {
+        for (; registered_count < embedding_buffers.size();
+             ++registered_count) {
+            int ret =
+                store_->register_buffer(embedding_buffers[registered_count],
+                                        buffer_sizes[registered_count]);
+            if (ret != 0) {
+                LOG(ERROR) << "Failed to register embedding buffer at index "
+                           << registered_count << ", rc=" << ret;
+                break;
             }
-            return -1;
         }
+        if (registered_count == embedding_buffers.size()) {
+            put_results = strict_store_->batch_put_from_create_only(
+                embed_keys, embedding_buffers, buffer_sizes, config);
+        }
+    } catch (...) {
+        LOG(ERROR) << "Exception during EngramStore populate; buffer ownership "
+                      "must be retained";
     }
-
-    std::vector<int> put_results = store_->batch_put_from(
-        embed_keys, embedding_buffers, buffer_sizes, config);
     const bool put_succeeded =
         put_results.size() == embed_keys.size() &&
         std::all_of(put_results.begin(), put_results.end(),
                     [](int result) { return result == 0; });
 
-    const bool unregister_failed =
-        cleanup_registered_buffers(embedding_buffers.size());
+    const bool unregister_failed = cleanup_registered_buffers();
 
-    if (!put_succeeded || unregister_failed) {
-        const bool put_results_complete =
-            put_results.size() == embed_keys.size();
-        for (size_t i = 0; i < embed_keys.size(); ++i) {
-            if (put_results_complete && put_results[i] != 0) {
-                continue;
-            }
-            int rc = store_->remove(embed_keys[i], true);
-            if (rc != 0 &&
-                rc != static_cast<int>(ErrorCode::OBJECT_NOT_FOUND)) {
-                LOG(ERROR)
-                    << "Failed to roll back partially populated EngramStore "
-                    << "key '" << embed_keys[i] << "', rc=" << rc;
-            }
+    if (!put_succeeded) {
+        // No object-version token proves that a key still belongs to this
+        // attempt. Even a successful creation may have been replaced remotely.
+        // Never force-delete another writer's objects during failed populate.
+        const bool terminal_results =
+            put_results.size() == embed_keys.size() &&
+            std::all_of(put_results.begin(), put_results.end(), [](int result) {
+                return result == 0 ||
+                       result ==
+                           static_cast<int>(ErrorCode::OBJECT_ALREADY_EXISTS);
+            });
+        if (terminal_results && !unregister_failed) {
+            // Strict creation conflicts never start a source transfer. Success
+            // entries completed all required transfers (flexible mode is
+            // rejected).
+            lock.unlock();
+            owner_guard.release_safe = true;
+            return -1;
         }
-        if (unregister_failed) {
-            LOG(ERROR)
-                << "Rolling back EngramStore populate because buffer cleanup "
-                   "failed after publish";
-        }
-        return -1;
+        // Failed registration can leave partial MRs; a failed upload can time
+        // out before DMA completes. Unregister alone cannot prove release safe.
+        return -3;
     }
 
-    invalidate_query_cache(layer_id);
+    try {
+        invalidate_query_cache(layer_id);
+    } catch (...) {
+        LOG(ERROR) << "EngramStore published layer " << layer_id
+                   << " but cache invalidation failed; retain buffers until "
+                      "process exit";
+        return -2;
+    }
+
+    if (unregister_failed) {
+        // Rolling back published tables would not release registered buffers.
+        LOG(ERROR) << "EngramStore populate published layer " << layer_id
+                   << " but failed to unregister some embedding buffers; "
+                      "keep them alive until process exit";
+        return -2;
+    }
+    lock.unlock();
+    owner_guard.release_safe = true;
     return 0;
 }
 

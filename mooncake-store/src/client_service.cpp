@@ -2686,7 +2686,8 @@ void Client::healDanglingLocalDiskBatchStarts(
 }
 
 void Client::StartBatchPut(std::vector<PutOperation>& ops,
-                           const ReplicateConfig& base_config) {
+                           const ReplicateConfig& base_config,
+                           bool create_only) {
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
     std::vector<size_t> active_indices;
@@ -2782,8 +2783,9 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         }
     }
 
-    healDanglingLocalDiskBatchStarts(ops, active_indices, already_exists, keys,
-                                     slice_lengths, config);
+    if (!create_only)
+        healDanglingLocalDiskBatchStarts(ops, active_indices, already_exists,
+                                         keys, slice_lengths, config);
     for (size_t i : already_exists) {
         auto& op = ops[active_indices[i]];
         if (!op.IsResolved() && op.replicas.empty()) {
@@ -3583,7 +3585,7 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
-    const std::vector<PutOperation>& ops) {
+    const std::vector<PutOperation>& ops, bool create_only) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(ops.size());
 
@@ -3592,12 +3594,22 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
         // With the new structure, result is always set (never nullopt)
         results.emplace_back(op.result);
 
+        // Reserve strict creation conflicts for starts that allocated no
+        // replicas. A later error with the same code does not prove that
+        // transfers have ended; callers must retain uncertain source buffers.
+        if (create_only && !op.result.has_value() &&
+            op.result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
+            !op.replicas.empty()) {
+            results.back() = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+        }
+
         // Additional validation and logging for debugging
         if (!op.result.has_value()) {
             // If error == object already exist, consider as ok (Put semantics).
             // UpsertStart never returns this error, so this branch is
             // unreachable for BatchUpsert — kept for BatchPut compatibility.
-            if (op.result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            if (!create_only &&
+                op.result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
                 results.back() = {};
                 continue;
             }
@@ -3658,6 +3670,22 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager,
     bool group_by_target) {
+    return BatchPutInternal(keys, batched_slices, config, stager,
+                            group_by_target, false);
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPutCreateOnly(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config) {
+    return BatchPutInternal(keys, batched_slices, config, {}, false, true);
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPutInternal(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config, const WriteBufferStager& stager,
+    bool group_by_target, bool create_only) {
     if (!config.ValidSessionIds(keys.size()) ||
         !config.HasValidKeyHints(keys.size())) {
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -3675,7 +3703,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
                 keys.size(), tl::unexpected(*err));
         }
     }
-    StartBatchPut(ops, client_cfg);
+    StartBatchPut(ops, client_cfg, create_only);
     StageWriteBuffersForRemoteReplicas(ops, stager);
 
     auto t0 = std::chrono::steady_clock::now();
@@ -3691,7 +3719,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     }
 
     FinalizeBatchPut(ops);
-    return CollectResults(ops);
+    return CollectResults(ops, create_only);
 }
 
 // Defined after PutOperation: std::vector<PutOperation> must be instantiated

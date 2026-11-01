@@ -4,6 +4,9 @@
 
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <utility>
+#include <vector>
 
 #include "engram/engram_store.h"
 #include "engram/engram_store_config.h"
@@ -111,20 +114,24 @@ void bind_engram_store(py::module& m) {
                         "Local table count must match heads");
                 std::vector<const void*> pointers;
                 std::vector<size_t> sizes;
+                std::vector<py::array> arrays;
                 for (size_t h = 0; h < rows.size(); ++h) {
                     auto arr = require_embedding_buffer(
                         buffers[h], rows[h], self.get_row_bytes(layer_id));
                     pointers.push_back(arr.data());
                     sizes.push_back(arr.nbytes());
+                    arrays.push_back(std::move(arr));
                 }
-                if (self.bind_local(layer_id, pointers, sizes) != 0)
+                auto owner =
+                    std::make_shared<std::vector<py::array>>(std::move(arrays));
+                if (self.bind_local(layer_id, pointers, sizes, owner) != 0)
                     throw std::runtime_error(
                         "bind_local requires an unbound layer and no Store "
                         "client");
             },
             py::arg("layer_id"), py::arg("embedding_buffers"),
-            py::keep_alive<1, 3>(),
-            "Bind immutable uint8 tables before lookup. Retains the arrays "
+            "Bind immutable uint8 tables before lookup. Retains an independent "
+            "snapshot of the arrays, even if the input list changes, "
             "without "
             "copying; do not modify, resize or unmap them while bound.")
         .def("get_layer_ids", &EngramStore::get_layer_ids)
@@ -135,7 +142,11 @@ void bind_engram_store(py::module& m) {
         .def(
             "remove_from_store",
             [](EngramStore& self, int layer_id, bool force) {
-                int ret = self.remove_from_store(layer_id, force);
+                int ret;
+                {
+                    py::gil_scoped_release release;
+                    ret = self.remove_from_store(layer_id, force);
+                }
                 if (ret < 0) {
                     throw std::runtime_error("remove_from_store failed, rc=" +
                                              std::to_string(ret));
@@ -191,11 +202,13 @@ void bind_engram_store(py::module& m) {
             "Read into caller-owned uint8 memory. The caller must keep the "
             "output registered with this Store for Store-backed reads. "
             "Local bound tables do not require output registration. "
-            "This method does not allocate, register, or unregister output.")
+            "This method does not allocate, register, or unregister output. "
+            "Shape, pointer and size precheck failures leave output untouched. "
+            "Invalid row IDs and reported read failures zero-fill output.")
         .def(
             "populate",
             [](EngramStore& self, int layer_id, py::list embedding_buffers,
-               const ReplicateConfig& config) {
+               ReplicateConfig config) {
                 const std::vector<int64_t> vocab_sizes =
                     self.get_table_vocab_sizes(layer_id);
                 const int row_bytes = self.get_row_bytes(layer_id);
@@ -219,14 +232,35 @@ void bind_engram_store(py::module& m) {
                     bufs.push_back(req.ptr);
                     sizes.push_back(arr.nbytes());
                 }
-                py::gil_scoped_release release;
-                int ret = self.populate(layer_id, bufs, sizes, config);
+                auto owner =
+                    std::make_shared<std::vector<py::array>>(std::move(arrays));
+                int ret;
+                {
+                    py::gil_scoped_release release;
+                    ret = self.populate(layer_id, bufs, sizes, config, owner);
+                }
+                if (ret == -2) {
+                    throw std::runtime_error(
+                        "populate published the layer but could not confirm "
+                        "finalization; input arrays are retained until process "
+                        "exit");
+                }
+                if (ret == -3) {
+                    throw std::runtime_error(
+                        "populate failed with uncertain registration or "
+                        "transfer "
+                        "state; input arrays are retained until process exit");
+                }
                 if (ret != 0) {
                     throw std::runtime_error("populate failed");
                 }
             },
             py::arg("layer_id"), py::arg("embedding_buffers"),
-            py::arg("config") = ReplicateConfig{});
+            py::arg("config") = ReplicateConfig{},
+            "Populate a new layer from contiguous uint8 arrays. Do not mutate "
+            "them during upload. If registration, transfer or cleanup state is "
+            "uncertain, the arrays are retained until process exit, even after "
+            "this Store is destroyed; do not resize or explicitly unmap them.");
 }
 
 }  // namespace engram

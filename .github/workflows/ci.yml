@@ -203,6 +203,9 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
+    - name: Install Engram test dependency
+      run: python3 -m pip install --disable-pip-version-check numpy
+
     - name: Install and start etcd
       uses: ./.github/actions/setup-etcd
 
@@ -231,6 +234,7 @@ jobs:
     - name: Configure project with unit tests
       run: |
         cmake -S . -B build -G Ninja \
+          -DPython3_EXECUTABLE="$(command -v python3)" \
           -DUSE_HTTP=ON \
           -DUSE_CXL=ON \
           -DUSE_UB=ON \

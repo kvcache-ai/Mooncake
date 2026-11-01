@@ -251,6 +251,11 @@ class RealClient : public PyClient {
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
+    std::vector<int> batch_put_from_create_only(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config);
+
     /**
      * @brief Put object data directly from multiple pre-allocated buffers for
      * multiple keys (batch version)
@@ -825,7 +830,14 @@ class RealClient : public PyClient {
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
-        const ReplicateConfig &config = ReplicateConfig{});
+        const ReplicateConfig &config = ReplicateConfig{},
+        bool create_only = false);
+
+    std::vector<int> batch_put_from_impl(const std::vector<std::string> &keys,
+                                         const std::vector<void *> &buffers,
+                                         const std::vector<size_t> &sizes,
+                                         const ReplicateConfig &config,
+                                         bool create_only);
 
     std::vector<tl::expected<void, ErrorCode>>
     batch_put_from_multi_buffers_internal(
