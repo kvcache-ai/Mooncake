@@ -470,6 +470,93 @@ TEST_F(XpuPlatformTest, DeviceToDeviceCopyAcrossDevices) {
     deviceToDeviceRoundTrip(*platform_, "xpu:1");
 }
 
+// Device-to-device copies from many threads at once. Device pairs without
+// peer access go through a host bounce buffer, with queues drawn from the
+// same per-device pools as host<->device copies. Each thread copies its source
+// slice to its destination slice -- on the same device for even threads, on
+// the next device for odd threads when there is more than one -- then reads
+// back its neighbour's destination slice. A bounce buffer shared between
+// concurrent copies shows up as another thread's bytes. The pattern changes
+// every iteration, so leftovers from an earlier iteration are caught too.
+TEST_F(XpuPlatformTest, ConcurrentDeviceToDeviceCopiesKeepTheirData) {
+    const int kThreads = 16;
+    const int kIterations = 16;
+    const size_t kSlice = 4 << 20;
+    auto pattern = [](int owner, int it, size_t i) {
+        return static_cast<uint8_t>(i * 131 + owner * 17 + it * 7 + 1);
+    };
+
+    std::vector<void *> src_mem(device_count_, nullptr);
+    std::vector<void *> dst_mem(device_count_, nullptr);
+    for (int d = 0; d < device_count_; ++d) {
+        MemoryOptions options;
+        options.location = "xpu:" + std::to_string(d);
+        Status alloc =
+            platform_->allocate(&src_mem[d], kSlice * kThreads, options);
+        ASSERT_TRUE(alloc.ok()) << alloc;
+        alloc = platform_->allocate(&dst_mem[d], kSlice * kThreads, options);
+        ASSERT_TRUE(alloc.ok()) << alloc;
+    }
+    auto src_slice = [&](int t) {
+        return static_cast<uint8_t *>(src_mem[t % device_count_]) + t * kSlice;
+    };
+    auto dst_slice = [&](int t) {
+        const int d = (t + t % 2) % device_count_;
+        return static_cast<uint8_t *>(dst_mem[d]) + t * kSlice;
+    };
+
+    std::barrier sync(kThreads);
+    std::vector<std::string> errors(kThreads);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            const int peer = (t + 1) % kThreads;
+            std::vector<uint8_t> src(kSlice), dst(kSlice);
+            for (int it = 0; it < kIterations; ++it) {
+                for (size_t i = 0; i < kSlice; ++i) src[i] = pattern(t, it, i);
+                std::fill(dst.begin(), dst.end(), 0);
+                Status status = Status::OK();
+                if (errors[t].empty()) {
+                    status = platform_->copy(src_slice(t), src.data(), kSlice);
+                    if (status.ok())
+                        status =
+                            platform_->copy(dst_slice(t), src_slice(t), kSlice);
+                }
+                sync.arrive_and_wait();  // every slice copied
+                if (errors[t].empty() && status.ok())
+                    status =
+                        platform_->copy(dst.data(), dst_slice(peer), kSlice);
+                sync.arrive_and_wait();  // every slice read before rewriting
+                if (!errors[t].empty()) continue;  // keep the barrier count
+                if (!status.ok()) {
+                    errors[t] = "copy failed at iteration " +
+                                std::to_string(it) + ": " + status.ToString();
+                    continue;
+                }
+                for (size_t i = 0; i < kSlice; ++i) {
+                    if (dst[i] != pattern(peer, it, i)) {
+                        errors[t] = "slice " + std::to_string(peer) +
+                                    " wrong at iteration " +
+                                    std::to_string(it) + ", byte " +
+                                    std::to_string(i);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    for (auto &th : threads) th.join();
+    for (int t = 0; t < kThreads; ++t)
+        EXPECT_TRUE(errors[t].empty()) << "thread " << t << ": " << errors[t];
+
+    for (int d = 0; d < device_count_; ++d) {
+        Status freed = platform_->free(src_mem[d], kSlice * kThreads);
+        EXPECT_TRUE(freed.ok()) << freed;
+        freed = platform_->free(dst_mem[d], kSlice * kThreads);
+        EXPECT_TRUE(freed.ok()) << freed;
+    }
+}
+
 // A copy running past the end of the allocation is rejected, including one so
 // long that the interior address plus the length wraps around.
 TEST_F(XpuPlatformTest, CopyRejectsRangePastAllocationEnd) {
