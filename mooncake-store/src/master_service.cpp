@@ -439,6 +439,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       quota_bytes_(config.quota_bytes),
       enable_multi_tenants_(config.enable_multi_tenants),
       segment_manager_(config.memory_allocator, config.enable_cxl),
+      local_ssd_manager_(config.offload_queue_limits),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_type_(config.enable_cxl
@@ -516,20 +517,30 @@ MasterService::MasterService(const MasterServiceConfig& config)
     // Validate offload tuning knobs here (not only via gflags validator),
     // because values loaded from a configuration file bypass the gflags
     // validator chain.
-    if (config.offload_cap_ratio < 0.0 || config.offload_cap_ratio > 1.0) {
+    if (!std::isfinite(config.offload_cap_ratio) ||
+        config.offload_cap_ratio < 0.0 || config.offload_cap_ratio > 1.0) {
         LOG(ERROR) << "offload_cap_ratio must be between 0.0 and 1.0, "
                    << "current value: " << config.offload_cap_ratio;
         throw std::invalid_argument("Invalid offload_cap_ratio");
     }
-    if (offloading_queue_limit_ == 0) {
+    if (!config.offload_queue_limits.use_bytes &&
+        offloading_queue_limit_ == 0) {
         LOG(ERROR) << "offloading_queue_limit must be greater than 0";
         throw std::invalid_argument("Invalid offloading_queue_limit");
     }
-    if (offloading_queue_limit_ > 100'000'000ULL) {
+    if (!config.offload_queue_limits.use_bytes &&
+        offloading_queue_limit_ > 100'000'000ULL) {
         LOG(ERROR) << "offloading_queue_limit must be <= 100000000 to avoid "
                    << "overflow when computing offload_cap, current value: "
                    << offloading_queue_limit_;
         throw std::invalid_argument("Invalid offloading_queue_limit");
+    }
+
+    if (config.offload_queue_limits.use_bytes &&
+        (config.offload_queue_limits.max_pending_bytes == 0 ||
+         config.offload_queue_limits.max_pending_bytes >
+             static_cast<uint64_t>(INT64_MAX))) {
+        throw std::invalid_argument("Invalid offload byte limit");
     }
 
     if (put_start_release_timeout_sec_ <= put_start_discard_timeout_sec_) {
@@ -581,9 +592,15 @@ MasterService::MasterService(const MasterServiceConfig& config)
             .through_oplog = enable_oplog_,
             .allow_evict_soft_pinned = allow_evict_soft_pinned_objects_,
             .offload_on_evict = offload_on_evict_,
-            .offload = {.cap = static_cast<long>(offloading_queue_limit_ *
-                                                 config.offload_cap_ratio),
-                        .force_evict = config.offload_force_evict}});
+            .offload = {
+                .cap = static_cast<long>(
+                    static_cast<long double>(
+                        config.offload_queue_limits.use_bytes
+                            ? config.offload_queue_limits.max_pending_bytes
+                            : offloading_queue_limit_) *
+                    config.offload_cap_ratio),
+                .force_evict = config.offload_force_evict,
+                .cap_in_bytes = config.offload_queue_limits.use_bytes}});
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY. Only meaningful when offload is enabled

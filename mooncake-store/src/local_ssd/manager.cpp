@@ -2,27 +2,37 @@
 
 #include <algorithm>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <utility>
 
 namespace mooncake {
 
-LocalSsdTaskMailbox::LocalSsdTaskMailbox(bool enable_offloading)
-    : enable_offloading_(enable_offloading) {}
+LocalSsdTaskMailbox::LocalSsdTaskMailbox(bool enable_offloading,
+                                         OffloadQueueLimits limits)
+    : offload_limits_(limits), enable_offloading_(enable_offloading) {}
 
 ErrorCode LocalSsdTaskMailbox::EnqueueOffload(OffloadTaskItem task,
                                               size_t limit) {
+    if (task.size <= 0) return ErrorCode::INVALID_PARAMS;
     MutexLocker lock(&mutex_);
     if (!enable_offloading_) {
         return ErrorCode::UNABLE_OFFLOADING;
     }
-    if (pending_offloads_.size() >= limit) {
+    const uint64_t byte_limit = offload_limits_.max_pending_bytes;
+    const auto bytes = static_cast<uint64_t>(task.size);
+    if ((offload_limits_.use_bytes &&
+         (pending_offload_bytes_ > byte_limit ||
+          bytes > byte_limit - pending_offload_bytes_)) ||
+        (!offload_limits_.use_bytes && pending_offloads_.size() >= limit) ||
+        bytes > std::numeric_limits<uint64_t>::max() - pending_offload_bytes_) {
         return ErrorCode::KEYS_ULTRA_LIMIT;
     }
     auto index = TenantId(task.tenant_id).MakeScopedKey(task.key);
     if (!pending_offloads_.emplace(std::move(index), std::move(task)).second) {
         return ErrorCode::OBJECT_ALREADY_EXISTS;
     }
+    pending_offload_bytes_ += bytes;
     return ErrorCode::OK;
 }
 
@@ -36,13 +46,18 @@ std::vector<OffloadTaskItem> LocalSsdTaskMailbox::SetOffloadingAndTakePending(
         tasks.push_back(std::move(task));
     }
     pending_offloads_.clear();
+    pending_offload_bytes_ = 0;
     return tasks;
 }
 
 bool LocalSsdTaskMailbox::RemoveOffload(const TenantId& tenant_id,
                                         std::string_view key) {
     MutexLocker lock(&mutex_);
-    return pending_offloads_.erase(tenant_id.MakeScopedKey(key)) != 0;
+    auto it = pending_offloads_.find(tenant_id.MakeScopedKey(key));
+    if (it == pending_offloads_.end()) return false;
+    pending_offload_bytes_ -= static_cast<uint64_t>(it->second.size);
+    pending_offloads_.erase(it);
+    return true;
 }
 
 ErrorCode LocalSsdTaskMailbox::EnqueuePromotion(PromotionTaskItem task) {
@@ -120,8 +135,8 @@ ErrorCode LocalSsdManager::RegisterClient(const UUID& client_id,
     if (clients_.contains(client_id)) {
         return ErrorCode::SEGMENT_ALREADY_EXISTS;
     }
-    clients_.emplace(client_id,
-                     std::make_shared<ClientRecord>(enable_offloading));
+    clients_.emplace(client_id, std::make_shared<ClientRecord>(
+                                    enable_offloading, offload_limits_));
     return ErrorCode::OK;
 }
 
@@ -291,7 +306,11 @@ bool LocalSsdManager::CancelOffloadsIfAllPending(
         }
     }
     for (auto& client : clients) {
-        client.record->mailbox.pending_offloads_.erase(index);
+        auto& mailbox = client.record->mailbox;
+        auto it = mailbox.pending_offloads_.find(index);
+        mailbox.pending_offload_bytes_ -=
+            static_cast<uint64_t>(it->second.size);
+        mailbox.pending_offloads_.erase(it);
     }
     return true;
 }

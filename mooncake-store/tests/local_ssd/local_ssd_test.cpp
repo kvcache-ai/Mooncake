@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <limits>
 #include <thread>
 
 #include "local_ssd/manager.h"
@@ -45,6 +46,82 @@ TEST(LocalSsdTaskMailboxTest, DisabledOffloadingDrainsPendingTasks) {
     ASSERT_EQ(tasks.size(), 1);
     EXPECT_TRUE(mailbox.EnqueueOffload(Offload("tenant", "next", 2), 10) ==
                 ErrorCode::UNABLE_OFFLOADING);
+}
+
+TEST(LocalSsdTaskMailboxTest, CountModeIgnoresConfiguredByteLimits) {
+    LocalSsdTaskMailbox mailbox(true, {1, false});
+    ASSERT_EQ(mailbox.EnqueueOffload(Offload("t", "a", 10), 2), ErrorCode::OK);
+    ASSERT_EQ(mailbox.EnqueueOffload(Offload("t", "b", 10), 2), ErrorCode::OK);
+    EXPECT_EQ(mailbox.EnqueueOffload(Offload("t", "c", 1), 2),
+              ErrorCode::KEYS_ULTRA_LIMIT);
+    EXPECT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 2);
+}
+
+TEST(LocalSsdTaskMailboxTest, ByteLimitReplacesCountLimitAndReclaimsCapacity) {
+    LocalSsdTaskMailbox mailbox(true, {10, true});
+    EXPECT_EQ(mailbox.EnqueueOffload(Offload("t", "zero", 0), 0),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(mailbox.EnqueueOffload(Offload("t", "negative", -1), 0),
+              ErrorCode::INVALID_PARAMS);
+    ASSERT_EQ(mailbox.EnqueueOffload(Offload("t", "a", 4), 0), ErrorCode::OK);
+    EXPECT_EQ(mailbox.EnqueueOffload(Offload("t", "a", 4), 0),
+              ErrorCode::OBJECT_ALREADY_EXISTS);
+    ASSERT_EQ(mailbox.EnqueueOffload(Offload("t", "b", 6), 0), ErrorCode::OK);
+    EXPECT_EQ(mailbox.EnqueueOffload(Offload("t", "full", 1), 100),
+              ErrorCode::KEYS_ULTRA_LIMIT);
+    ASSERT_TRUE(mailbox.RemoveOffload(TenantId("t"), "a"));
+    EXPECT_EQ(mailbox.EnqueueOffload(Offload("t", "c", 4), 0), ErrorCode::OK);
+    EXPECT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 2);
+    EXPECT_EQ(mailbox.EnqueueOffload(Offload("t", "all", 10), 0),
+              ErrorCode::OK);
+}
+
+TEST(LocalSsdTaskMailboxTest, CapacityModeDrainsWholeQueueAndReclaimsCapacity) {
+    LocalSsdTaskMailbox mailbox(true, {12, true});
+    for (int i = 0; i < 4; ++i)
+        ASSERT_EQ(mailbox.EnqueueOffload(Offload("t", std::to_string(i), 3), 1),
+                  ErrorCode::OK);
+    EXPECT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 4);
+    ASSERT_EQ(mailbox.EnqueueOffload(Offload("t", "new", 12), 1),
+              ErrorCode::OK);
+    EXPECT_EQ(mailbox.SetOffloadingAndTakePending(false).size(), 1);
+    EXPECT_TRUE(mailbox.SetOffloadingAndTakePending(true).empty());
+    EXPECT_EQ(mailbox.EnqueueOffload(Offload("t", "again", 12), 1),
+              ErrorCode::OK);
+}
+
+TEST(LocalSsdTaskMailboxTest, PayloadCounterDoesNotOverflow) {
+    LocalSsdTaskMailbox mailbox(true);
+    const auto size = std::numeric_limits<int64_t>::max();
+    ASSERT_EQ(mailbox.EnqueueOffload(Offload("t", "a", size), 4),
+              ErrorCode::OK);
+    ASSERT_EQ(mailbox.EnqueueOffload(Offload("t", "b", size), 4),
+              ErrorCode::OK);
+    EXPECT_EQ(mailbox.EnqueueOffload(Offload("t", "c", size), 4),
+              ErrorCode::KEYS_ULTRA_LIMIT);
+    EXPECT_EQ(mailbox.SetOffloadingAndTakePending(true).size(), 2);
+    EXPECT_EQ(mailbox.EnqueueOffload(Offload("t", "d", size), 4),
+              ErrorCode::OK);
+}
+
+TEST(LocalSsdManagerTest, ByteAccountingSurvivesMirroredCancel) {
+    LocalSsdManager manager({10, true});
+    UUID a{101, 102}, b{103, 104};
+    ASSERT_EQ(manager.RegisterClient(a, true), ErrorCode::OK);
+    ASSERT_EQ(manager.RegisterClient(b, true), ErrorCode::OK);
+    for (const auto& client : {a, b})
+        ASSERT_EQ(manager.EnqueueOffload(client, Offload("t", "key", 10), 0),
+                  ErrorCode::OK);
+    EXPECT_TRUE(
+        manager.CancelOffloadsIfAllPending({a, b}, TenantId("t"), "key"));
+    for (const auto& client : {a, b})
+        ASSERT_EQ(manager.EnqueueOffload(client, Offload("t", "next", 10), 0),
+                  ErrorCode::OK);
+    EXPECT_EQ(manager.EnqueueOffload(a, Offload("t", "full", 1), 0),
+              ErrorCode::KEYS_ULTRA_LIMIT);
+    EXPECT_EQ(manager.RemoveOffloadFromAll(TenantId("t"), "next"), 2);
+    EXPECT_EQ(manager.EnqueueOffload(a, Offload("t", "again", 10), 0),
+              ErrorCode::OK);
 }
 
 TEST(LocalSsdTaskMailboxTest, PromotionsAreBatchedAndRemoveAllIsConsumed) {

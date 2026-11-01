@@ -50,6 +50,7 @@ class OffloadingReclaimer final : public Reclaimer {
         long cap = 0;
         // Let an object go without its offload rather than keep it.
         bool force_evict = false;
+        bool cap_in_bytes = false;
     };
 
     // `inner` and `queue` outlive the reclaimer.

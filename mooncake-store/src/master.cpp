@@ -245,29 +245,17 @@ DEFINE_uint64(offloading_queue_limit, 50000,
               "Maximum number of objects allowed in the offloading queue per "
               "local disk segment. Increase to allow more objects to be "
               "offloaded to SSD before force-eviction kicks in");
-DEFINE_validator(offloading_queue_limit, [](const char* flagname,
-                                            uint64_t value) {
-    // Zero would cause PushOffloadingQueue to always return
-    // KEYS_ULTRA_LIMIT, disabling offload entirely. The upper
-    // bound (1e8) keeps `offloading_queue_limit_ *
-    // offload_cap_ratio_` well within signed long range to
-    // avoid overflow when computing offload_cap in
-    // BatchEvict / EvictNamespaceMemory.
-    if (value == 0) {
-        LOG(FATAL) << "offloading_queue_limit must be greater than 0";
-        return false;
-    }
-    if (value > 100'000'000ULL) {
-        LOG(FATAL) << "offloading_queue_limit must be <= "
-                      "100000000 to avoid overflow";
-        return false;
-    }
-    return true;
-});
+DEFINE_bool(
+    offloading_queue_use_bytes, mooncake::DEFAULT_OFFLOADING_QUEUE_USE_BYTES,
+    "Use byte limits for offload queues instead of object-count limits");
+DEFINE_uint64(offloading_queue_limit_bytes,
+              mooncake::DEFAULT_OFFLOADING_QUEUE_LIMIT_BYTES,
+              "Pending offload payload byte limit per local disk segment; "
+              "used only when offloading_queue_use_bytes is enabled");
 DEFINE_double(offload_cap_ratio, 0.5,
-              "Per-cycle offload cap as a fraction of offloading_queue_limit. "
-              "Controls how many objects can be queued for offload in a single "
-              "eviction cycle before falling back to force-evict");
+              "Per-cycle offload cap as a fraction of the active queue limit. "
+              "Controls the payload or object count queued for offload in a "
+              "single eviction cycle before falling back to force-evict");
 DEFINE_validator(offload_cap_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "offload_cap_ratio must be between 0.0 and 1.0";
@@ -603,6 +591,13 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
         master_config.offloading_queue_limit =
             static_cast<size_t>(tmp_offloading_queue_limit);
     }
+    default_config.GetBool("offloading_queue_use_bytes",
+                           &master_config.offload_queue_limits.use_bytes,
+                           FLAGS_offloading_queue_use_bytes);
+    default_config.GetUInt64(
+        "offloading_queue_limit_bytes",
+        &master_config.offload_queue_limits.max_pending_bytes,
+        FLAGS_offloading_queue_limit_bytes);
     default_config.GetDouble("offload_cap_ratio",
                              &master_config.offload_cap_ratio,
                              FLAGS_offload_cap_ratio);
@@ -952,6 +947,19 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.offloading_queue_limit =
             static_cast<size_t>(FLAGS_offloading_queue_limit);
+    }
+    if ((google::GetCommandLineFlagInfo("offloading_queue_use_bytes", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_queue_limits.use_bytes =
+            FLAGS_offloading_queue_use_bytes;
+    }
+    if ((google::GetCommandLineFlagInfo("offloading_queue_limit_bytes",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_queue_limits.max_pending_bytes =
+            FLAGS_offloading_queue_limit_bytes;
     }
     if ((google::GetCommandLineFlagInfo("offload_cap_ratio", &info) &&
          !info.is_default) ||
@@ -1612,6 +1620,10 @@ int main(int argc, char* argv[]) {
         << ", offload_on_evict=" << master_config.offload_on_evict
         << ", offload_force_evict=" << master_config.offload_force_evict
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit
+        << ", offloading_queue_use_bytes="
+        << master_config.offload_queue_limits.use_bytes
+        << ", offloading_queue_limit_bytes="
+        << master_config.offload_queue_limits.max_pending_bytes
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type
         << ", ha_backend_connstring=" << ha_backend_connstring
