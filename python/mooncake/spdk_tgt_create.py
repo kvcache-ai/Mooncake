@@ -352,7 +352,7 @@ done""",
         log_file = f"{spdk_path}/tgt.log"
         self._execute_command(
             ssh,
-            f"nohup {tgt_binary} -m {shlex.quote(self.core_mask)} > {log_file} 2>&1 &",
+            f"nohup {shlex.quote(tgt_binary)} -m {shlex.quote(self.core_mask)} > {shlex.quote(log_file)} 2>&1 &",
             timeout=None,
         )
         time.sleep(3)  # Give it time to start
@@ -367,7 +367,7 @@ done""",
         pci_allowed = " ".join(pci_devices)
         setup_script = f"{spdk_path}/scripts/setup.sh"
         self._execute_command(
-            ssh, f"PCI_ALLOWED='{pci_allowed}' {setup_script}", sudo=True
+            ssh, f"PCI_ALLOWED='{pci_allowed}' {shlex.quote(setup_script)}", sudo=True
         )
 
     def _format_transport_options(self) -> str:
@@ -388,7 +388,7 @@ done""",
         rpc_script = f"{spdk_path}/scripts/rpc.py"
         transport_options = self._format_transport_options()
         self._execute_command(
-            ssh, f"{rpc_script} nvmf_create_transport {transport_options}"
+            ssh, f"{shlex.quote(rpc_script)} nvmf_create_transport {transport_options}"
         )
 
     def _create_bdevs(
@@ -404,7 +404,7 @@ done""",
             self.logger.info(f"Creating bdev {bdev_name} for PCI {pci}")
             self._execute_command(
                 ssh,
-                f"{rpc_script} bdev_nvme_attach_controller -b {bdev_name} -t PCIe -a {pci}",
+                f"{shlex.quote(rpc_script)} bdev_nvme_attach_controller -b {bdev_name} -t PCIe -a {pci}",
             )
             bdevs.append(f"{bdev_name}n1")
             self.logger.info(f"Attached PCI {pci} as bdev {bdev_name}n1")
@@ -419,7 +419,7 @@ done""",
         rpc_script = f"{spdk_path}/scripts/rpc.py"
         self._execute_command(
             ssh,
-            f"{rpc_script} nvmf_create_subsystem {subsystem_nqn} -a -s SPDK00000000000001 -m 12",
+            f"{shlex.quote(rpc_script)} nvmf_create_subsystem {subsystem_nqn} -a -s SPDK00000000000001 -m 12",
         )
         return subsystem_nqn
 
@@ -437,7 +437,8 @@ done""",
         for bdev in bdevs:
             self.logger.info(f"Adding namespace {bdev} to subsystem {subsystem_nqn}")
             self._execute_command(
-                ssh, f"{rpc_script} nvmf_subsystem_add_ns {subsystem_nqn} {bdev}"
+                ssh,
+                f"{shlex.quote(rpc_script)} nvmf_subsystem_add_ns {subsystem_nqn} {bdev}",
             )
 
     def _add_listener(
@@ -451,7 +452,7 @@ done""",
         rpc_script = f"{spdk_path}/scripts/rpc.py"
         self._execute_command(
             ssh,
-            f"{rpc_script} nvmf_subsystem_add_listener {subsystem_nqn} -t {shlex.quote(str(trtype))} -a {ip} -s 4420",
+            f"{shlex.quote(rpc_script)} nvmf_subsystem_add_listener {subsystem_nqn} -t {shlex.quote(str(trtype))} -a {ip} -s 4420",
         )
 
     def deploy_target(self, target_config: Dict[str, Any]) -> bool:
