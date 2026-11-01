@@ -66,6 +66,23 @@ class SSHHostVerificationTests(unittest.TestCase):
                 client.exec_command.assert_not_called()
                 client.close.assert_called_once_with()
 
+                # 验证可信连接仍可使用，且成功返回的连接由调用方管理。
+                client.reset_mock()
+                client.connect.side_effect = None
+                stdout, stderr = MagicMock(), MagicMock()
+                stdout.channel.recv_exit_status.return_value = 0
+                stdout.read.return_value = b"output"
+                stderr.read.return_value = b""
+                client.exec_command.return_value = (MagicMock(), stdout, stderr)
+                result = getattr(instance, method)(*args)
+                if method == "_ssh_connect":
+                    self.assertIs(result, client)
+                    client.close.assert_not_called()
+                else:
+                    self.assertEqual(result, "output")
+                    self.assertEqual(client.exec_command.call_count, 2)
+                    client.close.assert_called_once_with()
+
     def test_topology_rejects_unknown_host(self) -> None:
         paramiko = MagicMock()
         client = paramiko.SSHClient.return_value
