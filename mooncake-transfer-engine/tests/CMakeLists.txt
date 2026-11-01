@@ -28,7 +28,23 @@ if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
                  ${WORKSPACE}/adaptive_congestion_control_benchmark.cpp)
   target_link_libraries(adaptive_congestion_control_benchmark
                         PRIVATE adaptive_congestion_control_core)
+
+  add_executable(classic_rdma_congestion_control_test
+                 ${WORKSPACE}/classic_rdma_congestion_control_test.cpp)
+  target_link_libraries(classic_rdma_congestion_control_test
+                        PRIVATE transfer_engine gtest gtest_main)
+  add_test(NAME classic_rdma_congestion_control_test
+           COMMAND classic_rdma_congestion_control_test)
 endif()
+
+configure_file(installed_congestion_control_header_test.cmake.in
+               installed_congestion_control_header_test.cmake @ONLY)
+add_test(
+  NAME installed_congestion_control_header_test
+  COMMAND
+    ${CMAKE_COMMAND} -DTRANSFER_ENGINE_LIBRARY=$<TARGET_FILE:transfer_engine>
+    -P
+    ${CMAKE_CURRENT_BINARY_DIR}/installed_congestion_control_header_test.cmake)
 
 if(USE_HIP)
   file(GLOB TEST_SOURCES "*.cpp")
@@ -114,12 +130,16 @@ target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # Control GID I/O and port-state queries so event recovery can be exercised
   # without an RDMA device.
+  if(BUILD_SHARED_LIBS)
+    # --wrap only rewrites calls in objects linked into this executable.
+    target_sources(worker_pool_rail_state_test
+                   PRIVATE $<TARGET_OBJECTS:rdma_transport>)
+  endif()
   target_link_options(
     worker_pool_rail_state_test
     PRIVATE
     "-Wl,--wrap=_ZN8mooncake11RdmaContext17refreshCurrentGidEPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_"
-    "-Wl,--wrap=_ZNK8mooncake11RdmaContext14queryPortStateEP14ibv_port_state"
-  )
+    "-Wl,--wrap=_ZNK8mooncake11RdmaContext14queryPortStateEP14ibv_port_state")
 endif()
 add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)
 
@@ -365,10 +385,9 @@ if(USE_EFA)
 
   add_executable(efa_stale_segment_desc_test
                  ${WORKSPACE}/efa_stale_segment_desc_test.cpp)
-  target_link_libraries(efa_stale_segment_desc_test PUBLIC transfer_engine gtest
-                                                           gtest_main)
-  add_test(NAME efa_stale_segment_desc_test
-           COMMAND efa_stale_segment_desc_test)
+  target_link_libraries(efa_stale_segment_desc_test PUBLIC transfer_engine
+                                                           gtest gtest_main)
+  add_test(NAME efa_stale_segment_desc_test COMMAND efa_stale_segment_desc_test)
 
   # Compiles the real EfaEndPoint source against the test-only
   # RPC/address-vector fakes in efa_endpoint_handshake_fakes/ (shadowed

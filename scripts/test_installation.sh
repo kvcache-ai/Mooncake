@@ -49,6 +49,7 @@ python -c "import mooncake._fast_copy"
 python -c "import mooncake.structured_object_store"
 python tests/test_fast_copy.py
 python tests/test_import_structure.py
+python tests/test_transfer_engine_gil.py
 
 echo "Running HTTP metadata server test..."
 python -m unittest service_tests/test_http_metadata_server.py
