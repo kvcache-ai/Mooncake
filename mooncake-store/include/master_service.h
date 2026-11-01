@@ -2178,9 +2178,22 @@ class MasterService {
     void RefreshDrainJobTasks(DrainJob& job);
     void ScheduleDrainJobTasks(DrainJob& job);
     bool MaybeCompleteDrainJob(DrainJob& job);
-    std::optional<std::string> SelectDrainTargetForKey(
-        const ObjectMetadata& metadata, const std::string& source_segment,
+    // A segment a drain may move to, and its utilization when the scheduling
+    // round began.
+    struct DrainTarget {
+        std::string segment;
+        double utilization;
+    };
+    // The allocatable segments among `requested_targets`, or among all
+    // segments when it is empty.
+    std::vector<DrainTarget> SnapshotDrainTargets(
         const std::vector<std::string>& requested_targets);
+    // The least utilized target that is neither the source nor already holds
+    // a replica of the key.
+    static std::optional<std::string> SelectDrainTargetForKey(
+        const std::vector<DrainTarget>& targets,
+        const std::vector<std::string>& replica_segments,
+        const std::string& source_segment);
     std::string MakeDrainUnitKey(const TenantId& tenant_id,
                                  const std::string& key,
                                  const std::string& source_segment) const;
