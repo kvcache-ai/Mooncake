@@ -1521,6 +1521,17 @@ MasterService::PolicyStoreAccess::EvictNamespaceMemory(
     return service_.EvictNamespaceMemory(tenant_id, target_bytes);
 }
 
+void MasterService::PortEffects::CleanupInvalidReplicas(
+    metadata::WriteHandle& handle) {
+    service_.CleanupInvalidMemoryReplicas(handle);
+}
+
+void MasterService::PortEffects::Erase(
+    metadata::Namespace& ns, const route::WriteGuard& guard,
+    EraseMode erase_mode, const std::vector<std::string>& previous_media_hint) {
+    service_.EraseMetadata(ns, guard, erase_mode, previous_media_hint);
+}
+
 WeightMetadataStore::Result<WeightRevisionMetadata>
 MasterService::BeginWeightImport(const BeginWeightImportRequest& request) {
     return weight_manager_.BeginWeightImport(request);
@@ -2015,7 +2026,8 @@ void MasterService::VisitNamespaces(
     });
 }
 
-void MasterService::CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor) {
+void MasterService::CleanupInvalidMemoryReplicas(
+    metadata::WriteHandle& accessor) {
     // Only memory replicas are checked here, to avoid a lock order violation
     // (client_mutex_ must be acquired before a key). local_disk
     // replicas are cleaned up by ClearInvalidHandles() in ClientMonitorFunc.
