@@ -375,7 +375,7 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
  * strategy, which provides efficient memory allocation with bin-based
- * optimization.
+ * optimization. Instances require shared ownership before allocate() is used.
  */
 class OffsetBufferAllocator : public BufferAllocatorBase {
    public:

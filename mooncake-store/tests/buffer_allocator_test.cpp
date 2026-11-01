@@ -134,6 +134,19 @@ TEST_F(BufferAllocatorTest, AllocatedBufferDoesNotExtendAllocatorLifetime) {
     }
 }
 
+TEST_F(BufferAllocatorTest, OffsetAllocationRequiresSharedOwnership) {
+    constexpr size_t kCapacity = 16 * 1024 * 1024;
+    OffsetBufferAllocator allocator("unowned", 0x140000000ULL, kCapacity,
+                                    "unowned");
+
+    auto buffer = allocator.allocate(1024);
+    EXPECT_EQ(buffer, nullptr);
+    EXPECT_EQ(allocator.size(), 0);
+    EXPECT_EQ(allocator.getLargestFreeRegion(), kCapacity);
+    EXPECT_EQ(allocator.getOffsetAllocator()->storageReport().totalFreeSpace,
+              kCapacity);
+}
+
 // Test multiple allocations within the buffer
 TEST_F(BufferAllocatorTest, AllocateMultiple) {
     for (const auto& allocator_type : allocator_types_) {
