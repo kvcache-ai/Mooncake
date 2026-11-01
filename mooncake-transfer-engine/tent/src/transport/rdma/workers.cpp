@@ -63,6 +63,13 @@ RailMonitor& getOrCreateRail(
     return *ins->second;
 }
 
+// Published RDMA device descriptors (name, LID, GID) of a memory segment.
+// RailMonitor reads the GIDs to tell which peer NICs a local NIC can reach.
+const std::vector<DeviceDesc>* segmentDevices(const SegmentDesc* segment) {
+    if (!segment || segment->type != SegmentType::Memory) return nullptr;
+    return &std::get<MemorySegmentDesc>(segment->detail).devices;
+}
+
 void cancelSliceProbe(RdmaSlice* slice) {
     if (!slice) return;
     const auto token =
@@ -1673,10 +1680,13 @@ uint64_t Workers::allocationDeviceMask(const RouteHint& source,
     }
     std::unique_lock<std::shared_mutex> guard(allocation_rails_mutex_);
     auto& rail = getOrCreateRail(allocation_rails_, machine);
-    // No admission state or per-worker configuration is needed in this cache.
+    // No admission state is needed in this cache, but the rail map itself must
+    // match the one the workers build, so it reads the same configuration and
+    // the same published device GIDs.
     rail.load(std::shared_ptr<const Topology>(source.pin, source.topo),
               std::shared_ptr<const Topology>(target.pin, target.topo),
-              rail_topo_json_);
+              rail_topo_json_, transport_->conf_.get(),
+              segmentDevices(source.segment), segmentDevices(target.segment));
     return rail.localDeviceMask(*target.topo_entry, same_machine);
 }
 
@@ -1729,10 +1739,11 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
     auto& rail = *rail_monitor;
     if (!rail.ready() || source.topo != rail.local() ||
         target.topo != rail.remote())
-        CHECK_STATUS(
-            rail.load(std::shared_ptr<const Topology>(source.pin, source.topo),
-                      std::shared_ptr<const Topology>(target.pin, target.topo),
-                      rail_topo_json_, transport_->conf_.get()));
+        CHECK_STATUS(rail.load(
+            std::shared_ptr<const Topology>(source.pin, source.topo),
+            std::shared_ptr<const Topology>(target.pin, target.topo),
+            rail_topo_json_, transport_->conf_.get(),
+            segmentDevices(source.segment), segmentDevices(target.segment)));
     if (slice->source_dev_id < 0) {
         const uint64_t device_mask =
             slice->task->device_mask &
@@ -1921,7 +1932,8 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
         CHECK_STATUS(rail_mon->load(
             std::shared_ptr<const Topology>(source.pin, source.topo),
             std::shared_ptr<const Topology>(target.pin, target.topo),
-            rail_topo_json_, transport_->conf_.get()));
+            rail_topo_json_, transport_->conf_.get(),
+            segmentDevices(source.segment), segmentDevices(target.segment)));
     }
     size_t start =
         static_cast<size_t>(slice->last_fallback_idx + 1) % total_combos;
