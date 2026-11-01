@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <future>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -718,6 +719,58 @@ TEST_F(TransferTaskTest, RemoteTransferWaitCompletesCorrectly) {
     }
     EXPECT_EQ(client.unregisterLocalMemory(local.data()), 0);
     EXPECT_EQ(server.unregisterLocalMemory(remote.data()), 0);
+}
+
+TEST_F(TransferTaskTest, TimedOutTransferDrainsBeforeReturning) {
+    ScopedEnvVar tent_config("MC_TENT_CONF", nullptr);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "127.0.0.1:0", "", 0, "tcp"), 0);
+    if (engine.isUsingTent()) GTEST_SKIP() << "Requires the classic engine";
+
+    // One task with a single outstanding slice. It stays in flight until the
+    // test completes the slice, so the deadline is always crossed mid-transfer
+    // instead of racing a real transfer against the timeout.
+    BatchID batch_id = engine.allocateBatchID(1);
+    ASSERT_NE(batch_id, INVALID_BATCH_ID);
+    auto& batch_desc = Transport::toBatchDesc(batch_id);
+    batch_desc.task_list.resize(1);
+    auto& task = batch_desc.task_list[0];
+    task.batch_id = batch_id;
+    task.slice_count = 1;
+
+    constexpr int64_t kTimeoutMilliseconds = 20;
+    auto state = std::make_shared<TransferEngineOperationState>(
+        engine, batch_id, 1, kTimeoutMilliseconds);
+    TransferFuture future(state);
+    ASSERT_FALSE(future.isReady());
+
+    std::promise<ErrorCode> waited;
+    auto result = waited.get_future();
+    std::thread waiter([&] { waited.set_value(future.wait()); });
+
+    // Far past the deadline the wait must still be blocked on the in-flight
+    // task rather than returning and letting the caller reuse its buffers.
+    EXPECT_EQ(
+        result.wait_for(std::chrono::milliseconds(25 * kTimeoutMilliseconds)),
+        std::future_status::timeout);
+
+    // Release the transfer.
+    __atomic_store_n(&task.success_slice_count, 1, __ATOMIC_RELEASE);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    {
+        std::lock_guard<std::mutex> lock(batch_desc.completion_mutex);
+        batch_desc.is_finished.store(true, std::memory_order_release);
+    }
+    batch_desc.completion_cv.notify_all();
+#endif
+    waiter.join();
+
+    // The task itself succeeded, so TRANSFER_FAIL can only come from the
+    // deadline having been crossed while it was in flight.
+    EXPECT_EQ(result.get(), ErrorCode::TRANSFER_FAIL);
+    TransferStatus status;
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
 }
 
 // Test TransferStrategy enum and stream operator
