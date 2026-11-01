@@ -831,6 +831,29 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
     defined(USE_HIP_DMABUF) || defined(USE_SUPA)
     if (exp.method == DmabufExport::Method::kDmabufReg) {
+        // #5015: a DMA-BUF MR whose start is 2^k-aligned (k >= 32) and whose
+        // length exceeds 2^k wraps every 2^k bytes, so an RDMA READ/WRITE at
+        // offset X silently lands at X mod 2^k. The wrap is below Mooncake:
+        // torvalds/linux@15fe76e23615 ("RDMA/umem: Fix truncation for block
+        // sizes >= 4G") left __rdma_block_iter_next() advancing block offset
+        // and step in 32-bit, so a block of >= 4 GiB never advances and every
+        // later block maps to the first. A single such block (length == align)
+        // never advances and is clean, so only a longer MR wraps. Warn so it is
+        // not silent. The check is VA-only: the kernel also considers the DMA
+        // address, so it may fire on some hosts that are not affected.
+        uintptr_t start = (uintptr_t)addr;
+        size_t align = start & (~start + 1);  // largest 2^k dividing start
+        if (align >= (size_t(1) << 32) && length > align) {
+            LOG(WARNING) << "DMA-BUF MR at " << addr << " length " << length
+                         << " starts on a " << align
+                         << "-byte boundary and may wrap every " << align
+                         << " bytes, corrupting RDMA offsets past that point "
+                            "(#5015, kernel block-iter truncation fixed in "
+                            "torvalds/linux@15fe76e23615). A kernel with that "
+                            "fix is unaffected; otherwise set MC_MAX_MR_SIZE "
+                            "<= 4GiB or register through nvidia-peermem "
+                            "(ibv_reg_mr) instead.";
+        }
         // Import the shared dma_buf fd into this NIC's PD. The fd is kept open
         // by the caller until every NIC has registered; this MR takes its own
         // reference, so all NICs share one dma_buf object (and one BAR1
