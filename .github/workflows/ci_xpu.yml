@@ -1,0 +1,254 @@
+name: 'Build Wheel (XPU)'
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: Git revision to build for a hardware consumer
+        type: string
+        default: ''
+      version_override:
+        description: Optional wheel version override for nightly snapshots
+        type: string
+        default: ''
+    outputs:
+      source_sha:
+        value: ${{ jobs.build-wheel-xpu.outputs.source_sha }}
+      artifact_id:
+        value: ${{ jobs.build-wheel-xpu.outputs.artifact_id }}
+      artifact_digest:
+        value: ${{ jobs.build-wheel-xpu.outputs.artifact_digest }}
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-wheel-xpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # Match the existing XPU development environment; no GPU is needed.
+    container: &xpu-image intel/pytorch:xpu-2.13.0-ubuntu24.04-20260907@sha256:7366f264bd7aaa7f0df7d1bfba43be7c84c126df21ba448ae5445a34c2def4f9
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      artifact_id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact_digest: ${{ steps.artifact.outputs.artifact-digest }}
+    env:
+      XPU_BUILD: "1"
+      PYTHON_VERSION: "3.12"
+      BUILD_DIR: build-xpu-ci
+      OUTPUT_DIR: dist-xpu-ci
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      # As in ROCm CI, git must exist before checkout to avoid a source tarball.
+      - name: Install git (pre-checkout)
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
+
+      - name: Record selected source
+        id: source
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install toolchain and dependencies
+        run: |
+          set -euo pipefail
+          apt-get install -y --no-install-recommends curl gpg
+          curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            | gpg --dearmor -o /usr/share/keyrings/oneapi-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+            > /etc/apt/sources.list.d/oneAPI.list
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            intel-oneapi-compiler-dpcpp-cpp-2026.1 \
+            python3.12-dev python3.12-venv iproute2 librdmacm-dev
+          bash dependencies.sh -y
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          /usr/bin/python3.12 -m venv "$RUNNER_TEMP/xpu-build-env"
+          echo "$RUNNER_TEMP/xpu-build-env/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/xpu-build-env/bin/python" -m pip install numpy
+
+      - name: Configure and build project
+        run: |
+          set -eo pipefail
+          source /opt/intel/oneapi/setvars.sh >/dev/null
+          mkdir -p xpu-ci-output
+          {
+            echo "source_sha=$(git rev-parse HEAD)"
+            echo "ci_run=$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
+            echo "image=$XPU_IMAGE"
+            echo "coverage=host-only; no XPU hardware tests executed"
+            icpx --version
+            python --version
+            dpkg-query -W
+          } > xpu-ci-output/provenance.txt
+          cmake -G Ninja -S . -B "$BUILD_DIR" \
+            -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+            -DPython3_EXECUTABLE="$(command -v python)" \
+            -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF \
+            -DUSE_XPU=ON -DUSE_TENT=ON -DUSE_CUDA=OFF -DUSE_XPU_GDS=OFF \
+            -DWITH_EP=ON -DMOONCAKE_EP_XPU_AOT_DEVICES=bmg \
+            -DWITH_STORE=ON -DWITH_STORE_RUST=OFF -DWITH_STORE_RS=OFF \
+            -DWITH_P2P_STORE=OFF -DUSE_HTTP=ON -DBUILD_UNIT_TESTS=ON
+          cmake --build "$BUILD_DIR" --parallel 2 --target \
+            engine store _ep mooncake_master mooncake_client transfer_engine_bench \
+            tent_xpu_platform_test tent_xpu_transport_test tent_xpu_engine_test \
+            tent_xpu_ipc_process_test pybind_client_test \
+            config_lifecycle_test ep_dispatch_slots_test crc32c_test
+        env:
+          XPU_IMAGE: *xpu-image
+
+      - name: Run host-side unit tests
+        run: |
+          set -eo pipefail
+          source /opt/intel/oneapi/setvars.sh >/dev/null
+          mkdir -p xpu-ci-output/reports
+          "$BUILD_DIR/mooncake-transfer-engine/tent/tests/config_lifecycle_test" \
+            --gtest_output=xml:xpu-ci-output/reports/config.xml
+          "$BUILD_DIR/mooncake-ep/tests/ep_dispatch_slots_test" \
+            --gtest_output=xml:xpu-ci-output/reports/ep.xml
+          "$BUILD_DIR/mooncake-store/tests/crc32c_test" \
+            --gtest_output=xml:xpu-ci-output/reports/crc32c.xml
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          for name, count in (("config", 19), ("ep", 6), ("crc32c", 5)):
+              cases = ET.parse(f"xpu-ci-output/reports/{name}.xml").findall(".//testcase")
+              if len(cases) != count:
+                  raise RuntimeError(f"{name}: expected {count} tests, got {len(cases)}")
+              for case in cases:
+                  if (case.get("status"), case.get("result")) != ("run", "completed") or any(
+                      case.find(tag) is not None for tag in ("failure", "error", "skipped")
+                  ):
+                      raise RuntimeError(f"{name}: test did not pass: {case.attrib}")
+          PY
+
+      - name: Apply wheel version override
+        if: inputs.version_override != ''
+        env:
+          VERSION_OVERRIDE: ${{ inputs.version_override }}
+        run: |
+          sed -i "s/^version = .*/version = \"${VERSION_OVERRIDE}\"/" mooncake-wheel/pyproject.toml
+
+      - name: Build Python wheel
+        env:
+          # auditwheel and the native test bundle still need the build tree.
+          FREE_BUILD_DIR: "0"
+        run: |
+          set -eo pipefail
+          source /opt/intel/oneapi/setvars.sh >/dev/null
+          library_dirs=$(find "$GITHUB_WORKSPACE/$BUILD_DIR" -type f -name '*.so*' -printf '%h\n' | sort -u | paste -sd:)
+          export LD_LIBRARY_PATH="$library_dirs:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          bash scripts/build_wheel.sh
+          cp "mooncake-wheel/$OUTPUT_DIR/"*.whl xpu-ci-output/
+          python -m pip freeze >> xpu-ci-output/provenance.txt
+
+      - name: Smoke test wheel
+        run: |
+          set -eo pipefail
+          source /opt/intel/oneapi/setvars.sh >/dev/null
+          smoke_venv=$(mktemp -d)
+          /usr/bin/python3.12 -m venv "$smoke_venv"
+          "$smoke_venv/bin/python" -m pip install xpu-ci-output/*.whl
+          # Do not expose build libraries or the source package to the check.
+          cd "$RUNNER_TEMP"
+          "$smoke_venv/bin/python" "$GITHUB_WORKSPACE/scripts/e2e/python/verify_xpu_wheel.py"
+
+      - name: Package Python dependencies for hardware
+        run: |
+          set -euo pipefail
+          out=xpu-ci-output/python-deps
+          mkdir -p "$out"
+          for wheel in xpu-ci-output/*.whl; do
+            python -m pip download --only-binary=:all: --dest "$out" "$wheel"
+            rm "$out/$(basename "$wheel")"
+          done
+
+      - name: Package native tests
+        run: |
+          set -eo pipefail
+          source /opt/intel/oneapi/setvars.sh >/dev/null
+          library_dirs=$(find "$GITHUB_WORKSPACE/$BUILD_DIR" -type f -name '*.so*' -printf '%h\n' | sort -u | paste -sd:)
+          export LD_LIBRARY_PATH="$library_dirs:${LD_LIBRARY_PATH:-}"
+          out=xpu-ci-output/native-tests
+          mkdir -p "$out/lib"
+          cp -R xpu-ci-output/python-deps "$out/"
+          cp xpu-ci-output/provenance.txt "$out/"
+          for binary in \
+            "$BUILD_DIR"/mooncake-transfer-engine/tent/tests/tent_xpu_{platform,transport,engine,ipc_process}_test \
+            "$BUILD_DIR/mooncake-store/tests/pybind_client_test"; do
+            name=$(basename "$binary")
+            cp "$binary" "$out/"
+            "$binary" --gtest_list_tests > "$out/$name.list"
+            if ! grep -Eq '^  [[:alnum:]_]' "$out/$name.list"; then
+              echo "Empty GoogleTest inventory: $binary" >&2
+              exit 1
+            fi
+            ldd "$binary" > "$out/$name.ldd"
+            if grep -q 'not found' "$out/$name.ldd"; then
+              cat "$out/$name.ldd" >&2
+              exit 1
+            fi
+            while read -r library; do
+              dependency=$(basename "$library")
+              # Match the host and Intel GPU runtimes on the hardware consumer.
+              case "$dependency" in
+                libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*|libresolv.so.*|\
+                libstdc++.so.*|libgcc_s.so.*|libsycl.so*|libze_loader.so*|libur_*.so*|\
+                libsvml.so*|libimf.so*|libirng.so*|libintlc.so*|libumf.so*|libtbb*.so*)
+                  continue ;;
+              esac
+              if [ -e "$out/lib/$dependency" ]; then
+                cmp "$library" "$out/lib/$dependency"
+              else
+                cp -L "$library" "$out/lib/$dependency"
+              fi
+            done < <(awk '/=> \// {print $3}' "$out/$name.ldd")
+          done
+          if ! grep -q XpuDeviceBufferPutGetRoundTrips "$out/pybind_client_test.list"; then
+            echo "Missing required XPU Store roundtrip test" >&2
+            exit 1
+          fi
+          (cd "$out"; find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+          tar -czf xpu-ci-output/native-tests.tar.gz -C xpu-ci-output native-tests
+          cp "$BUILD_DIR/CMakeCache.txt" xpu-ci-output/
+          cd xpu-ci-output
+          sha256sum ./*.whl native-tests.tar.gz > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Upload XPU wheel and matching native tests
+        id: artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-xpu-ci-py312-${{ steps.source.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            xpu-ci-output/*.whl
+            xpu-ci-output/native-tests.tar.gz
+            xpu-ci-output/SHA256SUMS
+            xpu-ci-output/provenance.txt
+          if-no-files-found: error
+
+      - name: Preserve build and test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-xpu-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            xpu-ci-output/*.txt
+            xpu-ci-output/reports/
+            xpu-ci-output/native-tests/*.list
+            xpu-ci-output/native-tests/*.ldd
+            build-xpu-ci/CMakeCache.txt
+            build-xpu-ci/Testing/Temporary/
+          if-no-files-found: error

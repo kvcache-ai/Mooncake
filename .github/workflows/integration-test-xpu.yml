@@ -1,0 +1,216 @@
+name: Integration test (XPU core)
+
+on:
+  workflow_call:
+    inputs:
+      checkout_sha:
+        type: string
+        required: true
+      source_sha:
+        type: string
+        required: true
+      artifact_id:
+        type: string
+        required: true
+      artifact_digest:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  core:
+    runs-on: xpu
+    timeout-minutes: 90
+    env:
+      XPU_IMAGE: intel/pytorch:xpu-2.13.0-ubuntu24.04-20260907@sha256:7366f264bd7aaa7f0df7d1bfba43be7c84c126df21ba448ae5445a34c2def4f9
+    steps:
+      - name: Check out trusted harness
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: xpu-control
+          persist-credentials: false
+
+      - name: Allocate run directory
+        id: run
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory=$(mktemp -d "$RUNNER_TEMP/xpu-core.XXXXXX")
+          echo "directory=$directory" >> "$GITHUB_OUTPUT"
+          cat > "$directory/cleanup.sh" <<'SH'
+          fail() { echo "::error::$*" >&2; exit 1; }
+
+          cleanup_container() {
+            local status=0
+            docker stop --time 10 "$container_id" || status=1
+            docker inspect "$container_id" > "$run_directory/output/container-final.json" || status=1
+            if [ "$(docker inspect --format '{{.State.Running}}' "$container_id")" != false ]; then
+              echo "Container processes were not released" >&2
+              status=1
+            fi
+            docker rm "$container_id" || status=1
+            docker info >/dev/null || status=1
+            if docker inspect "$container_id" >/dev/null 2>&1; then
+              echo "Current run container was not removed" >&2
+              status=1
+            fi
+            return "$status"
+          }
+          SH
+
+      - name: Download exact build artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          RUN_DIRECTORY: ${{ steps.run.outputs.directory }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]] || { echo "::error::Invalid artifact ID"; exit 1; }
+          [[ "$CHECKOUT_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Invalid source SHA"; exit 1; }
+          [ "$SOURCE_SHA" = "$CHECKOUT_SHA" ] || { echo "::error::Build SHA differs from authorized SHA"; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" > "$RUN_DIRECTORY/artifact.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$RUN_DIRECTORY/artifact.zip"
+          python3 xpu-control/scripts/e2e/python/verify_xpu_wheel.py unpack \
+            "$RUN_DIRECTORY" "$CHECKOUT_SHA" "$ARTIFACT_ID" "$ARTIFACT_DIGEST"
+
+      - name: Check out authorized test source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_sha }}
+          path: xpu-tested-source
+          persist-credentials: false
+
+      - name: Execute isolated two-B60 core
+        shell: bash
+        env:
+          RUN_DIRECTORY: ${{ steps.run.outputs.directory }}
+          CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git -C xpu-tested-source rev-parse HEAD)" = "$CHECKOUT_SHA" ] || {
+            echo "::error::Checked out source differs from authorized SHA"; exit 1;
+          }
+          run_directory=$(realpath "$RUN_DIRECTORY")
+          source_directory=$(realpath "$GITHUB_WORKSPACE/xpu-tested-source")
+          control_directory=$(realpath "$GITHUB_WORKSPACE/xpu-control/scripts")
+          source "$run_directory/cleanup.sh"
+          mkdir -p "$run_directory/output"
+          exec > >(tee "$run_directory/output/runner.log") 2>&1
+
+          [ "$(id -u)" -ne 0 ] || { echo "XPU runner must not run as root" >&2; exit 1; }
+          : "${ZE_AFFINITY_MASK:?Set a host-owned two-GPU ZE_AFFINITY_MASK}"
+          : "${XPU_IMAGE:?Missing pinned runtime image}"
+          : "${CHECKOUT_SHA:?Missing authorized SHA}"
+          [[ "$ZE_AFFINITY_MASK" =~ ^(0|[1-9][0-9]*),(0|[1-9][0-9]*)$ ]] || {
+            echo "ZE_AFFINITY_MASK must select two whole devices, not subdevices" >&2; exit 1;
+          }
+          [ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[2]}" ] || fail "Affinity must select distinct GPUs"
+          [[ "$XPU_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] || fail "Runtime image must be digest-pinned"
+          for command in docker python3 timeout; do
+            command -v "$command" >/dev/null || fail "Missing runner command: $command"
+          done
+
+          # Preserve host GPU ordinals for fixed masks; the mask is not security isolation.
+          shopt -s nullglob
+          devices=(/dev/dri/renderD*)
+          [ "${#devices[@]}" -ge 2 ] || fail "At least two GPU render nodes are required"
+          device_args=()
+          for device in "${devices[@]}"; do
+            [[ "$device" =~ ^/dev/dri/renderD[0-9]+$ ]] && [ -c "$device" ] \
+              || fail "Not a GPU render character device: $device"
+            device_args+=(--device "$device" --group-add "$(stat -c %g "$device")")
+          done
+          python3 "$control_directory/e2e/python/verify_xpu_wheel.py" seccomp "$run_directory/output/seccomp.json"
+
+          container_id=
+          cleanup() {
+            local status=$? cleanup_status=0
+            trap - EXIT INT TERM
+            if [ -n "$container_id" ]; then
+              cleanup_container || cleanup_status=1
+            fi
+            printf '{"cleanup_status":%d,"suite_status":%d}\n' "$cleanup_status" "$status" \
+              > "$run_directory/output/cleanup.json"
+            if [ "$cleanup_status" -ne 0 ]; then exit 1; fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          docker pull "$XPU_IMAGE"
+          docker image inspect "$XPU_IMAGE" > "$run_directory/output/image.json"
+          container_id=$(docker create \
+            --label "mooncake.xpu.run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --user "$(id -u):$(id -g)" --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --security-opt "seccomp=$run_directory/output/seccomp.json" \
+            --network none --ipc private --shm-size 2g \
+            --pids-limit 1024 --ulimit core=0 \
+            "${device_args[@]}" \
+            --mount "type=bind,src=$run_directory/bundle,dst=/bundle,readonly" \
+            --mount "type=bind,src=$source_directory,dst=/source,readonly" \
+            --mount "type=bind,src=$control_directory,dst=/control,readonly" \
+            --mount "type=bind,src=$run_directory/output,dst=/output" \
+            --env "ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK" \
+            --env ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
+            --env ZE_FLAT_DEVICE_HIERARCHY=FLAT \
+            --env MC_USE_TENT=1 --env MOONCAKE_STORE_BACKEND=cpp \
+            --env PROTOCOL=tcp --env MC_METADATA_SERVER=P2PHANDSHAKE \
+            --env LOCAL_HOSTNAME=127.0.0.1 --env MASTER_SERVER=127.0.0.1:50051 \
+            --env MOONCAKE_LOCAL_HOSTNAME=127.0.0.1 \
+            --env CCL_KVS_IFACE=lo --env GLOO_SOCKET_IFNAME=lo \
+            --env PYTHONOPTIMIZE=0 --env PYTHONDONTWRITEBYTECODE=1 \
+            --env TEST_TMPDIR=/output \
+            --env "XPU_SOURCE_SHA=$CHECKOUT_SHA" --env "XPU_IMAGE=$XPU_IMAGE" \
+            --env HOME=/tmp/home --workdir /tmp \
+            --entrypoint /bin/bash "$XPU_IMAGE" -c '
+              set -eo pipefail
+              mkdir -p "$HOME"
+              python3 /control/e2e/python/verify_xpu_wheel.py run /bundle /source /output
+            ')
+          timeout --signal=TERM --kill-after=30s 70m docker start --attach "$container_id"
+
+      - name: Recheck current-run container cleanup
+        if: always() && steps.run.outputs.directory != ''
+        shell: bash
+        env:
+          RUN_DIRECTORY: ${{ steps.run.outputs.directory }}
+        run: |
+          set -euo pipefail
+          run_directory=$(realpath "$RUN_DIRECTORY")
+          source "$run_directory/cleanup.sh"
+          mkdir -p "$run_directory/output"
+          remaining=$(docker ps -aq --no-trunc \
+            --filter "label=mooncake.xpu.run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT")
+          docker info >/dev/null
+          if [ -n "$remaining" ]; then
+            while read -r container_id; do
+              [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || fail "Invalid current-run container ID"
+              cleanup_container
+            done <<< "$remaining"
+          fi
+          echo '{"cleanup_recheck":"passed"}' > "$run_directory/output/cleanup-recheck.json"
+
+      - name: Preserve hardware diagnostics
+        if: always() && steps.run.outputs.directory != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpu-core-${{ inputs.checkout_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.run.outputs.directory }}/output/*.json
+            ${{ steps.run.outputs.directory }}/output/*.xml
+            ${{ steps.run.outputs.directory }}/output/*.log
+            ${{ steps.run.outputs.directory }}/output/*.list
+            ${{ steps.run.outputs.directory }}/output/*.ldd
+            ${{ steps.run.outputs.directory }}/artifact.json
+          if-no-files-found: error
+          retention-days: 14
