@@ -199,6 +199,8 @@ class RebootstrapTest : public ::testing::Test {
             return service_->GetLatestAppliedSequenceId() == 4 &&
                    !service_->GetSyncStatus().is_recovering;
         }));
+        EXPECT_EQ(4,
+                  HAMetricManager::instance().get_oplog_applied_sequence_id());
         EXPECT_TRUE(service_->IsReadyForPromotion());
         auto handoff = service_->PromoteAndDetachBatchOpLogStore();
         ASSERT_TRUE(handoff);
@@ -224,6 +226,30 @@ class RebootstrapTest : public ::testing::Test {
     std::unique_ptr<LocalFileSnapshotObjectStore> objects_;
     std::unique_ptr<HotStandbyService> service_;
 };
+
+TEST_F(RebootstrapTest, SnapshotBootstrapWithoutSuffixSetsAppliedMetric) {
+    // SetUp publishes a snapshot covering seq 1 with no OpLog suffix beyond it.
+    service_->Stop();
+    auto& metrics = HAMetricManager::instance();
+    metrics.set_oplog_applied_sequence_id(0);
+    metrics.update_snapshot_runtime(
+        [](auto& runtime) { runtime.applied_batch = 0; });
+    HotStandbyConfig config;
+    config.enable_snapshot_bootstrap = true;
+    config.enable_verification = false;
+    config.oplog_poll_interval_ms = 1;
+    service_ = std::make_unique<HotStandbyService>(config);
+    service_->SetCatchUpBatchKvBackendForTesting(backend_);
+    service_->SetBatchOpLogSnapshotProvider(
+        std::make_unique<BatchOpLogSnapshotProvider>("n09", *backend_,
+                                                     *objects_, "snapshots"));
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", "n09"));
+    const auto status = service_->GetSyncStatus();
+    EXPECT_EQ(1u, status.applied_seq_id);
+    EXPECT_EQ(0u, status.lag_entries);
+    EXPECT_EQ(1, metrics.get_oplog_applied_sequence_id());
+    EXPECT_EQ(1u, metrics.get_snapshot_runtime().applied_batch);
+}
 
 TEST_F(RebootstrapTest, CorruptLatestUsesFallbackAndReplaysSuffix) {
     auto& metrics = HAMetricManager::instance();
@@ -342,8 +368,10 @@ TEST_F(RebootstrapTest, RestartResumesPreservedPromotionCursor) {
                                  std::move(metadata), cursor,
                                  /*producer_view_version=*/7, {}));
     Prefix(50);
+    HAMetricManager::instance().set_oplog_applied_sequence_id(0);
     ASSERT_EQ(ErrorCode::OK, service_->Start("", "", "n09"));
     EXPECT_EQ(50u, service_->GetLatestAppliedSequenceId());
+    EXPECT_EQ(50, HAMetricManager::instance().get_oplog_applied_sequence_id());
     EXPECT_EQ(1u, service_->GetMetadataCount());
     EXPECT_EQ(50u, service_->GetSyncStatus().applied_seq_id);
 }
