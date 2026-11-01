@@ -855,10 +855,13 @@ TEST(RailMonitorSubnetTest, CrossSubnetPairsAreNotRails) {
     }
     // A rail NIC must never be offered the peer front-end NIC, and admit()
     // must refuse it so no slice is ever posted on it.
+    uint64_t probe_token = 0;
     EXPECT_FALSE(rail.isAvailable(/*local_nic=*/1, /*remote_nic=*/0));
-    EXPECT_FALSE(rail.admit(/*local_nic=*/1, /*remote_nic=*/0));
+    EXPECT_FALSE(rail.admit(/*local_nic=*/1, /*remote_nic=*/0, probe_token));
+    EXPECT_EQ(probe_token, 0u);
     EXPECT_FALSE(rail.isAvailable(/*local_nic=*/0, /*remote_nic=*/2));
-    EXPECT_FALSE(rail.admit(/*local_nic=*/0, /*remote_nic=*/2));
+    EXPECT_FALSE(rail.admit(/*local_nic=*/0, /*remote_nic=*/2, probe_token));
+    EXPECT_EQ(probe_token, 0u);
 
     // Allocation follows: only the local NIC that can reach the peer NIC in
     // the target memory entry may be charged.
