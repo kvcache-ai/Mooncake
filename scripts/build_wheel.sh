@@ -220,10 +220,6 @@ fi
 
 # Make the post-repair device library discoverable while auditwheel resolves
 # the host extension.  It is explicitly excluded below and injected later.
-# Libraries that already ship in the package (libetcd_wrapper.so, libasio.so,
-# ...) resolve from the staged copies through the RPATH=$ORIGIN set below, so
-# this no longer depends on LD_LIBRARY_PATH ordering or on the build directory
-# having been removed above (CI or FREE_BUILD_DIR=1).
 export LD_LIBRARY_PATH="${CUDA_EP_STAGING_DIR}:${LD_LIBRARY_PATH}"
 
 echo "Building wheel package..."
@@ -449,23 +445,15 @@ else
     exit 1
 fi
 
-# Pre-set RPATH=$ORIGIN on every staged ELF file so auditwheel resolves NEEDED
-# entries from the wheel-internal copies (libetcd_wrapper.so, libasio.so, ...):
-# they are no longer grafted into .libs as second, hashed copies, and the
-# result does not depend on LD_LIBRARY_PATH ordering or on the build tree still
-# being present. auditwheel skips dependencies that resolve inside the wheel
-# and preserves $ORIGIN when it appends its own .libs rpath entry. This runs
-# after the pip install above so the pinned patchelf (>= 0.14.5) is used.
-echo "Pre-setting RPATH=\$ORIGIN on staged ELF files so auditwheel resolves NEEDED from wheel-internal copies..."
-if ! command -v patchelf >/dev/null 2>&1; then
-    echo "Error: patchelf not found; the pip install above should have provided it"
-    exit 1
+# Keep the existing NPU repair layout. Other builds must retain their build-time
+# RPATH until auditwheel resolves external dependencies, including Conda's
+# libyaml-cpp.so.0.7 in the manylinux CUDA images. Replacing it with only $ORIGIN
+# makes those libraries undiscoverable. Strip debug info without changing RPATH.
+# Run after installing patchelf above so the supported version is used.
+if [ "$NPU_BUILD" = "1" ]; then
+    echo "Pre-setting RPATH=\$ORIGIN on NPU ELF files..."
+    find "$WHEEL_PACKAGE_DIR" -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0 | xargs -0 patchelf --force-rpath --set-rpath '$ORIGIN'
 fi
-if ! command -v file >/dev/null 2>&1; then
-    echo "Error: 'file' not found; it is needed to detect staged ELF files"
-    exit 1
-fi
-find "$WHEEL_PACKAGE_DIR" -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0 | xargs -0 patchelf --force-rpath --set-rpath '$ORIGIN'
 
 # Create directory for repaired wheels
 REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"
