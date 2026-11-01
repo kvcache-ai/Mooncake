@@ -550,18 +550,6 @@ bool TentMetrics::tryGetPrometheusMetrics(std::string& result) {
                 output += tmp;
             }
 
-            // Histograms: do NOT use ylt's
-            // basic_dynamic_histogram::serialize(). It silently drops the
-            // entire metric (including the # HELP / # TYPE header it already
-            // wrote) whenever every label combo has sum_==0 — via `if (value ==
-            // 0) continue; ... if (value_str.empty()) str.clear();`. That
-            // condition is reachable in production: e.g. stage_queue_wait_us
-            // with sub-microsecond latencies that truncate to 0 under int64_t
-            // observation. The JSON endpoint's custom serializer walks
-            // get_bucket_counts() directly and is unaffected, which is why
-            // /metrics/json reported count=4846 while /metrics omitted the
-            // metric entirely. Using the same bucket-walk here closes that
-            // drift.
             for (const auto& hist : histograms_) {
                 serializeHistogramPrometheus(*hist, output);
             }
@@ -629,11 +617,7 @@ template <uint8_t N>
 void TentMetrics::serializeHistogramPrometheus(
     metrics::CachedDynamicHistogram<N>& hist, std::string& out) const {
     // Walk the same bucket-counter / sum-counter data the JSON path uses, so
-    // the two endpoints cannot drift. Unlike ylt's serialize() this never
-    // silently drops a histogram that has observed >=1 sample: ylt clears its
-    // output string (taking the # HELP / # TYPE header with it) whenever
-    // every label combo has sum_==0, which is reachable in production when
-    // sub-microsecond latencies truncate to 0 under int64_t observation.
+    // the two endpoints cannot drift.
     //
     // Templated over label arity N: the per-transport histograms are N=1 and
     // the transport-attempt latency histogram is N=2. For N=1 the emitted

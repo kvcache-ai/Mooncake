@@ -428,12 +428,7 @@ class TentMetrics {
 
     // Serialize a single histogram in Prometheus text format. Walks the same
     // bucket-counter / sum-counter data the JSON path uses, so the two
-    // endpoints can never drift. Unlike ylt's serialize(), this never
-    // silently drops a histogram that has observed >=1 sample — even when
-    // every observation landed in the first bucket (which makes sum_==0
-    // and causes ylt's serialize() to clear() its output string, taking the
-    // # HELP / # TYPE header with it). Reachable in production when
-    // sub-microsecond latencies truncate to 0 under int64_t observation.
+    // endpoints can never drift.
     //
     // Templated over label arity N so both the per-transport (N=1) histograms
     // and the transport-attempt (N=2) histogram share one implementation.

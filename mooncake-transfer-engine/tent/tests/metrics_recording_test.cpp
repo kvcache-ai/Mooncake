@@ -1593,17 +1593,10 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
         json["tent_metrics_last_success_timestamp_seconds"].contains("json"));
 }
 
-// Regression guard for the silent-drop bug: ylt's
-// basic_dynamic_histogram::serialize() clears its output string (taking the
-// # HELP / # TYPE header with it) when every observed value truncates to 0
-// under int64_t. Sub-microsecond queue_wait latencies trigger this in
-// production — JSON reports a non-zero count but /metrics omits the metric
-// entirely. The custom serializer in getPrometheusMetrics() walks bucket
-// counts directly so the metric always appears when count > 0.
+// Sub-microsecond latencies truncate to 0 under int64_t. The histogram
+// must still appear in Prometheus output with the observed count.
 TEST_F(MetricsHttpTest, PrometheusExposesHistogramWhenAllSamplesAreZero) {
-    // Reproduce the bug condition: observe 3 sub-microsecond latencies.
-    // recordStageLatency casts to int64_t (val=0), so sum_ stays 0 — exactly
-    // the case ylt's serialize() drops.
+    // recordStageLatency casts to int64_t, so these three samples sum to 0.
     auto& m = TentMetrics::instance();
     m.recordStageLatency(TentMetrics::Stage::QueueWait, UNSPEC, 0.3);
     m.recordStageLatency(TentMetrics::Stage::QueueWait, UNSPEC, 0.5);
@@ -1611,12 +1604,9 @@ TEST_F(MetricsHttpTest, PrometheusExposesHistogramWhenAllSamplesAreZero) {
 
     auto resp = retryGet("/metrics");
     EXPECT_EQ(resp.http_status, 200);
-    // The bug: this substring was MISSING from Prometheus output even though
-    // JSON reported count=3. Must appear now.
     EXPECT_NE(resp.body.find("tent_stage_queue_wait_us_bucket"),
               std::string::npos)
-        << "stage_queue_wait_us silently dropped by ylt serialize() when all "
-           "samples truncate to 0 under int64_t";
+        << "stage_queue_wait_us missing when all samples truncate to 0";
     // The +Inf bucket must carry the cumulative count of 3.
     EXPECT_NE(
         resp.body.find("tent_stage_queue_wait_us_bucket{transport=\"unspec\","
@@ -1630,9 +1620,8 @@ TEST_F(MetricsHttpTest, PrometheusExposesHistogramWhenAllSamplesAreZero) {
         << "_count must match total observations";
 }
 
-// Same bug condition as above but with transport=TCP — this is what tebench
-// produces and what surfaced the original silent-drop bug in production.
-// Guard against a regression that only affects a subset of transports.
+// Same zero-valued samples as above, labeled transport=tcp. tebench is what
+// produces this series. Guard a regression that only affects one transport.
 TEST_F(MetricsHttpTest, PrometheusExposesZeroValuedHistogramForTcpTransport) {
     auto& m = TentMetrics::instance();
 
@@ -1659,20 +1648,16 @@ TEST_F(MetricsHttpTest, PrometheusExposesZeroValuedHistogramForTcpTransport) {
     EXPECT_EQ(resp.http_status, 200);
     EXPECT_NE(resp.body.find("tent_stage_queue_wait_us_bucket"),
               std::string::npos)
-        << "stage_queue_wait_us (transport=tcp) silently dropped when all "
-           "samples truncate to 0 under int64_t";
-    // All three samples truncate to 0 (sub-microsecond), so the +Inf bucket
-    // (cumulative == total count) must still advance by exactly 3 even though
-    // sum_ stays 0 — the silent-drop regression this test guards against.
+        << "stage_queue_wait_us (transport=tcp) missing when all samples "
+           "truncate to 0";
+    // All three samples truncate to 0, so the +Inf bucket (cumulative ==
+    // total count) must still advance by exactly 3.
     EXPECT_EQ(tcp_inf_count() - inf_before, 3)
         << "+Inf bucket for transport=tcp must be cumulative (== total count)";
 }
 
-// Regression guard for Prometheus/JSON drift: both endpoints must agree on
-// the histogram count for a given metric. Previously they used two completely
-// different serialization paths (ylt serialize() vs. custom bucket walk),
-// so any ylt behavior change would silently desync them. Both now share the
-// bucket-walk code path.
+// Both endpoints share the bucket-walk path and must agree on the histogram
+// count for a given metric.
 TEST_F(MetricsHttpTest, JsonAndPrometheusAgreeOnHistogramCount) {
     // Snapshot before so the assertion is delta-based. TentMetrics is a
     // process-wide singleton whose counter/histogram values are not reset
