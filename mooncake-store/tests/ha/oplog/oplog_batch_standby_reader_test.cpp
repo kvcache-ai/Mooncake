@@ -392,6 +392,7 @@ TEST(OpLogBatchStandbyReaderTest, FullPageContinuesOnNextPoll) {
     ASSERT_EQ(ErrorCode::OK, first.error);
     EXPECT_EQ(2u, first.applied_entries);
     EXPECT_EQ(2u, first.applied_batches);
+    EXPECT_TRUE(first.has_more_pages);
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
     EXPECT_FALSE(reader.GetLastAppliedDurablePrefix().has_value());
 
@@ -399,6 +400,7 @@ TEST(OpLogBatchStandbyReaderTest, FullPageContinuesOnNextPoll) {
     ASSERT_EQ(ErrorCode::OK, second.error);
     EXPECT_EQ(1u, second.applied_entries);
     EXPECT_EQ(1u, second.applied_batches);
+    EXPECT_FALSE(second.has_more_pages);
     EXPECT_EQ(4u, applier.GetExpectedSequenceId());
     auto applied_prefix = reader.GetLastAppliedDurablePrefix();
     ASSERT_TRUE(applied_prefix.has_value());

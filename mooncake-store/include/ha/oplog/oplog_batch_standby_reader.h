@@ -28,6 +28,7 @@ struct OpLogBatchStandbyPollResult {
     size_t applied_entries{0};
     // Complete batches processed in this poll, including before a later error.
     size_t applied_batches{0};
+    bool has_more_pages{false};
     DurablePrefix durable_prefix{};
     uint64_t compaction_floor{0};
 };

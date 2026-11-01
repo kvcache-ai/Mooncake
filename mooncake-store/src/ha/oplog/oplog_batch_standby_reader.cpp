@@ -86,6 +86,11 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
             SetPollError(result, err, IsRetryableBackendError(err));
         }
     }
+    result.has_more_pages = max_batches != 0 &&
+                            result.applied_batches >= max_batches &&
+                            result.durable_prefix_present &&
+                            last_applied_batch_id_ <
+                                result.durable_prefix.batch_id;
     return result;
 }
 
@@ -219,14 +224,15 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
             break;
         }
     }
-    const bool has_more_pages = max_batches != 0 &&
-                                batches.size() >= max_batches &&
-                                last_applied_batch_id_ < prefix.batch_id;
-    if (!has_more_pages &&
+    result.has_more_pages = max_batches != 0 &&
+                            batches.size() >= max_batches &&
+                            last_applied_batch_id_ < prefix.batch_id;
+    if (!result.has_more_pages &&
         IsSequenceOlderOrEqual(applier_.GetExpectedSequenceId(),
                                prefix.last_seq)) {
         SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
-    } else if (!has_more_pages && last_applied_batch_id_ == prefix.batch_id &&
+    } else if (!result.has_more_pages &&
+               last_applied_batch_id_ == prefix.batch_id &&
                last_scanned_batch_last_seq_ == prefix.last_seq) {
         const uint64_t expected = applier_.GetExpectedSequenceId();
         if (expected > 0 && expected - 1 == prefix.last_seq) {

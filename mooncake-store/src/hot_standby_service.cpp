@@ -1214,11 +1214,13 @@ void HotStandbyService::ReplicationLoop() {
             continue;
         }
 
+        bool standby_has_more_pages = false;
         if (batch_standby_reader_) {
             const uint64_t expected_before =
                 oplog_applier_->GetExpectedSequenceId();
             auto result = batch_standby_reader_->PollOnce(
                 config_.oplog_standby_max_batches_per_poll);
+            standby_has_more_pages = result.has_more_pages;
             if (result.durable_prefix_present ||
                 result.disposition ==
                     OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED) {
@@ -1325,8 +1327,10 @@ void HotStandbyService::ReplicationLoop() {
             NotifySyncStatus();
         }
 
-        wait_for_next_poll(
-            std::chrono::milliseconds(config_.oplog_poll_interval_ms));
+        if (!standby_has_more_pages) {
+            wait_for_next_poll(
+                std::chrono::milliseconds(config_.oplog_poll_interval_ms));
+        }
     }
 
     replication_loop_running_.store(false, std::memory_order_release);
