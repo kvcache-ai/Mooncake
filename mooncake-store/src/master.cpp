@@ -404,7 +404,7 @@ DEFINE_int32(oplog_poll_interval_ms, 1000,
 DEFINE_uint32(oplog_batch_max_entries, 1024,
               "Maximum number of committed/reserved entries in the open "
               "batch-record OpLog waiting batch.");
-DEFINE_uint32(oplog_standby_max_batches_per_poll, 1024,
+DEFINE_uint32(oplog_standby_max_batches_per_poll, 256,
               "Maximum number of durable batch records fetched per standby "
               "poll.");
 DEFINE_uint32(batch_oplog_retry_timeout_sec, 180,

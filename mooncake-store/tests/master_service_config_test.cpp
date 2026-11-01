@@ -156,10 +156,10 @@ TEST(MasterServiceConfigTest, OplogBatchMaxEntriesDefaultsTo1024) {
 
 TEST(MasterServiceConfigTest, StandbyPollPageSizeDefaultsAndPropagates) {
     MasterConfig master_config{};
-    EXPECT_EQ(1024u, master_config.oplog_standby_max_batches_per_poll);
+    EXPECT_EQ(256u, master_config.oplog_standby_max_batches_per_poll);
 
     MasterServiceSupervisorConfig defaults(master_config);
-    EXPECT_EQ(1024u, defaults.oplog_standby_max_batches_per_poll);
+    EXPECT_EQ(256u, defaults.oplog_standby_max_batches_per_poll);
 
     master_config.oplog_standby_max_batches_per_poll = 256;
     MasterServiceSupervisorConfig configured(master_config);
