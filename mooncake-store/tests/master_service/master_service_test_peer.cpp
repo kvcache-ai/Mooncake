@@ -126,6 +126,11 @@ MasterServiceTestPeer::GetNoFHeartbeatFailureCountForTesting(
     return it->second.consecutive_failures;
 }
 
+std::set<std::string> MasterServiceTestPeer::GetNoFExcludedSegmentsForTesting(
+    const UUID& client_id) {
+    return service_.GetNoFExcludedSegments(client_id);
+}
+
 size_t MasterServiceTestPeer::RunPromotionCandidateRetryForTesting() {
     return service_.RunPromotionCandidateRetry();
 }
