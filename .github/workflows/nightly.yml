@@ -136,6 +136,13 @@ jobs:
     with:
       version_override: ${{ needs.version-stamp.outputs.nightly_version }}
 
+  # Stage 1 is host-only and artifact-only: no GPU reservation or publication.
+  build-wheel-xpu:
+    needs: version-stamp
+    uses: ./.github/workflows/ci_xpu.yml
+    with:
+      version_override: ${{ needs.version-stamp.outputs.nightly_version }}
+
   rocm-integration-test:
     needs: [version-stamp, build-wheel-rocm]
     if: ${{ needs.version-stamp.outputs.run_rocm_integration == 'true' }}
@@ -686,6 +693,7 @@ jobs:
       - tone-sglang-integration
       - tone-sglang-integration-tent
       - build-wheel-rocm
+      - build-wheel-xpu
       - rocm-integration-test
       - build-musa
       - build-docker
