@@ -58,6 +58,15 @@ class RdmaTransportTestPeer {
 
 class RdmaContextTestPeer {
    public:
+    static void setTransferWorkerCount(RdmaContext &context, int count) {
+        context.transfer_worker_count_ = count;
+    }
+
+    static void bindWorkerPool(RdmaContext &context,
+                               std::shared_ptr<WorkerPool> pool) {
+        context.worker_pool_ = std::move(pool);
+    }
+
     static void bindProtectionDomain(RdmaContext &context, ibv_pd *pd) {
         context.pd_ = pd;
     }

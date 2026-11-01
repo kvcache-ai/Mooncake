@@ -99,7 +99,7 @@ urma_device_t **urma_get_device_list(int *num_devices) {
         if (device_list.empty()) {
             urma_device_t *device = new urma_device_t;
             strcpy(device->name, "mock_urma_device");
-            strcpy(device->path, "/sys/class/infiniband/mock_device");
+            strcpy(device->path, "/sys/class/ubcore/mock_device");
             device->type = URMA_TRANSPORT_UB;
             device->ops = nullptr;
             device->sysfs_dev = nullptr;
@@ -137,7 +137,7 @@ urma_device_t *urma_get_device_by_name(const char *name) {
         if (device_list.empty()) {
             auto *device = new urma_device_t;
             strcpy(device->name, "mock_urma_device");
-            strcpy(device->path, "/sys/class/infiniband/mock_device");
+            strcpy(device->path, "/sys/class/ubcore/mock_device");
             device->type = URMA_TRANSPORT_UB;
             device->ops = nullptr;
             device->sysfs_dev = nullptr;

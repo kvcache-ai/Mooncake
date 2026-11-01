@@ -876,6 +876,24 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
         return -1;
     }
 
+    supports_rdma_atomic_ = device_attr.atomic_cap != IBV_ATOMIC_NONE;
+    max_qp_rd_atom_ = device_attr.max_qp_rd_atom;
+    max_qp_init_rd_atom_ = device_attr.max_qp_init_rd_atom;
+    if (!supports_rdma_atomic_) {
+        LOG(INFO) << "RNIC " << device_name
+                  << " reports no RDMA atomic; data QPs will not request "
+                     "IBV_ACCESS_REMOTE_ATOMIC";
+    }
+    if (max_qp_rd_atom_ < kIdealRdAtomicDepth ||
+        max_qp_init_rd_atom_ < kIdealRdAtomicDepth) {
+        LOG(WARNING) << "Device " << device_name
+                     << " advertises a reduced RD-atomic depth: max_qp_rd_atom="
+                     << max_qp_rd_atom_
+                     << ", max_qp_init_rd_atom=" << max_qp_init_rd_atom_
+                     << "; configured QP depths above this limit will be "
+                        "clamped";
+    }
+
     MIN(params_->device.max_cqe, device_attr.max_cqe);
     if (params_->device.num_cq_list + 1 > device_attr.max_cq) {
         LOG(ERROR) << "Device " << device_name << " supports at most "

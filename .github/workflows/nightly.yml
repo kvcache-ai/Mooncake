@@ -30,7 +30,9 @@ concurrency:
 # 4. publish-testpypi uploads standard and ROCm nightly artifacts to TestPyPI.
 # 5. MI350X hardware tests require NIGHTLY_ROCM_INTEGRATION=true or a manual opt-in.
 #    ROCm wheel builds and their smoke tests always run.
-# 6. nightly-gate aggregates required results; notify-failure files an issue.
+# 6. T-One SGLang integration runs classic and TENT in parallel from the nightly
+#    cuda13 x86 wheel (use-tent). Runtime stays classic unless MC_USE_TENT=1.
+# 7. nightly-gate aggregates required results; notify-failure files an issue.
 # ──────────────────────────────────────────────────────────────────────────────
 
 env:
@@ -104,6 +106,9 @@ jobs:
       architecture: ${{ matrix.architecture }}
       artifact-prefix: ${{ matrix.artifact-prefix }}
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
+      # Same dual-engine wheel as PR CI cu13: T-One classic stays the default
+      # facade; the TENT job below activates via MC_USE_TENT=1.
+      use-tent: ${{ matrix.variant == 'cuda13' && matrix.architecture == 'x86_64' }}
 
   tone-sglang-integration:
     needs: build-wheels
@@ -112,6 +117,17 @@ jobs:
       pr_sha: ${{ github.sha }}
       source_run_id: ${{ github.run_id }}
       artifact_name: nightly-cuda13-x86-py312
+    secrets: inherit
+
+  # Same wheel and cases as tone-sglang-integration, with MC_USE_TENT=1.
+  tone-sglang-integration-tent:
+    needs: build-wheels
+    uses: ./.github/workflows/integration-test.yml
+    with:
+      pr_sha: ${{ github.sha }}
+      source_run_id: ${{ github.run_id }}
+      artifact_name: nightly-cuda13-x86-py312
+      use-tent: true
     secrets: inherit
 
   build-wheel-rocm:
@@ -668,6 +684,7 @@ jobs:
       - version-stamp
       - build-wheels
       - tone-sglang-integration
+      - tone-sglang-integration-tent
       - build-wheel-rocm
       - rocm-integration-test
       - build-musa
