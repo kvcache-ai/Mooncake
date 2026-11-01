@@ -19,6 +19,7 @@
 // are bounded: a locking regression must fail, not hang the runner.
 #include <chrono>
 #include <future>
+#include <mutex>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -38,6 +39,68 @@ Desc Reply(const Desc& request) {
     result.efa_addr = result.local_nic_path;
     return result;
 }
+
+// A handshake that cannot get the endpoint lock gives up after 5 s; this
+// leaves room for a loaded machine.
+constexpr auto kLockWait = std::chrono::seconds(15);
+
+void Connect(EfaContext& context, EfaEndPoint& endpoint) {
+    endpoint.setPeerNicPath("b:2@efa");
+    context.transport.rpc = [](const Desc& request, Desc& response) {
+        response = Reply(request);
+        return 0;
+    };
+    ASSERT_EQ(0, endpoint.setupConnectionsByActive());
+}
+
+// The peer "b:2@efa" starting a handshake with us, "a:1@efa".
+Desc FromPeer() {
+    Desc desc;
+    desc.local_nic_path = "b:2@efa";
+    desc.peer_nic_path = "a:1@efa";
+    desc.efa_addr = desc.local_nic_path;
+    return desc;
+}
+
+// Parks one submitPostSend() call inside submitSlicesOnPeer(), holding the
+// endpoint lock as a reader, the way a submitter does while it waits on a peer
+// that does not drain, until release().
+class ParkedSubmitter {
+   public:
+    ParkedSubmitter(EfaContext& context, EfaEndPoint& endpoint)
+        : context_(context) {
+        auto released = release_.get_future().share();
+        context_.on_submit = [this, released] {
+            entered_.set_value();
+            released.wait_for(std::chrono::seconds(30));
+        };
+        submit_ = std::async(std::launch::async, [&endpoint] {
+            std::vector<Transport::Slice*> slices, failed;
+            return endpoint.submitPostSend(slices, failed);
+        });
+        parked_ = entered_.get_future().wait_for(std::chrono::seconds(30)) ==
+                  std::future_status::ready;
+    }
+
+    ~ParkedSubmitter() {
+        release();
+        submit_.wait();
+        context_.on_submit = nullptr;
+    }
+
+    bool parked() const { return parked_; }
+
+    void release() {
+        std::call_once(released_once_, [this] { release_.set_value(); });
+    }
+
+   private:
+    EfaContext& context_;
+    std::promise<void> entered_, release_;
+    std::once_flag released_once_;
+    std::future<int> submit_;
+    bool parked_ = false;
+};
 
 TEST(EfaEndPointHandshakeTest, ReciprocalActiveSetupDoesNotDeadlock) {
     constexpr auto kWait = std::chrono::seconds(30);
@@ -188,6 +251,87 @@ TEST(EfaEndPointHandshakeTest,
     EXPECT_EQ(ERR_REJECT_HANDSHAKE, endpoint.setupConnectionsByActive());
     EXPECT_FALSE(endpoint.connected());
     EXPECT_EQ(2, context.inserts);
+}
+
+// The passive handler runs on the handshake daemon. RWSpinlock::lock() never
+// queues behind readers, so while submitters hold the endpoint lock it used to
+// wait for as long as they kept it. It now gives up and rejects the handshake,
+// which the peer retries.
+TEST(EfaEndPointHandshakeTest, PassiveSetupRejectsWhileSubmitterHoldsLock) {
+    EfaContext context("a:1@efa");
+    EfaEndPoint endpoint(context);
+    Connect(context, endpoint);
+    ParkedSubmitter submitter(context, endpoint);
+    ASSERT_TRUE(submitter.parked());
+
+    Desc response;
+    auto passive = std::async(std::launch::async, [&] {
+        return endpoint.setupConnectionsByPassive(FromPeer(), response);
+    });
+    const bool returned =
+        passive.wait_for(kLockWait) == std::future_status::ready;
+    submitter.release();  // lets a passive call that kept waiting finish
+    ASSERT_TRUE(returned) << "passive handshake kept waiting for the lock";
+    EXPECT_EQ(ERR_REJECT_HANDSHAKE, passive.get());
+    EXPECT_FALSE(response.reply_msg.empty());
+    EXPECT_TRUE(endpoint.connected());
+}
+
+// A caller that saw the endpoint unconnected, e.g. one queued on
+// active_setup_mutex_ behind the setup that connected it, must not wait for
+// the submitters that have started posting since.
+TEST(EfaEndPointHandshakeTest, ActiveSetupDoesNotWaitWhileSubmitterHoldsLock) {
+    EfaContext context("a:1@efa");
+    EfaEndPoint endpoint(context);
+    Connect(context, endpoint);
+    ParkedSubmitter submitter(context, endpoint);
+    ASSERT_TRUE(submitter.parked());
+
+    auto active = std::async(std::launch::async, [&] {
+        return endpoint.setupConnectionsByActive();
+    });
+    const bool returned =
+        active.wait_for(kLockWait) == std::future_status::ready;
+    submitter.release();
+    ASSERT_TRUE(returned) << "active setup kept waiting for the lock";
+    EXPECT_EQ(0, active.get());
+    EXPECT_EQ(1, context.inserts);
+}
+
+// Same, after the RPC: the peer's own handshake connected the endpoint while
+// the RPC was in flight, and a submitter started posting on it.
+TEST(EfaEndPointHandshakeTest,
+     ActiveSetupDoesNotWaitAfterPassiveConnectsDuringRpc) {
+    constexpr auto kWait = std::chrono::seconds(30);
+    EfaContext context("a:1@efa");
+    EfaEndPoint endpoint(context);
+    endpoint.setPeerNicPath("b:2@efa");
+    std::promise<void> rpc_started, rpc_resume;
+    auto resumed = rpc_resume.get_future().share();
+    context.transport.rpc = [&, resumed](const Desc& request, Desc& response) {
+        Desc passive_reply;
+        EXPECT_EQ(
+            0, endpoint.setupConnectionsByPassive(FromPeer(), passive_reply));
+        rpc_started.set_value();
+        resumed.wait_for(kWait);
+        response = Reply(request);
+        return 0;
+    };
+    auto active = std::async(std::launch::async, [&] {
+        return endpoint.setupConnectionsByActive();
+    });
+    ASSERT_EQ(std::future_status::ready,
+              rpc_started.get_future().wait_for(kWait));
+    ParkedSubmitter submitter(context, endpoint);
+    rpc_resume.set_value();
+    ASSERT_TRUE(submitter.parked());
+
+    const bool returned =
+        active.wait_for(kLockWait) == std::future_status::ready;
+    submitter.release();
+    ASSERT_TRUE(returned) << "active setup kept waiting for the lock";
+    EXPECT_EQ(0, active.get());
+    EXPECT_TRUE(endpoint.connected());
 }
 
 }  // namespace
