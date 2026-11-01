@@ -15,6 +15,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     config/replica_selection_config.cpp
     config/store_cluster_identity_config.cpp
     storage/distributed/distributed_storage_backend.cpp
+    storage/distributed/object_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
     common/file_util.cpp
     nof/nof_runtime.cpp)

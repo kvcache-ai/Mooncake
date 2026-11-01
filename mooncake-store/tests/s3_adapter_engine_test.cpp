@@ -39,6 +39,7 @@
 
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/s3_adapter.h"
+#include "storage/distributed/object_storage_backend.h"
 #include "storage_backend.h"
 #include "oss_fault_test_helpers.h"
 
@@ -391,7 +392,9 @@ size_t CountRequestsFor(const std::vector<std::string>& received,
 void CheckMixedGetBatch(bool timeout) {
     using Server = test::OssFaultHttpServer;
     Server server(
-        {{"waiting", timeout ? Server::Stall() : Server::Gate(206, "first")},
+        {{"waiting", timeout ? Server::Stall()
+                             : Server::Gate(206, "first",
+                                            "Content-Range: bytes 0-4/5\r\n")},
          {"missing", Server::Reply(404, "")},
          {"reset", Server::Reset()},
          {"large-error", Server::Reply(404, std::string(512, 'x'))},
@@ -401,7 +404,8 @@ void CheckMixedGetBatch(bool timeout) {
          {"short", Server::Reply(206, "val")},
          {"oversized", Server::Reply(206, "too-long")},
          {"unavailable", Server::Reply(503, "busy!")},
-         {"tail", Server::Reply(206, "later")}},
+         {"tail",
+          Server::Reply(206, "later", "Content-Range: bytes 0-4/5\r\n")}},
         true);
     ScopedEnvironment environment;
     ConfigureFaultEndpoint(environment, server.port());
@@ -631,7 +635,9 @@ TEST(S3ObjectStorageAdapterEngineTest, BatchConnectionLimitAppliesToGetAndPut) {
             for (size_t i = 0; i < count; ++i) {
                 const auto key = std::to_string(i);
                 routes.emplace(
-                    key, Server::Gate(upload ? 200 : 206, upload ? "" : "x"));
+                    key, Server::Gate(
+                             upload ? 200 : 206, upload ? "" : "x",
+                             upload ? "" : "Content-Range: bytes 0-0/1\r\n"));
                 gets.push_back({key, &buffers[i], 1});
                 puts.push_back({key, &iov, 1});
             }
@@ -843,12 +849,17 @@ TEST(S3ObjectStorageAdapterEngineTest,
          Server::Reply(206, "val", "Content-Range: bytes 0-2/3\r\n")},
         {"unsatisfiable-range", Server::Reply(416, "error")},
         {"full-200", Server::Reply(200, "value")},
-        {"full-206", Server::Reply(206, "value")},
+        {"missing-range", Server::Reply(206, "value")},
+        {"wrong-range",
+         Server::Reply(206, "value", "Content-Range: bytes 1-5/6\r\n")},
+        {"full-206",
+         Server::Reply(206, "value", "Content-Range: bytes 0-4/5\r\n")},
     });
-    const std::array<const char*, 5> keys{"short-200", "clipped-range",
-                                          "unsatisfiable-range", "full-200",
-                                          "full-206"};
-    constexpr size_t invalid_count = 4;
+    const std::array<const char*, 7> keys{
+        "short-200", "clipped-range", "unsatisfiable-range",
+        "full-200",  "missing-range", "wrong-range",
+        "full-206"};
+    constexpr size_t invalid_count = 6;
     ScopedEnvironment environment;
     ConfigureFaultEndpoint(environment, server.port());
     S3ObjectStorageAdapter adapter("/fault-test/");
@@ -1159,7 +1170,9 @@ TEST(S3ObjectStorageAdapterEngineTest, BatchQueueDoesNotConsumeRequestTimeout) {
     }
     using Server = test::OssFaultHttpServer;
     Server server(
-        {{"stall", Server::Stall()}, {"healthy", Server::Reply(206, "value")}});
+        {{"stall", Server::Stall()},
+         {"healthy",
+          Server::Reply(206, "value", "Content-Range: bytes 0-4/5\r\n")}});
     ScopedEnvironment environment;
     ConfigureFaultEndpoint(environment, server.port());
     environment.Set("MOONCAKE_S3_MAX_CONNECTIONS", "1");
@@ -1493,14 +1506,16 @@ TEST(S3ObjectStorageAdapterEngineTest,
 TEST(S3ObjectStorageAdapterEngineTest,
      GetRangeAndBatchDistinguishNotFoundFromTransferFailures) {
     using Server = test::OssFaultHttpServer;
-    Server server({{"missing", Server::Reply(404, std::string(512, 'x'))},
-                   {"truncated-error",
-                    Server::Raw("HTTP/1.1 404 Test\r\nContent-Length: 5\r\n"
-                                "Connection: close\r\n\r\nxx")},
-                   {"large-error", Server::Reply(503, std::string(512, 'x'))},
-                   {"oversized", Server::Reply(206, "too-long")},
-                   {"present", Server::Reply(206, "value")}},
-                  true);
+    Server server(
+        {{"missing", Server::Reply(404, std::string(512, 'x'))},
+         {"truncated-error",
+          Server::Raw("HTTP/1.1 404 Test\r\nContent-Length: 5\r\n"
+                      "Connection: close\r\n\r\nxx")},
+         {"large-error", Server::Reply(503, std::string(512, 'x'))},
+         {"oversized", Server::Reply(206, "too-long")},
+         {"present",
+          Server::Reply(206, "value", "Content-Range: bytes 0-4/5\r\n")}},
+        true);
     ScopedEnvironment environment;
     ConfigureFaultEndpoint(environment, server.port());
     S3ObjectStorageAdapter adapter("/get-error-mapping/");
@@ -1710,6 +1725,145 @@ TEST(S3ObjectStorageAdapterEngineTest,
     EXPECT_NE(server.requests()[0].find("/bucket" + root + "/"),
               std::string::npos)
         << server.requests()[0];
+}
+
+TEST(S3ObjectStorageAdapterEngineTest,
+     BackendUploadsMakeOneAttemptIncludingEmptyAndLostResponses) {
+    using Server = test::OssFaultHttpServer;
+    for (int mode = 0; mode < 4; ++mode) {
+        for (int failure = 0; failure < 3; ++failure) {
+            SCOPED_TRACE(::testing::Message()
+                         << "mode=" << mode << " failure=" << failure);
+            Server server({{"key", failure == 0   ? Server::Reply(200, "")
+                                   : failure == 1 ? Server::Reply(503, "busy")
+                                                  : Server::Reset()}});
+            ScopedEnvironment environment;
+            ConfigureFaultEndpoint(environment, server.port());
+            auto adapter =
+                std::make_shared<S3ObjectStorageAdapter>("/backend-io/");
+            ASSERT_TRUE(adapter->Init());
+            ObjectStorageBackend backend({16, 2}, adapter);
+            std::string host = "abc", device = "de", last = "fgh";
+            const bool empty = mode >= 2;
+            const std::vector<Slice> slices =
+                empty ? std::vector<Slice>{{nullptr, 0}}
+                      : std::vector<Slice>{{host.data(), 3},
+                                           {nullptr, 0},
+                                           {device.data(), 2},
+                                           {last.data(), 3}};
+            bool started = false;
+            const auto copy = [](void* dst, const void* src, size_t size) {
+                std::memcpy(dst, src, size);
+                return true;
+            };
+            ErrorCode result;
+            if (mode % 2 == 0) {
+                // Legacy backend Write still stages the full payload.
+                ObjectStorageBackend full_staging({16, 8}, adapter);
+                result = full_staging.Write("key", empty ? 0 : 8, slices, copy,
+                                            &started);
+            } else {
+                result = backend.WriteV(
+                    "key", empty ? 0 : 8, slices,
+                    [&](const Slice& slice) {
+                        return slice.ptr != device.data();
+                    },
+                    copy, &started);
+            }
+            EXPECT_TRUE(started);
+            EXPECT_EQ(result, failure == 0 ? ErrorCode::OK
+                              : failure == 1
+                                  ? ErrorCode::FILE_WRITE_FAIL
+                                  : ErrorCode::DFS_SERVICE_UNAVAILABLE);
+            server.Stop();
+            EXPECT_TRUE(server.error().empty()) << server.error();
+            const auto requests = server.requests();
+            ASSERT_EQ(requests.size(), 1U);
+            EXPECT_TRUE(requests[0].starts_with("PUT "));
+            EXPECT_TRUE(
+                requests[0].ends_with(empty ? "\r\n\r\n" : "\r\n\r\nabcdefgh"));
+        }
+    }
+}
+
+TEST(S3ObjectStorageAdapterEngineTest,
+     SingleAttemptDoesNotChangeLegacyRetries) {
+    using Server = test::OssFaultHttpServer;
+    Server server({{"once", Server::Gate(503, "busy")},
+                   {"put", Server::Reply(503, "busy")},
+                   {"putv", Server::Reply(503, "busy")}},
+                  true);
+    ScopedEnvironment environment;
+    ConfigureFaultEndpoint(environment, server.port());
+    S3ObjectStorageAdapter adapter("/backend-io/");
+    ASSERT_TRUE(adapter.Init());
+    std::string data = "payload";
+    const iovec iov{data.data(), data.size()};
+    auto once_result = std::async(std::launch::async, [&] {
+        return adapter.PutOnce("once", {data.data(), data.size()});
+    });
+    EXPECT_TRUE(server.WaitForRequest("once"));
+    // Legacy uploads still retry while the single-attempt call is in flight.
+    EXPECT_FALSE(adapter.Put("put", {data.data(), data.size()}));
+    EXPECT_FALSE(adapter.PutV("putv", &iov, 1));
+    server.ReleaseResponses();
+    EXPECT_FALSE(once_result.get());
+    server.Stop();
+    EXPECT_TRUE(server.error().empty()) << server.error();
+    size_t once = 0, put = 0, putv = 0;
+    for (const auto& request : server.requests()) {
+        EXPECT_TRUE(request.ends_with("\r\n\r\npayload"));
+        if (request.find("/once HTTP/") != std::string::npos) ++once;
+        if (request.find("/put HTTP/") != std::string::npos) ++put;
+        if (request.find("/putv HTTP/") != std::string::npos) ++putv;
+    }
+    EXPECT_EQ(once, 1U);
+    EXPECT_EQ(put, kAttempts);
+    EXPECT_EQ(putv, kAttempts);
+}
+
+TEST(S3ObjectStorageAdapterEngineTest,
+     PreservesLarge416WithoutMaskingTruncatedResponses) {
+    using Server = test::OssFaultHttpServer;
+    Server server(
+        {{"large-range", Server::Reply(416, std::string(512, 'x'))},
+         {"truncated-range",
+          Server::Raw("HTTP/1.1 416 Test\r\nContent-Length: 512\r\n"
+                      "Connection: close\r\n\r\nxx")},
+         {"present",
+          Server::Reply(206, "12345678", "Content-Range: bytes 0-7/8\r\n")}});
+    ScopedEnvironment environment;
+    ConfigureFaultEndpoint(environment, server.port());
+    S3ObjectStorageAdapter adapter("/range-errors/");
+    ASSERT_TRUE(adapter.Init());
+    std::array<char, 10> output;
+    for (const char* key : {"large-range", "truncated-range"}) {
+        SCOPED_TRACE(key);
+        output.fill('!');
+        const auto expected = std::string(key) == "large-range"
+                                  ? ErrorCode::FILE_READ_FAIL
+                                  : ErrorCode::DFS_SERVICE_UNAVAILABLE;
+        const auto single = adapter.GetRange(key, output.data() + 1, 8, 0);
+        ASSERT_FALSE(single);
+        EXPECT_EQ(single.error(), expected);
+        const auto batch = adapter.GetBatch({{key, output.data() + 1, 8}});
+        ASSERT_EQ(batch.size(), 1U);
+        ASSERT_FALSE(batch[0]);
+        EXPECT_EQ(batch[0].error(), expected);
+        EXPECT_EQ(output.front(), '!');
+        EXPECT_EQ(output.back(), '!');
+    }
+    ASSERT_TRUE(adapter.GetRange("present", output.data() + 1, 8, 0));
+    EXPECT_EQ(std::string(output.data(), output.size()), "!12345678!");
+    server.Stop();
+    EXPECT_TRUE(server.error().empty()) << server.error();
+    const auto requests = server.requests();
+    EXPECT_EQ(std::count_if(requests.begin(), requests.end(),
+                            [](const auto& request) {
+                                return request.find("/large-range HTTP/") !=
+                                       std::string::npos;
+                            }),
+              2);
 }
 
 }  // namespace

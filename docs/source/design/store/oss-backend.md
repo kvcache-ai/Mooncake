@@ -173,6 +173,82 @@ the returned result vector preserves input order and cardinality.
 | Request setup or multi-handle failure | Return errors for requests that could not complete; do not roll back successful cloud writes. |
 | One object fails in a batch | Preserve per-object results; successful uploads are not automatically deleted. |
 
+## Bounded Object I/O Component
+
+`ObjectStorageBackend` provides synchronous I/O for caller-selected object names,
+independently of the client-owned offload path above. Construct it with an
+initialized `ObjectStorageAdapter` and `ObjectStorageBackendConfig`:
+
+- `max_object_bytes` defaults to 256 MiB and limits the declared object size.
+- `max_staging_bytes` defaults to 1 GiB and bounds concurrent payload staging
+  allocations within one backend instance. It does not include iovec metadata,
+  caller buffers or the adapter's own HTTP buffers.
+
+`Write` validates and gathers all slices into a full-object host buffer, then
+invokes the adapter's `PutOnce`. It requires enough staging budget for the
+entire object. The adapter must advertise `SupportsSinglePutAttempt()`; otherwise
+writes return `NOT_SUPPORTED` before staging or issuing PUT. Both OSS and S3
+support this contract. The S3 single-attempt entry points disable retries for
+that call only; its legacy offload API is unchanged.
+The optional `upload_started` output becomes true immediately
+before the adapter call; an error with this flag set can have an ambiguous
+remote outcome. The backend does not retry PUT.
+
+`WriteV` is the opt-in path for borrowing host buffers. The caller supplies an
+`IsHostMemory` predicate; the backend does not detect pointer address spaces.
+Nonempty slices classified as host are passed directly to the adapter's
+`PutVOnce` and must remain valid and unchanged until the synchronous call returns.
+Other slices are gathered through `to_host`, reserving only their combined
+size from the staging budget. The predicate is evaluated once per nonempty
+slice. An all-host write needs neither payload staging nor a copy callback,
+even if the instance's staging budget is occupied by another operation.
+For borrowed buffers this budget is not an upload concurrency limit; the
+caller remains responsible for request admission and its own buffer budget.
+
+This path requires `SupportsSinglePutVAttempt()`, separately from the
+`PutOnce` capability. OSS and S3 support both single-attempt entry points.
+S3 uses a per-request retry policy: `PutOnce` and `PutVOnce` never retry,
+including empty uploads, while existing `Put`, `PutV` and batch calls retain
+their retry behavior. Concurrent calls do not change shared retry settings.
+All validation and staging complete before the single `PutVOnce` invocation;
+`upload_started` and failure/exception cleanup follow the same rules as `Write`.
+This removes the backend's gathering copy for borrowed slices, not copies
+inside the adapter or network stack. Existing `Write` calls retain their
+full-object staging behavior.
+
+For input known by the caller to be entirely host-accessible:
+
+```cpp
+backend.WriteV(object_key, object_size, slices,
+               [](const Slice&) { return true; }, {}, &upload_started);
+```
+
+`Read` validates the requested range against the caller-supplied object size,
+then reads consecutive chunks independently of destination slice boundaries
+and scatters each chunk into the slices. GETs remain serial. Each staging allocation
+is at most 4 MiB, or the configured staging limit if smaller. Reads fail on a
+short response. OSS and the REST adapter used by S3 also validate `Content-Range`
+against the requested offset and length, for both individual and batch reads.
+Adapters that do not implement
+the optional generic `GetRange` method return `NOT_SUPPORTED`.
+
+Copy callbacks allow callers to stage device buffers. They must finish copying
+before returning, and report failure with `false`. Invalid arguments return
+`INVALID_PARAMS`; staging exhaustion returns `NO_AVAILABLE_HANDLE`; copy
+failure returns `TRANSFER_FAIL`. Reservations are released on return or stack
+unwinding. A failed read can leave destination buffers partially written.
+
+This component does not allocate immutable names, manage read leases, publish
+replicas, or decide when deletion is safe. Those responsibilities remain with
+the caller, which can use the adapter's existing `Delete` operation. Sharing an
+adapter across concurrent operations requires a thread-safe adapter.
+
+This component does not add a first-class replica type or enable
+owner-independent Store reads. Those guarantees require Master/Client
+integration with durable attempt identity, commit, recovery and lease-aware
+reclamation. See [RFC #4296](https://github.com/kvcache-ai/Mooncake/issues/4296)
+for context.
+
 ## Current Limitations
 
 - Readers depend on a reachable owner and valid Master metadata, not just the
