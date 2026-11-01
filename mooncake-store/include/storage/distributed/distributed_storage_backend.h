@@ -114,7 +114,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
     // is reset to -1 so a later GetOrOpenShard reinitializes it.
     tl::expected<void, ErrorCode> ReopenShardLocked(ShardFile& shard);
     tl::expected<int, ErrorCode> OpenBucket(
-        const DistributedFSDescriptor& descriptor);
+        const DistributedFSDescriptor& descriptor, bool write);
     bool UsesBucketAllocator() const;
     // Preserve per-request bucket handles and shard I/O locking for adapters
     // that do not opt in to batching.
