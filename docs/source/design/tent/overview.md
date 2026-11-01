@@ -93,6 +93,14 @@ metrics
 transport-selector
 :::
 
+## TENT Transport Plugins
+
+:::{toctree}
+:maxdepth: 1
+
+transport-plugins
+:::
+
 ## TENT High-Performance TCP
 
 :::{toctree}
