@@ -46,6 +46,7 @@
 #include "master_config.h"
 #include "object_metadata.h"
 #include "object_runtime_state.h"
+#include "metadata/metadata_port.h"
 #include "metadata/namespace_table.h"
 #include "metadata/object_route.h"
 #include "metadata/object_state.h"
@@ -1198,10 +1199,7 @@ class MasterService {
     void JobDispatchThreadFunc();
 
     // Internal data structures
-    struct ObjectIdentity {
-        TenantId tenant_id;
-        std::string user_key;
-    };
+    using ObjectIdentity = metadata::ObjectIdentity;
 
     // What the namespace policy may see and ask of this service.
     class PolicyStoreAccess final : public StoreControl {
@@ -1220,6 +1218,21 @@ class MasterService {
         MasterService& service_;
     };
     PolicyStoreAccess policy_store_access_{*this};
+
+    // What this service does around a metadata access made through the port.
+    class PortEffects final : public metadata::MetadataEffects {
+       public:
+        explicit PortEffects(MasterService& service) : service_(service) {}
+        void CleanupInvalidReplicas(metadata::WriteHandle& handle) override;
+        void Erase(
+            metadata::Namespace& ns, const route::WriteGuard& guard,
+            metadata::EraseMode erase_mode,
+            const std::vector<std::string>& previous_media_hint) override;
+
+       private:
+        MasterService& service_;
+    };
+    PortEffects port_effects_{*this};
     // Multi-tenancy, when enabled; the namespace policy below points at it.
     std::unique_ptr<TenantQuotaPolicy> tenant_quota_policy_;
     // The policy every namespace is created under; null without one. Set in
@@ -1235,6 +1248,9 @@ class MasterService {
             policy_ == nullptr ? nullptr
                                : policy_->OnNamespaceCreated(tenant_id));
     }};
+    // Every metadata access goes through this port; declared after the
+    // namespaces and the effects it refers to.
+    metadata::MetadataPort metadata_port_{namespaces_, port_effects_};
     MasterStoreBackend weight_backend_{*this};
     tl::expected<void, ErrorCode> RemoveObject(const std::string& key,
                                                const TenantId& tenant_id,
@@ -1326,10 +1342,7 @@ class MasterService {
     // How an erase is published to KV-event subscribers: as the object's
     // removal, or, when an upsert replaces it under the same lock, as the
     // state the replacement starts from.
-    enum class EraseMode {
-        kFull,
-        kReplace,
-    };
+    using EraseMode = metadata::EraseMode;
     // The memory every segment mounted on this service adds up to,
     // saturating at the 64-bit range; what tenant quotas are carved from.
     uint64_t AllocatableMemoryBytes();
@@ -1519,7 +1532,7 @@ class MasterService {
     // The first step of an accessor that holds a key by name: drops the held
     // object's memory replicas whose segment is gone, and the object with them
     // when none is left valid.
-    void CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor);
+    void CleanupInvalidMemoryReplicas(metadata::WriteHandle& accessor);
 
     // Discards the namespace's expired processing replicas and expired tasks.
     void DiscardExpiredProcessingReplicas(
@@ -1659,201 +1672,36 @@ class MasterService {
     std::mutex weight_reconciliation_mutex_;
     std::condition_variable weight_reconciliation_cv_;
 
-    // Helper class for accessing metadata with automatic locking and cleanup
-    //
-    // Resolves the namespace of `object_id` and write-holds the key for the
-    // accessor's scope. A thread holds one key at a time, so nothing in the
-    // accessor's scope may reach another key through another accessor.
-    class MetadataAccessorRW {
+    // The service's names for the port's handles (see
+    // metadata/metadata_port.h), taken through this service's port. A thread
+    // holds one key at a time, so nothing in an accessor's scope may reach
+    // another key through another accessor.
+    class MetadataAccessorRW : public metadata::WriteHandle {
        public:
-        struct AsIs {};
-        // Holds the key only while it holds an object, and leaves that object
-        // as it is, without the invalid-replica cleanup: for a pass that acts
-        // on what the object's own state says, such as an expiry sweep.
         MetadataAccessorRW(MasterService* service, ObjectIdentity object_id,
-                           AsIs)
-            : service_(service),
-              object_id_(std::move(object_id)),
-              ns_(service_->namespaces_.Lookup(object_id_.tenant_id)),
-              guard_(ns_ == nullptr ? std::optional<route::WriteGuard>()
-                                    : ns_->objects.Write(object_id_.user_key)) {
-        }
-
-        // Holds the key only while it holds an object.
+                           AsIs as_is)
+            : WriteHandle(service->metadata_port_, std::move(object_id),
+                          as_is) {}
         MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
-            : MetadataAccessorRW(service, std::move(object_id), AsIs{}) {
-            // Invalid memory replicas go first, which may tear the object down.
-            if (IsPublished()) {
-                service_->CleanupInvalidMemoryReplicas(*this);
-            }
-        }
-
-        struct CreateKey {
-            bool cleanup_invalid = true;
-        };
-        // Holds the key whether or not it holds an object, creating the
-        // namespace if needed, so the caller can publish one under it.
+            : WriteHandle(service->metadata_port_, std::move(object_id)) {}
         MetadataAccessorRW(MasterService* service, ObjectIdentity object_id,
                            CreateKey options)
-            : service_(service),
-              object_id_(std::move(object_id)),
-              ns_(&service_->namespaces_.GetOrCreate(object_id_.tenant_id)),
-              guard_(ns_->objects.WriteKey(object_id_.user_key)) {
-            if (options.cleanup_invalid && IsPublished()) {
-                service_->CleanupInvalidMemoryReplicas(*this);
-            }
-        }
-
-        // Holds the key only while `ref` is still its current publication: a
-        // key republished since `ref` was taken, or emptied, is not held.
-        // The held object is left as it is, without the invalid-replica
-        // cleanup: the caller comes back to act on what it judged, and the
-        // cleanup's KV sync would bump the tenant epoch a RemoveAll compares
-        // its `cleared` against.
+            : WriteHandle(service->metadata_port_, std::move(object_id),
+                          options) {}
         MetadataAccessorRW(MasterService* service, const TenantId& tenant_id,
                            const route::ObjectRef& ref)
-            : service_(service),
-              object_id_{tenant_id, ref.key},
-              ns_(service_->namespaces_.Lookup(tenant_id)),
-              guard_(ns_ == nullptr ? std::optional<route::WriteGuard>()
-                                    : ns_->objects.Write(ref)) {}
-
-        MetadataAccessorRW(const MetadataAccessorRW&) = delete;
-        MetadataAccessorRW& operator=(const MetadataAccessorRW&) = delete;
-
-        // Check if metadata exists
-        bool Exists() const {
-            return IsPublished() && guard_->metadata().IsValid();
-        }
-
-        // Holds an object, whether or not a replica is still valid.
-        bool IsPublished() const {
-            return guard_.has_value() && guard_->has_object();
-        }
-
-        bool InProcessing() const {
-            return IsPublished() && guard_->state().is_processing;
-        }
-
-        bool HasReplicationTask() const {
-            return IsPublished() && guard_->state().replication_task;
-        }
-
-        const std::string& GetKey() const { return object_id_.user_key; }
-        // The tenant the object was resolved under.
-        const TenantId& GetTenantId() const { return object_id_.tenant_id; }
-        // The held publication; like `Get()`, only while one is held.
-        route::ObjectRef GetRef() const { return guard_->ref(); }
-
-        // The namespace policy's say on the held key taking `bytes` more
-        // memory, asked before it is allocated; zero bytes asks only whether
-        // the namespace admits writes. Only while a key is held. A caller that
-        // fails after growing needs no rollback: releasing the key settles the
-        // account to what the object holds then, which gives the growth back.
-        [[nodiscard]] tl::expected<void, ErrorCode> Grow(uint64_t bytes) const {
-            return ns_->Grow(*guard_, bytes);
-        }
-
-        // Tells the namespace policy the held object is about to be replaced
-        // under this same lock (see NamespacePolicy::OnReplace).
-        void BeforeReplace() const { ns_->BeforeReplace(*guard_); }
-
-        // Get metadata (only call when IsPublished() is true)
-        ObjectMetadata& Get() { return guard_->metadata(); }
-
-        // The tasks in flight for the object (only call when IsPublished()
-        // is true)
-        route::ObjectState& GetState() { return guard_->state(); }
-
-        ReplicationTask& GetReplicationTask() {
-            return *guard_->state().replication_task;
-        }
-
-        // Publishes an object under the held key, which must hold none:
-        // builds its metadata in place from `metadata_args`, ObjectMetadata's
-        // constructor arguments, with an empty state, and wires a grouped
-        // object to its group's shared lease. Only a CreateKey accessor holds
-        // a key with no object. Returns the new publication's generation.
-        template <typename... Args>
-        route::Generation Publish(Args&&... metadata_args) {
-            assert(guard_.has_value() && !guard_->has_object());
-            return guard_->Publish(std::forward<Args>(metadata_args)...);
-        }
-
-        // Erases the held object and everything keyed to it; the key stays
-        // held, so the caller may publish a replacement under it.
-        void Erase(const std::vector<std::string>& previous_media_hint = {}) {
-            Erase(EraseMode::kFull, previous_media_hint);
-        }
-        void Erase(EraseMode erase_mode,
-                   const std::vector<std::string>& previous_media_hint = {}) {
-            service_->EraseMetadata(*ns_, *guard_, erase_mode,
-                                    previous_media_hint);
-        }
-
-        void EraseFromProcessing() {
-            if (IsPublished()) {
-                guard_->state().is_processing = false;
-            }
-        }
-
-        void EraseReplicationTask() {
-            if (IsPublished()) {
-                guard_->state().replication_task.reset();
-            }
-        }
-
-       private:
-        MasterService* service_;
-        ObjectIdentity object_id_;
-        // Null when the namespace does not exist; a namespace stays put once
-        // created, so the pointer outlives the guard.
-        metadata::Namespace* ns_;
-        std::optional<route::WriteGuard> guard_;
+            : WriteHandle(service->metadata_port_, tenant_id, ref) {}
     };
 
-    class MetadataAccessorRO {
+    class MetadataAccessorRO : public metadata::ReadHandle {
        public:
-        // Reads the object without copying its identity, which a batch read
-        // would otherwise pay for once per key.
         MetadataAccessorRO(const MasterService* service,
                            const TenantId& tenant_id,
                            const std::string& user_key)
-            : guard_(Hold(service->namespaces_.Lookup(tenant_id), user_key)) {}
+            : ReadHandle(service->metadata_port_, tenant_id, user_key) {}
         MetadataAccessorRO(const MasterService* service,
                            const ObjectIdentity& object_id)
-            : MetadataAccessorRO(service, object_id.tenant_id,
-                                 object_id.user_key) {}
-
-        // Check if metadata exists
-        bool Exists() const {
-            return IsPublished() && guard_->metadata().IsValid();
-        }
-
-        // Holds an object, whether or not a replica is still valid.
-        bool IsPublished() const { return guard_.has_value(); }
-
-        bool InProcessing() const {
-            return IsPublished() && guard_->state().is_processing;
-        }
-
-        // Get metadata (only call when Exists() is true)
-        const ObjectMetadata& Get() const { return guard_->metadata(); }
-
-        // The tasks in flight for the object (only call when IsPublished()
-        // is true)
-        const route::ObjectState& GetState() const { return guard_->state(); }
-
-       private:
-        static std::optional<route::ReadGuard> Hold(
-            const metadata::Namespace* ns, const std::string& user_key) {
-            if (ns == nullptr) {
-                return std::nullopt;
-            }
-            return ns->objects.Read(user_key);
-        }
-
-        std::optional<route::ReadGuard> guard_;
+            : ReadHandle(service->metadata_port_, object_id) {}
     };
 
     // Calls `visit` with each namespace that holds an object when the walk
