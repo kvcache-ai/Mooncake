@@ -28,6 +28,13 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
           capabilities_(capabilities) {}
 
     tl::expected<void, ErrorCode> Init() {
+        auto resolved_path = ResolveNvmeKvDevicePath(
+            device_path_, NvmeKvDevicePathType::kBlockNamespace, nsid_);
+        if (!resolved_path.has_value()) {
+            return tl::make_unexpected(resolved_path.error());
+        }
+        device_path_ = resolved_path->path;
+        nsid_ = resolved_path->nsid;
         fd_ = ::open(device_path_.c_str(), O_RDWR | O_CLOEXEC);
         if (fd_ < 0) {
             LOG(ERROR) << "[NvmeKvIoctlExecutor] open failed for "

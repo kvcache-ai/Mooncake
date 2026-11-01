@@ -4,6 +4,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -20,6 +21,10 @@
 
 #include <spdk/env.h>
 #include <spdk/nvme.h>
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
+#include <spdk/nvme_kv.h>
+#include <spdk/nvme_spec.h>
+#endif
 
 #include "config/spdk_controller_config.h"
 #include "nof/page_registry.h"
@@ -256,8 +261,8 @@ NofRegistryBundle& GetNofRegistryBundle() {
 
 class NofSegmentHandle {
    public:
-    struct spdk_nvme_qpair* qpair;
-    struct spdk_nvme_ns* ns;
+    struct spdk_nvme_qpair* qpair = nullptr;
+    struct spdk_nvme_ns* ns = nullptr;
 };
 
 namespace {
@@ -271,6 +276,9 @@ struct tr_info {
 struct ctrlr_info {
     struct spdk_nvme_ctrlr* ctrlr;
     std::map<uint32_t, std::unique_ptr<NofSegmentHandle>> ns_seg;
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
+    std::vector<std::unique_ptr<NofSegmentHandle>> kv_segments;
+#endif
     std::mutex ns_mutex;
 };
 
@@ -306,6 +314,13 @@ class SpdkInitiator::Impl {
                             spdk_nvme_ctrlr_free_io_qpair(seg->qpair);
                         }
                     }
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
+                    for (auto& seg : info->kv_segments) {
+                        if (seg && seg->qpair) {
+                            spdk_nvme_ctrlr_free_io_qpair(seg->qpair);
+                        }
+                    }
+#endif
                     if (info->ctrlr) {
                         spdk_nvme_detach(info->ctrlr);
                     }
@@ -342,6 +357,90 @@ class SpdkInitiator::Impl {
     }
 
     NofSegmentHandle* OpenSegment(const std::string& tr_str) {
+        return OpenSegment(tr_str, true);
+    }
+
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
+    NofSegmentHandle* OpenKvSegment(const std::string& tr_str) {
+        return OpenSegment(tr_str, false);
+    }
+
+    void CloseKvSegment(NofSegmentHandle* handle) {
+        if (!handle) {
+            return;
+        }
+        std::unique_ptr<NofSegmentHandle> owned;
+        std::lock_guard<std::mutex> controllers_lock(ctrlrs_mutex_);
+        for (auto& [_, info] : connected_ctrlrs_) {
+            std::lock_guard<std::mutex> namespaces_lock(info->ns_mutex);
+            auto it =
+                std::find_if(info->kv_segments.begin(), info->kv_segments.end(),
+                             [handle](const auto& segment) {
+                                 return segment.get() == handle;
+                             });
+            if (it == info->kv_segments.end()) {
+                continue;
+            }
+            owned = std::move(*it);
+            info->kv_segments.erase(it);
+            break;
+        }
+        if (owned && owned->qpair) {
+            spdk_nvme_ctrlr_free_io_qpair(owned->qpair);
+            owned->qpair = nullptr;
+        }
+    }
+
+    void AbortKvSegment(NofSegmentHandle* handle) {
+        if (handle && handle->qpair) {
+            spdk_nvme_ctrlr_free_io_qpair(handle->qpair);
+            handle->qpair = nullptr;
+        }
+    }
+
+    bool IsKvNamespace(const NofSegmentHandle* handle) const {
+        return handle && handle->ns &&
+               spdk_nvme_ns_get_csi(handle->ns) == SPDK_NVME_CSI_KV &&
+               spdk_nvme_kv_ns_get_data(handle->ns) != nullptr;
+    }
+
+    int SubmitKvStore(NofSegmentHandle* handle, const void* key,
+                      uint8_t key_len, const void* value, uint32_t value_len,
+                      bool create_only, NofKvAdaptor* adaptor) {
+        if (!ValidKvRequest(handle, key, key_len, value, value_len, adaptor)) {
+            return -EINVAL;
+        }
+        const uint8_t options =
+            create_only ? SPDK_NVME_KV_STORE_OPT_DONT_STORE_IF_KEY_EXISTS : 0;
+        return spdk_nvme_kv_store(handle->ns, handle->qpair, key, key_len,
+                                  value, value_len, KvCompleteTrampoline,
+                                  adaptor, options);
+    }
+
+    int SubmitKvRetrieve(NofSegmentHandle* handle, const void* key,
+                         uint8_t key_len, void* value, uint32_t value_len,
+                         NofKvAdaptor* adaptor) {
+        if (!ValidKvRequest(handle, key, key_len, value, value_len, adaptor)) {
+            return -EINVAL;
+        }
+        return spdk_nvme_kv_retrieve(handle->ns, handle->qpair, key, key_len,
+                                     value, value_len, KvCompleteTrampoline,
+                                     adaptor, 0);
+    }
+
+    int SubmitKvDelete(NofSegmentHandle* handle, const void* key,
+                       uint8_t key_len, NofKvAdaptor* adaptor) {
+        if (!handle || !handle->qpair || !handle->ns || !key || key_len == 0 ||
+            !adaptor || !adaptor->cb) {
+            return -EINVAL;
+        }
+        return spdk_nvme_kv_delete(handle->ns, handle->qpair, key, key_len,
+                                   KvCompleteTrampoline, adaptor);
+    }
+#endif
+
+   private:
+    NofSegmentHandle* OpenSegment(const std::string& tr_str, bool shared) {
         if (!EnsureEnv()) {
             return nullptr;
         }
@@ -389,9 +488,11 @@ class SpdkInitiator::Impl {
         {
             auto& ns_seg = info->ns_seg;
             std::lock_guard<std::mutex> lock(info->ns_mutex);
-            auto ns_it = ns_seg.find(tr.ns);
-            if (ns_it != ns_seg.end()) {
-                return ns_it->second.get();
+            if (shared) {
+                auto ns_it = ns_seg.find(tr.ns);
+                if (ns_it != ns_seg.end()) {
+                    return ns_it->second.get();
+                }
             }
 
             struct spdk_nvme_ns* ns = nullptr;
@@ -413,11 +514,38 @@ class SpdkInitiator::Impl {
             new_seg->qpair = qpair;
             new_seg->ns = ns;
             seg_handle = new_seg.get();
-            ns_seg[tr.ns] = std::move(new_seg);
+            if (shared) {
+                ns_seg[tr.ns] = std::move(new_seg);
+            }
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
+            else {
+                info->kv_segments.push_back(std::move(new_seg));
+            }
+#endif
         }
         return seg_handle;
     }
 
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
+    static bool ValidKvRequest(NofSegmentHandle* handle, const void* key,
+                               uint8_t key_len, const void* value,
+                               uint32_t value_len, NofKvAdaptor* adaptor) {
+        return handle && handle->qpair && handle->ns && key && key_len != 0 &&
+               value && value_len != 0 && adaptor && adaptor->cb;
+    }
+
+    static void KvCompleteTrampoline(void* ctx,
+                                     const struct spdk_nvme_cpl* cpl) {
+        auto* adaptor = static_cast<NofKvAdaptor*>(ctx);
+        NofKvCompletion completion;
+        completion.status_code_type = cpl->status.sct;
+        completion.status_code = cpl->status.sc;
+        completion.result = cpl->cdw0;
+        adaptor->cb(adaptor->ctx, completion);
+    }
+#endif
+
+   public:
     uint32_t GetBlockSize(const NofSegmentHandle* handle) {
         if (!handle || !handle->ns) {
             return kInvalidBlockSize;
@@ -842,6 +970,44 @@ NofCapabilities SpdkInitiator::GetCapabilities() const {
 #endif
     return caps;
 }
+
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
+NofSegmentHandle* SpdkInitiator::OpenKvSegment(const std::string& tr_str) {
+    return impl_->OpenKvSegment(tr_str);
+}
+
+void SpdkInitiator::CloseKvSegment(NofSegmentHandle* handle) {
+    impl_->CloseKvSegment(handle);
+}
+
+void SpdkInitiator::AbortKvSegment(NofSegmentHandle* handle) {
+    impl_->AbortKvSegment(handle);
+}
+
+bool SpdkInitiator::IsKvNamespace(const NofSegmentHandle* handle) const {
+    return impl_->IsKvNamespace(handle);
+}
+
+int SpdkInitiator::SubmitKvStore(NofSegmentHandle* handle, const void* key,
+                                 uint8_t key_len, const void* value,
+                                 uint32_t value_len, bool create_only,
+                                 NofKvAdaptor* adaptor) {
+    return impl_->SubmitKvStore(handle, key, key_len, value, value_len,
+                                create_only, adaptor);
+}
+
+int SpdkInitiator::SubmitKvRetrieve(NofSegmentHandle* handle, const void* key,
+                                    uint8_t key_len, void* value,
+                                    uint32_t value_len, NofKvAdaptor* adaptor) {
+    return impl_->SubmitKvRetrieve(handle, key, key_len, value, value_len,
+                                   adaptor);
+}
+
+int SpdkInitiator::SubmitKvDelete(NofSegmentHandle* handle, const void* key,
+                                  uint8_t key_len, NofKvAdaptor* adaptor) {
+    return impl_->SubmitKvDelete(handle, key, key_len, adaptor);
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // SpdkDmaAllocator
