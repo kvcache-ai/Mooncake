@@ -7,7 +7,7 @@
 
 #include <glog/logging.h>
 
-#include "config/connector_config.h"
+#include "nvme_kv/connector_config.h"
 #include "nvme_kv/executor_util.h"
 #include "storage_backend.h"
 
@@ -41,13 +41,18 @@ tl::expected<void, ErrorCode> NvmeKvConnector::Init() {
     }
 #endif
 
-    return InitRealExecutor();
-}
-
-tl::expected<void, ErrorCode> NvmeKvConnector::InitRealExecutor() {
     auto config = NvmeKvConnectorConfig::FromEnvironment();
     if (!config.has_value()) {
         return tl::make_unexpected(config.error());
+    }
+
+    return Init(*config);
+}
+
+tl::expected<void, ErrorCode> NvmeKvConnector::Init(
+    const NvmeKvConnectorConfig &config) {
+    if (executor_ != nullptr) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     const auto create_executor =
@@ -55,12 +60,12 @@ tl::expected<void, ErrorCode> NvmeKvConnector::InitRealExecutor() {
         switch (selected_transport) {
             case NvmeKvTransport::kIoUring:
                 return CreateNvmeKvIoUringExecutor(
-                    config->device_path, config->nsid, config->queue_depth,
-                    config->runtime_transfer_limit);
+                    config.device_path, config.nsid, config.queue_depth,
+                    config.runtime_transfer_limit);
             case NvmeKvTransport::kIoctl:
                 return CreateNvmeKvIoctlExecutor(
-                    config->device_path, config->nsid, config->queue_depth,
-                    config->runtime_transfer_limit);
+                    config.device_path, config.nsid, config.queue_depth,
+                    config.runtime_transfer_limit);
             case NvmeKvTransport::kAuto:
                 break;
         }
@@ -69,7 +74,7 @@ tl::expected<void, ErrorCode> NvmeKvConnector::InitRealExecutor() {
 
     NvmeKvExecutorResult executor_result =
         tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    if (config->transport == NvmeKvTransport::kAuto) {
+    if (config.transport == NvmeKvTransport::kAuto) {
 #ifdef MOONCAKE_HAVE_NVME_URING_CMD
         executor_result = create_executor(NvmeKvTransport::kIoUring);
         if (!executor_result) {
@@ -82,15 +87,15 @@ tl::expected<void, ErrorCode> NvmeKvConnector::InitRealExecutor() {
             executor_result = create_executor(NvmeKvTransport::kIoctl);
         }
     } else {
-        executor_result = create_executor(config->transport);
+        executor_result = create_executor(config.transport);
     }
 
     if (!executor_result) {
         LOG(ERROR) << "Failed to initialize NVMe KV "
-                   << NvmeKvTransportName(config->transport) << " executor";
+                   << NvmeKvTransportName(config.transport) << " executor";
         return tl::make_unexpected(executor_result.error());
     }
-    executor_ = std::move(executor_result.value());
+    executor_ = std::move(*executor_result);
     return {};
 }
 

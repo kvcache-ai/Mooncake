@@ -18,6 +18,7 @@ struct NvmeKvObjectIdentity {
 constexpr uint32_t kNvmeKvMaxPhysicalKeySlots = 64;
 
 uint32_t ComputeNvmeKvChecksum(std::span<const uint8_t> data);
+uint64_t ComputeNvmeKvCanonicalIdentitySize(uint64_t logical_key_size);
 std::string SerializeNvmeKvCanonicalIdentity(
     const NvmeKvObjectIdentity& identity);
 bool ParseNvmeKvCanonicalIdentity(std::string_view encoded_identity,
