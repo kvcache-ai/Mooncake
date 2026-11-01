@@ -607,6 +607,48 @@ TEST_F(MasterServiceSSDTest, ExpiredOffloadingTaskReleasesItsSource) {
     EXPECT_EQ(hold->metadata().GetReplicaByID(source_id)->get_refcnt(), 0);
 }
 
+TEST_F(MasterServiceSSDTest, OnePassDropsEveryExpiredTaskOfAKey) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_id, "source", 0x600000000ULL);
+    MountMemoryAndLocalDisk(*service, generate_uuid(), "target",
+                            0x610000000ULL);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "source";
+    ASSERT_TRUE(
+        service->PutStart(client_id, "key", TenantId::Default(), 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service
+            ->PutEnd(client_id, "key", TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
+    ASSERT_TRUE(service
+                    ->CopyStart(client_id, "key", TenantId::Default(), "source",
+                                {"target"})
+                    .has_value());
+    const MasterServiceTestPeer::ObjectIdentity id{TenantId::Default(), "key"};
+    ReplicaID source_id = 0;
+    {
+        auto hold = MasterServiceTestPeer::WriteObject(*service, id);
+        ASSERT_TRUE(hold.has_value());
+        ASSERT_TRUE(hold->state().offloading_task.has_value());
+        ASSERT_TRUE(hold->state().replication_task.has_value());
+        source_id = hold->state().offloading_task->source_id;
+        ASSERT_EQ(hold->metadata().GetReplicaByID(source_id)->get_refcnt(), 2);
+    }
+
+    MasterServiceTestPeer(*service).DiscardExpiredProcessingReplicas(
+        TenantId::Default(),
+        std::chrono::system_clock::now() + std::chrono::hours(1));
+
+    auto hold = MasterServiceTestPeer::WriteObject(*service, id);
+    ASSERT_TRUE(hold.has_value());
+    EXPECT_FALSE(hold->state().replication_task.has_value());
+    EXPECT_FALSE(hold->state().offloading_task.has_value());
+    EXPECT_EQ(hold->metadata().GetReplicaByID(source_id)->get_refcnt(), 0);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
