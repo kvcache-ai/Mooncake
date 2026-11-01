@@ -10,7 +10,9 @@
 #include <boost/functional/hash.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_io/client_pool.hpp>
+#ifdef YLT_ENABLE_IBV
 #include <ylt/coro_io/ibverbs/ib_socket.hpp>
+#endif
 
 #include "client_metric.h"
 #include "config/rpc_protocol_config.h"
@@ -42,10 +44,12 @@ inline constexpr bool variant_contains_v =
 
 template <typename SocketConfigVariant>
 inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
+#ifdef YLT_ENABLE_IBV
     if constexpr (variant_contains_v<SocketConfigVariant,
                                      coro_io::ib_socket_t::config_t>) {
         socket_config = coro_io::ib_socket_t::config_t{};
     }
+#endif
 }
 
 // Applies the RPC timeout overrides to any mooncake-store RPC client config.
@@ -131,12 +135,31 @@ class MasterClient {
         const std::string& object_key);
 
     /**
+     * @brief Point-in-time existence check that grants no read lease
+     * @param object_key Key to query
+     * @return tl::expected<bool, ErrorCode> indicating exist or not at the
+     * time of the call; the object may still be evicted afterwards
+     */
+    [[nodiscard]] tl::expected<bool, ErrorCode> ProbeKey(
+        const std::string& object_key);
+
+    /**
      * @brief Checks if multiple objects exist
      * @param object_keys Vector of keys to query
      * @return Vector containing existence status for each key
      */
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& object_keys);
+
+    /**
+     * @brief Probe multiple objects, optionally leasing the last complete
+     * candidate. LastHitOnly leases the last all-true candidate in the results.
+     * @param object_keys Vector of keys to query
+     * @return Per-key existence results in input order
+     */
+    [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
+        const std::vector<std::string>& object_keys,
+        const GrantLeasePolicy& policy = {});
 
     /**
      * @brief Calculate Store-observed cache reuse metrics
@@ -207,6 +230,29 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys,
                         const std::string& tenant_id);
+
+    /**
+     * @brief Read-only variants of GetReplicaList / BatchGetReplicaList.
+     *
+     * Backed by the admin read-only RPCs: the master grants no lease, does
+     * not trigger promotion-on-hit, and does not update valid_get metrics.
+     * Note the response still carries the master's default lease_ttl_ms
+     * value; callers that need lease semantics must force it to 0 (see
+     * Client::QueryReadOnly).
+     *
+     * Intended for best-effort background paths (e.g. SSD prefetch metadata
+     * classification) that must not perturb hot-path state.
+     */
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaListReadOnly(const std::string& object_key);
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaListReadOnly(const std::string& object_key,
+                           const std::string& tenant_id);
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListReadOnly(const std::vector<std::string>& object_keys);
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListReadOnly(const std::vector<std::string>& object_keys,
+                                const std::string& tenant_id);
 
     /**
      * @brief Starts a put operation
@@ -462,6 +508,29 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<bool, ErrorCode> PollRemoveAll();
 
+    WeightRpcResult<WeightRevisionMetadata> BeginWeightImport(
+        const BeginWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> CommitWeightImport(
+        const CommitWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> AbortWeightImport(
+        const AbortWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionView> GetWeightRevision(
+        const GetWeightRevisionRequest& request);
+    WeightRpcResult<ListWeightRevisionsResponse> ListWeightRevisions(
+        const ListWeightRevisionsRequest& request);
+    WeightRpcResult<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request);
+    WeightRpcResult<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request);
+    WeightRpcResult<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request);
+    WeightRpcResult<WeightResidencyOperation> StartWeightResidencyOperation(
+        const StartWeightResidencyOperationRequest& request);
+    WeightRpcResult<WeightResidencyOperation> QueryWeightOperation(
+        const QueryWeightOperationRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> DeleteWeightRevision(
+        const DeleteWeightRevisionRequest& request);
+
     [[nodiscard]] tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
@@ -487,6 +556,22 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
+
+    /**
+     * @brief Registers a prefetch (SSD->DRAM promotion) task on the master.
+     *
+     * Creates a promotion_tasks entry consumed by PromotionAllocStart, but
+     * deliberately bypasses the promotion-on-hit admission gate and the
+     * holder's heartbeat mailbox, keeping the dedicated prefetch path
+     * separate from promotion-on-hit. The caller must be the holder of the
+     * key's LOCAL_DISK replica (the master checks holder_id == client_id).
+     * Best-effort: PROMOTION_ALREADY_EXISTS means a MEMORY replica or an
+     * in-flight promotion already exists and the caller should skip quietly.
+     * The client's own tenant is used.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> RegisterPrefetchTask(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during
@@ -673,6 +758,22 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> EvictDiskReplica(
         const std::string& key, const std::string& tenant_id,
         ReplicaType replica_type);
+
+    /**
+     * @brief Evict a disk replica only if the master still records the
+     * replica the caller failed on. A master that predates this RPC answers
+     * with an unknown-handler error, so the caller can tell the precondition
+     * was never enforced.
+     * @param key The object key whose disk replica was evicted
+     * @param tenant_id The tenant scope of the object
+     * @param replica_type DISK or LOCAL_DISK
+     * @param expected_replica_id The replica id the caller failed on
+     * @return true if evicted, false if the current record is a different
+     * replica (left untouched)
+     */
+    [[nodiscard]] tl::expected<bool, ErrorCode> EvictDiskReplicaIfCurrent(
+        const std::string& key, const std::string& tenant_id,
+        ReplicaType replica_type, ReplicaID expected_replica_id);
 
     /**
      * @brief Batch notify master that disk replicas were evicted locally.

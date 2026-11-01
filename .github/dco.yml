@@ -1,0 +1,4 @@
+# Configuration for https://github.com/dcoapp/app.
+# The App must be enabled separately in the repository settings.
+require:
+  members: true

@@ -3,10 +3,13 @@
 
 // csignal must precede coro_http_client.hpp: the bundled ylt's coro_io.hpp
 // calls std::signal without including <csignal> itself.
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <optional>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <ylt/coro_http/coro_http_client.hpp>
 
@@ -76,9 +79,10 @@ class ScopedEnv {
 
 tl::expected<void, ErrorCode> SetupClientWithHttp(
     const std::shared_ptr<RealClient>& client, const std::string& client_addr,
-    const std::string& master_addr, bool enable_http, int http_port) {
+    const std::string& master_addr, bool enable_http, int http_port,
+    size_t global_segment_size = 0) {
     return client->setup_internal(
-        client_addr, "P2PHANDSHAKE", /*global_segment_size=*/0,
+        client_addr, "P2PHANDSHAKE", global_segment_size,
         /*local_buffer_size=*/0, "tcp", "", master_addr, nullptr, "",
         /*local_rpc_port=*/50052, /*enable_ssd_offload=*/false,
         /*start_offload_rpc_server=*/false, /*ssd_offload_path=*/"",
@@ -502,12 +506,110 @@ TEST_F(ClientMetricsTest, HttpMetricsEndpointsReturnData) {
         FetchUrl("http://127.0.0.1:" + std::to_string(http_port) + "/metrics");
     EXPECT_EQ(metrics.status, 200);
     EXPECT_EQ(metrics.body.find("metrics not available"), std::string::npos);
+    // A request-only client does not start the storage heartbeat.
+    EXPECT_EQ(metrics.body.find("mooncake_client_master_heartbeat_status_ok"),
+              std::string::npos);
+    EXPECT_EQ(
+        metrics.body.find(
+            "mooncake_client_master_heartbeat_observation_timestamp_seconds"),
+        std::string::npos);
 
     auto summary = FetchUrl("http://127.0.0.1:" + std::to_string(http_port) +
                             "/metrics/summary");
     EXPECT_EQ(summary.status, 200);
     EXPECT_NE(summary.body.find("Client Metrics Summary"), std::string::npos);
 
+    EXPECT_EQ(client->tearDownAll(), 0);
+}
+
+TEST_F(ClientMetricsTest, HeartbeatObservationsUseClientMetricLabels) {
+    ClientMetric metrics(
+        0, {{"cluster_id", "cluster1"}, {"instance_id", "12345"}});
+    auto& heartbeat = metrics.master_heartbeat_metric;
+    heartbeat.EndConnection(heartbeat.BeginConnection(), true);
+    heartbeat.Observe(heartbeat.BeginObservation(), false, 100.5);
+    std::string serialized;
+    metrics.serialize(serialized);
+    const std::string labels =
+        "{cluster_id=\"cluster1\",instance_id=\"12345\"}";
+    EXPECT_NE(serialized.find("mooncake_client_master_heartbeat_status_ok" +
+                              labels + " 0\n"),
+              std::string::npos);
+    EXPECT_NE(
+        serialized.find(
+            "mooncake_client_master_heartbeat_observation_timestamp_seconds" +
+            labels + " 100.500000\n"),
+        std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, HttpHeartbeatMetricsRecoverAfterMasterRestart) {
+    ScopedEnv timeout("MC_RPC_TIMEOUT_MS");
+    setenv("MC_RPC_TIMEOUT_MS", "200", 1);
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_http_metadata_port(0)
+                                 .build()));
+    std::unordered_set<int> used_ports;
+    const int http_port = GetTestPort(used_ports);
+    const int client_port = GetTestPort(used_ports);
+    ASSERT_GT(http_port, 0);
+    ASSERT_GT(client_port, 0);
+    auto client = RealClient::create();
+    auto setup_result = SetupClientWithHttp(
+        client, "127.0.0.1:" + std::to_string(client_port),
+        master.master_address(), true, http_port, 16 * 1024 * 1024);
+    ASSERT_TRUE(setup_result.has_value()) << toString(setup_result.error());
+
+    const std::string url =
+        "http://127.0.0.1:" + std::to_string(http_port) + "/metrics";
+    const std::string status_name =
+        "mooncake_client_master_heartbeat_status_ok";
+    const std::string timestamp_name =
+        "mooncake_client_master_heartbeat_observation_timestamp_seconds";
+    auto sample = [](const std::string& body, const std::string& name) {
+        std::istringstream lines(body);
+        std::string line;
+        while (std::getline(lines, line)) {
+            if (line.starts_with(name + "{") || line.starts_with(name + " "))
+                return line;
+        }
+        return std::string{};
+    };
+    HttpResponse response;
+    auto wait_for = [&](bool known) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        do {
+            response = FetchUrl(url);
+            if (response.status == 200) {
+                const auto status = sample(response.body, status_name);
+                const auto timestamp = sample(response.body, timestamp_name);
+                if (known ? (status.ends_with(" 1") && !timestamp.empty())
+                          : (status.empty() && timestamp.empty()))
+                    return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        } while (std::chrono::steady_clock::now() < deadline);
+        return false;
+    };
+
+    ASSERT_TRUE(wait_for(true)) << response.body;
+    EXPECT_NE(sample(response.body, status_name).find("client_mode=\"real\""),
+              std::string::npos);
+    const auto before = std::stod(
+        sample(response.body, timestamp_name)
+            .substr(sample(response.body, timestamp_name).rfind(' ') + 1));
+    master.Stop();
+    ASSERT_TRUE(wait_for(false)) << response.body;
+    ASSERT_TRUE(
+        master.Start(mooncake::InProcMasterConfigBuilder()
+                         .set_rpc_port(master.rpc_port())
+                         .set_http_metrics_port(master.http_metrics_port())
+                         .set_http_metadata_port(0)
+                         .build()));
+    ASSERT_TRUE(wait_for(true)) << response.body;
+    const auto timestamp = sample(response.body, timestamp_name);
+    EXPECT_GT(std::stod(timestamp.substr(timestamp.rfind(' ') + 1)), before);
     EXPECT_EQ(client->tearDownAll(), 0);
 }
 

@@ -6,6 +6,9 @@
 // (issue #2516).
 
 #include "replica_selection.h"
+#include "client_service.h"
+#include "topology.h"
+#include "transfer_engine.h"
 
 #include <gtest/gtest.h>
 
@@ -115,6 +118,65 @@ TEST_F(ReplicaSelectionTest, LocalMemoryAlwaysWins) {
     EXPECT_EQ(
         sel->get_memory_descriptor().buffer_descriptor.transport_endpoint_,
         "nodeB");  // locality beats protocol
+}
+
+// Regression for issue #3658: a complete local MEMORY replica must win over a
+// complete local NOF replica regardless of the order they appear in the list.
+// ObjectMetadata preserves insertion order, and promotion appends a new MEMORY
+// replica to existing metadata, so a MEMORY replica may legally appear after a
+// NOF replica. The session planner supports MEMORY and DFS, but not NOF, so
+// selecting NOF here would regress a session that has a usable MEMORY replica.
+TEST_F(ReplicaSelectionTest, LocalMemoryBeatsLocalNoFInBothOrders) {
+    std::unordered_set<std::string> local = {"memB", "nofB"};
+
+    // local NOF listed before local MEMORY
+    std::vector<Replica::Descriptor> nof_first = {
+        MakeNoF("nofB"),
+        MakeMemory("memB", "tcp"),
+    };
+    const auto* sel = SelectBestReplica(nof_first, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_memory_replica());
+    EXPECT_EQ(
+        sel->get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "memB");
+
+    // local MEMORY listed before local NOF (the previously-correct order)
+    std::vector<Replica::Descriptor> mem_first = {
+        MakeMemory("memB", "tcp"),
+        MakeNoF("nofB"),
+    };
+    sel = SelectBestReplica(mem_first, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_memory_replica());
+    EXPECT_EQ(
+        sel->get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "memB");
+}
+
+TEST_F(ReplicaSelectionTest, IncompleteLocalMemoryFallsBackToLocalNoF) {
+    // The local MEMORY replica is not readable yet, so the local NOF_SSD one
+    // remains the best choice.
+    std::unordered_set<std::string> local = {"nodeA"};
+    std::vector<Replica::Descriptor> reps = {
+        MakeNoF("nodeA"),
+        MakeMemory("nodeA", "rdma", ReplicaStatus::PROCESSING),
+    };
+    const auto* sel = SelectBestReplica(reps, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_nof_replica());
+}
+
+TEST_F(ReplicaSelectionTest, LocalNoFPrecedesRemoteMemory) {
+    // Locality still outranks tier for remote MEMORY replicas.
+    std::unordered_set<std::string> local = {"nodeA"};
+    std::vector<Replica::Descriptor> reps = {
+        MakeNoF("nodeA"),
+        MakeMemory("nodeB", "rdma"),
+    };
+    const auto* sel = SelectBestReplica(reps, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_nof_replica());
 }
 
 TEST_F(ReplicaSelectionTest, ScoringOffKeepsFirstRemoteMemory) {
@@ -421,4 +483,74 @@ TEST_F(ReplicaSelectionTest, ConcurrentSetAndSelectIsRaceFree) {
 }
 
 }  // namespace
+
+TEST_F(ReplicaSelectionTest, CachedCandidatesReselectForCurrentDestination) {
+    auto first = MakeMemory("store-a", "rdma");
+    first.get_memory_descriptor().locality = SegmentLocality{7, {"mlx5_0"}};
+    auto second = MakeMemory("store-b", "rdma");
+    second.get_memory_descriptor().locality = SegmentLocality{0, {"mlx5_1"}};
+    std::vector<Replica::Descriptor> replicas{first, second};
+    const auto cached = RetainMemoryReadCandidates(replicas, first, true);
+    ASSERT_EQ(cached.size(), 2);
+    Topology topology;
+    ASSERT_EQ(topology.parse(R"({"cuda:0":[["mlx5_0"],[]],
+                                 "cuda:1":[["mlx5_1"],[]]})"),
+              0);
+    const std::vector<SegmentBufferInfo> buffers{{0x10000, 4096, "cuda:0"},
+                                                 {0x20000, 4096, "cuda:1"}};
+    const auto infer = Client::MakeHcaAffinity(topology, buffers);
+    for (const auto address : {0x10000, 0x20000, 0x10000}) {
+        const std::vector<Slice> slices{
+            {reinterpret_cast<void*>(address), 1024}};
+        const auto hcas = infer(slices);
+        const auto* selected = SelectBestReplica(cached, {}, hcas);
+        ASSERT_TRUE(selected);
+        EXPECT_EQ(selected->get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  address == 0x10000 ? "store-a" : "store-b");
+    }
+    EXPECT_EQ(RetainMemoryReadCandidates(replicas, first, false).size(), 1);
+}
+
+TEST_F(ReplicaSelectionTest, HcaReadPreferenceKeepsLocalityAndUsableFallbacks) {
+    auto wrong = MakeMemory("local", "rdma");
+    wrong.get_memory_descriptor().locality = SegmentLocality{0, {"mlx5_1"}};
+    auto match = MakeMemory("local", "rdma");
+    match.id = 1;
+    match.get_memory_descriptor().locality = SegmentLocality{7, {"mlx5_0"}};
+    std::vector<Replica::Descriptor> replicas{wrong, match};
+    EXPECT_EQ(SelectBestReplica(replicas, {"local"}, {"mlx5_0"})->id, 1);
+    replicas[1].status = ReplicaStatus::PROCESSING;
+    EXPECT_EQ(SelectBestReplica(replicas, {"local"}, {"mlx5_0"})->id, 0);
+    auto unknown = MakeMemory("remote", "rdma");
+    unknown.id = 2;
+    replicas = {wrong, unknown};
+    EXPECT_EQ(SelectBestReplica(replicas, {}, {"mlx5_0"})->id, 2);
+    // Host locality remains the primary policy; affinity ranks memory within
+    // it.
+    EXPECT_EQ(SelectBestReplica(replicas, {"local"}, {"mlx5_0"})->id, 0);
+}
+
+TEST_F(ReplicaSelectionTest, AffinityDoesNotEnableProtocolScoring) {
+    if (RemoteReplicaScoringEnabled()) GTEST_SKIP();
+    const std::vector<Replica::Descriptor> replicas{
+        MakeMemory("first", "tcp"), MakeMemory("second", "rdma")};
+    EXPECT_EQ(SelectBestReplica(replicas, {}, {"mlx5_0"}), &replicas[0]);
+}
+
+TEST_F(ReplicaSelectionTest, RetentionPreservesMediumAndObjectSize) {
+    auto chosen = MakeMemory("a", "rdma");
+    auto oversized = MakeMemory("b", "rdma");
+    oversized.get_memory_descriptor().buffer_descriptor.size_ *= 2;
+    const std::vector<Replica::Descriptor> replicas{
+        chosen, oversized,
+        MakeMemory("pending", "rdma", ReplicaStatus::PROCESSING),
+        MakeDisk("file")};
+    EXPECT_EQ(RetainMemoryReadCandidates(replicas, chosen, true).size(), 1);
+    const auto disk = replicas.back();
+    auto selected = RetainMemoryReadCandidates(replicas, disk, true);
+    ASSERT_EQ(selected.size(), 1);
+    EXPECT_TRUE(selected.front().is_disk_replica());
+}
+
 }  // namespace mooncake

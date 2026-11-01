@@ -25,6 +25,11 @@ rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
 
+if [ -d "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" ]; then
+    rm -rf mooncake-wheel/mooncake/_pg_jit
+    cp -R "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" mooncake-wheel/mooncake/
+fi
+
 echo "Creating directory structure..."
 
 # Copy shared allocator helper used by both CUDA and Ascend pluggable allocators.
@@ -54,19 +59,19 @@ cp mooncake-integration/shared_segment.py mooncake-wheel/mooncake/shared_segment
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
 
-# Copy store.so to mooncake directory
-if compgen -G "${BUILD_DIR}/mooncake-integration/store.*.so" >/dev/null; then
-    echo "Copying store.so..."
-    cp ${BUILD_DIR}/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
+# Copy the private C++ Store extension to the mooncake package.
+if compgen -G "${BUILD_DIR}/mooncake-integration/_store.*.so" >/dev/null; then
+    echo "Copying _store extension..."
+    cp ${BUILD_DIR}/mooncake-integration/_store.*.so mooncake-wheel/mooncake/
     echo "Copying master binary..."
     # Copy master binary
     cp ${BUILD_DIR}/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
     # Copy client binary
     cp ${BUILD_DIR}/mooncake-store/src/mooncake_client mooncake-wheel/mooncake/
-    # Copy async_store.py
-    cp mooncake-integration/store/async_store.py mooncake-wheel/mooncake/async_store.py
+    # Stage the canonical async Store client for the legacy wheel builder.
+    cp python/mooncake/async_store.py mooncake-wheel/mooncake/async_store.py
 else
-    echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
+    echo "Skipping _store extension (not built - likely WITH_STORE is set to OFF)"
 fi
 
 # Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
@@ -150,6 +155,9 @@ fi
 # relative path would silently point to the wrong location.
 CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
 
+# Kernel header tree the CUDA EP JIT compiles against at runtime.
+CUDA_EP_JIT_DIR="${BUILD_DIR_ABS}/mooncake_ep_jit"
+
 # CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
 # If EP/PG .so files were staged inside the build directory, preserve them in a
 # temporary location so they survive the cleanup.
@@ -159,6 +167,11 @@ if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
         CUDA_EP_STAGING_TEMP=$(mktemp -d)
         cp "$CUDA_EP_STAGING_DIR"/*.so "$CUDA_EP_STAGING_TEMP/"
         echo "Preserved EP/PG .so files to ${CUDA_EP_STAGING_TEMP} before build-dir cleanup"
+        if [ -d "$CUDA_EP_JIT_DIR" ]; then
+            cp -r "$CUDA_EP_JIT_DIR" "$CUDA_EP_STAGING_TEMP/"
+            CUDA_EP_JIT_DIR="${CUDA_EP_STAGING_TEMP}/mooncake_ep_jit"
+            echo "Preserved EP JIT headers to ${CUDA_EP_JIT_DIR} before build-dir cleanup"
+        fi
     fi
     echo "Freeing disk space: removing build directory (artifacts already copied)"
     rm -rf "${BUILD_DIR}/"
@@ -168,23 +181,70 @@ if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
     fi
 fi
 
+# Release builds still compile with -g (ENABLE_DEBUG_SYMBOLS defaults to ON),
+# and DWARF made up most of each wheel, pushing the CUDA wheels past the
+# 100 MiB per-file upload limit of PyPI/TestPyPI. The CI wheel profiles pass
+# -DENABLE_DEBUG_SYMBOLS=OFF, so this strip is the safety net for callers that
+# still build with -g. It runs before auditwheel: patchelf has to run after
+# strip, never before. --strip-debug keeps .symtab, so stack traces still
+# resolve function names. The CUDA device libraries injected after repair are
+# not touched.
+#
+# Strip by default in CI only: local developer builds keep the line tables
+# ENABLE_DEBUG_SYMBOLS=ON compiled in. KEEP_DEBUG_SYMBOLS=1 opts out
+# everywhere (including the NPU --strip-unneeded pass); STRIP overrides the
+# tool for cross/container toolchains.
+WHEEL_PACKAGE_DIR="$(pwd)/mooncake-wheel/mooncake"
+if [ "${KEEP_DEBUG_SYMBOLS:-0}" != "1" ] && [ "${CI:-false}" = "true" ]; then
+    STRIP="${STRIP:-strip}"
+    if ! command -v "$STRIP" >/dev/null 2>&1; then
+        echo "Error: '$STRIP' not found; install binutils or set STRIP to the target strip tool"
+        exit 1
+    fi
+    if [ "$NPU_BUILD" = "1" ]; then
+        echo "Stripping staged shared libraries to reduce wheel size (set KEEP_DEBUG_SYMBOLS=1 to keep them)..."
+        find "$WHEEL_PACKAGE_DIR" -type f -name "*.so" -exec "$STRIP" --strip-unneeded {} +
+    else
+        if ! command -v file >/dev/null 2>&1; then
+            echo "Error: 'file' not found; it is needed to detect staged ELF files"
+            exit 1
+        fi
+        echo "Stripping debug info from staged ELF files (set KEEP_DEBUG_SYMBOLS=1 to keep it)..."
+        find "$WHEEL_PACKAGE_DIR" -type f \( -name '*.so*' -o -perm -111 \) \
+            -exec sh -c 'file "$1" | grep -q ELF' _ {} \; \
+            -exec "$STRIP" --strip-debug {} +
+    fi
+else
+    echo "Keeping debug symbols in staged files (KEEP_DEBUG_SYMBOLS=${KEEP_DEBUG_SYMBOLS:-0}, CI=${CI:-false})"
+fi
+
 # Make the post-repair device library discoverable while auditwheel resolves
 # the host extension.  It is explicitly excluded below and injected later.
 export LD_LIBRARY_PATH="${CUDA_EP_STAGING_DIR}:${LD_LIBRARY_PATH}"
-
-if [ "$NPU_BUILD" = "1" ]; then
-    echo "Stripping shared libraries to reduce wheel size..."
-    find mooncake-wheel/mooncake -name "*.so" -exec strip --strip-unneeded {} \;
-    echo "Pre-setting RPATH=\$ORIGIN on project ELF files so auditwheel resolves NEEDED from wheel-internal copies..."
-    find mooncake-wheel/mooncake -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0 | xargs -0 patchelf --force-rpath --set-rpath '$ORIGIN'
-fi
 
 echo "Building wheel package..."
 # Stage migrated root Python modules and the legacy Reshard package for the
 # combined-wheel builder. Each tracked source remains in its authoritative tree.
 MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
 MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
+STORE_FACADE_SOURCE_DIR="python/mooncake/store"
+STORE_FACADE_STAGING_DIR="${MIGRATED_PYTHON_STAGING_DIR}/store"
+MIGRATED_PYTHON_INIT_BACKUP=""
 MIGRATED_PYTHON_MODULES=(
+    __init__.py
+    py.typed
+    engine.pyi
+    structured_object_store.py
+    _structured_ranges.py
+    _fast_copy.c
+    http_metadata_server.py
+    _launcher.py
+    cli.py
+    cli_bench.py
+    cli_client.py
+    transfer_engine_topology_dump.py
+    buffer_pool.py
+    mooncake_config.py
     ep.py
     mooncake_ep_buffer.py
     mooncake_elastic_buffer.py
@@ -197,16 +257,28 @@ RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
 RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
 cleanup_migrated_python_staging() {
     for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+        if [ "${module}" = "__init__.py" ]; then
+            continue
+        fi
         rm -f "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
     done
+    if [ -n "${MIGRATED_PYTHON_INIT_BACKUP}" ]; then
+        cp "${MIGRATED_PYTHON_INIT_BACKUP}" "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py"
+        rm -f "${MIGRATED_PYTHON_INIT_BACKUP}"
+        MIGRATED_PYTHON_INIT_BACKUP=""
+    fi
+    rm -rf "${STORE_FACADE_STAGING_DIR}"
     rm -rf "${RESHARD_STAGING_DIR}"
 }
 trap cleanup_migrated_python_staging EXIT
 cleanup_migrated_python_staging
+MIGRATED_PYTHON_INIT_BACKUP=$(mktemp)
+cp "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py" "${MIGRATED_PYTHON_INIT_BACKUP}"
 for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
     cp "${MIGRATED_PYTHON_SOURCE_DIR}/${module}" \
        "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
 done
+cp -R "${STORE_FACADE_SOURCE_DIR}" "${STORE_FACADE_STAGING_DIR}"
 cp -R "${RESHARD_SOURCE_DIR}" "${RESHARD_STAGING_DIR}"
 
 # Build the wheel package
@@ -373,6 +445,16 @@ else
     exit 1
 fi
 
+# Keep the existing NPU repair layout. Other builds must retain their build-time
+# RPATH until auditwheel resolves external dependencies, including Conda's
+# libyaml-cpp.so.0.7 in the manylinux CUDA images. Replacing it with only $ORIGIN
+# makes those libraries undiscoverable. Strip debug info without changing RPATH.
+# Run after installing patchelf above so the supported version is used.
+if [ "$NPU_BUILD" = "1" ]; then
+    echo "Pre-setting RPATH=\$ORIGIN on NPU ELF files..."
+    find "$WHEEL_PACKAGE_DIR" -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0 | xargs -0 patchelf --force-rpath --set-rpath '$ORIGIN'
+fi
+
 # Create directory for repaired wheels
 REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"
 mkdir -p ${REPAIRED_DIR}
@@ -453,10 +535,22 @@ fi
 # libmpcomm.so; and (b) let patchelf rewrite a library carrying CUDA fatbins
 # (MPComm builds TMA kernels with USE_CUDA_KERNELS=ON by default), the same
 # corruption risk the EP/PG extensions are kept away from below.
+#
+# The SYCL, Level Zero and Intel compiler runtimes of an XPU build are
+# excluded too: the XPU EP runs on PyTorch's own sycl::queue, so it must share
+# the one SYCL runtime that PyTorch XPU installs (intel-sycl-rt,
+# intel-cmplr-lib-rt) rather than carry a second copy.
 ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
+    --exclude libsycl.so* \
+    --exclude libze_loader.so* \
+    --exclude libsvml.so* \
+    --exclude libimf.so* \
+    --exclude libirng.so* \
+    --exclude libintlc.so* \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
     --exclude libefa.so* \
+    --exclude libhwloc.so* \
     --exclude libibverbs.so* \
     --exclude libmlx5.so* \
     --exclude libnuma.so* \
@@ -501,6 +595,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libmusa.so* \
     --exclude libmusart.so* \
     --exclude libamdhip64.so* \
+    --exclude libgalaxyhip.so* \
     --exclude libhsa-runtime64.so* \
     --exclude librocprofiler-register.so* \
     --exclude libc10.so* \
@@ -563,6 +658,11 @@ if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; 
                 cp "$so_file" "$UNPACKED_PKG_DIR/mooncake/$(basename "$so_file")"
             fi
         done
+        # Kernel headers for the EP JIT (runtime nvcc).
+        if [ -d "$CUDA_EP_JIT_DIR" ]; then
+            echo "  Adding EP JIT header tree"
+            cp -r "$CUDA_EP_JIT_DIR" "$UNPACKED_PKG_DIR/mooncake/"
+        fi
         # The host EP extension is repaired before the device library is
         # injected.  auditwheel therefore only adds its vendored .libs path;
         # add the package directory as well so the sibling device library is
@@ -622,6 +722,32 @@ fi
 # Replace original wheel with repaired wheel
 rm -f ${OUTPUT_DIR}/*.whl
 mv ${REPAIRED_DIR}/*.whl ${OUTPUT_DIR}/
+
+# PyPI and TestPyPI reject files above 100 MiB by default. Gate here, next to
+# OUTPUT_DIR, so every caller of this script is covered (CI, nightly,
+# pre-release and release; CUDA, EFA, NPU, MUSA and ROCm alike) instead of
+# only the _build-wheel.yaml workflow. Only CI builds fail: local and Docker
+# builds may intentionally exceed the limit (e.g. KEEP_DEBUG_SYMBOLS=1) and
+# never upload to an index.
+wheels=("${OUTPUT_DIR}"/*.whl)
+if [ ! -e "${wheels[0]}" ]; then
+    echo "Error: no wheel found in ${OUTPUT_DIR}/ after auditwheel repair"
+    exit 1
+fi
+size_limit=$((100 * 1024 * 1024))
+for wheel in "${wheels[@]}"; do
+    size=$(stat -c %s "$wheel")
+    size_mib=$(awk -v size="$size" 'BEGIN { printf "%.1f", size / 1048576 }')
+    echo "$(basename "$wheel"): ${size_mib} MiB"
+    if [ "$size" -gt "$size_limit" ]; then
+        message="$(basename "$wheel") is ${size_mib} MiB, above the 100 MiB per-file upload limit of PyPI/TestPyPI"
+        if [ "${CI:-false}" = "true" ]; then
+            echo "Error: $message"
+            exit 1
+        fi
+        echo "Warning: $message (not enforced outside CI)"
+    fi
+done
 
 cd ..
 

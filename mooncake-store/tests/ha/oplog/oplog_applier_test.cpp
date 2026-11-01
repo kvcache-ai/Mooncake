@@ -4,8 +4,13 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <atomic>
+#include <future>
+#include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <xxhash.h>
@@ -13,11 +18,41 @@
 #include "metadata_store.h"
 #include "mock_metadata_store.h"
 #include "ha/oplog/oplog_types.h"
+#include "ha/standby_metadata_store.h"
+#include "ha/snapshot/batch_oplog/codec.h"
 #include "types.h"
+#include "weight_management.h"
+#include "weight_metadata_store.h"
 
 using mooncake::test::MockMetadataStore;
 
 namespace mooncake::test {
+
+class ReplayDiagnosticSink : public google::LogSink {
+   public:
+    ReplayDiagnosticSink() { google::AddLogSink(this); }
+    ~ReplayDiagnosticSink() override { google::RemoveLogSink(this); }
+
+    void send(google::LogSeverity severity, const char*, const char*, int,
+              const struct ::tm*, const char* message,
+              size_t message_len) override {
+        if (severity != google::GLOG_ERROR) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        diagnostic_.append(message, message_len);
+        diagnostic_.push_back('\n');
+    }
+
+    std::string diagnostic() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return diagnostic_;
+    }
+
+   private:
+    std::mutex mutex_;
+    std::string diagnostic_;
+};
 
 // Helper function to create a valid OpLogEntry with checksum
 // Uses the production checksum algorithm (XXH32).
@@ -54,6 +89,54 @@ std::string MakeValidPayload(uint64_t client_id_first = 1,
     return std::string(result.begin(), result.end());
 }
 
+template <typename T>
+std::string SerializePayload(const T& value) {
+    auto bytes = struct_pack::serialize(value);
+    return std::string(bytes.begin(), bytes.end());
+}
+
+WeightRevisionIdentity MakeWeightIdentity() {
+    return WeightRevisionIdentity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+}
+
+WeightRevisionMetadata MakeWeightMetadata(uint64_t metadata_generation) {
+    auto identity = MakeWeightIdentity();
+    return WeightRevisionMetadata{
+        .identity = identity,
+        .manifest =
+            WeightManifestReference{
+                .manifest_key =
+                    "weights/production/llama-70b/step-100/7/manifest",
+                .manifest_sha256 = std::string(64, 'a'),
+                .payload_group_id = MakeWeightPayloadGroupId(identity),
+                .payload_keys_sha256 = std::string(64, 'b'),
+                .payload_count = 2,
+                .logical_bytes = 2048,
+            },
+        .availability = WeightAvailabilityState::READY,
+        .residency = WeightResidencyState::HOT,
+        .operation = WeightOperationState::NONE,
+        .metadata_generation = metadata_generation,
+        .created_at_ms = 100,
+        .updated_at_ms = 100 + metadata_generation,
+    };
+}
+
+std::string SerializeWeightUpsert(
+    const WeightRevisionMetadata& metadata,
+    std::optional<WeightResidencyOperation> operation = std::nullopt) {
+    return SerializePayload(WeightMetadataUpsertOp{
+        .metadata = metadata,
+        .operation = std::move(operation),
+    });
+}
+
 class OpLogApplierTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -71,6 +154,556 @@ class OpLogApplierTest : public ::testing::Test {
     std::unique_ptr<OpLogApplier> applier_;
     std::string cluster_id_;
 };
+
+TEST_F(OpLogApplierTest, AppliesWeightMetadataAndRejectsStaleGeneration) {
+    auto generation_one = MakeWeightMetadata(1);
+    const auto key = MakeWeightRevisionMetadataKey(generation_one.identity);
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT, key,
+                  SerializeWeightUpsert(generation_one))));
+    ASSERT_EQ(generation_one,
+              mock_metadata_store_->GetWeightMetadata(generation_one.identity));
+
+    auto generation_two = generation_one;
+    generation_two.metadata_generation = 2;
+    generation_two.updated_at_ms = 102;
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(2, OpType::WEIGHT_METADATA_UPSERT, key,
+                  SerializeWeightUpsert(generation_two))));
+    ASSERT_EQ(generation_two,
+              mock_metadata_store_->GetWeightMetadata(generation_one.identity));
+
+    EXPECT_FALSE(applier_->ApplyOpLogEntry(
+        MakeEntry(3, OpType::WEIGHT_METADATA_UPSERT, key,
+                  SerializeWeightUpsert(generation_one))));
+    EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
+    EXPECT_EQ(generation_two,
+              mock_metadata_store_->GetWeightMetadata(generation_one.identity));
+}
+
+TEST_F(OpLogApplierTest, AppliesImportingToReadyTransition) {
+    auto importing = MakeWeightMetadata(1);
+    importing.manifest.manifest_key.clear();
+    importing.manifest.manifest_sha256.clear();
+    importing.manifest.payload_keys_sha256.clear();
+    importing.availability = WeightAvailabilityState::IMPORTING;
+    importing.residency = WeightResidencyState::UNKNOWN;
+    auto ready = MakeWeightMetadata(2);
+    ready.created_at_ms = importing.created_at_ms;
+    const auto key = MakeWeightRevisionMetadataKey(importing.identity);
+
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT, key,
+                  SerializeWeightUpsert(importing))));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
+        2, OpType::WEIGHT_METADATA_UPSERT, key, SerializeWeightUpsert(ready))));
+    EXPECT_EQ(ready,
+              mock_metadata_store_->GetWeightMetadata(importing.identity));
+}
+
+TEST_F(OpLogApplierTest, WeightMetadataDuplicateReplayIsIdempotent) {
+    auto metadata = MakeWeightMetadata(1);
+    auto entry = MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT,
+                           MakeWeightRevisionMetadataKey(metadata.identity),
+                           SerializeWeightUpsert(metadata));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
+    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
+    EXPECT_EQ(metadata,
+              mock_metadata_store_->GetWeightMetadata(metadata.identity));
+}
+
+TEST_F(OpLogApplierTest, ReplaysWeightOperationStartAndCompletion) {
+    auto ready = MakeWeightMetadata(1);
+    const auto key = MakeWeightRevisionMetadataKey(ready.identity);
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
+        1, OpType::WEIGHT_METADATA_UPSERT, key, SerializeWeightUpsert(ready))));
+
+    auto evicting = ready;
+    evicting.metadata_generation = 2;
+    evicting.operation = WeightOperationState::EVICTING;
+    evicting.operation_id = 9;
+    evicting.updated_at_ms = 200;
+    WeightResidencyOperation operation{
+        .operation_id = 9,
+        .identity = ready.identity,
+        .operation = WeightOperationState::EVICTING,
+        .target_residency = WeightResidencyState::COLD,
+        .fenced_metadata_generation = 2,
+        .started_at_ms = 200,
+        .updated_at_ms = 200,
+        .processed_members = 0,
+        .total_members = 2,
+        .cursor = {},
+        .message = {},
+    };
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(2, OpType::WEIGHT_METADATA_UPSERT, key,
+                  SerializeWeightUpsert(evicting, operation))));
+    EXPECT_EQ(operation, mock_metadata_store_->GetWeightOperation(9));
+
+    auto cold = evicting;
+    cold.metadata_generation = 3;
+    cold.operation = WeightOperationState::NONE;
+    cold.operation_id = 0;
+    cold.residency = WeightResidencyState::COLD;
+    cold.updated_at_ms = 300;
+    operation.updated_at_ms = 300;
+    operation.message = "completed";
+    auto completion = MakeEntry(3, OpType::WEIGHT_METADATA_UPSERT, key,
+                                SerializeWeightUpsert(cold, operation));
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(completion));
+    EXPECT_EQ(cold, mock_metadata_store_->GetWeightMetadata(ready.identity));
+    EXPECT_EQ(operation, mock_metadata_store_->GetWeightOperation(9));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(completion));
+}
+
+TEST_F(OpLogApplierTest, RejectsWeightOperationWithoutRecord) {
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id_);
+    const auto ready = MakeWeightMetadata(1);
+    const auto key = MakeWeightRevisionMetadataKey(ready.identity);
+    ASSERT_TRUE(applier.ApplyOpLogEntry(MakeEntry(
+        1, OpType::WEIGHT_METADATA_UPSERT, key, SerializeWeightUpsert(ready))));
+
+    auto operating = MakeWeightMetadata(2);
+    operating.operation = WeightOperationState::EVICTING;
+    operating.operation_id = 1;
+    ASSERT_TRUE(ValidateWeightRevisionMetadata(operating).ok());
+    EXPECT_FALSE(applier.ApplyOpLogEntry(
+        MakeEntry(2, OpType::WEIGHT_METADATA_UPSERT, key,
+                  SerializeWeightUpsert(operating))));
+    EXPECT_EQ(2u, applier.GetExpectedSequenceId());
+    EXPECT_EQ(ready, standby.GetWeightMetadata(ready.identity));
+    EXPECT_TRUE(
+        ValidateWeightMetadataSnapshot(standby.SnapshotWeightMetadata()));
+}
+
+TEST_F(OpLogApplierTest, CancelledOperationRejectsLateProgressReplay) {
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id_);
+    auto metadata = MakeWeightMetadata(1);
+    const auto key = MakeWeightRevisionMetadataKey(metadata.identity);
+    ASSERT_TRUE(applier.ApplyOpLogEntry(
+        MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT, key,
+                  SerializeWeightUpsert(metadata))));
+    metadata.metadata_generation = 2;
+    metadata.operation = WeightOperationState::EVICTING;
+    metadata.operation_id = 9;
+    metadata.updated_at_ms = 200;
+    WeightResidencyOperation operation{
+        .operation_id = 9,
+        .identity = metadata.identity,
+        .operation = WeightOperationState::EVICTING,
+        .target_residency = WeightResidencyState::COLD,
+        .fenced_metadata_generation = 2,
+        .started_at_ms = 200,
+        .updated_at_ms = 200,
+        .processed_members = 0,
+        .total_members = 2,
+    };
+    const auto active_payload = SerializeWeightUpsert(metadata, operation);
+    ASSERT_TRUE(applier.ApplyOpLogEntry(
+        MakeEntry(2, OpType::WEIGHT_METADATA_UPSERT, key, active_payload)));
+    metadata.metadata_generation = 3;
+    metadata.availability = WeightAvailabilityState::DELETING;
+    metadata.operation = WeightOperationState::NONE;
+    metadata.operation_id = 0;
+    metadata.updated_at_ms = 300;
+    operation.message = kWeightOperationCancelledMessage;
+    operation.updated_at_ms = 300;
+    const auto cancellation =
+        MakeEntry(3, OpType::WEIGHT_METADATA_UPSERT, key,
+                  SerializeWeightUpsert(metadata, operation));
+    ASSERT_TRUE(applier.ApplyOpLogEntry(cancellation));
+    ASSERT_TRUE(applier.ApplyOpLogEntry(cancellation));
+    const auto cancelled = standby.SnapshotWeightMetadata();
+    EXPECT_TRUE(ValidateWeightMetadataSnapshot(cancelled));
+    EXPECT_NE(metadata.residency, operation.target_residency);
+    {
+        auto conflicting = operation;
+        ++conflicting.processed_members;
+        ReplayDiagnosticSink sink;
+        EXPECT_FALSE(applier.ApplyOpLogEntry(
+            MakeEntry(4, OpType::WEIGHT_METADATA_UPSERT, key,
+                      SerializeWeightUpsert(metadata, conflicting))));
+        const auto diagnostic = sink.diagnostic();
+        EXPECT_NE(diagnostic.find("cancellation duplicate operation mismatch"),
+                  std::string::npos);
+        EXPECT_NE(diagnostic.find("key=" + key), std::string::npos);
+        EXPECT_NE(diagnostic.find("sequence_id=4"), std::string::npos);
+        EXPECT_NE(diagnostic.find("operation_id=9"), std::string::npos);
+        EXPECT_EQ(cancelled, standby.SnapshotWeightMetadata());
+    }
+    EXPECT_FALSE(applier.ApplyOpLogEntry(
+        MakeEntry(4, OpType::WEIGHT_METADATA_UPSERT, key, active_payload)));
+    EXPECT_EQ(4u, applier.GetExpectedSequenceId());
+    EXPECT_EQ(cancelled, standby.SnapshotWeightMetadata());
+    metadata.metadata_generation = 4;
+    metadata.updated_at_ms = 400;
+    metadata.availability = WeightAvailabilityState::DELETED;
+    metadata.residency = WeightResidencyState::ABSENT;
+    ASSERT_TRUE(applier.ApplyOpLogEntry(
+        MakeEntry(4, OpType::WEIGHT_METADATA_UPSERT, key,
+                  SerializeWeightUpsert(metadata))));
+    WeightMetadataStore restored;
+    ASSERT_TRUE(restored.RestoreSnapshot(standby.SnapshotWeightMetadata()));
+    const auto queried = restored.QueryOperation(9);
+    ASSERT_TRUE(queried);
+    EXPECT_EQ(operation, *queried);
+    const auto view = restored.Get(metadata.identity, 400);
+    ASSERT_TRUE(view);
+    EXPECT_EQ(WeightAvailabilityState::DELETED, view->metadata.availability);
+}
+
+TEST_F(OpLogApplierTest, RejectsCancellationThatChangesPendingOperation) {
+    for (const std::string changed : {"operation_id", "target", "progress"}) {
+        SCOPED_TRACE(changed);
+        StandbyMetadataStore standby;
+        OpLogApplier applier(&standby, cluster_id_);
+        auto metadata = MakeWeightMetadata(1);
+        const auto key = MakeWeightRevisionMetadataKey(metadata.identity);
+        ASSERT_TRUE(applier.ApplyOpLogEntry(
+            MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT, key,
+                      SerializeWeightUpsert(metadata))));
+        metadata.metadata_generation = 2;
+        metadata.updated_at_ms = 200;
+        metadata.operation = WeightOperationState::EVICTING;
+        metadata.operation_id = 9;
+        WeightResidencyOperation operation{
+            .operation_id = 9,
+            .identity = metadata.identity,
+            .operation = WeightOperationState::EVICTING,
+            .target_residency = WeightResidencyState::COLD,
+            .fenced_metadata_generation = 2,
+            .started_at_ms = 200,
+            .updated_at_ms = 200,
+            .processed_members = 0,
+            .total_members = 2,
+        };
+        ASSERT_TRUE(applier.ApplyOpLogEntry(
+            MakeEntry(2, OpType::WEIGHT_METADATA_UPSERT, key,
+                      SerializeWeightUpsert(metadata, operation))));
+        const auto before = standby.SnapshotWeightMetadata();
+        ASSERT_TRUE(ValidateWeightMetadataSnapshot(before));
+        metadata.metadata_generation = 3;
+        metadata.updated_at_ms = 300;
+        metadata.availability = WeightAvailabilityState::DELETING;
+        metadata.operation = WeightOperationState::NONE;
+        metadata.operation_id = 0;
+        operation.message = kWeightOperationCancelledMessage;
+        operation.updated_at_ms = 300;
+        if (changed == "operation_id") {
+            operation.operation_id = 10;
+        } else if (changed == "target") {
+            operation.target_residency = WeightResidencyState::HOT;
+        } else {
+            operation.processed_members = 1;
+        }
+        ReplayDiagnosticSink sink;
+        EXPECT_FALSE(applier.ApplyOpLogEntry(
+            MakeEntry(3, OpType::WEIGHT_METADATA_UPSERT, key,
+                      SerializeWeightUpsert(metadata, operation))));
+        const auto diagnostic = sink.diagnostic();
+        EXPECT_NE(
+            diagnostic.find(changed == "operation_id"
+                                ? "cancellation prior lineage mismatch"
+                                : "cancellation changes operation fields"),
+            std::string::npos);
+        EXPECT_NE(diagnostic.find("key=" + key), std::string::npos);
+        EXPECT_NE(diagnostic.find("sequence_id=3"), std::string::npos);
+        EXPECT_NE(diagnostic.find("operation_id=" +
+                                  std::to_string(operation.operation_id)),
+                  std::string::npos);
+        EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+        EXPECT_EQ(before, standby.SnapshotWeightMetadata());
+    }
+}
+
+TEST_F(OpLogApplierTest, RejectsCancellationWithoutPriorOperation) {
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id_);
+    const auto before = standby.SnapshotWeightMetadata();
+    auto metadata = MakeWeightMetadata(1);
+    metadata.availability = WeightAvailabilityState::DELETING;
+    ASSERT_TRUE(ValidateWeightRevisionMetadata(metadata).ok());
+    WeightResidencyOperation operation{
+        .operation_id = 9,
+        .identity = metadata.identity,
+        .operation = WeightOperationState::REHYDRATING,
+        .target_residency = WeightResidencyState::HOT,
+        .fenced_metadata_generation = 0,
+        .started_at_ms = 100,
+        .updated_at_ms = 101,
+        .processed_members = 0,
+        .total_members = 2,
+        .cursor = {},
+        .message = kWeightOperationCancelledMessage,
+    };
+    ReplayDiagnosticSink sink;
+    EXPECT_FALSE(applier.ApplyOpLogEntry(
+        MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT,
+                  MakeWeightRevisionMetadataKey(metadata.identity),
+                  SerializeWeightUpsert(metadata, operation))));
+    const auto diagnostic = sink.diagnostic();
+    EXPECT_NE(diagnostic.find("cancellation has no current metadata"),
+              std::string::npos);
+    EXPECT_NE(diagnostic.find("key=" +
+                              MakeWeightRevisionMetadataKey(metadata.identity)),
+              std::string::npos);
+    EXPECT_NE(diagnostic.find("sequence_id=1"), std::string::npos);
+    EXPECT_NE(diagnostic.find("operation_id=9"), std::string::npos);
+    EXPECT_EQ(1u, applier.GetExpectedSequenceId());
+    EXPECT_EQ(before, standby.SnapshotWeightMetadata());
+}
+
+TEST_F(OpLogApplierTest, RejectsLegacyMetadataWithActiveOperation) {
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id_);
+    auto metadata = MakeWeightMetadata(1);
+    metadata.operation = WeightOperationState::EVICTING;
+    metadata.operation_id = 9;
+    ASSERT_TRUE(ValidateWeightRevisionMetadata(metadata).ok());
+    EXPECT_FALSE(applier.ApplyOpLogEntry(
+        MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT,
+                  MakeWeightRevisionMetadataKey(metadata.identity),
+                  SerializePayload(metadata))));
+    EXPECT_EQ(1u, applier.GetExpectedSequenceId());
+    EXPECT_TRUE(standby.SnapshotWeightMetadata().metadata.empty());
+}
+
+TEST_F(OpLogApplierTest, ReplaysLegacyWeightMetadataGolden) {
+    // Generated by struct_pack::serialize(WeightRevisionMetadata) at e4229791.
+    const std::string hex =
+        "f7c250b004fdfd800c800c800c800c04fffd800c800c800c800c0404ff0606060404"
+        "0404ff000764656661756c740a70726f64756374696f6e096c6c616d612d37306208"
+        "737465702d31303007000000000000000000477765696768743a3564626265613134"
+        "61613735633938613562336662623537366139633631326436346663366263386634"
+        "39306632346137666630313766636665333231623764000000000000000000000000"
+        "00000000000000000000000000000000010000000000000064000000000000006500"
+        "000000000000";
+    std::string payload;
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        payload.push_back(
+            static_cast<char>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+    }
+    WeightRevisionMetadata expected;
+    expected.identity = MakeWeightIdentity();
+    expected.manifest.payload_group_id =
+        MakeWeightPayloadGroupId(expected.identity);
+    expected.created_at_ms = 100;
+    expected.updated_at_ms = 101;
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id_);
+    const auto entry =
+        MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT,
+                  MakeWeightRevisionMetadataKey(expected.identity), payload);
+    ASSERT_TRUE(applier.ApplyOpLogEntry(entry));
+    EXPECT_EQ(expected, standby.GetWeightMetadata(expected.identity));
+    EXPECT_EQ(2u, applier.GetExpectedSequenceId());
+    EXPECT_TRUE(applier.ApplyOpLogEntry(entry));
+    EXPECT_TRUE(
+        ValidateWeightMetadataSnapshot(standby.SnapshotWeightMetadata()));
+}
+
+TEST_F(OpLogApplierTest, RestoresLegacyWeightSnapshotGolden) {
+    // Generated by struct_pack::serialize(WeightMetadataSnapshot) at e4229791.
+    const std::string hex =
+        "fd573cc304fd0284fdfd800c800c800c800c04fffd800c800c800c800c0404ff0606"
+        "0604040404ff84fd04fd800c800c800c800c04ff800c0404ff84fd04fd800c800c80"
+        "0c800c04ff06060404040404800c800cff0404ff0001000000010764656661756c74"
+        "0a70726f64756374696f6e096c6c616d612d37306208737465702d31303007000000"
+        "000000000000477765696768743a3564626265613134616137356339386135623366"
+        "62623537366139633631326436346663366263386634393066323461376666303137"
+        "66636665333231623764000000000000000000000000000000000000000000000000"
+        "00000000010000000000000064000000000000006500000000000000000001000000"
+        "000000000100000000000000";
+    std::vector<uint8_t> bytes;
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        bytes.push_back(
+            static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+    }
+    const auto decoded = DecodeBatchOpLogSnapshotWeightMetadata(bytes);
+    ASSERT_TRUE(decoded.has_value());
+    StandbyMetadataStore standby;
+    ASSERT_TRUE(standby.RestoreWeightMetadata(*decoded));
+    WeightMetadataStore restored;
+    ASSERT_TRUE(restored.RestoreSnapshot(standby.SnapshotWeightMetadata()));
+    auto view = restored.Get(MakeWeightIdentity(), 101);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(WeightAvailabilityState::IMPORTING, view->metadata.availability);
+    EXPECT_EQ(1u, view->metadata.metadata_generation);
+    EXPECT_EQ(100u, view->metadata.created_at_ms);
+    EXPECT_EQ(101u, view->metadata.updated_at_ms);
+}
+
+TEST_F(OpLogApplierTest, PublishesWeightOperationAtomicallyToSnapshotReaders) {
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id_);
+    auto metadata = MakeWeightMetadata(1);
+    const auto key = MakeWeightRevisionMetadataKey(metadata.identity);
+    ASSERT_TRUE(applier.ApplyOpLogEntry(
+        MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT, key,
+                  SerializeWeightUpsert(metadata))));
+    metadata.metadata_generation = 2;
+    metadata.updated_at_ms = 200;
+    metadata.operation = WeightOperationState::EVICTING;
+    metadata.operation_id = 9;
+    WeightResidencyOperation operation{
+        .operation_id = 9,
+        .identity = metadata.identity,
+        .operation = WeightOperationState::EVICTING,
+        .target_residency = WeightResidencyState::COLD,
+        .fenced_metadata_generation = 2,
+        .started_at_ms = 200,
+        .updated_at_ms = 200,
+        .processed_members = 0,
+        .total_members = 2,
+        .cursor = {},
+        .message = {},
+    };
+    std::atomic<bool> done{false};
+    std::atomic<size_t> reads{0};
+    std::atomic<size_t> invalid_reads{0};
+    std::atomic<bool> writer_active{false};
+    std::atomic<size_t> writer_active_reads{0};
+    auto reader = std::async(std::launch::async, [&] {
+        bool valid = true;
+        while (!done.load()) {
+            const auto snapshot = standby.SnapshotWeightMetadata();
+            const bool snapshot_valid =
+                ValidateWeightMetadataSnapshot(snapshot).has_value();
+            valid &= snapshot_valid;
+            if (!snapshot_valid) {
+                invalid_reads.fetch_add(1);
+            }
+            reads.fetch_add(1);
+            if (writer_active.load() && !snapshot.metadata.empty() &&
+                snapshot.metadata.front().metadata_generation >= 2) {
+                writer_active_reads.fetch_add(1);
+            }
+        }
+        return valid;
+    });
+    while (reads.load() == 0) {
+        std::this_thread::yield();
+    }
+    bool applied = true;
+    writer_active.store(true);
+    for (uint64_t iteration = 0; iteration < 256 && applied; ++iteration) {
+        metadata.metadata_generation = 2 + iteration * 2;
+        metadata.updated_at_ms = 200 + iteration * 2;
+        metadata.operation = iteration % 2 == 0
+                                 ? WeightOperationState::EVICTING
+                                 : WeightOperationState::REHYDRATING;
+        metadata.operation_id = 9 + iteration;
+        operation.operation_id = metadata.operation_id;
+        operation.operation = metadata.operation;
+        operation.target_residency = iteration % 2 == 0
+                                         ? WeightResidencyState::COLD
+                                         : WeightResidencyState::HOT;
+        operation.fenced_metadata_generation = metadata.metadata_generation;
+        operation.updated_at_ms = metadata.updated_at_ms;
+        operation.message.clear();
+        auto start = MakeEntry(metadata.metadata_generation,
+                               OpType::WEIGHT_METADATA_UPSERT, key,
+                               SerializeWeightUpsert(metadata, operation));
+        applied =
+            applier.ApplyOpLogEntry(start) && applier.ApplyOpLogEntry(start);
+        // Keep the writer in its mutation loop until a reader has observed
+        // an operation published by this loop, not just the initial state.
+        if (iteration == 0 && applied) {
+            while (writer_active_reads.load() == 0) {
+                std::this_thread::yield();
+            }
+        }
+        metadata.metadata_generation++;
+        metadata.updated_at_ms++;
+        metadata.operation = WeightOperationState::NONE;
+        metadata.operation_id = 0;
+        metadata.residency = operation.target_residency;
+        operation.updated_at_ms = metadata.updated_at_ms;
+        operation.message = "completed";
+        applied &= applier.ApplyOpLogEntry(MakeEntry(
+            metadata.metadata_generation, OpType::WEIGHT_METADATA_UPSERT, key,
+            SerializeWeightUpsert(metadata, operation)));
+    }
+    writer_active.store(false);
+    done.store(true);
+    EXPECT_TRUE(reader.get());
+    EXPECT_TRUE(applied);
+    EXPECT_GT(reads.load(), 0u);
+    EXPECT_GT(writer_active_reads.load(), 0u);
+    std::cout << "snapshot reads=" << reads.load()
+              << ", valid=" << reads.load() - invalid_reads.load()
+              << ", invalid=" << invalid_reads.load()
+              << ", writer_active=" << writer_active_reads.load() << '\n';
+    const auto snapshot = standby.SnapshotWeightMetadata();
+    EXPECT_TRUE(ValidateWeightMetadataSnapshot(snapshot));
+    ASSERT_EQ(1u, snapshot.metadata.size());
+    ASSERT_EQ(256u, snapshot.operations.size());
+    EXPECT_EQ(metadata, snapshot.metadata.front());
+    EXPECT_EQ(operation, snapshot.operations.back());
+    EXPECT_EQ(265u, snapshot.next_operation_id);
+}
+
+TEST_F(OpLogApplierTest, AppliesWeightLeaseAndDeleteTombstones) {
+    auto metadata = MakeWeightMetadata(1);
+    const auto metadata_key = MakeWeightRevisionMetadataKey(metadata.identity);
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT, metadata_key,
+                  SerializeWeightUpsert(metadata))));
+
+    WeightRevisionLease lease{
+        .lease_id = 42,
+        .identity = metadata.identity,
+        .holder = "worker-0",
+        .expires_at_ms = 1000,
+        .fenced_metadata_generation = metadata.metadata_generation,
+    };
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(2, OpType::WEIGHT_LEASE_UPSERT, "weight-lease:42",
+                  SerializePayload(lease))));
+    EXPECT_EQ(lease, mock_metadata_store_->GetWeightLease(lease.lease_id));
+
+    WeightLeaseDeleteOp lease_delete{
+        .lease_id = lease.lease_id,
+        .identity = lease.identity,
+        .fenced_metadata_generation = lease.fenced_metadata_generation,
+    };
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(3, OpType::WEIGHT_LEASE_DELETE, "weight-lease:42",
+                  SerializePayload(lease_delete))));
+    EXPECT_FALSE(mock_metadata_store_->GetWeightLease(lease.lease_id));
+
+    WeightMetadataDeleteOp metadata_delete{
+        .identity = metadata.identity,
+        .metadata_generation = metadata.metadata_generation,
+    };
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(4, OpType::WEIGHT_METADATA_DELETE, metadata_key,
+                  SerializePayload(metadata_delete))));
+    EXPECT_FALSE(
+        mock_metadata_store_->GetWeightMetadata(metadata.identity).has_value());
+
+    EXPECT_FALSE(applier_->ApplyOpLogEntry(
+        MakeEntry(5, OpType::WEIGHT_METADATA_UPSERT, metadata_key,
+                  SerializeWeightUpsert(metadata))));
+    EXPECT_EQ(5u, applier_->GetExpectedSequenceId());
+}
+
+TEST_F(OpLogApplierTest, RejectsMalformedWeightPayloadAndMismatchedKey) {
+    auto metadata = MakeWeightMetadata(1);
+    EXPECT_FALSE(applier_->ApplyOpLogEntry(MakeEntry(
+        1, OpType::WEIGHT_METADATA_UPSERT,
+        MakeWeightRevisionMetadataKey(metadata.identity), "invalid")));
+    EXPECT_EQ(1u, applier_->GetExpectedSequenceId());
+
+    EXPECT_FALSE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT, "weight-revision:wrong",
+                  SerializeWeightUpsert(metadata))));
+    EXPECT_EQ(1u, applier_->GetExpectedSequenceId());
+}
 
 // ========== 4.1.1 Basic apply tests ==========
 
@@ -114,12 +747,9 @@ TEST_F(OpLogApplierTest, TestApplyRemove) {
 }
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidOpType) {
-    OpLogEntry entry =
-        MakeEntry(1, OpType::PUT_END, "key1", MakeValidPayload());
-    // Manually set an invalid op_type (assuming OpType is an enum)
-    // Since we can't directly set invalid enum, we test with valid types
-    // and verify that unsupported types in ProcessPendingEntries are handled
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
+    OpLogEntry entry = MakeEntry(1, static_cast<OpType>(200), "key1", "");
+    EXPECT_FALSE(applier_->ApplyOpLogEntry(entry));
+    EXPECT_EQ(1u, applier_->GetExpectedSequenceId());
 }
 
 // ========== 4.1.2 Sequence ordering tests ==========

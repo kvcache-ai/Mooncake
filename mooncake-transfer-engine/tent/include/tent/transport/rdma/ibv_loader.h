@@ -29,6 +29,13 @@ struct IbvSymbols {
                             struct ibv_device_attr* device_attr);
     int (*ibv_query_gid)(struct ibv_context* context, uint8_t port_num,
                          int index, union ibv_gid* gid);
+    // The entry point behind the ibv_query_gid_ex() header inline. Taken
+    // through the table like the rest so GID scanning can be stood in for;
+    // call it through QueryGidEx() below rather than passing entry_size by
+    // hand.
+    int (*ibv_query_gid_ex)(struct ibv_context* context, uint32_t port_num,
+                            uint32_t gid_index, struct ibv_gid_entry* entry,
+                            uint32_t flags, size_t entry_size);
     int (*ibv_query_port_default)(ibv_context* context, uint8_t port_num,
                                   ibv_port_attr* port_attr);
     // Optional (rdma-core >= 62): effective port speed in 100 Mb/s units,
@@ -61,10 +68,24 @@ struct IbvSymbols {
                                   int access);
     ibv_mr* (*ibv_reg_mr_iova2)(struct ibv_pd* pd, void* addr, size_t length,
                                 uint64_t iova, unsigned int access);
+    // Optional (rdma-core >= 34): registers a dma-buf exported device buffer
+    // so the NIC DMAs to device memory directly. nullptr when the installed
+    // libibverbs predates it; callers then fall back to host staging.
+    ibv_mr* (*ibv_reg_dmabuf_mr)(ibv_pd* pd, uint64_t offset, size_t length,
+                                 uint64_t iova, int fd, int access);
     int (*ibv_dereg_mr)(ibv_mr* mr);
 
     int (*ibv_fork_init)(void);
 };
+
+// ibv_query_gid_ex() as the header defines it, but dispatched through a
+// context's own symbol table.
+inline int QueryGidEx(const IbvSymbols& verbs, ibv_context* context,
+                      uint32_t port_num, uint32_t gid_index,
+                      ibv_gid_entry* entry) {
+    return verbs.ibv_query_gid_ex(context, port_num, gid_index, entry,
+                                  /*flags=*/0, sizeof(*entry));
+}
 
 class IbvLoader {
    public:

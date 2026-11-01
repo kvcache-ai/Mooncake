@@ -11,13 +11,19 @@ jobs:
     if: ${{ !contains(github.ref_name, '-') }}
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [x86_64, arm64]
     uses: ./.github/workflows/_build-efa-wheel.yaml
     with:
+      architecture: ${{ matrix.architecture }}
       variant: non-cuda
-      python-versions: '["3.10", "3.11", "3.12", "3.13"]'
+      python-versions: '["3.10", "3.11", "3.12", "3.13", "3.14"]'
       build-profile: release
       cmake-args: >-
         -DUSE_HTTP=ON -DUSE_ETCD=ON -DWITH_EP=OFF -DSTORE_USE_ETCD=ON
+        -DENABLE_DEBUG_SYMBOLS=OFF
       artifact-prefix: mooncake-wheel-efa-non-cuda
 
   publish-release:

@@ -253,12 +253,12 @@ int UbWorkerPool::submitPostSend(
                                           slice->ub.dest_addr, slice->length,
                                           hint, buffer_id, device_id)) {
                 slice->markFailed();
-                for (const auto& dev_desc : peer_segment_desc.get()->devices) {
-                    LOG(ERROR) << "peer device : " << dev_desc.name;
-                }
+                failed_target_ids[slice->target_id] = getCurrentTimeInNano();
+                // The per-device list used to be logged here per event,
+                // which floods under failure storms; the throttled
+                // fixed-size record inside dumpMetadataContent covers it.
                 context_.engine().meta()->dumpMetadataContent(
-                    peer_segment_desc->name, slice->ub.dest_addr,
-                    slice->length);
+                    peer_segment_desc, slice->ub.dest_addr, slice->length);
                 continue;
             }
         }
@@ -377,7 +377,7 @@ void UbWorkerPool::performPostSend(int thread_id) {
             if (context_.active() && failed_nr_polls > 32 &&
                 !success_nr_polls) {
                 LOG(WARNING)
-                    << "Failed to establish peer endpoints in local RNIC "
+                    << "Failed to establish peer endpoints on local UB device "
                     << context_.nicPath() << ", mark it inactive";
                 context_.set_active(false);
             }
@@ -426,7 +426,7 @@ void UbWorkerPool::performPoll(int thread_id) {
             failed_nr_polls++;
             if (context_.active() && failed_nr_polls > 32 &&
                 !success_nr_polls) {
-                LOG(WARNING) << "Too many errors found in local RNIC "
+                LOG(WARNING) << "Too many errors found on local UB device "
                              << context_.nicPath() << ", mark it inactive";
                 context_.set_active(false);
             }

@@ -12,6 +12,7 @@
 #include <mutex>
 #include <numa.h>
 #include <numaif.h>
+#include <string>
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
@@ -296,6 +297,74 @@ void free_buffer_mmap_memory(void *ptr, size_t total_size) {
     }
 }
 
+namespace {
+
+// MPOL_MODE_FLAGS from <linux/mempolicy.h>, which clashes with <numaif.h>.
+// get_mempolicy() returns these OR'ed into the mode.
+constexpr int kMempolicyModeFlags = (1 << 15) | (1 << 14) | (1 << 13);
+
+std::vector<int> BitmaskNodes(const struct bitmask *mask) {
+    std::vector<int> nodes;
+    for (unsigned long node = 0; node < mask->size; ++node) {
+        if (numa_bitmask_isbitset(mask, node)) {
+            nodes.push_back(static_cast<int>(node));
+        }
+    }
+    return nodes;
+}
+
+bool Contains(const std::vector<int> &nodes, int node) {
+    return std::find(nodes.begin(), nodes.end(), node) != nodes.end();
+}
+
+}  // namespace
+
+std::vector<int> FilterNumaNodesToAllowed(const std::vector<int> &nodes) {
+    if (nodes.empty()) return {};
+    struct bitmask *mask = numa_allocate_nodemask();
+    if (mask == nullptr) return nodes;
+    if (get_mempolicy(nullptr, mask->maskp, mask->size + 1, nullptr,
+                      MPOL_F_MEMS_ALLOWED) != 0) {
+        const int err = errno;
+        numa_bitmask_free(mask);
+        LOG(WARNING) << "Cannot read this process's allowed NUMA nodes, errno="
+                     << err << " (" << strerror(err)
+                     << "); NIC NUMA nodes are used as is";
+        return nodes;
+    }
+    std::vector<int> allowed = BitmaskNodes(mask);
+
+    int mode = MPOL_DEFAULT;
+    numa_bitmask_clearall(mask);
+    if (get_mempolicy(&mode, mask->maskp, mask->size + 1, nullptr, 0) == 0 &&
+        (mode & ~kMempolicyModeFlags) == MPOL_BIND) {
+        const std::vector<int> bound = BitmaskNodes(mask);
+        allowed.erase(
+            std::remove_if(allowed.begin(), allowed.end(),
+                           [&](int node) { return !Contains(bound, node); }),
+            allowed.end());
+    }
+    numa_bitmask_free(mask);
+
+    std::vector<int> kept;
+    std::string dropped;
+    for (int node : nodes) {
+        if (Contains(allowed, node)) {
+            kept.push_back(node);
+        } else {
+            if (!dropped.empty()) dropped += ",";
+            dropped += std::to_string(node);
+        }
+    }
+    if (!dropped.empty()) {
+        LOG(INFO) << "NIC NUMA nodes [" << dropped
+                  << "] are outside this process's allowed memory nodes "
+                     "(cpuset.mems or an MPOL_BIND task policy); the global "
+                     "segment is not placed there";
+    }
+    return kept;
+}
+
 // NUMA-segmented buffer allocation
 void *allocate_buffer_numa_segments(size_t total_size,
                                     const std::vector<int> &numa_nodes,
@@ -362,6 +431,74 @@ void *allocate_buffer_numa_segments(size_t total_size,
             }
             return s;
         }() << "]";
+    return ptr;
+}
+
+void *allocate_buffer_thp_interleaved(size_t total_size) {
+    constexpr size_t kThpSize = SZ_2MB;
+    if (total_size == 0 || total_size % kThpSize != 0) {
+        LOG(ERROR) << "Invalid THP segment size " << total_size
+                   << ", must be a non-zero multiple of " << kThpSize;
+        return nullptr;
+    }
+
+    // Over-reserve by one huge page and trim, so the returned range is
+    // 2MB-aligned and every PMD in it can be backed by a THP. The trimmed
+    // mapping is exactly [ptr, ptr + total_size), which is what
+    // free_buffer_mmap_memory() unmaps.
+    const size_t reserve_size = total_size + kThpSize;
+    void *raw = mmap(nullptr, reserve_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (raw == MAP_FAILED) {
+        LOG(ERROR) << "mmap failed, size=" << reserve_size
+                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+        return nullptr;
+    }
+    const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(raw);
+    const uintptr_t addr = align_up(raw_addr, kThpSize);
+    if (addr > raw_addr) {
+        munmap(raw, addr - raw_addr);
+    }
+    const uintptr_t tail = addr + total_size;
+    if (raw_addr + reserve_size > tail) {
+        munmap(reinterpret_cast<void *>(tail), raw_addr + reserve_size - tail);
+    }
+    void *ptr = reinterpret_cast<void *>(addr);
+
+    // Request THP explicitly instead of relying on the system default or on
+    // GLIBC_TUNABLES=glibc.malloc.hugetlb=1. With THP enabled=madvise a 4KB
+    // backed segment needs 512x more NIC page-table entries, and EFA reg_mr
+    // runs out of them (ENOMEM) once several ranks register large segments.
+    if (madvise(ptr, total_size, MADV_HUGEPAGE) != 0) {
+        LOG(WARNING) << "madvise(MADV_HUGEPAGE) failed, errno=" << errno << " ("
+                     << strerror(errno) << "); segment may be 4KB backed";
+    }
+
+    // Interleave across all allowed NUMA nodes. Under the default local
+    // policy one node fills first, and from then on every THP fault runs
+    // direct compaction on the full node (__GFP_THISNODE) before falling back
+    // to the other node. With several ranks registering hundreds of GB each,
+    // that turns registration from tens of seconds into tens of minutes.
+    // Interleaving also spreads the segment evenly across the NICs' nodes.
+    // An explicit task policy (e.g. numactl --membind) is left untouched.
+    int task_policy = MPOL_DEFAULT;
+    if (get_mempolicy(&task_policy, nullptr, 0, nullptr, 0) != 0) {
+        task_policy = MPOL_DEFAULT;
+    }
+    if (task_policy == MPOL_DEFAULT && numa_available() >= 0) {
+        struct bitmask *nodes = numa_get_mems_allowed();
+        if (nodes && numa_bitmask_weight(nodes) > 1) {
+            if (mbind(ptr, total_size, MPOL_INTERLEAVE, nodes->maskp,
+                      nodes->size + 1, 0) != 0) {
+                LOG(WARNING) << "mbind(MPOL_INTERLEAVE) failed, errno=" << errno
+                             << " (" << strerror(errno) << ")";
+            }
+        }
+        if (nodes) numa_bitmask_free(nodes);
+    }
+
+    LOG(INFO) << "Allocated THP-interleaved buffer: " << total_size
+              << " bytes at " << ptr;
     return ptr;
 }
 

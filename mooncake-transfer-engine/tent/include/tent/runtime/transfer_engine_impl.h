@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -72,7 +73,8 @@ struct LogicalTransferRuntimePolicy {
 struct TaskInfo {
     TransportType type{UNSPEC};
     int sub_task_id{-1};
-    bool derived{false};                  // merged by other tasks
+    bool derived{false};  // merged by other tasks
+    size_t physical_owner_task_id{std::numeric_limits<size_t>::max()};
     int xport_priority{0};                // transport priority (for fallback)
     int failover_count{0};                // number of failover attempts
     int metadata_refresh_retry_count{0};  // same-transport stale-cache retries
@@ -112,6 +114,7 @@ struct TaskInfo {
         : type(other.type),
           sub_task_id(other.sub_task_id),
           derived(other.derived),
+          physical_owner_task_id(other.physical_owner_task_id),
           xport_priority(other.xport_priority),
           failover_count(other.failover_count),
           metadata_refresh_retry_count(other.metadata_refresh_retry_count),
@@ -137,6 +140,7 @@ struct TaskInfo {
         : type(other.type),
           sub_task_id(other.sub_task_id),
           derived(other.derived),
+          physical_owner_task_id(other.physical_owner_task_id),
           xport_priority(other.xport_priority),
           failover_count(other.failover_count),
           metadata_refresh_retry_count(other.metadata_refresh_retry_count),
@@ -163,6 +167,7 @@ struct TaskInfo {
             type = other.type;
             sub_task_id = other.sub_task_id;
             derived = other.derived;
+            physical_owner_task_id = other.physical_owner_task_id;
             xport_priority = other.xport_priority;
             failover_count = other.failover_count;
             metadata_refresh_retry_count = other.metadata_refresh_retry_count;
@@ -194,6 +199,7 @@ struct TaskInfo {
             type = other.type;
             sub_task_id = other.sub_task_id;
             derived = other.derived;
+            physical_owner_task_id = other.physical_owner_task_id;
             xport_priority = other.xport_priority;
             failover_count = other.failover_count;
             metadata_refresh_retry_count = other.metadata_refresh_retry_count;
@@ -223,12 +229,14 @@ struct TaskInfo {
 
 class TransferEngineImpl {
     friend class ProxyManager;
+    friend class TransferEngine;
     friend class ::mooncake::TransferEngineImplTestPeer;
 
    public:
     TransferEngineImpl();
 
-    TransferEngineImpl(std::shared_ptr<Config> config);
+    TransferEngineImpl(std::shared_ptr<Config> config,
+                       bool config_loaded = true);
 
     ~TransferEngineImpl();
 
@@ -304,8 +312,18 @@ class TransferEngineImpl {
 
     Status cancelTransfer(BatchID batch_id, size_t task_id);
 
+    // Tries every loaded notification transport in slot order. A transport
+    // whose channel is unavailable (endpoint down, no notify QP) is skipped
+    // for the next one, and when all are, the notification goes over the
+    // control-plane RPC the peer answers bootstrap on. Any other error is
+    // returned as is. notification/rpc_fallback=false restores the
+    // first-transport-only behavior.
     Status sendNotification(SegmentID target_id, const Notification& notifi);
 
+    // Drains every loaded notification transport plus the in-process queue,
+    // so a notification lands with the caller no matter which path carried
+    // it. Order is kept within one path only: in a poll, notifications that
+    // took the RPC fallback come after the ones the notify QP carried.
     Status receiveNotification(std::vector<Notification>& notifi_list);
 
     Status probePeerAliveByID(SegmentID target_id);
@@ -377,7 +395,8 @@ class TransferEngineImpl {
     // Wake the optional event-driven progress worker for `batch_id`. No-op if
     // enable_progress_worker is false. Transport completion paths use this as
     // an idempotent "maybe ready" signal.
-    void notifyBatchMaybeReady(BatchID batch_id);
+    void notifyBatchMaybeReady(BatchID batch_id,
+                               bool poll_until_terminal = false);
 
    private:
     friend class ProgressWorker;
@@ -393,10 +412,23 @@ class TransferEngineImpl {
     SelectionResult getTransportType(const Request& request,
                                      int transport_index = 0);
 
+    // One selection pass behind getTransportType(). `allow_xpu_direct` lets a
+    // dma-buf-registered XPU buffer route directly over RDMA (see
+    // xpuDirectRdmaReady); when false every XPU side is host-staged for the
+    // network transports. `allow_xpu_ipc` additionally offers XpuTransport,
+    // unstaged, for a same-host peer's XPU buffer that may be IPC-mapped (see
+    // xpuIpcCandidate); the mapping is made only if XPU is selected, and the
+    // pass is redone without IPC if that fails. `xpu_direct`, if given,
+    // reports whether this pass planned the network transports unstaged, so
+    // the caller can retry staged when it yields no transport.
+    SelectionResult planTransport(const Request& request, int transport_index,
+                                  bool allow_xpu_direct, bool allow_xpu_ipc,
+                                  bool* xpu_direct);
+
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
-    void deregisterRemovedBuffer(BufferDesc& desc);
+    Status deregisterRemovedBuffer(BufferDesc& desc);
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
@@ -427,10 +459,13 @@ class TransferEngineImpl {
 
     struct PreparedSubmit;
 
+    Status submitTransferRequiringPostSubmitCancellation(
+        BatchID batch_id, const std::vector<Request>& request_list);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list,
-                          const Notification* notifi,
-                          QueueOwnerKind owner_kind);
+                          const Notification* notifi, QueueOwnerKind owner_kind,
+                          bool require_post_submit_cancellation = false);
 
     Status submitStagingTransfer(BatchID batch_id,
                                  const std::vector<Request>& request_list);
@@ -442,7 +477,8 @@ class TransferEngineImpl {
                            QueueOwnerKind owner_kind) const;
 
     Status prepareSubmit(Batch* batch, const std::vector<Request>& request_list,
-                         PreparedSubmit& prepared);
+                         PreparedSubmit& prepared,
+                         bool require_post_submit_cancellation = false);
 
     Status commitPreparedSubmit(Batch* batch, const PreparedSubmit& prepared);
 
@@ -464,6 +500,19 @@ class TransferEngineImpl {
 
     Status finishQueuedOwner(QueueOwnerId owner_id,
                              TransferStatusEnum terminal_status);
+
+    // An owner the queue dropped at pick time: terminal on the queue side
+    // already, so only the impl's record and the batch's task statuses are
+    // left to settle. It never entered the dispatch window.
+    Status finishDroppedOwner(QueueOwnerId owner_id);
+
+    // Every queue owner of `batch`, dispatched or not, is finished with
+    // `terminal_status` so the dispatch window and the queue's byte accounting
+    // give back what the batch held. For a batch that is leaving the normal
+    // lifecycle (deferred staging teardown, quarantine): nothing will poll it
+    // to a terminal state any more.
+    Status detachQueuedOwnersOfBatch(Batch* batch,
+                                     TransferStatusEnum terminal_status);
 
     Status cancelQueuedOwner(QueueOwnerId owner_id);
 
@@ -487,8 +536,36 @@ class TransferEngineImpl {
 
     Status loadTransports();
 
+    // Control-plane delivery used by sendNotification() once every loaded
+    // notification transport has reported its channel unavailable. Same
+    // wire path as TcpTransport::sendNotification().
+    Status sendNotificationViaRpc(SegmentID target_id,
+                                  const Notification& notifi);
+
     void findStagingPolicy(const Request& req,
                            std::vector<std::string>& policy);
+
+    // True when a request touching Intel XPU memory can go over RDMA without
+    // host staging: the RDMA transport advertises the device capability the
+    // memory-type pair needs, and every buffer involved was registered on RDMA
+    // (an XPU buffer only carries RDMA when its dma-buf registration
+    // succeeded). `remote_entry` is the remote buffer the request targets.
+    bool xpuDirectRdmaReady(const Request& req, const BufferDesc* remote_entry,
+                            MemoryType local_mtype, MemoryType remote_mtype);
+
+    // True when the XPU buffer `remote_entry` of segment `desc` is on this
+    // host and publishes a Level Zero IPC handle XpuTransport may map, so
+    // XPU can be offered for the request. Does not import; always false
+    // without USE_XPU.
+    bool xpuIpcCandidate(const Request& req, const SegmentDesc* desc,
+                         const BufferDesc* remote_entry);
+
+    // True when the XPU buffer `remote_entry` of same-host segment `desc` is
+    // mapped into this process by XpuTransport (Level Zero IPC), so the
+    // request can run as a local PCIe P2P copy instead of RDMA or staging.
+    // Imports on first use; always false without USE_XPU.
+    bool xpuIpcReady(const Request& req, const SegmentDesc* desc,
+                     const BufferDesc* remote_entry);
 
     Status maybeFireSubmitHooks(Batch* batch, bool check = true);
 
@@ -573,6 +650,7 @@ class TransferEngineImpl {
     std::unique_ptr<ProxyManager> staging_proxy_;
     bool merge_requests_;
     std::shared_ptr<const RuntimeConfigSnapshot> runtime_config_snapshot_;
+    bool notify_rpc_fallback_{true};
     bool enable_progress_worker_{false};
     RuntimeQueueConfig runtime_queue_config_;
     std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;
@@ -590,8 +668,8 @@ class TransferEngineImpl {
     DeferredStageTeardown deferred_stage_teardown_;
     std::unique_ptr<ProgressWorker> progress_worker_;
 
-    // Per-batch hot paths (poll / free / retain) lock only the shard for
-    // that BatchID instead of progress_mutex_, so N threads polling N
+    // Per-batch hot paths (submit / poll / free / retain) lock only the shard
+    // for that BatchID instead of progress_mutex_, so N threads polling N
     // independent batches do not serialize.
     //
     // Exception: enable_runtime_queue=true keeps those paths on
@@ -615,8 +693,16 @@ class TransferEngineImpl {
         std::unordered_set<BatchID> alive_batches;
     };
     BatchShard& batchShard(BatchID batch_id) {
-        return batch_shards_[reinterpret_cast<uintptr_t>(batch_id) %
-                             kBatchLockShards];
+        // Batches come from a slab in sizeof(Batch) steps, so the low address
+        // bits take only a few values. Mix all bits (MurmurHash3 fmix64) so
+        // batches spread over every shard.
+        uint64_t key = batch_id;
+        key ^= key >> 33;
+        key *= 0xff51afd7ed558ccdULL;
+        key ^= key >> 33;
+        key *= 0xc4ceb9fe1a85ec53ULL;
+        key ^= key >> 33;
+        return batch_shards_[key % kBatchLockShards];
     }
     std::recursive_mutex& batchShardMutex(BatchID batch_id) {
         return batchShard(batch_id).mtx;

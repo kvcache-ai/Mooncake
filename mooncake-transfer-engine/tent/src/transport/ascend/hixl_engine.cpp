@@ -252,8 +252,10 @@ Status HixlEngine::registerMem(void* addr, size_t length, bool host) {
     auto status = vendor_->RegisterMem(reinterpret_cast<uint64_t>(addr), length,
                                        host, handle);
     if (status != kHixlOk) {
-        LOG(ERROR) << "RegisterMem failed for " << addr
-                   << ", status: " << status
+        LOG(ERROR) << "RegisterMem failed, addr: " << addr
+                   << ", length: " << length
+                   << ", mem type: " << (host ? "host" : "device")
+                   << ", device_id: " << device_id_ << ", status: " << status
                    << ", errmsg: " << aclGetRecentErrMsg();
         return Status::InternalError("Register failed" LOC_MARK);
     }

@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -282,6 +283,18 @@ class StorageBackendInterface {
 
     virtual tl::expected<bool, ErrorCode> IsExist(const std::string& key) = 0;
 
+    /**
+     * @brief Returns the stored data size for a key, or std::nullopt when the
+     * key is unknown (or the backend cannot answer cheaply). Used by SSD
+     * prefetch to size the staging allocation from authoritative local
+     * metadata instead of trusting a remote caller's hint.
+     */
+    virtual std::optional<int64_t> GetObjectDataSize(
+        const std::string& key) const {
+        (void)key;
+        return std::nullopt;
+    }
+
     virtual tl::expected<bool, ErrorCode> IsEnableOffloading() = 0;
 
     virtual tl::expected<void, ErrorCode> ScanMeta(
@@ -551,6 +564,7 @@ class StorageBackend {
     FileRecord PopFileToEvictByFIFO();
 
     void RestoreFileToWriteQueueFront(const FileRecord& record);
+    void RestoreFileToWriteQueue(const FileRecord& record, bool to_front);
 
     tl::expected<void, ErrorCode> DeleteEvictedFile(const FileRecord& record);
 
@@ -812,6 +826,13 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
 
     /**
+     * @brief Returns the data size recorded in the in-memory bucket index,
+     * or std::nullopt when the key is unknown.
+     */
+    std::optional<int64_t> GetObjectDataSize(
+        const std::string& key) const override;
+
+    /**
      * @brief Scan existing object metadata from storage and report via handler.
      * @param handler Callback invoked with a batch of keys and metadatas.
      * @return tl::expected<void, ErrorCode> indicating operation status.
@@ -842,13 +863,30 @@ class BucketStorageBackend : public StorageBackendInterface {
      * (bytes).
      * @param buckets_keys Output: bucketized keys; each inner vector is a
      * bucket.
+     * @param deferred_keys Optional output: keys moved to the internal
+     * ungrouped pool this call (the tail partial bucket, deferred so the next
+     * call can write them as part of a full bucket). These keys are NOT in
+     * buckets_keys now but WILL be emitted in a bucket by a later call. The
+     * caller must keep their offload tasks alive across the deferral — a key
+     * re-emitted from the pool arrives without a task otherwise
+     * (neuralwatt: the silent deferred-tail loss, upstream #3006).
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> AllocateOffloadingBuckets(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys);
+        std::vector<std::vector<std::string>>& buckets_keys,
+        std::vector<std::string>* deferred_keys = nullptr);
 
     void ClearUngroupedOffloadingObjects();
+
+    /**
+     * @brief Remove a single key from the ungrouped (deferred) pool.
+     * Used when a deferred key is re-drained before re-emission: the caller
+     * discards the pooled copy (stale size) so the freshly drained entry
+     * flows through grouping as new input with current size accounting.
+     * @return true if the key was present and removed.
+     */
+    bool RemoveUngroupedOffloadingObject(const std::string& key);
 
     size_t UngroupedOffloadingObjectsSize() const;
 
@@ -929,7 +967,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys);
+        std::vector<std::vector<std::string>>& buckets_keys,
+        std::vector<std::string>* deferred_keys = nullptr);
 
     tl::expected<void, ErrorCode> HandleNext(
         const std::function<
@@ -1076,6 +1115,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     std::atomic<bool> initialized_{false};
     std::optional<BucketIdGenerator> bucket_id_generator_;
+    // Held for process lifetime after Init(); enforces one client / path.
+    int owner_lock_fd_{-1};
     static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
 

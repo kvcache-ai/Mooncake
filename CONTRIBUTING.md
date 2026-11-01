@@ -12,6 +12,54 @@ Thank you for your interest in contributing to Mooncake! Our community warmly we
 
 # Contribution Guidelines
 
+## Developer Certificate of Origin (DCO)
+
+Contributions must comply with the [Developer Certificate of Origin 1.1](DCO).
+By adding a `Signed-off-by` trailer to a commit, you certify that you have the
+right to submit the contribution under the project's open source license.
+Read the DCO before signing off, and sign off every commit you contribute,
+including documentation-only changes.
+
+Use your name and email address matching the commit author. Configure your Git
+identity before committing:
+
+```bash
+git config user.name "Your Name"
+git config user.email "you@example.com"
+git commit -s -m "[Doc] Describe the change"
+```
+
+The `-s` option appends this trailer to the commit message:
+
+```text
+Signed-off-by: Your Name <you@example.com>
+```
+
+A DCO sign-off is separate from cryptographic commit signing (`git commit -S`);
+a cryptographic signature does not replace the trailer. Only sign off work you
+can certify under the DCO; do not add another person's sign-off for them.
+
+If your most recent, unpushed commit is missing your sign-off, add it with:
+
+```bash
+git commit --amend --no-edit -s
+```
+
+Check the commits in your pull request with `git log origin/main..HEAD`.
+For already-pushed commits, coordinate with collaborators before rewriting
+history to repair missing sign-offs. When squashing or rebasing, preserve the
+applicable sign-off trailers in the resulting commits.
+
+### Maintainer setup
+
+The [DCO GitHub App](https://github.com/apps/dco) checks pull request commits.
+A repository administrator must enable it for Mooncake and make its `DCO`
+check required in the branch protection rule or ruleset for the target branch.
+The configuration in [`.github/dco.yml`](.github/dco.yml) requires sign-offs
+from organization members as well. Adding this file alone does not install the
+App or enable a required check. The App's default exemptions for bot-authored
+commits and merge commits still apply; see the [App documentation](https://github.com/dcoapp/app).
+
 ## Pull Requests & Code Reviews
 
 ### PR Title and Classification
@@ -35,6 +83,22 @@ when they better match the change scope: ``[Bug fix]``, ``[Build]``, ``[CI]``,
 ``[Docs]``, ``[EP]``, ``[Feature]``, ``[MUSA]``, ``[PG]``, ``[TE]``,
 ``[TENT]``, and ``[Wheel]``.
 
+### Automatic PR Size Labels
+
+PRs receive one size label based on GitHub's total added and deleted lines:
+
+| Label | Changed lines (additions + deletions) |
+|-------|-------------------------------------|
+| `size/S` | 0–99 |
+| `size/M` | 100–1,000 |
+| `size/L` | More than 1,000 |
+
+The label is recalculated when a PR is opened, updated with new commits,
+reopened, or edited (including a base-branch change). The workflow creates
+missing size labels and replaces outdated size labels while preserving other
+labels. All files count toward this size, including tests, documentation, and
+generated files; the label is a review aid, not an RFC requirement.
+
 ### Notes for Large Changes
 
 Please keep changes as concise as possible. For major architectural changes
@@ -45,7 +109,7 @@ tagged with `rfc-required` and might not be reviewed until an RFC is provided.
 
 ### Development Workflow & Pre-commit Hooks
 
-Mooncake uses [pre-commit](https://pre-commit.com/) to enforce consistent formatting and lightweight static checks across Python, C++ and CMake sources.
+Mooncake uses [pre-commit](https://pre-commit.com/) to enforce consistent formatting and lightweight static checks across Python, C++, CMake, and Store-RS Rust sources.
 
 #### Included Hooks
 | Type | Tool | Purpose |
@@ -53,6 +117,7 @@ Mooncake uses [pre-commit](https://pre-commit.com/) to enforce consistent format
 | Generic | trailing-whitespace / end-of-file-fixer | Basic hygiene |
 | Project | `./scripts/code_format.sh --staged` | Format staged C/C++ changes before commit |
 | Python | ruff / ruff-format | Lint + format (includes import sorting) |
+| Store-RS Rust | `cargo fmt` / `cargo clippy` | Check Store-RS formatting and lint its Rust crates |
 | Spelling | codespell | Catch common typos (ignores domain-specific words) |
 | CMake | cmake-format | Keep build scripts readable |
 | Meta | check-yaml / check-merge-conflict / check-added-large-files | Prevent bad commits |
@@ -74,6 +139,12 @@ staged files (the first run may install hook environments):
 ```bash
 pre-commit run
 ```
+
+The Store-RS Rust hooks run only when files under `mooncake-store-rs/` change.
+Clippy uses the configured CMake build and its native shim libraries. Set
+`MOONCAKE_ROOT_DIR`, `MOONCAKE_BUILD_DIR`,
+`MOONCAKE_CLASSIC_SHIM_LIB_PATH`, and `MOONCAKE_TENT_SHIM_LIB_PATH` to the
+absolute paths from that build before running the hook.
 Before opening a PR, run hooks only on files changed against the PR base
 (default `origin/main`). The C/C++ hook remains limited to staged or changed
 line ranges:
@@ -91,7 +162,7 @@ Update hook versions occasionally:
 ```bash
 pre-commit autoupdate
 git add .pre-commit-config.yaml
-git commit -m "chore: pre-commit autoupdate"
+git commit -s -m "chore: pre-commit autoupdate"
 ```
 
 If clang-format or its `git-clang-format` helper is missing, install the LLVM
@@ -102,7 +173,7 @@ sudo apt-get update && sudo apt-get install -y clang-format-20
 
 You can temporarily skip hooks:
 ```bash
-git commit -m "wip: skipping hooks" --no-verify
+git commit -s -m "wip: skipping hooks" --no-verify
 ```
 But please avoid using `--no-verify` for routine commits to keep code quality high.
 
@@ -117,6 +188,21 @@ The configuration also supports automatic fixing PRs via `pre-commit.ci` if
 enabled. To activate, add the repository in the pre-commit.ci dashboard; no
 further changes are needed.
 
+
+## Store-RS Test Entry Point
+
+Run the root Store-RS smoke entry point from the repository root after building
+the Rust workspace and installing the `python` CMake component to a prefix:
+
+```bash
+scripts/ci/run_store_rs_smoke.sh
+```
+
+It runs Store-RS library and binary unit tests, checks both installed Python
+backends and all three commands, then validates dummy and routed TCP/classic-TE
+read/write paths against the installed package. See the [Store-RS validation
+guide](docs/source/deployment/store-rs/testing.md) for its required paths and
+the scenario-specific commands for heavier coverage.
 
 ## Code Quality
 

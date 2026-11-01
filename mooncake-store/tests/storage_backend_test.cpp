@@ -10,6 +10,7 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <new>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -33,6 +34,18 @@
 
 namespace fs = std::filesystem;
 namespace mooncake::test {
+
+// Ignore the #3528 path lock when tests assert "empty" / file counts.
+static int CountDataFiles(const std::string& dir) {
+    int n = 0;
+    if (!fs::exists(dir)) return 0;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().filename() == ".mooncake_local_disk.lock") continue;
+        ++n;
+    }
+    return n;
+}
 
 class StorageBackendTest : public ::testing::Test {
    protected:
@@ -373,7 +386,8 @@ TEST_F(StorageBackendTest, StorageBackendAll) {
     BucketStorageBackend storage_backend(config, bucket_config);
 
     ASSERT_TRUE(storage_backend.Init());
-    ASSERT_TRUE(fs::directory_iterator(data_path) == fs::directory_iterator{});
+    // Fresh Init may only leave the path lock from #3528.
+    ASSERT_EQ(CountDataFiles(data_path), 0);
     ASSERT_TRUE(!storage_backend.Init());
     std::unordered_map<std::string, std::string> test_data;
     std::vector<std::string> keys;
@@ -602,32 +616,68 @@ TEST_F(StorageBackendTest, LargeNumberOfIds_NoOverflowInLifetime) {
     EXPECT_GE(last_id, 101000);  // Should have increased by at least 100,000
 }
 
+TEST_F(StorageBackendTest, SharedStoragePathSecondLiveInitFails) {
+    // #3528: one live client per storage_path — second Init must fail fast.
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+
+    BucketStorageBackend first(config, bucket_config);
+    ASSERT_TRUE(first.Init().has_value());
+
+    BucketStorageBackend second(config, bucket_config);
+    auto second_init = second.Init();
+    ASSERT_FALSE(second_init.has_value())
+        << "second live client on the same storage_path must fail Init";
+}
+
+TEST_F(StorageBackendTest, SplitStoragePathBothInitOk) {
+    // #3528: per-client directories remain supported.
+    FileStorageConfig config_a;
+    FileStorageConfig config_b;
+    config_a.storage_filepath = data_path + "/client_a";
+    config_b.storage_filepath = data_path + "/client_b";
+    fs::create_directories(config_a.storage_filepath);
+    fs::create_directories(config_b.storage_filepath);
+    BucketBackendConfig bucket_config;
+
+    BucketStorageBackend a(config_a, bucket_config);
+    BucketStorageBackend b(config_b, bucket_config);
+    ASSERT_TRUE(a.Init().has_value());
+    ASSERT_TRUE(b.Init().has_value());
+}
+
 TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
-    // Create a valid bucket with data and metadata
-    BucketStorageBackend storage_backend(config, bucket_config);
-    ASSERT_TRUE(storage_backend.Init());
+    int64_t valid_bucket_id = 0;
+    const std::string key = "test_key";
+    {
+        // Create a valid bucket, then drop the live client so later Init can
+        // reclaim the same storage_path (#3528 flock).
+        BucketStorageBackend storage_backend(config, bucket_config);
+        ASSERT_TRUE(storage_backend.Init());
 
-    std::shared_ptr<SimpleAllocator> client_buffer_allocator =
-        std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
+        std::shared_ptr<SimpleAllocator> client_buffer_allocator =
+            std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
 
-    // Create one valid bucket
-    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
-    std::string key = "test_key";
-    std::string data = "test_data_content";
-    void* buffer = client_buffer_allocator->allocate(data.size());
-    memcpy(buffer, data.data(), data.size());
-    batched_slices.emplace(key, std::vector<Slice>{Slice{buffer, data.size()}});
+        // Create one valid bucket
+        std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+        std::string data = "test_data_content";
+        void* buffer = client_buffer_allocator->allocate(data.size());
+        memcpy(buffer, data.data(), data.size());
+        batched_slices.emplace(key,
+                               std::vector<Slice>{Slice{buffer, data.size()}});
 
-    auto result = storage_backend.BatchOffload(
-        batched_slices, [](const std::vector<std::string>& keys,
-                           std::vector<StorageObjectMetadata>& metadatas) {
-            return ErrorCode::OK;
-        });
-    ASSERT_TRUE(result);
-    int64_t valid_bucket_id = result.value();
+        auto result = storage_backend.BatchOffload(
+            batched_slices, [](const std::vector<std::string>& keys,
+                               std::vector<StorageObjectMetadata>& metadatas) {
+                return ErrorCode::OK;
+            });
+        ASSERT_TRUE(result);
+        valid_bucket_id = result.value();
+    }
 
     // Manually create an orphaned bucket file (simulate crash scenario)
     // The orphaned file will have a different ID and no corresponding .meta
@@ -660,13 +710,8 @@ TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
     ASSERT_TRUE(fs::exists(orphaned_bucket_path));
     ASSERT_TRUE(fs::exists(orphaned_bucket_path_2));
 
-    // Count files before cleanup
-    int file_count_before = 0;
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        if (entry.is_regular_file()) {
-            file_count_before++;
-        }
-    }
+    // Count files before cleanup (exclude #3528 path lock)
+    int file_count_before = CountDataFiles(data_path);
     // Should have: 1 valid .bucket + 1 valid .meta + 2 orphaned .bucket = 4
     ASSERT_EQ(file_count_before, 4);
 
@@ -693,13 +738,8 @@ TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
     ASSERT_TRUE(fs::exists(valid_meta_path))
         << "Valid bucket metadata file should still exist";
 
-    // Count files after cleanup
-    int file_count_after = 0;
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        if (entry.is_regular_file()) {
-            file_count_after++;
-        }
-    }
+    // Count files after cleanup (exclude #3528 path lock)
+    int file_count_after = CountDataFiles(data_path);
     // Should have only: 1 valid .bucket + 1 valid .meta = 2
     ASSERT_EQ(file_count_after, 2);
 
@@ -2098,6 +2138,112 @@ TEST_F(StorageBackendTest,
 // BucketStorageBackend: Duplicate Key Detection Tests (Phase 0 - D0)
 //-----------------------------------------------------------------------------
 
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_PartialFlushDisabledRetainsTail) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 4;
+    bucket_config.bucket_size_limit = 64;
+    EXPECT_FALSE(bucket_config.flush_partial_buckets);
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    std::vector<std::vector<std::string>> buckets;
+    ASSERT_TRUE(
+        backend.AllocateOffloadingBuckets({{"A1", 16}, {"A2", 16}}, buckets));
+    EXPECT_TRUE(buckets.empty());
+    EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 2);
+    ASSERT_TRUE(
+        backend.AllocateOffloadingBuckets({{"B1", 16}, {"B2", 16}}, buckets));
+    ASSERT_EQ(buckets.size(), 1);
+    std::sort(buckets[0].begin(), buckets[0].end());
+    EXPECT_EQ(buckets[0], (std::vector<std::string>{"A1", "A2", "B1", "B2"}));
+    EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 0);
+}
+
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_PartialFlushKeepsCyclesSeparate) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 4;
+    bucket_config.bucket_size_limit = 64;
+    bucket_config.flush_partial_buckets = true;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    for (const auto* prefix : {"A", "B"}) {
+        const std::string first = std::string(prefix) + "1";
+        const std::string second = std::string(prefix) + "2";
+        std::vector<std::vector<std::string>> buckets;
+        ASSERT_TRUE(backend.AllocateOffloadingBuckets(
+            {{first, 16}, {second, 16}}, buckets));
+        ASSERT_EQ(buckets.size(), 1);
+        std::sort(buckets[0].begin(), buckets[0].end());
+        EXPECT_EQ(buckets[0], (std::vector<std::string>{first, second}));
+        EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 0);
+    }
+}
+
+TEST_F(StorageBackendTest, BucketStorageBackend_PartialFlushSkipsEmptyBuckets) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 4;
+    bucket_config.bucket_size_limit = 64;
+    bucket_config.flush_partial_buckets = true;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    std::string value = "value";
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace("existing", std::vector<Slice>{{value.data(), value.size()}});
+    ASSERT_TRUE(backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    using Objects = std::unordered_map<std::string, int64_t>;
+    for (const auto& objects :
+         {Objects{}, Objects{{"existing", 5}}, Objects{{"oversized", 65}},
+          Objects{{"existing", 5}, {"oversized", 65}}}) {
+        std::vector<std::vector<std::string>> buckets;
+        ASSERT_TRUE(backend.AllocateOffloadingBuckets(objects, buckets));
+        EXPECT_TRUE(buckets.empty());
+        EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 0);
+    }
+}
+
+TEST_F(StorageBackendTest, BucketStorageBackend_PartialFlushRespectsLimits) {
+    for (const auto& limits : {std::pair<int64_t, int64_t>{2, 64},
+                               std::pair<int64_t, int64_t>{8, 24}}) {
+        FileStorageConfig config;
+        config.storage_filepath = data_path;
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = limits.first;
+        bucket_config.bucket_size_limit = limits.second;
+        bucket_config.flush_partial_buckets = true;
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+        const std::unordered_map<std::string, int64_t> objects{
+            {"A", 8}, {"B", 8}, {"C", 8}, {"D", 8}, {"E", 8}};
+        std::vector<std::vector<std::string>> buckets;
+        ASSERT_TRUE(backend.AllocateOffloadingBuckets(objects, buckets));
+        EXPECT_EQ(buckets.size(), limits.first == 2 ? 3 : 2);
+        std::vector<std::string> all_keys;
+        for (const auto& bucket : buckets) {
+            EXPECT_FALSE(bucket.empty());
+            EXPECT_LE(bucket.size(),
+                      static_cast<size_t>(bucket_config.bucket_keys_limit));
+            int64_t bytes = 0;
+            for (const auto& key : bucket) bytes += objects.at(key);
+            EXPECT_LE(bytes, bucket_config.bucket_size_limit);
+            all_keys.insert(all_keys.end(), bucket.begin(), bucket.end());
+        }
+        std::sort(all_keys.begin(), all_keys.end());
+        EXPECT_EQ(all_keys,
+                  (std::vector<std::string>{"A", "B", "C", "D", "E"}));
+        EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 0);
+    }
+}
+
 TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateKeyIdempotentSkip) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
@@ -2184,12 +2330,7 @@ TEST_F(StorageBackendTest,
     int64_t bucket1_id = result1.value();
 
     // Count files before duplicate attempt
-    int file_count_before = 0;
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        if (entry.is_regular_file()) {
-            file_count_before++;
-        }
-    }
+    int file_count_before = CountDataFiles(data_path);
     // Should have 1 .bucket + 1 .meta = 2 files
     EXPECT_EQ(file_count_before, 2);
 
@@ -2210,12 +2351,8 @@ TEST_F(StorageBackendTest,
         << "Duplicate re-offload should succeed as an idempotent no-op";
 
     // Count files after duplicate attempt - orphaned files should be cleaned up
-    int file_count_after = 0;
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        if (entry.is_regular_file()) {
-            file_count_after++;
-        }
-    }
+    // (exclude #3528 path lock)
+    int file_count_after = CountDataFiles(data_path);
     // Should still have only 2 files (orphaned bucket 2 files should be cleaned
     // up)
     EXPECT_EQ(file_count_after, 2) << "Orphaned bucket files should be cleaned "
@@ -3179,6 +3316,101 @@ TEST_F(StorageBackendTest,
     EXPECT_TRUE(std::filesystem::exists(test_dir + "/f3"));
 }
 
+TEST_F(StorageBackendTest, WatermarkPerFileRetryRollsBackOnTransportFailure) {
+    const auto test_dir = data_path + "/watermark_retry_failure";
+    std::filesystem::create_directories(test_dir);
+    StorageBackend backend(test_dir, "", true);
+    ASSERT_TRUE(backend.Init(4096));
+    const std::string data(1024, 'r');
+    for (const auto& key : {"key_1", "key_2", "key_3"}) {
+        ASSERT_TRUE(backend.StoreObject(test_dir + "/" + key, data, key));
+    }
+
+    auto result = backend.EvictAboveDiskWatermark(
+        0.70, 0.40,
+        [](const std::vector<std::string>& keys)
+            -> tl::expected<void, ErrorCode> {
+            if (keys.size() > 1) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+            if (keys.front() == "key_1") return {};
+            return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        });
+    ASSERT_FALSE(result);
+    EXPECT_EQ(ErrorCode::RPC_FAIL, result.error());
+    for (const auto& key : {"key_1", "key_2", "key_3"}) {
+        EXPECT_TRUE(std::filesystem::exists(test_dir + "/" + key));
+    }
+
+    // The restored queue remains usable after a partially acknowledged RPC.
+    auto retry = backend.EvictAboveDiskWatermark(
+        0.70, 0.40,
+        [](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
+            return {};
+        });
+    ASSERT_TRUE(retry);
+    EXPECT_EQ((std::vector<std::string>{"key_1", "key_2"}), *retry);
+    EXPECT_FALSE(std::filesystem::exists(test_dir + "/key_1"));
+    EXPECT_FALSE(std::filesystem::exists(test_dir + "/key_2"));
+    EXPECT_TRUE(std::filesystem::exists(test_dir + "/key_3"));
+}
+
+TEST_F(StorageBackendTest, WatermarkPerFileRetryRetainsAnonymousFiles) {
+    const auto test_dir = data_path + "/watermark_retry_anonymous";
+    std::filesystem::create_directories(test_dir);
+    StorageBackend backend(test_dir, "", true);
+    ASSERT_TRUE(backend.Init(4096));
+    const std::string data(1024, 'r');
+    ASSERT_TRUE(backend.StoreObject(test_dir + "/anonymous", data, ""));
+    ASSERT_TRUE(backend.StoreObject(test_dir + "/managed", data, "managed"));
+    ASSERT_TRUE(backend.StoreObject(test_dir + "/newest", data, "newest"));
+    auto result = backend.EvictAboveDiskWatermark(
+        0.70, 0.40,
+        [](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        });
+    ASSERT_FALSE(result);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, result.error());
+    for (const auto& key : {"anonymous", "managed", "newest"}) {
+        EXPECT_TRUE(std::filesystem::exists(test_dir + "/" + key));
+    }
+}
+
+TEST_F(StorageBackendTest, WatermarkProtectedPrefixRotatesBehindOrdinaryFiles) {
+    const auto test_dir = data_path + "/watermark_protected_prefix";
+    std::filesystem::create_directories(test_dir);
+    StorageBackend backend(test_dir, "", true);
+    ASSERT_TRUE(backend.Init(4096));
+    const std::string data(1024, 'r');
+    for (const auto& key : {"managed", "ordinary", "newest"}) {
+        ASSERT_TRUE(backend.StoreObject(test_dir + "/" + key, data, key));
+    }
+    auto authorize = [](const std::vector<std::string>& keys)
+        -> tl::expected<void, ErrorCode> {
+        for (const auto& key : keys) {
+            if (key == "managed") {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+        }
+        return {};
+    };
+    auto refused = backend.EvictAboveDiskWatermark(0.70, 0.60, authorize);
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, refused.error());
+    for (const auto& key : {"managed", "ordinary", "newest"}) {
+        EXPECT_TRUE(std::filesystem::exists(test_dir + "/" + key));
+    }
+    auto retry = backend.EvictAboveDiskWatermark(0.70, 0.60, authorize);
+    ASSERT_TRUE(retry);
+    EXPECT_EQ((std::vector<std::string>{"ordinary"}), *retry);
+    EXPECT_TRUE(std::filesystem::exists(test_dir + "/managed"));
+    EXPECT_FALSE(std::filesystem::exists(test_dir + "/ordinary"));
+    EXPECT_TRUE(std::filesystem::exists(test_dir + "/newest"));
+}
+
 TEST_F(StorageBackendTest, StoreObjectRejectsOverwriteDuringFailedEviction) {
     std::string test_dir = data_path + "/eviction_overwrite_race_test";
     std::filesystem::create_directories(test_dir);
@@ -3710,6 +3942,12 @@ TEST_F(StorageBackendTest, BucketBatchOffloadContinuesAfterFinalizeFailure) {
     ASSERT_TRUE(new_exists.has_value());
     EXPECT_TRUE(new_exists.value());
 
+    // #3528: end the live client before same-path re-Init (flock).
+    // Destroy via temporary unique_ptr move-out is unavailable (fd would
+    // double-close); use explicit destroy + reconstruct.
+    storage_backend.~BucketStorageBackend();
+    ::new (&storage_backend) BucketStorageBackend(config, bucket_config);
+
     BucketStorageBackend restarted_backend(config, bucket_config);
     ASSERT_TRUE(restarted_backend.Init());
 
@@ -3776,6 +4014,12 @@ TEST_F(StorageBackendTest,
     auto exists = storage_backend.IsExist("watermark_key");
     ASSERT_TRUE(exists.has_value());
     EXPECT_FALSE(exists.value());
+
+    // #3528: end the live client before same-path re-Init (flock).
+    // Destroy via temporary unique_ptr move-out is unavailable (fd would
+    // double-close); use explicit destroy + reconstruct.
+    storage_backend.~BucketStorageBackend();
+    ::new (&storage_backend) BucketStorageBackend(config, bucket_config);
 
     BucketStorageBackend restarted_backend(config, bucket_config);
     ASSERT_TRUE(restarted_backend.Init());

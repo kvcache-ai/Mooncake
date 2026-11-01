@@ -74,6 +74,23 @@ tl::expected<std::string, int> httpGet(const std::string &url) {
     return tl::unexpected(res.status);
 }
 
+tl::expected<void, std::string> httpDelete(const std::string &url,
+                                           std::chrono::milliseconds timeout) {
+    coro_http::coro_http_client client;
+    client.set_conn_timeout(timeout);
+    client.set_req_timeout(timeout);
+    auto res = async_simple::coro::syncAwait(
+        client.async_delete(url, "", coro_http::req_content_type::none));
+    if (res.net_err) {
+        return tl::unexpected("network error: " + res.net_err.message());
+    }
+    if (res.status != 200) {
+        return tl::unexpected("http=" + std::to_string(res.status) +
+                              " body: " + std::string(res.resp_body));
+    }
+    return {};
+}
+
 tl::expected<std::string, std::string> GetInterfaceIPv4Address(
     const std::string &interface_name) {
     if (interface_name.empty()) {

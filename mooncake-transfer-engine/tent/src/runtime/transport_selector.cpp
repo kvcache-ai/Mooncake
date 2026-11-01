@@ -379,6 +379,12 @@ bool TransportSelector::matchesMemoryPattern(const std::string& pattern,
         case MTYPE_TPU:
             type_str = "tpu";
             break;
+        case MTYPE_MLU:
+            type_str = "mlu";
+            break;
+        case MTYPE_XPU:
+            type_str = "xpu";
+            break;
         default:
             type_str = "unknown";
             break;
@@ -468,23 +474,38 @@ bool TransportSelector::isTransportAvailable(
         return false;
     }
 
-    // Special constraints
+    // MLU requires process-local addresses. XPU also supports a same-host
+    // peer's buffer mapped into this process over IPC.
+    if (type == MLU && !context.local_segment) return false;
+    const bool xpu_ipc =
+        type == XPU && !context.local_segment && context.xpu_ipc;
+    if (type == XPU && !context.local_segment &&
+        !(context.xpu_ipc && context.same_machine))
+        return false;
+    if (context.xpu_ipc_only && type != XPU) return false;
     if ((type == NVLINK || type == SHM || type == TPU) &&
         !context.same_machine) {
-        // NVLINK/SHM only work on same machine; TPU is a local-stage-only
-        // executor (HBM<->host), so it must never be picked for a remote hop.
         return false;
     }
 
     const auto& caps = transport->capabilities();
+    // The IPC route copies the original buffers; only the network leg of a
+    // staged request runs on host stage buffers.
+    if (context.host_staging && !xpu_ipc) {
+        return (type == RDMA || type == FABRIC || type == TCP ||
+                type == HP_TCP) &&
+               caps.dram_to_dram;
+    }
 
-    // Helper to check if memory type is a device (GPU/NPU/TPU). TPU is included
-    // so its device<->host staging hop routes to TpuTransport (gpu_to_dram /
-    // dram_to_gpu); it never satisfies gpu_to_gpu, so cross-node TPU traffic is
-    // always staged through host DRAM.
-    auto is_gpu = [](MemoryType t) {
-        return t == MTYPE_CUDA || t == MTYPE_ROCM || t == MTYPE_TPU;
-    };
+    // Helper to check if memory type is a device (GPU/NPU/TPU/XPU). Delegates
+    // to the single isGpuMemoryType() in platform.h so this routing predicate
+    // and the staging capability checks share one device-type list and cannot
+    // disagree. TPU and Intel XPU are included so their device<->host staging
+    // hop routes to the matching staging transport (gpu_to_dram / dram_to_gpu).
+    // XPU also satisfies gpu_to_gpu, but only for the local segment (checked
+    // above), so cross-node device traffic without GPUDirect RDMA is always
+    // staged through host DRAM.
+    auto is_gpu = [](MemoryType t) { return isGpuMemoryType(t); };
 
     // For file segments, check file-specific capabilities (original logic)
     if (context.segment_type == SegmentType::File) {

@@ -19,12 +19,15 @@
 #include <glog/logging.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
+#include <climits>
 #include <cstdlib>
+#include <cstring>
 #include <future>
 #include <limits>
 #include <sstream>
@@ -55,6 +58,18 @@ namespace tent {
 namespace {
 
 constexpr uint64_t kDefaultRdmaQuiesceTimeoutNs = 10000000000ull;
+
+// EFA devices are listed by ibverbs but have no RC QPs; they are served by
+// the fabric transport instead.
+bool isEfaDevice(const std::string& name) {
+    const std::string link = "/sys/class/infiniband/" + name + "/device/driver";
+    char target[PATH_MAX];
+    ssize_t len = readlink(link.c_str(), target, sizeof(target) - 1);
+    if (len <= 0) return false;
+    target[len] = '\0';
+    const char* base = strrchr(target, '/');
+    return strcmp(base ? base + 1 : target, "efa") == 0;
+}
 
 uint16_t getRdmaBindDefaultPort(const Config& config) {
     constexpr const char* kKey = "rpc_server_port";
@@ -169,6 +184,7 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_ENDPOINT(endpoint_store_cap, params->endpoint.endpoint_store_cap);
     SET_ENDPOINT(max_sge, params->endpoint.max_sge);
     SET_ENDPOINT(max_qp_wr, params->endpoint.max_qp_wr);
+    SET_ENDPOINT(signal_interval, params->endpoint.signal_interval);
     SET_ENDPOINT(max_inline_bytes, params->endpoint.max_inline_bytes);
     SET_ENDPOINT(pkey_index, params->endpoint.pkey_index);
     SET_ENDPOINT(hop_limit, params->endpoint.hop_limit);
@@ -185,6 +201,14 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_ENDPOINT(send_retry_count, params->endpoint.send_retry_count);
     SET_ENDPOINT(send_rnr_count, params->endpoint.send_rnr_count);
     SET_ENDPOINT(max_rd_atomic, params->endpoint.max_rd_atomic);
+
+    if (params->endpoint.signal_interval <= 0) {
+        std::stringstream ss;
+        ss << "Invalid RDMA endpoint.signal_interval: "
+           << params->endpoint.signal_interval
+           << ", expected a positive integer";
+        return Status::InvalidArgument(ss.str() + LOC_MARK);
+    }
 
     size_t mtu_val = conf->get("transports/rdma/endpoint/path_mtu", 4096);
     if (mtu_val == 4096)
@@ -248,16 +272,25 @@ static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
     if (disable_gpu_direct) {
         return false;
     }
+    // Intel XPU: no peer-memory kernel module; device buffers are exported as
+    // dma-bufs and registered with ibv_reg_dmabuf_mr, so the presence of that
+    // verb is the capability signal. Buffers that fail to export at
+    // registration time are simply not offered on RDMA and get staged.
+    if (Platform::getLoader().type() == "xpu") {
+        auto& loader = IbvLoader::Instance();
+        return loader.available() && loader.sym().ibv_reg_dmabuf_mr != nullptr;
+    }
     // Detect vendor GPUDirect/peer-memory drivers from /proc/modules.
     // NVIDIA: nvidia_peermem. AMD: peermem is built into amdgpu (linked with
     // ib_core), so the amdgpu module itself is the presence signal.
+    // Hygon: the hycu driver provides the same peer-memory support.
     std::ifstream modules("/proc/modules");
     std::string line;
     while (std::getline(modules, line)) {
         const auto name_end = line.find(' ');
         const auto name =
             name_end == std::string::npos ? line : line.substr(0, name_end);
-        if (name == "nvidia_peermem" || name == "amdgpu") {
+        if (name == "nvidia_peermem" || name == "amdgpu" || name == "hycu") {
             return true;
         }
     }
@@ -281,7 +314,10 @@ size_t RdmaTransport::initializeContexts() {
     size_t context_count = 0;
     for (size_t i = 0; i < local_topology_->getNicCount(); ++i) {
         auto entry = local_topology_->getNicEntry(i);
-        if (entry->type == Topology::NIC_RDMA) {
+        if (entry->type == Topology::NIC_RDMA && isEfaDevice(entry->name)) {
+            LOG(INFO) << "Skip EFA device " << entry->name
+                      << " (not RC capable; use the fabric transport)";
+        } else if (entry->type == Topology::NIC_RDMA) {
             auto context = std::make_shared<RdmaContext>(*this);
             if (context->construct(entry->name, params_) == 0) {
                 context_name_lookup_[entry->name] = i;
@@ -538,22 +574,12 @@ Status RdmaTransport::submitTransferTasks(
         std::vector<int> slice_dev_ids;
         // Only if a single request is enough, we perform aggregated allocation
         if (num_slices >= max_slice_count / 2) {
-            std::string source_location = kWildcardLocation;
-            auto source_locations =
-                Platform::getLoader().getLocation(request.source, 1, true);
-            if (!source_locations.empty()) {
-                source_location = source_locations[0].location;
-            }
-            auto device_selector = workers_->getDeviceSelector();
-            if (device_selector) {
-                auto status = device_selector->allocate(
-                    request.length, static_cast<uint32_t>(num_slices),
-                    block_size, source_location, slice_dev_ids,
-                    request.priority, batch->device_mask);
-                if (!status.ok() || slice_dev_ids.empty()) {
-                    LOG(WARNING) << "Device quota allocation failed: "
-                                 << status.message();
-                }
+            auto status = workers_->allocateDevices(
+                request, static_cast<uint32_t>(num_slices), block_size,
+                task->device_mask, slice_dev_ids);
+            if (!status.ok()) {
+                LOG(WARNING)
+                    << "Device quota allocation failed: " << status.message();
             }
         }
 
@@ -694,6 +720,10 @@ Status RdmaTransport::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
 
 bool RdmaTransport::warmupMemory(void* addr, size_t length) {
     if (length < kMrWarmupMinBytes) return false;
+    // Warm-up is a plain ibv_reg_mr. Intel XPU VRAM has no host pages behind
+    // it and is registered through dma-buf export instead, so the temporary
+    // ibv_reg_mr would only EFAULT.
+    if (Platform::getLoader().getMemoryType(addr) == MTYPE_XPU) return false;
     unsigned hwc = std::thread::hardware_concurrency();
     if (hwc < 4) return false;
     RdmaContext* warmup_ctx = nullptr;
@@ -735,7 +765,7 @@ Status RdmaTransport::removeMemoryBuffer(BufferDesc& desc) {
 }
 
 Status RdmaTransport::refreshLocalDeviceDesc(const std::string& device_name,
-                                             uint16_t lid,
+                                             uint32_t lid,
                                              const std::string& gid) {
     if (!metadata_)
         return Status::InvalidArgument(
@@ -743,7 +773,7 @@ Status RdmaTransport::refreshLocalDeviceDesc(const std::string& device_name,
 
     auto& manager = metadata_->segmentManager();
     bool existed = false;
-    uint16_t previous_lid = 0;
+    uint32_t previous_lid = 0;
     std::string previous_gid;
     CHECK_STATUS(manager.updateLocal([&](SegmentDesc& segment) -> Status {
         if (segment.type != SegmentType::Memory)
@@ -881,7 +911,8 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
 }
 
 std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
-                                                         int device_id) {
+                                                         int device_id,
+                                                         Status* failure) {
     std::string rpc_server_addr, target_seg_name, target_dev_name,
         target_nic_path_name;
 
@@ -909,6 +940,7 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
 
     if (!status.ok()) {
         LOG(ERROR) << status.ToString();
+        if (failure) *failure = status;
         return nullptr;
     }
 
@@ -922,6 +954,10 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
         }
     }
     if (!context) {
+        if (failure) {
+            *failure =
+                Status::DeviceNotFound("No enabled RDMA context" LOC_MARK);
+        }
         return nullptr;
     }
     std::shared_ptr<RdmaEndPoint> endpoint;
@@ -929,6 +965,10 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
+        if (failure) {
+            *failure =
+                Status::InternalError("Cannot allocate endpoint" LOC_MARK);
+        }
         return nullptr;
     }
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
@@ -942,21 +982,39 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
                 LOG(ERROR) << "Unable to connect endpoint " << peer_name << ": "
                            << status.ToString();
             }
+            if (failure) *failure = status;
             return nullptr;
         }
     }
     return endpoint;
 }
 
+Status RdmaTransport::notifyStatusForEndpointFailure(const Status& failure) {
+    if (failure.IsRpcServiceError()) {
+        return Status::RpcServiceError(
+            "RDMA notification endpoint bootstrap failed; peer control "
+            "plane unreachable, not falling back to RPC: " +
+            std::string{failure.message()} + LOC_MARK);
+    }
+    return Status::DeviceNotFound("RDMA notification endpoint unavailable: " +
+                                  std::string{failure.message()} + LOC_MARK);
+}
+
 Status RdmaTransport::sendNotification(SegmentID target_id,
                                        const Notification& notify) {
-    auto endpoint = getEndpoint(target_id, LOCAL_SEGMENT_ID);
-    if (!endpoint) {
-        return Status::InternalError(
-            "Endpoint not found for notification" LOC_MARK);
-    }
+    // Both failures below mean nothing left this host. Unless the bootstrap
+    // RPC itself failed (see notifyStatusForEndpointFailure), the engine may
+    // still reach the peer over the control plane, so they are reported with
+    // codes TransferEngineImpl::sendNotification() recognizes as "channel
+    // unavailable" rather than as a generic internal error.
+    Status failure;
+    auto endpoint = getEndpoint(target_id, LOCAL_SEGMENT_ID, &failure);
+    if (!endpoint) return notifyStatusForEndpointFailure(failure);
+    // Notify QP not connected (the peer has none, or it was disabled after a
+    // fault), or the post itself was refused.
     if (!endpoint->sendNotification(notify.name, notify.msg)) {
-        return Status::InternalError("Failed to send notification" LOC_MARK);
+        return Status::RdmaError(
+            "RDMA notification channel unavailable" LOC_MARK);
     }
     return Status::OK();
 }
@@ -1030,9 +1088,10 @@ int RdmaTransport::processNotifyCompletions() {
 
         // Process each completion
         for (int i = 0; i < completed; ++i) {
-            // Find endpoint by QP number before interpreting errors. A flush
-            // completion after endpoint unpublication is expected during
-            // retirement and should not flood logs.
+            // Find endpoint by QP number before interpreting errors. The QP
+            // stays published while the endpoint retires, so notifications
+            // that landed before the retirement are still handed out; the
+            // flushes that follow are told apart by the endpoint's state.
             std::shared_ptr<RdmaEndPoint> endpoint;
             {
                 RWSpinlock::ReadGuard guard(notify_endpoint_map_lock_);
@@ -1042,18 +1101,34 @@ int RdmaTransport::processNotifyCompletions() {
                 }
             }
 
+            // Released only once this completion has been consumed: the
+            // recv payload copied out of its slot, or the send / error path
+            // finished. finishDestroy() waits for this count and
+            // deconstructUnlocked() then frees the recv MR, so releasing it
+            // earlier would let the buffers go while the CQE is still in
+            // this batch. The ring depth and the CQ's completion order keep
+            // that from happening today; this makes it hold by construction,
+            // the way acknowledge() releases wr_depth on the data QPs only
+            // after the completion is handled.
+            struct NotifyInflightRelease {
+                RdmaEndPoint* ep;
+                ~NotifyInflightRelease() {
+                    if (ep) ep->noteNotifyCompletion();
+                }
+            } inflight_release{endpoint.get()};
+
             if (wc[i].status != IBV_WC_SUCCESS) {
                 // A failed completion leaves this notify QP unusable for good
                 // and only the endpoint lifecycle builds a new one, so left
                 // alone the endpoint stays EP_READY and every later
                 // sendNotification() silently flushes. Retiring it also moves
                 // the data QPs to ERR, so that is reserved for faults which may
-                // mean the peer restarted or the path died. Both acting
-                // branches re-take the notify_endpoint_map_lock_ ReadGuard
-                // released above via unregisterNotifyQp(); the locally held
-                // shared_ptr keeps the endpoint alive across the call.
+                // mean the peer restarted or the path died. A notify QP that
+                // is retiring or already disabled only flushes from here on,
+                // and those completions stay quiet.
                 const bool endpoint_ready =
-                    endpoint && endpoint->status() == RdmaEndPoint::EP_READY;
+                    endpoint && endpoint->status() == RdmaEndPoint::EP_READY &&
+                    endpoint->notifyConnected();
                 auto action = classifyNotifyCompletion(
                     wc[i].status, endpoint != nullptr, endpoint_ready);
                 if (action == NotifyCompletionAction::SkipSilently) continue;

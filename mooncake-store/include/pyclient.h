@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -168,6 +169,41 @@ class ClientRequester {
     void release_offload_buffer(const std::string &client_addr,
                                 uint64_t batch_id);
 
+    /**
+     * @brief Asks a remote holder node to prefetch (promote SSD->DRAM) the
+     * given keys. Used for cross-node SSD prefetch: the holder must register
+     * the promotion task itself (the master validates holder_id ==
+     * client_id), so the requester delegates via this RPC instead of calling
+     * RegisterPrefetchTask locally. Best-effort: errors are logged, not
+     * propagated, and never block the originating exist() call. Old peers
+     * reject the RPC and the keys simply stay SSD-only.
+     * @param client_addr Network address of the holder's offload RPC service.
+     * @param keys SSD-only keys held by the remote node.
+     * @param sizes Object sizes (bytes), index-aligned with keys. Hint only;
+     *        the holder re-reads sizes from its authoritative local metadata.
+     * @param tenant_id The keys' tenant. A shared SSD holder stores objects
+     *        from other tenants, so lookup/registration/promotion must run
+     *        under the object's own tenant, not the holder's.
+     */
+    void prefetch_offload_object(const std::string &client_addr,
+                                 const std::vector<std::string> &keys,
+                                 const std::vector<int64_t> &sizes,
+                                 const std::string &tenant_id);
+
+    /**
+     * @brief Asks a replica owner to verify the backing file of each key and
+     * evict its own replica when the file is proven gone.
+     * @param client_addr Network address of the replica owner's offload RPC
+     * service.
+     * @param request The caller's tenant (offload files are scoped by the
+     * object's recorded tenant) and the object keys to verify.
+     * @return Per-key tri-state in request order (present, evicted,
+     * undetermined), or an error when the owner could not answer at all.
+     */
+    tl::expected<VerifyDiskReplicaResponse, ErrorCode> verify_disk_replica(
+        const std::string &client_addr,
+        const VerifyDiskReplicaRequest &request);
+
    private:
     /**
      * @brief A batch of allocated memory buffers, tracking both handles and
@@ -222,6 +258,78 @@ class PyClient {
     using QueryResultCache =
         std::unordered_map<std::string, tl::expected<QueryResult, ErrorCode>>;
 
+    // A caller-owned metadata snapshot for repeated ranged reads against the
+    // same key set. It is reusable until refresh_at; after that, callers should
+    // refresh it before submitting more transfers.
+    struct RangedReadSnapshot {
+        QueryResultCache query_result_cache;
+        std::chrono::steady_clock::time_point refresh_at{};
+
+        bool reset(QueryResultCache cache,
+                   std::chrono::steady_clock::time_point now =
+                       std::chrono::steady_clock::now()) {
+            query_result_cache = std::move(cache);
+            refresh_at = now;
+            if (query_result_cache.empty()) return false;
+
+            auto earliest_lease = std::chrono::steady_clock::time_point::max();
+            bool all_fresh = true;
+            for (const auto &[key, query_result] : query_result_cache) {
+                (void)key;
+                if (query_result && !query_result->IsLeaseExpired(now)) {
+                    earliest_lease =
+                        std::min(earliest_lease, query_result->lease_timeout);
+                } else {
+                    all_fresh = false;
+                }
+            }
+            if (all_fresh && earliest_lease > now) {
+                refresh_at = now + (earliest_lease - now) / 2;
+            }
+            return all_fresh;
+        }
+
+        bool reset(
+            const std::vector<std::string> &keys,
+            std::vector<tl::expected<QueryResult, ErrorCode>> query_results,
+            std::chrono::steady_clock::time_point now =
+                std::chrono::steady_clock::now()) {
+            query_result_cache.clear();
+            refresh_at = now;
+            if (query_results.size() != keys.size()) return false;
+
+            query_result_cache.reserve(keys.size());
+            auto earliest_lease = std::chrono::steady_clock::time_point::max();
+            bool all_fresh = true;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (query_results[i] &&
+                    !query_results[i]->IsLeaseExpired(now)) {
+                    earliest_lease = std::min(earliest_lease,
+                                              query_results[i]->lease_timeout);
+                } else {
+                    all_fresh = false;
+                }
+                query_result_cache.emplace(keys[i],
+                                           std::move(query_results[i]));
+            }
+
+            if (all_fresh && earliest_lease > now) {
+                refresh_at = now + (earliest_lease - now) / 2;
+            }
+            return all_fresh;
+        }
+
+        bool reusable(std::chrono::steady_clock::time_point now =
+                          std::chrono::steady_clock::now()) const {
+            return !query_result_cache.empty() && now < refresh_at;
+        }
+
+        bool should_refresh(std::chrono::steady_clock::time_point now =
+                                std::chrono::steady_clock::now()) const {
+            return !reusable(now);
+        }
+    };
+
     virtual ~PyClient() = 0;
     virtual int setup_real(
         const std::string &local_hostname, const std::string &metadata_server,
@@ -266,8 +374,45 @@ class PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const QueryResultCache *query_result_cache = nullptr) = 0;
 
+    // Read only from the supplied query-result snapshot. Implementations must
+    // not re-query keys or renew leases; an expired snapshot fails.
+    virtual std::vector<std::vector<std::vector<int64_t>>>
+    get_into_ranges_from_snapshot(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache &query_result_cache) = 0;
+
+    std::vector<std::vector<std::vector<int64_t>>>
+    get_into_ranges_from_snapshot(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const RangedReadSnapshot &snapshot) {
+        return get_into_ranges_from_snapshot(buffers, all_keys, all_dst_offsets,
+                                             all_src_offsets, all_sizes,
+                                             snapshot.query_result_cache);
+    }
+
     virtual std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
         const std::vector<std::string> &keys) = 0;
+
+    RangedReadSnapshot prepare_get_into_ranges_snapshot(
+        const std::vector<std::string> &keys) {
+        RangedReadSnapshot snapshot;
+        refresh_get_into_ranges_snapshot(snapshot, keys);
+        return snapshot;
+    }
+
+    bool refresh_get_into_ranges_snapshot(
+        RangedReadSnapshot &snapshot, const std::vector<std::string> &keys) {
+        auto query_results = batch_query(keys);
+        return snapshot.reset(keys, std::move(query_results));
+    }
 
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,
@@ -278,7 +423,7 @@ class PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node) = 0;
+        bool prefer_alloc_in_same_node) = 0;
 
     virtual int put_from(const std::string &key, void *buffer, size_t size,
                          const ReplicateConfig &config = ReplicateConfig{}) = 0;
@@ -408,6 +553,74 @@ class PyClient {
     virtual std::vector<int> batchIsExist(
         const std::vector<std::string> &keys) = 0;
 
+    // Point-in-time existence check that grants no read lease: 1 if the
+    // object existed at the time of the call, 0 if not, negative on error.
+    // The object may still be evicted before a subsequent get.
+    virtual int probeKey(const std::string &key) = 0;
+
+    virtual std::vector<int> batchProbeKey(
+        const std::vector<std::string> &keys,
+        const GrantLeasePolicy &policy = {}) = 0;
+    virtual WeightRpcResult<WeightRevisionMetadata> begin_weight_import(
+        const BeginWeightImportRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionMetadata> commit_weight_import(
+        const CommitWeightImportRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionMetadata> abort_weight_import(
+        const AbortWeightImportRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionView> get_weight_revision(
+        const GetWeightRevisionRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<ListWeightRevisionsResponse> list_weight_revisions(
+        const ListWeightRevisionsRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionLease> acquire_weight_revision_lease(
+        const AcquireWeightRevisionLeaseRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionLease> renew_weight_revision_lease(
+        const RenewWeightRevisionLeaseRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<void> release_weight_revision_lease(
+        const ReleaseWeightRevisionLeaseRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightResidencyOperation>
+    start_weight_residency_operation(
+        const StartWeightResidencyOperationRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightResidencyOperation> query_weight_operation(
+        const QueryWeightOperationRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionMetadata> delete_weight_revision(
+        const DeleteWeightRevisionRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // ExistOptions variants. The default implementation ignores the options
+    // (prefetch unsupported); RealClient overrides them when
+    // enable_ssd_prefetch is on. See docs/source/design/store/ssd-prefetch.md.
+    virtual int isExist(const std::string &key, const ExistOptions &options) {
+        (void)options;
+        return isExist(key);
+    }
+
+    virtual std::vector<int> batchIsExist(const std::vector<std::string> &keys,
+                                          const ExistOptions &options) {
+        (void)options;
+        return batchIsExist(keys);
+    }
+
     virtual int64_t getSize(const std::string &key) = 0;
 
     virtual std::map<std::string, std::vector<Replica::Descriptor>>
@@ -467,11 +680,15 @@ inline CachedQueryResultResponse to_cached_query_result_response(
     if (query_result->IsLeaseExpired(now)) {
         return CachedQueryResultResponse(ErrorCode::OBJECT_NOT_FOUND);
     }
-    return CachedQueryResultResponse(GetReplicaListResponse(
+    GetReplicaListResponse value(
         std::vector<Replica::Descriptor>(query_result->replicas.begin(),
                                          query_result->replicas.end()),
         remaining_lease_ttl_ms(*query_result, now),
-        query_result->object_checksum));
+        query_result->object_checksum);
+    if (query_result->resolved_tenant_id) {
+        value.resolved_tenant_id = *query_result->resolved_tenant_id;
+    }
+    return CachedQueryResultResponse(std::move(value));
 }
 
 inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
@@ -485,7 +702,8 @@ inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
         std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
                                          cached_result.value.replicas.end()),
         now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),
-        cached_result.value.object_checksum);
+        cached_result.value.object_checksum,
+        cached_result.value.resolved_tenant_id);
 }
 
 inline PyClient::QueryResultCache build_query_result_cache_from_cached_results(

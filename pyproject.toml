@@ -3,9 +3,9 @@ requires = [
     "scikit-build-core>=1.0",
     "pybind11>=2.13",
     "numpy>=1.24",
-    # Mooncake PG still builds its Torch ABI extensions through setup.py.
+    # Retained for the legacy wheel helper and packaging test environment.
     "setuptools>=61",
-    # Multi-ABI PG builds install the requested Torch wheels at build time.
+    # Retained for the legacy wheel helper; PG Torch compilation is runtime JIT.
     "pip>=23",
 ]
 build-backend = "scikit_build_core.build"
@@ -40,6 +40,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: System :: Distributed Computing",
@@ -93,6 +94,9 @@ transfer_engine_bench = "mooncake.cli_bench:main"
 mooncake_http_metadata_server = "mooncake.http_metadata_server:main"
 mc_store_rest_server = "mooncake.mooncake_store_service:sync_main"
 transfer_engine_topology_dump = "mooncake.transfer_engine_topology_dump:main"
+mooncake-store-rs-client = "mooncake._launcher:store_rs_client"
+mooncake-store-rs-admin = "mooncake._launcher:store_rs_admin"
+mooncake-store-rs-bench = "mooncake._launcher:store_rs_bench"
 
 [tool.scikit-build]
 minimum-version = "build-system.requires"
@@ -113,3 +117,4 @@ WITH_EP = false
 WITH_P2P_STORE = false
 WITH_STORE_GO = false
 WITH_STORE_RUST = false
+WITH_STORE_RS = false

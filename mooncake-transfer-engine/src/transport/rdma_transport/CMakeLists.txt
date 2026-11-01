@@ -1,8 +1,19 @@
 file(GLOB RDMA_SOURCES "*.cpp")
 
 add_library(rdma_transport OBJECT ${RDMA_SOURCES})
-target_link_libraries(rdma_transport PUBLIC gflags::gflags glog::glog
-                                    PRIVATE JsonCpp::JsonCpp pthread)
+target_link_libraries(
+  rdma_transport
+  PUBLIC gflags::gflags glog::glog
+  PRIVATE JsonCpp::JsonCpp pthread)
+
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
+  target_link_libraries(rdma_transport PUBLIC adaptive_congestion_control_core)
+endif()
+
+if(USE_CUDA)
+  target_compile_definitions(rdma_transport PRIVATE _GNU_SOURCE)
+  target_link_libraries(rdma_transport PUBLIC ${CMAKE_DL_LIBS})
+endif()
 
 if(USE_MLX5DV)
   target_compile_definitions(rdma_transport PRIVATE USE_MLX5DV)

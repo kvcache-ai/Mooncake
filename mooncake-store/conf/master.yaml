@@ -9,7 +9,7 @@ rpc_enable_tcp_no_delay: true
 
 default_kv_lease_ttl: 10000
 default_kv_soft_pin_ttl: 1800000
-max_kv_soft_pin_ttl: 86400000
+max_kv_soft_pin_ttl: 604800000
 allow_evict_soft_pinned_objects: true
 eviction_ratio: 0.1
 # Overrides the 0.90 code default. A value of 1.0 disables proactive
@@ -53,6 +53,8 @@ client_suspicion_ttl_sec: 60
 
 # OpLog store configuration for HA hot-standby replication
 enable_oplog: false
+# Confirm all configured standbys support weight metadata and lease entries.
+weight_management_oplog_capability_confirmed: false
 enable_oplog_snapshot: false
 # Maximum objects per standby batch OpLog snapshot chunk
 snapshot_chunk_object_count: 1000000

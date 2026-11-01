@@ -185,6 +185,26 @@ shims! {
         count: usize,
         results_out: *mut i64,
     ) -> c_int;
+    fn mooncake_store_batch_put_from_multi_buffers(
+        store: mooncake_store_t,
+        keys: *mut *const c_char,
+        buffers: *mut *mut c_void,
+        sizes: *const usize,
+        counts: *const usize,
+        count: usize,
+        config: *const mooncake_replicate_config_t,
+        results_out: *mut c_int,
+    ) -> c_int;
+    fn mooncake_store_batch_get_into_multi_buffers(
+        store: mooncake_store_t,
+        keys: *mut *const c_char,
+        buffers: *mut *mut c_void,
+        sizes: *const usize,
+        counts: *const usize,
+        count: usize,
+        prefer_alloc_in_same_node: c_int,
+        results_out: *mut i64,
+    ) -> c_int;
     fn mooncake_store_is_exist(store: mooncake_store_t, key: *const c_char) -> c_int;
     fn mooncake_store_batch_is_exist(
         store: mooncake_store_t,

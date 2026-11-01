@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <chrono>
 #include <cerrno>
@@ -13,15 +14,19 @@
 #include <string>
 #include <vector>
 #include "config/transfer_submitter_config.h"
+#include "config/nof_debug_config.h"
 #include "config/fileread_worker_pool_config.h"
+#include "config/nof_worker_pool_config.h"
 #include "device/accelerator_registry.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
+#ifdef USE_TENT
+#include "tent/transfer_engine.h"
 #endif
+#include "nof/nvmeof_initiator.h"
 
-#ifdef USE_NOF
+namespace mooncake {
+
 static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     const char* raw_value = std::getenv(name);
     if (!raw_value || raw_value[0] == '\0') {
@@ -42,62 +47,29 @@ static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     return static_cast<int>(parsed);
 }
 
-static bool IsTruthyEnv(const char* value) {
-    if (!value) {
-        return false;
-    }
-    std::string normalized(value);
-    std::transform(
-        normalized.begin(), normalized.end(), normalized.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return normalized == "1" || normalized == "true" || normalized == "yes" ||
-           normalized == "on";
+static bool IsNofDebugEnabled() {
+    return mooncake::NoFDebugConfig::IsEnabledAtFirstUse();
 }
 
-static bool IsSpdkNofDebugEnabled() {
-    static const bool enabled = IsTruthyEnv(std::getenv("MC_NOF_DEBUG"));
-    return enabled;
+static std::chrono::milliseconds GetNofDebugIntervalMs() {
+    return mooncake::NoFDebugConfig::IntervalMsAtFirstUse();
 }
 
-static int GetSpdkNofDebugIntervalMs() {
-    static const int interval_ms = []() {
-        const char* raw_value = std::getenv("MC_NOF_DEBUG_INTERVAL_MS");
-        if (!raw_value) {
-            return 1000;
-        }
-        char* end_ptr = nullptr;
-        long parsed = std::strtol(raw_value, &end_ptr, 10);
-        if (end_ptr == raw_value || (end_ptr != nullptr && *end_ptr != '\0') ||
-            parsed <= 0) {
-            return 1000;
-        }
-        return static_cast<int>(parsed);
-    }();
-    return interval_ms;
-}
-
-static int GetSpdkNofSubmitChunkBytes() {
+static int GetNofSubmitChunkBytes() {
     static const int value = GetPositiveEnvOrDefault(
-        "MC_NOF_SUBMIT_CHUNK_BYTES", mooncake::kDefaultSpdkNofSubmitChunkBytes);
+        "MC_NOF_SUBMIT_CHUNK_BYTES", mooncake::kDefaultNofSubmitChunkBytes);
     return value;
 }
 
-static int GetSpdkNofInflightBytesLimit() {
-    static const int value =
-        GetPositiveEnvOrDefault("MC_NOF_INFLIGHT_BYTES_LIMIT",
-                                mooncake::kDefaultSpdkNofInflightBytesLimit);
-    return value;
-}
-
-static int GetSpdkNofWorkerCount() {
+static int GetNofInflightBytesLimit() {
     static const int value = GetPositiveEnvOrDefault(
-        "MC_NOF_WORKERS", mooncake::kDefaultSpdkNofWorkers);
+        "MC_NOF_INFLIGHT_BYTES_LIMIT", mooncake::kDefaultNofInflightBytesLimit);
     return value;
 }
 
-static int CountSpdkNofQueuedTasks(const mooncake::SpdkNofTask* head) {
+static int CountNofQueuedTasks(const mooncake::NofTask* head) {
     int count = 0;
-    const mooncake::SpdkNofTask* cursor = head;
+    const mooncake::NofTask* cursor = head;
     while (cursor != nullptr) {
         ++count;
         cursor = cursor->nxt;
@@ -105,29 +77,32 @@ static int CountSpdkNofQueuedTasks(const mooncake::SpdkNofTask* head) {
     return count;
 }
 
-static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
-    if (task->remaining_lba == 0 && task->outstanding_sub_io == 0) {
+static inline void NofTaskCompletion(mooncake::NofTask* task) {
+    if (task->remaining_bytes == 0 && task->outstanding_sub_io == 0) {
         task->state->set_completed(task->failed
                                        ? mooncake::ErrorCode::TRANSFER_FAIL
-                                       : mooncake::ErrorCode::OK);
+                                       : mooncake::ErrorCode::OK,
+                                   std::move(task->error_detail));
         if (!task->on_chain) {
             delete task;
         }
     }
 }
 
-static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
+static void nof_io_complete(void* ctx, const mooncake::NofIOCompletion& c) {
     if (!ctx) {
-        LOG(ERROR) << "nvmf_io_complete ctx is null";
+        LOG(ERROR) << "nof_io_complete ctx is null";
         return;
     }
 
-    mooncake::SpdkNofSubTask* sub_task =
-        reinterpret_cast<mooncake::SpdkNofSubTask*>(ctx);
-    mooncake::SpdkNofTask* task = sub_task->task;
-    mooncake::SpdkNofQos* nof_qos = task->nof_qos;
-    int op = task->op;
-    if (--(*task->io_count) < 0) {
+    mooncake::NofSubTask* sub_task =
+        reinterpret_cast<mooncake::NofSubTask*>(ctx);
+    mooncake::NofTask* task = sub_task->task;
+    mooncake::NofQos* nof_qos = task->nof_qos;
+    size_t op = static_cast<size_t>(task->op);
+
+    if (task->io_count &&
+        task->io_count->fetch_sub(1, std::memory_order_acq_rel) <= 0) {
         LOG(ERROR) << "total outstanding io < 0";
     }
 
@@ -135,43 +110,130 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
         LOG(ERROR) << "task outstanding io < 0";
     }
 
-    nof_qos->inflight_blocks[op] -= sub_task->submit_lba_count;
+    nof_qos->inflight_blocks[op] -=
+        static_cast<int>(sub_task->submit_bytes / nof_qos->block_size);
     if (nof_qos->inflight_blocks[op] < 0) {
-        LOG(ERROR) << "task outstanding io < 0";
+        LOG(ERROR) << "qos inflight blocks < 0";
     }
 
-    if (spdk_nvme_cpl_is_error(cpl)) {
-        LOG(ERROR) << "task_complete: I/O failed"
-                   << spdk_nvme_cpl_get_status_string(&cpl->status);
-        task->remaining_lba = 0;
+    if (!c.success) {
+#ifdef USE_NOF
+        // NofMetric is only defined in USE_NOF builds (metric is always
+        // nullptr elsewhere).
+        if (task->metric) {
+            if (task->op == NofIOOp::kWrite) {
+                task->metric->RecordWriteErrors();
+            } else {
+                task->metric->RecordReadErrors();
+            }
+        }
+#endif
+        LOG(ERROR) << "nof task I/O failed: sc=" << c.sc << " sct=" << c.sct
+                   << " " << c.error_string;
+        task->remaining_bytes = 0;
         task->failed = true;
+        if (task->error_detail.empty()) {
+            task->error_detail = c.error_string;  // keep the first error detail
+        }
+#ifdef USE_NOF
+    } else if (task->metric) {
+        if (task->op == NofIOOp::kWrite) {
+            task->metric->ObserveWrite(sub_task->submit_bytes);
+        } else {
+            task->metric->ObserveRead(sub_task->submit_bytes);
+        }
+#endif
     }
 
-    SpdkNofTaskCompletion(task);
+    NofTaskCompletion(task);
 
     sub_task->sub_task_pool->push(sub_task);
 }
-#endif
-namespace mooncake {
+namespace {
 
-#ifdef USE_NOF
-SpdkNofQos::SpdkNofQos(uint32_t block_size) {
-    int block_size_int = static_cast<int>(block_size);
-    if (block_size_int <= 0) {
-        block_size_int = 1;
+#ifdef USE_TENT
+int GetTentPositiveEnvOrDefault(const char* name, int default_value) {
+    const char* raw_value = std::getenv(name);
+    if (!raw_value || raw_value[0] == '\0') return default_value;
+
+    errno = 0;
+    char* end_ptr = nullptr;
+    long parsed = std::strtol(raw_value, &end_ptr, 10);
+    if (errno != 0 || end_ptr == raw_value || *end_ptr != '\0' || parsed <= 0 ||
+        parsed > std::numeric_limits<int>::max()) {
+        LOG(WARNING) << "Invalid value for " << name << ": " << raw_value
+                     << ", using default " << default_value;
+        return default_value;
     }
+    return static_cast<int>(parsed);
+}
 
-    blocks_per_chunk =
-        std::max(1, GetSpdkNofSubmitChunkBytes() / block_size_int);
-    inflight_blocks_limit =
-        std::max(1, GetSpdkNofInflightBytesLimit() / block_size_int);
-    for (int i = 0; i < kSpdkNofOpNum; ++i) {
+std::optional<tent::Request::OpCode> ToTentOpCode(
+    TransferRequest::OpCode op_code) {
+    switch (op_code) {
+        case TransferRequest::READ:
+            return tent::Request::READ;
+        case TransferRequest::WRITE:
+            return tent::Request::WRITE;
+        default:
+            return std::nullopt;
+    }
+}
+
+// NOTE: This only handles TransferIntent values (0-3). The compat-layer
+// toTentIntent in transfer_engine.cpp also handles raw int values 4-6
+// (CHECKPOINT, WEIGHT_LOADING, STAGING_INTERNAL) for forward compatibility.
+std::optional<tent::IntentType> ToTentIntent(TransferIntent intent) {
+    switch (intent) {
+        case TransferIntent::kUnspecified:
+            return tent::IntentType::INTENT_UNSPEC;
+        case TransferIntent::kForegroundGet:
+            return tent::IntentType::FOREGROUND_GET;
+        case TransferIntent::kBackgroundPrefetch:
+            return tent::IntentType::BACKGROUND_PREFETCH;
+        case TransferIntent::kMigration:
+            return tent::IntentType::MIGRATION;
+        default:
+            return std::nullopt;
+    }
+}
+
+std::optional<TransferStatusEnum> ToClassicTransferStatus(
+    tent::TransferStatusEnum status) {
+    switch (status) {
+        case tent::INITIAL:
+        case tent::PENDING:
+            return TransferStatusEnum::WAITING;
+        case tent::INVALID:
+            return TransferStatusEnum::INVALID;
+        case tent::CANCELED:
+            return TransferStatusEnum::CANCELED;
+        case tent::COMPLETED:
+            return TransferStatusEnum::COMPLETED;
+        case tent::TIMEOUT:
+            return TransferStatusEnum::TIMEOUT;
+        case tent::FAILED:
+            return TransferStatusEnum::FAILED;
+        default:
+            return std::nullopt;
+    }
+}
+#endif
+
+}  // namespace
+
+NofQos::NofQos(uint32_t bs)
+    : block_size(bs == 0 || bs == kInvalidBlockSize ? 1 : bs),
+      blocks_per_chunk(
+          std::max(1, GetNofSubmitChunkBytes() / static_cast<int>(block_size))),
+      inflight_blocks_limit(std::max(
+          1, GetNofInflightBytesLimit() / static_cast<int>(block_size))) {
+    for (size_t i = 0; i < static_cast<size_t>(NofIOOp::kNum); ++i) {
         inflight_blocks[i] = 0;
         head[i] = nullptr;
         tail[i] = nullptr;
     }
 }
-#endif
 
 // ============================================================================
 // FilereadWorkerPool Implementation
@@ -278,30 +340,30 @@ void FilereadWorkerPool::workerThread() {
 }
 
 // ============================================================================
-// SpdkNofWorkerPool Implementation
+// NofWorkerPool Implementation
 // ============================================================================
 // to fully utilize the available ssd bandwidth, we use a default of 4 worker
 // threads.
 
-#ifdef USE_NOF
-SpdkNofWorkerPool::SpdkNofWorkerPool(int numa_socket_id)
-    : worker_count_(GetSpdkNofWorkerCount()),
+NofWorkerPool::NofWorkerPool(std::shared_ptr<NVMeoFInitiator> initiator,
+                             int numa_socket_id)
+    : initiator_(std::move(initiator)),
+      worker_count_(NoFWorkerPoolConfig::AtFirstUse().worker_count),
       numa_socket_id_(numa_socket_id),
-      task_queue_(std::make_unique<std::queue<SpdkNofTask>[]>(worker_count_)),
+      task_queue_(std::make_unique<std::queue<NofTask>[]>(worker_count_)),
       queue_mutex_(std::make_unique<std::mutex[]>(worker_count_)),
       queue_cv_(std::make_unique<std::condition_variable[]>(worker_count_)),
       shutdown_(false) {
-    VLOG(1) << "Creating SpdkNofWorkerPool with " << worker_count_
-            << " workers";
+    VLOG(1) << "Creating NofWorkerPool with " << worker_count_ << " workers";
 
     // Start worker threads
     workers_.reserve(worker_count_);
     for (int i = 0; i < worker_count_; ++i) {
-        workers_.emplace_back(&SpdkNofWorkerPool::workerThread, this, i);
+        workers_.emplace_back(&NofWorkerPool::workerThread, this, i);
     }
 }
 
-SpdkNofWorkerPool::~SpdkNofWorkerPool() {
+NofWorkerPool::~NofWorkerPool() {
     if (shutdown_.exchange(true)) {
         return;
     }
@@ -316,18 +378,17 @@ SpdkNofWorkerPool::~SpdkNofWorkerPool() {
         }
     }
 
-    VLOG(1) << "SpdkNofWorkerPool destroyed";
+    VLOG(1) << "NofWorkerPool destroyed";
 }
 
-void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
+void NofWorkerPool::submitTask(NofTask task) {
     if (!task.state) {
-        LOG(ERROR) << "Attempting to submit spdk nof task without state";
+        LOG(ERROR) << "Attempting to submit nof task without state";
         return;
     }
 
     if (shutdown_.load()) {
-        LOG(WARNING)
-            << "Attempting to submit task to shutdown SpdkNofWorkerPool";
+        LOG(WARNING) << "Attempting to submit task to shutdown NofWorkerPool";
         task.state->set_completed(ErrorCode::TRANSFER_FAIL);
         return;
     }
@@ -335,7 +396,7 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
     int worker_idx = -1;
     {
         std::lock_guard<std::mutex> lock(seg_mutex_);
-        nof_seg_handle* seg = task.seg_handle;
+        NofSegmentHandle* seg = task.seg_handle;
         bool new_binding = false;
         if (seg_to_worker_.find(seg) != seg_to_worker_.end()) {
             worker_idx = seg_to_worker_[seg];
@@ -344,7 +405,7 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
             seg_to_worker_[seg] = worker_idx;
             new_binding = true;
         }
-        if (new_binding && IsSpdkNofDebugEnabled()) {
+        if (new_binding && IsNofDebugEnabled()) {
             LOG(INFO) << "nof_worker_bind seg_handle=" << seg
                       << " worker_idx=" << worker_idx;
         }
@@ -363,7 +424,7 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
 }
 
 static bool HasBufferedTask(
-    const std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>>& seg_to_qos) {
+    const std::map<NofSegmentHandle*, std::unique_ptr<NofQos>>& seg_to_qos) {
     for (const auto& [_, nof_qos] : seg_to_qos) {
         if (!nof_qos->Empty()) {
             return true;
@@ -372,23 +433,23 @@ static bool HasBufferedTask(
     return false;
 }
 
-constexpr int kSpdkNofSubTaskChunkSize = 4096;
+constexpr int kDefaultNofSubTaskChunkSize = 4096;
 
-static inline bool CheckSubTaskPool(
-    std::stack<SpdkNofSubTask*>& sub_task_pool,
-    std::vector<SpdkNofSubTask*>& sub_task_chunks, int work_idx) {
+static inline bool CheckSubTaskPool(std::stack<NofSubTask*>& sub_task_pool,
+                                    std::vector<NofSubTask*>& sub_task_chunks,
+                                    int work_idx) {
     if (!sub_task_pool.empty()) {
         return true;
     }
-    SpdkNofSubTask* sub_tasks =
-        new (std::nothrow) SpdkNofSubTask[kSpdkNofSubTaskChunkSize];
+    NofSubTask* sub_tasks =
+        new (std::nothrow) NofSubTask[kDefaultNofSubTaskChunkSize];
     if (!sub_tasks) {
-        LOG(ERROR) << "alloc SpdkNofSubTask failed, worker " << work_idx;
+        LOG(ERROR) << "alloc NofSubTask failed, worker " << work_idx;
         return false;
     }
     sub_task_chunks.push_back(sub_tasks);
 
-    for (int i = 0; i < kSpdkNofSubTaskChunkSize; ++i) {
+    for (int i = 0; i < kDefaultNofSubTaskChunkSize; ++i) {
         sub_tasks[i].sub_task_pool = &sub_task_pool;
         sub_task_pool.push(&sub_tasks[i]);
     }
@@ -396,63 +457,79 @@ static inline bool CheckSubTaskPool(
     return true;
 }
 
-void SpdkNofWorkerPool::workerThread(int work_idx) {
+void NofWorkerPool::workerThread(int work_idx) {
     bindToSocket(numa_socket_id_);
-    VLOG(2) << "SpdkNofWorkerPool worker thread started";
+    VLOG(2) << "NofWorkerPool worker thread started";
 
-    int64_t total_outstanding_io = 0;
-    // std::set<nof_seg_handle *> seg_set;
-    std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>> seg_to_qos;
-    std::stack<SpdkNofSubTask*> sub_task_pool;
-    std::vector<SpdkNofSubTask*> sub_task_chunks;
+    // No longer a stack-variable address: the worker and the task share
+    // ownership.
+    auto total_outstanding_io = std::make_shared<std::atomic<int64_t>>(0);
+    std::map<NofSegmentHandle*, std::unique_ptr<NofQos>> seg_to_qos;
+    std::stack<NofSubTask*> sub_task_pool;
+    std::vector<NofSubTask*> sub_task_chunks;
     auto& task_queue = task_queue_[work_idx];
     auto& queue_cv = queue_cv_[work_idx];
     auto& queue_mutex = queue_mutex_[work_idx];
     auto last_debug_snapshot = std::chrono::steady_clock::now();
 
-    if (!CheckSubTaskPool(sub_task_pool, sub_task_chunks, work_idx)) {
-        return;
-    }
+    // Best-effort preallocation: the submit loop retries on demand. The
+    // worker must not exit here — a dead worker hangs teardown at join().
+    (void)CheckSubTaskPool(sub_task_pool, sub_task_chunks, work_idx);
 
     while (true) {
         // Wait for task or shutdown signal
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
-            queue_cv.wait(
-                lock, [this, &task_queue, &total_outstanding_io, &seg_to_qos] {
-                    return shutdown_.load() || !task_queue.empty() ||
-                           total_outstanding_io || HasBufferedTask(seg_to_qos);
-                });
+            queue_cv.wait(lock, [this, &task_queue, &total_outstanding_io,
+                                 &seg_to_qos] {
+                return shutdown_.load() || !task_queue.empty() ||
+                       total_outstanding_io->load(std::memory_order_acquire) !=
+                           0 ||
+                       HasBufferedTask(seg_to_qos);
+            });
 
             if (shutdown_.load() && task_queue.empty() &&
-                (total_outstanding_io == 0) && !HasBufferedTask(seg_to_qos)) {
+                total_outstanding_io->load(std::memory_order_acquire) == 0 &&
+                !HasBufferedTask(seg_to_qos)) {
                 break;
             }
 
             while (!task_queue.empty()) {
-                SpdkNofTask* task = new (std::nothrow)
-                    SpdkNofTask(std::move(task_queue.front()));
+                NofTask* task =
+                    new (std::nothrow) NofTask(std::move(task_queue.front()));
                 if (task == nullptr) {
-                    LOG(ERROR)
-                        << "alloc SpdkNofTask failed, worker " << work_idx;
+                    LOG(ERROR) << "alloc NofTask failed, worker " << work_idx;
+                    // The front was not moved from: fail it and pop, or the
+                    // worker spins forever and teardown hangs at join().
+                    auto& front = task_queue.front();
+                    if (front.state) {
+                        front.state->set_completed(ErrorCode::TRANSFER_FAIL);
+                    }
+                    task_queue.pop();
                     continue;
                 }
 
-                SpdkNofQos* nof_qos = nullptr;
+                NofQos* nof_qos = nullptr;
                 auto it = seg_to_qos.find(task->seg_handle);
                 if (it == seg_to_qos.end()) {
-                    auto qos = std::make_unique<SpdkNofQos>(
-                        SpdkWrapper::GetInstance().GetBlockSize(
-                            task->seg_handle));
+                    auto qos = std::make_unique<NofQos>(
+                        initiator_->GetBlockSize(task->seg_handle));
                     if (qos == nullptr) {
                         LOG(ERROR)
-                            << "alloc SpdkNofQos failed, worker " << work_idx;
+                            << "alloc NofQos failed, worker " << work_idx;
+                        // task owns the moved-out state: fail it, then drop
+                        // the task and the moved-from queue front.
+                        if (task->state) {
+                            task->state->set_completed(
+                                ErrorCode::TRANSFER_FAIL);
+                        }
                         delete task;
+                        task_queue.pop();
                         continue;
                     }
                     nof_qos = qos.get();
                     seg_to_qos[task->seg_handle] = std::move(qos);
-                    if (IsSpdkNofDebugEnabled()) {
+                    if (IsNofDebugEnabled()) {
                         LOG(INFO)
                             << "nof_qos_create worker_idx=" << work_idx
                             << " seg_handle=" << task->seg_handle
@@ -465,7 +542,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 } else {
                     nof_qos = it->second.get();
                 }
-                task->io_count = &total_outstanding_io;
+                task->io_count = total_outstanding_io;
                 task->nof_qos = nof_qos;
                 task->on_chain = true;
                 nof_qos->PushTask(task);
@@ -474,79 +551,101 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         }
 
         for (auto& [seg_handle, nof_qos] : seg_to_qos) {
-            uint32_t block_size =
-                SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
-            for (int i = 0; i < kSpdkNofOpNum; ++i) {
+            // block_size comes from the QoS cache; the hot loop no longer
+            // queries the initiator.
+            const uint32_t block_size = nof_qos->block_size;
+            const uint64_t chunk_bytes =
+                static_cast<uint64_t>(nof_qos->blocks_per_chunk) * block_size;
+            for (size_t i = 0; i < static_cast<size_t>(NofIOOp::kNum); ++i) {
                 int avail_blocks = nof_qos->inflight_blocks_limit -
                                    nof_qos->inflight_blocks[i];
                 while (nof_qos->head[i] && avail_blocks > 0) {
-                    SpdkNofTask* task = nof_qos->head[i];
-                    SpdkNofSubTask* sub_task;
-                    while (task->remaining_lba > 0 && avail_blocks > 0) {
-                        uint32_t submit_lba_count = std::min(
-                            avail_blocks, std::min(task->remaining_lba,
-                                                   nof_qos->blocks_per_chunk));
-                        int lba_off = task->lba_count - task->remaining_lba;
-                        uint64_t submit_lba = task->lba + lba_off;
-                        void* submit_ptr = reinterpret_cast<void*>(
-                            reinterpret_cast<char*>(task->ptr) +
-                            lba_off * block_size);
+                    NofTask* task = nof_qos->head[i];
+                    NofSubTask* sub_task;
+                    while (task->remaining_bytes > 0 && avail_blocks > 0) {
+                        const uint64_t avail_bytes =
+                            static_cast<uint64_t>(avail_blocks) * block_size;
+                        const uint64_t sent_bytes =
+                            task->byte_length - task->remaining_bytes;
+                        const uint32_t submit_bytes =
+                            static_cast<uint32_t>(std::min<uint64_t>(
+                                {avail_bytes, task->remaining_bytes,
+                                 chunk_bytes}));
+                        const uint64_t submit_off =
+                            task->byte_offset + sent_bytes;
+                        void* submit_ptr =
+                            reinterpret_cast<char*>(task->ptr) + sent_bytes;
 
                         if (!CheckSubTaskPool(sub_task_pool, sub_task_chunks,
                                               work_idx)) {
                             task->failed = true;
-                            task->remaining_lba = 0;
+                            task->remaining_bytes = 0;
                             break;
                         }
                         sub_task = sub_task_pool.top();
                         sub_task_pool.pop();
                         sub_task->task = task;
-                        sub_task->submit_lba_count = submit_lba_count;
+                        sub_task->submit_bytes = submit_bytes;
+                        sub_task->adaptor = {&nof_io_complete, sub_task};
 
-                        int ret = SpdkWrapper::GetInstance().SubmitRequest(
-                            task->seg_handle, submit_ptr, submit_lba,
-                            submit_lba_count, task->op, nvmf_io_complete,
-                            sub_task);
+                        int ret = initiator_->SubmitIO(
+                            task->seg_handle, submit_ptr, submit_off,
+                            submit_bytes, task->op, &sub_task->adaptor);
                         if (ret != 0) {
+#ifdef USE_NOF
+                            if (task->metric) {
+                                if (task->op == NofIOOp::kWrite) {
+                                    task->metric->RecordWriteErrors();
+                                } else {
+                                    task->metric->RecordReadErrors();
+                                }
+                            }
+#endif
                             LOG(ERROR) << "work " << work_idx << ", seg "
                                        << task->seg_handle << " submit io fail";
+                            // Return the pool slot: a sub-task taken out
+                            // and then failing to submit must be returned,
+                            // or repeated failures would exhaust the 4096
+                            // slots and allocate new chunks unboundedly.
+                            sub_task->sub_task_pool->push(sub_task);
                             task->failed = true;
-                            task->remaining_lba = 0;
+                            task->remaining_bytes = 0;
                         } else {
+                            const int submit_blocks =
+                                static_cast<int>(submit_bytes / block_size);
                             task->idx++;
-                            task->remaining_lba -= submit_lba_count;
-                            nof_qos->inflight_blocks[i] += submit_lba_count;
-                            avail_blocks -= submit_lba_count;
+                            task->remaining_bytes -= submit_bytes;
+                            nof_qos->inflight_blocks[i] += submit_blocks;
+                            avail_blocks -= submit_blocks;
                             task->outstanding_sub_io++;
-                            total_outstanding_io++;
+                            total_outstanding_io->fetch_add(
+                                1, std::memory_order_acq_rel);
                         }
                     }
-                    if (task->remaining_lba == 0) {
-                        nof_qos->PopTask(i);
+                    if (task->remaining_bytes == 0) {
+                        nof_qos->PopTask(static_cast<NofIOOp>(i));
                         task->on_chain = false;
-                        SpdkNofTaskCompletion(task);
+                        NofTaskCompletion(task);
                     }
                 }
             }
         }
 
-        if (total_outstanding_io > 0) {
-            int64_t ret = 0;
+        if (total_outstanding_io->load(std::memory_order_acquire) > 0) {
             for (auto& it : seg_to_qos) {
-                ret = SpdkWrapper::GetInstance().NvmePollProcessCompletion(
-                    it.first, 0);
+                int64_t ret = initiator_->PollCompletion(it.first, 0);
                 if (ret < 0) {
                     LOG(ERROR) << "poll completion error: ret " << ret;
                 }
             }
         }
 
-        if (IsSpdkNofDebugEnabled()) {
+        if (IsNofDebugEnabled()) {
             auto now = std::chrono::steady_clock::now();
             auto elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - last_debug_snapshot);
-            if (elapsed.count() >= GetSpdkNofDebugIntervalMs()) {
+            if (elapsed >= GetNofDebugIntervalMs()) {
                 for (const auto& [seg_handle, nof_qos] : seg_to_qos) {
                     LOG(INFO)
                         << "nof_qos_state worker_idx=" << work_idx
@@ -555,10 +654,12 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         << " inflight_write=" << nof_qos->inflight_blocks[1]
                         << " inflight_limit=" << nof_qos->inflight_blocks_limit
                         << " queued_read="
-                        << CountSpdkNofQueuedTasks(nof_qos->head[0])
+                        << CountNofQueuedTasks(nof_qos->head[0])
                         << " queued_write="
-                        << CountSpdkNofQueuedTasks(nof_qos->head[1])
-                        << " total_outstanding_io=" << total_outstanding_io;
+                        << CountNofQueuedTasks(nof_qos->head[1])
+                        << " total_outstanding_io="
+                        << total_outstanding_io->load(
+                               std::memory_order_acquire);
                 }
                 last_debug_snapshot = now;
             }
@@ -568,12 +669,11 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
     for (auto* sub_tasks : sub_task_chunks) {
         delete[] sub_tasks;
     }
-    // seg_to_qos will automatically clean up SpdkNofQos objects using
+    // seg_to_qos will automatically clean up NofQos objects using
     // unique_ptr
 
-    VLOG(2) << "SpdkNofWorkerPool worker thread exiting";
+    VLOG(2) << "NofWorkerPool worker thread exiting";
 }
-#endif
 
 // ============================================================================
 // MemcpyWorkerPool Implementation
@@ -723,6 +823,15 @@ void MemcpyWorkerPool::workerThread() {
 // TransferEngineOperationState Implementation
 // ============================================================================
 
+TransferEngineOperationState::~TransferEngineOperationState() {
+#ifdef USE_TENT
+    if (tent_engine_)
+        tent_engine_->freeBatch(batch_id_);
+    else
+#endif
+        engine_.freeBatchID(batch_id_);
+}
+
 bool TransferEngineOperationState::is_completed() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (result_.has_value()) {
@@ -744,13 +853,41 @@ void TransferEngineOperationState::check_task_status() {
 
     for (size_t i = 0; i < batch_size_; ++i) {
         TransferStatus status;
-        Status s = engine_.getTransferStatus(batch_id_, i, status);
-        if (!s.ok()) {
-            LOG(ERROR) << "Failed to get transfer status for batch "
-                       << batch_id_ << " task " << i << " with error "
-                       << s.message();
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
-            return;
+        Status s;
+#ifdef USE_TENT
+        if (tent_engine_) {
+            tent::TransferStatus tent_status;
+            auto tent_s =
+                tent_engine_->getTransferStatus(batch_id_, i, tent_status);
+            if (!tent_s.ok()) {
+                LOG(ERROR) << "Failed to get transfer status for batch "
+                           << batch_id_ << " task " << i << " with error "
+                           << tent_s.message();
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
+            auto classic_status = ToClassicTransferStatus(tent_status.s);
+            if (!classic_status) {
+                LOG(ERROR) << "Unknown TENT transfer status for batch "
+                           << batch_id_ << " task " << i << " with status "
+                           << static_cast<int>(tent_status.s);
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
+            status.s = *classic_status;
+            status.transferred_bytes = tent_status.transferred_bytes;
+            s = Status::OK();
+        } else
+#endif
+        {
+            s = engine_.getTransferStatus(batch_id_, i, status);
+            if (!s.ok()) {
+                LOG(ERROR) << "Failed to get transfer status for batch "
+                           << batch_id_ << " task " << i << " with error "
+                           << s.message();
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
         }
 
         switch (status.s) {
@@ -824,7 +961,6 @@ void TransferEngineOperationState::wait_for_completion() {
     if (!engine_.isUsingTent()) {
         VLOG(1) << "Waiting for transfer engine completion for batch "
                 << batch_id_;
-
         // Wait directly on BatchDesc's condition variable.
         auto& batch_desc = Transport::toBatchDesc(batch_id_);
         bool completed;
@@ -859,16 +995,13 @@ void TransferEngineOperationState::wait_for_completion() {
         if (completed) {
             failed = batch_desc.has_failure.load(std::memory_order_relaxed);
         }
-
         ErrorCode error_code =
             completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
                       : ErrorCode::TRANSFER_FAIL;
-
         {
             std::lock_guard<std::mutex> lock(mutex_);
             set_result_internal(error_code);
         }
-
         if (completed) {
             VLOG(1) << "Transfer engine operation completed for batch "
                     << batch_id_
@@ -937,17 +1070,17 @@ TransferStrategy TransferFuture::strategy() const {
 // TransferSubmitter Implementation
 // ============================================================================
 
-TransferSubmitter::TransferSubmitter(TransferEngine& engine,
-                                     std::shared_ptr<StorageBackend>& backend,
-                                     const std::string& local_hostname,
-                                     TransferMetric* transfer_metric,
-                                     int numa_socket_id)
+TransferSubmitter::TransferSubmitter(
+    TransferEngine& engine, std::shared_ptr<StorageBackend>& backend,
+    const std::string& local_hostname, TransferMetric* transfer_metric,
+    int numa_socket_id, std::shared_ptr<NVMeoFInitiator> nof_initiator,
+    NofMetric* nof_metric)
     : engine_(engine),
+      tent_engine_(engine.getTentEngine().get()),
       local_endpoint_(engine.getLocalIpAndPort()),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
-#ifdef USE_NOF
-      spdk_nvmf_pool_(std::make_unique<SpdkNofWorkerPool>(numa_socket_id)),
-#endif
+      nof_initiator_(std::move(nof_initiator)),
+      nof_metric_(nof_metric),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       local_hostname_(local_hostname),
       transfer_metric_(transfer_metric) {
@@ -966,13 +1099,19 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                         "disabled");
     }
 
+    if (nof_initiator_) {
+        nof_pool_ =
+            std::make_unique<NofWorkerPool>(nof_initiator_, numa_socket_id);
+    }
+
     VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
             << memcpy_enabled_;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    TransferRequest::OpCode op_code, void* ptr, size_t size) {
+    TransferRequest::OpCode op_code, void* ptr, size_t size,
+    TransferIntent intent) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -984,7 +1123,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         }
 
         if (op_code == TransferRequest::READ) {
-            future = submitMemoryReadOperation(handle, slices, 0);
+            future = submitMemoryReadOperation(handle, slices, 0, intent);
         } else {
             TransferStrategy strategy = selectStrategy(handle, slices);
 
@@ -993,8 +1132,8 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                     future = submitMemcpyOperation(handle, slices, op_code);
                     break;
                 case TransferStrategy::TRANSFER_ENGINE:
-                    future =
-                        submitTransferEngineOperation(handle, slices, op_code);
+                    future = submitTransferEngineOperation(handle, slices,
+                                                           op_code, 0, intent);
                     break;
                 default:
                     LOG(ERROR) << "Unknown transfer strategy: " << strategy;
@@ -1002,7 +1141,6 @@ std::optional<TransferFuture> TransferSubmitter::submit(
             }
         }
     } else if (replica.is_nof_replica()) {
-#ifdef USE_NOF
         auto& ssd_desc = replica.get_nof_descriptor();
         auto& handle = ssd_desc.buffer_descriptor;
 
@@ -1010,11 +1148,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
             return std::nullopt;
         }
 
-        future = submitSpdkNofOperation(handle, ptr, size, op_code);
-#else
-        LOG(ERROR) << "NoF transfer requested while USE_NOF is disabled";
-        return std::nullopt;
-#endif
+        future = submitNofOperation(handle, ptr, size, op_code);
     } else {
         future = submitFileReadOperation(replica, slices, op_code);
     }
@@ -1030,14 +1164,13 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
-    TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code, TransferIntent intent) {
     if (replicas.size() != all_slices.size()) {
         LOG(ERROR) << "Mismatched replicas and slice lists";
         return std::nullopt;
     }
 
-    bool use_local_memcpy =
-        op_code == TransferRequest::WRITE && !replicas.empty();
+    bool use_local_memcpy = !replicas.empty();
     size_t operation_count = 0;
     for (size_t i = 0; i < replicas.size(); ++i) {
         if (!replicas[i].is_memory_replica()) {
@@ -1070,11 +1203,27 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             continue;
         }
         uint64_t offset = 0;
-        SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment "
-                       << handle.transport_endpoint_;
-            return std::nullopt;
+        SegmentHandle seg = 0;
+#ifdef USE_TENT
+        if (tent_engine_) {
+            tent::SegmentID seg_id;
+            auto status =
+                tent_engine_->openSegment(seg_id, handle.transport_endpoint_);
+            if (!status.ok()) {
+                LOG(ERROR) << "Failed to open segment "
+                           << handle.transport_endpoint_;
+                return std::nullopt;
+            }
+            seg = seg_id;
+        } else
+#endif
+        {
+            seg = engine_.openSegment(handle.transport_endpoint_);
+            if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+                LOG(ERROR) << "Failed to open segment "
+                           << handle.transport_endpoint_;
+                return std::nullopt;
+            }
         }
         for (const auto& slice : slices) {
             TransferRequest request;
@@ -1089,7 +1238,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     }
     auto future = use_local_memcpy
                       ? submitMemcpyOperations(std::move(memcpy_operations))
-                      : submitTransfer(requests);
+                      : submitTransfer(requests, intent);
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -1099,9 +1248,375 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     return future;
 }
 
+class StoreScatterTransferOperation::Impl {
+   public:
+    explicit Impl(TransferEngine::ScatterTransferOperation operation)
+        : classic_operation_(std::move(operation)) {}
+
+    explicit Impl(Status status)
+        : aggregate_status_(std::move(status)), completed_(true) {}
+
+#ifdef USE_TENT
+    Impl(std::shared_ptr<tent::TransferEngine> engine,
+         const std::vector<TransferEngine::ScatterTransferRange>& ranges,
+         TransferIntent intent)
+        : tent_engine_(std::move(engine)) {
+        build(ranges, intent);
+    }
+#endif
+    ~Impl() {
+        if (classic_operation_) {
+            classic_operation_->wait();
+            return;
+        }
+#ifdef USE_TENT
+        if (completed_) return;
+        // Destructor path: use a shorter timeout than wait() to avoid
+        // blocking too long when the caller didn't explicitly wait.
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(GetTentPositiveEnvOrDefault(
+                                  "MC_TENT_DESTRUCTOR_TIMEOUT_S", 5));
+        while (!completed_ && std::chrono::steady_clock::now() < deadline) {
+            poll();
+            if (!completed_) std::this_thread::sleep_for(kPollInterval);
+        }
+        if (!completed_) forceCleanup();
+#endif
+    }
+
+    Status wait() {
+        if (classic_operation_) return classic_operation_->wait();
+#ifdef USE_TENT
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(GetTentPositiveEnvOrDefault(
+                                  "MC_TENT_TRANSFER_TIMEOUT_S", 60));
+        while (!completed_) {
+            poll();
+            if (!completed_) std::this_thread::sleep_for(kPollInterval);
+            if (!completed_ && std::chrono::steady_clock::now() >= deadline) {
+                requestAbort(Status::Socket("TENT scatter transfer timed out"));
+                const auto cleanup_deadline =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::seconds(GetTentPositiveEnvOrDefault(
+                        "MC_TENT_CANCEL_GRACE_S", 1));
+                while (!completed_ &&
+                       std::chrono::steady_clock::now() < cleanup_deadline) {
+                    poll();
+                    if (!completed_) std::this_thread::sleep_for(kPollInterval);
+                }
+                if (!completed_) forceCleanup();
+            }
+        }
+#endif
+        return aggregate_status_;
+    }
+
+    Status waitFor(std::chrono::nanoseconds timeout) {
+        if (classic_operation_) return classic_operation_->waitFor(timeout);
+#ifdef USE_TENT
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!completed_) {
+            poll();
+            if (completed_) break;
+            if (std::chrono::steady_clock::now() >= deadline) {
+                requestAbort(Status::Clock("scatter transfer wait timed out"));
+                return aggregate_status_;
+            }
+            std::this_thread::sleep_for(kPollInterval);
+        }
+#else
+        (void)timeout;
+#endif
+        return aggregate_status_;
+    }
+
+   private:
+    static constexpr auto kPollInterval = std::chrono::microseconds(10);
+
+#ifdef USE_TENT
+    void remember(const Status& status) {
+        if (aggregate_status_.ok() && !status.ok()) aggregate_status_ = status;
+    }
+
+    void complete(size_t index, const Status& status) {
+        if (done_[index]) return;
+        done_[index] = true;
+        remember(status);
+        const auto [range_index, fragment_index] = request_fragments_[index];
+        if (callbacks_[range_index]) {
+            try {
+                callbacks_[range_index](fragment_index, status);
+            } catch (...) {
+                remember(Status::Context("scatter transfer callback failed"));
+            }
+        }
+    }
+
+    void finish() { completed_ = true; }
+
+    void failPending(const Status& status) {
+        for (size_t i = 0; i < done_.size(); ++i) complete(i, status);
+    }
+
+    void requestAbort(const Status& status) {
+        remember(status);
+        if (abort_requested_ || batch_id_ == 0) return;
+        abort_requested_ = true;
+        abort_deadline_ = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(GetTentPositiveEnvOrDefault(
+                              "MC_TENT_CANCEL_GRACE_S", 1));
+        for (size_t task = 0; task < tent_requests_.size(); ++task) {
+            const size_t index = native_indexes_[task];
+            if (done_[index]) continue;
+            auto cancel_status = tent_engine_->cancelTransfer(batch_id_, task);
+            if (!cancel_status.ok() && !cancel_status.IsNotImplemented())
+                remember(Status::Context(cancel_status.ToString()));
+        }
+    }
+
+    void forceCleanup() {
+        failPending(Status::Socket("TENT scatter transfer cleanup timed out"));
+        if (batch_id_ != 0) tent_engine_->freeBatch(batch_id_);
+        batch_id_ = 0;
+        finish();
+    }
+
+    void build(const std::vector<TransferEngine::ScatterTransferRange>& ranges,
+               TransferIntent intent) {
+        auto default_intent = ToTentIntent(intent);
+        if (!default_intent) {
+            aggregate_status_ =
+                Status::InvalidArgument("invalid TENT scatter transfer intent");
+            completed_ = true;
+            return;
+        }
+        std::map<std::string, tent::SegmentID> segment_ids;
+        for (size_t range_index = 0; range_index < ranges.size();
+             ++range_index) {
+            const auto& range = ranges[range_index];
+            callbacks_.push_back(range.on_fragment_complete);
+            const size_t count = range.local_offsets.size();
+            if (range.remote_offsets.size() != count ||
+                range.lengths.size() != count ||
+                range.local_buffer == nullptr || range.remote_segment.empty()) {
+                const auto error =
+                    Status::InvalidArgument("invalid scatter transfer range");
+                for (size_t i = 0; i < count; ++i) {
+                    request_fragments_.emplace_back(range_index, i);
+                    done_.push_back(false);
+                    complete(done_.size() - 1, error);
+                }
+                continue;
+            }
+            auto segment_it = segment_ids.find(range.remote_segment);
+            if (segment_it == segment_ids.end()) {
+                tent::SegmentID segment_id;
+                auto status =
+                    tent_engine_->openSegment(segment_id, range.remote_segment);
+                if (!status.ok()) {
+                    const auto error = Status::Context(status.ToString());
+                    for (size_t i = 0; i < count; ++i) {
+                        request_fragments_.emplace_back(range_index, i);
+                        done_.push_back(false);
+                        complete(done_.size() - 1, error);
+                    }
+                    continue;
+                }
+                segment_it =
+                    segment_ids.emplace(range.remote_segment, segment_id).first;
+                // openSegment is idempotent, not a reference-counted lease.
+                // Other Store operations can be using this same handle. Keep
+                // it cached in the engine, as the ordinary transfer paths do;
+                // closing it here would invalidate concurrent reads/writes.
+            }
+            for (size_t fragment = 0; fragment < count; ++fragment) {
+                const size_t length = range.lengths[fragment];
+                const size_t local_offset = range.local_offsets[fragment];
+                const size_t remote_offset = range.remote_offsets[fragment];
+                const bool valid =
+                    local_offset <= range.local_capacity &&
+                    length <= range.local_capacity - local_offset &&
+                    remote_offset <= range.remote_size &&
+                    length <= range.remote_size - remote_offset &&
+                    range.remote_base_offset <=
+                        std::numeric_limits<uint64_t>::max() - remote_offset &&
+                    length <= std::numeric_limits<uint64_t>::max() -
+                                  (range.remote_base_offset + remote_offset);
+                request_fragments_.emplace_back(range_index, fragment);
+                done_.push_back(false);
+                if (!valid) {
+                    complete(done_.size() - 1,
+                             Status::InvalidArgument(
+                                 "invalid scatter transfer fragment"));
+                    continue;
+                }
+                if (length == 0) {
+                    complete(done_.size() - 1, Status::OK());
+                    continue;
+                }
+                TransferIntent request_store_intent = intent;
+                if (range.intent_type != transfer_intent_values::kUnspecified) {
+                    auto parsed_intent =
+                        TransferIntentFromInt(range.intent_type);
+                    if (!parsed_intent) {
+                        complete(done_.size() - 1,
+                                 Status::InvalidArgument(
+                                     "invalid TENT scatter transfer intent"));
+                        continue;
+                    }
+                    request_store_intent = *parsed_intent;
+                }
+                auto opcode = ToTentOpCode(range.opcode);
+                auto request_intent = ToTentIntent(request_store_intent);
+                if (!opcode || !request_intent) {
+                    complete(done_.size() - 1,
+                             Status::InvalidArgument(
+                                 "invalid TENT scatter transfer request"));
+                    continue;
+                }
+                tent::Request request;
+                request.opcode = *opcode;
+                request.source =
+                    static_cast<char*>(range.local_buffer) + local_offset;
+                request.target_id = segment_it->second;
+                request.target_offset =
+                    range.remote_base_offset + remote_offset;
+                request.length = length;
+                request.intent_type = *request_intent;
+                // transport_hint left at default (0 = auto-select);
+                // ScatterTransferRange does not carry per-fragment hints.
+                tent_requests_.push_back(request);
+                native_indexes_.push_back(done_.size() - 1);
+            }
+        }
+        if (tent_requests_.empty()) {
+            finish();
+            return;
+        }
+        batch_id_ = tent_engine_->allocateBatch(tent_requests_.size());
+        if (batch_id_ == 0) {
+            failPending(Status::InvalidArgument(
+                "failed to allocate TENT scatter transfer batch"));
+            finish();
+            return;
+        }
+        auto status = tent_engine_->submitTransfer(batch_id_, tent_requests_);
+        if (!status.ok()) {
+            failPending(Status::Context(status.ToString()));
+            tent_engine_->freeBatch(batch_id_);
+            batch_id_ = 0;
+            finish();
+            return;
+        }
+        remaining_ = tent_requests_.size();
+    }
+
+    void poll() {
+        for (size_t task = 0; task < tent_requests_.size(); ++task) {
+            const size_t index = native_indexes_[task];
+            if (done_[index]) continue;
+            tent::TransferStatus transfer_status;
+            auto status = tent_engine_->getTransferStatus(batch_id_, task,
+                                                          transfer_status);
+            if (!status.ok()) {
+                requestAbort(Status::Context(status.ToString()));
+                if (!abort_requested_ ||
+                    std::chrono::steady_clock::now() >= abort_deadline_) {
+                    complete(index, Status::Context(status.ToString()));
+                    assert(remaining_ > 0);
+                    --remaining_;
+                }
+                continue;
+            } else {
+                auto state = ToClassicTransferStatus(transfer_status.s);
+                if (!state) {
+                    complete(
+                        index,
+                        Status::Socket("unknown TENT scatter transfer status"));
+                    --remaining_;
+                    continue;
+                }
+                if (*state == TransferStatusEnum::WAITING) continue;
+                complete(index, *state == TransferStatusEnum::COMPLETED
+                                    ? Status::OK()
+                                    : Status::Socket(
+                                          "scatter transfer fragment failed"));
+            }
+            assert(remaining_ > 0);
+            --remaining_;
+        }
+        if (remaining_ != 0) return;
+        auto status = tent_engine_->freeBatch(batch_id_);
+        remember(status.ok() ? Status::OK()
+                             : Status::Context(status.ToString()));
+        batch_id_ = 0;
+        finish();
+    }
+#endif
+
+    std::optional<TransferEngine::ScatterTransferOperation> classic_operation_;
+    Status aggregate_status_;
+    bool completed_ = false;
+#ifdef USE_TENT
+    std::shared_ptr<tent::TransferEngine> tent_engine_;
+    std::vector<tent::Request> tent_requests_;
+    std::vector<size_t> native_indexes_;
+    std::vector<std::pair<size_t, size_t>> request_fragments_;
+    std::vector<std::function<void(size_t, const Status&)>> callbacks_;
+    std::vector<uint8_t> done_;
+    BatchID batch_id_ = 0;
+    size_t remaining_ = 0;
+    bool abort_requested_ = false;
+    std::chrono::steady_clock::time_point abort_deadline_ =
+        std::chrono::steady_clock::time_point::max();
+#endif
+};
+
+StoreScatterTransferOperation::StoreScatterTransferOperation(
+    std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+
+StoreScatterTransferOperation::StoreScatterTransferOperation(
+    StoreScatterTransferOperation&&) noexcept = default;
+
+StoreScatterTransferOperation& StoreScatterTransferOperation::operator=(
+    StoreScatterTransferOperation&&) noexcept = default;
+
+StoreScatterTransferOperation::~StoreScatterTransferOperation() = default;
+
+Status StoreScatterTransferOperation::wait() {
+    return impl_
+               ? impl_->wait()
+               : Status::InvalidArgument("invalid scatter transfer operation");
+}
+
+Status StoreScatterTransferOperation::waitFor(
+    std::chrono::nanoseconds timeout) {
+    return impl_
+               ? impl_->waitFor(timeout)
+               : Status::InvalidArgument("invalid scatter transfer operation");
+}
+
 TransferEngine::ScatterTransferOperation TransferSubmitter::submitScatter(
     const std::vector<TransferEngine::ScatterTransferRange>& transfers) {
     return engine_.submitScatter(transfers);
+}
+
+StoreScatterTransferOperation TransferSubmitter::submitNativeScatter(
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+    TransferIntent intent) {
+#ifdef USE_TENT
+    if (tent_engine_) {
+        return StoreScatterTransferOperation(
+            std::make_unique<StoreScatterTransferOperation::Impl>(
+                engine_.getTentEngine(), transfers, intent));
+    }
+#else
+    (void)intent;
+#endif
+    return StoreScatterTransferOperation(
+        std::make_unique<StoreScatterTransferOperation::Impl>(
+            engine_.submitScatter(transfers)));
 }
 
 std::optional<TransferFuture>
@@ -1109,7 +1624,7 @@ TransferSubmitter::submit_batch_get_offload_object(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys, const std::vector<uint64_t>& pointers,
     const std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
-    OffloadBufferAccess buffer_access) {
+    OffloadBufferAccess buffer_access, TransferIntent intent) {
     if (keys.size() != pointers.size()) {
         LOG(ERROR) << "Mismatched offload transfer argument counts";
         return std::nullopt;
@@ -1129,10 +1644,24 @@ TransferSubmitter::submit_batch_get_offload_object(
     SegmentHandle seg = 0;
     if (!use_local_memcpy) {
         // Open once: all keys share the same transfer endpoint.
-        seg = engine_.openSegment(transfer_engine_addr);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
-            return std::nullopt;
+#ifdef USE_TENT
+        if (tent_engine_) {
+            tent::SegmentID seg_id;
+            auto status =
+                tent_engine_->openSegment(seg_id, transfer_engine_addr);
+            if (!status.ok()) {
+                LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
+                return std::nullopt;
+            }
+            seg = seg_id;
+        } else
+#endif
+        {
+            seg = engine_.openSegment(transfer_engine_addr);
+            if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+                LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
+                return std::nullopt;
+            }
         }
     }
 
@@ -1169,7 +1698,7 @@ TransferSubmitter::submit_batch_get_offload_object(
         }
     }
     return use_local_memcpy ? submitMemcpyOperations(std::move(operations))
-                            : submitTransfer(requests);
+                            : submitTransfer(requests, intent);
 }
 
 void TransferSubmitter::appendMemcpyOperations(
@@ -1219,34 +1748,71 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests) {
-    // Allocate batch ID
+    std::vector<TransferRequest>& requests, TransferIntent intent) {
     const size_t batch_size = requests.size();
-    BatchID batch_id = engine_.allocateBatchID(batch_size);
-    if (batch_id == INVALID_BATCH_ID) {
-        LOG(ERROR) << "Failed to allocate batch ID";
-        return std::nullopt;
+
+    BatchID batch_id = INVALID_BATCH_ID;
+    Status s;
+
+#ifdef USE_TENT
+    if (tent_engine_) {
+        batch_id = tent_engine_->allocateBatch(batch_size);
+        if (batch_id == 0) {
+            LOG(ERROR) << "Failed to allocate batch ID";
+            return std::nullopt;
+        }
+        std::vector<tent::Request> tent_reqs;
+        tent_reqs.reserve(requests.size());
+        auto tent_intent = ToTentIntent(intent);
+        if (!tent_intent) {
+            LOG(ERROR) << "Invalid TENT transfer intent: "
+                       << static_cast<int>(intent);
+            tent_engine_->freeBatch(batch_id);
+            return std::nullopt;
+        }
+        for (auto& r : requests) {
+            auto tent_opcode = ToTentOpCode(r.opcode);
+            if (!tent_opcode) {
+                LOG(ERROR) << "Invalid TENT transfer opcode: "
+                           << static_cast<int>(r.opcode);
+                tent_engine_->freeBatch(batch_id);
+                return std::nullopt;
+            }
+            tent::Request tr;
+            tr.opcode = *tent_opcode;
+            tr.source = r.source;
+            tr.target_id = r.target_id;
+            tr.target_offset = r.target_offset;
+            tr.length = r.length;
+            tr.transport_hint =
+                mooncake::tent::c_to_transport_hint(r.transport_hint);
+            tr.intent_type = *tent_intent;
+            tent_reqs.push_back(tr);
+        }
+        auto tent_status = tent_engine_->submitTransfer(batch_id, tent_reqs);
+        if (!tent_status.ok()) {
+            LOG(ERROR) << "Failed to submit all transfers, error: "
+                       << tent_status.ToString();
+            tent_engine_->freeBatch(batch_id);
+            return std::nullopt;
+        }
+    } else
+#endif
+    {
+        batch_id = engine_.allocateBatchID(batch_size);
+        if (batch_id == INVALID_BATCH_ID) {
+            LOG(ERROR) << "Failed to allocate batch ID";
+            return std::nullopt;
+        }
+        s = engine_.submitTransfer(batch_id, requests);
+        if (!s.ok()) {
+            LOG(ERROR) << "Failed to submit all transfers, error code is "
+                       << s.code();
+            engine_.freeBatchID(batch_id);
+            return std::nullopt;
+        }
     }
 
-    // Submit transfer
-    Status s = engine_.submitTransfer(batch_id, requests);
-    if (!s.ok()) {
-        LOG(ERROR) << "Failed to submit all transfers, error code is "
-                   << s.code();
-        // Note: batch_id will be freed by TransferEngineOperationState
-        // destructor if we create the state object, otherwise we need to free
-        // it here
-        engine_.freeBatchID(batch_id);
-        return std::nullopt;
-    }
-
-    if (batch_id == INVALID_BATCH_ID) {  // INVALID_BATCH_ID
-        LOG(ERROR) << "Invalid batch ID for transfer engine operation";
-        return std::nullopt;
-    }
-
-    // Create state with transfer engine context - no polling thread
-    // needed
     auto state = std::make_shared<TransferEngineOperationState>(
         engine_, batch_id, batch_size);
 
@@ -1255,18 +1821,34 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code, uint64_t src_offset) {
+    const TransferRequest::OpCode op_code, uint64_t src_offset,
+    TransferIntent intent) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
         return std::nullopt;
     }
-    SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
-
-    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-        LOG(ERROR) << "Failed to open segment for endpoint='"
-                   << handle.transport_endpoint_ << "'";
-        return std::nullopt;
+    SegmentHandle seg = 0;
+#ifdef USE_TENT
+    if (tent_engine_) {
+        tent::SegmentID seg_id;
+        auto status =
+            tent_engine_->openSegment(seg_id, handle.transport_endpoint_);
+        if (!status.ok()) {
+            LOG(ERROR) << "Failed to open segment for endpoint='"
+                       << handle.transport_endpoint_ << "'";
+            return std::nullopt;
+        }
+        seg = seg_id;
+    } else
+#endif
+    {
+        seg = engine_.openSegment(handle.transport_endpoint_);
+        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+            LOG(ERROR) << "Failed to open segment for endpoint='"
+                       << handle.transport_endpoint_ << "'";
+            return std::nullopt;
+        }
     }
 
     // Create transfer requests
@@ -1289,12 +1871,12 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         offset += slice.size;
         requests.emplace_back(request);
     }
-    return submitTransfer(requests);
+    return submitTransfer(requests, intent);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    uint64_t src_offset) {
+    uint64_t src_offset, TransferIntent intent) {
     TransferStrategy strategy = selectStrategy(handle, slices);
 
     if (strategy == TransferStrategy::LOCAL_MEMCPY) {
@@ -1302,8 +1884,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
                                      src_offset);
     }
     if (strategy == TransferStrategy::TRANSFER_ENGINE) {
-        return submitTransferEngineOperation(handle, slices,
-                                             TransferRequest::READ, src_offset);
+        return submitTransferEngineOperation(
+            handle, slices, TransferRequest::READ, src_offset, intent);
     }
 
     LOG(ERROR) << "Read only supports LOCAL_MEMCPY or TRANSFER_ENGINE, got: "
@@ -1313,7 +1895,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryWriteOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    uint64_t dst_offset) {
+    uint64_t dst_offset, TransferIntent intent) {
     TransferStrategy strategy = selectStrategy(handle, slices);
 
     if (strategy == TransferStrategy::LOCAL_MEMCPY) {
@@ -1322,7 +1904,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryWriteOperation(
     }
     if (strategy == TransferStrategy::TRANSFER_ENGINE) {
         return submitTransferEngineOperation(
-            handle, slices, TransferRequest::WRITE, dst_offset);
+            handle, slices, TransferRequest::WRITE, dst_offset, intent);
     }
 
     LOG(ERROR) << "Write only supports LOCAL_MEMCPY or TRANSFER_ENGINE, got: "
@@ -1332,7 +1914,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryWriteOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    uint64_t src_offset) {
+    uint64_t src_offset, TransferIntent intent) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -1349,7 +1931,7 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
             return std::nullopt;
         }
 
-        future = submitMemoryReadOperation(handle, slices, src_offset);
+        future = submitMemoryReadOperation(handle, slices, src_offset, intent);
     } else if (replica.is_nof_replica()) {
         LOG(ERROR) << "Range read not supported for NoF replicas";
         return std::nullopt;
@@ -1368,7 +1950,7 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
 
 std::optional<TransferFuture> TransferSubmitter::submitRangeWrite(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    uint64_t dst_offset) {
+    uint64_t dst_offset, TransferIntent intent) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -1385,7 +1967,7 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeWrite(
             return std::nullopt;
         }
 
-        future = submitMemoryWriteOperation(handle, slices, dst_offset);
+        future = submitMemoryWriteOperation(handle, slices, dst_offset, intent);
     } else if (replica.is_nof_replica()) {
         LOG(ERROR) << "Range write not supported for NoF replicas";
         return std::nullopt;
@@ -1402,10 +1984,16 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeWrite(
     return future;
 }
 
-#ifdef USE_NOF
-std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
+std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
     const AllocatedBuffer::Descriptor& handle, void* ptr, size_t size,
     const TransferRequest::OpCode op_code) {
+    if (!nof_pool_) {
+        // Runtime form of the former "NoF transfer requested while USE_NOF
+        // is disabled" error.
+        LOG(ERROR) << "NoF transfer requested but NoF is unavailable "
+                      "(no initiator in this process)";
+        return std::nullopt;
+    }
     if (handle.transport_endpoint_.empty() || handle.size_ < size) {
         LOG(ERROR) << "Invalid NoF request endpoint="
                    << handle.transport_endpoint_
@@ -1414,33 +2002,39 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
         return std::nullopt;
     }
 
-    nof_seg_handle* seg_handle =
-        SpdkWrapper::GetInstance().OpenNofSegment(handle.transport_endpoint_);
+    NofSegmentHandle* seg_handle =
+        nof_initiator_->OpenSegment(handle.transport_endpoint_);
     if (!seg_handle) {
         LOG(ERROR) << "Failed to open NoF segment endpoint="
                    << handle.transport_endpoint_;
         return std::nullopt;
     }
 
-    uint32_t block_size = SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
-    if (block_size == INVALID_BLOCK_SIZE ||
+    uint32_t block_size = nof_initiator_->GetBlockSize(seg_handle);
+    // Without SGL, ptr must be block-aligned; with SGL (supports_sgl) the
+    // requirement relaxes to dma_alignment.
+    const auto caps = nof_initiator_->GetCapabilities();
+    const uint64_t ptr_alignment =
+        caps.supports_sgl ? caps.dma_alignment : block_size;
+    if (block_size == kInvalidBlockSize ||
         handle.buffer_address_ % block_size != 0 || size % block_size != 0 ||
-        reinterpret_cast<std::uintptr_t>(ptr) % block_size != 0) {
+        reinterpret_cast<std::uintptr_t>(ptr) % ptr_alignment != 0) {
         LOG(ERROR) << "NoF request offset=" << handle.buffer_address_
                    << ", ptr=" << ptr << ", size=" << size
                    << " is not aligned to block size " << block_size;
         return std::nullopt;
     }
 
-    auto state = std::make_shared<SpdkNofOperationState>();
-    SpdkNofTask task(seg_handle, ptr, handle.buffer_address_ / block_size,
-                     size / block_size, op_code, state);
-    spdk_nvmf_pool_->submitTask(std::move(task));
+    const NofIOOp op =
+        (op_code == TransferRequest::READ) ? NofIOOp::kRead : NofIOOp::kWrite;
+    auto state = std::make_shared<NofOperationState>();
+    NofTask task(seg_handle, ptr, handle.buffer_address_, size, op, state);
+    task.metric = nof_metric_;
+    nof_pool_->submitTask(std::move(task));
 
-    VLOG(1) << "SPDK NoF transfer submitted to " << handle.transport_endpoint_;
+    VLOG(1) << "NoF transfer submitted to " << handle.transport_endpoint_;
     return TransferFuture(state);
 }
-#endif
 
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,

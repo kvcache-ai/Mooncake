@@ -19,8 +19,12 @@
 #include <cassert>
 #include <set>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <exception>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 
 #include "common.h"
 #include "config.h"
@@ -28,6 +32,36 @@
 #include "transfer_metadata_plugin.h"
 
 namespace mooncake {
+// Process-lifetime intern pool for RDMA NIC paths. Entries are never erased
+// so Slice can hold a non-owning pointer without tracking SegmentDesc.
+// Keys include the NIC-path server name (host:port, often an ephemeral RPC
+// port), so cardinality is historical peer endpoints × NICs, not hosts × NICs.
+// Function-local *new storage: lazy, thread-safe init, and no destructor
+// that would UAF slices during static teardown.
+static std::mutex &NicPathInternMu() {
+    static std::mutex &mu = *new std::mutex();
+    return mu;
+}
+
+static std::unordered_map<std::string, std::unique_ptr<std::string>> &
+NicPathInternPool() {
+    static auto &pool =
+        *new std::unordered_map<std::string, std::unique_ptr<std::string>>();
+    return pool;
+}
+
+static const std::string &InternNicPath(const std::string &path) {
+    auto &pool = NicPathInternPool();
+    std::lock_guard<std::mutex> lock(NicPathInternMu());
+    auto it = pool.find(path);
+    if (it != pool.end()) return *it->second;
+    auto owned = std::make_unique<std::string>(path);
+    const std::string *ptr = owned.get();
+    pool.emplace(path, std::move(owned));
+    LOG_EVERY_N(INFO, 128) << "NIC path intern pool size=" << pool.size();
+    return *ptr;
+}
+
 static uint64_t currentWallTimeInMicroseconds() {
     const int64_t now_ns = getCurrentTimeInNano();
     if (now_ns <= 0) return 1;
@@ -182,6 +216,8 @@ struct TransferHandshakeUtil {
         root["qp_num"] = qpNums;
         if (desc.ready_ack_supported || desc.ready_ack)
             root["ready_ack"] = desc.ready_ack;
+        if (!desc.auto_gid_reprobe_from.empty())
+            root["auto_gid_reprobe_from"] = desc.auto_gid_reprobe_from;
         if (desc.notify_qp_num != 0 || desc.ctrl_channel) {
             root["notify_qp_num"] = Json::UInt(desc.notify_qp_num);
             root["notify_rq_depth"] = Json::UInt(desc.notify_rq_depth);
@@ -230,6 +266,13 @@ struct TransferHandshakeUtil {
             desc.ready_ack = root["ready_ack"].asBool();
         } else {
             desc.ready_ack = false;
+        }
+        if (root.isMember("auto_gid_reprobe_from") &&
+            root["auto_gid_reprobe_from"].isString()) {
+            desc.auto_gid_reprobe_from =
+                root["auto_gid_reprobe_from"].asString();
+        } else {
+            desc.auto_gid_reprobe_from.clear();
         }
         desc.notify_qp_num = 0;
         desc.notify_rq_depth = 0;
@@ -402,6 +445,17 @@ int TransferMetadata::receivePeerNotify(const Json::Value &peer_json,
     RWSpinlock::WriteGuard guard(notify_lock_);
     TransferMetadata::NotifyDesc peer_notify, local_reply;
     TransferNotifyUtil::decode(peer_json, peer_notify);
+    const size_t max_entries = getHandshakeMaxNotifyEntries();
+    if (notifys.size() >= max_entries) {
+        // The daemon accepts notify frames from any peer, so an unbounded
+        // vector lets a flood grow RSS without limit (#4445). Evict the
+        // oldest undrained entry: a flood degrades pending notifications
+        // instead of the process.
+        notifys.erase(notifys.begin());
+        LOG_EVERY_N(WARNING, 1000)
+            << "pending notify queue is full (" << max_entries
+            << " entries); evicting the oldest entry";
+    }
     notifys.push_back(peer_notify);
     // reply
     local_reply.name = "";
@@ -490,8 +544,8 @@ static int encodeMultiProtocolSegmentDesc(
         } else if (buffer.protocol == "shm") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["shm_name"] = buffer.shm_name;
-        } else if (buffer.protocol == "hip" || buffer.protocol == "maca" ||
-                   buffer.protocol == "musa") {
+        } else if (buffer.protocol == "hip" || buffer.protocol == "hylink" ||
+                   buffer.protocol == "maca" || buffer.protocol == "musa") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["shm_name"] = buffer.shm_name;
         }
@@ -523,8 +577,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         is_multi_protocol = true;
         for (const auto &proto : protocols) {
             if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                proto != "hip" && proto != "maca" && proto != "musa" &&
-                proto != "shm") {
+                proto != "hip" && proto != "hylink" && proto != "maca" &&
+                proto != "musa" && proto != "shm") {
                 is_multi_protocol = false;
                 break;
             }
@@ -532,8 +586,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         if (!is_multi_protocol) {
             LOG(ERROR) << "Unsupported multi-protocol combination: "
                        << desc.protocol
-                       << ". Only cxl, tcp, rdma, hip, maca, musa and shm may "
-                          "be combined.";
+                       << ". Only cxl, tcp, rdma, hip, hylink, maca, musa "
+                          "and shm may be combined.";
             return ERR_INVALID_ARGUMENT;
         }
     }
@@ -653,6 +707,11 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
             bufferJSON["device_id"] = buffer.device_id;
+            // Host memfd handle (ASCEND_USE_SHMEM). Emitted only when the
+            // buffer is shareable, so a peer built without this field keeps
+            // parsing the descriptor unchanged.
+            if (!buffer.shm_name.empty())
+                bufferJSON["shm_name"] = buffer.shm_name;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -683,6 +742,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     } else if (segmentJSON["protocol"] == "nvlink" ||
                segmentJSON["protocol"] == "nvlink_intra" ||
                segmentJSON["protocol"] == "hip" ||
+               segmentJSON["protocol"] == "hylink" ||
                segmentJSON["protocol"] == "maca" ||
                segmentJSON["protocol"] == "musa" ||
                segmentJSON["protocol"] == "ubshmem" ||
@@ -925,8 +985,8 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
-        } else if (buffer_protocol == "hip" || buffer_protocol == "maca" ||
-                   buffer_protocol == "musa") {
+        } else if (buffer_protocol == "hip" || buffer_protocol == "hylink" ||
+                   buffer_protocol == "maca" || buffer_protocol == "musa") {
             TransferMetadata::BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
@@ -963,8 +1023,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             for (const auto &protocolStr : segmentJSON["protocol"]) {
                 std::string proto = protocolStr.asString();
                 if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                    proto != "hip" && proto != "maca" && proto != "musa" &&
-                    proto != "shm") {
+                    proto != "hip" && proto != "hylink" && proto != "maca" &&
+                    proto != "musa" && proto != "shm") {
                     is_multi_protocol = false;
                     break;
                 }
@@ -973,8 +1033,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 LOG(ERROR)
                     << "Unsupported multi-protocol combination in segment: "
                     << segment_name
-                    << ". Only cxl, tcp, rdma, hip, maca, musa and shm may be "
-                       "combined.";
+                    << ". Only cxl, tcp, rdma, hip, hylink, maca, musa and "
+                       "shm may be combined.";
                 return nullptr;
             }
         }
@@ -983,7 +1043,10 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     // If multi-protocol scenario, use multi-protocol decoding
     if (is_multi_protocol) {
         auto desc = decodeMultiProtocolSegmentDesc(segmentJSON, segment_name);
-        if (desc) desc->rebuildBufferRangeIndex();
+        if (desc) {
+            desc->rebuildBufferRangeIndex();
+            desc->rebuildInternedNicPaths();
+        }
         return desc;
     }
 #endif
@@ -1147,8 +1210,9 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             desc->buffers.push_back(buffer);
         }
     } else if (desc->protocol == "nvlink" || desc->protocol == "nvlink_intra" ||
-               desc->protocol == "hip" || desc->protocol == "maca" ||
-               desc->protocol == "musa" || desc->protocol == "ubshmem" ||
+               desc->protocol == "hip" || desc->protocol == "hylink" ||
+               desc->protocol == "maca" || desc->protocol == "musa" ||
+               desc->protocol == "ubshmem" ||
                desc->protocol == "sunrise_link" || desc->protocol == "shm") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
@@ -1211,6 +1275,10 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                              << segment_name << " protocol " << desc->protocol;
                 return nullptr;
             }
+            if (bufferJSON.isMember("shm_name") &&
+                bufferJSON["shm_name"].isString()) {
+                buffer.shm_name = bufferJSON["shm_name"].asString();
+            }
             desc->buffers.push_back(buffer);
         }
 
@@ -1254,6 +1322,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         return nullptr;
     }
     desc->rebuildBufferRangeIndex();
+    desc->rebuildInternedNicPaths();
     return desc;
 }
 
@@ -1369,10 +1438,43 @@ TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
     return result;
 }
 
+void TransferMetadata::SegmentDesc::rebuildInternedNicPaths() {
+    interned_nic_paths.clear();
+    interned_nic_paths.reserve(devices.size());
+    const auto &server = nicPathServerName();
+    for (const auto &device : devices) {
+        interned_nic_paths.push_back(
+            &InternNicPath(MakeNicPath(server, device.name)));
+    }
+}
+
+const std::string &TransferMetadata::SegmentDesc::internedNicPath(
+    size_t device_id) const {
+    if (device_id >= devices.size()) {
+        LOG_EVERY_N(ERROR, 1000)
+            << "internedNicPath: device_id " << device_id
+            << " out of range (devices=" << devices.size()
+            << ", interned=" << interned_nic_paths.size() << ")";
+        static const std::string kEmpty;
+        return kEmpty;
+    }
+    if (interned_nic_paths.size() == devices.size() &&
+        interned_nic_paths[device_id] != nullptr) {
+        return *interned_nic_paths[device_id];
+    }
+    LOG_FIRST_N(WARNING, 8)
+        << "internedNicPath: intern snapshot missing for "
+        << nicPathServerName() << " (devices=" << devices.size()
+        << ", interned=" << interned_nic_paths.size()
+        << "), falling back to the global pool";
+    return InternNicPath(
+        MakeNicPath(nicPathServerName(), devices[device_id].name));
+}
+
 bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
-    // timestamp, metadata_version, and buffer_range_index are excluded:
-    // publication may refresh timestamps, and the index is derived from
-    // `buffers`.
+    // timestamp, metadata_version, buffer_range_index, and interned_nic_paths
+    // are excluded: publication may refresh timestamps, and the last two are
+    // derived from `buffers` / `devices`.
     return name == other.name && protocol == other.protocol &&
            devices == other.devices && topology == other.topology &&
            buffers == other.buffers && nvmeof_buffers == other.nvmeof_buffers &&
@@ -1480,7 +1582,25 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
             updated_names.push_back(name);
             ++updated_count;
             LOG(WARNING) << "Segment cache descriptor changed, name=" << name
-                         << ", segment_id=" << segment_id;
+                         << ", segment_id=" << segment_id << ", old_version="
+                         << (old_desc ? old_desc->metadata_version : 0)
+                         << ", new_version=" << desc->metadata_version
+                         << ", buffers=" << desc->buffers.size();
+            // The old/new descriptor bodies are sizable (one line per
+            // registered buffer); under churn every sync cycle would print
+            // them per changed segment. Throttle process-wide like
+            // dumpMetadataContent(); trace mode always prints. The WARNING
+            // header above stays per-change so no event is lost.
+            static std::atomic<uint64_t> last_desc_dump_ns{0};
+            const uint64_t now_ns = getCurrentTimeInNano();
+            uint64_t prev = last_desc_dump_ns.load(std::memory_order_relaxed);
+            constexpr uint64_t kDescDumpThrottleNs = 500000000;  // 0.5 sec
+            const bool may_dump =
+                globalConfig().trace ||
+                (now_ns - prev > kDescDumpThrottleNs &&
+                 last_desc_dump_ns.compare_exchange_strong(
+                     prev, now_ns, std::memory_order_relaxed));
+            if (!may_dump) continue;
             if (old_desc) {
                 LOG(INFO) << "Old segment descriptor:";
                 old_desc->dump();
@@ -1700,6 +1820,7 @@ int TransferMetadata::updateLocalSegmentDesc(uint64_t segment_id) {
 int TransferMetadata::addLocalSegment(SegmentID segment_id,
                                       const std::string &segment_name,
                                       std::shared_ptr<SegmentDesc> &&desc) {
+    if (desc) desc->rebuildInternedNicPaths();
     RWSpinlock::WriteGuard guard(segment_lock_);
     segment_id_to_desc_map_[segment_id] = desc;
     segment_name_to_id_map_[segment_name] = segment_id;
@@ -1720,12 +1841,11 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                                            bool update_metadata) {
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
-        auto new_segment_desc = std::make_shared<SegmentDesc>();
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
-        *new_segment_desc = *segment_desc;
+        auto new_segment_desc = std::make_shared<SegmentDesc>(*segment_desc);
+        new_segment_desc->buffers.push_back(buffer_desc);
+        new_segment_desc->rebuildBufferRangeIndex();
         segment_desc = new_segment_desc;
-        segment_desc->buffers.push_back(buffer_desc);
-        segment_desc->rebuildBufferRangeIndex();
     }
     if (update_metadata) return updateLocalSegmentDesc();
     return 0;
@@ -1736,21 +1856,20 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
     bool addr_exist = false;
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
-        auto new_segment_desc = std::make_shared<SegmentDesc>();
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
-        *new_segment_desc = *segment_desc;
-        segment_desc = new_segment_desc;
-        for (auto iter = segment_desc->buffers.begin();
-             iter != segment_desc->buffers.end(); ++iter) {
+        auto new_segment_desc = std::make_shared<SegmentDesc>(*segment_desc);
+        for (auto iter = new_segment_desc->buffers.begin();
+             iter != new_segment_desc->buffers.end(); ++iter) {
             if (iter->addr == (uint64_t)addr
 #ifdef USE_CXL
-                ||
-                (iter->offset + segment_desc->cxl_base_addr) == (uint64_t)addr
+                || (iter->offset + new_segment_desc->cxl_base_addr) ==
+                       (uint64_t)addr
 #endif
             ) {
-                segment_desc->buffers.erase(iter);
+                new_segment_desc->buffers.erase(iter);
                 addr_exist = true;
-                segment_desc->rebuildBufferRangeIndex();
+                new_segment_desc->rebuildBufferRangeIndex();
+                segment_desc = new_segment_desc;
                 break;
             }
         }

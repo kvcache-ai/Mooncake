@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -34,6 +35,7 @@
 
 namespace mooncake {
 
+struct DmabufExport;
 class RdmaContext;
 class RdmaEndPoint;
 class TransferMetadata;
@@ -44,6 +46,7 @@ class RdmaTransport : public Transport {
     friend class RdmaContext;
     friend class RdmaEndPoint;
     friend class RdmaTransportTestPeer;
+    friend class RdmaNotificationTestPeer;
     friend class WorkerPool;
 
    public:
@@ -61,6 +64,13 @@ class RdmaTransport : public Transport {
                 std::shared_ptr<Topology> topo) override;
 
     const char *getName() const override { return "rdma"; }
+
+    bool supportsBatchCompletionCounter() const override { return true; }
+
+    // Ordinary RDMA's native notification channel. Success means the SEND
+    // was posted locally, not that the remote application consumed it.
+    int sendNativeNotify(const std::string &peer_server_name,
+                         const TransferMetadata::NotifyDesc &notify);
 
     int registerLocalMemory(void *addr, size_t length,
                             const std::string &location, bool remote_accessible,
@@ -85,6 +95,15 @@ class RdmaTransport : public Transport {
     int unregisterLocalMemoryInternal(void *addr, bool update_metadata,
                                       bool force_sequential);
 
+    // amdgpu before 6.19.14 charges a NIC's dma-buf pin of KFD-allocated VRAM
+    // against the KFD free pool a second time; only pins taken through its
+    // peer-memory client are offset. Holding one such pin per allocation keeps
+    // hipMemGetInfo and later device allocations exact while the data MRs stay
+    // on dma-buf. MC_HIP_KFD_PIN_FIX and a probe at the first registration
+    // decide whether the driver needs it.
+    bool acquireKfdPinAnchor(void *addr, const DmabufExport &exp);
+    void releaseKfdPinAnchor(void *addr);
+
    public:
     // TRANSFER
     Status submitTransfer(BatchID batch_id,
@@ -92,6 +111,11 @@ class RdmaTransport : public Transport {
 
     Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) override;
+
+    // Submit fresh tasks without an external submission seal owner. No slices
+    // may have been published before this call; all return statuses seal tasks.
+    Status submitTransferTaskWithSeal(
+        const std::vector<TransferTask *> &task_list);
 
     bool supportsGroupedScatter() const override { return true; }
 
@@ -106,7 +130,7 @@ class RdmaTransport : public Transport {
    private:
     int allocateLocalSegmentID();
 
-    int refreshLocalDeviceDesc(const std::string &device_name, uint16_t lid,
+    int refreshLocalDeviceDesc(const std::string &device_name, uint32_t lid,
                                const std::string &gid);
 
     int preTouchMemory(void *addr, size_t length);
@@ -127,19 +151,22 @@ class RdmaTransport : public Transport {
 
     int startHandshakeDaemon(std::string &local_server_name);
 
+    void notifyWorkerThread();
+
    public:
     static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
                             int &buffer_id, int &device_id, int retry_cnt = 0,
-                            int hint_buffer_id = -1);
+                            int hint_buffer_id = -1, int hint_device_id = -1);
     static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
                             std::string_view hint, int &buffer_id,
                             int &device_id, int retry_cnt = 0,
-                            int hint_buffer_id = -1);
+                            int hint_buffer_id = -1, int hint_device_id = -1);
     static int selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
                                       size_t length, std::string_view local_hca,
                                       int &buffer_id, int &device_id,
                                       int retry_cnt = 0,
-                                      int hint_buffer_id = -1);
+                                      int hint_buffer_id = -1,
+                                      int hint_device_id = -1);
 
     const std::vector<std::shared_ptr<RdmaContext>> &getContextList() const {
         return context_list_;
@@ -147,6 +174,8 @@ class RdmaTransport : public Transport {
 
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
+    std::atomic<bool> notify_running_{false};
+    std::thread notify_worker_;
     std::shared_ptr<Topology> local_topology_;
     // When MC_RDMA_BIND_ADDRESS is set in a dual-NIC environment,
     // rdma_server_name_ holds the RDMA-reachable address (e.g.
@@ -161,6 +190,23 @@ class RdmaTransport : public Transport {
     // start-addresses for cleanup.
     std::mutex chunk_map_mutex_;
     std::unordered_map<uint64_t, std::vector<uint64_t>> chunk_map_;
+
+    // Single-buffer counterpart of chunk_map_'s pending bookkeeping: base
+    // addresses whose metadata was removed but whose MR deregistration has
+    // not completed. Gates the metadata-missing fall-through so only a known
+    // pending cleanup retries the per-context deregistration — an address
+    // that was never a registration base must not reach the containing-range
+    // MR lookup.
+    std::mutex pending_dereg_mutex_;
+    std::unordered_set<uint64_t> pending_dereg_;
+
+    struct KfdPinAnchor {
+        ibv_mr *mr = nullptr;
+        size_t refs = 0;
+    };
+    std::mutex kfd_pin_anchor_mutex_;
+    std::unordered_map<uintptr_t, KfdPinAnchor> kfd_pin_anchors_;
+    std::unordered_map<uintptr_t, uintptr_t> kfd_pin_anchor_of_buffer_;
 };
 
 using TransferRequest = Transport::TransferRequest;

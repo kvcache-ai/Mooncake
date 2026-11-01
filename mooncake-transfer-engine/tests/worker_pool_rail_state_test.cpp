@@ -34,6 +34,7 @@
 #include <glog/logging.h>
 
 #include "rdma_test_peers.h"
+#include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/rdma_transport/worker_pool.h"
@@ -63,6 +64,7 @@ using namespace mooncake;
 #ifdef __linux__
 namespace {
 std::function<GidRefreshResult()> gid_probe;
+std::function<int(ibv_port_state *)> port_state_probe;
 }
 
 // Wrap the device probe, leaving the actual WorkerPool recovery path intact.
@@ -73,6 +75,13 @@ wrapRefreshCurrentGid(RdmaContext *, std::string *, std::string *) asm(
 extern "C" GidRefreshResult wrapRefreshCurrentGid(RdmaContext *, std::string *,
                                                   std::string *) {
     return gid_probe ? gid_probe() : GidRefreshResult::FAILED;
+}
+
+extern "C" int
+wrapQueryPortState(const RdmaContext *, ibv_port_state *state) asm(
+    "__wrap__ZNK8mooncake11RdmaContext14queryPortStateEP14ibv_port_state");
+extern "C" int wrapQueryPortState(const RdmaContext *, ibv_port_state *state) {
+    return port_state_probe ? port_state_probe(state) : -1;
 }
 #endif
 
@@ -113,6 +122,15 @@ class WorkerPoolTestPeer {
     static int errorThreshold() { return WorkerPool::kRailErrorThreshold; }
 
     static uint64_t errorWindowNs() { return WorkerPool::kRailErrorWindowNs; }
+
+    static int pausedRailCount(WorkerPool &pool) {
+        return pool.paused_rail_count_.load(std::memory_order_acquire);
+    }
+
+    static void expirePause(WorkerPool &pool, const std::string &path) {
+        std::lock_guard<std::mutex> lock(pool.rail_state_lock_);
+        pool.rail_states_[path].pause_until_ns = 1;
+    }
 
     static void setContextActive(WorkerPool &pool, bool active) {
         pool.context_.set_active(active);
@@ -161,6 +179,10 @@ class WorkerPoolTestPeer {
         pool.maybeActivateRecoveredContext();
     }
 
+    static void resumePausedContext(WorkerPool &pool) {
+        pool.resumePausedContext();
+    }
+
     static int contextFailureThreshold() {
         return WorkerPool::kLocalCompletionFailureThreshold;
     }
@@ -197,6 +219,7 @@ class WorkerPoolRailStateTest : public ::testing::Test {
     void TearDown() override {
 #ifdef __linux__
         gid_probe = {};
+        port_state_probe = {};
 #endif
         worker_pool_.reset();
         context_.reset();
@@ -222,6 +245,58 @@ class WorkerPoolRailStateTest : public ::testing::Test {
 
 TEST_F(WorkerPoolRailStateTest, UnknownRailIsAvailable) {
     EXPECT_TRUE(railAvailable(kPeerA));
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 0);
+}
+
+TEST_F(WorkerPoolRailStateTest, FailuresBelowThresholdDoNotPauseCount) {
+    for (int i = 0; i < WorkerPoolTestPeer::errorThreshold() - 1; ++i)
+        failRail(kPeerA);
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 0);
+    EXPECT_TRUE(railAvailable(kPeerA));
+}
+
+TEST_F(WorkerPoolRailStateTest, PauseIncrementsCountOnce) {
+    for (int i = 0; i < WorkerPoolTestPeer::errorThreshold(); ++i)
+        failRail(kPeerA);
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 1);
+    EXPECT_FALSE(railAvailable(kPeerA));
+
+    failRail(kPeerA, /*immediate_pause=*/true);
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 1);
+}
+
+TEST_F(WorkerPoolRailStateTest, IndependentPausesIncrementCount) {
+    failRail(kPeerA, /*immediate_pause=*/true);
+    failRail(kPeerB, /*immediate_pause=*/true);
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 2);
+    EXPECT_FALSE(railAvailable(kPeerA));
+    EXPECT_FALSE(railAvailable(kPeerB));
+}
+
+TEST_F(WorkerPoolRailStateTest, ExpiredPauseDecrementsCount) {
+    failRail(kPeerA, /*immediate_pause=*/true);
+    ASSERT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 1);
+    WorkerPoolTestPeer::expirePause(*worker_pool_, kPeerA);
+    EXPECT_TRUE(railAvailable(kPeerA));
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 0);
+    EXPECT_TRUE(railAvailable(kPeerB));
+}
+
+TEST_F(WorkerPoolRailStateTest, ExpiredPauseClearsCountOnOtherRailCheck) {
+    failRail(kPeerA, /*immediate_pause=*/true);
+    failRail(kPeerB, /*immediate_pause=*/true);
+    ASSERT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 2);
+    WorkerPoolTestPeer::expirePause(*worker_pool_, kPeerA);
+    EXPECT_FALSE(railAvailable(kPeerB));
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 1);
+    EXPECT_TRUE(railAvailable(kPeerA));
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 1);
+
+    WorkerPoolTestPeer::expirePause(*worker_pool_, kPeerB);
+    constexpr const char *kPeerC = "10.0.0.1@mlx5_bond_2";
+    EXPECT_TRUE(railAvailable(kPeerC));
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 0);
+    EXPECT_TRUE(railAvailable(kPeerB));
 }
 
 // A single local fault must stay free: the endpoint is rebuilt and the slice
@@ -462,6 +537,32 @@ TEST_F(WorkerPoolRailStateTest, GidProbeOwnsRecoveryThroughoutIoAndRetry) {
     EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 0);
 }
 
+TEST_F(WorkerPoolRailStateTest, UnchangedDefaultDoesNotDisconnectAllPeers) {
+    class RecordingStore : public FIFOEndpointStore {
+       public:
+        RecordingStore() : FIFOEndpointStore(8) {}
+        int disconnectQPs() override {
+            ++disconnects;
+            return 0;
+        }
+        int disconnects = 0;
+    };
+    auto store = std::make_shared<RecordingStore>();
+    RdmaContextTestPeer::bindEndpointStore(*context_, store);
+    RdmaContextTestPeer::seedAutoGidState(*context_, nullptr, 1, 0, {}, 0);
+    gid_probe = [] { return GidRefreshResult::UNCHANGED; };
+    WorkerPoolTestPeer::contextEvent(*worker_pool_, IBV_EVENT_GID_CHANGE);
+    EXPECT_EQ(store->disconnects, 0);
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, false);
+    WorkerPoolTestPeer::setRecoveryActivateAfter(*worker_pool_, 1);
+    WorkerPoolTestPeer::recoverContext(*worker_pool_);
+    EXPECT_EQ(store->disconnects, 0);
+    // A real default-GID change still rebuilds every endpoint.
+    gid_probe = [] { return GidRefreshResult::CHANGED; };
+    WorkerPoolTestPeer::contextEvent(*worker_pool_, IBV_EVENT_GID_CHANGE);
+    EXPECT_EQ(store->disconnects, 1);
+}
+
 TEST_F(WorkerPoolRailStateTest, FatalEventCancelsPendingGidProbe) {
     WorkerPoolTestPeer::setContextActive(*worker_pool_, false);
     WorkerPoolTestPeer::contextEvent(*worker_pool_, IBV_EVENT_PORT_ACTIVE);
@@ -476,6 +577,98 @@ TEST_F(WorkerPoolRailStateTest, FatalEventCancelsPendingGidProbe) {
     EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
     EXPECT_FALSE(
         WorkerPoolTestPeer::tryReactivateContext(*worker_pool_, UINT64_MAX));
+}
+
+TEST_F(WorkerPoolRailStateTest,
+       PortPollArmsRecoveryWhenPortActiveEventIsMissed) {
+    WorkerPoolTestPeer::contextEvent(*worker_pool_, IBV_EVENT_PORT_ERR);
+    ASSERT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+    ASSERT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
+
+    port_state_probe = [](ibv_port_state *state) {
+        *state = IBV_PORT_DOWN;
+        return 0;
+    };
+    WorkerPoolTestPeer::resumePausedContext(*worker_pool_);
+    EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
+
+    port_state_probe = [](ibv_port_state *state) {
+        *state = IBV_PORT_INIT;
+        return 0;
+    };
+    WorkerPoolTestPeer::resumePausedContext(*worker_pool_);
+    EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
+
+    port_state_probe = [](ibv_port_state *state) {
+        *state = IBV_PORT_ACTIVE;
+        return 0;
+    };
+    WorkerPoolTestPeer::resumePausedContext(*worker_pool_);
+    EXPECT_NE(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
+    EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_))
+        << "missed PORT_ACTIVE must reuse the delayed GID probe, not enable "
+           "the context immediately";
+
+    gid_probe = [] { return GidRefreshResult::UNCHANGED; };
+    WorkerPoolTestPeer::setRecoveryActivateAfter(*worker_pool_, 1);
+    WorkerPoolTestPeer::recoverContext(*worker_pool_);
+    EXPECT_TRUE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+    EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
+}
+
+TEST_F(WorkerPoolRailStateTest, PortPollLeavesNonPortErrFatalEventsInactive) {
+    port_state_probe = [](ibv_port_state *state) {
+        *state = IBV_PORT_ACTIVE;
+        return 0;
+    };
+    const ibv_event_type events[] = {
+        IBV_EVENT_DEVICE_FATAL,
+        IBV_EVENT_CQ_ERR,
+        IBV_EVENT_WQ_FATAL,
+        IBV_EVENT_LID_CHANGE,
+    };
+    for (ibv_event_type event : events) {
+        WorkerPoolTestPeer::contextEvent(*worker_pool_, event);
+        EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+        EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
+        WorkerPoolTestPeer::resumePausedContext(*worker_pool_);
+        EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u)
+            << ibv_event_type_str(event);
+        EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_))
+            << ibv_event_type_str(event);
+    }
+}
+
+TEST_F(WorkerPoolRailStateTest, PortPollDoesNotStealBreakerOwnedPause) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+    for (int i = 0; i < WorkerPoolTestPeer::contextFailureThreshold(); ++i)
+        WorkerPoolTestPeer::markLocalContextFailure(*worker_pool_);
+    ASSERT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+    ASSERT_NE(WorkerPoolTestPeer::breakerReactivateAfter(*worker_pool_), 0u);
+
+    port_state_probe = [](ibv_port_state *state) {
+        *state = IBV_PORT_ACTIVE;
+        return 0;
+    };
+    WorkerPoolTestPeer::resumePausedContext(*worker_pool_);
+    EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
+    EXPECT_NE(WorkerPoolTestPeer::breakerReactivateAfter(*worker_pool_), 0u);
+    EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+}
+
+TEST_F(WorkerPoolRailStateTest, PortPollLeavesArmedEventRecoveryAlone) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, false);
+    WorkerPoolTestPeer::contextEvent(*worker_pool_, IBV_EVENT_PORT_ACTIVE);
+    const uint64_t armed =
+        WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_);
+    ASSERT_NE(armed, 0u);
+
+    port_state_probe = [](ibv_port_state *state) {
+        *state = IBV_PORT_ACTIVE;
+        return 0;
+    };
+    WorkerPoolTestPeer::resumePausedContext(*worker_pool_);
+    EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), armed);
 }
 #endif
 
