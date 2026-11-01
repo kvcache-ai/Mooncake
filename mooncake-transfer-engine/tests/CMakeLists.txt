@@ -353,6 +353,35 @@ if(USE_MNNVL)
   endif()
 endif()
 
+if(USE_INTRA_NVLINK
+   AND USE_CUDA
+   AND NOT USE_HIP
+   AND UNIX
+   AND NOT APPLE)
+  add_executable(intranode_nvlink_submit_atomicity_test
+                 ${WORKSPACE}/intranode_nvlink_submit_atomicity_test.cpp)
+  target_link_libraries(intranode_nvlink_submit_atomicity_test
+                        PUBLIC transfer_engine gtest gtest_main)
+  foreach(
+    cuda_symbol
+    cudaGetDevice
+    cudaSetDevice
+    cudaGetDeviceProperties
+    cudaPointerGetAttributes
+    cudaStreamCreateWithFlags
+    cudaStreamDestroy
+    cudaEventCreateWithFlags
+    cudaEventRecord
+    cudaEventSynchronize
+    cudaEventDestroy
+    cudaIpcOpenMemHandle)
+    target_link_options(intranode_nvlink_submit_atomicity_test PRIVATE
+                        "-Wl,--wrap=${cuda_symbol}")
+  endforeach()
+  add_test(NAME intranode_nvlink_submit_atomicity_test
+           COMMAND intranode_nvlink_submit_atomicity_test)
+endif()
+
 if(USE_HIP)
   add_executable(hip_transport_test ${WORKSPACE}/hip_transport_test.cpp)
   target_link_libraries(hip_transport_test PUBLIC transfer_engine gtest
