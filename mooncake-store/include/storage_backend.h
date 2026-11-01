@@ -234,8 +234,8 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
-    // DFS page-offset mode. Enabled for filesystem-mode distributed storage;
-    // object storage uses the regular offload control plane.
+    // DFS control-plane mode. Enabled for filesystem-mode distributed storage
+    // and KVCS; other object stores use the regular offload control plane.
     bool enable_dfs = false;
     // Proactively evict local disk objects from the heartbeat thread once
     // backend usage crosses the high watermark.

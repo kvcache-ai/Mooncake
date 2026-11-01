@@ -29,6 +29,8 @@ struct ObjectGetRequest {
     size_t size = 0;
 };
 
+using ObjectStorageIoResults = std::vector<tl::expected<void, ErrorCode>>;
+
 /**
  * @brief Adapts object storage services to the distributed backend's
  * key-value I/O contract.
@@ -85,6 +87,14 @@ class ObjectStorageAdapter {
 
     virtual tl::expected<void, ErrorCode> Delete(
         const std::string& logical_key) = 0;
+
+    virtual ObjectStorageIoResults DeleteBatch(
+        std::span<const std::string> logical_keys) {
+        ObjectStorageIoResults results;
+        results.reserve(logical_keys.size());
+        for (const auto& key : logical_keys) results.emplace_back(Delete(key));
+        return results;
+    }
 
     // Pagination is an implementation detail. Returns decoded logical keys
     // from the adapter's configured physical namespace.

@@ -51,6 +51,7 @@ struct FdGuard {
 }  // namespace
 
 #include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/kvcs/kvcs_object_storage_adapter.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #ifdef HAVE_OSS_ADAPTER
 #include "storage/distributed/oss_adapter.h"
@@ -5724,6 +5725,10 @@ CreateStorageBackend(const FileStorageConfig& config) {
                 LOG(ERROR) << "S3 adapter requires libcurl and OpenSSL";
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 #endif
+            } else if (distributed_config.UsesKvcs()) {
+                object_storage_adapter =
+                    std::make_unique<KvcsObjectStorageAdapter>(
+                        distributed_config.object_storage_config_path);
             } else {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }

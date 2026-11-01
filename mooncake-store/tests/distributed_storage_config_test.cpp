@@ -48,6 +48,8 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar legacy_root_dir{"MOONCAKE_DISTRIBUTED_ROOT_DIR"};
     ScopedEnvVar fs_adapter{"MOONCAKE_DFS_FS_ADAPTER"};
     ScopedEnvVar legacy_fs_adapter{"MOONCAKE_DISTRIBUTED_FS_TYPE"};
+    ScopedEnvVar kvcs_efc_config{"MOONCAKE_KVCS_EFC_CONFIG"};
+    ScopedEnvVar kvcs_socket{"MOONCAKE_KVCS_EFC_SOCKET"};
     ScopedEnvVar health_check{"MOONCAKE_DISTRIBUTED_HEALTH_CHECK"};
     ScopedEnvVar shard_count{"MOONCAKE_DFS_SHARD_COUNT"};
     ScopedEnvVar shard_capacity{"MOONCAKE_DFS_SHARD_CAPACITY"};
@@ -75,6 +77,8 @@ void ExpectDefaultConfig(const DistributedStorageConfig& config) {
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.7);
     EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(30));
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(5));
+    EXPECT_TRUE(config.object_storage_config_path.empty());
+    EXPECT_FALSE(config.UsesKvcs());
 }
 
 DistributedStorageConfig ValidConfig() {
@@ -160,6 +164,30 @@ TEST_F(DistributedStorageConfigTest, PreservesAliasPrecedence) {
     EXPECT_EQ(preferred.fs_adapter_type, "hf3fs");
 }
 
+TEST_F(DistributedStorageConfigTest,
+       ExplicitFilesystemAdapterRemainsSelectedWithEfcSocket) {
+    env.kvcs_socket.Set("/var/run/kvcs/efc-grpc.sock");
+    env.fs_adapter.Set("posix");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    EXPECT_EQ(config.fs_adapter_type, "posix");
+    EXPECT_FALSE(config.UsesKvcs());
+    EXPECT_FALSE(config.enable_health_check);
+}
+
+TEST_F(DistributedStorageConfigTest, ExplicitKvcsAdapterSelectsLowLevel) {
+    env.kvcs_socket.Set("/var/run/kvcs/efc-grpc.sock");
+    env.fs_adapter.Set("kvcs-lowlevel");
+    env.kvcs_efc_config.Set("/etc/kvcs/efc.yaml");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    EXPECT_EQ(config.fs_adapter_type, "kvcs-lowlevel");
+    EXPECT_EQ(config.object_storage_config_path, "/etc/kvcs/efc.yaml");
+    EXPECT_FALSE(config.enable_health_check);
+}
+
 TEST_F(DistributedStorageConfigTest, EmptyPreferredRootOverridesAlias) {
     env.legacy_root_dir.Set("/tmp/legacy-dfs");
     env.root_dir.Set("");
@@ -231,6 +259,20 @@ TEST_F(DistributedStorageConfigTest,
     EXPECT_DOUBLE_EQ(config.eviction_high_watermark, 0.9);
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.7);
     EXPECT_TRUE(logs.empty());
+}
+
+TEST(DistributedStorageConfigValidationTest, KvcsUsesDfsEvictionSettings) {
+    DistributedStorageConfig config;
+    config.fs_adapter_type = "kvcs-lowlevel";
+    EXPECT_TRUE(config.Validate());
+
+    config.eviction_low_watermark = config.eviction_high_watermark;
+    EXPECT_FALSE(config.Validate());
+    config.eviction_low_watermark = 0.7;
+
+    config.eviction_enabled = false;
+    config.eviction_check_interval = std::chrono::seconds(0);
+    EXPECT_FALSE(config.Validate());
 }
 
 TEST(DistributedStorageConfigValidationTest, RejectsInvalidBaseSettings) {
