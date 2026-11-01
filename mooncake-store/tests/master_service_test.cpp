@@ -1,11 +1,14 @@
 #include "master_service.h"
+#include "common/network.h"
 #include "common/shrink_buckets.h"
 #include "config/replica_selection_config.h"
+#include "http_metadata_server.h"
 #include "master_service/master_service_test_peer.h"
 #include "rpc_service.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/struct_json/json_reader.h>
 
 #include <algorithm>
@@ -4310,6 +4313,66 @@ class RecordingDeleteServer {
     std::set<size_t> held_;
     std::set<size_t> released_;
 };
+
+TEST_F(MasterServiceTest, RemoteHttpMetadataCleanupAuthenticates) {
+    ScopedEnvVar token("MC_METADATA_HTTP_TOKEN", "remote-cleanup-test-token");
+    ScopedEnvVar cluster("MC_METADATA_CLUSTER_ID", "auth-cleanup");
+    ScopedEnvVar keys("MC_METADATA_MAX_KEYS", "2");
+    ScopedEnvVar bytes("MC_METADATA_MAX_TOTAL_BYTES", "1048576");
+    ScopedEnvVar body("MC_METADATA_MAX_BODY_BYTES", "1024");
+    HttpMetadataServer server(0, "127.0.0.1");
+    ASSERT_TRUE(server.start());
+    const auto endpoint =
+        "http://127.0.0.1:" + std::to_string(server.port()) + "/metadata";
+    const std::string segment_name = "host:1234/键 +%";
+    const std::string prefix = "mooncake/auth-cleanup/";
+    const std::vector<std::string> urls = {
+        endpoint +
+            "?key=" + code_utils::url_encode(prefix + "ram/" + segment_name),
+        endpoint + "?key=" +
+            code_utils::url_encode(prefix + "rpc_meta/" + segment_name)};
+    const std::string authorization = "Bearer remote-cleanup-test-token";
+    auto put = [&](const std::string& url) {
+        coro_http::coro_http_client client;
+        client.add_header("Authorization", authorization);
+        return async_simple::coro::syncAwait(
+                   client.async_put(url, "{}",
+                                    coro_http::req_content_type::json))
+            .status;
+    };
+    auto get = [&](const std::string& url) {
+        coro_http::coro_http_client client;
+        client.add_header("Authorization", authorization);
+        return client.get(url).status;
+    };
+    for (const auto& url : urls) ASSERT_EQ(200, put(url));
+
+    const auto missing = httpDelete(urls[0], std::chrono::seconds(1));
+    ASSERT_FALSE(missing);
+    EXPECT_NE(std::string::npos, missing.error().find("http=401"));
+    const auto wrong = httpDelete(urls[1], std::chrono::seconds(1),
+                                  {{"Authorization", "Bearer wrong-token"}});
+    ASSERT_FALSE(wrong);
+    EXPECT_NE(std::string::npos, wrong.error().find("http=401"));
+    for (const auto& url : urls) ASSERT_EQ(200, get(url));
+
+    MasterService service;
+    service.setHttpMetadataRemoteUrl(endpoint);
+    // Configuration is captured before the worker starts, not read from the
+    // mutable process environment during asynchronous cleanup.
+    ScopedEnvVar changed_token("MC_METADATA_HTTP_TOKEN", "changed-token");
+    MasterServiceTestPeer(service).CleanupHttpMetadataForTesting(segment_name);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while ((get(urls[0]) != 404 || get(urls[1]) != 404) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    service.StopHttpMetadataCleanup();
+    for (const auto& url : urls) EXPECT_EQ(404, get(url));
+    // Both slots are available again after authenticated remote cleanup.
+    for (const auto& url : urls) EXPECT_EQ(200, put(url));
+}
 
 // Drives one deterministic sequence against a held request:
 //  1. The server holds DELETE #1 (segment_a, ram key). segment_b and

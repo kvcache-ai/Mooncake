@@ -11356,6 +11356,12 @@ void MasterService::setHttpMetadataRemoteUrl(
         return;
     }
     http_metadata_remote_url_ = metadata_connstring;
+    http_metadata_remote_headers_.clear();
+    if (const char* token = std::getenv("MC_METADATA_HTTP_TOKEN");
+        token && *token) {
+        http_metadata_remote_headers_.emplace("Authorization",
+                                              "Bearer " + std::string(token));
+    }
     LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled "
                  "(remote metadata server "
               << metadata_connstring << ")";
@@ -11418,7 +11424,7 @@ bool MasterService::removeRemoteHttpMetadataKey(const std::string& key) const {
     constexpr std::chrono::milliseconds kTimeout{3000};
     auto result = httpDelete(
         http_metadata_remote_url_ + "?key=" + code_utils::url_encode(key),
-        kTimeout);
+        kTimeout, http_metadata_remote_headers_);
     if (!result) {
         LOG(WARNING) << "Remote HTTP metadata cleanup failed for key: " << key
                      << ": " << result.error();
