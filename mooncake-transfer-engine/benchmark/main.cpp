@@ -117,6 +117,12 @@ int processBatchSizes(
         target_stats[i].segment_name = target_names[i];
     XferBenchStats tight_stats;
     XferBenchStats loose_stats;
+    // Per-target and deadline-group stats are copies of the samples above;
+    // only collect them when the reporting below uses them.
+    const bool report_targets = runner.getTargetCount() > 1 ||
+                                !XferBenchConfig::result_output_jsonl.empty();
+    const bool report_deadline_groups =
+        XferBenchConfig::deadline_us > 0 && workload_classes.empty();
     std::mutex mutex;
     std::atomic<int> measurement_ready{0};
     std::atomic<bool> measurement_started{false};
@@ -293,39 +299,45 @@ int processBatchSizes(
         stats.total_duration.add(total_duration);
         stats.transfer_duration.add(transfer_duration);
         stats.instant_bandwidth.add(thread_instant_bandwidth);
-        auto& target = target_stats[target_index];
-        ++target.threads;
-        target.transferred_bytes =
-            checkedAdd(target.transferred_bytes, transferred_bytes,
-                       "target transferred bytes");
-        target.stats.total_duration.add(total_duration);
-        target.stats.transfer_duration.add(transfer_duration);
-        target.stats.instant_bandwidth.add(thread_instant_bandwidth);
+        if (report_targets) {
+            auto& target = target_stats[target_index];
+            ++target.threads;
+            target.transferred_bytes =
+                checkedAdd(target.transferred_bytes, transferred_bytes,
+                           "target transferred bytes");
+            target.stats.total_duration.add(total_duration);
+            target.stats.transfer_duration.add(transfer_duration);
+            target.stats.instant_bandwidth.add(thread_instant_bandwidth);
+        }
         if (qos_enabled) {
             qos_stats[qos_class].total_duration.add(total_duration);
             qos_stats[qos_class].transfer_duration.add(transfer_duration);
             qos_stats[qos_class].instant_bandwidth.add(
                 thread_instant_bandwidth);
         }
-        auto& group_stats = tight ? tight_stats : loose_stats;
-        group_stats.total_duration.add(total_duration);
-        group_stats.transfer_duration.add(transfer_duration);
+        if (report_deadline_groups) {
+            auto& group_stats = tight ? tight_stats : loose_stats;
+            group_stats.total_duration.add(total_duration);
+            group_stats.transfer_duration.add(transfer_duration);
+        }
         return 0;
     });
 
     if (rc != 0) return -1;
     if (workload_classes.empty())
         printStats(block_size, batch_size, stats, num_threads);
-    auto target_report = calculateTargetMetrics(
-        block_size, batch_size, num_threads, XferBenchConfig::backend,
-        mixed_opcode ? "mix" : XferBenchConfig::op_type, &target_stats);
-    if (runner.getTargetCount() > 1) printTargetMetrics(target_report);
-    if (!XferBenchConfig::result_output_jsonl.empty()) {
-        std::string error;
-        if (!appendTargetMetricsJsonl(XferBenchConfig::result_output_jsonl,
-                                      target_report, &error)) {
-            LOG(ERROR) << error;
-            return -1;
+    if (report_targets) {
+        auto target_report = calculateTargetMetrics(
+            block_size, batch_size, num_threads, XferBenchConfig::backend,
+            mixed_opcode ? "mix" : XferBenchConfig::op_type, &target_stats);
+        if (runner.getTargetCount() > 1) printTargetMetrics(target_report);
+        if (!XferBenchConfig::result_output_jsonl.empty()) {
+            std::string error;
+            if (!appendTargetMetricsJsonl(XferBenchConfig::result_output_jsonl,
+                                          target_report, &error)) {
+                LOG(ERROR) << error;
+                return -1;
+            }
         }
     }
     if (!qos_classes.empty()) {
@@ -347,7 +359,7 @@ int processBatchSizes(
             }
         }
     }
-    if (XferBenchConfig::deadline_us > 0 && workload_classes.empty()) {
+    if (report_deadline_groups) {
         const int tight_threads =
             std::min(num_threads, XferBenchConfig::deadline_tight_threads);
         printDeadlineGroupStats("tight", block_size, batch_size, tight_stats,
