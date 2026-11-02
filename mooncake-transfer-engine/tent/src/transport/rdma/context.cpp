@@ -605,27 +605,30 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
     }
 #endif
 
-    // Device memory with a dma-buf export (Intel XPU today): register the
-    // exported buffer so the NIC DMAs to VRAM directly. The exporter returns
-    // NotImplemented (platform has no export path) or InvalidArgument (not
-    // device memory) for everything that must take the plain ibv_reg_mr path
-    // below; any other failure, or a failed ibv_reg_dmabuf_mr, is reported as
-    // a registration failure so the buffer is staged instead of being
-    // registered as host memory (which would EFAULT or, worse, silently
-    // register the wrong pages).
+    // Register exported device memory so the NIC DMAs to VRAM directly.
+    // NotImplemented or InvalidArgument may describe ordinary host memory;
+    // the memory-type check below prevents an MLU pointer from reaching
+    // ibv_reg_mr if export is unavailable. Any other export failure, or a
+    // failed ibv_reg_dmabuf_mr, leaves the buffer to the staging route.
     if (verbs_.ibv_reg_dmabuf_mr) {
         DmabufExport handle;
         Status s = dmabuf_exporter_ ? dmabuf_exporter_(addr, length, handle)
                                     : Platform::getLoader().exportDmabuf(
                                           addr, length, handle);
+        struct ExportGuard {
+            DmabufExport& handle;
+            ~ExportGuard() {
+                if (handle.close_fd && handle.fd >= 0 && close(handle.fd) != 0)
+                    PLOG(WARNING) << "Failed to close dma-buf fd";
+            }
+        } export_guard{handle};
         if (s.ok()) {
             ibv_mr* entry = verbs_.ibv_reg_dmabuf_mr(
                 native_pd_, handle.offset, length,
                 reinterpret_cast<uint64_t>(addr), handle.fd, access);
-            // The MR takes its own reference to the dma-buf. The fd itself
-            // stays with the exporting runtime (see DmabufExport): Level
-            // Zero hands out one cached descriptor per allocation, so
-            // closing it here would leave the driver with a stale fd.
+            // The MR takes its own reference to the dma-buf. The guard closes
+            // a caller-owned CNDrv fd after registration and leaves borrowed
+            // Level Zero descriptors open.
             if (!entry) {
                 const void* end = static_cast<const char*>(addr) + length;
                 PLOG(ERROR)
@@ -645,6 +648,11 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
             return nullptr;
         }
     }
+
+    // MLU memory must not reach the plain MR path when dma-buf verbs or export
+    // are unavailable. The engine may still use a separate host stage buffer.
+    const auto memory_type = Platform::getLoader().getMemoryType(addr);
+    if (memory_type == MTYPE_MLU) return nullptr;
 
     // Standard CPU memory registration
     ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);

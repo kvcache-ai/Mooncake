@@ -2320,6 +2320,37 @@ TEST_F(RdmaContextDmabufTest, ExportableMemoryUsesDmabufRegistration) {
     close(fd);
 }
 
+TEST_F(RdmaContextDmabufTest, CallerOwnedExportIsClosedAfterRegistration) {
+    int fd = openFd();
+    context_->setDmabufExporter([&](void*, size_t, DmabufExport& out) {
+        out.fd = fd;
+        out.offset = 128;
+        out.close_fd = true;
+        return Status::OK();
+    });
+    auto mr = context_->registerMemReg(host_buffer_.data(), 1024,
+                                       IBV_ACCESS_LOCAL_WRITE);
+    ASSERT_EQ(mr, &fake_mr.dmabuf_mr);
+    EXPECT_EQ(fake_mr.last_fd, fd);
+    EXPECT_FALSE(fdOpen(fd));
+    EXPECT_EQ(context_->unregisterMemReg(mr), 0);
+}
+
+TEST_F(RdmaContextDmabufTest, CallerOwnedExportIsClosedOnRegistrationFailure) {
+    int fd = openFd();
+    context_->setDmabufExporter([&](void*, size_t, DmabufExport& out) {
+        out.fd = fd;
+        out.close_fd = true;
+        return Status::OK();
+    });
+    fake_mr.fail_dmabuf_reg = true;
+    EXPECT_EQ(context_->registerMemReg(host_buffer_.data(), 1024,
+                                       IBV_ACCESS_LOCAL_WRITE),
+              nullptr);
+    EXPECT_FALSE(fdOpen(fd));
+    EXPECT_EQ(fake_mr.reg_mr_calls, 0);
+}
+
 TEST_F(RdmaContextDmabufTest, HostMemoryTakesThePlainPath) {
     int exporter_calls = 0;
     context_->setDmabufExporter([&](void*, size_t, DmabufExport&) {
