@@ -625,8 +625,9 @@ class TransferEngineImpl {
                                 std::chrono::steady_clock::time_point end_time);
 
    private:
-    // Failed strict deregistrations retain their transport identity for retry.
     std::recursive_mutex strict_memory_mutex_;
+    // Unpublished registration failures retain their transport identity here.
+    // Failed tracked removals are restored and retried by SegmentTracker.
     std::unordered_map<uint64_t, BufferDesc> pending_mnnvl_unregister_;
     std::unordered_set<uint64_t> pending_mnnvl_metadata_;
 

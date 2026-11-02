@@ -1224,11 +1224,9 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         },
         [&](BufferDesc& desc) {
             need_sync = true;
-            auto cleanup = deregisterRemovedBuffer(desc);
-            if (!cleanup.ok() &&
-                conf_->get("transports/mnnvl/store_egm", false))
-                pending_mnnvl_unregister_[desc.addr] = desc;
-            return cleanup;
+            // The tracker restores failed removals with their remaining
+            // transport state; only unpublished buffers need a pending copy.
+            return deregisterRemovedBuffer(desc);
         });
     // Synchronize local segment to metadata server so remote peers can see the
     // new buffers
@@ -1265,6 +1263,7 @@ Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
                 [&](const auto& entry) { return covers(entry.second); });
         }
         if (pending != pending_mnnvl_unregister_.end()) {
+            // Failed registrations were never published to the tracker.
             CHECK_STATUS(deregisterRemovedBuffer(pending->second));
             pending_mnnvl_unregister_.erase(pending);
         } else {
@@ -1284,9 +1283,9 @@ Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
             }
             CHECK_STATUS(local_segment_tracker_->remove(
                 base, size, [&](BufferDesc& desc) {
-                    auto status = deregisterRemovedBuffer(desc);
-                    if (!status.ok()) pending_mnnvl_unregister_[base] = desc;
-                    return status;
+                    // On failure the tracker restores this descriptor. Retry
+                    // through it so success removes the restored entry too.
+                    return deregisterRemovedBuffer(desc);
                 }));
         }
         // Record the completed unregister before publishing. A metadata-only

@@ -4228,7 +4228,7 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         ConfigDict alias_config;
         if (location.starts_with("cpu:"))
             alias_config[CONFIG_KEY_EGM_NUMA_NODES] = location.substr(4);
-        if (!ParseEgmStorePoolConfig(alias_config, protocol, 0, 0))
+        if (!ParseEgmStorePoolConfig(alias_config, protocol, 0))
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (cleanup_state && !cleanup_state->cleanup_confirmed.load())
