@@ -1243,8 +1243,8 @@ class MasterService {
     // Records the responsibility. The caller holds the segment lock that
     // ordered the invalidation (PrepareUnmountSegment already released the
     // allocator), so a sweep that takes its sequence afterwards sees it.
-    void PublishSegmentCleanup(const UUID& segment_id,
-                               const std::string& endpoint);
+    std::shared_ptr<SegmentUnmountLogState> PublishSegmentCleanup(
+        const UUID& segment_id, const std::string& endpoint);
     void MarkSegmentCleanupLogged(const UUID& segment_id, bool logged);
     // Every SEGMENT_UNMOUNT submission goes through a claim, so one token has
     // exactly one submitter: the unmount RPC, the offboarding retry and the
@@ -1252,11 +1252,16 @@ class MasterService {
     // late duplicate delete a segment that reused the endpoint.
     // Returns true when the caller owns the submission; false when the token
     // is already logged or another thread holds the claim.
-    bool TryClaimSegmentUnmount(const UUID& segment_id,
-                                const std::string& endpoint,
-                                const std::string& payload);
-    void CompleteSegmentUnmountLog(const UUID& segment_id);
-    void ReleaseSegmentUnmountClaim(const UUID& segment_id);
+    bool TryClaimSegmentUnmount(
+        const UUID& segment_id, const std::string& endpoint,
+        const std::string& payload,
+        std::shared_ptr<SegmentUnmountLogState>* held_state);
+    void CompleteSegmentUnmountLog(
+        const UUID& segment_id,
+        const std::shared_ptr<SegmentUnmountLogState>& state);
+    void ReleaseSegmentUnmountClaim(
+        const UUID& segment_id,
+        const std::shared_ptr<SegmentUnmountLogState>& state);
     // Retries every claimed-and-failed SEGMENT_UNMOUNT entry; reschedules
     // itself while one is still refused.
     void FlushPendingSegmentUnmounts();
@@ -1677,22 +1682,18 @@ class MasterService {
     // state and never clears.
     bool cleanup_gate_closed_{false};
     bool cleanup_unrecoverable_{false};
-    // SEGMENT_UNMOUNT entries the writer refused, retried in the background.
-    // `in_flight` is the single-submitter claim.
-    struct PendingSegmentUnmount {
-        std::string endpoint;
-        std::string payload;
-        bool in_flight{false};
-    };
-    std::unordered_map<UUID, PendingSegmentUnmount, boost::hash<UUID>>
-        pending_unmount_ops_;
-    // Tokens whose SEGMENT_UNMOUNT already reached the writer. Kept after the
-    // barrier clears so a late offboarding retry cannot append a second
-    // unmount for an endpoint that was already reused. Bounded; the oldest
-    // token is forgotten first, long after any retry of its job ended.
-    static constexpr size_t kLoggedUnmountTokenCap{8192};
-    std::unordered_set<UUID, boost::hash<UUID>> logged_unmount_tokens_;
-    std::deque<UUID> logged_unmount_order_;
+    // One shared submission state per token (see SegmentUnmountLogState).
+    // The index holds it while the entry is pending or in flight; a holder
+    // (the offboarding job, an in-flight submitter) keeps it alive after the
+    // index drops it, so "already logged" outlives the responsibility without
+    // any history to prune.
+    std::unordered_map<UUID, std::shared_ptr<SegmentUnmountLogState>,
+                       boost::hash<UUID>>
+        unmount_log_states_;
+    // Test-only pause point between the segment commit and the unmount-log
+    // submission, so a suite can pin the interleaving where another submitter
+    // logs the token first.
+    std::function<void()> unmount_after_commit_hook_;
 
     /**
      * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an

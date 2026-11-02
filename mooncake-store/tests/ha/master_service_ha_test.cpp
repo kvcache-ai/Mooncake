@@ -366,6 +366,26 @@ class RejectOnceOrderedOpLogWriter : public OrderedOpLogWriter {
     std::atomic<bool> reject_next_segment_unmount_{false};
 };
 
+// Joins a worker thread when the test returns, including through a failing
+// ASSERT_*, so an early exit cannot destroy a joinable std::thread (which
+// terminates the process). Threads here finish either when their condition is
+// released or when their wait budget expires.
+class JoinOnExit {
+   public:
+    explicit JoinOnExit(std::thread& thread) : thread_(thread) {}
+    ~JoinOnExit() {
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    JoinOnExit(const JoinOnExit&) = delete;
+    JoinOnExit& operator=(const JoinOnExit&) = delete;
+
+   private:
+    std::thread& thread_;
+};
+
 class MasterServiceHATest : public ::testing::Test {
    protected:
     static void EnableDfsForTesting(MasterService& service) {
@@ -7914,6 +7934,7 @@ TEST_F(MasterServiceHATest, MountWaitsForTheSweepOfAReusedEndpoint) {
     std::thread mount_thread([&] {
         mounted.set_value(service.MountSegment(new_segment, generate_uuid()));
     });
+    JoinOnExit join_mount_thread(mount_thread);
 
     const auto before_sweep =
         mount_result.wait_for(std::chrono::milliseconds(300));
@@ -8004,6 +8025,7 @@ TEST_F(MasterServiceHATest, StoppingTheWriterWakesMountWaiters) {
     std::thread mount_thread([&] {
         mounted.set_value(service.MountSegment(new_segment, generate_uuid()));
     });
+    JoinOnExit join_mount_thread(mount_thread);
     EXPECT_EQ(mount_result.wait_for(std::chrono::milliseconds(300)),
               std::future_status::timeout);
 
@@ -8052,6 +8074,7 @@ TEST_F(MasterServiceHATest, OneEndpointWaitsForEveryUnmountedSegment) {
     std::thread mount_thread([&] {
         mounted.set_value(service.MountSegment(replacement, generate_uuid()));
     });
+    JoinOnExit join_mount_thread(mount_thread);
 
     const auto before_sweep =
         mount_result.wait_for(std::chrono::milliseconds(300));
@@ -8122,6 +8145,12 @@ TEST_F(MasterServiceHATest,
     new_segment.te_endpoint = old_segment.te_endpoint;
     ASSERT_TRUE(service.MountSegment(new_segment, generate_uuid()).has_value());
 
+    // The logged entry already left the master's index. The offboarding job
+    // still holds the shared state, so its retry knows the entry is logged
+    // without the master keeping any history (no capacity, no TTL).
+    EXPECT_FALSE(
+        MasterServiceTestPeer(service).HasUnmountLogState(old_segment.id));
+
     // The job retries now; it must not append the old unmount again.
     ASSERT_TRUE(ProcessClientOffboardingForTesting(service, job));
 
@@ -8169,6 +8198,147 @@ TEST_F(MasterServiceHATest,
     // endpoint, so the standby never drops the new segment.
     EXPECT_NE(0u, mount_seq);
     EXPECT_LT(unmount_seq, mount_seq);
+}
+
+// The unmount RPC must keep the shared state it published at prepare time.
+// If it re-looked the token up after another submitter logged it, the lookup
+// would miss (the index drops the entry once logged) and append a second,
+// late unmount that deletes a segment already mounted on that endpoint.
+TEST_F(MasterServiceHATest, RpcKeepsItsStateWhenAnotherSubmitterLogsFirst) {
+    const std::string cluster_id = "unmount_rpc_state";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    auto* writer = InstallRejectOnceWriter(service, backend);
+    ASSERT_NE(writer, nullptr);
+
+    auto old_segment = MakeSegment("rpc_state_old_segment");
+    const UUID old_client = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(old_segment, old_client).has_value());
+    PutObjectOnSegment(service, old_client, "rpc_state_key", old_segment.name);
+
+    const auto liveness = ClientRecordForTesting(service, old_client);
+    ASSERT_TRUE(liveness);
+    const auto now = ClientLivenessRecord::Clock::now();
+    ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                 std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    MasterMetricManager::instance().client_liveness_became_suspected();
+    ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                 std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    MasterMetricManager::instance().client_liveness_became_offline();
+
+    ClientOffboardingJob job;
+    job.client_id = old_client;
+    job.liveness = liveness;
+    job.pending_prepare_segments.push_back(
+        {.segment_id = old_segment.id,
+         .segment_name = old_segment.name,
+         .transport_endpoint = old_segment.te_endpoint});
+
+    auto& worker = MasterServiceTestPeer::ReplicaCleanupWorker(service);
+    worker.Stop();
+
+    // Attempt 1 prepares the segment (and publishes the shared state) but
+    // its metadata sweep is rejected, so it returns before committing.
+    writer->RejectNextCommit();
+    ASSERT_FALSE(ProcessClientOffboardingForTesting(service, job));
+    ASSERT_EQ(1u, job.prepared_segments.size());
+
+    // The RPC picks the UNMOUNTING segment up and commits it, then pauses
+    // between the commit and its unmount-log submission.
+    std::promise<void> entered;
+    auto entered_future = entered.get_future();
+    auto resume = std::make_shared<std::atomic<bool>>(false);
+    MasterServiceTestPeer(service).SetUnmountAfterCommitHook([&] {
+        entered.set_value();
+        while (!resume->load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    std::promise<tl::expected<void, ErrorCode>> rpc_done;
+    auto rpc_future = rpc_done.get_future();
+    std::thread rpc_thread([&] {
+        rpc_done.set_value(service.UnmountSegment(old_segment.id, old_client));
+    });
+    JoinOnExit join_rpc_thread(rpc_thread);
+    // Declared after the joiner, so it runs first on early exit: the paused
+    // RPC is released before its thread is joined.
+    struct ReleaseRpcOnExit {
+        std::shared_ptr<std::atomic<bool>> resume;
+        ~ReleaseRpcOnExit() { resume->store(true, std::memory_order_release); }
+    } release_rpc_on_exit{resume};
+    ASSERT_EQ(entered_future.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+
+    // The job retry finds the segment committed, submits the entry through
+    // the state it has held since prepare, and the endpoint reopens.
+    ASSERT_TRUE(ProcessClientOffboardingForTesting(service, job));
+    auto new_segment = MakeSegment("rpc_state_new_segment");
+    new_segment.te_endpoint = old_segment.te_endpoint;
+    ASSERT_TRUE(service.MountSegment(new_segment, generate_uuid()).has_value());
+
+    // Resume the RPC: it still holds the same state, which is now logged.
+    resume->store(true, std::memory_order_release);
+    rpc_thread.join();
+    auto rpc_result = rpc_future.get();
+    EXPECT_TRUE(rpc_result.has_value()) << toString(rpc_result.error());
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    std::vector<std::pair<uint64_t, OpType>> entries;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        entries.clear();
+        for (uint64_t batch_id = 1;; ++batch_id) {
+            OpLogBatchRecord batch;
+            if (storage.ReadBatch(batch_id, batch) != ErrorCode::OK) {
+                break;
+            }
+            for (const auto& entry : batch.entries) {
+                if (entry.object_key == old_segment.te_endpoint) {
+                    entries.emplace_back(entry.sequence_id, entry.op_type);
+                }
+            }
+        }
+        if (!entries.empty() &&
+            entries.back().second == OpType::SEGMENT_MOUNT) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    entries.clear();
+    for (uint64_t batch_id = 1;; ++batch_id) {
+        OpLogBatchRecord batch;
+        if (storage.ReadBatch(batch_id, batch) != ErrorCode::OK) {
+            break;
+        }
+        for (const auto& entry : batch.entries) {
+            if (entry.object_key == old_segment.te_endpoint) {
+                entries.emplace_back(entry.sequence_id, entry.op_type);
+            }
+        }
+    }
+    size_t unmounts = 0;
+    uint64_t unmount_seq = 0;
+    uint64_t mount_seq = 0;
+    for (const auto& [seq, type] : entries) {
+        if (type == OpType::SEGMENT_UNMOUNT) {
+            ++unmounts;
+            unmount_seq = seq;
+        } else if (type == OpType::SEGMENT_MOUNT) {
+            mount_seq = seq;
+        }
+    }
+    EXPECT_EQ(1u, unmounts);
+    EXPECT_NE(0u, mount_seq);
+    EXPECT_LT(unmount_seq, mount_seq);
+    MasterServiceTestPeer(service).SetUnmountAfterCommitHook(nullptr);
 }
 
 // The background worker and an RPC can flush the same token at once; the
@@ -8288,6 +8458,7 @@ TEST_F(MasterServiceHATest, ExternalTerminalCallbackKeepsTheInternalWakeup) {
     std::thread mount_thread([&] {
         mounted.set_value(service.MountSegment(new_segment, generate_uuid()));
     });
+    JoinOnExit join_mount_thread(mount_thread);
     EXPECT_EQ(mount_result.wait_for(std::chrono::milliseconds(300)),
               std::future_status::timeout);
 

@@ -2475,21 +2475,33 @@ bool MasterService::CleanupBarrierEnabled() const {
     return enable_ha_ && enable_oplog_ && ordered_oplog_writer_ != nullptr;
 }
 
-void MasterService::PublishSegmentCleanup(const UUID& segment_id,
-                                          const std::string& endpoint) {
-    if (!CleanupBarrierEnabled()) {
-        return;
+std::shared_ptr<SegmentUnmountLogState> MasterService::PublishSegmentCleanup(
+    const UUID& segment_id, const std::string& endpoint) {
+    const bool submits = enable_oplog_ && ordered_oplog_writer_ != nullptr;
+    if (!submits) {
+        return nullptr;
     }
     std::lock_guard<std::mutex> lock(barrier_mutex_);
-    auto [it, inserted] = pending_cleanup_.try_emplace(segment_id);
-    if (!inserted) {
-        // A repeated prepare of one segment owns the responsibility already.
-        return;
+    // One shared submission state per segment; the offboarding job keeps a
+    // reference so a retry still knows the entry was logged after the index
+    // below dropped it.
+    std::shared_ptr<SegmentUnmountLogState>& state =
+        unmount_log_states_[segment_id];
+    if (!state) {
+        state = std::make_shared<SegmentUnmountLogState>();
+        state->endpoint = endpoint;
     }
-    it->second.segment_id = segment_id;
-    it->second.endpoint = endpoint;
-    it->second.seq = ++barrier_seq_;
-    ++pending_by_endpoint_[endpoint].outstanding;
+    if (!CleanupBarrierEnabled()) {
+        return state;
+    }
+    auto [it, inserted] = pending_cleanup_.try_emplace(segment_id);
+    if (inserted) {
+        it->second.segment_id = segment_id;
+        it->second.endpoint = endpoint;
+        it->second.seq = ++barrier_seq_;
+        ++pending_by_endpoint_[endpoint].outstanding;
+    }
+    return state;
 }
 
 void MasterService::MarkSegmentCleanupLogged(const UUID& segment_id,
@@ -2531,51 +2543,74 @@ void MasterService::MarkCleanupSwept(
     barrier_cv_.notify_all();
 }
 
-bool MasterService::TryClaimSegmentUnmount(const UUID& segment_id,
-                                           const std::string& endpoint,
-                                           const std::string& payload) {
+bool MasterService::TryClaimSegmentUnmount(
+    const UUID& segment_id, const std::string& endpoint,
+    const std::string& payload,
+    std::shared_ptr<SegmentUnmountLogState>* held_state) {
     std::lock_guard<std::mutex> lock(barrier_mutex_);
-    if (logged_unmount_tokens_.contains(segment_id)) {
-        // Already in the log. Appending again would put a second unmount for
-        // this endpoint after a later mount, which the standby would apply in
-        // that order.
-        return false;
+    std::shared_ptr<SegmentUnmountLogState> state;
+    if (held_state != nullptr && *held_state) {
+        // The offboarding job's own reference: it survives the index entry.
+        state = *held_state;
+    } else {
+        auto it = unmount_log_states_.find(segment_id);
+        if (it != unmount_log_states_.end()) {
+            state = it->second;
+        } else {
+            state = std::make_shared<SegmentUnmountLogState>();
+            state->endpoint = endpoint;
+            state->payload = payload;
+            unmount_log_states_.emplace(segment_id, state);
+        }
+        if (held_state != nullptr) {
+            *held_state = state;
+        }
     }
-    auto [it, inserted] = pending_unmount_ops_.try_emplace(segment_id);
-    if (!inserted) {
-        if (it->second.in_flight) {
+    switch (state->phase) {
+        case SegmentUnmountLogState::Phase::kLogged:
+            // Already in the log. Appending again would put a second unmount
+            // for this endpoint after a later mount, which the standby would
+            // apply in that order.
+            return false;
+        case SegmentUnmountLogState::Phase::kInFlight:
             // Another submitter owns this token; its outcome decides.
             return false;
-        }
-        // A previous attempt failed and released the claim.
-        it->second.in_flight = true;
-        return true;
+        case SegmentUnmountLogState::Phase::kPending:
+            // The submitter owns the payload: the state may have been created
+            // at prepare time, before the entry was serialized.
+            state->endpoint = endpoint;
+            state->payload = payload;
+            state->phase = SegmentUnmountLogState::Phase::kInFlight;
+            return true;
     }
-    it->second = PendingSegmentUnmount{endpoint, payload, true};
-    return true;
+    return false;
 }
 
-void MasterService::CompleteSegmentUnmountLog(const UUID& segment_id) {
+void MasterService::CompleteSegmentUnmountLog(
+    const UUID& segment_id,
+    const std::shared_ptr<SegmentUnmountLogState>& state) {
     {
         std::lock_guard<std::mutex> lock(barrier_mutex_);
-        pending_unmount_ops_.erase(segment_id);
-        if (logged_unmount_tokens_.insert(segment_id).second) {
-            logged_unmount_order_.push_back(segment_id);
-            while (logged_unmount_order_.size() > kLoggedUnmountTokenCap) {
-                logged_unmount_tokens_.erase(logged_unmount_order_.front());
-                logged_unmount_order_.pop_front();
+        if (state) {
+            state->phase = SegmentUnmountLogState::Phase::kLogged;
+            auto it = unmount_log_states_.find(segment_id);
+            if (it != unmount_log_states_.end() && it->second == state) {
+                // The index drops its reference; any holder keeps the logged
+                // state alive for as long as it may still submit.
+                unmount_log_states_.erase(it);
             }
         }
     }
     MarkSegmentCleanupLogged(segment_id, true);
 }
 
-void MasterService::ReleaseSegmentUnmountClaim(const UUID& segment_id) {
+void MasterService::ReleaseSegmentUnmountClaim(
+    const UUID& segment_id,
+    const std::shared_ptr<SegmentUnmountLogState>& state) {
     {
         std::lock_guard<std::mutex> lock(barrier_mutex_);
-        auto it = pending_unmount_ops_.find(segment_id);
-        if (it != pending_unmount_ops_.end()) {
-            it->second.in_flight = false;
+        if (state && state->phase == SegmentUnmountLogState::Phase::kInFlight) {
+            state->phase = SegmentUnmountLogState::Phase::kPending;
         }
     }
     // The endpoint stays closed until this entry lands; retry in the
@@ -2584,33 +2619,36 @@ void MasterService::ReleaseSegmentUnmountClaim(const UUID& segment_id) {
 }
 
 void MasterService::FlushPendingSegmentUnmounts() {
-    if (!CleanupBarrierEnabled()) {
+    if (!enable_oplog_ || !ordered_oplog_writer_) {
         return;
     }
-    std::vector<std::tuple<UUID, std::string, std::string>> batch;
+    std::vector<std::pair<UUID, std::shared_ptr<SegmentUnmountLogState>>> batch;
     {
         std::lock_guard<std::mutex> lock(barrier_mutex_);
         if (cleanup_unrecoverable_) {
             return;
         }
-        batch.reserve(pending_unmount_ops_.size());
-        for (auto& [segment_id, op] : pending_unmount_ops_) {
-            if (op.in_flight) {
-                // The unmount RPC or the offboarding job owns it right now.
+        for (auto& [segment_id, state] : unmount_log_states_) {
+            if (!state ||
+                state->phase != SegmentUnmountLogState::Phase::kPending ||
+                state->payload.empty()) {
+                // No payload yet: the responsibility was published but the
+                // unmount RPC has not serialized its entry, so there is
+                // nothing to submit until it claims the token.
                 continue;
             }
-            op.in_flight = true;
-            batch.emplace_back(segment_id, op.endpoint, op.payload);
+            state->phase = SegmentUnmountLogState::Phase::kInFlight;
+            batch.emplace_back(segment_id, state);
         }
     }
-    for (const auto& [segment_id, endpoint, payload] : batch) {
+    for (const auto& [segment_id, state] : batch) {
         auto persisted = PersistSegmentOpForHAOrEnqueue(
-            "FlushPendingSegmentUnmount", OpType::SEGMENT_UNMOUNT, endpoint,
-            payload);
+            "FlushPendingSegmentUnmount", OpType::SEGMENT_UNMOUNT,
+            state->endpoint, state->payload);
         if (persisted) {
-            CompleteSegmentUnmountLog(segment_id);
+            CompleteSegmentUnmountLog(segment_id, state);
         } else {
-            ReleaseSegmentUnmountClaim(segment_id);
+            ReleaseSegmentUnmountClaim(segment_id, state);
         }
     }
 }
@@ -2813,15 +2851,17 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                 const auto err = segment_access.PrepareUnmountSegment(
                     it->segment_id, metrics_dec_capacity);
                 if (err == ErrorCode::OK) {
+                    // Same responsibility the unmount RPC publishes, under
+                    // the segment lock that ordered the invalidation. The job
+                    // keeps the submission state for the rest of its retries.
+                    auto unmount_log = PublishSegmentCleanup(
+                        it->segment_id, it->transport_endpoint);
                     job.prepared_segments.push_back(
                         {.segment_id = it->segment_id,
                          .segment_name = it->segment_name,
                          .transport_endpoint = it->transport_endpoint,
-                         .metrics_dec_capacity = metrics_dec_capacity});
-                    // Same responsibility the unmount RPC publishes, under
-                    // the segment lock that ordered the invalidation.
-                    PublishSegmentCleanup(it->segment_id,
-                                          it->transport_endpoint);
+                         .metrics_dec_capacity = metrics_dec_capacity,
+                         .unmount_log = std::move(unmount_log)});
                     it = job.pending_prepare_segments.erase(it);
                     continue;
                 }
@@ -2934,7 +2974,8 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                 // again here would append a second unmount after a later
                 // mount of the same endpoint.
                 if (TryClaimSegmentUnmount(it->segment_id,
-                                           it->transport_endpoint, payload)) {
+                                           it->transport_endpoint, payload,
+                                           &it->unmount_log)) {
                     auto persist_result = AppendOpLogVisibleBeforeDurable(
                         OpType::SEGMENT_UNMOUNT, TenantId::Default().value(),
                         it->transport_endpoint, payload);
@@ -2945,11 +2986,12 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                             << ", action=queue_client_offboarding_unmount"
                             << ", error=" << toString(persist_result.error());
                         MarkSegmentCleanupLogged(it->segment_id, false);
-                        ReleaseSegmentUnmountClaim(it->segment_id);
+                        ReleaseSegmentUnmountClaim(it->segment_id,
+                                                   it->unmount_log);
                         ++it;
                         continue;
                     }
-                    CompleteSegmentUnmountLog(it->segment_id);
+                    CompleteSegmentUnmountLog(it->segment_id, it->unmount_log);
                 }
             } else {
                 MarkSegmentCleanupLogged(it->segment_id, true);
@@ -3054,6 +3096,11 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     // responsibility is published.
     std::string segment_name;
     std::string te_endpoint;
+    // Held from the prepare critical section to the submission below: this
+    // RPC must keep the same shared state, or a submitter that logged the
+    // token in between would leave it looking up an index entry that is
+    // already gone, and it would append a second unmount after a later mount.
+    std::shared_ptr<SegmentUnmountLogState> unmount_log;
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
@@ -3093,7 +3140,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         }
         // After a successful prepare the allocator is released and cannot be
         // restored, so the responsibility stays even if a later step fails.
-        PublishSegmentCleanup(segment_id, te_endpoint);
+        unmount_log = PublishSegmentCleanup(segment_id, te_endpoint);
     }
 
     // 2. Sweep the metadata that pointed at the released allocator. With a
@@ -3130,6 +3177,10 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         }
     }
 
+    if (unmount_after_commit_hook_) {
+        unmount_after_commit_hook_();
+    }
+
     if (enable_oplog_ && ordered_oplog_writer_ && !te_endpoint.empty()) {
         SegmentUnmountOp op{te_endpoint};
         auto bytes = struct_pack::serialize(op);
@@ -3139,15 +3190,16 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         // A failed submission is retried in the background; the segment is
         // already committed, so that retry is the only path that can complete
         // the ordering the endpoint barrier waits on.
-        if (TryClaimSegmentUnmount(segment_id, te_endpoint, payload)) {
+        if (TryClaimSegmentUnmount(segment_id, te_endpoint, payload,
+                                   &unmount_log)) {
             auto persisted = PersistSegmentOpForHAOrEnqueue(
                 "UnmountSegment", OpType::SEGMENT_UNMOUNT, te_endpoint,
                 payload);
             if (persisted) {
-                CompleteSegmentUnmountLog(segment_id);
+                CompleteSegmentUnmountLog(segment_id, unmount_log);
             } else {
                 MarkSegmentCleanupLogged(segment_id, false);
-                ReleaseSegmentUnmountClaim(segment_id);
+                ReleaseSegmentUnmountClaim(segment_id, unmount_log);
             }
         }
     } else {

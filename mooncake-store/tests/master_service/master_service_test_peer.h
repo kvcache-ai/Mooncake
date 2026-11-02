@@ -534,6 +534,18 @@ class MasterServiceTestPeer {
         service_.FlushPendingSegmentUnmounts();
     }
 
+    // Runs after the segment commit and before the unmount-log submission.
+    void SetUnmountAfterCommitHook(std::function<void()> hook) {
+        service_.unmount_after_commit_hook_ = std::move(hook);
+    }
+
+    // Whether the master still holds a reference to this token's submission
+    // state; once the entry is logged only the holders keep it alive.
+    bool HasUnmountLogState(const UUID& segment_id) {
+        std::lock_guard<std::mutex> lock(service_.barrier_mutex_);
+        return service_.unmount_log_states_.contains(segment_id);
+    }
+
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr) {
