@@ -482,11 +482,11 @@ class EfaNicSelectionEnvTest : public ::testing::Test {
     void TearDown() override { ::unsetenv("MC_EFA_NIC_SELECTION"); }
 };
 
-TEST_F(EfaNicSelectionEnvTest, DefaultsToAll) {
+TEST_F(EfaNicSelectionEnvTest, DefaultsToLocal) {
     ::unsetenv("MC_EFA_NIC_SELECTION");
     GlobalConfig config;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
 }
 
 TEST_F(EfaNicSelectionEnvTest, LocalIsApplied) {
@@ -516,16 +516,43 @@ TEST_F(EfaNicSelectionEnvTest, UnknownValueKeepsDefault) {
     // NIC set is a correctness-adjacent surprise, not a perf knob.
     ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "topology", 1), 0);
     GlobalConfig config;
-    config.efa_nic_selection = EfaNicSelection::LOCAL;
+    config.efa_nic_selection = EfaNicSelection::ALL;  // a non-default value
     loadGlobalConfig(config);
-    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
 }
 
 TEST_F(EfaNicSelectionEnvTest, EmptyStringKeepsDefault) {
     ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "", 1), 0);
     GlobalConfig config;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
+}
+
+class HipKfdPinFixEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_HIP_KFD_PIN_FIX"); }
+
+    static HipKfdPinFix load(const char* value) {
+        EXPECT_EQ(::setenv("MC_HIP_KFD_PIN_FIX", value, 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        return config.hip_kfd_pin_fix;
+    }
+};
+
+TEST_F(HipKfdPinFixEnvTest, DefaultsToProbe) {
+    ::unsetenv("MC_HIP_KFD_PIN_FIX");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.hip_kfd_pin_fix, HipKfdPinFix::PROBE);
+}
+
+TEST_F(HipKfdPinFixEnvTest, ParsesValues) {
+    EXPECT_EQ(load("0"), HipKfdPinFix::OFF);
+    EXPECT_EQ(load("1"), HipKfdPinFix::PROBE);
+    EXPECT_EQ(load("force"), HipKfdPinFix::FORCE);
+    EXPECT_EQ(load("FORCE"), HipKfdPinFix::FORCE);
+    EXPECT_EQ(load("always"), HipKfdPinFix::PROBE);  // invalid keeps default
 }
 
 // max_wr_from_env distinguishes "the operator asked for this depth" from "this
@@ -991,6 +1018,83 @@ TEST_F(ContextPauseTtlEnvTest, EmptyStringKeepsDefault) {
     config.context_pause_ttl_ms = 17;
     loadGlobalConfig(config);
     EXPECT_EQ(config.context_pause_ttl_ms, 17);
+}
+
+// MC_RDMA_WORKER_IDLE_SPIN_US sets how long an RDMA transfer worker keeps
+// busy-polling after its device instance goes idle before it parks. The
+// default keeps the historical 100 ms; 0 parks immediately; the range is
+// capped at 10 s. A typo / out-of-range value must preserve the default.
+class RdmaWorkerIdleSpinEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_RDMA_WORKER_IDLE_SPIN_US"); }
+};
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, DefaultIs100msWhenUnset) {
+    ::unsetenv("MC_RDMA_WORKER_IDLE_SPIN_US");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 100000u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "1000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 1000u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, ZeroIsAccepted) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "0", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 0u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, MaxBoundaryIsApplied) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "10000000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 10000000u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, OutOfRangeKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "10000001", 1), 0);
+    GlobalConfig config;
+    config.rdma_worker_idle_spin_us = 11;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 11u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, NegativeKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "-1", 1), 0);
+    GlobalConfig config;
+    config.rdma_worker_idle_spin_us = 13;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 13u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, NonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "abc", 1), 0);
+    GlobalConfig config;
+    config.rdma_worker_idle_spin_us = 15;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 15u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, NumericSuffixKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "1000us", 1), 0);
+    GlobalConfig config;
+    config.rdma_worker_idle_spin_us = 17;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 17u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "", 1), 0);
+    GlobalConfig config;
+    config.rdma_worker_idle_spin_us = 19;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 19u);
 }
 
 }  // namespace

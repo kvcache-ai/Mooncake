@@ -64,7 +64,7 @@ struct ReplicateConfig {
 };
 ```
 
-`dfs_replica_num` may currently be `0` or `1`. When it is `1`, `replica_num >= 1` is required, so DFS-only placement is not supported. DFS replicas currently support only the `default` tenant and require the master and client DFS backends to be configured with the same shared root and shard layout. See the {ref}`DFS deployment documentation <dfs-storage>` for setup and lifecycle limitations. Native C++ clients must initialize a `DistributedStorageBackend` and attach it with `SetDfsStorageBackend()` before issuing DFS reads or writes. DFS descriptors are carried by each `PutStart`, `UpsertStart`, or query response; there is no client-side descriptor cache. The Python/RealClient setup path attaches the backend through `FileStorage`.
+`dfs_replica_num` may currently be `0` or `1`. DFS-only placement (`replica_num = 0`, `nof_replica_num = 0`, `dfs_replica_num = 1`) is supported; the DFS replica is then the object's only copy, so DFS eviction or removal deletes the object. DFS replicas currently support only the `default` tenant and require the master and client DFS backends to be configured with the same shared root and shard layout. See the {ref}`DFS deployment documentation <dfs-storage>` for setup and lifecycle limitations. Native C++ clients must initialize a `DistributedStorageBackend` and attach it with `SetDfsStorageBackend()` before issuing DFS reads or writes. DFS descriptors are carried by each `PutStart`, `UpsertStart`, or query response; there is no client-side descriptor cache. The Python/RealClient setup path attaches the backend through `FileStorage`.
 
 Soft pinning starts when the first replica becomes readable and has a fixed
 lifetime: reads do not extend it. `PRESERVE` keeps the committed deadline on an
@@ -74,6 +74,52 @@ cache, and values above the Master's configured maximum are rejected.
 Soft-pin state is not persisted in snapshots or the HA OpLog; after recovery or
 Standby promotion, restored objects are ordinary cache until a later write
 explicitly enables soft pinning again.
+
+### Managed Weight Revisions
+
+`MasterClient` and the Store client interface expose typed revision-management
+operations:
+
+```C++
+WeightRpcResult<WeightRevisionMetadata> BeginWeightImport(
+    const BeginWeightImportRequest& request);
+WeightRpcResult<WeightRevisionMetadata> CommitWeightImport(
+    const CommitWeightImportRequest& request);
+WeightRpcResult<WeightRevisionView> GetWeightRevision(
+    const GetWeightRevisionRequest& request);
+WeightRpcResult<ListWeightRevisionsResponse> ListWeightRevisions(
+    const ListWeightRevisionsRequest& request);
+WeightRpcResult<WeightRevisionLease> AcquireWeightRevisionLease(
+    const AcquireWeightRevisionLeaseRequest& request);
+WeightRpcResult<WeightResidencyOperation> StartWeightResidencyOperation(
+    const StartWeightResidencyOperationRequest& request);
+WeightRpcResult<WeightRevisionMetadata> DeleteWeightRevision(
+    const DeleteWeightRevisionRequest& request);
+```
+
+The same interface also provides abort, lease renew/release, and operation
+query calls. `WeightRpcResult<T>` preserves weight-management-domain errors
+separately from RPC transport errors. Commit, abort, lease acquisition,
+operation start, and deletion check the caller's expected metadata generation.
+Lease renewal and release use the lease identity. List requests use bounded
+deterministic pagination. Reconciliation is internal to the Master; clients
+start an operation and observe it through revision and operation queries.
+
+`QueryWeightOperation` returns a terminal operation when its `message` is
+`"completed"` or `"cancelled"`. Call `IsWeightOperationTerminal(operation.message)`
+to check both terminal outcomes. Cancellation preserves the original `operation`
+type (`EVICTING` or `REHYDRATING`), target, and progress; the operation type alone
+does not indicate whether work is still running.
+
+Upserts of existing managed weight payload or manifest members must explicitly
+provide the revision's `group_ids`; omitting them is rejected. This requirement
+does not apply to an ordinary new key outside a managed weight revision.
+
+The Weight metadata record contains one immutable manifest reference and aggregate
+lifecycle state. Tensor descriptors stay in `StoredWeightManifest`, while
+replica addresses stay in ordinary Store object metadata. See
+[Weight Management Architecture](../../design/mooncake-reshard/weight-management.md) for the
+complete ownership and recovery contract.
 
 ### Upsert
 

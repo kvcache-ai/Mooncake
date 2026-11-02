@@ -14,6 +14,7 @@
 
 #include "tent/runtime/platform.h"
 
+#include <cstdlib>
 #include <mutex>
 #include <unordered_set>
 #include <vector>
@@ -24,10 +25,13 @@
 #include "tent/platform/rocm.h"
 #elif defined(USE_SUNRISE)
 #include "tent/platform/sunrise.h"
-#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
+    defined(USE_MEMFABRIC)
 #include "tent/platform/ascend.h"
 #elif defined(USE_TPU)
 #include "tent/platform/tpu.h"
+#elif defined(USE_MLU)
+#include "tent/platform/mlu.h"
 #elif defined(USE_XPU)
 #include "tent/platform/xpu.h"
 #else
@@ -47,10 +51,13 @@ Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
         g_instance = std::make_shared<RocmPlatform>(conf);
 #elif defined(USE_SUNRISE)
         g_instance = std::make_shared<SunrisePlatform>(conf);
-#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
+    defined(USE_MEMFABRIC)
         g_instance = std::make_shared<AscendPlatform>(conf);
 #elif defined(USE_TPU)
         g_instance = std::make_shared<TpuPlatform>(conf);
+#elif defined(USE_MLU)
+            g_instance = std::make_shared<MluPlatform>(conf);
 #elif defined(USE_XPU)
             g_instance = std::make_shared<XpuPlatform>(conf);
 #else
@@ -62,6 +69,33 @@ Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
 
 Status Platform::synchronizeDevices(const Topology* topology) {
     (void)topology;
+    return Status::OK();
+}
+
+Status Platform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
+    (void)addr;
+    (void)length;
+    out = DmabufExport{};
+    return Status::NotImplemented(
+        "dma-buf export is not supported by this platform" LOC_MARK);
+}
+
+// Fallback for platforms without a pinned-host API: ordinary pageable
+// memory (see platform.h). Page alignment is required for O_DIRECT staging.
+Status Platform::allocatePinnedHost(void** pptr, size_t size) {
+    if (!pptr || size == 0)
+        return Status::InvalidArgument(
+            "Invalid pinned host allocation" LOC_MARK);
+    if (posix_memalign(pptr, 4096, size) != 0) {
+        *pptr = nullptr;
+        return Status::InternalError("posix_memalign failed" LOC_MARK);
+    }
+    return Status::OK();
+}
+
+Status Platform::freePinnedHost(void* ptr, size_t size) {
+    (void)size;
+    std::free(ptr);
     return Status::OK();
 }
 

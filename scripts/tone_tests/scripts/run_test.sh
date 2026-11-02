@@ -35,6 +35,9 @@ ARTIFACT_ID_VLLM=${ARTIFACT_ID_VLLM:-$ARTIFACT_ID}
 WHEEL_DIR=${WHEEL_DIR:-}
 WHEEL_DIR_SGLANG=${WHEEL_DIR_SGLANG:-$WHEEL_DIR}
 WHEEL_DIR_VLLM=${WHEEL_DIR_VLLM:-$WHEEL_DIR}
+# TENT runtime selector (classic by default). The TENT e2e job sets USE_TENT=true
+# via T-One env_info; it must be in .shrc so remote nodes inherit it.
+USE_TENT=${USE_TENT:-false}
 GIT_REPO=${GIT_REPO:-}
 MOONCAKE_ENV_UNHEALTHY=false
 
@@ -53,6 +56,29 @@ All_TEST_SCRIPTS_SGLANG=(
 All_TEST_SCRIPTS_VLLM=(
     "test_vllm_1p1d_erdma.sh"
 )
+
+list_tests() {
+    case "${1:-default}" in
+        default)
+            printf '%s\n' "${All_TEST_SCRIPTS_SGLANG[@]}" "${All_TEST_SCRIPTS_VLLM[@]}"
+            ;;
+        SGLANG)
+            printf '%s\n' "${All_TEST_SCRIPTS_SGLANG[@]}"
+            ;;
+        VLLM)
+            printf '%s\n' "${All_TEST_SCRIPTS_VLLM[@]}"
+            ;;
+        *)
+            echo "ERROR: Unknown framework '$1'. Use SGLANG or VLLM." >&2
+            return 1
+            ;;
+    esac
+}
+
+if [ "${1:-}" = "list-tests" ]; then
+    list_tests "${2:-default}"
+    exit $?
+fi
 
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-"$REMOTE_IP"}
 SSH_CMD=${SSH_CMD:-"ssh -o StrictHostKeyChecking=no"}

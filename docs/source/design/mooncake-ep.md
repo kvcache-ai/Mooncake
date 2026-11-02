@@ -115,6 +115,52 @@ The runtime reports whether IBGDA is disabled and whether the fast path is usabl
 through native helper methods surfaced in Python. The Python wrapper updates its
 fallback flag after metadata exchange.
 
+(mooncake-ep-intel-xpu)=
+### Intel XPU
+
+On Intel XPU the native buffer is a SYCL implementation
+(`mooncake-ep/src/xpu/`) with the same Python-facing methods, so
+`mooncake_ep_buffer.Buffer`, its outputs and its handle are unchanged. The
+Python wrapper and the `ep_py.cpp` bindings are shared with CUDA, as is the
+host bookkeeping that pairs each combine with its dispatch
+(`mooncake_ep_dispatch_slots.h`); the kernels and transport are XPU-specific.
+It provides the P2P / IPC fast path only:
+
+- Peers share one device buffer through Level Zero IPC handles, exchanged over
+  the process group like the CUDA IPC handles. Ranks must be on one host and in
+  one PID namespace, their devices need peer access to each other, and each rank
+  must be allowed to `pidfd_getfd` the others: Yama `ptrace_scope` 0 or 1, or 2
+  with `CAP_SYS_PTRACE`. Otherwise, and for multi-node groups, the Python
+  fallback is used.
+- Data is pulled rather than pushed: each rank stages what it sends in its own
+  half of the buffer and only writes small ready flags to peers. On PCIe a GPU
+  writing to several peers at once is far slower than one reading from several.
+- A token that picks several experts on one rank crosses PCIe once: dispatch
+  pulls it once and copies it to each of those experts locally. When
+  `dispatch()` is given `topk_weights`, combine also sums each token's rows on
+  the expert side, so one row per rank travels back. The partial sum is rounded
+  to BF16 once.
+- Kernels run on the caller's `torch.xpu` stream. Zero-copy combine and the
+  elastic buffer are not supported.
+
+## JIT kernel compilation
+
+On NVIDIA GPUs, Mooncake EP compiles its dispatch and combine kernels, including
+the elastic buffer kernels, at runtime. Parameters such as `hidden`,
+`num_experts`, and `num_topk` are compile-time template arguments of these
+kernels. Without JIT, the library can only contain a fixed set of
+instantiations (for example, `hidden` in {2048, 2560, 3072, 3584, 4096, 5120,
+6144, 7168, 8192}), and any other value fails with an "Unsupported" error. With
+JIT, the first call with a new combination of values runs nvcc to build that
+instantiation and caches the cubin on disk; later calls and later runs reuse it.
+
+JIT is currently not supported on other backends.
+
+At runtime this needs nvcc, the kernel headers, and a writable cache directory.
+Installed wheels ship the kernel headers, so they usually need no setup. See
+[JIT kernel compilation](../deployment/mooncake-ep-jit.md) for path lookup,
+cache behavior, and environment variables.
+
 ## Metadata exchange
 
 During `Buffer.connect()`, ranks exchange:
@@ -236,6 +282,12 @@ python python/tests/ep/test_ep_grid.py
 
 # EP wrapper smoke test
 python python/tests/ep/test_mooncake_ep.py
+
+# Intel XPU correctness test (exact payloads, hooks, two batches, timeouts)
+python python/tests/ep/test_mooncake_ep_xpu.py --num-ranks 4 --num-experts 256
+
+# Host-only test of the dispatch bookkeeping shared by every backend
+ctest --test-dir build -R ep_dispatch_slots_test
 ```
 
 Adapt launch commands to the target environment and number of GPUs.
@@ -245,3 +297,4 @@ Adapt launch commands to the target environment and number of GPUs.
 - [Mooncake PG design](mooncake-backend-pg.md)
 - [Python API reference](../api-reference/python/ep-backend.md)
 - [PG/EP troubleshooting](../troubleshooting/pg-ep-troubleshooting.md)
+- [Mooncake EP JIT kernel compilation](../deployment/mooncake-ep-jit.md)

@@ -21,27 +21,15 @@ Optional:
 
 import ctypes
 import os
-import sys
 import time
 import uuid
 from contextlib import contextmanager
 
 import numpy as np
 
-repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-build_dir = os.environ.get("MOONCAKE_BUILD_DIR", "build")
-build_store = os.path.join(repo_root, build_dir, "mooncake-integration")
-wheel_dir = os.path.join(repo_root, "mooncake-wheel")
-for d in [build_store, wheel_dir]:
-    if os.path.isdir(d) and d not in sys.path:
-        sys.path.insert(0, d)
-
-try:
-    import store
-    from mooncake.mooncake_config import MooncakeConfig
-except ImportError as e:
-    print(f"❌ Import failed: {e}")
-    sys.exit(1)
+os.environ["MOONCAKE_STORE_BACKEND"] = "cpp"
+from mooncake import _store as store
+from mooncake.mooncake_config import MooncakeConfig
 
 BATCH_SIZES = [1, 4, 16, 64, 128, 256]
 NUM_WARMUP = 10
@@ -249,7 +237,6 @@ def main():
     print("EngramStore Backend Benchmark")
     print("  Config: 1 token, Mooncake row-id lookup only")
     print("  Batch sizes: 1, 4, 16, 64, 128, 256")
-    print(f"  Build dir: {build_dir}")
     print(f"  Protocol: {os.environ.get('MOONCAKE_PROTOCOL', '<unset>')}")
     print(f"  Allow populate fallback: {ALLOW_POPULATE_FALLBACK}")
     print("=" * 60)

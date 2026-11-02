@@ -120,7 +120,7 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaDeviceGetAttribute musaDeviceGetAttribute
 #define cudaEvent_t musaEvent_t
 #define cudaEventCreateWithFlags musaEventCreateWithFlags
-#define cudaEventDisableTiming MU_EVENT_DISABLE_TIMING
+#define cudaEventDisableTiming musaEventDisableTiming
 #define cudaEventDestroy musaEventDestroy
 #define cudaEventQuery musaEventQuery
 #define cudaEventRecord musaEventRecord

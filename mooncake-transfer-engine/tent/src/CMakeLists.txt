@@ -42,13 +42,22 @@ if(USE_HYLINK)
   target_compile_definitions(tent_interface INTERFACE USE_HYLINK)
 endif()
 
-# GDS
+# GDS. With USE_XPU_GDS, cufile.h and libcufile.so come from a cuFile-compatible
+# library for Intel XPU; pass -DCUFILE_INCLUDE=<dir> and -DCUFILE_LIB=<path>
+# when they are outside the default search paths.
 find_library(CUFILE_LIB cufile HINTS ${CUDAToolkit_LIBRARY_DIR})
 find_path(CUFILE_INCLUDE cufile.h HINTS ${CUDAToolkit_INCLUDE_DIRS})
-if(USE_CUDA
-   AND CUDAToolkit_FOUND
-   AND CUFILE_LIB
-   AND CUFILE_INCLUDE)
+if(USE_XPU_GDS AND NOT (CUFILE_LIB AND CUFILE_INCLUDE))
+  message(
+    FATAL_ERROR
+      "USE_XPU_GDS=ON requires cufile.h and libcufile.so from a "
+      "cuFile-compatible library (found CUFILE_INCLUDE='${CUFILE_INCLUDE}', "
+      "CUFILE_LIB='${CUFILE_LIB}'). Pass -DCUFILE_INCLUDE=<dir> and "
+      "-DCUFILE_LIB=<path/to/libcufile.so>.")
+endif()
+if(CUFILE_LIB
+   AND CUFILE_INCLUDE
+   AND ((USE_CUDA AND CUDAToolkit_FOUND) OR USE_XPU_GDS))
   message(STATUS "GDS: Enabled")
   target_compile_definitions(tent_interface INTERFACE USE_GDS)
   target_include_directories(tent_interface INTERFACE ${CUFILE_INCLUDE})
@@ -67,6 +76,7 @@ if(IBVERBS_LIB AND IBVERBS_INCLUDE)
   target_compile_definitions(tent_interface INTERFACE USE_RDMA)
   target_include_directories(tent_interface INTERFACE ${IBVERBS_INCLUDE})
   target_link_libraries(tent_interface INTERFACE ${IBVERBS_LIB})
+  set(TENT_FEATURE_RDMA ON)
   # ibv_port_attr::active_speed is a uint8_t and reads 0 for XDR (encoding 256);
   # newer rdma-core adds active_speed_ex to carry it.
   include(CheckStructHasMember)
@@ -96,14 +106,66 @@ else()
   message(STATUS "RDMA: Disabled")
 endif()
 
+# libfabric (EFA, and tcp;ofi_rxm for tests). USE_EFA/USE_CXI already
+# resolve libfabric in mooncake-common/common.cmake.
+if(USE_FABRIC
+   OR USE_EFA
+   OR USE_CXI)
+  if(NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
+    find_path(
+      LIBFABRIC_INCLUDE_DIR rdma/fabric.h
+      HINTS /opt/amazon/efa/include
+      PATH_SUFFIXES include)
+    find_library(
+      LIBFABRIC_LIBRARY fabric
+      HINTS /opt/amazon/efa/lib
+      PATH_SUFFIXES lib lib64)
+  endif()
+  if(NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
+    if(USE_FABRIC)
+      message(
+        FATAL_ERROR
+          "TENT fabric transport needs libfabric. Set LIBFABRIC_INCLUDE_DIR and LIBFABRIC_LIBRARY."
+      )
+    endif()
+    # USE_EFA/USE_CXI wheel builds may provision libfabric headers only (the
+    # classic engine dlopens the library at runtime). With no linkable library,
+    # build TENT without its fabric transport instead of failing the configure.
+    message(WARNING "libfabric library not found; TENT fabric transport disabled")
+    set(TENT_WITH_FABRIC
+        OFF
+        CACHE INTERNAL "")
+    message(STATUS "Fabric (libfabric): Disabled")
+  else()
+    set(TENT_WITH_FABRIC
+        ON
+        CACHE INTERNAL "")
+    message(STATUS "Fabric (libfabric): Enabled, ${LIBFABRIC_LIBRARY}")
+    target_compile_definitions(tent_interface INTERFACE USE_FABRIC)
+    target_include_directories(tent_interface INTERFACE ${LIBFABRIC_INCLUDE_DIR})
+    target_link_libraries(tent_interface INTERFACE ${LIBFABRIC_LIBRARY})
+  endif()
+else()
+  set(TENT_WITH_FABRIC
+      OFF
+      CACHE INTERNAL "")
+  message(STATUS "Fabric (libfabric): Disabled")
+endif()
+
 # io_uring
 if(TARGET Mooncake::liburing)
   message(STATUS "Uring: Enabled")
   target_compile_definitions(tent_interface INTERFACE USE_URING)
   target_link_libraries(tent_interface INTERFACE Mooncake::liburing)
+  set(TENT_FEATURE_URING ON)
 else()
   message(STATUS "Uring: Disabled")
 endif()
+
+# Configure diagnostics only after optional local capabilities have been
+# detected. The resulting library is deliberately independent of tent_interface
+# so the CLI cannot initialize transports or device runtimes.
+add_subdirectory(diagnostics)
 
 if(USE_SUNRISE)
   target_compile_definitions(tent_interface INTERFACE USE_SUNRISE)
@@ -153,6 +215,7 @@ foreach(
   platform_sunrise
   platform_tpu
   platform_xpu
+  platform_mlu
   tent_xport_gds
   tent_xport_uring
   tent_xport_bufio
@@ -168,8 +231,11 @@ foreach(
   tent_xport_sunrise_link
   tent_xport_tpu
   tent_xport_xpu
+  tent_xport_mlu
   tent_xport_mpcomm
   tent_xport_hylink
+  tent_xport_fabric
+  tent_xport_memfabric
   tent_metrics)
   if(TARGET ${tgt})
     target_link_libraries(tent_link_group INTERFACE ${tgt})

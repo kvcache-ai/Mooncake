@@ -197,6 +197,20 @@ get_whl(){
     fi
     echo "Found wheel file: $mooncake_whl_file"
 
+    # Fail on arch mismatch here; otherwise pip later dies with the cryptic
+    # "not a supported wheel on this platform" far from the real cause.
+    local host_arch wheel_arch
+    host_arch=$(uname -m)
+    case "$mooncake_whl_file" in
+        *x86_64*)  wheel_arch="x86_64" ;;
+        *aarch64*) wheel_arch="aarch64" ;;
+        *)         wheel_arch="" ;;
+    esac
+    if [ -n "$wheel_arch" ] && [ "$wheel_arch" != "$host_arch" ]; then
+        echo "ERROR: wheel arch mismatch: $mooncake_whl_file is $wheel_arch but this host is $host_arch (wrong CI artifact selected?)" >&2
+        return 1
+    fi
+
     echo "Successfully downloaded and extracted wheel file to $whls_path"
     return 0
 }

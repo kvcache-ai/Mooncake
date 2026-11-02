@@ -42,39 +42,39 @@ class AscendDirectTransport : public Transport {
     ~AscendDirectTransport() override;
 
     Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest> &entries) override;
+                          const std::vector<TransferRequest>& entries) override;
 
     Status submitTransferTask(
-        const std::vector<TransferTask *> &task_list) override;
+        const std::vector<TransferTask*>& task_list) override;
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
-                             TransferStatus &status) override;
+                             TransferStatus& status) override;
 
-    int install(std::string &local_server_name,
+    int install(std::string& local_server_name,
                 std::shared_ptr<TransferMetadata> meta,
                 std::shared_ptr<Topology> topo) override;
 
-    const char *getName() const override { return "ascend_direct"; }
+    const char* getName() const override { return "ascend_direct"; }
 
-    int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location, bool remote_accessible,
+    int registerLocalMemory(void* addr, size_t length,
+                            const std::string& location, bool remote_accessible,
                             bool update_metadata) override;
 
-    int unregisterLocalMemory(void *addr, bool update_metadata) override;
+    int unregisterLocalMemory(void* addr, bool update_metadata) override;
 
     int registerLocalMemoryBatch(
-        const std::vector<Transport::BufferEntry> &buffer_list,
-        const std::string &location) override;
+        const std::vector<Transport::BufferEntry>& buffer_list,
+        const std::string& location) override;
 
     int unregisterLocalMemoryBatch(
-        const std::vector<void *> &addr_list) override;
+        const std::vector<void*>& addr_list) override;
 
    private:
     int allocateLocalSegmentID();
 
     // Add one engine to segment desc
     int addEngineToSegmentDesc(int32_t device_id, aclrtContext context,
-                               const std::string &host_ip, SegmentDesc *desc);
+                               const std::string& host_ip, SegmentDesc* desc);
 
     int32_t base_port_ = 20000;
     // Mirrors globalConfig().ascend_agent_mode. ascend_agent_mode is enabled
@@ -93,7 +93,14 @@ class AscendDirectTransport : public Transport {
     // Store TE's fabric setting that leaked into the process-global flag. All
     // transfer-time decisions read this member, not the global.
     bool use_fabric_mem_{false};
+    // Resolved protocol_desc contains "hccs:device". Captured at install,
+    // with use_fabric_mem_, so a later clear of ascend_store_te_init does
+    // not change the protocol this TE was created under.
+    bool hccs_device_protocol_{false};
     std::vector<aclrtContext> local_engine_contexts_;
+    // Same order as local_engine_contexts_. ACL logic ids, not a second
+    // aclrtGetDevice call at dispatcher start.
+    std::vector<int32_t> local_engine_device_ids_;
 
     std::unique_ptr<TransferExecutorBase> transfer_executor_;
     std::unique_ptr<ISliceDispatcher> dispatcher_;

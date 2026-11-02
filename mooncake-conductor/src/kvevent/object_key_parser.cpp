@@ -75,14 +75,16 @@ bool IsVllmHashText(std::string_view value) {
 }
 
 std::string FillProjectedHash(std::string_view hash,
-                              ParsedSglangObjectKey* result, bool first_half) {
+                              ParsedSglangObjectKey* result) {
     hash = StripOptionalHexPrefix(hash);
     if (!IsHashText(hash)) return "object key hash is not valid hex";
     // IsHashText has restricted the input to hex digits, where ASCII lowering
     // only touches A-F.
     result->full_hash = AsciiToLower(hash);
     result->prefix.value = 0;
-    const size_t offset = first_half ? 0 : result->full_hash.size() - 16;
+    // The index projection is the low 64 bits of the digest, so only the last
+    // sixteen hex digits contribute.
+    const size_t offset = result->full_hash.size() - 16;
     for (size_t index = offset; index < offset + 16; ++index) {
         const char character = result->full_hash[index];
         const uint64_t nibble =
@@ -179,7 +181,7 @@ std::string ParseVllmObjectKey(const std::string& object_key,
             result->namespace_prefix = parts.size() == 3
                                            ? std::string(parts[0])
                                            : JoinParts(parts, 0, hash_index);
-            return FillProjectedHash(parts[hash_index], result, false);
+            return FillProjectedHash(parts[hash_index], result);
         }
     }
 
@@ -217,7 +219,7 @@ std::string ParseVllmObjectKey(const std::string& object_key,
         result->logical_key = object_key;
         result->namespace_prefix =
             index > 1 ? JoinParts(parts, 0, index - 1) : "";
-        return FillProjectedHash(parts[hash_index], result, false);
+        return FillProjectedHash(parts[hash_index], result);
     }
 
     // vLLM-Ascend keys have pcp/dcp/head_or_tp_rank, followed by optional
@@ -269,7 +271,7 @@ std::string ParseVllmObjectKey(const std::string& object_key,
         }
         result->logical_key = object_key;
         result->namespace_prefix = std::string(parts[0]);
-        return FillProjectedHash(parts[hash_index], result, false);
+        return FillProjectedHash(parts[hash_index], result);
     }
 
     return "unrecognized vLLM/vLLM-Ascend object_key";
