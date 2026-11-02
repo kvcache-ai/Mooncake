@@ -10,6 +10,40 @@ descriptor-based DFS replicas. It is selected explicitly with
 `MOONCAKE_DFS_FS_ADAPTER=hf3fs`; the legacy `--root_fs_dir` option does not
 enable it, and it does not automatically fall back to POSIX I/O.
 
+Descriptor batches use the per-thread USRBIO read or write ring to keep several
+positional requests in flight. Each request owns a separate slice of the shared
+staging buffer until its completion is reaped. Batches larger than the ring and
+requests larger than a staging slice are processed in bounded waves; completion
+order does not change the order of returned results. A short transfer or an I/O
+error fails only the affected request. A failure to reap completions retires the
+thread's rings and staging buffer before another call can reuse them. An
+unexpected completion identity fails its wave, which is drained before the
+resources are retired.
+
+## Failed writes and range reuse
+
+Retiring a client ring does not cancel I/O already accepted by a 3FS worker.
+After a fatal completion-wait error, writes can still land in the original
+inode after the adapter returns failure. Closing the file descriptor or
+recreating the rings does not make those file ranges safe to reuse.
+
+Conservatively abandon allocated ranges for positional requests that return
+`FILE_WRITE_FAIL`. Retry at fresh, nonoverlapping offsets or in a new inode;
+do not overwrite or recycle the failed ranges unless all earlier I/O is known
+to have finished. The adapter cannot establish that after a fatal wait error.
+
+## Tests
+
+Both tests require `USE_3FS=ON` and the installed SDK header.
+
+- `hf3fs_adapter_batch_test` is a unit test. It replaces the USRBIO API with a
+  fake defined in the test, so it needs no mounted cluster, and covers
+  failure paths such as short transfers, ring pressure, and failed waits.
+- `dfs_hf3fs_test` is an integration test against the real API, including
+  batches that exceed the ring and per-entry buffer capacities. It uses
+  `MOONCAKE_DFS_ROOT_DIR` (default: `/mnt/3fs/mooncake_test`) and skips
+  without an hf3fs mount.
+
 ## Prerequisites
 
 ### 1. HF3FS installation
@@ -29,6 +63,48 @@ cmake -DUSE_3FS=ON ...
 ```
 
 Then build and install Mooncake as usual.
+
+## USRBIO resource settings
+
+The adapter reads these optional environment variables once during
+initialization:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MOONCAKE_HF3FS_IOV_SIZE` | `16777216` (16 MiB) | Staging buffer size in bytes per ring entry |
+| `MOONCAKE_HF3FS_IOR_ENTRIES` | `8` | Requested entries in each thread's read and write ring |
+
+Each I/O thread allocates one shared staging buffer of
+`MOONCAKE_HF3FS_IOR_ENTRIES * MOONCAKE_HF3FS_IOV_SIZE` bytes for its read and
+write rings. The defaults allocate `8 * 16 MiB = 128 MiB` per thread.
+
+For example, configure 64 MiB per entry and 32 entries per ring (2 GiB of
+staging memory per thread) before starting a process that uses the adapter:
+
+```bash
+export MOONCAKE_HF3FS_IOV_SIZE=67108864
+export MOONCAKE_HF3FS_IOR_ENTRIES=32
+```
+
+Values must be positive decimal integers. The product of the two settings must
+fit in `ptrdiff_t`, and ring entries must be less than `INT_MAX` because 3FS
+reserves one additional internal slot. Empty, malformed, zero, negative, or
+out-of-range values fail adapter initialization. Resource allocation can still
+fail when the configured sizes exceed available shared memory or 3FS limits.
+
+Each ring entry's staging slice is registered with 3FS as a separate buffer
+block, so `MOONCAKE_HF3FS_IOV_SIZE` must stay within the 3FS client's
+buffer-registration limit. Otherwise buffer creation still succeeds, but every
+I/O through the adapter fails; on a local test cluster, entries larger than
+1 GiB failed with permission errors.
+
+These are process-local tuning settings and may differ between clients and the
+master. Thread resources are allocated lazily on first I/O and retain the
+settings captured at initialization. Restart the process to apply changes.
+Staging memory scales with both the ring entry count and the number of I/O
+threads. Each active request uses a separate slice of up to
+`MOONCAKE_HF3FS_IOV_SIZE` bytes; larger requests use multiple waves. Increasing
+ring entries increases total staging memory and preserves the per-entry size.
 
 ## Usage
 
