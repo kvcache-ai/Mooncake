@@ -173,6 +173,37 @@ TEST_F(MasterServiceSSDTest, ForceEvictCapUsesBytesForGlobalAndTenantEviction) {
     }
 }
 
+TEST_F(MasterServiceSSDTest, ForceEvictByteCapAbove32Bits) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.offload_on_evict = true;
+    config.offload_force_evict = true;
+    config.default_kv_lease_ttl = 0;
+    config.eviction_high_watermark_ratio = 1.0;
+    config.offload_queue_limits.use_bytes = true;
+    config.offload_queue_limits.max_pending_bytes = (1ULL << 33) + 8192;
+    config.offload_cap_ratio = 0.5;
+    MasterService service(config);
+    const auto client = generate_uuid();
+    MountMemoryAndLocalDisk(service, client, "large-byte-cap", 0x1300000000);
+    for (int i = 0; i < 10; ++i) {
+        const auto key = "large-cap-key-" + std::to_string(i);
+        ASSERT_TRUE(service
+                        .PutStart(client, key, TenantId::Default(), 1536,
+                                  {.replica_num = 1})
+                        .has_value());
+        ASSERT_TRUE(
+            service
+                .PutEnd(client, key, TenantId::Default(), ReplicaType::MEMORY)
+                .has_value());
+    }
+    MasterServiceTestPeer peer(service);
+    peer.RunBatchEvictForTesting(1.0, 1.0);
+    auto tasks = service.OffloadObjectHeartbeat(client, true);
+    ASSERT_TRUE(tasks.has_value());
+    EXPECT_EQ(tasks->size(), 10);
+}
+
 TEST_F(MasterServiceSSDTest, PutRevokeProcessingDiskKeepsSsdTotal) {
     auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
     auto& metrics = MasterMetricManager::instance();

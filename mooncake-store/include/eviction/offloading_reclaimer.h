@@ -17,6 +17,7 @@
 //   force_evict lets it go without one. With force_evict, a run that has
 //   queued `cap` offloads lets the rest go without one too.
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -46,8 +47,8 @@ class OffloadQueue {
 class OffloadingReclaimer final : public Reclaimer {
    public:
     struct Options {
-        // How many offloads one run may queue; enforced with force_evict.
-        long cap = 0;
+        // Offload count or payload bytes per run; enforced with force_evict.
+        uint64_t cap = 0;
         // Let an object go without its offload rather than keep it.
         bool force_evict = false;
         bool cap_in_bytes = false;

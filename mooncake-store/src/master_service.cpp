@@ -593,7 +593,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
             .allow_evict_soft_pinned = allow_evict_soft_pinned_objects_,
             .offload_on_evict = offload_on_evict_,
             .offload = {
-                .cap = static_cast<long>(
+                .cap = static_cast<uint64_t>(
                     static_cast<long double>(
                         config.offload_queue_limits.use_bytes
                             ? config.offload_queue_limits.max_pending_bytes

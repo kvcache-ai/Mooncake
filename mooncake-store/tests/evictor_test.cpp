@@ -733,6 +733,25 @@ TEST_F(OffloadingReclaimerTest, OversizedByteCapOnlyForcesWhenEnabled) {
     EXPECT_EQ(unforced->outcome, Outcome::kOffloadQueued);
 }
 
+TEST_F(OffloadingReclaimerTest, ByteCapExceeds32BitRange) {
+    Publish("a", "fits", seconds(10));
+    Publish("a", "exceeds", seconds(10));
+    constexpr uint64_t cap = 5ULL * 1024 * 1024 * 1024;
+    eviction::Report so_far;
+    so_far.offload_bytes = cap - 128;
+    auto fits =
+        Apply("fits", {.cap = cap, .force_evict = true, .cap_in_bytes = true},
+              so_far);
+    ASSERT_TRUE(fits.has_value());
+    EXPECT_EQ(fits->outcome, Outcome::kOffloadQueued);
+    so_far.Add(*fits);
+    auto exceeds =
+        Apply("exceeds",
+              {.cap = cap, .force_evict = true, .cap_in_bytes = true}, so_far);
+    ASSERT_TRUE(exceeds.has_value());
+    EXPECT_EQ(exceeds->reason, eviction::DropReason::kOffloadCap);
+}
+
 // --- Report observers --------------------------------------------------------
 
 TEST_F(EvictorTest, MetricsLeaveAPoolRunToItsCaller) {
