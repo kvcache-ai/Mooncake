@@ -29,13 +29,24 @@ constexpr size_t SZ_512MB = 512 * 1024 * 1024;
 constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
 constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
 
+class DmaBufferAllocator;
+
+/**
+ * @brief Allocates memory for the `BufferAllocator` class.
+ * @param total_size The total size of the memory to allocate.
+ * @param dma_allocator Optional DMA-specialized allocator (e.g. SPDK hugepage
+ * pool). When non-null and total_size > 0, it takes precedence over the
+ * generic path; when null the historical protocol→VRAM→aligned_alloc order is
+ * preserved.
+ * @return A pointer to the allocated memory.
+ */
 void* allocate_buffer_allocator_memory(
     size_t total_size, const std::string& protocol = "",
     size_t alignment = facebook::cachelib::Slab::kSize,
-    bool use_spdk_dma = false);
+    DmaBufferAllocator* dma_allocator = nullptr);
 
 void free_memory(const std::string& protocol, void* ptr,
-                 bool use_spdk_dma = false);
+                 DmaBufferAllocator* dma_allocator = nullptr);
 
 inline size_t align_up(size_t size, size_t alignment) {
     if (alignment == 0) {
@@ -60,6 +71,14 @@ void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
 [[nodiscard]] bool is_mmap_arena_allocation(const void* ptr);
 
 void free_buffer_mmap_memory(void* ptr, size_t total_size);
+
+// The entries of `nodes` this process may allocate from, in order: its
+// cpuset's mems_allowed, narrowed to an MPOL_BIND task policy if it has one.
+// mbind() to a node outside the cpuset fails with EINVAL, and binding to one
+// outside the task policy overrides it, so a NUMA-segmented buffer must use
+// only these. Returns `nodes` unchanged if the kernel does not answer (a
+// seccomp profile that blocks get_mempolicy blocks mbind too).
+std::vector<int> FilterNumaNodesToAllowed(const std::vector<int>& nodes);
 
 void* allocate_buffer_numa_segments(size_t total_size,
                                     const std::vector<int>& numa_nodes,

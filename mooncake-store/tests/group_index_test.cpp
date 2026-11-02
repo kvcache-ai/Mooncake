@@ -1,4 +1,4 @@
-#include "group_index.h"
+#include "metadata/group_index.h"
 
 #include <atomic>
 #include <cstddef>

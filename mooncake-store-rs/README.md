@@ -95,8 +95,8 @@ Python facade and does not change the standalone command behavior.
 
 | Topic | Guide |
 |-------|-------|
-| Source-checkout build and wheel | [Store-RS quickstart](../docs/source/getting_started/store-rs.md) |
-| Feature overview | [Store-RS features](../docs/source/getting_started/store-rs-features.md) |
+| Source-checkout build and wheel | [Build with Store-RS](../docs/source/getting_started/build.md#build-with-store-rs) |
+| Feature overview | [Store-RS features](../docs/source/design/store/store-rs/features.md) |
 | Rust integration | [Rust API](../docs/source/api-reference/rust/store-rs.md) |
 | Python facade and Store-RS semantics | [Python API](../docs/source/api-reference/python/store-rs.md) |
 | Configuration and deployment | [Store-RS deployment guides](../docs/source/deployment/store-rs/index.md) |

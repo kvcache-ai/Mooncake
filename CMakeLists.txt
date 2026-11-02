@@ -24,6 +24,8 @@ option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE
        "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_STORE_RUST "build the Rust bindings for the Mooncake Store" ON)
+option(WITH_CONDUCTOR_RUST
+       "build the Rust bindings for the Mooncake Conductor client" OFF)
 option(
   WITH_STORE_RS
   "build the Rust-native Mooncake Store implementation (mooncake-store-rs)"
@@ -41,6 +43,18 @@ if(MOONCAKE_ENABLE_TEST_FAILPOINTS)
 endif()
 option(MOONCAKE_ENABLE_OPLOG_PERF_METRICS
        "Enable detailed batch OpLog performance metrics" OFF)
+
+# Without TENT only Mooncake EP builds for XPU: the Store's XPU device gets its
+# SYCL flags from TENT's platform library. Checked before the Store's
+# dependencies are looked up, which would fail first and less clearly.
+if(USE_XPU
+   AND NOT USE_TENT
+   AND WITH_STORE)
+  message(
+    FATAL_ERROR
+      "USE_XPU=ON without USE_TENT=ON builds Mooncake EP only. Re-run cmake with -DWITH_EP=ON -DWITH_STORE=OFF, or with -DUSE_TENT=ON."
+  )
+endif()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
 if(SKBUILD)
@@ -114,6 +128,9 @@ endif()
 if(WITH_STORE OR (WITH_TE AND USE_TENT))
   mooncake_provide_liburing()
 endif()
+if(WITH_TE AND USE_TENT)
+  mooncake_provide_cli11()
+endif()
 if((WITH_TE AND USE_REDIS) OR (WITH_STORE AND STORE_USE_REDIS))
   mooncake_provide_hiredis(REQUIRED)
 elseif(WITH_TE AND USE_TENT)
@@ -124,6 +141,11 @@ endif()
 add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
 
 add_subdirectory(mooncake-common)
+if(BUILD_UNIT_TESTS)
+  # Tests of the EP code shared across backends: host-only, so they run
+  # without WITH_EP or a GPU.
+  add_subdirectory(mooncake-ep/tests)
+endif()
 include_directories(mooncake-common/etcd)
 include_directories(mooncake-common/k8s-lease)
 include_directories(mooncake-common/include)
@@ -158,13 +180,27 @@ if(WITH_STORE_RUST)
   add_subdirectory(mooncake-store/rust)
 endif()
 
+if(WITH_CONDUCTOR_RUST)
+  if(NOT WITH_CONDUCTOR)
+    message(FATAL_ERROR "WITH_CONDUCTOR_RUST=ON requires WITH_CONDUCTOR=ON")
+  endif()
+  message(STATUS "Mooncake Conductor Rust bindings will be built")
+  add_subdirectory(mooncake-conductor/rust)
+endif()
+
 if (WITH_STORE_RS)
   message(STATUS "Mooncake Store Rust-native implementation (store-rs) will be built")
   add_subdirectory(mooncake-store-rs)
 endif()
 
 option(EP_USE_IDE "Enable intelligent indexing for IDEs" OFF)
-if(WITH_EP)
+if(WITH_EP AND USE_XPU)
+  # Mooncake PG is CUDA/MUSA/MACA-only; the XPU EP bootstraps over any
+  # torch.distributed group, so only the EP module is built.
+  message(
+    STATUS "WITH_EP enabled on Intel XPU: building the SYCL Mooncake EP module")
+  add_subdirectory(mooncake-ep)
+elseif(WITH_EP)
   add_subdirectory(mooncake-pg)
   include_directories(mooncake-pg/include)
 
