@@ -317,6 +317,26 @@ bool Contains(const std::vector<int> &nodes, int node) {
     return std::find(nodes.begin(), nodes.end(), node) != nodes.end();
 }
 
+// Anonymous mapping of exactly [ptr, ptr + size) with ptr 2MB-aligned, so
+// every PMD in it can be backed by a THP. Over-reserves by one huge page and
+// trims. Returns MAP_FAILED on failure, like mmap().
+void *mmap_thp_aligned(size_t size, int flags) {
+    const size_t reserve_size = size + SZ_2MB;
+    void *raw =
+        mmap(nullptr, reserve_size, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (raw == MAP_FAILED) return MAP_FAILED;
+    const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(raw);
+    const uintptr_t addr = align_up(raw_addr, SZ_2MB);
+    if (addr > raw_addr) {
+        munmap(raw, addr - raw_addr);
+    }
+    const uintptr_t tail = addr + size;
+    if (raw_addr + reserve_size > tail) {
+        munmap(reinterpret_cast<void *>(tail), raw_addr + reserve_size - tail);
+    }
+    return reinterpret_cast<void *>(addr);
+}
+
 }  // namespace
 
 std::vector<int> FilterNumaNodesToAllowed(const std::vector<int> &nodes) {
@@ -391,13 +411,23 @@ void *allocate_buffer_numa_segments(size_t total_size,
     } else if (page_size != static_cast<size_t>(getpagesize())) {
         flags |= MAP_HUGETLB;
     }
-    void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
+    const bool thp = !(flags & MAP_HUGETLB);
+    void *ptr =
+        thp ? mmap_thp_aligned(map_size, flags)
+            : mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (ptr == MAP_FAILED) {
         LOG(ERROR) << "mmap failed (hugepage="
                    << ((flags & MAP_HUGETLB) ? "yes" : "no")
                    << "), size=" << map_size << ", errno=" << errno << " ("
                    << strerror(errno) << ")";
         return nullptr;
+    }
+    // Same reason as in allocate_buffer_thp_interleaved(): 4KB-backed, the
+    // segment needs 512x more NIC page-table entries, and ibv_reg_mr fails
+    // (EINVAL/ENOMEM) once a few ranks register hundreds of GB each.
+    if (thp && madvise(ptr, map_size, MADV_HUGEPAGE) != 0) {
+        LOG(WARNING) << "madvise(MADV_HUGEPAGE) failed, errno=" << errno << " ("
+                     << strerror(errno) << "); segment may be 4KB backed";
     }
 
     // bind each region to its NUMA node
@@ -442,28 +472,15 @@ void *allocate_buffer_thp_interleaved(size_t total_size) {
         return nullptr;
     }
 
-    // Over-reserve by one huge page and trim, so the returned range is
-    // 2MB-aligned and every PMD in it can be backed by a THP. The trimmed
-    // mapping is exactly [ptr, ptr + total_size), which is what
+    // The mapping is exactly [ptr, ptr + total_size), which is what
     // free_buffer_mmap_memory() unmaps.
-    const size_t reserve_size = total_size + kThpSize;
-    void *raw = mmap(nullptr, reserve_size, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (raw == MAP_FAILED) {
-        LOG(ERROR) << "mmap failed, size=" << reserve_size
+    void *ptr = mmap_thp_aligned(total_size,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE);
+    if (ptr == MAP_FAILED) {
+        LOG(ERROR) << "mmap failed, size=" << total_size + kThpSize
                    << ", errno=" << errno << " (" << strerror(errno) << ")";
         return nullptr;
     }
-    const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(raw);
-    const uintptr_t addr = align_up(raw_addr, kThpSize);
-    if (addr > raw_addr) {
-        munmap(raw, addr - raw_addr);
-    }
-    const uintptr_t tail = addr + total_size;
-    if (raw_addr + reserve_size > tail) {
-        munmap(reinterpret_cast<void *>(tail), raw_addr + reserve_size - tail);
-    }
-    void *ptr = reinterpret_cast<void *>(addr);
 
     // Request THP explicitly instead of relying on the system default or on
     // GLIBC_TUNABLES=glibc.malloc.hugetlb=1. With THP enabled=madvise a 4KB
