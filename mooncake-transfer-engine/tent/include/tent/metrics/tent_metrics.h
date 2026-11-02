@@ -172,6 +172,29 @@ class TentMetrics {
     void recordSelectionEvent(SelectionEvent event,
                               TransportType transport = UNSPEC);
 
+    enum class AdmissionOwnerKind { User, Staging, All };
+    enum class AdmissionEvent {
+        Admitted,
+        RejectedBatchCapacity,
+        RejectedOwnerCapacity,
+        RejectedByteCapacity,
+        RejectedUserOwnerCapacity,
+        RejectedUserByteCapacity,
+        RejectedDispatchWindow,
+        Dispatched,
+        DeadlineDropped,
+        Canceled,
+    };
+
+    // Admission events count queue owners, not public request aliases. Queue
+    // gauges are paired charge/uncharge updates and therefore remain active
+    // across runtime metric enable/disable transitions.
+    void recordAdmissionEvent(AdmissionOwnerKind kind, AdmissionEvent event,
+                              int64_t count = 1);
+    void recordAdmissionQueued(AdmissionOwnerKind kind, int64_t owner_delta,
+                               int64_t byte_delta);
+    void recordAdmissionWait(AdmissionOwnerKind kind, double latency_us);
+
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
     // sitting in the engine right now — a persistently high or stuck value
@@ -307,6 +330,10 @@ class TentMetrics {
         "transport", "reason"};
     static inline const std::array<std::string, 2> kSelectionEventLabels{
         "event", "transport"};
+    static inline const std::array<std::string, 2> kAdmissionEventLabels{
+        "owner_kind", "event"};
+    static inline const std::array<std::string, 1> kAdmissionOwnerKindLabel{
+        "owner_kind"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -325,6 +352,10 @@ class TentMetrics {
     static constexpr size_t kSelectionEventValueDomain = 9;
     static constexpr size_t kSelectionEventDomain =
         kSelectionEventValueDomain * kTransportDomain;
+    static constexpr size_t kAdmissionOwnerKindDomain = 3;
+    static constexpr size_t kAdmissionEventValueDomain = 10;
+    static constexpr size_t kAdmissionEventDomain =
+        kAdmissionOwnerKindDomain * kAdmissionEventValueDomain;
 
     // Stable slot indices into the cached-cell label domain.
     static size_t transportSlot(TransportType tp) {
@@ -355,6 +386,11 @@ class TentMetrics {
                                      TransportType transport) {
         return static_cast<size_t>(event) * kTransportDomain +
                transportSlot(transport);
+    }
+    static size_t admissionEventSlot(AdmissionOwnerKind kind,
+                                     AdmissionEvent event) {
+        return static_cast<size_t>(kind) * kAdmissionEventValueDomain +
+               static_cast<size_t>(event);
     }
 
     // Per-transport counters (label: transport). Values are int64_t.
@@ -422,6 +458,10 @@ class TentMetrics {
         "tent_transport_selection_events_total",
         "Transport selector decisions by bounded event and transport",
         kSelectionEventLabels, kSelectionEventDomain};
+    metrics::CachedDynamicCounter<2> admission_events_total_{
+        "tent_admission_events_total",
+        "Runtime admission queue owner decisions by kind and event",
+        kAdmissionEventLabels, kAdmissionEventDomain};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_
@@ -437,6 +477,14 @@ class TentMetrics {
     metrics::CachedDynamicCounter<1> registered_buffer_bytes_{
         "tent_registered_buffer_bytes", "Registered local buffer bytes",
         kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> admission_queue_owners_{
+        "tent_admission_queue_owners",
+        "Runtime admission queue owners charged as outstanding",
+        kAdmissionOwnerKindLabel, kAdmissionOwnerKindDomain};
+    metrics::CachedDynamicCounter<1> admission_queue_bytes_{
+        "tent_admission_queue_bytes",
+        "Runtime admission queue bytes charged as outstanding",
+        kAdmissionOwnerKindLabel, kAdmissionOwnerKindDomain};
     std::vector<metrics::CachedDynamicCounter<1>*> gauges_;
 
     // Latency histograms use microseconds (us) as unit
@@ -495,6 +543,10 @@ class TentMetrics {
         "tent_transport_attempt_latency_us",
         "Observed physical transport attempt latency in microseconds",
         kLatencyBuckets, kAttemptLabels, kAttemptDomain};
+    metrics::CachedDynamicHistogram<1> admission_wait_latency_{
+        "tent_admission_wait_us",
+        "Runtime admission queue wait before dispatch in microseconds",
+        kLatencyBuckets, kAdmissionOwnerKindLabel, kAdmissionOwnerKindDomain};
 
     // Per-transport (N=1) histograms for unified serialization; the N=2
     // transport_attempt_latency_ histogram is serialized separately (see

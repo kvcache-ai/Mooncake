@@ -131,6 +131,44 @@ const char* selectionEventName(TentMetrics::SelectionEvent event) {
     }
     return "unknown";
 }
+
+const char* admissionOwnerKindName(TentMetrics::AdmissionOwnerKind kind) {
+    switch (kind) {
+        case TentMetrics::AdmissionOwnerKind::User:
+            return "user";
+        case TentMetrics::AdmissionOwnerKind::Staging:
+            return "staging";
+        case TentMetrics::AdmissionOwnerKind::All:
+            return "all";
+    }
+    return "all";
+}
+
+const char* admissionEventName(TentMetrics::AdmissionEvent event) {
+    switch (event) {
+        case TentMetrics::AdmissionEvent::Admitted:
+            return "admitted";
+        case TentMetrics::AdmissionEvent::RejectedBatchCapacity:
+            return "rejected_batch_capacity";
+        case TentMetrics::AdmissionEvent::RejectedOwnerCapacity:
+            return "rejected_owner_capacity";
+        case TentMetrics::AdmissionEvent::RejectedByteCapacity:
+            return "rejected_byte_capacity";
+        case TentMetrics::AdmissionEvent::RejectedUserOwnerCapacity:
+            return "rejected_user_owner_capacity";
+        case TentMetrics::AdmissionEvent::RejectedUserByteCapacity:
+            return "rejected_user_byte_capacity";
+        case TentMetrics::AdmissionEvent::RejectedDispatchWindow:
+            return "rejected_dispatch_window";
+        case TentMetrics::AdmissionEvent::Dispatched:
+            return "dispatched";
+        case TentMetrics::AdmissionEvent::DeadlineDropped:
+            return "deadline_dropped";
+        case TentMetrics::AdmissionEvent::Canceled:
+            return "canceled";
+    }
+    return "unknown";
+}
 }  // namespace
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
@@ -343,12 +381,13 @@ void TentMetrics::registerMetrics() {
         &deadline_infeasible_total_,
         &quarantined_batches_total_,
         &selection_events_total_,
+        &admission_events_total_,
     };
 
     gauges_ = {
-        &inflight_attempts_,
-        &logical_requests_inflight_,
-        &registered_buffer_bytes_,
+        &inflight_attempts_,       &logical_requests_inflight_,
+        &registered_buffer_bytes_, &admission_queue_owners_,
+        &admission_queue_bytes_,
     };
 
     // Register the N=1 per-transport histograms for unified serialization.
@@ -356,8 +395,9 @@ void TentMetrics::registerMetrics() {
     // (it can't share this N=1-typed vector); see getPrometheusMetrics /
     // getJsonMetrics.
     histograms_ = {
-        &read_latency_, &write_latency_,    &read_size_,      &write_size_,
-        &deadline_mlu_, &stage_queue_wait_, &stage_dispatch_, &stage_transport_,
+        &read_latency_,   &write_latency_,   &read_size_,
+        &write_size_,     &deadline_mlu_,    &stage_queue_wait_,
+        &stage_dispatch_, &stage_transport_, &admission_wait_latency_,
     };
 
     preResolveAccountingMetrics();
@@ -529,6 +569,47 @@ void TentMetrics::recordSelectionEvent(SelectionEvent event,
             return std::array<std::string, 2>{selectionEventName(event),
                                               transportTypeName(transport)};
         });
+}
+
+void TentMetrics::recordAdmissionEvent(AdmissionOwnerKind kind,
+                                       AdmissionEvent event, int64_t count) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed) ||
+        count <= 0)
+        return;
+    admission_events_total_.incCached(
+        admissionEventSlot(kind, event),
+        [kind, event] {
+            return std::array<std::string, 2>{admissionOwnerKindName(kind),
+                                              admissionEventName(event)};
+        },
+        count);
+}
+
+void TentMetrics::recordAdmissionQueued(AdmissionOwnerKind kind,
+                                        int64_t owner_delta,
+                                        int64_t byte_delta) {
+    if (!initialized_) return;
+    const size_t slot = static_cast<size_t>(kind);
+    auto label = [kind] {
+        return std::array<std::string, 1>{admissionOwnerKindName(kind)};
+    };
+    if (owner_delta != 0)
+        admission_queue_owners_.incCached(slot, label, owner_delta);
+    if (byte_delta != 0)
+        admission_queue_bytes_.incCached(slot, label, byte_delta);
+}
+
+void TentMetrics::recordAdmissionWait(AdmissionOwnerKind kind,
+                                      double latency_us) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed) ||
+        latency_us < 0.0)
+        return;
+    admission_wait_latency_.observeCached(
+        static_cast<size_t>(kind),
+        [kind] {
+            return std::array<std::string, 1>{admissionOwnerKindName(kind)};
+        },
+        static_cast<int64_t>(latency_us));
 }
 
 // Gauge updates below deliberately ignore runtime_enabled_: gauges track
@@ -1032,6 +1113,8 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 static_cast<int64_t>(quarantined_batches_total_.value());
             root[selection_events_total_.str_name()] =
                 sumCounterValues(&selection_events_total_);
+            root[admission_events_total_.str_name()] =
+                sumCounterValues(&admission_events_total_);
 
             // Gauges: aggregate across transport labels (total in-flight
             // attempts / total registered bytes). Per-transport breakdown is
@@ -1042,6 +1125,10 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&logical_requests_inflight_);
             root[registered_buffer_bytes_.str_name()] =
                 sumCounterValues(&registered_buffer_bytes_);
+            root[admission_queue_owners_.str_name()] =
+                sumCounterValues(&admission_queue_owners_);
+            root[admission_queue_bytes_.str_name()] =
+                sumCounterValues(&admission_queue_bytes_);
 
             // Histograms: sum bucket counts across all transport labels. The
             // templated helper also reads back the histogram's sum counter so
@@ -1056,6 +1143,7 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
             serializeHistogramToJson(root, stage_dispatch_);
             serializeHistogramToJson(root, stage_transport_);
             serializeHistogramToJson(root, transport_attempt_latency_);
+            serializeHistogramToJson(root, admission_wait_latency_);
 
             root["tent_metrics_build_info"] = {
                 {"version", TENT_BUILD_VERSION},
@@ -1190,6 +1278,10 @@ void TentMetrics::recordDeadlineInfeasible(TransportType) {}
 void TentMetrics::recordBatchQuarantined() {}
 void TentMetrics::recordTaskFailure(TransportType, TaskFailureReason) {}
 void TentMetrics::recordSelectionEvent(SelectionEvent, TransportType) {}
+void TentMetrics::recordAdmissionEvent(AdmissionOwnerKind, AdmissionEvent,
+                                       int64_t) {}
+void TentMetrics::recordAdmissionQueued(AdmissionOwnerKind, int64_t, int64_t) {}
+void TentMetrics::recordAdmissionWait(AdmissionOwnerKind, double) {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}

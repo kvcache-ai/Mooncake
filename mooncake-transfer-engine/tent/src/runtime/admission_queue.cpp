@@ -15,6 +15,8 @@
 #include "tent/runtime/admission_queue.h"
 #include "tent/runtime/deadline_mlu.h"
 
+#include "tent/metrics/tent_metrics.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -51,6 +53,22 @@ bool isSupportedOwnerKind(QueueOwnerKind kind) {
     }
     return false;
 }
+
+#if TENT_METRICS_ENABLED
+TentMetrics::AdmissionOwnerKind metricOwnerKind(QueueOwnerKind kind) {
+    return kind == QueueOwnerKind::User
+               ? TentMetrics::AdmissionOwnerKind::User
+               : TentMetrics::AdmissionOwnerKind::Staging;
+}
+
+TentMetrics::AdmissionOwnerKind aggregateMetricOwnerKind(
+    size_t owner_count, size_t user_owner_count) {
+    if (user_owner_count == owner_count)
+        return TentMetrics::AdmissionOwnerKind::User;
+    if (user_owner_count == 0) return TentMetrics::AdmissionOwnerKind::Staging;
+    return TentMetrics::AdmissionOwnerKind::All;
+}
+#endif
 
 Status checkedAdd(size_t lhs, size_t rhs, size_t& out) {
     if (rhs > std::numeric_limits<size_t>::max() - lhs) {
@@ -128,6 +146,11 @@ Status LocalTransferAdmissionQueue::tryAdmit(
     }
 
     if (public_keys.size() > submit.batch_slots_left) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordAdmissionEvent(
+            aggregateMetricOwnerKind(submit.owners.size(), user_owner_charge),
+            TentMetrics::AdmissionEvent::RejectedBatchCapacity);
+#endif
         return Status::TooManyRequests(
             "batch public task capacity exceeded" LOC_MARK);
     }
@@ -159,16 +182,36 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         limits_.max_outstanding_bytes - limits_.staging_byte_reserve;
 
     if (next_outstanding_owners > limits_.max_outstanding_owners) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordAdmissionEvent(
+            aggregateMetricOwnerKind(owner_charge, user_owner_charge),
+            TentMetrics::AdmissionEvent::RejectedOwnerCapacity);
+#endif
         return Status::TooManyRequests(
             "queue owner capacity exceeded" LOC_MARK);
     }
     if (next_outstanding_bytes > limits_.max_outstanding_bytes) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordAdmissionEvent(
+            aggregateMetricOwnerKind(owner_charge, user_owner_charge),
+            TentMetrics::AdmissionEvent::RejectedByteCapacity);
+#endif
         return Status::TooManyRequests("queue byte capacity exceeded" LOC_MARK);
     }
     if (next_user_owners > user_owner_limit) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordAdmissionEvent(
+            TentMetrics::AdmissionOwnerKind::User,
+            TentMetrics::AdmissionEvent::RejectedUserOwnerCapacity);
+#endif
         return Status::TooManyRequests("user owner capacity exceeded" LOC_MARK);
     }
     if (next_user_bytes > user_byte_limit) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordAdmissionEvent(
+            TentMetrics::AdmissionOwnerKind::User,
+            TentMetrics::AdmissionEvent::RejectedUserByteCapacity);
+#endif
         return Status::TooManyRequests("user byte capacity exceeded" LOC_MARK);
     }
 
@@ -216,6 +259,29 @@ Status LocalTransferAdmissionQueue::tryAdmit(
     outstanding_bytes_ = next_outstanding_bytes;
     outstanding_user_owners_ = next_user_owners;
     outstanding_user_bytes_ = next_user_bytes;
+#if TENT_METRICS_ENABLED
+    const size_t staging_owner_charge = owner_charge - user_owner_charge;
+    const size_t staging_byte_charge = byte_charge - user_byte_charge;
+    auto& metrics = TentMetrics::instance();
+    if (user_owner_charge != 0) {
+        metrics.recordAdmissionEvent(TentMetrics::AdmissionOwnerKind::User,
+                                     TentMetrics::AdmissionEvent::Admitted,
+                                     static_cast<int64_t>(user_owner_charge));
+        metrics.recordAdmissionQueued(TentMetrics::AdmissionOwnerKind::User,
+                                      static_cast<int64_t>(user_owner_charge),
+                                      static_cast<int64_t>(user_byte_charge));
+    }
+    if (staging_owner_charge != 0) {
+        metrics.recordAdmissionEvent(
+            TentMetrics::AdmissionOwnerKind::Staging,
+            TentMetrics::AdmissionEvent::Admitted,
+            static_cast<int64_t>(staging_owner_charge));
+        metrics.recordAdmissionQueued(
+            TentMetrics::AdmissionOwnerKind::Staging,
+            static_cast<int64_t>(staging_owner_charge),
+            static_cast<int64_t>(staging_byte_charge));
+    }
+#endif
     return Status::OK();
 }
 
@@ -338,6 +404,13 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
             --outstanding_user_owners_;
             outstanding_user_bytes_ -= owner.request.length;
         }
+#if TENT_METRICS_ENABLED
+        auto kind = metricOwnerKind(owner.kind);
+        TentMetrics::instance().recordAdmissionEvent(
+            kind, TentMetrics::AdmissionEvent::DeadlineDropped);
+        TentMetrics::instance().recordAdmissionQueued(
+            kind, -1, -static_cast<int64_t>(owner.request.length));
+#endif
         if (dropped_owner_ids) dropped_owner_ids->push_back(owner_id);
         if (degradation_hooks_.on_local_decode_suggested) {
             degradation_hooks_.on_local_decode_suggested(owner.request);
@@ -377,6 +450,11 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
         if (owner.degradation_eligible)
             dispatching_bytes_ += owner.request.length;
         picked.push_back(owner_id);
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordAdmissionEvent(
+            metricOwnerKind(owner.kind),
+            TentMetrics::AdmissionEvent::Dispatched);
+#endif
         ++used_owners;
         used_bytes += owner.request.length;
     }
@@ -410,6 +488,11 @@ Status LocalTransferAdmissionQueue::complete(
         --outstanding_user_owners_;
         outstanding_user_bytes_ -= owner.request.length;
     }
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordAdmissionQueued(
+        metricOwnerKind(owner.kind), -1,
+        -static_cast<int64_t>(owner.request.length));
+#endif
     return Status::OK();
 }
 
@@ -441,6 +524,13 @@ Status LocalTransferAdmissionQueue::cancel(QueueOwnerId owner_id) {
         --outstanding_user_owners_;
         outstanding_user_bytes_ -= owner.request.length;
     }
+#if TENT_METRICS_ENABLED
+    auto kind = metricOwnerKind(owner.kind);
+    TentMetrics::instance().recordAdmissionEvent(
+        kind, TentMetrics::AdmissionEvent::Canceled);
+    TentMetrics::instance().recordAdmissionQueued(
+        kind, -1, -static_cast<int64_t>(owner.request.length));
+#endif
     return Status::OK();
 }
 

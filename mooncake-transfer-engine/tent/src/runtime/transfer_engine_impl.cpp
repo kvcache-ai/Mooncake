@@ -2645,6 +2645,13 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
     submit.owners.reserve(prepared.owners.size());
     for (const auto& owner : prepared.owners) {
         if (owner.request.length > runtime_queue_config_.max_dispatch_bytes) {
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordAdmissionEvent(
+                owner_kind == QueueOwnerKind::User
+                    ? TentMetrics::AdmissionOwnerKind::User
+                    : TentMetrics::AdmissionOwnerKind::Staging,
+                TentMetrics::AdmissionEvent::RejectedDispatchWindow);
+#endif
             return Status::TooManyRequests(
                 "request exceeds runtime queue dispatch byte window" LOC_MARK);
         }
@@ -2701,6 +2708,9 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         queued.batch = batch;
         queued.owner_task_id = prepared.owners[i].owner_task_id;
         queued.byte_charge = prepared.owners[i].request.length;
+#if TENT_METRICS_ENABLED
+        queued.owner_kind = owner_kind;
+#endif
         queued.public_task_ids.push_back(prepared.owners[i].owner_task_id);
         queued.public_task_ids.insert(
             queued.public_task_ids.end(),
@@ -2841,6 +2851,15 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     auto* batch = queued.batch;
     auto& task = batch->task_list[queued.owner_task_id];
     task.dispatch_time = std::chrono::steady_clock::now();
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordAdmissionWait(
+        queued.owner_kind == QueueOwnerKind::User
+            ? TentMetrics::AdmissionOwnerKind::User
+            : TentMetrics::AdmissionOwnerKind::Staging,
+        std::chrono::duration<double, std::micro>(task.dispatch_time -
+                                                  task.start_time)
+            .count());
+#endif
     auto route = resolveTransport(task.request, 0);
     task.type = route.transport;
     task.device_mask = route.device_mask;
