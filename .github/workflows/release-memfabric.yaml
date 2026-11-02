@@ -100,6 +100,7 @@ jobs:
             -DBUILD_SHARED_LIBS=ON \
             -DBUILD_UNIT_TESTS=OFF \
             -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_DEBUG_SYMBOLS=OFF \
             -DPython3_EXECUTABLE="${PYTHON_BIN}" \
             -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF \
@@ -122,31 +123,6 @@ jobs:
         shell: bash
         run: |
           echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-
-      - name: Add TENT artifacts to wheel staging
-        shell: bash
-        run: |
-          set -euo pipefail
-          "${PYTHON_BIN}" - <<'PY'
-          from pathlib import Path
-
-          path = Path("scripts/build_wheel.sh")
-          source = path.read_text()
-          marker = "# Copy ascend_transport.so to mooncake directory (only when USE_ASCEND_DIRECT is set)"
-          block = '''# Copy TENT artifacts when built.
-          if [ -f "${BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so" ]; then
-              cp "${BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so" mooncake-wheel/mooncake/
-              cp "${BUILD_DIR}/mooncake-transfer-engine/tent/src/metrics/libtent_metrics.so" mooncake-wheel/mooncake/
-              cp "${BUILD_DIR}"/mooncake-transfer-engine/tent/src/python/tent.cpython-*.so mooncake-wheel/mooncake/
-          fi
-
-          '''
-          if source.count(marker) != 1:
-              raise SystemExit("Cannot locate the TENT wheel staging insertion point")
-          if block not in source:
-              path.write_text(source.replace(marker, block + marker, 1))
-          PY
-          bash -n scripts/build_wheel.sh
 
       - name: Build Python wheel
         shell: bash

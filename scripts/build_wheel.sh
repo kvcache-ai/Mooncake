@@ -104,6 +104,14 @@ if [ -f ${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so ]; then
     cp ${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so mooncake-wheel/mooncake/libtransfer_engine.so
 fi
 
+# Copy TENT artifacts for the memfabric wheel.
+if [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
+    echo "Copying TENT libraries and Python extension..."
+    cp "${BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so" mooncake-wheel/mooncake/
+    cp "${BUILD_DIR}/mooncake-transfer-engine/tent/src/metrics/libtent_metrics.so" mooncake-wheel/mooncake/
+    cp "${BUILD_DIR}"/mooncake-transfer-engine/tent/src/python/tent.cpython-*.so mooncake-wheel/mooncake/
+fi
+
 # Copy ascend_transport.so to mooncake directory (only when USE_ASCEND_DIRECT is set)
 if [ -f ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so ]; then
     echo "Copying ascend_transport.so..."
@@ -465,6 +473,17 @@ fi
 if [ "$NPU_BUILD" = "1" ]; then
     echo "Pre-setting RPATH=\$ORIGIN on NPU ELF files..."
     find "$WHEEL_PACKAGE_DIR" -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0 | xargs -0 patchelf --force-rpath --set-rpath '$ORIGIN'
+fi
+
+# Prioritize the package directory for sibling-library lookup while preserving
+# build-time dependency paths needed by auditwheel.
+if [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
+    echo "Prioritizing package-local RPATH for memfabric ELF files..."
+    while IFS= read -r -d '' elf_file; do
+        existing_rpath=$(patchelf --print-rpath "$elf_file")
+        patchelf --set-rpath "\$ORIGIN${existing_rpath:+:$existing_rpath}" "$elf_file"
+    done < <(find "$WHEEL_PACKAGE_DIR" -type f \
+        -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0)
 fi
 
 # Create directory for repaired wheels
