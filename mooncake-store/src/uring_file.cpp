@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include <sys/uio.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_set>
 #include <vector>
 
 #include <glog/logging.h>
@@ -45,22 +47,51 @@ static constexpr size_t kMaxFixedBufBytes = 1ULL << 30;
 // hundreds of I/O threads, registering per ring pinned the buffer once per
 // thread and stalled the first read on every thread. Without clone support
 // (liburing < 2.9 or kernel < 6.13) the rings use unfixed I/O.
+//
+// Releasing the source also drops every ring's clone, so the pages are unpinned
+// before the caller frees the buffer, and bumps `generation`. A ring compares
+// it on each I/O, so a clone of an older registration is never used, even if a
+// new buffer is later registered at the same address.
 // ============================================================================
 struct GlobalBufInfo {
     std::atomic<void*> base{nullptr};
     std::atomic<size_t> size{0};
-    std::mutex source_mu;  // guards source and source_ready
+    // Guards source, source_ready, writes to generation, and every ring's
+    // clone_live_.
+    std::mutex source_mu;
     struct io_uring source{};
     bool source_ready = false;
+    // Changes whenever the source registration is created or released.
+    std::atomic<uint64_t> generation{0};
 };
-static GlobalBufInfo g_buf;
+// Never destroyed, like the ring registry below: a thread that exits during
+// static destruction still releases its ring's clone under source_mu.
+static GlobalBufInfo& g_buf = *new GlobalBufInfo;
 
-// Unpins the source registration and closes the source ring. Unregistering
-// first makes the unpin synchronous: io_uring_queue_exit() alone leaves it to
-// the kernel's deferred ring teardown.
+class SharedUringRing;
+// Every live thread-local ring, so that releasing the source can drop their
+// clones. The I/O threads (RPC handlers, offload workers) are not owned by
+// the storage that registered the buffer and may outlive it.
+struct RingRegistry {
+    std::mutex mu;
+    std::unordered_set<SharedUringRing*> rings;
+};
+static RingRegistry& ring_registry() {
+    static auto* registry = new RingRegistry;
+    return *registry;
+}
+static void revoke_cloned_buffers_locked();
+
+// Unpins the source registration, drops every ring's clone of it, and closes
+// the source ring. No I/O on the registered buffer may be in flight: a ring
+// whose clone is dropped mid-I/O fails that I/O. Unregistering first makes
+// the unpin synchronous: io_uring_queue_exit() alone leaves it to the
+// kernel's deferred ring teardown.
 static void release_source_registration() {
     std::lock_guard<std::mutex> lock(g_buf.source_mu);
     if (!g_buf.source_ready) return;
+    g_buf.generation.fetch_add(1, std::memory_order_acq_rel);
+    revoke_cloned_buffers_locked();
     io_uring_unregister_buffers(&g_buf.source);
     io_uring_queue_exit(&g_buf.source);
     g_buf.source_ready = false;
@@ -95,6 +126,7 @@ static bool register_source_buffer(void* buffer, size_t length) {
         return false;
     }
     g_buf.source_ready = true;
+    g_buf.generation.fetch_add(1, std::memory_order_acq_rel);
     LOG(INFO) << "[UringFile] registered fixed buffer addr=" << buffer
               << " size=" << length << " pieces=" << iovs.size();
     return true;
@@ -144,24 +176,31 @@ class SharedUringRing {
     // -----------------------------------------------------------------
 
     // Give THIS thread's ring the global fixed buffer by cloning the source
-    // ring's buffer table.  Called lazily from each thread before the first
-    // fixed-buffer I/O.
+    // ring's buffer table. Called before each read, so it is lock-free while
+    // the clone is current; it re-clones, or drops the clone, once the source
+    // registration changes.
     bool ensure_buf_registered() {
-        if (buf_registered_) return true;
-        if (buf_register_failed_) return false;  // don't retry after failure
         if (!initialized_) return false;
-        void* b = g_buf.base.load(std::memory_order_acquire);
-        size_t s = g_buf.size.load(std::memory_order_acquire);
-        if (!b || !s) return false;
+        const uint64_t gen = g_buf.generation.load(std::memory_order_acquire);
+        if (buf_registered_ && buf_generation_ == gen) return true;
+        if (buf_registered_) drop_buf_clone();  // clone of an older table
+        if (attempted_generation_ == gen) return false;  // already tried
+        attempted_generation_ = gen;
 #ifdef MC_HAVE_URING_CLONE_BUFFERS
+        void* b = nullptr;
+        size_t s = 0;
         int ret;
         {
             std::lock_guard<std::mutex> lock(g_buf.source_mu);
-            if (!g_buf.source_ready) {
-                buf_register_failed_ = true;
+            // A registration that changed since `gen` is picked up next call.
+            if (!g_buf.source_ready ||
+                g_buf.generation.load(std::memory_order_relaxed) != gen)
                 return false;
-            }
+            b = g_buf.base.load(std::memory_order_acquire);
+            s = g_buf.size.load(std::memory_order_acquire);
+            if (!b || !s) return false;
             ret = io_uring_clone_buffers(&ring_, &g_buf.source);
+            if (ret == 0) clone_live_ = true;
         }
         if (ret < 0) {
             static std::atomic<bool> warned{false};
@@ -171,27 +210,33 @@ class SharedUringRing {
                              << -ret << " (" << strerror(-ret)
                              << ") — using unfixed I/O";
             }
-            buf_register_failed_ = true;
             return false;
         }
         buf_registered_ = true;
+        buf_generation_ = gen;
         buf_base_ = b;
         buf_size_ = s;
         VLOG(1) << "[SharedUringRing] cloned fixed buffer addr=" << b
                 << " size=" << s;
         return true;
 #else
-        buf_register_failed_ = true;
         return false;
 #endif
     }
 
     void unregister_buf_local() {
         if (!initialized_ || !buf_registered_) return;
+        drop_buf_clone();
+    }
+
+    // Drops this ring's clone on behalf of release_source_registration(),
+    // which holds g_buf.source_mu. Only issues the unregister syscall: the
+    // owner thread notices the generation change on its next I/O and resets
+    // its own state.
+    void revoke_clone_locked() {
+        if (!clone_live_) return;
         io_uring_unregister_buffers(&ring_);
-        buf_registered_ = false;
-        buf_base_ = nullptr;
-        buf_size_ = 0;
+        clone_live_ = false;
     }
 
     // -----------------------------------------------------------------
@@ -304,9 +349,36 @@ class SharedUringRing {
     // Construction / destruction
     // -----------------------------------------------------------------
 
-    SharedUringRing() { initialize_ring(); }
+    SharedUringRing() {
+        initialize_ring();
+        auto& registry = ring_registry();
+        std::lock_guard<std::mutex> lock(registry.mu);
+        registry.rings.insert(this);
+    }
 
-    ~SharedUringRing() { shutdown_ring(); }
+    ~SharedUringRing() {
+        {
+            auto& registry = ring_registry();
+            std::lock_guard<std::mutex> lock(registry.mu);
+            registry.rings.erase(this);
+        }
+        shutdown_ring();
+    }
+
+    // Unregisters this ring's clone (if the source has not already revoked
+    // it) and forgets the fixed buffer.
+    void drop_buf_clone() {
+        {
+            std::lock_guard<std::mutex> lock(g_buf.source_mu);
+            if (clone_live_) {
+                io_uring_unregister_buffers(&ring_);
+                clone_live_ = false;
+            }
+        }
+        buf_registered_ = false;
+        buf_base_ = nullptr;
+        buf_size_ = 0;
+    }
 
     // -----------------------------------------------------------------
     // Internal helpers
@@ -329,7 +401,7 @@ class SharedUringRing {
 
     void shutdown_ring() {
         if (!initialized_) return;
-        if (buf_registered_) io_uring_unregister_buffers(&ring_);
+        if (buf_registered_) drop_buf_clone();
         io_uring_queue_exit(&ring_);
         initialized_ = false;
         buf_registered_ = false;
@@ -671,12 +743,25 @@ class SharedUringRing {
     struct io_uring ring_{};
     bool initialized_ = false;
 
+    // Owner-thread state of the fixed buffer this ring uses.
     bool buf_registered_ = false;
-    bool buf_register_failed_ = false;  // set on first failure; skip retries
+    uint64_t buf_generation_ = 0;  // g_buf.generation of the cloned table
+    // Generation last tried, so a failed clone is not retried on every I/O.
+    uint64_t attempted_generation_ = UINT64_MAX;
     void* buf_base_ = nullptr;
     size_t buf_size_ = 0;
     uint64_t op_id_ = 0;  // monotonic ID for stale CQE filtering
+    // Whether the kernel still holds this ring's clone. Guarded by
+    // g_buf.source_mu, since release_source_registration() clears it from
+    // another thread.
+    bool clone_live_ = false;
 };
+
+static void revoke_cloned_buffers_locked() {
+    auto& registry = ring_registry();
+    std::lock_guard<std::mutex> lock(registry.mu);
+    for (SharedUringRing* ring : registry.rings) ring->revoke_clone_locked();
+}
 
 // ============================================================================
 // UringFile — thin wrapper over SharedUringRing

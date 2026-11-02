@@ -5,10 +5,14 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -477,6 +481,190 @@ TEST_F(PosixFileTest, UringReadsUnfixedWithoutBufferClone) {
     }
     UringLargeBuffer::expectReads(test_fd, test_filename, buffer.base());
     if (!can_clone) UringFile::unregister_global_buffer();
+}
+
+// Runs tasks on one long-lived thread, whose thread-local ring keeps its
+// clone of the fixed buffer between tasks, like an RPC or offload worker that
+// outlives the storage which registered the buffer.
+class RingWorker {
+   public:
+    RingWorker() : thread_([this] { loop(); }) {}
+    ~RingWorker() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+
+    void run(std::function<void()> fn) {
+        std::unique_lock<std::mutex> lock(mu_);
+        task_ = std::move(fn);
+        cv_.notify_all();
+        cv_.wait(lock, [this] { return !task_; });
+    }
+
+   private:
+    void loop() {
+        std::unique_lock<std::mutex> lock(mu_);
+        while (true) {
+            cv_.wait(lock, [this] { return stop_ || task_; });
+            if (stop_) return;
+            task_();
+            task_ = nullptr;
+            cv_.notify_all();
+        }
+    }
+
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::function<void()> task_;
+    bool stop_ = false;
+    std::thread thread_;
+};
+
+// An anonymous mapping that can be replaced in place by fresh pages, the way
+// a freed staging buffer's address is reused by the next allocation.
+class UringRemappableBuffer {
+   public:
+    static constexpr size_t kLen = 64ULL << 20;
+    static constexpr size_t kBlock = 4096;
+
+    ~UringRemappableBuffer() {
+        if (base_) munmap(base_, kLen);
+    }
+    bool map() {
+        void* p = mmap(nullptr, kLen, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return false;
+        base_ = static_cast<char*>(p);
+        return true;
+    }
+    bool remap() {
+        return mmap(base_, kLen, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1,
+                    0) == static_cast<void*>(base_);
+    }
+    char* base() const { return base_; }
+
+    static bool memlockTooSmall() {
+        struct rlimit rl{};
+        return geteuid() != 0 && getrlimit(RLIMIT_MEMLOCK, &rl) == 0 &&
+               rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < kLen;
+    }
+
+   private:
+    char* base_ = nullptr;
+};
+
+// Reads block `index` of the file into `dst` through io_uring and returns
+// whether every byte equals `fill`. `fixed` reports whether the calling
+// thread's ring held the fixed buffer during the read.
+static bool uringReadBlock(int test_fd, const std::string& test_filename,
+                           char* dst, int index, char fill, bool* fixed) {
+    constexpr size_t kBlock = UringRemappableBuffer::kBlock;
+    int uring_fd = dup(test_fd);
+    if (uring_fd < 0) return false;
+    UringFile uring_file(test_filename, uring_fd, 32, false);
+    UringFile::ReadDesc desc{dst, kBlock, static_cast<off_t>(index * kBlock)};
+    auto result = uring_file.batch_read(&desc, 1);
+    if (fixed) *fixed = uring_file.is_buffer_registered();
+    return result.has_value() && desc.error == ErrorCode::OK &&
+           desc.bytes_read == kBlock &&
+           std::count(dst, dst + kBlock, fill) ==
+               static_cast<std::ptrdiff_t>(kBlock);
+}
+
+static void writeBlocks(int test_fd, const std::string& fills) {
+    constexpr size_t kBlock = UringRemappableBuffer::kBlock;
+    for (size_t i = 0; i < fills.size(); ++i) {
+        std::vector<char> block(kBlock, fills[i]);
+        ASSERT_EQ(pwrite(test_fd, block.data(), kBlock,
+                         static_cast<off_t>(i * kBlock)),
+                  static_cast<ssize_t>(kBlock));
+    }
+}
+
+// Unregistering the global buffer unpins it even while an I/O thread that
+// cloned the registration is still alive, so the owner can free it.
+TEST_F(PosixFileTest, UringUnregisterUnpinsClonesOfLiveThreads) {
+    if (!uringCanCloneBuffers()) {
+        GTEST_SKIP() << "io_uring cannot clone buffers here";
+    }
+    if (UringRemappableBuffer::memlockTooSmall()) {
+        GTEST_SKIP() << "RLIMIT_MEMLOCK too small to pin "
+                     << UringRemappableBuffer::kLen << " bytes";
+    }
+    writeBlocks(test_fd, "A");
+    UringRemappableBuffer buffer;
+    ASSERT_TRUE(buffer.map());
+    const long pinned_before = pinnedKib();
+    ASSERT_TRUE(UringFile::register_global_buffer(buffer.base(),
+                                                  UringRemappableBuffer::kLen));
+    EXPECT_GT(pinnedKib(), pinned_before);
+
+    RingWorker worker;
+    bool ok = false, fixed = false;
+    worker.run([&] {
+        ok = uringReadBlock(test_fd, test_filename, buffer.base(), 0, 'A',
+                            &fixed);
+    });
+    EXPECT_TRUE(ok);
+    EXPECT_TRUE(fixed) << "the worker's ring should have cloned the buffer";
+
+    UringFile::unregister_global_buffer();
+    EXPECT_LE(pinnedKib(), pinned_before)
+        << "the live worker's clone must not keep the buffer pinned";
+
+    // The worker keeps working, now with unfixed I/O.
+    memset(buffer.base(), 0, UringRemappableBuffer::kBlock);
+    worker.run([&] {
+        ok = uringReadBlock(test_fd, test_filename, buffer.base(), 0, 'A',
+                            &fixed);
+    });
+    EXPECT_TRUE(ok);
+    EXPECT_FALSE(fixed);
+}
+
+// A thread that cloned an earlier registration must not read into that
+// registration's pages once a new buffer is registered at the same address.
+TEST_F(PosixFileTest, UringReregistrationAtSameAddressReachesNewPages) {
+    if (!uringCanCloneBuffers()) {
+        GTEST_SKIP() << "io_uring cannot clone buffers here";
+    }
+    if (UringRemappableBuffer::memlockTooSmall()) {
+        GTEST_SKIP() << "RLIMIT_MEMLOCK too small to pin "
+                     << UringRemappableBuffer::kLen << " bytes";
+    }
+    writeBlocks(test_fd, "AB");
+    UringRemappableBuffer buffer;
+    ASSERT_TRUE(buffer.map());
+    char* base = buffer.base();
+    ASSERT_TRUE(
+        UringFile::register_global_buffer(base, UringRemappableBuffer::kLen));
+
+    RingWorker worker;
+    bool ok = false, fixed = false;
+    worker.run([&] {
+        ok = uringReadBlock(test_fd, test_filename, base, 0, 'A', &fixed);
+    });
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(fixed);
+
+    // Free the buffer and allocate fresh pages at the same address.
+    UringFile::unregister_global_buffer();
+    ASSERT_TRUE(buffer.remap());
+    ASSERT_TRUE(
+        UringFile::register_global_buffer(base, UringRemappableBuffer::kLen));
+
+    char* dst = base + UringRemappableBuffer::kBlock;
+    worker.run([&] {
+        ok = uringReadBlock(test_fd, test_filename, dst, 1, 'B', &fixed);
+    });
+    EXPECT_TRUE(ok) << "the read must land in the new pages";
+    EXPECT_TRUE(fixed) << "the worker should re-clone the new registration";
+    UringFile::unregister_global_buffer();
 }
 
 TEST_F(PosixFileTest, UringBatchReadReportsShortReadPerRequest) {
