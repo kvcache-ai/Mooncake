@@ -430,7 +430,7 @@ echo "Installing required build packages"
 if [ "$NPU_BUILD" = "1" ]; then
     PYTHON_CMD="python${PYTHON_VERSION}"
     if ! command -v "$PYTHON_CMD" &>/dev/null; then
-        echo "Error: $PYTHON_CMD not found for wheel build"
+        echo "Error: $PYTHON_CMD not found for NPU wheel build"
         exit 1
     fi
     max_attempts=3
