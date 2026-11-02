@@ -41,11 +41,12 @@ struct StandbyObjectMetadata {
 
     struct_pack::compatible<std::string, 2> session_id;
     struct_pack::compatible<uint64_t, 3> object_checksum;
+    struct_pack::compatible<uint32_t, 4> session_refcount; // Session refcount
 
     StandbyObjectMetadata() = default;
 
     YLT_REFL(StandbyObjectMetadata, client_id, size, replicas, group_id,
-             data_type, hard_pinned, session_id, object_checksum);
+             data_type, hard_pinned, session_id, object_checksum, session_refcount);
 
     // Check if this metadata has valid replicas
     bool HasReplicas() const { return !replicas.empty(); }
@@ -111,9 +112,10 @@ struct MetadataPayload {
 
     struct_pack::compatible<std::string, 2> session_id;
     struct_pack::compatible<uint64_t, 3> object_checksum;
+    struct_pack::compatible<uint32_t, 4> session_refcount;
 
     YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type,
-             hard_pinned, session_id, object_checksum);
+             hard_pinned, session_id, object_checksum, session_refcount);
 
     // Convert to StandbyObjectMetadata
     StandbyObjectMetadata ToStandbyMetadata() const {
@@ -124,6 +126,7 @@ struct MetadataPayload {
         meta.group_id = group_id.value_or("");
         meta.session_id = session_id.value_or("");
         meta.object_checksum = object_checksum;
+        meta.session_refcount = session_refcount.value_or(0);
         meta.data_type = data_type.value_or(ObjectDataType::UNKNOWN);
         meta.hard_pinned = hard_pinned.value_or(false);
         return meta;

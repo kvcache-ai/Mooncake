@@ -50,6 +50,7 @@ struct mooncake_replicate_config {
      * above its configured maximum. */
     int has_soft_pin_ttl;
     uint64_t soft_pin_ttl_ms;
+    const char* session_id;
 };
 typedef struct mooncake_replicate_config mooncake_replicate_config_t;
 

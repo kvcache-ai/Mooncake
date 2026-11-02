@@ -114,6 +114,12 @@ class MasterAdminServer {
                                  coro_http::coro_http_response& resp);
     void HandleRemoveAll(coro_http::coro_http_request& req,
                          coro_http::coro_http_response& resp);
+    void HandleUpdateActiveSessions(coro_http::coro_http_request& req,
+                                    coro_http::coro_http_response& resp);
+    void HandleRemoveBySession(coro_http::coro_http_request& req,
+                                    coro_http::coro_http_response& resp);
+    void HandleGetActiveSessions(coro_http::coro_http_request& req,
+                                    coro_http::coro_http_response& resp);          
 
     void HandleSoftPin(coro_http::coro_http_request& req,
                        coro_http::coro_http_response& resp, bool unpin);

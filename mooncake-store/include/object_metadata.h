@@ -75,7 +75,7 @@ struct ObjectMetadata {
                    bool enable_hard_pin = false,
                    ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
                    std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
-                   std::string user_key_ = {})
+                   std::string user_key_ = {}, std::string session_id_ = "")
         : client_id(client_id_),
           put_start_time(put_start_time_),
           data_type(data_type_),
@@ -105,6 +105,13 @@ struct ObjectMetadata {
     const std::string group_id;
     const TenantId tenant_id;
     const std::string user_key;
+    const std::string session_id;
+    // "" = no session association
+    // Reference count of how many sessions are using this object.
+    // Incremented on PutStart (to 1) and on cross-session GetReplicaList;
+    // decremented on RemoveBySession. Object data is only erased when
+    // this reaches 0.
+    mutable std::atomic<uint32_t> session_refcount_{0};
 
     // Committed attribution only; protected by the key's lock.
     std::string session_id;

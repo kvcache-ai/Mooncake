@@ -711,11 +711,17 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
 
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     const std::string& object_key, const std::string& tenant_id) {
+    return GetReplicaList(object_key, tenant_id_, std::string());
+}
+
+tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
+    const std::string& object_key, const std::string& tenant_id,
+    const std::string& session_id) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", object_key, ", tenant_id=", tenant_id);
 
     auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             GetReplicaListResponse>(object_key, tenant_id);
+                             GetReplicaListResponse>(object_key, tenant_id, session_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -726,15 +732,21 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
+    return BatchGetReplicaList(object_keys, tenant_id_, std::string());
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
-                                  const std::string& tenant_id) {
+                                  const std::string& tenant_id,
+                                  const std::string& session_id) {
     ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
     timer.LogRequest("keys_count=", object_keys.size(),
                      ", tenant_id=", tenant_id);
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
                                    GetReplicaListResponse>(
-        object_keys.size(), object_keys, tenant_id);
+        object_keys.size(), object_keys, tenant_id, session_id);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

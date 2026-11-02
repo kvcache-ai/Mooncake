@@ -226,6 +226,10 @@ class Client {
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys,
         const std::string& tenant_id);
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
+        const std::vector<std::string>& object_keys,
+        const std::string& tenant_id,
+        const std::string& session_id);
 
     /**
      * @brief Read-only variant of BatchQuery(); see QueryReadOnly() for the

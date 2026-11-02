@@ -86,6 +86,10 @@ class DummyClient : public PyClient {
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);
+    std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
+                                        const std::vector<void *> &buffers,
+                                        const std::vector<size_t> &sizes,
+                                        const std:string &session_id);
 
     std::vector<int64_t> batch_get_into_cuda_ipc(
         const std::vector<CudaIpcReadRequest> &requests);

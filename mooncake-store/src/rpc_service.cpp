@@ -352,7 +352,8 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
 
 tl::expected<GetReplicaListResponse, ErrorCode>
 WrappedMasterService::GetReplicaList(const std::string& key,
-                                     const std::string& tenant_id) {
+                                     const std::string& tenant_id,
+                                     std::string session_id) {
     return execute_rpc(
         "GetReplicaList",
         [&] {
@@ -362,7 +363,10 @@ WrappedMasterService::GetReplicaList(const std::string& key,
                     : TenantId::kDefaultValue,
                 [&](const TenantId& resolved_tenant_id) {
                     auto result =
-                        master_service_.GetReplicaList(key, resolved_tenant_id);
+                        master_service_.GetReplicaList(key, resolved_tenant_id, 
+                            session_id.empty()
+                                ? std::nullopt
+                                : std::optional<std::string>(session_id));
                     // Tell the reader which scope the
                     // object actually lives in, so its
                     // disk-replica verify requests can
@@ -382,7 +386,8 @@ WrappedMasterService::GetReplicaList(const std::string& key,
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
-                                          const std::string& tenant_id) {
+                                          const std::string& tenant_id,
+                                          std::string session_id) {
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys);
@@ -397,7 +402,10 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                                                : TenantId::kDefaultValue,
         keys.size(), [&](const TenantId& resolved_tenant_id) {
             auto batch =
-                master_service_.BatchGetReplicaList(keys, resolved_tenant_id);
+                master_service_.BatchGetReplicaList(keys, resolved_tenant_id,
+                            session_id.empty()
+                                ? std::nullopt
+                                : std::optional<std::string>(std::move(session_id)));
             for (auto& result : batch) {
                 if (result) {
                     result->resolved_tenant_id = resolved_tenant_id.value();
@@ -1758,6 +1766,34 @@ tl::expected<bool, ErrorCode> WrappedMasterService::PollRemoveAll(
     timer.LogResponse("should_remove_all=",
                       result.has_value() ? result.value() : false);
     return result;
+}
+
+size_t WrappedMasterService::BatchUpdateActiveSessions(
+    const std::unordered_map<std::string,
+                             std::chrono::system_clock::time_point>& sessions) {
+    master_service_.BatchUpdateActiveSessions(sessions);
+    return sessions.size();
+}
+
+size_t WrappedMasterService::GetActiveSessionCount() {
+    return master_service_.GetActiveSessionCount();
+}
+
+std::vector<WrappedMasterService::ActiveSessionInfo>
+WrappedMasterService::GetActiveSessions() {
+    auto internal = master_service_.GetActiveSessionInfo();
+    std::vector<ActiveSessionInfo> result;
+    result.reserve(internal.size());
+    for (auto& s : internal) {
+        result.push_back({std::move(s.session_id), s.last_active_ts_ms,
+                          s.key_count});
+    }
+    return result;
+}
+
+size_t WrappedMasterService::RemoveBySession(const std::string& session_id,
+                                               const std::string& tenant_id) {
+    return master_service_.RemoveBySession(session_id, TenantId(tenant_id));
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(

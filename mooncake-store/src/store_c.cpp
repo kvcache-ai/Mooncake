@@ -57,6 +57,9 @@ std::optional<mooncake::ReplicateConfig> to_replicate_config(
         config.soft_pin_ttl_ms = c_config->soft_pin_ttl_ms;
     }
     config.with_hard_pin = c_config->with_hard_pin != 0;
+    if (c_config->session_id && c_config->session_id[0] != '\0') {
+        config.session_id = std::string(c_config->session_id);
+    }
     if (c_config->preferred_segments &&
         c_config->preferred_segments_count > 0) {
         for (size_t i = 0; i < c_config->preferred_segments_count; ++i) {
