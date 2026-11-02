@@ -298,6 +298,64 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
 #endif
 }
 
+// A single small copy completes faster with a blocking cudaMemcpy than with
+// the async stream + stream-query pipeline: the sync call returns with the
+// copy already done and saves the fixed per-copy event/poll overhead, while
+// the copy itself runs at the same speed. Only single-entry batches take
+// this path: batched submissions amortize the per-copy submit cost across
+// entries, and blocking copies serialize inside the driver under
+// concurrency, so multi-entry batches and sizes at/above the threshold keep
+// the async pipeline. Mirrors NvlinkTransport's sync fast path (see
+// MC_NVLINK_ASYNC_MEMCPY_THRESHOLD, in KiB; 0 disables).
+//
+// Returns true when the batch was handled through this path (the slice is
+// terminally marked via the Slice::SUCCESS / FAILED semantics); a failed
+// copy only marks the slice.
+static bool trySubmitSingleSyncMemcpy(const std::vector<Slice *> &slices,
+                                      const std::vector<void *> &srcs,
+                                      const std::vector<void *> &dsts,
+                                      const std::vector<size_t> &sizes) {
+    const uint64_t threshold =
+        globalConfig().nvlink_async_memcpy_threshold * 1024;
+    if (threshold == 0 || slices.size() != 1 || sizes.front() >= threshold)
+        return false;
+
+    Slice *slice = slices.front();
+    // Match the async path's device discipline: run the copy on the source
+    // buffer's device (see getStreamForRequest), then restore the caller's
+    // device.
+    int copy_device = getDeviceForPointer(slice->source_addr);
+    int saved_device = -1;
+    if (copy_device >= 0) {
+        cudaError_t dev_err = cudaGetDevice(&saved_device);
+        if (dev_err == cudaSuccess && saved_device != copy_device) {
+            dev_err = cudaSetDevice(copy_device);
+        }
+        if (dev_err != cudaSuccess) {
+            LOG(ERROR) << "IntraNodeNvlinkTransport: "
+                          "cudaGetDevice/cudaSetDevice failed for sync copy: "
+                       << cudaGetErrorString(dev_err);
+            slice->markFailed();
+            return true;
+        }
+    }
+    cudaError_t err = cudaMemcpy(dsts.front(), srcs.front(), sizes.front(),
+                                  cudaMemcpyDefault);
+    if (copy_device >= 0 && saved_device >= 0 &&
+        saved_device != copy_device) {
+        cudaSetDevice(saved_device);
+    }
+    if (err == cudaSuccess) {
+        slice->markSuccess();
+    } else {
+        LOG(ERROR) << "IntraNodeNvlinkTransport: synchronous cudaMemcpy "
+                      "failed: "
+                   << cudaGetErrorString(err);
+        slice->markFailed();
+    }
+    return true;
+}
+
 static int getNumDevices() {
     static int cached_num_devices = -1;
     if (cached_num_devices == -1) {
@@ -496,6 +554,9 @@ Status IntraNodeNvlinkTransport::submitTransfer(
     }
 
     // Phase 2: Submit all memcpy operations
+    if (trySubmitSingleSyncMemcpy(slices, srcs, dsts, sizes)) {
+        return Status::OK();
+    }
     submitBatchMemcpy(slices, srcs, dsts, sizes, stream);
 
     return Status::OK();
@@ -618,6 +679,9 @@ Status IntraNodeNvlinkTransport::submitTransferTask(
     }
 
     // Phase 2: Submit all memcpy operations
+    if (trySubmitSingleSyncMemcpy(slices, srcs, dsts, sizes)) {
+        return Status::OK();
+    }
     submitBatchMemcpy(slices, srcs, dsts, sizes, stream);
 
     return Status::OK();

@@ -105,19 +105,7 @@ void parseNicPeerAffinity(
 
 }  // namespace
 
-// Whether a GPU peer-memory kernel module is loaded: nvidia-peermem, or
-// nv_peer_mem from MLNX_OFED. ibv_reg_mr() on device memory needs one.
-static bool peerMemoryModuleLoaded() {
-    return std::filesystem::exists("/sys/module/nvidia_peermem") ||
-           std::filesystem::exists("/sys/module/nv_peer_mem");
-}
-
 void loadGlobalConfig(GlobalConfig& config) {
-    // Without a peer-memory module, ibv_reg_mr() fails with EFAULT at the
-    // first GPU buffer, so the dma_buf export is the default there;
-    // WITH_NVIDIA_PEERMEM below still decides when set.
-    config.with_nvidia_peermem = peerMemoryModuleLoaded();
-
     const char* num_cq_per_ctx_env = std::getenv("MC_NUM_CQ_PER_CTX");
     if (num_cq_per_ctx_env) {
         int val = atoi(num_cq_per_ctx_env);
@@ -304,6 +292,26 @@ void loadGlobalConfig(GlobalConfig& config) {
         else
             LOG(WARNING)
                 << "Ignore value from environment variable MC_SLICE_SIZE";
+    }
+
+    const char* nvlink_async_memcpy_threshold_env =
+        std::getenv("MC_NVLINK_ASYNC_MEMCPY_THRESHOLD");
+    if (nvlink_async_memcpy_threshold_env) {
+        // Strict parse (not atoi): a typo keeps the default instead of
+        // silently enabling or disabling the sync fast path. 0 disables it.
+        uint64_t val = 0;
+        const char* end = nvlink_async_memcpy_threshold_env +
+                          strlen(nvlink_async_memcpy_threshold_env);
+        auto [ptr, ec] =
+            std::from_chars(nvlink_async_memcpy_threshold_env, end, val);
+        if (ec == std::errc() && ptr == end && val <= (1ull << 30)) {
+            config.nvlink_async_memcpy_threshold = static_cast<size_t>(val);
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_NVLINK_ASYNC_MEMCPY_THRESHOLD: "
+                         << nvlink_async_memcpy_threshold_env
+                         << ". Expected an integer in range 0-1073741824 (KiB)";
+        }
     }
 
     const char* min_reg_size_env = std::getenv("MC_MIN_REG_SIZE");
@@ -624,11 +632,6 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.efa_cq_drain_timeout_ms = atoll(efa_cq_drain_timeout_env);
     }
 
-    const char* efa_stall_min_env = std::getenv("MC_EFA_STALL_MIN_MS");
-    if (efa_stall_min_env) {
-        config.efa_stall_min_ms = atoll(efa_stall_min_env);
-    }
-
     const char* use_rdma_twosided_env = std::getenv("MC_USE_RDMA_TWOSIDED");
     if (use_rdma_twosided_env) {
         parseBoolConfigEnv(use_rdma_twosided_env, "MC_USE_RDMA_TWOSIDED",
@@ -943,7 +946,6 @@ void dumpGlobalConfig() {
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "efa_homogeneous_peers = " << config.efa_homogeneous_peers;
     LOG(INFO) << "efa_cq_drain_timeout_ms = " << config.efa_cq_drain_timeout_ms;
-    LOG(INFO) << "efa_stall_min_ms = " << config.efa_stall_min_ms;
     LOG(INFO) << "efa_nic_selection = "
               << (config.efa_nic_selection == EfaNicSelection::LOCAL ? "local"
                                                                      : "all");
@@ -980,6 +982,8 @@ void dumpGlobalConfig() {
               << config.rdma_notify_max_pending_sends;
     LOG(INFO) << "rdma_notify_oob_fallback = "
               << (config.rdma_notify_oob_fallback ? "true" : "false");
+    LOG(INFO) << "nvlink_async_memcpy_threshold = "
+              << config.nvlink_async_memcpy_threshold;
 }
 
 GlobalConfig& globalConfig() {

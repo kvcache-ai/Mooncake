@@ -231,6 +231,11 @@ struct GlobalConfig {
     // ASCEND_GLOBAL_RESOURCE_CONFIG (e.g. Store=RoCE, P2P=HCCS). Assumes TE
     // inits are serialized within the process.
     bool ascend_store_te_init = false;
+    // Threshold (KiB) below which a single-entry NVLink batch runs as a
+    // blocking cudaMemcpy instead of the async stream + stream-query
+    // pipeline; 0 disables the synchronous fast path. Override via
+    // MC_NVLINK_ASYNC_MEMCPY_THRESHOLD.
+    size_t nvlink_async_memcpy_threshold = 2048;
     // ub config parameters
     size_t num_jfc_per_ctx = 2;
     size_t num_jfce_per_ctx = 2;
