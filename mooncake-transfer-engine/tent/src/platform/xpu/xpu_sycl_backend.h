@@ -973,11 +973,18 @@ class XpuSyclBackend {
                 q.emplace(proto->get_context(), proto->get_device(),
                           sycl::property::queue::in_order());
             q->memcpy(dst, src, len).wait();
-        } catch (const sycl::exception &) {
-            return 1;  // a queue that saw an error is not reused
+        } catch (...) {
+            // Callers expect a status, not an exception. A queue that saw an
+            // error is not reused.
+            return 1;
         }
-        std::lock_guard<std::mutex> lock(mu_);
-        idle_copy_queues_[device_index].push_back(std::move(*q));
+        try {
+            std::lock_guard<std::mutex> lock(mu_);
+            idle_copy_queues_[device_index].push_back(std::move(*q));
+        } catch (...) {
+            // The copy succeeded; this queue is destroyed instead of being
+            // reused, and a later copy creates another.
+        }
         return 0;
     }
 
