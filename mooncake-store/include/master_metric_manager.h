@@ -144,6 +144,13 @@ class MasterMetricManager {
     void observe_value_size(int64_t size);
     int64_t get_key_count();
     int64_t get_soft_pin_key_count();
+    // Memory bytes that eviction cannot reclaim right now, refreshed by a
+    // periodic metadata walk: PROCESSING replicas (puts in flight) and
+    // COMPLETE replicas of objects holding an unexpired read lease.
+    void set_mem_processing_bytes(int64_t val);
+    void set_mem_leased_bytes(int64_t val);
+    int64_t get_mem_processing_bytes();
+    int64_t get_mem_leased_bytes();
 
     // Cluster Metrics
     void inc_active_clients(int64_t val = 1);
@@ -624,6 +631,8 @@ class MasterMetricManager {
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;
     ylt::metric::gauge_t soft_pin_key_count_;
+    ylt::metric::gauge_t mem_processing_bytes_;
+    ylt::metric::gauge_t mem_leased_bytes_;
     ylt::metric::histogram_t value_size_distribution_;
 
     // Cluster Metrics

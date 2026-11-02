@@ -9616,6 +9616,7 @@ void MasterService::EvictionThreadFunc() {
 
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
+    auto next_unevictable_metrics_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         // RFC #4700 slice 1: eviction, tenant watermark eviction, DFS/NoF
         // eviction, expired-processing discard and promotion retry all
@@ -9703,11 +9704,46 @@ void MasterService::EvictionThreadFunc() {
             RunPromotionCandidateRetry();
         }
 
+        if (std::chrono::steady_clock::now() >= next_unevictable_metrics_time) {
+            UpdateUnevictableMemMetrics(std::chrono::system_clock::now());
+            next_unevictable_metrics_time =
+                std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(kUnevictableMemMetricsIntervalMs);
+        }
+
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kEvictionThreadSleepMs));
     }
 
     VLOG(1) << "action=eviction_thread_stopped";
+}
+
+void MasterService::UpdateUnevictableMemMetrics(
+    std::chrono::system_clock::time_point now) {
+    int64_t processing_bytes = 0;
+    int64_t leased_bytes = 0;
+    {
+        std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+        VisitNamespaces([&](const TenantId& /*tenant_id*/,
+                            metadata::Namespace& ns) {
+            for (auto object : ns.objects.ReadCursor()) {
+                const auto& metadata = object.metadata();
+                const bool leased = !metadata.IsLeaseExpired(now);
+                for (const auto& replica : metadata.GetAllReplicas()) {
+                    if (!replica.is_memory_replica()) {
+                        continue;
+                    }
+                    if (replica.is_processing()) {
+                        processing_bytes += replica.get_memory_buffer_size();
+                    } else if (leased && replica.is_completed()) {
+                        leased_bytes += replica.get_memory_buffer_size();
+                    }
+                }
+            }
+        });
+    }
+    MasterMetricManager::instance().set_mem_processing_bytes(processing_bytes);
+    MasterMetricManager::instance().set_mem_leased_bytes(leased_bytes);
 }
 
 void MasterService::DiscardExpiredProcessingReplicas(

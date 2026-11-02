@@ -1151,6 +1151,9 @@ class MasterService {
     // raises it again when the round could free nothing that was there to
     // free.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    // Walks all objects and publishes the memory bytes that eviction cannot
+    // reclaim now: PROCESSING replicas and leased COMPLETE replicas.
+    void UpdateUnevictableMemMetrics(std::chrono::system_clock::time_point now);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
     using NamespaceEvictionResult = StoreControl::EvictionResult;
@@ -1651,6 +1654,8 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
+    // Interval of the full-metadata walk behind UpdateUnevictableMemMetrics.
+    static constexpr uint64_t kUnevictableMemMetricsIntervalMs = 1000;
 
     // Task cleanup thread related members
     std::thread task_cleanup_thread_;

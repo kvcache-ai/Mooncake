@@ -170,6 +170,24 @@ The admin HTTP server is configured in the master config file (`master.json` or 
 
 Set `enable_metric_reporting` to `false` to disable the periodic metrics log. HTTP endpoints (`/metrics`, `/health`, etc.) remain available regardless of this setting.
 
+### Unevictable Memory Metrics
+
+`master_allocated_bytes` counts all allocated memory, including data that
+eviction can reclaim, so it cannot tell a full-but-evictable store from one
+pinned by in-flight work. Two gauges split out the memory eviction cannot
+reclaim right now. A metadata walk on the eviction thread refreshes them about
+once a second.
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `master_mem_processing_bytes` | gauge | Memory held by `PROCESSING` replicas: puts that have started but not ended |
+| `master_mem_leased_bytes` | gauge | Memory of `COMPLETE` replicas whose object holds an unexpired read lease |
+
+Divided by `master_total_capacity_bytes`, these give the write, read and total
+(sum) usage that clients such as vLLM's Mooncake store connector report. Read
+usage includes the whole lease TTL (`default_kv_lease_ttl`), not only the time
+a read transfer takes.
+
 ### Process and Allocator Memory Metrics
 
 Both `/metrics` endpoints export the resident set size of the serving process,

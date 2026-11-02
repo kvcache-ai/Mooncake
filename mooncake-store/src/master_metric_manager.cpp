@@ -68,6 +68,13 @@ MasterMetricManager::MasterMetricManager()
       soft_pin_key_count_(
           "master_soft_pin_key_count",
           "Total number of soft-pinned keys managed by the master"),
+      mem_processing_bytes_(
+          "master_mem_processing_bytes",
+          "Memory bytes held by PROCESSING replicas (puts not yet ended)"),
+      mem_leased_bytes_(
+          "master_mem_leased_bytes",
+          "Memory bytes of COMPLETE replicas whose object holds an unexpired "
+          "read lease"),
       // Initialize Histogram (4KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB)
       value_size_distribution_(
           "master_value_size_bytes", "Distribution of object value sizes",
@@ -585,6 +592,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     dfs_file_count_.update(0);
     key_count_.update(0);
     soft_pin_key_count_.update(0);
+    mem_processing_bytes_.update(0);
+    mem_leased_bytes_.update(0);
     active_clients_.update(0);
     client_liveness_active_clients_.update(0);
     client_liveness_suspected_clients_.update(0);
@@ -996,6 +1005,19 @@ int64_t MasterMetricManager::get_key_count() { return key_count_.value(); }
 
 int64_t MasterMetricManager::get_soft_pin_key_count() {
     return soft_pin_key_count_.value();
+}
+
+void MasterMetricManager::set_mem_processing_bytes(int64_t val) {
+    mem_processing_bytes_.update(val);
+}
+void MasterMetricManager::set_mem_leased_bytes(int64_t val) {
+    mem_leased_bytes_.update(val);
+}
+int64_t MasterMetricManager::get_mem_processing_bytes() {
+    return mem_processing_bytes_.value();
+}
+int64_t MasterMetricManager::get_mem_leased_bytes() {
+    return mem_leased_bytes_.value();
 }
 
 // Cluster Metrics
@@ -2158,6 +2180,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(dfs_file_count_);
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
+    serialize_metric(mem_processing_bytes_);
+    serialize_metric(mem_leased_bytes_);
     serialize_metric(active_clients_);
     serialize_metric(client_liveness_active_clients_);
     serialize_metric(client_liveness_suspected_clients_);
