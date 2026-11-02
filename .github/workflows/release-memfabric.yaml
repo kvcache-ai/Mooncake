@@ -134,6 +134,35 @@ jobs:
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
           PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-memfabric-py${{ steps.generate_tag_release.outputs.python_version_tag }} bash scripts/build_wheel.sh
 
+      - name: Smoke test repaired wheel
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH=""
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          export LD_LIBRARY_PATH=""
+          source /usr/local/Ascend/cann/set_env.sh
+          export PYTHONPATH=""
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
+          export MOONCAKE_STORE_BACKEND=cpp
+          export WHEEL_DIR="${GITHUB_WORKSPACE}/mooncake-wheel/dist-memfabric-py${{ steps.generate_tag_release.outputs.python_version_tag }}"
+          smoke_dir=$(mktemp -d)
+          trap 'rm -rf "$smoke_dir"' EXIT
+          "${PYTHON_BIN}" -m venv "$smoke_dir/venv"
+          "$smoke_dir/venv/bin/python" -m pip install --no-deps "$WHEEL_DIR"/*.whl
+          cd "$smoke_dir"
+          "$smoke_dir/venv/bin/python" -I - <<'PY'
+          from mooncake import engine, tent
+          from mooncake.store import MooncakeDistributedStore
+          from pathlib import Path
+          import subprocess
+          import sysconfig
+
+          package = Path(sysconfig.get_path("platlib")) / "mooncake"
+          subprocess.run([str(package / "mooncake_master"), "--version"], check=True)
+          print("Memfabric wheel smoke test passed")
+          PY
+
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4
         with:
