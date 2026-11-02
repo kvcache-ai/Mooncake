@@ -235,6 +235,15 @@ bool FileStorageConfig::Validate() const {
             return false;
         }
     }
+    // Only the bucket backend dispatches files across roots; the others use
+    // storage_filepath as a single directory and would try to create a
+    // directory whose name contains a comma.
+    if (paths.size() > 1 && storage_backend_type != StorageBackendType::kBucket) {
+        LOG(ERROR) << "FileStorageConfig: multiple storage directories are "
+                      "only supported by bucket_storage_backend; got "
+                   << paths.size() << " paths";
+        return false;
+    }
     if (total_keys_limit <= 0) {
         LOG(ERROR) << "FileStorageConfig: total_keys_limit must > 0";
         return false;

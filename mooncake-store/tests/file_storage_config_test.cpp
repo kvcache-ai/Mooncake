@@ -45,6 +45,8 @@ struct FileStorageEnvironment {
     ScopedEnvVar storage_backend_descriptor{
         "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR"};
     ScopedEnvVar storage_path{"MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"};
+    ScopedEnvVar allow_storage_path_change{
+        "MOONCAKE_OFFLOAD_ALLOW_STORAGE_PATH_CHANGE"};
     ScopedEnvVar local_buffer_size{"MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES"};
     ScopedEnvVar pinned_restore_arena_size{
         "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES"};
@@ -272,6 +274,16 @@ TEST_F(FileStorageConfigTest, OutOfRangeValueUsesDefault) {
     EXPECT_EQ(negative.heartbeat_interval_seconds, 10u);
 }
 
+TEST_F(FileStorageConfigTest, ReadsAllowStoragePathChangeFlag) {
+    EXPECT_FALSE(FileStorageConfig::FromEnvironment().allow_storage_path_change);
+
+    env.allow_storage_path_change.Set("true");
+    EXPECT_TRUE(FileStorageConfig::FromEnvironment().allow_storage_path_change);
+
+    env.allow_storage_path_change.Set("0");
+    EXPECT_FALSE(FileStorageConfig::FromEnvironment().allow_storage_path_change);
+}
+
 TEST_F(FileStorageConfigTest, ValidateSuccessWithValidConfig) {
     FileStorageConfig config;
     config.storage_filepath = data_path.string();
@@ -301,6 +313,34 @@ TEST_F(FileStorageConfigTest, ValidateFailsOnInvalidStoragePath) {
     config.storage_filepath = "/tmp/this_directory_does_not_exist_12345";
     EXPECT_FALSE(config.Validate());
     config.storage_filepath = data_path.string();
+    EXPECT_TRUE(config.Validate());
+}
+
+TEST_F(FileStorageConfigTest, ValidateRejectsMultiplePathsForOtherBackends) {
+    const std::string path0 = (data_path / "disk0").string();
+    const std::string path1 = (data_path / "disk1").string();
+    std::filesystem::create_directories(path0);
+    std::filesystem::create_directories(path1);
+
+    FileStorageConfig config;
+    config.total_keys_limit = 1000000;
+    config.total_size_limit = 1073741824;
+    config.storage_filepath = path0 + "," + path1;
+
+    config.storage_backend_type = StorageBackendType::kBucket;
+    EXPECT_TRUE(config.Validate());
+
+    // The other backends treat storage_filepath as one directory, so the list
+    // would be created verbatim as a directory name containing a comma.
+    for (const auto type :
+         {StorageBackendType::kFilePerKey, StorageBackendType::kOffsetAllocator,
+          StorageBackendType::kDistributed, StorageBackendType::kNvmeKv}) {
+        config.storage_backend_type = type;
+        EXPECT_FALSE(config.Validate()) << "backend type " << static_cast<int>(type);
+    }
+
+    // A single path is valid on every backend.
+    config.storage_filepath = path0;
     EXPECT_TRUE(config.Validate());
 }
 
