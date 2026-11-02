@@ -380,7 +380,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
         // randomly. Non-serving segments are skipped here instead of building
         // the serving list, which would check every segment per allocation;
         // they do not count toward the retry limit.
-        const size_t start_idx = randomIndex(names.size());
+        const size_t start_idx = randomStartIndex(allocator_manager, names);
         size_t try_count = 0;
 
         for (size_t i = 0; i < names.size() && replicas.size() < replica_num &&
@@ -476,8 +476,23 @@ class RandomAllocationStrategy : public AllocationStrategy {
         return nullptr;
     }
 
+   protected:
+    // Draws again on a non-serving segment, so the serving segment right after
+    // a run of them is not more likely to come first.
+    static size_t randomStartIndex(const AllocatorManager& allocator_manager,
+                                   const std::vector<std::string>& names) {
+        size_t start_idx = randomIndex(names.size());
+        for (int draw = 0; draw < kMaxStartDraws &&
+                           !allocator_manager.isServing(names[start_idx]);
+             ++draw) {
+            start_idx = randomIndex(names.size());
+        }
+        return start_idx;
+    }
+
    private:
     static constexpr size_t kMaxRetryLimit = 100;
+    static constexpr int kMaxStartDraws = 16;
 };
 
 /**
@@ -526,7 +541,7 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
 
         const size_t remaining = replica_num - replicas.size();
         const size_t sample_count = kCandidateMultiplier * remaining;
-        const size_t start_idx = randomIndex(names.size());
+        const size_t start_idx = randomStartIndex(allocator_manager, names);
 
         struct Candidate {
             size_t name_idx;

@@ -652,6 +652,33 @@ TEST_P(AllocationStrategyParameterizedTest,
 }
 
 TEST_P(AllocationStrategyParameterizedTest,
+       NonServingRunDoesNotFavorTheNextSegment) {
+    AllocatorManager allocator_manager;
+    for (size_t i = 0; i < 12; ++i) {
+        if (i == 6) {
+            AddSuspectedSegments(allocator_manager, 12, 4);
+        }
+        const auto name = "serving" + std::to_string(i);
+        allocator_manager.addAllocator(name,
+                                       CreateTestAllocator(name, i * 64 * MiB));
+    }
+
+    constexpr int kAllocations = 3000;
+    std::unordered_map<std::string, int> picks;
+    for (int i = 0; i < kAllocations; ++i) {
+        auto result = strategy_->Allocate(allocator_manager, 1024);
+        ASSERT_TRUE(result.has_value());
+        ++picks[(*result)[0]
+                    .get_descriptor()
+                    .get_memory_descriptor()
+                    .buffer_descriptor.transport_endpoint_];
+    }
+    for (const auto& [name, count] : picks) {
+        EXPECT_LT(count, kAllocations * 15 / 100) << name;
+    }
+}
+
+TEST_P(AllocationStrategyParameterizedTest,
        FreeRatioFirstRanksOnlyServingSegments) {
     auto [strategy_type, allocator_type] = GetParam();
     if (strategy_type != AllocationStrategyType::FREE_RATIO_FIRST) {
