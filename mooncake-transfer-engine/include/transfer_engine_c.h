@@ -163,6 +163,19 @@ int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
                       size_t task_id, struct transfer_status *status);
 
 /*
+ * Aggregate status of the whole batch in one call, instead of one
+ * getTransferStatus() per task. On the classic engine, while an RDMA-only
+ * batch is in flight (and MC_SLICE_TIMEOUT is unset), this does not walk the
+ * task list and reports transferred_bytes as 0; the real total is filled in
+ * once the batch is COMPLETED. The call that observes COMPLETED may send the
+ * batch's pending notification synchronously. FAILED can be reported while
+ * other tasks are still in flight. It does not wait. *status is written only
+ * when 0 is returned.
+ */
+int getBatchTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
+                           struct transfer_status *status);
+
+/*
  * Returns 0 when cleanup completes immediately, or BATCH_CLEANUP_DEFERRED when
  * cleanup ownership is accepted but physical cleanup must wait. Both results
  * invalidate batch_id; the caller must not use it again.

@@ -416,8 +416,7 @@ DynamicReplicationController::SelectPlan(
     if (!target_segment.has_value()) {
         return std::nullopt;
     }
-    const auto source_session =
-        source_session_by_segment.find(source_segment);
+    const auto source_session = source_session_by_segment.find(source_segment);
     if (source_session == source_session_by_segment.end() ||
         !source_session->second) {
         return std::nullopt;

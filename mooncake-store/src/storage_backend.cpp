@@ -51,6 +51,7 @@ struct FdGuard {
 }  // namespace
 
 #include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/kvcs/kvcs_object_storage_adapter.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #ifdef HAVE_OSS_ADAPTER
 #include "storage/distributed/oss_adapter.h"
@@ -869,6 +870,11 @@ FileRecord StorageBackend::PopFileToEvictByFIFO() {
 }
 
 void StorageBackend::RestoreFileToWriteQueueFront(const FileRecord& record) {
+    RestoreFileToWriteQueue(record, true);
+}
+
+void StorageBackend::RestoreFileToWriteQueue(const FileRecord& record,
+                                             bool to_front) {
     if (record.path.empty()) {
         return;
     }
@@ -881,8 +887,10 @@ void StorageBackend::RestoreFileToWriteQueueFront(const FileRecord& record) {
         if (file_queue_map_.find(record.path) != file_queue_map_.end()) {
             was_replaced = true;
         } else {
-            file_write_queue_.push_front(record);
-            file_queue_map_[record.path] = file_write_queue_.begin();
+            const auto position =
+                to_front ? file_write_queue_.begin() : file_write_queue_.end();
+            file_queue_map_[record.path] =
+                file_write_queue_.insert(position, record);
         }
     }
 
@@ -1085,11 +1093,56 @@ StorageBackend::EvictAboveDiskWatermark(
     if (eviction_handler && !evicted_keys.empty()) {
         auto notify_result = eviction_handler(evicted_keys);
         if (!notify_result) {
-            for (auto it = pending_evictions.rbegin();
-                 it != pending_evictions.rend(); ++it) {
-                RestoreFileToWriteQueueFront(*it);
+            auto restore_all = [&] {
+                for (auto it = pending_evictions.rbegin();
+                     it != pending_evictions.rend(); ++it) {
+                    RestoreFileToWriteQueueFront(*it);
+                }
+            };
+            if (notify_result.error() !=
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+                restore_all();
+                return tl::make_unexpected(notify_result.error());
             }
-            return tl::make_unexpected(notify_result.error());
+
+            // A protected file must not pin unrelated orphan files. Retry
+            // authorization per physical file only after an explicit refusal.
+            // Keep all records pending until every retry finishes so an RPC
+            // failure can still roll back the entire physical deletion batch.
+            std::vector<FileRecord> approved;
+            std::vector<FileRecord> retained;
+            evicted_keys.clear();
+            for (const auto& pending : pending_evictions) {
+                if (pending.key.empty()) {
+                    retained.push_back(pending);
+                    continue;
+                }
+                auto result = eviction_handler({pending.key});
+                if (result) {
+                    approved.push_back(pending);
+                    evicted_keys.push_back(pending.key);
+                } else if (result.error() ==
+                           ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+                    retained.push_back(pending);
+                } else {
+                    restore_all();
+                    return tl::make_unexpected(result.error());
+                }
+            }
+            for (auto it = retained.rbegin(); it != retained.rend(); ++it) {
+                if (it->key.empty()) RestoreFileToWriteQueueFront(*it);
+            }
+            // Rotate confirmed protected files so later heartbeat batches
+            // can reach ordinary files behind a protected FIFO prefix.
+            for (const auto& record : retained) {
+                if (!record.key.empty()) {
+                    RestoreFileToWriteQueue(record, false);
+                }
+            }
+            pending_evictions = std::move(approved);
+            if (pending_evictions.empty()) {
+                return tl::make_unexpected(notify_result.error());
+            }
         }
     }
 
@@ -2191,6 +2244,16 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
     return on_disk;
 }
 
+std::optional<int64_t> BucketStorageBackend::GetObjectDataSize(
+    const std::string& key) const {
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    auto it = object_bucket_map_.find(key);
+    if (it == object_bucket_map_.end() || it->second.data_size <= 0) {
+        return std::nullopt;
+    }
+    return it->second.data_size;
+}
+
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
     // When eviction is enabled, always allow offloading since PrepareEviction
     // will manage capacity by evicting old buckets as needed.
@@ -2277,13 +2340,21 @@ BucketStorageBackend::GetStoreMetadata() {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
-    std::vector<std::vector<std::string>>& buckets_keys) {
-    return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys);
+    std::vector<std::vector<std::string>>& buckets_keys,
+    std::vector<std::string>* deferred_keys) {
+    return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys,
+                                       deferred_keys);
 }
 
 void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
     MutexLocker locker(&offloading_mutex_);
     ungrouped_offloading_objects_.clear();
+}
+
+bool BucketStorageBackend::RemoveUngroupedOffloadingObject(
+    const std::string& key) {
+    MutexLocker locker(&offloading_mutex_);
+    return ungrouped_offloading_objects_.erase(key) > 0;
 }
 
 size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
@@ -2293,7 +2364,8 @@ size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
-    std::vector<std::vector<std::string>>& buckets_keys) {
+    std::vector<std::vector<std::string>>& buckets_keys,
+    std::vector<std::string>* deferred_keys) {
     MutexLocker offloading_locker(&offloading_mutex_);
     if (offloading_objects.empty()) {
         return {};
@@ -2342,6 +2414,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                 for (const auto& bucket_object : bucket_objects) {
                     ungrouped_offloading_objects.emplace(bucket_object.first,
                                                          bucket_object.second);
+                    // Report the deferral so the caller can keep these keys'
+                    // offload tasks alive until a later call re-emits them in
+                    // a bucket (upstream #3006: without this the tasks are
+                    // NACKed at deferral and the keys are silently dropped on
+                    // re-emission).
+                    if (deferred_keys != nullptr) {
+                        deferred_keys->push_back(bucket_object.first);
+                    }
                 }
                 VLOG(1) << "Add offloading objects to ungrouped pool. "
                         << "Total ungrouped count: "
@@ -5645,6 +5725,10 @@ CreateStorageBackend(const FileStorageConfig& config) {
                 LOG(ERROR) << "S3 adapter requires libcurl and OpenSSL";
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 #endif
+            } else if (distributed_config.UsesKvcs()) {
+                object_storage_adapter =
+                    std::make_unique<KvcsObjectStorageAdapter>(
+                        distributed_config.object_storage_config_path);
             } else {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }

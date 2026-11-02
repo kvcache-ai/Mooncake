@@ -17,9 +17,12 @@ constexpr int kMaxWaitingExpiryAcquisitionsPerPass = 4;
 
 }  // namespace
 
-ClientSessionRegistry::ClientSessionRegistry(Clock::duration active_ttl,
-                                             Clock::duration suspicion_ttl)
-    : active_ttl_(active_ttl), suspicion_ttl_(suspicion_ttl) {}
+ClientSessionRegistry::ClientSessionRegistry(
+    Clock::duration active_ttl, Clock::duration suspicion_ttl,
+    std::function<bool()> admits_expiry)
+    : active_ttl_(active_ttl),
+      suspicion_ttl_(suspicion_ttl),
+      admits_expiry_(std::move(admits_expiry)) {}
 
 ClientSessionRegistry::~ClientSessionRegistry() {
     Stop();
@@ -411,6 +414,9 @@ void ClientSessionRegistry::ExpiryThreadFunc() {
 }
 
 void ClientSessionRegistry::ExpireSessions(Clock::time_point now) {
+    if (admits_expiry_ && !admits_expiry_()) {
+        return;
+    }
     // Restore/reset freeze expiry, but not heartbeats. Do not wait here:
     // event delivery must remain independent of restore work.
     std::shared_lock lifecycle_lock(lifecycle_mutex_, std::try_to_lock);

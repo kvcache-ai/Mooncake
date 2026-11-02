@@ -38,6 +38,7 @@ struct EfaHandshakeTestTransport {
 
 class EfaContext {
    public:
+    struct AvSlotState;  // EfaOpContext holds a pointer to one.
     std::string name;
     EfaHandshakeTestTransport transport;
     int inserts = 0;
@@ -61,6 +62,7 @@ class EfaContext {
         ++removals;
         return 0;
     }
+    bool slotHasInflight(fi_addr_t) { return false; }
     int submitSlicesOnPeer(fi_addr_t, std::vector<Transport::Slice*>&,
                            std::vector<Transport::Slice*>&) {
         return 0;

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -45,9 +46,13 @@ class ClientSessionRegistry {
     // A session unobserved for active_ttl becomes SUSPECTED, and OFFLINE
     // suspicion_ttl later; the defaults never expire. Identities may outlive
     // the registry: a record that left it is never mutated again.
+    // Optional expiry admission is checked outside registry locks before each
+    // pass, so an owner can pause expiry during recovery. It must not throw
+    // and its captures must outlive Stop.
     explicit ClientSessionRegistry(
         Clock::duration active_ttl = Clock::duration::max(),
-        Clock::duration suspicion_ttl = Clock::duration::max());
+        Clock::duration suspicion_ttl = Clock::duration::max(),
+        std::function<bool()> admits_expiry = {});
     ~ClientSessionRegistry();
     ClientSessionRegistry(const ClientSessionRegistry&) = delete;
     ClientSessionRegistry& operator=(const ClientSessionRegistry&) = delete;
@@ -221,6 +226,7 @@ class ClientSessionRegistry {
 
     const Clock::duration active_ttl_;
     const Clock::duration suspicion_ttl_;
+    const std::function<bool()> admits_expiry_;
     std::mutex expiry_mutex_;
     std::condition_variable expiry_cv_;
     bool expiry_stopping_{false};

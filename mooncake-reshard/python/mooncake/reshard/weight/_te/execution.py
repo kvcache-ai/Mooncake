@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Sequence, Union, cast
 
 from ...contracts import ParticipantId, RuntimeFragmentId, RuntimeInstanceId
+from ...transfer_engine import TransferBatch, TransferBatchReceipt
 from ..manifest import (
     RuntimeBindingFragment,
     WeightPlacementManifest,
@@ -17,7 +19,48 @@ from ..planner import (
     RuntimeFragmentSnapshot,
     TransferPlan,
 )
+from .batching import iter_transfer_batches
 from .completion import TransferEngineError
+
+
+def iter_endpoint_batches(
+    operations_by_endpoint: Mapping[
+        str,
+        Sequence[
+            tuple[LiveTransferOperation, BoundWeightFragment, BoundWeightFragment]
+        ],
+    ],
+    *,
+    max_batch_operations: int,
+    max_region_segments: int,
+) -> Iterator[TransferBatch]:
+    for endpoint in sorted(operations_by_endpoint):
+        operations = sorted(
+            operations_by_endpoint[endpoint],
+            key=lambda item: (
+                item[2].address + item[0].target_offset,
+                item[1].address + item[0].source_offset,
+            ),
+        )
+        yield from iter_transfer_batches(
+            endpoint,
+            operations,
+            max_batch_operations=max_batch_operations,
+            max_region_segments=max_region_segments,
+        )
+
+
+def endpoint_receipt_totals(
+    receipts: Iterable[TransferBatchReceipt],
+) -> dict[str, tuple[int, int]]:
+    totals: dict[str, tuple[int, int]] = {}
+    for receipt in receipts:
+        operation_count, total_bytes = totals.get(receipt.endpoint, (0, 0))
+        totals[receipt.endpoint] = (
+            operation_count + receipt.operation_count,
+            total_bytes + receipt.nbytes,
+        )
+    return totals
 
 
 def validate_lowering_limits(
@@ -27,8 +70,10 @@ def validate_lowering_limits(
     max_total_lowered_segments: int,
     max_completion_drain_attempts: int,
     completion_drain_timeout_ms: int,
+    max_inflight_batches: int = 1,
 ) -> None:
     for name, value in (
+        ("max_inflight_batches", max_inflight_batches),
         ("max_batch_operations", max_batch_operations),
         ("max_region_segments", max_region_segments),
         ("max_total_lowered_segments", max_total_lowered_segments),

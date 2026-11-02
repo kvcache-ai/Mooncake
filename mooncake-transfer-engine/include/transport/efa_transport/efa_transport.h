@@ -15,8 +15,6 @@
 #ifndef EFA_TRANSPORT_H_
 #define EFA_TRANSPORT_H_
 
-#include <infiniband/verbs.h>
-
 #include <atomic>
 #include <cstddef>
 #include <map>
@@ -93,12 +91,20 @@ class EfaTransport : public Transport {
     int warmupSegment(const std::string& segment_name);
 
    private:
-    // Internal version with force_sequential option to avoid nested parallelism
+    // How a THP-backed buffer is planned. kAuto budgets PTEs at 2MB and puts
+    // every chunk on every NIC; when that registration fails, the buffer is
+    // retried (already pre-touched) with kThpPartitioned, which keeps 2MB but
+    // gives each NIC only its share of the buffer, and then with kBasePages,
+    // the 4KB partitioned plan used for non-THP memory.
+    enum class ThpPlan { kAuto, kThpPartitioned, kBasePages };
+
+    // Internal version with force_sequential option to avoid nested
+    // parallelism.
     int registerLocalMemoryInternal(void* addr, size_t length,
                                     const std::string& location,
                                     bool remote_accessible,
-                                    bool update_metadata,
-                                    bool force_sequential);
+                                    bool update_metadata, bool force_sequential,
+                                    ThpPlan thp_plan = ThpPlan::kAuto);
 
     int unregisterLocalMemoryInternal(void* addr, bool update_metadata,
                                       bool force_sequential);
@@ -145,11 +151,20 @@ class EfaTransport : public Transport {
     int startHandshakeDaemon(std::string& local_server_name);
 
    public:
+    // Published as the lkey of a buffer registered without remote_accessible,
+    // in place of its real MR key (see registerLocalMemoryInternal()).
+    static constexpr uint64_t kLocalOnlyKey = 1;
+
+    // require_remote_key: true for a peer's segment (the device must hold an
+    // rkey), false for the local segment, whose buffers registered without
+    // remote_accessible publish only lkeys.
     static int selectDevice(SegmentDesc* desc, uint64_t offset, size_t length,
-                            int& buffer_id, int& device_id, int retry_cnt = 0);
+                            int& buffer_id, int& device_id, int retry_cnt = 0,
+                            bool require_remote_key = true);
     static int selectDevice(SegmentDesc* desc, uint64_t offset, size_t length,
                             std::string_view hint, int& buffer_id,
-                            int& device_id, int retry_cnt = 0);
+                            int& device_id, int retry_cnt = 0,
+                            bool require_remote_key = true);
 
    private:
     // Start/stop CQ polling worker threads

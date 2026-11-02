@@ -24,6 +24,17 @@ class WrappedMasterService {
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
     void StopBatchOpLogWriter();
+    void StopHttpMetadataCleanup();
+    // Restore lifecycle hooks (RFC #4700, slice 1). Serving means "committed
+    // to normal operation, restore refused from here on", not "already
+    // reachable": the non-HA path and EmbeddedMaster both run
+    // MarkReadyForServing + ActivateServing before registering the RPC
+    // service, while the HA supervisor's ActivateServingState takes the
+    // Ready -> Serving edge after readiness is published, on a per-term
+    // instance that is destroyed rather than reused if publication fails.
+    void MarkReadyForServing();
+    void ActivateServing();
+    MasterService::RestoreLifecycleState GetRestoreLifecycleState() const;
     // Constructor with optional metadata-cleanup-on-timeout configuration.
     // - http_metadata_server: in-process pointer used when the HTTP metadata
     //   server is co-located in the master process (nullptr = not co-located).
@@ -161,6 +172,10 @@ class WrappedMasterService {
     long RemoveAll(bool force = false,
                    const std::string& tenant_id = "default");
 
+    std::vector<tl::expected<void, ErrorCode>> BatchUpdateSoftPin(
+        const std::vector<std::string>& keys, uint64_t ttl_ms,
+        const std::string& tenant_id = "default");
+
     std::vector<tl::expected<void, ErrorCode>> BatchRemove(
         const std::vector<std::string>& keys, bool force = false,
         const std::string& tenant_id = "default");
@@ -245,6 +260,15 @@ class WrappedMasterService {
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
 
+    // SSD prefetch RPC. Registers a promotion task without the
+    // promotion-on-hit admission gates and without the holder's heartbeat
+    // mailbox; the caller drives the execution chain itself. Best-effort:
+    // PROMOTION_ALREADY_EXISTS is a normal "skip" outcome. Additive RPC —
+    // older masters reject it and prefetch degrades to a no-op.
+    tl::expected<void, ErrorCode> RegisterPrefetchTask(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
+
     tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id, uint64_t size,
@@ -276,6 +300,41 @@ class WrappedMasterService {
         const UUID& segment_id);
     tl::expected<void, ErrorCode> SetSegmentStatus(
         const std::string& segment_name, SegmentStatus status);
+
+    WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
+        const BeginWeightImportRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(
+        const CommitWeightImportRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> AbortWeightImport(
+        const AbortWeightImportRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionView> GetWeightRevision(
+        const GetWeightRevisionRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<ListWeightRevisionsResponse>
+    ListWeightRevisions(const ListWeightRevisionsRequest& request,
+                        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightResidencyOperation>
+    StartWeightResidencyOperation(
+        const StartWeightResidencyOperationRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightResidencyOperation> QueryWeightOperation(
+        const QueryWeightOperationRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> DeleteWeightRevision(
+        const DeleteWeightRevisionRequest& request,
+        const std::string& tenant_id = "default");
 
     // Internal method called by supervisor during promotion; NOT an RPC
     // endpoint.
