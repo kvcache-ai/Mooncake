@@ -2158,8 +2158,9 @@ TEST_F(DfsBackendTest, ConcurrentWritesWithReopenPreserveData) {
     std::atomic<int> failures{0};
     for (int i = 0; i < kThreads; ++i) {
         threads.emplace_back([&, i]() {
-            const DistributedFSDescriptor desc{ShardPath(0), i * kBlock, kBlock,
-                                               kBlock, 0};
+            const DistributedFSDescriptor desc{
+                ShardPath(0), static_cast<uint64_t>(i * kBlock), kBlock, kBlock,
+                0};
             auto results = backend->BatchWrite(
                 {{"key_" + std::to_string(i),
                   desc,
@@ -2177,8 +2178,8 @@ TEST_F(DfsBackendTest, ConcurrentWritesWithReopenPreserveData) {
     for (int i = 0; i < kThreads; ++i) {
         AlignedBuffer read_buf(kBlock);
         ASSERT_NE(read_buf.data(), nullptr);
-        const DistributedFSDescriptor desc{ShardPath(0), i * kBlock, kBlock,
-                                           kBlock, 0};
+        const DistributedFSDescriptor desc{
+            ShardPath(0), static_cast<uint64_t>(i * kBlock), kBlock, kBlock, 0};
         auto read_results =
             backend->BatchRead({{"key_" + std::to_string(i),
                                  desc,
