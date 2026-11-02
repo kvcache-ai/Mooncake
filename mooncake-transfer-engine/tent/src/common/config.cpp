@@ -170,6 +170,25 @@ void ConfigHelper::forceTcp(Config& config) {
     config.set("transports/fabric/enable", false);
 }
 
+void ConfigHelper::forceMnnvlEgm(Config& config) {
+    config.set("transports/mnnvl/store_egm", true);
+    config.set("transports/mnnvl/enable", true);
+    config.set("transports/mnnvl/egm", true);
+    config.set("transports/mnnvl/egm_strict", true);
+    config.set("transports/nvlink/handle_type", "fabric");
+    config.set("transports/nvlink/host_register", true);
+    for (const char* name : {"tcp", "hp_tcp", "rdma", "shm", "nvlink", "ub",
+                             "fabric", "ascend_direct", "sunrise_link", "tpu",
+                             "mlu", "xpu", "mpcomm", "hylink", "memfabric"}) {
+        config.set(std::string("transports/") + name + "/enable", false);
+    }
+    config.set("max_failover_attempts", 0);
+    config.set("enable_auto_failover_on_poll", false);
+    // A stream drain cannot fence requests still waiting in an admission queue.
+    config.set("enable_runtime_queue", false);
+    config.set("enable_progress_worker", false);
+}
+
 Status ConfigHelper::loadFromEnv(Config& config) {
     const char* conf_str = std::getenv("MC_TENT_CONF");
     Status status = Status::OK();

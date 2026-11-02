@@ -53,6 +53,9 @@ class AcceleratorDevice {
     virtual bool Copy(void* dst, const void* src, size_t size,
                       CopyDirection direction) const = 0;
     virtual PinnedHostBuffer AllocatePinnedHost(size_t size) const = 0;
+    // Blocks until the runtime event (e.g. cudaEvent_t) has completed.
+    // Runtimes without event support report failure.
+    virtual bool SynchronizeEvent(void* /*event*/) const { return false; }
 };
 
 class ProbeCachedAcceleratorDevice : public AcceleratorDevice {

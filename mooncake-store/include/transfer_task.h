@@ -626,13 +626,17 @@ class TransferSubmitter {
      * @param handles Buffer descriptors for the transfer
      * @param slices Memory slices for the transfer
      * @param op_code Transfer operation (READ/WRITE)
+     * @param producer_event Optional runtime event the source waits on. Only
+     * accepted on transfer-engine routes that order it on the device (see
+     * ordersProducerEventOnDevice()); other strategies fail the submission.
      * @return TransferFuture representing the async operation, or nullopt on
      * failure
      */
     std::optional<TransferFuture> submit(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
         TransferRequest::OpCode op_code, void* ptr = nullptr, size_t size = 0,
-        TransferIntent intent = TransferIntent::kUnspecified);
+        TransferIntent intent = TransferIntent::kUnspecified,
+        void* producer_event = nullptr);
 
     /**
      * @brief Submit a range read: read [src_offset, src_offset+size) from
@@ -658,7 +662,8 @@ class TransferSubmitter {
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
         TransferRequest::OpCode op_code,
-        TransferIntent intent = TransferIntent::kUnspecified);
+        TransferIntent intent = TransferIntent::kUnspecified,
+        void* producer_event = nullptr);
 
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,
@@ -670,6 +675,15 @@ class TransferSubmitter {
         TransferIntent intent = TransferIntent::kUnspecified);
 
     [[nodiscard]] bool canUseLocalMemcpy(const std::string& endpoint) const;
+
+    /**
+     * @brief True when memory-replica transfer-engine writes are pinned to
+     * MNNVL, whose transport orders a producer event on the copy stream. Other
+     * routes need the caller to wait on the event from the host instead.
+     */
+    [[nodiscard]] bool ordersProducerEventOnDevice() const {
+        return strict_mnnvl_;
+    }
 
     /**
      * @brief Pure comparison helper: returns true iff both endpoints are
@@ -698,6 +712,9 @@ class TransferSubmitter {
     bool memcpy_enabled_;
     const std::string local_hostname_;
     TransferMetric* transfer_metric_;
+    // Strict TENT MNNVL EGM engine: memory-replica requests carry the MNNVL
+    // transport hint and may forward producer events.
+    bool strict_mnnvl_ = false;
 
     /**
      * @brief Select the optimal transfer strategy
@@ -743,7 +760,11 @@ class TransferSubmitter {
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
         uint64_t src_offset = 0,
-        TransferIntent intent = TransferIntent::kUnspecified);
+        TransferIntent intent = TransferIntent::kUnspecified,
+        void* producer_event = nullptr);
+
+    void applyMemoryReplicaHints(TransferRequest& request,
+                                 void* producer_event) const;
 
     std::optional<TransferFuture> submitMemoryReadOperation(
         const AllocatedBuffer::Descriptor& handle,

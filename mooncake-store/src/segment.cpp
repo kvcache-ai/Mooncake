@@ -112,6 +112,23 @@ void AddAllocatorUsage(
 
 }  // namespace
 
+AllocatorManager ScopedAllocatorAccess::SnapshotAllocatorManager(
+    const std::string& source_segment) const {
+    auto snapshot = allocator_manager_.Snapshot(client_by_name_);
+    if (!source_segment.empty() && mounted_segments_ && segment_id_by_name_) {
+        auto indexed = segment_id_by_name_->find(source_segment);
+        if (indexed != segment_id_by_name_->end()) {
+            auto mounted = mounted_segments_->find(indexed->second);
+            if (mounted != mounted_segments_->end()) {
+                // Identity only: never restore the draining source's allocator
+                // or add it to serving names in the detached snapshot.
+                snapshot.SetSegmentMetadata(mounted->second.segment);
+            }
+        }
+    }
+    return snapshot;
+}
+
 std::vector<std::string> ScopedAllocatorAccess::GetHostOrderedSegments(
     const std::string& writer_host_id, const std::string& key) const {
     if (segments_by_host_ == nullptr) {
@@ -170,6 +187,12 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     if (segment.locality && segment.locality->numa_node < 0) {
         return ErrorCode::INVALID_PARAMS;
     }
+    if (segment.protocol == "mnnvl" &&
+        (!segment.physical_placement || !segment.physical_placement->Valid())) {
+        LOG(ERROR)
+            << "MNNVL mount requires physical identity and fabric domain";
+        return ErrorCode::INVALID_PARAMS;
+    }
     const auto indexed_name =
         segment_manager_->segment_id_by_name_.find(segment.name);
     if (indexed_name != segment_manager_->segment_id_by_name_.end()) {
@@ -180,6 +203,13 @@ ErrorCode ScopedSegmentAccess::MountSegment(
             // has been accepted. Live same-name Segments remain supported.
             return ErrorCode::INVALID_PARAMS;
         }
+        const auto& indexed = indexed_segment->second.segment;
+        if (indexed.protocol != segment.protocol ||
+            bool(indexed.physical_placement) !=
+                bool(segment.physical_placement) ||
+            (indexed.physical_placement &&
+             *indexed.physical_placement != *segment.physical_placement))
+            return ErrorCode::INVALID_PARAMS;
         if (indexed_segment->second.status == SegmentStatus::UNMOUNTING) {
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
         }
@@ -201,6 +231,11 @@ ErrorCode ScopedSegmentAccess::MountSegment(
             mounted.base != segment.base || mounted.size != segment.size ||
             mounted.te_endpoint != segment.te_endpoint ||
             mounted.protocol != segment.protocol ||
+            mounted.host_id != segment.host_id ||
+            bool(mounted.physical_placement) !=
+                bool(segment.physical_placement) ||
+            (mounted.physical_placement &&
+             *mounted.physical_placement != *segment.physical_placement) ||
             (mounted.locality && segment.locality &&
              *mounted.locality != *segment.locality)) {
             return ErrorCode::INVALID_PARAMS;
@@ -210,6 +245,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
             if (existing->second.buf_allocator) {
                 existing->second.buf_allocator->SetLocality(segment.locality);
             }
+            segment_manager_->allocator_manager_.SetSegmentMetadata(mounted);
         }
         return ErrorCode::SEGMENT_ALREADY_EXISTS;
     }
@@ -229,6 +265,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
             auto registration =
                 segment_manager_->allocator_manager_.addAllocator(
                     segment.name, allocator, std::move(client_liveness));
+            segment_manager_->allocator_manager_.SetSegmentMetadata(segment);
             segment_manager_->client_segments_[client_id].push_back(segment.id);
             segment_manager_->mounted_segments_[segment.id] = {
                 segment, SegmentStatus::OK, allocator, registration};
@@ -272,6 +309,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
     auto registration = segment_manager_->allocator_manager_.addAllocator(
         segment.name, allocator, std::move(client_liveness));
+    segment_manager_->allocator_manager_.SetSegmentMetadata(segment);
     segment_manager_->client_segments_[client_id].push_back(segment.id);
     segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator), registration};
@@ -372,10 +410,28 @@ ErrorCode ScopedSegmentAccess::ValidateRemountSegment(
         authoritative.protocol != segment.protocol ||
         authoritative.host_id != segment.host_id ||
         (authoritative.locality && segment.locality &&
-         *authoritative.locality != *segment.locality)) {
+         *authoritative.locality != *segment.locality) ||
+        bool(authoritative.physical_placement) !=
+            bool(segment.physical_placement) ||
+        (authoritative.physical_placement &&
+         *authoritative.physical_placement != *segment.physical_placement)) {
         return ErrorCode::INVALID_PARAMS;
     }
     return ErrorCode::OK;
+}
+
+bool ScopedSegmentAccess::CanCopyWithinFabric(const std::string& source,
+                                              const std::string& target) const {
+    const auto& indexed = segment_manager_->segment_id_by_name_;
+    auto src = indexed.find(source);
+    auto tgt = indexed.find(target);
+    if (src == indexed.end() || tgt == indexed.end()) return false;
+    const auto& mounted = segment_manager_->mounted_segments_;
+    auto src_segment = mounted.find(src->second);
+    auto tgt_segment = mounted.find(tgt->second);
+    return src_segment != mounted.end() && tgt_segment != mounted.end() &&
+           AllocatorManager::CanCopyWithinFabric(src_segment->second.segment,
+                                                 tgt_segment->second.segment);
 }
 
 bool ScopedSegmentAccess::GetSegment(const UUID& segment_id,
@@ -816,6 +872,7 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     if (should_be_allocatable && !is_allocatable && registration) {
         registration->SetAllocatable(true);
         allocator_manager.addRegistration(name, registration);
+        allocator_manager.SetSegmentMetadata(mounted_segment.segment);
         AddHostSegment(segment_manager_->segments_by_host_,
                        mounted_segment.segment);
     } else if (!should_be_allocatable && is_allocatable) {

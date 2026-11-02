@@ -77,6 +77,16 @@ class CudaLikeAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         return PinnedHostBuffer(addr, size, FreeCudaLikePinnedHostBuffer);
     }
 
+    bool SynchronizeEvent(void* event) const override {
+        if (!event) return false;
+        if (cudaEventSynchronize(static_cast<cudaEvent_t>(event)) ==
+            cudaSuccess) {
+            return true;
+        }
+        cudaGetLastError();
+        return false;
+    }
+
    private:
     AcceleratorVendor vendor_;
 };

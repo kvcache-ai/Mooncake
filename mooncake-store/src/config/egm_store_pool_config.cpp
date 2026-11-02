@@ -3,6 +3,7 @@
 #include "egm_store_pool_config.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <string_view>
 
 #include <glog/logging.h>
@@ -24,6 +25,8 @@ tl::expected<EgmStorePoolConfig, ErrorCode> ParseEgmStorePoolConfig(
     const ConfigDict& config, const std::string& protocol,
     size_t global_segment_size) {
     EgmStorePoolConfig parsed;
+    const bool mnnvl = NormalizeEgmStoreProtocol(protocol) == "mnnvl";
+    parsed.enabled = mnnvl;
     const auto enabled = config.find(CONFIG_KEY_ENABLE_EGM_STORE_POOL);
     if (enabled != config.end()) {
         const auto value = TryParseBool(
@@ -32,17 +35,46 @@ tl::expected<EgmStorePoolConfig, ErrorCode> ParseEgmStorePoolConfig(
             LOG(ERROR) << "Invalid enable_egm_store_pool: " << enabled->second;
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        parsed.enabled = *value;
+        if (mnnvl && !*value && global_segment_size != 0) {
+            LOG(ERROR) << "MNNVL Store capacity cannot disable EGM allocation";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        parsed.enabled = mnnvl || *value;
     }
     if (!parsed.enabled) return parsed;
 
-    if (protocol != "nvlink" || global_segment_size == 0) {
+    if (!mnnvl && (protocol != "nvlink" || global_segment_size == 0)) {
         LOG(ERROR) << "EGM Store Pool requires protocol=nvlink, "
                       "global_segment_size>0";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     const auto nodes = config.find(CONFIG_KEY_EGM_NUMA_NODES);
+    if (protocol == "nvlink_host") {
+        if (const char* backend = std::getenv("MC_NVLINK_HOST_BACKEND")) {
+            if (std::string_view(backend) != "fabric") {
+                LOG(ERROR) << "nvlink_host only supports the Fabric backend";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+        if (nodes == config.end()) {
+            parsed.nearest_numa_node = true;
+            if (const char* expression = std::getenv("MC_FABRIC_NUMA")) {
+                const auto node = TryParseInteger<int>(
+                    expression, {.trim_ascii_whitespace = true});
+                if (!node || *node < -1) {
+                    LOG(ERROR) << "Invalid MC_FABRIC_NUMA";
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                if (*node >= 0) {
+                    parsed.nearest_numa_node = false;
+                    parsed.auto_numa_nodes = false;
+                    parsed.numa_nodes = {*node};
+                }
+            }
+            return parsed;
+        }
+    }
     if (nodes == config.end() || TrimAsciiWhitespace(nodes->second) == "auto") {
         return parsed;
     }

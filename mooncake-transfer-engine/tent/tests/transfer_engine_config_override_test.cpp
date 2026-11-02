@@ -351,6 +351,64 @@ TEST(TransferEngineConfigOverrideTest, LegacyForceTcpEnvOverridesTentConfig) {
 }
 
 TEST(TransferEngineConfigOverrideTest,
+     StrictStoreMnnvlPolicySurvivesConfigReload) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"transports":{"mnnvl":{"store_egm":false,"enable":false,"egm":false,"egm_strict":false},"tcp":{"enable":true},"nvlink":{"handle_type":"posix","enable":true}},"max_failover_attempts":9,"enable_runtime_queue":true,"enable_progress_worker":true,"enable_auto_failover_on_poll":true})");
+    auto config = std::make_shared<Config>();
+    config->set("metadata_type", "p2p");
+    config->set("local_segment_name", "strict-store-policy");
+    // Fail before opening transports: this is a hardware-free policy test.
+    config->set("rpc_server_hostname", kInvalidHostname);
+    ConfigHelper::forceMnnvlEgm(*config);
+    TransferEngineImpl engine(config);
+    EXPECT_FALSE(engine.available());
+    EXPECT_TRUE(config->get("transports/mnnvl/store_egm", false));
+    EXPECT_TRUE(config->get("transports/mnnvl/enable", false));
+    EXPECT_TRUE(config->get("transports/mnnvl/egm", false));
+    EXPECT_TRUE(config->get("transports/mnnvl/egm_strict", false));
+    EXPECT_EQ(config->get("transports/nvlink/handle_type", ""), "fabric");
+    EXPECT_FALSE(config->get("transports/tcp/enable", true));
+    EXPECT_FALSE(config->get("transports/nvlink/enable", true));
+    EXPECT_FALSE(config->get("enable_runtime_queue", true));
+    EXPECT_FALSE(config->get("enable_progress_worker", true));
+    EXPECT_FALSE(config->get("enable_auto_failover_on_poll", true));
+    EXPECT_EQ(config->get("max_failover_attempts", -1), 0);
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     StrictStoreMnnvlRejectsForcedTcpConflict) {
+    EnvVarGuard conf_guard("MC_TENT_CONF", "{}");
+    EnvVarGuard force_tcp("MC_FORCE_TCP", "1");
+    auto config = std::make_shared<Config>();
+    ConfigHelper::forceMnnvlEgm(*config);
+    TransferEngineImpl engine(config);
+    EXPECT_FALSE(engine.available());
+    EXPECT_FALSE(engine.isStrictMnnvlEgm());
+    EXPECT_EQ(engine.getRpcServerPort(), 0);
+}
+
+#ifndef USE_CUDA
+TEST(TransferEngineConfigOverrideTest,
+     RequiredMnnvlCannotUseCpuTransportFallback) {
+    auto config = std::make_shared<Config>();
+    config->set("rpc_server_hostname", kLoopbackHostname);
+    config->set("local_segment_name", "strict-without-cuda");
+    config->set("metadata_type", "p2p");
+    ConfigHelper::forceMnnvlEgm(*config);
+    config->set("transports/tcp/enable", true);
+    TransferEngineImpl engine(config, false);
+    EXPECT_FALSE(engine.available());
+    std::vector<int> nodes{42};
+    EXPECT_FALSE(engine.getEgmNumaNodes(nodes, false).ok());
+    EXPECT_TRUE(nodes.empty());
+    size_t granularity = 42;
+    EXPECT_FALSE(engine.getEgmGranularity(0, granularity).ok());
+    EXPECT_EQ(granularity, 0);
+}
+#endif
+
+TEST(TransferEngineConfigOverrideTest,
      ExplicitForceTcpSurvivesMcTentConfThroughConstructor) {
     EnvVarGuard conf_guard(
         "MC_TENT_CONF",

@@ -2166,6 +2166,14 @@ PYBIND11_MODULE(_store, m) {
         .value("ENABLE", SoftPinAction::ENABLE)
         .value("DISABLE", SoftPinAction::DISABLE);
 
+    py::class_<PhysicalPlacement>(m, "PhysicalPlacement")
+        .def(py::init<>())
+        .def_readwrite("fabric_domain", &PhysicalPlacement::fabric_domain)
+        .def_readwrite("rack", &PhysicalPlacement::rack)
+        .def_readwrite("tray", &PhysicalPlacement::tray)
+        .def_readwrite("physical_gpu", &PhysicalPlacement::physical_gpu)
+        .def_readwrite("numa_node", &PhysicalPlacement::numa_node);
+
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
@@ -2184,6 +2192,35 @@ PYBIND11_MODULE(_store, m) {
                        &ReplicateConfig::prefer_alloc_in_same_node)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
+        .def_property(
+            "requester_self_id",
+            [](const ReplicateConfig &c) {
+                return c.requester_self_id ? *c.requester_self_id
+                                           : std::string{};
+            },
+            [](ReplicateConfig &c, const std::string &id) {
+                c.requester_self_id.reset();
+                if (!id.empty()) c.requester_self_id = id;
+            })
+        .def_property(
+            "fabric_domain",
+            [](const ReplicateConfig &c) {
+                return c.fabric_domain ? *c.fabric_domain : std::string{};
+            },
+            [](ReplicateConfig &c, const std::string &id) {
+                c.fabric_domain.reset();
+                if (!id.empty()) c.fabric_domain = id;
+            })
+        .def_property(
+            "requester_placement",
+            [](const ReplicateConfig &c) -> std::optional<PhysicalPlacement> {
+                if (!c.requester_placement) return std::nullopt;
+                return *c.requester_placement;
+            },
+            [](ReplicateConfig &c, std::optional<PhysicalPlacement> p) {
+                c.requester_placement.reset();
+                if (p) c.requester_placement = std::move(*p);
+            })
         .def_property(
             "session_ids",
             [](const ReplicateConfig &config)
@@ -3293,20 +3330,37 @@ PYBIND11_MODULE(_store, m) {
                const std::vector<std::string> &keys,
                const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
                const std::vector<std::vector<size_t>> &all_sizes,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig &config = ReplicateConfig{},
+               uintptr_t wait_event_ptr = 0) {
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
                     return std::vector<int>{};
                 }
                 py::gil_scoped_release release;
+                if (wait_event_ptr) {
+                    // Runtime events are process-local; a dummy client
+                    // would forward the copy to another process.
+                    if (self.use_dummy_client_ || !self.real_client_) {
+                        LOG(ERROR) << "wait_event_ptr requires a real client";
+                        return std::vector<int>(
+                            keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                    }
+                    return self.real_client_->batch_put_from_multi_buffers(
+                        keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
+                        config, false,
+                        reinterpret_cast<void *>(wait_event_ptr));
+                }
                 return self.store_->batch_put_from_multi_buffers(
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config);
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
             py::arg("config") = ReplicateConfig{},
+            py::arg("wait_event_ptr") = 0,
             "Put object data directly from multiple pre-allocated buffers for "
-            "multiple "
-            "keys")
+            "multiple keys. wait_event_ptr is an optional raw runtime event "
+            "handle (e.g. torch.cuda.Event.cuda_event) recorded after the "
+            "buffers were produced; it must stay valid until the call "
+            "returns.")
         .def(
             "batch_get_into_multi_buffers",
             [](MooncakeStorePyWrapper &self,

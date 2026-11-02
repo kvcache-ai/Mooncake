@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <charconv>
 #include <map>
 #include <memory>
 #include <optional>
@@ -498,6 +499,44 @@ inline int HcaAffinityTier(const std::optional<SegmentLocality>& locality,
                            const std::vector<std::string>& hcas) {
     return HcaAffinityTier(locality ? &*locality : nullptr, hcas);
 }
+// Placement identity is never a routable TE address. The fabric domain is
+// explicitly provisioned by the operator, not inferred from rack membership.
+struct PhysicalPlacement {
+    std::string fabric_domain;
+    std::string rack;
+    std::string tray;
+    int physical_gpu{-1};
+    int numa_node{-1};
+
+    bool Valid() const {
+        return !fabric_domain.empty() && !rack.empty() && !tray.empty() &&
+               physical_gpu >= 0 && numa_node >= -1;
+    }
+    bool operator==(const PhysicalPlacement&) const = default;
+
+    // Compatibility with the fork's <rack>.<host>[:port]#g<physical_gpu>.
+    // A domain must still be supplied separately by the caller.
+    static std::optional<PhysicalPlacement> FromSelfId(std::string_view id) {
+        const auto dot = id.find('.');
+        const auto gpu = id.rfind("#g");
+        if (dot == std::string_view::npos || dot == 0 ||
+            gpu == std::string_view::npos || gpu <= dot + 1)
+            return std::nullopt;
+        PhysicalPlacement result;
+        result.rack = id.substr(0, dot);
+        result.tray = id.substr(dot + 1, gpu - dot - 1);
+        const auto colon = result.tray.find(':');
+        if (colon != std::string::npos) result.tray.resize(colon);
+        const auto number = id.substr(gpu + 2);
+        auto [end, ec] = std::from_chars(
+            number.data(), number.data() + number.size(), result.physical_gpu);
+        if (ec != std::errc{} || end != number.data() + number.size() ||
+            result.physical_gpu < 0 || result.tray.empty())
+            return std::nullopt;
+        return result;
+    }
+};
+YLT_REFL(PhysicalPlacement, fabric_domain, rack, tray, physical_gpu, numa_node);
 
 /**
  * @brief Represents a contiguous memory region
@@ -512,11 +551,21 @@ struct Segment {
     std::string protocol;
     std::string host_id{};
     struct_pack::compatible<SegmentLocality, 1> locality;
+    struct_pack::compatible<PhysicalPlacement, 2> physical_placement;
     Segment() = default;
-    bool operator==(const Segment&) const = default;
+    bool operator==(const Segment& other) const {
+        return id == other.id && name == other.name && base == other.base &&
+               size == other.size && te_endpoint == other.te_endpoint &&
+               protocol == other.protocol && host_id == other.host_id &&
+               bool(locality) == bool(other.locality) &&
+               (!locality || *locality == *other.locality) &&
+               bool(physical_placement) == bool(other.physical_placement) &&
+               (!physical_placement ||
+                *physical_placement == *other.physical_placement);
+    }
 };
 YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id,
-         locality);
+         locality, physical_placement);
 
 /**
  * @brief Allocation strategy type for segment allocation

@@ -316,6 +316,10 @@ class Client {
      * with one transfer submission. A failed submission or transfer then
      * fails that replica for every key in the group. Defaults to false.
      * prefer_alloc_in_same_node also groups through this path.
+     * @param producer_event Optional runtime event (e.g. cudaEvent_t) that
+     * must complete before the source slices are read. It is waited on by the
+     * MNNVL copy stream when every replica is an MNNVL memory write, otherwise
+     * on the host. Must stay valid until the call returns.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
@@ -325,7 +329,7 @@ class Client {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config, const WriteBufferStager& stager,
-        bool group_by_target = false);
+        bool group_by_target = false, void* producer_event = nullptr);
 
     /**
      * @brief Write slices into a memory replica at an object-byte offset.
@@ -404,7 +408,7 @@ class Client {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config, const WriteBufferStager& stager,
-        bool group_by_target = false);
+        bool group_by_target = false, void* producer_event = nullptr);
 
     /**
      * @brief Removes an object and all its replicas
@@ -471,9 +475,19 @@ class Client {
      * @param size Size of the buffer in bytes
      * @return ErrorCode indicating success/failure
      */
+    struct MnnvlMountState {
+        std::atomic<bool> cleanup_confirmed{true};
+        UUID id{};
+        // These stages are protected by mounted_segments_mutex_.
+        bool publication_pending = false;
+        bool registration_pending = false;
+        bool remountable = false;
+    };
+
     tl::expected<void, ErrorCode> MountSegment(
         const void* buffer, size_t size, const std::string& protocol = "tcp",
-        const std::string& location = kWildcardLocation);
+        const std::string& location = kWildcardLocation,
+        std::shared_ptr<MnnvlMountState> cleanup_state = {});
 
     /**
      * @brief Unregisters a memory segment from master
@@ -490,7 +504,15 @@ class Client {
      */
     tl::expected<UUID, ErrorCode> MountSegmentAndGetId(
         const void* buffer, size_t size, const std::string& protocol = "tcp",
-        const std::string& location = kWildcardLocation);
+        const std::string& location = kWildcardLocation,
+        std::shared_ptr<MnnvlMountState> cleanup_state = {});
+
+    // Stop Store-owned submissions before removing EGM visibility/backing.
+    void StopStoreWorkers();
+    tl::expected<void, ErrorCode> CleanupMnnvlSegments();
+    std::shared_ptr<TransferEngine> GetTransferEngine() const {
+        return transfer_engine_;
+    }
 
     /**
      * @brief Unmounts a segment by its UUID.
@@ -1111,7 +1133,12 @@ class Client {
     void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
     void StageWriteBuffersForRemoteReplicas(std::vector<PutOperation>& ops,
                                             const WriteBufferStager& stager);
-    void SubmitTransfers(std::vector<PutOperation>& ops, bool group_by_target);
+    // Returns the event to forward to MNNVL submissions, or nullptr after
+    // waiting on the host; a failed wait fails the unresolved operations.
+    void* ResolveProducerEvent(std::vector<PutOperation>& ops,
+                               void* producer_event, bool host_only);
+    void SubmitTransfers(std::vector<PutOperation>& ops, bool group_by_target,
+                         void* producer_event = nullptr);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void SubmitDfsWrites(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
@@ -1150,6 +1177,23 @@ class Client {
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
+    std::unordered_map<UUID, std::shared_ptr<MnnvlMountState>,
+                       boost::hash<UUID>>
+        mnnvl_mount_states_;
+    std::mutex stop_workers_mutex_;
+    bool store_workers_stopped_ = false;
+    friend class EgmStoreLifecycleTestPeer;
+    // Fault injection is confined to the test peer; production uses TE/Master.
+    struct MnnvlLifecycleOps {
+        std::function<int(void*, size_t, const std::string&)> register_memory;
+        std::function<bool(void*, size_t)> exported;
+        std::function<tl::expected<void, ErrorCode>(const Segment&)> mount;
+        std::function<tl::expected<void, ErrorCode>(const UUID&)> unmount;
+        std::function<int(void*)> unregister_memory;
+        std::function<int()> drain;
+    };
+    std::unique_ptr<MnnvlLifecycleOps> mnnvl_ops_for_test_;
+    tl::expected<void, ErrorCode> CleanupMnnvlMount(const Segment& segment);
 
     // Segments in graceful unmount: readable by remote peers, not allocatable
     // locally. TE MR remains registered until master confirms removal.
@@ -1177,6 +1221,7 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string host_id_;
+    const std::optional<PhysicalPlacement> physical_placement_;
     const std::string metadata_connstring_;
     const std::string protocol_;
     const bool object_checksum_enabled_;

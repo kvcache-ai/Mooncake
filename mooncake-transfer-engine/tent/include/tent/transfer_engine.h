@@ -300,6 +300,13 @@ class TransferEngine {
 
     Status freeLocalMemory(void* addr);
 
+    bool isStrictMnnvlEgm() const;
+    Status getEgmNumaNodes(std::vector<int>& nodes, bool nearest = false);
+    Status getEgmGranularity(int node, size_t& granularity);
+    bool isMnnvlExported(void* addr, size_t size) const;
+    // Caller must prevent concurrent submissions until memory is released.
+    Status quiesce();
+
     Status registerLocalMemory(void* addr, size_t size,
                                Permission permission = kGlobalReadWrite);
 

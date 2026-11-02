@@ -51,6 +51,35 @@ add_store_test(real_client_direct_read_test real_client_direct_read_test.cpp)
 add_store_test(ranged_disk_lease_test ranged_disk_lease_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
+set_tests_properties(
+  egm_store_pool_test
+  PROPERTIES
+    ENVIRONMENT
+    "MC_USE_TENT=0;MOONCAKE_STORE_CHECKSUM=0;GTEST_FILTER=-MnnvlStoreFabricTest.*"
+    TIMEOUT
+    60)
+if(USE_TENT)
+  target_compile_definitions(egm_store_pool_test PRIVATE USE_TENT)
+  target_link_libraries(egm_store_pool_test PRIVATE tent)
+endif()
+option(MOONCAKE_STORE_MNNVL_TESTS "Run strict Store CUDA/Fabric hardware tests"
+       OFF)
+if(USE_TENT AND USE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  target_compile_definitions(egm_store_pool_test
+                             PRIVATE MOONCAKE_TEST_STORE_MNNVL)
+  target_link_libraries(egm_store_pool_test PRIVATE CUDA::cudart)
+  if(MOONCAKE_STORE_MNNVL_TESTS)
+    add_test(NAME store_mnnvl_fabric_test
+             COMMAND egm_store_pool_test --gtest_filter=MnnvlStoreFabricTest.*)
+    set_tests_properties(
+      store_mnnvl_fabric_test
+      PROPERTIES LABELS "cuda;fabric;store_egm;hardware" ENVIRONMENT
+                 "MC_USE_TENT=1;MOONCAKE_RUN_STORE_MNNVL=1" TIMEOUT 180)
+  endif()
+elseif(MOONCAKE_STORE_MNNVL_TESTS)
+  message(FATAL_ERROR "Store MNNVL tests require USE_TENT and USE_CUDA")
+endif()
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(client_liveness_test client_liveness_test.cpp)
 add_store_test(master_config_test master_config_test.cpp)
@@ -200,8 +229,7 @@ add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 add_store_test(nvmeof_initiator_test nvmeof_initiator_test.cpp)
 add_store_test(nof_page_registry_test nof_page_registry_test.cpp)
-add_store_test(nof_probe_context_pool_test
-               nof_probe_context_pool_test.cpp)
+add_store_test(nof_probe_context_pool_test nof_probe_context_pool_test.cpp)
 if(USE_TENT)
   target_compile_definitions(transfer_task_test PRIVATE USE_TENT)
   target_link_libraries(transfer_task_test PRIVATE tent)
@@ -239,15 +267,14 @@ if(USE_TENT)
       --gtest_filter=TransferTaskTest.TransferScatterHandlesFragmentedCpuBuffers
   )
   set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
-                                                           "MC_USE_TENT=1")
+                                                             "MC_USE_TENT=1")
   add_test(
     NAME transfer_submitter_scatter_tent_test
     COMMAND
       transfer_task_test
-      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath
-  )
-  set_tests_properties(transfer_submitter_scatter_tent_test PROPERTIES
-                       ENVIRONMENT "MC_USE_TENT=1")
+      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath)
+  set_tests_properties(transfer_submitter_scatter_tent_test
+                       PROPERTIES ENVIRONMENT "MC_USE_TENT=1")
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_manager_test tenant_quota_manager_test.cpp)
@@ -299,9 +326,12 @@ add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(local_hot_cache_concurrency_test
                local_hot_cache_concurrency_test.cpp)
-add_store_test(real_client_hugepage_register_test real_client_hugepage_register_test.cpp)
-add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
-add_store_test(real_client_uninitialized_test real_client_uninitialized_test.cpp)
+add_store_test(real_client_hugepage_register_test
+               real_client_hugepage_register_test.cpp)
+add_store_test(real_client_regular_page_register_test
+               real_client_regular_page_register_test.cpp)
+add_store_test(real_client_uninitialized_test
+               real_client_uninitialized_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(standalone_client_test standalone_client_test.cpp)

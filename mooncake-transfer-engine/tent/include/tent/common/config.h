@@ -188,6 +188,9 @@ struct ConfigHelper {
 
     static void forceTcp(Config& config);
 
+    // Strict Store policy: Fabric EGM is the only memory transport.
+    static void forceMnnvlEgm(Config& config);
+
     // Common parsing utilities for environment variable values
     static bool parseBool(const std::string& str, bool default_value = false);
     static int parseInt(const std::string& str, int default_value = 0);

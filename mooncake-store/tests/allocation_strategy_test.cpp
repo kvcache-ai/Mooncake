@@ -100,6 +100,173 @@ INSTANTIATE_TEST_SUITE_P(
         return strategy_str + "_" + allocator_str;
     });
 
+class FabricPlacementTest : public AllocationStrategyTest {
+   protected:
+    void Add(const std::string& name, const PhysicalPlacement& placement,
+             const std::string& protocol = "mnnvl") {
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = name;
+        segment.base = 0x100000000ULL + manager_.getNames().size() * 64 * MiB;
+        segment.size = 64 * MiB;
+        segment.te_endpoint = "10.0.0.1:18060";
+        segment.protocol = protocol;
+        segment.physical_placement = placement;
+        manager_.addAllocator(
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, segment.base, segment.size, segment.te_endpoint));
+        manager_.SetSegmentMetadata(segment);
+    }
+
+    ReplicateConfig Request(size_t count = 1) {
+        ReplicateConfig config;
+        config.replica_num = count;
+        config.requester_placement =
+            PhysicalPlacement{"fabric-a", "rack1", "tray1", 3, -1};
+        return config;
+    }
+
+    std::string Name(const Replica& replica) {
+        return *replica.get_segment_names().front();
+    }
+    AllocatorManager manager_;
+};
+
+TEST_F(FabricPlacementTest, FabricSnapshotsPreserveHcaAffinity) {
+    Add("local", {"fabric-a", "rack1", "tray1", 3, 0});
+    Add("foreign", {"fabric-b", "rack1", "tray1", 3, 0});
+    const std::vector<std::string> hcas{"mlx5_0"};
+    manager_.SetHcaAffinity(hcas);
+    auto snapshot = manager_.Snapshot();
+    EXPECT_EQ(snapshot.GetHcaAffinity(), hcas);
+    auto filtered = snapshot.FilterForFabric("fabric-a");
+    EXPECT_EQ(filtered.GetHcaAffinity(), hcas);
+    EXPECT_EQ(filtered.getNames(), (std::vector<std::string>{"local"}));
+}
+
+TEST_F(FabricPlacementTest, PhysicalLocalityTiersAndRoutableEndpoint) {
+    Add("local", {"fabric-a", "rack1", "tray1", 3, 0});
+    Add("same-rack", {"fabric-a", "rack1", "tray2", 3, 0});
+    Add("remote-same-gpu", {"fabric-a", "rack2", "tray3", 3, 0});
+    Add("remote-fallback", {"fabric-a", "rack3", "tray4", 1, 0});
+    Add("foreign", {"fabric-b", "rack1", "tray1", 3, 0});
+    auto result = strategy_->AllocateForRequest(manager_, 1024, Request(4), {});
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 4);
+    EXPECT_EQ(Name((*result)[0]), "local");
+    EXPECT_EQ(Name((*result)[1]), "same-rack");
+    EXPECT_EQ(Name((*result)[2]), "remote-same-gpu");
+    EXPECT_EQ(Name((*result)[3]), "remote-fallback");
+    for (const auto& replica : *result) {
+        EXPECT_EQ(replica.get_descriptor()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  "10.0.0.1:18060");
+    }
+}
+
+TEST_F(FabricPlacementTest, CrossRackFallbackDeduplicatesRacks) {
+    Add("same-gpu", {"fabric-a", "rack2", "tray2", 3, 0});
+    Add("same-rack-other-gpu", {"fabric-a", "rack2", "tray3", 2, 0});
+    Add("other-rack", {"fabric-a", "rack3", "tray4", 2, 0});
+    auto result = strategy_->AllocateForRequest(manager_, 1024, Request(4), {});
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 2);
+    EXPECT_EQ(Name((*result)[0]), "same-gpu");
+    EXPECT_EQ(Name((*result)[1]), "other-rack");
+}
+
+TEST_F(FabricPlacementTest, ExplicitPreferencesRemainOrderedWithinDomain) {
+    Add("first", {"fabric-a", "rack1", "tray1", 3, 0});
+    Add("second", {"fabric-a", "rack1", "tray1", 3, 1});
+    auto result = strategy_->AllocateForRequest(manager_, 1024, Request(2),
+                                                {"second", "first"});
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 2);
+    EXPECT_EQ(Name((*result)[0]), "second");
+    EXPECT_EQ(Name((*result)[1]), "first");
+}
+
+TEST_F(FabricPlacementTest, RestrictedSnapshotBlocksExplicitAndFallbackEscape) {
+    Add("local", {"fabric-a", "rack1", "tray1", 3, 0});
+    Add("foreign", {"fabric-b", "rack2", "tray2", 3, 0});
+    Add("tcp", {"fabric-a", "rack1", "tray1", 3, 0}, "tcp");
+    auto eligible = manager_.FilterForFabric("fabric-a");
+    ASSERT_EQ(eligible.getNames(), (std::vector<std::string>{"local"}));
+    EXPECT_EQ(eligible.getAllocators("foreign"), nullptr);
+    EXPECT_FALSE(strategy_->AllocateFrom(eligible, 1024, "foreign"));
+    for (const auto* name : {"foreign", "tcp"}) {
+        auto result =
+            strategy_->AllocateForRequest(manager_, 1024, Request(), {name});
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+    ReplicateConfig legacy;
+    auto result =
+        strategy_->AllocateForRequest(manager_, 1024, legacy, {"local"});
+    ASSERT_TRUE(result);
+    EXPECT_EQ(Name(result->front()), "tcp");
+    auto snapshot = manager_.Snapshot();
+    ASSERT_NE(snapshot.GetSegmentMetadata("local"), nullptr);
+    EXPECT_EQ(
+        snapshot.GetSegmentMetadata("local")->physical_placement->physical_gpu,
+        3);
+}
+
+TEST_F(FabricPlacementTest, NoEligibleCapacityNeverFallsOutsideDomain) {
+    Add("foreign", {"fabric-b", "rack1", "tray1", 3, 0});
+    auto result = strategy_->AllocateForRequest(manager_, 1024, Request(), {});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+}
+
+TEST_F(FabricPlacementTest, SelfIdRequiresDomainAndConsistentPhysicalIdentity) {
+    ReplicateConfig config;
+    config.requester_self_id = "rack1.10.0.0.1:18060#g3";
+    EXPECT_FALSE(AllocationStrategy::ResolvePlacement(config));
+    config.fabric_domain = "fabric-a";
+    auto resolved = AllocationStrategy::ResolvePlacement(config);
+    ASSERT_TRUE(resolved);
+    ASSERT_TRUE(resolved->requester);
+    EXPECT_EQ(resolved->requester->tray, "10.0.0.1");
+    EXPECT_EQ(resolved->requester->physical_gpu, 3);
+    config.requester_placement =
+        PhysicalPlacement{"fabric-a", "rack1", "10.0.0.1", 0, -1};
+    EXPECT_FALSE(AllocationStrategy::ResolvePlacement(config));
+    config.requester_placement->physical_gpu = 3;
+    config.requester_placement->fabric_domain = "fabric-b";
+    EXPECT_FALSE(AllocationStrategy::ResolvePlacement(config));
+    config.fabric_domain = "";
+    EXPECT_FALSE(AllocationStrategy::ResolvePlacement(config));
+    for (const auto* id : {"rack1.host", "rack1.host#g-1", "rack1.host#g3x",
+                           "rack1.#g0", ".host#g0"}) {
+        EXPECT_FALSE(PhysicalPlacement::FromSelfId(id)) << id;
+    }
+}
+
+TEST_F(FabricPlacementTest, CopyMoveAndReuseShareFabricEligibility) {
+    Add("a", {"fabric-a", "rack1", "tray1", 3, 0});
+    Add("a2", {"fabric-a", "rack2", "tray2", 3, 0});
+    Add("b", {"fabric-b", "rack2", "tray2", 3, 0});
+    Add("tcp", {"fabric-a", "rack1", "tray1", 3, 0}, "tcp");
+    EXPECT_TRUE(manager_.CanCopyWithinFabric("a", "a2"));
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("a", "b"));
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("a", "tcp"));
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("tcp", "a"));
+    EXPECT_TRUE(manager_.CanCopyWithinFabric("tcp", "tcp"));
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("missing", "tcp"));
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("tcp", "missing"));
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("missing", "missing"));
+    EXPECT_FALSE(manager_.IsFabricEligible("a", "fabric-b"));
+    EXPECT_FALSE(manager_.IsFabricEligible("a", ""));
+    EXPECT_TRUE(manager_.IsFabricEligible("a", "fabric-a"));
+    auto registration = manager_.getAllocators("a")->front();
+    EXPECT_TRUE(manager_.removeAllocator("a", registration));
+    EXPECT_EQ(manager_.GetSegmentMetadata("a"), nullptr);
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("a", "tcp"));
+    EXPECT_FALSE(manager_.CanCopyWithinFabric("a", "a2"));
+}
+
 // Test basic functionality with empty allocators map (non-parameterized)
 TEST_F(AllocationStrategyTest, EmptyAllocatorsMap) {
     AllocatorManager allocator_manager;

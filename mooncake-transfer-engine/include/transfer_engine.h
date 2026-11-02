@@ -171,6 +171,17 @@ class TransferEngine {
                             bool remote_accessible = true,
                             bool update_metadata = true);
 
+    // Strict TENT MNNVL EGM bridge. Unsupported on classic engines.
+    bool isStrictMnnvlEgm() const;
+    int allocateLocalMemory(void** addr, size_t length,
+                            const std::string& location = "cpu");
+    int freeLocalMemory(void* addr);
+    int getEgmNumaNodes(std::vector<int>& nodes, bool nearest = false);
+    int getEgmGranularity(int node, size_t& granularity);
+    bool isMnnvlExported(void* addr, size_t length) const;
+    // No new submissions may race quiesce/unregister/free.
+    int quiesce();
+
     // Allocate shared memory that ShmTransport can export to same-host peers.
     // Requires ShmTransport (MC_FORCE_SHM=1 or installTransport("shm")).
     // Caller must registerLocalMemory before remote access. Returns nullptr

@@ -162,7 +162,14 @@ static int resolveSegTypeParams(const std::string& seg_type,
                                 int& num_buffers) {
     if (seg_type == "DRAM" || seg_type == "dram") {
         device_prefix = "cpu";
-        num_buffers = numa_num_configured_nodes();
+        std::string error;
+        if (!XferBenchConfig::resolveDramNumaRange(start_idx, num_buffers,
+                                                   error)) {
+            LOG(ERROR) << error;
+            return -1;
+        }
+        if (XferBenchConfig::local_numa_id >= 0)
+            LOG(INFO) << "TENT DRAM allocation restricted to cpu:" << start_idx;
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
     } else if (seg_type == "VRAM" || seg_type == "vram") {
         device_prefix = "cuda";

@@ -108,6 +108,74 @@ print(store.get("hello_key").decode())
 store.close()
 ```
 
+### Strict MNNVL EGM Store (C++ backend)
+
+Build with TENT and CUDA enabled. `protocol="mnnvl"` uses exported EGM Store
+capacity and pins memory-replica transfers to MNNVL. `nvlink_host` is a
+Fabric-only alias; classic `nvlink` behavior is unchanged. Provision IMEX and
+verify reachability before assigning a fabric domain; rack membership alone
+is not a reachability guarantee.
+
+The client-side local hot cache is disabled in MNNVL mode, including the
+`nvlink_host` alias. A positive `MC_STORE_LOCAL_HOT_CACHE_SIZE` is ignored with
+a warning; single and batch reads continue using the exported EGM replicas.
+Hot-cache behavior for other protocols is unchanged.
+
+Set these variables **before importing Mooncake or initializing CUDA**:
+
+```bash
+export MOONCAKE_STORE_BACKEND=cpp
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES=3
+export MC_PHYSICAL_GPU=3
+export MC_RACK=rack1
+export MC_TRAY=10.0.0.1
+export MOONCAKE_FABRIC_DOMAIN=fabric1
+```
+
+`MC_PHYSICAL_GPU` is the deployment's physical GPU ordinal, not CUDA's
+visibility-renumbered device `0`. A single numeric `CUDA_VISIBLE_DEVICES` is
+used when `MC_PHYSICAL_GPU` is absent; UUID visibility and multi-GPU workers
+require an explicit physical ID. Verify the ordinal mapping on the target
+host. `MC_TRAY` defaults to the normalized placement host ID, honoring
+`MOONCAKE_HOST_ID`; the fabric domain and rack must be supplied explicitly.
+
+Launch passive owners from the source checkout on each storage host:
+
+```bash
+python scripts/launch_egm_owners.py --host 10.0.0.1 --rack rack1 \
+  --fabric-domain fabric1 --master 10.0.0.2:50051 \
+  --gpus 0,1,2,3 --segment-gib 32
+```
+
+The launcher creates a fresh, single-visible-GPU process per owner. It waits
+for both native export/metadata/master-mount completion and successful Store
+setup/health checks. Owners maintain mounted capacity; workers perform direct
+MNNVL transfers without a retrieve-RPC data-plane hop. Keep owners running
+until workers have drained their transfers. Shutdown only signals supervised
+children and does not force-kill live fabric mappings.
+
+Worker setup can use `global_segment_size=0`, `local_buffer_size=0`, and
+`protocol="mnnvl"`. Its physical placement defaults from the environment and
+is attached to write requests. Overrides use `ReplicateConfig.requester_self_id`
+(`rack1.10.0.0.1:18060#g3`) or `requester_placement`, a `PhysicalPlacement` with
+`fabric_domain`, `rack`, `tray`, `physical_gpu`, and optional `numa_node` (`-1`
+means unknown). The requester ID is not a TE endpoint.
+
+Placement first restricts candidates to the worker's fabric domain, then
+prefers the same tray/GPU, the same rack/GPU, and cross-rack candidates in
+that domain. Explicit preferences cannot escape the domain. Unscoped legacy
+requests do not allocate MNNVL segments. Same-size upsert rejects reuse across
+domains; copy/move cannot cross MNNVL fabric boundaries. Logical owner segment
+names include GPU and NUMA identity; returned transport endpoints remain
+routable addresses.
+
+For GPU-produced multi-buffer writes, pass a recorded runtime event as
+`wait_event_ptr` to `batch_put_from_multi_buffers` and keep it alive until the
+call returns. MNNVL orders it on the copy stream; host-side checksums or staging
+wait for it before accessing source buffers. No event argument changes existing
+zero-event calls.
+
 ## Basic API Usage
 
 ### Simple Get/Put Operations
@@ -3082,7 +3150,7 @@ Store multiple objects from multiple pre-registered buffers (zero-copy).
 
 ```python
 def batch_put_from_multi_buffers(self, keys: List[str], all_buffer_ptrs: List[List[int]], all_sizes: List[List[int]],
-                                 config: ReplicateConfig = None) -> List[int]
+                                 config: ReplicateConfig = None, wait_event_ptr: int = 0) -> List[int]
 ```
 
 **Parameters:**
@@ -3090,6 +3158,7 @@ def batch_put_from_multi_buffers(self, keys: List[str], all_buffer_ptrs: List[Li
 - `all_buffer_ptrs` (List[int]): all List of memory addresses
 - `sizes` (List[int]): all List of buffer sizes
 - `config` (ReplicateConfig, optional): Replication configuration
+- `wait_event_ptr` (int, optional): Raw in-process runtime event handle (for example `torch.cuda.Event().cuda_event`) recorded after the buffers were produced. On a strict MNNVL EGM engine the copy stream waits on it for memory-replica writes; any other path waits on the host before reading the buffers. Requires a real (non-dummy) client, and the event must stay valid until the call returns.
 
 **Returns:**
 - `List[int]`: List of status codes for each operation (0 = success, negative = error)

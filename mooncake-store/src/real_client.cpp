@@ -106,6 +106,16 @@ size_t GetNextSegmentSize(size_t remaining,
                     DivideRoundUp(balanced_size, alignment) * alignment);
 }
 
+ErrorCode ValidateStoreOffloadProtocol(const std::string &protocol,
+                                       bool enable_ssd_offload) {
+    if (NormalizeEgmStoreProtocol(protocol) == "mnnvl" && enable_ssd_offload) {
+        LOG(ERROR) << "MNNVL Store supports host-memory EGM only; SSD offload "
+                      "and persistent offload backends are unsupported";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    return ErrorCode::OK;
+}
+
 bool IsHostStoreSegmentProtocol(const std::string &protocol) {
     return protocol.empty() || protocol == "tcp" || protocol == "rdma" ||
            protocol == "efa" || protocol == "cxi" || protocol == "rpc_only";
@@ -273,7 +283,7 @@ bool GroupMultiBufferTransfers(const std::string &protocol,
 
 using BatchWriteMethod = std::vector<tl::expected<void, ErrorCode>> (Client::*)(
     const std::vector<ObjectKey> &, std::vector<std::vector<Slice>> &,
-    const ReplicateConfig &, const Client::WriteBufferStager &, bool);
+    const ReplicateConfig &, const Client::WriteBufferStager &, bool, void *);
 
 std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     const std::shared_ptr<Client> &client, const std::vector<std::string> &keys,
@@ -281,7 +291,8 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     const std::vector<std::vector<size_t>> &all_sizes,
     const ReplicateConfig &config,
     const std::shared_ptr<ClientBufferAllocator> &allocator,
-    bool stage_nonlocal, BatchWriteMethod write) {
+    bool stage_nonlocal, BatchWriteMethod write,
+    void *producer_event = nullptr) {
     if (!client) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -305,7 +316,7 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     const bool group_by_target = GroupMultiBufferTransfers(
         client->GetProtocol(), config.prefer_alloc_in_same_node);
     return ((*client).*write)(keys, batched_slices.value(), config, stager,
-                              group_by_target);
+                              group_by_target, producer_event);
 }
 
 // Backing slot for RealClient::SetNofRuntimeFactoryForTesting.
@@ -936,6 +947,41 @@ RealClient::RealClient() : prefetcher_(std::make_unique<SsdPrefetcher>()) {
     use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
 }
 
+int EngineEgmAllocation::Allocate(int node, size_t size) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (base_ || !engine_ || node < 0 || !size) return -1;
+    size_ = size;
+    return engine_->allocateLocalMemory(&base_, size,
+                                        "cpu:" + std::to_string(node));
+}
+
+int EngineEgmAllocation::Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!base_) return 0;
+    if (!mount_state_->cleanup_confirmed.load(std::memory_order_acquire))
+        return -1;
+    int rc = drain_for_test_ ? drain_for_test_() : engine_->quiesce();
+    if (rc != 0) return rc;
+    rc = free_for_test_ ? free_for_test_(base_)
+                        : engine_->freeLocalMemory(base_);
+    if (rc == 0) base_ = nullptr;
+    return rc;
+}
+
+EngineEgmAllocation::~EngineEgmAllocation() {
+    if (Release() == 0) return;
+    // A failed close must retain the allocation, engine and reconciliation ID,
+    // including when the RealClient itself is being destroyed.
+    auto *retained = new EngineEgmAllocation(std::move(engine_));
+    retained->base_ = base_;
+    retained->size_ = size_;
+    retained->mount_state_ = std::move(mount_state_);
+    retained->drain_for_test_ = std::move(drain_for_test_);
+    retained->free_for_test_ = std::move(free_for_test_);
+    LOG(ERROR) << "Retaining unsafe EGM allocation " << base_
+               << " and allocating engine until process exit";
+}
+
 RealClient::~RealClient() {
     if (offload_rpc_server_) {
         offload_rpc_server_->stop();
@@ -945,9 +991,17 @@ RealClient::~RealClient() {
     stop_http_server();
     // A destructor cannot propagate errors, but a teardown failure (e.g.
     // unconfirmed NoF cleanup) must still leave a trace.
-    if (!tearDownAll_internal()) {
+    auto result = tearDownAll_internal();
+    if (!result) {
         LOG(ERROR) << "RealClient teardown completed with cleanup failures; "
                       "some buffers must stay mapped until process exit";
+        if (protocol == "mnnvl" && client_) {
+            // Retain backing storage and its engine when final drain fails.
+            (void)new std::pair<std::shared_ptr<TransferEngine>,
+                                std::shared_ptr<ClientBufferAllocator>>(
+                client_->GetTransferEngine(), client_buffer_allocator_);
+            client_.reset();
+        }
     }
 }
 
@@ -1006,6 +1060,13 @@ void RealClient::SetTeUnregisterHookForTesting(
     TeUnregisterHookForTestingSlot() = std::move(hook);
 }
 
+bool RealClient::HasMnnvlSetupConflict(
+    const std::string &requested_protocol) const {
+    return (NormalizeEgmStoreProtocol(requested_protocol) == "mnnvl" ||
+            protocol == "mnnvl") &&
+           (client_ || !engine_egm_segment_ptrs_.empty());
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -1017,19 +1078,34 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
     bool enable_embedded_master) {
-    return setup_internal(EgmStorePoolConfig{}, local_hostname, metadata_server,
-                          global_segment_size, local_buffer_size, protocol,
-                          rdma_devices, master_server_addr, transfer_engine,
-                          ipc_socket_path, local_rpc_port, enable_ssd_offload,
-                          start_offload_rpc_server, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port,
-                          enable_embedded_master);
+    if (HasMnnvlSetupConflict(protocol))
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    if (auto error = ValidateStoreOffloadProtocol(protocol, enable_ssd_offload);
+        error != ErrorCode::OK)
+        return tl::unexpected(error);
+    auto egm_config =
+        ParseEgmStorePoolConfig({}, protocol, global_segment_size);
+    if (!egm_config) return tl::unexpected(egm_config.error());
+    try {
+        auto result = setup_internal(
+            *egm_config, local_hostname, metadata_server, global_segment_size,
+            local_buffer_size, protocol, rdma_devices, master_server_addr,
+            transfer_engine, ipc_socket_path, local_rpc_port,
+            enable_ssd_offload, start_offload_rpc_server, ssd_offload_path,
+            tenant_id, enable_client_http_server, client_http_port,
+            enable_embedded_master);
+        if (!result && egm_config->enabled) (void)tearDownAll_internal();
+        return result;
+    } catch (...) {
+        if (egm_config->enabled) (void)tearDownAll_internal();
+        throw;
+    }
 }
 
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const EgmStorePoolConfig &egm_config, const std::string &local_hostname,
     const std::string &metadata_server, size_t global_segment_size,
-    size_t local_buffer_size, const std::string &protocol,
+    size_t local_buffer_size, const std::string &requested_protocol,
     const std::string &rdma_devices, const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, int local_rpc_port,
@@ -1074,7 +1150,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // Reset the teardown latch so this instance can be torn down again.
     closed_.store(false, std::memory_order_release);
 
+    const auto protocol = NormalizeEgmStoreProtocol(requested_protocol);
+    const bool tent_egm = protocol == "mnnvl";
+    if (HasMnnvlSetupConflict(requested_protocol))
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    if (auto error = ValidateStoreOffloadProtocol(protocol, enable_ssd_offload);
+        error != ErrorCode::OK)
+        return tl::unexpected(error);
     this->protocol = protocol;
+    if (tent_egm) {
+        engine_egm_numa_nodes_ = egm_config.numa_nodes;
+        engine_egm_nearest_ = egm_config.nearest_numa_node;
+    }
     this->ipc_socket_path_ = ipc_socket_path;
     if (!enable_embedded_master &&
         Environ::Process().GetTypedOr(
@@ -1197,7 +1284,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
-    if (egm_config.enabled && !client_->HasClassicTransport("nvlink")) {
+    if (tent_egm && !client_->GetTransferEngine()->isStrictMnnvlEgm())
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    if (egm_config.enabled && !tent_egm &&
+        !client_->HasClassicTransport("nvlink")) {
         LOG(ERROR) << "EGM Store requires the classic NVLink transport; "
                       "check MC_MS_AUTO_DISC and MC_FORCE_MNNVL";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1283,13 +1373,20 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         std::vector<int> egm_numa_nodes;
         std::vector<size_t> egm_node_sizes;
         size_t egm_node_index = 0;
-        if (egm_config.enabled) {
+        if (egm_config.enabled && global_segment_size > 0) {
             if (egm_config.auto_numa_nodes) {
-                auto status = NvlinkHostNumaAllocation::DiscoverHostNumaNodes(
-                    egm_numa_nodes);
-                if (!status.ok()) {
-                    LOG(ERROR) << "EGM NUMA discovery failed: " << status;
-                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                if (tent_egm) {
+                    if (client_->GetTransferEngine()->getEgmNumaNodes(
+                            egm_numa_nodes, egm_config.nearest_numa_node) != 0)
+                        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                } else {
+                    auto status =
+                        NvlinkHostNumaAllocation::DiscoverHostNumaNodes(
+                            egm_numa_nodes);
+                    if (!status.ok()) {
+                        LOG(ERROR) << "EGM NUMA discovery failed: " << status;
+                        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                    }
                 }
             } else {
                 egm_numa_nodes = egm_config.numa_nodes;
@@ -1297,13 +1394,20 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             std::vector<size_t> granularities;
             for (int node : egm_numa_nodes) {
                 size_t granularity = 0;
-                auto status =
-                    NvlinkHostNumaAllocation::GetAllocationGranularity(
-                        node, granularity);
-                if (!status.ok()) {
-                    LOG(ERROR) << "EGM granularity query failed for NUMA node "
-                               << node << ": " << status;
-                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                if (tent_egm) {
+                    if (client_->GetTransferEngine()->getEgmGranularity(
+                            node, granularity) != 0)
+                        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                } else {
+                    auto status =
+                        NvlinkHostNumaAllocation::GetAllocationGranularity(
+                            node, granularity);
+                    if (!status.ok()) {
+                        LOG(ERROR)
+                            << "EGM granularity query failed for NUMA node "
+                            << node << ": " << status;
+                        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                    }
                 }
                 granularities.push_back(granularity);
             }
@@ -1389,11 +1493,23 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
             std::unique_ptr<NvlinkHostNumaAllocation> egm_owner;
+            std::shared_ptr<EngineEgmAllocation> engine_owner;
             std::string seg_location = kWildcardLocation;
             bool use_mmap_segment = !seg_numa_nodes.empty() || use_hugepage_;
             std::vector<int> segment_numa_nodes;
 
-            if (egm_config.enabled) {
+            if (tent_egm) {
+                engine_owner = std::make_shared<EngineEgmAllocation>(
+                    client_->GetTransferEngine());
+                engine_egm_segment_ptrs_.push_back(engine_owner);
+                seg_location =
+                    "cpu:" + std::to_string(egm_numa_nodes[egm_node_index]);
+                if (engine_owner->Allocate(egm_numa_nodes[egm_node_index],
+                                           segment_size) != 0)
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                ptr = engine_owner->base();
+                mapped_size = engine_owner->length();
+            } else if (egm_config.enabled) {
                 auto status = NvlinkHostNumaAllocation::Create(
                     egm_numa_nodes[egm_node_index], segment_size, alignment,
                     egm_owner);
@@ -1472,7 +1588,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(INFO) << "Mounting segment: " << mount_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
 
-            if (egm_config.enabled) {
+            if (tent_egm) {
+                // The engine owner was recorded before allocation/registration.
+            } else if (egm_config.enabled) {
                 egm_segment_ptrs_.emplace_back(std::move(egm_owner));
             } else if (this->protocol == "ascend" ||
                        this->protocol == "ubshmem") {
@@ -1533,8 +1651,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
             auto pinned_region =
                 TryPinStoreSegment(ptr, mapped_size, this->protocol, "setup");
-            auto mount_result =
-                client_->MountSegment(ptr, mount_size, protocol, seg_location);
+            auto mount_result = client_->MountSegment(
+                ptr, mount_size, protocol, seg_location,
+                engine_owner ? engine_owner->mount_state() : nullptr);
             if (!mount_result.has_value()) {
                 if (!ReleasePinnedRegionForFree(pinned_region,
                                                 "Store setup segment")) {
@@ -1804,6 +1923,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     size_t local_buffer_size = local_buffer_size_opt.value();
     std::string protocol =
         get_config(config, CONFIG_KEY_PROTOCOL, DEFAULT_PROTOCOL);
+    if (HasMnnvlSetupConflict(protocol))
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     std::string rdma_devices = get_config(config, CONFIG_KEY_RDMA_DEVICES);
     std::string master_server_addr = get_config(
         config, CONFIG_KEY_MASTER_SERVER_ADDR,
@@ -1843,6 +1964,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
     bool enable_ssd_offload =
         get_config_bool(config, "enable_ssd_offload", false);
+    if (auto error = ValidateStoreOffloadProtocol(protocol, enable_ssd_offload);
+        error != ErrorCode::OK)
+        return tl::unexpected(error);
     bool enable_client_http_server =
         get_config_bool(config, CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER, false);
     auto client_http_port_opt = get_config_int(
@@ -1952,6 +2076,21 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 
     ErrorCode cleanup_error = ErrorCode::OK;
     if (client_) {
+        if (protocol == "mnnvl") {
+            if (offload_rpc_server_) {
+                offload_rpc_server_->stop();
+                offload_rpc_server_.reset();
+            }
+            file_storage_.reset();
+            client_->StopStoreWorkers();
+            // Include caller-managed and failed-publication mounts, not only
+            // the allocations owned by this RealClient.
+            auto result = client_->CleanupMnnvlSegments();
+            if (!result) {
+                closed_.store(false, std::memory_order_release);
+                return result;
+            }
+        }
         if (!egm_segment_ptrs_.empty()) {
             // Callers must quiesce in-flight requests before close. FileStorage
             // owns a Client reference and workers that access segments.
@@ -1987,9 +2126,25 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
                 LOG(WARNING)
                     << "Failed to unregister client local buffer on tear down: "
                     << toString(unregister_result.error());
+                if (protocol == "mnnvl") {
+                    closed_.store(false, std::memory_order_release);
+                    return tl::unexpected(unregister_result.error());
+                }
+            }
+            if (protocol == "mnnvl" &&
+                client_->GetTransferEngine()->quiesce() != 0) {
+                closed_.store(false, std::memory_order_release);
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
             }
             std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
             local_buffer_region_.reset();
+        }
+        // Also retry unfinished native allocation cleanup for zero-capacity
+        // initiators and setup failures with no registered Store segments.
+        if (protocol == "mnnvl" &&
+            client_->GetTransferEngine()->quiesce() != 0) {
+            closed_.store(false, std::memory_order_release);
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
         // Keep EGM Release separate from UnmountSegment above. Unmount only
         // removes Master metadata and TE registration; replica copy/move
@@ -1999,6 +2154,14 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         // transfers that timed out may still require deferred cleanup.
         client_.reset();
     }
+    for (auto &owner : engine_egm_segment_ptrs_) {
+        if (owner->Release() != 0) {
+            closed_.store(false, std::memory_order_release);
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+    engine_egm_segment_ptrs_.clear();
+    engine_egm_numa_nodes_.clear();
     if (embedded_master_) {
         embedded_master_->Stop();
         embedded_master_.reset();
@@ -2196,6 +2359,12 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
         return -1;
     }
 
+    if (this->protocol == "mnnvl" ||
+        NormalizeEgmStoreProtocol(protocol) == "mnnvl") {
+        LOG(ERROR) << "File/SHM mappings cannot supply Fabric-exportable EGM "
+                      "Store capacity";
+        return -1;
+    }
     size_t page_size = sysconf(_SC_PAGESIZE);
 
     int fd = open(path.c_str(), O_RDWR);
@@ -2320,11 +2489,19 @@ void RealClient::ReleaseAllMountedSegmentRecords() {
     }
 }
 
-void RealClient::FreeAllocatedStoreSegment(AllocatedSegmentRecord &record) {
+bool RealClient::FreeAllocatedStoreSegment(AllocatedSegmentRecord &record) {
+    if (record.egm_owner) {
+        if (record.egm_owner->Release() != 0) return false;
+        record.base = nullptr;
+        return true;
+    }
     if (record.base && ReleasePinnedRegionForFree(record.pinned_region,
                                                   "allocated Store segment")) {
         free_memory(record.protocol, record.base);
+        record.base = nullptr;
+        return true;
     }
+    return !record.base;
 }
 
 void RealClient::ReleaseAllocatedSegmentRecord(const std::string &segment_id) {
@@ -2339,8 +2516,10 @@ void RealClient::ReleaseAllocatedSegmentRecord(const std::string &segment_id) {
             found = true;
         }
     }
-    if (found && record.base) {
-        FreeAllocatedStoreSegment(record);
+    if (found && record.base && !FreeAllocatedStoreSegment(record) &&
+        record.egm_owner) {
+        std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
+        allocated_segment_records_[segment_id] = std::move(record);
     }
 }
 
@@ -2351,7 +2530,11 @@ void RealClient::ReleaseAllAllocatedSegmentRecords() {
         records.swap(allocated_segment_records_);
     }
     for (auto &entry : records) {
-        FreeAllocatedStoreSegment(entry.second);
+        if (!FreeAllocatedStoreSegment(entry.second) &&
+            entry.second.egm_owner) {
+            std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
+            allocated_segment_records_[entry.first] = std::move(entry.second);
+        }
     }
 }
 
@@ -2432,8 +2615,12 @@ int RealClient::unmountSegment(const std::vector<std::string> &segment_ids,
 }
 
 int RealClient::allocateAndMountSegment(
-    size_t size, const std::string &protocol, const std::string &location,
-    std::vector<std::string> &out_segment_ids, size_t *out_allocated_size) {
+    size_t size, const std::string &requested_protocol,
+    const std::string &location, std::vector<std::string> &out_segment_ids,
+    size_t *out_allocated_size) {
+    const auto protocol = NormalizeEgmStoreProtocol(requested_protocol);
+    out_segment_ids.clear();
+    if (out_allocated_size) *out_allocated_size = 0;
     if (!client_) {
         LOG(ERROR) << "Client not initialized";
         return -1;
@@ -2444,6 +2631,91 @@ int RealClient::allocateAndMountSegment(
         return -1;
     }
 
+    if ((protocol == "mnnvl") != (this->protocol == "mnnvl")) return -1;
+    if (protocol == "mnnvl") {
+        auto engine = client_->GetTransferEngine();
+        if (!engine->isStrictMnnvlEgm()) return -1;
+        std::vector<int> nodes = engine_egm_numa_nodes_;
+        if (location.starts_with("cpu:")) {
+            auto node =
+                TryParseInteger<int>(std::string_view(location).substr(4));
+            if (!node || *node < 0) return -1;
+            nodes = {*node};
+        } else if (location != kWildcardLocation && location != "cpu" &&
+                   location != "host") {
+            return -1;  // Store backing capacity cannot be GPU memory.
+        }
+        ConfigDict alias_config;
+        if (!nodes.empty()) {
+            std::string explicit_nodes;
+            for (int node : nodes) {
+                if (!explicit_nodes.empty()) explicit_nodes += ",";
+                explicit_nodes += std::to_string(node);
+            }
+            alias_config[CONFIG_KEY_EGM_NUMA_NODES] = explicit_nodes;
+        }
+        if (!ParseEgmStorePoolConfig(alias_config, requested_protocol, 0))
+            return -1;
+        if (nodes.empty() &&
+            engine->getEgmNumaNodes(nodes, engine_egm_nearest_) != 0)
+            return -1;
+        std::vector<size_t> granularities;
+        for (int node : nodes) {
+            size_t granularity = 0;
+            if (engine->getEgmGranularity(node, granularity) != 0) return -1;
+            granularities.push_back(granularity);
+        }
+        auto capacity = CalculateEgmStorePoolCapacity(
+            size, granularities, facebook::cachelib::Slab::kSize,
+            static_cast<size_t>(globalConfig().max_mr_size));
+        if (!capacity) return -1;
+        std::erase_if(engine_egm_segment_ptrs_,
+                      [](const auto &owner) { return !owner->base(); });
+        std::vector<std::string> ids;
+        size_t allocated = 0;
+        bool failed = false;
+        for (size_t n = 0; n < nodes.size() && !failed; ++n) {
+            size_t remaining = capacity->node_sizes[n];
+            while (remaining) {
+                size_t chunk = GetNextSegmentSize(
+                    remaining, capacity->max_chunk_size, capacity->alignment);
+                auto owner = std::make_shared<EngineEgmAllocation>(engine);
+                engine_egm_segment_ptrs_.push_back(owner);
+                if (owner->Allocate(nodes[n], chunk) != 0) {
+                    failed = true;
+                    break;
+                }
+                auto result = client_->MountSegmentAndGetId(
+                    owner->base(), chunk, protocol,
+                    "cpu:" + std::to_string(nodes[n]), owner->mount_state());
+                if (!result) {
+                    // Only confirmed cleanup permits immediate release. Pending
+                    // UUID/state remains in Client and the owner vector for
+                    // close.
+                    (void)owner->Release();
+                    failed = true;
+                    break;
+                }
+                auto id = UuidToString(*result);
+                {
+                    std::lock_guard<std::mutex> lock(
+                        allocated_segment_records_mutex_);
+                    allocated_segment_records_[id] = {
+                        owner->base(), chunk, protocol, {}, owner};
+                }
+                ids.push_back(id);
+                allocated += chunk;
+                remaining -= chunk;
+            }
+        }
+        if (failed) {
+            (void)unmountAndFreeSegment(ids);
+            return -1;
+        }
+        if (out_allocated_size) *out_allocated_size = allocated;
+        out_segment_ids = std::move(ids);
+        return 0;
+    }
     const size_t slab_size = facebook::cachelib::Slab::kSize;
     // Check overflow before aligning up to slab_size
     if (size > std::numeric_limits<size_t>::max() - (slab_size - 1)) {
@@ -2495,11 +2767,17 @@ int RealClient::allocateAndMountSegment(
     if (remaining > 0) {
         for (size_t i = 0; i < mounted_ids.size(); ++i) {
             UUID id;
-            if (StringToUuid(mounted_ids[i], id)) {
-                client_->UnmountSegmentById(id);
-            }
-            if (allocated_records[i].base) {
+            auto result = StringToUuid(mounted_ids[i], id)
+                              ? client_->UnmountSegmentById(id)
+                              : tl::expected<void, ErrorCode>(
+                                    tl::unexpected(ErrorCode::INVALID_PARAMS));
+            if (result) {
                 FreeAllocatedStoreSegment(allocated_records[i]);
+            } else {
+                std::lock_guard<std::mutex> lock(
+                    allocated_segment_records_mutex_);
+                allocated_segment_records_[mounted_ids[i]] =
+                    allocated_records[i];
             }
         }
         out_segment_ids.clear();
@@ -2532,9 +2810,11 @@ int RealClient::unmountAndFreeSegment(
     struct SegmentToUnmount {
         std::string segment_id;
         UUID id;
+        std::shared_ptr<EngineEgmAllocation> egm_owner;
     };
     std::vector<SegmentToUnmount> to_unmount;
     std::vector<std::pair<std::string, AllocatedSegmentRecord>> to_cleanup;
+    std::unordered_set<std::string> already_clean;
     {
         std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
         for (const auto &segment_id : segment_ids) {
@@ -2552,20 +2832,35 @@ int RealClient::unmountAndFreeSegment(
                 if (first_error == 0) first_error = -1;
                 continue;
             }
-
-            to_unmount.push_back({segment_id, id});
+            if (it->second.egm_owner &&
+                it->second.egm_owner->mount_state()->cleanup_confirmed.load())
+                already_clean.insert(segment_id);
+            to_unmount.push_back({segment_id, id, it->second.egm_owner});
         }
     }
 
     for (auto &entry : to_unmount) {
         std::function<void(const UUID &)> cleanup_callback;
-        if (grace_period_ms != 0) {
-            cleanup_callback = [this](const UUID &cleanup_id) {
-                ReleaseAllocatedSegmentRecord(UuidToString(cleanup_id));
-            };
+        if (grace_period_ms > 0) {
+            if (entry.egm_owner) {
+                // An externally shared Client may outlive this RealClient.
+                // Keep only allocation/engine ownership in the callback;
+                // the record remains available for a failed-free retry.
+                cleanup_callback = [owner = entry.egm_owner](const UUID &) {
+                    if (owner->Release() != 0)
+                        LOG(ERROR) << "Graceful EGM free pending retry";
+                };
+            } else {
+                cleanup_callback = [this](const UUID &cleanup_id) {
+                    ReleaseAllocatedSegmentRecord(UuidToString(cleanup_id));
+                };
+            }
         }
-        auto result = client_->UnmountSegmentById(entry.id, grace_period_ms,
-                                                  std::move(cleanup_callback));
+        auto result =
+            already_clean.contains(entry.segment_id)
+                ? tl::expected<void, ErrorCode>{}
+                : client_->UnmountSegmentById(entry.id, grace_period_ms,
+                                              std::move(cleanup_callback));
         if (!result.has_value()) {
             LOG(ERROR) << "UnmountSegmentById failed for " << entry.segment_id;
             if (first_error == 0) {
@@ -2574,7 +2869,7 @@ int RealClient::unmountAndFreeSegment(
             continue;  // Don't release local resources on failure
         }
 
-        if (grace_period_ms == 0) {
+        if (grace_period_ms == 0 || already_clean.contains(entry.segment_id)) {
             std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
             auto it = allocated_segment_records_.find(entry.segment_id);
             if (it != allocated_segment_records_.end()) {
@@ -2585,7 +2880,11 @@ int RealClient::unmountAndFreeSegment(
     }
 
     for (auto &p : to_cleanup) {
-        FreeAllocatedStoreSegment(p.second);
+        if (!FreeAllocatedStoreSegment(p.second) && p.second.egm_owner) {
+            std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
+            allocated_segment_records_[p.first] = std::move(p.second);
+            if (first_error == 0) first_error = -1;
+        }
     }
 
     return first_error;
@@ -7186,12 +7485,13 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &sizes,
-    const ReplicateConfig &config, bool stage_nonlocal) {
+    const ReplicateConfig &config, bool stage_nonlocal, void *producer_event) {
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
                 return batch_put_from_multi_buffers_internal(
-                    keys, all_buffers, sizes, config, stage_nonlocal);
+                    keys, all_buffers, sizes, config, stage_nonlocal,
+                    producer_event);
             },
             [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
@@ -8445,10 +8745,10 @@ RealClient::batch_put_from_multi_buffers_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
-    const ReplicateConfig &config, bool stage_nonlocal) {
-    return BatchWriteFromMultiBuffers(client_, keys, all_buffers, all_sizes,
-                                      config, client_buffer_allocator_,
-                                      stage_nonlocal, &Client::BatchPut);
+    const ReplicateConfig &config, bool stage_nonlocal, void *producer_event) {
+    return BatchWriteFromMultiBuffers(
+        client_, keys, all_buffers, all_sizes, config, client_buffer_allocator_,
+        stage_nonlocal, &Client::BatchPut, producer_event);
 }
 
 std::vector<int> RealClient::batch_get_into_multi_buffers(

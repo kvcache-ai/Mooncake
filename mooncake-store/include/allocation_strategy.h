@@ -99,6 +99,7 @@ class AllocatorManager {
 
         if (it->second.empty()) {
             allocators_.erase(name);
+            segment_metadata_.erase(name);
             auto name_it = std::find(names_.begin(), names_.end(), name);
             if (name_it != names_.end()) {
                 std::swap(*name_it, names_.back());
@@ -144,10 +145,71 @@ class AllocatorManager {
         AllocatorManager snapshot;
         snapshot.names_ = names_;
         snapshot.allocators_ = allocators_;
+        snapshot.segment_metadata_ = segment_metadata_;
+        snapshot.preferred_hcas_ = preferred_hcas_;
         if (owners) {
             snapshot.owner_by_name_ = *owners;
         }
         return snapshot;
+    }
+
+    void SetSegmentMetadata(const Segment& segment) {
+        segment_metadata_[segment.name] = segment;
+    }
+    const Segment* GetSegmentMetadata(const std::string& name) const {
+        auto it = segment_metadata_.find(name);
+        return it == segment_metadata_.end() ? nullptr : &it->second;
+    }
+
+    bool IsFabricEligible(const std::string& name,
+                          const std::string& domain) const {
+        const auto* segment = GetSegmentMetadata(name);
+        const bool mnnvl = segment && segment->protocol == "mnnvl";
+        return domain.empty()
+                   ? !mnnvl
+                   : mnnvl && segment->physical_placement &&
+                         segment->physical_placement->Valid() &&
+                         segment->physical_placement->fabric_domain == domain;
+    }
+
+    // Explicit copies/moves have no requester config. Derive eligibility from
+    // the source segment and never cross between MNNVL and other transports.
+    static bool CanCopyWithinFabric(const Segment& source,
+                                    const Segment& target) {
+        const bool source_mnnvl = source.protocol == "mnnvl";
+        const bool target_mnnvl = target.protocol == "mnnvl";
+        if (!source_mnnvl || !target_mnnvl)
+            return !source_mnnvl && !target_mnnvl;
+        return source.physical_placement &&
+               source.physical_placement->Valid() &&
+               target.physical_placement &&
+               target.physical_placement->Valid() &&
+               source.physical_placement->fabric_domain ==
+                   target.physical_placement->fabric_domain;
+    }
+    bool CanCopyWithinFabric(const std::string& source,
+                             const std::string& target) const {
+        const auto* src = GetSegmentMetadata(source);
+        const auto* tgt = GetSegmentMetadata(target);
+        // Unknown identity is not evidence of a legacy/non-MNNVL source.
+        return src && tgt && CanCopyWithinFabric(*src, *tgt);
+    }
+
+    // Produces a restricted snapshot, including getAllocators/AllocateFrom.
+    // Merely excluding fallback names would leave explicit preferences open.
+    AllocatorManager FilterForFabric(const std::string& domain) const {
+        auto result = Snapshot(&owner_by_name_);
+        for (const auto& name : names_) {
+            if (!IsFabricEligible(name, domain)) {
+                result.allocators_.erase(name);
+                result.segment_metadata_.erase(name);
+                result.owner_by_name_.erase(name);
+            }
+        }
+        std::erase_if(result.names_, [&](const auto& name) {
+            return !result.allocators_.contains(name);
+        });
+        return result;
     }
 
     [[nodiscard]] std::optional<UUID> GetOwnerClientId(
@@ -212,6 +274,7 @@ class AllocatorManager {
         allocators_;
     std::unordered_map<std::string, UUID> owner_by_name_;
     std::vector<std::string> preferred_hcas_;
+    std::unordered_map<std::string, Segment> segment_metadata_;
     friend class ScopedSegmentAccess;
 };
 
@@ -228,6 +291,20 @@ class AllocatorManager {
 class AllocationStrategy {
    public:
     virtual ~AllocationStrategy() = default;
+
+    struct ResolvedPlacement {
+        std::string fabric_domain;
+        std::optional<PhysicalPlacement> requester;
+    };
+    static tl::expected<ResolvedPlacement, ErrorCode> ResolvePlacement(
+        const ReplicateConfig& config);
+
+    // Request-scoped fabric eligibility and physical locality. Other storage
+    // classes and requests without physical placement retain their strategy.
+    tl::expected<std::vector<Replica>, ErrorCode> AllocateForRequest(
+        const AllocatorManager& manager, size_t length,
+        const ReplicateConfig& config,
+        const std::vector<std::string>& preferred_segments);
 
     /**
      * @brief Allocates a slice across the requested number of replicas

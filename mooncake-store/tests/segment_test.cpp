@@ -22,6 +22,221 @@ namespace mooncake {
 
 namespace {
 
+// RPC layouts before physical placement was added. Keep the upstream HCA
+// versions unchanged so older readers never interpret placement as HCA data.
+struct LegacyReplicateConfig {
+    size_t replica_num{1};
+    size_t nof_replica_num{0};
+    size_t dfs_replica_num{0};
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms{};
+    bool with_hard_pin{false};
+    std::vector<std::string> preferred_segments{};
+    std::string preferred_segment{};
+    std::vector<std::string> preferred_nof_segments{};
+    bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::string host_id{};
+    std::optional<std::vector<std::string>> group_ids{};
+    struct_pack::compatible<std::vector<std::string>, 1> session_ids;
+};
+
+struct HcaReplicateConfig {
+    size_t replica_num{1};
+    size_t nof_replica_num{0};
+    size_t dfs_replica_num{0};
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms{};
+    bool with_hard_pin{false};
+    std::vector<std::string> preferred_segments{};
+    std::string preferred_segment{};
+    std::vector<std::string> preferred_nof_segments{};
+    bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::string host_id{};
+    std::optional<std::vector<std::string>> group_ids{};
+    struct_pack::compatible<std::vector<std::string>, 1> session_ids;
+    struct_pack::compatible<std::vector<std::string>, 2> preferred_hca_names;
+    struct_pack::compatible<std::vector<std::vector<std::string>>, 3>
+        per_key_preferred_hca_names;
+};
+
+// Current upstream RPC layout, before this branch's physical placement fields.
+struct ResidencyReplicateConfig {
+    size_t replica_num{1};
+    size_t nof_replica_num{0};
+    size_t dfs_replica_num{0};
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms{};
+    bool with_hard_pin{false};
+    std::vector<std::string> preferred_segments{};
+    std::string preferred_segment{};
+    std::vector<std::string> preferred_nof_segments{};
+    bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::string host_id{};
+    std::optional<std::vector<std::string>> group_ids{};
+    struct_pack::compatible<std::vector<std::string>, 1> session_ids;
+    struct_pack::compatible<std::vector<std::string>, 2> preferred_hca_names;
+    struct_pack::compatible<std::vector<std::vector<std::string>>, 3>
+        per_key_preferred_hca_names;
+    struct_pack::compatible<std::vector<std::string>, 4> residency_affinity_ids;
+};
+
+struct LegacySegment {
+    UUID id{0, 0};
+    std::string name{};
+    uintptr_t base{0};
+    size_t size{0};
+    std::string te_endpoint{};
+    std::string protocol;
+    std::string host_id{};
+};
+
+struct HcaSegment {
+    UUID id{0, 0};
+    std::string name{};
+    uintptr_t base{0};
+    size_t size{0};
+    std::string te_endpoint{};
+    std::string protocol;
+    std::string host_id{};
+    struct_pack::compatible<SegmentLocality, 1> locality;
+};
+
+TEST(PlacementRpcTest, LegacyLayoutsRemainCompatibleInBothDirections) {
+    LegacyReplicateConfig legacy;
+    legacy.host_id = "host1";
+    legacy.session_ids = std::vector<std::string>{"session1"};
+    auto decoded = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(legacy));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->host_id, "host1");
+    EXPECT_EQ(decoded->SessionId(), "session1");
+    EXPECT_FALSE(decoded->requester_placement);
+    EXPECT_FALSE(decoded->fabric_domain);
+    decoded->requester_self_id = "rack1.host1#g3";
+    decoded->fabric_domain = "fabric1";
+    decoded->requester_placement =
+        PhysicalPlacement{"fabric1", "rack1", "host1", 3, 2};
+    const auto bytes = struct_pack::serialize(*decoded);
+    auto restored = struct_pack::deserialize<ReplicateConfig>(bytes);
+    ASSERT_TRUE(restored);
+    ASSERT_TRUE(restored->requester_placement);
+    EXPECT_EQ(*restored->requester_placement, *decoded->requester_placement);
+    EXPECT_EQ(*restored->requester_self_id, "rack1.host1#g3");
+    auto old_reader = struct_pack::deserialize<LegacyReplicateConfig>(bytes);
+    ASSERT_TRUE(old_reader);
+    EXPECT_EQ(old_reader->host_id, "host1");
+    ASSERT_TRUE(old_reader->session_ids);
+    EXPECT_EQ(old_reader->session_ids->front(), "session1");
+
+    LegacySegment old_segment;
+    old_segment.name = "rack1.host1#g3/numa2";
+    old_segment.te_endpoint = "10.0.0.1:18060";
+    old_segment.protocol = "mnnvl";
+    auto segment =
+        struct_pack::deserialize<Segment>(struct_pack::serialize(old_segment));
+    ASSERT_TRUE(segment);
+    EXPECT_FALSE(segment->physical_placement);
+    segment->physical_placement = *decoded->requester_placement;
+    const auto segment_bytes = struct_pack::serialize(*segment);
+    auto new_segment = struct_pack::deserialize<Segment>(segment_bytes);
+    ASSERT_TRUE(new_segment);
+    EXPECT_EQ(*new_segment, *segment);
+    auto old_segment_reader =
+        struct_pack::deserialize<LegacySegment>(segment_bytes);
+    ASSERT_TRUE(old_segment_reader);
+    EXPECT_EQ(old_segment_reader->te_endpoint, "10.0.0.1:18060");
+}
+
+TEST(PlacementRpcTest, HcaAndPlacementExtensionsRemainIndependent) {
+    HcaReplicateConfig upstream;
+    upstream.session_ids = std::vector<std::string>{"session1"};
+    upstream.preferred_hca_names = std::vector<std::string>{"mlx5_0"};
+    upstream.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_1"}};
+    auto decoded = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(upstream));
+    ASSERT_TRUE(decoded);
+    ASSERT_TRUE(decoded->preferred_hca_names);
+    EXPECT_EQ(*decoded->preferred_hca_names, *upstream.preferred_hca_names);
+    ASSERT_TRUE(decoded->per_key_preferred_hca_names);
+    EXPECT_EQ(*decoded->per_key_preferred_hca_names,
+              *upstream.per_key_preferred_hca_names);
+    EXPECT_FALSE(decoded->requester_placement);
+    decoded->requester_self_id = "rack1.host1#g3";
+    decoded->fabric_domain = "fabric1";
+    decoded->requester_placement =
+        PhysicalPlacement{"fabric1", "rack1", "host1", 3, 2};
+    auto reader = struct_pack::deserialize<HcaReplicateConfig>(
+        struct_pack::serialize(*decoded));
+    ASSERT_TRUE(reader);
+    ASSERT_TRUE(reader->preferred_hca_names);
+    ASSERT_TRUE(reader->per_key_preferred_hca_names);
+    EXPECT_EQ(*reader->preferred_hca_names, *upstream.preferred_hca_names);
+    EXPECT_EQ(*reader->per_key_preferred_hca_names,
+              *upstream.per_key_preferred_hca_names);
+
+    HcaSegment upstream_segment;
+    upstream_segment.locality = SegmentLocality{2, {"mlx5_0"}};
+    auto segment = struct_pack::deserialize<Segment>(
+        struct_pack::serialize(upstream_segment));
+    ASSERT_TRUE(segment);
+    ASSERT_TRUE(segment->locality);
+    EXPECT_FALSE(segment->physical_placement);
+    segment->physical_placement = *decoded->requester_placement;
+    const auto bytes = struct_pack::serialize(*segment);
+    auto restored = struct_pack::deserialize<Segment>(bytes);
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(*restored, *segment);
+    auto old_reader = struct_pack::deserialize<HcaSegment>(bytes);
+    ASSERT_TRUE(old_reader);
+    ASSERT_TRUE(old_reader->locality);
+    EXPECT_EQ(*old_reader->locality, *upstream_segment.locality);
+}
+
+TEST(PlacementRpcTest, ResidencyAndPlacementExtensionsRemainIndependent) {
+    ResidencyReplicateConfig upstream;
+    upstream.session_ids = std::vector<std::string>{"session1"};
+    upstream.preferred_hca_names = std::vector<std::string>{"mlx5_0"};
+    upstream.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_1"}};
+    upstream.residency_affinity_ids = std::vector<std::string>{"affinity1"};
+    EXPECT_EQ(struct_pack::get_type_code<ReplicateConfig>(),
+              struct_pack::get_type_code<ResidencyReplicateConfig>());
+    auto decoded = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(upstream));
+    ASSERT_TRUE(decoded);
+    ASSERT_TRUE(decoded->residency_affinity_ids);
+    EXPECT_EQ(*decoded->residency_affinity_ids,
+              *upstream.residency_affinity_ids);
+    EXPECT_FALSE(decoded->requester_self_id);
+    EXPECT_FALSE(decoded->fabric_domain);
+    EXPECT_FALSE(decoded->requester_placement);
+
+    decoded->requester_self_id = "rack1.host1#g3";
+    decoded->fabric_domain = "fabric1";
+    decoded->requester_placement =
+        PhysicalPlacement{"fabric1", "rack1", "host1", 3, 2};
+    const auto bytes = struct_pack::serialize(*decoded);
+    auto reader = struct_pack::deserialize<ResidencyReplicateConfig>(bytes);
+    ASSERT_TRUE(reader);
+    EXPECT_EQ(reader->session_ids, upstream.session_ids);
+    EXPECT_EQ(reader->preferred_hca_names, upstream.preferred_hca_names);
+    EXPECT_EQ(reader->per_key_preferred_hca_names,
+              upstream.per_key_preferred_hca_names);
+    EXPECT_EQ(reader->residency_affinity_ids, upstream.residency_affinity_ids);
+
+    auto restored = struct_pack::deserialize<ReplicateConfig>(bytes);
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(restored->residency_affinity_ids,
+              upstream.residency_affinity_ids);
+    EXPECT_EQ(restored->requester_self_id, decoded->requester_self_id);
+    EXPECT_EQ(restored->fabric_domain, decoded->fabric_domain);
+    EXPECT_EQ(restored->requester_placement, decoded->requester_placement);
+}
+
 class BlockingOffsetBufferAllocator : public OffsetBufferAllocator {
    public:
     BlockingOffsetBufferAllocator(std::string segment_name, size_t base,
@@ -211,6 +426,67 @@ TEST_F(SegmentTest, MountSegmentSuccess) {
 
     // Verify segment is properly mounted
     ValidateMountedSegment(segment_manager, segment, client_id);
+}
+
+TEST_F(SegmentTest, ReadableFabricIdentitySurvivesDrainAndUnmount) {
+    SegmentManager manager(BufferAllocatorType::OFFSET);
+    const auto client_id = generate_uuid();
+    Segment source;
+    source.id = generate_uuid();
+    source.name = "source";
+    source.base = 0x300000000ULL;
+    source.size = 16 * 1024 * 1024;
+    source.te_endpoint = "10.0.0.1:18060";
+    source.protocol = "mnnvl";
+    source.physical_placement =
+        PhysicalPlacement{"fabric-a", "rack1", "tray1", 3, 0};
+    auto target = source;
+    target.id = generate_uuid();
+    target.name = "target";
+    target.base += source.size;
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.MountSegment(source, client_id, client_liveness_),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(target, client_id, client_liveness_),
+                  ErrorCode::OK);
+        ASSERT_EQ(
+            access.SetSegmentStatusByName(source.name, SegmentStatus::DRAINING),
+            ErrorCode::OK);
+        EXPECT_TRUE(access.CanCopyWithinFabric(source.name, target.name));
+        EXPECT_FALSE(access.IsSegmentAllocatable(source.name));
+    }
+    auto check_snapshot = [&](SegmentManager& segments) {
+        auto access = segments.getAllocatorAccess();
+        auto snapshot = access.SnapshotAllocatorManager(source.name);
+        EXPECT_EQ(snapshot.getAllocators(source.name), nullptr);
+        EXPECT_EQ(snapshot.getNames(), (std::vector<std::string>{target.name}));
+        EXPECT_TRUE(snapshot.CanCopyWithinFabric(source.name, target.name));
+        auto ordinary = access.SnapshotAllocatorManager();
+        EXPECT_EQ(ordinary.GetSegmentMetadata(source.name), nullptr);
+    };
+    check_snapshot(manager);
+
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.PrepareGracefulUnmountSegment(source.id),
+                  ErrorCode::OK);
+        EXPECT_TRUE(access.CanCopyWithinFabric(source.name, target.name));
+    }
+    check_snapshot(manager);
+    {
+        auto access = manager.getSegmentAccess();
+        size_t capacity = 0;
+        ASSERT_EQ(access.PrepareUnmountSegment(source.id, capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.CommitUnmountSegment(source.id, client_id, capacity),
+                  ErrorCode::OK);
+        EXPECT_FALSE(access.CanCopyWithinFabric(source.name, target.name));
+    }
+    auto access = manager.getAllocatorAccess();
+    auto removed = access.SnapshotAllocatorManager(source.name);
+    EXPECT_EQ(removed.GetSegmentMetadata(source.name), nullptr);
+    EXPECT_FALSE(removed.CanCopyWithinFabric(source.name, target.name));
 }
 
 TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {

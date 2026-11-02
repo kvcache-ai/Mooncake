@@ -100,6 +100,9 @@ class ScopedSegmentAccess {
 
     bool GetSegment(const UUID& segment_id, Segment& segment) const;
 
+    bool CanCopyWithinFabric(const std::string& source,
+                             const std::string& target) const;
+
     struct AllocatorReplacement {
         UUID segment_id;
         std::shared_ptr<BufferAllocatorBase> expected;
@@ -309,19 +312,26 @@ class ScopedAllocatorAccess {
         const AllocatorManager& allocator_manager,
         const HostSegmentIndex& segments_by_host,
         const std::unordered_map<std::string, UUID>& client_by_name,
-        std::shared_mutex& mutex)
+        std::shared_mutex& mutex,
+        const std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>*
+            mounted_segments = nullptr,
+        const std::unordered_map<std::string, UUID>* segment_id_by_name =
+            nullptr)
         : allocator_manager_(allocator_manager),
           segments_by_host_(&segments_by_host),
           client_by_name_(&client_by_name),
+          mounted_segments_(mounted_segments),
+          segment_id_by_name_(segment_id_by_name),
           lock_(mutex) {}
 
     const AllocatorManager& getAllocatorManager() const {
         return allocator_manager_;
     }
 
-    AllocatorManager SnapshotAllocatorManager() const {
-        return allocator_manager_.Snapshot(client_by_name_);
-    }
+    // A readable source may no longer have an allocation registration while
+    // draining. Resolve its identity from mounted records under the same lock.
+    AllocatorManager SnapshotAllocatorManager(
+        const std::string& source_segment = {}) const;
 
     std::vector<std::string> GetHostOrderedSegments(
         const std::string& writer_host_id, const std::string& key) const;
@@ -332,6 +342,9 @@ class ScopedAllocatorAccess {
     const AllocatorManager& allocator_manager_;
     const HostSegmentIndex* segments_by_host_{nullptr};
     const std::unordered_map<std::string, UUID>* client_by_name_{nullptr};
+    const std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>*
+        mounted_segments_{nullptr};
+    const std::unordered_map<std::string, UUID>* segment_id_by_name_{nullptr};
     std::shared_lock<std::shared_mutex> lock_;
 };
 
@@ -372,7 +385,8 @@ class SegmentManager {
      */
     ScopedAllocatorAccess getAllocatorAccess() {
         return ScopedAllocatorAccess(allocator_manager_, segments_by_host_,
-                                     client_by_name_, segment_mutex_);
+                                     client_by_name_, segment_mutex_,
+                                     &mounted_segments_, &segment_id_by_name_);
     }
 
     /**
