@@ -34,6 +34,8 @@
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/ordered_oplog_writer.h"
+#include "storage/distributed/kvcs/kvcs_capacity_provider.h"
+#include "storage/distributed/kvcs/kvcs_driver.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -167,6 +169,48 @@ class FailingBatchHaKvBackend : public FakeBatchHaKvBackend {
     std::condition_variable cv_;
     ErrorCode txn_error_{ErrorCode::OK};
     size_t txn_calls_{0};
+};
+
+class HaKvcsWatermarkDriver final : public KvcsDriver {
+   public:
+    tl::expected<void, ErrorCode> Init() override { return {}; }
+    uint64_t MaxValueSize() const override { return 4 * 1024 * 1024; }
+    tl::expected<std::vector<KvcsMountpointStat>, ErrorCode>
+    GetMountpointStats() override {
+        return std::vector<KvcsMountpointStat>{{.index = 1,
+                                                .id = "target-mp",
+                                                .total_bytes = 100,
+                                                .used_bytes = 95}};
+    }
+    KvcsIoResults BatchPut(std::span<const KvcsIoRequest> requests) override {
+        return Errors(requests.size(), ErrorCode::NOT_SUPPORTED);
+    }
+    KvcsIoResults BatchGet(std::span<const KvcsIoRequest> requests) override {
+        return Errors(requests.size(), ErrorCode::NOT_SUPPORTED);
+    }
+    KvcsIoResults BatchDelete(std::span<const ObjectKey> keys) override {
+        {
+            std::lock_guard lock(mutex_);
+            deleted_keys_.insert(deleted_keys_.end(), keys.begin(), keys.end());
+        }
+        cv_.notify_all();
+        return KvcsIoResults(keys.size());
+    }
+
+    bool WaitForDelete(std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, timeout,
+                            [this] { return !deleted_keys_.empty(); });
+    }
+
+   private:
+    static KvcsIoResults Errors(size_t count, ErrorCode error) {
+        return KvcsIoResults(count, tl::make_unexpected(error));
+    }
+
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<ObjectKey> deleted_keys_;
 };
 
 class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
@@ -1225,6 +1269,52 @@ class MasterServiceHATest : public ::testing::Test {
     std::vector<std::string> policy_files_;
     int next_policy_file_{0};
 };
+
+TEST_F(MasterServiceHATest, KvcsWatermarkUsesOpLogForMetadataRemoval) {
+    auto config = MasterServiceConfig::builder()
+                      .set_default_kv_lease_ttl(1)
+                      .set_default_kv_soft_pin_ttl(1)
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id("kvcs_watermark_oplog")
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    auto writer =
+        InstallGatedWriter(service, std::make_shared<FakeBatchHaKvBackend>());
+    const auto segment = PrepareSimpleSegment(service);
+
+    auto driver = std::make_unique<HaKvcsWatermarkDriver>();
+    auto* driver_state = driver.get();
+    MasterServiceTestPeer peer(service);
+    peer.ConfigureKvcsCapacityForTesting(std::make_unique<KvcsCapacityProvider>(
+                                             1, "target-mp", std::move(driver)),
+                                         true, 0.9, 0.7);
+
+    ReplicateConfig replicate;
+    replicate.replica_num = 1;
+    replicate.dfs_replica_num = 1;
+    const std::string key = "kvcs-watermark-oplog";
+    ASSERT_TRUE(service.PutStart(segment.client_id, key, kDefaultTenant, 64,
+                                 replicate));
+    ASSERT_TRUE(service.PutEnd(segment.client_id, key, kDefaultTenant,
+                               ReplicaType::ALL));
+    ASSERT_TRUE(writer->PauseCallbacksAfter(1));
+
+    peer.RefreshKvcsDfsUsageForTesting();
+    ASSERT_TRUE(driver_state->WaitForDelete(std::chrono::seconds(1)));
+    ASSERT_TRUE(writer->WaitForSubmittedCount(2, std::chrono::seconds(1)));
+    auto pending = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(pending);
+    ASSERT_EQ(pending->replicas.size(), 1u);
+    EXPECT_TRUE(pending->replicas.front().is_memory_replica());
+
+    ASSERT_TRUE(writer->RunCallbacksThrough(2));
+    auto remaining = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(remaining);
+    ASSERT_EQ(remaining->replicas.size(), 1u);
+    EXPECT_TRUE(remaining->replicas.front().is_memory_replica());
+}
 
 class MasterServiceBatchRecordE2ETest : public MasterServiceHATest {};
 
