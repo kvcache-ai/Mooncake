@@ -296,7 +296,8 @@ int TENTBenchRunner::freeBuffers() {
         // exiting, so leaving them allocated costs nothing.
         LOG(WARNING) << abandoned
                      << " transfer batch(es) were still in flight when the "
-                        "run stopped; leaving the local buffers allocated";
+                        "run stopped; leaving the engine and local buffers "
+                        "allocated";
         pinned_buffer_list_.clear();
         return 0;
     }
@@ -319,7 +320,15 @@ TENTBenchRunner::TENTBenchRunner() {
     allocateBuffers();
 }
 
-TENTBenchRunner::~TENTBenchRunner() { freeBuffers(); }
+TENTBenchRunner::~TENTBenchRunner() {
+    freeBuffers();
+    if (abandoned_batches_.load() != 0) {
+        // The default Transport::quiesce() does not drain outstanding work.
+        // Keep the engine's registrations, batches and transport state alive
+        // alongside the buffers until process exit.
+        (void)engine_.release();
+    }
+}
 
 int TENTBenchRunner::runTarget() {
     while (g_tent_running.load()) sleep(1);

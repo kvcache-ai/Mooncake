@@ -70,6 +70,19 @@ set_target_properties(
              "$ORIGIN/../lib:$ORIGIN/../../mooncake-common${TANGRT_RPATH}")
 
 if(BUILD_UNIT_TESTS)
+  if(USE_TENT)
+    add_executable(
+      tebench_tent_teardown_test tests/tent_teardown_test.cpp tent_backend.cpp
+                                 split_output.cpp utils.cpp)
+    target_link_libraries(
+      tebench_tent_teardown_test
+      PRIVATE $<TARGET_PROPERTY:tebench,LINK_LIBRARIES> gtest gtest_main)
+    target_include_directories(tebench_tent_teardown_test
+                               PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tebench_tent_teardown_test COMMAND tebench_tent_teardown_test)
+    set_tests_properties(tebench_tent_teardown_test PROPERTIES TIMEOUT 30)
+  endif()
+
   add_test(NAME tebench_build_tree_help
            COMMAND ${CMAKE_COMMAND} -E env --unset=LD_LIBRARY_PATH
                    $<TARGET_FILE:tebench> --help)
