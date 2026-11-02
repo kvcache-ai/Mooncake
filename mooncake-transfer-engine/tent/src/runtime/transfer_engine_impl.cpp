@@ -2467,6 +2467,13 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
             if (!status.ok()) {
                 LOG(WARNING) << "Failed to allocate SubBatch " << task.type
                              << ":" << status.ToString();
+                // No transport task was published, so this owner is already
+                // terminal. Keep the selected type for failure attribution;
+                // the completion pass below closes its logical accounting
+                // after the start token has been established.
+                task.status = FAILED;
+                task.failure_stage = 0;
+                task.suppress_failover = true;
                 merged_task_id_map[merged_task_id] = task;
                 continue;
             }
@@ -2484,12 +2491,17 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
     // already-counted user request. Count only user-visible owner tasks as
     // logical requests, after their TaskInfo state is fully published and
     // before any transport attempt can complete.
-    if (owner_kind == QueueOwnerKind::User) {
-        for (const auto& [merged_task_id, owner_task_id] :
-             owner_task_id_by_merged_task) {
-            (void)merged_task_id;
-            startLogicalRequestObservability(batch->task_list[owner_task_id]);
+    for (const auto& [merged_task_id, owner_task_id] :
+         owner_task_id_by_merged_task) {
+        (void)merged_task_id;
+        auto& task = batch->task_list[owner_task_id];
+        if (owner_kind == QueueOwnerKind::User) {
+            startLogicalRequestObservability(task);
         }
+        // A synchronous pre-attempt failure has no transport completion to
+        // poll. Settle it now, after logical start pairing is available.
+        if (task.status != PENDING)
+            recordTaskCompletionMetrics(task, PENDING, task.status);
     }
 
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
@@ -3277,11 +3289,11 @@ bool TransferEngineImpl::attemptSubmitStageFailover(Batch* batch,
 Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
                                           TransferStatus& task_status) {
     auto& task = batch->task_list[task_id];
-    // Match batch polling: a logical failure is terminal. A rejected fallback
-    // may not have created a sub-task, but keep its type for metric
-    // attribution.
-    if (task.status == FAILED) {
-        task_status = {FAILED, 0};
+    // Match batch polling: every published terminal state is stable. In
+    // particular, an UNSPEC task canceled before publication must not be
+    // reinterpreted as FAILED merely because it has no transport SubBatch.
+    if (task.status != PENDING) {
+        task_status = {task.status, 0};
         return Status::OK();
     }
     if (task.staging) {

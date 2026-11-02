@@ -211,12 +211,15 @@ class FakeSubBatch : public Transport::SubBatch {
 class FakeTransport : public Transport {
    public:
     explicit FakeTransport(TransportType self_type, bool force_fail = false,
-                           bool force_submit_fail = false)
+                           bool force_submit_fail = false,
+                           int allocate_failures = 0)
         : self_type_(self_type),
           force_fail_(force_fail),
-          force_submit_fail_(force_submit_fail) {
+          force_submit_fail_(force_submit_fail),
+          allocate_failures_(allocate_failures) {
         caps.dram_to_dram = true;
     }
+    std::atomic<int> allocate_calls{0};
     std::atomic<int> submit_calls{0};
 
     Status install(std::string&, std::shared_ptr<ControlService>,
@@ -226,6 +229,11 @@ class FakeTransport : public Transport {
     }
 
     Status allocateSubBatch(SubBatchRef& batch, size_t) override {
+        ++allocate_calls;
+        if (allocate_failures_ > 0) {
+            --allocate_failures_;
+            return Status::InternalError("forced allocation failure" LOC_MARK);
+        }
         batch = new FakeSubBatch();
         return Status::OK();
     }
@@ -309,6 +317,7 @@ class FakeTransport : public Transport {
     TransportType self_type_;
     bool force_fail_;
     bool force_submit_fail_;
+    int allocate_failures_;
 };
 
 std::shared_ptr<Config> makeMetricsTestConfig() {
@@ -613,6 +622,141 @@ TEST_F(MetricsRecordingTest, CompletedTransferRecordsBytesAndLatency) {
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+// A pre-attempt allocation failure is terminal for that logical request. It
+// must not leave a PENDING task with a concrete transport but no SubBatch, and
+// it must not prevent later requests in the same batch from being polled.
+TEST_F(MetricsRecordingTest,
+       AllocateSubBatchFailureSettlesRequestAndDoesNotBlockBatch) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA, /*force_fail=*/false,
+                                                /*force_submit_fail=*/false,
+                                                /*allocate_failures=*/1);
+    auto fallback = std::make_shared<FakeTransport>(TCP);
+    installFakeRdma(engine, fake);
+    installFakeTcp(engine, fallback);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(2 * kLen, 0xBC);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    BatchID batch = engine.allocateBatch(2);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto failed_request = makeLocalWrite(buf.data(), kLen);
+    failed_request.transport_hint = UNSPEC;
+    const auto before = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch, {failed_request,
+                                    makeLocalWrite(buf.data() + kLen, kLen)})
+            .ok());
+
+    // The first task failed before publication. Cancel must be harmless, and
+    // the batch status query must still reach the second, successful task.
+    EXPECT_TRUE(engine.cancelTransfer(batch, 0).ok());
+    TransferStatus overall_status{PENDING, 0};
+    ASSERT_TRUE(engine.getTransferStatus(batch, overall_status).ok());
+    EXPECT_EQ(overall_status.s, FAILED);
+
+    std::vector<TransferStatus> statuses;
+    ASSERT_TRUE(engine.getTransferStatus(batch, statuses).ok());
+    ASSERT_EQ(statuses.size(), 2);
+    EXPECT_EQ(statuses[0].s, FAILED);
+    EXPECT_EQ(statuses[1].s, COMPLETED);
+
+    const auto after = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(fake->allocate_calls.load(), 2);
+    EXPECT_EQ(fake->submit_calls.load(), 1);
+    EXPECT_EQ(fallback->allocate_calls.load(), 0);
+    EXPECT_EQ(fallback->submit_calls.load(), 0);
+    EXPECT_EQ(
+        after.series(
+            "tent_logical_requests_started_total{operation=\"write\"}") -
+            before.series(
+                "tent_logical_requests_started_total{operation=\"write\"}"),
+        2);
+    EXPECT_EQ(after.series("tent_logical_request_outcomes_total{operation=\""
+                           "write\",outcome=\"failed\"}") -
+                  before.series(
+                      "tent_logical_request_outcomes_total{operation=\"write\","
+                      "outcome=\"failed\"}"),
+              1);
+    EXPECT_EQ(after.series("tent_logical_request_outcomes_total{operation=\""
+                           "write\",outcome=\"success\"}") -
+                  before.series(
+                      "tent_logical_request_outcomes_total{operation=\"write\","
+                      "outcome=\"success\"}"),
+              1);
+    EXPECT_EQ(
+        after.series("tent_logical_requests_inflight{operation=\"write\"}") -
+            before.series(
+                "tent_logical_requests_inflight{operation=\"write\"}"),
+        0);
+    EXPECT_EQ(after.counter("tent_transport_attempts_total") -
+                  before.counter("tent_transport_attempts_total"),
+              1);
+    EXPECT_EQ(after.counter("tent_transport_attempt_failures_total") -
+                  before.counter("tent_transport_attempt_failures_total"),
+              0);
+    EXPECT_EQ(after.series("tent_task_failures_total{transport=\"rdma\",reason="
+                           "\"submit\"}") -
+                  before.series(
+                      "tent_task_failures_total{transport=\"rdma\",reason=\""
+                      "submit\"}"),
+              1);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+TEST_F(MetricsRecordingTest,
+       CanceledUnroutableRequestRemainsCanceledAcrossPolls) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xBD);
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto request = makeLocalWrite(buf.data(), kLen);
+    request.transport_hint = UNSPEC;
+    const auto before = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
+    ASSERT_TRUE(engine.cancelTransfer(batch, 0).ok());
+
+    for (int poll = 0; poll < 2; ++poll) {
+        TransferStatus status{PENDING, 0};
+        ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
+        EXPECT_EQ(status.s, CANCELED);
+    }
+
+    const auto after = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(after.series("tent_logical_request_outcomes_total{operation=\""
+                           "write\",outcome=\"canceled\"}") -
+                  before.series(
+                      "tent_logical_request_outcomes_total{operation=\"write\","
+                      "outcome=\"canceled\"}"),
+              1);
+    EXPECT_EQ(after.series("tent_logical_request_outcomes_total{operation=\""
+                           "write\",outcome=\"failed\"}") -
+                  before.series(
+                      "tent_logical_request_outcomes_total{operation=\"write\","
+                      "outcome=\"failed\"}"),
+              0);
+    EXPECT_EQ(
+        after.series("tent_logical_requests_inflight{operation=\"write\"}") -
+            before.series(
+                "tent_logical_requests_inflight{operation=\"write\"}"),
+        0);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
 }
 
 // ---------------------------------------------------------------------------
