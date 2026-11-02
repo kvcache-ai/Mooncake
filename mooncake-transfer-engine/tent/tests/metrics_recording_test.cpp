@@ -456,6 +456,10 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStreamAdmission(HP_TCP, -2, -4096);
     metrics.recordStreamConnection(
         HP_TCP, TentMetrics::StreamConnectionRole::Client, -1);
+    metrics.recordProtocolError(
+        HP_TCP, TentMetrics::ProtocolErrorKind::RequestIdMismatch);
+    metrics.recordTcpSocketSample(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, 2, 120, 32);
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -465,7 +469,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 42>
+    const std::array<std::pair<std::string_view, std::string_view>, 46>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -483,6 +487,8 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_deadline_infeasible_total", "counter"},
             {"tent_quarantined_batches_total", "counter"},
             {"tent_stream_events_total", "counter"},
+            {"tent_protocol_errors_total", "counter"},
+            {"tent_tcp_retransmissions_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
             {"tent_logical_requests_inflight", "gauge"},
             {"tent_stream_queue_depth", "gauge"},
@@ -502,6 +508,8 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_transport_attempt_latency_us", "histogram"},
             {"tent_stream_attempt_latency_us", "histogram"},
             {"tent_stream_queue_wait_us", "histogram"},
+            {"tent_tcp_rtt_us", "histogram"},
+            {"tent_tcp_congestion_window_segments", "histogram"},
             {"tent_metrics_build_info", "gauge"},
             {"tent_metrics_runtime_enabled", "gauge"},
             {"tent_metrics_http_server_up", "gauge"},
@@ -558,6 +566,36 @@ TEST_F(MetricsRecordingTest, StreamSignalsSeparateQueueAndPhysicalAttempts) {
               1);
     EXPECT_EQ(after.histogramCount("tent_stream_queue_wait_us") -
                   before.histogramCount("tent_stream_queue_wait_us"),
+              1);
+}
+
+TEST_F(MetricsRecordingTest, NetworkAndProtocolSignalsUseBoundedLabels) {
+    auto& metrics = TentMetrics::instance();
+    const auto before = MetricsSnapshot(metrics);
+
+    metrics.recordProtocolError(
+        HP_TCP, TentMetrics::ProtocolErrorKind::CommittedLengthMismatch);
+    metrics.recordTcpSocketSample(
+        HP_TCP, TentMetrics::StreamConnectionRole::Server, 3, 240, 64);
+
+    const auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        after.series("tent_protocol_errors_total{transport=\"hp_tcp\","
+                     "kind=\"committed_length_mismatch\"}") -
+            before.series("tent_protocol_errors_total{transport=\"hp_tcp\","
+                          "kind=\"committed_length_mismatch\"}"),
+        1);
+    EXPECT_EQ(
+        after.series("tent_tcp_retransmissions_total{transport=\"hp_tcp\","
+                     "role=\"server\"}") -
+            before.series("tent_tcp_retransmissions_total{transport=\"hp_tcp\","
+                          "role=\"server\"}"),
+        3);
+    EXPECT_EQ(after.histogramCount("tent_tcp_rtt_us") -
+                  before.histogramCount("tent_tcp_rtt_us"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_tcp_congestion_window_segments") -
+                  before.histogramCount("tent_tcp_congestion_window_segments"),
               1);
 }
 
@@ -1973,6 +2011,10 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_stream_admitted_tasks"));
     EXPECT_TRUE(json.contains("tent_stream_admitted_bytes"));
     EXPECT_TRUE(json.contains("tent_stream_connections"));
+    EXPECT_TRUE(json.contains("tent_protocol_errors_total"));
+    EXPECT_TRUE(json.contains("tent_tcp_retransmissions_total"));
+    EXPECT_TRUE(json.contains("tent_tcp_rtt_us"));
+    EXPECT_TRUE(json.contains("tent_tcp_congestion_window_segments"));
     EXPECT_TRUE(json.contains("tent_metrics_build_info"));
     EXPECT_FALSE(
         json["tent_metrics_build_info"].contains("compile_time_enabled"));

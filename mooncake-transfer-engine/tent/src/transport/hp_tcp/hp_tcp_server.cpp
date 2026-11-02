@@ -12,8 +12,35 @@
 
 #include "tent/metrics/tent_metrics.h"
 #include "tent/transport/hp_tcp/hp_tcp_protocol.h"
+#include "tent/transport/hp_tcp/hp_tcp_socket_observability.h"
 
 namespace mooncake::tent {
+#if TENT_METRICS_ENABLED
+namespace {
+TentMetrics::ProtocolErrorKind protocolErrorKind(
+    HighPerformanceTcpFrameError error) {
+    switch (error) {
+        case HighPerformanceTcpFrameError::kInvalidSize:
+            return TentMetrics::ProtocolErrorKind::InvalidSize;
+        case HighPerformanceTcpFrameError::kBadMagic:
+            return TentMetrics::ProtocolErrorKind::BadMagic;
+        case HighPerformanceTcpFrameError::kBadVersion:
+            return TentMetrics::ProtocolErrorKind::BadVersion;
+        case HighPerformanceTcpFrameError::kInvalidReserved:
+            return TentMetrics::ProtocolErrorKind::InvalidReserved;
+        case HighPerformanceTcpFrameError::kBadOpcode:
+            return TentMetrics::ProtocolErrorKind::BadOpcode;
+        case HighPerformanceTcpFrameError::kBadLength:
+            return TentMetrics::ProtocolErrorKind::BadLength;
+        case HighPerformanceTcpFrameError::kInvalidStatus:
+            return TentMetrics::ProtocolErrorKind::InvalidStatus;
+        case HighPerformanceTcpFrameError::kNone:
+            return TentMetrics::ProtocolErrorKind::InvalidReserved;
+    }
+    return TentMetrics::ProtocolErrorKind::InvalidReserved;
+}
+}  // namespace
+#endif
 
 class HighPerformanceTcpServer::Session
     : public std::enable_shared_from_this<HighPerformanceTcpServer::Session> {
@@ -33,6 +60,9 @@ class HighPerformanceTcpServer::Session
     void cancel() {
         forced_close_ = true;
         cancelTimer();
+#if TENT_METRICS_ENABLED
+        sampleSocket(true);
+#endif
         std::error_code ignored;
         socket_->cancel(ignored);
         socket_->shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
@@ -61,6 +91,9 @@ class HighPerformanceTcpServer::Session
             finishClosed();
             return;
         }
+#if TENT_METRICS_ENABLED
+        if (request_epoch_ != 0) sampleSocket(false);
+#endif
         lease_.reset();
         body_offset_ = 0;
         header_offset_ = 0;
@@ -106,15 +139,26 @@ class HighPerformanceTcpServer::Session
     void handleHeader() {
         HighPerformanceTcpStatus wire_error =
             HighPerformanceTcpStatus::kInternalError;
+        HighPerformanceTcpFrameError frame_error =
+            HighPerformanceTcpFrameError::kNone;
         const Status decoded = DecodeHighPerformanceTcpRequest(
             request_bytes_.data(), request_bytes_.size(), &request_,
-            &wire_error);
+            &wire_error, &frame_error);
         if (!decoded.ok()) {
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordProtocolError(
+                TransportType::HP_TCP, protocolErrorKind(frame_error));
+#endif
             request_.request_id = 0;
             sendResponse(wire_error, 0, true);
             return;
         }
         if (request_.length > config_.max_transfer_bytes) {
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordProtocolError(
+                TransportType::HP_TCP,
+                TentMetrics::ProtocolErrorKind::BadLength);
+#endif
             sendResponse(HighPerformanceTcpStatus::kBadLength, 0, true);
             return;
         }
@@ -293,6 +337,9 @@ class HighPerformanceTcpServer::Session
                     return;
                 }
                 self->forced_close_ = true;
+#if TENT_METRICS_ENABLED
+                self->sampleSocket(true);
+#endif
                 std::error_code ignored;
                 self->socket_->cancel(ignored);
                 self->socket_->shutdown(asio::ip::tcp::socket::shutdown_both,
@@ -312,6 +359,9 @@ class HighPerformanceTcpServer::Session
         if (closed_) return;
         closed_ = true;
         cancelTimer();
+#if TENT_METRICS_ENABLED
+        sampleSocket(true);
+#endif
         std::error_code ignored;
         socket_->cancel(ignored);
         socket_->shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
@@ -319,6 +369,27 @@ class HighPerformanceTcpServer::Session
         lease_.reset();
         parent_->onSessionClosed(worker_id_, shared_from_this());
     }
+
+#if TENT_METRICS_ENABLED
+    void sampleSocket(bool force) {
+        constexpr uint64_t kSampleInterval = 256;
+        if (force && socket_observation_finalized_) return;
+        if (!force && ++socket_sample_tick_ % kSampleInterval != 0) return;
+        if (force) socket_observation_finalized_ = true;
+        TcpSocketObservation observation;
+        if (!ReadTcpSocketObservation(*socket_, &observation)) return;
+        const uint32_t retransmit_delta =
+            observation.total_retransmissions >= last_total_retransmissions_
+                ? observation.total_retransmissions -
+                      last_total_retransmissions_
+                : observation.total_retransmissions;
+        last_total_retransmissions_ = observation.total_retransmissions;
+        TentMetrics::instance().recordTcpSocketSample(
+            TransportType::HP_TCP, TentMetrics::StreamConnectionRole::Server,
+            retransmit_delta, observation.rtt_us,
+            observation.congestion_window_segments);
+    }
+#endif
 
     HighPerformanceTcpServer* parent_;
     size_t worker_id_;
@@ -338,6 +409,11 @@ class HighPerformanceTcpServer::Session
     uint64_t timer_generation_{0};
     bool forced_close_{false};
     bool closed_{false};
+#if TENT_METRICS_ENABLED
+    uint32_t last_total_retransmissions_{0};
+    uint64_t socket_sample_tick_{0};
+    bool socket_observation_finalized_{false};
+#endif
 };
 
 HighPerformanceTcpServer::HighPerformanceTcpServer(

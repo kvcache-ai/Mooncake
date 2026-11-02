@@ -189,6 +189,17 @@ class TentMetrics {
     void recordStreamQueueWait(TransportType transport,
                                Request::OpCode operation, double latency_us);
     enum class StreamConnectionRole { Client, Server };
+    enum class ProtocolErrorKind {
+        InvalidSize,
+        BadMagic,
+        BadVersion,
+        InvalidReserved,
+        BadOpcode,
+        BadLength,
+        InvalidStatus,
+        RequestIdMismatch,
+        CommittedLengthMismatch,
+    };
     // Paired stream state gauges. These updates remain active when runtime
     // sampling is disabled so current state cannot drift.
     void recordStreamQueueDepth(TransportType transport, int64_t delta);
@@ -197,6 +208,11 @@ class TentMetrics {
                                int64_t byte_delta);
     void recordStreamConnection(TransportType transport,
                                 StreamConnectionRole role, int64_t delta);
+    void recordProtocolError(TransportType transport, ProtocolErrorKind kind);
+    void recordTcpSocketSample(TransportType transport,
+                               StreamConnectionRole role,
+                               uint32_t retransmit_delta, uint32_t rtt_us,
+                               uint32_t congestion_window_segments);
 
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
@@ -337,6 +353,8 @@ class TentMetrics {
         "transport", "operation", "outcome"};
     static inline const std::array<std::string, 2> kStreamConnectionLabels{
         "transport", "role"};
+    static inline const std::array<std::string, 2> kProtocolErrorLabels{
+        "transport", "kind"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -360,6 +378,9 @@ class TentMetrics {
     static constexpr size_t kStreamAttemptDomain =
         kStreamOperationDomain * kStreamOutcomeDomain;
     static constexpr size_t kStreamConnectionDomain = kTransportDomain * 2;
+    static constexpr size_t kProtocolErrorKindDomain = 9;
+    static constexpr size_t kProtocolErrorDomain =
+        kTransportDomain * kProtocolErrorKindDomain;
 
     // Stable slot indices into the cached-cell label domain.
     static size_t transportSlot(TransportType tp) {
@@ -407,6 +428,11 @@ class TentMetrics {
     static size_t streamConnectionSlot(TransportType transport,
                                        StreamConnectionRole role) {
         return transportSlot(transport) * 2 + static_cast<size_t>(role);
+    }
+    static size_t protocolErrorSlot(TransportType transport,
+                                    ProtocolErrorKind kind) {
+        return transportSlot(transport) * kProtocolErrorKindDomain +
+               static_cast<size_t>(kind);
     }
 
     // Per-transport counters (label: transport). Values are int64_t.
@@ -474,6 +500,14 @@ class TentMetrics {
         "tent_stream_events_total",
         "TCP and HP-TCP queue, attempt, connection, retry and terminal events",
         kStreamEventLabels, kStreamEventDomain};
+    metrics::CachedDynamicCounter<2> protocol_errors_total_{
+        "tent_protocol_errors_total",
+        "Rejected or inconsistent transport protocol frames",
+        kProtocolErrorLabels, kProtocolErrorDomain};
+    metrics::CachedDynamicCounter<2> tcp_retransmissions_total_{
+        "tent_tcp_retransmissions_total",
+        "Kernel TCP retransmissions observed through TCP_INFO deltas",
+        kStreamConnectionLabels, kStreamConnectionDomain};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_
@@ -528,6 +562,8 @@ class TentMetrics {
     // Buckets span 10us to 500ms to capture both fast RDMA and slower TCP.
     static inline const std::vector<double> kStageBuckets{
         10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000};
+    static inline const std::vector<double> kCongestionWindowBuckets{
+        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 4096};
 
     // Histograms are composed of cached-cell counters: one counter per bucket
     // plus a sum counter. The sum is part of the histogram itself, so no
@@ -568,6 +604,14 @@ class TentMetrics {
         "tent_stream_attempt_latency_us",
         "Physical TCP and HP-TCP attempt latency in microseconds",
         kLatencyBuckets, kStreamAttemptLabels, kStreamAttemptDomain};
+    metrics::CachedDynamicHistogram<2> tcp_rtt_us_{
+        "tent_tcp_rtt_us", "Kernel smoothed TCP RTT samples in microseconds",
+        kLatencyBuckets, kStreamConnectionLabels, kStreamConnectionDomain};
+    metrics::CachedDynamicHistogram<2> tcp_congestion_window_segments_{
+        "tent_tcp_congestion_window_segments",
+        "Kernel TCP send congestion window samples in segments",
+        kCongestionWindowBuckets, kStreamConnectionLabels,
+        kStreamConnectionDomain};
     metrics::CachedDynamicHistogram<2> stream_queue_wait_{
         "tent_stream_queue_wait_us",
         "TCP logical-task and HP-TCP physical-slice queue wait in microseconds",

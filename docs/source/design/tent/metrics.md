@@ -268,6 +268,8 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_deadline_infeasible_total` | Counter | `transport` | Transfers whose deadline was already in the past at submit time |
 | `tent_quarantined_batches_total` | Counter | - | Batches abandoned after repeated reclaim failures and retained until engine teardown |
 | `tent_stream_events_total` | Counter | `transport`, `operation`, `event` | TCP and HP-TCP queue, physical attempt, connection, retry and terminal events |
+| `tent_protocol_errors_total` | Counter | `transport`, `kind` | Malformed or inconsistent HP-TCP frames, including header fields, request IDs, and committed lengths |
+| `tent_tcp_retransmissions_total` | Counter | `transport`, `role` | Delta of Linux `TCP_INFO.tcpi_total_retrans` sampled from HP-TCP sockets |
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
 | `tent_logical_requests_inflight` | Gauge | `operation` | Counted logical requests without a terminal outcome |
 | `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
@@ -287,6 +289,8 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_transport_attempt_latency_us` | Histogram | `transport`, `operation` | Observed latency of each physical transport attempt |
 | `tent_stream_attempt_latency_us` | Histogram | `transport`, `operation`, `outcome` | End-to-end latency of physical TCP or HP-TCP network attempts |
 | `tent_stream_queue_wait_us` | Histogram | `transport`, `operation` | TCP logical-task and HP-TCP physical-slice queue wait before an attempt starts |
+| `tent_tcp_rtt_us` | Histogram | `transport`, `role` | Linux TCP_INFO smoothed RTT samples from HP-TCP sockets |
+| `tent_tcp_congestion_window_segments` | Histogram | `transport`, `role` | Linux TCP_INFO send congestion-window samples from HP-TCP sockets |
 
 ### Metrics pipeline self-observability
 
@@ -329,6 +333,16 @@ visible when runtime transfer recording is disabled.
 - State gauges ignore the runtime sampling switch. Every queue, worker,
   admission, and connection increment is paired with a decrement on success,
   cancellation, timeout, dispatch failure, and shutdown paths.
+- `tent_tcp_retransmissions_total` reports kernel TCP retransmissions sampled
+  through TCP_INFO; it is different from TENT software retry events. TCP_INFO
+  is sampled every 256 completed HP-TCP operations and once before a
+  connection closes. The classic RPC-backed TCP transport does not expose its
+  socket handle here; pair TENT metrics with host TCP telemetry for that
+  transport.
+- `tent_protocol_errors_total` separates malformed headers from response
+  correlation failures such as `request_id_mismatch` and
+  `committed_length_mismatch`. A rising protocol counter is not ordinary
+  packet loss because TCP already provides an ordered byte stream.
 - `tent_transport_attempts_total` and `tent_transport_attempt_failures_total` measure physical transport reliability. A recovered RDMA→TCP request contributes one failed RDMA attempt and one successful TCP attempt.
 - Attempt latency currently ends when polling or the progress worker observes the terminal status, so it may include completion-observation delay.
 - `*_failures_total` does not record bytes; failed transfers transfer no bytes.
@@ -360,6 +374,7 @@ or other unbounded values are accepted.
 | `reason` | `submit`, `poll`, `timeout`, `canceled` | Task failure classification |
 | `event` | `queued`, `attempt_started`, `attempt_success`, `connect_started`, `connect_success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error`, `retry_issued`, `retry_exhausted` | Bounded stream lifecycle event |
 | `role` | `client`, `server` | Stream connection endpoint role |
+| `kind` | `invalid_size`, `bad_magic`, `bad_version`, `invalid_reserved`, `bad_opcode`, `bad_length`, `invalid_status`, `request_id_mismatch`, `committed_length_mismatch` | Bounded HP-TCP protocol error classification |
 | `format` | `prometheus`, `json` | Serialization output format |
 | `from` | (same set) | Transport that failed before failover |
 | `to` | (same set) | Transport that the failover switched to |

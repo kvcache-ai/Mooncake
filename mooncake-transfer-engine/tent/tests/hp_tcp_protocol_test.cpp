@@ -41,17 +41,43 @@ TEST(HighPerformanceTcpProtocolTest, RejectsMalformedWireFrames) {
         {HighPerformanceTcpOpcode::kRead, 1, 2, 3, 4});
     HighPerformanceTcpRequestFrame decoded;
     HighPerformanceTcpStatus wire_error = HighPerformanceTcpStatus::kOk;
+    HighPerformanceTcpFrameError frame_error =
+        HighPerformanceTcpFrameError::kNone;
     request[5] = 2;
     EXPECT_FALSE(DecodeHighPerformanceTcpRequest(request.data(), request.size(),
-                                                 &decoded, &wire_error)
+                                                 &decoded, &wire_error,
+                                                 &frame_error)
                      .ok());
     EXPECT_EQ(wire_error, HighPerformanceTcpStatus::kBadVersion);
+    EXPECT_EQ(frame_error, HighPerformanceTcpFrameError::kBadVersion);
     request[5] = 1;
     request[6] = 0xff;
     EXPECT_FALSE(DecodeHighPerformanceTcpRequest(request.data(), request.size(),
-                                                 &decoded, &wire_error)
+                                                 &decoded, &wire_error,
+                                                 &frame_error)
                      .ok());
     EXPECT_EQ(wire_error, HighPerformanceTcpStatus::kBadOpcode);
+    EXPECT_EQ(frame_error, HighPerformanceTcpFrameError::kBadOpcode);
+
+    auto response =
+        EncodeHighPerformanceTcpResponse({HighPerformanceTcpStatus::kOk, 1, 4});
+    HighPerformanceTcpResponseFrame decoded_response;
+    response[0] = 0;
+    EXPECT_FALSE(
+        DecodeHighPerformanceTcpResponse(response.data(), response.size(),
+                                         &decoded_response, &frame_error)
+            .ok());
+    EXPECT_EQ(frame_error, HighPerformanceTcpFrameError::kBadMagic);
+
+    response =
+        EncodeHighPerformanceTcpResponse({HighPerformanceTcpStatus::kOk, 1, 4});
+    response[6] = 0xff;
+    response[7] = 0xff;
+    EXPECT_FALSE(
+        DecodeHighPerformanceTcpResponse(response.data(), response.size(),
+                                         &decoded_response, &frame_error)
+            .ok());
+    EXPECT_EQ(frame_error, HighPerformanceTcpFrameError::kInvalidStatus);
 }
 
 TEST(HighPerformanceTcpProtocolTest, MetadataAttributesRoundTrip) {

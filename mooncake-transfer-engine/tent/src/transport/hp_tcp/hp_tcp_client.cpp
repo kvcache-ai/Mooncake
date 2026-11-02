@@ -13,6 +13,7 @@
 
 #include "tent/common/utils/os.h"
 #include "tent/metrics/tent_metrics.h"
+#include "tent/transport/hp_tcp/hp_tcp_socket_observability.h"
 
 namespace mooncake::tent {
 #if TENT_METRICS_ENABLED
@@ -26,6 +27,29 @@ bool isPeerClosedError(const std::error_code& error) {
     return error == asio::error::eof ||
            error == asio::error::connection_reset ||
            error == asio::error::broken_pipe;
+}
+
+TentMetrics::ProtocolErrorKind protocolErrorKind(
+    HighPerformanceTcpFrameError error) {
+    switch (error) {
+        case HighPerformanceTcpFrameError::kInvalidSize:
+            return TentMetrics::ProtocolErrorKind::InvalidSize;
+        case HighPerformanceTcpFrameError::kBadMagic:
+            return TentMetrics::ProtocolErrorKind::BadMagic;
+        case HighPerformanceTcpFrameError::kBadVersion:
+            return TentMetrics::ProtocolErrorKind::BadVersion;
+        case HighPerformanceTcpFrameError::kInvalidReserved:
+            return TentMetrics::ProtocolErrorKind::InvalidReserved;
+        case HighPerformanceTcpFrameError::kBadOpcode:
+            return TentMetrics::ProtocolErrorKind::BadOpcode;
+        case HighPerformanceTcpFrameError::kBadLength:
+            return TentMetrics::ProtocolErrorKind::BadLength;
+        case HighPerformanceTcpFrameError::kInvalidStatus:
+            return TentMetrics::ProtocolErrorKind::InvalidStatus;
+        case HighPerformanceTcpFrameError::kNone:
+            return TentMetrics::ProtocolErrorKind::InvalidReserved;
+    }
+    return TentMetrics::ProtocolErrorKind::InvalidReserved;
 }
 }  // namespace
 #endif
@@ -291,6 +315,8 @@ class HighPerformanceTcpClient::Lane
                     1, std::memory_order_relaxed);
 #if TENT_METRICS_ENABLED
                 self->connection_counted_ = true;
+                self->last_total_retransmissions_ = 0;
+                self->socket_sample_tick_ = 0;
                 TentMetrics::instance().recordStreamConnection(
                     TransportType::HP_TCP,
                     TentMetrics::StreamConnectionRole::Client, 1);
@@ -382,14 +408,26 @@ class HighPerformanceTcpClient::Lane
                     }
                     self->armTimer(self->config_.progress_timeout_ms, epoch);
                     HighPerformanceTcpResponseFrame response;
+                    HighPerformanceTcpFrameError frame_error =
+                        HighPerformanceTcpFrameError::kNone;
                     const Status decoded = DecodeHighPerformanceTcpResponse(
                         self->response_bytes_.data(),
-                        self->response_bytes_.size(), &response);
+                        self->response_bytes_.size(), &response, &frame_error);
                     if (!decoded.ok()) {
+#if TENT_METRICS_ENABLED
+                        TentMetrics::instance().recordProtocolError(
+                            TransportType::HP_TCP,
+                            protocolErrorKind(frame_error));
+#endif
                         self->finishProtocolError();
                         return;
                     }
                     if (response.request_id != self->current_->request_id) {
+#if TENT_METRICS_ENABLED
+                        TentMetrics::instance().recordProtocolError(
+                            TransportType::HP_TCP,
+                            TentMetrics::ProtocolErrorKind::RequestIdMismatch);
+#endif
                         self->finishProtocolError();
                         return;
                     }
@@ -398,6 +436,12 @@ class HighPerformanceTcpClient::Lane
                         return;
                     }
                     if (response.committed_bytes != self->current_->length) {
+#if TENT_METRICS_ENABLED
+                        TentMetrics::instance().recordProtocolError(
+                            TransportType::HP_TCP,
+                            TentMetrics::ProtocolErrorKind::
+                                CommittedLengthMismatch);
+#endif
                         self->finishProtocolError();
                         return;
                     }
@@ -498,6 +542,9 @@ class HighPerformanceTcpClient::Lane
 
     void closeDirty() {
         std::error_code ignored;
+#if TENT_METRICS_ENABLED
+        if (connection_counted_) sampleSocket(true);
+#endif
         if (socket_.is_open()) {
             socket_.cancel(ignored);
             socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
@@ -558,8 +605,11 @@ class HighPerformanceTcpClient::Lane
         TransferStatusEnum terminal, size_t bytes, bool keep_stream,
         std::optional<HighPerformanceTcpStatus> remote_status = std::nullopt) {
         cancelTimer();
-        if (!keep_stream) closeDirty();
+        if (!keep_stream) {
+            closeDirty();
+        }
 #if TENT_METRICS_ENABLED
+        if (keep_stream) sampleSocket(false);
         if (terminal == COMPLETED) {
             attempt_outcome_ = TentMetrics::StreamOutcome::Success;
         } else if (terminal == TIMEOUT) {
@@ -610,6 +660,25 @@ class HighPerformanceTcpClient::Lane
         parent_->operationFinished();
     }
 
+#if TENT_METRICS_ENABLED
+    void sampleSocket(bool force) {
+        constexpr uint64_t kSampleInterval = 256;
+        if (!force && ++socket_sample_tick_ % kSampleInterval != 0) return;
+        TcpSocketObservation observation;
+        if (!ReadTcpSocketObservation(socket_, &observation)) return;
+        const uint32_t retransmit_delta =
+            observation.total_retransmissions >= last_total_retransmissions_
+                ? observation.total_retransmissions -
+                      last_total_retransmissions_
+                : observation.total_retransmissions;
+        last_total_retransmissions_ = observation.total_retransmissions;
+        TentMetrics::instance().recordTcpSocketSample(
+            TransportType::HP_TCP, TentMetrics::StreamConnectionRole::Client,
+            retransmit_delta, observation.rtt_us,
+            observation.congestion_window_segments);
+    }
+#endif
+
     HighPerformanceTcpClient* parent_;
     Config config_;
     LaneKey key_;
@@ -630,6 +699,8 @@ class HighPerformanceTcpClient::Lane
     TentMetrics::StreamOutcome attempt_outcome_{
         TentMetrics::StreamOutcome::IoError};
     bool connection_counted_{false};
+    uint32_t last_total_retransmissions_{0};
+    uint64_t socket_sample_tick_{0};
 #endif
 };
 

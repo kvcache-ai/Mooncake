@@ -190,6 +190,30 @@ const char* streamConnectionRoleName(TentMetrics::StreamConnectionRole role) {
     }
     return "unknown";
 }
+
+const char* protocolErrorKindName(TentMetrics::ProtocolErrorKind kind) {
+    switch (kind) {
+        case TentMetrics::ProtocolErrorKind::InvalidSize:
+            return "invalid_size";
+        case TentMetrics::ProtocolErrorKind::BadMagic:
+            return "bad_magic";
+        case TentMetrics::ProtocolErrorKind::BadVersion:
+            return "bad_version";
+        case TentMetrics::ProtocolErrorKind::InvalidReserved:
+            return "invalid_reserved";
+        case TentMetrics::ProtocolErrorKind::BadOpcode:
+            return "bad_opcode";
+        case TentMetrics::ProtocolErrorKind::BadLength:
+            return "bad_length";
+        case TentMetrics::ProtocolErrorKind::InvalidStatus:
+            return "invalid_status";
+        case TentMetrics::ProtocolErrorKind::RequestIdMismatch:
+            return "request_id_mismatch";
+        case TentMetrics::ProtocolErrorKind::CommittedLengthMismatch:
+            return "committed_length_mismatch";
+    }
+    return "invalid_reserved";
+}
 }  // namespace
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
@@ -402,6 +426,8 @@ void TentMetrics::registerMetrics() {
         &deadline_infeasible_total_,
         &quarantined_batches_total_,
         &stream_events_total_,
+        &protocol_errors_total_,
+        &tcp_retransmissions_total_,
     };
 
     gauges_ = {
@@ -681,6 +707,37 @@ void TentMetrics::recordStreamConnection(TransportType transport,
         delta);
 }
 
+void TentMetrics::recordProtocolError(TransportType transport,
+                                      ProtocolErrorKind kind) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    protocol_errors_total_.incCached(
+        protocolErrorSlot(transport, kind), [transport, kind] {
+            return std::array<std::string, 2>{transportTypeName(transport),
+                                              protocolErrorKindName(kind)};
+        });
+}
+
+void TentMetrics::recordTcpSocketSample(TransportType transport,
+                                        StreamConnectionRole role,
+                                        uint32_t retransmit_delta,
+                                        uint32_t rtt_us,
+                                        uint32_t congestion_window_segments) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    const size_t slot = streamConnectionSlot(transport, role);
+    auto labels = [transport, role] {
+        return std::array<std::string, 2>{transportTypeName(transport),
+                                          streamConnectionRoleName(role)};
+    };
+    if (retransmit_delta != 0) {
+        tcp_retransmissions_total_.incCached(slot, labels, retransmit_delta);
+    }
+    tcp_rtt_us_.observeCached(slot, labels, rtt_us);
+    tcp_congestion_window_segments_.observeCached(slot, labels,
+                                                  congestion_window_segments);
+}
+
 // Gauge updates below deliberately ignore runtime_enabled_: gauges track
 // engine state through paired add/sub operations (attempt start/finish,
 // register/unregister), and skipping one half of a pair across a
@@ -856,6 +913,9 @@ bool TentMetrics::tryGetPrometheusMetrics(std::string& result) {
             serializeHistogramPrometheus(transport_attempt_latency_, output);
             serializeHistogramPrometheus(stream_attempt_latency_, output);
             serializeHistogramPrometheus(stream_queue_wait_, output);
+            serializeHistogramPrometheus(tcp_rtt_us_, output);
+            serializeHistogramPrometheus(tcp_congestion_window_segments_,
+                                         output);
 
             // Gauges: current value per label.
             for (auto* gauge : gauges_) {
@@ -1189,6 +1249,10 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 static_cast<int64_t>(quarantined_batches_total_.value());
             root[stream_events_total_.str_name()] =
                 sumCounterValues(&stream_events_total_);
+            root[protocol_errors_total_.str_name()] =
+                sumCounterValues(&protocol_errors_total_);
+            root[tcp_retransmissions_total_.str_name()] =
+                sumCounterValues(&tcp_retransmissions_total_);
 
             // Gauges: aggregate across transport labels (total in-flight
             // attempts / total registered bytes). Per-transport breakdown is
@@ -1225,6 +1289,8 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
             serializeHistogramToJson(root, transport_attempt_latency_);
             serializeHistogramToJson(root, stream_attempt_latency_);
             serializeHistogramToJson(root, stream_queue_wait_);
+            serializeHistogramToJson(root, tcp_rtt_us_);
+            serializeHistogramToJson(root, tcp_congestion_window_segments_);
 
             root["tent_metrics_build_info"] = {
                 {"version", TENT_BUILD_VERSION},
@@ -1369,6 +1435,9 @@ void TentMetrics::recordStreamBusyWorkers(TransportType, int64_t) {}
 void TentMetrics::recordStreamAdmission(TransportType, int64_t, int64_t) {}
 void TentMetrics::recordStreamConnection(TransportType, StreamConnectionRole,
                                          int64_t) {}
+void TentMetrics::recordProtocolError(TransportType, ProtocolErrorKind) {}
+void TentMetrics::recordTcpSocketSample(TransportType, StreamConnectionRole,
+                                        uint32_t, uint32_t, uint32_t) {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}

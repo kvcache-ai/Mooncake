@@ -35,6 +35,17 @@ enum class HighPerformanceTcpStatus : uint16_t {
     kInternalError = 8,
 };
 
+enum class HighPerformanceTcpFrameError : uint8_t {
+    kNone = 0,
+    kInvalidSize,
+    kBadMagic,
+    kBadVersion,
+    kInvalidReserved,
+    kBadOpcode,
+    kBadLength,
+    kInvalidStatus,
+};
+
 struct HighPerformanceTcpRequestFrame {
     HighPerformanceTcpOpcode opcode{HighPerformanceTcpOpcode::kRead};
     uint64_t request_id{0};
@@ -54,13 +65,15 @@ EncodeHighPerformanceTcpRequest(const HighPerformanceTcpRequestFrame& frame);
 
 Status DecodeHighPerformanceTcpRequest(
     const uint8_t* bytes, size_t size, HighPerformanceTcpRequestFrame* frame,
-    HighPerformanceTcpStatus* wire_error = nullptr);
+    HighPerformanceTcpStatus* wire_error = nullptr,
+    HighPerformanceTcpFrameError* frame_error = nullptr);
 
 std::array<uint8_t, kHighPerformanceTcpResponseSize>
 EncodeHighPerformanceTcpResponse(const HighPerformanceTcpResponseFrame& frame);
 
-Status DecodeHighPerformanceTcpResponse(const uint8_t* bytes, size_t size,
-                                        HighPerformanceTcpResponseFrame* frame);
+Status DecodeHighPerformanceTcpResponse(
+    const uint8_t* bytes, size_t size, HighPerformanceTcpResponseFrame* frame,
+    HighPerformanceTcpFrameError* frame_error = nullptr);
 
 struct HighPerformanceTcpEndpoint {
     std::string host;
