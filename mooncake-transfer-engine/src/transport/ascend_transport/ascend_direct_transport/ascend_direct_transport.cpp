@@ -381,6 +381,9 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
                [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
 
     BufferDesc buffer_desc;
+#ifdef ENABLE_MULTI_PROTOCOL
+    buffer_desc.protocol = "ascend_direct";
+#endif
     buffer_desc.name = location;
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = (uint64_t)length;
@@ -435,8 +438,8 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
         return 0;
     }
 
-    const int rollback_ret =
-        metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    const int rollback_ret = metadata_->removeLocalMemoryBuffer(
+        addr, update_metadata, "ascend_direct");
     if (rollback_ret != 0) {
         LOG(ERROR) << "removeLocalMemoryBuffer rollback failed, ret: "
                    << rollback_ret;
@@ -459,7 +462,8 @@ int AscendDirectTransport::unregisterLocalMemory(void* addr,
     if (ret != 0) {
         return ret;
     }
-    (void)metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    (void)metadata_->removeLocalMemoryBuffer(addr, update_metadata,
+                                             "ascend_direct");
     return 0;
 }
 
