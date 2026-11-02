@@ -402,31 +402,45 @@ struct MasterService::KvcsDfsEviction {
     class Reclaimer final : public eviction::Reclaimer {
        public:
         explicit Reclaimer(MasterService& service)
-            : service_(service), metadata_(service) {}
+            : service_(service), immediate_(service), oplog_(service) {}
 
         tl::expected<eviction::Effect, ErrorCode> Apply(
             metadata::Namespace& ns, const route::WriteGuard& hold,
             const eviction::Plan& plan,
             const eviction::Report& report) override {
-            auto deleted =
-                service_.dfs_kvcs_capacity_provider_->DeleteObject(hold.key());
-            if (deleted) return metadata_.Apply(ns, hold, plan, report);
-            ++failures_;
-            LOG(ERROR) << "KVCS DFS watermark provider delete failed, key="
-                       << hold.key() << ", error=" << toString(deleted.error());
-            return tl::make_unexpected(deleted.error());
+            auto deleted = DeleteProviderObject(hold.key());
+            if (!deleted) return tl::make_unexpected(deleted.error());
+            return service_.enable_oplog_
+                       ? oplog_.Apply(ns, hold, plan, report)
+                       : immediate_.Apply(ns, hold, plan, report);
         }
 
         void TearDown(metadata::Namespace& ns,
                       const route::WriteGuard& hold) override {
-            metadata_.TearDown(ns, hold);
+            if (service_.enable_oplog_) {
+                oplog_.TearDown(ns, hold);
+            } else {
+                immediate_.TearDown(ns, hold);
+            }
         }
 
         size_t TakeFailures() { return std::exchange(failures_, 0); }
 
        private:
+        tl::expected<void, ErrorCode> DeleteProviderObject(
+            const std::string& key) {
+            auto deleted =
+                service_.dfs_kvcs_capacity_provider_->DeleteObject(key);
+            if (deleted) return {};
+            ++failures_;
+            LOG(ERROR) << "KVCS DFS watermark provider delete failed, key="
+                       << key << ", error=" << toString(deleted.error());
+            return tl::make_unexpected(deleted.error());
+        }
+
         MasterService& service_;
-        MemoryEviction::ImmediateReclaimer metadata_;
+        MemoryEviction::ImmediateReclaimer immediate_;
+        MemoryEviction::OpLogReclaimer oplog_;
         size_t failures_{0};
     };
 
@@ -436,7 +450,10 @@ struct MasterService::KvcsDfsEviction {
           reclaimer(service),
           kv_events(service, "disk"),
           evictor(service.namespaces_, policy, reclaimer,
-                  {&metrics, &kv_events}) {}
+                  service.enable_oplog_
+                      ? std::vector<eviction::EvictionObserver*>{&metrics}
+                      : std::vector<eviction::EvictionObserver*>{&metrics,
+                                                                 &kv_events}) {}
 
     MemoryEviction::Policy policy;
     Reclaimer reclaimer;
@@ -7964,11 +7981,6 @@ void MasterService::RunKvcsDfsEviction(const DfsUsageSnapshot& usage) {
         usage.capacity_bytes == 0) {
         return;
     }
-    if (enable_oplog_) {
-        VLOG(1) << "KVCS DFS watermark eviction is disabled with OpLog";
-        return;
-    }
-
     const long double high_bytes =
         static_cast<long double>(usage.capacity_bytes) *
         dfs_kvcs_eviction_high_watermark_;
