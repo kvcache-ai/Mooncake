@@ -16,6 +16,8 @@
 #define UB_CONTEXT_H
 
 #include <atomic>
+#include <climits>
+#include <cstdlib>
 #include <fcntl.h>
 #include <fstream>
 #include <list>
@@ -249,10 +251,10 @@ class UbContext {
 
     int disconnectAllEndpoints() { return endpoint_store_->disconnect(); }
 
-    // Device name, such as `mlx5_3`
+    // Device name in ubcore, such as `udmac0d1e2`
     std::string deviceName() const { return device_name_; }
 
-    // NIC Path, such as `192.168.3.76@mlx5_3`
+    // NIC Path, such as `192.168.3.76:15365@udmac0d1e2`
     std::string nicPath() const {
         return MakeNicPath(engine_.local_server_name_, device_name_);
     }
@@ -266,17 +268,26 @@ class UbContext {
     int eventFd() const { return event_fd_; }
 
     int socketId() {
-        std::string path =
-            "/sys/class/infiniband/" + device_name_ + "/device/numa_node";
-        std::ifstream file(path);
-        if (file.is_open()) {
-            int socket_id;
-            file >> socket_id;
-            file.close();
-            return socket_id;
-        } else {
-            return 0;
+        // URMA devices are exposed under /sys/class/ubcore/<dev>; there is no
+        // /sys/class/infiniband entry for them, so the old path always missed
+        // and every worker was pinned to node 0. The node is two directories
+        // above the device link and is written in hex (e.g. 0x01), which a
+        // plain >> int would also truncate to 0.
+        char resolved[PATH_MAX];
+        const std::string link = "/sys/class/ubcore/" + device_name_;
+        if (realpath(link.c_str(), resolved) == nullptr) return 0;
+        std::string path(resolved);
+        for (int i = 0; i < 2; ++i) {
+            auto slash = path.rfind('/');
+            if (slash == std::string::npos) return 0;
+            path.resize(slash);
         }
+        path += "/numa";
+        std::ifstream file(path);
+        if (!file.is_open()) return 0;
+        std::string value;
+        if (!(file >> value)) return 0;
+        return static_cast<int>(std::strtol(value.c_str(), nullptr, 0));
     }
 
     static int hexCharToValue(char c) {

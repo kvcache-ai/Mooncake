@@ -126,7 +126,7 @@ class ConductorServerPreservationTest(unittest.TestCase):
         script = (Path(SMOKE.__file__).parent / "build_wheel.sh").read_text()
         # Execute the actual staging/cleanup block, without building a GPU wheel.
         start = script.index("# Preserve the Conductor server")
-        end = script.index("# Make the post-repair device library discoverable", start)
+        end = script.index("# Release builds still compile with -g", start)
         for cleanup_flag in ("CI", "FREE_BUILD_DIR"):
             for absolute in (False, True):
                 for exit_code in (0, 23):
