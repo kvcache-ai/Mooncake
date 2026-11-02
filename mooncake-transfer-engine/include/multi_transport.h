@@ -21,10 +21,19 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "transport/transport.h"
 
 namespace mooncake {
+
+// Snapshot of a batch that reached a terminal state. Drain copies this out
+// of the ready queue and does not look the batch up again.
+struct BatchCompletion {
+    Transport::BatchID batch_id = 0;
+    Transport::TransferStatus status{};
+};
+
 class TransferEngineImpl;
 class TransferEngineImplTestPeer;
 class MultiTransportTestPeer;
@@ -79,6 +88,17 @@ class MultiTransport {
         std::vector<TransferStatusEnum> &request_statuses);
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status);
+
+    // Engine-owned counter-mode eventfd. -1 when this platform has no
+    // eventfd, or eventfd() failed. The caller may dup it; this object
+    // closes the original in its destructor.
+    int completionFd() const { return completion_fd_; }
+
+    // Non-blocking. Swaps out every completion freeBatchID has not removed.
+    // One read of the counter, then the whole queue. An empty queue with a
+    // stale counter is discarded. A non-empty queue is returned even when
+    // that read is EAGAIN.
+    Status drainCompletions(std::vector<BatchCompletion> &out);
 
     Transport *installTransport(const std::string &proto,
                                 std::shared_ptr<Topology> topo);
@@ -139,6 +159,15 @@ class MultiTransport {
 
     void deferredCleanupLoop();
 
+    // Drops a still-queued id and ignores a later terminal callback. The
+    // batch must still be alive. Called only once freeBatchID has committed
+    // to invalidating the handle.
+    void discardQueuedCompletion(BatchID batch_id);
+
+    void enqueueTerminal(BatchID batch_id, TransferStatus status);
+
+    static void onTerminal(void *ctx, BatchID batch_id, TransferStatus status);
+
 #ifdef ENABLE_MULTI_PROTOCOL
     Status mp_selectTransport(const TransferRequest &entry,
                               Transport *&transport,
@@ -158,6 +187,12 @@ class MultiTransport {
         deferred_cleanup_batches_;
     bool stop_deferred_cleanup_ = false;
     std::thread deferred_cleanup_thread_;
+
+    // completion_mu_ guards ready_ and the two terminal flags on BatchDesc.
+    // The eventfd write stays outside the lock and is not retried.
+    std::mutex completion_mu_;
+    std::vector<BatchCompletion> ready_;
+    int completion_fd_ = -1;
 };
 }  // namespace mooncake
 

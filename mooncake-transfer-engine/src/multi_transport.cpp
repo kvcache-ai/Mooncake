@@ -14,10 +14,15 @@
 
 #include "multi_transport.h"
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <sstream>
 #include <string>
+#ifdef __linux__
+#include <sys/eventfd.h>
+#include <unistd.h>
+#endif
 
 #include "config.h"
 #include "multi_transport_locality.h"
@@ -94,7 +99,15 @@
 namespace mooncake {
 MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                                std::string& local_server_name)
-    : metadata_(metadata), local_server_name_(local_server_name) {}
+    : metadata_(metadata), local_server_name_(local_server_name) {
+#ifdef __linux__
+    // Counter mode, not EFD_SEMAPHORE. Drain reads the sum once.
+    completion_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (completion_fd_ < 0) {
+        LOG(WARNING) << "completion eventfd failed: errno " << errno;
+    }
+#endif
+}
 
 MultiTransport::~MultiTransport() {
     {
@@ -105,6 +118,12 @@ MultiTransport::~MultiTransport() {
     if (deferred_cleanup_thread_.joinable()) {
         deferred_cleanup_thread_.join();
     }
+#ifdef __linux__
+    if (completion_fd_ >= 0) {
+        ::close(completion_fd_);
+        completion_fd_ = -1;
+    }
+#endif
 }
 
 MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
@@ -114,6 +133,10 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     batch_desc->batch_size = batch_size;
     batch_desc->task_list.reserve(batch_size);
     batch_desc->context = NULL;
+    if (completion_fd_ >= 0) {
+        batch_desc->terminal_notify = &MultiTransport::onTerminal;
+        batch_desc->terminal_notify_ctx = this;
+    }
 #ifdef CONFIG_USE_BATCH_DESC_SET
     batch_desc_lock_.lock();
     batch_desc_set_[batch_desc->id] = batch_desc;
@@ -139,6 +162,9 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
         return status;
     }
 
+    // The handle is already invalid for the caller. Drop a queued wake
+    // before the deferred thread deletes the descriptor.
+    discardQueuedCompletion(batch_id);
     deferred_cleanup_batches_.emplace(batch_id, before_delete);
     if (!deferred_cleanup_thread_.joinable()) {
         // Start the cleanup worker lazily after taking ownership of a busy
@@ -202,6 +228,10 @@ Status MultiTransport::tryFreeBatchID(
         return Status::BatchBusy(
             "BatchID cannot be freed until completion callbacks are quiescent");
     }
+    // Remove the id before the descriptor is deleted. A completion callback
+    // still holding a pin cannot pass the pin check above; one that runs
+    // after this sees terminal_suppressed and does not touch the queue.
+    discardQueuedCompletion(batch_id);
     if (before_delete) {
         before_delete();
     }
@@ -210,6 +240,63 @@ Status MultiTransport::tryFreeBatchID(
     RWSpinlock::WriteGuard guard(batch_desc_lock_);
     batch_desc_set_.erase(batch_id);
 #endif
+    return Status::OK();
+}
+
+void MultiTransport::discardQueuedCompletion(BatchID batch_id) {
+    std::lock_guard<std::mutex> lock(completion_mu_);
+    Transport::toBatchDesc(batch_id).terminal_suppressed = true;
+    ready_.erase(std::remove_if(ready_.begin(), ready_.end(),
+                                [batch_id](const BatchCompletion& item) {
+                                    return item.batch_id == batch_id;
+                                }),
+                 ready_.end());
+}
+
+void MultiTransport::onTerminal(void* ctx, BatchID batch_id,
+                                TransferStatus status) {
+    static_cast<MultiTransport*>(ctx)->enqueueTerminal(batch_id, status);
+}
+
+void MultiTransport::enqueueTerminal(BatchID batch_id, TransferStatus status) {
+    bool wake = false;
+    {
+        std::lock_guard<std::mutex> lock(completion_mu_);
+        auto& batch = Transport::toBatchDesc(batch_id);
+        if (batch.terminal_suppressed || batch.terminal_enqueued) return;
+        batch.terminal_enqueued = true;
+        ready_.push_back(BatchCompletion{batch_id, status});
+        wake = completion_fd_ >= 0;
+    }
+#ifdef __linux__
+    if (!wake) return;
+    const uint64_t one = 1;
+    // Wake only. EAGAIN or a short write leaves the id on the queue.
+    // Do not retry here: this runs on the completion path.
+    const ssize_t n = ::write(completion_fd_, &one, sizeof(one));
+    (void)n;
+#else
+    (void)wake;
+#endif
+}
+
+Status MultiTransport::drainCompletions(std::vector<BatchCompletion>& out) {
+    out.clear();
+    if (completion_fd_ < 0) {
+        return Status::NotSupportedTransport(
+            "completion eventfd is not available");
+    }
+#ifdef __linux__
+    uint64_t value = 0;
+    const ssize_t n = ::read(completion_fd_, &value, sizeof(value));
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        // The queue is still the record. Surface the ids, then the error
+        // is visible on the next wait because the counter was not cleared.
+        PLOG(WARNING) << "completion eventfd read failed";
+    }
+#endif
+    std::lock_guard<std::mutex> lock(completion_mu_);
+    out.swap(ready_);
     return Status::OK();
 }
 

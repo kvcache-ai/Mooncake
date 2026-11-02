@@ -356,8 +356,11 @@ class Transport {
             // Non-EDC: is_finished stays with getTransferStatus on the
             // completion walk. The WAITING fast path never frees the batch;
             // COMPLETED always walks first, so CQ must not write is_finished.
-            batch_desc.finished_task_count.fetch_add(1,
-                                                     std::memory_order_acq_rel);
+            // The terminal notify is a separate wake. It does not settle
+            // is_finished and does not require a status poll.
+            const uint64_t prev = batch_desc.finished_task_count.fetch_add(
+                1, std::memory_order_acq_rel);
+            batch_desc.publishTerminalIfDone(prev);
 #else
             // EDC waiters can freeBatchID after the CV without a walk.
 #ifdef WITH_METRICS
@@ -400,6 +403,7 @@ class Transport {
                 // only to block again on the mutex.
                 batch_desc.completion_cv.notify_all();
             }
+            batch_desc.publishTerminalIfDone(prev);
 #endif
         }
 
@@ -572,6 +576,35 @@ class Transport {
         // TransferTask objects in task_list. freeBatchID() must not delete
         // this object while a pin is held.
         std::atomic<uint64_t> active_completion_callbacks{0};
+
+        // Installed by MultiTransport for the engine-owned completion
+        // eventfd. Null when this batch has no completion queue. The callback
+        // must not throw and must not call getBatchTransferStatus.
+        using TerminalNotifyFn = void (*)(void *ctx, BatchID batch_id,
+                                          TransferStatus status);
+        TerminalNotifyFn terminal_notify = nullptr;
+        void *terminal_notify_ctx = nullptr;
+        // Touched only under MultiTransport's completion lock.
+        bool terminal_suppressed = false;
+        bool terminal_enqueued = false;
+
+        // Called when this completion made finished_task_count reach the
+        // allocated batch capacity, the same boundary as completion_cv.
+        // The notify target drops the event if freeBatchID already
+        // suppressed it.
+        void publishTerminalIfDone(uint64_t prev) {
+            if (terminal_notify == nullptr || prev + 1 != batch_size) return;
+            TransferStatus status;
+            status.s = has_failure.load(std::memory_order_acquire)
+                           ? TransferStatusEnum::FAILED
+                           : TransferStatusEnum::COMPLETED;
+            status.transferred_bytes = 0;
+            for (auto &task : task_list) {
+                status.transferred_bytes +=
+                    __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
+            }
+            terminal_notify(terminal_notify_ctx, id, status);
+        }
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         // Synchronization primitives for direct notification

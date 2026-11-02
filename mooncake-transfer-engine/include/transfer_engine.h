@@ -289,6 +289,16 @@ class TransferEngine {
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
+    // Engine-owned counter-mode eventfd for batch completion. -1 on
+    // non-Linux, when eventfd() failed, or when this engine is the TENT
+    // runtime (classic BatchDesc completion is not on that path). The
+    // caller may dup the fd. Destroying the engine closes the original.
+    int completionFd() const;
+
+    // Non-blocking drain of terminal batches. See BatchCompletion.
+    // NotSupportedTransport when completionFd() is -1.
+    Status drainCompletions(std::vector<BatchCompletion>& out);
+
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
     Transport* getTransport(const std::string& proto);

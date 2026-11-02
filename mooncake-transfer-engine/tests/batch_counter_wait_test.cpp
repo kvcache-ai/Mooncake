@@ -1,6 +1,12 @@
 // Copyright 2026 KVCache.AI
 // Licensed under the Apache License, Version 2.0.
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <vector>
+#ifdef __linux__
+#include <poll.h>
+#include <unistd.h>
+#endif
 #include "multi_transport.h"
 #include "transfer_metadata.h"
 #include "config.h"
@@ -11,6 +17,10 @@ class MultiTransportTestPeer {
     static void install(MultiTransport& m, const std::string& name,
                         std::shared_ptr<Transport> t) {
         m.transport_map_[name] = std::move(t);
+    }
+    static void enqueue(MultiTransport& m, Transport::BatchID id,
+                        Transport::TransferStatus status) {
+        m.enqueueTerminal(id, status);
     }
 };
 namespace {
@@ -300,6 +310,159 @@ TEST_F(BatchCounterWait, RejectedSubmissionKeepsFallback) {
     EXPECT_FALSE(submit(b, {1}).ok());
     EXPECT_EQ(query(b).s, Transport::WAITING);
     EXPECT_GT(rdma->polls, 0);
+}
+
+void forget(std::vector<Transport::BatchID>& batches, Transport::BatchID id) {
+    batches.erase(std::remove(batches.begin(), batches.end(), id),
+                  batches.end());
+}
+
+#ifdef __linux__
+bool fdReadable(int fd) {
+    pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    return ::poll(&pfd, 1, 1000) == 1 && (pfd.revents & POLLIN);
+}
+#endif
+
+// The wake is published from markSuccess. These tests do not call
+// getBatchTransferStatus until after drain, except where the assertion is
+// that a drained id is still queryable.
+TEST_F(BatchCounterWait, CompletionFdWakesWithoutStatusPoll) {
+#ifndef __linux__
+    EXPECT_EQ(multi.completionFd(), -1);
+    std::vector<BatchCompletion> done;
+    EXPECT_TRUE(multi.drainCompletions(done).IsNotSupportedTransport());
+#else
+    ASSERT_GE(multi.completionFd(), 0);
+    auto b = batch(2);
+    ASSERT_TRUE(submit(b, {1, 1}).ok());
+    rdma->finish(0);
+    rdma->finish(1);
+    ASSERT_TRUE(fdReadable(multi.completionFd()));
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    ASSERT_EQ(done.size(), 1u);
+    EXPECT_EQ(done[0].batch_id, b);
+    EXPECT_EQ(done[0].status.s, Transport::COMPLETED);
+    EXPECT_EQ(done[0].status.transferred_bytes, 34u);
+    done.clear();
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    EXPECT_TRUE(done.empty());
+    pollfd pfd{};
+    pfd.fd = multi.completionFd();
+    pfd.events = POLLIN;
+    EXPECT_EQ(::poll(&pfd, 1, 0), 0);
+    EXPECT_EQ(query(b).s, Transport::COMPLETED);
+    EXPECT_EQ(query(b).transferred_bytes, 34u);
+#endif
+}
+
+TEST_F(BatchCounterWait, OneDrainReturnsEveryReadyBatch) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    auto first = batch(1);
+    auto second = batch(1);
+    ASSERT_TRUE(submit(first, {1}).ok());
+    ASSERT_TRUE(submit(second, {1}).ok());
+    rdma->finish(0);
+    rdma->finish(1);
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    ASSERT_EQ(done.size(), 2u);
+    EXPECT_EQ(done[0].batch_id, first);
+    EXPECT_EQ(done[1].batch_id, second);
+    EXPECT_EQ(done[0].status.s, Transport::COMPLETED);
+    EXPECT_EQ(done[1].status.s, Transport::COMPLETED);
+    done.clear();
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    EXPECT_TRUE(done.empty());
+    pollfd pfd{};
+    pfd.fd = multi.completionFd();
+    pfd.events = POLLIN;
+    EXPECT_EQ(::poll(&pfd, 1, 0), 0);
+#endif
+}
+
+TEST_F(BatchCounterWait, FreeBeforeDrainDropsTheQueuedId) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    auto b = batch(1);
+    ASSERT_TRUE(submit(b, {1}).ok());
+    rdma->finish(0);
+    ASSERT_TRUE(fdReadable(multi.completionFd()));
+    ASSERT_TRUE(multi.freeBatchID(b).ok());
+    forget(batches, b);
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    EXPECT_TRUE(done.empty());
+#endif
+}
+
+TEST_F(BatchCounterWait, FailedSliceWakesWithFailedStatus) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    auto b = batch(1);
+    ASSERT_TRUE(submit(b, {1}).ok());
+    rdma->finish(0, true);
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    ASSERT_EQ(done.size(), 1u);
+    EXPECT_EQ(done[0].batch_id, b);
+    EXPECT_EQ(done[0].status.s, Transport::FAILED);
+#endif
+}
+
+TEST_F(BatchCounterWait, DrainKeepsCanceledAndTimeout) {
+    auto canceled = batch(1);
+    auto timed_out = batch(1);
+    Transport::TransferStatus canceled_status{};
+    canceled_status.s = Transport::CANCELED;
+    Transport::TransferStatus timeout_status{};
+    timeout_status.s = Transport::TIMEOUT;
+    MultiTransportTestPeer::enqueue(multi, canceled, canceled_status);
+    MultiTransportTestPeer::enqueue(multi, timed_out, timeout_status);
+    std::vector<BatchCompletion> done;
+    if (multi.completionFd() < 0) {
+        EXPECT_TRUE(multi.drainCompletions(done).IsNotSupportedTransport());
+        return;
+    }
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    ASSERT_EQ(done.size(), 2u);
+    EXPECT_EQ(done[0].status.s, Transport::CANCELED);
+    EXPECT_EQ(done[1].status.s, Transport::TIMEOUT);
+}
+
+TEST(CompletionEventFd, DestroyClosesOriginalFd) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    auto md = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    std::string local = "eventfd-destroy:1";
+    int fd = -1;
+    int duped = -1;
+    {
+        MultiTransport multi(md, local);
+        fd = multi.completionFd();
+        ASSERT_GE(fd, 0);
+        duped = ::dup(fd);
+        ASSERT_GE(duped, 0);
+    }
+    pollfd closed{};
+    closed.fd = fd;
+    closed.events = POLLIN;
+    ASSERT_EQ(::poll(&closed, 1, 0), 1);
+    EXPECT_NE(closed.revents & POLLNVAL, 0);
+    pollfd held{};
+    held.fd = duped;
+    held.events = POLLIN;
+    EXPECT_EQ(::poll(&held, 1, 0), 0);
+    ::close(duped);
+#endif
 }
 }  // namespace
 }  // namespace mooncake

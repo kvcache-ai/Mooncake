@@ -18,6 +18,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
+#include <stdexcept>
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -2027,6 +2028,42 @@ PYBIND11_MODULE(engine, m) {
                  "SGLang's failed-session blacklist recovery.")
             .def("get_engine", &TransferEnginePy::getEngine)
             .def("get_engine_ptr", &TransferEnginePy::getEnginePtr);
+
+    adaptor_cls
+        .def(
+            "completion_fd",
+            [](TransferEnginePy& self) {
+                auto engine = self.getEngine();
+                return engine ? engine->completionFd() : -1;
+            },
+            "Engine-owned completion eventfd. -1 when the wake is unavailable.")
+        .def(
+            "drain_completions",
+            [](TransferEnginePy& self) {
+                auto engine = self.getEngine();
+                if (!engine) {
+                    throw std::runtime_error(
+                        "transfer engine is not initialized");
+                }
+                // GIL stays on the caller thread. Completion only writes the
+                // eventfd.
+                std::vector<BatchCompletion> done;
+                auto status = engine->drainCompletions(done);
+                if (!status.ok()) {
+                    throw std::runtime_error(status.ToString());
+                }
+                py::list out;
+                for (const auto& item : done) {
+                    py::dict row;
+                    row["batch_id"] = item.batch_id;
+                    row["status"] = static_cast<int>(item.status.s);
+                    row["transferred_bytes"] = item.status.transferred_bytes;
+                    out.append(std::move(row));
+                }
+                return out;
+            },
+            "Non-blocking drain of terminal batches. Each item has batch_id, "
+            "status, and transferred_bytes.");
 
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
 

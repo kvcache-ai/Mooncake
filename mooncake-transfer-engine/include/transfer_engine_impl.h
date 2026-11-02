@@ -342,6 +342,20 @@ class TransferEngineImpl {
         return result;
     }
 
+    int completionFd() const {
+        if (!multi_transports_) return -1;
+        return multi_transports_->completionFd();
+    }
+
+    Status drainCompletions(std::vector<BatchCompletion>& out) {
+        if (!multi_transports_) {
+            out.clear();
+            return Status::NotSupportedTransport(
+                "transfer engine is not initialized");
+        }
+        return multi_transports_->drainCompletions(out);
+    }
+
     Transport* getTransport(const std::string& proto) {
         if (!multi_transports_) return nullptr;
         return multi_transports_->getTransport(proto);
