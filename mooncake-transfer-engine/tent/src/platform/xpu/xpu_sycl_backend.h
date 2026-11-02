@@ -251,7 +251,7 @@ class XpuSyclBackend {
                     }
                 }
                 if (!known) contexts_.push_back(ctx);
-                queues_.emplace_back(ctx, d, sycl::property::queue::in_order());
+                queues_.push_back(makeQueue(ctx, d));
                 std::optional<DeviceUuid> uuid;
                 if (d.has(sycl::aspect::ext_intel_device_info_uuid)) {
                     const auto raw =
@@ -947,6 +947,13 @@ class XpuSyclBackend {
         }
     }
 
+    // Builds every queue the backend uses, so the per-copy queues get the
+    // same properties as queues_.
+    static sycl::queue makeQueue(const sycl::context &ctx,
+                                 const sycl::device &dev) {
+        return sycl::queue(ctx, dev, sycl::property::queue::in_order());
+    }
+
     int copy(void *dst, const void *src, size_t len, bool to_host) {
         // Each copy takes a queue of its own from the device's idle list (or
         // creates one) and runs the blocking memcpy().wait() outside the lock.
@@ -970,8 +977,7 @@ class XpuSyclBackend {
         }
         if (!q) {
             try {
-                q.emplace(proto->get_context(), proto->get_device(),
-                          sycl::property::queue::in_order());
+                q = makeQueue(proto->get_context(), proto->get_device());
             } catch (...) {
                 // No new queue: run this copy on the device's shared queue,
                 // as all copies did before they had queues of their own.
