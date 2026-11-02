@@ -3165,7 +3165,9 @@ reserve object space via Master `BatchPutStart` and finalize with
 Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for
 flexible dual-replica configs (`replica_num == 1` and `nof_replica_num == 1`), where
 `batch_put_session_end` finalizes MEMORY and revokes the unused NoF reservation.
-Reliable multi-replica NoF configs are rejected at session start. `end` / `revoke`
+Reliable multi-replica NoF configs are rejected at session start. DFS configs
+(`dfs_replica_num > 0`, including DFS-only) are also rejected at session start with
+`INVALID_PARAMS`; use `put` / `batch_put_from` for DFS placement. `end` / `revoke`
 seal the session (no further range writes) and wait for in-flight range transfers
 before talking to Master.
 
