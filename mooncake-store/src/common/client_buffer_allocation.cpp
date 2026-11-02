@@ -129,6 +129,14 @@ void *allocate_buffer_allocator_memory(size_t total_size,
     if (dma_allocator && total_size > 0) {
         return dma_allocator->Alloc(total_size, alignment, -1);
     }
+    // MNNVL client buffers are private host endpoints even in VRAM builds.
+    if (protocol == "mnnvl" || protocol == "nvlink_host") {
+        if (!alignment || (alignment & (alignment - 1)) ||
+            total_size > SIZE_MAX - (alignment - 1))
+            return nullptr;
+        return aligned_alloc(
+            alignment, ((total_size + alignment - 1) / alignment) * alignment);
+    }
 #ifdef USE_VRAM_SEGMENT
     auto ret = allocate_vram_memory(total_size, protocol);
     if (!ret) {
@@ -169,6 +177,10 @@ void free_memory(const std::string &protocol, void *ptr,
     // guaranteed by the allocator object identity.
     if (dma_allocator) {
         dma_allocator->Free(ptr);
+        return;
+    }
+    if (protocol == "mnnvl" || protocol == "nvlink_host") {
+        free(ptr);
         return;
     }
 #ifdef USE_VRAM_SEGMENT

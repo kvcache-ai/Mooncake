@@ -47,6 +47,7 @@
 #include "rpc_types.h"
 #include "local_hot_cache.h"
 #include "config/client_auto_discovery_config.h"
+#include "config/egm_store_pool_config.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_INTRA_NVLINK
 #include "gpu_vendor/intra_nvlink.h"
@@ -461,6 +462,8 @@ Client::Client(const std::string& local_hostname,
       local_hostname_(local_hostname),
       host_id_(
           ClientHostIdentityConfig::FromEnvironment(local_hostname).host_id),
+      physical_placement_(
+          ClientHostIdentityConfig::PhysicalFromEnvironment(local_hostname)),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
       object_checksum_enabled_(
@@ -491,7 +494,10 @@ Client::Client(const std::string& local_hostname,
     }
 }
 
-Client::~Client() {
+void Client::StopStoreWorkers() {
+    std::lock_guard<std::mutex> lock(stop_workers_mutex_);
+    if (store_workers_stopped_) return;
+    store_workers_stopped_ = true;
     task_poll_running_ = false;
     if (task_poll_thread_.joinable()) {
         task_poll_thread_.join();
@@ -516,6 +522,12 @@ Client::~Client() {
     // Stop queued timer/task callbacks before tearing down segment state.
     task_running_ = false;
     task_thread_pool_.stop();
+    write_thread_pool_.stop();
+    hot_cache_handler_.reset();
+}
+
+Client::~Client() {
+    StopStoreWorkers();
 
     // Make copies to avoid modifying while iterating
     std::vector<Segment> mounted_segments_copy;
@@ -551,7 +563,14 @@ Client::~Client() {
     }
 
     // Unregister gracefully unmounting segments: master already has timer
+    std::unordered_set<UUID, boost::hash<UUID>> failed_mnnvl_cleanup;
     for (auto& segment : gracefully_unmounting_segments_copy) {
+        if (protocol_ == "mnnvl") {
+            std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+            auto result = CleanupMnnvlMount(segment);
+            if (!result) failed_mnnvl_cleanup.insert(segment.id);
+            continue;
+        }
         int rc = transfer_engine_->unregisterLocalMemory(
             reinterpret_cast<void*>(segment.base));
         if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
@@ -568,7 +587,7 @@ Client::~Client() {
     }
 
     for (auto& entry : graceful_cleanup_callbacks) {
-        if (entry.second) {
+        if (entry.second && !failed_mnnvl_cleanup.contains(entry.first)) {
             entry.second(entry.first);
         }
     }
@@ -590,6 +609,14 @@ ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
     }
     if (!host_id_.empty()) {
         client_cfg.host_id = host_id_;
+    }
+    if (protocol_ == "mnnvl" && physical_placement_) {
+        // A request cannot advertise reachability outside this engine's domain.
+        client_cfg.fabric_domain = physical_placement_->fabric_domain;
+        if (!client_cfg.requester_placement &&
+            (!client_cfg.requester_self_id ||
+             client_cfg.requester_self_id->empty()))
+            client_cfg.requester_placement = *physical_placement_;
     }
     return client_cfg;
 }
@@ -998,8 +1025,11 @@ ErrorCode Client::InitTransferEngine(
         }
     }
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
-    int rc = transfer_engine_->init(metadata_connstring, local_hostname,
-                                    hostname, port);
+    int rc = protocol == "mnnvl"
+                 ? transfer_engine_->init(metadata_connstring, local_hostname,
+                                          hostname, port, protocol)
+                 : transfer_engine_->init(metadata_connstring, local_hostname,
+                                          hostname, port);
     if (rc != 0) {
         LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
         return ErrorCode::INTERNAL_ERROR;
@@ -1191,14 +1221,32 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::shared_ptr<TransferEngine>& transfer_engine,
     std::map<std::string, std::string> labels, const std::string& tenant_id,
     std::shared_ptr<NVMeoFInitiator> nof_initiator) {
+    const auto normalized_protocol = NormalizeEgmStoreProtocol(protocol);
+    if (normalized_protocol == "mnnvl") {
+        const auto placement =
+            ClientHostIdentityConfig::PhysicalFromEnvironment(local_hostname);
+        if (!placement || !placement->Valid()) {
+            LOG(ERROR) << "MNNVL requires MOONCAKE_FABRIC_DOMAIN, MC_RACK, "
+                          "MC_TRAY (or host identity), and MC_PHYSICAL_GPU "
+                          "(or a single numeric CUDA_VISIBLE_DEVICES)";
+            return std::nullopt;
+        }
+        if (!ParseEgmStorePoolConfig({}, protocol, 0) ||
+            (transfer_engine && !transfer_engine->isStrictMnnvlEgm())) {
+            LOG(ERROR)
+                << "Store requires an already strict TENT MNNVL/Fabric engine";
+            return std::nullopt;
+        }
+    }
     // Reused engines retain their metadata mode. In particular, P2PHANDSHAKE
     // must publish the engine's actual endpoint rather than the Store hostname.
     const auto& resolved_metadata =
         transfer_engine && metadata_connstring.empty()
             ? transfer_engine->getMetadataConnectionString()
             : metadata_connstring;
-    auto client = std::shared_ptr<Client>(new Client(
-        local_hostname, resolved_metadata, protocol, labels, tenant_id));
+    auto client = std::shared_ptr<Client>(
+        new Client(local_hostname, resolved_metadata, normalized_protocol,
+                   labels, tenant_id));
     if (!nof_initiator) {
         // nullptr means "use the process default", not "disable NoF" —
         // existing callers keep the pre-parameter behavior. Explicit disable
@@ -1221,6 +1269,11 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         auto response = client->master_client_.GetFsdir();
         if (!response) {
             LOG(ERROR) << "Failed to get fsdir from master";
+            if (normalized_protocol == "mnnvl") {
+                LOG(ERROR) << "Cannot verify host-memory-only MNNVL setup "
+                              "without the master's storage configuration";
+                return std::nullopt;
+            }
         } else if (response.value().empty()) {
             LOG(INFO)
                 << "Storage root directory is not set. persisting data is "
@@ -1294,7 +1347,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     if (transfer_engine == nullptr) {
         client->transfer_engine_ = std::make_shared<TransferEngine>();
         err = client->InitTransferEngine(local_hostname, metadata_connstring,
-                                         protocol, device_names);
+                                         normalized_protocol, device_names);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to initialize transfer engine";
             return std::nullopt;
@@ -1305,6 +1358,11 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                      "initialization.";
     }
 
+    if (normalized_protocol == "mnnvl" &&
+        !client->transfer_engine_->isStrictMnnvlEgm()) {
+        LOG(ERROR) << "Strict Store MNNVL/Fabric transport is unavailable";
+        return std::nullopt;
+    }
     client->InitTransferSubmitter();
     // Initialize local hot cache
     err = client->InitLocalHotCache();
@@ -2560,6 +2618,7 @@ void Client::ComputeBatchObjectChecksums(std::vector<PutOperation>& ops) {
         return;
     }
     for (auto& op : ops) {
+        if (op.IsResolved()) continue;
         auto checksum_result = ComputeObjectChecksumForSlices(
             op.key, op.slices, CalculateSliceSize(op.slices));
         if (!checksum_result) {
@@ -2891,7 +2950,7 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
 }
 
 void Client::SubmitTransfers(std::vector<PutOperation>& ops,
-                             bool group_by_target) {
+                             bool group_by_target, void* producer_event) {
     if (std::all_of(ops.begin(), ops.end(),
                     [](const PutOperation& op) { return op.IsResolved(); })) {
         return;
@@ -2984,7 +3043,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops,
                 } else {
                     submit_result = transfer_submitter_->submit(
                         replica, op.slices, TransferRequest::WRITE, nullptr, 0,
-                        TransferIntent::kUnspecified);
+                        TransferIntent::kUnspecified, producer_event);
                 }
 
                 if (!submit_result) {
@@ -3009,7 +3068,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops,
     for (auto& [endpoint, group] : target_groups) {
         auto submit_result = transfer_submitter_->submit_batch(
             group.replicas, group.slices, TransferRequest::WRITE,
-            TransferIntent::kUnspecified);
+            TransferIntent::kUnspecified, producer_event);
         for (auto* op : group.ops) {
             if (!submit_result) {
                 op->transfer_summary.RecordFailure(ReplicaType::MEMORY,
@@ -3655,6 +3714,37 @@ void Client::StageWriteBuffersForRemoteReplicas(
     }
 }
 
+void* Client::ResolveProducerEvent(std::vector<PutOperation>& ops,
+                                   void* producer_event, bool host_only) {
+    if (!producer_event) return nullptr;
+    // Only MNNVL memory-replica writes order the event on the copy stream;
+    // checksums, staging, local memcpy and disk/NoF/DFS writes read the
+    // source from the host and need the event completed first.
+    const bool device_ordered =
+        !host_only && transfer_submitter_ &&
+        transfer_submitter_->ordersProducerEventOnDevice() &&
+        std::all_of(ops.begin(), ops.end(), [this](const PutOperation& op) {
+            return op.IsResolved() ||
+                   std::all_of(op.replicas.begin(), op.replicas.end(),
+                               [this](const Replica::Descriptor& replica) {
+                                   return replica.is_memory_replica() &&
+                                          !CanUseLocalMemcpy(replica);
+                               });
+        });
+    if (device_ordered) return producer_event;
+    if (device::GetAcceleratorRegistry().RuntimeAccelerators().SynchronizeEvent(
+            producer_event)) {
+        return nullptr;
+    }
+    for (auto& op : ops) {
+        if (!op.IsResolved()) {
+            op.SetError(ErrorCode::TRANSFER_FAIL,
+                        "Failed to wait on producer event");
+        }
+    }
+    return nullptr;
+}
+
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
@@ -3666,7 +3756,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager,
-    bool group_by_target) {
+    bool group_by_target, void* producer_event) {
     if (!config.ValidSessionIds(keys.size()) ||
         !config.HasValidKeyHints(keys.size())) {
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -3677,6 +3767,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         client_cfg.preferred_segment = local_hostname_;
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    if (object_checksum_enabled_) {
+        producer_event = ResolveProducerEvent(ops, producer_event, true);
+    }
     ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {
         if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
@@ -3685,11 +3778,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         }
     }
     StartBatchPut(ops, client_cfg);
+    producer_event =
+        ResolveProducerEvent(ops, producer_event, static_cast<bool>(stager));
     StageWriteBuffersForRemoteReplicas(ops, stager);
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops,
-                    group_by_target || client_cfg.prefer_alloc_in_same_node);
+                    group_by_target || client_cfg.prefer_alloc_in_same_node,
+                    producer_event);
     WaitForTransfers(ops);
     SubmitDfsWrites(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -3716,7 +3812,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager,
-    bool group_by_target) {
+    bool group_by_target, void* producer_event) {
     if (!config.ValidSessionIds(keys.size()) ||
         !config.HasValidKeyHints(keys.size())) {
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -3727,6 +3823,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
         client_cfg.preferred_segment = local_hostname_;
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    if (object_checksum_enabled_) {
+        producer_event = ResolveProducerEvent(ops, producer_event, true);
+    }
     ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {
         if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
@@ -3736,10 +3835,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     }
 
     StartBatchUpsert(ops, client_cfg);
+    producer_event =
+        ResolveProducerEvent(ops, producer_event, static_cast<bool>(stager));
     StageWriteBuffersForRemoteReplicas(ops, stager);
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops,
-                    group_by_target || client_cfg.prefer_alloc_in_same_node);
+                    group_by_target || client_cfg.prefer_alloc_in_same_node,
+                    producer_event);
     WaitForTransfers(ops);
     SubmitDfsWrites(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -3950,16 +4052,92 @@ std::vector<int> Client::GetNicNumaNodes() const {
 
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol,
-    const std::string& location) {
-    auto result = MountSegmentAndGetId(buffer, size, protocol, location);
+    const std::string& location,
+    std::shared_ptr<MnnvlMountState> cleanup_state) {
+    auto result = MountSegmentAndGetId(buffer, size, protocol, location,
+                                       std::move(cleanup_state));
     if (!result) {
         return tl::unexpected(result.error());
     }
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::CleanupMnnvlSegments() {
+    if (protocol_ != "mnnvl") return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    ErrorCode first_error = ErrorCode::OK;
+    std::vector<std::pair<UUID, std::function<void(const UUID&)>>> callbacks;
+    {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        auto cleanup = [&](auto& segments) {
+            for (auto it = segments.begin(); it != segments.end();) {
+                auto result = CleanupMnnvlMount(it->second);
+                if (!result) {
+                    if (first_error == ErrorCode::OK)
+                        first_error = result.error();
+                    ++it;
+                    continue;
+                }
+                auto callback =
+                    graceful_unmount_cleanup_callbacks_.find(it->first);
+                if (callback != graceful_unmount_cleanup_callbacks_.end()) {
+                    callbacks.emplace_back(callback->first,
+                                           std::move(callback->second));
+                    graceful_unmount_cleanup_callbacks_.erase(callback);
+                }
+                it = segments.erase(it);
+            }
+        };
+        cleanup(mounted_segments_);
+        cleanup(gracefully_unmounting_segments_);
+    }
+    for (auto& [id, callback] : callbacks)
+        if (callback) callback(id);
+    if (first_error != ErrorCode::OK) return tl::unexpected(first_error);
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::CleanupMnnvlMount(
+    const Segment& segment) {
+    auto it = mnnvl_mount_states_.find(segment.id);
+    if (it == mnnvl_mount_states_.end())
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    auto& state = *it->second;
+    // Never let a heartbeat re-publish an uncertain removal.
+    state.remountable = false;
+    if (state.publication_pending) {
+        auto result = mnnvl_ops_for_test_
+                          ? mnnvl_ops_for_test_->unmount(segment.id)
+                          : master_client_.UnmountSegment(segment.id);
+        if (!result && result.error() != ErrorCode::SEGMENT_NOT_FOUND)
+            return tl::unexpected(result.error());
+        state.publication_pending = false;
+    }
+    if (state.registration_pending) {
+        int rc = mnnvl_ops_for_test_
+                     ? mnnvl_ops_for_test_->unregister_memory(
+                           reinterpret_cast<void*>(segment.base))
+                     : transfer_engine_->unregisterLocalMemory(
+                           reinterpret_cast<void*>(segment.base));
+        if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED)
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        state.registration_pending = false;
+    }
+    if ((mnnvl_ops_for_test_ ? mnnvl_ops_for_test_->drain()
+                             : transfer_engine_->quiesce()) != 0)
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    state.cleanup_confirmed.store(true, std::memory_order_release);
+    mnnvl_mount_states_.erase(it);
+    return {};
+}
+
 tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
     std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it) {
+    if (protocol_ == "mnnvl") {
+        auto result = CleanupMnnvlMount(it->second);
+        if (!result) return result;
+        mounted_segments_.erase(it);
+        return {};
+    }
     auto unmount_result = master_client_.UnmountSegment(it->second.id);
     if (!unmount_result) {
         ErrorCode err = unmount_result.error();
@@ -3987,7 +4165,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
 
 tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
                                                      size_t size) {
-    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    std::unique_lock<std::mutex> lock(mounted_segments_mutex_);
     auto segment = mounted_segments_.end();
 
     for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
@@ -3996,6 +4174,27 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
             it->second.size == size) {
             segment = it;
             break;
+        }
+    }
+    if (segment == mounted_segments_.end() && protocol_ == "mnnvl") {
+        for (auto it = gracefully_unmounting_segments_.begin();
+             it != gracefully_unmounting_segments_.end(); ++it) {
+            if (it->second.base == reinterpret_cast<uintptr_t>(buffer) &&
+                it->second.size == size) {
+                auto result = CleanupMnnvlMount(it->second);
+                if (!result) return result;
+                const auto id = it->first;
+                std::function<void(const UUID&)> callback;
+                auto saved = graceful_unmount_cleanup_callbacks_.find(id);
+                if (saved != graceful_unmount_cleanup_callbacks_.end()) {
+                    callback = std::move(saved->second);
+                    graceful_unmount_cleanup_callbacks_.erase(saved);
+                }
+                gracefully_unmounting_segments_.erase(it);
+                lock.unlock();
+                if (callback) callback(id);
+                return {};
+            }
         }
     }
     if (segment == mounted_segments_.end()) {
@@ -4008,8 +4207,27 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 
 tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     const void* buffer, size_t size, const std::string& protocol,
-    const std::string& location) {
-    auto check_result = CheckRegisterMemoryParams(buffer, size, protocol);
+    const std::string& location,
+    std::shared_ptr<MnnvlMountState> cleanup_state) {
+    const auto normalized_protocol = NormalizeEgmStoreProtocol(protocol);
+    const bool strict = protocol_ == "mnnvl";
+    if (strict && (!physical_placement_ || !physical_placement_->Valid()))
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    if (strict && protocol == "nvlink_host") {
+        ConfigDict alias_config;
+        if (location.starts_with("cpu:"))
+            alias_config[CONFIG_KEY_EGM_NUMA_NODES] = location.substr(4);
+        if (!ParseEgmStorePoolConfig(alias_config, protocol, 0, 0))
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (cleanup_state && !cleanup_state->cleanup_confirmed.load())
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    if ((normalized_protocol == "mnnvl") != strict ||
+        (strict && !mnnvl_ops_for_test_ &&
+         !transfer_engine_->isStrictMnnvlEgm()))
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    auto check_result =
+        CheckRegisterMemoryParams(buffer, size, normalized_protocol);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
@@ -4033,25 +4251,77 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             }
         }
 
-        int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
-                                                       location, true, true);
+        if (strict) {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(buffer);
+            if (size > UINTPTR_MAX - base)
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            for (const auto& [id, segment] : gracefully_unmounting_segments_) {
+                if (segment.base < base + size &&
+                    base < segment.base + segment.size)
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+        Segment pending;
+        if (strict) {
+            if (!cleanup_state)
+                cleanup_state = std::make_shared<MnnvlMountState>();
+            pending.id = generate_uuid();
+            pending.base = reinterpret_cast<uintptr_t>(buffer);
+            pending.size = size;
+            pending.protocol = normalized_protocol;
+            cleanup_state->id = pending.id;
+            cleanup_state->registration_pending = true;
+            cleanup_state->cleanup_confirmed.store(false,
+                                                   std::memory_order_release);
+            mounted_segments_[pending.id] = pending;
+            mnnvl_mount_states_[pending.id] = cleanup_state;
+        }
+        int rc = strict && mnnvl_ops_for_test_
+                     ? mnnvl_ops_for_test_->register_memory((void*)buffer, size,
+                                                            location)
+                     : transfer_engine_->registerLocalMemory(
+                           (void*)buffer, size, location, true, true);
         if (rc != 0) {
             LOG(ERROR) << "register_local_memory_failed base=" << buffer
                        << " size=" << size << ", error=" << rc;
+            if (strict)
+                (void)UnmountSegmentImpl(mounted_segments_.find(pending.id));
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (strict &&
+            !(mnnvl_ops_for_test_
+                  ? mnnvl_ops_for_test_->exported((void*)buffer, size)
+                  : transfer_engine_->isMnnvlExported((void*)buffer, size))) {
+            (void)UnmountSegmentImpl(mounted_segments_.find(pending.id));
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
         Segment segment;
-        segment.id = generate_uuid();
+        segment.id = strict ? pending.id : generate_uuid();
         segment.name = local_hostname_;
         segment.base = reinterpret_cast<uintptr_t>(buffer);
         segment.size = size;
-        segment.protocol = protocol;
+        segment.protocol = normalized_protocol;
         segment.host_id = host_id_;
         if (protocol == "rdma" && StoreHcaAffinityEnabled()) {
             if (auto topology = transfer_engine_->getLocalTopology()) {
                 segment.locality = DiscoverSegmentLocality(*topology, location);
             }
+        }
+        if (strict) {
+            auto placement = *physical_placement_;
+            if (location.starts_with("cpu:")) {
+                const auto node = std::string_view(location).substr(4);
+                auto [end, ec] =
+                    std::from_chars(node.data(), node.data() + node.size(),
+                                    placement.numa_node);
+                if (ec != std::errc{} || end != node.data() + node.size())
+                    placement.numa_node = -1;
+            }
+            segment.physical_placement = placement;
+            segment.name = placement.rack + "." + placement.tray + "#g" +
+                           std::to_string(placement.physical_gpu) + "/numa" +
+                           std::to_string(placement.numa_node);
         }
         if (metadata_connstring_ == P2PHANDSHAKE) {
             segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
@@ -4059,27 +4329,62 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             segment.te_endpoint = local_hostname_;
         }
 
-        auto mount_result = master_client_.MountSegment(segment);
+        if (strict) {
+            mounted_segments_[segment.id] = segment;
+            cleanup_state->publication_pending = true;
+        }
+        auto mount_result = strict && mnnvl_ops_for_test_
+                                ? mnnvl_ops_for_test_->mount(segment)
+                                : master_client_.MountSegment(segment);
         if (!mount_result) {
             ErrorCode err = mount_result.error();
             LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                        << " size=" << size << ", error=" << err;
+            if (strict)
+                (void)UnmountSegmentImpl(mounted_segments_.find(segment.id));
             return tl::unexpected(err);
         }
 
+        if (strict) {
+            cleanup_state->remountable = true;
+            LOG(INFO) << "MNNVL_SEGMENT_READY name=" << segment.name
+                      << " te_endpoint=" << segment.te_endpoint
+                      << " domain=" << segment.physical_placement->fabric_domain
+                      << " gpu=" << segment.physical_placement->physical_gpu
+                      << " numa=" << segment.physical_placement->numa_node
+                      << " exported=1 metadata_published=1 master_mounted=1";
+        }
         segment_id = segment.id;
         mounted_segments_[segment_id] = segment;
     }
 
-    EnsureStorageControlPlaneStarted();
+    if (!mnnvl_ops_for_test_) EnsureStorageControlPlaneStarted();
     return segment_id;
 }
 
 tl::expected<void, ErrorCode> Client::UnmountSegmentById(
     const UUID& segment_id, uint64_t grace_period_ms,
     std::function<void(const UUID&)> cleanup_callback) {
-    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    std::unique_lock<std::mutex> lock(mounted_segments_mutex_);
     auto segment = mounted_segments_.find(segment_id);
+    if (segment == mounted_segments_.end() && protocol_ == "mnnvl") {
+        auto graceful = gracefully_unmounting_segments_.find(segment_id);
+        if (graceful != gracefully_unmounting_segments_.end()) {
+            if (grace_period_ms != 0) return {};
+            auto result = CleanupMnnvlMount(graceful->second);
+            if (!result) return result;
+            std::function<void(const UUID&)> callback;
+            auto saved = graceful_unmount_cleanup_callbacks_.find(segment_id);
+            if (saved != graceful_unmount_cleanup_callbacks_.end()) {
+                callback = std::move(saved->second);
+                graceful_unmount_cleanup_callbacks_.erase(saved);
+            }
+            gracefully_unmounting_segments_.erase(graceful);
+            lock.unlock();
+            if (callback) callback(segment_id);
+            return {};
+        }
+    }
     if (segment == mounted_segments_.end()) {
         LOG(ERROR) << "segment_not_found id=" << UuidToString(segment_id);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -4151,31 +4456,43 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
     }
 
     if (removed) {
+        bool cleanup_failed = false;
         std::function<void(const UUID&)> cleanup_callback;
         {
             std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
             auto it = gracefully_unmounting_segments_.find(segment_id);
             if (it != gracefully_unmounting_segments_.end()) {
-                int rc = transfer_engine_->unregisterLocalMemory(
-                    reinterpret_cast<void*>(it->second.base));
+                int rc = 0;
+                if (protocol_ == "mnnvl") {
+                    // Master removal is confirmed; keep state/callback on any
+                    // unregister or drain failure so close can retry it.
+                    mnnvl_mount_states_.at(segment_id)->publication_pending =
+                        false;
+                    auto result = CleanupMnnvlMount(it->second);
+                    cleanup_failed = !result;
+                } else {
+                    rc = transfer_engine_->unregisterLocalMemory(
+                        reinterpret_cast<void*>(it->second.base));
+                }
                 if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
                     LOG(ERROR)
                         << "Failed to unregister TE MR for graceful unmount: "
                         << rc;
                 }
-                gracefully_unmounting_segments_.erase(it);
+                if (!cleanup_failed) gracefully_unmounting_segments_.erase(it);
             }
             auto callback_it =
                 graceful_unmount_cleanup_callbacks_.find(segment_id);
-            if (callback_it != graceful_unmount_cleanup_callbacks_.end()) {
+            if (!cleanup_failed &&
+                callback_it != graceful_unmount_cleanup_callbacks_.end()) {
                 cleanup_callback = std::move(callback_it->second);
                 graceful_unmount_cleanup_callbacks_.erase(callback_it);
             }
         }
-        if (cleanup_callback) {
-            cleanup_callback(segment_id);
+        if (!cleanup_failed) {
+            if (cleanup_callback) cleanup_callback(segment_id);
+            return;
         }
-        return;
     }
 
     if (retry_left > 0) {
@@ -4551,6 +4868,31 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // Fence Store-owned copy/move workers against strict segment cleanup.
+    // Queued tasks must revalidate the range after acquiring this lock.
+    std::unique_lock<std::mutex> segment_lock(mounted_segments_mutex_,
+                                              std::defer_lock);
+    if (protocol_ == "mnnvl") {
+        segment_lock.lock();
+        const auto& range = source.get_memory_descriptor().buffer_descriptor;
+        auto covers = [&](const auto& entry) {
+            const auto& segment = entry.second;
+            auto state = mnnvl_mount_states_.find(entry.first);
+            return state != mnnvl_mount_states_.end() &&
+                   state->second->remountable &&
+                   range.buffer_address_ >= segment.base &&
+                   range.buffer_address_ - segment.base <= segment.size &&
+                   range.size_ <=
+                       segment.size - (range.buffer_address_ - segment.base);
+        };
+        if (std::none_of(mounted_segments_.begin(), mounted_segments_.end(),
+                         covers) &&
+            std::none_of(gracefully_unmounting_segments_.begin(),
+                         gracefully_unmounting_segments_.end(), covers)) {
+            revoke_lambda();
+            return tl::unexpected(ErrorCode::REPLICA_NOT_IN_LOCAL_MEMORY);
+        }
+    }
     // Validate that source replica is in local memory
     if (!IsReplicaOnLocalMemory(source)) {
         LOG(ERROR) << "action=replica_" << action_name << "_failed"
@@ -4748,6 +5090,13 @@ ErrorCode Client::PrepareStorageBackend(const std::string& storage_root_dir,
                                         const std::string& fsdir,
                                         bool enable_eviction,
                                         uint64_t quota_bytes) {
+    // Covers both GetStorageConfig and the legacy GetFsdir fallback before
+    // creating persistent storage, a transfer engine, or exported capacity.
+    if (protocol_ == "mnnvl") {
+        LOG(ERROR) << "MNNVL Store supports host-memory EGM only; "
+                      "master-configured persistence is unsupported";
+        return ErrorCode::INVALID_PARAMS;
+    }
     // Initialize storage backend
     auto backend_result =
         StorageBackend::Create(storage_root_dir, fsdir, enable_eviction);
@@ -5577,6 +5926,7 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         // Other errors (e.g., OBJECT_NOT_FOUND, REPLICA_NOT_FOUND) should
         // not be retried
         bool should_retry =
+            task_running_.load() &&
             (result == ErrorCode::NO_AVAILABLE_HANDLE) &&
             (current_retry_count < assignment.max_retry_attempts);
 
@@ -5640,6 +5990,12 @@ void Client::StorageHeartbeatThreadMain() {
         std::vector<Segment> segments;
         for (auto it : mounted_segments_) {
             auto& segment = it.second;
+            if (protocol_ == "mnnvl") {
+                auto state = mnnvl_mount_states_.find(segment.id);
+                if (state == mnnvl_mount_states_.end() ||
+                    !state->second->remountable)
+                    continue;
+            }
             segments.emplace_back(segment);
         }
         auto remount_result = master_client_.ReMountSegment(segments);
@@ -5891,6 +6247,14 @@ ErrorCode Client::InitLocalHotCache() {
     if (config.total_size_bytes == 0) {
         return ErrorCode::OK;
     }
+    if (protocol_ == "mnnvl") {
+        // Plain host cache buffers are not exported EGM replicas. Keep both
+        // single and batch reads on the original MNNVL-addressable replica.
+        LOG(WARNING)
+            << "Local hot cache is disabled for MNNVL EGM; ignoring "
+               "MC_STORE_LOCAL_HOT_CACHE_SIZE and reading EGM replicas";
+        return ErrorCode::OK;
+    }
 
     size_t thread_num = 2;
 
@@ -5921,13 +6285,17 @@ ErrorCode Client::InitLocalHotCache() {
         }
         int rc = transfer_engine_->registerLocalMemory(
             hot_cache_->GetBaseAddress(), hot_cache_reg_size, kWildcardLocation,
-            true, true);
+            protocol_ != "mnnvl", true);
         if (rc != 0) {
             LOG(ERROR)
                 << "Failed to register local hot cache memory with transfer "
                    "engine, base="
                 << hot_cache_->GetBaseAddress()
                 << ", size=" << hot_cache_->GetTotalSize() << ", ret=" << rc;
+            if (protocol_ == "mnnvl") {
+                hot_cache_memory_registered_ = true;
+                UnregisterLocalHotCacheMemory();
+            }
             hot_cache_.reset();
             hot_cache_handler_.reset();
             admission_sketch_.reset();
@@ -5968,6 +6336,15 @@ void Client::UnregisterLocalHotCacheMemory() {
                "engine, base="
             << hot_cache_->GetBaseAddress()
             << ", size=" << hot_cache_->GetTotalSize() << ", ret=" << rc;
+    }
+    if (protocol_ == "mnnvl" &&
+        ((rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) ||
+         transfer_engine_->quiesce() != 0)) {
+        // Keep endpoint backing and its engine if unregister/drain is
+        // uncertain.
+        (void)new std::pair<std::shared_ptr<TransferEngine>,
+                            std::shared_ptr<LocalHotCache>>(
+            transfer_engine_, std::move(hot_cache_));
     }
     hot_cache_memory_registered_ = false;
 }

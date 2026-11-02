@@ -27,6 +27,9 @@ class RuntimeAccelerator {
     // falls back to memcpy when neither side is on a known accelerator.
     bool CopyAuto(void* dst, const void* src, size_t size) const;
 
+    // Waits on the host for a runtime event; false when no runtime accepts it.
+    bool SynchronizeEvent(void* event) const;
+
    private:
     std::vector<const AcceleratorDevice*> devices_;
 };

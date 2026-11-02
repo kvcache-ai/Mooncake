@@ -38,4 +38,29 @@ ClientHostIdentityConfig ClientHostIdentityConfig::FromEnvironment(
                                            : configured_host_id)};
 }
 
+std::optional<PhysicalPlacement>
+ClientHostIdentityConfig::PhysicalFromEnvironment(
+    const std::string& local_hostname) {
+    auto read = [](const char* name) {
+        return std::string(
+            TrimAsciiWhitespace(Environ::Process().Get(name).value_or("")));
+    };
+    PhysicalPlacement placement;
+    placement.fabric_domain = read("MOONCAKE_FABRIC_DOMAIN");
+    if (placement.fabric_domain.empty()) return std::nullopt;
+    placement.rack = read("MC_RACK");
+    placement.tray = read("MC_TRAY");
+    if (placement.tray.empty())
+        placement.tray = FromEnvironment(local_hostname).host_id;
+    auto gpu = read("MC_PHYSICAL_GPU");
+    // A single numeric CVD names the physical GPU even though CUDA sees 0.
+    // UUID CVD and multi-GPU workers must explicitly provide MC_PHYSICAL_GPU.
+    if (gpu.empty()) gpu = read("CUDA_VISIBLE_DEVICES");
+    auto [end, ec] = std::from_chars(gpu.data(), gpu.data() + gpu.size(),
+                                     placement.physical_gpu);
+    if (ec != std::errc{} || end != gpu.data() + gpu.size())
+        placement.physical_gpu = -1;
+    return placement;
+}
+
 }  // namespace mooncake

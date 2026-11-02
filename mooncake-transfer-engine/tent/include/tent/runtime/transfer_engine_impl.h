@@ -303,6 +303,13 @@ class TransferEngineImpl {
 
     Status freeLocalMemory(void* addr);
 
+    bool isStrictMnnvlEgm() const;
+    Status getEgmNumaNodes(std::vector<int>& nodes, bool nearest);
+    Status getEgmGranularity(int node, size_t& granularity);
+    bool isMnnvlExported(void* addr, size_t size) const;
+    // Caller must prevent new submissions while draining/freeing memory.
+    Status quiesce();
+
     Status registerLocalMemory(void* addr, size_t size,
                                Permission permission = kGlobalReadWrite);
 
@@ -561,6 +568,11 @@ class TransferEngineImpl {
     // Verify that req.transport_hint is usable for this request
     Status validateTransportHint(const Request& req, size_t request_index);
 
+    // False when req carries a producer_event that the route (a concrete
+    // transport, or a staged route) would not order the copy after.
+    bool producerEventHonored(const Request& req, TransportType type,
+                              bool staging) const;
+
     Status loadTransports();
 
     // Control-plane delivery used by sendNotification() once every loaded
@@ -614,6 +626,11 @@ class TransferEngineImpl {
                                 std::chrono::steady_clock::time_point end_time);
 
    private:
+    // Failed strict deregistrations retain their transport identity for retry.
+    std::recursive_mutex strict_memory_mutex_;
+    std::unordered_map<uint64_t, BufferDesc> pending_mnnvl_unregister_;
+    std::unordered_set<uint64_t> pending_mnnvl_metadata_;
+
     struct AllocatedMemory {
         void* addr;
         size_t size;

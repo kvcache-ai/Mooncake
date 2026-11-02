@@ -1106,13 +1106,32 @@ TransferSubmitter::TransferSubmitter(
 
     VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
             << memcpy_enabled_;
+    strict_mnnvl_ = engine_.isStrictMnnvlEgm();
+    if (strict_mnnvl_) {
+        LOG(INFO) << "TransferSubmitter pins memory-replica transfers to MNNVL";
+    }
+}
+
+void TransferSubmitter::applyMemoryReplicaHints(TransferRequest& request,
+                                                void* producer_event) const {
+#ifdef USE_TENT
+    if (strict_mnnvl_) request.transport_hint = tent::MNNVL;
+#endif
+    request.producer_event = producer_event;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
     TransferRequest::OpCode op_code, void* ptr, size_t size,
-    TransferIntent intent) {
+    TransferIntent intent, void* producer_event) {
     std::optional<TransferFuture> future;
+
+    if (producer_event &&
+        (op_code != TransferRequest::WRITE || !replica.is_memory_replica() ||
+         !ordersProducerEventOnDevice())) {
+        LOG(ERROR) << "producer_event requires an MNNVL memory-replica write";
+        return std::nullopt;
+    }
 
     if (replica.is_memory_replica()) {
         auto& mem_desc = replica.get_memory_descriptor();
@@ -1129,11 +1148,16 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 
             switch (strategy) {
                 case TransferStrategy::LOCAL_MEMCPY:
+                    if (producer_event) {
+                        LOG(ERROR) << "producer_event cannot order a local "
+                                      "memcpy write";
+                        return std::nullopt;
+                    }
                     future = submitMemcpyOperation(handle, slices, op_code);
                     break;
                 case TransferStrategy::TRANSFER_ENGINE:
-                    future = submitTransferEngineOperation(handle, slices,
-                                                           op_code, 0, intent);
+                    future = submitTransferEngineOperation(
+                        handle, slices, op_code, 0, intent, producer_event);
                     break;
                 default:
                     LOG(ERROR) << "Unknown transfer strategy: " << strategy;
@@ -1164,9 +1188,15 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
-    TransferRequest::OpCode op_code, TransferIntent intent) {
+    TransferRequest::OpCode op_code, TransferIntent intent,
+    void* producer_event) {
     if (replicas.size() != all_slices.size()) {
         LOG(ERROR) << "Mismatched replicas and slice lists";
+        return std::nullopt;
+    }
+    if (producer_event &&
+        (op_code != TransferRequest::WRITE || !ordersProducerEventOnDevice())) {
+        LOG(ERROR) << "producer_event requires an MNNVL memory-replica write";
         return std::nullopt;
     }
 
@@ -1185,6 +1215,10 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         use_local_memcpy =
             use_local_memcpy && canUseLocalMemcpy(handle.transport_endpoint_);
         operation_count += all_slices[i].size();
+    }
+    if (use_local_memcpy && producer_event) {
+        LOG(ERROR) << "producer_event cannot order a local memcpy write";
+        return std::nullopt;
     }
 
     std::vector<TransferRequest> requests;
@@ -1232,6 +1266,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             request.target_id = seg;
             request.target_offset = handle.buffer_address_ + offset;
             request.length = slice.size;
+            applyMemoryReplicaHints(request, producer_event);
             requests.emplace_back(request);
             offset += slice.size;
         }
@@ -1787,6 +1822,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
             tr.transport_hint =
                 mooncake::tent::c_to_transport_hint(r.transport_hint);
             tr.intent_type = *tent_intent;
+            tr.producer_event = r.producer_event;
             tent_reqs.push_back(tr);
         }
         auto tent_status = tent_engine_->submitTransfer(batch_id, tent_reqs);
@@ -1822,7 +1858,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code, uint64_t src_offset,
-    TransferIntent intent) {
+    TransferIntent intent, void* producer_event) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
@@ -1867,6 +1903,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         request.target_id = seg;
         request.target_offset = base_address + offset;
         request.length = slice.size;
+        applyMemoryReplicaHints(request, producer_event);
 
         offset += slice.size;
         requests.emplace_back(request);
