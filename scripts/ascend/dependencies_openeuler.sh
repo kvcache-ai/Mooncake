@@ -24,7 +24,7 @@ NC="\033[0m"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 DEPS_BUILD_DIR="${REPO_ROOT}/.mooncake-openeuler-deps"
-GOVER=1.25.9
+GOVER=1.26.9
 ASCEND_GITHUB_MIRROR_URLS="${ASCEND_GITHUB_MIRROR_URLS:-https://ghfast.top/}"
 
 print_section() {

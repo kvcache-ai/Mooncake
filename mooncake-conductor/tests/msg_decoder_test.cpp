@@ -1132,7 +1132,9 @@ TEST(DecodeSglangEventBatch, AcceptsOmittedMediumAndBigramTokens) {
     std::stringstream buffer;
     Packer packer(buffer);
     packer.pack_array(3);
-    packer.pack_double(1.0);
+    // msgpack-c 6 packs an integral double as an integer, which the decoder
+    // rejects as a timestamp; keep a fractional value.
+    packer.pack_double(1.5);
     packer.pack_array(2);
     // Omitting medium is normal: omit_defaults drops fields left at None.
     packer.pack_map(6);
@@ -1178,7 +1180,7 @@ TEST(DecodeSglangEventBatch, RejectsLegacyTaggedArrayEvents) {
     std::stringstream buffer;
     Packer packer(buffer);
     packer.pack_array(3);
-    packer.pack_double(1.0);
+    packer.pack_double(1.5);
     packer.pack_array(1);
     packer.pack_array(3);
     packer.pack("BlockRemoved");

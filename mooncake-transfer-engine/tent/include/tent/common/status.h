@@ -77,7 +77,7 @@
     } while (0)
 #endif
 
-#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_MEMFABRIC)
 #define CHECK_ASCEND(call)                                                \
     do {                                                                  \
         aclError err = call;                                              \

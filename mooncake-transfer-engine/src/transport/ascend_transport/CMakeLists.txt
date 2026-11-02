@@ -4,7 +4,9 @@ if (USE_ASCEND)
 elseif (USE_ASCEND_HETEROGENEOUS)
 	file(GLOB ASCEND_SOURCES "heterogeneous_rdma_transport/*.cpp")
 elseif (USE_UBSHMEM)
-    file(GLOB ASCEND_SOURCES "ubshmem_transport/*.cpp" "*.cpp")
+    # utils.cpp holds the protocol_desc parser the host allocator calls.
+    file(GLOB ASCEND_SOURCES "ubshmem_transport/*.cpp" "*.cpp"
+         "ascend_direct_transport/utils.cpp")
 else ()
     file(GLOB ASCEND_SOURCES "ascend_direct_transport/*.cpp" "*.cpp")
 endif ()

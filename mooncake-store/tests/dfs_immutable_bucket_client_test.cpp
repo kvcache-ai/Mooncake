@@ -242,6 +242,60 @@ TEST_F(DfsImmutableBucketClientTest, ExhaustionEvictsWholeBucketAndRetries) {
     EXPECT_EQ(third_query->replicas.size(), 2u);
 }
 
+TEST_F(DfsImmutableBucketClientTest, DfsOnlyObjectsLiveAndDieWithTheirBucket) {
+    ReplicateConfig dfs_only;
+    dfs_only.replica_num = 0;
+    dfs_only.dfs_replica_num = 1;
+    auto expect_value = [this](const std::string& key,
+                               const std::string& expected) {
+        auto query = writer_->Query(key);
+        ASSERT_TRUE(query) << key;
+        ASSERT_EQ(query->replicas.size(), 1u) << key;
+        ASSERT_TRUE(query->replicas[0].is_dfs_replica()) << key;
+        // The fixture's zero lease TTL makes Client::Get report LEASE_EXPIRED,
+        // so read the descriptor through the backend like the other tests.
+        std::string output(expected.size(), '\0');
+        auto reads =
+            backend_->BatchRead({{key,
+                                  query->replicas[0].get_dfs_descriptor(),
+                                  {{output.data(), output.size()}}}});
+        ASSERT_TRUE(reads[0]) << key;
+        EXPECT_EQ(output, expected) << key;
+    };
+
+    std::string first(4096, '1');
+    std::string second(4096, '2');
+    std::string third(4096, '3');
+    auto first_slices = Slices(first);
+    auto second_slices = Slices(second);
+    auto third_slices = Slices(third);
+    ASSERT_TRUE(writer_->Put("first", first_slices, dfs_only));
+    ASSERT_TRUE(writer_->Put("second", second_slices, dfs_only));
+    // Both buckets are full: the third write forces a whole-bucket eviction.
+    // With no memory replica, the evicted object disappears entirely.
+    ASSERT_TRUE(writer_->Put("third", third_slices, dfs_only));
+    auto first_query = writer_->Query("first");
+    ASSERT_FALSE(first_query);
+    EXPECT_EQ(first_query.error(), ErrorCode::OBJECT_NOT_FOUND);
+    expect_value("third", third);
+
+    adapter_->FailNextWrite();
+    std::string failed(4096, 'F');
+    auto failed_slices = Slices(failed);
+    auto failed_put = writer_->Put("failed", failed_slices, dfs_only);
+    ASSERT_FALSE(failed_put);
+    EXPECT_EQ(failed_put.error(), ErrorCode::FILE_WRITE_FAIL);
+    auto missing = writer_->Query("failed");
+    ASSERT_FALSE(missing);
+    EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    // Same-size upsert reallocates into a new bucket.
+    std::string replacement(4096, 'R');
+    auto replacement_slices = Slices(replacement);
+    ASSERT_TRUE(writer_->Upsert("third", replacement_slices, dfs_only));
+    expect_value("third", replacement);
+}
+
 TEST_F(DfsImmutableBucketLruClientTest, BatchQueryRefreshesDfsBucketLru) {
     std::string first(4096, '1');
     std::string second(4096, '2');

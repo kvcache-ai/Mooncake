@@ -29,6 +29,7 @@
 #include <glog/logging.h>
 #include <signal.h>
 #include <sys/time.h>
+#include <atomic>
 
 #include "transfer_engine.h"
 
@@ -109,15 +110,39 @@ class TEBenchRunner : public BenchRunner {
 
     int runner(int thread_id);
 
+    // Stops the run from a worker thread; main then joins the workers and
+    // tears down normally. Workers must not call exit() (see BenchRunner).
+    void noteTransferFailed();
+
+    // Polls batch_id until it is terminal. A stop does not end the wait
+    // early: the transports may still be writing into the local buffers.
+    // Returns with status PENDING only if the batch did not finish within the
+    // drain timeout after the stop; the batch is then counted in
+    // abandoned_batches_.
+    mooncake::Status waitForBatch(BatchID batch_id,
+                                  mooncake::TransferStatus& status,
+                                  uint64_t& polls);
+
     size_t targetIndex(int thread_id) const;
 
     int localTargetThreadId(int thread_id) const;
 
    private:
+    enum class DramBacking {
+        kNone,
+        kNuma,
+        kSharedMemory,
+        kMmap,
+        kIsolatedMmap,
+    };
+
     std::unique_ptr<mooncake::TransferEngine> engine_;
     std::vector<void*> pinned_buffer_list_;
-    std::vector<char> shm_backed_;
-    std::vector<char> hugepage_backed_;
+    DramBacking dram_backing_ = DramBacking::kNone;
+    // Isolated anonymous mmap: leading PROT_NONE size and full mapping length
+    // saved at allocation so munmap does not recompute (and overflow).
+    size_t mmap_guard_ = 0;
+    size_t mmap_span_ = 0;
     std::vector<SegmentID> target_handles_;
     std::vector<std::shared_ptr<TransferMetadata::SegmentDesc>> target_infos_;
 
@@ -128,6 +153,9 @@ class TEBenchRunner : public BenchRunner {
     std::condition_variable cv_done_;
     int pending_ = 0;
     bool init_ok_ = true;
+    // Batches that may still be in flight (see waitForBatch); while non-zero
+    // freeBuffers() leaves the local buffers allocated.
+    std::atomic<uint64_t> abandoned_batches_{0};
 };
 
 }  // namespace tent
