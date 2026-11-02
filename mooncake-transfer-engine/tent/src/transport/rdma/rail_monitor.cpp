@@ -64,6 +64,7 @@ Status RailMonitor::load(std::shared_ptr<const Topology> local,
                          std::shared_ptr<const Topology> remote,
                          const std::string& rail_topo_json,
                          const Config* conf) {
+    std::lock_guard<std::mutex> guard(mutex_);
     const bool first_load = !ready_;
     const bool same_layout = ready_ &&
                              sameRailLayout(local_.get(), local.get()) &&
@@ -98,6 +99,11 @@ Status RailMonitor::load(std::shared_ptr<const Topology> local,
 }
 
 bool RailMonitor::isAvailable(int local_nic, int remote_nic) const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return isAvailableUnlocked(local_nic, remote_nic);
+}
+
+bool RailMonitor::isAvailableUnlocked(int local_nic, int remote_nic) const {
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
     if (it == rail_states_.end()) return false;
     // True only for Closed/healthy rails. Open (cooldown running),
@@ -111,6 +117,7 @@ bool RailMonitor::isAvailable(int local_nic, int remote_nic) const {
 
 uint64_t RailMonitor::localDeviceMask(const Topology::MemEntry& remote_memory,
                                       bool same_machine) const {
+    std::lock_guard<std::mutex> guard(mutex_);
     uint64_t mask = 0;
     if (!ready_) return mask;
     for (const auto& devices : remote_memory.device_list) {
@@ -134,10 +141,17 @@ uint64_t RailMonitor::localDeviceMask(const Topology::MemEntry& remote_memory,
     return mask;
 }
 
-bool RailMonitor::admit(int local_nic, int remote_nic) {
+bool RailMonitor::admit(int local_nic, int remote_nic, uint64_t& probe_token) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    probe_token = 0;
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
     if (it == rail_states_.end()) return false;
     auto& st = it->second;
+    auto arm_probe = [&] {
+        st.probe_in_flight = true;
+        st.active_probe_token = allocateProbeToken();
+        probe_token = st.active_probe_token;
+    };
     // Closed: healthy and directly usable. No probe, no flag -- a normal
     // transfer whose completion is the fast-path markRecovered no-op.
     if (!st.paused()) return true;
@@ -156,7 +170,7 @@ bool RailMonitor::admit(int local_nic, int remote_nic) {
         if (!st.probe_in_flight &&
             (probe_interval_.count() == 0 ||
              now - st.last_probe_time >= probe_interval_)) {
-            st.probe_in_flight = true;
+            arm_probe();
             st.last_probe_time = now;
             return true;
         }
@@ -169,7 +183,7 @@ bool RailMonitor::admit(int local_nic, int remote_nic) {
     // If an Open-phase probe is still in flight at expiry, wait for it.
     if (!st.probe_in_flight) {
         st.half_open = true;
-        st.probe_in_flight = true;
+        arm_probe();
         st.last_probe_time = now;
         LOG(INFO) << "Rail half-open: local_nic=" << local_nic
                   << " remote_nic=" << remote_nic
@@ -180,12 +194,16 @@ bool RailMonitor::admit(int local_nic, int remote_nic) {
     return false;
 }
 
-void RailMonitor::cancelProbe(int local_nic, int remote_nic) {
+void RailMonitor::cancelProbe(int local_nic, int remote_nic,
+                              uint64_t probe_token) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (probe_token == 0) return;
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
     if (it == rail_states_.end()) return;
     auto& st = it->second;
-    if (st.probe_in_flight) {
+    if (st.probe_in_flight && st.active_probe_token == probe_token) {
         st.probe_in_flight = false;
+        st.active_probe_token = 0;
         // Revert a Half-Open trial to expired-Open so the next admit() re-arms
         // a fresh trial. A plain Open probe just clears its flag.
         st.half_open = false;
@@ -193,10 +211,25 @@ void RailMonitor::cancelProbe(int local_nic, int remote_nic) {
     }
 }
 
-void RailMonitor::markFailed(int local_nic, int remote_nic) {
+uint64_t RailMonitor::allocateProbeToken() {
+    // Reserve zero for slices that did not admit a probe. Unsigned wraparound
+    // is defined; skip zero when it occurs so every active probe has an owner.
+    uint64_t token = next_probe_token_++;
+    if (token == 0) token = next_probe_token_++;
+    return token;
+}
+
+void RailMonitor::markFailed(int local_nic, int remote_nic,
+                             uint64_t probe_token) {
+    std::lock_guard<std::mutex> guard(mutex_);
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
     if (it == rail_states_.end()) return;
     auto& st = it->second;
+    // A stale probe completion cannot be counted as a new failure cycle or
+    // consume a newer probe on the same rail.
+    if (probe_token != 0 &&
+        (!st.probe_in_flight || st.active_probe_token != probe_token))
+        return;
     auto now = std::chrono::steady_clock::now();
     if (st.error_count == 0 || now - st.last_error > error_window_) {
         st.error_count = 1;
@@ -209,8 +242,9 @@ void RailMonitor::markFailed(int local_nic, int remote_nic) {
     // sub-state: a Half-Open trial failure escalates and re-arms (the ONLY
     // escalation point for a paused rail); an Open-phase probe failure is a
     // no-op (was paused, defect A). Either way this is not a fresh burst.
-    if (st.probe_in_flight) {
+    if (probe_token != 0 && st.probe_in_flight) {
         st.probe_in_flight = false;
+        st.active_probe_token = 0;
         if (st.half_open) {
             st.half_open = false;
             st.cooldown *= 2;
@@ -275,15 +309,23 @@ void RailMonitor::markFailed(int local_nic, int remote_nic) {
     }
 }
 
-void RailMonitor::markRecovered(int local_nic, int remote_nic) {
+void RailMonitor::markRecovered(int local_nic, int remote_nic,
+                                uint64_t probe_token) {
+    std::lock_guard<std::mutex> guard(mutex_);
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
     if (it == rail_states_.end()) return;
     auto& st = it->second;
+    // A nonzero token belongs to an admitted probe. It can resolve the rail
+    // only while it is still the active probe; old completions are no-ops.
+    if (probe_token != 0 &&
+        (!st.probe_in_flight || st.active_probe_token != probe_token))
+        return;
     // A probe/trial succeeded: clear the in-flight flag and close the rail,
     // resetting all backoff memory. This is the early-recovery path for both
     // an Open-phase probe and a Half-Open trial.
-    if (st.probe_in_flight) {
+    if (probe_token != 0 && st.probe_in_flight) {
         st.probe_in_flight = false;
+        st.active_probe_token = 0;
         st.half_open = false;
         st.error_count = 0;
         st.resume_time = {};
@@ -294,6 +336,9 @@ void RailMonitor::markRecovered(int local_nic, int remote_nic) {
         updateBestMapping();
         return;
     }
+    // A normal completion cannot resolve an in-flight probe owned by another
+    // slice. It may still resolve a paused rail when no probe is active.
+    if (st.probe_in_flight) return;
     // Fast path: a healthy rail stays healthy. 99%+ of completions land
     // here, so we must not touch best_mapping_ or write any field.
     if (!st.paused() && st.error_count == 0 && st.cooldown.count() == 0) return;
@@ -314,6 +359,7 @@ void RailMonitor::markRecovered(int local_nic, int remote_nic) {
 }
 
 int RailMonitor::findBestRemoteDevice(int local_nic, int remote_numa) {
+    std::lock_guard<std::mutex> guard(mutex_);
     if (remote_numa >= 0 && remote_numa < (int)kMaxNuma) {
         if (best_mapping_[remote_numa].count(local_nic))
             return best_mapping_[remote_numa][local_nic];
@@ -325,7 +371,7 @@ int RailMonitor::findBestRemoteDevice(int local_nic, int remote_numa) {
     // map instead of whichever NUMA bucket happens to be visited first.
     auto direct = direct_rails_.find(local_nic);
     if (direct != direct_rails_.end() && direct->second >= 0 &&
-        isAvailable(local_nic, direct->second))
+        isAvailableUnlocked(local_nic, direct->second))
         return direct->second;
 
     for (remote_numa = 0; remote_numa < (int)kMaxNuma; ++remote_numa) {
@@ -569,10 +615,10 @@ void RailMonitor::updateBestMapping() {
                         remote_nic =
                             remote_devices[remote_numa][i % remote_cnt];
                 }
-                if (!isAvailable(local_nic, remote_nic)) {
+                if (!isAvailableUnlocked(local_nic, remote_nic)) {
                     bool found = false;
                     for (int cand : remote_devices[remote_numa]) {
-                        if (isAvailable(local_nic, cand)) {
+                        if (isAvailableUnlocked(local_nic, cand)) {
                             remote_nic = cand;
                             found = true;
                             break;
@@ -580,7 +626,7 @@ void RailMonitor::updateBestMapping() {
                     }
                     if (!found) {
                         for (int cand = 0; cand < remote_nic_count; ++cand) {
-                            if (isAvailable(local_nic, cand)) {
+                            if (isAvailableUnlocked(local_nic, cand)) {
                                 remote_nic = cand;
                                 break;
                             }

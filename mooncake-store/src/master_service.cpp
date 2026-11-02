@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <array>
-#include <algorithm>
 #include <cassert>
 #include <cctype>
 #include <cmath>
@@ -62,13 +61,6 @@
 namespace mooncake {
 
 namespace {
-
-uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
-    if (lhs > std::numeric_limits<uint64_t>::max() - rhs) {
-        return std::numeric_limits<uint64_t>::max();
-    }
-    return lhs + rhs;
-}
 
 uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
     if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs) {
@@ -984,9 +976,9 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         op.is_memory_segment = true;
         op.file_path.clear();
         auto bytes = struct_pack::serialize(op);
-        PersistSegmentOpForHAOrEnqueue("MountSegment", OpType::SEGMENT_MOUNT,
-                                       segment.te_endpoint,
-                                       std::string(bytes.begin(), bytes.end()));
+        PersistSegmentOpForHA("MountSegment", OpType::SEGMENT_MOUNT,
+                              segment.te_endpoint,
+                              std::string(bytes.begin(), bytes.end()));
     }
     if (mount_result == ErrorCode::OK) {
         UpdateClientHostId(client_id, segment.host_id);
@@ -1381,9 +1373,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             op.is_memory_segment = true;
             op.file_path.clear();
             auto bytes = struct_pack::serialize(op);
-            PersistSegmentOpForHAOrEnqueue(
-                "ReMountSegment", OpType::SEGMENT_MOUNT, seg.name,
-                std::string(bytes.begin(), bytes.end()));
+            PersistSegmentOpForHA("ReMountSegment", OpType::SEGMENT_MOUNT,
+                                  seg.name,
+                                  std::string(bytes.begin(), bytes.end()));
         }
     }
     NotifyPolicyCapacityChanged();
@@ -2744,9 +2736,9 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     if (enable_oplog_ && ordered_oplog_writer_ && !te_endpoint.empty()) {
         SegmentUnmountOp op{te_endpoint};
         auto bytes = struct_pack::serialize(op);
-        PersistSegmentOpForHAOrEnqueue("UnmountSegment",
-                                       OpType::SEGMENT_UNMOUNT, te_endpoint,
-                                       std::string(bytes.begin(), bytes.end()));
+        PersistSegmentOpForHA("UnmountSegment", OpType::SEGMENT_UNMOUNT,
+                              te_endpoint,
+                              std::string(bytes.begin(), bytes.end()));
     }
     NotifyPolicyCapacityChanged();
     return {};
@@ -3813,12 +3805,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         }
     }
 
-    const bool bounded_restore = metadata_store != nullptr;
-    // Batch restore spans chunks, so it needs an ordered cross-chunk index;
-    // legacy restore keeps its contiguous vector-and-sort validation path.
-    std::unordered_map<const StandbySegmentInfo*,
-                       std::vector<std::pair<uintptr_t, uint64_t>>>
-        legacy_memory_ranges;
+    // Batch restore spans chunks, so it needs an ordered cross-chunk index.
     std::unordered_map<const StandbySegmentInfo*, std::map<uintptr_t, uint64_t>>
         bounded_memory_ranges;
     std::unordered_map<std::string, uint64_t> restored_accounted_memory_bytes;
@@ -3920,29 +3907,21 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                             return tl::make_unexpected(
                                 ErrorCode::INVALID_PARAMS);
                         }
-                        if (bounded_restore) {
-                            auto& ranges = bounded_memory_ranges[segment];
-                            auto next =
-                                ranges.lower_bound(buffer.buffer_address_);
-                            const uintptr_t end =
-                                buffer.buffer_address_ + buffer.size_;
-                            if ((next != ranges.end() && end > next->first) ||
-                                (next != ranges.begin() &&
-                                 std::prev(next)->first +
-                                         std::prev(next)->second >
-                                     buffer.buffer_address_)) {
-                                LOG(ERROR) << "RestoreFromStandbySnapshot: "
-                                              "overlapping "
-                                              "memory descriptors";
-                                return tl::make_unexpected(
-                                    ErrorCode::INVALID_PARAMS);
-                            }
-                            ranges.emplace(buffer.buffer_address_,
-                                           buffer.size_);
-                        } else {
-                            legacy_memory_ranges[segment].emplace_back(
-                                buffer.buffer_address_, buffer.size_);
+                        auto& ranges = bounded_memory_ranges[segment];
+                        auto next = ranges.lower_bound(buffer.buffer_address_);
+                        const uintptr_t end =
+                            buffer.buffer_address_ + buffer.size_;
+                        if ((next != ranges.end() && end > next->first) ||
+                            (next != ranges.begin() &&
+                             std::prev(next)->first + std::prev(next)->second >
+                                 buffer.buffer_address_)) {
+                            LOG(ERROR) << "RestoreFromStandbySnapshot: "
+                                          "overlapping "
+                                          "memory descriptors";
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_PARAMS);
                         }
+                        ranges.emplace(buffer.buffer_address_, buffer.size_);
                         bytes += buffer.size_;
                     }
 
@@ -4019,22 +3998,6 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
             }
             prepared.push_back({&entry, std::move(tenant_id),
                                 std::move(user_key), std::move(replicas)});
-        }
-
-        if (!bounded_restore) {
-            for (auto& [segment, ranges] : legacy_memory_ranges) {
-                (void)segment;
-                std::sort(ranges.begin(), ranges.end());
-                for (size_t i = 1; i < ranges.size(); ++i) {
-                    if (ranges[i].first <
-                        ranges[i - 1].first + ranges[i - 1].second) {
-                        LOG(ERROR)
-                            << "RestoreFromStandbySnapshot: overlapping memory "
-                               "descriptors";
-                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                    }
-                }
-            }
         }
 
         if (auto published = PublishRestoredObjects(prepared, installed);
@@ -4323,13 +4286,6 @@ auto MasterService::BatchQueryIp(const std::vector<UUID>& client_ids)
         }
     }
     return results;
-}
-
-auto MasterService::BatchReplicaClear(
-    const std::vector<std::string>& object_keys, const UUID& client_id,
-    const std::string& segment_name)
-    -> tl::expected<std::vector<std::string>, ErrorCode> {
-    return BatchReplicaClear(object_keys, client_id, segment_name, "default");
 }
 
 auto MasterService::BatchReplicaClear(
@@ -5324,6 +5280,12 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             if (metadata.HasReplica(&Replica::fn_is_completed) ||
                 metadata.put_start_time + put_start_discard_timeout_sec_ >=
                     now) {
+                // A put of what the store already holds is a read of it: the
+                // writer just showed the object is still wanted.
+                if (HasReadableReplica(metadata)) {
+                    metadata.GrantReadLease(
+                        std::chrono::milliseconds(default_kv_lease_ttl_));
+                }
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
             if (enable_oplog_ && ordered_oplog_writer_) {
@@ -8691,13 +8653,6 @@ void MasterService::CleanupExpiredDynamicReplicationState() {
 }
 
 tl::expected<ReplicaActionLease, ErrorCode>
-MasterService::SubmitReplicaActionProposal(
-    const ReplicaActionProposal& proposal) {
-    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    return SubmitReplicaActionProposalLocked(proposal);
-}
-
-tl::expected<ReplicaActionLease, ErrorCode>
 MasterService::SubmitReplicaActionProposalLocked(
     const ReplicaActionProposal& proposal) {
     const int64_t now_ms = DynamicReplicationController::NowMs();
@@ -10259,9 +10214,6 @@ void MasterService::NofHeartbeatThreadFunc() {
                 auto [it, inserted] =
                     nof_heartbeat_states_.try_emplace(snapshot.segment_id);
                 auto& state = it->second;
-                state.owner_client_id = snapshot.client_id;
-                state.segment_name = snapshot.segment.name;
-                state.te_endpoint = snapshot.segment.te_endpoint;
                 if (inserted) {
                     int64_t spread_ms = 0;
                     if (!ok_segments.empty()) {
@@ -10329,7 +10281,6 @@ void MasterService::NofHeartbeatThreadFunc() {
                 if (it != nof_heartbeat_states_.end()) {
                     it->second.consecutive_failures = 0;
                     it->second.last_success_at = success_time;
-                    it->second.last_error_reason.clear();
                     it->second.next_probe_at =
                         success_time + nof_heartbeat_interval_sec_;
                 }
@@ -10359,7 +10310,6 @@ void MasterService::NofHeartbeatThreadFunc() {
             if (it != nof_heartbeat_states_.end()) {
                 it->second.consecutive_failures++;
                 failure_count = it->second.consecutive_failures;
-                it->second.last_error_reason = error_reason;
                 it->second.next_probe_at =
                     failure_time + nof_heartbeat_interval_sec_;
                 should_unmount =
@@ -10699,12 +10649,6 @@ tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
         return tl::make_unexpected(err);
     }
     return {};
-}
-
-tl::expected<void, ErrorCode> MasterService::ValidateDrainRequest(
-    const CreateDrainJobRequest& request) {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    return ValidateDrainRequestLocked(segment_access, request);
 }
 
 tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
@@ -11618,14 +11562,14 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
         }
         payload.replicas.push_back(replica.get_descriptor());
     }
-
-    auto result = struct_pack::serialize(payload);
-    return std::string(result.begin(), result.end());
+    return SerializeMetadataForOpLogFromReplicaDescriptors(metadata, replicas);
 }
 
 std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     const ObjectMetadata& metadata,
     const std::vector<Replica::Descriptor>& replicas) const {
+    // Leases are not serialized: a standby does not evict, and a promoted
+    // primary grants fresh leases instead of restoring old ones.
     MetadataPayload payload;
     payload.client_id = metadata.client_id;
     payload.size = metadata.TotalLength();
@@ -11829,11 +11773,6 @@ MasterService::AppendReservedOpLogWithDurableFinalize(
 }
 
 tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
-    const char* why, const std::string& key) {
-    return PersistRemoveForHA(why, TenantId::Default(), key);
-}
-
-tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
     const char* why, const TenantId& tenant_id, const std::string& key) {
     auto result = AppendOpLogWithDurableFinalize(
         OpType::REMOVE, tenant_id.value(), key, {}, nullptr);
@@ -11845,19 +11784,11 @@ tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
     return {};
 }
 
-void MasterService::PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
-                                                   const std::string& key,
-                                                   const std::string& payload) {
-    PersistSegmentOpForHAOrEnqueue(why, type, TenantId::Default(), key,
-                                   payload);
-}
-
-void MasterService::PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
-                                                   const TenantId& tenant_id,
-                                                   const std::string& key,
-                                                   const std::string& payload) {
-    auto result =
-        AppendOpLogVisibleBeforeDurable(type, tenant_id.value(), key, payload);
+void MasterService::PersistSegmentOpForHA(const char* why, OpType type,
+                                          const std::string& key,
+                                          const std::string& payload) {
+    auto result = AppendOpLogVisibleBeforeDurable(
+        type, TenantId::Default().value(), key, payload);
     if (!result) {
         LOG(WARNING) << why << ": segment OpLog queue failed for key=" << key
                      << ", type=" << static_cast<int>(type)

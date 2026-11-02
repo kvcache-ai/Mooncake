@@ -10,6 +10,8 @@ on:
       - '.github/workflows/deploy.yml'
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * *"
 
 # Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
@@ -46,6 +48,16 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r docs/requirements-docs.txt
+
+      - name: Restore download statistics
+        uses: actions/cache@v4
+        with:
+          path: docs/source/_static/pypi-downloads.json
+          key: pypi-downloads-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: pypi-downloads-v1-
+
+      - name: Refresh download statistics
+        run: python docs/scripts/update_pypi_downloads.py
 
       - name: Build documentation
         run: |
