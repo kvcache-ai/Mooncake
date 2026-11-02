@@ -166,6 +166,46 @@ class WorkerPoolTestPeer {
         for (auto &entry : pool.worker_thread_) entry.join();
     }
 
+    static void enqueuePrepared(WorkerPool &pool,
+                                const std::vector<Transport::Slice *> &slices) {
+        pool.enqueuePreparedSlices(slices, slices.size());
+    }
+
+    static uint64_t pendingForPeer(WorkerPool &pool, const std::string &path) {
+        const int owner = pool.postingThreadForPeer(path);
+        if (owner < 0) return 0;
+        return pool.pending_slice_state_[owner].load(std::memory_order_acquire);
+    }
+
+    static size_t queuedForPeer(WorkerPool &pool, const std::string &path) {
+        const int owner = pool.postingThreadForPeer(path);
+        if (owner < 0) return 0;
+        std::lock_guard<std::mutex> lock(pool.worker_slice_queue_lock_[owner]);
+        return pool.worker_slice_queue_[owner][path].size();
+    }
+
+    static uint64_t submittedCount(WorkerPool &pool) {
+        return pool.submitted_slice_count_.load(std::memory_order_acquire);
+    }
+
+    static bool hasPendingWork(WorkerPool &pool) {
+        return pool.hasPendingWork(0);
+    }
+
+    static void setPendingSetup(WorkerPool &pool, std::future<int> result) {
+        pool.pending_setups_[0]["pending-peer"].result = std::move(result);
+    }
+
+    static void setPendingRedispatch(WorkerPool &pool,
+                                    std::future<int> result) {
+        pool.pending_redispatch_[0][77].result = std::move(result);
+    }
+
+    static void clearPendingControlWork(WorkerPool &pool) {
+        pool.pending_setups_[0].clear();
+        pool.pending_redispatch_[0].clear();
+    }
+
     static int errorThreshold() { return WorkerPool::kRailErrorThreshold; }
 
     static uint64_t errorWindowNs() { return WorkerPool::kRailErrorWindowNs; }
@@ -626,6 +666,52 @@ TEST_F(WorkerPoolCongestionOffHealthTest,
     EXPECT_EQ(slice.status, Transport::Slice::FAILED);
 }
 #endif
+
+TEST_F(WorkerPoolRailStateTest, BatchedEnqueuePublishesPerWorkerPendingState) {
+    Transport::Slice first{}, second{}, third{};
+    first.peer_nic_path = kPeerA;
+    second.peer_nic_path = kPeerB;
+    third.peer_nic_path = kPeerA;
+
+    WorkerPoolTestPeer::enqueuePrepared(*worker_pool_,
+                                        {&first, &second, &third});
+
+    EXPECT_EQ(WorkerPoolTestPeer::queuedForPeer(*worker_pool_, kPeerA), 2);
+    EXPECT_EQ(WorkerPoolTestPeer::queuedForPeer(*worker_pool_, kPeerB), 1);
+    EXPECT_EQ(WorkerPoolTestPeer::submittedCount(*worker_pool_), 3);
+    const auto pending_a =
+        WorkerPoolTestPeer::pendingForPeer(*worker_pool_, kPeerA);
+    const auto pending_b =
+        WorkerPoolTestPeer::pendingForPeer(*worker_pool_, kPeerB);
+    // Both peer paths may hash to the same worker. The queued-count bits
+    // describe that worker's complete cross-thread queue in either case.
+    EXPECT_GE(pending_a, 2 * 2);
+    EXPECT_GE(pending_b, 1 * 2);
+    EXPECT_EQ(pending_a & 1, 0);
+    EXPECT_EQ(pending_b & 1, 0);
+}
+
+TEST_F(WorkerPoolRailStateTest, PendingControlWorkPreventsIdleWithoutSlices) {
+    EXPECT_FALSE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
+
+    std::promise<int> setup;
+    WorkerPoolTestPeer::setPendingSetup(*worker_pool_, setup.get_future());
+    EXPECT_TRUE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
+    setup.set_value(0);
+    // Ready results still need a worker pass to consume them.
+    EXPECT_TRUE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
+    WorkerPoolTestPeer::clearPendingControlWork(*worker_pool_);
+    EXPECT_FALSE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
+
+    std::promise<int> redispatch;
+    WorkerPoolTestPeer::setPendingRedispatch(*worker_pool_,
+                                           redispatch.get_future());
+    EXPECT_TRUE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
+    redispatch.set_value(0);
+    EXPECT_TRUE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
+    WorkerPoolTestPeer::clearPendingControlWork(*worker_pool_);
+    EXPECT_FALSE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
+}
 
 TEST_F(WorkerPoolRailStateTest, FailuresBelowThresholdDoNotPauseCount) {
     for (int i = 0; i < WorkerPoolTestPeer::errorThreshold() - 1; ++i)
