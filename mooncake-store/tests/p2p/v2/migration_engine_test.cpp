@@ -196,7 +196,14 @@ class MigrationEngineTest : public ::testing::Test {
         logical.tags = {"fast"};
         // No event sink: nothing in this file asserts on facts, and the engine
         // publishes none of its own.
-        return std::make_unique<TilerManager>(logical, BlockIndexConfig{},
+        auto index = CreateBlockIndex(BlockIndexConfig{}, logical.tiler_id,
+                                      (*pool)->Capacity());
+        if (!index) {
+            ADD_FAILURE() << "CreateBlockIndex failed: "
+                          << toString(index.error());
+            return nullptr;
+        }
+        return std::make_unique<TilerManager>(logical, std::move(index.value()),
                                               std::move(pool.value()),
                                               registry_, EventPublisher());
     }
@@ -221,7 +228,14 @@ class MigrationEngineTest : public ::testing::Test {
         logical.memory_type = MemoryType::NVME;
         logical.priority = priority;
         logical.tags = {"slow"};
-        return std::make_unique<TilerManager>(logical, BlockIndexConfig{},
+        auto index = CreateBlockIndex(BlockIndexConfig{}, logical.tiler_id,
+                                      (*pool)->Capacity());
+        if (!index) {
+            ADD_FAILURE() << "CreateBlockIndex failed: "
+                          << toString(index.error());
+            return nullptr;
+        }
+        return std::make_unique<TilerManager>(logical, std::move(index.value()),
                                               std::move(pool.value()),
                                               registry_, EventPublisher());
     }

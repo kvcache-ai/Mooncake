@@ -118,10 +118,10 @@ class OffloadConsumer final : public EventConsumer {
         }
 
         // The block that arrived is not the one that should leave: what to
-        // shed is a property of the tier's contents, and its eviction index is
+        // shed is a property of the tier's contents, and its block index is
         // what orders them. The index bounds the candidate window; skip
         // temporarily ineligible entries and enqueue at most one command.
-        auto victims = source->Eviction()->SelectVictims(source->Capacity());
+        auto victims = source->Index()->SelectVictims(source->Capacity());
         for (const BlockToken& victim : victims) {
             auto registration = victim.registration.Lock();
             if (!registration.has_value() || registration->IsRetired()) {

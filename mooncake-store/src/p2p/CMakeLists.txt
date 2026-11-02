@@ -57,7 +57,6 @@ set(MOONCAKE_STORE_P2P_SOURCES
     client/data_manager/v2/v2_common.cpp
     client/data_manager/v2/movement.cpp
     client/data_manager/v2/copier.cpp
-    client/data_manager/v2/eviction_index.cpp
     client/data_manager/v2/eviction_policy.cpp
     client/data_manager/v2/movement_tracker.cpp
     client/data_manager/v2/tier_graph.cpp

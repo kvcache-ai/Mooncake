@@ -214,9 +214,12 @@ class MovementConsumersTest : public ::testing::Test {
         logical.tiler_id = generate_uuid();
         logical.memory_type = MemoryType::DRAM;
         logical.priority = priority;
+        auto index = CreateBlockIndex(BlockIndexConfig{}, logical.tiler_id,
+                                      (*pool)->Capacity());
+        if (!index) return nullptr;
         return std::make_unique<TilerManager>(
-            logical, BlockIndexConfig{}, std::move(pool.value()), registry_,
-            EventPublisher(), EvictionIndexConfig{}, offload_high_watermark);
+            logical, std::move(index.value()), std::move(pool.value()),
+            registry_, EventPublisher(), offload_high_watermark);
     }
 
     std::unique_ptr<TilerManager> MakeSsdTiler(int32_t priority,
@@ -233,7 +236,14 @@ class MovementConsumersTest : public ::testing::Test {
         logical.tiler_id = generate_uuid();
         logical.memory_type = MemoryType::NVME;
         logical.priority = priority;
-        return std::make_unique<TilerManager>(logical, BlockIndexConfig{},
+        auto index = CreateBlockIndex(BlockIndexConfig{}, logical.tiler_id,
+                                      (*pool)->Capacity());
+        if (!index) {
+            ADD_FAILURE() << "CreateBlockIndex failed: "
+                          << toString(index.error());
+            return nullptr;
+        }
+        return std::make_unique<TilerManager>(logical, std::move(index.value()),
                                               std::move(pool.value()),
                                               registry_, EventPublisher());
     }

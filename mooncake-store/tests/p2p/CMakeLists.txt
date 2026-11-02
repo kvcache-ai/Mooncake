@@ -112,7 +112,11 @@ add_p2p_store_test(v2_block_registry_test v2/block_registry_test.cpp)
 add_p2p_store_test(v2_block_index_test v2/block_index_test.cpp)
 add_p2p_store_test(v2_block_pool_test v2/block_pool_test.cpp)
 add_p2p_store_test(v2_local_copy_engine_test v2/local_copy_engine_test.cpp)
-add_p2p_store_test(v2_eviction_index_test v2/eviction_index_test.cpp)
+add_p2p_store_test(v2_block_index_ordering_test
+                   v2/block_index_ordering_test.cpp)
+add_p2p_store_test(v2_block_index_failure_test v2/block_index_failure_test.cpp)
+set_tests_properties(v2_block_index_test v2_block_index_ordering_test
+                     v2_block_index_failure_test PROPERTIES TIMEOUT 60)
 add_p2p_store_test(v2_eviction_policy_test v2/eviction_policy_test.cpp)
 add_p2p_store_test(v2_movement_tracker_test v2/movement_tracker_test.cpp)
 add_p2p_store_test(v2_tier_graph_test v2/tier_graph_test.cpp)

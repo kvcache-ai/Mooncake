@@ -44,7 +44,7 @@ std::string PayloadFor(std::string_view key) {
     return payload;
 }
 
-class BlockIndexTest : public ::testing::Test {
+class BlockIndexTest : public ::testing::TestWithParam<const char*> {
    protected:
     static void SetUpTestSuite() {
         static std::once_flag logging_once;
@@ -70,7 +70,12 @@ class BlockIndexTest : public ::testing::Test {
         ASSERT_TRUE(pool_->Init().has_value());
 
         registry_ = BlockRegistry(BlockRegistryConfig{});
-        index_ = std::make_unique<BlockIndex>(kTilerId, BlockIndexConfig{});
+        BlockIndexConfig config;
+        config.type = GetParam();
+        config.max_victim_candidates = 1024;
+        auto index = CreateBlockIndex(config, kTilerId, kArenaBytes);
+        ASSERT_TRUE(index.has_value()) << toString(index.error());
+        index_ = std::move(index.value());
     }
 
     BlockRegistrationHandle Register(std::string_view key) {
@@ -118,7 +123,7 @@ class BlockIndexTest : public ::testing::Test {
     std::unique_ptr<BlockIndex> index_;
 };
 
-TEST_F(BlockIndexTest, InsertedBlockIsVisibleWithItsKeySizeAndRegistration) {
+TEST_P(BlockIndexTest, InsertedBlockIsVisibleWithItsKeySizeAndRegistration) {
     const std::string payload = PayloadFor("alpha");
     auto registration = Register("alpha");
 
@@ -140,7 +145,7 @@ TEST_F(BlockIndexTest, InsertedBlockIsVisibleWithItsKeySizeAndRegistration) {
     EXPECT_EQ(found->Entry().get(), inserted->Entry().get());
 }
 
-TEST_F(BlockIndexTest, InsertConsumesTheCompletedBlockOnSuccess) {
+TEST_P(BlockIndexTest, InsertConsumesTheCompletedBlockOnSuccess) {
     auto registration = Register("consumed");
     CompletedBlock block = MakeCompleted("consumed", PayloadFor("consumed"));
     ASSERT_TRUE(static_cast<bool>(block));
@@ -152,7 +157,7 @@ TEST_F(BlockIndexTest, InsertConsumesTheCompletedBlockOnSuccess) {
     EXPECT_FALSE(static_cast<bool>(block));
 }
 
-TEST_F(BlockIndexTest,
+TEST_P(BlockIndexTest,
        DuplicateRegistrationIsRejectedAndTheRejectedBlockIsReclaimed) {
     auto registration = Register("dup");
     InsertAndForget(registration, PayloadFor("dup"));
@@ -177,7 +182,7 @@ TEST_F(BlockIndexTest,
     EXPECT_EQ(index_->Stats().entry_count, 1u);
 }
 
-TEST_F(BlockIndexTest,
+TEST_P(BlockIndexTest,
        InsertWithoutARegistrationIsRejectedAndStillConsumesTheBlock) {
     CompletedBlock block = MakeCompleted("orphan", PayloadFor("orphan"));
     ASSERT_TRUE(static_cast<bool>(block));
@@ -190,7 +195,7 @@ TEST_F(BlockIndexTest,
     EXPECT_EQ(index_->Stats().entry_count, 0u);
 }
 
-TEST_F(BlockIndexTest, LookupOfAnUnindexedRegistrationMisses) {
+TEST_P(BlockIndexTest, LookupOfAnUnindexedRegistrationMisses) {
     auto indexed = Register("present");
     InsertAndForget(indexed, PayloadFor("present"));
 
@@ -204,7 +209,7 @@ TEST_F(BlockIndexTest, LookupOfAnUnindexedRegistrationMisses) {
     EXPECT_EQ(index_->Erase(absent), nullptr);
 }
 
-TEST_F(BlockIndexTest, EraseDetachesTheEntryAndSubsequentLookupsMiss) {
+TEST_P(BlockIndexTest, EraseDetachesTheEntryAndSubsequentLookupsMiss) {
     auto registration = Register("gone");
     InsertAndForget(registration, PayloadFor("gone"));
 
@@ -221,7 +226,7 @@ TEST_F(BlockIndexTest, EraseDetachesTheEntryAndSubsequentLookupsMiss) {
     EXPECT_EQ(index_->Erase(registration), nullptr);
 }
 
-TEST_F(BlockIndexTest, EraseWithAStaleBlockIdLeavesTheEntryInPlace) {
+TEST_P(BlockIndexTest, EraseWithAStaleBlockIdLeavesTheEntryInPlace) {
     auto registration = Register("guarded");
     InsertAndForget(registration, PayloadFor("guarded"));
 
@@ -246,7 +251,7 @@ TEST_F(BlockIndexTest, EraseWithAStaleBlockIdLeavesTheEntryInPlace) {
     EXPECT_FALSE(index_->Lookup(registration).has_value());
 }
 
-TEST_F(BlockIndexTest, PhysicalMemoryIsHeldUntilTheLastSnapshotIsReleased) {
+TEST_P(BlockIndexTest, PhysicalMemoryIsHeldUntilTheLastSnapshotIsReleased) {
     const std::string payload = PayloadFor("deferred-snapshot");
     auto registration = Register("deferred-snapshot");
     ASSERT_EQ(pool_->Usage(), 0u);
@@ -272,7 +277,7 @@ TEST_F(BlockIndexTest, PhysicalMemoryIsHeldUntilTheLastSnapshotIsReleased) {
     EXPECT_EQ(pool_->Usage(), 0u);
 }
 
-TEST_F(BlockIndexTest, PhysicalMemoryIsHeldUntilTheDetachedEntryIsReleased) {
+TEST_P(BlockIndexTest, PhysicalMemoryIsHeldUntilTheDetachedEntryIsReleased) {
     const std::string payload = PayloadFor("deferred-detached");
     auto registration = Register("deferred-detached");
     InsertAndForget(registration, payload);
@@ -292,7 +297,7 @@ TEST_F(BlockIndexTest, PhysicalMemoryIsHeldUntilTheDetachedEntryIsReleased) {
     EXPECT_EQ(pool_->Usage(), 0u);
 }
 
-TEST_F(BlockIndexTest, EveryEntryLivesOnlyInTheShardShardForSelects) {
+TEST_P(BlockIndexTest, EveryEntryLivesOnlyInTheShardShardForSelects) {
     constexpr int kKeys = 200;
     std::vector<BlockRegistrationHandle> registrations;
     for (int i = 0; i < kKeys; ++i) {
@@ -324,7 +329,7 @@ TEST_F(BlockIndexTest, EveryEntryLivesOnlyInTheShardShardForSelects) {
     }
 }
 
-TEST_F(BlockIndexTest, SnapshotOfEveryShardYieldsEachEntryExactlyOnce) {
+TEST_P(BlockIndexTest, SnapshotOfEveryShardYieldsEachEntryExactlyOnce) {
     constexpr int kKeys = 128;
     // The handles are dropped at the end of each iteration on purpose: the
     // registry only holds weak references, so the walk below is also a check
@@ -353,7 +358,7 @@ TEST_F(BlockIndexTest, SnapshotOfEveryShardYieldsEachEntryExactlyOnce) {
     EXPECT_TRUE(index_->SnapshotShard(index_->ShardCount()).empty());
 }
 
-TEST_F(BlockIndexTest, StatsFollowInsertedAndErasedBytes) {
+TEST_P(BlockIndexTest, StatsFollowInsertedAndErasedBytes) {
     auto stats = index_->Stats();
     EXPECT_EQ(stats.entry_count, 0u);
     EXPECT_EQ(stats.indexed_bytes, 0u);
@@ -386,7 +391,7 @@ TEST_F(BlockIndexTest, StatsFollowInsertedAndErasedBytes) {
     EXPECT_EQ(stats.indexed_bytes, small.size() + large.size());
 }
 
-TEST_F(BlockIndexTest, DrainEmptiesEveryShardAndHandsBackEveryEntry) {
+TEST_P(BlockIndexTest, DrainEmptiesEveryShardAndHandsBackEveryEntry) {
     constexpr int kKeys = 100;
     std::vector<BlockRegistrationHandle> registrations;
     for (int i = 0; i < kKeys; ++i) {
@@ -417,9 +422,10 @@ TEST_F(BlockIndexTest, DrainEmptiesEveryShardAndHandsBackEveryEntry) {
     EXPECT_EQ(pool_->Usage(), 0u);
 
     EXPECT_TRUE(index_->Drain().empty());
+    EXPECT_TRUE(index_->SelectVictims(kArenaBytes).empty());
 }
 
-TEST_F(BlockIndexTest, BlockLocalIdsAreUniqueAcrossShards) {
+TEST_P(BlockIndexTest, BlockLocalIdsAreUniqueAcrossShards) {
     constexpr int kKeys = 500;
     std::unordered_set<uint64_t> local_ids;
     for (int i = 0; i < kKeys; ++i) {
@@ -435,7 +441,7 @@ TEST_F(BlockIndexTest, BlockLocalIdsAreUniqueAcrossShards) {
     EXPECT_EQ(local_ids.size(), static_cast<size_t>(kKeys));
 }
 
-TEST_F(BlockIndexTest,
+TEST_P(BlockIndexTest,
        ConcurrentInsertsOfDistinctRegistrationsAllBecomeVisible) {
     constexpr int kThreads = 8;
     constexpr int kPerThread = 64;
@@ -470,6 +476,7 @@ TEST_F(BlockIndexTest,
     auto stats = index_->Stats();
     EXPECT_EQ(stats.entry_count, keys.size());
     EXPECT_EQ(stats.indexed_bytes, keys.size() * kBlockBytes);
+    EXPECT_EQ(index_->SelectVictims(kArenaBytes).size(), keys.size());
 
     // Every writer's entry must be readable and carry its own bytes: a lost
     // update or a crossed allocation would show up here.
@@ -482,7 +489,7 @@ TEST_F(BlockIndexTest,
     }
 }
 
-TEST_F(BlockIndexTest, LookupRacingEraseNeverReadsTornOrFreedBytes) {
+TEST_P(BlockIndexTest, LookupRacingEraseNeverReadsTornOrFreedBytes) {
     constexpr int kKeys = 128;
     constexpr int kReaders = 2;
     std::vector<std::string> keys;
@@ -542,6 +549,7 @@ TEST_F(BlockIndexTest, LookupRacingEraseNeverReadsTornOrFreedBytes) {
         << "every reader must read a snapshot held across Erase";
     EXPECT_EQ(index_->Stats().entry_count, 0u);
     EXPECT_EQ(index_->Stats().indexed_bytes, 0u);
+    EXPECT_TRUE(index_->SelectVictims(kArenaBytes).empty());
     for (const auto& registration : registrations) {
         EXPECT_FALSE(index_->Lookup(registration).has_value());
     }
@@ -549,7 +557,7 @@ TEST_F(BlockIndexTest, LookupRacingEraseNeverReadsTornOrFreedBytes) {
     EXPECT_EQ(pool_->Usage(), 0u);
 }
 
-TEST_F(BlockIndexTest,
+TEST_P(BlockIndexTest,
        ValidateBlockIndexConfigRejectsZeroShardsAndOutOfRangeLoadFactor) {
     EXPECT_TRUE(ValidateBlockIndexConfig(BlockIndexConfig{}).has_value());
 
@@ -572,6 +580,9 @@ TEST_F(BlockIndexTest,
     exactly_one.max_load_factor = 1.0F;
     EXPECT_TRUE(ValidateBlockIndexConfig(exactly_one).has_value());
 }
+
+INSTANTIATE_TEST_SUITE_P(Orderings, BlockIndexTest,
+                         ::testing::Values("lru", "multi_lru", "tinylfu_lru"));
 
 }  // namespace
 }  // namespace mooncake::v2

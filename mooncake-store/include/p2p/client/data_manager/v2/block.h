@@ -223,9 +223,9 @@ using BlockEntryPtr = std::shared_ptr<const BlockEntry>;
  * @struct BlockToken
  * @brief A non-owning name for one committed block.
  *
- * Everything that reasons about a block without owning it -- the eviction
- * index, the evict engine, a movement proposal -- holds one of these. Every
- * field is a name, not a resource: the weak registration and the BlockId are
+ * Everything that reasons about a block without owning it -- the evict engine
+ * or a movement proposal -- holds one of these. Every field is a name, not a
+ * resource: the weak registration and the BlockId are
  * re-validated against the owning BlockIndex, under its shard lock, before
  * anything is removed or copied. That is what stops approximate state from
  * ever becoming a second source of truth about what exists.
@@ -268,8 +268,8 @@ class CompletedBlock {
     friend class MutableBlock;
     friend class TilerManager;
     friend class BlockIndex;
-    // BlockIndex::Insert moves the allocation and the key straight into the
-    // BlockEntry it builds, which is why it needs access here.
+    // BlockIndex's protected entry builder transfers resources on behalf of
+    // its backends, which therefore need no access to these private fields.
     CompletedBlock(BlockAllocation allocation, std::string key)
         : allocation_(std::move(allocation)),
           key_(std::move(key)),

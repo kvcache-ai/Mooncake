@@ -130,7 +130,14 @@ class TilerManagerTest : public ::testing::Test {
         logical.memory_type = MemoryType::DRAM;
         logical.priority = priority;
         logical.tags = {"fast"};
-        return std::make_unique<TilerManager>(logical, BlockIndexConfig{},
+        auto index = CreateBlockIndex(BlockIndexConfig{}, logical.tiler_id,
+                                      (*pool)->Capacity());
+        if (!index) {
+            ADD_FAILURE() << "CreateBlockIndex failed: "
+                          << toString(index.error());
+            return nullptr;
+        }
+        return std::make_unique<TilerManager>(logical, std::move(index.value()),
                                               std::move(pool.value()),
                                               registry_, EventPublisher(sink_));
     }
@@ -155,7 +162,14 @@ class TilerManagerTest : public ::testing::Test {
         logical.memory_type = MemoryType::NVME;
         logical.priority = priority;
         logical.tags = {"slow"};
-        return std::make_unique<TilerManager>(logical, BlockIndexConfig{},
+        auto index = CreateBlockIndex(BlockIndexConfig{}, logical.tiler_id,
+                                      (*pool)->Capacity());
+        if (!index) {
+            ADD_FAILURE() << "CreateBlockIndex failed: "
+                          << toString(index.error());
+            return nullptr;
+        }
+        return std::make_unique<TilerManager>(logical, std::move(index.value()),
                                               std::move(pool.value()),
                                               registry_, EventPublisher(sink_));
     }
@@ -423,16 +437,8 @@ TEST_F(TilerManagerTest, DrainAllEmptiesTheIndexAndReleasesTheSpace) {
     EXPECT_EQ(fast_->Usage(), 0u);
 }
 
-// ---------------------------------------------------------------------------
-// The eviction index beside the BlockIndex
-// ---------------------------------------------------------------------------
-
-// The safety-net scan the evict engine runs: one shard at a time, so it never
-// holds more than one index lock. A per-shard snapshot is authoritative for
-// its own shard only -- if Reconcile treats it as proof about the whole tier,
-// walking the shards in turn leaves just the last shard's blocks, and a block
-// the ordering has forgotten is one nothing offers as a victim again.
-TEST_F(TilerManagerTest, ReconcilingShardByShardKeepsTheWholeTierOrdered) {
+// Snapshots and victim selection enumerate the same unified membership.
+TEST_F(TilerManagerTest, ShardSnapshotsAndVictimsCoverTheSameBlocks) {
     constexpr size_t kKeys = 12;
     for (size_t i = 0; i < kKeys; ++i) {
         ImmutableBlock block =
@@ -440,25 +446,29 @@ TEST_F(TilerManagerTest, ReconcilingShardByShardKeepsTheWholeTierOrdered) {
                    Pattern(kBlockSize, static_cast<uint8_t>(i)));
         ASSERT_TRUE(static_cast<bool>(block));
     }
-    ASSERT_EQ(fast_->Eviction()->Stats().tracked_blocks, kKeys);
-
+    ASSERT_EQ(fast_->IndexStats().entry_count, kKeys);
+    size_t snapshots = 0;
     for (size_t shard = 0; shard < fast_->ShardCount(); ++shard) {
-        const BlockIndexSnapshot snapshot = fast_->SnapshotTokens(shard);
-        EXPECT_EQ(snapshot.shard_id, shard);
-        EXPECT_EQ(snapshot.shard_count, fast_->ShardCount());
-        EXPECT_FALSE(snapshot.complete);
-        fast_->Eviction()->Reconcile(snapshot);
+        for (const auto& entry : fast_->SnapshotShard(shard)) {
+            ++snapshots;
+            EXPECT_EQ(fast_->Index()->ShardFor(entry->block.registration.Id()),
+                      shard);
+        }
     }
-    EXPECT_EQ(fast_->Eviction()->Stats().tracked_blocks, kKeys);
-
-    // And the whole-tier form, which is the only one that can report the
-    // ordering whole again.
-    const BlockIndexSnapshot everything = fast_->SnapshotAllTokens();
-    EXPECT_TRUE(everything.complete);
-    EXPECT_EQ(everything.entries.size(), kKeys);
-    fast_->Eviction()->Reconcile(everything);
-    EXPECT_EQ(fast_->Eviction()->Stats().tracked_blocks, kKeys);
-    EXPECT_FALSE(fast_->Eviction()->NeedsReconcile());
+    EXPECT_EQ(snapshots, kKeys);
+    const auto victims = fast_->Index()->SelectVictims(kKeys * kBlockSize);
+    ASSERT_EQ(victims.size(), kKeys);
+    for (const auto& victim : victims) {
+        auto registration = victim.registration.Lock();
+        ASSERT_TRUE(registration.has_value());
+        auto block = fast_->Match(*registration);
+        ASSERT_TRUE(block.has_value());
+        EXPECT_EQ(block->Id(), victim.block_id);
+    }
+    auto detached = fast_->DrainAll();
+    EXPECT_EQ(detached.size(), kKeys);
+    EXPECT_EQ(fast_->IndexStats().entry_count, 0U);
+    EXPECT_TRUE(fast_->Index()->SelectVictims(kKeys * kBlockSize).empty());
 }
 
 // ---------------------------------------------------------------------------

@@ -8,11 +8,10 @@
 namespace mooncake::v2 {
 
 TilerManager::TilerManager(const LogicalTilerConfig& logical_config,
-                           const BlockIndexConfig& index_config,
+                           std::unique_ptr<BlockIndex> block_index,
                            std::shared_ptr<BlockPool> block_pool,
                            BlockRegistry block_registry,
                            EventPublisher event_publisher,
-                           const EvictionIndexConfig& eviction_config,
                            double offload_high_watermark)
     : tiler_id_(logical_config.tiler_id),
       memory_type_(logical_config.memory_type),
@@ -20,26 +19,18 @@ TilerManager::TilerManager(const LogicalTilerConfig& logical_config,
       offload_high_watermark_(offload_high_watermark),
       tags_(logical_config.tags),
       block_pool_(std::move(block_pool)),
-      block_index_(
-          std::make_unique<BlockIndex>(logical_config.tiler_id, index_config)),
+      block_index_(std::move(block_index)),
       block_registry_(std::move(block_registry)),
       event_publisher_(std::move(event_publisher)) {
     CHECK(block_pool_ != nullptr) << "TilerManager requires a BlockPool";
-    auto eviction = CreateEvictionIndex(eviction_config, tiler_id_,
-                                        block_pool_->Capacity());
-    // The configuration is validated at Init, so a failure here is a
-    // programming error rather than an operator one -- and continuing without
-    // an ordering would leave the tier with no victims to offer and no way to
-    // reclaim anything.
-    CHECK(eviction.has_value())
-        << "TilerManager could not build its eviction index: "
-        << toString(eviction.error());
-    eviction_index_ = std::move(eviction.value());
+    CHECK(block_index_ != nullptr) << "TilerManager requires a BlockIndex";
+    CHECK(block_index_->TilerId() == tiler_id_)
+        << "TilerManager requires an index for its own tiler";
 }
 
 namespace {
 
-/** The non-owning name of a committed block, for the eviction index. */
+/** The non-owning identity of a committed block. */
 BlockToken TokenOf(const BlockRegistrationHandle& registration,
                    const UUID& tiler_id, const BlockId& block_id,
                    size_t size_bytes) {
@@ -106,13 +97,6 @@ tl::expected<ImmutableBlock, ErrorCode> TilerManager::InsertRegistered(
     if (!inserted) {
         return tl::make_unexpected(inserted.error());
     }
-    // Synchronously, and only after the authoritative insert succeeded: an
-    // ordering that lists a block the index does not have would offer a victim
-    // that can never be removed, and one that misses a block the index does
-    // have would leak that block's bytes for good. Outside the shard lock,
-    // inside whatever mutation guard the caller holds.
-    eviction_index_->OnCommit(
-        TokenOf(registration, tiler_id_, inserted->Id(), size_bytes));
     if (replica_observer_) replica_observer_(registration, true);
     if (!defer_notify) {
         NotifyRegistered(registration, inserted->Id(), size_bytes);
@@ -147,7 +131,7 @@ void TilerManager::NotifyAccess(const BlockRegistrationHandle& registration,
     // coalesce access events under pressure -- and dropping exactly the reads
     // that arrive while the tier is busiest is when the ordering matters most.
     // This call takes only the index's own lock and holds nothing else.
-    eviction_index_->OnAccess(
+    block_index_->OnAccess(
         TokenOf(registration, tiler_id_, block.Id(), block.Size()));
 
     BlockEvent event;
@@ -192,11 +176,6 @@ tl::expected<void, ErrorCode> TilerManager::Delete(
     const size_t size_bytes = detached->block.size_bytes;
     detached.reset();
 
-    // Token-scoped inside the index: if a newer block for this registration
-    // has already been committed, its record survives this removal.
-    eviction_index_->OnDelete(
-        TokenOf(registration, tiler_id_, block_id, size_bytes));
-
     if (replica_observer_) replica_observer_(registration, false);
     if (!defer_notify) {
         NotifyDeleted(registration, block_id, size_bytes);
@@ -221,9 +200,6 @@ void TilerManager::NotifyDeleted(const BlockRegistrationHandle& registration,
 
 std::vector<BlockEntryPtr> TilerManager::DrainAll() {
     std::unique_lock<std::shared_mutex> mutation(replica_mutation_mu_);
-    // Both halves, or the ordering would keep naming victims for a tier that
-    // no longer indexes anything.
-    eviction_index_->Clear();
     auto detached = block_index_->Drain();
     if (replica_observer_) {
         for (const auto& entry : detached) {
@@ -231,59 +207,6 @@ std::vector<BlockEntryPtr> TilerManager::DrainAll() {
         }
     }
     return detached;
-}
-
-BlockIndexSnapshot TilerManager::SnapshotTokens(size_t shard_id) const {
-    BlockIndexSnapshot snapshot;
-    // One shard, so this never locks more than one at a time; the caller
-    // assembles the whole tier with SnapshotAllTokens if it needs to.
-    snapshot.complete = false;
-    snapshot.shard_id = shard_id;
-    OpenSnapshot(snapshot);
-    AppendShardTokens(shard_id, snapshot);
-    return snapshot;
-}
-
-BlockIndexSnapshot TilerManager::SnapshotAllTokens() const {
-    BlockIndexSnapshot snapshot;
-    // Complete in the sense the eviction index needs -- every shard was
-    // read -- while still locking one shard at a time. A commit that lands
-    // mid-walk is caught by the mutation sample below, which is what stops
-    // Reconcile from treating this as proof that the ordering is whole.
-    snapshot.complete = true;
-    OpenSnapshot(snapshot);
-    for (size_t shard_id = 0; shard_id < block_index_->ShardCount();
-         ++shard_id) {
-        AppendShardTokens(shard_id, snapshot);
-    }
-    return snapshot;
-}
-
-void TilerManager::OpenSnapshot(BlockIndexSnapshot& snapshot) const {
-    snapshot.tiler_id = tiler_id_;
-    // Which shards the drop side of Reconcile is allowed to judge: without
-    // this a one-shard snapshot looks like proof that every block in the
-    // other shards is gone.
-    snapshot.shard_count = block_index_->ShardCount();
-    // Sampled before a single entry is read. A commit landing between here
-    // and the Reconcile call is missing from `entries` through no fault of
-    // the eviction index, and must not be dropped from it.
-    snapshot.observed_mutations = eviction_index_->MutationCount();
-}
-
-void TilerManager::AppendShardTokens(size_t shard_id,
-                                     BlockIndexSnapshot& snapshot) const {
-    for (const auto& entry : block_index_->SnapshotShard(shard_id)) {
-        if (!entry) continue;
-        BlockToken token;
-        token.key = entry->block.key;
-        token.registration_id = entry->block.registration.Id();
-        token.registration = entry->block.registration.Downgrade();
-        token.tiler_id = tiler_id_;
-        token.block_id = entry->block.id;
-        token.size_bytes = entry->block.size_bytes;
-        snapshot.entries.push_back(std::move(token));
-    }
 }
 
 std::vector<BlockEntryPtr> TilerManager::SnapshotShard(size_t shard_id) const {
@@ -322,36 +245,6 @@ std::function<size_t()> TilerManager::UsageReader() const {
         auto pool = weak.lock();
         return pool ? pool->Usage() : 0;
     };
-}
-
-void TilerManager::ReconcileEviction(const Clock& clock,
-                                     Clock::time_point deadline) {
-    if (!eviction_index_->NeedsReconcile()) return;
-    std::unique_lock<std::mutex> lock(reconcile_mu_, std::try_to_lock);
-    if (!lock.owns_lock()) return;
-    try {
-        BlockIndexSnapshot full;
-        OpenSnapshot(full);
-        full.complete = true;
-        std::vector<BlockIndexSnapshot> partial;
-        for (size_t i = 0; i < ShardCount(); ++i) {
-            if (clock.Now() >= deadline) {
-                // Rotate so a short budget eventually reaches every shard.
-                for (const auto& snapshot : partial) {
-                    eviction_index_->Reconcile(snapshot);
-                }
-                return;
-            }
-            auto snapshot = SnapshotTokens(reconcile_cursor_++ % ShardCount());
-            full.entries.insert(full.entries.end(), snapshot.entries.begin(),
-                                snapshot.entries.end());
-            partial.push_back(std::move(snapshot));
-        }
-        eviction_index_->Reconcile(full);
-    } catch (const std::bad_alloc&) {
-        LOG(WARNING)
-            << "Eviction reconciliation deferred after allocation failure";
-    }
 }
 
 size_t TilerManager::FreeBytes() const {

@@ -14,6 +14,7 @@
 #include <json/json.h>
 
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -183,6 +184,8 @@ TEST_F(V2ConfigTest, GlobalDefaultsAreOverriddenByTheV2Block) {
     ASSERT_TRUE(defaults.has_value());
     EXPECT_EQ(defaults->registry.shard_count, 64U);
     EXPECT_EQ(defaults->block_index.shard_count, 64U);
+    EXPECT_EQ(defaults->block_index.type, "tinylfu_lru");
+    EXPECT_EQ(defaults->block_index.max_victim_candidates, 256U);
     EXPECT_TRUE(defaults->allocation_failure.try_evict);
     EXPECT_EQ(defaults->allocation_failure.max_evict_rounds, 1U);
 
@@ -400,31 +403,182 @@ TEST(DataManagerV2ConfigTest, ANegativeCopyTimeoutIsRejected) {
     EXPECT_EQ(config.error(), ErrorCode::INVALID_PARAMS);
 }
 
-// The eviction ordering was reachable only from C++ until now: every tier got
-// the built-in default whatever the file said.
-TEST(DataManagerV2ConfigTest, TheEvictionOrderingReachesEveryTier) {
+TEST(DataManagerV2ConfigTest, GlobalBlockIndexDefaultsIncludeTheOrdering) {
     auto config = Parse(R"({
-  "v2": {"eviction_index": {"type": "lru", "max_victim_candidates": 32}},
+  "v2": {"block_index": {"type": "lru", "max_victim_candidates": 32}},
   "tiers": [
     {"type": "DRAM", "capacity": 1048576, "priority": 10},
     {"type": "DRAM", "capacity": 1048576, "priority": 5}
   ]
 })");
-    ASSERT_TRUE(config.has_value()) << toString(config.error());
-    ASSERT_EQ(config->tilers.size(), 2U);
+    ASSERT_TRUE(config) << toString(config.error());
+    EXPECT_EQ(config->block_index.type, "lru");
+    EXPECT_EQ(config->block_index.max_victim_candidates, 32u);
+    ASSERT_EQ(config->tilers.size(), 2u);
     for (const auto& tiler : config->tilers) {
-        EXPECT_EQ(tiler.eviction.type, "lru");
-        EXPECT_EQ(tiler.eviction.max_victim_candidates, 32U);
+        EXPECT_FALSE(tiler.block_index_override.has_value());
     }
 }
 
-TEST(DataManagerV2ConfigTest, AnUnknownEvictionOrderingIsRejected) {
+TEST(DataManagerV2ConfigTest,
+     TierBlockIndexFieldsOverrideMergedGlobalDefaults) {
     auto config = Parse(R"({
-  "v2": {"eviction_index": {"type": "random"}},
-  "tiers": [{"type": "DRAM", "capacity": 1048576, "priority": 10}]
+  "v2": {"block_index": {
+    "type": "multi_lru", "shard_count": 32, "max_load_factor": 0.5,
+    "max_victim_candidates": 17, "sketch_capacity": 2048,
+    "band_warm_threshold": 4, "band_hot_threshold": 12,
+    "band_veryhot_threshold": 24
+  }},
+  "tiers": [
+    {"type": "DRAM", "capacity": 1048576},
+    {"type": "DRAM", "capacity": 1048576,
+     "block_index": {"type": "lru", "max_victim_candidates": 8}},
+    {"type": "DRAM", "capacity": 1048576,
+     "block_index": {"shard_count": 8, "sketch_capacity": 4096}}
+  ]
 })");
-    ASSERT_FALSE(config.has_value());
-    EXPECT_EQ(config.error(), ErrorCode::INVALID_PARAMS);
+    ASSERT_TRUE(config) << toString(config.error());
+    ASSERT_EQ(config->tilers.size(), 3u);
+    EXPECT_FALSE(config->tilers[0].block_index_override);
+    ASSERT_TRUE(config->tilers[1].block_index_override);
+    const auto& recency = *config->tilers[1].block_index_override;
+    EXPECT_EQ(recency.type, "lru");
+    EXPECT_EQ(recency.max_victim_candidates, 8u);
+    EXPECT_EQ(recency.shard_count, 32u);
+    EXPECT_FLOAT_EQ(recency.max_load_factor, 0.5F);
+    EXPECT_EQ(recency.sketch_capacity, 2048u);
+    EXPECT_EQ(recency.band_warm_threshold, 4u);
+    EXPECT_EQ(recency.band_hot_threshold, 12u);
+    EXPECT_EQ(recency.band_veryhot_threshold, 24u);
+    ASSERT_TRUE(config->tilers[2].block_index_override);
+    const auto& sharded = *config->tilers[2].block_index_override;
+    EXPECT_EQ(sharded.type, "multi_lru");
+    EXPECT_EQ(sharded.shard_count, 8u);
+    EXPECT_EQ(sharded.sketch_capacity, 4096u);
+    EXPECT_EQ(sharded.max_victim_candidates, 17u);
+    EXPECT_EQ(sharded.band_hot_threshold, 12u);
+    EXPECT_EQ(config->block_index.shard_count, 32u);
+    EXPECT_EQ(config->block_index.sketch_capacity, 2048u);
+}
+
+TEST(DataManagerV2ConfigTest,
+     InvalidBlockIndexFieldsAreRejectedGloballyAndPerTier) {
+    for (const char* fields :
+         {R"({"type": "random"})", R"({"shard_count": 0})",
+          R"({"max_load_factor": 0})", R"({"max_load_factor": 1.5})",
+          R"({"max_victim_candidates": 0})", R"({"band_warm_threshold": 12})",
+          R"({"band_hot_threshold": 2})", R"({"band_veryhot_threshold": 8})"}) {
+        const auto node = ParseJson(fields);
+        Json::Value global = ParseJson(R"({
+            "tiers": [{"type": "DRAM", "capacity": 1048576}]
+        })");
+        global["v2"]["block_index"] = node;
+        auto parsed = ParseDataManagerV2Config(global, LocalTransferConfig{},
+                                               KeyLeaseConfig{});
+        ASSERT_FALSE(parsed) << fields;
+        EXPECT_EQ(parsed.error(), ErrorCode::INVALID_PARAMS);
+        global.removeMember("v2");
+        global["tiers"][0]["block_index"] = node;
+        parsed = ParseDataManagerV2Config(global, LocalTransferConfig{},
+                                          KeyLeaseConfig{});
+        ASSERT_FALSE(parsed) << fields;
+        EXPECT_EQ(parsed.error(), ErrorCode::INVALID_PARAMS);
+    }
+}
+
+TEST(DataManagerV2ConfigTest, MalformedBlockIndexObjectsAndFieldsAreRejected) {
+    for (const char* text :
+         {"null", "3", "true", R"("lru")", "[]",
+          R"({"max_victim_candidates": "32"})", R"({"shard_count": -1})",
+          R"({"shard_count": 1.5})", R"({"max_load_factor": "bad"})",
+          R"({"type": 3})", R"({"type": null})", R"({"shard_count": null})",
+          R"({"max_load_factor": null})", R"({"max_victim_candidates": null})",
+          R"({"sketch_capacity": null})", R"({"band_warm_threshold": null})",
+          R"({"band_hot_threshold": null})",
+          R"({"band_veryhot_threshold": null})"}) {
+        Json::Value config = ParseJson(R"({
+            "tiers": [{"type": "DRAM", "capacity": 1048576}]
+        })");
+        const auto malformed = ParseJson(text);
+        config["v2"]["block_index"] = malformed;
+        auto parsed = ParseDataManagerV2Config(config, LocalTransferConfig{},
+                                               KeyLeaseConfig{});
+        ASSERT_FALSE(parsed) << "global " << text;
+        EXPECT_EQ(parsed.error(), ErrorCode::INVALID_PARAMS);
+        config.removeMember("v2");
+        config["tiers"][0]["block_index"] = malformed;
+        parsed = ParseDataManagerV2Config(config, LocalTransferConfig{},
+                                          KeyLeaseConfig{});
+        ASSERT_FALSE(parsed) << "tier " << text;
+        EXPECT_EQ(parsed.error(), ErrorCode::INVALID_PARAMS);
+    }
+}
+
+TEST(DataManagerV2ConfigTest, LegacyOrderingConfigurationIsRejected) {
+    Json::Value config = ParseJson(R"({
+        "tiers": [{"type": "DRAM", "capacity": 1048576}]
+    })");
+    config["v2"]["eviction_index"] = Json::objectValue;
+    auto parsed = ParseDataManagerV2Config(config, LocalTransferConfig{},
+                                           KeyLeaseConfig{});
+    ASSERT_FALSE(parsed);
+    EXPECT_EQ(parsed.error(), ErrorCode::INVALID_PARAMS);
+    config.removeMember("v2");
+    for (const char* field : {"sketch_capacity", "band_warm_threshold",
+                              "band_hot_threshold", "band_veryhot_threshold"}) {
+        config["v2"]["placement_policy"] = Json::objectValue;
+        config["v2"]["placement_policy"][field] = 0;
+        parsed = ParseDataManagerV2Config(config, LocalTransferConfig{},
+                                          KeyLeaseConfig{});
+        ASSERT_FALSE(parsed) << field;
+        EXPECT_EQ(parsed.error(), ErrorCode::INVALID_PARAMS);
+    }
+}
+
+TEST_F(V2ConfigTest, BlockIndexValidationRejectsInvalidCppConfiguration) {
+    for (const char* type : {"lru", "multi_lru", "tinylfu_lru"}) {
+        BlockIndexConfig valid;
+        valid.type = type;
+        EXPECT_TRUE(ValidateBlockIndexConfig(valid));
+        EXPECT_TRUE(CreateBlockIndex(valid, UUID{1, 2}, 1024));
+    }
+    std::vector<BlockIndexConfig> invalid(7);
+    invalid[0].type = "arc";
+    invalid[1].max_victim_candidates = 0;
+    invalid[2].band_hot_threshold = 2;
+    invalid[3].band_warm_threshold = 12;
+    invalid[4].band_veryhot_threshold = 8;
+    invalid[5].max_load_factor = std::numeric_limits<float>::quiet_NaN();
+    invalid[6].max_load_factor = std::numeric_limits<float>::infinity();
+    for (const auto& config : invalid) {
+        auto validated = ValidateBlockIndexConfig(config);
+        ASSERT_FALSE(validated);
+        EXPECT_EQ(validated.error(), ErrorCode::INVALID_PARAMS);
+        auto created = CreateBlockIndex(config, UUID{1, 2}, 1024);
+        ASSERT_FALSE(created);
+        EXPECT_EQ(created.error(), ErrorCode::INVALID_PARAMS);
+    }
+    EXPECT_FALSE(CreateBlockIndex(BlockIndexConfig{}, UUID{0, 0}, 1024));
+}
+
+TEST(DataManagerV2ConfigTest, HandBuiltTierBlockIndexOverridesAreValidated) {
+    auto parsed = Parse(R"({
+        "tiers": [{"type": "DRAM", "capacity": 1048576}]
+    })");
+    ASSERT_TRUE(parsed);
+    parsed->block_index.type = "unknown";
+    EXPECT_FALSE(ValidateDataManagerV2Config(*parsed));
+    parsed->block_index = BlockIndexConfig{};
+    BlockIndexConfig invalid;
+    invalid.max_victim_candidates = 0;
+    parsed->tilers[0].block_index_override = invalid;
+    EXPECT_FALSE(ValidateDataManagerV2Config(*parsed));
+    parsed->register_tiers_with_transfer_engine = false;
+    DataManagerV2 manager(*parsed, std::make_shared<TransferEngine>(),
+                          MetadataCallbacks{});
+    auto initialized = manager.Init();
+    ASSERT_FALSE(initialized);
+    EXPECT_EQ(initialized.error(), ErrorCode::INVALID_PARAMS);
 }
 
 // ---------------------------------------------------------------------------

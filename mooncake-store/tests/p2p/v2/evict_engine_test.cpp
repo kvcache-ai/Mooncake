@@ -41,7 +41,7 @@
 #include "p2p/client/data_manager/v2/frequency_tracker.h"
 #include "p2p/client/data_manager/v2/local_copy_engine.h"
 #include "p2p/client/data_manager/v2/migration_engine.h"
-#include "p2p/client/data_manager/v2/eviction_index.h"
+#include "p2p/client/data_manager/v2/block_index.h"
 #include "p2p/client/data_manager/v2/tiler_manager.h"
 #include "p2p/client/data_manager/v2/v2_common.h"
 #include "p2p/common/p2p_types.h"
@@ -81,17 +81,75 @@ class ManualClock final : public Clock {
  * @class AcceptingSink
  * @brief Swallows the facts the tilers publish.
  *
- * Nothing here needs them any more: victim ordering lives in each tiler's own
- * eviction index and is updated synchronously by TilerManager, in the same
- * mutation as the BlockIndex. This exists only so the tilers have somewhere to
- * publish to. A test that wants a genuinely stale candidate injects one
- * directly -- see InjectStaleToken.
+ * Victim ordering belongs to the injected BlockIndex. This sink gives the
+ * tilers somewhere to publish their lifecycle facts.
  */
 class AcceptingSink final : public EventSink {
    public:
     QueuePushResult Publish(BlockEvent) override {
         return QueuePushResult::kEnqueued;
     }
+};
+
+// A replaceable backend can return candidates captured before a concurrent
+// mutation. Inject such a candidate at this boundary without corrupting the
+// real index's unified membership or ordering.
+class CandidateInjectingIndex final : public BlockIndex {
+   public:
+    explicit CandidateInjectingIndex(std::unique_ptr<BlockIndex> delegate)
+        : delegate_(std::move(delegate)) {}
+
+    void Inject(BlockToken token) { injected_.push_back(std::move(token)); }
+
+    tl::expected<ImmutableBlock, ErrorCode> Insert(
+        CompletedBlock&& block,
+        const BlockRegistrationHandle& registration) override {
+        return delegate_->Insert(std::move(block), registration);
+    }
+    std::optional<ImmutableBlock> Lookup(
+        const BlockRegistrationHandle& registration) const override {
+        return delegate_->Lookup(registration);
+    }
+    BlockEntryPtr Erase(const BlockRegistrationHandle& registration,
+                        std::optional<BlockId> expected_id) override {
+        return delegate_->Erase(registration, expected_id);
+    }
+    BlockEntryPtr EraseById(RegistrationId id,
+                            std::optional<BlockId> expected_id) override {
+        return delegate_->EraseById(id, expected_id);
+    }
+    void OnAccess(const BlockToken& token) override {
+        delegate_->OnAccess(token);
+    }
+    std::vector<BlockToken> SelectVictims(size_t target_bytes) override {
+        if (target_bytes == 0) return {};
+        std::vector<BlockToken> victims;
+        victims.swap(injected_);
+        size_t selected_bytes = 0;
+        for (const auto& token : victims) selected_bytes += token.size_bytes;
+        if (selected_bytes < target_bytes) {
+            auto live = delegate_->SelectVictims(target_bytes - selected_bytes);
+            for (auto& token : live) victims.push_back(std::move(token));
+        }
+        return victims;
+    }
+    std::vector<BlockEntryPtr> SnapshotShard(size_t shard_id) const override {
+        return delegate_->SnapshotShard(shard_id);
+    }
+    std::vector<BlockEntryPtr> Drain() override {
+        injected_.clear();
+        return delegate_->Drain();
+    }
+    size_t ShardCount() const override { return delegate_->ShardCount(); }
+    BlockIndexStats Stats() const override { return delegate_->Stats(); }
+    UUID TilerId() const override { return delegate_->TilerId(); }
+    size_t ShardFor(RegistrationId id) const override {
+        return delegate_->ShardFor(id);
+    }
+
+   private:
+    std::unique_ptr<BlockIndex> delegate_;
+    std::vector<BlockToken> injected_;
 };
 
 std::vector<uint8_t> Pattern(size_t size, uint8_t seed) {
@@ -204,9 +262,17 @@ class EvictEngineTest : public ::testing::Test {
         logical.memory_type = MemoryType::DRAM;
         logical.priority = priority;
         logical.tags = {"fast"};
-        return std::make_unique<TilerManager>(logical, BlockIndexConfig{},
-                                              std::move(pool.value()),
-                                              registry_, EventPublisher());
+        auto index = CreateBlockIndex(BlockIndexConfig{}, logical.tiler_id,
+                                      (*pool)->Capacity());
+        if (!index) {
+            ADD_FAILURE() << "CreateBlockIndex failed: "
+                          << toString(index.error());
+            return nullptr;
+        }
+        return std::make_unique<TilerManager>(
+            logical,
+            std::make_unique<CandidateInjectingIndex>(std::move(index.value())),
+            std::move(pool.value()), registry_, EventPublisher());
     }
 
     std::unique_ptr<TilerManager> MakeSsdTiler(int32_t priority,
@@ -229,9 +295,17 @@ class EvictEngineTest : public ::testing::Test {
         logical.memory_type = MemoryType::NVME;
         logical.priority = priority;
         logical.tags = {"slow"};
-        return std::make_unique<TilerManager>(logical, BlockIndexConfig{},
-                                              std::move(pool.value()),
-                                              registry_, EventPublisher());
+        auto index = CreateBlockIndex(BlockIndexConfig{}, logical.tiler_id,
+                                      (*pool)->Capacity());
+        if (!index) {
+            ADD_FAILURE() << "CreateBlockIndex failed: "
+                          << toString(index.error());
+            return nullptr;
+        }
+        return std::make_unique<TilerManager>(
+            logical,
+            std::make_unique<CandidateInjectingIndex>(std::move(index.value())),
+            std::move(pool.value()), registry_, EventPublisher());
     }
 
     /** Allocate, fill and register `key`, returning the caller's snapshot. */
@@ -283,15 +357,7 @@ class EvictEngineTest : public ::testing::Test {
         tiler.NotifyAccess(handle.value(), block.value());
     }
 
-    /**
-     * @brief Make the tier's ordering name `block_id` for `key`.
-     *
-     * The ordering is updated synchronously with the index now, so staleness
-     * can no longer be produced by hiding an event -- but it is still
-     * reachable: an update that could not be applied leaves the shard marked
-     * needs_reconcile, and a reconcile pass can race a commit. This injects
-     * that state directly, which is the honest way to test the engine's
-     * response to it.
+    /** Offer a candidate captured before a mutation through the test backend.
      */
     void InjectStaleToken(TilerManager& tiler,
                           const BlockRegistrationHandle& handle,
@@ -303,7 +369,9 @@ class EvictEngineTest : public ::testing::Test {
         token.tiler_id = tiler.Id();
         token.block_id = block_id;
         token.size_bytes = size_bytes;
-        tiler.Eviction()->OnCommit(token);
+        auto* index = dynamic_cast<CandidateInjectingIndex*>(tiler.Index());
+        CHECK(index != nullptr);
+        index->Inject(std::move(token));
     }
 
     ReclaimRequest RequestFor(size_t target_bytes) const {
@@ -487,7 +555,7 @@ TEST_F(EvictEngineTest, AReplacedBlockIsSkippedAndTheLiveOneSurvives) {
         fast_->RegisterWithHandle(std::move(completed.value()), registration);
     ASSERT_TRUE(second.has_value()) << toString(second.error());
 
-    // Put the ordering back to naming the block that is already gone.
+    // Offer the candidate that was captured before the replacement.
     InjectStaleToken(*fast_, registration, first_id, kBlockSize);
 
     auto result = evict_->ReclaimOneRound(RequestFor(kBlockSize));
@@ -507,12 +575,10 @@ TEST_F(EvictEngineTest, AReplacedBlockIsSkippedAndTheLiveOneSurvives) {
     EXPECT_EQ(readback, payload);
     EXPECT_TRUE(RemovedReplicas().empty());
 
-    // And the ordering has been repaired rather than merely skipped: the live
-    // block is offered next time. Without that, a block whose token went stale
-    // once would never be a candidate again and its bytes would be stranded.
-    const auto repaired = fast_->Eviction()->SelectVictims(kBlockSize);
-    ASSERT_EQ(repaired.size(), 1U);
-    EXPECT_EQ(repaired[0].block_id, second->Id());
+    // Skipping the stale candidate must leave the live block selectable.
+    const auto candidates = fast_->Index()->SelectVictims(kBlockSize);
+    ASSERT_EQ(candidates.size(), 1U);
+    EXPECT_EQ(candidates[0].block_id, second->Id());
 }
 
 // Delete-then-recreate gives the key a new identity. The old token upgrades
@@ -805,10 +871,8 @@ TEST_F(EvictEngineTest, ExecuteOnAStaleCommandReportsNotFoundAndKeepsTheBlock) {
 // decide whether reclaiming is working at all. Every examined candidate ends
 // up in exactly one of detached or stale, and one call is one round.
 TEST_F(EvictEngineTest, StatsCountRoundsVictimsAndDeadlinesConsistently) {
-    // The stale record is built first so it sits at the cold end and is the
-    // first candidate the round meets. Re-inserting it after the others would
-    // put it at the warm end, where no round of this size would reach it and
-    // the test would silently stop exercising the stale path.
+    // The injected backend offers a previously captured candidate first,
+    // followed by live candidates up to the requested byte target.
     CommitAndForget(*fast_, "evict/stats/0", 0);
     const BlockRegistrationHandle stale_handle = HandleFor("evict/stats/0");
     auto stale_block = fast_->Match(stale_handle);
