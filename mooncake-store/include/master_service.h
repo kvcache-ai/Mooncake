@@ -1515,11 +1515,8 @@ class MasterService {
     // after one forced bucket eviction. Memory or NoF exhaustion is left to
     // the background eviction, so it cannot delete unrelated DFS data. Each
     // attempt takes the key afresh, since recovery evicts other keys.
-    auto AdmitWithDfsRecovery(
-        const ReplicateConfig& config,
-        const std::function<
-            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>(
-                bool* dfs_allocation_failed)>& admit)
+    template <typename Admit>
+    auto AdmitWithDfsRecovery(const ReplicateConfig& config, const Admit& admit)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
     // The first step of an accessor that holds a key by name: drops the held
     // object's memory replicas whose segment is gone, and the object with them
