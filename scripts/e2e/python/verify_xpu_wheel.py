@@ -742,6 +742,20 @@ def validate_application_report(path: Path, scenario: str) -> dict:
     return report
 
 
+def pids_cgroup_snapshot() -> dict:
+    # Task budget evidence: the pd scenario runs the master and two vLLM
+    # processes in one container, and thread pools in that stack are mostly
+    # fixed-size, so the pid cgroup is the binding limit when it aborts
+    # thread creation with EAGAIN (std::system_error).
+    snapshot = {}
+    for name in ("pids.current", "pids.peak", "pids.max"):
+        try:
+            snapshot[name] = (Path("/sys/fs/cgroup") / name).read_text().strip()
+        except OSError:
+            snapshot[name] = None
+    return snapshot
+
+
 def applications(native: Path, source: Path, output: Path) -> None:
     started = time.monotonic()
     os.environ.update(APPLICATION_THREAD_ENV)
@@ -751,6 +765,7 @@ def applications(native: Path, source: Path, output: Path) -> None:
                 "logical_cpus": os.cpu_count(),
                 "cpu_affinity": sorted(os.sched_getaffinity(0)),
                 "thread_environment": APPLICATION_THREAD_ENV,
+                "pids_cgroup": pids_cgroup_snapshot(),
             },
             indent=2,
         )
@@ -829,6 +844,7 @@ def applications(native: Path, source: Path, output: Path) -> None:
                 "model": MODEL_ID,
                 "model_revision": MODEL_REVISION,
                 "scenarios": results,
+                "pids_cgroup": pids_cgroup_snapshot(),
                 "elapsed_seconds": time.monotonic() - started,
             },
             indent=2,

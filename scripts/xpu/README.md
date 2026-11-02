@@ -151,17 +151,20 @@ Applications set `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
 `NUMEXPR_NUM_THREADS`, and `RAYON_NUM_THREADS` to 2 **before** preflight imports
 PyTorch. Both PD children inherit these settings. This prevents host-sized
 Torch/BLAS and tokenizer Rayon pools from exhausting the shared container
-thread budget on large CPU hosts. Tokenizer parallelism remains enabled,
-the container's 1024-PID limit and the core profile remain unchanged.
+thread budget on large CPU hosts. Tokenizer parallelism remains enabled and
+the core profile remains unchanged.
 `cpu-resources.json` retains CPU visibility and the enforced thread settings.
 
-The hardware container is additionally pinned to at most 32 of the runner's
-CPUs via `--cpuset-cpus`. Native pools sized from CPU affinity (oneTBB, SYCL,
-glibc `nproc`) are not covered by the thread environment above; on many-core
-hosts the master plus both PD vLLM processes otherwise exceed the 1024-PID
-budget, aborting the decode side's first KV pull with
-`std::system_error: Resource temporarily unavailable`. The PID limit itself
-stays at 1024, and `cpu-resources.json` records the resulting affinity.
+The hardware container runs with `--pids-limit 4096`. The PD scenario
+legitimately runs the master plus two vLLM-XPU processes, whose thread pools
+are mostly fixed-size; a 1024-task budget deterministically aborted the decode
+side's first KV pull with `std::system_error: Resource temporarily unavailable`
+(EAGAIN from `pthread_create`). Pinning the container to a reduced CPU set is
+not an alternative: oneCCL in the core suite pins workers from host-sized core
+lists and fails to start under `--cpuset-cpus`. `cpu-resources.json` and
+`result.json` record `pids.current`/`pids.peak`/`pids.max` so the remaining
+headroom stays visible. The ROCm harness uses `--pids-limit=32768` for a
+comparable single-instance workload.
 
 Nightly Gate requires the builder and both selected hardware jobs to succeed.
 Missing results, unexpected skips, cancellation, test errors, absent completion

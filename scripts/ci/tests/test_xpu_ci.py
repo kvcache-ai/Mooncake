@@ -1872,33 +1872,26 @@ class ApplicationTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "preflight stopped"):
                 VERIFY.applications(Path(temporary), ROOT, Path(temporary))
         launch = hardware_step("Execute isolated two-B60 core")
-        self.assertIn("--pids-limit 1024", launch)
+        self.assertIn("--pids-limit 4096", launch)
 
-    def test_container_cpu_set_is_bounded_validated_and_applied(self):
+    def test_container_task_budget_fits_two_vllm_processes_without_cpu_pinning(self):
         launch = hardware_step("Execute isolated two-B60 core")
-        self.assertIn('--cpuset-cpus "$cpuset"', launch)
-        self.assertIn("--pids-limit 1024", launch)
-        self.assertIn(
-            '[[ "$cpuset" =~ ^[0-9]+(,[0-9]+)*$ ]] '
-            '|| fail "Cannot derive a bounded container CPU set"',
-            launch,
+        # The pd scenario legitimately runs the master plus two vLLM processes;
+        # a 1024-task budget aborts the decode side's first KV pull with
+        # EAGAIN, and --cpuset-cpus breaks oneCCL workers pinned from
+        # host-sized core lists in the core suite.
+        self.assertIn("--pids-limit 4096", launch)
+        self.assertNotIn("--cpuset-cpus", launch)
+        self.assertNotIn("--pids-limit 1024", launch)
+
+    def test_cpu_resources_report_includes_pid_cgroup_snapshot(self):
+        snapshot = VERIFY.pids_cgroup_snapshot()
+        self.assertEqual(
+            set(snapshot), {"pids.current", "pids.peak", "pids.max"}
         )
-        derivation = next(
-            line for line in launch.splitlines() if line.lstrip().startswith("cpuset=$(")
-        )
-        match = re.search(r"python3 -c '([^']+)'", derivation)
-        self.assertIsNotNone(match, derivation)
-        result = subprocess.run(
-            [sys.executable, "-c", match.group(1)],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        cpus = [int(cpu) for cpu in result.stdout.strip().split(",")]
-        self.assertTrue(cpus, "Derived CPU set must not be empty")
-        self.assertLessEqual(len(cpus), 32)
-        self.assertLessEqual(set(cpus), os.sched_getaffinity(0))
+        for name, value in snapshot.items():
+            if value is not None:
+                self.assertRegex(value, r"^(max|\d+)$", name)
 
     def test_artifact_install_dispatches_only_the_selected_suite(self):
         for selected, mode in (
