@@ -154,6 +154,24 @@ class TentMetrics {
     // the only failure metric that records TIMEOUT/CANCELED outcomes.
     void recordTaskFailure(TransportType tp, TaskFailureReason reason);
 
+    enum class SelectionEvent {
+        Selected,
+        FallbackSelected,
+        CandidateUnavailable,
+        PolicyMiss,
+        CandidateEmpty,
+        HintRejected,
+        HintUnavailable,
+        Exhausted,
+        MetadataRefresh,
+    };
+
+    // Selection metrics count decisions, not transfers. `transport` is the
+    // selected, rejected or unavailable bounded enum value; events without a
+    // concrete candidate use UNSPEC.
+    void recordSelectionEvent(SelectionEvent event,
+                              TransportType transport = UNSPEC);
+
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
     // sitting in the engine right now — a persistently high or stuck value
@@ -287,6 +305,8 @@ class TentMetrics {
         "transport", "operation", "outcome"};
     static inline const std::array<std::string, 2> kTaskFailureLabels{
         "transport", "reason"};
+    static inline const std::array<std::string, 2> kSelectionEventLabels{
+        "event", "transport"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -302,6 +322,9 @@ class TentMetrics {
     static constexpr size_t kAttemptOutcomeDomain =
         kAttemptDomain * kOutcomeValueDomain;
     static constexpr size_t kTaskFailureDomain = kTransportDomain * 4;
+    static constexpr size_t kSelectionEventValueDomain = 9;
+    static constexpr size_t kSelectionEventDomain =
+        kSelectionEventValueDomain * kTransportDomain;
 
     // Stable slot indices into the cached-cell label domain.
     static size_t transportSlot(TransportType tp) {
@@ -327,6 +350,11 @@ class TentMetrics {
     }
     static size_t taskFailureSlot(TransportType tp, TaskFailureReason reason) {
         return static_cast<size_t>(tp) * 4 + static_cast<size_t>(reason);
+    }
+    static size_t selectionEventSlot(SelectionEvent event,
+                                     TransportType transport) {
+        return static_cast<size_t>(event) * kTransportDomain +
+               transportSlot(transport);
     }
 
     // Per-transport counters (label: transport). Values are int64_t.
@@ -390,6 +418,10 @@ class TentMetrics {
         "tent_quarantined_batches_total",
         "Batches abandoned by lazyFreeBatch after repeated failed reclaim "
         "attempts; reclaimed only at engine teardown"};
+    metrics::CachedDynamicCounter<2> selection_events_total_{
+        "tent_transport_selection_events_total",
+        "Transport selector decisions by bounded event and transport",
+        kSelectionEventLabels, kSelectionEventDomain};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_

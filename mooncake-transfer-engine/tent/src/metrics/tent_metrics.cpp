@@ -107,6 +107,30 @@ const char* taskFailureReasonName(TentMetrics::TaskFailureReason reason) {
     }
     return "unknown";
 }
+
+const char* selectionEventName(TentMetrics::SelectionEvent event) {
+    switch (event) {
+        case TentMetrics::SelectionEvent::Selected:
+            return "selected";
+        case TentMetrics::SelectionEvent::FallbackSelected:
+            return "fallback_selected";
+        case TentMetrics::SelectionEvent::CandidateUnavailable:
+            return "candidate_unavailable";
+        case TentMetrics::SelectionEvent::PolicyMiss:
+            return "policy_miss";
+        case TentMetrics::SelectionEvent::CandidateEmpty:
+            return "candidate_empty";
+        case TentMetrics::SelectionEvent::HintRejected:
+            return "hint_rejected";
+        case TentMetrics::SelectionEvent::HintUnavailable:
+            return "hint_unavailable";
+        case TentMetrics::SelectionEvent::Exhausted:
+            return "exhausted";
+        case TentMetrics::SelectionEvent::MetadataRefresh:
+            return "metadata_refresh";
+    }
+    return "unknown";
+}
 }  // namespace
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
@@ -318,6 +342,7 @@ void TentMetrics::registerMetrics() {
         &task_failures_total_,
         &deadline_infeasible_total_,
         &quarantined_batches_total_,
+        &selection_events_total_,
     };
 
     gauges_ = {
@@ -493,6 +518,17 @@ void TentMetrics::recordLogicalRequestFinished(
     logical_request_outcomes_total_.incResolved(
         logicalOutcomeSlot(operation, status));
     logical_requests_inflight_.incResolved(operationSlot(operation), -1);
+}
+
+void TentMetrics::recordSelectionEvent(SelectionEvent event,
+                                       TransportType transport) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    selection_events_total_.incCached(
+        selectionEventSlot(event, transport), [event, transport] {
+            return std::array<std::string, 2>{selectionEventName(event),
+                                              transportTypeName(transport)};
+        });
 }
 
 // Gauge updates below deliberately ignore runtime_enabled_: gauges track
@@ -994,6 +1030,8 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&deadline_infeasible_total_);
             root[quarantined_batches_total_.str_name()] =
                 static_cast<int64_t>(quarantined_batches_total_.value());
+            root[selection_events_total_.str_name()] =
+                sumCounterValues(&selection_events_total_);
 
             // Gauges: aggregate across transport labels (total in-flight
             // attempts / total registered bytes). Per-transport breakdown is
@@ -1151,6 +1189,7 @@ void TentMetrics::recordDeadlineMLU(TransportType, double) {}
 void TentMetrics::recordDeadlineInfeasible(TransportType) {}
 void TentMetrics::recordBatchQuarantined() {}
 void TentMetrics::recordTaskFailure(TransportType, TaskFailureReason) {}
+void TentMetrics::recordSelectionEvent(SelectionEvent, TransportType) {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}
