@@ -6,11 +6,11 @@
 // The tracker owns the index of keys carrying a candidate, ordered by when
 // each is due for another try, the global count held against the candidate
 // limit, and the retry rules. It owns no object: the candidate of a key lives
-// on route::ObjectState, guarded by the lock of the metadata shard holding
-// the key, and the *Locked methods apply the rules to a state whose shard
-// lock the caller already holds. Every change to a candidate goes through
-// them, so the index files each candidate at its retry_after, and a retry
-// round reads only the candidates that are due instead of walking objects.
+// on route::ObjectState, guarded by the key's lock, and the *Locked methods
+// apply the rules to a state whose key lock the caller already holds. Every
+// change to a candidate goes through them, so the index files each candidate at
+// its retry_after, and a retry round reads only the candidates that are due
+// instead of walking objects.
 //
 // Lock order: shard lock -> index lock. The index lock is a leaf.
 
@@ -91,10 +91,6 @@ class PromotionCandidateTracker {
     // Drops the index entry of a key that no longer carries a candidate,
     // because its object went away without EraseLocked.
     void ForgetLocked(const TenantId& tenant_id, const std::string& key);
-
-    // Forgets every candidate, for a metadata reload that already dropped the
-    // objects carrying them.
-    void Reset();
 
    private:
     friend class test::MasterServiceTestPeer;

@@ -245,12 +245,7 @@ def test_query_rank_keys_match_http(conductor_endpoints, rank):
             )
             with urlopen(request, timeout=3) as response:
                 http_result = msgpack.unpackb(response.read(), raw=False)
-            # Python exposes device memory under "device"; the existing HTTP API
-            # uses "npu". All rank keys and token counts must still agree.
-            for http_hit in http_result["instances"].values():
-                http_hit["device"] = http_hit.pop("npu")
-                for rank_match in http_hit["rank_matches"].values():
-                    rank_match["device"] = rank_match.pop("npu")
+            # Both channels expose the same tier names, rank keys and token counts.
             assert result["hits"] == http_result["instances"]
         finally:
             client.close()

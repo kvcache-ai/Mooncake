@@ -99,6 +99,11 @@ struct int_with_bits<64> {
 };
 
 using topk_idx_t = int_with_bits<EP_NUM_TOPK_IDX_BITS>::type;
+// The host launchers pass int64_t* top-k arrays, so any other width (e.g. set
+// only for the JIT compile via NVCC_EXTRA_FLAGS) would be misread silently.
+static_assert(sizeof(topk_idx_t) == sizeof(int64_t),
+              "EP_NUM_TOPK_IDX_BITS must be 64: the host launchers pass "
+              "int64_t* top-k arrays");
 
 union sf_pack_t {
     float fp32;

@@ -1,13 +1,14 @@
 set(_pg_device_source "${CMAKE_CURRENT_SOURCE_DIR}/mooncake_worker.cu")
 if(USE_CUDA)
-  # Preserve the existing sm_80/sm_90 coverage on CUDA 12 unless the caller
-  # selects architectures through CMake's standard variable or CUDAARCHS
-  # environment.
+  # Unless the caller selects architectures through CMake's standard variable or
+  # CUDAARCHS environment, build the same list as mooncake-ep: SASS plus PTX for
+  # each entry. Without PTX, GPUs outside the list (sm_100, sm_120, ...) cannot
+  # load any PG kernel ("no kernel image is available").
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
     if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
-      set(CMAKE_CUDA_ARCHITECTURES 80-real 90-real 103-real)
+      set(CMAKE_CUDA_ARCHITECTURES 80 90 103)
     else()
-      set(CMAKE_CUDA_ARCHITECTURES 80-real 90-real)
+      set(CMAKE_CUDA_ARCHITECTURES 80 90)
     endif()
   endif()
   enable_language(CUDA)
@@ -148,6 +149,7 @@ add_library(
   mooncake_pg.cpp
   mooncake_worker_host.cpp
   mooncake_worker_thread.cpp
+  pg_host_ip_resolve.cpp
   p2p_proxy.cpp)
 
 # The initial collective v2 runtime implementation is CUDA-only.
@@ -175,9 +177,9 @@ target_include_directories(
   mooncake_pg PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
                      $<INSTALL_INTERFACE:include>)
 if(USE_MACA)
-  target_include_directories(mooncake_pg PRIVATE
-                             "${MACA_ROOT}/tools/cu-bridge/include"
-                             "${MACA_ROOT}/include/mcr")
+  target_include_directories(
+    mooncake_pg PRIVATE "${MACA_ROOT}/tools/cu-bridge/include"
+                        "${MACA_ROOT}/include/mcr")
 endif()
 target_link_libraries(mooncake_pg PRIVATE transfer_engine mooncake_pg_device)
 

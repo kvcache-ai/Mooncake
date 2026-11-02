@@ -18,6 +18,15 @@
 #include "transfer_engine.h"
 
 namespace mooncake {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+void Transport::releaseCongestionPermit(Slice *slice) {
+    adaptive_congestion_control::complete(
+        slice->rdma_congestion_control_permit,
+        adaptive_congestion_control::OutcomeClass::kDerivedFlush,
+        adaptive_congestion_control::FailureScope::kOperation);
+}
+#endif
+
 thread_local static Transport::ThreadLocalSliceCache tl_slice_cache;
 
 Transport::ThreadLocalSliceCache &Transport::getSliceCache() {

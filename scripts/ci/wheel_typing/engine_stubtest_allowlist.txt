@@ -1,0 +1,11 @@
+# mypy.stubtest allowlist for python/mooncake/engine.pyi.
+#
+# pybind11 classes use the pybind11_type metaclass, which cannot be named in
+# a stub; stubtest reports it against each class object itself.
+mooncake\.engine\.(InnerTransferEngine|ReceivedData|ReceivedTensor|RpcInterface|ScatterTransferCompletionStatus|ScatterTransferTicket|SharedSegment|TransferEngine|TransferNotify|TransferOpcode)
+
+# No py::init is bound, so these cannot be constructed from Python.
+mooncake\.engine\.(InnerTransferEngine|ReceivedData|ReceivedTensor|ScatterTransferTicket|SharedSegment)\.__init__
+
+# Bound only when the wheel is built with USE_CUDA.
+mooncake\.engine\.TransferEngine\.(batch_transfer_read_on_cuda|batch_transfer_write_on_cuda|transfer_read_on_cuda|transfer_write_on_cuda)

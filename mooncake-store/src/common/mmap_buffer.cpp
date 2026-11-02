@@ -12,6 +12,7 @@
 #include <mutex>
 #include <numa.h>
 #include <numaif.h>
+#include <string>
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
@@ -294,6 +295,74 @@ void free_buffer_mmap_memory(void *ptr, size_t total_size) {
         VLOG(1) << "Freed direct mmap allocation at " << ptr
                 << ", size=" << map_size;
     }
+}
+
+namespace {
+
+// MPOL_MODE_FLAGS from <linux/mempolicy.h>, which clashes with <numaif.h>.
+// get_mempolicy() returns these OR'ed into the mode.
+constexpr int kMempolicyModeFlags = (1 << 15) | (1 << 14) | (1 << 13);
+
+std::vector<int> BitmaskNodes(const struct bitmask *mask) {
+    std::vector<int> nodes;
+    for (unsigned long node = 0; node < mask->size; ++node) {
+        if (numa_bitmask_isbitset(mask, node)) {
+            nodes.push_back(static_cast<int>(node));
+        }
+    }
+    return nodes;
+}
+
+bool Contains(const std::vector<int> &nodes, int node) {
+    return std::find(nodes.begin(), nodes.end(), node) != nodes.end();
+}
+
+}  // namespace
+
+std::vector<int> FilterNumaNodesToAllowed(const std::vector<int> &nodes) {
+    if (nodes.empty()) return {};
+    struct bitmask *mask = numa_allocate_nodemask();
+    if (mask == nullptr) return nodes;
+    if (get_mempolicy(nullptr, mask->maskp, mask->size + 1, nullptr,
+                      MPOL_F_MEMS_ALLOWED) != 0) {
+        const int err = errno;
+        numa_bitmask_free(mask);
+        LOG(WARNING) << "Cannot read this process's allowed NUMA nodes, errno="
+                     << err << " (" << strerror(err)
+                     << "); NIC NUMA nodes are used as is";
+        return nodes;
+    }
+    std::vector<int> allowed = BitmaskNodes(mask);
+
+    int mode = MPOL_DEFAULT;
+    numa_bitmask_clearall(mask);
+    if (get_mempolicy(&mode, mask->maskp, mask->size + 1, nullptr, 0) == 0 &&
+        (mode & ~kMempolicyModeFlags) == MPOL_BIND) {
+        const std::vector<int> bound = BitmaskNodes(mask);
+        allowed.erase(
+            std::remove_if(allowed.begin(), allowed.end(),
+                           [&](int node) { return !Contains(bound, node); }),
+            allowed.end());
+    }
+    numa_bitmask_free(mask);
+
+    std::vector<int> kept;
+    std::string dropped;
+    for (int node : nodes) {
+        if (Contains(allowed, node)) {
+            kept.push_back(node);
+        } else {
+            if (!dropped.empty()) dropped += ",";
+            dropped += std::to_string(node);
+        }
+    }
+    if (!dropped.empty()) {
+        LOG(INFO) << "NIC NUMA nodes [" << dropped
+                  << "] are outside this process's allowed memory nodes "
+                     "(cpuset.mems or an MPOL_BIND task policy); the global "
+                     "segment is not placed there";
+    }
+    return kept;
 }
 
 // NUMA-segmented buffer allocation

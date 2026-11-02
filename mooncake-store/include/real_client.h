@@ -24,7 +24,9 @@
 #include "mutex.h"
 #include "common/network.h"
 #include "pyclient.h"
+#include "nof/nof_runtime.h"
 #include "rpc_types.h"
+#include "ssd_prefetcher.h"
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
 #endif
@@ -36,6 +38,10 @@
 namespace mooncake {
 
 class RealClient;
+
+namespace test {
+class PrefetchTeardownTest;
+}  // namespace test
 class NvlinkHostNumaAllocation;
 struct EgmStorePoolConfig;
 class RegisteredPinnedRegion;
@@ -180,6 +186,9 @@ class RealClient : public PyClient {
      * @param all_buffers Vector of vectors of pointers to the pre-allocated
      * buffers
      * @param all_sizes Vector of vectors of sizes of the buffers
+     * @param prefer_alloc_in_same_node Group exact-size memory replicas on
+     * one segment into one transfer. A size mismatch stays on the per-key
+     * path. Ascend and ascend_direct group even when this flag is false.
      * @return Vector of integers, where each element is the number of bytes
      * read on success, or a negative value on error
      * @note The buffer addresses must resolve to Store-managed registered
@@ -190,7 +199,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool prefer_alloc_in_same_node);
 
     /**
      * @brief Put object data directly from a pre-allocated buffer
@@ -361,6 +370,20 @@ class RealClient : public PyClient {
 
     int tearDownAll();
 
+    // Test-only seam: when set, setup_internal() builds the NoF runtime from
+    // this factory instead of CreateNofRuntime(). Not thread-safe; set before
+    // setup and reset (pass nullptr) after the test.
+    static void SetNofRuntimeFactoryForTesting(
+        std::function<NofRuntime()> factory);
+
+    // Test-only seam: when set, unregister_buffer_internal() calls this hook
+    // instead of Client::unregisterLocalMemory, so a test can replay a TE
+    // failure sequence (e.g. partial deregistration failure followed by
+    // NOT_REGISTERED) that TCP cannot produce. Not thread-safe; reset (pass
+    // nullptr) after the test.
+    static void SetTeUnregisterHookForTesting(
+        std::function<tl::expected<void, ErrorCode>(void *)> hook);
+
     int health_check() override;
 
     /**
@@ -377,6 +400,29 @@ class RealClient : public PyClient {
      * error
      */
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
+
+    WeightRpcResult<WeightRevisionMetadata> begin_weight_import(
+        const BeginWeightImportRequest &request) override;
+    WeightRpcResult<WeightRevisionMetadata> commit_weight_import(
+        const CommitWeightImportRequest &request) override;
+    WeightRpcResult<WeightRevisionMetadata> abort_weight_import(
+        const AbortWeightImportRequest &request) override;
+    WeightRpcResult<WeightRevisionView> get_weight_revision(
+        const GetWeightRevisionRequest &request) override;
+    WeightRpcResult<ListWeightRevisionsResponse> list_weight_revisions(
+        const ListWeightRevisionsRequest &request) override;
+    WeightRpcResult<WeightRevisionLease> acquire_weight_revision_lease(
+        const AcquireWeightRevisionLeaseRequest &request) override;
+    WeightRpcResult<WeightRevisionLease> renew_weight_revision_lease(
+        const RenewWeightRevisionLeaseRequest &request) override;
+    WeightRpcResult<void> release_weight_revision_lease(
+        const ReleaseWeightRevisionLeaseRequest &request) override;
+    WeightRpcResult<WeightResidencyOperation> start_weight_residency_operation(
+        const StartWeightResidencyOperationRequest &request) override;
+    WeightRpcResult<WeightResidencyOperation> query_weight_operation(
+        const QueryWeightOperationRequest &request) override;
+    WeightRpcResult<WeightRevisionMetadata> delete_weight_revision(
+        const DeleteWeightRevisionRequest &request) override;
 
     /**
      * @brief Point-in-time existence check that grants no read lease
@@ -395,6 +441,17 @@ class RealClient : public PyClient {
      */
     std::vector<int> batchProbeKey(const std::vector<std::string> &keys,
                                    const GrantLeasePolicy &policy = {});
+
+    /**
+     * @brief isExist / batchIsExist with options. With
+     * ExistOptions.prefetch_to_memory and enable_ssd_prefetch configured,
+     * existing keys that turn out SSD-only get a best-effort asynchronous
+     * SSD->DRAM promotion so a later get() can hit DRAM. The synchronous
+     * path does no extra RPC (a throttle dedup plus a thread-pool enqueue).
+     */
+    int isExist(const std::string &key, const ExistOptions &options) override;
+    std::vector<int> batchIsExist(const std::vector<std::string> &keys,
+                                  const ExistOptions &options) override;
 
     /**
      * @brief Get the size of an object
@@ -713,7 +770,18 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool prefer_alloc_in_same_node);
+
+    // Demand-side kick, shared by all get paths: a get headed for LOCAL_DISK
+    // fires one promotion attempt for those keys (best-effort, non-blocking,
+    // one dedup lookup + one pool enqueue; no RPC on the caller's thread).
+    // ignore_cooldown bypasses only this client's throttle backoff — never a
+    // master-side gate (the in-flight cap, holder check, and dedup TTL still
+    // apply). No-op unless enable_ssd_prefetch_ and the prefetcher is set up.
+    void KickPrefetchForDiskHeadedKeys(
+        const std::vector<std::string> &keys,
+        const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
+        const std::unordered_set<std::string> &local_endpoints);
 
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,
@@ -794,6 +862,11 @@ class RealClient : public PyClient {
 
     tl::expected<void, ErrorCode> tearDownAll_internal();
 
+    // Idempotently releases this client's NoF registrations for all recorded
+    // user buffers; failures keep their records and latch
+    // nof_buffer_cleanup_failed_.
+    ErrorCode CleanupNofRegisteredBuffers();
+
     tl::expected<bool, ErrorCode> isExist_internal(const std::string &key);
 
     std::vector<tl::expected<bool, ErrorCode>> batchIsExist_internal(
@@ -862,6 +935,16 @@ class RealClient : public PyClient {
      * @return true if batch was found and released, false otherwise
      */
     bool release_offload_buffer(uint64_t batch_id);
+
+    /**
+     * @brief RPC handler: a remote requester asks this node (the LOCAL_DISK
+     * holder) to prefetch-promote the given keys into DRAM. Best-effort and
+     * asynchronous; returns false when prefetch is disabled or SSD offload
+     * is not set up here.
+     */
+    bool prefetch_offload_object(const std::vector<std::string> &keys,
+                                 const std::vector<int64_t> &sizes,
+                                 const std::string &tenant_id);
 
     /**
      * @brief Verifies each key's backing offload file on this (the replica
@@ -1079,7 +1162,21 @@ class RealClient : public PyClient {
     std::string local_rpc_addr;
     std::unique_ptr<coro_rpc::coro_rpc_server> offload_rpc_server_;
     int offload_rpc_port_ = 0;
+
+    // SSD prefetch (best-effort SSD->DRAM promotion on exist probes). Off
+    // unless enable_ssd_prefetch is set in the config; knobs are read from
+    // the config dict in setup_internal. See
+    // docs/source/design/store/ssd-prefetch.md.
+    std::unique_ptr<SsdPrefetcher> prefetcher_;
+    bool enable_ssd_prefetch_ = false;
+    int64_t ssd_prefetch_cooldown_sec_ = DEFAULT_SSD_PREFETCH_COOLDOWN_SEC;
+    int64_t ssd_prefetch_dedup_ttl_sec_ = DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC;
     bool use_hugepage_ = false;
+    // NoF runtime (initiator + DMA allocator) created during setup_internal.
+    // Both components are additionally owned by client_ /
+    // client_buffer_allocator_ (in the PyClient base), so member declaration
+    // order is not load-bearing.
+    NofRuntime nof_runtime_{};
 
     struct MappedShm {
         std::string shm_name;
@@ -1120,7 +1217,14 @@ class RealClient : public PyClient {
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
 
     mutable std::shared_mutex registered_buffer_mutex_;
-    std::unordered_map<void *, size_t> registered_buffer_sizes_;
+    struct BufferRegistrationRecord {
+        size_t size;
+    };
+    // A present record means "registered OR cleanup-pending": a record is
+    // retained when NoF/TE cleanup failed, in which case the buffer must
+    // stay mapped until the cleanup retry succeeds (or process exit).
+    std::unordered_map<void *, BufferRegistrationRecord>
+        registered_buffer_sizes_;
     std::optional<WritableBufferRegion> local_buffer_region_;
 
     // KV transfer sessions (process-local; not shared with DummyClient).
@@ -1189,6 +1293,10 @@ class RealClient : public PyClient {
 
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
+
+    // Latched when teardown's NoF buffer cleanup failed: repeat teardown
+    // calls retry the cleanup and keep reporting the failure until it heals.
+    std::atomic<bool> nof_buffer_cleanup_failed_{false};
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
@@ -1335,6 +1443,7 @@ class RealClient : public PyClient {
         bool enable_embedded_master);
 
     friend class DirectGpuReadTest;
+    friend class test::PrefetchTeardownTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,
                                     void *buffer, size_t size) const;
@@ -1364,8 +1473,9 @@ class RealClient : public PyClient {
     std::vector<MappedShm> quarantine_shms_;
 
     // Re-attempt TE + SPDK unregister and munmap of quarantine_shms_. Caller
-    // must hold dummy_client_mutex_. Failures stay quarantined.
-    void RetryQuarantinedShmsLocked();
+    // must hold dummy_client_mutex_. Failures stay quarantined; returns OK
+    // only when nothing remains quarantined.
+    ErrorCode RetryQuarantinedShmsLocked();
 };
 
 }  // namespace mooncake

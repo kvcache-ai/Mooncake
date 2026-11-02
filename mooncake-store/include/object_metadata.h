@@ -4,7 +4,7 @@
 //
 // Moved out of MasterService so the service and the per-object metadata
 // module share one definition. The envelope owns the object identity, the
-// authoritative read lease, the soft-pin state and the tenant quota ledger.
+// authoritative read lease and the soft-pin state.
 // The object's content and the replicas holding it live in the envelope's
 // single ObjectPart.
 //
@@ -27,13 +27,13 @@
 #include <utility>
 #include <vector>
 
+#include "common/heap_optional.h"
 #include "lease.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "object_part.h"
 #include "replica.h"
 #include "tenant_id.h"
-#include "tenant_quota_ledger.h"
 #include "types.h"
 
 namespace mooncake {
@@ -106,13 +106,13 @@ struct ObjectMetadata {
     const TenantId tenant_id;
     const std::string user_key;
 
-    // Committed attribution only; protected by the owning metadata shard lock.
+    // Committed attribution only; protected by the key's lock.
     std::string session_id;
     struct PendingSessionTag {
         std::string session_id;
         std::unordered_set<ReplicaID> eligible_replica_ids;
     };
-    std::optional<PendingSessionTag> pending_session_tag;
+    HeapOptional<PendingSessionTag> pending_session_tag;
 
     void BeginSessionTag(std::string id,
                          const std::unordered_set<ReplicaID>& replicas) {
@@ -153,11 +153,10 @@ struct ObjectMetadata {
     // Replica IDs scope this action to the current write. PutEnd does not
     // carry a generation token, so a stale End from the same client cannot
     // otherwise be distinguished from the current write.
-    std::optional<PendingSoftPinAction> pending_soft_pin_action;
+    HeapOptional<PendingSoftPinAction> pending_soft_pin_action;
     const bool hard_pinned{false};  // immutable, set at creation
     bool memory_cache_total_accounted{false};
     bool disk_cache_total_accounted{false};
-    TenantQuotaLedger quota_ledger;
 
     struct DynamicReplicaRecord {
         std::chrono::system_clock::time_point created_at;
@@ -328,7 +327,7 @@ struct ObjectMetadata {
         return lease_->IsExpired(now);
     }
 
-    // Lease deadline for the eviction census.
+    // Lease deadline eviction ranks the object by.
     std::chrono::system_clock::time_point EvictionDeadline() const {
         return lease_->ExpiresAt();
     }
@@ -408,6 +407,14 @@ struct ObjectMetadata {
             std::move(*pending_soft_pin_action);
         pending_soft_pin_action.reset();
 
+        return ApplySoftPin({pending.action, pending.ttl}, now);
+    }
+
+    // Caller holds the object's metadata write lock. Independent commands do
+    // not consume or replace a pending write's soft-pin action.
+    SoftPinEvaluation ApplySoftPin(
+        const ResolvedSoftPinRequest& request,
+        const std::chrono::system_clock::time_point& now) {
         SpinLocker locker(&lock);
         int metric_delta = 0;
         std::optional<std::chrono::system_clock::time_point> removed_deadline;
@@ -418,11 +425,11 @@ struct ObjectMetadata {
             --metric_delta;
         }
 
-        switch (pending.action) {
+        switch (request.action) {
             case SoftPinAction::PRESERVE:
                 break;
             case SoftPinAction::ENABLE:
-                if (pending.ttl == std::chrono::milliseconds::zero()) {
+                if (request.ttl == std::chrono::milliseconds::zero()) {
                     if (soft_pin_timeout) {
                         removed_deadline = *soft_pin_timeout;
                         soft_pin_timeout.reset();
@@ -432,7 +439,7 @@ struct ObjectMetadata {
                     if (!soft_pin_timeout) {
                         ++metric_delta;
                     }
-                    soft_pin_timeout = ComputeSoftPinDeadline(now, pending.ttl);
+                    soft_pin_timeout = ComputeSoftPinDeadline(now, request.ttl);
                     deadline_to_index = soft_pin_timeout;
                     // Upserting the latest registration supersedes any
                     // expired or previously active deadline.
