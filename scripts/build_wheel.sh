@@ -427,7 +427,7 @@ echo "Installing required build packages"
 # rocm/musa CI images built on it) is 0.14.3, which makes `auditwheel repair`
 # abort. The PyPI wheel lands ahead of /usr/bin on PATH and works everywhere
 # the Python toolchain does.
-if [ "$NPU_BUILD" = "1" ] || [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
+if [ "$NPU_BUILD" = "1" ]; then
     PYTHON_CMD="python${PYTHON_VERSION}"
     if ! command -v "$PYTHON_CMD" &>/dev/null; then
         echo "Error: $PYTHON_CMD not found for wheel build"
@@ -526,7 +526,7 @@ echo "Detected glibc version: $GLIBC_VERSION"
 echo "Using platform tag: $PLATFORM_TAG"
 
 echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-if [ "$NPU_BUILD" = "1" ] || [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
+if [ "$NPU_BUILD" = "1" ]; then
     python${PYTHON_VERSION} -m build --wheel --no-isolation --outdir ${OUTPUT_DIR}
     AUDITWHEEL_CMD="python${PYTHON_VERSION} -m auditwheel"
 else
@@ -698,7 +698,7 @@ if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
 fi
 # NPU only: move auditwheel-vendored .libs into mooncake/ and set RPATH=$ORIGIN
 # on all ELF files so everything resolves from a single directory.
-if [ "$NPU_BUILD" = "1" ] || [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
+if [ "$NPU_BUILD" = "1" ]; then
     REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
     if [ -n "$REPAIRED_WHEEL" ]; then
         WHEEL_UNPACK_DIR=$(mktemp -d)
