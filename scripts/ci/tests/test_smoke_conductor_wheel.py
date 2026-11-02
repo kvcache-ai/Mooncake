@@ -11,6 +11,8 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
+import yaml
+
 SPEC = importlib.util.spec_from_file_location(
     "smoke_conductor_wheel",
     Path(__file__).resolve().parents[3] / "scripts/smoke_conductor_wheel.py",
@@ -168,6 +170,52 @@ class ConductorServerPreservationTest(unittest.TestCase):
                         self.assertEqual(result.returncode, exit_code, result.stderr)
                         preserved = Path((root / "preserved-path").read_text())
                         self.assertFalse(preserved.exists())
+
+
+class WheelBuildCallerTest(unittest.TestCase):
+    """build_wheel.sh requires _conductor, so every direct caller must build it."""
+
+    ROOT = Path(SMOKE.__file__).resolve().parents[1]
+
+    @staticmethod
+    def code(text):
+        # A flag mentioned only in a comment must not satisfy the check.
+        return "\n".join(
+            line for line in text.splitlines() if not line.lstrip().startswith("#")
+        )
+
+    def callers(self):
+        found = {}
+        # Workflows are checked per job: the configure step must share a job
+        # with the build_wheel.sh step. Reusable-workflow callers are covered
+        # by the reusable workflow's own job.
+        for path in sorted(self.ROOT.glob(".github/workflows/*.y*ml")):
+            jobs = yaml.safe_load(path.read_text()).get("jobs") or {}
+            for name, job in jobs.items():
+                steps = job.get("steps") or []
+                script = self.code("\n".join(step.get("run", "") for step in steps))
+                if "build_wheel.sh" in script:
+                    found[f"{path.relative_to(self.ROOT)}:{name}"] = script
+        for pattern in ("docker/*Dockerfile*", "*.sh", "scripts/**/*.sh"):
+            for path in sorted(self.ROOT.glob(pattern)):
+                script = self.code(path.read_text())
+                if path.name != "build_wheel.sh" and "build_wheel.sh" in script:
+                    found[str(path.relative_to(self.ROOT))] = script
+        return found
+
+    def test_every_wheel_build_caller_enables_conductor(self):
+        callers = self.callers()
+        # Entry points that PR CI does not build; guard the discovery itself.
+        for known in (
+            "docker/mooncake.Dockerfile",
+            "docker/musa.Dockerfile",
+            ".github/workflows/pre-release.yaml:build-npu",
+            ".github/workflows/_build-wheel.yaml:build",
+        ):
+            self.assertIn(known, callers)
+        for caller, script in callers.items():
+            with self.subTest(caller=caller):
+                self.assertIn("-DWITH_CONDUCTOR=ON", script)
 
 
 if __name__ == "__main__":

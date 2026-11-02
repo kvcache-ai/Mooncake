@@ -166,7 +166,7 @@ jobs:
           rm -rf build
           mkdir build
           cd build
-          cmake ..             -DUSE_ASCEND_DIRECT=ON             -DUSE_ETCD=ON             -DSTORE_USE_ETCD=ON             -DBUILD_UNIT_TESTS=OFF             -DCMAKE_BUILD_TYPE=Release             -DPython3_EXECUTABLE="${PYTHON_BIN}"             -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF             -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF             -DCMAKE_SKIP_INSTALL_RPATH=ON
+          cmake ..             -DWITH_CONDUCTOR=ON             -DUSE_ASCEND_DIRECT=ON             -DUSE_ETCD=ON             -DSTORE_USE_ETCD=ON             -DBUILD_UNIT_TESTS=OFF             -DCMAKE_BUILD_TYPE=Release             -DPython3_EXECUTABLE="${PYTHON_BIN}"             -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF             -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF             -DCMAKE_SKIP_INSTALL_RPATH=ON
 
       - name: Build project
         shell: bash
