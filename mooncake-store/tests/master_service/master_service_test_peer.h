@@ -530,6 +530,17 @@ class MasterServiceTestPeer {
         return service_.ProcessClientOffboardingJob(job);
     }
 
+    ClientOffboardingJob BuildClientOffboardingJob(
+        const UUID& client_id,
+        const std::shared_ptr<ClientLivenessRecord>& record) {
+        return service_.BuildClientOffboardingJob(client_id, record);
+    }
+
+    bool EndpointCleanupPending(const std::string& endpoint) {
+        std::lock_guard<std::mutex> lock(service_.barrier_mutex_);
+        return service_.pending_by_endpoint_.contains(endpoint);
+    }
+
     void FlushPendingSegmentUnmounts() {
         service_.FlushPendingSegmentUnmounts();
     }

@@ -8093,6 +8093,117 @@ TEST_F(MasterServiceHATest, OneEndpointWaitsForEveryUnmountedSegment) {
 // Every SEGMENT_UNMOUNT submission goes through a per-token claim. A late
 // offboarding retry must not append a second unmount after a new segment has
 // taken the endpoint: the standby would apply it and drop that segment.
+TEST_F(MasterServiceHATest, ClientMonitorRetirePublishesTheEndpointBarrier) {
+    const std::string cluster_id = "monitor_retire_barrier";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    auto segment = MakeSegment("monitor_retire_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    PutObjectOnSegment(service, client_id, "monitor_retire_key", segment.name);
+
+    const auto liveness = ClientRecordForTesting(service, client_id);
+    ASSERT_TRUE(liveness);
+    const auto now = ClientLivenessRecord::Clock::now();
+    ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                 std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    MasterMetricManager::instance().client_liveness_became_suspected();
+    ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                 std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    MasterMetricManager::instance().client_liveness_became_offline();
+
+    // This is the function the client monitor calls when it retires a client:
+    // it prepares the segments, so it must publish their cleanup
+    // responsibility in the same step and hand the state to the job.
+    auto job = MasterServiceTestPeer(service).BuildClientOffboardingJob(
+        client_id, liveness);
+    ASSERT_EQ(1u, job.prepared_segments.size());
+    EXPECT_NE(nullptr, job.prepared_segments.front().unmount_log);
+    EXPECT_TRUE(MasterServiceTestPeer(service).EndpointCleanupPending(
+        segment.te_endpoint));
+
+    // A new segment, different name, same endpoint: it must wait.
+    auto replacement = MakeSegment("monitor_retire_replacement");
+    replacement.te_endpoint = segment.te_endpoint;
+    std::promise<tl::expected<void, ErrorCode>> mounted;
+    auto mount_result = mounted.get_future();
+    std::thread mount_thread([&] {
+        mounted.set_value(service.MountSegment(replacement, generate_uuid()));
+    });
+    JoinOnExit join_mount_thread(mount_thread);
+    EXPECT_EQ(mount_result.wait_for(std::chrono::milliseconds(300)),
+              std::future_status::timeout);
+
+    // Drive the job as the offboarding worker would. The endpoint opens once
+    // its entry is logged and the sweep covered the invalidation.
+    ASSERT_TRUE(
+        MasterServiceTestPeer(service).ProcessClientOffboardingJob(job));
+    EXPECT_EQ(mount_result.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    ASSERT_TRUE(mount_result.get().has_value());
+
+    // Exactly one unmount for the endpoint, and it precedes the replacement's
+    // mount: a later duplicate would remove the replacement from a standby.
+    // Committing only enqueues, so poll until the replacement's mount is
+    // persisted, as the other OpLog tests do.
+    OpLogBatchStorage storage(cluster_id, *backend);
+    const auto read_entries = [&]() {
+        std::vector<OpType> ordered;
+        for (uint64_t batch_id = 1;; ++batch_id) {
+            OpLogBatchRecord batch;
+            if (storage.ReadBatch(batch_id, batch) != ErrorCode::OK) {
+                break;
+            }
+            for (const auto& entry : batch.entries) {
+                if (entry.object_key == segment.te_endpoint) {
+                    ordered.push_back(entry.op_type);
+                }
+            }
+        }
+        return ordered;
+    };
+    const auto count_type = [](const std::vector<OpType>& entries,
+                               OpType type) {
+        return static_cast<size_t>(
+            std::count(entries.begin(), entries.end(), type));
+    };
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    std::vector<OpType> ordered = read_entries();
+    // The old segment's mount and the replacement's are the two mounts on
+    // this endpoint.
+    while (count_type(ordered, OpType::SEGMENT_MOUNT) < 2 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        ordered = read_entries();
+    }
+    const size_t unmount_count = count_type(ordered, OpType::SEGMENT_UNMOUNT);
+    const auto last_mount =
+        std::find(ordered.rbegin(), ordered.rend(), OpType::SEGMENT_MOUNT);
+    const auto unmount =
+        std::find(ordered.begin(), ordered.end(), OpType::SEGMENT_UNMOUNT);
+    ASSERT_EQ(2u, count_type(ordered, OpType::SEGMENT_MOUNT));
+    EXPECT_EQ(1u, unmount_count);
+    ASSERT_LT(unmount, ordered.end());
+    ASSERT_NE(last_mount, ordered.rend());
+    // Index of the replacement's mount, counted from the front.
+    const size_t last_mount_pos =
+        ordered.size() - 1 - static_cast<size_t>(last_mount - ordered.rbegin());
+    EXPECT_LT(static_cast<size_t>(unmount - ordered.begin()), last_mount_pos);
+}
+
 TEST_F(MasterServiceHATest,
        LateOffboardingRetryDoesNotDuplicateTheUnmountEntry) {
     const std::string cluster_id = "unmount_claim_retry";

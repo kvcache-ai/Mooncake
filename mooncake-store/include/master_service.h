@@ -1279,6 +1279,12 @@ class MasterService {
     void RunReplicaCleanupSweep();
     void StallCleanupWaiters();
 
+    // Prepares what a retired client's segments need and publishes each
+    // prepared segment's cleanup responsibility. The client monitor calls
+    // this before scheduling the job; tests drive the same function.
+    ClientOffboardingJob BuildClientOffboardingJob(
+        const UUID& client_id,
+        const std::shared_ptr<ClientLivenessRecord>& record);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future

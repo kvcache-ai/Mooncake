@@ -10593,6 +10593,66 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
             << ", total_freed_size=" << total_freed_size;
 }
 
+ClientOffboardingJob MasterService::BuildClientOffboardingJob(
+    const UUID& client_id,
+    const std::shared_ptr<ClientLivenessRecord>& record) {
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = record;
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    std::vector<Segment> segments;
+    const auto get_result =
+        segment_access.GetClientSegments(client_id, segments);
+    if (get_result != ErrorCode::OK) {
+        return job;
+    }
+    for (const auto& segment : segments) {
+        SegmentStatus status = SegmentStatus::UNDEFINED;
+        const auto status_result =
+            segment_access.GetSegmentStatusById(segment.id, status);
+        if (status_result == ErrorCode::SEGMENT_NOT_FOUND) {
+            continue;
+        }
+        if (status_result == ErrorCode::OK &&
+            status == SegmentStatus::UNMOUNTING) {
+            job.pending_prepare_segments.push_back(
+                {.segment_id = segment.id,
+                 .segment_name = segment.name,
+                 .transport_endpoint = segment.te_endpoint});
+            continue;
+        }
+
+        size_t metrics_dec_capacity = 0;
+        const auto prepare_result = segment_access.PrepareUnmountSegment(
+            segment.id, metrics_dec_capacity);
+        if (prepare_result == ErrorCode::OK) {
+            // Publish under the same segment lock that ordered the
+            // invalidation: the job may not run for a while, and until this
+            // responsibility is covered no new segment may mount on the
+            // endpoint. The job keeps the submission state for its retries.
+            auto unmount_log =
+                PublishSegmentCleanup(segment.id, segment.te_endpoint);
+            job.prepared_segments.push_back(
+                {.segment_id = segment.id,
+                 .segment_name = segment.name,
+                 .transport_endpoint = segment.te_endpoint,
+                 .metrics_dec_capacity = metrics_dec_capacity,
+                 .unmount_log = std::move(unmount_log)});
+        } else if (prepare_result != ErrorCode::SEGMENT_NOT_FOUND) {
+            job.pending_prepare_segments.push_back(
+                {.segment_id = segment.id,
+                 .segment_name = segment.name,
+                 .transport_endpoint = segment.te_endpoint});
+            LOG(ERROR) << "client_id=" << client_id
+                       << ", segment_name=" << segment.name
+                       << ", action=prepare_client_offboarding"
+                       << ", error=" << toString(prepare_result);
+        }
+    }
+    return job;
+}
+
 void MasterService::ClientMonitorFunc() {
     while (client_monitor_running_) {
         // RFC #4700 slice 1: liveness transitions retire clients and drive
@@ -10639,68 +10699,8 @@ void MasterService::ClientMonitorFunc() {
                             return pending.client_id == client_id;
                         });
 
-                    ClientOffboardingJob job;
-                    job.client_id = client_id;
-                    job.liveness = record;
-                    std::shared_lock<std::shared_mutex> snapshot_lock(
-                        master_state_mutex_);
-                    {
-                        ScopedSegmentAccess segment_access =
-                            segment_manager_.getSegmentAccess();
-                        std::vector<Segment> segments;
-                        const auto get_result =
-                            segment_access.GetClientSegments(client_id,
-                                                             segments);
-                        if (get_result == ErrorCode::OK) {
-                            for (const auto& segment : segments) {
-                                SegmentStatus status = SegmentStatus::UNDEFINED;
-                                const auto status_result =
-                                    segment_access.GetSegmentStatusById(
-                                        segment.id, status);
-                                if (status_result ==
-                                    ErrorCode::SEGMENT_NOT_FOUND) {
-                                    continue;
-                                }
-                                if (status_result == ErrorCode::OK &&
-                                    status == SegmentStatus::UNMOUNTING) {
-                                    job.pending_prepare_segments.push_back(
-                                        {.segment_id = segment.id,
-                                         .segment_name = segment.name,
-                                         .transport_endpoint =
-                                             segment.te_endpoint});
-                                    continue;
-                                }
-
-                                size_t metrics_dec_capacity = 0;
-                                const auto prepare_result =
-                                    segment_access.PrepareUnmountSegment(
-                                        segment.id, metrics_dec_capacity);
-                                if (prepare_result == ErrorCode::OK) {
-                                    job.prepared_segments.push_back(
-                                        {.segment_id = segment.id,
-                                         .segment_name = segment.name,
-                                         .transport_endpoint =
-                                             segment.te_endpoint,
-                                         .metrics_dec_capacity =
-                                             metrics_dec_capacity});
-                                } else if (prepare_result !=
-                                           ErrorCode::SEGMENT_NOT_FOUND) {
-                                    job.pending_prepare_segments.push_back(
-                                        {.segment_id = segment.id,
-                                         .segment_name = segment.name,
-                                         .transport_endpoint =
-                                             segment.te_endpoint});
-                                    LOG(ERROR)
-                                        << "client_id=" << client_id
-                                        << ", segment_name=" << segment.name
-                                        << ", action=prepare_client_offboarding"
-                                        << ", error="
-                                        << toString(prepare_result);
-                                }
-                            }
-                        }
-                    }
-
+                    ClientOffboardingJob job =
+                        BuildClientOffboardingJob(client_id, record);
                     MasterMetricManager::instance()
                         .client_liveness_became_offline();
                     client_offboarding_worker_.ScheduleReserved(std::move(job));
