@@ -74,6 +74,10 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
 
     config.storage_paths = ResolveOffloadDiskPaths(config.storage_filepath);
 
+    config.allow_storage_path_change =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_ALLOW_STORAGE_PATH_CHANGE,
+                        config.allow_storage_path_change);
+
     config.local_buffer_size =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES,
                         config.local_buffer_size);

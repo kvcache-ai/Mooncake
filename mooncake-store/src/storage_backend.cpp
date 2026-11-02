@@ -13,8 +13,12 @@
 
 #include <array>
 #include <cctype>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <regex>
+#include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -24,6 +28,7 @@
 
 #include <ylt/struct_pb.hpp>
 
+#include "ascii_string.h"
 #include "mutex.h"
 #include "nvme_kv/backend.h"
 #include "common/timestamp.h"
@@ -1631,6 +1636,170 @@ void BucketStorageBackend::ReleaseDiskOwnerLocks() {
     owner_lock_fds_.clear();
 }
 
+bool BucketStorageBackend::CheckStorageRootManifest() {
+    namespace fs = std::filesystem;
+
+    // Collect the union of roots recorded by every manifest. A root that was
+    // used before but is gone from the current configuration would make its
+    // buckets silently unreachable, so it is treated as a hard error unless
+    // the operator explicitly opts in.
+    std::set<std::string> recorded;
+    for (const auto& root : disk_paths_) {
+        const auto manifest_path = fs::path(root) / STORAGE_ROOTS_MANIFEST;
+        std::error_code ec;
+        const bool exists = fs::exists(manifest_path, ec);
+        if (ec) {
+            LOG(ERROR) << "Failed to inspect storage root manifest "
+                       << manifest_path.string() << ": " << ec.message();
+            return false;
+        }
+        if (!exists) {
+            continue;
+        }
+        std::ifstream in(manifest_path);
+        if (!in) {
+            LOG(ERROR) << "Failed to open storage root manifest "
+                       << manifest_path.string();
+            return false;
+        }
+        std::string line;
+        if (!std::getline(in, line) ||
+            TrimAsciiWhitespace(line) != STORAGE_ROOTS_MANIFEST_HEADER) {
+            LOG(ERROR) << "Invalid storage root manifest header in "
+                       << manifest_path.string();
+            return false;
+        }
+        while (std::getline(in, line)) {
+            const auto trimmed = TrimAsciiWhitespace(line);
+            if (!trimmed.empty()) {
+                recorded.emplace(trimmed);
+            }
+        }
+        if (in.bad()) {
+            LOG(ERROR) << "Failed to read storage root manifest "
+                       << manifest_path.string();
+            return false;
+        }
+    }
+
+    const std::set<std::string> configured(disk_paths_.begin(),
+                                           disk_paths_.end());
+    std::vector<std::string> missing;
+    std::set_difference(recorded.begin(), recorded.end(), configured.begin(),
+                        configured.end(), std::back_inserter(missing));
+    if (!missing.empty()) {
+        std::string missing_list;
+        for (const auto& path : missing) {
+            missing_list += "\n  " + path;
+        }
+        if (!file_storage_config_.allow_storage_path_change) {
+            LOG(ERROR) << "Storage root(s) used by a previous run are missing "
+                          "from MOONCAKE_OFFLOAD_FILE_STORAGE_PATH:"
+                       << missing_list
+                       << "\nTheir buckets would become unreachable. Add them "
+                          "back, or set "
+                          "MOONCAKE_OFFLOAD_ALLOW_STORAGE_PATH_CHANGE=true to "
+                          "start without them (their data stays invisible).";
+            return false;
+        }
+        LOG(WARNING) << "Storage root(s) used by a previous run are missing "
+                        "from the current configuration:"
+                     << missing_list
+                     << "\nContinuing because "
+                        "MOONCAKE_OFFLOAD_ALLOW_STORAGE_PATH_CHANGE is set; "
+                        "buckets on those roots will not be served.";
+    }
+
+    return true;
+}
+
+bool BucketStorageBackend::WriteStorageRootManifest() {
+    namespace fs = std::filesystem;
+
+    // Rewrite manifests where the configured set differs (new root added, or
+    // escape hatch taken).
+    std::string content = STORAGE_ROOTS_MANIFEST_HEADER;
+    content += '\n';
+    for (const auto& root : disk_paths_) {
+        content += root;
+        content += '\n';
+    }
+    for (const auto& root : disk_paths_) {
+        const auto manifest_path = fs::path(root) / STORAGE_ROOTS_MANIFEST;
+        {
+            std::error_code ec;
+            if (fs::exists(manifest_path, ec) && !ec) {
+                std::ifstream in(manifest_path);
+                std::stringstream buffer;
+                buffer << in.rdbuf();
+                if (in && buffer.str() == content) {
+                    continue;  // Up to date.
+                }
+            }
+        }
+        // Write a sibling temp file first, fsync it, then rename so a crash
+        // can never leave a truncated manifest behind.
+        const auto tmp_path = manifest_path.string() + ".tmp";
+        {
+            std::ofstream out(tmp_path, std::ios::trunc);
+            out << content;
+            out.flush();
+            if (!out) {
+                LOG(ERROR) << "Failed to write storage root manifest "
+                           << tmp_path;
+                std::error_code ec;
+                fs::remove(tmp_path, ec);
+                return false;
+            }
+        }
+        const int fd = ::open(tmp_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            LOG(ERROR) << "Failed to open storage root manifest for fsync: "
+                       << tmp_path << ", errno=" << errno;
+            std::error_code ec;
+            fs::remove(tmp_path, ec);
+            return false;
+        }
+        const int sync_ret = ::fsync(fd);
+        ::close(fd);
+        if (sync_ret != 0) {
+            LOG(ERROR) << "Failed to fsync storage root manifest " << tmp_path
+                       << ", errno=" << errno;
+            std::error_code ec;
+            fs::remove(tmp_path, ec);
+            return false;
+        }
+        std::error_code ec;
+        fs::rename(tmp_path, manifest_path, ec);
+        if (ec) {
+            LOG(ERROR) << "Failed to install storage root manifest "
+                       << manifest_path.string() << ": " << ec.message();
+            fs::remove(tmp_path, ec);
+            return false;
+        }
+        // fsync the containing directory so the rename itself is durable: the
+        // file fsync above only covers the temp file's contents, not the
+        // directory entry. Without this a crash right after Init could bring
+        // back the previous manifest. Filesystems that reject fsync on a
+        // directory (e.g. EINVAL) have still applied the rename, so only warn
+        // instead of failing startup.
+        const int dir_fd =
+            ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dir_fd < 0) {
+            LOG(WARNING) << "Failed to open storage root for fsync: " << root
+                         << ", errno=" << errno;
+        } else {
+            const int dir_sync_ret = ::fsync(dir_fd);
+            ::close(dir_fd);
+            if (dir_sync_ret != 0) {
+                LOG(WARNING) << "Failed to fsync storage root directory "
+                             << root << ", errno=" << errno;
+            }
+        }
+    }
+    return true;
+}
+
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
@@ -2119,6 +2288,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             }
         }
 
+        // Refuse to start when a root that previously held buckets dropped out
+        // of the configuration: its data would silently become unreachable.
+        // The manifest is only rewritten once Init has fully succeeded (see
+        // below), so a failed start cannot forget a dropped root.
+        if (!CheckStorageRootManifest()) {
+            ReleaseDiskOwnerLocks();
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+
         for (int disk_index = 0; disk_index < static_cast<int>(disks_.size());
              ++disk_index) {
             auto& disk = disks_[disk_index];
@@ -2407,6 +2585,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         } else {
             LOG(INFO) << "Initialized BucketIdGenerator from existing state. "
                       << "Last used bucket ID was " << max_bucket_id;
+        }
+
+        // Persist the root set only after the scan succeeded. Writing it any
+        // earlier would let a later Init failure permanently drop a root that
+        // was skipped under MOONCAKE_OFFLOAD_ALLOW_STORAGE_PATH_CHANGE, so the
+        // next start would no longer warn about its data.
+        if (!WriteStorageRootManifest()) {
+            ReleaseDiskOwnerLocks();
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
         }
         initialized_.store(true, std::memory_order_release);
     } catch (const std::exception& e) {

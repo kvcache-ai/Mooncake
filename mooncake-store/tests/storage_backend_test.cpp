@@ -13,6 +13,7 @@
 #include <new>
 #include <optional>
 #include <ranges>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -35,13 +36,15 @@
 namespace fs = std::filesystem;
 namespace mooncake::test {
 
-// Ignore the #3528 path lock when tests assert "empty" / file counts.
+// Ignore the bookkeeping dotfiles (#3528 path lock, storage root manifest)
+// when tests assert "empty" / file counts.
 static int CountDataFiles(const std::string& dir) {
     int n = 0;
     if (!fs::exists(dir)) return 0;
     for (const auto& entry : fs::directory_iterator(dir)) {
         if (!entry.is_regular_file()) continue;
-        if (entry.path().filename() == ".mooncake_local_disk.lock") continue;
+        const auto name = entry.path().filename().string();
+        if (!name.empty() && name.front() == '.') continue;
         ++n;
     }
     return n;
@@ -5513,14 +5516,28 @@ int CountMetaFiles(const std::string& dir) {
     return count;
 }
 
+// Cache bytes only: the dotfile bookkeeping (owner lock, root manifest) is not
+// part of what total_size accounts for.
 int64_t DirectoryBytes(const std::string& dir) {
     int64_t bytes = 0;
     for (const auto& entry : fs::recursive_directory_iterator(dir)) {
-        if (entry.is_regular_file()) {
-            bytes += static_cast<int64_t>(fs::file_size(entry.path()));
+        if (!entry.is_regular_file()) {
+            continue;
         }
+        const auto name = entry.path().filename().string();
+        if (!name.empty() && name.front() == '.') {
+            continue;
+        }
+        bytes += static_cast<int64_t>(fs::file_size(entry.path()));
     }
     return bytes;
+}
+
+std::string ReadTextFile(const std::string& path) {
+    std::ifstream in(path);
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    return buffer.str();
 }
 
 }  // namespace
@@ -6145,6 +6162,100 @@ TEST_F(StorageBackendTest, MultiDiskValidateRejectsNonPositiveQuotaEntry) {
 
     config.max_total_size_per_disk = {-1};
     EXPECT_FALSE(config.Validate());
+}
+
+// Each disk records the full configured root set, so a later run can tell
+// when a disk it used to write to has dropped out of the configuration.
+TEST_F(StorageBackendTest, MultiDiskInitWritesManifestToEveryDisk) {
+    const std::string disk0 = data_path + "/disk0";
+    const std::string disk1 = data_path + "/disk1";
+    fs::create_directories(disk0);
+    fs::create_directories(disk1);
+
+    FileStorageConfig config;
+    config.storage_filepath = disk0 + "," + disk1;
+    BucketBackendConfig bucket_config;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    const auto m0 = ReadTextFile(disk0 + "/.mooncake_storage_roots");
+    const auto m1 = ReadTextFile(disk1 + "/.mooncake_storage_roots");
+    ASSERT_FALSE(m0.empty());
+    EXPECT_EQ(m0, m1);
+    for (const auto& path : {disk0, disk1}) {
+        EXPECT_NE(m0.find(path), std::string::npos)
+            << "manifest must list " << path;
+    }
+}
+
+// Dropping a disk that previously held buckets would silently strand its
+// data, so Init refuses unless the operator opts in explicitly.
+TEST_F(StorageBackendTest, MultiDiskManifestMissingDiskFailsInit) {
+    const std::string disk0 = data_path + "/disk0";
+    const std::string disk1 = data_path + "/disk1";
+    fs::create_directories(disk0);
+    fs::create_directories(disk1);
+    BucketBackendConfig bucket_config;
+
+    {
+        FileStorageConfig both;
+        both.storage_filepath = disk0 + "," + disk1;
+        BucketStorageBackend backend(both, bucket_config);
+        ASSERT_TRUE(backend.Init());
+        ASSERT_TRUE(OffloadOneKey(backend, "manifest_key", 4096));
+    }
+    const auto manifest_before = ReadTextFile(disk0 + "/.mooncake_storage_roots");
+    ASSERT_NE(manifest_before.find(disk1), std::string::npos);
+
+    FileStorageConfig reduced;
+    reduced.storage_filepath = disk0;
+    {
+        BucketStorageBackend blocked(reduced, bucket_config);
+        auto init_result = blocked.Init();
+        ASSERT_FALSE(init_result.has_value());
+        EXPECT_EQ(init_result.error(), ErrorCode::FILE_OPEN_FAIL);
+    }
+    // A failed Init must not rewrite the manifest, otherwise the next strict
+    // start would no longer notice the missing disk.
+    EXPECT_EQ(ReadTextFile(disk0 + "/.mooncake_storage_roots"),
+              manifest_before);
+
+    // The failed Init must have released its locks, so the escape hatch can
+    // start right away.
+    reduced.allow_storage_path_change = true;
+    BucketStorageBackend escaped(reduced, bucket_config);
+    ASSERT_TRUE(escaped.Init());
+    const auto rewritten = ReadTextFile(disk0 + "/.mooncake_storage_roots");
+    EXPECT_EQ(rewritten.find(disk1), std::string::npos)
+        << "an accepted root change must update the manifest";
+}
+
+// Adding a disk is the normal scale-out path and needs no opt-in.
+TEST_F(StorageBackendTest, MultiDiskManifestAddDiskSucceeds) {
+    const std::string disk0 = data_path + "/disk0";
+    const std::string disk1 = data_path + "/disk1";
+    fs::create_directories(disk0);
+    fs::create_directories(disk1);
+    BucketBackendConfig bucket_config;
+
+    {
+        FileStorageConfig single;
+        single.storage_filepath = disk0;
+        BucketStorageBackend backend(single, bucket_config);
+        ASSERT_TRUE(backend.Init());
+    }
+
+    FileStorageConfig grown;
+    grown.storage_filepath = disk0 + "," + disk1;
+    BucketStorageBackend backend(grown, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    for (const auto& path : {disk0, disk1}) {
+        const auto manifest = ReadTextFile(path + "/.mooncake_storage_roots");
+        EXPECT_NE(manifest.find(disk0), std::string::npos) << path;
+        EXPECT_NE(manifest.find(disk1), std::string::npos) << path;
+    }
 }
 
 //-----------------------------------------------------------------------------

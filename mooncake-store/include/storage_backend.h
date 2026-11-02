@@ -244,6 +244,11 @@ struct FileStorageConfig {
     // actual storage location re-derives it from storage_filepath instead.
     std::vector<std::string> storage_paths;
 
+    // Allow Init() to start when a storage root recorded in the per-root
+    // manifest is no longer configured. Data on the missing root stays
+    // unreachable; default false (fail fast).
+    bool allow_storage_path_change = false;
+
     // Size of the local client-side buffer (used for caching or batching)
     int64_t local_buffer_size = 1280 * kMB;  // ~1.2 GB
 
@@ -1233,6 +1238,40 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> AcquireDiskOwnerLocks();
 
     void ReleaseDiskOwnerLocks();
+
+    /**
+     * @brief Check that every disk root a previous run recorded is still
+     *        configured.
+     *
+     * Each root carries a manifest naming the full root set of the run that
+     * used it. A root that drops out of the configuration takes its buckets
+     * with it: they stay on disk but are no longer scanned or served. Refuse
+     * to start unless allow_storage_path_change is set, so a mistyped or
+     * removed disk cannot silently shrink the cache. (A disk whose mount
+     * disappears while its path stays configured is not detected here: the
+     * path is recreated empty and no manifest is found.)
+     *
+     * Must run after the owner locks are held and before the roots are
+     * scanned; the manifests are written back only once Init() succeeds.
+     *
+     * @return true if the configured roots cover every recorded root (or the
+     *         operator opted in), false on an unreadable or invalid manifest
+     *         or a missing root without the opt-in.
+     */
+    bool CheckStorageRootManifest();
+
+    /**
+     * @brief Write the configured root set to every root's manifest where it
+     *        is out of date.
+     *
+     * @return true on success, false if a manifest could not be installed.
+     */
+    bool WriteStorageRootManifest();
+
+    static constexpr const char* STORAGE_ROOTS_MANIFEST =
+        ".mooncake_storage_roots";
+    static constexpr const char* STORAGE_ROOTS_MANIFEST_HEADER =
+        "mooncake_offload_roots_v1";
 
     std::atomic<bool> test_datasync_failure_{false};
     // Alignment helper functions for O_DIRECT I/O
