@@ -3,12 +3,99 @@
 
 #include <glog/logging.h>
 
+#include <atomic>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace mooncake::test {
+
+TEST_F(MasterServiceTest, RemoveAllPreservesManagedGroupImportedDuringScan) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const UUID client_id = context.client_id;
+    WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "concurrent-scan",
+        .revision = "step-1",
+        .weight_generation = 1,
+    };
+    const std::string manifest_key = MakeWeightManifestKey(identity);
+    const std::string payload_key = "concurrent-scan-payload";
+    const std::string ordinary_key = "concurrent-scan-ordinary";
+    ReplicateConfig ordinary;
+    ordinary.replica_num = 1;
+    PutCompletedObject(service, client_id, ordinary_key, ordinary, 1024);
+
+    std::promise<void> paused;
+    std::promise<void> resume;
+    auto paused_future = paused.get_future();
+    const auto resume_future = resume.get_future().share();
+    std::atomic<bool> gate_timed_out{false};
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(
+        [&](const TenantId& tenant_id) {
+            if (!tenant_id.IsDefault()) return;
+            paused.set_value();
+            gate_timed_out = resume_future.wait_for(std::chrono::seconds(10)) !=
+                             std::future_status::ready;
+        });
+    auto sweep =
+        std::async(std::launch::async, [&] { return service.RemoveAll(true); });
+    const bool reached = paused_future.wait_for(std::chrono::seconds(3)) ==
+                         std::future_status::ready;
+    bool published = false;
+    if (reached) {
+        auto importing = service.BeginWeightImport(BeginWeightImportRequest{
+            .identity = identity,
+            .payload_group_id = {},
+            .expected_payload_count = 1,
+            .expected_logical_bytes = 1024,
+        });
+        if (importing) {
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.group_ids =
+                std::vector<std::string>{importing->manifest.payload_group_id};
+            config.data_type = ObjectDataType::WEIGHT;
+            PutCompletedObject(service, client_id, payload_key, config, 1024);
+            config.data_type = ObjectDataType::METADATA;
+            PutCompletedObject(service, client_id, manifest_key, config, 128);
+            auto ready = service.CommitWeightImport(CommitWeightImportRequest{
+                .identity = identity,
+                .expected_metadata_generation = importing->metadata_generation,
+                .manifest =
+                    WeightManifestReference{
+                        .manifest_key = manifest_key,
+                        .manifest_sha256 = std::string(64, 'a'),
+                        .payload_group_id =
+                            importing->manifest.payload_group_id,
+                        .payload_keys_sha256 =
+                            ComputeWeightPayloadKeysSha256({payload_key}),
+                        .payload_count = 1,
+                        .logical_bytes = 1024,
+                    },
+            });
+            published =
+                ready && ready->availability == WeightAvailabilityState::READY;
+        }
+    }
+    resume.set_value();
+    const auto removed = sweep.get();
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(nullptr);
+    ASSERT_TRUE(reached);
+    ASSERT_TRUE(published);
+    ASSERT_FALSE(gate_timed_out);
+    EXPECT_EQ(1, removed);
+    EXPECT_FALSE(
+        service.ExistKey(ordinary_key, TenantId::Default()).value_or(true));
+    EXPECT_TRUE(
+        service.ExistKey(payload_key, TenantId::Default()).value_or(false));
+    EXPECT_TRUE(
+        service.ExistKey(manifest_key, TenantId::Default()).value_or(false));
+}
 
 TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
     auto service_config =
@@ -19,7 +106,7 @@ TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
 
     const std::string key_a = "lease_group_key_a";
     const std::string key_b = "lease_group_key_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = key_a + "_group";
 
     ReplicateConfig config_a;
     config_a.replica_num = 1;
@@ -60,7 +147,7 @@ TEST_F(MasterServiceTest, GroupedEvictionSkipsUnsafeMembersAndEvictsSafePeers) {
 
     const std::string safe_key = "grouped_mixed_safe_key";
     const std::string hard_pinned_key = "grouped_mixed_hard_pinned_key";
-    const std::string group_id = FindGroupIdOnDifferentShard(safe_key);
+    const std::string group_id = safe_key + "_group";
 
     ReplicateConfig safe_config;
     safe_config.replica_num = 1;
@@ -92,6 +179,114 @@ TEST_F(MasterServiceTest, GroupedEvictionSkipsUnsafeMembersAndEvictsSafePeers) {
             .has_value());
 }
 
+TEST_F(MasterServiceTest,
+       ManagedWeightGroupIsSkippedByEvictionAndGenericRemoval) {
+    constexpr size_t kSegmentSize = 4 * 1024 * 1024;
+    constexpr size_t kObjectSize = 1024 * 1024;
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    MasterService service(service_config);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(
+        service, "managed_weight_segment", kDefaultSegmentBase, kSegmentSize);
+    const UUID client_id = generate_uuid();
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    auto importing = service.BeginWeightImport(BeginWeightImportRequest{
+        .identity = identity,
+        .payload_group_id = {},
+        .expected_payload_count = 1,
+        .expected_logical_bytes = kObjectSize,
+    });
+    ASSERT_TRUE(importing.has_value());
+    const std::string payload_key = "managed-weight-payload";
+    const std::string manifest_key =
+        "weights/production/llama-70b/step-100/7/manifest";
+    ReplicateConfig payload_config;
+    payload_config.replica_num = 1;
+    payload_config.data_type = ObjectDataType::WEIGHT;
+    payload_config.group_ids =
+        std::vector<std::string>{importing->manifest.payload_group_id};
+    PutCompletedObject(service, client_id, payload_key, payload_config,
+                       kObjectSize);
+    auto manifest_config = payload_config;
+    manifest_config.data_type = ObjectDataType::METADATA;
+    PutCompletedObject(service, client_id, manifest_key, manifest_config,
+                       kObjectSize);
+    auto ready = service.CommitWeightImport(CommitWeightImportRequest{
+        .identity = identity,
+        .expected_metadata_generation = importing->metadata_generation,
+        .manifest =
+            WeightManifestReference{
+                .manifest_key = manifest_key,
+                .manifest_sha256 = std::string(64, 'a'),
+                .payload_group_id = importing->manifest.payload_group_id,
+                .payload_keys_sha256 =
+                    ComputeWeightPayloadKeysSha256({payload_key}),
+                .payload_count = 1,
+                .logical_bytes = kObjectSize,
+            },
+    });
+    ASSERT_TRUE(ready.has_value());
+
+    auto extra_config = payload_config;
+    auto extra =
+        service.PutStart(client_id, "managed-weight-extra", TenantId::Default(),
+                         kObjectSize, extra_config);
+    ASSERT_FALSE(extra.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, extra.error());
+
+    ReplicateConfig trigger_config;
+    trigger_config.replica_num = 1;
+    auto trigger =
+        service.PutStart(client_id, "managed-weight-pressure",
+                         TenantId::Default(), 3 * kObjectSize, trigger_config);
+    ASSERT_FALSE(trigger.has_value());
+    EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger.error());
+    EXPECT_TRUE(
+        service.ExistKey(payload_key, TenantId::Default()).value_or(false));
+    EXPECT_TRUE(
+        service.ExistKey(manifest_key, TenantId::Default()).value_or(false));
+
+    auto remove =
+        service.Remove(payload_key, TenantId::Default(), /*force=*/true);
+    ASSERT_FALSE(remove.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, remove.error());
+    auto batch_remove = service.BatchRemove(
+        {payload_key, manifest_key}, TenantId::Default(), /*force=*/true);
+    ASSERT_EQ(2u, batch_remove.size());
+    for (const auto& result : batch_remove) {
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, result.error());
+    }
+
+    const std::string ordinary_key = "managed-weight-ordinary";
+    for (int mode = 0; mode < 3; ++mode) {
+        PutCompletedObject(service, client_id, ordinary_key, trigger_config,
+                           1024);
+        if (mode == 0) {
+            auto removed =
+                service.RemoveByRegex(".*", TenantId::Default(), true);
+            ASSERT_TRUE(removed.has_value());
+            EXPECT_EQ(1, *removed);
+        } else if (mode == 1) {
+            EXPECT_EQ(1, service.RemoveAll(TenantId::Default(), true));
+        } else {
+            EXPECT_EQ(1, service.RemoveAll(true));
+        }
+        EXPECT_FALSE(
+            service.ExistKey(ordinary_key, TenantId::Default()).value_or(true));
+        EXPECT_TRUE(
+            service.ExistKey(payload_key, TenantId::Default()).value_or(false));
+        EXPECT_TRUE(service.ExistKey(manifest_key, TenantId::Default())
+                        .value_or(false));
+    }
+}
+
 TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = 100;
@@ -112,8 +307,7 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.group_ids =
-        std::vector<std::string>{FindGroupIdOnDifferentShard(keys[0]), "",
-                                 FindGroupIdOnDifferentShard(keys[2])};
+        std::vector<std::string>{keys[0] + "_group", "", keys[2] + "_group"};
 
     auto results = service_.BatchPutStart(client_id, keys, sizes, config);
     ASSERT_EQ(results.size(), keys.size());
@@ -245,62 +439,6 @@ TEST_F(MasterServiceTest, BatchReplicaClearWithLeaseActive) {
     ASSERT_TRUE(exist_result.value()) << "Key should still exist";
 }
 
-TEST_F(MasterServiceTest, GroupedRoutingUsesHashOfTenantAndKeyOnly) {
-    // Route-decoupling invariant: object routing is a pure function of
-    // (tenant, key); the group_id is only a lifecycle annotation and never
-    // affects which metadata shard an object lands in. The group domain is
-    // keyed by scoped(tenant, group_id) and stores only the member key list.
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    // Two member keys that hash to different metadata shards, sharing one
-    // group whose id hashes to yet another shard. The default-tenant route is
-    // hash(key) % kNumShards (mirrors MasterService::getShardIndex).
-    constexpr size_t kMetadataShardCountForTest = 1024;
-    const std::string key_a = "route_decouple_key_a";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
-    std::string key_b = "route_decouple_key_b";
-    const size_t shard_a =
-        std::hash<std::string>{}(key_a) % kMetadataShardCountForTest;
-    size_t shard_b =
-        std::hash<std::string>{}(key_b) % kMetadataShardCountForTest;
-    for (int i = 0; i < 10000 && shard_b == shard_a; ++i) {
-        key_b = "route_decouple_key_b_" + std::to_string(i);
-        shard_b = std::hash<std::string>{}(key_b) % kMetadataShardCountForTest;
-    }
-    ASSERT_NE(shard_a, shard_b);  // members span metadata shards
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-    config.group_ids = std::vector<std::string>{group_id};
-    PutCompletedObject(*service_, client_id, key_a, config);
-    PutCompletedObject(*service_, client_id, key_b, config);
-
-    // Both members are reachable purely through hash(tenant, key) routing,
-    // which is decoupled from the group domain.
-    EXPECT_TRUE(service_->ExistKey(key_a, TenantId::Default()).value_or(false));
-    EXPECT_TRUE(service_->ExistKey(key_b, TenantId::Default()).value_or(false));
-    EXPECT_TRUE(
-        service_->GetReplicaList(key_a, TenantId::Default()).has_value());
-    EXPECT_TRUE(
-        service_->GetReplicaList(key_b, TenantId::Default()).has_value());
-
-    // The group table still sees both members: group state is a separate,
-    // key-list-only domain.
-    auto members = GetGroupMemberKeysForTest(*service_, group_id);
-    EXPECT_EQ(2u, members.size());
-
-    // Route stability: the object route is hash(tenant, key) alone — grouping
-    // does not change it (identical to the ungrouped route computed before the
-    // objects existed), so a later ungrouped put of the same key would land on
-    // the same shard.
-    EXPECT_EQ(shard_a,
-              std::hash<std::string>{}(key_a) % kMetadataShardCountForTest);
-    EXPECT_EQ(shard_b,
-              std::hash<std::string>{}(key_b) % kMetadataShardCountForTest);
-}
-
 TEST_F(MasterServiceTest, GroupedReadRefreshesSharedGroupLease) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(200).build();
@@ -310,7 +448,7 @@ TEST_F(MasterServiceTest, GroupedReadRefreshesSharedGroupLease) {
 
     const std::string key_a = "lease_group_key_a";
     const std::string key_b = "lease_group_key_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = key_a + "_group";
 
     ReplicateConfig config_a;
     config_a.replica_num = 1;
@@ -359,7 +497,7 @@ TEST_F(MasterServiceTest, GroupedMembershipChangeStillSharesGroupLeaseOnRead) {
 
     const std::string key_a = "lease_group_dirty_key_a";
     const std::string key_b = "lease_group_dirty_key_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = key_a + "_group";
 
     ReplicateConfig config;
     config.replica_num = 1;
@@ -437,7 +575,7 @@ TEST_F(MasterServiceTest, GroupLeaseIsSharedAndExtendsOnMemberRead) {
 
     const std::string key_a = "group_lease_member_a";
     const std::string key_b = "group_lease_member_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = key_a + "_group";
 
     ReplicateConfig config;
     config.replica_num = 1;

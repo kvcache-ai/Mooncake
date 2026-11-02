@@ -35,6 +35,9 @@ ARTIFACT_ID_VLLM=${ARTIFACT_ID_VLLM:-$ARTIFACT_ID}
 WHEEL_DIR=${WHEEL_DIR:-}
 WHEEL_DIR_SGLANG=${WHEEL_DIR_SGLANG:-$WHEEL_DIR}
 WHEEL_DIR_VLLM=${WHEEL_DIR_VLLM:-$WHEEL_DIR}
+# TENT runtime selector (classic by default). The TENT e2e job sets USE_TENT=true
+# via T-One env_info; it must be in .shrc so remote nodes inherit it.
+USE_TENT=${USE_TENT:-false}
 GIT_REPO=${GIT_REPO:-}
 MOONCAKE_ENV_UNHEALTHY=false
 

@@ -26,8 +26,8 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <string>
-#include <vector>
+#include <span>
+#include <string_view>
 
 #include "metadata/object_route.h"
 
@@ -40,9 +40,11 @@ class EvictionIndex {
     // Lower ranks are evicted first.
     using Rank = int64_t;
 
-    // What the index filed at one rank: one key, or a group's members.
+    // What the index filed at one rank: one key, or a group's members. The
+    // keys view the cursor that handed the entry out, until it is asked for
+    // the next entry or destroyed.
     struct Entry {
-        std::vector<std::string> keys;
+        std::span<const std::string_view> keys;
         Rank rank;
         // Which incarnation of a group the keys were filed in, as the index
         // numbers them; 0 for a key on its own.

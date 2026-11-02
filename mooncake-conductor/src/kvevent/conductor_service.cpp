@@ -27,7 +27,8 @@ prefixindex::EngineRegistration RegistrationFromService(
             .instance_id = service.instance_id,
             .dp_rank = service.dp_rank,
             .effective_block_size = service.block_size,
-            .cache_group = service.cache_group};
+            .cache_group = service.cache_group,
+            .publisher_kind = service.publisher_kind};
 }
 
 std::string ValidateServiceConfig(const common::ServiceConfig& service) {

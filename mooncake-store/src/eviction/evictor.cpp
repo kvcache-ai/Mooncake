@@ -68,27 +68,37 @@ class Evictor::Pass {
     // Walks the cursor until the namespace's share of the target is met, then
     // the objects the policy deferred until its share of the minimum is; each
     // also ends when an OpLog write fails or nothing is left. A group's
-    // members come in one entry and go together, one key lock at a time.
+    // members come in one entry and go together, one key lock at a time, in
+    // the walk and in the fallback alike.
     void Run() {
         while (!report_.stopped && !Met(/*fallback=*/false)) {
             std::optional<Entry> entry = cursor_->Next();
             if (!entry) {
                 break;
             }
-            for (const std::string& key : entry->keys) {
+            deferred_.emplace_back();
+            for (const std::string_view key : entry->keys) {
                 if (report_.stopped) {
                     break;
                 }
                 Evict(ns_.objects.Write(key), &*entry);
             }
+            if (deferred_.back().empty()) {
+                deferred_.pop_back();
+            }
         }
-        for (const route::ObjectRef& ref : deferred_) {
+        for (const std::vector<route::ObjectRef>& refs : deferred_) {
             if (report_.stopped || Met(/*fallback=*/true)) {
                 break;
             }
-            // Only the publication the policy deferred: a replacement was
-            // never judged.
-            Evict(ns_.objects.Write(ref), /*entry=*/nullptr);
+            for (const route::ObjectRef& ref : refs) {
+                if (report_.stopped) {
+                    break;
+                }
+                // Only the publication the policy deferred: a replacement was
+                // never judged.
+                Evict(ns_.objects.Write(ref), /*entry=*/nullptr);
+            }
         }
     }
 
@@ -163,7 +173,7 @@ class Evictor::Pass {
             }
             reason = plan.error();
             if (reason == SkipReason::kDeferred && !fallback) {
-                deferred_.push_back(hold.ref());
+                deferred_.back().push_back(hold.ref());
             }
         }
         Skip(hold, reason);
@@ -187,8 +197,8 @@ class Evictor::Pass {
     const Aim& aim_;
     Report& report_;
     const Clock::time_point now_;
-    // In the order the walk met them.
-    std::vector<route::ObjectRef> deferred_;
+    // In the order the walk met them, one list for each entry that had any.
+    std::vector<std::vector<route::ObjectRef>> deferred_;
 };
 
 Evictor::Evictor(metadata::NamespaceTable& namespaces,

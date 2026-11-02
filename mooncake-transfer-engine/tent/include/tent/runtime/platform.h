@@ -94,6 +94,15 @@ class Platform {
     // owned by the exporting runtime and the caller must not close it.
     virtual Status exportDmabuf(void *addr, size_t length, DmabufExport &out);
 
+    // Page-aligned host memory that this platform's device copies reach by
+    // DMA (pinned / page-locked), for staging buffers that are allocated once
+    // and reused. Release it with freePinnedHost, never with free(). The
+    // default returns ordinary page-aligned host memory, so platforms without
+    // a pinned-host API still work, only without the faster copies.
+    virtual Status allocatePinnedHost(void **pptr, size_t size);
+
+    virtual Status freePinnedHost(void *ptr, size_t size);
+
    protected:
     static std::vector<int> topologyDeviceIndices(const Topology *topology,
                                                   Topology::MemType mem_type);

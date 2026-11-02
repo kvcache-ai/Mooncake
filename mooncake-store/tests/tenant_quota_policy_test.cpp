@@ -440,6 +440,33 @@ TEST_F(TenantQuotaPolicyTest, ATenantWithObjectsCannotBeDeleted) {
     EXPECT_FALSE(policy_->IsTenantRegistered(kTenantA));
 }
 
+TEST_F(TenantQuotaPolicyTest, AWriteThatChargesNothingHoldsOffTheDelete) {
+    Register(kTenantA, 1000);
+    auto& ns = NamespaceOf(kTenantA);
+    {
+        // A write with no memory replica: admitted, charged nothing, and its
+        // object not published yet.
+        auto guard = ns.objects.WriteKey("k");
+        ASSERT_TRUE(ns.Grow(guard, 0).has_value());
+        ASSERT_EQ(Charged(kTenantA), 0u);
+        ASSERT_EQ(ns.objects.ObjectCount(), 0u);
+
+        auto refused = policy_->DeletePolicy(kTenantA);
+        ASSERT_FALSE(refused.has_value());
+        EXPECT_EQ(refused.error(), ErrorCode::TENANT_NOT_EMPTY);
+        EXPECT_TRUE(policy_->IsTenantRegistered(kTenantA));
+    }
+    // Let go without publishing: the key's words are back to their initial
+    // value and the tenant can go.
+    EXPECT_TRUE(policy_->DeletePolicy(kTenantA).has_value());
+    EXPECT_FALSE(policy_->IsTenantRegistered(kTenantA));
+
+    auto guard = ns.objects.WriteKey("k");
+    auto refused = ns.Grow(guard, 0);
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error(), ErrorCode::TENANT_NOT_REGISTERED);
+}
+
 TEST_F(TenantQuotaPolicyTest, MaintenanceEvictsTenantsOverTheWatermark) {
     MakePolicy({.eviction_high_watermark_ratio = 0.75,
                 .eviction_ratio = 0.25,

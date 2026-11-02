@@ -1,7 +1,10 @@
 #include "master_service.h"
+#include "common/shrink_buckets.h"
 #include "config/replica_selection_config.h"
 #include "master_service/master_service_test_peer.h"
 #include "rpc_service.h"
+#include "storage/distributed/kvcs/kvcs_capacity_provider.h"
+#include "storage/distributed/kvcs/kvcs_driver.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -15,17 +18,26 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <limits>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 #include <unordered_set>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <unistd.h>
+
+#include <condition_variable>
+#include <mutex>
 
 #include "tenant/quota_policy_store.h"
 #include "random.h"
@@ -65,6 +77,252 @@ class ScopedEnvVar {
     std::string name_;
     std::optional<std::string> previous_value_;
 };
+
+struct KvcsWatermarkDriverState {
+    std::vector<ObjectKey> deleted_keys;
+    bool fail_delete{false};
+};
+
+class KvcsWatermarkDriver final : public KvcsDriver {
+   public:
+    explicit KvcsWatermarkDriver(
+        std::shared_ptr<KvcsWatermarkDriverState> state)
+        : state_(std::move(state)) {}
+
+    tl::expected<void, ErrorCode> Init() override { return {}; }
+    uint64_t MaxValueSize() const override { return 4 * 1024 * 1024; }
+    tl::expected<std::vector<KvcsMountpointStat>, ErrorCode>
+    GetMountpointStats() override {
+        return std::vector<KvcsMountpointStat>{{.index = 1,
+                                                .id = "target-mp",
+                                                .total_bytes = 100,
+                                                .used_bytes = 95}};
+    }
+    KvcsIoResults BatchPut(std::span<const KvcsIoRequest> requests) override {
+        return Errors(requests.size(), ErrorCode::NOT_SUPPORTED);
+    }
+    KvcsIoResults BatchGet(std::span<const KvcsIoRequest> requests) override {
+        return Errors(requests.size(), ErrorCode::NOT_SUPPORTED);
+    }
+    KvcsIoResults BatchDelete(std::span<const ObjectKey> keys) override {
+        KvcsIoResults results;
+        results.reserve(keys.size());
+        for (const auto& key : keys) {
+            state_->deleted_keys.push_back(key);
+            if (state_->fail_delete) {
+                results.emplace_back(tl::make_unexpected(ErrorCode::RPC_FAIL));
+            } else {
+                results.emplace_back();
+            }
+        }
+        return results;
+    }
+
+   private:
+    static KvcsIoResults Errors(size_t count, ErrorCode error) {
+        return KvcsIoResults(count, tl::make_unexpected(error));
+    }
+
+    std::shared_ptr<KvcsWatermarkDriverState> state_;
+};
+
+TEST_F(MasterServiceTest,
+       KvcsStorageModeSkipsFilesystemAllocatorRecoveryRestriction) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar kvcs_adapter("MOONCAKE_DFS_FS_ADAPTER", "kvcs-lowlevel");
+    MasterServiceConfig config;
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.ha_backend_type = "etcd";
+    MasterService service(config);
+    EXPECT_TRUE(MasterServiceTestPeer::EnableDfs(service));
+    EXPECT_EQ(MasterServiceTestPeer::DfsAllocator(service), nullptr);
+    EXPECT_TRUE(MasterServiceTestPeer::UsesKvcs(service));
+}
+
+TEST_F(MasterServiceTest,
+       KvcsCapacityWatermarkEvictsDfsReplicaAndProviderData) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar clear_adapter("MOONCAKE_DFS_FS_ADAPTER");
+
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 1;
+    config.default_kv_soft_pin_ttl = 1;
+    MasterService service(config);
+    const auto context = PrepareSimpleSegment(service);
+    MasterServiceTestPeer peer(service);
+    peer.EvictionRunning(service).store(false, std::memory_order_relaxed);
+    if (peer.EvictionThread(service).joinable()) {
+        peer.EvictionThread(service).join();
+    }
+
+    auto driver_state = std::make_shared<KvcsWatermarkDriverState>();
+    peer.ConfigureKvcsCapacityForTesting(
+        std::make_unique<KvcsCapacityProvider>(
+            1, "target-mp",
+            std::make_unique<KvcsWatermarkDriver>(driver_state)),
+        true, 0.9, 0.7);
+
+    ReplicateConfig replicate;
+    replicate.replica_num = 1;
+    replicate.dfs_replica_num = 1;
+    constexpr std::string_view key = "kvcs-watermark";
+    ASSERT_TRUE(service.PutStart(context.client_id, std::string(key),
+                                 TenantId::Default(), 64, replicate));
+    ASSERT_TRUE(service.PutEnd(context.client_id, std::string(key),
+                               TenantId::Default(), ReplicaType::ALL));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    driver_state->fail_delete = true;
+    peer.RefreshKvcsDfsUsageForTesting();
+    auto unchanged =
+        service.GetReplicaList(std::string(key), TenantId::Default());
+    ASSERT_TRUE(unchanged);
+    ASSERT_EQ(unchanged->replicas.size(), 2u);
+    ASSERT_EQ(driver_state->deleted_keys.size(), 1u);
+
+    driver_state->fail_delete = false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    peer.RefreshKvcsDfsUsageForTesting();
+
+    auto remaining =
+        service.GetReplicaList(std::string(key), TenantId::Default());
+    ASSERT_TRUE(remaining);
+    ASSERT_EQ(remaining->replicas.size(), 1u);
+    EXPECT_TRUE(remaining->replicas.front().is_memory_replica());
+    ASSERT_EQ(driver_state->deleted_keys.size(), 2u);
+    EXPECT_EQ(driver_state->deleted_keys.back(), EncodeKvcsKey(key));
+
+    const auto usage = service.GetStorageUsageSnapshot().dfs;
+    EXPECT_TRUE(usage.enabled);
+    EXPECT_EQ(usage.used_bytes, 95u);
+    EXPECT_EQ(usage.capacity_bytes, 100u);
+}
+
+TEST_F(MasterServiceTest,
+       FilesystemStorageModeRetainsAllocatorRecoveryRestriction) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_recovery_restriction_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    MasterServiceConfig config;
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.ha_backend_type = "etcd";
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+    std::filesystem::remove_all(dfs_root);
+}
+
+TEST_F(MasterServiceTest, KvcsStandbyRestoreAcceptsObjectStorageDfsReplica) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar kvcs_adapter("MOONCAKE_DFS_FS_ADAPTER", "kvcs-lowlevel");
+
+    MasterServiceConfig config;
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.ha_backend_type = "etcd";
+    MasterService service(config);
+
+    constexpr uint64_t kObjectSize = 128;
+    DistributedFSDescriptor dfs_descriptor;
+    dfs_descriptor.object_size = kObjectSize;
+    dfs_descriptor.aligned_size = kObjectSize;
+    dfs_descriptor.shard_idx = -1;
+    Replica replica(std::move(dfs_descriptor), ReplicaStatus::COMPLETE);
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = generate_uuid();
+    metadata.size = kObjectSize;
+    metadata.replicas.push_back(replica.get_descriptor());
+
+    const std::string key = "restored-kvcs-dfs-object";
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {{std::string(TenantId::kDefaultValue), key, metadata}},
+                        /*initial_oplog_sequence_id=*/0, {})
+                    .has_value());
+
+    auto response = service.GetReplicaListForAdmin(key, TenantId::Default());
+    ASSERT_TRUE(response);
+    ASSERT_EQ(response->replicas.size(), 1u);
+    ASSERT_TRUE(response->replicas[0].is_dfs_replica());
+    const auto& restored = response->replicas[0].get_dfs_descriptor();
+    EXPECT_EQ(restored.object_size, kObjectSize);
+}
+
+TEST_F(MasterServiceTest, KvcsMissEvictsOnlyTheObservedDfsReplica) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar kvcs_adapter("MOONCAKE_DFS_FS_ADAPTER", "kvcs-lowlevel");
+
+    MasterService service;
+    const UUID client_id = generate_uuid();
+    const std::string key = "missing-kvcs-value";
+    DistributedFSDescriptor descriptor;
+    descriptor.object_size = 128;
+    descriptor.aligned_size = 128;
+    descriptor.shard_idx = -1;
+    Replica first(descriptor, ReplicaStatus::COMPLETE);
+    Replica second(descriptor, ReplicaStatus::COMPLETE);
+    const ReplicaID first_id = first.id();
+    const ReplicaID second_id = second.id();
+    ASSERT_NE(first_id, second_id);
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = client_id;
+    metadata.size = descriptor.object_size;
+    metadata.replicas = {first.get_descriptor(), second.get_descriptor()};
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {{std::string(TenantId::kDefaultValue), key, metadata}},
+                        /*initial_oplog_sequence_id=*/0, {})
+                    .has_value());
+
+    auto unconditional = service.EvictDiskReplica(
+        client_id, key, TenantId::Default(), ReplicaType::DFS);
+    ASSERT_FALSE(unconditional.has_value());
+    EXPECT_EQ(unconditional.error(), ErrorCode::INVALID_PARAMS);
+
+    ReplicaID missing_id = 0;
+    while (missing_id == first_id || missing_id == second_id) ++missing_id;
+    auto stale = service.EvictDiskReplicaIfCurrent(
+        client_id, key, TenantId::Default(), ReplicaType::DFS, missing_id);
+    ASSERT_TRUE(stale.has_value());
+    EXPECT_FALSE(*stale);
+    ASSERT_TRUE(service.GetReplicaList(key, TenantId::Default()).has_value());
+
+    auto current = service.EvictDiskReplicaIfCurrent(
+        client_id, key, TenantId::Default(), ReplicaType::DFS, first_id);
+    ASSERT_TRUE(current.has_value());
+    EXPECT_TRUE(*current);
+    auto remaining = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(remaining.has_value());
+    ASSERT_EQ(remaining->replicas.size(), 1u);
+    EXPECT_EQ(remaining->replicas.front().id, second_id);
+
+    current = service.EvictDiskReplicaIfCurrent(
+        client_id, key, TenantId::Default(), ReplicaType::DFS, second_id);
+    ASSERT_TRUE(current.has_value());
+    EXPECT_TRUE(*current);
+    auto missing = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
 
 TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
     const auto scoped =
@@ -1261,19 +1519,13 @@ TEST_F(MasterServiceTest,
         constexpr size_t kObjectSize = 4096;
         constexpr size_t kConcurrentWrites = 8;
         constexpr size_t kOldKeyCount = 32;
-        const size_t old_shard =
-            MetadataShardIndex(service, "single_flight_old_seed");
         std::vector<std::string> old_keys;
         std::vector<std::string> new_keys;
-        for (size_t i = 0; old_keys.size() < kOldKeyCount ||
-                           new_keys.size() < kConcurrentWrites;
-             ++i) {
-            const std::string key = "single_flight_key_" + std::to_string(i);
-            if (MetadataShardIndex(service, key) == old_shard) {
-                if (old_keys.size() < kOldKeyCount) old_keys.push_back(key);
-            } else if (new_keys.size() < kConcurrentWrites) {
-                new_keys.push_back(key);
-            }
+        for (size_t i = 0; i < kOldKeyCount; ++i) {
+            old_keys.push_back("single_flight_old_" + std::to_string(i));
+        }
+        for (size_t i = 0; i < kConcurrentWrites; ++i) {
+            new_keys.push_back("single_flight_new_" + std::to_string(i));
         }
 
         for (const auto& key : old_keys) {
@@ -1287,7 +1539,16 @@ TEST_F(MasterServiceTest,
                             .has_value());
         }
 
-        auto old_shard_lock = LockMetadataShardForTest(service, old_shard);
+        // Holding every old key blocks the eviction's validation of the
+        // bucket they share.
+        std::vector<route::WriteGuard> old_key_holds;
+        for (const auto& key : old_keys) {
+            auto hold = MasterServiceTestPeer::WriteObject(
+                service, MasterServiceTestPeer::ObjectIdentity{
+                             TenantId::Default(), key});
+            ASSERT_TRUE(hold.has_value()) << key;
+            old_key_holds.push_back(std::move(*hold));
+        }
         std::barrier start_barrier(kConcurrentWrites + 1);
         std::vector<int> errors(kConcurrentWrites,
                                 static_cast<int>(ErrorCode::INTERNAL_ERROR));
@@ -1322,9 +1583,9 @@ TEST_F(MasterServiceTest,
         start_barrier.arrive_and_wait();
         // Keep eviction validation blocked long enough for all writers to
         // encounter the full allocator. Without single-flight recovery they
-        // freeze different LRU buckets while waiting on this shard.
+        // freeze different LRU buckets while waiting on these keys.
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        old_shard_lock.reset();
+        old_key_holds.clear();
         for (auto& writer : writers) writer.join();
 
         for (size_t i = 0; i < kConcurrentWrites; ++i) {
@@ -2205,11 +2466,11 @@ TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
 
 // A mass client expiry marks handles stale all over the metadata table, so
 // the sweep cleans each object under its own write lock instead of holding a
-// shard exclusively for the whole walk. Dropping and retaking the lock
-// mid-shard must not cost coverage: every key of the departed segment is
+// stripe exclusively for the whole walk. Dropping and retaking the lock
+// mid-stripe must not cost coverage: every key of the departed segment is
 // erased, and every key of a live segment survives. The keys are forced onto
-// one shard so the sweep returns to it many times.
-TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsShardAcrossLockBatches) {
+// one stripe of the route so the sweep returns to it many times.
+TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsStripeAcrossLockBatches) {
     auto service = std::make_unique<MasterService>();
     PauseReplicaCleanup(*service);
 
@@ -2221,19 +2482,18 @@ TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsShardAcrossLockBatches) {
     const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
                                                    0x400000000, kSegmentSize);
 
-    // Enough keys per segment that draining the shard takes several batches.
+    // Enough keys per segment that draining the stripe takes several batches.
     constexpr size_t kKeysPerSegment = 100;
-    const size_t target_shard =
-        MetadataShardIndex(*service, "batch_sweep_seed");
+    const size_t target_stripe = RouteStripeIndex("batch_sweep_seed");
 
     std::vector<std::string> stale_keys;
     std::vector<std::string> live_keys;
     for (size_t i = 0;
          stale_keys.size() + live_keys.size() < 2 * kKeysPerSegment; ++i) {
         ASSERT_LT(i, 1000000u)
-            << "could not gather enough keys on shard " << target_shard;
+            << "could not gather enough keys on stripe " << target_stripe;
         const std::string key = "batch_sweep_key_" + std::to_string(i);
-        if (MetadataShardIndex(*service, key) != target_shard) {
+        if (RouteStripeIndex(key) != target_stripe) {
             continue;
         }
 
@@ -2590,14 +2850,14 @@ TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
     [[maybe_unused]] const auto context = PrepareSimpleSegment(
         *service_, "test_segment", buffer, object_size * object_count * 16);
 
-    // Pick keys that all hash to one shard so its metadata map grows past
-    // the shrink floor; random keys would spread these objects thinly
-    // across all 1024 shards.
-    const size_t target_shard = MetadataShardIndex(*service_, "shrink_key_0");
+    // Pick keys that all hash to one stripe of the route so its map grows
+    // past the shrink floor; random keys would spread these objects thinly
+    // across all 1024 stripes.
+    const size_t target_stripe = RouteStripeIndex("shrink_key_0");
     std::vector<std::string> keys;
     for (size_t i = 0; keys.size() < object_count; ++i) {
         std::string key = "shrink_key_" + std::to_string(i);
-        if (MetadataShardIndex(*service_, key) != target_shard) continue;
+        if (RouteStripeIndex(key) != target_stripe) continue;
         keys.push_back(std::move(key));
     }
 
@@ -2619,16 +2879,48 @@ TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
                         .has_value());
     }
 
-    const size_t buckets_before = MetadataBucketCount(*service_, target_shard);
+    const size_t buckets_before =
+        RouteStripeBucketCount(*service_, target_stripe);
     ASSERT_GT(buckets_before, kShrinkMinBucketCount);
 
     MasterServiceTestPeer(*service_).RunBatchEvictForTesting(1.0, 1.0);
 
-    const size_t buckets_after = MetadataBucketCount(*service_, target_shard);
+    const size_t buckets_after =
+        RouteStripeBucketCount(*service_, target_stripe);
     ASSERT_GT(buckets_after, 0u);
-    // Without the post-eviction shrink the bucket array would still sit at
-    // its high-water mark and this assertion would fail.
+    // Without the route shrinking a stripe as its slots go, the bucket array
+    // would still sit at its high-water mark and this assertion would fail.
     EXPECT_LT(buckets_after, buckets_before / 2);
+}
+
+TEST_F(MasterServiceTest, BatchEvictCountsARoundOnlyWhenItHadSomethingToDo) {
+    // Zero lease TTL so the committed object is immediately evictable.
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service = std::make_unique<MasterService>(service_config);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(
+        service->PutStart(client_id, "key", TenantId::Default(), 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service
+            ->PutEnd(client_id, "key", TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t successes = metrics.get_mem_eviction_success();
+    const int64_t attempts = metrics.get_mem_eviction_attempts();
+
+    MasterServiceTestPeer(*service).RunBatchEvictForTesting(1.0, 1.0);
+    EXPECT_EQ(metrics.get_mem_eviction_success(), successes + 1);
+    EXPECT_EQ(metrics.get_mem_eviction_attempts(), attempts + 1);
+
+    // Nothing left filed and nothing discarded: neither a success nor a
+    // failure.
+    MasterServiceTestPeer(*service).RunBatchEvictForTesting(1.0, 1.0);
+    EXPECT_EQ(metrics.get_mem_eviction_attempts(), attempts + 1);
 }
 
 TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
@@ -2636,8 +2928,8 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     // ClearInvalidHandles -> ClearStaleHandles can erase tens of millions of
     // keys from a shared tenant; erase() never returns bucket memory, so a
     // tenant that loses most (but not all) of its keys would keep its
-    // high-water bucket array forever and RSS would never drop. The shrink
-    // pass at the end of ClearStaleHandles mirrors the one in BatchEvict.
+    // high-water bucket array forever and RSS would never drop. The route
+    // shrinks a stripe as its slots go, whichever path erases them.
     auto service = std::make_unique<MasterService>();
     PauseReplicaCleanup(*service);
 
@@ -2649,10 +2941,9 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
                                                    0x400000000, kSegmentSize);
 
-    // Gather keys on one shard so its metadata map grows past the shrink
-    // floor; spreading them across all 1024 shards would leave each map tiny.
-    const size_t target_shard =
-        MetadataShardIndex(*service, "clear_shrink_key_0");
+    // Gather keys on one stripe of the route so its map grows past the shrink
+    // floor; spreading them across all 1024 stripes would leave each map tiny.
+    const size_t target_stripe = RouteStripeIndex("clear_shrink_key_0");
     // A few live keys keep the shared tenant alive after the sweep (partial
     // drain, not full erase); the rest are swept and must trigger a shrink.
     constexpr size_t kLiveKeys = 128;
@@ -2662,9 +2953,9 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     std::vector<std::string> live_keys;
     for (size_t i = 0; stale_keys.size() + live_keys.size() < kTotalKeys; ++i) {
         ASSERT_LT(i, 5000000u)
-            << "could not gather enough keys on shard " << target_shard;
+            << "could not gather enough keys on stripe " << target_stripe;
         const std::string key = "clear_shrink_key_" + std::to_string(i);
-        if (MetadataShardIndex(*service, key) != target_shard) {
+        if (RouteStripeIndex(key) != target_stripe) {
             continue;
         }
 
@@ -2690,7 +2981,8 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     }
     ASSERT_GT(stale_keys.size(), live_keys.size());
 
-    const size_t buckets_before = MetadataBucketCount(*service, target_shard);
+    const size_t buckets_before =
+        RouteStripeBucketCount(*service, target_stripe);
     ASSERT_GT(buckets_before, kShrinkMinBucketCount);
 
     // Unmount the stale segment, then sweep inline. The tenant survives
@@ -2707,10 +2999,11 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     // "merely hidden by the unmount".
     EXPECT_EQ(live_keys.size(), service->GetKeyCount());
 
-    const size_t buckets_after = MetadataBucketCount(*service, target_shard);
+    const size_t buckets_after =
+        RouteStripeBucketCount(*service, target_stripe);
     ASSERT_GT(buckets_after, 0u);
-    // Without the post-sweep shrink the bucket array would stay at its
-    // high-water mark and this assertion would fail.
+    // Without the route shrinking a stripe as its slots go, the bucket array
+    // would stay at its high-water mark and this assertion would fail.
     EXPECT_LT(buckets_after, buckets_before / 2);
     // The shrunk map must still be large enough to hold every live key.
     EXPECT_GE(buckets_after, live_keys.size());
@@ -2878,8 +3171,8 @@ TEST_F(MasterServiceTest, SoftPinDeadlineIndexExpiresOnlyDueEntries) {
     PutCompletedObject(*service, client_id, "deadline_key", config);
 
     ReplicateConfig grouped_config = config;
-    grouped_config.group_ids = std::vector<std::string>{
-        FindGroupIdOnDifferentShard("grouped_deadline_key")};
+    grouped_config.group_ids =
+        std::vector<std::string>{"grouped_deadline_key_group"};
     PutCompletedObject(*service, client_id, "grouped_deadline_key",
                        grouped_config);
 
@@ -4137,6 +4430,248 @@ TEST_F(MasterServiceTest,
     EXPECT_TRUE(job.prepared_segments.empty());
     EXPECT_TRUE(job.pending_prepare_segments.empty());
     EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
+}
+
+// Localhost-only HTTP server that records DELETE request lines. A test picks
+// which requests (by 1-based arrival number) the server holds before it
+// answers, and releases them one by one, so the cleanup worker can be stopped
+// while a chosen DELETE is in flight.
+class RecordingDeleteServer {
+   public:
+    RecordingDeleteServer() {
+        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        EXPECT_GE(listen_fd_, 0) << "socket() failed";
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        EXPECT_EQ(0, ::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
+                            sizeof(addr)))
+            << "bind() failed";
+        EXPECT_EQ(0, ::listen(listen_fd_, 16)) << "listen() failed";
+        socklen_t len = sizeof(addr);
+        ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
+        port_ = ntohs(addr.sin_port);
+        thread_ = std::thread([this] { Serve(); });
+    }
+
+    ~RecordingDeleteServer() {
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+        ::close(listen_fd_);
+    }
+
+    std::string Url() const {
+        return "http://127.0.0.1:" + std::to_string(port_) + "/metadata";
+    }
+
+    // Hold the answer to the request_number-th DELETE until it is released.
+    // Call before that request can arrive.
+    void HoldRequest(size_t request_number) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        held_.insert(request_number);
+    }
+
+    void ReleaseRequest(size_t request_number) {
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            released_.insert(request_number);
+        }
+        cv_.notify_all();
+    }
+
+    size_t DeleteCount() {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return requests_.size();
+    }
+
+    // Blocks until at least count DELETE requests have arrived.
+    bool WaitForDeleteCount(size_t count, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lk(mutex_);
+        return cv_.wait_for(lk, timeout,
+                            [&] { return requests_.size() >= count; });
+    }
+
+    std::vector<std::string> Requests() {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return requests_;
+    }
+
+   private:
+    void Serve() {
+        while (!stopping_) {
+            pollfd pfd{listen_fd_, POLLIN, 0};
+            if (::poll(&pfd, 1, 20) <= 0) {
+                continue;
+            }
+            const int fd = ::accept(listen_fd_, nullptr, nullptr);
+            if (fd < 0) {
+                continue;
+            }
+            Handle(fd);
+            ::close(fd);
+        }
+    }
+
+    void Handle(int fd) {
+        std::string request;
+        char buf[1024];
+        while (request.find("\r\n\r\n") == std::string::npos) {
+            pollfd pfd{fd, POLLIN, 0};
+            if (::poll(&pfd, 1, 2000) <= 0) {
+                return;
+            }
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) {
+                return;
+            }
+            request.append(buf, static_cast<size_t>(n));
+        }
+        {
+            std::unique_lock<std::mutex> lk(mutex_);
+            requests_.push_back(request.substr(0, request.find("\r\n")));
+            const size_t request_number = requests_.size();
+            cv_.notify_all();
+            if (held_.count(request_number) != 0) {
+                cv_.wait(lk, [&] {
+                    return stopping_ || released_.count(request_number) != 0;
+                });
+            }
+        }
+        static constexpr char kOk[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n"
+            "Connection: close\r\n\r\n";
+        (void)::send(fd, kOk, sizeof(kOk) - 1, MSG_NOSIGNAL);
+    }
+
+    int listen_fd_ = -1;
+    uint16_t port_ = 0;
+    std::atomic<bool> stopping_{false};
+    std::thread thread_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<std::string> requests_;
+    std::set<size_t> held_;
+    std::set<size_t> released_;
+};
+
+// Drives one deterministic sequence against a held request:
+//  1. The server holds DELETE #1 (segment_a, ram key). segment_b and
+//     segment_c queue behind it as one batch.
+//  2. Releasing #1 lets the worker send segment_a's rpc key (#2), then take
+//     [segment_b, segment_c].
+//  3. The server holds DELETE #3 (segment_b, ram key); segment_d is queued and
+//     stop starts on another thread.
+//  4. While #3 is held, stop has not returned (it joins the worker) and the
+//     queue is empty.
+//  5. Releasing #3 ends the worker without segment_b's rpc key and without
+//     segment_c; stop returns.
+//  6. A cleanup request after stop is dropped.
+TEST_F(MasterServiceTest, StopHttpMetadataCleanupWaitsForInFlightDelete) {
+    RecordingDeleteServer server;
+    server.HoldRequest(1);
+    server.HoldRequest(3);
+
+    MasterService service;
+    service.setHttpMetadataRemoteUrl(server.Url());
+    MasterServiceTestPeer peer(service);
+
+    std::thread stop_thread;
+    // Never leave a held request or the stop thread behind on an early
+    // assertion failure.
+    auto cleanup = [&] {
+        server.ReleaseRequest(1);
+        server.ReleaseRequest(3);
+        if (stop_thread.joinable()) {
+            stop_thread.join();
+        }
+    };
+
+    // 1. The worker takes [segment_a] and blocks inside DELETE #1.
+    peer.CleanupHttpMetadataForTesting("segment_a");
+    if (!server.WaitForDeleteCount(1, std::chrono::seconds(5))) {
+        cleanup();
+        FAIL() << "the cleanup worker never sent its first DELETE";
+    }
+    peer.CleanupHttpMetadataForTesting("segment_b");
+    peer.CleanupHttpMetadataForTesting("segment_c");
+    EXPECT_EQ(2u, peer.HttpMetadataCleanupQueueSizeForTesting());
+
+    // 2. Release #1: the worker sends segment_a's rpc key, then takes the
+    // [segment_b, segment_c] batch and blocks inside DELETE #3.
+    server.ReleaseRequest(1);
+    if (!server.WaitForDeleteCount(3, std::chrono::seconds(5))) {
+        cleanup();
+        FAIL() << "the worker did not reach DELETE #3";
+    }
+    EXPECT_EQ(0u, peer.HttpMetadataCleanupQueueSizeForTesting());
+
+    // 3. Queue one more segment, then stop while #3 is in flight.
+    peer.CleanupHttpMetadataForTesting("segment_d");
+    EXPECT_EQ(1u, peer.HttpMetadataCleanupQueueSizeForTesting());
+    // The packaged task sets the future inside the thread runtime, which
+    // removes the user-code window after Stop returns. A scheduler pause of
+    // more than 150 ms after the queue clear is the only residual window;
+    // the queue gate above is bounded at 5 s, and a stall past the HTTP
+    // client's request timeout can make a correct run finish early.
+    std::packaged_task<void()> stop_task(
+        [&] { service.StopHttpMetadataCleanup(); });
+    auto stop_done = stop_task.get_future();
+    stop_thread = std::thread(std::move(stop_task));
+
+    // 4. Stop drops the queue at once but keeps joining the held worker.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (peer.HttpMetadataCleanupQueueSizeForTesting() != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_EQ(0u, peer.HttpMetadataCleanupQueueSizeForTesting())
+        << "stop did not drop the queued segment";
+    EXPECT_EQ(std::future_status::timeout,
+              stop_done.wait_for(std::chrono::milliseconds(150)))
+        << "StopHttpMetadataCleanup returned while a DELETE was in flight";
+
+    // 5. Release #3: the worker skips segment_b's rpc key and the rest of the
+    // batch, and stop returns.
+    server.ReleaseRequest(3);
+    stop_thread.join();
+    EXPECT_EQ(std::future_status::ready,
+              stop_done.wait_for(std::chrono::milliseconds(0)));
+    EXPECT_EQ(3u, server.DeleteCount())
+        << "the second key or the rest of the batch was sent after stop";
+    const auto requests = server.Requests();
+    ASSERT_EQ(3u, requests.size());
+    for (const auto& request : requests) {
+        EXPECT_NE(std::string::npos, request.find("DELETE "));
+    }
+    EXPECT_NE(std::string::npos, requests[0].find("ram"));
+    EXPECT_NE(std::string::npos, requests[0].find("segment_a"));
+    EXPECT_NE(std::string::npos, requests[1].find("rpc_meta"));
+    EXPECT_NE(std::string::npos, requests[1].find("segment_a"));
+    EXPECT_NE(std::string::npos, requests[2].find("ram"));
+    EXPECT_NE(std::string::npos, requests[2].find("segment_b"));
+
+    // 6. A late client-monitor callback must not grow the queue or send.
+    peer.CleanupHttpMetadataForTesting("segment_e");
+    EXPECT_EQ(0u, peer.HttpMetadataCleanupQueueSizeForTesting())
+        << "a cleanup request was queued after stop";
+    EXPECT_FALSE(server.WaitForDeleteCount(4, std::chrono::milliseconds(300)))
+        << "a DELETE arrived after StopHttpMetadataCleanup returned";
+}
+
+TEST_F(MasterServiceTest, StopHttpMetadataCleanupIsNoOpWhenNeverStarted) {
+    MasterService service;
+    service.StopHttpMetadataCleanup();
+    service.StopHttpMetadataCleanup();
+
+    // Cleanup stays disabled: neither a co-located server nor a remote URL.
+    MasterServiceTestPeer(service).CleanupHttpMetadataForTesting("segment_a");
+    service.StopHttpMetadataCleanup();
 }
 
 }  // namespace mooncake::test

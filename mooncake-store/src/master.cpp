@@ -252,7 +252,7 @@ DEFINE_validator(offloading_queue_limit, [](const char* flagname,
     // bound (1e8) keeps `offloading_queue_limit_ *
     // offload_cap_ratio_` well within signed long range to
     // avoid overflow when computing offload_cap in
-    // BatchEvict / EvictTenantMemoryForQuota.
+    // BatchEvict / EvictNamespaceMemory.
     if (value == 0) {
         LOG(FATAL) << "offloading_queue_limit must be greater than 0";
         return false;
@@ -386,6 +386,9 @@ DEFINE_bool(weight_management_oplog_capability_confirmed, false,
             "and lease entry types before enabling weight mutations");
 DEFINE_bool(enable_oplog_snapshot, false,
             "Enable standby batch OpLog snapshot production");
+DEFINE_uint64(weight_import_idle_timeout_ms, 5 * 60 * 1000,
+              "Abort managed weight imports after this many milliseconds "
+              "without accepted member writes");
 DEFINE_uint64(snapshot_chunk_object_count, 1000000,
               "Maximum objects per standby batch OpLog snapshot chunk");
 DEFINE_uint64(snapshot_interval_seconds, 600,
@@ -690,6 +693,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("enable_oplog_snapshot",
                            &master_config.enable_oplog_snapshot,
                            FLAGS_enable_oplog_snapshot);
+    default_config.GetUInt64("weight_import_idle_timeout_ms",
+                             &master_config.weight_import_idle_timeout_ms,
+                             FLAGS_weight_import_idle_timeout_ms);
     default_config.GetUInt64("snapshot_chunk_object_count",
                              &master_config.snapshot_chunk_object_count,
                              FLAGS_snapshot_chunk_object_count);
@@ -1164,6 +1170,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_oplog_snapshot = FLAGS_enable_oplog_snapshot;
+    }
+    if ((google::GetCommandLineFlagInfo("weight_import_idle_timeout_ms",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.weight_import_idle_timeout_ms =
+            FLAGS_weight_import_idle_timeout_ms;
     }
     if ((google::GetCommandLineFlagInfo("snapshot_chunk_object_count", &info) &&
          !info.is_default) ||
@@ -1732,6 +1745,12 @@ int main(int argc, char* argv[]) {
             mooncake::ha::MasterRuntimeState::kServing);
         admin_server.SetServiceDelegate(wrapped_master_service);
         admin_server.SetServiceAvailable(true);
+
+        // Open the restore lifecycle (RFC #4700, slice 1): the non-HA path
+        // has no promotion restore, so it moves Constructed -> Ready ->
+        // Serving explicitly, before the RPC service is registered.
+        wrapped_master_service->MarkReadyForServing();
+        wrapped_master_service->ActivateServing();
 
         // Declared after the service so that it drains before the service
         // is destroyed.

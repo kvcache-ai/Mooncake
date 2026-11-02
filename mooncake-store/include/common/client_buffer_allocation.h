@@ -72,6 +72,14 @@ void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
 
 void free_buffer_mmap_memory(void* ptr, size_t total_size);
 
+// The entries of `nodes` this process may allocate from, in order: its
+// cpuset's mems_allowed, narrowed to an MPOL_BIND task policy if it has one.
+// mbind() to a node outside the cpuset fails with EINVAL, and binding to one
+// outside the task policy overrides it, so a NUMA-segmented buffer must use
+// only these. Returns `nodes` unchanged if the kernel does not answer (a
+// seccomp profile that blocks get_mempolicy blocks mbind too).
+std::vector<int> FilterNumaNodesToAllowed(const std::vector<int>& nodes);
+
 void* allocate_buffer_numa_segments(size_t total_size,
                                     const std::vector<int>& numa_nodes,
                                     size_t page_size = 0);

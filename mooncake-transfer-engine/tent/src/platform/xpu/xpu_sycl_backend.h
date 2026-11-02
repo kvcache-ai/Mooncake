@@ -47,6 +47,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <cstddef>
 #include <cstdint>
@@ -358,6 +359,55 @@ class XpuSyclBackend {
             return 0;
         }
         return 1;  // not a base pointer we handed out
+    }
+
+    // Page-aligned pinned host memory: ordinary pages, imported into the
+    // devices' context with prepare_for_device_copy so device copies run at
+    // pinned speed. Not sycl::aligned_alloc_host: O_DIRECT I/O must take
+    // page references on the buffer (get_user_pages), which the GPU
+    // driver's USM host mapping refuses, so it fails with EFAULT.
+    // The import is per context, so this fails unless every device shares
+    // one context (one Level Zero platform, the normal case).
+    int allocHost(void **pptr, size_t size) {
+#ifdef SYCL_EXT_ONEAPI_COPY_OPTIMIZE
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!initialized_ || !pptr || size == 0 || contexts_.size() != 1)
+            return 1;
+        void *ptr = nullptr;
+        if (posix_memalign(&ptr, 4096, size) != 0) return 1;
+        try {
+            sycl::ext::oneapi::experimental::prepare_for_device_copy(
+                ptr, size, contexts_[0]);
+        } catch (const sycl::exception &) {
+            std::free(ptr);
+            return 1;
+        }
+        *pptr = ptr;
+        return 0;
+#else
+        (void)pptr;
+        (void)size;
+        return 1;
+#endif
+    }
+
+    int freeHost(void *ptr) {
+#ifdef SYCL_EXT_ONEAPI_COPY_OPTIMIZE
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!initialized_ || !ptr || contexts_.size() != 1) return 1;
+        int rc = 0;
+        try {
+            sycl::ext::oneapi::experimental::release_from_device_copy(
+                ptr, contexts_[0]);
+        } catch (const sycl::exception &) {
+            rc = 1;
+        }
+        std::free(ptr);
+        return rc;
+#else
+        (void)ptr;
+        return 1;
+#endif
     }
 
     bool isDevicePtr(const void *addr) {

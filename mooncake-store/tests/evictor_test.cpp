@@ -487,6 +487,30 @@ TEST_F(EvictorTest, AGroupMemberIsDeferredOnce) {
         1);
 }
 
+// The fallback asks whether the minimum is met only between entries, so a
+// group's deferred members go together even past the minimum.
+TEST_F(EvictorTest, AGroupsDeferredMembersGoTogetherInTheFallback) {
+    Publish("a", "g1", seconds(10), "g");
+    Publish("a", "g2", seconds(10), "g");
+    Publish("a", "g3", seconds(10), "g");
+    Publish("a", "x", seconds(5));
+    Publish("a", "y", seconds(3));
+    policy_.soft_pinned = {"g1", "g2", "g3"};
+    policy_.defer_soft_pinned = true;
+
+    // The walk frees x and y, one short of the minimum of 3 (2.5 rounded up).
+    const auto report = Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 0.5});
+
+    ASSERT_EQ(reclaimer_.applied.size(), 5u);
+    EXPECT_EQ(std::vector<std::string>(reclaimer_.applied.begin(),
+                                       reclaimer_.applied.begin() + 2),
+              (std::vector<std::string>{"x", "y"}));
+    EXPECT_EQ(std::set<std::string>(reclaimer_.applied.begin() + 2,
+                                    reclaimer_.applied.end()),
+              (std::set<std::string>{"g1", "g2", "g3"}));
+    EXPECT_EQ(report.evicted_objects, 5u);
+}
+
 // A read that extends a lease leaves the key filed where it was. The run meets
 // it there, leaves it alone, and refiles it at its real deadline.
 TEST_F(EvictorTest, AKeyWhoseLeaseWasExtendedIsRefiledNotEvicted) {
@@ -678,31 +702,18 @@ TEST_F(OffloadingReclaimerTest, PastTheCapAForcedRunDropsWithoutOffload) {
 
 // --- Report observers --------------------------------------------------------
 
-TEST_F(EvictorTest, MetricsCountAPoolRunThatReleasedMemory) {
+TEST_F(EvictorTest, MetricsLeaveAPoolRunToItsCaller) {
     Publish("a", "k1", seconds(10));
     Publish("b", "k2", seconds(8));
-    auto& metrics = MasterMetricManager::instance();
-    const int64_t successes = metrics.get_mem_eviction_success();
-    const int64_t evicted_keys = metrics.get_evicted_key_count();
-
-    eviction::MetricsObserver observer;
-    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&observer});
-    evictor.Run(Scope::All(),
-                ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
-
-    EXPECT_EQ(metrics.get_mem_eviction_success(), successes + 1);
-    EXPECT_EQ(metrics.get_evicted_key_count(), evicted_keys + 2);
-}
-
-TEST_F(EvictorTest, MetricsIgnoreAPoolRunWithNothingFiled) {
     auto& metrics = MasterMetricManager::instance();
     const int64_t attempts = metrics.get_mem_eviction_attempts();
 
     eviction::MetricsObserver observer;
     eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&observer});
-    evictor.Run(Scope::All(),
-                ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+    const auto report = evictor.Run(
+        Scope::All(), ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
 
+    EXPECT_EQ(report.evicted_objects, 2u);
     EXPECT_EQ(metrics.get_mem_eviction_attempts(), attempts);
 }
 
