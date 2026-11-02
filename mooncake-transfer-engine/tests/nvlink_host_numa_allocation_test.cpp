@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <cstdlib>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -68,26 +67,6 @@ struct ThrowingDeviceCount {
         *count = 3;
         return CUDA_SUCCESS;
     }
-};
-
-class ScopedEnvVar {
-   public:
-    ScopedEnvVar(const char* name, const char* value) : name_(name) {
-        const char* current = std::getenv(name);
-        if (current) old_value_ = current;
-        setenv(name, value, 1);
-    }
-
-    ~ScopedEnvVar() {
-        if (old_value_)
-            setenv(name_.c_str(), old_value_->c_str(), 1);
-        else
-            unsetenv(name_.c_str());
-    }
-
-   private:
-    std::string name_;
-    std::optional<std::string> old_value_;
 };
 
 class FakeCudaDriver {
@@ -256,20 +235,17 @@ TEST(NvlinkHostNumaAllocationTest, DiscoversSortedGpuLocalNodes) {
 TEST(NvlinkHostNumaAllocationTest, NvlinkIpcZeroKeepsFabricAllocations) {
     FakeCudaDriver driver;
     std::vector<int> nodes;
-    {
-        ScopedEnvVar env("MC_USE_NVLINK_IPC", "0");
-        ASSERT_TRUE(
-            NvlinkHostNumaAllocationTestPeer::Discover(driver.api(), nodes)
-                .ok());
-        EXPECT_EQ(nodes, (std::vector<int>{0, 2}));
-    }
-    {
-        ScopedEnvVar env("MC_USE_NVLINK_IPC", "1");
-        EXPECT_TRUE(
-            NvlinkHostNumaAllocationTestPeer::Discover(driver.api(), nodes)
-                .IsNotSupportedTransport());
-        EXPECT_TRUE(nodes.empty());
-    }
+    setenv("MC_USE_NVLINK_IPC", "0", 1);
+    auto zero = NvlinkHostNumaAllocationTestPeer::Discover(driver.api(), nodes);
+    unsetenv("MC_USE_NVLINK_IPC");
+    ASSERT_TRUE(zero.ok());
+    EXPECT_EQ(nodes, (std::vector<int>{0, 2}));
+
+    setenv("MC_USE_NVLINK_IPC", "1", 1);
+    auto one = NvlinkHostNumaAllocationTestPeer::Discover(driver.api(), nodes);
+    unsetenv("MC_USE_NVLINK_IPC");
+    EXPECT_TRUE(one.IsNotSupportedTransport());
+    EXPECT_TRUE(nodes.empty());
 }
 
 TEST(NvlinkHostNumaAllocationTest, AlignsAndGrantsCpuAndGpuAccess) {
