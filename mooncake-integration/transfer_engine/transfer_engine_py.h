@@ -274,6 +274,15 @@ class TransferEnginePy {
     // No-op on non-EFA builds or when the EFA transport is not installed.
     int warmupEfaSegment(const std::string &segment_name);
 
+    pybind11::bytes exportLocalSegment();
+
+    int64_t importSegment(const std::string &segment_name,
+                          const std::string &blob);
+
+    int bindSegment(int64_t segment_id, int local_device);
+
+    int removeSegment(const std::string &segment_name);
+
     int writeBytesToBuffer(uintptr_t dest_address, char *src_ptr,
                            size_t length) {
         memcpy((void *)dest_address, (void *)src_ptr, length);

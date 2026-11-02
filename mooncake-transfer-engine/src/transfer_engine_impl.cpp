@@ -151,8 +151,11 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     local_server_name_ = local_server_name;
 #endif
 
-    if (getenv("MC_LEGACY_RPC_PORT_BINDING") ||
-        metadata_conn_string == P2PHANDSHAKE) {
+    // EXTERNAL mode has no metadata server to publish RPC locations to, so
+    // it binds like P2P: the segment name carries host and RPC port.
+    const bool p2p_binding = metadata_conn_string == P2PHANDSHAKE ||
+                             metadata_conn_string == EXTERNAL_METADATA;
+    if (getenv("MC_LEGACY_RPC_PORT_BINDING") || p2p_binding) {
         rpc_binding_method = "legacy/P2P";
         desc.ip_or_host_name = host_name;
         desc.rpc_port = port;
@@ -170,7 +173,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             tmp_fd = -1;
         }
 #endif
-        if (metadata_conn_string == P2PHANDSHAKE) {
+        if (p2p_binding) {
             rpc_binding_method = "P2P handshake";
             desc.rpc_port = findAvailableTcpPort(desc.sockfd);
             if (desc.rpc_port == 0) {
@@ -784,6 +787,42 @@ int TransferEngineImpl::removeLocalSegment(const std::string& segment_name) {
         trimmed_segment_name.erase(0, 1);
     if (trimmed_segment_name.empty()) return ERR_INVALID_ARGUMENT;
     return metadata_->removeLocalSegment(trimmed_segment_name);
+}
+
+int TransferEngineImpl::exportLocalSegment(std::string& blob) {
+    return metadata_->exportLocalSegment(blob);
+}
+
+Transport::SegmentHandle TransferEngineImpl::importSegment(
+    const std::string& segment_name, const std::string& blob) {
+    SegmentID sid = 0;
+    bool replaced = false;
+    int ret = metadata_->importSegment(segment_name, blob, sid, replaced);
+    if (ret) return static_cast<Transport::SegmentHandle>(ret);
+    if (replaced) {
+        LOG(INFO) << "importSegment: descriptor of segment " << sid
+                  << " replaced, dropping cached mappings";
+        for (auto* transport : multi_transports_->listTransports())
+            transport->invalidateSegment(sid);
+    }
+    return sid;
+}
+
+int TransferEngineImpl::bindSegment(Transport::SegmentHandle handle,
+                                    int local_device) {
+    for (auto* transport : multi_transports_->listTransports()) {
+        int ret = transport->bindSegment(handle, local_device);
+        if (ret) return ret;
+    }
+    return 0;
+}
+
+int TransferEngineImpl::removeSegment(const std::string& segment_name) {
+    SegmentID sid = metadata_->removeImportedSegment(segment_name);
+    if (sid == static_cast<SegmentID>(-1)) return ERR_INVALID_ARGUMENT;
+    for (auto* transport : multi_transports_->listTransports())
+        transport->invalidateSegment(sid);
+    return 0;
 }
 
 bool TransferEngineImpl::checkOverlap(void* addr, uint64_t length) {

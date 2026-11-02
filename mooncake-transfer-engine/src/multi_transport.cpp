@@ -89,6 +89,21 @@
 #include <cassert>
 
 namespace mooncake {
+
+#ifdef ENABLE_MULTI_PROTOCOL
+// GPU buffers on another host are reachable only through a fabric export in
+// a vPOD shared with this host (UALink); IPC and POSIX fd exports are not.
+static bool isFabricReachable(const TransferMetadata::BufferDesc& buffer) {
+#ifdef USE_HIP
+    return buffer.protocol == "hip" &&
+           HipTransport::isFabricReachable(buffer.shm_name);
+#else
+    (void)buffer;
+    return false;
+#endif
+}
+#endif
+
 MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                                std::string& local_server_name)
     : metadata_(metadata), local_server_name_(local_server_name) {}
@@ -1012,14 +1027,19 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
     // by both rdma and hip), pick the highest-performance transport by a fixed
     // priority instead of relying on buffer registration order.
     if (proto.find(',') != std::string::npos) {
+        // Read once: getenv scans the whole environment on every call.
+        static const bool disable_hylink = std::getenv("MC_DISABLE_HYLINK");
+        static const bool disable_hip = std::getenv("MC_DISABLE_HIP");
+        static const bool disable_maca = std::getenv("MC_DISABLE_MACA");
+        static const bool disable_musa = std::getenv("MC_DISABLE_MUSA");
         auto protocol_priority = [](const std::string& p) {
             // hip is intra-node GPU-IPC only. On a cross-node request a
             // hip+rdma segment must fall through to rdma; allow deployments
             // that know they need the cross-node path to de-prioritize hip.
-            if (p == "hylink") return std::getenv("MC_DISABLE_HYLINK") ? 0 : 5;
-            if (p == "hip") return std::getenv("MC_DISABLE_HIP") ? 0 : 4;
-            if (p == "maca") return std::getenv("MC_DISABLE_MACA") ? 0 : 4;
-            if (p == "musa") return std::getenv("MC_DISABLE_MUSA") ? 0 : 4;
+            if (p == "hylink") return disable_hylink ? 0 : 5;
+            if (p == "hip") return disable_hip ? 0 : 4;
+            if (p == "maca") return disable_maca ? 0 : 4;
+            if (p == "musa") return disable_musa ? 0 : 4;
             if (p == "shm") return 4;
             if (p == "cxl") return 3;
             if (p == "rdma") return 2;
@@ -1032,8 +1052,18 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         // This makes the intra-node fast path (hip) and the cross-node path
         // (rdma) work automatically from a single multi-protocol segment,
         // without requiring the operator to set MC_DISABLE_HIP.
-        const bool local_ipc_reachable = isLocalIpcReachableTarget(
-            target_segment_desc->name, local_server_name_);
+        // Batches target the same segment back to back; skip re-parsing.
+        thread_local std::string last_target_name;
+        thread_local std::string last_local_name;
+        thread_local bool last_reachable = false;
+        if (target_segment_desc->name != last_target_name ||
+            local_server_name_ != last_local_name) {
+            last_target_name = target_segment_desc->name;
+            last_local_name = local_server_name_;
+            last_reachable =
+                isLocalIpcReachableTarget(last_target_name, last_local_name);
+        }
+        const bool local_ipc_reachable = last_reachable;
         std::string chosen;
         int chosen_priority = -1;
         for (const auto& buffer : target_segment_desc->buffers) {
@@ -1047,7 +1077,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                 entry.target_offset < start + buffer.length) {
                 if ((buffer.protocol == "hip" || buffer.protocol == "musa" ||
                      buffer.protocol == "shm") &&
-                    !local_ipc_reachable) {
+                    !local_ipc_reachable && !isFabricReachable(buffer)) {
                     continue;
                 }
                 int priority = protocol_priority(buffer.protocol);
@@ -1124,10 +1154,20 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
     // hip GPU IPC and POSIX SHM cannot reach a remote host; downgrade an
     // explicit intra-node preference to a cross-host-capable transport
     // (mirrors the locality gate in selectTransport). Prefer rdma, then tcp.
+    auto fabric_reachable_target = [&]() {
+        for (const auto& buffer : target_segment_desc->buffers) {
+            if (buffer.protocol == preferred_proto &&
+                entry.target_offset >= buffer.addr &&
+                entry.target_offset < buffer.addr + buffer.length)
+                return isFabricReachable(buffer);
+        }
+        return false;
+    };
     if ((preferred_proto == "hip" || preferred_proto == "musa" ||
          preferred_proto == "shm") &&
         !isLocalIpcReachableTarget(target_segment_desc->name,
-                                   local_server_name_)) {
+                                   local_server_name_) &&
+        !fabric_reachable_target()) {
         std::string fallback;
         for (const char* candidate : {"rdma", "tcp"}) {
             if (std::find(protos.begin(), protos.end(), candidate) !=
