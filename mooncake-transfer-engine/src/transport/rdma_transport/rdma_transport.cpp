@@ -1207,7 +1207,15 @@ Status RdmaTransport::submitTransfer(
 #endif
         task_list.push_back(&task);
     }
-    return submitTransferTask(task_list);
+    return submitTransferTaskWithSeal(task_list);
+}
+
+Status RdmaTransport::submitTransferTaskWithSeal(
+    const std::vector<TransferTask *> &task_list) {
+    for (auto *task : task_list) Slice::unsealTaskSubmission(task);
+    auto status = submitTransferTask(task_list);
+    for (auto *task : task_list) Slice::sealTaskSubmission(task);
+    return status;
 }
 
 Status RdmaTransport::submitTransferTask(
@@ -1234,6 +1242,15 @@ Status RdmaTransport::submitTransferTask(
     const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark =
         globalConfig().max_wr * globalConfig().num_qp_per_ep;
+    size_t pending_slice_count = 0;
+    auto flush_pending_slices = [&]() {
+        for (auto &entry : slices_to_post) {
+            if (entry.second.empty()) continue;
+            entry.first->submitPostSend(entry.second);
+            entry.second.clear();
+        }
+        pending_slice_count = 0;
+    };
     auto fail_unposted_slices = [&]() {
         for (auto &entry : slices_to_post)
             for (auto *slice : entry.second) slice->markFailed();
@@ -1270,7 +1287,6 @@ Status RdmaTransport::submitTransferTask(
 #endif
         fail_unstarted_tasks(task_index + 1);
     };
-    uint64_t nr_slices;
     size_t task_index = 0, request_index = 0;
     BatchRdmaDeviceCache local_device_cache;
     int last_local_buffer_id = -1;
@@ -1282,7 +1298,6 @@ Status RdmaTransport::submitTransferTask(
         assert(task_list[task_index]);
         auto &task = *task_list[task_index];
         const size_t current_task_index = task_index;
-        nr_slices = 0;
         assert(task.request);
 #ifndef MOONCAKE_ENABLE_PXN
         auto &request = task.request[request_index++];
@@ -1360,10 +1375,6 @@ Status RdmaTransport::submitTransferTask(
 
                 Slice *slice = getSliceCache().allocate();
                 assert(slice);
-                if (!slice->from_cache) {
-                    nr_slices++;
-                }
-
                 slice->source_addr = (char *)request.source + offset;
                 slice->length = slice_length;
                 slice->source_location.clear();
@@ -1457,12 +1468,10 @@ Status RdmaTransport::submitTransferTask(
                     __sync_fetch_and_add(&task.slice_count, 1);
                 }
 
-                if (nr_slices >= kSubmitWatermark) {
-                    for (auto &entry : slices_to_post)
-                        entry.first->submitPostSend(entry.second);
-                    slices_to_post.clear();
-                    nr_slices = 0;
-                }
+                // Flush prepared slices so TE worker post can overlap with slice
+                // preparation
+                if (++pending_slice_count >= kSubmitWatermark)
+                    flush_pending_slices();
 
                 offset += slice->length;
             }
@@ -1471,8 +1480,7 @@ Status RdmaTransport::submitTransferTask(
 #endif
     }
 
-    for (auto &entry : slices_to_post)
-        if (!entry.second.empty()) entry.first->submitPostSend(entry.second);
+    flush_pending_slices();
     return Status::OK();
 }
 

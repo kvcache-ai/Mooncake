@@ -181,16 +181,46 @@ if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
     fi
 fi
 
+# Release builds still compile with -g (ENABLE_DEBUG_SYMBOLS defaults to ON),
+# and DWARF made up most of each wheel, pushing the CUDA wheels past the
+# 100 MiB per-file upload limit of PyPI/TestPyPI. The CI wheel profiles pass
+# -DENABLE_DEBUG_SYMBOLS=OFF, so this strip is the safety net for callers that
+# still build with -g. It runs before auditwheel: patchelf has to run after
+# strip, never before. --strip-debug keeps .symtab, so stack traces still
+# resolve function names. The CUDA device libraries injected after repair are
+# not touched.
+#
+# Strip by default in CI only: local developer builds keep the line tables
+# ENABLE_DEBUG_SYMBOLS=ON compiled in. KEEP_DEBUG_SYMBOLS=1 opts out
+# everywhere (including the NPU --strip-unneeded pass); STRIP overrides the
+# tool for cross/container toolchains.
+WHEEL_PACKAGE_DIR="$(pwd)/mooncake-wheel/mooncake"
+if [ "${KEEP_DEBUG_SYMBOLS:-0}" != "1" ] && [ "${CI:-false}" = "true" ]; then
+    STRIP="${STRIP:-strip}"
+    if ! command -v "$STRIP" >/dev/null 2>&1; then
+        echo "Error: '$STRIP' not found; install binutils or set STRIP to the target strip tool"
+        exit 1
+    fi
+    if [ "$NPU_BUILD" = "1" ]; then
+        echo "Stripping staged shared libraries to reduce wheel size (set KEEP_DEBUG_SYMBOLS=1 to keep them)..."
+        find "$WHEEL_PACKAGE_DIR" -type f -name "*.so" -exec "$STRIP" --strip-unneeded {} +
+    else
+        if ! command -v file >/dev/null 2>&1; then
+            echo "Error: 'file' not found; it is needed to detect staged ELF files"
+            exit 1
+        fi
+        echo "Stripping debug info from staged ELF files (set KEEP_DEBUG_SYMBOLS=1 to keep it)..."
+        find "$WHEEL_PACKAGE_DIR" -type f \( -name '*.so*' -o -perm -111 \) \
+            -exec sh -c 'file "$1" | grep -q ELF' _ {} \; \
+            -exec "$STRIP" --strip-debug {} +
+    fi
+else
+    echo "Keeping debug symbols in staged files (KEEP_DEBUG_SYMBOLS=${KEEP_DEBUG_SYMBOLS:-0}, CI=${CI:-false})"
+fi
+
 # Make the post-repair device library discoverable while auditwheel resolves
 # the host extension.  It is explicitly excluded below and injected later.
 export LD_LIBRARY_PATH="${CUDA_EP_STAGING_DIR}:${LD_LIBRARY_PATH}"
-
-if [ "$NPU_BUILD" = "1" ]; then
-    echo "Stripping shared libraries to reduce wheel size..."
-    find mooncake-wheel/mooncake -name "*.so" -exec strip --strip-unneeded {} \;
-    echo "Pre-setting RPATH=\$ORIGIN on project ELF files so auditwheel resolves NEEDED from wheel-internal copies..."
-    find mooncake-wheel/mooncake -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0 | xargs -0 patchelf --force-rpath --set-rpath '$ORIGIN'
-fi
 
 echo "Building wheel package..."
 # Stage migrated root Python modules and the legacy Reshard package for the
@@ -413,6 +443,16 @@ elif command -v uv &>/dev/null; then
 else
     echo "Error: Neither python${PYTHON_VERSION}, pip nor uv found"
     exit 1
+fi
+
+# Keep the existing NPU repair layout. Other builds must retain their build-time
+# RPATH until auditwheel resolves external dependencies, including Conda's
+# libyaml-cpp.so.0.7 in the manylinux CUDA images. Replacing it with only $ORIGIN
+# makes those libraries undiscoverable. Strip debug info without changing RPATH.
+# Run after installing patchelf above so the supported version is used.
+if [ "$NPU_BUILD" = "1" ]; then
+    echo "Pre-setting RPATH=\$ORIGIN on NPU ELF files..."
+    find "$WHEEL_PACKAGE_DIR" -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0 | xargs -0 patchelf --force-rpath --set-rpath '$ORIGIN'
 fi
 
 # Create directory for repaired wheels
@@ -682,6 +722,32 @@ fi
 # Replace original wheel with repaired wheel
 rm -f ${OUTPUT_DIR}/*.whl
 mv ${REPAIRED_DIR}/*.whl ${OUTPUT_DIR}/
+
+# PyPI and TestPyPI reject files above 100 MiB by default. Gate here, next to
+# OUTPUT_DIR, so every caller of this script is covered (CI, nightly,
+# pre-release and release; CUDA, EFA, NPU, MUSA and ROCm alike) instead of
+# only the _build-wheel.yaml workflow. Only CI builds fail: local and Docker
+# builds may intentionally exceed the limit (e.g. KEEP_DEBUG_SYMBOLS=1) and
+# never upload to an index.
+wheels=("${OUTPUT_DIR}"/*.whl)
+if [ ! -e "${wheels[0]}" ]; then
+    echo "Error: no wheel found in ${OUTPUT_DIR}/ after auditwheel repair"
+    exit 1
+fi
+size_limit=$((100 * 1024 * 1024))
+for wheel in "${wheels[@]}"; do
+    size=$(stat -c %s "$wheel")
+    size_mib=$(awk -v size="$size" 'BEGIN { printf "%.1f", size / 1048576 }')
+    echo "$(basename "$wheel"): ${size_mib} MiB"
+    if [ "$size" -gt "$size_limit" ]; then
+        message="$(basename "$wheel") is ${size_mib} MiB, above the 100 MiB per-file upload limit of PyPI/TestPyPI"
+        if [ "${CI:-false}" = "true" ]; then
+            echo "Error: $message"
+            exit 1
+        fi
+        echo "Warning: $message (not enforced outside CI)"
+    fi
+done
 
 cd ..
 
