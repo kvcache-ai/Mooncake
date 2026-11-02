@@ -53,9 +53,11 @@ class ProxyManager {
     };
 
    public:
+    // 256 chunks let all kShards workers stage 8-chunk (32 MiB) requests at
+    // once; with 64 they waited on each other for buffers.
     explicit ProxyManager(TransferEngineImpl* impl,
                           size_t chunk_size = 4 * 1024 * 1024,
-                          size_t chunk_count = 64);
+                          size_t chunk_count = 256);
 
     ~ProxyManager();
 
@@ -158,7 +160,10 @@ class ProxyManager {
         // Tasks queued on or running in this worker.
         std::atomic<size_t> pending{0};
     };
-    const static size_t kShards = 8;
+    // A worker runs one staged request at a time and overlaps only that
+    // request's chunks, so a batch of small requests (a KV cache's layers
+    // and shards) needs many workers to keep enough chunks in flight.
+    const static size_t kShards = 32;
     WorkerShard shards_[kShards];
 };
 }  // namespace tent
