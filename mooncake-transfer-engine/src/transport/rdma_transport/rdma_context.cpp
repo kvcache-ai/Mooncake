@@ -156,18 +156,64 @@ bool isKernelDmabufSupported() {
             if (found[0] && found[1]) break;
         }
 
-        // Fallback: probe /proc/kallsyms for the corresponding kernel symbols.
+        // Fallback: probe /proc/kallsyms for kernel symbols that exist ONLY
+        // when the corresponding config is enabled.
+        //
+        // The previous substring match on "pci_p2pdma" was a FALSE POSITIVE:
+        // the exported helper dma_pci_p2pdma_supported() is compiled in
+        // whenever CONFIG_HAS_DMA is set — regardless of CONFIG_PCI_P2PDMA
+        // (see include/linux/dma-mapping.h / kernel/dma/mapping.c) — so
+        // kernels without P2PDMA passed this gate. Since the config-file
+        // candidates above are typically invisible inside containers, this
+        // fallback is the deciding probe in containerized deployments.
+        //
+        // Consequence observed in production on MI308X + bnxt_re (Thor2)
+        // with kernel 6.6 lacking CONFIG_PCI_P2PDMA: the dmabuf MR path was
+        // allowed, and amdgpu silently migrated the registered VRAM buffer
+        // to GTT/system memory (mem_info_vram_used dropped by the buffer
+        // size, mem_info_gtt_used grew by the same amount). GPU-side access
+        // to the buffer collapsed from ~1838 GB/s to 115 GB/s (16x) and did
+        // not recover after MR deregistration; on a KV-cache pool this
+        // slowed attention kernels by 5-50x.
+        //
+        // The matching below is an exact symbol-name comparison (the third
+        // kallsyms field, with the __pfx_ prefix stripped) against symbols
+        // from drivers/pci/p2pdma.c, which is only compiled when
+        // CONFIG_PCI_P2PDMA=y (the =n variants are static inline and never
+        // appear in kallsyms).
         if (!found[0] || !found[1]) {
             std::ifstream f("/proc/kallsyms");
             if (f.good()) {
                 std::string line;
                 while (std::getline(f, line)) {
-                    if (!found[0] &&
-                        line.find("pci_p2pdma") != std::string::npos)
+                    // kallsyms line format: "<addr> <type> <name> [module]"
+                    size_t t1 = line.find(' ');
+                    size_t t2 = (t1 == std::string::npos)
+                                    ? std::string::npos
+                                    : line.find(' ', t1 + 1);
+                    if (t2 == std::string::npos) continue;
+                    std::string name = line.substr(t2 + 1);
+                    size_t sp = name.find(' ');
+                    if (sp != std::string::npos) name.resize(sp);
+                    // Strip the __pfx_ prefix used by newer kernels.
+                    if (name.rfind("__pfx_", 0) == 0) name.erase(0, 6);
+
+                    // Present in kallsyms iff CONFIG_PCI_P2PDMA=y.
+                    if (!found[0] && (name == "pci_p2pdma_add_resource" ||
+                                      name == "pci_p2pdma_distance_many" ||
+                                      name == "pci_p2pdma_enable_store")) {
                         found[0] = true;
-                    if (!found[1] &&
-                        line.find("dma_buf_move_notify") != std::string::npos)
+                    }
+                    // NOTE: dma_buf_move_notify() is compiled with the
+                    // dma-buf core (CONFIG_DMA_SHARED_BUFFER, see
+                    // drivers/dma-buf/dma-buf.c), so this only proves the
+                    // core exists, not that CONFIG_DMABUF_MOVE_NOTIFY=y.
+                    // No single =y-only symbol exists for MOVE_NOTIFY; the
+                    // overall gate is effectively decided by the P2PDMA
+                    // check above.
+                    if (!found[1] && name == "dma_buf_move_notify") {
                         found[1] = true;
+                    }
                     if (found[0] && found[1]) break;
                 }
             }
