@@ -1480,7 +1480,8 @@ class RealClient : public PyClient {
     void ReleaseAllocatedSegmentRecord(const std::string &segment_id);
     void ReleaseAllAllocatedSegmentRecords();
     ErrorCode RetryPendingMountRollbacks();
-    void LeakSegmentRecordsUntilProcessExit() noexcept;
+    tl::expected<void, ErrorCode> tearDownAll_internal(bool final_cleanup);
+    void LeakMemoryOwnersUntilProcessExit() noexcept;
 
     // MappedShm whose spdk_mem_unregister() (spdk_registered) or transfer
     // engine unregisterLocalMemory() (te_unregister_pending) failed during

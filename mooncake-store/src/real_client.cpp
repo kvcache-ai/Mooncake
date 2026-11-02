@@ -20,6 +20,7 @@
 #include <new>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -944,12 +945,9 @@ RealClient::~RealClient() {
     stop_http_server();
     // A destructor cannot propagate errors, but a teardown failure (e.g.
     // unconfirmed NoF cleanup) must still leave a trace.
-    if (!tearDownAll_internal()) {
+    if (!tearDownAll_internal(/*final_cleanup=*/true)) {
         LOG(ERROR) << "RealClient teardown completed with cleanup failures; "
                       "some buffers must stay mapped until process exit";
-        if (mount_rollback_cleanup_failed_.load(std::memory_order_acquire)) {
-            LeakSegmentRecordsUntilProcessExit();
-        }
     }
 }
 
@@ -1908,6 +1906,11 @@ int RealClient::initAll(const std::string &protocol_,
 }
 
 tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
+    return tearDownAll_internal(/*final_cleanup=*/false);
+}
+
+tl::expected<void, ErrorCode> RealClient::tearDownAll_internal(
+    bool final_cleanup) {
     // Serialize the destructor/close/signal entry points: a rollback retry
     // must never race a concurrent full teardown of the same client.
     std::lock_guard<std::mutex> teardown_guard(teardown_mutex_);
@@ -1916,19 +1919,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
                                          std::memory_order_acq_rel)) {
-        if (mount_rollback_cleanup_failed_.load(std::memory_order_acquire)) {
-            // A previous teardown stopped background services but retained
-            // Client and segment owners because rollback unmounts failed.
-            // Retry the unmounts; on success continue into the cleanup body
-            // below with closed_ still latched, so concurrent callers keep
-            // taking this early path instead of racing the cleanup.
-            const ErrorCode rollback_rc = RetryPendingMountRollbacks();
-            if (rollback_rc != ErrorCode::OK) {
-                return tl::unexpected(rollback_rc);
-            }
-            mount_rollback_cleanup_failed_.store(false,
-                                                 std::memory_order_release);
-        } else {
+        if (!mount_rollback_cleanup_failed_.load(std::memory_order_acquire)) {
             // A previous teardown's cleanup failure must not decay into
             // success on repeat calls: retry the idempotent cleanups and
             // keep reporting failure until they heal.
@@ -1948,6 +1939,8 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
             }
             return {};
         }
+        // A previous rollback failure retained Client and its memory owners.
+        // Continue below to retry with closed_ still latched.
     }
 
     // Drain the prefetch pool before any resource release below. Pool jobs
@@ -1966,11 +1959,22 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     const ErrorCode rollback_rc = RetryPendingMountRollbacks();
     if (rollback_rc != ErrorCode::OK) {
         mount_rollback_cleanup_failed_.store(true, std::memory_order_release);
-        return tl::unexpected(rollback_rc);
+        if (!final_cleanup) return tl::unexpected(rollback_rc);
+        // There can be no later retry once RealClient is being destroyed.
+        // Retain all backing-memory owners, not just the failed chunks, and
+        // still drain Client while our record tables and mutexes are alive.
+        LeakMemoryOwnersUntilProcessExit();
+    } else {
+        mount_rollback_cleanup_failed_.store(false, std::memory_order_release);
     }
-    mount_rollback_cleanup_failed_.store(false, std::memory_order_release);
 
-    ErrorCode cleanup_error = ErrorCode::OK;
+    ErrorCode cleanup_error = rollback_rc;
+    if (final_cleanup) {
+        // FileStorage owns a Client reference and may run segment readers.
+        // Drop it before Client and before any backing memory can be freed.
+        file_storage_.reset();
+        client_requester_.reset();
+    }
     if (client_) {
         if (!egm_segment_ptrs_.empty()) {
             // Callers must quiesce in-flight requests before close. FileStorage
@@ -2466,25 +2470,41 @@ ErrorCode RealClient::RetryPendingMountRollbacks() {
     return first_error;
 }
 
-void RealClient::LeakSegmentRecordsUntilProcessExit() noexcept {
-    auto *mounted_records = new (std::nothrow)
-        std::unordered_map<std::string, MountedSegmentRecord>();
-    if (mounted_records) {
+void RealClient::LeakMemoryOwnersUntilProcessExit() noexcept {
+    // These containers deliberately have no destructor. Unconfirmed transport
+    // registrations must never point into freed or reused backing memory.
+    const auto retain = [](auto &owners) {
+        auto *quarantine = new std::decay_t<decltype(owners)>();
+        quarantine->swap(owners);
+    };
+    {
         std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
-        mounted_records->swap(mounted_segment_records_);
-    } else {
-        LOG(ERROR) << "Could not retain mounted segment records in the "
-                      "process-lifetime quarantine";
+        retain(mounted_segment_records_);
     }
-
-    auto *allocated_records = new (std::nothrow)
-        std::unordered_map<std::string, AllocatedSegmentRecord>();
-    if (allocated_records) {
+    {
         std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
-        allocated_records->swap(allocated_segment_records_);
-    } else {
-        LOG(ERROR) << "Could not retain allocated segment records in the "
-                      "process-lifetime quarantine";
+        retain(allocated_segment_records_);
+    }
+    retain(hugepage_segment_ptrs_);
+    retain(segment_ptrs_);
+    retain(ascend_segment_ptrs_);
+#ifdef USE_MEMFABRIC
+    retain(memfabric_segment_ptrs_);
+#endif
+    retain(ub_segment_ptrs_);
+#ifdef USE_VRAM_SEGMENT
+    retain(vram_segment_ptrs_);
+#endif
+#if defined(USE_SUNRISE)
+    retain(sunrise_segment_ptrs_);
+#endif
+    retain(egm_segment_ptrs_);
+    retain(setup_segment_pinned_regions_);
+    retain(client_buffer_allocator_);
+    {
+        std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        retain(shm_contexts_);
+        retain(quarantine_shms_);
     }
 }
 
