@@ -3,6 +3,10 @@
 #include <glog/logging.h>
 
 #include <boost/functional/hash.hpp>
+#include <boost/locale/utf.hpp>
+
+#include <algorithm>
+#include <ylt/struct_pack/compatible.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -124,13 +128,89 @@ struct ReplicateConfig {
     // eviction treats the group as a unit (all-or-none). Object routing is
     // always hash(tenant, key) and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
+    // Per-key write attribution, independent of key identity and eviction
+    // groups. Preserve the session extension already used by main.
+    struct_pack::compatible<std::vector<std::string>, 1> session_ids;
+    // Best-effort receiver affinity. A matching range is local to every
+    // named HCA on that receiver; NUMA IDs are never compared across hosts.
+    struct_pack::compatible<std::vector<std::string>, 2> preferred_hca_names;
+    // Batch hints follow the key order; an empty entry means no preference.
+    struct_pack::compatible<std::vector<std::vector<std::string>>, 3>
+        per_key_preferred_hca_names;
+
+    bool HasValidKeyHints(size_t key_count) const {
+        return (!group_ids || group_ids->size() == key_count) &&
+               (!per_key_preferred_hca_names ||
+                per_key_preferred_hca_names->size() == key_count);
+    }
+
+    ReplicateConfig ForKeySubset(const std::vector<size_t>& indices) const {
+        ReplicateConfig result = *this;
+        if (group_ids) {
+            result.group_ids = std::vector<std::string>{};
+            for (auto index : indices)
+                result.group_ids->push_back(group_ids->at(index));
+        }
+        if (session_ids) {
+            result.session_ids = std::vector<std::string>{};
+            for (auto index : indices)
+                result.session_ids->push_back(session_ids->at(index));
+        }
+        if (per_key_preferred_hca_names) {
+            result.per_key_preferred_hca_names =
+                std::vector<std::vector<std::string>>{};
+            for (auto index : indices) {
+                result.per_key_preferred_hca_names->push_back(
+                    per_key_preferred_hca_names->at(index));
+            }
+        }
+        return result;
+    }
+
+    bool ValidSessionIds(size_t key_count) const {
+        return !session_ids ||
+               (session_ids->size() == key_count &&
+                std::all_of(session_ids->begin(), session_ids->end(),
+                            [](const auto& id) {
+                                if (id.size() > 256) return false;
+                                auto it = id.begin();
+                                while (it != id.end()) {
+                                    namespace utf = boost::locale::utf;
+                                    if (!utf::is_valid_codepoint(
+                                            utf::utf_traits<char>::decode(
+                                                it, id.end()))) {
+                                        return false;
+                                    }
+                                }
+                                return true;
+                            }));
+    }
+
+    std::string SessionId() const {
+        return session_ids && !session_ids->empty() ? session_ids->front() : "";
+    }
+
+    // Reuse a copy of the batch config; select metadata from the original
+    // batch.
+    void SetKeyIds(const ReplicateConfig& batch_config, size_t key_index) {
+        if (batch_config.group_ids.has_value()) {
+            group_ids =
+                std::vector<std::string>{batch_config.group_ids->at(key_index)};
+        }
+        if (batch_config.session_ids) {
+            session_ids = std::vector<std::string>{
+                batch_config.session_ids->at(key_index)};
+        }
+        if (batch_config.per_key_preferred_hca_names) {
+            preferred_hca_names =
+                batch_config.per_key_preferred_hca_names->at(key_index);
+            per_key_preferred_hca_names.reset();
+        }
+    }
 
     ReplicateConfig ForSingleKey(size_t key_index) const {
         ReplicateConfig key_config = *this;
-        if (group_ids.has_value()) {
-            key_config.group_ids =
-                std::vector<std::string>{group_ids->at(key_index)};
-        }
+        key_config.SetKeyIds(*this, key_index);
         return key_config;
     }
 
@@ -188,6 +268,26 @@ enum class ReplicaWriteMode {
     RELIABLE_MULTI_REPLICA,
 };
 
+/**
+ * @brief Options for is_exist / batch_is_exist.
+ *
+ * Mirrors the ReplicateConfig pattern: a struct leaves room for future
+ * extensions without changing the function signature each time.
+ *
+ * prefetch_to_memory requires the client to be configured with
+ * enable_ssd_prefetch (and SSD offload for local promotion); otherwise it is
+ * silently ignored. See docs/source/design/store/ssd-prefetch.md.
+ */
+struct ExistOptions {
+    bool prefetch_to_memory = false;
+    friend std::ostream& operator<<(std::ostream& os,
+                                    const ExistOptions& options) noexcept {
+        os << "ExistOptions: { prefetch_to_memory: "
+           << options.prefetch_to_memory << " }";
+        return os;
+    }
+};
+
 inline ReplicaWriteMode DetermineReplicaWriteMode(
     const ReplicateConfig& config) {
     if (config.dfs_replica_num == 0 && config.replica_num == 1 &&
@@ -242,7 +342,8 @@ struct DfsReplicaData {
 
 struct MemoryDescriptor {
     AllocatedBuffer::Descriptor buffer_descriptor;
-    YLT_REFL(MemoryDescriptor, buffer_descriptor);
+    struct_pack::compatible<SegmentLocality, 1> locality;
+    YLT_REFL(MemoryDescriptor, buffer_descriptor, locality);
 };
 
 struct NoFDescriptor {
@@ -826,8 +927,7 @@ class Replica {
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 
-    friend class Serializer<Replica>;
-    friend class MasterService;  // For MetadataSerializer to access next_id_
+    friend class MasterService;  // Standby restore advances next_id_
     std::atomic<uint32_t> refcnt_{0};
 };
 
@@ -838,16 +938,16 @@ inline Replica::Descriptor Replica::get_descriptor() const {
 
     if (is_memory_replica()) {
         const auto& mem_data = std::get<MemoryReplicaData>(data_);
-        MemoryDescriptor mem_desc;
+        auto& mem_desc = desc.get_memory_descriptor();
         if (mem_data.buffer) {
-            mem_desc.buffer_descriptor = mem_data.buffer->get_descriptor();
+            mem_desc.buffer_descriptor =
+                mem_data.buffer->get_descriptor(&mem_desc.locality);
         } else {
             mem_desc.buffer_descriptor.size_ = 0;
             mem_desc.buffer_descriptor.buffer_address_ = 0;
             mem_desc.buffer_descriptor.transport_endpoint_ = "";
             LOG(ERROR) << "Trying to get invalid memory replica descriptor";
         }
-        desc.descriptor_variant = std::move(mem_desc);
     } else if (is_nof_replica()) {
         const auto& nof_data = std::get<NoFReplicaData>(data_);
         NoFDescriptor nof_desc;

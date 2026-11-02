@@ -21,6 +21,10 @@
 #include <optional>
 #include <string_view>
 
+#ifdef USE_XPU
+#include "tent/runtime/platform.h"
+#endif
+
 DEFINE_string(seg_name, "", "Memory segment name for the local side");
 DEFINE_string(seg_type, "DRAM",
               "Memory segment type for the target side: DRAM|VRAM");
@@ -29,10 +33,9 @@ DEFINE_string(
     "Comma-separated segment types for mixed DRAM+VRAM runs, e.g. "
     "\"dram,vram\". When set, target registers buffers of each listed type "
     "in one segment, and initiator threads round-robin across them so a "
-    "single tebench process drives traffic over multiple memory types (and "
-    "thus multiple transports — SHM for DRAM, NVLink for VRAM) "
-    "concurrently. Empty falls back to --seg_type (single type, existing "
-    "behavior). Requires transports to be enabled via MC_TENT_CONF.");
+    "single tebench process drives traffic over multiple memory types "
+    "concurrently. Empty falls back to --seg_type. Select transports "
+    "with --xport_type or MC_TENT_CONF.");
 DEFINE_string(target_seg_name, "",
               "Target segment name for the initiator side. A comma-separated "
               "list enables multi-target initiator mode.");
@@ -60,6 +63,18 @@ DEFINE_uint64(
     target_range_size, 0,
     "Per-initiator target range size. 0 disables range validation; "
     "non-zero requires every target address to stay inside the range.");
+DEFINE_string(target_access, "fixed",
+              "Target offset of each operation within the thread's window: "
+              "fixed (same offset every time) or random (a random "
+              "operation-aligned slot, never the previous one). Rewriting one "
+              "SSD block back to back can be far slower than writing "
+              "different blocks; random avoids that.");
+DEFINE_uint64(target_window_size, 0,
+              "Bytes of target each thread spreads its operations over, e.g. "
+              "file size / thread count. Requires --target_access=random "
+              "and a multiple of 4096. Threads' windows do not overlap. 0 "
+              "uses max_block_size x max_batch_size, which is also the "
+              "minimum.");
 DEFINE_string(
     qos_classes, "",
     "QoS classes as name:threads:slo_us:weight[:isolated_gbps],...; "
@@ -97,8 +112,13 @@ DEFINE_int32(deadline_tight_threads, 0,
              "--workload_classes_json.");
 DEFINE_bool(deadline_bw_arbitration, false,
             "tent only: enable deadline-aware RDMA bandwidth arbitration.");
-DEFINE_int32(local_gpu_id, 0, "Local GPU ID to be used, -1 for all GPUs");
-DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used, -1 for all GPUs");
+DEFINE_int32(local_gpu_id, 0,
+             "Local device ordinal for VRAM, -1 for all visible devices. "
+             "Selects an MLU or XPU device with --backend=tent in USE_MLU "
+             "or USE_XPU builds.");
+DEFINE_int32(target_gpu_id, 0,
+             "Offset for round-robin assignment across target buffers; "
+             "-1 uses 0.");
 DEFINE_string(metadata_type, "p2p",
               "Type of metadata service: p2p|etcd|redis|http");
 DEFINE_string(metadata_url_list, "",
@@ -154,6 +174,8 @@ int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
 size_t XferBenchConfig::target_offset = 0;
 size_t XferBenchConfig::target_range_size = 0;
+std::string XferBenchConfig::target_access;
+size_t XferBenchConfig::target_window_size = 0;
 std::string XferBenchConfig::qos_classes;
 std::string XferBenchConfig::qos_classes_json;
 std::string XferBenchConfig::workload_classes_json;
@@ -243,6 +265,8 @@ void XferBenchConfig::loadFromFlags() {
     max_num_threads = FLAGS_max_num_threads;
     target_offset = FLAGS_target_offset;
     target_range_size = FLAGS_target_range_size;
+    target_access = FLAGS_target_access;
+    target_window_size = FLAGS_target_window_size;
     qos_classes = FLAGS_qos_classes;
     qos_classes_json = FLAGS_qos_classes_json;
     workload_classes_json = FLAGS_workload_classes_json;
@@ -370,6 +394,17 @@ uint8_t stableDataSeed(uint64_t target_addr) {
     uint8_t seed = static_cast<uint8_t>(value);
     return seed == 0 ? 1 : seed;
 }
+
+#ifdef USE_XPU
+bool isXpuMemory(void* ptr) {
+    return Platform::getLoader().getMemoryType(ptr) == MTYPE_XPU;
+}
+
+void copyXpuData(void* dst, void* src, size_t length) {
+    auto status = Platform::getLoader().copy(dst, src, length);
+    LOG_ASSERT(status.ok()) << "XPU copy failed: " << status.ToString();
+}
+#endif
 
 }  // namespace tent
 }  // namespace mooncake

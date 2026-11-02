@@ -1,11 +1,11 @@
 # Store-RS Python Operations
 
 The root wheel installs the standalone Store-RS commands. Build and install it
-using the [source-checkout quickstart](../../getting_started/store-rs.md).
+using {ref}`Build with Store-RS <build-with-store-rs>`.
 
 ## Standalone Store-RS Commands
 
-The root CMake target build_store_rs_cli builds the client, admin, and benchmark binaries. The unified root wheel installs the standalone commands under their mooncake-store-rs-* names. Use the [source-checkout quickstart](../../getting_started/store-rs.md) to configure the root build and install the wheel.
+The root CMake target build_store_rs_cli builds the client, admin, and benchmark binaries. The unified root wheel installs the standalone commands under their mooncake-store-rs-* names. Use {ref}`Build with Store-RS <build-with-store-rs>` to configure the root build and install the wheel.
 
 Start a storage client:
 

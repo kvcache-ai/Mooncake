@@ -1,5 +1,9 @@
 #pragma once
 
+#include <functional>
+#include <optional>
+#include <unordered_set>
+
 #include "client_service.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
@@ -103,6 +107,43 @@ class FileStorage {
     FileStorageConfig config_;
 
     /**
+     * @brief Promote a set of keys from local SSD to DRAM (SSD prefetch).
+     *
+     * Each key must already have a promotion task registered on the master
+     * (Client::RegisterPrefetchTask) with this client as holder; this method
+     * runs the promotion execution chain (PromotionAllocStart -> staging
+     * AllocateBatch -> BatchLoad -> PromotionWrite -> NotifyPromotionSuccess).
+     * Failures are reported per-key via on_key_done and do not propagate;
+     * this is best-effort.
+     *
+     * @param keys  Keys to promote
+     * @param sizes Corresponding object sizes in bytes
+     * @param dram_pressure Optional out-flag, set to true if any key failed
+     *        because the master is out of DRAM (PromotionAllocStart returned
+     *        NO_AVAILABLE_HANDLE), so the caller can back off prefetch and let
+     *        eviction/offload reclaim memory. Never reset to false here;
+     *        the caller initializes it.
+     * @param on_key_done Optional per-key completion callback.
+     * @return void on success, ErrorCode on critical (pre-loop) failure
+     */
+    using PrefetchKeyCallback =
+        std::function<void(const std::string& key, bool success)>;
+
+    tl::expected<void, ErrorCode> PrefetchKeys(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        bool* dram_pressure = nullptr,
+        PrefetchKeyCallback on_key_done = nullptr,
+        const std::string& tenant_id = "");
+
+    /**
+     * @brief Local SSD object size from the storage backend's authoritative
+     * metadata (with tenant-scoped key fallback). Remote callers' size hints
+     * must not be trusted for allocation sizing.
+     */
+    std::optional<int64_t> LookupLocalObjectSize(
+        const std::string& key, const std::string& tenant_id = "") const;
+
+    /**
      * @brief Releases buffer associated with a specific batch_id.
      * Called by remote client after transfer completion.
      * @param batch_id The unique identifier of the batch to release
@@ -192,6 +233,21 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> ProcessPromotionTasks();
 
+    /**
+     * @brief Execute the promotion chain for one key whose LOCAL_DISK replica
+     * lives on this node: PromotionAllocStart -> staging AllocateBatch ->
+     * BatchLoad -> PromotionWrite -> NotifyPromotionSuccess, with eager
+     * NotifyPromotionFailure on every failure path (RAII guard).
+     *
+     * Shared by the heartbeat-driven promotion-on-hit path
+     * (ProcessPromotionTasks) and the prefetch path (PrefetchKeys).
+     * @param dram_pressure Optional out-flag set when PromotionAllocStart
+     *        failed with NO_AVAILABLE_HANDLE (master out of DRAM).
+     */
+    tl::expected<void, ErrorCode> PromoteOneKeyFromLocalDisk(
+        const std::string& key, const std::string& tenant_id, int64_t size,
+        bool* dram_pressure);
+
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
     tl::expected<void, ErrorCode> RunDiskWatermarkEviction();
@@ -238,6 +294,71 @@ class FileStorage {
     std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
         client_buffer_mutex_) client_buffer_allocated_batches_;
     std::atomic<uint64_t> next_batch_id_{1};
+
+    /**
+     * @brief Partition drained-but-unbucketed offload tasks into NACKs vs
+     * carries (pure function; extracted for direct unit testing).
+     *
+     * A key absent from all_bucket_keys was either deliberately skipped by
+     * the backend (size over bucket limit / already on disk) — those must be
+     * NACKed so the master releases the task and source-replica refcount — or
+     * DEFERRED to the backend's ungrouped pool to be written as part of a
+     * full bucket next cycle. Deferred keys must NOT be NACKed: the backend
+     * carries only key+size across the deferral, so their tasks must be
+     * carried here or the re-emitted keys arrive task-less and are silently
+     * dropped (upstream #3006 — measured as ~12% of pool entries never
+     * reaching the SSD tier).
+     *
+     * Previously carried keys must also be RETAINED while un-emitted: the
+     * backend's pool only moves on a call with non-empty input, so a cycle
+     * can pass without the pooled keys being either emitted or re-reported
+     * (empty effective input after the carry merge). Rebuilding the carry
+     * from deferred_keys alone would NACK such keys while the pool still
+     * holds them — re-introducing the task-less drop.
+     *
+     * Retention is void for a key re-drained this cycle (redrained_carried_
+     * keys): the collision handling in OffloadObjects dropped its pooled copy,
+     * so it is no longer waiting and the stale carried task must not be
+     * retained. Without the exclusion, a re-drained key the backend then
+     * skipped (e.g. re-PUT at a size over the bucket limit) is neither
+     * bucketed nor deferred, so the stale task would be retained forever as a
+     * zombie AND its presence in carried_tasks would suppress the NACK for the
+     * fresh task — losing the fresh task and leaking its source refcount.
+     * Note the exclusion cannot be expressed as "absent from
+     * task_by_storage_key": the carry merge inserts every non-collision
+     * carried task into that map, so such a test would void retention
+     * entirely.
+     *
+     * @param task_by_storage_key All tasks known this cycle (drained +
+     * carried).
+     * @param all_bucket_keys Storage keys emitted in a bucket this cycle.
+     * @param deferred_keys Storage keys the backend deferred this cycle.
+     * @param previously_carried Carry map from the previous cycle; entries
+     * not emitted this cycle are retained in carried_tasks.
+     * @param redrained_carried_keys Carried keys re-drained this cycle, whose
+     * pooled copies the caller already removed; excluded from retention.
+     * @param failed_tasks Output: tasks to NACK (appended).
+     * @param carried_tasks Output: tasks to carry to the next cycle.
+     */
+    static void PartitionUnbucketedTasks(
+        const std::unordered_map<std::string, OffloadTaskItem>&
+            task_by_storage_key,
+        const std::unordered_set<std::string>& all_bucket_keys,
+        const std::vector<std::string>& deferred_keys,
+        const std::unordered_map<std::string, OffloadTaskItem>&
+            previously_carried,
+        const std::unordered_set<std::string>& redrained_carried_keys,
+        std::vector<OffloadTaskItem>& failed_tasks,
+        std::unordered_map<std::string, OffloadTaskItem>& carried_tasks);
+
+    // Tasks for keys the bucket backend deferred to its ungrouped pool, keyed
+    // by tenant-scoped storage key. Consumed (merged into task_by_storage_key)
+    // on the next OffloadObjects call, when the backend re-emits those keys in
+    // a bucket. Only touched from the offload worker path (single-threaded);
+    // lost on restart together with the backend's in-memory ungrouped pool,
+    // in which case the master's TTL reaper reclaims the orphaned tasks.
+    std::unordered_map<std::string, OffloadTaskItem>
+        deferred_task_by_storage_key_;
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;

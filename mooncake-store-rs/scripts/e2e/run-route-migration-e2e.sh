@@ -777,7 +777,7 @@ assert store.setup(
     driver_scratch_bytes,
     "tcp",
     "",
-    "",
+    redis_url,
     stable_id=f"route-migration-driver-{int(time.time() * 1000)}",
     keyspace=keyspace,
     labels={"pool": "pool-a", "storage": "false", "route": "false"},

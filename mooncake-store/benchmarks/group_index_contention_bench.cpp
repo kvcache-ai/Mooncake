@@ -19,7 +19,7 @@
 #include <thread>
 #include <vector>
 
-#include "group_index.h"
+#include "metadata/group_index.h"
 
 namespace mooncake {
 namespace {

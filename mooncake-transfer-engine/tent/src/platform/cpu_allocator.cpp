@@ -22,7 +22,8 @@ namespace mooncake {
 namespace tent {
 Status CpuPlatform::allocate(void** pptr, size_t size, MemoryOptions& options) {
     LocationParser location(options.location);
-    if (location.type() == "cuda" || isAmdGpuLocationType(location.type())) {
+    if (location.type() == "cuda" || isAmdGpuLocationType(location.type()) ||
+        location.type() == "mlu" || options.location == "mlu") {
         return Status::NotImplemented(
             "GPU locations are not supported in cpu platform" LOC_MARK);
     }

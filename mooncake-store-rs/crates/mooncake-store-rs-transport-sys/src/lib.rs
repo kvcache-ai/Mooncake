@@ -630,6 +630,8 @@ pub mod tent {
 
     pub const TYPE_MEMORY: c_int = 0;
     pub const TYPE_FILE: c_int = 1;
+    pub const PRIORITY_HIGH: c_int = 0;
+    pub const TRANSPORT_UNSPEC: c_int = 0;
 
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -639,6 +641,8 @@ pub mod tent {
         pub target_id: SegmentId,
         pub target_offset: u64,
         pub length: u64,
+        pub priority: c_int,
+        pub transport_hint: c_int,
     }
 
     #[repr(C)]
@@ -904,10 +908,25 @@ pub mod tent {
 
 #[cfg(test)]
 mod tests {
-    use super::{add_base_search_dirs, add_upstream_search_dirs, search_library_in_dir};
+    use super::{add_base_search_dirs, add_upstream_search_dirs, search_library_in_dir, tent};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn tent_request_matches_c_abi_layout() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(size_of::<tent::TentRequest>(), 48);
+        assert_eq!(offset_of!(tent::TentRequest, opcode), 0);
+        assert_eq!(offset_of!(tent::TentRequest, source), 8);
+        assert_eq!(offset_of!(tent::TentRequest, target_id), 16);
+        assert_eq!(offset_of!(tent::TentRequest, target_offset), 24);
+        assert_eq!(offset_of!(tent::TentRequest, length), 32);
+        assert_eq!(offset_of!(tent::TentRequest, priority), 40);
+        assert_eq!(offset_of!(tent::TentRequest, transport_hint), 44);
+    }
 
     struct TempDir {
         path: PathBuf,

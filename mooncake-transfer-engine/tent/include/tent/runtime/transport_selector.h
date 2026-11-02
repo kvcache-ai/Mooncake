@@ -89,6 +89,13 @@ struct SelectionContext {
     // Match policy against the original memory types, but select a network
     // transport for the host-to-host leg of a staged request.
     bool host_staging{false};
+    // The peer's XPU buffer may be mapped into this process (Level Zero IPC),
+    // so XpuTransport can address it, unstaged, although the segment is not
+    // local. Other transports still follow host_staging.
+    bool xpu_ipc{false};
+    // Only XpuTransport may carry the request: the device memory has neither
+    // a dma-buf RDMA registration nor a host staging route.
+    bool xpu_ipc_only{false};
 };
 
 /**
@@ -161,7 +168,7 @@ struct SelectionResult {
     std::optional<int> traffic_class;
     // Consumed: names the QP pool the transfer is routed to.
     std::optional<std::string> qp_pool;
-    // Filled by the engine for XPU orchestration, never by select() itself.
+    // Filled by the engine for device staging, never by select() itself.
     std::vector<std::string> staging_params;
 };
 
