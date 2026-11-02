@@ -1886,9 +1886,7 @@ class ApplicationTest(unittest.TestCase):
 
     def test_cpu_resources_report_includes_pid_cgroup_snapshot(self):
         snapshot = VERIFY.pids_cgroup_snapshot()
-        self.assertEqual(
-            set(snapshot), {"pids.current", "pids.peak", "pids.max"}
-        )
+        self.assertEqual(set(snapshot), {"pids.current", "pids.peak", "pids.max"})
         for name, value in snapshot.items():
             if value is not None:
                 self.assertRegex(value, r"^(max|\d+)$", name)
